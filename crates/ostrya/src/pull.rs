@@ -371,8 +371,8 @@ pub enum TimestampCheck {
     /// fetches a delta index, a static delta superblock, a `.commitmeta`, or
     /// an object. If this repository does not hold the commit, the pull fails
     /// with [`Error::ObjectNotFound`] at that point. A pull with no target
-    /// reads no commit. A local pull makes no timestamp check and reads no
-    /// commit.
+    /// reads no commit. [`Repo::pull_local`] makes no timestamp check and
+    /// reads no commit.
     Rev(Checksum),
 }
 
@@ -470,7 +470,7 @@ pub enum TimestampCheck {
 /// - If a requested ref names an intermediate commit, discovery also makes
 ///   the ref-binding check and the timestamp check of that ref.
 ///
-/// A local pull makes no timestamp check.
+/// [`Repo::pull_local`] makes no timestamp check.
 ///
 /// A commit that discovery refuses costs the superblocks and the
 /// `.commitmeta` files that discovery fetched, and the pull fetches no part.
@@ -665,7 +665,8 @@ pub struct PullOptions {
     /// `[core] collection-id` of this repository. [`Repo::pull`],
     /// [`Repo::pull_with_session`], and [`Repo::pull_collection`] refuse an id
     /// with [`Error::Unsupported`] before they send a request.
-    /// [`Repo::pull_collection`] pulls the collection refs of a remote.
+    /// [`Repo::pull_collection`] pulls the collection refs of a remote, and
+    /// of a local repository at a `file://` address.
     pub collection_id: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
@@ -1622,7 +1623,7 @@ impl Repo {
     /// of the commit too, if the pull makes that check. Then it checks the
     /// format of field 2 of the commit, as "Dependencies" states. The walk of
     /// the commit chains does not check the signatures or the bindings of that
-    /// commit again. A local pull makes no timestamp check. So a target that
+    /// commit again. This pull makes no timestamp check. So a target that
     /// the policy or its bindings refuse costs the reads of the superblocks,
     /// and the pull applies no part. The pull reports this refusal before a
     /// defect that the walk of the commit chains finds. A target with no chain
@@ -1773,6 +1774,7 @@ impl Repo {
         let checks = LocalChecks {
             collection_binding: (opts.collection_id.is_some() && !opts.no_ref_writes)
                 .then_some(false),
+            ..LocalChecks::default()
         };
         self.pull_local_with(src, opts, checks).await
     }
@@ -1800,17 +1802,22 @@ impl Repo {
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
-        let trust = crate::verify::PullTrust::resolve(
-            self,
-            opts.remote.as_deref(),
-            &opts.verify,
-            opts.trust_group
-                .as_deref()
-                .map(crate::verify::trust::FieldGroup::new)
-                .as_mut(),
-            crate::verify::Defaults::Section,
-        )
-        .await?;
+        let trust = match checks.trust {
+            Some(trust) => trust,
+            None => {
+                crate::verify::PullTrust::resolve(
+                    self,
+                    opts.remote.as_deref(),
+                    &opts.verify,
+                    opts.trust_group
+                        .as_deref()
+                        .map(crate::verify::trust::FieldGroup::new)
+                        .as_mut(),
+                    crate::verify::Defaults::Section,
+                )
+                .await?
+            }
+        };
         let verification = verify::Verification::from_trust(trust);
         // A pull that requires static deltas reads the source as a fetch
         // reads a remote: the summary, then the deltas that it advertises. A
@@ -1834,36 +1841,45 @@ impl Repo {
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
         let needs_summary = fetching && edges.is_none();
-        let checks_summary = verification.checks_summary();
-        let summary_file = if checks_summary || needs_summary {
-            delta::open_local(src, crate::summary::SUMMARY_FILE).await?
-        } else {
-            None
+        // The caller read the summary and checked it under the same trust, so
+        // the pull does not read or check it again.
+        let summary = match checks.summary {
+            Some(bytes) => Some(bytes),
+            None => {
+                let checks_summary = verification.checks_summary();
+                let summary_file = if checks_summary || needs_summary {
+                    delta::open_local(src, crate::summary::SUMMARY_FILE).await?
+                } else {
+                    None
+                };
+                let signature_file = if checks_summary && summary_file.is_some() {
+                    delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
+                } else {
+                    None
+                };
+                verification
+                    .check_summary_files(summary_file.is_some(), signature_file.is_some())?;
+                let summary = delta::read_opened(
+                    summary_file,
+                    crate::summary::SUMMARY_FILE,
+                    crate::summary::SUMMARY_READ_CAP,
+                )
+                .await?
+                .map(Arc::new);
+                if checks_summary {
+                    let signature = delta::read_opened(
+                        signature_file,
+                        crate::summary::SUMMARY_SIG_FILE,
+                        crate::summary::SUMMARY_READ_CAP,
+                    )
+                    .await?;
+                    verification
+                        .check_summary(summary.as_ref(), signature)
+                        .await?;
+                }
+                summary
+            }
         };
-        let signature_file = if checks_summary && summary_file.is_some() {
-            delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
-        } else {
-            None
-        };
-        verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
-        let summary = delta::read_opened(
-            summary_file,
-            crate::summary::SUMMARY_FILE,
-            crate::summary::SUMMARY_READ_CAP,
-        )
-        .await?
-        .map(Arc::new);
-        if checks_summary {
-            let signature = delta::read_opened(
-                signature_file,
-                crate::summary::SUMMARY_SIG_FILE,
-                crate::summary::SUMMARY_READ_CAP,
-            )
-            .await?;
-            verification
-                .check_summary(summary.as_ref(), signature)
-                .await?;
-        }
         if needs_summary && summary.is_none() {
             return Err(delta::no_summary_error());
         }
@@ -1888,7 +1904,10 @@ impl Repo {
             _ => None,
         };
 
-        let targets = resolve_targets(src, &opts, collection_relpaths).await?;
+        let targets = match checks.targets {
+            Some(targets) => targets,
+            None => resolve_targets(src, &opts, collection_relpaths).await?,
+        };
         let flags = opts.flags;
         // A pull with the collection-binding check reads and writes the refs
         // of the collection. Each other local pull reads and writes the refs
@@ -1901,11 +1920,19 @@ impl Repo {
             Some((id, _)) => RefPlace::of_collection(self, id),
             None => RefPlace::of_remote(opts.remote.as_deref()),
         };
-        // A local pull makes no timestamp check.
+        // `Repo::pull_local` makes no timestamp check. A pull of collection
+        // refs from a local candidate makes the check of the options. The
+        // check reads a commit that it names one time, before discovery.
+        let timestamp = if checks.timestamp {
+            TimestampBase::resolve(self, &opts.timestamp_check).await?
+        } else {
+            TimestampBase::Off
+        };
         let tip_checks = TipChecks {
             collection: collection.map(|(id, _)| id),
             allow_unbound: collection.is_some_and(|(_, allow_unbound)| allow_unbound),
-            ..TipChecks::new(flags, TimestampBase::Off, place)
+            listed: checks.listed.as_ref(),
+            ..TipChecks::new(flags, timestamp, place)
         };
 
         // The pull finds the deltas before the transaction opens, so a refusal
@@ -3563,8 +3590,13 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
     Ok(None)
 }
 
-/// The checks of a local pull that [`PullOptions`] does not state.
-#[derive(Debug, Clone, Copy, Default)]
+/// The checks and the inputs of a local pull that [`PullOptions`] does not
+/// state.
+///
+/// [`Repo::pull_local`] sets `collection_binding` alone. A pull of collection
+/// refs from a local candidate sets each field. It sets `summary` only if
+/// its probe read the refs from the summary.
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LocalChecks {
     /// The collection-binding check of each tip, against
     /// [`collection_id`](PullOptions::collection_id).
@@ -3576,6 +3608,35 @@ pub(crate) struct LocalChecks {
     /// `[core] collection-id` of the destination. `None`, or a pull with no
     /// collection id, makes no collection-binding check.
     pub(crate) collection_binding: Option<bool>,
+    /// The commit of each name of [`refs`](PullOptions::refs), in the same
+    /// order, as the caller read it from the source.
+    ///
+    /// With `Some`, the pull reads no ref of the source and pulls these
+    /// commits. `None` reads the commit of each ref from the source.
+    pub(crate) targets: Option<Vec<(String, Checksum)>>,
+    /// The trust that the caller resolved for the pull.
+    ///
+    /// With `Some`, the pull applies this trust, and does not read
+    /// [`remote`](PullOptions::remote),
+    /// [`verify`](PullOptions::verify), or
+    /// [`trust_group`](PullOptions::trust_group) for it. `None` resolves the
+    /// trust from these fields.
+    pub(crate) trust: Option<crate::verify::PullTrust>,
+    /// `true` if the pull makes the check of
+    /// [`timestamp_check`](PullOptions::timestamp_check), as [`Repo::pull`]
+    /// makes it. With `false`, the pull makes no timestamp check.
+    pub(crate) timestamp: bool,
+    /// The `summary` of the source, which the caller read and checked under
+    /// [`trust`](LocalChecks::trust).
+    ///
+    /// With `Some`, the pull reads no `summary` and no `summary.sig` of the
+    /// source, and does not check them again. It uses these bytes wherever
+    /// it needs the summary. `None` reads the files of the source.
+    pub(crate) summary: Option<Arc<Vec<u8>>>,
+    /// The timestamp that the caller read for each name of
+    /// [`refs`](PullOptions::refs), which the timestamp of its tip must
+    /// equal. `None` makes no such check.
+    pub(crate) listed: Option<HashMap<String, u64>>,
 }
 
 /// Checks the collection options of a local pull.

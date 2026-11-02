@@ -1103,6 +1103,685 @@ fn a_collection_pull_fetches_the_dependency() {
     });
 }
 
+// --- local repositories ------------------------------------------------------
+
+/// The bindings of a commit bound to `ID` with no ref binding.
+const COLLECTION_ONLY: Bind<'static> = Bind {
+    collection: Some(ID),
+    refs: None,
+};
+
+/// Returns the `file://` address of the repository at `dir/name`.
+fn file_url(dir: &Path, name: &str) -> String {
+    format!("file://{}", dir.join(name).display())
+}
+
+/// Returns the names of the remotes of the skip events of `events`, and
+/// checks that each message holds the path of the remote at `dir/NAME`.
+fn skipped(dir: &Path, events: &Mutex<Vec<CollectionPullEvent>>) -> Vec<String> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| match event {
+            CollectionPullEvent::RemoteSkipped {
+                remote, message, ..
+            } => {
+                let path = dir.join(remote).display().to_string();
+                assert!(message.contains(&path), "{remote}: {message}");
+                remote.clone()
+            }
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// Sets `mode` on `path`. Returns `false`, with mode `restore` set again,
+/// when the process still reads the path: a user that ignores the mode
+/// cannot run the test.
+fn lock(path: &Path, mode: u32, restore: u32) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    let readable = if path.is_dir() {
+        std::fs::read_dir(path).is_ok()
+    } else {
+        std::fs::read(path).is_ok()
+    };
+    if readable {
+        unlock(path, restore);
+        return false;
+    }
+    true
+}
+
+/// Sets `mode` on `path`.
+fn unlock(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+/// A remote at a `file://` address is a local repository, and the pull reads
+/// its refs and objects through the file system. Without `allow_unbound`, a
+/// tip with no collection binding fails the pull, and the pull writes
+/// nothing. With it, the pull writes each ref with the commit and the
+/// timestamp of the ref file of the source, and copies the `.commitmeta` of
+/// a commit. The pull fetches nothing. With no ref name, the pull takes each
+/// ref of the collection.
+#[test]
+fn a_file_remote_pulls_from_a_local_repository() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let unbound = Bind {
+            collection: None,
+            refs: None,
+        };
+        let stable = commit(&a, dir.path(), "a1", Some(ID), REF, FIXED_TS, unbound).await;
+        let next = commit(
+            &a,
+            dir.path(),
+            "a2",
+            Some(ID),
+            "os/next",
+            FIXED_TS + 5,
+            unbound,
+        )
+        .await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        a.sign_commit(&stable, &signer).await.unwrap();
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+
+        let (opts, events) = options(&[REF, "os/next"]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("no collection binding")),
+            "{err:?}"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert_nothing_written(&dest).await;
+
+        let (mut opts, events) = options(&[REF, "os/next"]);
+        opts.allow_unbound = true;
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (REF, "a", stable, FIXED_TS),
+                ("os/next", "a", next, FIXED_TS + 5)
+            ]
+        );
+        assert_eq!(mirror(&dest, REF).await, Some(stable));
+        assert_eq!(mirror(&dest, "os/next").await, Some(next));
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        let detached = dest.read_commit_detached_metadata(&stable).await.unwrap();
+        assert!(detached.is_some());
+        assert_eq!(
+            detached,
+            a.read_commit_detached_metadata(&stable).await.unwrap()
+        );
+        assert!(pulled.stats.metadata_imported > 0, "{:?}", pulled.stats);
+        assert!(pulled.stats.content_imported > 0, "{:?}", pulled.stats);
+        assert_eq!(pulled.stats.metadata_fetched, 0);
+        assert_eq!(pulled.stats.content_fetched, 0);
+        assert_eq!(pulled.stats.bytes_transferred, 0);
+
+        let (mut opts, _) = options(&[]);
+        opts.allow_unbound = true;
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        let names: Vec<&str> = pulled.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["os/next", REF]);
+    });
+}
+
+/// An HTTP remote and a `file://` remote each give the ref for which they
+/// list the newer commit.
+#[test]
+fn an_http_remote_and_a_file_remote_each_give_the_newer_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-mixed");
+        let next_bound = Bind {
+            collection: Some(ID),
+            refs: Some(&["os/next"]),
+        };
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let a_stable = commit(&a, dir.path(), "a1", None, REF, FIXED_TS + 10, BOUND).await;
+        commit(&a, dir.path(), "a2", None, "os/next", FIXED_TS, next_bound).await;
+        summarize(&a).await;
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        commit(&b, dir.path(), "b1", Some(ID), REF, FIXED_TS, BOUND).await;
+        let b_next = commit(
+            &b,
+            dir.path(),
+            "b2",
+            Some(ID),
+            "os/next",
+            FIXED_TS + 10,
+            next_bound,
+        )
+        .await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("b", &file_url(dir.path(), "b"), ""),
+            ],
+        )
+        .await;
+
+        let (opts, events) = options(&[REF, "os/next"]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str()))
+            .collect();
+        assert_eq!(got, [(REF, "a"), ("os/next", "b")]);
+        assert_eq!(mirror(&dest, REF).await, Some(a_stable));
+        assert_eq!(mirror(&dest, "os/next").await, Some(b_next));
+        assert!(objects_requested(&server_a));
+        assert!(pulled.stats.content_fetched > 0, "{:?}", pulled.stats);
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// A `file://` address with a host part, `localhost` included, with no
+/// path, or with `%`, `?`, or `#` stops the pull before the request to the
+/// first remote. The pull writes nothing.
+#[test]
+fn a_malformed_file_address_stops_the_pull_before_the_first_request() {
+    block_on(async {
+        for (tag, reason) in [
+            ("localhost", "names a host"),
+            ("host", "names a host"),
+            ("empty", "has no path"),
+            ("percent", "holds '%'"),
+            ("query", "holds '%'"),
+            ("fragment", "holds '%'"),
+        ] {
+            let dir = TmpDir::new("pull-collection-file-address");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let path = dir.path().join("a").display().to_string();
+            let address = match tag {
+                "localhost" => format!("file://localhost{path}"),
+                "host" => format!("file://host{path}"),
+                "empty" => "file://".to_owned(),
+                "percent" => format!("file://{path}%41"),
+                "query" => format!("file://{path}?x"),
+                _ => format!("file://{path}#x"),
+            };
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            let dest = dest(
+                dir.path(),
+                None,
+                &[("a", &server_a.url(), ""), ("b", &address, "")],
+            )
+            .await;
+
+            let (opts, events) = options(&[REF]);
+            let err = dest
+                .pull_collection(ID, &["a", "b"], opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::Pull(m)
+                    if m.starts_with("remote 'b': the file address") && m.contains(reason)),
+                "{tag}: {err:?}"
+            );
+            assert!(events.lock().unwrap().is_empty(), "{tag}");
+            assert!(server_a.seen().is_empty(), "{tag}: {:?}", server_a.seen());
+            assert_nothing_written(&dest).await;
+        }
+    });
+}
+
+/// A `file://` path with no repository, absent or an empty directory, skips
+/// the remote. The message holds the path. The pull takes the ref from the
+/// next remote.
+#[test]
+fn a_file_path_with_no_repository_skips_the_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-none");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        std::fs::create_dir(dir.path().join("empty")).unwrap();
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("missing", &file_url(dir.path(), "missing"), ""),
+                ("empty", &file_url(dir.path(), "empty"), ""),
+                ("a", &file_url(dir.path(), "a"), ""),
+            ],
+        )
+        .await;
+
+        let (opts, events) = options(&[REF]);
+        let pulled = dest
+            .pull_collection(ID, &["missing", "empty", "a"], opts)
+            .await
+            .unwrap();
+        assert_eq!(skipped(dir.path(), &events), ["missing", "empty"]);
+        assert_eq!(pulled.refs[0].remote, "a");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
+/// The client groups of a local source do not apply: a `file://` pull reads
+/// a ref that no group of the source lets a client read.
+#[test]
+fn the_client_groups_of_a_local_source_do_not_apply() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-groups");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let tip = commit(&a, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        let config = dir.path().join("a/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:pub/**\n\
+             [ex-ostrya client \"d\"]\nauth=anonymous\ncollection=*\nallow=r:pub/**\n",
+        );
+        std::fs::write(&config, text).unwrap();
+        // Over HTTP, the groups hide the ref from an anonymous client.
+        let source = Repo::open(&dir.path().join("a")).await.unwrap();
+        let holds_ref = |bytes: &[u8]| bytes.windows(REF.len()).any(|w| w == REF.as_bytes());
+        let refs = RefSelector::parse(["!**"]).unwrap();
+        let collections = RefSelector::parse([format!("{ID}/**").as_str()]).unwrap();
+        let hidden = source
+            .build_ref_listing(
+                &refs,
+                Some(&collections),
+                &common::repo_access(&source, "anonymous"),
+            )
+            .await
+            .unwrap();
+        assert!(!holds_ref(&hidden.bytes));
+        assert!(holds_ref(
+            &repo_listing(&source, &refs, Some(&collections)).await
+        ));
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+
+        let (opts, events) = options(&[REF]);
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs[0].commit, tip);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
+/// A directory or a ref file inside the selection that the probe cannot read
+/// skips the remote, and the pull takes the ref from the next remote. A
+/// directory outside the selection that the probe cannot read fails nothing.
+/// The test returns at once for a user that ignores the mode.
+#[test]
+fn an_unreadable_path_skips_the_remote_only_inside_the_selection() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-perm");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let a_pool = commit(
+            &a,
+            dir.path(),
+            "a1",
+            Some(ID),
+            "pool/x",
+            FIXED_TS + 10,
+            COLLECTION_ONLY,
+        )
+        .await;
+        commit(
+            &a,
+            dir.path(),
+            "a2",
+            Some(ID),
+            "builds/locked/y",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let b_pool = commit(
+            &b,
+            dir.path(),
+            "b1",
+            Some(ID),
+            "pool/x",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let b_build = commit(
+            &b,
+            dir.path(),
+            "b2",
+            Some(ID),
+            "builds/locked/y",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &file_url(dir.path(), "a"), ""),
+                ("b", &file_url(dir.path(), "b"), ""),
+            ],
+        )
+        .await;
+        let mirrors = dir.path().join("a/refs/mirrors").join(ID);
+        let locked = mirrors.join("builds/locked");
+        if !lock(&locked, 0o000, 0o755) {
+            return;
+        }
+
+        let (opts, events) = options(&["pool/x"]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await;
+        let (opts, all_events) = options(&[]);
+        let all = dest.pull_collection(ID, &["a", "b"], opts).await;
+        unlock(&locked, 0o755);
+
+        let pulled = pulled.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs[0].remote, "a");
+        assert_eq!(pulled.refs[0].commit, a_pool);
+        let all = all.unwrap();
+        assert_eq!(skipped(dir.path(), &all_events), ["a"]);
+        let got: Vec<(&str, &str, Checksum)> = all
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit))
+            .collect();
+        assert_eq!(
+            got,
+            [("builds/locked/y", "b", b_build), ("pool/x", "b", b_pool)]
+        );
+
+        let file = mirrors.join("pool/x");
+        if !lock(&file, 0o000, 0o644) {
+            return;
+        }
+        let (opts, events) = options(&["pool/x"]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await;
+        unlock(&file, 0o644);
+        let pulled = pulled.unwrap();
+        assert_eq!(skipped(dir.path(), &events), ["a"]);
+        assert_eq!(pulled.refs[0].remote, "b");
+    });
+}
+
+/// A source whose collection id is `ID` holds the refs of the collection
+/// under `refs/heads`. The pull reads them there, with a ref name and with
+/// no ref name.
+#[test]
+fn a_file_remote_of_the_collection_gives_its_local_refs() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-own");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+        for names in [&[REF][..], &[][..]] {
+            let (opts, events) = options(names);
+            let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(pulled.refs.len(), 1);
+            assert_eq!(pulled.refs[0].name, REF);
+            assert_eq!(pulled.refs[0].commit, tip);
+            assert_eq!(mirror(&dest, REF).await, Some(tip));
+        }
+    });
+}
+
+/// The timestamp check applies to a pull from a `file://` remote.
+#[test]
+fn the_timestamp_check_applies_to_a_file_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-timestamp");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let older = create(dir.path(), "older", Some(ID)).await;
+        commit(&older, dir.path(), "older", None, REF, FIXED_TS - 10, BOUND).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &file_url(dir.path(), "a"), ""),
+                ("older", &file_url(dir.path(), "older"), ""),
+            ],
+        )
+        .await;
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        let err = dest
+            .pull_collection(ID, &["older"], opts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("chronologically older")),
+            "{err:?}"
+        );
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
+/// With a `file://` remote, the pull refuses a subpath with `Unsupported`,
+/// and a field of another transport with `InvalidInput` that names it,
+/// before the request to the first remote. The pull writes nothing.
+#[test]
+fn a_file_remote_refuses_subpaths_and_the_fields_of_other_transports() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-refusals");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("b", &file_url(dir.path(), "a"), ""),
+            ],
+        )
+        .await;
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.subpaths = vec!["/dir".to_owned()];
+        let err = dest
+            .pull_collection(ID, &["a", "b"], opts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("remote 'b'")),
+            "{err:?}"
+        );
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.overrides.http_headers = vec![("X-A".to_owned(), "b".to_owned())];
+        let err = dest
+            .pull_collection(ID, &["a", "b"], opts)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput(m) if m.starts_with("http-header applies to")),
+            "{err:?}"
+        );
+        assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// Under a summary policy, the probe of a `file://` remote reads the refs
+/// from the verified summary of the source, and the pull takes the commit
+/// that the summary lists, also when the ref file names a newer commit. A
+/// summary signed with a key that is not trusted, and a summary with no
+/// `summary.sig`, skip the remote.
+#[test]
+fn a_summary_policy_reads_the_verified_summary_of_a_file_remote() {
+    block_on(async {
+        for case in ["trusted", "other key", "no signature"] {
+            let dir = TmpDir::new("pull-collection-file-summary");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a1", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let secret = match case {
+                "trusted" => Some(SECRET_B64),
+                "other key" => Some(OTHER_SECRET_B64),
+                _ => None,
+            };
+            if let Some(secret) = secret {
+                let signer = Ed25519Signer::from_base64(secret).unwrap();
+                a.sign_summary(&signer).await.unwrap();
+            }
+            commit(&a, dir.path(), "a2", None, REF, FIXED_TS + 10, BOUND).await;
+            let b = create(dir.path(), "b", Some(ID)).await;
+            let fallback = commit(&b, dir.path(), "b", None, REF, FIXED_TS - 10, BOUND).await;
+            let policy =
+                format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+            let dest = dest(
+                dir.path(),
+                None,
+                &[
+                    ("a", &file_url(dir.path(), "a"), &policy),
+                    ("b", &file_url(dir.path(), "b"), ""),
+                ],
+            )
+            .await;
+
+            let (opts, events) = options(&[REF]);
+            let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+            if case == "trusted" {
+                assert!(events.lock().unwrap().is_empty());
+                assert_eq!(pulled.refs[0].remote, "a");
+                assert_eq!(pulled.refs[0].commit, tip);
+                assert_eq!(mirror(&dest, REF).await, Some(tip));
+            } else {
+                assert_eq!(skipped(dir.path(), &events), ["a"], "{case}");
+                assert_eq!(pulled.refs[0].remote, "b", "{case}");
+                assert_eq!(mirror(&dest, REF).await, Some(fallback), "{case}");
+            }
+        }
+    });
+}
+
+/// Under a summary policy, a commit of a `file://` remote whose timestamp
+/// differs from the timestamp that the verified summary lists fails the
+/// pull, as over HTTP. The summary lists one ref, with a timestamp that the
+/// commit does not hold, and a trusted key signs that summary.
+#[test]
+fn a_file_remote_commit_with_another_timestamp_than_listed_fails() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-listed-timestamp");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        commit(&a, dir.path(), "a", None, REF, FIXED_TS + 1, BOUND).await;
+        summarize(&a).await;
+        // The summary states 99 seconds more than the commit holds.
+        let path = dir.path().join("a/summary");
+        let mut bytes = std::fs::read(&path).unwrap();
+        let real = (FIXED_TS + 1).to_be_bytes();
+        let at = bytes
+            .windows(8)
+            .position(|w| w == real)
+            .expect("the summary holds the timestamp");
+        bytes[at..at + 8].copy_from_slice(&(FIXED_TS + 100).to_be_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        a.sign_summary(&signer).await.unwrap();
+        let policy =
+            format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &file_url(dir.path(), "a"), &policy)],
+        )
+        .await;
+
+        let (opts, events) = options(&[REF]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(events.lock().unwrap().is_empty());
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("timestamp")),
+            "{err:?}"
+        );
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// The commit keys of a `file://` remote apply to the pull from it. The
+/// remote trusts one key. A commit signed with another key fails the pull,
+/// and the pull writes nothing. A commit signed with the trusted key passes.
+#[test]
+fn the_keys_of_a_file_remote_apply() {
+    block_on(async {
+        for secret in [OTHER_SECRET_B64, SECRET_B64] {
+            let dir = TmpDir::new("pull-collection-file-keys");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            let signer = Ed25519Signer::from_base64(secret).unwrap();
+            a.sign_commit(&tip, &signer).await.unwrap();
+            let policy = format!("sign-verify=true\nverification-ed25519-key={PUBLIC_B64}\n");
+            let dest = dest(
+                dir.path(),
+                None,
+                &[("a", &file_url(dir.path(), "a"), &policy)],
+            )
+            .await;
+
+            let (opts, events) = options(&[REF]);
+            let pulled = dest.pull_collection(ID, &["a"], opts).await;
+            assert!(events.lock().unwrap().is_empty());
+            if secret == SECRET_B64 {
+                assert_eq!(pulled.unwrap().refs[0].remote, "a");
+                assert_eq!(mirror(&dest, REF).await, Some(tip));
+            } else {
+                let err = pulled.unwrap_err();
+                assert!(matches!(err, Error::Signature(_)), "{err:?}");
+                assert_nothing_written(&dest).await;
+            }
+        }
+    });
+}
+
+/// A pull of one remote and the fetch of its summary still refuse a
+/// `file://` address: the fetcher reads `http` and `https` alone.
+#[test]
+fn a_pull_from_one_remote_refuses_a_file_address() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-plain");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+
+        let opts = PullOptions {
+            refs: vec![REF.to_owned()],
+            ..PullOptions::default()
+        };
+        let err = dest.pull("a", opts).await.unwrap_err();
+        assert!(err.to_string().contains("fetch url scheme file"), "{err:?}");
+        let err = dest.remote_fetch_summary("a").await.unwrap_err();
+        assert!(err.to_string().contains("fetch url scheme file"), "{err:?}");
+        assert_nothing_written(&dest).await;
+    });
+}
+
 // --- refusals ----------------------------------------------------------------
 
 /// The pull refuses each option that it cannot carry before its first

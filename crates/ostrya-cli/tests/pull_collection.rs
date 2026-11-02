@@ -433,3 +433,59 @@ fn no_operand_and_no_listed_ref_fails() {
     );
     assert!(!client.join("refs/mirrors").join(ID).exists());
 }
+
+/// A candidate at a `file://` address is a local repository. The pull reads
+/// its refs and objects through the file system, and prints the statistics
+/// line of `pull-local`. A pull of the same remote with no `--collection`
+/// refuses the `file://` address. A `file://` address with a host part
+/// fails the collection pull with exit 1 and writes no ref.
+#[test]
+fn a_file_candidate_is_a_local_repository() {
+    let dir = TmpDir::new("file");
+    let a = dir.path().join("a");
+    let client = dir.path().join("client");
+    init(&a, Some(ID));
+    init(&client, None);
+    let stable = commit(&a, "a1", REF, TS);
+    configure(
+        &client,
+        &http_remote("a", &format!("file://{}", a.display()), ID),
+    );
+
+    let out = ostrya(&client, &["pull", "--collection", ID, REF]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let line = stdout(&out);
+    assert_eq!(line.lines().count(), 1, "{line}");
+    assert!(line.contains(" content objects imported; "), "{line}");
+    assert!(line.ends_with(" content written\n"), "{line}");
+    assert_eq!(stderr(&out), "");
+    assert_eq!(
+        ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")),
+        Some(stable)
+    );
+    ok(&client, &["fsck"]);
+
+    let out = ostrya(&client, &["pull", "a", REF]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("fetch url scheme file"),
+        "{}",
+        stderr(&out)
+    );
+
+    let other = dir.path().join("other");
+    init(&other, None);
+    configure(
+        &other,
+        &http_remote("a", &format!("file://localhost{}", a.display()), ID),
+    );
+    let out = ostrya(&other, &["pull", "--collection", ID, REF]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        stderr(&out).starts_with("error: pull: remote 'a': the file address 'file://localhost"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!other.join("refs/mirrors").join(ID).exists());
+}

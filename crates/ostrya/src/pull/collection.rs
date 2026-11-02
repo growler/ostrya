@@ -8,19 +8,23 @@
 //!    request.
 //! 2. The probe of each remote, in the given order: the commit and the
 //!    timestamp of each ref, from the ref listing or from the summary. The
-//!    pull skips a remote that fails.
+//!    probe of a remote at a `file://` address reads the ref files of the
+//!    local repository, or its summary. The pull skips a remote that fails.
 //! 3. The selection of a remote for each ref, and then one pull from each
 //!    selected remote, in the given order, through the engine of
-//!    [`Repo::pull`], over the session of its probe.
+//!    [`Repo::pull`], over the session of its probe. A local repository goes
+//!    through the engine of [`Repo::pull_local`].
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ostrya_core::{Checksum, RefSelector, Value, is_collection_id};
+use ostrya_core::{Checksum, Commit, ObjectType, RefSelector, Value, is_collection_id};
 
-use crate::endpoint::{EndpointOverrides, resolve_pull};
+use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
 use crate::refs::{MAX_COLLECTION_ID_LEN, check_ref_path};
@@ -32,8 +36,8 @@ use crate::remote::{Endpoint, PullSession, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::send::write_escaped;
 use crate::summary::{
-    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, Summary, SummaryRef,
-    collection_map_refs, parse_ref_list,
+    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, SUMMARY_READ_CAP, SUMMARY_SIG_FILE,
+    Summary, SummaryRef, collection_map_refs, parse_ref_list,
 };
 use crate::verify::PullTrust;
 use crate::verify::trust::FieldGroup;
@@ -45,7 +49,8 @@ use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, refuse_remote_collection,
+    LocalChecks, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, delta,
+    refuse_remote_collection,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -128,7 +133,14 @@ pub enum CollectionPullEvent {
     /// The pull selects no ref from this remote. The causes are a failed
     /// connection or request, a listing or a summary that does not parse, a
     /// listed ref with no valid timestamp, a summary that the policy of the
-    /// remote refuses, and a bucket repository with no summary.
+    /// remote refuses, and a bucket repository with no summary. For a remote
+    /// at a `file://` address, the causes also include a path with no
+    /// repository, and a directory or a ref file of the selection that
+    /// cannot be read. Without a summary policy, they also include a ref
+    /// whose commit the repository does not hold. The message then names the
+    /// path. Under a summary policy, the probe reads no commit, and a listed
+    /// commit that the repository does not hold fails the pull from it, as
+    /// for a remote.
     #[non_exhaustive]
     RemoteSkipped {
         /// The name of the remote.
@@ -163,7 +175,9 @@ pub struct CollectionPullStats {
     pub refs: Vec<CollectionPullRef>,
     /// The sum of the statistics of the pulls from the selected remotes.
     ///
-    /// [`elapsed`](PullStats::elapsed) is the run time of the whole call.
+    /// [`elapsed`](PullStats::elapsed) is the run time of the whole call. A
+    /// pull from a local repository adds its import counts, and no fetch
+    /// count unless it reads static deltas.
     pub stats: PullStats,
 }
 
@@ -203,6 +217,9 @@ enum Transport {
     /// builds the fetcher before its first request.
     #[cfg(feature = "s3")]
     S3(Fetcher, Box<S3Endpoint>),
+    /// The path of a local repository, from a `file://` address. The pull
+    /// opens the repository in the probe.
+    Local(PathBuf),
 }
 
 impl Transport {
@@ -241,20 +258,32 @@ impl Transport {
     /// Opens a session to the remote.
     ///
     /// The connection to a bucket repository holds a bucket client over the
-    /// fetcher of the session.
-    async fn open(&self) -> Result<Connection> {
+    /// fetcher of the session. The session of a local repository is the open
+    /// repository.
+    async fn open(&self) -> Result<Session> {
         match self {
-            Transport::Http(fetcher) => Ok(PullSession::Http(fetcher.clone()).into()),
-            Transport::Ssh(endpoint, stream) => {
-                connect(Endpoint::clone(endpoint), stream.clone()).await
+            Transport::Http(fetcher) => {
+                Ok(Session::Remote(PullSession::Http(fetcher.clone()).into()))
             }
+            Transport::Ssh(endpoint, stream) => connect(Endpoint::clone(endpoint), stream.clone())
+                .await
+                .map(Session::Remote),
             #[cfg(feature = "s3")]
-            Transport::S3(fetcher, s3) => Ok(Connection {
+            Transport::S3(fetcher, s3) => Ok(Session::Remote(Connection {
                 session: PullSession::Http(fetcher.clone()),
                 bucket: Some(Bucket::from_fetcher(s3, fetcher.clone())),
-            }),
+            })),
+            Transport::Local(path) => Repo::open(path).await.map(Session::Local),
         }
     }
+}
+
+/// An open session to a remote of a collection pull.
+enum Session {
+    /// The session to a server, and its bucket client.
+    Remote(Connection),
+    /// The repository at the `file://` address of a local candidate.
+    Local(Repo),
 }
 
 /// One ref that a remote lists for the collection.
@@ -271,9 +300,8 @@ struct Probed {
     listed: Vec<Listed>,
     /// The `summary` of the remote, if the probe read the refs from it.
     summary: Option<Arc<Vec<u8>>>,
-    /// The open session to the remote, and its bucket client, for the pull
-    /// from it.
-    session: Connection,
+    /// The open session to the remote, for the pull from it.
+    session: Session,
 }
 
 /// The remote that the pull selected for one ref.
@@ -318,12 +346,17 @@ impl Repo {
     /// and their key sources. With `trust_group`, or with the key `trust` of
     /// the remote, the trust group supplies the commit keys.
     ///
+    /// A remote whose `pull-url`, or else `url`, has the scheme `file` is a
+    /// local repository, and the pull does not call [`resolve_pull`] for it.
+    /// "Local repository" below states the rules.
+    ///
     /// # Probe
     ///
     /// The pull asks each remote in turn for the commit of each ref. It
-    /// opens one session to each remote: an ssh client over ssh, or the
-    /// fetcher and its connections over HTTP and to an `s3://` address. The
-    /// pull from a selected remote uses the same session. The pull ends the
+    /// opens one session to each remote: an ssh client over ssh, the
+    /// fetcher and its connections over HTTP and to an `s3://` address, or
+    /// the open repository at a `file://` address. The pull from a selected
+    /// remote uses the same session. The pull ends the
     /// session of each other remote after the selection, and an error of
     /// that end has no effect.
     ///
@@ -417,6 +450,53 @@ impl Repo {
     /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) read
     /// the current commit of a ref at the same place.
     ///
+    /// # Local repository
+    ///
+    /// The address of a local repository is `file://` followed by an
+    /// absolute path, with the scheme in ASCII letters of either case. The
+    /// pull takes the path as written, and decodes no `%` escape. A
+    /// `pull-url` with another address wins over a `file://` value of
+    /// `url`. The pull ignores the TLS keys, the key `proxy`, and the ssh
+    /// keys of the remote. The trust of the remote applies, as for each
+    /// remote.
+    ///
+    /// The probe opens the repository at the path with [`Repo::open`], and
+    /// the repository stays open until the pull from it ends. The probe
+    /// takes the refs as follows:
+    ///
+    /// - If the policy of the remote covers the summary, the probe reads the
+    ///   `summary` and the `summary.sig` of the repository, verifies the
+    ///   summary, and reads the refs from it, as from a remote.
+    /// - Otherwise, the probe reads the ref files of the collection with
+    ///   [`Repo::list_collection_refs_in`]. So a repository whose
+    ///   `[core] collection-id` is `collection_id` gives its `refs/heads`
+    ///   refs. The probe reads only the directories that the names can
+    ///   reach. The timestamp of each ref is the timestamp of the commit
+    ///   that the probe pins, which the probe reads one time for each
+    ///   commit.
+    ///
+    /// The client groups of the repository do not apply, because they govern
+    /// `ostrya serve` and `ostrya send` alone. The file permissions are the
+    /// access. A directory outside the selection that the probe cannot read
+    /// fails nothing. A directory or a ref file inside the selection that the
+    /// probe cannot read skips the remote, as each other error of the open
+    /// and of the probe does. The message of the event names the path.
+    ///
+    /// The pull from a selected local repository is a pull of
+    /// [`Repo::pull_local`] at the commits that the probe read. It reads no
+    /// ref file again. It makes the checks of "Pull", and the timestamp
+    /// check of [`timestamp_check`](PullOptions::timestamp_check). So it
+    /// checks each commit against the listed timestamp of the probe, as for
+    /// a remote. Under a summary policy, these timestamps come from the
+    /// verified summary, and the pull uses the summary that the probe
+    /// verified. It does not read the `summary` or the `summary.sig` of the
+    /// repository again. A listed commit that the repository does not hold
+    /// then fails the pull. As each local pull,
+    /// it hashes an imported object only with
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED). Its counts go to
+    /// [`CollectionPullStats::stats`] as the counts of a local pull: the
+    /// import counts, and no fetch count unless it reads static deltas.
+    ///
     /// # Options
     ///
     /// Each field of [`PullOptions`] that [`Repo::pull`] reads applies to
@@ -429,7 +509,8 @@ impl Repo {
     ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
     ///   apply to the probe and the pull of each remote.
     /// - [`progress`](PullOptions::progress) gets the counters of each pull
-    ///   from a remote, and no count of the probe.
+    ///   from a remote, and no count of the probe. A pull from a local
+    ///   repository does not use it.
     ///
     /// # Errors
     ///
@@ -462,6 +543,14 @@ impl Repo {
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
     ///   for each remote, and the errors of
     ///   [`trust_group`](PullOptions::trust_group).
+    /// - For each remote at a `file:` address, [`Error::Pull`] if the
+    ///   address does not start with `file://`, names a host (`localhost`
+    ///   too), has no path, or holds `%`, `?`, or `#`. Also
+    ///   [`Error::InvalidInput`] if [`overrides`](PullOptions::overrides)
+    ///   sets a field of another transport, for example a TLS path, a
+    ///   header, or a retry count above 0. The message names the field.
+    /// - [`Error::Unsupported`] if [`subpaths`](PullOptions::subpaths) is not
+    ///   empty and a remote is at a `file://` address.
     /// - For each HTTP remote and each remote at an `s3://` address, the
     ///   errors of [`Repo::pull`] that come from the build of its fetcher:
     ///   [`Error::Unsupported`] for a mirror scheme other than `http` and
@@ -534,14 +623,19 @@ impl Repo {
         // reads the key sources of the group one time for all the remotes.
         let mut group = opts.trust_group.as_deref().map(FieldGroup::new);
         for name in first_of_each(remotes.iter().copied()) {
-            let endpoint = resolve_pull(Some(self.config()), name, opts.overrides.clone()).await?;
-            let trust = PullTrust::for_pull(self, name, &opts.verify, group.as_mut()).await?;
-            let transport = Transport::new(endpoint, opts.max_outstanding_fetches).await?;
-            candidates.push(Candidate {
-                name,
-                transport,
-                trust,
-            });
+            candidates.push(resolve_candidate(self, name, &opts, group.as_mut()).await?);
+        }
+        // A local pull copies whole trees.
+        if !opts.subpaths.is_empty()
+            && let Some(local) = candidates
+                .iter()
+                .find(|candidate| matches!(candidate.transport, Transport::Local(_)))
+        {
+            return Err(Error::Unsupported(format!(
+                "the pull address of remote '{}' is a local repository, and a pull of \
+                 collection refs from a local repository takes no subpath",
+                local.name
+            )));
         }
 
         // The session and the summary of each remote that answered, by the
@@ -559,9 +653,15 @@ impl Repo {
                 }
                 Err(e) => {
                     if let Some(on_event) = on_event.as_mut() {
+                        let message = match &candidate.transport {
+                            Transport::Local(path) => {
+                                format!("local repository '{}': {e}", path.display())
+                            }
+                            _ => e.to_string(),
+                        };
                         on_event(CollectionPullEvent::RemoteSkipped {
                             remote: candidate.name.to_owned(),
-                            message: e.to_string(),
+                            message,
                         });
                     }
                     answers.push(None);
@@ -596,39 +696,63 @@ impl Repo {
                 .filter(|selected| selected.remote == index)
                 .map(|selected| &selected.listed)
                 .collect();
-            let pinned = Pinned {
-                targets: mine.iter().map(|l| (l.name.clone(), l.commit)).collect(),
-                listed: mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect(),
-                collection: collection_id,
-                allow_unbound,
-                place,
-                summary: Mutex::new(summaries[index].take()),
-            };
+            let targets: Vec<(String, Checksum)> =
+                mine.iter().map(|l| (l.name.clone(), l.commit)).collect();
+            let listed: HashMap<String, u64> =
+                mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect();
+            let summary = summaries[index].take();
             // The trust and the session hold what these fields gave.
             let run = PullOptions {
-                refs: pinned
-                    .targets
-                    .iter()
-                    .map(|(name, _)| name.clone())
-                    .collect(),
+                refs: targets.iter().map(|(name, _)| name.clone()).collect(),
                 verify: PullVerify::default(),
                 trust_group: None,
                 max_outstanding_fetches: None,
                 overrides: EndpointOverrides::default(),
                 ..opts.clone()
             };
-            let pulled = self
-                .run_session(
-                    session,
-                    candidate.trust,
-                    related,
-                    run,
-                    Wanted::Pinned(&pinned),
-                    subpaths.clone(),
-                    None,
-                    Instant::now(),
-                )
-                .await;
+            let pulled = match session {
+                Session::Remote(connection) => {
+                    let pinned = Pinned {
+                        targets,
+                        listed,
+                        collection: collection_id,
+                        allow_unbound,
+                        place,
+                        summary: Mutex::new(summary),
+                    };
+                    self.run_session(
+                        connection,
+                        candidate.trust,
+                        related,
+                        run,
+                        Wanted::Pinned(&pinned),
+                        subpaths.clone(),
+                        None,
+                        Instant::now(),
+                    )
+                    .await
+                }
+                // The local pull checks each tip against the timestamp of
+                // the probe, as a pull from a remote does. Without a summary
+                // policy, the probe read that timestamp from the same commit.
+                // Under a summary policy, it comes from the summary that the
+                // probe checked, and the pull uses that summary.
+                Session::Local(src) => {
+                    let run = PullOptions {
+                        collection_id: Some(collection_id.to_owned()),
+                        ..run
+                    };
+                    let checks = LocalChecks {
+                        collection_binding: Some(allow_unbound),
+                        targets: Some(targets),
+                        trust: Some(candidate.trust),
+                        timestamp: true,
+                        summary,
+                        listed: Some(listed),
+                    };
+                    self.pull_local_with(&src, run, checks).await
+                }
+            };
             match pulled {
                 Ok(pulled) => add_stats(&mut stats, &pulled),
                 Err(e) => {
@@ -685,11 +809,52 @@ fn take_unselected<S, M>(
 /// Ends each session of `sessions`.
 ///
 /// The pull reads nothing more from these remotes, so an error of an end has
-/// no effect, and the call drops it.
-async fn end_sessions(sessions: impl IntoIterator<Item = Connection>) {
-    for connection in sessions {
-        let _ = connection.session.finish().await;
+/// no effect, and the call drops it. A local repository has no session to
+/// end, and the call drops its handle.
+async fn end_sessions(sessions: impl IntoIterator<Item = Session>) {
+    for session in sessions {
+        if let Session::Remote(connection) = session {
+            let _ = connection.session.finish().await;
+        }
     }
+}
+
+/// Resolves the remote `name` of `repo` to a candidate of a collection pull,
+/// with the options `opts` and the trust group `group` of the options.
+///
+/// The call resolves the address, then the trust, then the transport. A
+/// `file://` address gives a local candidate. Each other address goes
+/// through [`resolve_pull`] and [`Transport::new`]. The call sends no
+/// request and opens no repository.
+async fn resolve_candidate<'a>(
+    repo: &Repo,
+    name: &'a str,
+    opts: &PullOptions,
+    group: Option<&mut FieldGroup<'_>>,
+) -> Result<Candidate<'a>> {
+    /// The address of a candidate.
+    enum Address {
+        Local(PathBuf),
+        Endpoint(Box<Endpoint>),
+    }
+    let address = match local_pull_path(repo.config(), name, &opts.overrides)? {
+        Some(path) => Address::Local(path),
+        None => Address::Endpoint(Box::new(
+            resolve_pull(Some(repo.config()), name, opts.overrides.clone()).await?,
+        )),
+    };
+    let trust = PullTrust::for_pull(repo, name, &opts.verify, group).await?;
+    let transport = match address {
+        Address::Local(path) => Transport::Local(path),
+        Address::Endpoint(endpoint) => {
+            Transport::new(*endpoint, opts.max_outstanding_fetches).await?
+        }
+    };
+    Ok(Candidate {
+        name,
+        transport,
+        trust,
+    })
 }
 
 /// Makes the checks of [`Repo::pull_collection`] that read the arguments
@@ -810,9 +975,21 @@ fn name_cost(id: &str, name: &str) -> usize {
 /// empty.
 ///
 /// The probe opens a session. If the probe fails, it ends the session. If
-/// the probe succeeds, it gives the session back for the pull.
+/// the probe succeeds, it gives the session back for the pull. The session
+/// of a local candidate is the open repository at its `file://` address.
 async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Probed> {
-    let connection = candidate.transport.open().await?;
+    let connection = match candidate.transport.open().await? {
+        Session::Remote(connection) => connection,
+        Session::Local(src) => {
+            let verification = Verification::from_trust(candidate.trust.clone());
+            let (listed, summary) = probe_local(&src, &verification, id, names).await?;
+            return Ok(Probed {
+                listed,
+                summary,
+                session: Session::Local(src),
+            });
+        }
+    };
     let http = matches!(connection.session, PullSession::Http(_));
     // The probe reads files that a pull reads before its count starts, so it
     // counts no byte.
@@ -822,7 +999,7 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
         Ok((listed, summary)) => Ok(Probed {
             listed,
             summary,
-            session: source.into_connection(),
+            session: Session::Remote(source.into_connection()),
         }),
         Err(e) => source.finish(Err(e)).await,
     }
@@ -830,6 +1007,87 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
 
 /// The refs that a probe read, and the `summary` if the refs come from it.
 type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
+
+/// Reads the refs of `names` in the collection `id` from the local
+/// repository `src`, or each ref of the collection if `names` is empty.
+///
+/// If `verification` checks the summary, the refs come from the `summary`
+/// of `src`, after the check of the summary and its `summary.sig`, as from a
+/// remote. The probe reads these files under the size cap of a summary, and
+/// gives back the bytes of the summary for the pull.
+///
+/// Otherwise the refs come from the ref files of `src`, through
+/// [`Repo::list_collection_refs_in`]. So the collection id of `src` puts its
+/// `refs/heads` refs in the collection, and the probe reads only the
+/// directories that the names can reach. The timestamp of each ref is the
+/// timestamp of its commit in `src`. The probe reads each commit one time, on
+/// the blocking pool, under the size cap of a metadata object.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] if the summary fails the policy, or if `src` has
+///   no `summary` or no `summary.sig` under the policy.
+/// - [`Error::InvalidRefspec`] if a name fails the ref-name rule.
+/// - [`Error::ObjectNotFound`] if `src` does not hold the commit of a ref.
+/// - [`Error::Io`] if a directory or a ref file that the names reach cannot
+///   be read, and the errors of the read of a ref file or a commit.
+async fn probe_local(
+    src: &Repo,
+    verification: &Verification,
+    id: &str,
+    names: &[&str],
+) -> Result<Refs> {
+    if verification.checks_summary() {
+        let summary_file = delta::open_local(src, SUMMARY_FILE).await?;
+        let signature_file = if summary_file.is_some() {
+            delta::open_local(src, SUMMARY_SIG_FILE).await?
+        } else {
+            None
+        };
+        verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
+        let summary = delta::read_opened(summary_file, SUMMARY_FILE, SUMMARY_READ_CAP)
+            .await?
+            .map(Arc::new);
+        let signature =
+            delta::read_opened(signature_file, SUMMARY_SIG_FILE, SUMMARY_READ_CAP).await?;
+        verification
+            .check_summary(summary.as_ref(), signature)
+            .await?;
+        let Some(bytes) = summary else {
+            unreachable!("the summary check needs a summary");
+        };
+        let (_, listed) = parse_refs(Arc::clone(&bytes), id, names).await?;
+        return Ok((listed, Some(bytes)));
+    }
+    let refs = src
+        .list_collection_refs_in(id, &RefSelector::parse(names.iter().copied())?)
+        .await?;
+    for (name, _) in &refs {
+        check_ref_path(name)?;
+    }
+    let src = src.clone();
+    let listed = ostrya_rt::unblock(move || {
+        let mut timestamps: HashMap<Checksum, u64> = HashMap::new();
+        refs.into_iter()
+            .map(|(name, commit)| {
+                let timestamp = match timestamps.entry(commit) {
+                    Entry::Occupied(known) => *known.get(),
+                    Entry::Vacant(slot) => {
+                        let bytes = src.load_object_bytes_blocking(ObjectType::Commit, &commit)?;
+                        *slot.insert(Commit::parse_timestamp(&bytes)?)
+                    }
+                };
+                Ok(Listed {
+                    name,
+                    commit,
+                    timestamp,
+                })
+            })
+            .collect::<Result<Vec<Listed>>>()
+    })
+    .await?;
+    Ok((listed, None))
+}
 
 /// Reads the refs of `names` in the collection `id` from `source`, or each
 /// ref of the collection if `names` is empty.
@@ -1184,7 +1442,9 @@ mod tests {
         ostrya_rt::block_on(async {
             let transport = Transport::new(Endpoint::S3(s3), None).await.unwrap();
             assert!(matches!(transport, Transport::S3(..)));
-            let connection = transport.open().await.unwrap();
+            let Session::Remote(connection) = transport.open().await.unwrap() else {
+                panic!("an S3 transport opens a remote session");
+            };
             assert!(matches!(connection.session, PullSession::Http(_)));
             assert!(connection.bucket.is_some());
         });

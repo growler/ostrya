@@ -59,6 +59,9 @@ for it.
 - `Repo::pull` over HTTP refuses `collection_id`. `Repo::pull_collection`
   pulls collection refs.
 - `Repo::pull_local` refuses a subpath.
+- `ostrya pull REMOTE`, `remote refs`, and `remote summary` refuse a
+  `file://` address, which the `ostree` command reads. `ostrya pull
+  --collection` reads a `file://` candidate through the local pull.
 - The HTTP pull of the port reads a 403 for an optional file as an error,
   for example for `summary.sig`, a `.commitmeta` object, or the superblock
   of a static delta. So the HTTP pull of the port stops at the first absent

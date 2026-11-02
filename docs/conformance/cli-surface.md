@@ -3466,8 +3466,11 @@ port adds `--force-copy`, `--sign-verify`, and `--sign-verify-summary`. It also 
 `--gpg-verify[=BOOL]` and `--gpg-verify-summary[=BOOL]`, which the tool refuses
 with `error: Unknown option --gpg-verify` (or the option as written, value
 included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
-`file://` remote, which the tool pulls from, reports `error: unsupported: fetch
-url scheme file: only http and https are fetched` at exit 1 and writes nothing.
+pull from one `file://` remote, which the tool pulls from, reports `error:
+unsupported: fetch url scheme file: only http and https are fetched` at exit 1
+and writes nothing. `pull --collection` takes a `file://` candidate, and reads
+the repository at its path as `pull-local` does (`format-reference.md`, "The
+pull of collection refs").
 The port reads the remote key `trust=NAME`, and the trust group
 `[ex-ostrya trust "NAME"]` then checks the commits of the pull
 (`ostrya-config(1)`, "REMOTE KEYS"). The tool keeps the key and ignores it
@@ -3507,8 +3510,14 @@ and the command takes no REMOTE. `clap` refuses it together with `--url`,
 the bindings of each commit. The command reads the `collection-id` key of
 each remote, so a value with a malformed escape sequence in any remote fails
 the command at exit 1. With no ref operand, a pull in which no candidate
-lists a ref of ID fails at exit 1 and writes nothing. The counterpart in the
-tool is `find-remotes --pull` ("P3").
+lists a ref of ID fails at exit 1 and writes nothing. A candidate at a
+`file://` address is a local repository. A `file://` address with a host
+part, `localhost` included, with no path, or with `%`, `?`, or `#` fails the
+command at exit 1 before the first request. The command then also refuses
+`--subpath`, `--http-header`, `--network-retries` above 0, and the low-speed
+options at exit 1. When the pull fetched nothing and imported objects, the
+statistics line has the form of `pull-local`. The counterpart in the tool is
+`find-remotes --pull` ("P3").
 
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port
@@ -3752,7 +3761,9 @@ at exit 1. Both stop before the first request, and neither writes an object
 or a ref (`cli-behavior.md`, "HTTP pull surface", "Depth less than -1").
 
 `--untrusted` over a `file://` remote changes what the tool does; the port
-fetches no `file://` remote. Under `--require-static-deltas` into `archive`
+fetches no `file://` remote. A `file://` candidate of `pull --collection` is
+a local pull, which hashes an imported object only under `--untrusted`, as
+`pull-local` does. Under `--require-static-deltas` into `archive`
 the tool refuses with `error: Can't use static deltas in an archive repo`, and
 the port takes the delta, with or without `--subpath`. This is a capability
 difference: the delta applier of the port writes each object through the

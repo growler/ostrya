@@ -3776,7 +3776,15 @@ struct PullArgs {
     /// candidate, and the pull fails before its first request. The S3
     /// settings of each candidate come from the config, and the command
     /// refuses the `--s3-*` options. It refuses --allow-cleartext-credentials
-    /// if the pull address of a candidate is an HTTP or an ssh address. For
+    /// if the pull address of a candidate is an HTTP or an ssh address.
+    /// A candidate whose `pull-url`, or else `url`, is `file://PATH` is a
+    /// local repository: the pull reads the repository at PATH through the
+    /// file system, as `pull-local` does, and the file permissions are the
+    /// access. PATH is an absolute path, as written. A host part, an empty
+    /// path, a `file:` address with no `//`, `%`, `?`, and `#` are errors,
+    /// and the pull fails before its first request. The
+    /// pull also refuses --subpath, --http-header, --network-retries above 0,
+    /// and the low-speed options with a local candidate. For
     /// each ref, it selects the candidate with the newest commit, and a tie
     /// goes to the first candidate in the config. A candidate that fails to
     /// answer is skipped with a warning. The pull from each selected
@@ -3786,6 +3794,8 @@ struct PullArgs {
     /// Each commit must be bound to ID. If a commit has a ref binding, the
     /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`, or
     /// `refs/heads/REF` if the `collection-id` of this repository is ID.
+    /// If the pull fetched nothing and imported objects, the statistics line
+    /// has the form of `pull-local`.
     #[arg(
         long,
         value_name = "ID",
@@ -6732,7 +6742,10 @@ async fn pull(
         ..PullOptions::default()
     };
     let pulled = match from {
-        PullFrom::Remote(remote) => repo.pull(&remote, opts).await,
+        PullFrom::Remote(remote) => repo
+            .pull(&remote, opts)
+            .await
+            .map(|stats| (stats, PullSource::Http)),
         PullFrom::Collection { id, remotes } => {
             let remotes: Vec<&str> = remotes.iter().map(String::as_str).collect();
             let mut collection = CollectionPullOptions::default();
@@ -6740,12 +6753,12 @@ async fn pull(
             collection.on_event = Some(Box::new(|event| eprintln!("warning: {event}")));
             repo.pull_collection(&id, &remotes, collection)
                 .await
-                .map(|pulled| pulled.stats)
+                .map(|pulled| (pulled.stats, collection_source(&pulled.stats)))
         }
     };
     let prefix = line.map_or("", ProgressLine::finish);
-    let stats = match pulled {
-        Ok(stats) => stats,
+    let (stats, source) = match pulled {
+        Ok(pulled) => pulled,
         Err(e) => {
             // The error goes to standard error, on a line of its own.
             if terminal {
@@ -6754,7 +6767,7 @@ async fn pull(
             return Err(e);
         }
     };
-    let mut text = statistics_line(&stats, PullSource::Http);
+    let mut text = statistics_line(&stats, source);
     if terminal {
         // The statistics line is drawn over the progress line and padded as
         // the progress line is.
@@ -6961,6 +6974,24 @@ enum PullSource {
     Http,
     /// Another local repository.
     Local,
+}
+
+/// Returns the source whose statistics line a pull of collection refs
+/// prints.
+///
+/// A pull that fetched nothing and imported objects gets the line of a local
+/// pull. Each other pull gets the line of a pull from a remote.
+fn collection_source(stats: &PullStats) -> PullSource {
+    let fetched = stats.metadata_fetched > 0
+        || stats.content_fetched > 0
+        || stats.delta_parts > 0
+        || stats.bytes_transferred > 0;
+    let imported = stats.metadata_imported > 0 || stats.content_imported > 0;
+    if !fetched && imported {
+        PullSource::Local
+    } else {
+        PullSource::Http
+    }
 }
 
 /// Returns the success line of a pull, in the words of the `ostree` command.
@@ -16359,6 +16390,44 @@ mod tests {
             statistics_line(&PullStats::default(), PullSource::Http),
             "0 metadata, 0 content objects fetched; 0 bytes content written"
         );
+    }
+
+    /// A pull of collection refs that fetched nothing and imported objects
+    /// prints the line of a local pull. A fetch, or no import, keeps the
+    /// line of a pull from a remote.
+    #[test]
+    fn a_collection_pull_with_no_fetch_prints_the_local_line() {
+        let imported = PullStats {
+            metadata_imported: 3,
+            ..PullStats::default()
+        };
+        assert_eq!(collection_source(&imported), PullSource::Local);
+        let content = PullStats {
+            content_imported: 1,
+            ..PullStats::default()
+        };
+        assert_eq!(collection_source(&content), PullSource::Local);
+        assert_eq!(collection_source(&PullStats::default()), PullSource::Http);
+        for fetched in [
+            PullStats {
+                metadata_fetched: 1,
+                ..imported
+            },
+            PullStats {
+                content_fetched: 1,
+                ..imported
+            },
+            PullStats {
+                delta_parts: 1,
+                ..imported
+            },
+            PullStats {
+                bytes_transferred: 1,
+                ..imported
+            },
+        ] {
+            assert_eq!(collection_source(&fetched), PullSource::Http, "{fetched:?}");
+        }
     }
 
     /// The progress text appended to an empty line.

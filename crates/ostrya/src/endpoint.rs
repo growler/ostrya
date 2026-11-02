@@ -231,6 +231,11 @@ pub(crate) type S3Environment = ();
 /// or an `s3://` address, because the `ostree` command also reads it. The
 /// function ignores the keys `contenturl` and `metalink`.
 ///
+/// The fetcher refuses a `file://` address.
+/// [`Repo::pull_collection`](crate::Repo::pull_collection) reads a remote at
+/// a `file://` address as a local repository, and does not call this
+/// function for it.
+///
 /// A `url` of the caller replaces the address alone. The TLS keys, the key
 /// `proxy`, the ssh keys, and the S3 keys of the section still apply.
 ///
@@ -536,6 +541,114 @@ fn parse_pull_address(value: &str) -> Result<PullAddress> {
         address,
         options: SshOptions::default(),
     }))
+}
+
+/// Returns the path of the local repository that a pull of collection refs
+/// reads for `remote`, or `None` if the pull address of `remote` is not a
+/// `file:` address.
+///
+/// The address is the first of these that is set: `url` of `o`, the key
+/// `pull-url`, and the key `url`. It is a `file:` address if its scheme is
+/// `file`, in ASCII letters of either case. A `file:` address is `file://`
+/// followed by an absolute path. The function takes the path as written: it
+/// decodes no `%` escape. `None` also comes for a remote with no section or
+/// with no address, so that [`resolve_pull`] states the refusal.
+///
+/// For a `file:` address, the function also refuses the S3 keys of the
+/// section as [`resolve_pull`] does, and each field of `o` that applies to
+/// another transport. It reads no file, and it ignores the TLS keys, the key
+/// `proxy`, and the ssh keys of the section.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if `o` sets `push_token_file` or `push_user`,
+///   for each address, before the function reads a key.
+/// - [`Error::Pull`] if a `file:` address does not start with `file://`,
+///   names a host (`localhost` too), has no path, or holds `%`, `?`, or `#`.
+///   The message shows the address without the text up to its last `@`.
+/// - [`Error::Pull`] if the section sets an S3 key, as [`resolve_pull`]
+///   states.
+/// - [`Error::InvalidInput`] if `o` sets a field of an HTTP address, of an
+///   `s3://` address, or of an ssh address: a TLS path,
+///   `allow_cleartext_credentials`, `http_headers`, a `max_retries` above 0,
+///   a low-speed field, an S3 field, `ssh_command`, or `remote_command`. The
+///   message names the first such field.
+/// - [`Error::Core`] if a key that the function reads holds a malformed
+///   escape sequence.
+pub(crate) fn local_pull_path(
+    config: &RepoConfig,
+    remote: &str,
+    o: &EndpointOverrides,
+) -> Result<Option<PathBuf>> {
+    let push_fields = [
+        ("push-token-file", o.push_token_file.is_some()),
+        ("push-user", o.push_user.is_some()),
+    ];
+    if let Some((name, _)) = push_fields.iter().find(|(_, set)| *set) {
+        return Err(Error::InvalidInput(format!(
+            "{name} applies to a push, and this is a pull"
+        )));
+    }
+    let section = config.remote(remote);
+    let address = match (&o.url, &section) {
+        (Some(url), _) => Some(url.clone()),
+        (None, Some(section)) => match section.pull_url()? {
+            Some(pull_url) => Some(pull_url),
+            None => section.url()?,
+        },
+        (None, None) => None,
+    };
+    let Some(address) = address else {
+        return Ok(None);
+    };
+    if !address
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
+        return Ok(None);
+    }
+    let refused = |reason: &str| {
+        Error::Pull(format!(
+            "remote '{remote}': the file address '{}' {reason}; a local repository is file:// \
+             followed by an absolute path",
+            remote::without_userinfo(&address)
+        ))
+    };
+    let Some(rest) = address[5..].strip_prefix("//") else {
+        return Err(refused("does not start with file://"));
+    };
+    if rest.is_empty() {
+        return Err(refused("has no path"));
+    }
+    if !rest.starts_with('/') {
+        return Err(refused("names a host"));
+    }
+    if rest.contains(['%', '?', '#']) {
+        return Err(refused("holds '%', '?', or '#'"));
+    }
+    check_s3_keys(remote, section.as_ref())?;
+    let field = http_field(o)
+        .map(|name| (name, "a pull over HTTP"))
+        .or_else(|| s3_field(o).map(|name| (name, "a pull from an s3:// address")))
+        .or_else(|| ssh_field(o).map(|name| (name, "a pull over ssh")));
+    if let Some((name, transport)) = field {
+        return Err(Error::InvalidInput(format!(
+            "{name} applies to {transport}, and the pull address of remote '{remote}' is a \
+             local repository"
+        )));
+    }
+    Ok(Some(PathBuf::from(rest)))
+}
+
+/// Returns the name of the first field of `o` that applies to an ssh
+/// address alone, or `None` if `o` sets no such field. Each name is the
+/// remote key of the field.
+fn ssh_field(o: &EndpointOverrides) -> Option<&'static str> {
+    let set = [
+        ("ssh-command", o.ssh_command.is_some()),
+        ("send-command", o.remote_command.is_some()),
+    ];
+    set.iter().find(|(_, set)| *set).map(|(name, _)| *name)
 }
 
 /// Refuses an S3 key of `section`, the section of `remote`, if neither
@@ -2499,6 +2612,125 @@ mod tests {
         assert_eq!(http.tls.roots, TrustRoots::Pem(b"KEY-CA".to_vec()));
         assert_eq!(identity(&http), (b"KEY-CERT".to_vec(), b"KEY-KEY".to_vec()));
         assert!(matches!(&http.proxy, Proxy::Url(url) if url == "http://proxy.ex.com:3128"));
+    }
+
+    const LOCAL_SECTIONS: &str = "[remote \"url\"]\nurl=file:///srv/repo\n\n\
+                                  [remote \"upper\"]\npull-url=FILE:///srv/a@b c\n\
+                                  url=https://ex.com/repo\n\n\
+                                  [remote \"http-pull-url\"]\npull-url=https://ex.com/repo\n\
+                                  url=file:///srv/repo\n\n\
+                                  [remote \"http\"]\nurl=https://ex.com/repo\n\n\
+                                  [remote \"ssh\"]\npull-url=ssh://h/srv/repo\n\n\
+                                  [remote \"keys\"]\nurl=file:///srv/repo\n\
+                                  tls-ca-path=/nowhere/ca.pem\nproxy=http://proxy.ex.com\n\
+                                  ssh-command=ssh -q\nsend-command=ostrya send\n\n\
+                                  [remote \"s3-key\"]\nurl=file:///srv/repo\n\
+                                  s3-region=eu-west-1\n\n\
+                                  [remote \"none\"]\ngpg-verify=false\n";
+
+    fn local(remote: &str, o: &EndpointOverrides) -> Result<Option<PathBuf>> {
+        local_pull_path(&config(LOCAL_SECTIONS), remote, o)
+    }
+
+    /// A `file:` address of a pull, in either case of the scheme, gives the
+    /// path as written. The TLS, proxy, and ssh keys of the section do not
+    /// apply. Each other address, an absent section, and a section with no
+    /// address give `None`. `pull-url` wins over `url`, and the url of the
+    /// caller wins over both.
+    #[test]
+    fn a_file_address_gives_the_path_of_a_local_repository() {
+        let d = EndpointOverrides::default();
+        assert_eq!(local("url", &d).unwrap(), Some("/srv/repo".into()));
+        assert_eq!(local("upper", &d).unwrap(), Some("/srv/a@b c".into()));
+        assert_eq!(local("keys", &d).unwrap(), Some("/srv/repo".into()));
+        for name in ["http-pull-url", "http", "ssh", "absent", "none"] {
+            assert_eq!(local(name, &d).unwrap(), None, "{name}");
+        }
+        let o = EndpointOverrides {
+            url: Some("file:////srv//x".into()),
+            ..EndpointOverrides::default()
+        };
+        assert_eq!(local("http", &o).unwrap(), Some("//srv//x".into()));
+        let o = EndpointOverrides {
+            url: Some("https://ex.com/".into()),
+            ..EndpointOverrides::default()
+        };
+        assert_eq!(local("url", &o).unwrap(), None);
+    }
+
+    /// A `file:` address with a host part, with no path, with no `//`, or
+    /// with `%`, `?`, or `#` is refused with the name of the remote.
+    #[test]
+    fn a_malformed_file_address_is_refused() {
+        for (address, reason) in [
+            ("file://localhost/srv/repo", "names a host"),
+            ("file://h/srv/repo", "names a host"),
+            ("file://u-QXZ@h/srv/repo", "names a host"),
+            ("file://", "has no path"),
+            ("file:/srv/repo", "does not start with file://"),
+            ("file:///srv/a%20b", "holds '%', '?', or '#'"),
+            ("file:///srv/a?b", "holds '%', '?', or '#'"),
+            ("file:///srv/a#b", "holds '%', '?', or '#'"),
+        ] {
+            let config = config(&format!("[remote \"r\"]\nurl={address}\n"));
+            let msg = pull_error(local_pull_path(&config, "r", &EndpointOverrides::default()));
+            assert!(!msg.contains("QXZ"), "{msg}");
+            assert!(
+                msg.starts_with("remote 'r': the file address '")
+                    && msg.contains(&format!("' {reason}; ")),
+                "{address}: {msg}"
+            );
+        }
+    }
+
+    /// For a `file:` address, a field of the caller that applies to another
+    /// transport is refused with its name, and so is a field of a push. An
+    /// S3 key of the section is refused. A retry count of 0 is accepted.
+    #[test]
+    fn a_local_repository_refuses_the_fields_of_another_transport() {
+        let ssh = [
+            (
+                "ssh-command",
+                EndpointOverrides {
+                    ssh_command: Some(vec!["ssh".into()]),
+                    ..EndpointOverrides::default()
+                },
+            ),
+            (
+                "send-command",
+                EndpointOverrides {
+                    remote_command: Some("ostrya send".into()),
+                    ..EndpointOverrides::default()
+                },
+            ),
+        ];
+        let fields = http_fields().into_iter().chain(s3_fields()).chain(ssh);
+        for (name, o) in fields {
+            let msg = invalid_input(local("url", &o));
+            assert!(
+                msg.starts_with(&format!("{name} applies to "))
+                    && msg.ends_with("the pull address of remote 'url' is a local repository"),
+                "{msg}"
+            );
+        }
+        let o = EndpointOverrides {
+            push_user: Some("u".into()),
+            ..EndpointOverrides::default()
+        };
+        assert_eq!(
+            invalid_input(local("url", &o)),
+            "push-user applies to a push, and this is a pull"
+        );
+        let o = EndpointOverrides {
+            max_retries: Some(0),
+            ..EndpointOverrides::default()
+        };
+        assert_eq!(local("url", &o).unwrap(), Some("/srv/repo".into()));
+        let msg = pull_error(local("s3-key", &EndpointOverrides::default()));
+        assert!(
+            msg.contains("s3-region applies to an s3:// address"),
+            "{msg}"
+        );
     }
 
     #[cfg(feature = "push")]

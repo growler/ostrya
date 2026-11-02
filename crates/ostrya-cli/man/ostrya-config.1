@@ -169,6 +169,7 @@ The base URL of a pull over HTTP: \fB\%http://\fR or \fB\%https://\fR.
 When \fB\%pull\-url\fR is set, a pull uses it in place of this key.
 When \fB\%push\-url\fR is absent, a push uses this key if it starts with \fB\%http://\fR or \fB\%https://\fR.
 A pull refuses an ssh address and an \fB\%s3://\fR address in this key, and a push refuses an \fB\%s3://\fR address in it.
+\fB\%ostrya pull \-\-collection\fR reads a \fB\%file://\fR address in this key as a local repository, as \fB\%pull\-url\fR states.
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
@@ -179,6 +180,8 @@ The collection that the remote serves.
 A pull that names the remote does not read this key.
 \fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
 A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs that the summary of its bucket repository lists, and the pull skips such a candidate if its bucket repository has no summary.
+A candidate whose pull address is a \fB\%file://\fR address is a local repository, which the pull reads through the file system.
+The client groups of that repository do not apply, and the file permissions are the access.
 \fB\%ostrya remote summary \-u\fR writes the summary of a bucket repository.
 .SS "Verification"
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
@@ -297,7 +300,11 @@ A value that starts with \fB\%s3://\fR is the address of a bucket repository of 
 \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read the bucket repository at such an address.
 \fB\%ostrya remote add\fR writes an \fB\%s3://\fR address to \fB\%pull\-url\fR and \fB\%push\-url\fR, and writes no \fB\%url\fR.
 A value that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address.
-A pull gives each other value to the HTTP client, which refuses a scheme other than \fB\%http\fR and \fB\%https\fR.
+\fB\%ostrya pull \-\-collection\fR refuses a \fB\%file:\fR value with no \fB\%//\fR.
+For \fB\%ostrya pull \-\-collection\fR, a value with the scheme \fB\%file\fR, in letters of either case, is \fB\%file://\fR followed by the absolute path of a local repository.
+The command takes the path as written, and refuses a host part (\fB\%localhost\fR too), an empty path, and \fB\%%\fR, \fB\%?\fR, or \fB\%#\fR in the path.
+The command ignores the TLS keys, \fB\%proxy\fR, and the ssh keys of such a remote.
+Each other pull gives the value to the HTTP client, which refuses a scheme other than \fB\%http\fR and \fB\%https\fR.
 A remote that the \fB\%ostree\fR tool also reads must keep an HTTP \fB\%url\fR.
 .TP
 \fB\%push\-url\fR (string)

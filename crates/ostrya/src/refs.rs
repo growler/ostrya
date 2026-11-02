@@ -2201,12 +2201,13 @@ fn uncovered_patterns(patterns: &[RefPattern]) -> Vec<&RefPattern> {
             literal.then_some((i, lead))
         })
         .collect();
+    // The texts of the patterns before the current one.
+    let mut seen: HashSet<&str> = HashSet::new();
     patterns
         .iter()
-        .enumerate()
-        .filter(|(i, p)| {
+        .filter(|p| {
             let text = p.as_str();
-            let repeat = patterns[..*i].iter().any(|q| q.as_str() == text);
+            let repeat = !seen.insert(text);
             !repeat
                 && !leads.iter().any(|(j, lead)| {
                     patterns[*j].as_str() != text
@@ -2214,7 +2215,6 @@ fn uncovered_patterns(patterns: &[RefPattern]) -> Vec<&RefPattern> {
                         && text.starts_with(lead)
                 })
         })
-        .map(|(_, p)| p)
         .collect()
 }
 

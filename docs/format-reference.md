@@ -4844,7 +4844,11 @@ alone over HTTP (item 2 below) is longer than 16 KiB. It resolves the address
 and the trust of each candidate. It also builds the HTTP client of each HTTP
 candidate and of each candidate at an `s3://` address, and checks the ssh
 command and the send command of each ssh candidate. An error in the config of
-any candidate stops the pull.
+any candidate stops the pull. For a local candidate (below), these errors are
+a `file:` address with a host part (`localhost` too), with no path, with no
+`//`, or with `%`, `?`, or `#`. With a local candidate, the pull also refuses
+a subpath, and an option of another transport: a TLS path, a header, a retry
+count above 0, a low-speed limit, an S3 setting, and an ssh command.
 
 The pull asks each candidate in turn for the commit of each ref. It opens one
 session to each candidate: an ssh client over ssh, or the HTTP client over
@@ -4882,6 +4886,34 @@ together. A bucket repository with no `summary` is skipped.
 The pull takes the commit that the summary lists for a ref, also when the ref
 file of the bucket names another commit.
 
+A candidate whose `pull-url`, or else `url`, has the scheme `file`, in ASCII
+letters of either case, is a local candidate. Its address is `file://`
+followed by an absolute path. The pull takes the path as written, and
+decodes no `%` escape. A `pull-url` with another address wins over a
+`file://` value of `url`. The pull ignores the TLS keys, the key `proxy`, and
+the ssh keys of a local candidate. Each other pull from a remote, and
+`remote summary`, give a `file://` address to the HTTP client, which refuses
+it.
+
+The probe opens the repository at the path, and the repository stays open
+until the pull from it ends. A path with no repository skips the candidate.
+Under a summary policy, the probe reads `summary` and `summary.sig` of the
+repository under the size cap of a summary, verifies the summary, and reads
+the refs from it, as item 1 states. Otherwise the probe reads the ref files
+of `ID` by the rule of `Repo::list_collection_refs_in`: in a source whose
+`[core] collection-id` is `ID`, the refs of `ID` are the refs of
+`refs/mirrors/ID/` and of `refs/heads/`, and the ref of `refs/mirrors/ID/`
+wins when a name is in the two directories. The probe reads only the
+directories that the requested names can reach. The timestamp of each ref is
+the timestamp of its commit in the source.
+
+A local candidate reads the source through the file system. The client
+groups of the source do not apply, because they govern `ostrya serve` and
+`ostrya send` alone. The file permissions are the access. A directory
+outside the selection that the probe cannot read fails nothing. A directory
+or a ref file inside the selection that the probe cannot read skips the
+candidate.
+
 In the listing or the summary, the refs of `ID` are in field 0 when
 `ostree.summary.collection-id` is `ID`. Otherwise they are in
 `ostree.summary.collection-map` under `ID`, and the pull ignores field 0. The
@@ -4891,7 +4923,13 @@ A candidate is skipped, with a warning, when a request fails, when a listing
 request gets a status from 500 to 599, when the listing or the summary does
 not parse, when the summary fails its signature check, when a listed name
 fails the ref-name rule, when a listed ref has no `ostree.commit.timestamp` of
-type `t`, or when a bucket repository has no `summary`. The pull fails when
+type `t`, or when a bucket repository has no `summary`. A local candidate is
+also skipped when its path holds no repository, or when the probe cannot read
+a directory or a ref file that the names reach. Without a summary policy, it
+is also skipped when the source does not hold the commit of a ref. The
+warning names the path. Under a summary policy, the probe reads no commit. A
+listed commit that the source does not hold then fails the pull from the
+candidate, as for a remote. The pull fails when
 each candidate is skipped, when no candidate lists a requested `REF`, and,
 with no `REF`, when no candidate lists a ref of `ID`. These failures come
 before the first object request.
@@ -4908,6 +4946,20 @@ the candidate. It reads the `config` of the candidate, and no ref file. It
 reads the `config` of a bucket repository through the bucket client. The
 keys of that candidate verify its commits. A failure of a selected candidate
 stops the pull, and the refs of the earlier candidates stay written.
+
+The pull from a selected local candidate is a local pull of the commits that
+the probe read, as `Repo::pull_local` below states, with the keys of the
+candidate and the checks below. It also makes the timestamp check of the
+pull. It reads no ref file of the source again. It checks the timestamp of
+each commit against the listed timestamp of the probe, as for a remote.
+Without a summary policy, the probe read each timestamp from the commit that
+it pins. Under a summary policy, the timestamps come from the verified
+summary, and the pull uses the summary that the probe verified. It does not
+read `summary` or `summary.sig` of the source again. As each local pull, it
+hashes an imported object only
+under `--untrusted`. A pull from a local candidate counts no fetch, unless it
+reads static deltas. So when the pull fetched nothing and imported objects,
+`ostrya pull --collection` prints the statistics line of `pull-local`.
 
 The pull refuses a commit:
 
@@ -4938,9 +4990,9 @@ the caller sets `no_ref_writes`, the pull writes the refs at the place above,
 and delta discovery reads the `from` commit of a delta at the same place. The
 pull refuses a tip commit whose `ostree.collection-binding` is absent, is not
 a string, or is not `ID`. It checks the `ostree.ref-binding` as each pull
-does, and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone. A
-local pull makes no timestamp check. The pull makes each check before it
-writes an object, a `.commitpartial` marker, or a ref. With ref writes, the
+does, and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone.
+`Repo::pull_local` makes no timestamp check. The pull makes each check before
+it writes an object, a `.commitpartial` marker, or a ref. With ref writes, the
 remote name of the call selects only the `[remote "NAME"]` section whose
 verification keys apply, and the pull writes no ref under `refs/remotes/`.
 With `no_ref_writes`, the pull writes no ref and reads no
@@ -5352,6 +5404,9 @@ server of `ostrya-server` with no
 receive policies identifies no client. Each read there gets the rights of
 the `anonymous` item under the two implicit groups. `ostrya serve` always
 reads the client groups.
+
+A collection pull from a `file://` candidate reads the source through the
+file system, and no client group applies ("The pull of collection refs").
 
 ### GET /_ostrya/refs/v1
 

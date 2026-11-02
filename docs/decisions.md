@@ -2737,6 +2737,55 @@ These alternatives were rejected:
   binding is a binding. The presence test of the ref binding check refuses a
   value of the same shape.
 
+## The local candidate of a collection pull
+
+`Repo::pull_collection` takes a remote whose `pull-url`, or else `url`, is a
+`file://` address as a local candidate. The rules:
+
+- The address is `file://` followed by an absolute path, taken as written.
+  A host part (`localhost` too), an empty path, and `%`, `?`, or `#` in the
+  path are config errors, which stop the pull before its first request.
+- The probe opens the repository at the path, and reads the refs of the
+  collection with the rule of `Repo::list_collection_refs_in`. The timestamp
+  of each ref is the timestamp of the commit that the probe pins. Under a
+  summary policy, the probe reads the refs and their timestamps from the
+  verified summary of the source, as over HTTP.
+- The pull from the candidate is the local pull of `Repo::pull_local`, at the
+  commits of the probe, with the trust of the remote, the binding rules of
+  the collection pull, and the timestamp check of the options. It checks
+  each commit against the listed timestamp of the probe, as over HTTP. Under
+  a summary policy, it uses the summary that the probe verified.
+- The client groups of the source do not apply. The file permissions are
+  the access.
+- Each error of the open and of the probe skips the candidate.
+- A caller field of another transport, and a subpath, are refused before the
+  first request.
+- Each other pull from a remote, and the fetch of a summary, keep the
+  refusal of a `file://` address by the HTTP client.
+
+The local pull already reads a source repository through the file system,
+with hardlinks where the file systems permit them. So the collection pull
+sends a local candidate there, and the HTTP client stays a client of `http`
+and `https` alone.
+
+These alternatives were rejected:
+
+- A `file://` scheme in the HTTP client, for each pull. It is a second reader
+  of a local repository, apart from the local pull, with the request and
+  retry rules of a fetch that do not apply to a file.
+- A decode of `%` escapes and a host of `localhost`, as RFC 8089 permits.
+  The port does not link a URL parser in `ostrya`, and a parser written for
+  this one form carries its own edge cases. A path as written, with a
+  refusal of each other form, has no such edge case.
+- The client groups of the source as the access of a local candidate. The
+  groups govern `ostrya serve` and `ostrya send`. A process that reads the
+  files of the source reads them with or without the groups.
+- A second read of the ref files of the source at the pull. The probe pins
+  a commit for each ref, so the selection and the pull agree. Without a
+  summary policy, the probe reads each timestamp from the commit that it
+  pins. Under a summary policy, the timestamps come from the verified
+  summary, and the pull checks each commit against them.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.

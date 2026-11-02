@@ -346,6 +346,19 @@ checksum of the mirror ref. `ID` is not a key of
 `ostree.summary.collection-map`. The summary writer of the port does the
 same.
 
+`Repo::resolve_collection_ref` reads one ref of the collection `ID` by the
+same rule for the ref files and the aliases that the port writes. It reads
+`refs/mirrors/ID/NAME`. It reads `refs/heads/NAME` only when the mirror path
+is absent, is a directory, has a parent that is a file, or is longer than
+the system accepts. For each other collection id, it reads
+`refs/mirrors/ID/NAME` alone. The read takes no lock.
+
+A symlink that the port does not write can make the resolve and the ref
+listing give different results. Examples are a symlink to a directory in
+the mirror tree, an alias loop, and an absolute alias. The listing does not
+follow a symlink to a directory, and it reads an alias by its own rule. The
+resolve follows each link through the file system.
+
 The file `summary` at the repository root is the root summary. It holds
 each local ref and each collection ref, whatever the client groups, and it
 is the summary that the tool writes for the same refs. A local reader reads

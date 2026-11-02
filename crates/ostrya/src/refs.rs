@@ -6,6 +6,8 @@
 //! - [`Repo::resolve_rev`] resolves a revision string to a commit. Its doc
 //!   gives the revision syntax.
 //! - [`Repo::resolve_ref_tip`] reads one ref from the ref store.
+//! - [`Repo::resolve_collection_ref`] reads one collection ref from the ref
+//!   store.
 //! - [`Repo::list_refs`], [`Repo::list_remote_refs`],
 //!   [`Repo::list_mirror_refs`], [`Repo::list_collection_refs`], and
 //!   [`Repo::list_ref_aliases`] list refs.
@@ -366,6 +368,102 @@ impl Repo {
     ///   directory.
     pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>> {
         self.resolve_relpath_tip(refspec_to_relpath(refspec)?).await
+    }
+
+    /// Returns the commit that a collection ref names, read from the ref store
+    /// with no lock.
+    ///
+    /// The collection id of `cref` selects the ref path:
+    ///
+    /// - No collection id reads `refs/heads/NAME`.
+    /// - The `[core] collection-id` of the repository reads
+    ///   `refs/mirrors/ID/NAME`. When that path holds no ref file, the call
+    ///   reads `refs/heads/NAME`. The path holds no ref file when it is
+    ///   absent, when it is a directory, when a parent component is a file,
+    ///   or when it is longer than the system accepts. For the ref files and
+    ///   the aliases that the port writes, the summary and the ref listing
+    ///   apply the same rule: the mirror ref wins.
+    /// - Each other collection id reads `refs/mirrors/ID/NAME` alone.
+    ///
+    /// The call reads `[core] collection-id` from the config that the handle
+    /// read at the open.
+    ///
+    /// If the ref is an alias, the call follows the link, as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) does. An alias whose target
+    /// is absent reads as an absent ref.
+    ///
+    /// A symlink that the port does not write can make the call and the ref
+    /// listing give different results. Examples are a symlink to a directory
+    /// in the mirror tree, an alias loop, and an absolute alias. The listing
+    /// does not follow a symlink to a directory, and it reads an alias by its
+    /// own rule. The call follows each link through the file system.
+    ///
+    /// The call takes no lock. It does not wait for an
+    /// [`UpdateGuard`](crate::UpdateGuard) or for a transaction. A ref write
+    /// renames a complete file over the ref, so each read of one ref file
+    /// gives the old commit or the new commit. Under the collection id of the
+    /// repository, the call can read two files. Writes between the two reads
+    /// can give a result that the store did not hold at one time.
+    ///
+    /// If the ref is absent, `allow_noent` selects the result: `Ok(None)` if
+    /// it is `true`, and [`Error::RefNotFound`] if it is `false`. No other
+    /// failure depends on `allow_noent`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if the collection id does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes, or if the ref name is not valid. The call reads no file.
+    /// - [`Error::RefNotFound`] if the ref is absent and `allow_noent` is
+    ///   `false`. The error holds `ID:NAME`, or `NAME` alone for a ref with no
+    ///   collection id.
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::Core`] if the ref file holds no checksum.
+    /// - [`Error::Io`] if the read fails, for example if the ref path of
+    ///   another collection id names a directory. Under the collection id of
+    ///   the repository, an error of the read of the mirror path stops the
+    ///   call, except when the path holds no ref file. An error of the read
+    ///   of `refs/heads/NAME` also stops the call, for example when that path
+    ///   is a directory. `allow_noent` does not change this.
+    pub async fn resolve_collection_ref(
+        &self,
+        cref: &CollectionRef,
+        allow_noent: bool,
+    ) -> Result<Option<Checksum>> {
+        let relpath = collection_ref_to_relpath(cref)?;
+        let heads = match &cref.collection_id {
+            Some(id) if self.config().collection_id() == Some(id.as_str()) => {
+                Some(format!("{HEADS_DIR}/{}", cref.ref_name))
+            }
+            _ => None,
+        };
+        let repo = self.clone();
+        let found = ostrya_rt::unblock(move || {
+            match repo.resolve_relpath_tip_blocking(&relpath) {
+                Ok(None) => {}
+                // `InvalidFilename` is `ENAMETOOLONG`: the mirror path is
+                // longer than the system accepts.
+                Err(Error::Io(e))
+                    if heads.is_some()
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::IsADirectory
+                                | std::io::ErrorKind::NotADirectory
+                                | std::io::ErrorKind::InvalidFilename
+                        ) => {}
+                other => return other,
+            }
+            match heads {
+                Some(heads) => repo.resolve_relpath_tip_blocking(&heads),
+                None => Ok(None),
+            }
+        })
+        .await?;
+        match found {
+            Some(checksum) => Ok(Some(checksum)),
+            None if allow_noent => Ok(None),
+            None => Err(Error::RefNotFound(collection_ref_label(cref))),
+        }
     }
 
     /// Returns the commit that the ref file at `relpath` names, read as
@@ -2176,16 +2274,25 @@ pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> 
                 || !ostrya_core::is_collection_id(collection_id)
                 || !is_ref_path(name)
             {
-                return Err(Error::InvalidRefspec(format!("{collection_id}:{name}")));
+                return Err(Error::InvalidRefspec(collection_ref_label(cref)));
             }
             Ok(format!("refs/mirrors/{collection_id}/{name}"))
         }
         None => {
             if !is_ref_path(name) {
-                return Err(Error::InvalidRefspec(name.to_owned()));
+                return Err(Error::InvalidRefspec(collection_ref_label(cref)));
             }
             Ok(format!("refs/heads/{name}"))
         }
+    }
+}
+
+/// Returns the text that an error about a collection ref holds: `ID:NAME`, or
+/// `NAME` alone for a ref with no collection id.
+fn collection_ref_label(cref: &CollectionRef) -> String {
+    match &cref.collection_id {
+        Some(collection_id) => format!("{collection_id}:{}", cref.ref_name),
+        None => cref.ref_name.clone(),
     }
 }
 

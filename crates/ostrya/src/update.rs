@@ -316,7 +316,12 @@ impl UpdateGuard {
     /// Returns the commit that a collection ref names in the ref store.
     ///
     /// The call reads the ref as [`read_ref`](UpdateGuard::read_ref) reads a
-    /// refspec.
+    /// refspec. It reads the path of the collection ref alone. For the
+    /// collection id of the repository, it does not read `refs/heads/NAME`
+    /// when the mirror ref is absent. [`Repo::resolve_collection_ref`] reads
+    /// a collection ref with no lock, and for the collection id of the
+    /// repository it reads `refs/heads/NAME` when the mirror path holds no
+    /// ref file.
     ///
     /// # Errors
     ///

@@ -186,6 +186,13 @@ fn a_resolution_refuses_a_name_outside_the_rule() {
             assert_refused(repo.resolve_rev(name, true).await, name);
             assert_refused(repo.resolve_rev(name, false).await, name);
             assert_refused(repo.resolve_ref_tip(name).await, name);
+            for cref in [
+                CollectionRef::new(COLLECTION, name),
+                CollectionRef::local(name),
+            ] {
+                assert_refused(repo.resolve_collection_ref(&cref, true).await, name);
+                assert_refused(repo.resolve_collection_ref(&cref, false).await, name);
+            }
         }
     });
 }
@@ -296,6 +303,19 @@ fn an_update_guard_refuses_an_id_outside_the_rule() {
 }
 
 #[test]
+fn a_collection_ref_resolution_refuses_an_id_outside_the_rule() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id-resolve");
+        let (repo, _) = repo_with_commit(tmp.path()).await;
+        for id in refused_ids() {
+            let cref = CollectionRef::new(id.as_str(), "main");
+            assert_refused(repo.resolve_collection_ref(&cref, true).await, &id);
+            assert_refused(repo.resolve_collection_ref(&cref, false).await, &id);
+        }
+    });
+}
+
+#[test]
 fn a_collection_ref_write_takes_an_id_inside_the_rule() {
     block_on(async {
         let tmp = TmpDir::new("rule-collection-id-valid");
@@ -345,6 +365,11 @@ fn a_ref_under_an_invalid_collection_directory_stays() {
         std::fs::write(&path, format!("{commit}\n")).unwrap();
         assert_refused(
             repo.set_collection_ref_immediate(&CollectionRef::new("fresh", "x"), None)
+                .await,
+            "fresh:x",
+        );
+        assert_refused(
+            repo.resolve_collection_ref(&CollectionRef::new("fresh", "x"), true)
                 .await,
             "fresh:x",
         );

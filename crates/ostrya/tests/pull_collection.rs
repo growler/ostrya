@@ -22,9 +22,9 @@ use common::{TmpDir, anyone, store_with_field2};
 use ostrya::endpoint::EndpointOverrides;
 use ostrya::{
     Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
-    CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer, Error,
-    FsckOptions, MutableTree, ObjectType, PullFlags, PullOptions, RefSelector, Repo, RepoMode,
-    SummaryOptions, TimestampCheck, Type, Value,
+    CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer,
+    Error, FsckOptions, MutableTree, ObjectType, PullFlags, PullOptions, RefSelector, Repo,
+    RepoMode, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -640,11 +640,13 @@ fn no_ref_name_and_no_listed_ref_fails_the_pull() {
 
 /// The pull refuses a commit bound to another collection, a commit with no
 /// collection binding, and a commit whose ref binding does not hold the ref.
-/// A commit with no ref binding passes.
+/// A commit with no ref binding passes. With `allow_unbound`, a commit bound
+/// to another collection and a commit whose ref binding does not hold the ref
+/// also fail.
 #[test]
 fn the_bindings_of_each_commit_are_checked() {
     block_on(async {
-        let cases: [(&str, Bind<'static>, bool); 4] = [
+        let cases: [(&str, Bind<'static>, bool, Option<&str>); 6] = [
             (
                 "other collection",
                 Bind {
@@ -652,6 +654,16 @@ fn the_bindings_of_each_commit_are_checked() {
                     refs: Some(&[REF]),
                 },
                 false,
+                Some(OTHER),
+            ),
+            (
+                "other collection",
+                Bind {
+                    collection: Some(OTHER),
+                    refs: Some(&[REF]),
+                },
+                true,
+                Some(OTHER),
             ),
             (
                 "no collection binding",
@@ -660,6 +672,7 @@ fn the_bindings_of_each_commit_are_checked() {
                     refs: Some(&[REF]),
                 },
                 false,
+                Some("no collection binding"),
             ),
             (
                 "other ref",
@@ -668,6 +681,16 @@ fn the_bindings_of_each_commit_are_checked() {
                     refs: Some(&["os/next"]),
                 },
                 false,
+                Some("in ref binding metadata"),
+            ),
+            (
+                "other ref",
+                Bind {
+                    collection: None,
+                    refs: Some(&["os/next"]),
+                },
+                true,
+                Some("in ref binding metadata"),
             ),
             (
                 "no ref binding",
@@ -675,10 +698,11 @@ fn the_bindings_of_each_commit_are_checked() {
                     collection: Some(ID),
                     refs: None,
                 },
-                true,
+                false,
+                None,
             ),
         ];
-        for (tag, bind, passes) in cases {
+        for (tag, bind, allow_unbound, fragment) in cases {
             let dir = TmpDir::new("pull-collection-bindings");
             let a = create(dir.path(), "a", Some(ID)).await;
             let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
@@ -686,17 +710,109 @@ fn the_bindings_of_each_commit_are_checked() {
             let server_a = RepoServer::start(&dir.path().join("a"), false).await;
             let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
 
-            let (opts, _) = options(&[REF]);
+            let (mut opts, _) = options(&[REF]);
+            opts.allow_unbound = allow_unbound;
             let pulled = dest.pull_collection(ID, &["a"], opts).await;
-            if passes {
+            let Some(fragment) = fragment else {
                 pulled.unwrap();
-                assert_eq!(mirror(&dest, REF).await, Some(tip), "{tag}");
+                assert_eq!(
+                    mirror(&dest, REF).await,
+                    Some(tip),
+                    "{tag}, allow_unbound={allow_unbound}"
+                );
                 continue;
-            }
+            };
             let err = pulled.unwrap_err();
-            assert!(matches!(err, Error::Pull(_)), "{tag}: {err:?}");
+            assert!(
+                matches!(&err, Error::Pull(m) if m.contains(fragment)),
+                "{tag}, allow_unbound={allow_unbound}: {err:?}"
+            );
             assert_nothing_written(&dest).await;
         }
+    });
+}
+
+/// With `allow_unbound`, a tip with no collection binding passes, with or
+/// without a ref binding that holds the ref. The pull writes the collection
+/// ref.
+#[test]
+fn allow_unbound_pulls_a_tip_with_no_collection_binding() {
+    block_on(async {
+        let cases: [(&str, Bind<'static>); 2] = [
+            (
+                "ref binding",
+                Bind {
+                    collection: None,
+                    refs: Some(&[REF]),
+                },
+            ),
+            (
+                "no binding",
+                Bind {
+                    collection: None,
+                    refs: None,
+                },
+            ),
+        ];
+        for (tag, bind) in cases {
+            let dir = TmpDir::new("pull-collection-unbound");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
+            summarize(&a).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+            let (mut opts, _) = options(&[REF]);
+            opts.allow_unbound = true;
+            let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+            assert_eq!(pulled.refs.len(), 1, "{tag}");
+            assert_eq!(pulled.refs[0].commit, tip, "{tag}");
+            assert_eq!(mirror(&dest, REF).await, Some(tip), "{tag}");
+            assert!(
+                dest.fsck(&FsckOptions::default()).await.unwrap().is_ok(),
+                "{tag}"
+            );
+        }
+    });
+}
+
+/// With `allow_unbound`, the pull takes a tip with no collection binding from
+/// a static delta. Without it, the same pull fails and writes nothing.
+#[test]
+fn allow_unbound_reaches_a_tip_from_a_static_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-unbound-delta");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let bind = Bind {
+            collection: None,
+            refs: Some(&[REF]),
+        };
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
+        a.generate_static_delta(None, &tip, &DeltaOptions::default())
+            .await
+            .unwrap();
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.require_static_deltas = true;
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("no collection binding")),
+            "{err:?}"
+        );
+        let seen = server_a.seen();
+        assert!(seen.iter().any(|p| p.starts_with("deltas/")), "{seen:?}");
+        assert_nothing_written(&dest).await;
+
+        let (mut opts, _) = options(&[REF]);
+        opts.pull.require_static_deltas = true;
+        opts.allow_unbound = true;
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(pulled.stats.delta_parts > 0, "{:?}", pulled.stats);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
     });
 }
 

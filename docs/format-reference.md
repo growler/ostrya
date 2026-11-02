@@ -4911,9 +4911,20 @@ stops the pull, and the refs of the earlier candidates stay written.
 
 The pull refuses a commit:
 
-- whose `ostree.collection-binding` is not `ID`, or that has no such key;
+- whose `ostree.collection-binding` is not `ID`, or whose
+  `ostree.collection-binding` value is not a string;
+- that has no `ostree.collection-binding` key, unless the library caller sets
+  `CollectionPullOptions::allow_unbound`;
 - whose `ostree.ref-binding` is present and does not hold `REF`;
 - whose timestamp is not the listed timestamp of `REF`.
+
+The `ostrya` command does not set `allow_unbound`. The switch does not change
+the ref binding check, the check of the listed timestamp, or the timestamp
+check. The pull refuses `PullFlags::DISABLE_VERIFY_BINDINGS` with either value
+of the switch. Apart from the ref binding, the pull does not check a commit
+against the name of its ref. So a remote can serve, for `REF`, any commit with
+no binding of either kind. The trust of the remote and a check of the content
+by the caller after the pull are the protection.
 
 The pull writes `refs/mirrors/ID/REF`. In a repository with
 `[core] collection-id=ID`, it writes `refs/heads/REF`. It writes no ref under

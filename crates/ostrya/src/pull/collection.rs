@@ -86,6 +86,20 @@ pub struct CollectionPullOptions {
     /// warning on standard error. The default is `None`, which drops each
     /// event.
     pub on_event: Option<Box<dyn FnMut(CollectionPullEvent) + Send>>,
+    /// `true` if a tip commit with no `ostree.collection-binding` key passes
+    /// the collection-binding check.
+    ///
+    /// The default is `false`, and such a tip fails the pull. The switch
+    /// applies only when the key is absent. A tip whose binding is not a
+    /// string, or names another collection, fails with either value. The
+    /// switch does not change the `ostree.ref-binding` check, the check of
+    /// the listed timestamp, or the timestamp check.
+    ///
+    /// Apart from the ref binding, the pull does not check a commit against
+    /// the name of its ref. So a remote can serve, for a name, any commit with
+    /// no binding of either kind. The trust of the remote and a check of the
+    /// content by the caller after the pull are the protection.
+    pub allow_unbound: bool,
 }
 
 /// The debug text shows a callback that is set as `<callback>`.
@@ -94,6 +108,7 @@ impl fmt::Debug for CollectionPullOptions {
         f.debug_struct("CollectionPullOptions")
             .field("pull", &self.pull)
             .field("on_event", &self.on_event.as_ref().map(|_| "<callback>"))
+            .field("allow_unbound", &self.allow_unbound)
             .finish()
     }
 }
@@ -382,7 +397,9 @@ impl Repo {
     /// fails one fails the pull with [`Error::Pull`]:
     ///
     /// - The `ostree.collection-binding` of the commit must be
-    ///   `collection_id`. A commit with no collection binding fails.
+    ///   `collection_id`. A commit with no `ostree.collection-binding` key
+    ///   fails, unless [`allow_unbound`](CollectionPullOptions::allow_unbound)
+    ///   is set. A key whose value is not a string fails always.
     /// - The `ostree.ref-binding` of the commit must hold the ref. A commit
     ///   with no ref binding passes, as in each other pull.
     /// - The timestamp of the commit must be the timestamp that the remote
@@ -500,6 +517,7 @@ impl Repo {
         let CollectionPullOptions {
             pull: opts,
             mut on_event,
+            allow_unbound,
         } = opts;
         let subpaths = check_collection_pull(collection_id, remotes, &opts)?;
         // The pull reads the rule one time, here. A value that is not a
@@ -586,6 +604,7 @@ impl Repo {
                 targets: mine.iter().map(|l| (l.name.clone(), l.commit)).collect(),
                 listed: mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect(),
                 collection: collection_id,
+                allow_unbound,
                 place,
                 summary: Mutex::new(summaries[index].take()),
             };

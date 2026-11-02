@@ -2703,6 +2703,40 @@ These alternatives were rejected:
   refspec maps below `refs/mirrors`. The form `ID:NAME` reads as the refspec
   of a remote named `ID`.
 
+## The unbound collection pull
+
+`CollectionPullOptions::allow_unbound` is one `bool` switch of
+`Repo::pull_collection`. The default is `false`. The rules:
+
+- With `true`, a tip passes the collection-binding check when the commit
+  metadata has no `ostree.collection-binding` key. The switch applies to this
+  case alone.
+- A tip whose binding names another collection fails with either value. A
+  tip whose binding value is not a string fails with either value.
+- The switch does not change the ref binding check, the check of the listed
+  timestamp, or the timestamp check. A tip with no binding of either kind
+  passes. A tip whose ref binding does not hold the ref fails.
+- `Repo::pull_collection` refuses `PullFlags::DISABLE_VERIFY_BINDINGS` with
+  either value.
+- The `ostrya` command does not set the switch.
+
+The switch is for content-addressed refs that carry no binding. A binding in
+the commit object gives one content a different commit for each collection
+id. Without a binding, one commit serves each collection that names the
+content.
+
+These alternatives were rejected:
+
+- A collection pull that takes `PullFlags::DISABLE_VERIFY_BINDINGS`. The flag
+  also turns off the ref binding check, and the collection pull keeps that
+  check.
+- A check of the content of the commit against the name of its ref, in
+  addition to the ref binding check. The pull has no rule that maps a name to
+  content. The caller checks the content after the pull.
+- A binding value that is not a string, read as an absent key. A malformed
+  binding is a binding. The presence test of the ref binding check refuses a
+  value of the same shape.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.

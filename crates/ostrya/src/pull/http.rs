@@ -1197,6 +1197,7 @@ impl Repo {
         let tip_checks = match wanted {
             Wanted::Pinned(pinned) => TipChecks {
                 collection: Some(pinned.collection),
+                allow_unbound: pinned.allow_unbound,
                 listed: Some(&pinned.listed),
                 ..TipChecks::new(opts.flags, timestamp, place)
             },
@@ -2556,6 +2557,9 @@ pub(super) struct Pinned<'a> {
     /// The collection id that the `ostree.collection-binding` of each tip
     /// must state.
     pub(super) collection: &'a str,
+    /// `true` if a tip with no `ostree.collection-binding` key passes the
+    /// collection-binding check.
+    pub(super) allow_unbound: bool,
     /// The place of the written refs.
     pub(super) place: RefPlace<'a>,
     /// The `summary` of the remote, if the probe of the collection pull read

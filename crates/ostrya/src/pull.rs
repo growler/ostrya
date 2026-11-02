@@ -288,7 +288,9 @@ impl PullFlags {
     /// each pulled commit names the ref that the pull reads. A commit with no
     /// binding key passes. A commit with a list that does not name the ref
     /// fails the pull with [`Error::Pull`]. [`Repo::pull_collection`] refuses
-    /// this flag, because it always checks the bindings.
+    /// this flag, because it always checks the bindings. To pull a tip with no
+    /// collection binding, set
+    /// [`CollectionPullOptions::allow_unbound`](crate::CollectionPullOptions::allow_unbound).
     pub const DISABLE_VERIFY_BINDINGS: PullFlags = PullFlags(1 << 3);
     /// A copy of each object, with no hardlink.
     ///
@@ -3704,6 +3706,9 @@ struct TipChecks<'a> {
     /// The collection id that the `ostree.collection-binding` of each tip
     /// must state, or `None` for no collection-binding check.
     collection: Option<&'a str>,
+    /// `true` if a tip with no `ostree.collection-binding` key passes the
+    /// collection-binding check.
+    allow_unbound: bool,
     /// The timestamp that the remote listed for each requested ref, which the
     /// timestamp of its tip must equal. `None` for no such check.
     listed: Option<&'a HashMap<String, u64>>,
@@ -3721,6 +3726,7 @@ impl<'a> TipChecks<'a> {
             timestamp,
             place,
             collection: None,
+            allow_unbound: false,
             listed: None,
         }
     }
@@ -3744,7 +3750,7 @@ async fn check_tip_refs(
             check_ref_binding(tip, commit, ref_name)?;
         }
         if let Some(id) = checks.collection {
-            check_collection_binding(tip, commit, id)?;
+            check_collection_binding(tip, commit, id, checks.allow_unbound)?;
         }
         if let Some(listed) = checks.listed.and_then(|listed| listed.get(*ref_name)) {
             check_listed_timestamp(tip, commit, ref_name, *listed)?;
@@ -3757,19 +3763,30 @@ async fn check_tip_refs(
 /// Checks that the `ostree.collection-binding` of a commit states the
 /// collection id `id`.
 ///
-/// A commit with no binding key fails, and so does a commit whose binding is
-/// not a string.
-fn check_collection_binding(checksum: &Checksum, commit: &Commit, id: &str) -> Result<()> {
+/// A commit with no binding key fails, unless `allow_unbound` is `true`. A
+/// commit whose binding is not a string fails with either value.
+fn check_collection_binding(
+    checksum: &Checksum,
+    commit: &Commit,
+    id: &str,
+    allow_unbound: bool,
+) -> Result<()> {
     match commit.collection_binding() {
         Some(bound) if bound == id => Ok(()),
         Some(bound) => Err(Error::Pull(format!(
             "commit {checksum}: collection binding '{bound}' is not the requested collection \
              '{id}'"
         ))),
-        None => Err(Error::Pull(format!(
-            "commit {checksum}: no collection binding metadata for the requested collection \
-             '{id}'"
-        ))),
+        None => match commit.metadata_value("ostree.collection-binding") {
+            Some(_) => Err(Error::Pull(format!(
+                "commit {checksum}: collection binding metadata is not a string"
+            ))),
+            None if allow_unbound => Ok(()),
+            None => Err(Error::Pull(format!(
+                "commit {checksum}: no collection binding metadata for the requested \
+                 collection '{id}'"
+            ))),
+        },
     }
 }
 
@@ -4108,22 +4125,39 @@ mod tests {
         let tip = Checksum::from_bytes([3; 32]);
         let id = "org.example.Os";
         let bound = commit_with(&[("ostree.collection-binding", "s", Value::Str(id.into()))]);
-        check_collection_binding(&tip, &bound, id).unwrap();
+        check_collection_binding(&tip, &bound, id, false).unwrap();
         let other = commit_with(&[(
             "ostree.collection-binding",
             "s",
             Value::Str("org.example.Other".into()),
         )]);
-        let err = check_collection_binding(&tip, &other, id).unwrap_err();
-        assert!(
-            matches!(&err, Error::Pull(m) if m.contains("org.example.Other") && m.contains(id)),
-            "{err:?}"
-        );
+        for allow_unbound in [false, true] {
+            let err = check_collection_binding(&tip, &other, id, allow_unbound).unwrap_err();
+            assert!(
+                matches!(&err, Error::Pull(m) if m.contains("org.example.Other") && m.contains(id)),
+                "{err:?}"
+            );
+        }
         let none = commit_with(&[]);
         assert!(matches!(
-            check_collection_binding(&tip, &none, id),
+            check_collection_binding(&tip, &none, id, false),
             Err(Error::Pull(_))
         ));
+        check_collection_binding(&tip, &none, id, true).unwrap();
+        // A binding key whose value is not a string is a binding, and fails
+        // with either value of the switch.
+        let malformed = commit_with(&[(
+            "ostree.collection-binding",
+            "as",
+            Value::Array(vec![Value::Str(id.into())]),
+        )]);
+        for allow_unbound in [false, true] {
+            let err = check_collection_binding(&tip, &malformed, id, allow_unbound).unwrap_err();
+            assert!(
+                matches!(&err, Error::Pull(m) if m.contains("collection binding metadata is not a string")),
+                "{allow_unbound}: {err:?}"
+            );
+        }
         assert!(check_listed_timestamp(&tip, &none, "os/stable", 7).is_ok());
         assert!(matches!(
             check_listed_timestamp(&tip, &none, "os/stable", 8),

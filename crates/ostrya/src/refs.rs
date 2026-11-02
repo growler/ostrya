@@ -37,8 +37,8 @@ use crate::traverse::read_dir_names;
 ///
 /// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`. A
 /// ref with no collection id maps to the local ref `refs/heads/<name>`. The
-/// collection id is one path component: it is not `.` or `..`, it holds no
-/// `/`, and it can hold dots.
+/// collection id must pass [`is_collection_id`](crate::is_collection_id) and
+/// be at most 255 bytes. The ref store refuses another id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRef {
     /// The collection id, or `None` for a local ref.
@@ -153,6 +153,17 @@ impl Transaction {
     /// objects. If `checksum` is `None`, the commit removes the ref. The
     /// commit checks the collection id and the ref name before it publishes
     /// any object.
+    ///
+    /// The call itself does not check the ref. If the collection id does not
+    /// pass [`is_collection_id`](crate::is_collection_id), if it is longer
+    /// than 255 bytes, or if the ref name is not valid, the commit fails with
+    /// [`Error::InvalidRefspec`]. The error holds `collection:name`, or the
+    /// ref name alone for a local ref. The commit then publishes no object
+    /// and writes no ref.
+    ///
+    /// If a directory of `refs/mirrors/` has a name that fails the rule, a
+    /// ref under it cannot be written or removed through this call. Remove
+    /// such a ref by hand.
     pub fn set_collection_ref(&self, cref: &CollectionRef, checksum: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
             target: QueuedRef::Collection(cref.clone()),
@@ -816,15 +827,21 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if the collection id is not one path
-    ///   component, or the ref name is not valid. The error holds
-    ///   `collection:name`, or the ref name alone for a local ref.
+    /// - [`Error::InvalidRefspec`] if the collection id does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes, or if the ref name is not valid. The error holds
+    ///   `collection:name`, or the ref name alone for a local ref. The call
+    ///   writes nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
+    ///
+    /// If a directory of `refs/mirrors/` has a name that fails the rule, a
+    /// ref under it cannot be written or removed through this call. Remove
+    /// such a ref by hand.
     pub async fn set_collection_ref_immediate(
         &self,
         cref: &CollectionRef,
@@ -2129,13 +2146,17 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 
 // A ref name can contain `/`. A component of a ref name, and a remote, is not
 // empty, does not start with `-` or `.`, and holds ASCII alphanumerics, `-`,
-// `.`, `_`, and alphanumeric characters that are not ASCII. The collection id
-// uses the wider `is_ref_component`: not empty, not `.` or `..`, no slash, no
-// NUL. `ostrya-core` holds the rule.
-pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
+// `.`, `_`, and alphanumeric characters that are not ASCII. `is_component` is
+// the wider one-component rule that the remote part of a receive pattern uses
+// (`receive/pattern.rs`): not empty, not `.` or `..`, no slash, no NUL. A
+// collection id takes `is_collection_id` and `MAX_COLLECTION_ID_LEN`.
+// `ostrya-core` holds the rules.
+#[cfg(feature = "receive")]
+pub(crate) use ostrya_core::is_ref_component as is_component;
+pub(crate) use ostrya_core::is_ref_name as is_ref_path;
 
-/// The longest collection id, in bytes, that a push session or a collection
-/// pull names.
+/// The longest collection id, in bytes, that the ref store, a push session,
+/// or a collection pull takes.
 ///
 /// The id is one path component under `refs/mirrors/`, and a Linux file
 /// system takes a name of 255 bytes at most (`NAME_MAX`).
@@ -2143,13 +2164,18 @@ pub(crate) const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// Maps a collection ref to its path under `refs/`. A collection id puts the
 /// ref under `refs/mirrors/<collection>/`. A `None` id gives a local ref under
-/// `refs/heads/`. The collection id is one component (dots are allowed, a
-/// slash or a traversal is not).
+/// `refs/heads/`. The collection id must pass
+/// [`is_collection_id`](ostrya_core::is_collection_id) and be at most
+/// [`MAX_COLLECTION_ID_LEN`] bytes. A failure gives
+/// [`Error::InvalidRefspec`], and the caller writes nothing.
 pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
     let name = &cref.ref_name;
     match &cref.collection_id {
         Some(collection_id) => {
-            if !is_component(collection_id) || !is_ref_path(name) {
+            if collection_id.len() > MAX_COLLECTION_ID_LEN
+                || !ostrya_core::is_collection_id(collection_id)
+                || !is_ref_path(name)
+            {
                 return Err(Error::InvalidRefspec(format!("{collection_id}:{name}")));
             }
             Ok(format!("refs/mirrors/{collection_id}/{name}"))
@@ -2703,6 +2729,11 @@ mod tests {
             .unwrap_err();
         assert!(
             matches!(&err, Error::InvalidRefspec(name) if name == "org.example.Foo:a/../b"),
+            "{err}"
+        );
+        let err = collection_ref_to_relpath(&CollectionRef::new("a", "main")).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if name == "a:main"),
             "{err}"
         );
         let err = collection_ref_to_relpath(&CollectionRef::local("a/../b")).unwrap_err();

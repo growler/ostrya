@@ -320,8 +320,9 @@ impl UpdateGuard {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if the collection id is not one path
-    ///   component, or if the ref name is not valid.
+    /// - [`Error::InvalidRefspec`] if the collection id does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes, or if the ref name is not valid. The call reads no file.
     /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
     /// - [`Error::Core`] if the ref file holds no checksum.
     /// - [`Error::Io`] if the read fails, for example if the ref path names a
@@ -354,9 +355,14 @@ impl UpdateGuard {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if the collection id is not one path
-    ///   component, or if the ref name is not valid.
+    /// - [`Error::InvalidRefspec`] if the collection id does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes, or if the ref name is not valid. The call writes nothing.
     /// - [`Error::Io`] if a file system operation fails.
+    ///
+    /// If a directory of `refs/mirrors/` has a name that fails the rule, a
+    /// ref under it cannot be written or removed through this call. Remove
+    /// such a ref by hand.
     pub async fn set_collection_ref(
         &self,
         cref: &CollectionRef,

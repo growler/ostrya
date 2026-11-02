@@ -1493,8 +1493,10 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if a queued refspec is malformed. The call
-    ///   publishes no object.
+    /// - [`Error::InvalidRefspec`] if a queued refspec is malformed, or if
+    ///   the collection id of a queued collection ref does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes. The call publishes no object and writes no ref.
     /// - [`Error::InvalidRelated`] if an `ostrya.related` entry of a queued
     ///   detached-metadata dict is not a variant of type `a(say)`, or if one
     ///   of its elements has an empty name or a checksum that is not 32

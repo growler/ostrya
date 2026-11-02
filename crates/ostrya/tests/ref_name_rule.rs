@@ -16,7 +16,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, Repo, RepoMode,
+    Error, MutableTree, ObjectType, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -76,6 +76,11 @@ async fn repo_with_commit(base: &Path) -> (Repo, Checksum) {
 /// Returns the paths of the regular files and links below `refs/` that the
 /// test did not create, sorted.
 fn ref_files(repo_dir: &Path) -> Vec<String> {
+    files_below(&repo_dir.join("refs"))
+}
+
+/// Returns the paths of the regular files and links below `root`, sorted.
+fn files_below(root: &Path) -> Vec<String> {
     fn walk(dir: &Path, prefix: &str, out: &mut Vec<String>) {
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
@@ -88,7 +93,7 @@ fn ref_files(repo_dir: &Path) -> Vec<String> {
         }
     }
     let mut out = Vec::new();
-    walk(&repo_dir.join("refs"), "", &mut out);
+    walk(root, "", &mut out);
     out.sort();
     out
 }
@@ -182,5 +187,167 @@ fn a_resolution_refuses_a_name_outside_the_rule() {
             assert_refused(repo.resolve_rev(name, false).await, name);
             assert_refused(repo.resolve_ref_tip(name).await, name);
         }
+    });
+}
+
+/// Collection ids that the collection-id rule refuses: one element, an empty
+/// element, an element that starts with a digit, and an id of 256 bytes.
+fn refused_ids() -> [String; 4] {
+    [
+        "a".to_owned(),
+        "org..x".to_owned(),
+        "1org.x".to_owned(),
+        format!("a.{}", "b".repeat(254)),
+    ]
+}
+
+/// Collection ids that the collection-id rule accepts. The last one is 255
+/// bytes, the longest id that the ref store takes.
+fn accepted_ids() -> [String; 4] {
+    [
+        COLLECTION.to_owned(),
+        "_a.b".to_owned(),
+        "A.b1".to_owned(),
+        format!("a.{}", "b".repeat(253)),
+    ]
+}
+
+/// Stages a commit of one new file in `txn` and returns it. `body` makes the
+/// commit new to the repository.
+async fn stage_commit(txn: &ostrya::Transaction, base: &Path, body: &str) -> Checksum {
+    let tree = base.join(format!("src-{body}"));
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("b.txt"), format!("{body}\n")).unwrap();
+    let dfd = std::fs::File::open(&tree).unwrap();
+    let mut modifier = Some(CommitModifier::new(
+        CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
+    ));
+    let mut mtree = MutableTree::new();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, modifier.as_mut())
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    txn.write_commit(
+        CommitOptions {
+            subject: Some(body.to_owned()),
+            timestamp: Some(1_700_000_000),
+            ..CommitOptions::default()
+        },
+        &root,
+    )
+    .await
+    .unwrap()
+}
+
+#[test]
+fn a_collection_ref_write_refuses_an_id_outside_the_rule() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id");
+        let (repo, commit) = repo_with_commit(tmp.path()).await;
+        let repo_dir = tmp.path().join("repo");
+        for (index, id) in refused_ids().iter().enumerate() {
+            let cref = CollectionRef::new(id.as_str(), "main");
+            let refs_before = ref_files(&repo_dir);
+            let objects_before = files_below(&repo_dir.join("objects"));
+
+            assert_refused(
+                repo.set_collection_ref_immediate(&cref, Some(&commit))
+                    .await,
+                id,
+            );
+            assert_eq!(ref_files(&repo_dir), refs_before, "{id:?} wrote a ref");
+
+            // The transaction checks the id at the commit, before it
+            // publishes an object.
+            let txn = repo.transaction().await.unwrap();
+            let staged = stage_commit(&txn, tmp.path(), &format!("staged-{index}")).await;
+            txn.set_collection_ref(&cref, Some(&staged));
+            assert_refused(txn.commit().await, id);
+            assert!(
+                !repo.has_object(ObjectType::Commit, &staged).await.unwrap(),
+                "{id:?}: the commit published the staged commit"
+            );
+            assert_eq!(ref_files(&repo_dir), refs_before, "{id:?} wrote a ref");
+            assert_eq!(
+                files_below(&repo_dir.join("objects")),
+                objects_before,
+                "{id:?} published an object"
+            );
+        }
+    });
+}
+
+#[test]
+fn an_update_guard_refuses_an_id_outside_the_rule() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id-guard");
+        let (repo, commit) = repo_with_commit(tmp.path()).await;
+        let repo_dir = tmp.path().join("repo");
+        let before = ref_files(&repo_dir);
+        let guard = repo.begin_update().await.unwrap();
+        for id in refused_ids() {
+            let cref = CollectionRef::new(id.as_str(), "main");
+            assert_refused(guard.set_collection_ref(&cref, Some(&commit)).await, &id);
+            assert_refused(guard.read_collection_ref(&cref).await, &id);
+        }
+        guard.finish().await.unwrap();
+        assert_eq!(ref_files(&repo_dir), before);
+    });
+}
+
+#[test]
+fn a_collection_ref_write_takes_an_id_inside_the_rule() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id-valid");
+        let (repo, commit) = repo_with_commit(tmp.path()).await;
+        let repo_dir = tmp.path().join("repo");
+        for id in accepted_ids() {
+            let immediate = CollectionRef::new(id.as_str(), "immediate");
+            repo.set_collection_ref_immediate(&immediate, Some(&commit))
+                .await
+                .unwrap();
+
+            let queued = CollectionRef::new(id.as_str(), "queued");
+            let txn = repo.transaction().await.unwrap();
+            txn.set_collection_ref(&queued, Some(&commit));
+            txn.commit().await.unwrap();
+
+            let guarded = CollectionRef::new(id.as_str(), "guarded");
+            let guard = repo.begin_update().await.unwrap();
+            guard
+                .set_collection_ref(&guarded, Some(&commit))
+                .await
+                .unwrap();
+            assert_eq!(
+                guard.read_collection_ref(&guarded).await.unwrap(),
+                Some(commit),
+                "{id}"
+            );
+            guard.finish().await.unwrap();
+
+            for name in ["immediate", "queued", "guarded"] {
+                let path = repo_dir.join(format!("refs/mirrors/{id}/{name}"));
+                assert!(path.is_file(), "{id}: no ref file {name}");
+            }
+        }
+    });
+}
+
+/// A directory under `refs/mirrors/` whose name fails the rule comes from an
+/// out-of-band write alone. The ref store does not remove a ref under it.
+#[test]
+fn a_ref_under_an_invalid_collection_directory_stays() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id-stays");
+        let (repo, commit) = repo_with_commit(tmp.path()).await;
+        let path = tmp.path().join("repo/refs/mirrors/fresh/x");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, format!("{commit}\n")).unwrap();
+        assert_refused(
+            repo.set_collection_ref_immediate(&CollectionRef::new("fresh", "x"), None)
+                .await,
+            "fresh:x",
+        );
+        assert!(path.is_file(), "the ref store removed the ref");
     });
 }

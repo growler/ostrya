@@ -608,11 +608,21 @@ remotes of `é:main`, `o.:main`, and `_o:main`. It refuses these names with
   `a/b:x`.
 
 The port applies the same rule to the remote and to the name part of every ref
-name and refspec. It refuses an empty name and a name part with a `:`. The ref
-store takes a collection id that is one path component. The id is not empty, is
-neither `.` nor `..`, and holds no `/` and no NUL. `refs -c --create` first
-applies the collection-id rule of the tool, which is stricter
-(`conformance/cli-behavior.md`, "CLI output formats", `refs`).
+name and refspec. It refuses an empty name and a name part with a `:`.
+
+The collection id rule is the rule of the tool
+(`conformance/cli-behavior.md`, "CLI output formats", `refs`). A collection id
+is two or more elements separated by `.`. Each element starts with an ASCII
+letter or `_`, and continues with ASCII letters, ASCII digits, or `_`. The ref
+store takes a collection id that passes this rule and is at most 255 bytes. The
+id is one name under `refs/mirrors/`, and a file system takes a name of 255
+bytes at most. A write or a read of a collection ref with another id fails with
+`InvalidRefspec`, which holds `<id>:<name>`, and writes nothing.
+
+A directory under `refs/mirrors/` whose name fails the collection id rule stays
+in the repository. Prune and the ref writers of the port do not change it.
+`ostrya refs --delete -c` refuses a ref under it. Only a manual removal, for
+example with `rm`, removes it.
 
 For non-ASCII characters, the tool accepts letters, numbers, nonspacing
 combining marks (Unicode category Mn), and non-ASCII connector punctuation

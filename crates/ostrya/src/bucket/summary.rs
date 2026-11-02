@@ -80,7 +80,7 @@ pub struct BucketSummaryReport {
     /// The number of static deltas that `ostree.static-deltas` lists.
     pub deltas: usize,
     /// The name of the engine of each signer, in the order of the
-    /// signatures, as [`Signer::name`](crate::Signer::name) gives it. Empty
+    /// signatures, as [`Signer::name`] gives it. Empty
     /// if the update wrote no `summary.sig`.
     pub signers: Vec<String>,
     /// The `ostree.summary.last-modified` value of the summary.

@@ -182,10 +182,19 @@ are observed and deliberately not reproduced:
   'collection_id == NULL || ostree_validate_collection_id (collection_id,
   NULL)' failed`, and a signal ends it. The port lists what that path holds.
   The tool refuses an invalid id given as a `-c` positional with `error:
-  Listing refs: Invalid collection ID <id>` and exit 1. The port validates a
-  collection id only where `-c --create` writes one. So a `-c` positional that
-  the tool refuses matches no collection ref in the port, which prints nothing
-  and exits 0;
+  Listing refs: Invalid collection ID <id>` and exit 1. The port does not
+  validate a `-c` positional. So a `-c` positional that names no directory
+  under `refs/mirrors` matches no collection ref in the port, which prints
+  nothing and exits 0. The port validates a collection id where `-c --create`
+  writes one and where `-c --delete` removes one. `-c --delete` checks each
+  ref that its positionals select and that it removes, before it removes a
+  ref. The mirror refs of the own `collection-id` stay, and the check skips
+  them. If the ref store refuses one selected ref by its id or its name, the
+  command removes no ref and exits 1. A mirror ref whose id fails the
+  collection-id rule or is longer than 255 bytes, or whose name fails the
+  ref-name rule, gives `error: Invalid refspec <id>:<name>`. A ref under
+  `refs/heads` whose name fails the refspec rule gives `error: Invalid refspec
+  <name>`;
 - `refs -c --create=<id>`, whose NEWREF holds no `:` and therefore no ref name,
   makes the tool print a GLib assertion line (`g_regex_match_full: assertion
   'string != NULL' failed`) ahead of its own `error: Invalid ref name (null)`;

@@ -7,9 +7,8 @@
 //! which `char::is_alphanumeric` is `true`, less the characters that the
 //! `ostree` tool refuses. The remote part of a refspec follows the rule of a
 //! component. `is_ref_component` is a wider check for a part that is not a
-//! ref name, such as a collection id. `is_checksum_shaped` marks a valid ref
-//! name that a revision reads as a checksum. `is_collection_id` checks a
-//! collection id.
+//! ref name. `is_checksum_shaped` marks a valid ref name that a revision
+//! reads as a checksum. `is_collection_id` checks a collection id.
 
 use crate::Checksum;
 
@@ -237,10 +236,11 @@ pub fn is_ref_name_component(component: &str) -> bool {
 }
 
 /// Returns `true` if `component` is one valid component of a part that is
-/// not a ref name, such as a collection id.
+/// not a ref name.
 ///
 /// A component is not empty, is not `.` or `..`, and holds no `/` and no NUL.
-/// A ref name uses the stricter [`is_ref_name_component`].
+/// A ref name uses the stricter [`is_ref_name_component`]. A collection id
+/// uses [`is_collection_id`].
 pub fn is_ref_component(component: &str) -> bool {
     !(component.is_empty()
         || component == "."

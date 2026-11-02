@@ -5626,6 +5626,8 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
             ("", "main"),
             ("..", "main"),
             ("a/b", "main"),
+            ("a", "main"),
+            ("1org.x", "main"),
             (COLLECTION, "a:b"),
             (COLLECTION, "x:"),
             (COLLECTION, ":y"),

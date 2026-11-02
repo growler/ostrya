@@ -12367,6 +12367,114 @@ fn refs_delete_collection_own_id_matches_the_tool() {
     );
 }
 
+/// `refs -c --delete` checks the collection id of each selected mirror ref
+/// before it removes a ref. A directory under `refs/mirrors/` whose name fails
+/// the collection-id rule stops the command, and no ref is removed. The tool
+/// aborts on such a directory, so the test runs the port alone.
+#[test]
+fn refs_delete_collection_refuses_an_invalid_id_before_it_removes_a_ref() {
+    let tmp = TmpDir::new("refs-delete-coll-invalid");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let head = commit_tree(&repo, "keep", &base.join("src"), None);
+    write_ref_file(&repo, "mirrors/org.example.Valid/mm", &head);
+    write_ref_file(&repo, "mirrors/fresh/x", &head);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &[
+            "refs",
+            &repo_arg,
+            "-c",
+            "--delete",
+            "org.example.Valid",
+            "fresh",
+        ],
+        None,
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "the port exited 0: {stderr}");
+    assert!(
+        stderr.contains("error: Invalid refspec fresh:x"),
+        "the port gave: {stderr}"
+    );
+    for path in ["refs/mirrors/org.example.Valid/mm", "refs/mirrors/fresh/x"] {
+        assert!(repo.join(path).exists(), "the port removed {path}");
+    }
+}
+
+/// `refs -c --delete` with the own id removes the refs under `refs/heads` and
+/// does not check the mirror refs of that id, which stay. The config gives an
+/// own id that fails the collection-id rule, so the tool does not take the
+/// repository, and the test runs the port alone.
+#[test]
+fn refs_delete_collection_own_invalid_id_skips_its_mirror_refs() {
+    let tmp = TmpDir::new("refs-delete-coll-own-invalid");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let head = commit_tree(&repo, "main", &base.join("src"), None);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &["config", &repo_arg, "set", "core.collection-id", "foo"],
+        None,
+        &[],
+    )
+    .ok();
+    write_ref_file(&repo, "mirrors/foo/x", &head);
+    let run = ostrya(&["refs", &repo_arg, "-c", "--delete", "foo"], None, &[]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "the port exited non-zero: {stderr}");
+    assert!(
+        !repo.join("refs/heads/main").exists(),
+        "the port kept refs/heads/main"
+    );
+    assert!(
+        repo.join("refs/mirrors/foo/x").exists(),
+        "the port removed refs/mirrors/foo/x"
+    );
+}
+
+/// `refs -c --delete` checks the ref name of each selected mirror ref before
+/// it removes a ref. A mirror ref whose name fails the ref-name rule stops the
+/// command, and no ref is removed.
+#[test]
+fn refs_delete_collection_refuses_an_invalid_name_before_it_removes_a_ref() {
+    let tmp = TmpDir::new("refs-delete-coll-invalid-name");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let head = commit_tree(&repo, "keep", &base.join("src"), None);
+    write_ref_file(&repo, "mirrors/org.example.A/a", &head);
+    write_ref_file(&repo, "mirrors/org.example.B/-bad", &head);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &[
+            "refs",
+            &repo_arg,
+            "-c",
+            "--delete",
+            "org.example.A",
+            "org.example.B",
+        ],
+        None,
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "the port exited 0: {stderr}");
+    assert!(
+        stderr.contains("error: Invalid refspec org.example.B:-bad"),
+        "the port gave: {stderr}"
+    );
+    for path in [
+        "refs/mirrors/org.example.A/a",
+        "refs/mirrors/org.example.B/-bad",
+    ] {
+        assert!(repo.join(path).exists(), "the port removed {path}");
+    }
+}
+
 #[test]
 fn refs_create_ancestry_suffix_matches_the_tool() {
     if !ostree_available() {

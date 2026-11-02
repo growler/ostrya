@@ -1,3 +1,13 @@
+ostrya (0.8.0) unstable; urgency=medium
+
+  * commit --tree=tar gives the uid, gid, and xattr records of a pax
+    global header to the members that follow it.
+  * commit --tree=tar refuses a symlink member whose size is not 0.
+  * commit --tree=tar reports a header field that is not valid UTF-8 as
+    an i/o error.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 02 Nov 2026 12:38:27 +0100
+
 ostrya (0.7.0) unstable; urgency=medium
 
   * Add fsck --no-mark-dependencies.

@@ -1,3 +1,9 @@
+ostrya-mountd (0.8.0) unstable; urgency=medium
+
+  * New upstream release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 02 Nov 2026 12:38:27 +0100
+
 ostrya-mountd (0.7.0) unstable; urgency=medium
 
   * New upstream release.

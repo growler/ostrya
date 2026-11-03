@@ -68,6 +68,15 @@ for it.
   of a static delta. So the HTTP pull of the port stops at the first absent
   optional file of a bucket repository whose anonymous policy gives no
   `s3:ListBucket` (`ostrya-repo(5)`, section BUCKET REPOSITORIES).
+- A local pull under `PullFlags::UNTRUSTED` hashes a metadata object, and
+  the payload of a reflink clone, in one read, and copies, clones, or links
+  the object in a second step. A source that changes between the two steps
+  can pass the hash. On the hardlink path, the import links the source file
+  first, and then hashes the file that it opens again at the same path. A
+  rename between the two steps stages another inode than the inode that it
+  hashes. The destination also shares the inode with the source after the
+  pull, so a later change of the source file changes the object in the
+  destination. A fix copies and hashes each object in one read.
 
 ## Gaps in the commands
 

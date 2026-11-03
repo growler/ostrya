@@ -3790,7 +3790,11 @@ struct PullArgs {
     /// answer is skipped with a warning. The pull from each selected
     /// candidate is a pull of its own, so a failure of a later candidate
     /// keeps the refs of the earlier ones. The keys of the selected candidate
-    /// apply.
+    /// apply. If the keys of a `file://` candidate check the signatures of
+    /// the commits or of the summary, the pull hashes each object that it
+    /// imports from it, as --untrusted does. A signature covers the commit or
+    /// the summary alone, and the hash carries the proof to the objects of
+    /// the tree.
     /// Each commit must be bound to ID. If a commit has a ref binding, the
     /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`. If
     /// the `collection-id` of this repository is ID, the pull writes
@@ -3836,11 +3840,16 @@ struct PullArgs {
     /// --require-static-deltas is given.
     #[arg(long = "subpath", value_name = "PATH")]
     subpath: Vec<String>,
-    /// Verify the checksum of every object. A pull always does this.
+    /// Verify the checksum of every object.
     ///
-    /// A pull over HTTP or over ssh hashes each object that it stores, and
-    /// compares the result with the name of the object. So this switch changes
-    /// nothing.
+    /// A pull over HTTP, over ssh, or from an `s3://` address hashes each
+    /// object that it stores, and compares the result with the name of the
+    /// object, with or without this switch. For a `file://` candidate of
+    /// --collection, this switch makes the pull hash each object that it
+    /// imports. Without this switch, and if the keys of the candidate check
+    /// no signature, the pull links, clones, or copies an object with no
+    /// hash. An object that the pull writes again in another form always gets
+    /// a hash.
     #[arg(long)]
     untrusted: bool,
     /// A switch of the `ostree` command that this pull accepts and ignores.
@@ -4950,7 +4959,9 @@ struct PullLocalArgs {
     ///
     /// Without this switch, the pull links or copies an object with no hash.
     /// An object that the pull writes again in another form always gets a
-    /// hash. A mismatch fails the pull.
+    /// hash. A mismatch fails the pull. The keys of --remote and of --trust
+    /// do not make the pull hash an object, so give this switch for a source
+    /// that is not trusted.
     #[arg(long)]
     untrusted: bool,
     /// Reject regular files with mode bits outside 0775.

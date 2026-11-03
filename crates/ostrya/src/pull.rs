@@ -267,6 +267,8 @@ impl PullFlags {
     /// is off by default, as in the `ostree` command: a local source is
     /// trusted, and the pull links its objects without a read.
     /// [`Repo::pull_local`] states the reads that the flag adds.
+    /// [`Repo::pull_collection`] turns the flag on for a local repository
+    /// whose remote checks signatures.
     pub const UNTRUSTED: PullFlags = PullFlags(1 << 0);
     /// The import of the commit objects alone.
     ///
@@ -1572,7 +1574,12 @@ impl Repo {
     /// result with the name, whatever the flags say. So that path refuses a
     /// corrupt source with or without the flag. The other paths move bytes
     /// without a hash, and the flag adds one read of each object. An untrusted
-    /// pull thus reads each object exactly once.
+    /// pull thus hashes each object once.
+    ///
+    /// A signature covers the commit or the summary alone. A signature check
+    /// of this pull does not set the flag. A caller that checks the
+    /// signatures of a source that it does not trust also sets
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED).
     ///
     /// # Detached metadata
     ///
@@ -4206,16 +4213,24 @@ fn check_bareuseronly(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
 }
 
 /// Verifies that the serialized bytes of a metadata object hash to its name.
+///
+/// A metadata object can be as large as
+/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), so the read and the hash
+/// run in one call on the blocking pool.
 async fn verify_metadata(src: &Repo, name: ObjectName) -> Result<()> {
-    let bytes = src.load_object_bytes(name.ty, &name.checksum).await?;
-    let actual = Checksum::from_bytes(Sha256::digest(&bytes).into());
-    if actual != name.checksum {
-        return Err(Error::ChecksumMismatch {
-            expected: name.checksum,
-            actual,
-        });
-    }
-    Ok(())
+    let src = src.clone();
+    ostrya_rt::unblock(move || {
+        let bytes = src.load_object_bytes_blocking(name.ty, &name.checksum)?;
+        let actual = Checksum::from_bytes(Sha256::digest(&bytes).into());
+        if actual != name.checksum {
+            return Err(Error::ChecksumMismatch {
+                expected: name.checksum,
+                actual,
+            });
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// Verifies that the framed header and the streamed payload of a content

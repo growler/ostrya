@@ -559,9 +559,15 @@ impl Repo {
     /// verified summary, and the pull uses the summary that the probe
     /// verified. It does not read the `summary` or the `summary.sig` of the
     /// repository again. A listed commit that the repository does not hold
-    /// then fails the pull. As each local pull,
-    /// it hashes an imported object only with
-    /// [`UNTRUSTED`](PullFlags::UNTRUSTED). Its counts go to
+    /// then fails the pull. If the trust of the remote checks the signatures
+    /// of the commits or of the summary, the pull hashes each object that it
+    /// imports and compares the result with the name of the object, as with
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED). A signature covers the commit or
+    /// the summary alone, and the hash carries the proof to the objects of
+    /// the tree. Otherwise the flags of the caller apply: without
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull links, clones, or copies
+    /// an object with no hash, and an object that it writes again in another
+    /// form always gets a hash. The counts of the pull go to
     /// [`CollectionPullStats::stats`] as the counts of a local pull: the
     /// import counts, and no fetch count unless it reads static deltas.
     ///
@@ -579,6 +585,9 @@ impl Repo {
     /// - [`progress`](PullOptions::progress) gets the counters of each pull
     ///   from a remote, and no count of the probe. A pull from a local
     ///   repository does not use it.
+    /// - [`flags`](PullOptions::flags) of a pull from a local repository
+    ///   also hold [`UNTRUSTED`](PullFlags::UNTRUSTED) if the trust of the
+    ///   remote checks signatures, as "Local repository" states.
     ///
     /// # Errors
     ///
@@ -640,7 +649,8 @@ impl Repo {
     /// After these checks, the pull from each selected remote has the errors
     /// of [`Repo::pull`] that stop it before it fetches an object, while it
     /// fetches, and at any request or write. [`Error::Pull`] also comes from
-    /// the checks of each commit above.
+    /// the checks of each commit above. [`Error::ChecksumMismatch`] comes
+    /// from an object of a local repository that does not hash to its name.
     ///
     /// # Examples
     ///
@@ -807,8 +817,18 @@ impl Repo {
                 // Under a summary policy, it comes from the summary that the
                 // probe checked, and the pull uses that summary.
                 Session::Local(src) => {
+                    // A signature proves the commit alone, or the summary
+                    // its checksum. The hash of each imported object
+                    // against its name carries the proof to the objects of
+                    // the tree.
+                    let flags = if candidate.trust.checks_signatures() {
+                        run.flags | PullFlags::UNTRUSTED
+                    } else {
+                        run.flags
+                    };
                     let run = PullOptions {
                         collection_id: Some(collection_id.to_owned()),
+                        flags,
                         ..run
                     };
                     let checks = LocalChecks {

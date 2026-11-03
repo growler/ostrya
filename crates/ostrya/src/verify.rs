@@ -239,6 +239,12 @@ impl PullTrust {
         self.summary.as_ref()
     }
 
+    /// Returns true if the pull checks the signatures of the commits or of
+    /// the summary.
+    pub(crate) fn checks_signatures(&self) -> bool {
+        self.commit.is_some() || self.summary.is_some()
+    }
+
     /// Reads the trust that [`Repo::pull`] uses for a pull from `remote`.
     ///
     /// The keys come from the `[remote "NAME"]` section of the repository
@@ -1588,6 +1594,30 @@ mod tests {
             Some(&ed25519_signed(SECRET_B64)),
         ))
         .unwrap();
+    }
+
+    /// A trust checks signatures when it holds the commit keys, the summary
+    /// keys, or both.
+    #[test]
+    fn a_trust_with_keys_checks_signatures() {
+        let keys = || {
+            let verifier =
+                Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
+                    .unwrap();
+            TrustedKeys::new(vec![Arc::new(verifier)]).unwrap()
+        };
+        assert!(!PullTrust::unverified().checks_signatures());
+        assert!(PullTrust::commits(keys()).checks_signatures());
+        assert!(
+            PullTrust::unverified()
+                .with_summary(keys())
+                .checks_signatures()
+        );
+        assert!(
+            PullTrust::commits(keys())
+                .with_summary(keys())
+                .checks_signatures()
+        );
     }
 
     /// A policy check runs the verifier of each axis on the blocking pool, so

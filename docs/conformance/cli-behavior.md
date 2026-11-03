@@ -1197,6 +1197,46 @@ The help of `--http-trusted` reads "Do not verify checksums of HTTP sources
 `cli-surface.md`, "P2", `pull`, records the port side.
 `pull-local` takes neither `--subpath` nor `--http-trusted` (`Unknown option`).
 
+These records of a `file://` remote come from libostree 2026.1 on a NixOS
+host, observed on 2026-11-03. The source is an `archive` or a `bare-user`
+repository with a collection id. `commit --sign-type=ed25519 --sign=KEY`
+signed its commit of three files. Then the bytes of the object of one file
+were replaced by the bytes of the object of another file. The destination
+has the remote `src` at the `file://` address of the source, with
+`gpg-verify=false` and `gpg-verify-summary=false`.
+
+Without `--untrusted`, `pull src REF` imports the replaced object, writes the
+ref, and exits 0. It prints `4 metadata, 3 content objects imported; N bytes
+content written`. `fsck` of the destination then fails at exit 1 with
+`In commits <commit>: fsck content object <c>: Corrupted file object;
+checksum expected='<c>' actual='<other>'` and `error: Repository corruption
+encountered`. The pull
+does this with these remote keys and paths:
+
+- `sign-verify=true` and the public key, on the hardlink path: `archive` to
+  `archive` and `bare-user` to `bare-user`. The object in the destination
+  is a hardlink of the object in the source. `N` is 0.
+- `sign-verify=true` and the public key, on the copy path: `archive` to
+  `bare-user` and `bare-user` to `archive`.
+- `sign-verify-summary=true` alone, with a summary that the key signed, on
+  the hardlink path.
+- No verification key, on the hardlink path.
+
+With `--untrusted` and `sign-verify=true`, the pull fails at exit 1 and
+writes no ref:
+
+- On the hardlink path: `error: fsck content object <c>: Corrupted file
+  object; checksum expected='<c>' actual='<other>'`. The pull writes no
+  object.
+- On the copy path, `archive` to `bare-user`: `error: Writing content
+  object: Corrupted file object; checksum expected='<c>' actual='<other>'`.
+
+`find-remotes --finders=config --pull` with the same remote fails on the
+commit, before it imports a content object, also with `gpg-verify=false`:
+`GPG verification enabled, but no signatures found (use gpg-verify=false in
+remote config to disable)`. Its import of a replaced object is not
+observed. `cli-surface.md`, "P2", `pull`, records the port side.
+
 #### The subpath option
 
 `--subpath=PATH` fetches a part of the tree of each commit. The option is

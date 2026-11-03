@@ -45,7 +45,7 @@ Import only the commit objects, and mark each commit partial.
 \fB\-\-untrusted\fR
 Verify the checksum of every imported object against its name.
 .IP
-Without this switch, the pull links or copies an object with no hash. An object that the pull writes again in another form always gets a hash. A mismatch fails the pull.
+Without this switch, the pull links or copies an object with no hash. An object that the pull writes again in another form always gets a hash. A mismatch fails the pull. The keys of \%\-\-remote and of \%\-\-trust do not make the pull hash an object, so give this switch for a source that is not trusted.
 .TP
 \fB\-\-bareuseronly\-files\fR
 Reject regular files with mode bits outside \%0775.

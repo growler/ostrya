@@ -157,6 +157,9 @@ The client groups of that repository do not apply, and the file permissions are 
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
 The checks of the commits apply to each target, each parent that the depth takes, and each commit of a chain of static deltas.
 A pull checks no signature of a dependency in field 2 of a commit, unless the dependency also has one of these roles.
+When the keys of a \fB\%file://\fR candidate of \fB\%ostrya pull \-\-collection\fR check the signatures of the commits or of the summary, the pull hashes each object that it imports from that candidate.
+These keys do not make \fB\%ostrya pull\-local \-\-remote=NAME\fR hash an object.
+For a source that is not trusted, give \fB\%\-\-untrusted\fR to \fB\%ostrya pull\-local\fR.
 \fB\%ostrya remote fsck NAME\fR reads \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the trusted keys of these two checks.
 A switch of the command that turns a check on or off wins over its key.
 For a remote with the key \fB\%trust\fR, the switches of the checks of the commits follow the rule of that key.

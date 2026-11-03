@@ -3762,9 +3762,15 @@ or a ref (`cli-behavior.md`, "HTTP pull surface", "Depth less than -1").
 
 `--untrusted` over a `file://` remote changes what the tool does; the port
 fetches no `file://` remote. A `file://` candidate of `pull --collection` is
-a local pull, which hashes an imported object only under `--untrusted`, as
-`pull-local` does. Under `--require-static-deltas` into `archive`
-the tool refuses with `error: Can't use static deltas in an archive repo`, and
+a local pull. It hashes each imported object under `--untrusted`, as
+`pull-local` does, and also when the keys of the candidate check the
+signatures of the commits or of the summary. The tool hashes an object from
+a `file://` remote only under `--untrusted`, whatever the keys of the remote.
+Without the switch it imports a replaced content object, exits 0, and a later
+`fsck` fails (`cli-behavior.md`, "HTTP pull surface", "Checksum
+verification"). With such keys and without `--untrusted`, the port refuses
+that object at exit 1 and writes no ref. Under `--require-static-deltas`
+into `archive` the tool refuses with `error: Can't use static deltas in an archive repo`, and
 the port takes the delta, with or without `--subpath`. This is a capability
 difference: the delta applier of the port writes each object through the
 content writer of the transaction, which stores the object in the form that

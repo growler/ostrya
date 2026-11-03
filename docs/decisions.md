@@ -2762,6 +2762,11 @@ These alternatives were rejected:
   first request.
 - Each other pull from a remote, and the fetch of a summary, keep the
   refusal of a `file://` address by the HTTP client.
+- If the trust of the remote checks the signatures of the commits or of the
+  summary, the pull from the candidate hashes each object that it imports,
+  as under `PullFlags::UNTRUSTED`. A signature covers the commit, or the
+  summary the checksum of the commit, and the hash carries the proof to the
+  objects of the tree. Otherwise the flags of the caller apply.
 
 The local pull already reads a source repository through the file system,
 with hardlinks where the file systems permit them. So the collection pull
@@ -2785,6 +2790,15 @@ These alternatives were rejected:
   summary policy, the probe reads each timestamp from the commit that it
   pins. Under a summary policy, the timestamps come from the verified
   summary, and the pull checks each commit against them.
+- The flags of the caller alone for a candidate whose remote checks
+  signatures. A signature proves the commit, and nothing proves the objects
+  of its tree. A source on removable media can keep a signed commit and
+  replace the bytes of an object under its name, and the pull then imports
+  that object.
+- A hash of each object of each local candidate. A builder on the same host
+  that checks no signature then reads each object one more time. The link
+  still saves the write and the disk space. The read removes most of the
+  time that the link saves.
 
 ## The own collection id of a collection pull
 

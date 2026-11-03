@@ -3203,9 +3203,10 @@ refs and to a pull of collection refs:
   checksum of the dependency, and the checksum and the signatures of the
   commit that names it cover field 2. An untrusted pull (`--untrusted`,
   `PullFlags::UNTRUSTED`) hashes the dependency commit that it imports and
-  compares the result with that checksum. A pull without the flag trusts the
-  source for a dependency as for each other object. The pull makes no
-  ref-binding check on a dependency.
+  compares the result with that checksum. The pull from a local candidate of
+  a collection pull whose keys check signatures does the same. A pull
+  without the flag trusts the source for a dependency as for each other
+  object. The pull makes no ref-binding check on a dependency.
 - A target, a parent that the depth of the pull takes, and a commit of a
   chain of static deltas keep the checks of that role, also if a field 2
   names them.
@@ -5009,10 +5010,16 @@ each commit against the listed timestamp of the probe, as for a remote.
 Without a summary policy, the probe read each timestamp from the commit that
 it pins. Under a summary policy, the timestamps come from the verified
 summary, and the pull uses the summary that the probe verified. It does not
-read `summary` or `summary.sig` of the source again. As each local pull, it
-hashes an imported object only
-under `--untrusted`. A pull from a local candidate counts no fetch, unless it
-reads static deltas. So when the pull fetched nothing and imported objects,
+read `summary` or `summary.sig` of the source again. If the keys of the
+candidate check the signatures of the commits or of the summary
+(`gpg-verify`, `sign-verify`, `gpg-verify-summary`, `sign-verify-summary`,
+or a trust group), the pull hashes each object that it imports and compares
+the result with the name of the object, as under `--untrusted`. A signature
+covers the commit or the summary alone, and the hash carries the proof to
+the objects of the tree. Otherwise, without `--untrusted`, the pull links,
+clones, or copies an object with no hash, and an object that it writes again
+in another form always gets a hash. A pull from a local candidate counts no
+fetch, unless it reads static deltas. So when the pull fetched nothing and imported objects,
 `ostrya pull --collection` prints the statistics line of `pull-local`.
 
 The pull refuses a commit:

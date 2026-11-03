@@ -23,8 +23,8 @@ use ostrya::endpoint::EndpointOverrides;
 use ostrya::{
     Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
     CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer,
-    Error, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectType, PullFlags, PullOptions,
-    RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type, Value,
+    Error, FileKind, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectName, ObjectType, PullFlags,
+    PullOptions, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -1888,6 +1888,130 @@ fn the_keys_of_a_file_remote_apply() {
             } else {
                 let err = pulled.unwrap_err();
                 assert!(matches!(err, Error::Signature(_)), "{err:?}");
+                assert_nothing_written(&dest).await;
+            }
+        }
+    });
+}
+
+/// Writes the bytes of the second regular content object of `commit` in
+/// `repo` at `dir/a` under the name of the first, in the order of the
+/// checksums. Returns the checksum of the first.
+async fn swap_content(dir: &Path, repo: &Repo, commit: &Checksum) -> Checksum {
+    let mut names: Vec<Checksum> = repo
+        .traverse_commit(commit, 0)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|name| name.ty == ObjectType::File)
+        .map(|name| name.checksum)
+        .collect();
+    names.sort_by_key(Checksum::to_hex);
+    let mut regular = Vec::new();
+    for checksum in names {
+        let file = repo.load_file(&checksum).await.unwrap();
+        if matches!(file.kind, FileKind::Regular { .. }) {
+            regular.push(checksum);
+        }
+    }
+    let path = |checksum: Checksum| {
+        dir.join("a/objects")
+            .join(ObjectName::new(checksum, ObjectType::File).loose_path(RepoMode::Archive))
+    };
+    std::fs::remove_file(path(regular[0])).unwrap();
+    std::fs::copy(path(regular[1]), path(regular[0])).unwrap();
+    regular[0]
+}
+
+/// Writes the bytes of the dirtree of the one subdirectory of the root of
+/// `commit` in `repo` at `dir/a` under the name of the root dirtree. Returns
+/// the checksum of the root dirtree.
+///
+/// The bytes parse as a dirtree, and each object that they name is an object
+/// of the commit. So the walk of the pull reads them, and each content object
+/// that the pull imports hashes to its name.
+async fn swap_dirtree(dir: &Path, repo: &Repo, commit: &Checksum) -> Checksum {
+    let (commit, _) = repo.load_commit(commit).await.unwrap();
+    let root = commit.root_dirtree;
+    let dirs = repo.load_dirtree(&root).await.unwrap().dirs;
+    assert_eq!(dirs.len(), 1);
+    let path = |checksum: Checksum| {
+        dir.join("a/objects")
+            .join(ObjectName::new(checksum, ObjectType::DirTree).loose_path(RepoMode::Archive))
+    };
+    std::fs::remove_file(path(root)).unwrap();
+    std::fs::copy(path(dirs[0].1), path(root)).unwrap();
+    root
+}
+
+/// A signature covers the commit, or the summary its checksum, and not the
+/// objects of the tree. So the pull from a `file://` remote whose keys check
+/// the signatures of the commits or of the summary hashes each object that
+/// it imports. The source holds a signed commit and a signed summary, and
+/// the bytes of one content object under the name of another. With commit
+/// keys, with the commit keys of a trust group, and with summary keys alone,
+/// the pull fails and writes nothing. With no keys, the pull does not read
+/// the objects, and the bad object goes to the destination. `UNTRUSTED` from
+/// the caller makes that pull fail. A dirtree under the name of another
+/// dirtree fails the pull with commit keys in the same way.
+#[test]
+fn a_file_remote_with_signature_keys_hashes_each_imported_object() {
+    block_on(async {
+        let keys = format!("verification-ed25519-key={PUBLIC_B64}\n");
+        for case in [
+            "commit keys",
+            "trust group",
+            "summary keys",
+            "no keys",
+            "untrusted",
+            "dirtree",
+        ] {
+            let dir = TmpDir::new("pull-collection-file-hash");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+            a.sign_commit(&tip, &signer).await.unwrap();
+            summarize(&a).await;
+            a.sign_summary(&signer).await.unwrap();
+            let target = if case == "dirtree" {
+                swap_dirtree(dir.path(), &a, &tip).await
+            } else {
+                swap_content(dir.path(), &a, &tip).await
+            };
+            let extra = match case {
+                "commit keys" | "dirtree" => format!("sign-verify=true\n{keys}"),
+                "trust group" => format!("[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n{keys}"),
+                "summary keys" => format!("sign-verify-summary=ed25519\n{keys}"),
+                _ => String::new(),
+            };
+            let dest = dest(
+                dir.path(),
+                None,
+                &[("a", &file_url(dir.path(), "a"), &extra)],
+            )
+            .await;
+
+            let (mut opts, events) = options(&[REF]);
+            if case == "trust group" {
+                opts.pull.trust_group = Some("t".to_owned());
+            }
+            if case == "untrusted" {
+                opts.pull.flags = PullFlags::UNTRUSTED;
+            }
+            let pulled = dest.pull_collection(ID, &["a"], opts).await;
+            assert!(events.lock().unwrap().is_empty(), "{case}");
+            if case == "no keys" {
+                assert_eq!(pulled.unwrap().refs[0].commit, tip);
+                assert_eq!(mirror(&dest, REF).await, Some(tip));
+                let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+                let bad: Vec<Checksum> = report.errors.iter().map(|e| e.object.checksum).collect();
+                assert_eq!(bad, [target]);
+            } else {
+                let err = pulled.unwrap_err();
+                assert!(
+                    matches!(err, Error::ChecksumMismatch { expected, .. } if expected == target),
+                    "{case}: {err:?}"
+                );
                 assert_nothing_written(&dest).await;
             }
         }

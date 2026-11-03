@@ -6,18 +6,25 @@
 //! 1. The checks of the options, and the endpoint, the trust, and the
 //!    transport of each remote. A failure stops the pull before its first
 //!    request.
-//! 2. The probe of each remote, in the given order: the commit and the
-//!    timestamp of each ref, from the ref listing or from the summary. The
-//!    probe of a remote at a `file://` address reads the ref files of the
-//!    local repository, or its summary. The pull skips a remote that fails.
+//! 2. The find step: the probe of each remote, in the given order. The probe
+//!    reads the commit and the timestamp of each ref, from the ref listing or
+//!    from the summary. The probe of a remote at a `file://` address reads
+//!    the ref files of the local repository, or its summary. The find step
+//!    gives the refs and the session of each remote that answers, and the
+//!    error of each other remote. If the probe of a remote read the refs
+//!    from its `summary`, the find step also gives these bytes. The pull from
+//!    that remote reads them in place of the `summary` and the `summary.sig`.
+//!    The probe of a local repository gives no summary. The pull skips a
+//!    remote that fails.
 //! 3. The selection of a remote for each ref, and then one pull from each
 //!    selected remote, in the given order, through the engine of
 //!    [`Repo::pull`], over the session of its probe. A local repository goes
 //!    through the engine of [`Repo::pull_local`].
 //!
 //! [`Repo::remote_list_collection_refs_with`] makes the checks of part 1 and
-//! the probe of part 2 for one remote, and returns the refs that the probe
-//! read.
+//! the find step of part 2 for its one remote. The error of that remote is
+//! the error of the call. The call returns the name and the commit of each
+//! ref that the find step read, and drops the timestamps.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -305,7 +312,9 @@ struct Listed {
     timestamp: u64,
 }
 
-/// What the probe of one remote gives.
+/// What the probe of one remote gives if the remote answers. [`find_refs`]
+/// gives a `Result<Probed>` for each candidate: this value for a candidate
+/// that answers, or the error that skips the candidate.
 struct Probed {
     /// The refs of the collection that the remote lists.
     listed: Vec<Listed>,
@@ -729,32 +738,36 @@ impl Repo {
             )));
         }
 
+        // The pull reports each remote that it skips before it probes the
+        // next one.
+        let found = find_refs(&candidates, collection_id, &names, |candidate, probed| {
+            if let (Err(e), Some(on_event)) = (probed, on_event.as_mut()) {
+                let message = match &candidate.transport {
+                    Transport::Local(path) => {
+                        format!("local repository '{}': {e}", path.display())
+                    }
+                    _ => e.to_string(),
+                };
+                on_event(CollectionPullEvent::RemoteSkipped {
+                    remote: candidate.name.to_owned(),
+                    message,
+                });
+            }
+        })
+        .await;
         // The session and the summary of each remote that answered, by the
         // position of the remote.
-        let mut answers = Vec::with_capacity(candidates.len());
-        let mut sessions = Vec::with_capacity(candidates.len());
-        let mut summaries = Vec::with_capacity(candidates.len());
-        for candidate in &candidates {
-            let probed = Box::pin(probe(candidate, collection_id, &names)).await;
+        let mut answers = Vec::with_capacity(found.len());
+        let mut sessions = Vec::with_capacity(found.len());
+        let mut summaries = Vec::with_capacity(found.len());
+        for probed in found {
             match probed {
                 Ok(probed) => {
                     answers.push(Some(probed.listed));
                     sessions.push(Some(probed.session));
                     summaries.push(probed.summary);
                 }
-                Err(e) => {
-                    if let Some(on_event) = on_event.as_mut() {
-                        let message = match &candidate.transport {
-                            Transport::Local(path) => {
-                                format!("local repository '{}': {e}", path.display())
-                            }
-                            _ => e.to_string(),
-                        };
-                        on_event(CollectionPullEvent::RemoteSkipped {
-                            remote: candidate.name.to_owned(),
-                            message,
-                        });
-                    }
+                Err(_) => {
                     answers.push(None);
                     sessions.push(None);
                     summaries.push(None);
@@ -922,7 +935,7 @@ impl Repo {
     /// # Probe
     ///
     /// The call reads the refs as the probe of [`Repo::pull_collection`]
-    /// does, in one session:
+    /// does, with its one remote, in one session:
     ///
     /// - Under a summary policy (`gpg-verify-summary`,
     ///   `sign-verify-summary`), the call reads the `summary` and the
@@ -938,7 +951,16 @@ impl Repo {
     /// - A bucket repository at an `s3://` address gives the refs of its
     ///   `summary` alone.
     /// - A local repository gives the refs of its ref files, or of its
-    ///   verified summary under a summary policy.
+    ///   verified summary under a summary policy. Without a summary policy,
+    ///   the call reads the tip commit of each ref for its timestamp.
+    ///
+    /// A commit that the source does not hold fails the call when the source
+    /// reads the commit. The ref files of a local repository give
+    /// [`Error::ObjectNotFound`]. `ostrya serve` answers the listing request
+    /// with the status 500, and the call returns [`Error::HttpStatus`] after
+    /// the retries of the request. `ostrya send` answers with an error, and
+    /// the call returns [`Error::Remote`]. A ref that the call reads from a
+    /// summary gives the commit that the summary lists.
     ///
     /// The call ends the session before it returns.
     ///
@@ -1069,11 +1091,21 @@ impl Repo {
             ..PullOptions::default()
         };
         let candidate = resolve_candidate(self, remote, &opts, TrustScope::Summary).await?;
+        let Some(found) = find_refs(
+            std::slice::from_ref(&candidate),
+            collection_id,
+            &names,
+            |_, _| {},
+        )
+        .await
+        .pop() else {
+            unreachable!("the find step gives one result for each candidate");
+        };
         // The summary goes before the end of the session, which waits for the
         // ssh client.
         let Probed {
             listed, session, ..
-        } = Box::pin(probe(&candidate, collection_id, &names)).await?;
+        } = found?;
         // A local repository has no session to end.
         if let Session::Remote(connection) = session {
             RemoteSource::new(connection, Vec::new())
@@ -1366,6 +1398,8 @@ fn name_cost(id: &str, name: &str) -> usize {
 /// The probe opens a session. If the probe fails, it ends the session. If
 /// the probe succeeds, it gives the session back for the pull. The session
 /// of a local candidate is the open repository at its `file://` address.
+///
+/// [`find_refs`] calls the probe for each candidate.
 async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Probed> {
     let connection = match candidate.transport.open().await? {
         Session::Remote(connection) => connection,
@@ -1392,6 +1426,32 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
         }),
         Err(e) => source.finish(Err(e)).await,
     }
+}
+
+/// The find step of a collection pull: probes each of `candidates` for the
+/// refs of `names` in the collection `id`, or for each ref of the collection
+/// if `names` is empty.
+///
+/// The step probes the candidates one at a time, in their order, through
+/// [`probe`]. After each probe, and before the next one, it calls
+/// `on_probed` with the candidate and the result of its probe.
+///
+/// The result holds the result of each candidate, at the position of the
+/// candidate: the [`Probed`] of a candidate that answered, or the error that
+/// skips the candidate.
+async fn find_refs(
+    candidates: &[Candidate<'_>],
+    id: &str,
+    names: &[&str],
+    mut on_probed: impl FnMut(&Candidate<'_>, &Result<Probed>),
+) -> Vec<Result<Probed>> {
+    let mut found = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let probed = Box::pin(probe(candidate, id, names)).await;
+        on_probed(candidate, &probed);
+        found.push(probed);
+    }
+    found
 }
 
 /// The refs that a probe read, and the `summary` if the refs come from it.

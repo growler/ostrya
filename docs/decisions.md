@@ -2780,6 +2780,12 @@ These alternatives were rejected:
 - The client groups of the source do not apply. The file permissions are
   the access.
 - Each error of the open and of the probe skips the candidate.
+- `Repo::remote_list_collection_refs_with` lists the refs of one remote
+  through the same probe as the pull, and drops the timestamps. So without
+  a summary policy, the listing of a local candidate reads each tip commit
+  for its timestamp. A tip commit that the source does not hold then fails
+  the listing. `Repo::build_ref_listing`, the listing of `ostrya serve` and
+  `ostrya send`, fails the same way.
 - A caller field of another transport, and a subpath, are refused before the
   first request.
 - Each other pull from a remote, and the fetch of a summary, keep the
@@ -2857,6 +2863,11 @@ These alternatives were rejected:
   The rule of the target of an alias, the rule of the collection id of the
   repository, and the shape of the walk are in the read access. A path with
   no access needs a copy of these rules.
+- A listing of one remote that reads no tip commit and gives each ref with
+  its listed commit. A missing tip commit does not fail such a listing.
+  The pull and the listing then need two probes with different rules. The
+  listing of `ostrya serve` reads each commit, and a missing commit fails
+  the whole listing too.
 
 ## The own collection id of a collection pull
 

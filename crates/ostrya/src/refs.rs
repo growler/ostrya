@@ -19,13 +19,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+#[cfg(feature = "receive")]
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::access::{AccessRules, AuthItem, ClientAccess, Namespace, ReadAccess};
+use crate::access::{AccessRules, Namespace, ReadAccess};
 use crate::archive::{Walked, resolve_alias, walk};
 use crate::error::{Error, Result};
 use crate::perm;
@@ -1018,13 +1019,10 @@ impl Repo {
             return Ok(Vec::new());
         }
         let own = self.config().collection_id();
-        let everyone = ReadAccess::new(
-            Arc::new(ClientAccess::implicit(own)),
-            AuthItem::Anonymous,
-            None,
-        );
         if own == Some(collection_id) {
-            let selection = self.select_refs(refs, None, &everyone, None).await?;
+            let selection = self
+                .select_refs(refs, None, self.implicit_reads(), None)
+                .await?;
             return Ok(selection.local);
         }
         // The selector of `ID/NAME` paths. With no positive pattern, `ID/**`
@@ -1046,6 +1044,7 @@ impl Repo {
         let repo = self.clone();
         let id = collection_id.to_owned();
         ostrya_rt::unblock(move || {
+            let everyone = repo.implicit_reads();
             let Some(rules) = everyone.collection_rules(&id) else {
                 return Ok(Vec::new());
             };
@@ -1062,7 +1061,7 @@ impl Repo {
                 &CollectionWalk::new(&collections),
                 &id,
                 &rules,
-                &everyone,
+                everyone,
                 &mut floor,
                 &mut selection,
             )?;
@@ -3547,6 +3546,20 @@ mod tests {
         std::fs::read_to_string(path)
             .ok()
             .map(|text| text.trim().to_owned())
+    }
+
+    /// The implicit read access of a handle takes the collection id of the
+    /// repository as the local namespace, and reads the mirror path of a ref
+    /// of that id.
+    #[test]
+    fn the_implicit_read_access_takes_the_collection_id_of_the_repository() {
+        let root = Root::new("implicit-reads");
+        ostrya_rt::block_on(async {
+            let repo = own_repo(&root.dir.join("repo")).await;
+            let reads = repo.implicit_reads();
+            assert_eq!(reads.access().namespace(Some(OWN)), Namespace::Local);
+            assert!(reads.can_read_path(&format!("refs/mirrors/{OWN}/{NAME}")));
+        });
     }
 
     /// The write of a ref of the collection id of the repository selects the

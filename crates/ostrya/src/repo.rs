@@ -6,13 +6,14 @@
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ostrya_core::RepoMode;
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::config::{MinFreeSpace, RepoConfig};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
@@ -130,6 +131,9 @@ struct RepoInner {
     // the handle keeps it for its full life beside `lock`. So all clones of
     // this handle share one `.update.lock` descriptor and one queue of waiters.
     update_lock: Mutex<Option<Arc<UpdateLock>>>,
+    // The anonymous read access of the implicit client groups. The first
+    // use builds it from `config`, and all clones of this handle share it.
+    implicit_reads: OnceLock<ReadAccess>,
     // How many times the handle read a commit object, for the tests of the
     // reads of a pull.
     #[cfg(test)]
@@ -354,6 +358,19 @@ impl Repo {
     /// Returns the parsed config of the repository, as the open read it.
     pub fn config(&self) -> &RepoConfig {
         &self.inner.config
+    }
+
+    /// Returns the read access of an anonymous client under the implicit
+    /// client groups of the collection id of the repository. The first call
+    /// builds the value, and the handle and its clones keep it.
+    pub(crate) fn implicit_reads(&self) -> &ReadAccess {
+        self.inner.implicit_reads.get_or_init(|| {
+            ReadAccess::new(
+                Arc::new(ClientAccess::implicit(self.config().collection_id())),
+                AuthItem::Anonymous,
+                None,
+            )
+        })
     }
 
     /// Returns the path that opened or created this handle, as the caller gave it.
@@ -661,6 +678,7 @@ impl Repo {
                 strict: materials.strict,
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
+                implicit_reads: OnceLock::new(),
                 #[cfg(test)]
                 commit_reads: std::sync::atomic::AtomicUsize::new(0),
             }),

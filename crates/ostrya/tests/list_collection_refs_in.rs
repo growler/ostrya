@@ -508,6 +508,41 @@ fn an_alias_lists_the_commit_of_its_target() {
     });
 }
 
+/// An alias to a ref under a mirror directory whose name fails the
+/// collection-id rule is not in the listing, in the listing of another
+/// collection and in the listing of the collection id of the repository. An
+/// alias to a ref of a valid collection is in it.
+#[test]
+fn an_alias_to_a_mirror_ref_of_an_invalid_collection_id_is_not_listed() {
+    let tmp = TmpDir::new("list-cref-in-alias-invalid");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put(&repo, OTHER, "stable", &checksum(1)).await;
+        put(&repo, THIRD, "main", &checksum(2)).await;
+        let mirrors = path.join("refs/mirrors");
+        let invalid = mirrors.join("invalid");
+        std::fs::create_dir(&invalid).unwrap();
+        std::fs::write(invalid.join("main"), format!("{}\n", checksum(3))).unwrap();
+        let mirror = mirrors.join(OTHER);
+        std::os::unix::fs::symlink("../invalid/main", mirror.join("bad")).unwrap();
+        std::os::unix::fs::symlink(format!("../{THIRD}/main"), mirror.join("good")).unwrap();
+        assert_eq!(
+            list(&repo, OTHER, &[]).await,
+            pairs(&[("good", 2), ("stable", 1)])
+        );
+
+        put_local(&repo, "main", &checksum(4)).await;
+        let heads = path.join("refs/heads");
+        std::os::unix::fs::symlink("../mirrors/invalid/main", heads.join("bad")).unwrap();
+        std::os::unix::fs::symlink(format!("../mirrors/{THIRD}/main"), heads.join("good")).unwrap();
+        assert_eq!(
+            list(&repo, OWN, &[]).await,
+            pairs(&[("good", 2), ("main", 4)])
+        );
+    });
+}
+
 /// The listing does not check a name that it finds against the ref-name
 /// rule. A wildcard selects such a name.
 #[test]

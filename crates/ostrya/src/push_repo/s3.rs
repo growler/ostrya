@@ -19,8 +19,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use super::invalid;
 use super::negotiate::{Commits, Local, Plan, RepoPushOptions, check_bindings, offered_history};
 use super::source::RepoSource;
-use crate::access::{AuthItem, ClientAccess, ReadAccess};
+use crate::access::ReadAccess;
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::bucket::{
     BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
@@ -539,11 +539,7 @@ impl Repo {
         }
 
         let view = ArchiveView::with_zlib_level(self.clone(), level);
-        let access = ReadAccess::new(
-            Arc::new(ClientAccess::implicit(self.config().collection_id())),
-            AuthItem::Anonymous,
-            None,
-        );
+        let access = self.implicit_reads();
         let source = RepoSource::new(
             self.clone(),
             RelatedRule {
@@ -555,7 +551,7 @@ impl Repo {
             origin: Origin::Repo {
                 repo: self,
                 view: &view,
-                access: &access,
+                access,
                 source: &source,
                 sizes: &sizes,
             },

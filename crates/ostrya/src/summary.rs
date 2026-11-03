@@ -1058,13 +1058,9 @@ impl Repo {
     ) -> Result<SummaryRun> {
         let last_modified = resolve_last_modified(opts.last_modified)?;
         let all = RefSelector::parse([])?;
-        let own = self.config().collection_id();
-        let everyone = ReadAccess::new(
-            Arc::new(ClientAccess::implicit(own)),
-            AuthItem::Anonymous,
-            None,
-        );
-        let every = self.select_refs(&all, Some(&all), &everyone, None).await?;
+        let every = self
+            .select_refs(&all, Some(&all), self.implicit_reads(), None)
+            .await?;
         let (facts, deltas) = if opts.auth_items_only {
             // The run writes no root summary, so it reads only what the
             // summaries of the items use. `summary_bytes` reads each commit

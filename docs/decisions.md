@@ -2750,6 +2750,15 @@ These alternatives were rejected:
   of each ref is the timestamp of the commit that the probe pins. Under a
   summary policy, the probe reads the refs and their timestamps from the
   verified summary of the source, as over HTTP.
+- `Repo::list_collection_refs_in` reads under one `ReadAccess`: an
+  anonymous client under the implicit client groups of the collection id of
+  the repository. Each repository handle builds this access one time, at its
+  first use, and the clones of the handle share it. The summary write and
+  the S3 push read under the same value of the handle. The access gives the
+  rule of the target of an alias: a target under `refs/remotes/`, or under a
+  directory of `refs/mirrors/` whose name fails the collection-id rule, gives
+  no ref. It also gives the rule of the collection id of the repository and
+  the shape of the walk.
 - The pull from the candidate is the local pull of `Repo::pull_local`, at the
   commits of the probe, with the trust of the remote, the binding rules of
   the collection pull, and the timestamp check of the options. Under a
@@ -2849,6 +2858,11 @@ These alternatives were rejected:
   this form.
 - The import counts inside the statistics line of a fetch. The tool never
   prints this form.
+- A listing with no access: the crate-internal `select_refs` with an
+  `Option<&ReadAccess>`, and `None` from `Repo::list_collection_refs_in`.
+  The rule of the target of an alias, the rule of the collection id of the
+  repository, and the shape of the walk are in the read access. A path with
+  no access needs a copy of these rules.
 
 ## The own collection id of a collection pull
 

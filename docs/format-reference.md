@@ -5032,9 +5032,38 @@ against the name of its ref. So a remote can serve, for `REF`, any commit with
 no binding of either kind. The trust of the remote and a check of the content
 by the caller after the pull are the protection.
 
-The pull writes `refs/mirrors/ID/REF`. In a repository with
-`[core] collection-id=ID`, it writes `refs/heads/REF`. It writes no ref under
+The pull writes `refs/mirrors/ID/REF`. It writes no ref under
 `refs/remotes/`.
+
+In a repository with `[core] collection-id=ID`, the pull writes the ref that
+`Repo::resolve_collection_ref` reads. The pull makes one `stat` of
+`refs/mirrors/ID/REF` that follows each symlink, and selects the path by the
+result:
+
+- A regular file, an alias to a file, or another file that is not a
+  directory: the pull writes `refs/mirrors/ID/REF`.
+- A directory, an absent path, an alias whose target is absent, a parent
+  component that is a file (`ENOTDIR`), or a path longer than the system
+  accepts (`ENAMETOOLONG`): the pull writes `refs/heads/REF`.
+- Each other error, for example `ELOOP` or `EACCES`: the pull fails, and
+  writes no ref. The published objects stay.
+
+The pull makes the selection when it writes the refs, under the update lock,
+and makes each `stat` before the first ref write. It removes no ref, so the
+path that it does not write keeps its commit. Delta discovery and the
+timestamp check read the current commit of the ref by the same rule. A write
+of a collection ref through `Transaction::set_collection_ref` or
+`Repo::set_collection_ref_immediate` always writes `refs/mirrors/ID/REF`.
+
+In each state of the ref store that the port and the `ostree` tool write,
+`Repo::resolve_collection_ref`, `Repo::list_collection_refs_in`, and the
+summary read the ref that the pull writes. Two states that neither writes
+are exceptions. If `refs/mirrors/ID/REF` is a directory with no read
+permission, the pull writes `refs/heads/REF`, and the resolve fails with
+`EACCES`. If a component of the mirror tree is a symlink to a directory, for
+example `refs/mirrors/ID` to `../alt`, the pull and the resolve follow it, and
+the listing and the summary open the mirror tree with no symlink followed and
+do not give the written ref.
 
 The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
 collection refs from a local repository. It reads `refs/mirrors/ID/REF` of

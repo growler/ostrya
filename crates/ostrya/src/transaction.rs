@@ -1578,7 +1578,7 @@ impl Transaction {
     /// release a lock or remove a staged file while the writes run.
     async fn write_tail(
         mut self,
-        refs: Vec<(String, Option<Checksum>)>,
+        refs: Vec<(crate::refs::RefPath, Option<Checksum>)>,
         synced: bool,
         held: Option<UpdateLockHeld>,
     ) -> Result<TransactionStats> {

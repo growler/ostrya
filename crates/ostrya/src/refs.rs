@@ -96,21 +96,115 @@ pub struct RefAlias {
     pub target: String,
 }
 
-/// A queued ref target: a refspec or a collection ref.
+/// A queued ref target: a refspec, a collection ref, or a collection ref of
+/// the collection id of the repository that a pull writes.
 enum QueuedRef {
     Ref(String),
     Collection(CollectionRef),
+    OwnCollection(CollectionRef),
 }
 
 impl QueuedRef {
-    /// Returns the path under `refs/` that this target writes to. Refuses a
-    /// name that leaves the tree.
-    fn relpath(&self) -> Result<String> {
+    /// Returns the path under the repository that this target writes to.
+    /// Refuses a name that leaves the tree.
+    fn ref_path(&self) -> Result<RefPath> {
         match self {
-            QueuedRef::Ref(refspec) => refspec_to_relpath(refspec),
-            QueuedRef::Collection(cref) => collection_ref_to_relpath(cref),
+            QueuedRef::Ref(refspec) => refspec_to_relpath(refspec).map(RefPath::One),
+            QueuedRef::Collection(cref) => collection_ref_to_relpath(cref).map(RefPath::One),
+            QueuedRef::OwnCollection(cref) => {
+                RefPath::of_collection(cref.collection_id.as_deref(), cref)
+            }
         }
     }
+}
+
+/// The path of one ref under the repository, as a read or a write addresses
+/// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RefPath {
+    /// The ref file at this path.
+    One(String),
+    /// A ref of the collection id of the repository: the mirror path
+    /// `refs/mirrors/ID/NAME` and the local path `refs/heads/NAME`.
+    ///
+    /// A read reads the mirror path, and reads the local path when the
+    /// mirror path holds no ref file, as
+    /// [`Repo::resolve_collection_ref`] states. A write writes the mirror
+    /// path when a read reads it, and the local path otherwise.
+    Own {
+        /// The path `refs/mirrors/ID/NAME`.
+        mirror: String,
+        /// The path `refs/heads/NAME`.
+        heads: String,
+    },
+}
+
+impl RefPath {
+    /// Returns the path of the collection ref `cref` in a repository whose
+    /// `[core] collection-id` is `own`: [`RefPath::Own`] if the id of `cref`
+    /// is `own`, and the path that [`collection_ref_to_relpath`] gives
+    /// otherwise.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRefspec`] if [`collection_ref_to_relpath`] refuses
+    /// `cref`.
+    pub(crate) fn of_collection(own: Option<&str>, cref: &CollectionRef) -> Result<RefPath> {
+        let relpath = collection_ref_to_relpath(cref)?;
+        Ok(match &cref.collection_id {
+            Some(id) if own == Some(id.as_str()) => RefPath::Own {
+                mirror: relpath,
+                heads: format!("{HEADS_DIR}/{}", cref.ref_name),
+            },
+            _ => RefPath::One(relpath),
+        })
+    }
+}
+
+/// Returns `true` if an error of the kind `kind`, from the read of the mirror
+/// path of a ref of the collection id of the repository, means that the path
+/// holds no ref file.
+///
+/// The path holds no ref file when it is absent (`NotFound`), when it is a
+/// directory (`IsADirectory`), when a parent component is a file
+/// (`NotADirectory`), or when it is longer than the system accepts
+/// (`InvalidFilename`, which is `ENAMETOOLONG`). The read of such a ref then
+/// reads the local path, and the write of a pull writes the local path.
+fn mirror_holds_no_ref(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::NotFound
+            | std::io::ErrorKind::IsADirectory
+            | std::io::ErrorKind::NotADirectory
+            | std::io::ErrorKind::InvalidFilename
+    )
+}
+
+/// Returns the path that the write of the ref `mirror` or `heads` of the
+/// collection id of the repository selects: `mirror` if the read of the ref
+/// reads that path, and `heads` otherwise.
+///
+/// The call runs one `stat` of `mirror` that follows each symlink. A
+/// directory selects `heads`, and each other file type selects `mirror`. An
+/// error that [`mirror_holds_no_ref`] accepts selects `heads`, so an alias
+/// whose target is absent selects `heads`. Each other error, for example
+/// `ELOOP` or `EACCES`, fails the call with [`Error::Io`].
+fn own_ref_target_blocking<'p>(
+    repo_fd: BorrowedFd<'_>,
+    mirror: &'p str,
+    heads: &'p str,
+) -> Result<&'p str> {
+    let held = match rustix::fs::statat(repo_fd, mirror, AtFlags::empty()) {
+        Ok(stat) => FileType::from_raw_mode(stat.st_mode) != FileType::Directory,
+        Err(e) => {
+            let e = std::io::Error::from(e);
+            if !mirror_holds_no_ref(e.kind()) {
+                return Err(Error::Io(e));
+            }
+            false
+        }
+    };
+    Ok(if held { mirror } else { heads })
 }
 
 /// The state of one ref path, as the receive path reads it under its lock.
@@ -173,14 +267,32 @@ impl Transaction {
         });
     }
 
-    /// Maps each queued ref to its path under `refs/`. A malformed refspec
-    /// fails the call. [`commit`](Transaction::commit) calls it first, so a
-    /// malformed refspec fails before the commit publishes any object.
-    pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(String, Option<Checksum>)>> {
+    /// Queues the write of the collection ref `cref`, whose collection id is
+    /// the `[core] collection-id` of the repository, to the commit
+    /// `checksum`.
+    ///
+    /// [`commit`](Transaction::commit) checks the collection id and the ref
+    /// name as [`set_collection_ref`](Transaction::set_collection_ref) does.
+    /// Under the update lock, before the first ref write, it selects the path
+    /// of the write: `refs/mirrors/ID/NAME` if
+    /// [`Repo::resolve_collection_ref`] reads that path, and
+    /// `refs/heads/NAME` otherwise. The write removes no ref.
+    pub(crate) fn set_own_collection_ref(&self, cref: CollectionRef, checksum: &Checksum) {
+        self.refs.lock().unwrap().push(RefWrite {
+            target: QueuedRef::OwnCollection(cref),
+            checksum: Some(*checksum),
+        });
+    }
+
+    /// Maps each queued ref to its path under the repository. A malformed
+    /// refspec fails the call. [`commit`](Transaction::commit) calls it
+    /// first, so a malformed refspec fails before the commit publishes any
+    /// object.
+    pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(RefPath, Option<Checksum>)>> {
         let queue = self.refs.lock().unwrap();
         queue
             .iter()
-            .map(|w| Ok((w.target.relpath()?, w.checksum)))
+            .map(|w| Ok((w.target.ref_path()?, w.checksum)))
             .collect()
     }
 }
@@ -202,16 +314,30 @@ impl Transaction {
 ///
 /// `tmp_fd` is the open `tmp/` of the repository. Each ref write creates its
 /// temp file there.
+///
+/// Before the first write, the call selects the path of each
+/// [`RefPath::Own`] entry with [`own_ref_target_blocking`]. A failure of the
+/// selection fails the call, and the call then writes no ref.
 pub(crate) fn write_resolved_refs_blocking(
     repo_fd: BorrowedFd<'_>,
     tmp_fd: BorrowedFd<'_>,
-    refs: &[(String, Option<Checksum>)],
+    refs: &[(RefPath, Option<Checksum>)],
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
-    let mut dirs = Vec::new();
-    let written = refs
+    let targets = refs
         .iter()
+        .map(|(path, checksum)| {
+            let relpath = match path {
+                RefPath::One(relpath) => relpath.as_str(),
+                RefPath::Own { mirror, heads } => own_ref_target_blocking(repo_fd, mirror, heads)?,
+            };
+            Ok((relpath, checksum))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut dirs = Vec::new();
+    let written = targets
+        .into_iter()
         .try_for_each(|(relpath, checksum)| match checksum {
             Some(checksum) => put_ref_file_blocking(
                 repo_fd, tmp_fd, relpath, *checksum, fsync, repo_mode, &mut dirs,
@@ -430,39 +556,41 @@ impl Repo {
         cref: &CollectionRef,
         allow_noent: bool,
     ) -> Result<Option<Checksum>> {
-        let relpath = collection_ref_to_relpath(cref)?;
-        let heads = match &cref.collection_id {
-            Some(id) if self.config().collection_id() == Some(id.as_str()) => {
-                Some(format!("{HEADS_DIR}/{}", cref.ref_name))
-            }
-            _ => None,
-        };
-        let repo = self.clone();
-        let found = ostrya_rt::unblock(move || {
-            match repo.resolve_relpath_tip_blocking(&relpath) {
-                Ok(None) => {}
-                // `InvalidFilename` is `ENAMETOOLONG`: the mirror path is
-                // longer than the system accepts.
-                Err(Error::Io(e))
-                    if heads.is_some()
-                        && matches!(
-                            e.kind(),
-                            std::io::ErrorKind::IsADirectory
-                                | std::io::ErrorKind::NotADirectory
-                                | std::io::ErrorKind::InvalidFilename
-                        ) => {}
-                other => return other,
-            }
-            match heads {
-                Some(heads) => repo.resolve_relpath_tip_blocking(&heads),
-                None => Ok(None),
-            }
-        })
-        .await?;
-        match found {
+        let path = RefPath::of_collection(self.config().collection_id(), cref)?;
+        match self.resolve_ref_path(path).await? {
             Some(checksum) => Ok(Some(checksum)),
             None if allow_noent => Ok(None),
             None => Err(Error::RefNotFound(collection_ref_label(cref))),
+        }
+    }
+
+    /// Returns the commit of the ref at `path`, as
+    /// [`resolve_ref_path_blocking`](Repo::resolve_ref_path_blocking) reads
+    /// it, on the blocking pool.
+    pub(crate) async fn resolve_ref_path(&self, path: RefPath) -> Result<Option<Checksum>> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || repo.resolve_ref_path_blocking(&path)).await
+    }
+
+    /// Returns the commit of the ref at `path` on the calling thread, or
+    /// `None` if the path holds no ref.
+    ///
+    /// [`RefPath::One`] reads its file as
+    /// [`resolve_relpath_tip_blocking`](Repo::resolve_relpath_tip_blocking)
+    /// does. [`RefPath::Own`] reads the mirror path. When
+    /// [`mirror_holds_no_ref`] accepts the error of that read, or no file is
+    /// at the path, the call reads the local path. Each other error of the
+    /// read of the mirror path stops the call.
+    pub(crate) fn resolve_ref_path_blocking(&self, path: &RefPath) -> Result<Option<Checksum>> {
+        match path {
+            RefPath::One(relpath) => self.resolve_relpath_tip_blocking(relpath),
+            RefPath::Own { mirror, heads } => match self.resolve_relpath_tip_blocking(mirror) {
+                Ok(None) => self.resolve_relpath_tip_blocking(heads),
+                Err(Error::Io(e)) if mirror_holds_no_ref(e.kind()) => {
+                    self.resolve_relpath_tip_blocking(heads)
+                }
+                other => other,
+            },
         }
     }
 
@@ -3320,6 +3448,224 @@ mod tests {
                 .unwrap();
             assert_eq!(parse_ref_content(&read).unwrap(), commit);
             assert_eq!(target.as_deref(), Some("refs/heads/secret"));
+        });
+    }
+
+    /// The collection id of the repositories of the own-collection tests.
+    const OWN: &str = "org.example.Os";
+    /// The ref name of the own-collection tests.
+    const NAME: &str = "os/stable";
+
+    /// Creates an archive repository at `path` with the collection id
+    /// [`OWN`].
+    async fn own_repo(path: &std::path::Path) -> Repo {
+        Repo::create(
+            path,
+            crate::CreateOptions {
+                mode: RepoMode::Archive,
+                collection_id: Some(OWN.to_owned()),
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Returns the trimmed content of the file at `path`, read with each
+    /// symlink followed, or `None` if the read fails.
+    fn ref_text(path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(path)
+            .ok()
+            .map(|text| text.trim().to_owned())
+    }
+
+    /// The write of a ref of the collection id of the repository selects the
+    /// mirror path when the read reads it, and the local path otherwise. The
+    /// `stat` follows each symlink. An alias loop fails the selection.
+    #[test]
+    fn the_own_ref_write_selects_the_path_that_the_read_reads() {
+        let root = Root::new("own-target");
+        let mirrors = root.dir.join("refs/mirrors");
+        std::fs::create_dir_all(mirrors.join("id/dir")).unwrap();
+        std::fs::write(root.dir.join("refs/heads/target"), b"").unwrap();
+        std::fs::write(mirrors.join("id/file"), b"").unwrap();
+        std::fs::write(mirrors.join("parent"), b"").unwrap();
+        std::os::unix::fs::symlink("../../heads/target", mirrors.join("id/alias")).unwrap();
+        std::os::unix::fs::symlink("../../heads/absent", mirrors.join("id/dangling")).unwrap();
+        std::os::unix::fs::symlink("loop", mirrors.join("id/loop")).unwrap();
+        let heads = "refs/heads/x";
+        let long = format!("refs/mirrors/id/{}", "n".repeat(300));
+        for (mirror, selected) in [
+            ("refs/mirrors/id/absent", heads),
+            ("refs/mirrors/id/file", "refs/mirrors/id/file"),
+            ("refs/mirrors/id/dir", heads),
+            ("refs/mirrors/parent/x", heads),
+            (long.as_str(), heads),
+            ("refs/mirrors/id/dangling", heads),
+            ("refs/mirrors/id/alias", "refs/mirrors/id/alias"),
+        ] {
+            let target = own_ref_target_blocking(root.fd(), mirror, heads).unwrap();
+            assert_eq!(target, selected, "{mirror}");
+        }
+        let err = own_ref_target_blocking(root.fd(), "refs/mirrors/id/loop", heads).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.raw_os_error() == Some(Errno::LOOP.raw_os_error())),
+            "{err:?}"
+        );
+    }
+
+    /// A mirror path in a directory with no search permission fails the
+    /// selection with `EACCES`. Root ignores the mode, so the test skips as
+    /// root.
+    #[test]
+    fn a_mirror_path_with_no_search_permission_fails_the_selection() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = Root::new("own-target-access");
+        let id = root.dir.join("refs/mirrors/id");
+        std::fs::create_dir_all(&id).unwrap();
+        std::fs::write(id.join("x"), b"").unwrap();
+        let mode = |bits| std::fs::set_permissions(&id, std::fs::Permissions::from_mode(bits));
+        mode(0o600).unwrap();
+        if std::fs::metadata(id.join("x")).is_ok() {
+            mode(0o755).unwrap();
+            eprintln!("skipping: the process ignores the mode of a directory");
+            return;
+        }
+        let result = own_ref_target_blocking(root.fd(), "refs/mirrors/id/x", "refs/heads/x");
+        mode(0o755).unwrap();
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.raw_os_error() == Some(Errno::ACCESS.raw_os_error())),
+            "{err:?}"
+        );
+    }
+
+    /// The commit writes a queued ref of the collection id of the repository
+    /// at the path that the resolve reads, in each state of the mirror path,
+    /// and the resolve then gives the written commit. A mirror ref file and an
+    /// alias to a ref take the write at the mirror path. The write replaces
+    /// the alias, and does not write its target. Each other state takes the
+    /// write at the local path, and the mirror path keeps its state.
+    #[test]
+    fn an_own_collection_ref_write_is_read_back_by_the_resolve() {
+        let root = Root::new("own-write");
+        ostrya_rt::block_on(async {
+            let old = Checksum::from_bytes([1; 32]);
+            let new = Checksum::from_bytes([2; 32]);
+            let cref = CollectionRef::new(OWN, NAME);
+            for (case, mirrored) in [
+                ("absent", false),
+                ("file", true),
+                ("dir", false),
+                ("parent", false),
+                ("dangling", false),
+                ("alias", true),
+            ] {
+                let path = root.dir.join(case);
+                let repo = own_repo(&path).await;
+                let mirror = path.join(format!("refs/mirrors/{OWN}/{NAME}"));
+                let heads = path.join(format!("refs/heads/{NAME}"));
+                let parent = mirror.parent().unwrap();
+                match case {
+                    "file" => repo
+                        .set_collection_ref_immediate(&cref, Some(&old))
+                        .await
+                        .unwrap(),
+                    "dir" => std::fs::create_dir_all(&mirror).unwrap(),
+                    "parent" => {
+                        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+                        std::fs::write(parent, b"").unwrap();
+                    }
+                    "dangling" => {
+                        std::fs::create_dir_all(parent).unwrap();
+                        std::os::unix::fs::symlink("../../../heads/absent", &mirror).unwrap();
+                    }
+                    "alias" => {
+                        repo.set_ref_immediate("other", Some(&old)).await.unwrap();
+                        std::fs::create_dir_all(parent).unwrap();
+                        std::os::unix::fs::symlink("../../../heads/other", &mirror).unwrap();
+                    }
+                    _ => {}
+                }
+
+                let txn = repo.transaction().await.unwrap();
+                txn.set_own_collection_ref(cref.clone(), &new);
+                txn.commit().await.unwrap();
+
+                assert_eq!(
+                    repo.resolve_collection_ref(&cref, false).await.unwrap(),
+                    Some(new),
+                    "{case}"
+                );
+                if mirrored {
+                    assert_eq!(ref_text(&mirror), Some(new.to_hex()), "{case}");
+                    assert_eq!(ref_text(&heads), None, "{case}");
+                } else {
+                    assert_eq!(ref_text(&heads), Some(new.to_hex()), "{case}");
+                    assert_eq!(ref_text(&mirror), None, "{case}");
+                }
+                if case == "alias" {
+                    let other = path.join("refs/heads/other");
+                    assert_eq!(ref_text(&other), Some(old.to_hex()));
+                }
+                if case == "dangling" {
+                    let meta = std::fs::symlink_metadata(&mirror).unwrap();
+                    assert!(meta.file_type().is_symlink());
+                }
+            }
+        });
+    }
+
+    /// The commit selects the path of a queued ref of the collection id of
+    /// the repository at the ref write, under the update lock. A mirror ref
+    /// that is written after the queue call and before the commit takes the
+    /// write.
+    #[test]
+    fn the_commit_selects_the_path_of_an_own_collection_ref() {
+        let root = Root::new("own-commit-time");
+        ostrya_rt::block_on(async {
+            let path = root.dir.join("repo");
+            let repo = own_repo(&path).await;
+            let old = Checksum::from_bytes([1; 32]);
+            let new = Checksum::from_bytes([2; 32]);
+            let cref = CollectionRef::new(OWN, NAME);
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_own_collection_ref(cref.clone(), &new);
+            repo.set_collection_ref_immediate(&cref, Some(&old))
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            let mirror = path.join(format!("refs/mirrors/{OWN}/{NAME}"));
+            assert_eq!(ref_text(&mirror), Some(new.to_hex()));
+            assert_eq!(ref_text(&path.join(format!("refs/heads/{NAME}"))), None);
+        });
+    }
+
+    /// A selection that fails stops the commit before the first ref write:
+    /// the commit fails with the error of the `stat`, and writes no queued
+    /// ref.
+    #[test]
+    fn a_failed_selection_writes_no_ref() {
+        let root = Root::new("own-failed");
+        ostrya_rt::block_on(async {
+            let path = root.dir.join("repo");
+            let repo = own_repo(&path).await;
+            let new = Checksum::from_bytes([2; 32]);
+            let mirror = path.join(format!("refs/mirrors/{OWN}/{NAME}"));
+            std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink("stable", &mirror).unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref("first", Some(&new));
+            txn.set_own_collection_ref(CollectionRef::new(OWN, NAME), &new);
+            let err = txn.commit().await.unwrap_err();
+
+            assert!(
+                matches!(&err, Error::Io(e) if e.raw_os_error() == Some(Errno::LOOP.raw_os_error())),
+                "{err:?}"
+            );
+            assert_eq!(repo.list_refs(None).await.unwrap(), Vec::new());
         });
     }
 

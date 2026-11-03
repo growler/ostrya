@@ -2786,6 +2786,61 @@ These alternatives were rejected:
   pins. Under a summary policy, the timestamps come from the verified
   summary, and the pull checks each commit against them.
 
+## The own collection id of a collection pull
+
+In a repository whose `[core] collection-id` is the id of the pulled
+collection ref, `Repo::pull_collection` and `Repo::pull_local` with
+`PullOptions::collection_id` write the ref that `Repo::resolve_collection_ref`
+reads. The rules:
+
+- The pull writes `refs/mirrors/ID/NAME` when the resolve reads that file,
+  and `refs/heads/NAME` otherwise. The pull removes no ref.
+- One `stat` of `refs/mirrors/ID/NAME`, which follows each symlink, selects
+  the path. A directory, an absent path, an alias whose target is absent,
+  `ENOTDIR`, and `ENAMETOOLONG` select `refs/heads/NAME`. Each other file
+  type selects `refs/mirrors/ID/NAME`. Each other error fails the commit of
+  the transaction, which then writes no ref. One helper holds the set of
+  errors that the resolve reads as an absent mirror ref, and the selection
+  uses the same helper.
+- Delta discovery, the search for the delta of a dependency, and
+  `TimestampCheck::CurrentRef` read the current commit of the ref through
+  the resolve rule. So the pull reads and writes one ref.
+- `Transaction::set_collection_ref` and `Repo::set_collection_ref_immediate`
+  write `refs/mirrors/ID/NAME` in each state. The rule applies to the pull
+  alone, through a crate-private entry of the ref queue of the transaction.
+- `Repo::list_collection_refs` gives both refs. The result of the pull does
+  not state the path that the pull wrote.
+- The resolve, `Repo::list_collection_refs_in`, and the summary read the
+  written ref in each state of the ref store that the port and the `ostree`
+  command write. Two states that neither writes are exceptions. If
+  `refs/mirrors/ID/NAME` is a directory with no read permission, the pull
+  writes `refs/heads/NAME`, and the resolve fails with `EACCES`. If a
+  component of the mirror tree is a symlink to a directory, the pull and the
+  resolve follow it, and the listing and the summary open the mirror tree
+  with no symlink followed and do not give the written ref. The port adds no
+  check for these states.
+
+The commit of the transaction selects the path in its ref-write step, under
+the update lock, and makes each `stat` before the first ref write. Another
+transaction of the same process, or `Repo::set_collection_ref_immediate`,
+can write `refs/mirrors/ID/NAME` between the plan of the pull and its
+commit. Each such write takes the update lock, so the selection under the
+lock sees it.
+
+These alternatives were rejected:
+
+- A write of `refs/heads/NAME` and a removal of `refs/mirrors/ID/NAME`. The
+  pull then removes a ref that the user wrote, and the `ostree` command
+  removes no ref in this case either.
+- A write of `refs/heads/NAME` in each state. The resolve, the collection
+  ref listing, the summary, and the ref listing read `refs/mirrors/ID/NAME`
+  first, so they give the old commit after a pull that succeeds. The
+  timestamp check also reads a ref that these readers do not read.
+- A selection when the pull makes its plan, or when it queues the ref. The
+  selection then reads the ref store without the update lock, and a
+  concurrent transaction or `Repo::set_collection_ref_immediate` can change
+  the mirror path before the commit.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.

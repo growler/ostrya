@@ -4371,6 +4371,16 @@ No matrix cell needs these. The shell suite invokes them.
     each candidate that it skips.
   - The port has no `--mirror` for a collection pull, and no command that
     finds the remotes and pulls nothing.
+  - In a repository whose `[core] collection-id` is ID, the port writes
+    `refs/mirrors/ID/REF` when that file holds a ref, as
+    `Repo::resolve_collection_ref` reads it, and `refs/heads/REF` otherwise.
+    The tool writes `refs/heads/REF` in each state under
+    `find-remotes --pull --mirror`, and `refs/remotes/REMOTE/REF` under
+    `find-remotes --pull` (`cli-behavior.md`, "The pulled ref under the own
+    collection id"). The reason: the readers of the port and `refs -c -r` of
+    the tool read `refs/mirrors/ID/REF` first. So while that file holds a
+    ref, the write of the tool leaves the pulled commit hidden from these
+    readers. Neither the port nor the tool removes a ref.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
   `--commit=COMMIT`.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG

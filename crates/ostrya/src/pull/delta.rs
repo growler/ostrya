@@ -944,7 +944,7 @@ pub(crate) async fn discover(
             continue;
         }
         let tip = repo
-            .resolve_relpath_tip(tips.place.relpath(ref_name)?)
+            .resolve_ref_path(tips.place.ref_path(ref_name)?)
             .await?;
         let from = source_commit(repo, tip, to).await?;
         let scratch = scratch_allowed(tip, from, to);
@@ -1702,7 +1702,7 @@ async fn chain_targets<'t>(
         if held.contains(to) {
             continue;
         }
-        let tip = repo.resolve_relpath_tip(place.relpath(ref_name)?).await?;
+        let tip = repo.resolve_ref_path(place.ref_path(ref_name)?).await?;
         tips.push((ref_name.as_str(), *to, tip));
     }
     // A tip can be the source commit only if it is not the target.

@@ -930,8 +930,9 @@ fn a_collection_pull_takes_the_trust_group_option() {
 
 // --- the place of the refs ---------------------------------------------------
 
-/// Into a repository whose own collection id is the pulled id, the pull
-/// writes the local ref, and the timestamp check reads that ref.
+/// Into a repository whose own collection id is the pulled id, and that holds
+/// no collection ref of the name, the pull writes the local ref, and the
+/// timestamp check reads that ref.
 #[test]
 fn the_own_collection_writes_the_local_ref() {
     block_on(async {
@@ -973,6 +974,107 @@ fn the_own_collection_writes_the_local_ref() {
             "{err:?}"
         );
         assert_eq!(dest.resolve_ref_tip(REF).await.unwrap(), Some(tip));
+    });
+}
+
+/// Creates the destination at `dir/dest` with the collection id `ID` and the
+/// remote `a` at `url`. The destination holds the collection ref `REF` of
+/// `ID` at a commit with the timestamp `mirror_ts`, and the local ref `REF`
+/// at a commit with the timestamp `local_ts`. Returns the destination and
+/// the two commits.
+async fn dest_with_own_mirror(
+    dir: &Path,
+    url: &str,
+    mirror_ts: u64,
+    local_ts: u64,
+) -> (Repo, Checksum, Checksum) {
+    let dest = dest(dir, Some(ID), &[("a", url, "")]).await;
+    let held = commit(&dest, dir, "held", Some(ID), REF, mirror_ts, BOUND).await;
+    let local = commit(&dest, dir, "local", None, REF, local_ts, BOUND).await;
+    (dest, held, local)
+}
+
+/// Asserts that the destination `dest` at `dir/dest` holds the collection
+/// ref `REF` of `ID` at `mirrored` and the local ref `REF` at `local`, and
+/// that the resolve and the listing of the collection ref give `mirrored`.
+async fn assert_own_refs(dir: &Path, dest: &Repo, mirrored: Checksum, local: Checksum) {
+    let path = dir.join(format!("dest/refs/mirrors/{ID}/{REF}"));
+    let file = std::fs::read_to_string(path).unwrap();
+    assert_eq!(file.trim(), mirrored.to_hex());
+    assert_eq!(dest.resolve_ref_tip(REF).await.unwrap(), Some(local));
+    let cref = CollectionRef::new(ID, REF);
+    assert_eq!(
+        dest.resolve_collection_ref(&cref, false).await.unwrap(),
+        Some(mirrored)
+    );
+    let all = RefSelector::parse([]).unwrap();
+    assert_eq!(
+        dest.list_collection_refs_in(ID, &all).await.unwrap(),
+        vec![(REF.to_owned(), mirrored)]
+    );
+}
+
+/// Into a repository whose own collection id is the pulled id, and that holds
+/// the collection ref of the name, the pull writes that collection ref. The
+/// resolve and the listing of the collection ref read it. The local ref of
+/// the name keeps its commit.
+#[test]
+fn the_own_collection_writes_an_existing_mirror_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-own-mirror");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let (dest, _, local) =
+            dest_with_own_mirror(dir.path(), &server_a.url(), FIXED_TS - 10, FIXED_TS - 10).await;
+
+        let (opts, _) = options(&[REF]);
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert_own_refs(dir.path(), &dest, tip, local).await;
+    });
+}
+
+/// Into a repository whose own collection id is the pulled id, and that holds
+/// the collection ref of the name, the timestamp check reads that collection
+/// ref and not the local ref. A collection ref newer than the tip fails the
+/// pull, and the pull writes no ref. A collection ref older than the tip
+/// passes, and the pull writes the collection ref. The local ref has the
+/// other timestamp in each case.
+#[test]
+fn the_timestamp_check_of_the_own_collection_reads_an_existing_mirror_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-own-mirror-timestamp");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        for (case, mirror_ts, local_ts) in [
+            ("newer", FIXED_TS + 10, FIXED_TS - 10),
+            ("older", FIXED_TS - 10, FIXED_TS + 10),
+        ] {
+            let path = dir.path().join(case);
+            std::fs::create_dir(&path).unwrap();
+            let (dest, held, local) =
+                dest_with_own_mirror(&path, &server_a.url(), mirror_ts, local_ts).await;
+
+            let (mut opts, _) = options(&[REF]);
+            opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+            let pulled = dest.pull_collection(ID, &["a"], opts).await;
+
+            if mirror_ts > FIXED_TS {
+                let err = pulled.unwrap_err();
+                assert!(
+                    matches!(&err, Error::Pull(m) if m.contains("chronologically older")),
+                    "{case}: {err:?}"
+                );
+                assert_own_refs(&path, &dest, held, local).await;
+            } else {
+                pulled.unwrap();
+                assert_own_refs(&path, &dest, tip, local).await;
+            }
+        }
     });
 }
 
@@ -1584,6 +1686,33 @@ fn the_timestamp_check_applies_to_a_file_remote() {
             "{err:?}"
         );
         assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
+/// From a `file://` remote into a repository whose own collection id is the
+/// pulled id, and that holds the collection ref of the name, the timestamp
+/// check reads that collection ref, and the pull writes it. The collection
+/// ref is older than the tip, and the local ref is newer.
+#[test]
+fn a_file_remote_into_the_own_collection_writes_an_existing_mirror_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-own-mirror");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let (dest, _, local) = dest_with_own_mirror(
+            dir.path(),
+            &file_url(dir.path(), "a"),
+            FIXED_TS - 10,
+            FIXED_TS + 10,
+        )
+        .await;
+
+        let (mut opts, events) = options(&[REF]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert_own_refs(dir.path(), &dest, tip, local).await;
     });
 }
 

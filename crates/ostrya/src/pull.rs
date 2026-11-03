@@ -218,7 +218,7 @@ use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
-use crate::refs::{CollectionRef, collection_ref_to_relpath, refspec_to_relpath};
+use crate::refs::{CollectionRef, RefPath, collection_ref_to_relpath, refspec_to_relpath};
 use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
@@ -360,6 +360,12 @@ pub enum TimestampCheck {
     #[default]
     Off,
     /// The commit that the ref names in this repository now.
+    ///
+    /// The check reads the ref that the pull writes. Under the
+    /// `[core] collection-id` of this repository, a collection pull reads
+    /// the ref as [`Repo::resolve_collection_ref`] reads it:
+    /// `refs/mirrors/<id>/<name>` if that path holds a ref file, and
+    /// `refs/heads/<name>` otherwise.
     ///
     /// A ref that this repository does not hold passes.
     CurrentRef,
@@ -630,12 +636,31 @@ pub struct PullOptions {
     ///
     /// Without [`no_ref_writes`](PullOptions::no_ref_writes), the pull writes
     /// each ref to `refs/mirrors/<id>/<name>`. If the id is the
-    /// `[core] collection-id` of this repository, the pull writes
-    /// `refs/heads/<name>` in its place. Each ref names the commit that the
-    /// pull read from the source. Delta discovery reads the `from` commit of a
-    /// delta at the same place. [`remote`](PullOptions::remote) selects only
-    /// the `[remote "NAME"]` section whose verification keys apply, and the
-    /// pull writes no `refs/remotes` ref.
+    /// `[core] collection-id` of this repository, the pull writes the ref
+    /// that [`Repo::resolve_collection_ref`] reads: `refs/mirrors/<id>/<name>`
+    /// if that path holds a ref file, and `refs/heads/<name>` otherwise. It
+    /// selects the path at the ref write, under the update lock, and removes
+    /// no ref. If the `stat` of the mirror path fails with an error that the
+    /// resolve does not read as an absent ref, for example `ELOOP` or
+    /// `EACCES`, the pull fails with [`Error::Io`] after it publishes the
+    /// objects and before it writes a ref.
+    ///
+    /// In each state of the ref store that the port and the `ostree` command
+    /// write, the resolve, [`Repo::list_collection_refs_in`], and the summary
+    /// read the ref that the pull writes. Two states that neither writes are
+    /// exceptions. If the mirror path is a directory with no read permission,
+    /// the pull writes `refs/heads/<name>`, and the resolve fails with
+    /// `EACCES`. If a component of the mirror tree is a symlink to a
+    /// directory, the pull and the resolve follow it, and the listing and the
+    /// summary open the mirror tree with no symlink followed and do not give
+    /// the written ref.
+    ///
+    /// Each ref names the commit that the pull read from the source.
+    /// Delta discovery reads the `from` commit of a delta at the same place,
+    /// as [`Repo::resolve_collection_ref`] reads it.
+    /// [`remote`](PullOptions::remote) selects only the `[remote "NAME"]`
+    /// section whose verification keys apply, and the pull writes no
+    /// `refs/remotes` ref.
     ///
     /// Without `no_ref_writes`, the pull also checks the
     /// `ostree.collection-binding` of each tip commit. The pull fails with
@@ -658,11 +683,10 @@ pub struct PullOptions {
     /// with [`Error::InvalidRefspec`], which carries `<id>:<name>`. The local
     /// pull makes these checks in this order, before it reads the source.
     ///
-    /// The pull refuses a `:` with and without `no_ref_writes`. If delta
-    /// discovery reads the ref under `refs/remotes` or `refs/heads`, it reads
-    /// the name as a refspec, where a `:` changes what the name refers to.
-    /// This occurs with `no_ref_writes`, and with ref writes if the id is the
-    /// `[core] collection-id` of this repository. [`Repo::pull`],
+    /// The pull refuses a `:` with and without `no_ref_writes`. With
+    /// `no_ref_writes`, delta discovery reads the ref under `refs/remotes` or
+    /// `refs/heads`, and it reads the name as a refspec, where a `:` changes
+    /// what the name refers to. [`Repo::pull`],
     /// [`Repo::pull_with_session`], and [`Repo::pull_collection`] refuse an id
     /// with [`Error::Unsupported`] before they send a request.
     /// [`Repo::pull_collection`] pulls the collection refs of a remote, and
@@ -1770,6 +1794,11 @@ impl Repo {
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    ///   Also, under the `[core] collection-id` of this repository, if the
+    ///   `stat` of `refs/mirrors/<id>/<name>` fails with an error that the
+    ///   resolve does not read as an absent ref, for example `ELOOP` or
+    ///   `EACCES`, after the pull publishes the objects and before it writes a
+    ///   ref.
     pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
         let checks = LocalChecks {
             collection_binding: (opts.collection_id.is_some() && !opts.no_ref_writes)
@@ -2720,8 +2749,9 @@ fn refspec(remote: Option<&str>, ref_name: &str) -> String {
 
 /// The place of the refs of a pull.
 ///
-/// The pull writes each pulled ref at this place. Delta discovery and the
-/// timestamp check read the current commit of a ref at the same place.
+/// The pull writes each pulled ref at this place. Delta discovery, the
+/// search for the delta of a dependency, and the timestamp check read the
+/// current commit of a ref at the same place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefPlace<'a> {
     /// The local refs, `refs/heads/<name>`.
@@ -2730,6 +2760,13 @@ pub(crate) enum RefPlace<'a> {
     Remote(&'a str),
     /// The refs of a collection, `refs/mirrors/<id>/<name>`.
     Collection(&'a str),
+    /// The refs of the collection `id` that is the `[core] collection-id` of
+    /// the repository: [`RefPath::Own`]. A read reads
+    /// `refs/mirrors/<id>/<name>`, and reads `refs/heads/<name>` when that
+    /// path holds no ref file, as [`Repo::resolve_collection_ref`] does. The
+    /// write selects the path that the read reads, at the commit of the
+    /// transaction.
+    OwnCollection(&'a str),
 }
 
 impl<'a> RefPlace<'a> {
@@ -2742,11 +2779,12 @@ impl<'a> RefPlace<'a> {
         }
     }
 
-    /// Returns the refs of the collection `id` in `repo`: the local refs if
-    /// `id` is the `[core] collection-id` of `repo`, else the collection refs.
+    /// Returns the refs of the collection `id` in `repo`:
+    /// [`RefPlace::OwnCollection`] if `id` is the `[core] collection-id` of
+    /// `repo`, else the collection refs.
     pub(crate) fn of_collection(repo: &Repo, id: &'a str) -> RefPlace<'a> {
         if repo.config().collection_id() == Some(id) {
-            RefPlace::Heads
+            RefPlace::OwnCollection(id)
         } else {
             RefPlace::Collection(id)
         }
@@ -2758,11 +2796,18 @@ impl<'a> RefPlace<'a> {
     ///
     /// [`Error::InvalidRefspec`] if the place and the name give no valid ref
     /// path.
-    pub(crate) fn relpath(self, name: &str) -> Result<String> {
+    pub(crate) fn ref_path(self, name: &str) -> Result<RefPath> {
         match self {
-            RefPlace::Heads => refspec_to_relpath(name),
-            RefPlace::Remote(remote) => refspec_to_relpath(&refspec(Some(remote), name)),
-            RefPlace::Collection(id) => collection_ref_to_relpath(&CollectionRef::new(id, name)),
+            RefPlace::Heads => refspec_to_relpath(name).map(RefPath::One),
+            RefPlace::Remote(remote) => {
+                refspec_to_relpath(&refspec(Some(remote), name)).map(RefPath::One)
+            }
+            RefPlace::Collection(id) => {
+                collection_ref_to_relpath(&CollectionRef::new(id, name)).map(RefPath::One)
+            }
+            RefPlace::OwnCollection(id) => {
+                RefPath::of_collection(Some(id), &CollectionRef::new(id, name))
+            }
         }
     }
 
@@ -2774,6 +2819,9 @@ impl<'a> RefPlace<'a> {
             RefPlace::Remote(remote) => txn.set_ref(&refspec(Some(remote), name), Some(tip)),
             RefPlace::Collection(id) => {
                 txn.set_collection_ref(&CollectionRef::new(id, name), Some(tip));
+            }
+            RefPlace::OwnCollection(id) => {
+                txn.set_own_collection_ref(CollectionRef::new(id, name), tip);
             }
         }
     }
@@ -3603,10 +3651,11 @@ pub(crate) struct LocalChecks {
     ///
     /// `Some(allow_unbound)` turns on the check, and `allow_unbound` lets a
     /// tip with no `ostree.collection-binding` key pass. With the check, the
-    /// pull reads and writes the refs of the collection:
-    /// `refs/mirrors/<id>/<name>`, or `refs/heads/<name>` if the id is the
-    /// `[core] collection-id` of the destination. `None`, or a pull with no
-    /// collection id, makes no collection-binding check.
+    /// pull reads and writes the refs of the collection at
+    /// [`RefPlace::of_collection`]: [`RefPlace::Collection`], or
+    /// [`RefPlace::OwnCollection`] if the id is the `[core] collection-id` of
+    /// the destination. `None`, or a pull with no collection id, makes no
+    /// collection-binding check.
     pub(crate) collection_binding: Option<bool>,
     /// The commit of each name of [`refs`](PullOptions::refs), in the same
     /// order, as the caller read it from the source.
@@ -3819,18 +3868,22 @@ async fn commit_timestamp(repo: &Repo, commit: &Checksum) -> Result<u64> {
     .await
 }
 
-/// Reads the commit that the ref at `relpath` of this repository names, and
-/// the timestamp of that commit. Returns `None` if this repository holds no
-/// such ref.
+/// Reads the commit that the ref at `path` of this repository names, and the
+/// timestamp of that commit. Returns `None` if this repository holds no such
+/// ref.
+///
+/// The read of the ref follows the rule of
+/// [`Repo::resolve_ref_path_blocking`], so under the collection id of the
+/// repository it reads the ref that [`Repo::resolve_collection_ref`] reads.
 ///
 /// The ref, the read of the commit, and the decode run in one call on the
 /// blocking pool. The errors come in this order: the read and the parse of
 /// the ref, then the read and the decode of the commit, as
 /// [`commit_timestamp`] states.
-async fn current_ref_timestamp(repo: &Repo, relpath: String) -> Result<Option<(Checksum, u64)>> {
+async fn current_ref_timestamp(repo: &Repo, path: RefPath) -> Result<Option<(Checksum, u64)>> {
     let repo = repo.clone();
     ostrya_rt::unblock(move || {
-        let Some(current) = repo.resolve_relpath_tip_blocking(&relpath)? else {
+        let Some(current) = repo.resolve_ref_path_blocking(&path)? else {
             return Ok(None);
         };
         let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &current)?;
@@ -3848,7 +3901,7 @@ struct TipChecks<'a> {
     /// The timestamp check of the pull.
     timestamp: TimestampBase,
     /// The place of the pulled refs. The timestamp check resolves the current
-    /// tip of a ref there.
+    /// tip of a ref there, by the rule of [`RefPlace::ref_path`].
     place: RefPlace<'a>,
     /// The collection id that the `ostree.collection-binding` of each tip
     /// must state, or `None` for no collection-binding check.
@@ -3959,7 +4012,9 @@ fn check_listed_timestamp(
 ///
 /// Under [`TimestampBase::CurrentRef`], the call reads the ref at `place` and
 /// the timestamp of its commit in one call on the blocking pool, through
-/// [`current_ref_timestamp`].
+/// [`current_ref_timestamp`]. Under [`RefPlace::OwnCollection`], it reads the
+/// ref that [`Repo::resolve_collection_ref`] reads, which is the ref that the
+/// pull writes.
 async fn check_timestamp(
     repo: &Repo,
     check: TimestampBase,
@@ -3973,7 +4028,8 @@ async fn check_timestamp(
         TimestampBase::CurrentRef => {
             // A ref that this repository does not hold has nothing to be
             // older than.
-            let Some(current) = current_ref_timestamp(repo, place.relpath(ref_name)?).await? else {
+            let Some(current) = current_ref_timestamp(repo, place.ref_path(ref_name)?).await?
+            else {
                 return Ok(());
             };
             current
@@ -4213,29 +4269,90 @@ mod tests {
 
     #[test]
     fn a_ref_place_gives_the_path_of_its_refs() {
+        let one = |relpath: &str| RefPath::One(relpath.to_owned());
         assert_eq!(
-            RefPlace::Heads.relpath("os/stable").unwrap(),
-            "refs/heads/os/stable"
+            RefPlace::Heads.ref_path("os/stable").unwrap(),
+            one("refs/heads/os/stable")
         );
         assert_eq!(
-            RefPlace::Remote("origin").relpath("os/stable").unwrap(),
-            "refs/remotes/origin/os/stable"
+            RefPlace::Remote("origin").ref_path("os/stable").unwrap(),
+            one("refs/remotes/origin/os/stable")
         );
         assert_eq!(
             RefPlace::Collection("org.example.Os")
-                .relpath("os/stable")
+                .ref_path("os/stable")
                 .unwrap(),
-            "refs/mirrors/org.example.Os/os/stable"
+            one("refs/mirrors/org.example.Os/os/stable")
+        );
+        assert_eq!(
+            RefPlace::OwnCollection("org.example.Os")
+                .ref_path("os/stable")
+                .unwrap(),
+            RefPath::Own {
+                mirror: "refs/mirrors/org.example.Os/os/stable".to_owned(),
+                heads: "refs/heads/os/stable".to_owned(),
+            }
         );
         assert_eq!(RefPlace::of_remote(None), RefPlace::Heads);
         assert_eq!(
             RefPlace::of_remote(Some("origin")),
             RefPlace::Remote("origin")
         );
-        assert!(matches!(
-            RefPlace::Collection("org.example.Os").relpath("../x"),
-            Err(Error::InvalidRefspec(_))
+        for place in [
+            RefPlace::Collection("org.example.Os"),
+            RefPlace::OwnCollection("org.example.Os"),
+        ] {
+            for name in ["../x", "origin:x"] {
+                assert!(
+                    matches!(place.ref_path(name), Err(Error::InvalidRefspec(_))),
+                    "{place:?} {name}"
+                );
+            }
+        }
+    }
+
+    /// A collection id is the place of its own collection in a repository
+    /// whose `[core] collection-id` is that id, and the place of the
+    /// collection refs in each other repository.
+    #[test]
+    fn a_collection_place_follows_the_collection_id_of_the_repository() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pull-place-{}-{}",
+            std::process::id(),
+            crate::write::unique()
         ));
+        std::fs::create_dir_all(&dir).unwrap();
+        ostrya_rt::block_on(async {
+            for (name, own, place) in [
+                (
+                    "own",
+                    Some("org.example.Os"),
+                    RefPlace::OwnCollection("org.example.Os"),
+                ),
+                (
+                    "other",
+                    Some("org.example.Other"),
+                    RefPlace::Collection("org.example.Os"),
+                ),
+                ("none", None, RefPlace::Collection("org.example.Os")),
+            ] {
+                let repo = Repo::create(
+                    &dir.join(name),
+                    crate::CreateOptions {
+                        mode: crate::RepoMode::Archive,
+                        collection_id: own.map(str::to_owned),
+                    },
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    RefPlace::of_collection(&repo, "org.example.Os"),
+                    place,
+                    "{name}"
+                );
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Returns a commit with the metadata `entries`, each a key and a value

@@ -1136,6 +1136,41 @@ the delta index, and `.commitmeta` again, and then stops. Into an `archive`
 client, the tool does not request the delta index ("Delta selection in a
 pull"). `cli-surface.md`, "P2", `pull`, records the port side.
 
+#### The pulled ref under the own collection id
+
+These records come from libostree 2026.1 on a NixOS host, observed on
+2026-11-03. The source is an `archive` repository with
+`[core] collection-id=ID`. The destination is a `bare-user` repository with
+the remote `origin` at the `file://` address of the source and the
+`collection-id=ID` key. The pulled ref is `REF` of `ID`. Before the pull, the
+destination holds one of these states:
+
+- no ref of `REF`;
+- `refs/mirrors/ID/REF` alone;
+- `refs/mirrors/ID/REF` and `refs/heads/REF`, at the same commit or at
+  different commits;
+- `refs/heads/REF` alone.
+
+With `[core] collection-id=ID` in the destination, the tool writes these
+refs in each state:
+
+- `find-remotes --finders=config --pull --mirror ID REF`,
+  `pull --mirror origin REF`, and `pull-local SRC REF` write
+  `refs/heads/REF`.
+- `find-remotes --finders=config --pull ID REF`, `pull origin REF`, and
+  `pull-local --remote=origin SRC REF` write `refs/remotes/origin/REF`.
+
+The tool does not examine which ref files exist. It does not change or
+remove `refs/mirrors/ID/REF`. When that file holds a commit before the pull,
+`refs -c -r` after the pull shows `(ID, REF)` with that old commit, and not
+the pulled commit. No pull is refused, and each pull exits 0. No pull removes
+a ref file.
+
+With a destination of another collection id, or of no collection id,
+`find-remotes --finders=config --pull --mirror ID REF` and
+`pull --mirror origin REF` write `refs/mirrors/ID/REF`.
+`cli-surface.md`, "P3", `find-remotes`, records the port side.
+
 #### Timestamp check
 
 `-T` fails the pull only on a timestamp that is strictly older. An equal

@@ -162,6 +162,17 @@ for it.
   `Repo::load_commit_with_bytes` run two jobs on the blocking pool: one for
   the read of the object and one for the check of the `.commitpartial`
   marker. One job can do the read, the parse, and the check.
+- The receive path under the own collection id. A push to the
+  `[core] collection-id` of the repository writes `refs/heads/NAME`
+  (`ref_path` in `crates/ostrya/src/receive/core.rs`, `queue_ref` in
+  `crates/ostrya/src/receive/finish.rs`), and its check of the old value
+  reads that file. `Repo::resolve_collection_ref`, the collection ref
+  listing, the summary, and the ref listing read `refs/mirrors/ID/NAME`
+  first. So a push into a repository that holds `refs/mirrors/ID/NAME` writes
+  a ref that these readers do not give, and checks the old value against a
+  ref that they do not read. A collection pull writes the ref that the
+  readers read ("The own collection id of a collection pull" in
+  `decisions.md`).
 
 ## Gaps of bucket repositories
 

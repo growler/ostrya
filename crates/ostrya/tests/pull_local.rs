@@ -21,8 +21,8 @@ use futures_lite::future::poll_once;
 use ostrya::{
     AdvertisedDelta, Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions,
     CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error, FsckOptions,
-    MutableTree, ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo,
-    RepoMode, Signer, SummaryOptions, TimestampCheck, Type, Value,
+    MutableTree, ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify,
+    RefSelector, Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -5687,8 +5687,9 @@ fn a_collection_pull_with_ref_writes_writes_the_collection_refs() {
     });
 }
 
-/// If the collection id is the own id of the destination, the pull writes the
-/// ref under `refs/heads` and no ref under `refs/mirrors`.
+/// If the collection id is the own id of the destination, and the destination
+/// holds no collection ref of the name, the pull writes the ref under
+/// `refs/heads` and no ref under `refs/mirrors`.
 #[test]
 fn a_collection_pull_into_the_own_collection_writes_refs_heads() {
     let tmp = TmpDir::new("pull-collection-own");
@@ -5730,6 +5731,77 @@ fn a_collection_pull_into_the_own_collection_writes_refs_heads() {
         assert_eq!(
             dst.resolve_collection_ref(&cref, false).await.unwrap(),
             Some(commit)
+        );
+        assert_complete(&src, &dst, &dst_dir, &commit).await;
+    });
+}
+
+/// If the collection id is the own id of the destination, and the destination
+/// holds the collection ref of the name, the pull writes that collection ref.
+/// The resolve and the listing of the collection ref read it. The local ref
+/// of the name keeps its commit.
+#[test]
+fn a_collection_pull_into_the_own_collection_writes_an_existing_mirror_ref() {
+    let tmp = TmpDir::new("pull-collection-own-mirror");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::BareUser).await;
+        let mut commits = Vec::new();
+        for (sub, name) in [("vm", "app/m"), ("vh", "app/h"), ("va", "app/a")] {
+            let refs: &[&str] = &[name];
+            commits.push(
+                commit_collection_ref(
+                    &src,
+                    base,
+                    sub,
+                    name,
+                    None,
+                    bound_to(COLLECTION),
+                    Some(refs),
+                )
+                .await,
+            );
+        }
+        let (held, local, commit) = (commits[0], commits[1], commits[2]);
+        let dst_dir = base.join("dst");
+        let dst = Repo::create(
+            &dst_dir,
+            CreateOptions {
+                mode: RepoMode::BareUser,
+                collection_id: Some(COLLECTION.to_owned()),
+            },
+        )
+        .await
+        .unwrap();
+        for c in [held, local] {
+            hold_commit(&dst, &src, &c).await;
+        }
+        let txn = dst.transaction().await.unwrap();
+        txn.set_collection_ref(&CollectionRef::new(COLLECTION, "app/a"), Some(&held));
+        txn.set_ref("app/a", Some(&local));
+        txn.commit().await.unwrap();
+
+        dst.pull_local(&src, collection_write_pull(&["app/a"]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            vec![("app/a".to_owned(), local)]
+        );
+        assert_eq!(
+            dst.list_mirror_refs().await.unwrap(),
+            vec![(COLLECTION.to_owned(), "app/a".to_owned(), commit)]
+        );
+        let cref = CollectionRef::new(COLLECTION, "app/a");
+        assert_eq!(
+            dst.resolve_collection_ref(&cref, false).await.unwrap(),
+            Some(commit)
+        );
+        let all = RefSelector::parse([]).unwrap();
+        assert_eq!(
+            dst.list_collection_refs_in(COLLECTION, &all).await.unwrap(),
+            vec![("app/a".to_owned(), commit)]
         );
         assert_complete(&src, &dst, &dst_dir, &commit).await;
     });
@@ -6013,9 +6085,21 @@ enum HeldAt {
     /// The local ref `main`, in a destination whose `[core] collection-id` is
     /// [`COLLECTION`].
     Own,
+    /// The collection ref `main` of [`COLLECTION`] and no local ref `main`, in
+    /// a destination whose `[core] collection-id` is [`COLLECTION`].
+    OwnMirror,
+    /// The collection ref `main` of [`COLLECTION`], and the local ref `main`
+    /// at [`unheld_commit`], in a destination whose `[core] collection-id` is
+    /// [`COLLECTION`].
+    OwnBoth,
     /// The ref `main` under the remote name `origin` and the local ref `main`,
     /// in a destination with no collection id.
     Elsewhere,
+}
+
+/// Returns a commit checksum that no repository of the tests holds.
+fn unheld_commit() -> Checksum {
+    Checksum::from_bytes([0xa5; 32])
 }
 
 /// Creates a destination under `base/<name>` that holds each commit of `held`
@@ -6033,7 +6117,8 @@ async fn dst_with_main(
         &path,
         CreateOptions {
             mode: RepoMode::BareUser,
-            collection_id: matches!(at, HeldAt::Own).then(|| COLLECTION.to_owned()),
+            collection_id: matches!(at, HeldAt::Own | HeldAt::OwnMirror | HeldAt::OwnBoth)
+                .then(|| COLLECTION.to_owned()),
         },
     )
     .await
@@ -6043,8 +6128,12 @@ async fn dst_with_main(
     }
     let txn = dst.transaction().await.unwrap();
     match at {
-        HeldAt::Mirror => {
+        HeldAt::Mirror | HeldAt::OwnMirror => {
             txn.set_collection_ref(&CollectionRef::new(COLLECTION, "main"), Some(tip));
+        }
+        HeldAt::OwnBoth => {
+            txn.set_collection_ref(&CollectionRef::new(COLLECTION, "main"), Some(tip));
+            txn.set_ref("main", Some(&unheld_commit()));
         }
         HeldAt::Own => txn.set_ref("main", Some(tip)),
         HeldAt::Elsewhere => {
@@ -6056,15 +6145,30 @@ async fn dst_with_main(
     (path, dst)
 }
 
+/// Checks that the pull kept `refs/heads/main` of `dst` at [`unheld_commit`],
+/// and then removes that ref, so that fsck finds no ref to an absent commit.
+async fn clear_unheld_main(dst: &Repo, name: &str) {
+    assert_eq!(
+        dst.list_refs(None).await.unwrap(),
+        vec![("main".to_owned(), unheld_commit())],
+        "{name}"
+    );
+    dst.set_ref_immediate("main", None).await.unwrap();
+}
+
 /// Delta discovery reads the current commit of the ref at the place where the
-/// pull writes the ref: the collection ref, or the local ref if the id is the
-/// `[core] collection-id` of the destination. The source holds the delta from
-/// scratch to `c2` alone, and each destination holds `c1` complete. If the
-/// ref at that place names `c1`, the pull does not take the delta from
-/// scratch, and it imports `c2` loose. If `c1` is under the remote name and
-/// under `refs/heads` alone, the ref at the place names no commit, and the
-/// pull takes the delta from scratch. Each case runs with the deltas of the
-/// summary and with a list.
+/// pull writes the ref: the collection ref, or, if the id is the
+/// `[core] collection-id` of the destination, the collection ref when the
+/// destination holds it and the local ref otherwise. The source holds the
+/// delta from scratch to `c2` alone, and each destination holds `c1`
+/// complete. If the ref at that place names `c1`, the pull does not take the
+/// delta from scratch, and it imports `c2` loose. If `c1` is under the remote
+/// name and under `refs/heads` alone, the ref at the place names no commit,
+/// and the pull takes the delta from scratch. If the collection ref names
+/// `c1` and `refs/heads/main` names a commit that the destination does not
+/// hold, the pull reads the collection ref: a read of `refs/heads/main` takes
+/// the delta from scratch. Each case runs with the deltas of the summary and
+/// with a list.
 #[test]
 fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
     let tmp = TmpDir::new("pull-collection-delta-place");
@@ -6077,6 +6181,8 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
             for (at, parts) in [
                 (HeldAt::Mirror, 0),
                 (HeldAt::Own, 0),
+                (HeldAt::OwnMirror, 0),
+                (HeldAt::OwnBoth, 0),
                 (HeldAt::Elsewhere, 1),
             ] {
                 let name = format!("{path}-{at:?}");
@@ -6100,6 +6206,9 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
                         );
                     }
                 }
+                if let HeldAt::OwnBoth = at {
+                    clear_unheld_main(&dst, &name).await;
+                }
                 assert_complete(&src, &dst, &dst_dir, &c2).await;
                 assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
             }
@@ -6108,8 +6217,11 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
 }
 
 /// The search for the delta of a dependency reads the paired entry from the
-/// commit that the ref names at the place where the pull writes the ref. T1
-/// names D1 as `boot/uki`, and its child T2 names D2. Each destination holds
+/// commit that the ref names at the place where the pull writes the ref. In a
+/// destination whose `[core] collection-id` is the id, that place is the
+/// collection ref when the destination holds it, also when `refs/heads/main`
+/// names another commit. T1 names D1 as `boot/uki`, and its child T2 names
+/// D2. Each destination holds
 /// T1 and D1 complete. The source holds the delta `<T1>-<T2>` and the delta
 /// from scratch to D2. If the ref at that place names T1, the paired entry D1
 /// is held complete, and the pull imports D2 loose. If T1 is under the remote
@@ -6155,6 +6267,8 @@ fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref()
             for (at, parts) in [
                 (HeldAt::Mirror, 1),
                 (HeldAt::Own, 1),
+                (HeldAt::OwnMirror, 1),
+                (HeldAt::OwnBoth, 1),
                 (HeldAt::Elsewhere, 2),
             ] {
                 let name = format!("{path}-{at:?}");
@@ -6163,6 +6277,9 @@ fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref()
                 let stats = dst.pull_local(&src, opts.clone()).await.unwrap();
 
                 assert_eq!(stats.delta_parts, parts, "{name}");
+                if let HeldAt::OwnBoth = at {
+                    clear_unheld_main(&dst, &name).await;
+                }
                 for commit in [t2, d2] {
                     assert_complete(&src, &dst, &dst_dir, &commit).await;
                 }

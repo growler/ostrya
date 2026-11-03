@@ -3792,8 +3792,10 @@ struct PullArgs {
     /// keeps the refs of the earlier ones. The keys of the selected candidate
     /// apply.
     /// Each commit must be bound to ID. If a commit has a ref binding, the
-    /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`, or
-    /// `refs/heads/REF` if the `collection-id` of this repository is ID.
+    /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`. If
+    /// the `collection-id` of this repository is ID, the pull writes
+    /// `refs/mirrors/ID/REF` if that file holds a ref, and `refs/heads/REF`
+    /// otherwise. It removes no ref. The timestamp check reads the same ref.
     /// If the pull fetched nothing and imported objects, the statistics line
     /// has the form of `pull-local`.
     #[arg(

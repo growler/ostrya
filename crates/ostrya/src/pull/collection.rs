@@ -484,12 +484,39 @@ impl Repo {
     /// # Refs
     ///
     /// The pull writes each ref as the collection ref
-    /// `refs/mirrors/<collection_id>/<name>`. If the `[core] collection-id`
-    /// of this repository is `collection_id`, it writes the local ref
-    /// `refs/heads/<name>`. It writes no ref under `refs/remotes/`. Delta
-    /// discovery and
+    /// `refs/mirrors/<collection_id>/<name>`. It writes no ref under
+    /// `refs/remotes/`.
+    ///
+    /// If the `[core] collection-id` of this repository is `collection_id`,
+    /// the pull writes the ref that [`resolve_collection_ref`] reads:
+    /// `refs/mirrors/<collection_id>/<name>` if that path holds a ref file,
+    /// and the local ref `refs/heads/<name>` otherwise. The pull selects the
+    /// path at the ref write, under the update lock. It removes no ref, so
+    /// the other path keeps its commit, and
+    /// [`list_collection_refs`](Repo::list_collection_refs) gives both refs.
+    /// [`CollectionPullStats`] does not state the path that the pull wrote.
+    /// If the `stat` of the mirror path fails with an error that the resolve
+    /// does not read as an absent ref, for example `ELOOP` or `EACCES`, the
+    /// pull fails with [`Error::Io`]. The published objects stay, and the
+    /// transaction of the pull writes no ref.
+    ///
+    /// In each state of the ref store that the port and the `ostree` command
+    /// write, the resolve,
+    /// [`list_collection_refs_in`](Repo::list_collection_refs_in), and the
+    /// summary read the ref that the pull writes. Two states that neither
+    /// writes are exceptions. If the mirror path is a directory with no read
+    /// permission, the pull writes `refs/heads/<name>`, and the resolve fails
+    /// with `EACCES`. If a component of the mirror tree is a symlink to a
+    /// directory, the pull and the resolve follow it, and the listing and the
+    /// summary open the mirror tree with no symlink followed and do not give
+    /// the written ref.
+    ///
+    /// Delta discovery and
     /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) read
-    /// the current commit of a ref at the same place.
+    /// the current commit of a ref at the same place, as
+    /// [`resolve_collection_ref`] reads it.
+    ///
+    /// [`resolve_collection_ref`]: Repo::resolve_collection_ref
     ///
     /// # Local repository
     ///

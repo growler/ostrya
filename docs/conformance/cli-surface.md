@@ -3524,8 +3524,12 @@ part, `localhost` included, with no path, or with `%`, `?`, or `#` fails the
 command at exit 1 before the first request. The command then also refuses
 `--subpath`, `--http-header`, `--network-retries` above 0, and the low-speed
 options at exit 1. When the pull fetched nothing and imported objects, the
-statistics line has the form of `pull-local`. The counterpart in the tool is
-`find-remotes --pull` ("P3").
+statistics line has the form of `pull-local`. When the pull fetched objects,
+and the local candidates imported objects and fetched nothing, the command
+prints two lines: the line of a fetch, and then the line of `pull-local`
+with the counts of the local candidates. The content written of the two
+lines adds up to the content written of the pull. The counterpart in the
+tool is `find-remotes --pull` ("P3").
 
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port
@@ -4382,7 +4386,9 @@ No matrix cell needs these. The shell suite invokes them.
   - The operands are refs of one collection. The tool takes
     `COLLECTION-ID REF` pairs.
   - The port prints the statistics line of a pull, and one warning line for
-    each candidate that it skips.
+    each candidate that it skips. When the pull fetched objects, and the
+    local candidates imported objects and fetched nothing, the port prints
+    two statistics lines.
   - The port has no `--mirror` for a collection pull, and no command that
     finds the remotes and pulls nothing.
   - In a repository whose `[core] collection-id` is ID, the port writes

@@ -181,8 +181,15 @@ pub struct CollectionPullStats {
     ///
     /// [`elapsed`](PullStats::elapsed) is the run time of the whole call. A
     /// pull from a local repository adds its import counts, and no fetch
-    /// count unless it reads static deltas.
+    /// count unless it reads static deltas. [`local`](Self::local) holds the
+    /// part of these counts that the pulls from local repositories gave.
     pub stats: PullStats,
+    /// The part of [`stats`](Self::stats) that the pulls from local
+    /// repositories (`file://` candidates) gave.
+    ///
+    /// [`elapsed`](PullStats::elapsed) is the sum of the run times of those
+    /// pulls. Each count is zero if the pull selected no local repository.
+    pub local: PullStats,
 }
 
 /// One ref of a collection pull, and the remote that the pull selected for
@@ -601,6 +608,7 @@ impl Repo {
     /// form always gets a hash. The counts of the pull go to
     /// [`CollectionPullStats::stats`] as the counts of a local pull: the
     /// import counts, and no fetch count unless it reads static deltas.
+    /// [`CollectionPullStats::local`] also gets these counts.
     ///
     /// # Options
     ///
@@ -811,10 +819,12 @@ impl Repo {
         let place = RefPlace::of_collection(self, collection_id);
         let candidate_names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
         let mut stats = PullStats::default();
+        let mut local = PullStats::default();
         for (index, candidate) in candidates.into_iter().enumerate() {
             let Some(session) = sessions[index].take() else {
                 continue;
             };
+            let from_local = matches!(session, Session::Local(_));
             let mine: Vec<&Listed> = selected
                 .iter()
                 .filter(|selected| selected.remote == index)
@@ -878,7 +888,13 @@ impl Repo {
                 }
             };
             match pulled {
-                Ok(pulled) => add_stats(&mut stats, &pulled),
+                Ok(pulled) => {
+                    add_stats(&mut stats, &pulled);
+                    if from_local {
+                        add_stats(&mut local, &pulled);
+                        local.elapsed += pulled.elapsed;
+                    }
+                }
                 Err(e) => {
                     end_sessions(sessions.into_iter().flatten()).await;
                     return Err(e);
@@ -896,7 +912,7 @@ impl Repo {
                 timestamp: selected.listed.timestamp,
             })
             .collect();
-        Ok(CollectionPullStats { refs, stats })
+        Ok(CollectionPullStats { refs, stats, local })
     }
 
     /// Lists the refs of the collection `collection_id` that the remote

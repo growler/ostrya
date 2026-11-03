@@ -2781,6 +2781,17 @@ These alternatives were rejected:
   as under `PullFlags::UNTRUSTED`. A signature covers the commit, or the
   summary the checksum of the commit, and the hash carries the proof to the
   objects of the tree. Otherwise the flags of the caller apply.
+- `CollectionPullStats::local` holds the counts of the pulls from local
+  candidates, and `CollectionPullStats::stats` the counts of all pulls. When
+  the pull fetched objects, and the local candidates imported objects and
+  fetched nothing, `ostrya pull --collection` prints two lines: the
+  statistics line of a fetch, and then the statistics line of `pull-local`
+  with the counts of the local candidates. The content written of the first
+  line excludes the part of the local candidates, so the two figures add up
+  to the total. Each line has a form that the tool prints, and the import
+  counts of the local candidates stay in the output. A local candidate that
+  reads static deltas counts as a fetch, so its counts stay in the one line
+  of a fetch.
 
 The local pull already reads a source repository through the file system,
 with hardlinks where the file systems permit them. So the collection pull
@@ -2830,6 +2841,14 @@ These alternatives were rejected:
   candidate, also the tips that the pull does not select from it. The pull
   hashes the bytes of a selected tip alone, and only under
   `PullFlags::UNTRUSTED`, where a hash is a requirement.
+- One statistics line of a fetch with the sums, when the pull fetched
+  objects and also imported objects from a local candidate. The line of a
+  fetch has no import counts, so the output then drops the counts of the
+  local candidates.
+- One statistics line for each selected candidate. The tool never prints
+  this form.
+- The import counts inside the statistics line of a fetch. The tool never
+  prints this form.
 
 ## The own collection id of a collection pull
 

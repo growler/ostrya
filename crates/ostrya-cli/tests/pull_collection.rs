@@ -490,6 +490,65 @@ fn a_file_candidate_is_a_local_repository() {
     assert!(!other.join("refs/mirrors").join(ID).exists());
 }
 
+/// A pull that fetches from an HTTP candidate and imports from a `file://`
+/// candidate prints two statistics lines: the line of the fetch, and then
+/// the line of the import. The client is a `bare-user` repository, so the
+/// import writes content, and each line gives a part of the content written.
+/// A second pull that gets no object prints one line.
+#[test]
+fn an_http_and_a_file_candidate_print_both_statistics_lines() {
+    let dir = TmpDir::new("http-file");
+    let a = dir.path().join("a");
+    let b = dir.path().join("b");
+    let client = dir.path().join("client");
+    init(&a, Some(ID));
+    init(&b, Some(ID));
+    let a_stable = commit(&a, "a1", REF, TS + 10);
+    commit(&a, "a2", "os/next", TS);
+    commit(&b, "b1", REF, TS);
+    let b_next = commit(&b, "b2", "os/next", TS + 10);
+    let serving = Serving::start(&a);
+    ok(&client, &["init", "--mode=bare-user"]);
+    configure(
+        &client,
+        &format!(
+            "{}{}",
+            http_remote("a", &serving.url, ID),
+            http_remote("b", &format!("file://{}", b.display()), ID),
+        ),
+    );
+
+    let out = ostrya(&client, &["pull", "--collection", ID, REF, "os/next"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(lines[0].contains(" content objects fetched; "), "{text}");
+    assert!(lines[0].contains(" transferred in "), "{text}");
+    assert!(lines[0].ends_with(" content written"), "{text}");
+    assert!(!lines[0].ends_with("; 0 bytes content written"), "{text}");
+    let (counts, written) = lines[1].split_once(" content objects imported; ").unwrap();
+    assert!(written.ends_with(" content written"), "{text}");
+    assert_ne!(written, "0 bytes content written", "{text}");
+    let (metadata, content) = counts.split_once(" metadata, ").unwrap();
+    assert!(metadata.parse::<u32>().unwrap() > 0, "{text}");
+    assert!(content.parse::<u32>().unwrap() > 0, "{text}");
+    let mirrors = format!("refs/mirrors/{ID}");
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/{REF}")),
+        Some(a_stable)
+    );
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/os/next")),
+        Some(b_next)
+    );
+    ok(&client, &["fsck"]);
+
+    let text = ok(&client, &["pull", "--collection", ID, REF, "os/next"]);
+    assert_eq!(text.lines().count(), 1, "{text}");
+}
+
 /// `Repo::remote_list_collection_refs` lists the refs of an ssh remote
 /// through the built `ostrya send`, and ends the session. After a clean end
 /// of the session, a remote command that exits with a failure status does

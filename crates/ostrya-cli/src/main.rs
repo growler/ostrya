@@ -403,8 +403,9 @@ enum Command {
     /// --commit-metadata-only or --subpath.
     ///
     /// On success, the command prints one statistics line to standard output.
+    /// A pull with --collection can print two lines, as --collection states.
     /// If standard output is a terminal, a progress line shows while the pull
-    /// runs, and the statistics line is drawn over it.
+    /// runs, and the first statistics line is drawn over it.
     Pull(PullArgs),
     /// Import refs and their objects from another local repository.
     ///
@@ -3801,7 +3802,13 @@ struct PullArgs {
     /// `refs/mirrors/ID/REF` if that file holds a ref, and `refs/heads/REF`
     /// otherwise. It removes no ref. The timestamp check reads the same ref.
     /// If the pull fetched nothing and imported objects, the statistics line
-    /// has the form of `pull-local`.
+    /// has the form of `pull-local`. If the pull fetched objects, and the
+    /// local candidates imported objects and fetched nothing, the command
+    /// prints two lines. The first line has the form of a fetch. The second
+    /// line has the form of `pull-local` and gives the counts of the local
+    /// candidates. The content written of the two lines adds up to the
+    /// content written of the pull. Each other pull prints one line in the
+    /// form of a fetch.
     #[arg(
         long,
         value_name = "ID",
@@ -6758,7 +6765,7 @@ async fn pull(
         PullFrom::Remote(remote) => repo
             .pull(&remote, opts)
             .await
-            .map(|stats| (stats, PullSource::Http)),
+            .map(|stats| vec![(stats, PullSource::Http)]),
         PullFrom::Collection { id, remotes } => {
             let remotes: Vec<&str> = remotes.iter().map(String::as_str).collect();
             let mut collection = CollectionPullOptions::default();
@@ -6766,11 +6773,11 @@ async fn pull(
             collection.on_event = Some(Box::new(|event| eprintln!("warning: {event}")));
             repo.pull_collection(&id, &remotes, collection)
                 .await
-                .map(|pulled| (pulled.stats, collection_source(&pulled.stats)))
+                .map(|pulled| collection_lines(&pulled.stats, &pulled.local))
         }
     };
     let prefix = line.map_or("", ProgressLine::finish);
-    let (stats, source) = match pulled {
+    let lines = match pulled {
         Ok(pulled) => pulled,
         Err(e) => {
             // The error goes to standard error, on a line of its own.
@@ -6780,14 +6787,16 @@ async fn pull(
             return Err(e);
         }
     };
-    let mut text = statistics_line(&stats, source);
-    if terminal {
-        // The statistics line is drawn over the progress line and padded as
-        // the progress line is.
-        pad_line(&mut text, 0);
-        println!("{prefix}\x1b8{text}");
-    } else {
-        println!("{text}");
+    for (index, (stats, source)) in lines.iter().enumerate() {
+        let mut text = statistics_line(stats, *source);
+        if terminal && index == 0 {
+            // The first statistics line is drawn over the progress line and
+            // padded as the progress line is.
+            pad_line(&mut text, 0);
+            println!("{prefix}\x1b8{text}");
+        } else {
+            println!("{text}");
+        }
     }
     Ok(())
 }
@@ -6989,22 +6998,48 @@ enum PullSource {
     Local,
 }
 
-/// Returns the source whose statistics line a pull of collection refs
-/// prints.
-///
-/// A pull that fetched nothing and imported objects gets the line of a local
-/// pull. Each other pull gets the line of a pull from a remote.
-fn collection_source(stats: &PullStats) -> PullSource {
-    let fetched = stats.metadata_fetched > 0
+/// Returns `true` if a pull fetched an object, a delta part, or a byte.
+fn stats_fetched(stats: &PullStats) -> bool {
+    stats.metadata_fetched > 0
         || stats.content_fetched > 0
         || stats.delta_parts > 0
-        || stats.bytes_transferred > 0;
-    let imported = stats.metadata_imported > 0 || stats.content_imported > 0;
-    if !fetched && imported {
-        PullSource::Local
-    } else {
-        PullSource::Http
+        || stats.bytes_transferred > 0
+}
+
+/// Returns `true` if a pull imported an object.
+fn stats_imported(stats: &PullStats) -> bool {
+    stats.metadata_imported > 0 || stats.content_imported > 0
+}
+
+/// Returns the statistics lines that a pull of collection refs prints, in
+/// order, each as its statistics and its source.
+///
+/// `total` holds the counts of all pulls, and `local` the part of them that
+/// the pulls from local repositories gave. The rules are:
+///
+/// - A pull that fetched nothing and imported objects gets one line of a
+///   local pull, with the counts of `total`.
+/// - If the pull fetched objects, and the local pulls fetched nothing and
+///   imported objects, it gets two lines: the line of a pull from a remote,
+///   and then the line of a local pull with the counts of `local`. The
+///   content written of the first line excludes the part of `local`, so the
+///   two figures add up to the figure of `total`.
+/// - Each other pull gets one line of a pull from a remote, with the counts
+///   of `total`.
+fn collection_lines(total: &PullStats, local: &PullStats) -> Vec<(PullStats, PullSource)> {
+    if !stats_fetched(total) && stats_imported(total) {
+        return vec![(*total, PullSource::Local)];
     }
+    if stats_fetched(total) && !stats_fetched(local) && stats_imported(local) {
+        let remote = PullStats {
+            content_bytes_unpacked: total
+                .content_bytes_unpacked
+                .saturating_sub(local.content_bytes_unpacked),
+            ..*total
+        };
+        return vec![(remote, PullSource::Http), (*local, PullSource::Local)];
+    }
+    vec![(*total, PullSource::Http)]
 }
 
 /// Returns the success line of a pull, in the words of the `ostree` command.
@@ -16396,22 +16431,32 @@ mod tests {
     }
 
     /// A pull of collection refs that fetched nothing and imported objects
-    /// prints the line of a local pull. A fetch, or no import, keeps the
-    /// line of a pull from a remote.
+    /// prints the line of a local pull. A fetch plus an import of the local
+    /// pulls with no fetch of their own prints the line of a pull from a
+    /// remote and then the line of the local pulls, with the content written
+    /// split between the two. Each other pull prints the line of a pull from
+    /// a remote with the totals.
     #[test]
-    fn a_collection_pull_with_no_fetch_prints_the_local_line() {
+    fn a_collection_pull_prints_the_lines_of_its_sources() {
+        let none = PullStats::default();
         let imported = PullStats {
             metadata_imported: 3,
-            ..PullStats::default()
+            ..none
         };
-        assert_eq!(collection_source(&imported), PullSource::Local);
+        assert_eq!(
+            collection_lines(&imported, &imported),
+            [(imported, PullSource::Local)]
+        );
         let content = PullStats {
             content_imported: 1,
-            ..PullStats::default()
+            ..none
         };
-        assert_eq!(collection_source(&content), PullSource::Local);
-        assert_eq!(collection_source(&PullStats::default()), PullSource::Http);
-        for fetched in [
+        assert_eq!(
+            collection_lines(&content, &none),
+            [(content, PullSource::Local)]
+        );
+        assert_eq!(collection_lines(&none, &none), [(none, PullSource::Http)]);
+        let fetches = [
             PullStats {
                 metadata_fetched: 1,
                 ..imported
@@ -16428,9 +16473,94 @@ mod tests {
                 bytes_transferred: 1,
                 ..imported
             },
-        ] {
-            assert_eq!(collection_source(&fetched), PullSource::Http, "{fetched:?}");
+        ];
+        for fetched in fetches {
+            assert_eq!(
+                collection_lines(&fetched, &none),
+                [(fetched, PullSource::Http)],
+                "{fetched:?}"
+            );
         }
+
+        // An HTTP fetch and an import of a local pull give two lines.
+        let total = PullStats {
+            metadata_imported: 10,
+            content_imported: 6,
+            content_bytes_written: 9000,
+            content_bytes_unpacked: 5000,
+            metadata_fetched: 7,
+            content_fetched: 4,
+            delta_parts: 0,
+            bytes_transferred: 4096,
+            elapsed: std::time::Duration::from_secs(3),
+        };
+        let local = PullStats {
+            metadata_imported: 3,
+            content_imported: 2,
+            content_bytes_written: 2000,
+            content_bytes_unpacked: 1200,
+            elapsed: std::time::Duration::from_secs(1),
+            ..none
+        };
+        let remote = PullStats {
+            content_bytes_unpacked: 3800,
+            ..total
+        };
+        assert_eq!(
+            collection_lines(&total, &local),
+            [(remote, PullSource::Http), (local, PullSource::Local)]
+        );
+
+        // A local pull that imported content and no metadata also gives two
+        // lines.
+        let content_only = PullStats {
+            metadata_imported: 0,
+            ..local
+        };
+        assert_eq!(
+            collection_lines(&total, &content_only),
+            [
+                (remote, PullSource::Http),
+                (content_only, PullSource::Local)
+            ]
+        );
+
+        // A local pull with a fetch of its own, as a pull that read static
+        // deltas, gives one line with the totals.
+        for local in [
+            PullStats {
+                delta_parts: 1,
+                ..local
+            },
+            PullStats {
+                metadata_fetched: 1,
+                ..local
+            },
+            PullStats {
+                content_fetched: 1,
+                ..local
+            },
+            PullStats {
+                bytes_transferred: 1,
+                ..local
+            },
+        ] {
+            assert_eq!(
+                collection_lines(&total, &local),
+                [(total, PullSource::Http)],
+                "{local:?}"
+            );
+        }
+
+        // A local pull that imported nothing adds no line.
+        let empty = PullStats {
+            elapsed: std::time::Duration::from_secs(1),
+            ..none
+        };
+        assert_eq!(
+            collection_lines(&total, &empty),
+            [(total, PullSource::Http)]
+        );
     }
 
     /// The progress text appended to an empty line.

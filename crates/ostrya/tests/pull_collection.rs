@@ -24,7 +24,8 @@ use ostrya::{
     Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
     CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer,
     Error, FileKind, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectName, ObjectType, PullFlags,
-    PullOptions, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type, Value,
+    PullOptions, PullStats, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type,
+    Value,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -309,6 +310,7 @@ fn the_newest_commit_wins_from_a_listing_or_a_summary() {
         assert!(dest.list_remote_refs().await.unwrap().is_empty());
         assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
         assert_eq!(pulled.stats.content_fetched, 4);
+        assert_eq!(pulled.local, PullStats::default());
 
         // The remote with no listing answered the probe from its summary,
         // and the pull asked it for no object.
@@ -1340,6 +1342,13 @@ fn a_file_remote_pulls_from_a_local_repository() {
         assert_eq!(pulled.stats.metadata_fetched, 0);
         assert_eq!(pulled.stats.content_fetched, 0);
         assert_eq!(pulled.stats.bytes_transferred, 0);
+        assert_eq!(
+            PullStats {
+                elapsed: pulled.stats.elapsed,
+                ..pulled.local
+            },
+            pulled.stats
+        );
 
         let (mut opts, _) = options(&[]);
         opts.allow_unbound = true;
@@ -1399,6 +1408,17 @@ fn an_http_remote_and_a_file_remote_each_give_the_newer_commit() {
         assert_eq!(mirror(&dest, "os/next").await, Some(b_next));
         assert!(objects_requested(&server_a));
         assert!(pulled.stats.content_fetched > 0, "{:?}", pulled.stats);
+        assert!(pulled.local.metadata_imported > 0, "{:?}", pulled.local);
+        assert!(pulled.local.content_imported > 0, "{:?}", pulled.local);
+        assert_eq!(pulled.local.metadata_fetched, 0);
+        assert_eq!(pulled.local.content_fetched, 0);
+        assert_eq!(pulled.local.bytes_transferred, 0);
+        assert!(
+            pulled.stats.metadata_imported > pulled.local.metadata_imported,
+            "{:?} {:?}",
+            pulled.stats,
+            pulled.local
+        );
         assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
     });
 }

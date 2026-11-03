@@ -5034,6 +5034,14 @@ clones, or copies an object with no hash, and an object that it writes again
 in another form always gets a hash. A pull from a local candidate counts no
 fetch, unless it reads static deltas. So when the pull fetched nothing and imported objects,
 `ostrya pull --collection` prints the statistics line of `pull-local`.
+`CollectionPullStats::local` holds the counts of the pulls from local
+candidates. When the pull fetched objects, and the local candidates
+imported objects and fetched nothing, `ostrya pull --collection` prints two
+lines. The first line is the statistics line of a fetch. The second line is
+the statistics line of `pull-local` with the counts of the local candidates.
+The content written of the first line is the total minus the part of the
+local candidates, so the two figures add up to the total. Each other pull
+prints one statistics line of a fetch with the totals.
 
 The pull refuses a commit:
 

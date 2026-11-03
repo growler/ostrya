@@ -40,8 +40,8 @@ use crate::remote::{Endpoint, PullSession, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::send::write_escaped;
 use crate::summary::{
-    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, SUMMARY_READ_CAP, SUMMARY_SIG_FILE,
-    Summary, SummaryRef, collection_map_refs, parse_ref_list,
+    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, Summary, SummaryRef,
+    collection_map_refs, parse_ref_list,
 };
 use crate::verify::PullTrust;
 use crate::verify::trust::FieldGroup;
@@ -53,8 +53,8 @@ use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    LocalChecks, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, delta,
-    refuse_remote_collection,
+    LocalChecks, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth,
+    read_checked_local_summary, refuse_remote_collection,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -1368,8 +1368,9 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 ///
 /// If `verification` checks the summary, the refs come from the `summary`
 /// of `src`, after the check of the summary and its `summary.sig`, as from a
-/// remote. The probe reads these files under the size cap of a summary, and
-/// gives back the bytes of the summary for the pull.
+/// remote. [`read_checked_local_summary`] reads these files under the size
+/// cap of a summary, and the probe gives back the bytes of the summary for
+/// the pull.
 ///
 /// Otherwise the refs come from the ref files of `src`, through
 /// [`Repo::list_collection_refs_in`]. So the collection id of `src` puts its
@@ -1382,6 +1383,11 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 ///
 /// - [`Error::Signature`] if the summary fails the policy, or if `src` has
 ///   no `summary` or no `summary.sig` under the policy.
+/// - [`Error::InvalidFormat`] if the `summary` or the `summary.sig` of `src`
+///   is not a regular file or is larger than the size cap of a summary, or if
+///   a ref of the summary has no `ostree.commit.timestamp` of type `t`.
+/// - [`Error::Core`] or [`Error::InvalidFormat`] if the summary does not
+///   parse.
 /// - [`Error::InvalidRefspec`] if a name fails the ref-name rule.
 /// - [`Error::ObjectNotFound`] if `src` does not hold the commit of a ref.
 /// - [`Error::Io`] if a directory or a ref file that the names reach cannot
@@ -1393,22 +1399,7 @@ async fn probe_local(
     names: &[&str],
 ) -> Result<Refs> {
     if verification.checks_summary() {
-        let summary_file = delta::open_local(src, SUMMARY_FILE).await?;
-        let signature_file = if summary_file.is_some() {
-            delta::open_local(src, SUMMARY_SIG_FILE).await?
-        } else {
-            None
-        };
-        verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
-        let summary = delta::read_opened(summary_file, SUMMARY_FILE, SUMMARY_READ_CAP)
-            .await?
-            .map(Arc::new);
-        let signature =
-            delta::read_opened(signature_file, SUMMARY_SIG_FILE, SUMMARY_READ_CAP).await?;
-        verification
-            .check_summary(summary.as_ref(), signature)
-            .await?;
-        let Some(bytes) = summary else {
+        let Some(bytes) = read_checked_local_summary(src, verification, false).await? else {
             unreachable!("the summary check needs a summary");
         };
         let (_, listed) = parse_refs(Arc::clone(&bytes), id, names).await?;

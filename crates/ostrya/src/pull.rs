@@ -1866,12 +1866,8 @@ impl Repo {
         // - the refusal of a source with no summary or outside archive mode.
         // - the search for each delta.
         //
-        // The pull reads
-        // the summary and its signature under the size cap of a summary. It
-        // refuses a file there that is not a regular file. Under the summary
-        // verification, a missing file stops the pull before it reads the
-        // other file: with no `summary`, the pull does not open `summary.sig`,
-        // and with no `summary.sig`, it does not read `summary`.
+        // `read_checked_local_summary` states the read of the summary and its
+        // signature.
         let fetching = opts.require_static_deltas && !opts.disable_static_deltas;
         // A commit-only pull ignores the list.
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
@@ -1881,40 +1877,7 @@ impl Repo {
         // the pull does not read or check it again.
         let summary = match checks.summary {
             Some(bytes) => Some(bytes),
-            None => {
-                let checks_summary = verification.checks_summary();
-                let summary_file = if checks_summary || needs_summary {
-                    delta::open_local(src, crate::summary::SUMMARY_FILE).await?
-                } else {
-                    None
-                };
-                let signature_file = if checks_summary && summary_file.is_some() {
-                    delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
-                } else {
-                    None
-                };
-                verification
-                    .check_summary_files(summary_file.is_some(), signature_file.is_some())?;
-                let summary = delta::read_opened(
-                    summary_file,
-                    crate::summary::SUMMARY_FILE,
-                    crate::summary::SUMMARY_READ_CAP,
-                )
-                .await?
-                .map(Arc::new);
-                if checks_summary {
-                    let signature = delta::read_opened(
-                        signature_file,
-                        crate::summary::SUMMARY_SIG_FILE,
-                        crate::summary::SUMMARY_READ_CAP,
-                    )
-                    .await?;
-                    verification
-                        .check_summary(summary.as_ref(), signature)
-                        .await?;
-                }
-                summary
-            }
+            None => read_checked_local_summary(src, &verification, needs_summary).await?,
         };
         if needs_summary && summary.is_none() {
             return Err(delta::no_summary_error());
@@ -1930,14 +1893,14 @@ impl Repo {
         // parsed summary alone. A summary can be as large as
         // `SUMMARY_READ_CAP`, so the parse runs on the blocking pool, and the
         // bytes and the rest of the parse drop there.
-        let advert = match summary {
-            Some(bytes) if needs_summary => Some(
+        let advert = match summary.filter(|_| needs_summary) {
+            Some(bytes) => Some(
                 ostrya_rt::unblock(move || {
                     crate::summary::Summary::parse(&bytes).map(delta::DeltaAdvert::from_summary)
                 })
                 .await?,
             ),
-            _ => None,
+            None => None,
         };
 
         let targets = match checks.targets {
@@ -3800,6 +3763,72 @@ async fn take_static_deltas(opts: &mut PullOptions) -> Result<Option<chain::Edge
     ostrya_rt::unblock(move || chain::Edges::new(list))
         .await
         .map(Some)
+}
+
+/// Reads the `summary` of the local repository `src`, and checks it if
+/// `verification` checks the summary.
+///
+/// The function opens `summary` if `verification` checks the summary or if
+/// `needed` is `true`. It opens `summary.sig` only if `verification` checks
+/// the summary and `summary` exists. It reads each file under
+/// [`SUMMARY_READ_CAP`](crate::summary::SUMMARY_READ_CAP), and refuses a file
+/// that is not a regular file. If `verification` checks the summary, the
+/// function gives the two files to
+/// [`Verification::check_summary`](verify::Verification::check_summary).
+///
+/// Under the summary verification, a missing file stops the call before it
+/// reads the other file: with no `summary`, the call does not open
+/// `summary.sig`, and with no `summary.sig`, it does not read `summary`. So
+/// under the summary verification, a call that succeeds returns `Some`.
+///
+/// Without the summary verification, returns `None` if `src` has no
+/// `summary`, or if the function does not open it.
+///
+/// # Errors
+///
+/// - [`Error::Signature`] if `verification` checks the summary and `src` has
+///   no `summary` or no `summary.sig`, or if the summary fails the policy.
+/// - [`Error::InvalidFormat`] if a file that the function opens is not a
+///   regular file, or is longer than the cap.
+/// - [`Error::Io`] if a file cannot be opened or read.
+/// - The other errors of
+///   [`Verification::check_summary`](verify::Verification::check_summary).
+async fn read_checked_local_summary(
+    src: &Repo,
+    verification: &verify::Verification,
+    needed: bool,
+) -> Result<Option<Arc<Vec<u8>>>> {
+    let checks_summary = verification.checks_summary();
+    let summary_file = if checks_summary || needed {
+        delta::open_local(src, crate::summary::SUMMARY_FILE).await?
+    } else {
+        None
+    };
+    let signature_file = if checks_summary && summary_file.is_some() {
+        delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
+    } else {
+        None
+    };
+    verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
+    let summary = delta::read_opened(
+        summary_file,
+        crate::summary::SUMMARY_FILE,
+        crate::summary::SUMMARY_READ_CAP,
+    )
+    .await?
+    .map(Arc::new);
+    if checks_summary {
+        let signature = delta::read_opened(
+            signature_file,
+            crate::summary::SUMMARY_SIG_FILE,
+            crate::summary::SUMMARY_READ_CAP,
+        )
+        .await?;
+        verification
+            .check_summary(summary.as_ref(), signature)
+            .await?;
+    }
+    Ok(summary)
 }
 
 /// Checks that the `ostree.ref-binding` of a commit names the ref that the pull

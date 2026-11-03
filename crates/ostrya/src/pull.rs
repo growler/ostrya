@@ -203,8 +203,8 @@
 //! [`Fetcher`]: crate::fetch::Fetcher
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use futures_lite::AsyncReadExt;
@@ -1806,23 +1806,7 @@ impl Repo {
     ///   resolve does not read as an absent ref, for example `ELOOP` or
     ///   `EACCES`, after the pull publishes the objects and before it writes a
     ///   ref.
-    pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
-        let checks = LocalChecks {
-            collection_binding: (opts.collection_id.is_some() && !opts.no_ref_writes)
-                .then_some(false),
-            ..LocalChecks::default()
-        };
-        self.pull_local_with(src, opts, checks).await
-    }
-
-    /// Pulls from the local repository `src` as [`Repo::pull_local`] does,
-    /// with the checks `checks`.
-    pub(crate) async fn pull_local_with(
-        &self,
-        src: &Repo,
-        mut opts: PullOptions,
-        checks: LocalChecks,
-    ) -> Result<PullStats> {
+    pub async fn pull_local(&self, src: &Repo, mut opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A local pull copies whole trees. The `ostree pull-local` command
         // takes no subpath either.
@@ -1838,22 +1822,52 @@ impl Repo {
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
         // fails here, before the walk of a chain.
-        let trust = match checks.trust {
-            Some(trust) => trust,
-            None => {
-                crate::verify::PullTrust::resolve(
-                    self,
-                    opts.remote.as_deref(),
-                    &opts.verify,
-                    opts.trust_group
-                        .as_deref()
-                        .map(crate::verify::trust::FieldGroup::new)
-                        .as_mut(),
-                    crate::verify::Defaults::Section,
-                )
-                .await?
-            }
-        };
+        let trust = crate::verify::PullTrust::resolve(
+            self,
+            opts.remote.as_deref(),
+            &opts.verify,
+            opts.trust_group
+                .as_deref()
+                .map(crate::verify::trust::FieldGroup::new)
+                .as_mut(),
+            crate::verify::Defaults::Section,
+        )
+        .await?;
+        self.pull_local_from(
+            src,
+            trust,
+            related,
+            opts,
+            LocalWanted::Named(collection_relpaths),
+            edges,
+            started,
+        )
+        .await
+    }
+
+    /// Pulls the refs `wanted` from the local repository `src` under `trust`,
+    /// as [`Repo::pull_local`] does.
+    ///
+    /// The caller made each check of `opts` that applies to its entry, and
+    /// took the list of static deltas out of `opts` as the index `edges`.
+    /// With [`LocalWanted::Pinned`], the refs of the pull are at the place of
+    /// the [`Pinned`]. With [`LocalWanted::Named`], they are at
+    /// [`RefPlace::of_collection`] of
+    /// [`collection_id`](PullOptions::collection_id) if it is set and
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) is `false`, and else at
+    /// the place that [`remote`](PullOptions::remote) names. `started` is the
+    /// start of [`PullStats::elapsed`].
+    #[allow(clippy::too_many_arguments)]
+    async fn pull_local_from(
+        &self,
+        src: &Repo,
+        trust: crate::verify::PullTrust,
+        related: RelatedRule,
+        opts: PullOptions,
+        wanted: LocalWanted<'_>,
+        edges: Option<chain::Edges>,
+        started: Instant,
+    ) -> Result<PullStats> {
         let verification = verify::Verification::from_trust(trust);
         // A pull that requires static deltas reads the source as a fetch
         // reads a remote: the summary, then the deltas that it advertises. A
@@ -1873,9 +1887,18 @@ impl Repo {
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
         let needs_summary = fetching && edges.is_none();
-        // The caller read the summary and checked it under the same trust, so
-        // the pull does not read or check it again.
-        let summary = match checks.summary {
+        // The probe of a collection pull read this summary and checked it
+        // under the trust of this pull, so the pull does not read or check it
+        // again. The pull takes the bytes, so they drop after the parse.
+        let probed = match &wanted {
+            LocalWanted::Pinned(pinned, _) => pinned
+                .summary
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+            LocalWanted::Named(_) => None,
+        };
+        let summary = match probed {
             Some(bytes) => Some(bytes),
             None => read_checked_local_summary(src, &verification, needs_summary).await?,
         };
@@ -1903,26 +1926,36 @@ impl Repo {
             None => None,
         };
 
-        let targets = match checks.targets {
-            Some(targets) => targets,
-            None => resolve_targets(src, &opts, collection_relpaths).await?,
+        let resolved;
+        let (targets, pinned, mut kept) = match wanted {
+            LocalWanted::Named(relpaths) => {
+                resolved = resolve_targets(src, &opts, relpaths).await?;
+                (resolved.as_slice(), None, KeptCommits::new())
+            }
+            LocalWanted::Pinned(pinned, kept) => (pinned.targets.as_slice(), Some(pinned), kept),
         };
         let flags = opts.flags;
         // A pull with the collection-binding check reads and writes the refs
         // of the collection. Each other local pull reads and writes the refs
-        // at the place that `remote` names.
-        let collection = match (checks.collection_binding, opts.collection_id.as_deref()) {
-            (Some(allow_unbound), Some(id)) => Some((id, allow_unbound)),
-            _ => None,
+        // at the place that `remote` names. `Repo::pull_local` makes the check
+        // with a collection id, unless it writes no ref.
+        let collection = match pinned {
+            Some(pinned) => Some((pinned.collection, pinned.allow_unbound)),
+            None => opts
+                .collection_id
+                .as_deref()
+                .filter(|_| !opts.no_ref_writes)
+                .map(|id| (id, false)),
         };
-        let place = match collection {
-            Some((id, _)) => RefPlace::of_collection(self, id),
-            None => RefPlace::of_remote(opts.remote.as_deref()),
+        let place = match (pinned, collection) {
+            (Some(pinned), _) => pinned.place,
+            (None, Some((id, _))) => RefPlace::of_collection(self, id),
+            (None, None) => RefPlace::of_remote(opts.remote.as_deref()),
         };
         // `Repo::pull_local` makes no timestamp check. A pull of collection
         // refs from a local candidate makes the check of the options. The
         // check reads a commit that it names one time, before discovery.
-        let timestamp = if checks.timestamp {
+        let timestamp = if pinned.is_some() {
             TimestampBase::resolve(self, &opts.timestamp_check).await?
         } else {
             TimestampBase::Off
@@ -1930,7 +1963,7 @@ impl Repo {
         let tip_checks = TipChecks {
             collection: collection.map(|(id, _)| id),
             allow_unbound: collection.is_some_and(|(_, allow_unbound)| allow_unbound),
-            listed: checks.listed.as_ref(),
+            listed: pinned.map(|pinned| &pinned.listed),
             ..TipChecks::new(flags, timestamp, place)
         };
 
@@ -1944,7 +1977,7 @@ impl Repo {
                 self,
                 &delta::DeltaSource::Local(src),
                 advert.as_ref(),
-                &targets,
+                targets,
                 &opts,
                 tip_checks,
                 edges,
@@ -2018,10 +2051,6 @@ impl Repo {
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
-        // The caller read the listed timestamp of a kept tip from the same
-        // bytes, so the check of the listed timestamp compares the commit
-        // with itself, and this loop does not make it.
-        let mut kept = checks.commits;
         // Under `UNTRUSTED`, the pull hashes each kept commit one time, before
         // it uses the bytes, also if several refs or a chain name the commit.
         // A commit object can be as large as `MAX_METADATA_SIZE`, so the hash
@@ -2041,7 +2070,10 @@ impl Repo {
             })
             .await?;
         }
-        for (ref_name, tip) in &targets {
+        for (ref_name, tip) in targets {
+            // The probe read the listed timestamp of a kept tip from the same
+            // bytes, so the check of the listed timestamp compares the commit
+            // with itself, and this loop does not make it.
             let (loaded, listed) = match kept.get(tip) {
                 Some(bytes) => (parse_kept_commit(*tip, Arc::clone(bytes)).await?, None),
                 None => (load_commit(src, tip).await?, tip_checks.listed),
@@ -2095,14 +2127,14 @@ impl Repo {
         let mut dependency_deltas = match deps.take() {
             Some(deps) if reads_deltas && !appended.is_empty() => {
                 let named = dependency::pair_targets(
-                    &targets,
+                    targets,
                     opts.depth,
                     &deps.parents,
                     deps.inner.naming(),
                     appended,
                 );
                 drop(deps);
-                let (lookups, known) = dependency::lookups(self, &targets, place, named).await?;
+                let (lookups, known) = dependency::lookups(self, targets, place, named).await?;
                 delta::discover_dependencies(
                     self,
                     &delta::DeltaSource::Local(src),
@@ -2256,7 +2288,7 @@ impl Repo {
             // commit and imports what no part produced. The pull takes or
             // parses the job of one target at a time, and drops it after its
             // parts. A target that a level made has its commit already.
-            for (_, tip) in &targets {
+            for (_, tip) in targets {
                 if done.contains(tip) || txn.is_staged(tip, ObjectType::Commit) {
                     continue;
                 }
@@ -2324,7 +2356,7 @@ impl Repo {
                     .await?;
             }
             if !opts.no_ref_writes {
-                for (ref_name, tip) in &targets {
+                for (ref_name, tip) in targets {
                     place.queue(&txn, ref_name, tip);
                 }
             }
@@ -2891,7 +2923,7 @@ async fn resolve_targets(
 /// `tip_commit` holds the bytes of the tip, the commit parsed from them, and
 /// the format check of its field 2. The walk parses a parent that is in
 /// `kept` from the kept bytes, and reads each other parent from `src`, as
-/// [`LocalChecks::commits`] states. If `check` is present, it runs on each
+/// [`LocalWanted::Pinned`] states. If `check` is present, it runs on each
 /// commit when the walk appends it, over the bytes that the walk read. The
 /// walk appends each commit with the root of its tree, so the plan of the tree
 /// does not read the commit object again.
@@ -3660,72 +3692,62 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
     Ok(None)
 }
 
-/// The checks and the inputs of a local pull that [`PullOptions`] does not
-/// state.
+/// The refs of a collection pull from one candidate, and the checks of their
+/// commits.
 ///
-/// [`Repo::pull_local`] sets `collection_binding` alone. A pull of collection
-/// refs from a local candidate sets each field. It sets `summary` only if
-/// its probe read the refs from the summary, and `commits` only if its probe
-/// read the refs from the ref files.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct LocalChecks {
-    /// The collection-binding check of each tip, against
-    /// [`collection_id`](PullOptions::collection_id).
-    ///
-    /// `Some(allow_unbound)` turns on the check, and `allow_unbound` lets a
-    /// tip with no `ostree.collection-binding` key pass. With the check, the
-    /// pull reads and writes the refs of the collection at
-    /// [`RefPlace::of_collection`]: [`RefPlace::Collection`], or
-    /// [`RefPlace::OwnCollection`] if the id is the `[core] collection-id` of
-    /// the destination. `None`, or a pull with no collection id, makes no
+/// The pull from a remote and the pull from a local candidate read it.
+struct Pinned<'a> {
+    /// Each ref name, and the commit that the pull selected for it.
+    targets: Vec<(String, Checksum)>,
+    /// The timestamp that the candidate listed for each ref of `targets`,
+    /// which the timestamp of its tip must equal.
+    listed: HashMap<String, u64>,
+    /// The collection id that the `ostree.collection-binding` of each tip
+    /// must state.
+    collection: &'a str,
+    /// `true` if a tip with no `ostree.collection-binding` key passes the
     /// collection-binding check.
-    pub(crate) collection_binding: Option<bool>,
-    /// The commit of each name of [`refs`](PullOptions::refs), in the same
-    /// order, as the caller read it from the source.
+    allow_unbound: bool,
+    /// The place of the written refs.
+    place: RefPlace<'a>,
+    /// The `summary` of the candidate, if the probe of the collection pull
+    /// read the refs from it. The probe checked it under the trust of this
+    /// pull, so the pull reads these bytes in place of the `summary` and the
+    /// `summary.sig` of the candidate, and does not check them again. The
+    /// pull takes them out before the parse.
+    summary: Mutex<Option<Arc<Vec<u8>>>>,
+}
+
+/// The bytes of the tip commits that the probe of a local candidate kept for
+/// the pull, by checksum.
+type KeptCommits = HashMap<Checksum, Arc<Vec<u8>>>;
+
+/// The refs of a local pull.
+enum LocalWanted<'a> {
+    /// The refs of [`refs`](PullOptions::refs), or each ref under
+    /// `refs/heads` of the source if the list is empty. The pull reads the
+    /// commit of each ref from the source. With a collection id, the value
+    /// holds the path of the collection ref of each name, in order, as
+    /// [`check_local_collection`] gives it.
+    Named(Option<Vec<String>>),
+    /// The refs of a collection pull from a local candidate, each at the
+    /// commit that the probe of the candidate selected, and the bytes of tip
+    /// commits that the probe kept.
     ///
-    /// With `Some`, the pull reads no ref of the source and pulls these
-    /// commits. `None` reads the commit of each ref from the source.
-    pub(crate) targets: Option<Vec<(String, Checksum)>>,
-    /// The trust that the caller resolved for the pull.
-    ///
-    /// With `Some`, the pull applies this trust, and does not read
-    /// [`remote`](PullOptions::remote),
-    /// [`verify`](PullOptions::verify), or
-    /// [`trust_group`](PullOptions::trust_group) for it. `None` resolves the
-    /// trust from these fields.
-    pub(crate) trust: Option<crate::verify::PullTrust>,
-    /// `true` if the pull makes the check of
-    /// [`timestamp_check`](PullOptions::timestamp_check), as [`Repo::pull`]
-    /// makes it. With `false`, the pull makes no timestamp check.
-    pub(crate) timestamp: bool,
-    /// The `summary` of the source, which the caller read and checked under
-    /// [`trust`](LocalChecks::trust).
-    ///
-    /// With `Some`, the pull reads no `summary` and no `summary.sig` of the
-    /// source, and does not check them again. It uses these bytes wherever
-    /// it needs the summary. `None` reads the files of the source.
-    pub(crate) summary: Option<Arc<Vec<u8>>>,
-    /// The timestamp that the caller read for each name of
-    /// [`refs`](PullOptions::refs), which the timestamp of its tip must
-    /// equal. `None` makes no such check.
-    pub(crate) listed: Option<HashMap<String, u64>>,
-    /// The bytes of tip commits of [`targets`](LocalChecks::targets) that the
-    /// caller read from the source, by checksum.
-    ///
-    /// The pull parses these bytes and does not read these tips from the
-    /// source. The walk of a chain also parses a parent from these bytes if
-    /// the map holds it. The caller read the listed timestamp of each such
-    /// tip from the same bytes, so the commit loop of the pull makes no check
-    /// of [`listed`](LocalChecks::listed) for it. Delta discovery still
-    /// checks each tip that a delta reaches against
-    /// [`listed`](LocalChecks::listed). With
-    /// [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull first checks that the
-    /// bytes of each commit hash to its checksum, one time for each commit.
-    /// The pull reads each tip that is not in the map from the source, and
-    /// makes each check for it. An empty map reads each tip from the source.
-    /// The pull drops the map after it walked each chain, before its
-    /// transaction opens.
-    pub(crate) commits: HashMap<Checksum, Arc<Vec<u8>>>,
+    /// The pull reads no ref of the source, and does not read
+    /// [`refs`](PullOptions::refs). It parses the kept bytes and does not
+    /// read these tips from the source. The walk of a chain also parses a
+    /// parent from these bytes if the map holds it. The probe read the
+    /// listed timestamp of each such tip from the same bytes, so the commit
+    /// loop of the pull makes no check of [`listed`](Pinned::listed) for it.
+    /// Delta discovery checks each tip that a delta reaches against
+    /// `listed`. With [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull first
+    /// checks that the bytes of each commit hash to its checksum, one time
+    /// for each commit. The pull reads each tip that is not in the map from
+    /// the source, and makes each check for it. An empty map reads each tip
+    /// from the source. The pull drops the map after it walked each chain,
+    /// before its transaction opens.
+    Pinned(&'a Pinned<'a>, KeptCommits),
 }
 
 /// Checks the collection options of a local pull.

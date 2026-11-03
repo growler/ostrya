@@ -63,7 +63,7 @@ use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, s
 use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
-    CheckedMeta, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
+    CheckedMeta, ModeChecks, Pinned, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
     READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
     check_tip_refs, refuse_remote_collection, take_static_deltas,
@@ -2545,28 +2545,6 @@ pub(super) enum Wanted<'a> {
     /// selected. The pull reads no ref of the remote, and does not read
     /// [`refs`](PullOptions::refs).
     Pinned(&'a Pinned<'a>),
-}
-
-/// The refs of a collection pull from one remote, and the checks of their
-/// commits.
-pub(super) struct Pinned<'a> {
-    /// Each ref name, and the commit that the pull selected for it.
-    pub(super) targets: Vec<(String, Checksum)>,
-    /// The timestamp that the remote listed for each ref of `targets`.
-    pub(super) listed: HashMap<String, u64>,
-    /// The collection id that the `ostree.collection-binding` of each tip
-    /// must state.
-    pub(super) collection: &'a str,
-    /// `true` if a tip with no `ostree.collection-binding` key passes the
-    /// collection-binding check.
-    pub(super) allow_unbound: bool,
-    /// The place of the written refs.
-    pub(super) place: RefPlace<'a>,
-    /// The `summary` of the remote, if the probe of the collection pull read
-    /// the refs from it. The probe checked it under the trust of this pull,
-    /// so the pull reads these bytes in place of the remote file. The pull
-    /// takes them out before the parse.
-    pub(super) summary: Mutex<Option<Arc<Vec<u8>>>>,
 }
 
 /// The state that every step of one pull shares.

@@ -48,13 +48,13 @@ use crate::verify::trust::FieldGroup;
 
 #[cfg(feature = "s3")]
 use super::http::s3_fetcher;
-use super::http::{Pinned, Wanted, connect, session_options};
+use super::http::{Wanted, connect, session_options};
 use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    LocalChecks, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth,
-    read_checked_local_summary, refuse_remote_collection,
+    KeptCommits, LocalWanted, Pinned, PullFlags, PullOptions, PullStats, PullVerify, RefPlace,
+    check_depth, read_checked_local_summary, refuse_remote_collection,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -304,10 +304,6 @@ struct Listed {
     commit: Checksum,
     timestamp: u64,
 }
-
-/// The bytes of the tip commits that the probe of a local candidate kept for
-/// the pull, by checksum.
-type KeptCommits = HashMap<Checksum, Arc<Vec<u8>>>;
 
 /// The largest total of commit bytes that the probe of one local candidate
 /// keeps for the pull. A probe under a summary policy keeps a summary of up
@@ -845,17 +841,17 @@ impl Repo {
                 overrides: EndpointOverrides::default(),
                 ..opts.clone()
             };
+            let pinned = Pinned {
+                targets,
+                listed,
+                collection: collection_id,
+                allow_unbound,
+                place,
+                summary: Mutex::new(summary),
+            };
             let pulled = match session {
                 Session::Remote(connection) => {
                     drop(commits);
-                    let pinned = Pinned {
-                        targets,
-                        listed,
-                        collection: collection_id,
-                        allow_unbound,
-                        place,
-                        summary: Mutex::new(summary),
-                    };
                     self.run_session(
                         connection,
                         candidate.trust,
@@ -874,16 +870,7 @@ impl Repo {
                 // tip from the commit, and the pull parses the bytes that the
                 // probe kept.
                 Session::Local(src) => {
-                    let checks = LocalChecks {
-                        collection_binding: Some(allow_unbound),
-                        targets: Some(targets),
-                        trust: Some(candidate.trust),
-                        timestamp: true,
-                        summary,
-                        listed: Some(listed),
-                        commits,
-                    };
-                    self.pull_local_candidate(&src, collection_id, run, checks)
+                    self.pull_local_candidate(&src, candidate.trust, related, run, &pinned, commits)
                         .await
                 }
             };
@@ -1142,41 +1129,44 @@ impl Repo {
         Ok(refs)
     }
 
-    /// Pulls the selected refs of a local candidate of
+    /// Pulls the selected refs `pinned` of a local candidate of
     /// [`Repo::pull_collection`] from the repository `src` that its probe
-    /// opened, with the options `run` and the checks `checks` of the
-    /// candidate.
+    /// opened, under the trust `trust` of the candidate, with the rule
+    /// `related` and the options `run`. `commits` holds the bytes of the tip
+    /// commits that the probe kept.
     ///
-    /// The call sets [`collection_id`](PullOptions::collection_id) of `run`
-    /// to `collection_id`. If the trust in `checks` checks the signatures of
-    /// the commits or of the summary, the call adds
-    /// [`UNTRUSTED`](PullFlags::UNTRUSTED) to the flags. A signature covers
-    /// the commit or the checksum of the summary alone, and the hash of each
-    /// imported object against its name carries the proof to the objects of
-    /// the tree. The hash also applies to the commit bytes that the probe
-    /// kept in [`commits`](LocalChecks::commits).
+    /// If `trust` checks the signatures of the commits or of the summary, the
+    /// call adds [`UNTRUSTED`](PullFlags::UNTRUSTED) to the flags. A
+    /// signature covers the commit or the checksum of the summary alone, and
+    /// the hash of each imported object against its name carries the proof
+    /// to the objects of the tree. The hash also applies to the commit bytes
+    /// in `commits`.
     async fn pull_local_candidate(
         &self,
         src: &Repo,
-        collection_id: &str,
+        trust: PullTrust,
+        related: RelatedRule,
         run: PullOptions,
-        checks: LocalChecks,
+        pinned: &Pinned<'_>,
+        commits: KeptCommits,
     ) -> Result<PullStats> {
-        let flags = if checks
-            .trust
-            .as_ref()
-            .is_some_and(PullTrust::checks_signatures)
-        {
+        let started = Instant::now();
+        let flags = if trust.checks_signatures() {
             run.flags | PullFlags::UNTRUSTED
         } else {
             run.flags
         };
-        let run = PullOptions {
-            collection_id: Some(collection_id.to_owned()),
-            flags,
-            ..run
-        };
-        self.pull_local_with(src, run, checks).await
+        let run = PullOptions { flags, ..run };
+        self.pull_local_from(
+            src,
+            trust,
+            related,
+            run,
+            LocalWanted::Pinned(pinned, commits),
+            None,
+            started,
+        )
+        .await
     }
 }
 
@@ -2445,21 +2435,20 @@ mod tests {
             depth,
             ..PullOptions::default()
         };
-        let checks = LocalChecks {
-            collection_binding: Some(true),
-            targets: Some(listed.iter().map(|l| (l.name.clone(), l.commit)).collect()),
-            trust: Some(trust),
-            timestamp: true,
-            summary,
-            listed: Some(
-                listed
-                    .iter()
-                    .map(|l| (l.name.clone(), l.timestamp))
-                    .collect(),
-            ),
-            commits,
+        let pinned = Pinned {
+            targets: listed.iter().map(|l| (l.name.clone(), l.commit)).collect(),
+            listed: listed
+                .iter()
+                .map(|l| (l.name.clone(), l.timestamp))
+                .collect(),
+            collection: LOCAL_ID,
+            allow_unbound: true,
+            place: RefPlace::of_collection(dst, LOCAL_ID),
+            summary: Mutex::new(summary),
         };
-        dst.pull_local_candidate(src, LOCAL_ID, run, checks).await
+        let related = RelatedRule::of(dst.config()).unwrap();
+        dst.pull_local_candidate(src, trust, related, run, &pinned, commits)
+            .await
     }
 
     /// Without a summary policy, the probe of a local candidate keeps the
@@ -2554,6 +2543,66 @@ mod tests {
         });
     }
 
+    /// Under a summary policy, the pull of a local candidate parses the
+    /// summary that the probe read and checked, and reads no `summary` and no
+    /// `summary.sig` of the source. So a pull that requires static deltas
+    /// applies the delta that the summary of the probe advertises, also when
+    /// the source holds neither file at the pull.
+    #[test]
+    fn a_local_candidate_uses_the_summary_of_its_probe() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let tip = local_commit(&src, &["os/a"], None, 1_700_000_001, b"one").await;
+            src.generate_static_delta(None, &tip, &crate::DeltaOptions::default())
+                .await
+                .unwrap();
+            src.regenerate_summary(&crate::SummaryOptions::default())
+                .await
+                .unwrap();
+            src.sign_summary(&ed25519_signer()).await.unwrap();
+            let trust = PullTrust::unverified().with_summary(ed25519_keys());
+            let verification = Verification::from_trust(trust.clone());
+            let (listed, summary, commits) =
+                probe_local(&src, &verification, LOCAL_ID, &["os/a"], KEPT_COMMITS_CAP)
+                    .await
+                    .unwrap();
+            assert!(summary.is_some());
+            for name in ["summary", "summary.sig"] {
+                std::fs::remove_file(scratch.root.join("src").join(name)).unwrap();
+            }
+
+            let dst = scratch.create("dst").await;
+            let run = PullOptions {
+                refs: vec!["os/a".to_owned()],
+                require_static_deltas: true,
+                ..PullOptions::default()
+            };
+            let pinned = Pinned {
+                targets: listed.iter().map(|l| (l.name.clone(), l.commit)).collect(),
+                listed: listed
+                    .iter()
+                    .map(|l| (l.name.clone(), l.timestamp))
+                    .collect(),
+                collection: LOCAL_ID,
+                allow_unbound: true,
+                place: RefPlace::of_collection(&dst, LOCAL_ID),
+                summary: Mutex::new(summary),
+            };
+            let related = RelatedRule::of(dst.config()).unwrap();
+            let stats = dst
+                .pull_local_candidate(&src, trust, related, run, &pinned, commits)
+                .await
+                .unwrap();
+            assert!(stats.delta_parts > 0, "{stats:?}");
+            let cref = crate::CollectionRef::new(LOCAL_ID, "os/a");
+            assert_eq!(
+                dst.resolve_collection_ref(&cref, false).await.unwrap(),
+                Some(tip)
+            );
+        });
+    }
+
     /// With depth 1, the walk of a chain parses a kept tip that is the parent
     /// of another selected tip from the kept bytes. So the probe and the pull
     /// read each tip commit from the source one time, in each order of the
@@ -2616,16 +2665,27 @@ mod tests {
                 flags: PullFlags::UNTRUSTED,
                 ..PullOptions::default()
             };
-            let checks = LocalChecks {
-                collection_binding: Some(true),
-                targets: Some(vec![("os/a".to_owned(), one)]),
-                trust: Some(PullTrust::unverified()),
-                timestamp: true,
-                summary: None,
-                listed: Some([("os/a".to_owned(), 1_700_000_001)].into()),
-                commits: [(one, Arc::new(other))].into(),
+            let pinned = Pinned {
+                targets: vec![("os/a".to_owned(), one)],
+                listed: [("os/a".to_owned(), 1_700_000_001)].into(),
+                collection: LOCAL_ID,
+                allow_unbound: true,
+                place: RefPlace::of_collection(&dst, LOCAL_ID),
+                summary: Mutex::new(None),
             };
-            match dst.pull_local_candidate(&src, LOCAL_ID, run, checks).await {
+            let related = RelatedRule::of(dst.config()).unwrap();
+            let commits = [(one, Arc::new(other))].into();
+            let pulled = dst
+                .pull_local_candidate(
+                    &src,
+                    PullTrust::unverified(),
+                    related,
+                    run,
+                    &pinned,
+                    commits,
+                )
+                .await;
+            match pulled {
                 Err(Error::ChecksumMismatch { expected, actual }) => {
                     assert_eq!((expected, actual), (one, two));
                 }

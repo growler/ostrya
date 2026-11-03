@@ -1914,6 +1914,58 @@ fn the_keys_of_a_file_remote_apply() {
     });
 }
 
+/// With `require_static_deltas`, the pull from a `file://` remote applies
+/// the static delta that the summary of the source advertises. Under a
+/// summary policy, the probe reads the refs from the verified summary, and
+/// the pull takes the commit that the summary lists, also when the ref file
+/// names a newer commit. Without the policy, the probe reads the ref file,
+/// and the pull reads the summary for the delta.
+#[test]
+fn a_file_remote_with_require_static_deltas_applies_the_delta() {
+    block_on(async {
+        for case in ["summary policy", "ref files"] {
+            let dir = TmpDir::new("pull-collection-file-delta");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a1", None, REF, FIXED_TS, BOUND).await;
+            a.generate_static_delta(None, &tip, &DeltaOptions::default())
+                .await
+                .unwrap();
+            summarize(&a).await;
+            let policy = if case == "summary policy" {
+                let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+                a.sign_summary(&signer).await.unwrap();
+                commit(&a, dir.path(), "a2", None, REF, FIXED_TS + 10, BOUND).await;
+                format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n")
+            } else {
+                String::new()
+            };
+            let dest = dest(
+                dir.path(),
+                None,
+                &[("a", &file_url(dir.path(), "a"), &policy)],
+            )
+            .await;
+
+            let (mut opts, events) = options(&[REF]);
+            opts.pull.require_static_deltas = true;
+            let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+            assert!(events.lock().unwrap().is_empty(), "{case}");
+            assert_eq!(pulled.refs[0].commit, tip, "{case}");
+            assert!(pulled.stats.delta_parts > 0, "{case}: {:?}", pulled.stats);
+            assert_eq!(mirror(&dest, REF).await, Some(tip), "{case}");
+            assert!(
+                dest.has_object(ObjectType::Commit, &tip).await.unwrap(),
+                "{case}"
+            );
+            assert!(
+                dest.fsck(&FsckOptions::default()).await.unwrap().is_ok(),
+                "{case}"
+            );
+        }
+    });
+}
+
 /// Writes the bytes of the second regular content object of `commit` in
 /// `repo` at `dir/a` under the name of the first, in the order of the
 /// checksums. Returns the checksum of the first.

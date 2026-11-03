@@ -2032,6 +2032,53 @@ fn a_ref_binding_that_omits_the_pulled_ref_is_rejected() {
     });
 }
 
+/// A pull of two refs that name one commit checks the ref binding of each
+/// ref. The binding of the commit lists `main` alone, so the pull of `main`
+/// and `other` fails on `other` and imports no commit. With the check off,
+/// the pull writes both refs.
+#[test]
+fn each_ref_that_names_one_commit_gets_the_ref_binding_check() {
+    let tmp = TmpDir::new("pull-binding-shared");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.set_ref_immediate("other", Some(&c2)).await.unwrap();
+        let refs = vec!["main".to_owned(), "other".to_owned()];
+
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: refs.clone(),
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Pull(_)), "{err}");
+        assert!(err.to_string().contains("other"), "{err}");
+        assert!(
+            !dst.has_object(ostrya::ObjectType::Commit, &c2)
+                .await
+                .unwrap()
+        );
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs,
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(c2));
+        assert_eq!(dst.resolve_rev("other", false).await.unwrap(), Some(c2));
+    });
+}
+
 #[test]
 fn a_commit_with_no_binding_key_is_accepted() {
     let tmp = TmpDir::new("pull-no-binding");

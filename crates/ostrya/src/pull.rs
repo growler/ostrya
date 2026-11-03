@@ -204,7 +204,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::AsyncReadExt;
@@ -1887,21 +1887,7 @@ impl Repo {
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
         let needs_summary = fetching && edges.is_none();
-        // The probe of a collection pull read this summary and checked it
-        // under the trust of this pull, so the pull does not read or check it
-        // again. The pull takes the bytes, so they drop after the parse.
-        let probed = match &wanted {
-            LocalWanted::Pinned(pinned, _) => pinned
-                .summary
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take(),
-            LocalWanted::Named(_) => None,
-        };
-        let summary = match probed {
-            Some(bytes) => Some(bytes),
-            None => read_checked_local_summary(src, &verification, needs_summary).await?,
-        };
+        let summary = read_checked_local_summary(src, &verification, needs_summary).await?;
         if needs_summary && summary.is_none() {
             return Err(delta::no_summary_error());
         }
@@ -1927,12 +1913,12 @@ impl Repo {
         };
 
         let resolved;
-        let (targets, pinned, mut kept) = match wanted {
+        let (targets, pinned) = match wanted {
             LocalWanted::Named(relpaths) => {
                 resolved = resolve_targets(src, &opts, relpaths).await?;
-                (resolved.as_slice(), None, KeptCommits::new())
+                (resolved.as_slice(), None)
             }
-            LocalWanted::Pinned(pinned, kept) => (pinned.targets.as_slice(), Some(pinned), kept),
+            LocalWanted::Pinned(pinned) => (pinned.targets.as_slice(), Some(pinned)),
         };
         let flags = opts.flags;
         // A pull with the collection-binding check reads and writes the refs
@@ -2051,47 +2037,29 @@ impl Repo {
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
-        // Under `UNTRUSTED`, the pull hashes each kept commit one time, before
-        // it uses the bytes, also if several refs or a chain name the commit.
-        // A commit object can be as large as `MAX_METADATA_SIZE`, so the hash
-        // runs on the blocking pool.
-        if flags.contains(PullFlags::UNTRUSTED) && !kept.is_empty() {
-            kept = ostrya_rt::unblock(move || {
-                for (checksum, bytes) in &kept {
-                    let actual = Checksum::sha256(bytes);
-                    if actual != *checksum {
-                        return Err(Error::ChecksumMismatch {
-                            expected: *checksum,
-                            actual,
-                        });
-                    }
-                }
-                Ok(kept)
-            })
-            .await?;
-        }
+        // The refs of each tip, in the order of the first ref that names the
+        // tip. The loop reads each tip one time, and makes the checks of each
+        // ref that names it.
+        let mut tips: Vec<(Checksum, Vec<&str>)> = Vec::new();
+        let mut slots: HashMap<Checksum, usize> = HashMap::new();
         for (ref_name, tip) in targets {
-            // The probe read the listed timestamp of a kept tip from the same
-            // bytes, so the check of the listed timestamp compares the commit
-            // with itself, and this loop does not make it.
-            let (loaded, listed) = match kept.get(tip) {
-                Some(bytes) => (parse_kept_commit(*tip, Arc::clone(bytes)).await?, None),
-                None => (load_commit(src, tip).await?, tip_checks.listed),
-            };
+            let slot = *slots.entry(*tip).or_insert_with(|| {
+                tips.push((*tip, Vec::new()));
+                tips.len() - 1
+            });
+            tips[slot].1.push(ref_name.as_str());
+        }
+        for (tip, refs) in &tips {
+            let loaded = load_commit(src, tip).await?;
             // Discovery made the binding checks of each ref that names a
             // commit of a chain.
             if !deltas.checked(tip) {
-                let tip_checks = TipChecks {
-                    listed,
-                    ..tip_checks
-                };
-                check_tip_refs(self, tip_checks, tip, &loaded.commit, &[ref_name.as_str()]).await?;
+                check_tip_refs(self, tip_checks, tip, &loaded.commit, refs).await?;
             }
             collect_chain(
                 src,
                 *tip,
                 loaded,
-                &kept,
                 opts.depth,
                 &mut commits,
                 &mut seen,
@@ -2100,8 +2068,6 @@ impl Repo {
             )
             .await?;
         }
-        // The kept bytes drop here, before the transaction opens.
-        drop(kept);
         if let Some(deps) = deps.as_mut() {
             // The run of the levels imports the intermediate commits of the
             // chains, so the walk reads none of them again.
@@ -2921,12 +2887,11 @@ async fn resolve_targets(
 /// the first time that it gets to it, and not again.
 ///
 /// `tip_commit` holds the bytes of the tip, the commit parsed from them, and
-/// the format check of its field 2. The walk parses a parent that is in
-/// `kept` from the kept bytes, and reads each other parent from `src`, as
-/// [`LocalWanted::Pinned`] states. If `check` is present, it runs on each
-/// commit when the walk appends it, over the bytes that the walk read. The
-/// walk appends each commit with the root of its tree, so the plan of the tree
-/// does not read the commit object again.
+/// the format check of its field 2. The walk reads each parent from `src`.
+/// If `check` is present, it runs on each commit when the walk appends it,
+/// over the bytes that the walk read. The walk appends each commit with the
+/// root of its tree, so the plan of the tree does not read the commit object
+/// again.
 ///
 /// The walk takes the format check of field 2 of each commit when it appends
 /// the commit, also if `deps` is `None`. If `deps` is present, the walk
@@ -2943,7 +2908,6 @@ async fn collect_chain(
     src: &Repo,
     tip: Checksum,
     tip_commit: LoadedCommit,
-    kept: &HashMap<Checksum, Arc<Vec<u8>>>,
     depth: i32,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
@@ -2995,11 +2959,9 @@ async fn collect_chain(
         let Some(parent) = commit.parent else {
             return Ok(());
         };
-        let parent_commit = match kept.get(&parent) {
-            Some(bytes) => Some(parse_kept_commit(parent, Arc::clone(bytes)).await?),
-            None => try_load_commit(src, &parent).await?,
-        };
-        current = parent_commit.map(|parent_commit| (parent, parent_commit));
+        current = try_load_commit(src, &parent)
+            .await?
+            .map(|parent_commit| (parent, parent_commit));
         if remaining > 0 {
             remaining -= 1;
         }
@@ -3566,21 +3528,6 @@ async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<LoadedCommit> {
     .await
 }
 
-/// Parses the bytes `bytes` of the tip commit `checksum`, which the probe of
-/// a local candidate of a collection pull kept, as [`load_commit`] parses the
-/// bytes that it reads.
-///
-/// The call does not hash `bytes`. A commit object can be as large as
-/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), so the parse runs on the
-/// blocking pool.
-///
-/// # Errors
-///
-/// The errors of [`parse_loaded`].
-async fn parse_kept_commit(checksum: Checksum, bytes: Arc<Vec<u8>>) -> Result<LoadedCommit> {
-    ostrya_rt::unblock(move || parse_loaded(checksum, bytes)).await
-}
-
 /// Loads a commit, or returns `None` for an absent object.
 async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<LoadedCommit>> {
     match load_commit(repo, checksum).await {
@@ -3710,17 +3657,14 @@ struct Pinned<'a> {
     allow_unbound: bool,
     /// The place of the written refs.
     place: RefPlace<'a>,
-    /// The `summary` of the candidate, if the probe of the collection pull
-    /// read the refs from it. The probe checked it under the trust of this
-    /// pull, so the pull reads these bytes in place of the `summary` and the
-    /// `summary.sig` of the candidate, and does not check them again. The
-    /// pull takes them out before the parse.
+    /// The `summary` of a remote candidate, if the probe read the refs from
+    /// it. The probe checked it under the trust of this pull, so the pull
+    /// from the remote reads these bytes in place of the `summary` and the
+    /// `summary.sig`, and does not check them again. The pull takes them out
+    /// before the parse. `None` for a local candidate: its pull reads and
+    /// checks the summary of the source again.
     summary: Mutex<Option<Arc<Vec<u8>>>>,
 }
-
-/// The bytes of the tip commits that the probe of a local candidate kept for
-/// the pull, by checksum.
-type KeptCommits = HashMap<Checksum, Arc<Vec<u8>>>;
 
 /// The refs of a local pull.
 enum LocalWanted<'a> {
@@ -3731,23 +3675,13 @@ enum LocalWanted<'a> {
     /// [`check_local_collection`] gives it.
     Named(Option<Vec<String>>),
     /// The refs of a collection pull from a local candidate, each at the
-    /// commit that the probe of the candidate selected, and the bytes of tip
-    /// commits that the probe kept.
+    /// commit that the probe of the candidate selected.
     ///
     /// The pull reads no ref of the source, and does not read
-    /// [`refs`](PullOptions::refs). It parses the kept bytes and does not
-    /// read these tips from the source. The walk of a chain also parses a
-    /// parent from these bytes if the map holds it. The probe read the
-    /// listed timestamp of each such tip from the same bytes, so the commit
-    /// loop of the pull makes no check of [`listed`](Pinned::listed) for it.
-    /// Delta discovery checks each tip that a delta reaches against
-    /// `listed`. With [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull first
-    /// checks that the bytes of each commit hash to its checksum, one time
-    /// for each commit. The pull reads each tip that is not in the map from
-    /// the source, and makes each check for it. An empty map reads each tip
-    /// from the source. The pull drops the map after it walked each chain,
-    /// before its transaction opens.
-    Pinned(&'a Pinned<'a>, KeptCommits),
+    /// [`refs`](PullOptions::refs). It reads each tip commit from the source,
+    /// and checks it against [`listed`](Pinned::listed), as the pull from a
+    /// remote does. It does not read [`summary`](Pinned::summary).
+    Pinned(&'a Pinned<'a>),
 }
 
 /// Checks the collection options of a local pull.

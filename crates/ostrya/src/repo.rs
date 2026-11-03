@@ -134,10 +134,6 @@ struct RepoInner {
     // The anonymous read access of the implicit client groups. The first
     // use builds it from `config`, and all clones of this handle share it.
     implicit_reads: OnceLock<ReadAccess>,
-    // How many times the handle read a commit object, for the tests of the
-    // reads of a pull.
-    #[cfg(test)]
-    commit_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl RepoInner {
@@ -647,23 +643,6 @@ impl Repo {
         self.inner.objects_fd.as_fd()
     }
 
-    /// Counts one read of a commit object through this handle or a clone.
-    #[cfg(test)]
-    pub(crate) fn count_commit_read(&self) {
-        self.inner
-            .commit_reads
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Returns how many times this handle and its clones read a commit
-    /// object.
-    #[cfg(test)]
-    pub(crate) fn commit_reads(&self) -> usize {
-        self.inner
-            .commit_reads
-            .load(std::sync::atomic::Ordering::Relaxed)
-    }
-
     /// Parses the config bytes and assembles the handle. This step is CPU work
     /// only. `path` is the argument that the caller gave the constructor,
     /// stored as given for [`Repo::path`].
@@ -679,8 +658,6 @@ impl Repo {
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
                 implicit_reads: OnceLock::new(),
-                #[cfg(test)]
-                commit_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }

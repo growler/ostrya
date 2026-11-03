@@ -116,10 +116,6 @@ impl Repo {
         ty: ObjectType,
         checksum: &Checksum,
     ) -> Result<Vec<u8>> {
-        #[cfg(test)]
-        if ty == ObjectType::Commit {
-            self.count_commit_read();
-        }
         let path = loose_path(checksum, ty, self.mode());
         match object::read_meta_object_with(
             self.objects_fd(),

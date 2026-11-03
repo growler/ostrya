@@ -3,13 +3,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ostrya_core::{Checksum, RepoMode, is_collection_id, is_ref_name};
+use ostrya_core::{Checksum, RepoMode, is_ref_name};
 
 use super::BucketRepo;
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
-use crate::refs::MAX_COLLECTION_ID_LEN;
+use crate::refs::is_valid_collection_id;
 use crate::remote::s3::Object;
 use crate::repo::MAX_CONFIG_SIZE;
 
@@ -111,7 +111,7 @@ impl BucketRepo {
             )));
         }
         if let Some(id) = config.collection_id()
-            && !is_namespace_id(id)
+            && !is_valid_collection_id(id)
         {
             return Err(self.malformed(format!(
                 "its config states the collection id '{}', which the collection id rule refuses",
@@ -356,12 +356,6 @@ impl BucketRepo {
     }
 }
 
-/// Returns `true` if `id` can name a namespace of a bucket repository: it
-/// passes the collection id rule and is at most 255 bytes.
-pub(crate) fn is_namespace_id(id: &str) -> bool {
-    id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id)
-}
-
 /// Returns the ref that the key `key` names, or `None` for a key that is no
 /// ref key.
 pub(super) fn ref_key(key: &str) -> Option<RefKey<'_>> {
@@ -369,7 +363,7 @@ pub(super) fn ref_key(key: &str) -> Option<RefKey<'_>> {
         return is_ref_name(name).then_some(RefKey::Head(name));
     }
     let (id, name) = key.strip_prefix("refs/mirrors/")?.split_once('/')?;
-    (is_namespace_id(id) && is_ref_name(name)).then_some(RefKey::Mirror(id, name))
+    (is_valid_collection_id(id) && is_ref_name(name)).then_some(RefKey::Mirror(id, name))
 }
 
 /// Returns the key of the partial-commit marker of `commit`.
@@ -575,14 +569,5 @@ mod tests {
         );
         assert_eq!(collections.len(), 1);
         assert_eq!(collections["org.example.B"], [("main".to_owned(), csum(1))]);
-    }
-
-    #[test]
-    fn a_namespace_id_passes_the_collection_id_rule_and_the_length() {
-        assert!(is_namespace_id("org.example.Os"));
-        assert!(is_namespace_id(&format!("org.{}", "a".repeat(251))));
-        assert!(!is_namespace_id(&format!("org.{}", "a".repeat(252))));
-        assert!(!is_namespace_id("nodot"));
-        assert!(!is_namespace_id(""));
     }
 }

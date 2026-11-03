@@ -595,9 +595,9 @@ impl WeakRef {
 /// - A ref in `refs/remotes` is [`RefLocation::Remote`] on the same
 ///   condition. Its listed name is its `<remote>:<name>` refspec.
 /// - A ref in `refs/mirrors` is [`RefLocation::Collection`] if the part of
-///   its path before the first `/` is a valid collection id of at most
-///   [`MAX_COLLECTION_ID_LEN`](crate::refs::MAX_COLLECTION_ID_LEN) bytes and
-///   the rest is a valid ref name. The listing gives a mirror ref no
+///   its path before the first `/` is a collection id that the ref store
+///   takes ([`is_valid_collection_id`](crate::refs::is_valid_collection_id))
+///   and the rest is a valid ref name. The listing gives a mirror ref no
 ///   addressability, so the call does not read it.
 fn ref_location(space: RefSpace, name: &str, addressable: bool) -> Option<RefLocation<'_>> {
     match space {
@@ -608,8 +608,7 @@ fn ref_location(space: RefSpace, name: &str, addressable: bool) -> Option<RefLoc
         }
         RefSpace::Mirrors => {
             let (collection_id, name) = name.split_once('/')?;
-            let valid = collection_id.len() <= crate::refs::MAX_COLLECTION_ID_LEN
-                && ostrya_core::is_collection_id(collection_id)
+            let valid = crate::refs::is_valid_collection_id(collection_id)
                 && ostrya_core::is_ref_name(name);
             valid.then_some(RefLocation::Collection {
                 collection_id,

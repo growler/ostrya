@@ -498,7 +498,7 @@ impl BucketRepo {
         break_lock: bool,
     ) -> Result<Option<LockHolder>> {
         if let Some(id) = collection_id
-            && !state::is_namespace_id(id)
+            && !crate::refs::is_valid_collection_id(id)
         {
             return Err(crate::Error::InvalidInput(format!(
                 "the collection id '{}' of a bucket repository fails the collection id rule or \

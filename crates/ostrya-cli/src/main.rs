@@ -11130,12 +11130,12 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// With `-c`, the prefixes are collection ids. The id that is equal to the
 /// `collection-id` of the repository removes only the refs under
 /// `refs/heads`. The mirror refs with that id stay. The command checks each
-/// selected ref that it removes before it removes a ref. A ref under
-/// `refs/heads` must pass the refspec rule. A mirror ref must have an id that
-/// passes the collection-id rule and is at most 255 bytes, and a name that
-/// passes the ref-name rule. If the ref store refuses one selected ref by its
-/// id or its name, the command fails with [`Error::InvalidRefspec`] and
-/// removes no ref.
+/// selected ref that it removes with [`CollectionRef::validate`] before it
+/// removes the first ref. A ref under `refs/heads` is a `CollectionRef` with
+/// no id and takes the ref-name rule, so a name with `:` fails. A mirror ref
+/// takes the collection-id rule and the ref-name rule. If one selected ref
+/// fails, the command fails with [`Error::InvalidRefspec`] and removes no
+/// ref.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -11146,39 +11146,29 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // id stay. A foreign id removes the mirror refs that it names.
         let own = repo.config().collection_id().map(str::to_owned);
         let selected = select_collection_refs(repo, &args.prefix).await?;
-        // A selected ref that the ref store refuses stops the command before
-        // it removes any ref. The check applies the rule of the call that
-        // removes the ref, and skips the mirror refs that stay. A ref under
-        // `refs/heads` takes the refspec rule. A mirror ref takes the
-        // collection-id rule and the ref-name rule. A ref name holds no `:`,
-        // so a name with no `:` that passes the refspec rule is a ref name.
-        if let Some(refused) = selected.iter().find_map(|entry| {
-            if entry.local {
-                validate_refspec(&entry.name).err()
-            } else if own.as_deref() == Some(entry.collection.as_str()) {
-                None
-            } else if entry.collection.len() > 255
-                || !ostrya::is_collection_id(&entry.collection)
-                || entry.name.contains(':')
-                || validate_refspec(&entry.name).is_err()
-            {
-                Some(Error::InvalidRefspec(format!(
-                    "{}:{}",
-                    entry.collection, entry.name
-                )))
-            } else {
-                None
-            }
-        }) {
-            return Err(refused);
+        // The refs to remove. The mirror refs of the own id stay, so they are
+        // not in the list. A ref under `refs/heads` has no id.
+        let removed: Vec<CollectionRef> = selected
+            .into_iter()
+            .filter_map(|entry| {
+                if entry.local {
+                    Some(CollectionRef::local(entry.name))
+                } else if own.as_deref() == Some(entry.collection.as_str()) {
+                    None
+                } else {
+                    Some(CollectionRef::new(entry.collection, entry.name))
+                }
+            })
+            .collect();
+        // Each ref to remove passes the rule of the ref store before the
+        // first removal. A ref under `refs/heads` takes the ref-name rule, so
+        // a name with `:` fails. A mirror ref takes the collection-id rule
+        // and the ref-name rule.
+        for cref in &removed {
+            cref.validate()?;
         }
-        for entry in selected {
-            if entry.local {
-                repo.set_ref_immediate(&entry.name, None).await?;
-            } else if own.as_deref() != Some(entry.collection.as_str()) {
-                let cref = CollectionRef::new(entry.collection, entry.name);
-                repo.set_collection_ref_immediate(&cref, None).await?;
-            }
+        for cref in &removed {
+            repo.set_collection_ref_immediate(cref, None).await?;
         }
         return Ok(());
     }

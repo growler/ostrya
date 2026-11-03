@@ -12475,6 +12475,53 @@ fn refs_delete_collection_refuses_an_invalid_name_before_it_removes_a_ref() {
     }
 }
 
+/// `refs -c --delete` with the own id checks each selected ref under
+/// `refs/heads` by the ref-name rule before it removes a ref. A file
+/// `refs/heads/origin:main` has a name with `:`, so the command stops, and no
+/// ref is removed. The ref `refs/remotes/origin/main`, which the id does not
+/// select, also stays.
+#[test]
+fn refs_delete_collection_refuses_a_local_name_with_a_colon() {
+    let tmp = TmpDir::new("refs-delete-coll-local-colon");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = base.join("own-coll");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Coll",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let head = commit_tree(&repo, "keep", &base.join("src"), None);
+    write_ref_file(&repo, "heads/origin:main", &head);
+    write_ref_file(&repo, "remotes/origin/main", &head);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &["refs", &repo_arg, "-c", "--delete", "org.example.Coll"],
+        None,
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "the port exited 0: {stderr}");
+    assert!(
+        stderr.contains("error: Invalid refspec origin:main"),
+        "the port gave: {stderr}"
+    );
+    for path in [
+        "refs/heads/keep",
+        "refs/heads/origin:main",
+        "refs/remotes/origin/main",
+    ] {
+        assert!(repo.join(path).exists(), "the port removed {path}");
+    }
+}
+
 #[test]
 fn refs_create_ancestry_suffix_matches_the_tool() {
     if !ostree_available() {

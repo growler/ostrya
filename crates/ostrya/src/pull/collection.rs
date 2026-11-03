@@ -26,12 +26,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ostrya_core::{Checksum, Commit, ObjectType, RefSelector, Value, is_collection_id};
+use ostrya_core::{Checksum, Commit, ObjectType, RefSelector, Value};
 
 use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
-use crate::refs::{MAX_COLLECTION_ID_LEN, check_ref_path};
+use crate::refs::{check_ref_path, is_valid_collection_id};
 use crate::related::RelatedRule;
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
 #[cfg(feature = "s3")]
@@ -595,7 +595,8 @@ impl Repo {
     /// no object and no ref:
     ///
     /// - [`Error::InvalidInput`] if `collection_id` fails the collection-id
-    ///   rule ([`is_collection_id`]) or is longer than 255 bytes.
+    ///   rule ([`is_collection_id`](crate::is_collection_id)) or is longer than
+    ///   255 bytes.
     /// - [`Error::InvalidInput`] if `remotes` is empty.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
@@ -982,7 +983,8 @@ impl Repo {
     /// These errors come before the first request:
     ///
     /// - [`Error::InvalidInput`] if `collection_id` fails the collection-id
-    ///   rule ([`is_collection_id`]) or is longer than 255 bytes.
+    ///   rule ([`is_collection_id`](crate::is_collection_id)) or is longer than
+    ///   255 bytes.
     /// - [`Error::InvalidRefspec`] if a name in `names` is not a valid ref
     ///   name.
     /// - [`Error::InvalidInput`] if a name in `names` does not fit in a ref
@@ -1239,11 +1241,10 @@ fn check_collection_pull(
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidInput`] if `collection_id` fails the collection-id rule
-///   ([`is_collection_id`]) or is longer than [`MAX_COLLECTION_ID_LEN`]
-///   bytes.
+/// - [`Error::InvalidInput`] if `collection_id` fails
+///   [`is_valid_collection_id`]: the collection-id rule or the length limit.
 fn check_collection_id(collection_id: &str) -> Result<()> {
-    if !is_collection_id(collection_id) || collection_id.len() > MAX_COLLECTION_ID_LEN {
+    if !is_valid_collection_id(collection_id) {
         return Err(Error::InvalidInput(format!(
             "invalid collection id: {collection_id}"
         )));

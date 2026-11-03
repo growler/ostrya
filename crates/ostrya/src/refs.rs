@@ -39,8 +39,8 @@ use crate::traverse::read_dir_names;
 ///
 /// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`. A
 /// ref with no collection id maps to the local ref `refs/heads/<name>`. The
-/// collection id must pass [`is_collection_id`](crate::is_collection_id) and
-/// be at most 255 bytes. The ref store refuses another id.
+/// ref store takes a pair that passes [`validate`](CollectionRef::validate)
+/// and refuses another pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRef {
     /// The collection id, or `None` for a local ref.
@@ -63,6 +63,44 @@ impl CollectionRef {
         CollectionRef {
             collection_id: None,
             ref_name: ref_name.into(),
+        }
+    }
+
+    /// Checks the pair against the rule of the ref store.
+    ///
+    /// The collection id, if there is one, must pass
+    /// [`is_collection_id`](crate::is_collection_id) and be at most 255
+    /// bytes. The ref name must pass the ref-name rule: the rule of
+    /// [`validate_refspec`] for a name with no remote, so a name with `:`
+    /// fails. A ref with no collection id takes the ref-name rule alone. The
+    /// ref store applies this check where it maps a `CollectionRef` to its
+    /// file under `refs/`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRefspec`] if the id or the name fails its rule. The
+    /// error holds `ID:NAME`, or `NAME` alone for a ref with no collection
+    /// id.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::CollectionRef;
+    ///
+    /// assert!(CollectionRef::new("org.example.Os", "os/x86_64").validate().is_ok());
+    /// assert!(CollectionRef::local("main").validate().is_ok());
+    /// assert!(CollectionRef::local("origin:main").validate().is_err());
+    /// ```
+    pub fn validate(&self) -> Result<()> {
+        let valid = self
+            .collection_id
+            .as_deref()
+            .is_none_or(is_valid_collection_id)
+            && is_ref_path(&self.ref_name);
+        if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidRefspec(collection_ref_label(self)))
         }
     }
 }
@@ -973,9 +1011,7 @@ impl Repo {
         collection_id: &str,
         refs: &RefSelector,
     ) -> Result<Vec<(String, Checksum)>> {
-        if collection_id.len() > MAX_COLLECTION_ID_LEN
-            || !ostrya_core::is_collection_id(collection_id)
-        {
+        if !is_valid_collection_id(collection_id) {
             return Err(Error::InvalidRefspec(collection_id.to_owned()));
         }
         if selects_no_name(refs) {
@@ -1657,7 +1693,7 @@ fn collect_collections_selected(
         if Some(name.as_str()) == own {
             continue;
         }
-        if !ostrya_core::is_collection_id(&name) {
+        if !is_valid_collection_id(&name) {
             if ref_entry_type(mirrors, &name)? == Some(FileType::Directory) {
                 selection.invalid_dirs.push(name);
             }
@@ -2631,9 +2667,10 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 // empty, does not start with `-` or `.`, and holds ASCII alphanumerics, `-`,
 // `.`, `_`, and alphanumeric characters that are not ASCII. `is_component` is
 // the wider one-component rule that the remote part of a receive pattern uses
-// (`receive/pattern.rs`): not empty, not `.` or `..`, no slash, no NUL. A
-// collection id takes `is_collection_id` and `MAX_COLLECTION_ID_LEN`.
-// `ostrya-core` holds the rules.
+// (`receive/pattern.rs`): not empty, not `.` or `..`, no slash, no NUL.
+// `ostrya-core` holds the rules. A collection id takes
+// `is_valid_collection_id`, which adds a length limit to the rule of
+// `ostrya-core`.
 #[cfg(feature = "receive")]
 pub(crate) use ostrya_core::is_ref_component as is_component;
 pub(crate) use ostrya_core::is_ref_name as is_ref_path;
@@ -2645,31 +2682,24 @@ pub(crate) use ostrya_core::is_ref_name as is_ref_path;
 /// system takes a name of 255 bytes at most (`NAME_MAX`).
 pub(crate) const MAX_COLLECTION_ID_LEN: usize = 255;
 
+/// Returns `true` if `id` is a collection id that the ref store takes: it
+/// passes [`is_collection_id`](ostrya_core::is_collection_id) and is at most
+/// [`MAX_COLLECTION_ID_LEN`] bytes.
+pub(crate) fn is_valid_collection_id(id: &str) -> bool {
+    id.len() <= MAX_COLLECTION_ID_LEN && ostrya_core::is_collection_id(id)
+}
+
 /// Maps a collection ref to its path under `refs/`. A collection id puts the
 /// ref under `refs/mirrors/<collection>/`. A `None` id gives a local ref under
-/// `refs/heads/`. The collection id must pass
-/// [`is_collection_id`](ostrya_core::is_collection_id) and be at most
-/// [`MAX_COLLECTION_ID_LEN`] bytes. A failure gives
-/// [`Error::InvalidRefspec`], and the caller writes nothing.
+/// `refs/heads/`. The pair must pass [`CollectionRef::validate`]. A failure
+/// gives [`Error::InvalidRefspec`], and the caller writes nothing.
 pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
+    cref.validate()?;
     let name = &cref.ref_name;
-    match &cref.collection_id {
-        Some(collection_id) => {
-            if collection_id.len() > MAX_COLLECTION_ID_LEN
-                || !ostrya_core::is_collection_id(collection_id)
-                || !is_ref_path(name)
-            {
-                return Err(Error::InvalidRefspec(collection_ref_label(cref)));
-            }
-            Ok(format!("refs/mirrors/{collection_id}/{name}"))
-        }
-        None => {
-            if !is_ref_path(name) {
-                return Err(Error::InvalidRefspec(collection_ref_label(cref)));
-            }
-            Ok(format!("refs/heads/{name}"))
-        }
-    }
+    Ok(match &cref.collection_id {
+        Some(collection_id) => format!("refs/mirrors/{collection_id}/{name}"),
+        None => format!("refs/heads/{name}"),
+    })
 }
 
 /// Returns the text that an error about a collection ref holds: `ID:NAME`, or
@@ -3236,6 +3266,47 @@ mod tests {
             matches!(&err, Error::InvalidRefspec(name) if name == "a/../b"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn validate_applies_the_ref_store_rule() {
+        let err = CollectionRef::local("origin:main").validate().unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if name == "origin:main"),
+            "{err}"
+        );
+        let err = CollectionRef::new("org.example.B", "-bad")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if name == "org.example.B:-bad"),
+            "{err}"
+        );
+        let longest = format!("org.{}", "a".repeat(251));
+        assert_eq!(longest.len(), MAX_COLLECTION_ID_LEN);
+        assert!(
+            CollectionRef::new(longest.as_str(), "main")
+                .validate()
+                .is_ok()
+        );
+        let too_long = format!("org.{}", "a".repeat(252));
+        let err = CollectionRef::new(too_long.as_str(), "main")
+            .validate()
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if *name == format!("{too_long}:main")),
+            "{err}"
+        );
+        assert!(CollectionRef::local("main").validate().is_ok());
+    }
+
+    #[test]
+    fn a_valid_collection_id_passes_the_collection_id_rule_and_the_length() {
+        assert!(is_valid_collection_id("org.example.Os"));
+        assert!(is_valid_collection_id(&format!("org.{}", "a".repeat(251))));
+        assert!(!is_valid_collection_id(&format!("org.{}", "a".repeat(252))));
+        assert!(!is_valid_collection_id("nodot"));
+        assert!(!is_valid_collection_id(""));
     }
 
     #[test]

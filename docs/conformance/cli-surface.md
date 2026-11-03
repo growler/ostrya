@@ -193,8 +193,16 @@ are observed and deliberately not reproduced:
   command removes no ref and exits 1. A mirror ref whose id fails the
   collection-id rule or is longer than 255 bytes, or whose name fails the
   ref-name rule, gives `error: Invalid refspec <id>:<name>`. A ref under
-  `refs/heads` whose name fails the refspec rule gives `error: Invalid refspec
-  <name>`;
+  `refs/heads` whose name fails the ref-name rule gives `error: Invalid refspec
+  <name>`. The ref-name rule refuses a name with `:`;
+- a file under `refs/heads` whose name holds `:`, for example
+  `refs/heads/origin:main` in a repository with `[core] collection-id`. Such a
+  file comes from an out-of-band change alone. The `-c` listing of the tool
+  does not print the ref. `refs -c --delete <own id>` of the tool removes the
+  other refs under `refs/heads`, keeps the file, and exits 0. The `-c` listing
+  of the port prints `(<own id>, origin:main)`. `refs -c --delete <own id>` of
+  the port reports `error: Invalid refspec origin:main`, exits 1, and removes
+  no ref. In both, `refs/remotes/origin/main` stays;
 - `refs -c --create=<id>`, whose NEWREF holds no `:` and therefore no ref name,
   makes the tool print a GLib assertion line (`g_regex_match_full: assertion
   'string != NULL' failed`) ahead of its own `error: Invalid ref name (null)`;

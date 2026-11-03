@@ -2752,9 +2752,23 @@ These alternatives were rejected:
   verified summary of the source, as over HTTP.
 - The pull from the candidate is the local pull of `Repo::pull_local`, at the
   commits of the probe, with the trust of the remote, the binding rules of
-  the collection pull, and the timestamp check of the options. It checks
-  each commit against the listed timestamp of the probe, as over HTTP. Under
-  a summary policy, it uses the summary that the probe verified.
+  the collection pull, and the timestamp check of the options. Under a
+  summary policy, it uses the summary that the probe verified, and checks
+  each commit against the listed timestamp of the summary, as over HTTP.
+- Without a summary policy, the probe reads each tip commit one time. It
+  keeps the bytes of a tip commit for the pull if the kept bytes of the
+  candidate then total at most `SUMMARY_READ_CAP`, 64 MiB. For a commit that
+  does not fit, it keeps the timestamp alone, and it can still keep a
+  smaller commit after it. The pull parses the kept bytes of each selected
+  tip, and does not read that commit from the source again. The listed
+  timestamp of such a commit comes from the same bytes, so the commit loop
+  of the pull makes no check of the listed timestamp for it. The search for
+  static deltas still checks each such commit that a delta reaches against
+  the listed timestamp. The pull reads each tip that the probe did not keep
+  again, and checks it against the listed timestamp of the probe. Under
+  `PullFlags::UNTRUSTED`, the pull hashes the kept bytes of each commit one
+  time and compares the result with the name of the commit before it parses
+  them.
 - The client groups of the source do not apply. The file permissions are
   the access.
 - Each error of the open and of the probe skips the candidate.
@@ -2799,6 +2813,23 @@ These alternatives were rejected:
   that checks no signature then reads each object one more time. The link
   still saves the write and the disk space. The read removes most of the
   time that the link saves.
+- A second read of each tip commit at the pull, with the check of the listed
+  timestamp. The probe took the listed timestamp from the same file, so the
+  check compares the commit with itself. It finds only a change of the file
+  between the probe and the pull. Under `PullFlags::UNTRUSTED`, the hash of
+  the kept bytes and the hash of the imported file find each such change.
+  Without it, the pull trusts the source, as for each other object.
+- A second read of each tip commit at the pull, without the check. The read
+  gives the bytes that the probe read a moment before, and no check uses
+  them.
+- Kept bytes with no cap. A candidate with many refs on distinct commits
+  then keeps each commit, each up to `MAX_METADATA_SIZE`, until the pull
+  from it ends. The cap bounds the kept bytes of a candidate as the size cap
+  of a summary bounds the summary that a probe keeps.
+- A hash of the kept bytes in the probe. The probe reads the tips of each
+  candidate, also the tips that the pull does not select from it. The pull
+  hashes the bytes of a selected tip alone, and only under
+  `PullFlags::UNTRUSTED`, where a hash is a requirement.
 
 ## The own collection id of a collection pull
 

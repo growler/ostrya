@@ -40,7 +40,7 @@ use crate::remote::{Endpoint, PullSession, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::send::write_escaped;
 use crate::summary::{
-    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, Summary, SummaryRef,
+    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, SUMMARY_READ_CAP, Summary, SummaryRef,
     collection_map_refs, parse_ref_list,
 };
 use crate::verify::PullTrust;
@@ -298,12 +298,25 @@ struct Listed {
     timestamp: u64,
 }
 
+/// The bytes of the tip commits that the probe of a local candidate kept for
+/// the pull, by checksum.
+type KeptCommits = HashMap<Checksum, Arc<Vec<u8>>>;
+
+/// The largest total of commit bytes that the probe of one local candidate
+/// keeps for the pull. A probe under a summary policy keeps a summary of up
+/// to the same size for the pull.
+const KEPT_COMMITS_CAP: u64 = SUMMARY_READ_CAP;
+
 /// What the probe of one remote gives.
 struct Probed {
     /// The refs of the collection that the remote lists.
     listed: Vec<Listed>,
     /// The `summary` of the remote, if the probe read the refs from it.
     summary: Option<Arc<Vec<u8>>>,
+    /// The bytes of the tip commits that the probe of a local candidate kept
+    /// when it read the refs from the ref files. Empty for each other
+    /// candidate.
+    commits: KeptCommits,
     /// The open session to the remote, for the pull from it.
     session: Session,
 }
@@ -477,7 +490,10 @@ impl Repo {
     /// - The `ostree.ref-binding` of the commit must hold the ref. A commit
     ///   with no ref binding passes, as in each other pull.
     /// - The timestamp of the commit must be the timestamp that the remote
-    ///   listed for the ref.
+    ///   listed for the ref. A local repository with no summary policy lists
+    ///   the timestamp of a commit that the pull parses from the same bytes,
+    ///   and the commit loop of the pull makes no such check for it, as
+    ///   "Local repository" states.
     ///
     /// The pull makes none of these checks on a dependency.
     ///
@@ -541,7 +557,10 @@ impl Repo {
     ///   refs. The probe reads only the directories that the names can
     ///   reach. The timestamp of each ref is the timestamp of the commit
     ///   that the probe pins, which the probe reads one time for each
-    ///   commit.
+    ///   commit. The probe keeps the bytes of such a commit for the pull if
+    ///   the kept bytes of the repository then total at most 64 MiB, the
+    ///   size cap of a summary. For a commit that does not fit, it keeps the
+    ///   timestamp alone, and it can still keep a smaller commit after it.
     ///
     /// The client groups of the repository do not apply, because they govern
     /// `ostrya serve` and `ostrya send` alone. The file permissions are the
@@ -553,15 +572,27 @@ impl Repo {
     /// The pull from a selected local repository is a pull of
     /// [`Repo::pull_local`] at the commits that the probe read. It reads no
     /// ref file again. It makes the checks of "Pull", and the timestamp
-    /// check of [`timestamp_check`](PullOptions::timestamp_check). So it
-    /// checks each commit against the listed timestamp of the probe, as for
-    /// a remote. Under a summary policy, these timestamps come from the
-    /// verified summary, and the pull uses the summary that the probe
-    /// verified. It does not read the `summary` or the `summary.sig` of the
-    /// repository again. A listed commit that the repository does not hold
-    /// then fails the pull. If the trust of the remote checks the signatures
-    /// of the commits or of the summary, the pull hashes each object that it
-    /// imports and compares the result with the name of the object, as with
+    /// check of [`timestamp_check`](PullOptions::timestamp_check).
+    ///
+    /// - Under a summary policy, the pull checks each commit against the
+    ///   listed timestamp of the verified summary, as for a remote, and uses
+    ///   the summary that the probe verified. It does not read the `summary`
+    ///   or the `summary.sig` of the repository again. A listed commit that
+    ///   the repository does not hold then fails the pull.
+    /// - Otherwise, the pull parses the bytes that the probe kept, and does
+    ///   not read these commits from the repository again. The listed
+    ///   timestamp of such a commit comes from the same bytes, so the commit
+    ///   loop of the pull makes no check of the listed timestamp for it. The
+    ///   search for static deltas still checks each such commit that a delta
+    ///   reaches against the listed timestamp. With
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull first hashes the kept
+    ///   bytes of each commit one time and compares the result with the name
+    ///   of the commit. The pull reads each commit that the probe did not
+    ///   keep again, and checks it against the listed timestamp of the probe.
+    ///
+    /// If the trust of the remote checks the signatures of the commits or of
+    /// the summary, the pull hashes each object that it imports and compares
+    /// the result with the name of the object, as with
     /// [`UNTRUSTED`](PullFlags::UNTRUSTED). A signature covers the commit or
     /// the summary alone, and the hash carries the proof to the objects of
     /// the tree. Otherwise the flags of the caller apply: without
@@ -718,18 +749,20 @@ impl Repo {
             )));
         }
 
-        // The session and the summary of each remote that answered, by the
-        // position of the remote.
+        // The session, the summary, and the kept commits of each remote that
+        // answered, by the position of the remote.
         let mut answers = Vec::with_capacity(candidates.len());
         let mut sessions = Vec::with_capacity(candidates.len());
         let mut summaries = Vec::with_capacity(candidates.len());
+        let mut kept = Vec::with_capacity(candidates.len());
         for candidate in &candidates {
-            let probed = Box::pin(probe(candidate, collection_id, &names)).await;
+            let probed = Box::pin(probe(candidate, collection_id, &names, KEPT_COMMITS_CAP)).await;
             match probed {
                 Ok(probed) => {
                     answers.push(Some(probed.listed));
                     sessions.push(Some(probed.session));
                     summaries.push(probed.summary);
+                    kept.push(probed.commits);
                 }
                 Err(e) => {
                     if let Some(on_event) = on_event.as_mut() {
@@ -747,6 +780,7 @@ impl Repo {
                     answers.push(None);
                     sessions.push(None);
                     summaries.push(None);
+                    kept.push(KeptCommits::new());
                 }
             }
         }
@@ -759,10 +793,20 @@ impl Repo {
         };
         drop(answers);
         // A remote with no selected ref is not asked again.
-        let unselected = take_unselected(&mut sessions, &mut summaries, |index| {
+        let unselected = take_unselected(&mut sessions, &mut summaries, &mut kept, |index| {
             selected.iter().any(|s| s.remote == index)
         });
         end_sessions(unselected).await;
+        // The pull uses the kept bytes of a tip that it selected from the
+        // same remote alone.
+        let tips: HashSet<(usize, Checksum)> = selected
+            .iter()
+            .map(|s| (s.remote, s.listed.commit))
+            .collect();
+        for (index, commits) in kept.iter_mut().enumerate() {
+            commits.retain(|commit, _| tips.contains(&(index, *commit)));
+        }
+        drop(tips);
 
         let place = RefPlace::of_collection(self, collection_id);
         let candidate_names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
@@ -781,6 +825,7 @@ impl Repo {
             let listed: HashMap<String, u64> =
                 mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect();
             let summary = summaries[index].take();
+            let commits = std::mem::take(&mut kept[index]);
             // The trust and the session hold what these fields gave.
             let run = PullOptions {
                 refs: targets.iter().map(|(name, _)| name.clone()).collect(),
@@ -792,6 +837,7 @@ impl Repo {
             };
             let pulled = match session {
                 Session::Remote(connection) => {
+                    drop(commits);
                     let pinned = Pinned {
                         targets,
                         listed,
@@ -812,26 +858,12 @@ impl Repo {
                     )
                     .await
                 }
-                // The local pull checks each tip against the timestamp of
-                // the probe, as a pull from a remote does. Without a summary
-                // policy, the probe read that timestamp from the same commit.
-                // Under a summary policy, it comes from the summary that the
-                // probe checked, and the pull uses that summary.
+                // Under a summary policy, the listed timestamps come from the
+                // summary that the probe checked, and the pull uses that
+                // summary. Without it, the probe read the timestamp of each
+                // tip from the commit, and the pull parses the bytes that the
+                // probe kept.
                 Session::Local(src) => {
-                    // A signature proves the commit alone, or the summary
-                    // its checksum. The hash of each imported object
-                    // against its name carries the proof to the objects of
-                    // the tree.
-                    let flags = if candidate.trust.checks_signatures() {
-                        run.flags | PullFlags::UNTRUSTED
-                    } else {
-                        run.flags
-                    };
-                    let run = PullOptions {
-                        collection_id: Some(collection_id.to_owned()),
-                        flags,
-                        ..run
-                    };
                     let checks = LocalChecks {
                         collection_binding: Some(allow_unbound),
                         targets: Some(targets),
@@ -839,8 +871,10 @@ impl Repo {
                         timestamp: true,
                         summary,
                         listed: Some(listed),
+                        commits,
                     };
-                    self.pull_local_with(&src, run, checks).await
+                    self.pull_local_candidate(&src, collection_id, run, checks)
+                        .await
                 }
             };
             match pulled {
@@ -1074,9 +1108,10 @@ impl Repo {
         let candidate = resolve_candidate(self, remote, &opts, TrustScope::Summary).await?;
         // The summary goes before the end of the session, which waits for the
         // ssh client.
+        // The listing parses no commit, so the probe keeps no commit bytes.
         let Probed {
             listed, session, ..
-        } = Box::pin(probe(&candidate, collection_id, &names)).await?;
+        } = Box::pin(probe(&candidate, collection_id, &names, 0)).await?;
         // A local repository has no session to end.
         if let Session::Remote(connection) = session {
             RemoteSource::new(connection, Vec::new())
@@ -1090,6 +1125,43 @@ impl Repo {
         refs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
         Ok(refs)
     }
+
+    /// Pulls the selected refs of a local candidate of
+    /// [`Repo::pull_collection`] from the repository `src` that its probe
+    /// opened, with the options `run` and the checks `checks` of the
+    /// candidate.
+    ///
+    /// The call sets [`collection_id`](PullOptions::collection_id) of `run`
+    /// to `collection_id`. If the trust in `checks` checks the signatures of
+    /// the commits or of the summary, the call adds
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED) to the flags. A signature covers
+    /// the commit or the checksum of the summary alone, and the hash of each
+    /// imported object against its name carries the proof to the objects of
+    /// the tree. The hash also applies to the commit bytes that the probe
+    /// kept in [`commits`](LocalChecks::commits).
+    async fn pull_local_candidate(
+        &self,
+        src: &Repo,
+        collection_id: &str,
+        run: PullOptions,
+        checks: LocalChecks,
+    ) -> Result<PullStats> {
+        let flags = if checks
+            .trust
+            .as_ref()
+            .is_some_and(PullTrust::checks_signatures)
+        {
+            run.flags | PullFlags::UNTRUSTED
+        } else {
+            run.flags
+        };
+        let run = PullOptions {
+            collection_id: Some(collection_id.to_owned()),
+            flags,
+            ..run
+        };
+        self.pull_local_with(src, run, checks).await
+    }
 }
 
 /// Returns the first appearance of each value of `values`, in order.
@@ -1100,23 +1172,27 @@ fn first_of_each<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
 
 /// Takes out of `sessions` the session of each remote for whose position
 /// `selected` returns `false`, and drops the summary of that remote in
-/// `summaries`.
+/// `summaries` and its kept commits in `commits`.
 ///
-/// `sessions` and `summaries` hold one slot for each remote, by its
-/// position. The pull reads nothing more from a remote with no selected ref,
-/// so its summary does not stay in memory for the rest of the pull.
-fn take_unselected<S, M>(
+/// `sessions`, `summaries`, and `commits` hold one slot for each remote, by
+/// its position. The pull reads nothing more from a remote with no selected
+/// ref, so its summary and its kept commits do not stay in memory for the
+/// rest of the pull.
+fn take_unselected<S, M, K: Default>(
     sessions: &mut [Option<S>],
     summaries: &mut [Option<M>],
+    commits: &mut [K],
     selected: impl Fn(usize) -> bool,
 ) -> Vec<S> {
     sessions
         .iter_mut()
         .zip(summaries.iter_mut())
+        .zip(commits.iter_mut())
         .enumerate()
         .filter(|(index, _)| !selected(*index))
-        .filter_map(|(_, (session, summary))| {
+        .filter_map(|(_, ((session, summary), commits))| {
             *summary = None;
+            *commits = K::default();
             session.take()
         })
         .collect()
@@ -1332,15 +1408,19 @@ fn name_cost(id: &str, name: &str) -> usize {
 /// The probe opens a session. If the probe fails, it ends the session. If
 /// the probe succeeds, it gives the session back for the pull. The session
 /// of a local candidate is the open repository at its `file://` address.
-async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Probed> {
+/// The probe of a local candidate keeps tip commits of at most `cap` bytes
+/// in total, as [`probe_local`] states.
+async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str], cap: u64) -> Result<Probed> {
     let connection = match candidate.transport.open().await? {
         Session::Remote(connection) => connection,
         Session::Local(src) => {
             let verification = Verification::from_trust(candidate.trust.clone());
-            let (listed, summary) = probe_local(&src, &verification, id, names).await?;
+            let (listed, summary, commits) =
+                probe_local(&src, &verification, id, names, cap).await?;
             return Ok(Probed {
                 listed,
                 summary,
+                commits,
                 session: Session::Local(src),
             });
         }
@@ -1354,6 +1434,7 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
         Ok((listed, summary)) => Ok(Probed {
             listed,
             summary,
+            commits: KeptCommits::new(),
             session: Session::Remote(source.into_connection()),
         }),
         Err(e) => source.finish(Err(e)).await,
@@ -1377,7 +1458,15 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 /// `refs/heads` refs in the collection, and the probe reads only the
 /// directories that the names can reach. The timestamp of each ref is the
 /// timestamp of its commit in `src`. The probe reads each commit one time, on
-/// the blocking pool, under the size cap of a metadata object.
+/// the blocking pool, under the size cap of a metadata object. It keeps the
+/// bytes of a commit for the pull if the total of the kept bytes then stays
+/// at or below `cap`, and else keeps the timestamp alone. The total counts
+/// the allocated capacity of each kept buffer. The probe does not hash the
+/// kept bytes.
+///
+/// The result holds the refs, the bytes of the summary if the refs come from
+/// it, and the kept commits by checksum. Under a summary policy, the probe
+/// keeps no commit.
 ///
 /// # Errors
 ///
@@ -1397,13 +1486,14 @@ async fn probe_local(
     verification: &Verification,
     id: &str,
     names: &[&str],
-) -> Result<Refs> {
+    cap: u64,
+) -> Result<(Vec<Listed>, Option<Arc<Vec<u8>>>, KeptCommits)> {
     if verification.checks_summary() {
         let Some(bytes) = read_checked_local_summary(src, verification, false).await? else {
             unreachable!("the summary check needs a summary");
         };
         let (_, listed) = parse_refs(Arc::clone(&bytes), id, names).await?;
-        return Ok((listed, Some(bytes)));
+        return Ok((listed, Some(bytes), KeptCommits::new()));
     }
     let refs = src
         .list_collection_refs_in(id, &RefSelector::parse(names.iter().copied())?)
@@ -1412,15 +1502,24 @@ async fn probe_local(
         check_ref_path(name)?;
     }
     let src = src.clone();
-    let listed = ostrya_rt::unblock(move || {
+    let (listed, kept) = ostrya_rt::unblock(move || {
         let mut timestamps: HashMap<Checksum, u64> = HashMap::new();
-        refs.into_iter()
+        let mut kept = KeptCommits::new();
+        let mut total: u64 = 0;
+        let listed = refs
+            .into_iter()
             .map(|(name, commit)| {
                 let timestamp = match timestamps.entry(commit) {
                     Entry::Occupied(known) => *known.get(),
                     Entry::Vacant(slot) => {
                         let bytes = src.load_object_bytes_blocking(ObjectType::Commit, &commit)?;
-                        *slot.insert(Commit::parse_timestamp(&bytes)?)
+                        let timestamp = Commit::parse_timestamp(&bytes)?;
+                        let size = u64::try_from(bytes.capacity()).unwrap_or(u64::MAX);
+                        if let Some(sum) = total.checked_add(size).filter(|sum| *sum <= cap) {
+                            total = sum;
+                            kept.insert(commit, Arc::new(bytes));
+                        }
+                        *slot.insert(timestamp)
                     }
                 };
                 Ok(Listed {
@@ -1429,10 +1528,11 @@ async fn probe_local(
                     timestamp,
                 })
             })
-            .collect::<Result<Vec<Listed>>>()
+            .collect::<Result<Vec<Listed>>>()?;
+        Ok::<_, Error>((listed, kept))
     })
     .await?;
-    Ok((listed, None))
+    Ok((listed, None, kept))
 }
 
 /// Reads the refs of `names` in the collection `id` from `source`, or each
@@ -1947,16 +2047,21 @@ mod tests {
     }
 
     /// The sessions of the remotes with no selected ref leave their slots,
-    /// and the summaries of these remotes are dropped. The slots of the
-    /// selected remotes keep their sessions and their summaries.
+    /// and the summaries and the kept commits of these remotes are dropped.
+    /// The slots of the selected remotes keep their sessions, their
+    /// summaries, and their kept commits.
     #[test]
     fn the_unselected_remotes_leave_their_sessions_and_summaries() {
         let mut sessions = vec![Some('a'), None, Some('c'), Some('d')];
         let mut summaries = vec![Some(1), None, Some(3), Some(4)];
-        let taken = take_unselected(&mut sessions, &mut summaries, |index| index == 2);
+        let mut commits = vec![vec![1], vec![], vec![3], vec![4]];
+        let taken = take_unselected(&mut sessions, &mut summaries, &mut commits, |index| {
+            index == 2
+        });
         assert_eq!(taken, ['a', 'd']);
         assert_eq!(sessions, [None, None, Some('c'), None]);
         assert_eq!(summaries, [None, None, Some(3), None]);
+        assert_eq!(commits, [vec![], vec![], vec![3], vec![]]);
     }
 
     /// A summary whose own collection id is the pulled id gives the refs of
@@ -2201,5 +2306,330 @@ mod tests {
             message: "bad\nline".to_owned(),
         };
         assert_eq!(event.to_string(), "remote mirror skipped: bad\\nline");
+    }
+
+    /// The collection of the local tests.
+    const LOCAL_ID: &str = "org.example.Os";
+    /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+    const SECRET_B64: &str =
+        "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+    /// The matching 32-byte ed25519 public key.
+    const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+    /// The ed25519 key [`PUBLIC_B64`] as a trusted set.
+    fn ed25519_keys() -> crate::verify::TrustedKeys {
+        use crate::sign::{Ed25519Verifier, Verifier};
+        let verifier = Ed25519Verifier::new(
+            [ostrya_core::base64::decode(PUBLIC_B64).unwrap()],
+            Vec::<Vec<u8>>::new(),
+        )
+        .unwrap();
+        crate::verify::TrustedKeys::new(vec![Arc::new(verifier) as Arc<dyn Verifier>]).unwrap()
+    }
+
+    /// The signer of the key [`SECRET_B64`].
+    fn ed25519_signer() -> crate::sign::Ed25519Signer {
+        crate::sign::Ed25519Signer::from_base64(SECRET_B64).unwrap()
+    }
+
+    /// A scratch directory that the value removes when it drops.
+    struct Scratch {
+        root: PathBuf,
+    }
+
+    impl Scratch {
+        fn new() -> Scratch {
+            let root = std::env::temp_dir().join(format!(
+                "ostrya-collection-local-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            Scratch { root }
+        }
+
+        /// Creates an archive repository at `name` in the directory.
+        async fn create(&self, name: &str) -> Repo {
+            let mode = crate::CreateOptions::new(crate::RepoMode::Archive);
+            Repo::create(&self.root.join(name), mode).await.unwrap()
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    /// Writes a commit with the parent `parent` and the timestamp
+    /// `timestamp` whose tree holds the file `f` with `content`, points the
+    /// collection ref of each name of `names` in [`LOCAL_ID`] at it, and
+    /// returns it.
+    async fn local_commit(
+        repo: &Repo,
+        names: &[&str],
+        parent: Option<Checksum>,
+        timestamp: u64,
+        content: &[u8],
+    ) -> Checksum {
+        let txn = repo.transaction().await.unwrap();
+        let dirmeta = ostrya_core::DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o40755,
+            xattrs: Default::default(),
+        };
+        let dirmeta = txn
+            .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+            .await
+            .unwrap();
+        let file = txn
+            .write_regfile_inline(None, &crate::write::FileMeta::regular(0, 0, 0o644), content)
+            .await
+            .unwrap();
+        let mut mtree = crate::mtree::MutableTree::new();
+        mtree.set_metadata_checksum(dirmeta);
+        mtree.replace_file("f", file).unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let options = crate::commit::CommitOptions {
+            parent,
+            timestamp: Some(timestamp),
+            ..crate::commit::CommitOptions::default()
+        };
+        let commit = txn.write_commit(options, &root).await.unwrap();
+        txn.commit().await.unwrap();
+        for name in names {
+            let cref = crate::CollectionRef::new(LOCAL_ID, *name);
+            repo.set_collection_ref_immediate(&cref, Some(&commit))
+                .await
+                .unwrap();
+        }
+        commit
+    }
+
+    /// Probes the local repository `src` under `trust` for the refs `names`,
+    /// with no cap on the kept commits, and pulls the refs into `dst` with
+    /// the flags `flags` and the depth `depth`, as a pull of collection refs
+    /// pulls from a selected local candidate.
+    async fn probe_and_pull(
+        dst: &Repo,
+        src: &Repo,
+        trust: PullTrust,
+        names: &[&str],
+        flags: PullFlags,
+        depth: i32,
+    ) -> Result<PullStats> {
+        let verification = Verification::from_trust(trust.clone());
+        let (listed, summary, commits) =
+            probe_local(src, &verification, LOCAL_ID, names, KEPT_COMMITS_CAP).await?;
+        let run = PullOptions {
+            refs: listed.iter().map(|l| l.name.clone()).collect(),
+            flags,
+            depth,
+            ..PullOptions::default()
+        };
+        let checks = LocalChecks {
+            collection_binding: Some(true),
+            targets: Some(listed.iter().map(|l| (l.name.clone(), l.commit)).collect()),
+            trust: Some(trust),
+            timestamp: true,
+            summary,
+            listed: Some(
+                listed
+                    .iter()
+                    .map(|l| (l.name.clone(), l.timestamp))
+                    .collect(),
+            ),
+            commits,
+        };
+        dst.pull_local_candidate(src, LOCAL_ID, run, checks).await
+    }
+
+    /// Without a summary policy, the probe of a local candidate keeps the
+    /// bytes of each distinct tip commit one time, and the bytes hash to the
+    /// commit. Under a summary policy, it keeps no commit. Past the cap, the
+    /// probe keeps the timestamp of a tip alone.
+    #[test]
+    fn the_local_probe_keeps_the_bytes_of_each_tip_commit() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let one = local_commit(&src, &["os/a", "os/b"], None, 1_700_000_001, b"one").await;
+            let two = local_commit(&src, &["os/c"], None, 1_700_000_002, b"two").await;
+            let unverified = Verification::from_trust(PullTrust::unverified());
+
+            let (listed, summary, kept) =
+                probe_local(&src, &unverified, LOCAL_ID, &[], KEPT_COMMITS_CAP)
+                    .await
+                    .unwrap();
+            assert_eq!(listed.len(), 3);
+            assert!(summary.is_none());
+            let mut keys: Vec<Checksum> = kept.keys().copied().collect();
+            keys.sort_unstable();
+            let mut expected = vec![one, two];
+            expected.sort_unstable();
+            assert_eq!(keys, expected);
+            for (commit, bytes) in &kept {
+                assert_eq!(Checksum::sha256(bytes), *commit);
+            }
+
+            // A cap of the counted size of the first tip, the capacity of its
+            // buffer, keeps that tip alone. The probe reads the timestamp of
+            // the other tip.
+            let first = listed[0].commit;
+            let size = u64::try_from(kept[&first].capacity()).unwrap();
+            let (capped, _, kept) = probe_local(&src, &unverified, LOCAL_ID, &[], size)
+                .await
+                .unwrap();
+            assert_eq!(capped, listed);
+            assert_eq!(kept.keys().copied().collect::<Vec<_>>(), [first]);
+            let timestamps: HashMap<Checksum, u64> =
+                capped.iter().map(|l| (l.commit, l.timestamp)).collect();
+            assert_eq!(timestamps[&one], 1_700_000_001);
+            assert_eq!(timestamps[&two], 1_700_000_002);
+
+            // Under a summary policy, the refs come from the summary.
+            src.regenerate_summary(&crate::SummaryOptions::default())
+                .await
+                .unwrap();
+            src.sign_summary(&ed25519_signer()).await.unwrap();
+            let policy =
+                Verification::from_trust(PullTrust::unverified().with_summary(ed25519_keys()));
+            let (from_summary, summary, kept) =
+                probe_local(&src, &policy, LOCAL_ID, &[], KEPT_COMMITS_CAP)
+                    .await
+                    .unwrap();
+            assert_eq!(from_summary.len(), 3);
+            assert!(summary.is_some());
+            assert!(kept.is_empty());
+        });
+    }
+
+    /// The probe and the pull of a local candidate read the tip commit from
+    /// the source one time. If the trust checks signatures, or the caller
+    /// sets `UNTRUSTED`, the import hashes the commit file that it links,
+    /// and so reads it a second time.
+    #[test]
+    fn a_local_candidate_reads_each_tip_commit_one_time() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let tip = local_commit(&src, &["os/a"], None, 1_700_000_001, b"one").await;
+            src.sign_commit(&tip, &ed25519_signer()).await.unwrap();
+            let cases = [
+                (PullTrust::unverified(), PullFlags::NONE, 1),
+                (PullTrust::unverified(), PullFlags::UNTRUSTED, 2),
+                (PullTrust::commits(ed25519_keys()), PullFlags::NONE, 2),
+            ];
+            for (at, (trust, flags, reads)) in cases.into_iter().enumerate() {
+                let dst = scratch.create(&format!("dst{at}")).await;
+                let src = Repo::open(&scratch.root.join("src")).await.unwrap();
+                probe_and_pull(&dst, &src, trust, &["os/a"], flags, 0)
+                    .await
+                    .unwrap();
+                assert_eq!(src.commit_reads(), reads, "case {at}");
+                let cref = crate::CollectionRef::new(LOCAL_ID, "os/a");
+                assert_eq!(
+                    dst.resolve_collection_ref(&cref, false).await.unwrap(),
+                    Some(tip)
+                );
+            }
+        });
+    }
+
+    /// With depth 1, the walk of a chain parses a kept tip that is the parent
+    /// of another selected tip from the kept bytes. So the probe and the pull
+    /// read each tip commit from the source one time, in each order of the
+    /// refs.
+    #[test]
+    fn the_walk_of_a_chain_parses_a_kept_parent() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            for (at, (child_ref, parent_ref)) in
+                [("os/a", "os/b"), ("os/b", "os/a")].into_iter().enumerate()
+            {
+                let src = scratch.create(&format!("src{at}")).await;
+                let parent = local_commit(&src, &[parent_ref], None, 1_700_000_001, b"one").await;
+                let child =
+                    local_commit(&src, &[child_ref], Some(parent), 1_700_000_002, b"two").await;
+                let dst = scratch.create(&format!("dst{at}")).await;
+                let src = Repo::open(&scratch.root.join(format!("src{at}")))
+                    .await
+                    .unwrap();
+                probe_and_pull(
+                    &dst,
+                    &src,
+                    PullTrust::unverified(),
+                    &["os/a", "os/b"],
+                    PullFlags::NONE,
+                    1,
+                )
+                .await
+                .unwrap();
+                assert_eq!(src.commit_reads(), 2, "case {at}");
+                for (name, commit) in [(child_ref, child), (parent_ref, parent)] {
+                    let cref = crate::CollectionRef::new(LOCAL_ID, name);
+                    assert_eq!(
+                        dst.resolve_collection_ref(&cref, false).await.unwrap(),
+                        Some(commit)
+                    );
+                }
+            }
+        });
+    }
+
+    /// Under `UNTRUSTED`, kept bytes that do not hash to the tip fail the
+    /// pull with [`Error::ChecksumMismatch`] before the transaction opens,
+    /// so the pull writes no object, no ref, no `.commitpartial` marker, and
+    /// no staging directory.
+    #[test]
+    fn kept_bytes_that_do_not_hash_to_the_tip_fail_an_untrusted_pull() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let one = local_commit(&src, &["os/a"], None, 1_700_000_001, b"one").await;
+            let two = local_commit(&src, &[], None, 1_700_000_001, b"two").await;
+            let dst = scratch.create("dst").await;
+            let other = src
+                .load_object_bytes(ObjectType::Commit, &two)
+                .await
+                .unwrap();
+            let run = PullOptions {
+                refs: vec!["os/a".to_owned()],
+                flags: PullFlags::UNTRUSTED,
+                ..PullOptions::default()
+            };
+            let checks = LocalChecks {
+                collection_binding: Some(true),
+                targets: Some(vec![("os/a".to_owned(), one)]),
+                trust: Some(PullTrust::unverified()),
+                timestamp: true,
+                summary: None,
+                listed: Some([("os/a".to_owned(), 1_700_000_001)].into()),
+                commits: [(one, Arc::new(other))].into(),
+            };
+            match dst.pull_local_candidate(&src, LOCAL_ID, run, checks).await {
+                Err(Error::ChecksumMismatch { expected, actual }) => {
+                    assert_eq!((expected, actual), (one, two));
+                }
+                other => panic!("{other:?}"),
+            }
+            let objects = dst.list_objects().await.unwrap();
+            assert!(objects.is_empty(), "{objects:?}");
+            let dst_dir = scratch.root.join("dst");
+            let leftovers: Vec<String> = ["state", "tmp"]
+                .into_iter()
+                .flat_map(|dir| std::fs::read_dir(dst_dir.join(dir)).unwrap())
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".commitpartial") || name.starts_with("staging-"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+            let refs = dst
+                .list_collection_refs_in(LOCAL_ID, &RefSelector::parse(std::iter::empty()).unwrap())
+                .await
+                .unwrap();
+            assert!(refs.is_empty(), "{refs:?}");
+        });
     }
 }

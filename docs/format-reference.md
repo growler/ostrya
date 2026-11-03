@@ -5005,12 +5005,25 @@ stops the pull, and the refs of the earlier candidates stay written.
 The pull from a selected local candidate is a local pull of the commits that
 the probe read, as `Repo::pull_local` below states, with the keys of the
 candidate and the checks below. It also makes the timestamp check of the
-pull. It reads no ref file of the source again. It checks the timestamp of
-each commit against the listed timestamp of the probe, as for a remote.
-Without a summary policy, the probe read each timestamp from the commit that
-it pins. Under a summary policy, the timestamps come from the verified
-summary, and the pull uses the summary that the probe verified. It does not
-read `summary` or `summary.sig` of the source again. If the keys of the
+pull. It reads no ref file of the source again. Under a summary policy, the
+pull checks the timestamp of each commit against the listed timestamp of the
+verified summary, as for a remote, and uses the summary that the probe
+verified. It does not read `summary` or `summary.sig` of the source again.
+Without a summary policy, the probe reads each tip commit one time, and takes
+the listed timestamp from it. The probe keeps the bytes of a tip commit for
+the pull if the kept bytes of the candidate then total at most 64 MiB, the
+size cap of a summary. For a commit that does not fit, the probe keeps the
+timestamp alone, and it can still keep a smaller commit after it. The pull
+parses the kept bytes, and does not read these commits from the source
+again. The listed timestamp of such a commit comes from the same bytes, so
+the commit loop of the pull makes no check of the listed timestamp for it.
+The search for static deltas still checks each such commit that a delta
+reaches against the listed timestamp. The pull reads each tip commit that
+the probe did not keep again, and checks its timestamp against the listed
+timestamp of the probe. With `--untrusted`, or when the keys of the candidate
+check signatures as below, the pull first hashes the kept bytes of each
+commit one time and compares the result with the name of the commit. The
+probe does not hash them. If the keys of the
 candidate check the signatures of the commits or of the summary
 (`gpg-verify`, `sign-verify`, `gpg-verify-summary`, `sign-verify-summary`,
 or a trust group), the pull hashes each object that it imports and compares

@@ -2018,17 +2018,48 @@ impl Repo {
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
+        // The caller read the listed timestamp of a kept tip from the same
+        // bytes, so the check of the listed timestamp compares the commit
+        // with itself, and this loop does not make it.
+        let mut kept = checks.commits;
+        // Under `UNTRUSTED`, the pull hashes each kept commit one time, before
+        // it uses the bytes, also if several refs or a chain name the commit.
+        // A commit object can be as large as `MAX_METADATA_SIZE`, so the hash
+        // runs on the blocking pool.
+        if flags.contains(PullFlags::UNTRUSTED) && !kept.is_empty() {
+            kept = ostrya_rt::unblock(move || {
+                for (checksum, bytes) in &kept {
+                    let actual = Checksum::sha256(bytes);
+                    if actual != *checksum {
+                        return Err(Error::ChecksumMismatch {
+                            expected: *checksum,
+                            actual,
+                        });
+                    }
+                }
+                Ok(kept)
+            })
+            .await?;
+        }
         for (ref_name, tip) in &targets {
-            let loaded = load_commit(src, tip).await?;
+            let (loaded, listed) = match kept.get(tip) {
+                Some(bytes) => (parse_kept_commit(*tip, Arc::clone(bytes)).await?, None),
+                None => (load_commit(src, tip).await?, tip_checks.listed),
+            };
             // Discovery made the binding checks of each ref that names a
             // commit of a chain.
             if !deltas.checked(tip) {
+                let tip_checks = TipChecks {
+                    listed,
+                    ..tip_checks
+                };
                 check_tip_refs(self, tip_checks, tip, &loaded.commit, &[ref_name.as_str()]).await?;
             }
             collect_chain(
                 src,
                 *tip,
                 loaded,
+                &kept,
                 opts.depth,
                 &mut commits,
                 &mut seen,
@@ -2037,6 +2068,8 @@ impl Repo {
             )
             .await?;
         }
+        // The kept bytes drop here, before the transaction opens.
+        drop(kept);
         if let Some(deps) = deps.as_mut() {
             // The run of the levels imports the intermediate commits of the
             // chains, so the walk reads none of them again.
@@ -2856,7 +2889,9 @@ async fn resolve_targets(
 /// the first time that it gets to it, and not again.
 ///
 /// `tip_commit` holds the bytes of the tip, the commit parsed from them, and
-/// the format check of its field 2. If `check` is present, it runs on each
+/// the format check of its field 2. The walk parses a parent that is in
+/// `kept` from the kept bytes, and reads each other parent from `src`, as
+/// [`LocalChecks::commits`] states. If `check` is present, it runs on each
 /// commit when the walk appends it, over the bytes that the walk read. The
 /// walk appends each commit with the root of its tree, so the plan of the tree
 /// does not read the commit object again.
@@ -2876,6 +2911,7 @@ async fn collect_chain(
     src: &Repo,
     tip: Checksum,
     tip_commit: LoadedCommit,
+    kept: &HashMap<Checksum, Arc<Vec<u8>>>,
     depth: i32,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
@@ -2903,9 +2939,6 @@ async fn collect_chain(
         {
             return Ok(());
         }
-        // The check gives the bytes to the blocking pool in an `Arc`, with no
-        // copy.
-        let bytes = Arc::new(bytes);
         if seen.insert(checksum, remaining).is_none() {
             let dependencies = dependencies?;
             out.push(ChainCommit {
@@ -2930,9 +2963,11 @@ async fn collect_chain(
         let Some(parent) = commit.parent else {
             return Ok(());
         };
-        current = try_load_commit(src, &parent)
-            .await?
-            .map(|parent_commit| (parent, parent_commit));
+        let parent_commit = match kept.get(&parent) {
+            Some(bytes) => Some(parse_kept_commit(parent, Arc::clone(bytes)).await?),
+            None => try_load_commit(src, &parent).await?,
+        };
+        current = parent_commit.map(|parent_commit| (parent, parent_commit));
         if remaining > 0 {
             remaining -= 1;
         }
@@ -3447,7 +3482,9 @@ async fn source_size(repo: &Repo, ty: ObjectType, checksum: &Checksum) -> Result
 /// A commit that a local pull read: its bytes, the commit parsed from them,
 /// and the result of the format check of field 2.
 struct LoadedCommit {
-    bytes: Vec<u8>,
+    /// The bytes of the commit. The signature check gives them to the
+    /// blocking pool in this `Arc`, with no copy.
+    bytes: Arc<Vec<u8>>,
     /// The parsed commit. Its field 2 is empty: the entries are in
     /// `dependencies`.
     commit: Commit,
@@ -3471,7 +3508,7 @@ struct LoadedDependency {
 ///
 /// The call runs on the calling thread. A caller on the executor calls it on
 /// the blocking pool.
-fn parse_loaded(checksum: Checksum, bytes: Vec<u8>) -> Result<LoadedCommit> {
+fn parse_loaded(checksum: Checksum, bytes: Arc<Vec<u8>>) -> Result<LoadedCommit> {
     let mut commit = Commit::parse(&bytes)?;
     let related = std::mem::take(&mut commit.related);
     Ok(LoadedCommit {
@@ -3492,9 +3529,24 @@ async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<LoadedCommit> {
     let checksum = *checksum;
     ostrya_rt::unblock(move || {
         let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &checksum)?;
-        parse_loaded(checksum, bytes)
+        parse_loaded(checksum, Arc::new(bytes))
     })
     .await
+}
+
+/// Parses the bytes `bytes` of the tip commit `checksum`, which the probe of
+/// a local candidate of a collection pull kept, as [`load_commit`] parses the
+/// bytes that it reads.
+///
+/// The call does not hash `bytes`. A commit object can be as large as
+/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), so the parse runs on the
+/// blocking pool.
+///
+/// # Errors
+///
+/// The errors of [`parse_loaded`].
+async fn parse_kept_commit(checksum: Checksum, bytes: Arc<Vec<u8>>) -> Result<LoadedCommit> {
+    ostrya_rt::unblock(move || parse_loaded(checksum, bytes)).await
 }
 
 /// Loads a commit, or returns `None` for an absent object.
@@ -3554,7 +3606,7 @@ fn load_dependencies_blocking(
             commit,
             dependencies,
             ..
-        } = parse_loaded(*checksum, bytes)?;
+        } = parse_loaded(*checksum, Arc::new(bytes))?;
         if !dependencies?.is_empty() {
             return Ok(Err(at));
         }
@@ -3613,7 +3665,8 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
 ///
 /// [`Repo::pull_local`] sets `collection_binding` alone. A pull of collection
 /// refs from a local candidate sets each field. It sets `summary` only if
-/// its probe read the refs from the summary.
+/// its probe read the refs from the summary, and `commits` only if its probe
+/// read the refs from the ref files.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct LocalChecks {
     /// The collection-binding check of each tip, against
@@ -3656,6 +3709,23 @@ pub(crate) struct LocalChecks {
     /// [`refs`](PullOptions::refs), which the timestamp of its tip must
     /// equal. `None` makes no such check.
     pub(crate) listed: Option<HashMap<String, u64>>,
+    /// The bytes of tip commits of [`targets`](LocalChecks::targets) that the
+    /// caller read from the source, by checksum.
+    ///
+    /// The pull parses these bytes and does not read these tips from the
+    /// source. The walk of a chain also parses a parent from these bytes if
+    /// the map holds it. The caller read the listed timestamp of each such
+    /// tip from the same bytes, so the commit loop of the pull makes no check
+    /// of [`listed`](LocalChecks::listed) for it. Delta discovery still
+    /// checks each tip that a delta reaches against
+    /// [`listed`](LocalChecks::listed). With
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull first checks that the
+    /// bytes of each commit hash to its checksum, one time for each commit.
+    /// The pull reads each tip that is not in the map from the source, and
+    /// makes each check for it. An empty map reads each tip from the source.
+    /// The pull drops the map after it walked each chain, before its
+    /// transaction opens.
+    pub(crate) commits: HashMap<Checksum, Arc<Vec<u8>>>,
 }
 
 /// Checks the collection options of a local pull.

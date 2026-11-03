@@ -130,6 +130,10 @@ struct RepoInner {
     // the handle keeps it for its full life beside `lock`. So all clones of
     // this handle share one `.update.lock` descriptor and one queue of waiters.
     update_lock: Mutex<Option<Arc<UpdateLock>>>,
+    // How many times the handle read a commit object, for the tests of the
+    // reads of a pull.
+    #[cfg(test)]
+    commit_reads: std::sync::atomic::AtomicUsize,
 }
 
 impl RepoInner {
@@ -626,6 +630,23 @@ impl Repo {
         self.inner.objects_fd.as_fd()
     }
 
+    /// Counts one read of a commit object through this handle or a clone.
+    #[cfg(test)]
+    pub(crate) fn count_commit_read(&self) {
+        self.inner
+            .commit_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Returns how many times this handle and its clones read a commit
+    /// object.
+    #[cfg(test)]
+    pub(crate) fn commit_reads(&self) -> usize {
+        self.inner
+            .commit_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Parses the config bytes and assembles the handle. This step is CPU work
     /// only. `path` is the argument that the caller gave the constructor,
     /// stored as given for [`Repo::path`].
@@ -640,6 +661,8 @@ impl Repo {
                 strict: materials.strict,
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
+                #[cfg(test)]
+                commit_reads: std::sync::atomic::AtomicUsize::new(0),
             }),
         })
     }

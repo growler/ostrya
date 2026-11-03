@@ -14,6 +14,10 @@
 //!    selected remote, in the given order, through the engine of
 //!    [`Repo::pull`], over the session of its probe. A local repository goes
 //!    through the engine of [`Repo::pull_local`].
+//!
+//! [`Repo::remote_list_collection_refs_with`] makes the checks of part 1 and
+//! the probe of part 2 for one remote, and returns the refs that the probe
+//! read.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -249,7 +253,7 @@ impl Transport {
             Endpoint::S3(s3) => Transport::S3(s3_fetcher(&s3, stream).await?, Box::new(s3)),
             _ => {
                 return Err(crate::endpoint::neither_ssh_nor_http(
-                    "a pull of collection refs",
+                    "a read of collection refs",
                 ));
             }
         })
@@ -404,6 +408,43 @@ impl Repo {
     /// policy refuses, a listed name that the ref-name rule refuses, a listed
     /// ref with no `ostree.commit.timestamp` of type `t`, and a bucket
     /// repository with no `summary`.
+    ///
+    /// # Access
+    ///
+    /// A remote that `ostrya serve` serves identifies the client of each
+    /// request: by the client certificate of the keys `tls-client-cert-path`
+    /// and `tls-client-key-path` of the remote, by the client address, or as
+    /// `anonymous`. When `http_headers` of
+    /// [`overrides`](PullOptions::overrides) holds an `Authorization` header,
+    /// each HTTP request carries the bearer token or the Basic credential of
+    /// that header, which gives a `token-sha256` or a `basic-sha256` item.
+    /// Over ssh, `ostrya send` identifies the client by its `ssh:NAME` item.
+    /// The listing holds a ref when the client group of the item in the
+    /// namespace of the ref has `r` on its name. With
+    /// `tls-accept-claim=true`, the claims of the certificate for that
+    /// namespace replace the rules of the group. The namespace of the own
+    /// collection id of the remote is its local namespace. So the local group
+    /// of the remote applies, with the `ostrya:ref:` claims and the
+    /// `ostrya:collection:ID:` claims of that id.
+    ///
+    /// So the probe cannot tell a ref that the remote does not hold from a
+    /// ref that the client cannot read. When one remote hides a ref, the pull
+    /// takes the ref from another remote that lists it. Else the pull fails,
+    /// because no remote lists the ref.
+    ///
+    /// A remote that refuses the client answers the listing request with 401
+    /// or 403. The probe then reads the `summary`, by the rule of the status
+    /// from 400 to 499, and the remote refuses that request with the same
+    /// status. So the pull skips the remote.
+    ///
+    /// Under a summary policy, the probe reads the summary of the item alone.
+    /// That summary holds no ref of a namespace whose group has
+    /// `summary=false`, and claims never apply to a summary. A group with
+    /// `tls-accept-claim=true` cannot set `summary=true`. So from such a
+    /// remote, a client whose right comes from claims, or from a group with
+    /// `summary=false`, gets no ref of that namespace. The policy refuses ref
+    /// data that no signature covers, so the probe does not read the listing
+    /// in place of the summary.
     ///
     /// # Selection
     ///
@@ -623,7 +664,8 @@ impl Repo {
         // reads the key sources of the group one time for all the remotes.
         let mut group = opts.trust_group.as_deref().map(FieldGroup::new);
         for name in first_of_each(remotes.iter().copied()) {
-            candidates.push(resolve_candidate(self, name, &opts, group.as_mut()).await?);
+            let trust = TrustScope::Pull(group.as_mut());
+            candidates.push(resolve_candidate(self, name, &opts, trust).await?);
         }
         // A local pull copies whole trees.
         if !opts.subpaths.is_empty()
@@ -774,6 +816,231 @@ impl Repo {
             .collect();
         Ok(CollectionPullStats { refs, stats })
     }
+
+    /// Lists the refs of the collection `collection_id` that the remote
+    /// `remote` serves, as
+    /// [`remote_list_collection_refs_with`](Repo::remote_list_collection_refs_with)
+    /// does with the default overrides.
+    ///
+    /// The default overrides do not set `allow_cleartext_credentials`, so the
+    /// call refuses an `http://` S3 endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The errors of
+    /// [`remote_list_collection_refs_with`](Repo::remote_list_collection_refs_with).
+    pub async fn remote_list_collection_refs(
+        &self,
+        remote: &str,
+        collection_id: &str,
+        names: &[&str],
+    ) -> Result<Vec<(String, Checksum)>> {
+        self.remote_list_collection_refs_with(
+            remote,
+            collection_id,
+            names,
+            EndpointOverrides::default(),
+        )
+        .await
+    }
+
+    /// Lists the refs of the collection `collection_id` that the remote
+    /// `remote` serves, with the overrides `overrides` of the caller.
+    ///
+    /// `remote` is a `[remote "<name>"]` section of the config of this
+    /// repository. The call does not read the `collection-id` key of the
+    /// remote. `names` holds exact ref names. An empty slice selects each ref
+    /// of the collection. A name that occurs again adds nothing.
+    ///
+    /// The result holds the name and the commit of each ref that the remote
+    /// lists, sorted byte-wise by name. A name that the remote does not hold
+    /// is absent from the result. The call writes nothing to this repository,
+    /// and checks no commit signature.
+    ///
+    /// # Address and trust
+    ///
+    /// The call resolves the remote as [`Repo::pull_collection`] resolves a
+    /// remote, before its first request. A remote whose `pull-url`, or else
+    /// `url`, has the scheme `file` is a local repository, as "Local
+    /// repository" of [`Repo::pull_collection`] states. For each other
+    /// remote, the call resolves the endpoint with [`resolve_pull`] and
+    /// `overrides`. So over HTTP, the TLS keys and the key `proxy` of the
+    /// remote apply. Over ssh, the ssh command and the send command of the
+    /// remote apply. For an `s3://` address, the S3 keys of the remote apply,
+    /// and `allow_cleartext_credentials` permits an `http://` S3 endpoint.
+    /// The trust of the remote is its summary policy alone: the keys
+    /// `gpg-verify-summary` and `sign-verify-summary` of the remote and the
+    /// key sources that they read, as [`PullTrust::from_remote`] reads them.
+    /// The call checks no commit signature, so it does not read `gpg-verify`,
+    /// `sign-verify`, the key `trust`, or a trust group.
+    ///
+    /// # Probe
+    ///
+    /// The call reads the refs as the probe of [`Repo::pull_collection`]
+    /// does, in one session:
+    ///
+    /// - Under a summary policy (`gpg-verify-summary`,
+    ///   `sign-verify-summary`), the call reads the `summary` and the
+    ///   `summary.sig` of the remote, and verifies the summary before it
+    ///   reads the refs from it. It does not read the ref listing.
+    /// - Otherwise, the call reads the ref listing, in one or more requests.
+    ///   With no names, it asks for the local refs of the remote when the
+    ///   listing states `collection_id` as the collection id of the remote.
+    /// - If the remote serves no ref listing, the call reads the `summary`.
+    ///   An HTTP remote serves no listing when it answers with a status from
+    ///   400 to 499. A remote with no listing and no summary gives an empty
+    ///   vector.
+    /// - A bucket repository at an `s3://` address gives the refs of its
+    ///   `summary` alone.
+    /// - A local repository gives the refs of its ref files, or of its
+    ///   verified summary under a summary policy.
+    ///
+    /// The call ends the session before it returns.
+    ///
+    /// # Access
+    ///
+    /// A remote that `ostrya serve` serves identifies the client by the client
+    /// certificate of the keys `tls-client-cert-path` and
+    /// `tls-client-key-path` of the remote, by the client address, or as
+    /// `anonymous`. When `http_headers` of `overrides` holds an
+    /// `Authorization` header, each HTTP request carries the bearer token or
+    /// the Basic credential of that header, which gives a `token-sha256` or a
+    /// `basic-sha256` item. Over ssh, `ostrya send` identifies the client by
+    /// its `ssh:NAME` item.
+    /// The result holds a ref when the client group of the item in the
+    /// namespace of the ref has `r` on its name. With
+    /// `tls-accept-claim=true`, the claims of the certificate for that
+    /// namespace replace the rules of the group. The namespace of the own
+    /// collection id of the remote is its local namespace. So the local group
+    /// of the remote applies, with the `ostrya:ref:` claims and the
+    /// `ostrya:collection:ID:` claims of that id. So a ref that the client
+    /// cannot read is absent from the result, as a ref that the remote does
+    /// not hold is.
+    ///
+    /// A remote that refuses the client answers the listing request and the
+    /// `summary` request with 401 or 403, and the call returns
+    /// [`Error::HttpStatus`].
+    ///
+    /// Under a summary policy, the call reads the summary of the item alone.
+    /// That summary holds no ref of a namespace whose group has
+    /// `summary=false`, and claims never apply to a summary. So from such a
+    /// remote, a client whose right comes from claims, or from a group with
+    /// `summary=false`, gets no ref of that namespace.
+    ///
+    /// A local repository applies no client group. The file permissions are
+    /// the access.
+    ///
+    /// # Errors
+    ///
+    /// These errors come before the first request:
+    ///
+    /// - [`Error::InvalidInput`] if `collection_id` fails the collection-id
+    ///   rule ([`is_collection_id`]) or is longer than 255 bytes.
+    /// - [`Error::InvalidRefspec`] if a name in `names` is not a valid ref
+    ///   name.
+    /// - [`Error::InvalidInput`] if a name in `names` does not fit in a ref
+    ///   listing request alone, as for [`Repo::pull_collection`].
+    /// - [`Error::InvalidInput`] if `overrides` holds a `url`.
+    /// - The errors of [`resolve_pull`].
+    /// - The errors of [`PullTrust::from_remote`] that come from the summary
+    ///   policy:
+    ///   - [`Error::Core`] if `gpg-verify-summary` is not a boolean, if a
+    ///     value holds a malformed escape sequence, or if a sign-api key is
+    ///     not valid base64.
+    ///   - [`Error::Signature`] if `sign-verify-summary` names an engine that
+    ///     has no trusted key, if `sign-verify-summary=true` finds no engine
+    ///     with a trusted key, or if a keyring or a key file of the policy
+    ///     cannot be read or is not valid for its engine.
+    ///   - [`Error::Unsupported`] if the policy asks for an engine that this
+    ///     build does not verify with.
+    ///   - [`Error::Io`] if a directory of keys cannot be listed.
+    /// - For a remote at a `file:` address, the errors of the address and of
+    ///   `overrides` that [`Repo::pull_collection`] states.
+    /// - For an HTTP remote and a remote at an `s3://` address, the errors of
+    ///   the build of its fetcher that [`Repo::pull_collection`] states. For
+    ///   an ssh remote, the errors of its ssh command and of its send command.
+    ///
+    /// These errors come from the probe:
+    ///
+    /// - [`Error::HttpStatus`] if the remote refuses the client, or if a
+    ///   request gets a status from 500 to 599 after its retries.
+    /// - [`Error::Fetch`] and the other errors of an HTTP request that fails.
+    /// - [`Error::Remote`] if the ssh session fails, also at its end, or if
+    ///   a read from a bucket repository fails.
+    /// - [`Error::Signature`] if the summary fails the policy, or if the
+    ///   remote has no `summary` or no `summary.sig` under the policy.
+    /// - [`Error::Pull`] if a bucket repository has no `summary` and no
+    ///   summary policy applies.
+    /// - [`Error::Core`] or [`Error::InvalidFormat`] if the listing or the
+    ///   summary does not parse, and [`Error::InvalidFormat`] if a listed ref
+    ///   has no `ostree.commit.timestamp` of type `t`.
+    /// - [`Error::InvalidRefspec`] if a listed name fails the ref-name rule.
+    /// - For a local repository, the errors of [`Repo::open`],
+    ///   [`Error::Io`] if a directory or a ref file that the names reach
+    ///   cannot be read, and, without a summary policy,
+    ///   [`Error::ObjectNotFound`] if the repository does not hold the commit
+    ///   of a ref.
+    ///
+    /// # Examples
+    ///
+    /// List two refs of a collection on one remote:
+    ///
+    /// ```no_run
+    /// # async fn run() -> ostrya::Result<()> {
+    /// let repo = ostrya::Repo::open("/srv/repo".as_ref()).await?;
+    /// let refs = repo
+    ///     .remote_list_collection_refs_with(
+    ///         "mirror1",
+    ///         "org.example.Os",
+    ///         &["exampleos/stable", "exampleos/next"],
+    ///         ostrya::endpoint::EndpointOverrides::default(),
+    ///     )
+    ///     .await?;
+    /// for (name, commit) in &refs {
+    ///     println!("{name} {commit}");
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn remote_list_collection_refs_with(
+        &self,
+        remote: &str,
+        collection_id: &str,
+        names: &[&str],
+        overrides: EndpointOverrides,
+    ) -> Result<Vec<(String, Checksum)>> {
+        check_collection_id(collection_id)?;
+        check_ref_names(collection_id, names)?;
+        if overrides.url.is_some() {
+            return Err(Error::InvalidInput(
+                "a listing of collection refs reads the address of the remote from the \
+                 config, and takes no url override"
+                    .into(),
+            ));
+        }
+        let names = first_of_each(names.iter().copied());
+        let opts = PullOptions {
+            overrides,
+            ..PullOptions::default()
+        };
+        let candidate = resolve_candidate(self, remote, &opts, TrustScope::Summary).await?;
+        // The summary goes before the end of the session, which waits for the
+        // ssh client.
+        let Probed {
+            listed, session, ..
+        } = Box::pin(probe(&candidate, collection_id, &names)).await?;
+        // A local repository has no session to end.
+        if let Session::Remote(connection) = session {
+            RemoteSource::new(connection, Vec::new())
+                .finish(Ok(()))
+                .await?;
+        }
+        let mut refs: Vec<(String, Checksum)> = listed
+            .into_iter()
+            .map(|listed| (listed.name, listed.commit))
+            .collect();
+        refs.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Ok(refs)
+    }
 }
 
 /// Returns the first appearance of each value of `values`, in order.
@@ -819,8 +1086,18 @@ async fn end_sessions(sessions: impl IntoIterator<Item = Session>) {
     }
 }
 
+/// The trust that [`resolve_candidate`] reads for a remote.
+enum TrustScope<'g, 'f> {
+    /// The trust of a pull, with the trust group of the options, which
+    /// [`PullTrust::for_pull`] reads.
+    Pull(Option<&'g mut FieldGroup<'f>>),
+    /// The summary policy of the remote alone, which
+    /// [`PullTrust::for_summary`] reads.
+    Summary,
+}
+
 /// Resolves the remote `name` of `repo` to a candidate of a collection pull,
-/// with the options `opts` and the trust group `group` of the options.
+/// with the options `opts` and the trust that `trust` gives.
 ///
 /// The call resolves the address, then the trust, then the transport. A
 /// `file://` address gives a local candidate. Each other address goes
@@ -830,7 +1107,7 @@ async fn resolve_candidate<'a>(
     repo: &Repo,
     name: &'a str,
     opts: &PullOptions,
-    group: Option<&mut FieldGroup<'_>>,
+    trust: TrustScope<'_, '_>,
 ) -> Result<Candidate<'a>> {
     /// The address of a candidate.
     enum Address {
@@ -843,7 +1120,10 @@ async fn resolve_candidate<'a>(
             resolve_pull(Some(repo.config()), name, opts.overrides.clone()).await?,
         )),
     };
-    let trust = PullTrust::for_pull(repo, name, &opts.verify, group).await?;
+    let trust = match trust {
+        TrustScope::Pull(group) => PullTrust::for_pull(repo, name, &opts.verify, group).await?,
+        TrustScope::Summary => PullTrust::for_summary(repo, name).await?,
+    };
     let transport = match address {
         Address::Local(path) => Transport::Local(path),
         Address::Endpoint(endpoint) => {
@@ -864,11 +1144,7 @@ fn check_collection_pull(
     remotes: &[&str],
     opts: &PullOptions,
 ) -> Result<Option<Subpaths>> {
-    if !is_collection_id(collection_id) || collection_id.len() > MAX_COLLECTION_ID_LEN {
-        return Err(Error::InvalidInput(format!(
-            "invalid collection id: {collection_id}"
-        )));
-    }
+    check_collection_id(collection_id)?;
     if remotes.is_empty() {
         return Err(Error::InvalidInput(
             "a collection pull needs at least one remote".into(),
@@ -907,13 +1183,44 @@ fn check_collection_pull(
                 .into(),
         ));
     }
-    for name in &opts.refs {
-        check_ref_path(name)?;
-    }
-    for name in &opts.refs {
-        check_listing_name(collection_id, name)?;
-    }
+    check_ref_names(collection_id, &opts.refs)?;
     Ok(subpaths)
+}
+
+/// Checks the collection id `collection_id` of a pull or a listing of
+/// collection refs.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if `collection_id` fails the collection-id rule
+///   ([`is_collection_id`]) or is longer than [`MAX_COLLECTION_ID_LEN`]
+///   bytes.
+fn check_collection_id(collection_id: &str) -> Result<()> {
+    if !is_collection_id(collection_id) || collection_id.len() > MAX_COLLECTION_ID_LEN {
+        return Err(Error::InvalidInput(format!(
+            "invalid collection id: {collection_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks the ref names `names` of a pull or a listing of the collection
+/// `collection_id`: first the ref-name rule of each name, then the size of
+/// each name in a ref listing request.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if a name is not a valid ref name.
+/// - [`Error::InvalidInput`] if a ref listing request cannot hold a name
+///   alone ([`check_listing_name`]).
+fn check_ref_names<S: AsRef<str>>(collection_id: &str, names: &[S]) -> Result<()> {
+    for name in names {
+        check_ref_path(name.as_ref())?;
+    }
+    for name in names {
+        check_listing_name(collection_id, name.as_ref())?;
+    }
+    Ok(())
 }
 
 /// Checks that a ref listing request of the collection `id` can hold the
@@ -1200,8 +1507,8 @@ async fn summary_refs(
     let Some(bytes) = summary else {
         if source.has_bucket() {
             return Err(Error::Pull(
-                "the bucket repository has no summary, and a pull of collection refs reads \
-                 the refs of a bucket repository from its summary"
+                "the bucket repository has no summary, and the summary is the one source of \
+                 the refs of a bucket repository"
                     .into(),
             ));
         }
@@ -1394,8 +1701,9 @@ fn add_stats(total: &mut PullStats, pulled: &PullStats) {
     total.bytes_transferred += pulled.bytes_transferred;
 }
 
-/// A compile-time check that the future of a collection pull is `Send`, and
-/// that its result is `Send` and `Sync`.
+/// A compile-time check that the futures of a collection pull and of a
+/// listing of collection refs are `Send`, and that the result of a pull is
+/// `Send` and `Sync`.
 const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     fn assert_send_sync<T: Send + Sync>() {}
@@ -1404,6 +1712,17 @@ const _: fn() = || {
             "org.example.Os",
             &["origin"],
             CollectionPullOptions::default(),
+        ))
+    };
+    let _ = |repo: &Repo| {
+        assert_send(&repo.remote_list_collection_refs("origin", "org.example.Os", &[]))
+    };
+    let _ = |repo: &Repo| {
+        assert_send(&repo.remote_list_collection_refs_with(
+            "origin",
+            "org.example.Os",
+            &[],
+            EndpointOverrides::default(),
         ))
     };
     assert_send_sync::<CollectionPullStats>();

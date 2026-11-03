@@ -1403,8 +1403,12 @@ impl Repo {
     /// listing. The call does not read a ref that the selectors do not
     /// select or that `access` does not read.
     ///
-    /// `ostrya-server` exports no handler of the listing. A host with a router
-    /// of its own calls this method in its own handler.
+    /// `ostrya-server` answers `GET /_ostrya/refs/v1` with this listing, and
+    /// so does `ostrya serve`, which runs that server.
+    /// [`Repo::pull_collection`] and [`Repo::remote_list_collection_refs`]
+    /// read the listing. The handler of `ostrya-server` is not a public item,
+    /// so a host with a router of its own calls this method in its own
+    /// handler.
     pub async fn build_ref_listing(
         &self,
         refs: &RefSelector,

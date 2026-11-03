@@ -10,6 +10,7 @@
 //! - the authentication of each request
 //! - the PROXY protocol, the trusted proxies, and the forwarded certificates
 //! - the claims of a client certificate
+//! - the access of a client to the collection refs that a query lists
 
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -30,9 +31,9 @@ use ostrya::remote::proto::{
 };
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectName, ObjectType, PruneOptions, ReceivePolicies, ReceiveReport, RefSelector, Repo,
-    RepoMode, loose_path,
+    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
+    MutableTree, ObjectName, ObjectType, PruneOptions, ReceivePolicies, ReceiveReport, RefSelector,
+    Repo, RepoMode, loose_path,
 };
 use ostrya_rt::{Timer, block_on};
 use ostrya_server::{ServeOptions, ServerEvent, ServerTls};
@@ -2693,6 +2694,515 @@ fn the_claims_of_a_forwarded_certificate_open_a_session() {
                     if *digest == Checksum::sha256(&malformed_der) && san == "ostrya:ref:w:main/"
             )),
             "{events:?}"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Collection refs.
+// ---------------------------------------------------------------------------
+
+/// The collection id of the repository of the server.
+const OWN: &str = "org.example.Own";
+/// The collection that a client lists.
+const ID: &str = "org.example.Os";
+/// Another collection of the repository of the server.
+const OTHER: &str = "org.example.Other";
+/// The fixture CA, which signed the certificate of the server.
+const CA_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/tls/ca.pem"
+);
+/// The key of the fixture client certificate.
+const CLIENT_KEY_PATH: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../tests/fixtures/tls/client.key.pem"
+);
+/// A fixed ed25519 keypair that signs the summaries of the server.
+const SUMMARY_SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+const SUMMARY_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+/// Creates the repository of the server at `base/served`, with the
+/// collection id `OWN` and one commit. The commit is the target of the local
+/// refs `main` and `pool/a`, of the refs `main`, `pool/a`, and `pool/x/b` of
+/// `ID`, and of the ref `c` of `OTHER`.
+async fn served(base: &Path) -> (Repo, Checksum) {
+    let root = base.join("served");
+    let repo = Repo::create(
+        &root,
+        CreateOptions {
+            mode: RepoMode::Archive,
+            collection_id: Some(OWN.to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    let src = base.join("served-tree");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(src.join("file"), b"served\n").unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+    let dfd = std::fs::File::open(&src).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let tree = txn.write_mtree(&mut mtree).await.unwrap();
+    let options = CommitOptions {
+        timestamp: Some(1_700_000_000),
+        ..CommitOptions::default()
+    };
+    let commit = txn.write_commit(options, &tree).await.unwrap();
+    for name in ["main", "pool/a"] {
+        txn.set_ref(name, Some(&commit));
+    }
+    for name in ["main", "pool/a", "pool/x/b"] {
+        txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&commit));
+    }
+    txn.set_collection_ref(&CollectionRef::new(OTHER, "c"), Some(&commit));
+    txn.commit().await.unwrap();
+    (repo, commit)
+}
+
+/// Returns the repository of [`served`] and the options of a TLS server
+/// over it, with the client groups `groups` and the test CA `ca` as the
+/// client CA. The repository holds the groups in its config.
+fn tls_served(base: &Path, groups: &str, ca: &test_pki::TestCa) -> (Repo, Checksum, ServeOptions) {
+    let (repo, commit) = block_on(served(base));
+    let mut opts = options_with(&repo, groups);
+    with_tls(&mut opts);
+    opts.client_ca_pem = Some(ca.pem.clone().into_bytes());
+    let repo = block_on(Repo::open(repo.path())).unwrap();
+    (repo, commit, opts)
+}
+
+/// Returns a PEM client certificate that the test CA `ca` signs over the
+/// key of the fixture client certificate, with the URI SANs `uris`. With no
+/// URI, the certificate has no SubjectAltName extension.
+fn claims_leaf(ca: &test_pki::TestCa, uris: &[&str]) -> Vec<u8> {
+    let spki = test_pki::spki_of(std::str::from_utf8(CLIENT_CERT_PEM).unwrap());
+    let sans: Vec<Vec<u8>> = if uris.is_empty() {
+        Vec::new()
+    } else {
+        vec![test_pki::uri_sans(uris)]
+    };
+    test_pki::pem(&ca.leaf_with("client", Some(spki), &sans)).into_bytes()
+}
+
+/// Creates the client repository at `base/client`, with one remote for each
+/// entry of `remotes`: its name, the PEM of its client certificate or
+/// `None`, and its other keys. Each remote has the address of the server at
+/// `addr`, and trusts the fixture CA.
+async fn collection_client(
+    base: &Path,
+    addr: SocketAddr,
+    remotes: &[(&str, Option<&[u8]>, &str)],
+) -> Repo {
+    let root = base.join("client");
+    drop(
+        Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap(),
+    );
+    let config = root.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    for (name, cert, keys) in remotes {
+        text.push_str(&format!(
+            "\n[remote \"{name}\"]\nurl=https://127.0.0.1:{}/\ngpg-verify=false\n\
+             tls-ca-path={CA_PATH}\n",
+            addr.port()
+        ));
+        if let Some(cert) = cert {
+            let path = base.join(format!("{name}.pem"));
+            std::fs::write(&path, cert).unwrap();
+            text.push_str(&format!(
+                "tls-client-cert-path={}\ntls-client-key-path={CLIENT_KEY_PATH}\n",
+                path.display()
+            ));
+        }
+        text.push_str(keys);
+    }
+    std::fs::write(&config, text).unwrap();
+    Repo::open(&root).await.unwrap()
+}
+
+/// Lists the refs `names` of the collection `id` on the remote `remote` of
+/// `repo`, with no retry, and returns their names.
+async fn listed_refs(
+    repo: &Repo,
+    remote: &str,
+    id: &str,
+    names: &[&str],
+) -> ostrya::Result<Vec<String>> {
+    let overrides = ostrya::endpoint::EndpointOverrides {
+        max_retries: Some(0),
+        ..Default::default()
+    };
+    let refs = repo
+        .remote_list_collection_refs_with(remote, id, names, overrides)
+        .await?;
+    Ok(refs.into_iter().map(|(name, _)| name).collect())
+}
+
+/// A collection group with no `r` on a name hides the ref: the name is
+/// absent from the result of a query, and the refs of the group are
+/// present.
+#[test]
+fn a_query_holds_no_ref_without_r_in_the_group() {
+    let tmp = TmpDir::new("query-group");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\nallow=r:pool/**\n";
+    let (repo, commit, opts) = tls_served(tmp.path(), groups, &ca);
+    let cert = claims_leaf(&ca, &[]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(tmp.path(), addr, &[("a", Some(&cert), "")]).await;
+        let refs = client
+            .remote_list_collection_refs("a", ID, &["main", "pool/a"])
+            .await
+            .unwrap();
+        assert_eq!(refs, [("pool/a".to_owned(), commit)]);
+        assert_eq!(
+            listed_refs(&client, "a", ID, &[]).await.unwrap(),
+            ["pool/a", "pool/x/b"]
+        );
+    });
+}
+
+/// With `tls-accept-claim=true`, the claim `ostrya:collection:ID:r:pool/**`
+/// replaces the rules of the group: the refs under `pool/` are present, and
+/// `main`, which the group alone gives, is absent. A certificate with no
+/// claim gets the rules of the group.
+#[test]
+fn the_claims_of_a_collection_replace_the_group_in_a_query() {
+    let tmp = TmpDir::new("query-claims");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\n\
+                  tls-accept-claim=true\nallow=r:main\n";
+    let (repo, _, opts) = tls_served(tmp.path(), groups, &ca);
+    let claimed = claims_leaf(&ca, &[&format!("ostrya:collection:{ID}:r:pool/**")]);
+    let plain = claims_leaf(&ca, &["https://example.com/"]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(
+            tmp.path(),
+            addr,
+            &[("claimed", Some(&claimed), ""), ("plain", Some(&plain), "")],
+        )
+        .await;
+        for names in [&[][..], &["main", "pool/a", "pool/x/b"][..]] {
+            assert_eq!(
+                listed_refs(&client, "claimed", ID, names).await.unwrap(),
+                ["pool/a", "pool/x/b"]
+            );
+            assert_eq!(
+                listed_refs(&client, "plain", ID, names).await.unwrap(),
+                ["main"]
+            );
+        }
+    });
+}
+
+/// The deny claim `ostrya:collection:ID:!pool/x/**` hides the refs under
+/// `pool/x/`. The same allow claim with no deny claim gives them.
+#[test]
+fn a_deny_claim_hides_refs_from_a_query() {
+    let tmp = TmpDir::new("query-deny");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\n";
+    let (repo, _, opts) = tls_served(tmp.path(), groups, &ca);
+    let allow = format!("ostrya:collection:{ID}:r:**");
+    let deny = format!("ostrya:collection:{ID}:!pool/x/**");
+    let denied = claims_leaf(&ca, &[&allow, &deny]);
+    let full = claims_leaf(&ca, &[&allow]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(
+            tmp.path(),
+            addr,
+            &[("denied", Some(&denied), ""), ("full", Some(&full), "")],
+        )
+        .await;
+        assert_eq!(
+            listed_refs(&client, "denied", ID, &[]).await.unwrap(),
+            ["main", "pool/a"]
+        );
+        assert_eq!(
+            listed_refs(&client, "denied", ID, &["pool/a", "pool/x/b"])
+                .await
+                .unwrap(),
+            ["pool/a"]
+        );
+        assert_eq!(
+            listed_refs(&client, "full", ID, &[]).await.unwrap(),
+            ["main", "pool/a", "pool/x/b"]
+        );
+    });
+}
+
+/// A claim of another collection gives no ref of `ID`. The same certificate
+/// lists the ref of that collection.
+#[test]
+fn a_claim_of_another_collection_gives_no_ref_to_a_query() {
+    let tmp = TmpDir::new("query-other");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\n";
+    let (repo, _, opts) = tls_served(tmp.path(), groups, &ca);
+    let cert = claims_leaf(&ca, &[&format!("ostrya:collection:{OTHER}:r:**")]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(tmp.path(), addr, &[("a", Some(&cert), "")]).await;
+        assert!(listed_refs(&client, "a", ID, &[]).await.unwrap().is_empty());
+        assert!(
+            listed_refs(&client, "a", ID, &["main", "pool/a"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(listed_refs(&client, "a", OTHER, &[]).await.unwrap(), ["c"]);
+    });
+}
+
+/// The own collection id of the remote is its local namespace. The local
+/// group reads the claim `ostrya:collection:OWN_ID:r:pool/**`, so a query
+/// of the own id gives the local refs under `pool/`, and no `main`. The
+/// claim gives no ref of `ID`.
+#[test]
+fn a_claim_of_the_own_collection_applies_to_the_local_refs() {
+    let tmp = TmpDir::new("query-own");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"local\"]\nauth=tls:*\ntls-accept-claim=true\n\
+                  [ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\n";
+    let (repo, commit, opts) = tls_served(tmp.path(), groups, &ca);
+    let cert = claims_leaf(&ca, &[&format!("ostrya:collection:{OWN}:r:pool/**")]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(tmp.path(), addr, &[("a", Some(&cert), "")]).await;
+        let refs = client
+            .remote_list_collection_refs("a", OWN, &[])
+            .await
+            .unwrap();
+        assert_eq!(refs, [("pool/a".to_owned(), commit)]);
+        assert_eq!(
+            listed_refs(&client, "a", OWN, &["main", "pool/a"])
+                .await
+                .unwrap(),
+            ["pool/a"]
+        );
+        assert!(listed_refs(&client, "a", ID, &[]).await.unwrap().is_empty());
+    });
+}
+
+/// Claims that do not parse refuse the listing and the summary with 403. The
+/// query returns `Error::HttpStatus` with 403, and a collection pull skips
+/// the remote.
+#[test]
+fn claims_that_do_not_parse_refuse_a_query_with_403() {
+    let tmp = TmpDir::new("query-bad-claims");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\nallow=r:**\n";
+    let (repo, _, opts) = tls_served(tmp.path(), groups, &ca);
+    let cert = claims_leaf(&ca, &["ostrya:ref:w:main", "ostrya:ref:w:a b"]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(tmp.path(), addr, &[("a", Some(&cert), "")]).await;
+        let err = listed_refs(&client, "a", ID, &["pool/a"])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ostrya::Error::HttpStatus { status: 403, .. }),
+            "{err:?}"
+        );
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut pull = ostrya::CollectionPullOptions::default();
+        pull.pull.refs = vec!["pool/a".to_owned()];
+        pull.pull.overrides.max_retries = Some(0);
+        pull.on_event = Some(Box::new(move |event| sink.lock().unwrap().push(event)));
+        let err = client.pull_collection(ID, &["a"], pull).await.unwrap_err();
+        assert!(matches!(err, ostrya::Error::Pull(_)), "{err:?}");
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(&events[..], [ostrya::CollectionPullEvent::RemoteSkipped { remote, message, .. }]
+                if remote == "a" && message.contains("403")),
+            "{events:?}"
+        );
+    });
+}
+
+/// A client with no certificate, on a server whose groups need a
+/// certificate or a token, gets 401 on the listing and on the summary. The
+/// query returns `Error::HttpStatus` with 401. A client with a certificate
+/// lists the refs.
+#[test]
+fn a_query_with_no_certificate_gets_401() {
+    let tmp = TmpDir::new("query-no-cert");
+    let ca = test_pki::TestCa::new();
+    let groups = format!(
+        "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\nallow=r:**\n\
+         [ex-ostrya client \"ci\"]\nauth=token-sha256:{}\nallow=r:**\n",
+        Checksum::sha256(ALICE.as_bytes()).to_hex()
+    );
+    let (repo, _, opts) = tls_served(tmp.path(), &groups, &ca);
+    let cert = claims_leaf(&ca, &[]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(
+            tmp.path(),
+            addr,
+            &[("nobody", None, ""), ("cert", Some(&cert), "")],
+        )
+        .await;
+        let err = listed_refs(&client, "nobody", ID, &[]).await.unwrap_err();
+        assert!(
+            matches!(err, ostrya::Error::HttpStatus { status: 401, .. }),
+            "{err:?}"
+        );
+        assert_eq!(
+            listed_refs(&client, "cert", ID, &[]).await.unwrap(),
+            ["main", "pool/a", "pool/x/b"]
+        );
+    });
+}
+
+/// A bearer token in an `Authorization` header of the endpoint overrides
+/// gives the item of a `token-sha256` group: the query lists the refs that
+/// the group reads. With no header, the query gets 401.
+#[test]
+fn a_bearer_token_in_the_headers_gives_a_query_access() {
+    let tmp = TmpDir::new("query-token");
+    let ca = test_pki::TestCa::new();
+    let groups = format!(
+        "[ex-ostrya client \"ci\"]\nauth=token-sha256:{}\ncollection=*\nallow=r:pool/**\n",
+        Checksum::sha256(ALICE.as_bytes()).to_hex()
+    );
+    let (repo, commit, opts) = tls_served(tmp.path(), &groups, &ca);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(tmp.path(), addr, &[("a", None, "")]).await;
+        let overrides = ostrya::endpoint::EndpointOverrides {
+            max_retries: Some(0),
+            http_headers: vec![("Authorization".to_owned(), format!("Bearer {ALICE}"))],
+            ..Default::default()
+        };
+        let refs = client
+            .remote_list_collection_refs_with("a", ID, &[], overrides)
+            .await
+            .unwrap();
+        assert_eq!(
+            refs,
+            [
+                ("pool/a".to_owned(), commit),
+                ("pool/x/b".to_owned(), commit)
+            ]
+        );
+        let err = listed_refs(&client, "a", ID, &[]).await.unwrap_err();
+        assert!(
+            matches!(err, ostrya::Error::HttpStatus { status: 401, .. }),
+            "{err:?}"
+        );
+    });
+}
+
+/// Under a summary policy, the query reads the summary of the item alone,
+/// and claims never apply to a summary. So a claim of `ID` gives no ref of
+/// `ID`, and the query gives an empty vector. The verified summary holds the
+/// local refs of a group with `summary=true`. Without the policy, the same
+/// certificate lists the refs of `ID` through the claim. A collection pull
+/// under the policy finds no remote that lists the ref.
+#[test]
+fn a_summary_policy_hides_the_rights_of_claims_from_a_query() {
+    let tmp = TmpDir::new("query-summary-policy");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"local\"]\nauth=tls:*\nallow=r:**\nsummary=true\n\
+                  [ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\n";
+    let (repo, _, opts) = tls_served(tmp.path(), groups, &ca);
+    let signer = ostrya::Ed25519Signer::from_base64(SUMMARY_SECRET_B64).unwrap();
+    block_on(repo.regenerate_summaries(&ostrya::SummaryOptions::default(), &[&signer])).unwrap();
+    let cert = claims_leaf(&ca, &[&format!("ostrya:collection:{ID}:r:**")]);
+    let policy =
+        format!("sign-verify-summary=ed25519\nverification-ed25519-key={SUMMARY_PUBLIC_B64}\n");
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(
+            tmp.path(),
+            addr,
+            &[("signed", Some(&cert), &policy), ("plain", Some(&cert), "")],
+        )
+        .await;
+        assert!(
+            listed_refs(&client, "signed", ID, &[])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            listed_refs(&client, "signed", ID, &["pool/a"])
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        // The write of the summaries also writes the local ref
+        // `ostree-metadata` of a repository with a collection id.
+        assert_eq!(
+            listed_refs(&client, "signed", OWN, &[]).await.unwrap(),
+            ["main", "ostree-metadata", "pool/a"]
+        );
+        assert_eq!(
+            listed_refs(&client, "plain", ID, &[]).await.unwrap(),
+            ["main", "pool/a", "pool/x/b"]
+        );
+
+        let mut pull = ostrya::CollectionPullOptions::default();
+        pull.pull.refs = vec!["pool/a".to_owned()];
+        pull.pull.overrides.max_retries = Some(0);
+        let err = client
+            .pull_collection(ID, &["signed"], pull)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ostrya::Error::Pull(m) if m.contains("lists the ref 'pool/a'")),
+            "{err:?}"
+        );
+    });
+}
+
+/// A collection pull with two remotes, where the first hides a ref by a
+/// deny claim: the pull takes that ref from the second remote. The two
+/// remotes list the same timestamp, so a ref that both list comes from the
+/// first.
+#[test]
+fn a_collection_pull_takes_a_hidden_ref_from_the_next_remote() {
+    let tmp = TmpDir::new("query-two-remotes");
+    let ca = test_pki::TestCa::new();
+    let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\ntls-accept-claim=true\n";
+    let (repo, commit, opts) = tls_served(tmp.path(), groups, &ca);
+    let allow = format!("ostrya:collection:{ID}:r:**");
+    let deny = format!("ostrya:collection:{ID}:!pool/x/**");
+    let hiding = claims_leaf(&ca, &[&allow, &deny]);
+    let full = claims_leaf(&ca, &[&allow]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = collection_client(
+            tmp.path(),
+            addr,
+            &[("a", Some(&hiding), ""), ("b", Some(&full), "")],
+        )
+        .await;
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&events);
+        let mut pull = ostrya::CollectionPullOptions::default();
+        pull.pull.refs = vec!["pool/a".to_owned(), "pool/x/b".to_owned()];
+        pull.pull.overrides.max_retries = Some(0);
+        pull.allow_unbound = true;
+        pull.on_event = Some(Box::new(move |event| sink.lock().unwrap().push(event)));
+        let pulled = client.pull_collection(ID, &["a", "b"], pull).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit))
+            .collect();
+        assert_eq!(got, [("pool/a", "a", commit), ("pool/x/b", "b", commit)]);
+        let mut mirrors = client.list_mirror_refs().await.unwrap();
+        mirrors.sort();
+        assert_eq!(
+            mirrors,
+            [
+                (ID.to_owned(), "pool/a".to_owned(), commit),
+                (ID.to_owned(), "pool/x/b".to_owned(), commit),
+            ]
         );
     });
 }

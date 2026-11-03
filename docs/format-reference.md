@@ -4831,6 +4831,12 @@ ids after each ref that it selects, before it reads a commit. It reads no more
 ref file when the bound passes the size. It writes the map one ref entry at a
 time, so a listing over the size fails before it is whole in memory.
 
+A client reads the listing in `Repo::pull_collection` and in
+`Repo::remote_list_collection_refs` ("The pull of collection refs"). The
+listing holds only the refs that the client of the request reads. So when the
+listing does not hold a ref, the repository does not hold the ref, or the
+client cannot read it. The client cannot tell the two cases apart.
+
 ## The pull of collection refs
 
 `ostrya pull --collection ID [REF]...` pulls refs of the collection `ID` from
@@ -4919,6 +4925,54 @@ In the listing or the summary, the refs of `ID` are in field 0 when
 `ostree.summary.collection-map` under `ID`, and the pull ignores field 0. The
 timestamp of each ref is its `ostree.commit.timestamp`, a big-endian `t`.
 
+A candidate that `ostrya serve` serves identifies the client of each request
+("Authentication of the receive endpoint") in one of these ways:
+
+- by the client certificate of `tls-client-cert-path` and
+  `tls-client-key-path` of the remote, which gives a `tls:*`, `tls:NAME`, or
+  `tls-sha256:HEX` item;
+- by the client address, which gives a `net:` item;
+- by the bearer token or the Basic credential of an `Authorization` header
+  in the `http_headers` of the endpoint overrides of the caller, which gives
+  a `token-sha256:HEX` or a `basic-sha256:HEX` item;
+- with no credential, which gives the `anonymous` item.
+
+Over ssh, `ostrya send` identifies the client by its `ssh:NAME` item. Claims
+never apply to `net:`, `anonymous`, or `ssh:NAME`.
+
+The listing holds the refs that the client reads ("Read access"). With
+`tls-accept-claim=true`, the claims of the namespace of a ref replace `allow`
+and `deny` of the group ("Claims of a client certificate"). The namespace of
+the own collection id of the remote is its local namespace. The probe then
+reads field 0, so the local group of the remote applies, with the
+`ostrya:ref:` claims and the `ostrya:collection:ID:` claims of that id. When
+one candidate hides a ref, the pull takes the ref from another candidate that
+lists it. Else the pull fails, because no candidate lists the ref.
+
+A server that refuses the client answers the listing request with 401 or 403.
+So the pull reads `summary`, by item 4, and `ostrya serve` refuses that
+request with the same status. The pull then skips the candidate. These are
+the cases:
+
+- no credential, where a group needs one (401);
+- a certificate that matches no item (403);
+- a certificate whose claims do not parse, in a group with
+  `tls-accept-claim=true` (403).
+
+A 404 on the listing and on the summary stays a candidate with no ref.
+
+A summary policy hides the rights of claims. Under `gpg-verify-summary` or
+`sign-verify-summary`, the probe reads the summary of the item alone ("The
+serve of a summary"). That summary holds no ref of a namespace whose group
+has `summary=false`, and claims never apply to a summary ("Summaries of auth
+items"). A group with `tls-accept-claim=true` cannot set `summary=true`. So
+from such a candidate, a client whose right comes from claims, or from a
+group with `summary=false`, gets no ref of that namespace. A pull of such a
+ref fails, because no candidate lists it. The policy refuses ref data that no
+signature covers, so the probe does not read the listing in place of the
+summary. Under the policy, a candidate with no summary fails the signature
+check.
+
 A candidate is skipped, with a warning, when a request fails, when a listing
 request gets a status from 500 to 599, when the listing or the summary does
 not parse, when the summary fails its signature check, when a listed name
@@ -4999,6 +5053,38 @@ With `no_ref_writes`, the pull writes no ref and reads no
 `ostree.collection-binding`. The remote name then also selects the place
 where delta discovery reads the `from` commit of a delta:
 `refs/remotes/REMOTE/REF`, or `refs/heads/REF` with no remote name.
+
+The library call `Repo::remote_list_collection_refs` lists the refs of `ID`
+on one remote, and pulls nothing. `Repo::remote_list_collection_refs_with`
+takes the endpoint overrides of the caller, and refuses a `url` override. The
+call checks `ID` and the names as the pull does. Then it resolves the remote
+as the pull resolves a candidate, before its first request. The trust of the
+remote is its summary policy alone: `gpg-verify-summary`,
+`sign-verify-summary`, and the key sources that they read. The call does not
+read `gpg-verify`, `sign-verify`, `trust`, or a trust group. It makes the
+probe of the candidate above, in one session, and ends the session before it
+returns:
+
+- Under a summary policy, it reads the refs from the verified summary.
+- Otherwise it reads the ref listing, in the requests of items 2 and 3, and
+  the summary of a remote that serves no listing (item 4).
+- From a bucket repository, it reads the refs from the summary alone.
+- From a local candidate, it reads the ref files, or the verified summary
+  under a summary policy.
+
+The result holds the name and the commit of each listed ref, sorted
+byte-wise by name. A name that the remote does not hold, or that the client
+cannot read, is not in the result. The call writes nothing to the repository,
+and checks no commit signature.
+
+Each failure that skips a candidate of the pull is the error of the call. So
+a status from 500 to 599 fails the call, and a refusal of the client gives
+the status 401 or 403. Under a summary policy, a remote with no summary fails
+the signature check. A bucket repository with no summary fails the call
+when no summary policy applies, because the summary is the one source of its
+refs. The call returns the
+errors of a local candidate unchanged. A remote with no listing and no
+summary gives an empty result.
 
 ## Summaries of auth items
 

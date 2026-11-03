@@ -23,8 +23,8 @@ use ostrya::endpoint::EndpointOverrides;
 use ostrya::{
     Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
     CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer,
-    Error, FsckOptions, MutableTree, ObjectType, PullFlags, PullOptions, RefSelector, Repo,
-    RepoMode, SummaryOptions, TimestampCheck, Type, Value,
+    Error, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectType, PullFlags, PullOptions,
+    RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -252,11 +252,13 @@ async fn reconfigure(dir: &Path, text: &str) -> Repo {
     Repo::open(&dir.join("dest")).await.unwrap()
 }
 
-/// Asserts that `repo` holds no ref and no commit object.
+/// Asserts that `repo` holds no ref and no object.
 async fn assert_nothing_written(repo: &Repo) {
     assert!(repo.list_refs(None).await.unwrap().is_empty());
     assert!(repo.list_mirror_refs().await.unwrap().is_empty());
     assert!(repo.list_remote_refs().await.unwrap().is_empty());
+    let objects = repo.list_objects().await.unwrap();
+    assert!(objects.is_empty(), "{objects:?}");
 }
 
 /// Returns `true` if `server` received a request for an object.
@@ -1136,9 +1138,9 @@ fn skipped(dir: &Path, events: &Mutex<Vec<CollectionPullEvent>>) -> Vec<String> 
         .collect()
 }
 
-/// Sets `mode` on `path`. Returns `false`, with mode `restore` set again,
-/// when the process still reads the path: a user that ignores the mode
-/// cannot run the test.
+/// Sets `mode` on `path`. Returns `false`, with mode `restore` set again
+/// and a skip message on standard error, when the process still reads the
+/// path: a user that ignores the mode cannot run the test.
 fn lock(path: &Path, mode: u32, restore: u32) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
@@ -1149,6 +1151,10 @@ fn lock(path: &Path, mode: u32, restore: u32) -> bool {
     };
     if readable {
         unlock(path, restore);
+        eprintln!(
+            "skipping: the process reads {} with mode {mode:o}, so it ignores the mode",
+            path.display()
+        );
         return false;
     }
     true
@@ -1937,6 +1943,534 @@ fn an_empty_ssh_command_fails_before_the_first_request() {
     });
 }
 
+// --- the listing of collection refs ------------------------------------------
+
+/// Returns the overrides of a query with no retry.
+fn no_retry() -> EndpointOverrides {
+    EndpointOverrides {
+        max_retries: Some(0),
+        ..EndpointOverrides::default()
+    }
+}
+
+/// Lists the refs `names` of `ID` on the remote `remote` of `repo`, with no
+/// retry.
+async fn query(
+    repo: &Repo,
+    remote: &str,
+    names: &[&str],
+) -> ostrya::Result<Vec<(String, Checksum)>> {
+    repo.remote_list_collection_refs_with(remote, ID, names, no_retry())
+        .await
+}
+
+/// A list of 300 names takes more than one listing request. The result holds
+/// each listed ref once, sorted by name, whatever the order of the names. A
+/// name that the remote does not hold, and a name that occurs again, add
+/// nothing.
+#[test]
+fn a_query_of_300_names_takes_more_than_one_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-many");
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let tip = commit(
+            &b,
+            dir.path(),
+            "b",
+            Some(ID),
+            "pool/n000",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let names: Vec<String> = (0..300).map(|n| format!("pool/n{n:03}")).collect();
+        let txn = b.transaction().await.unwrap();
+        for name in &names[1..] {
+            txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&tip));
+        }
+        txn.commit().await.unwrap();
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        serve_listing(&server_b, &b, &[]).await;
+        let dest = dest(dir.path(), None, &[("b", &server_b.url(), "")]).await;
+
+        let mut asked: Vec<&str> = names.iter().rev().map(String::as_str).collect();
+        asked.push("pool/absent");
+        asked.push("pool/n007");
+        let listed = query(&dest, "b", &asked).await.unwrap();
+        let expected: Vec<(String, Checksum)> =
+            names.iter().map(|name| (name.clone(), tip)).collect();
+        assert_eq!(listed, expected);
+        let requests = (asked.len() - 1).div_ceil(MAX_REF_PATTERNS / 2);
+        assert!(requests > 1);
+        assert_eq!(server_b.requests_for(LISTING), requests);
+        assert_eq!(server_b.requests_for("summary"), 0);
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// A remote whose own collection id is the queried id lists the refs in
+/// field 0. With no name, the query asks it a second time, for each local
+/// ref. With names, one request names each ref and each ref under the id.
+#[test]
+fn a_query_reads_the_local_refs_of_a_remote_of_the_collection() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-own");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let stable = commit(&a, dir.path(), "a1", None, REF, FIXED_TS, BOUND).await;
+        let next_bind = Bind {
+            collection: Some(ID),
+            refs: Some(&["os/next"]),
+        };
+        let next = commit(&a, dir.path(), "a2", None, "os/next", FIXED_TS, next_bind).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let refs = RefSelector::parse(std::iter::empty()).unwrap();
+        server_a.tamper(LISTING, repo_listing(&a, &refs, None).await);
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let listed = dest
+            .remote_list_collection_refs("a", ID, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            [("os/next".to_owned(), next), (REF.to_owned(), stable)]
+        );
+        assert_eq!(
+            server_a.queries_for(LISTING),
+            ["pattern=%21%2A%2A&collection=org.example.Os%2F%2A%2A", ""]
+        );
+
+        server_a.forget();
+        let listed = query(&dest, "a", &[REF, REF]).await.unwrap();
+        assert_eq!(listed, [(REF.to_owned(), stable)]);
+        assert_eq!(
+            server_a.queries_for(LISTING),
+            ["pattern=os%2Fstable&collection=org.example.Os%2Fos%2Fstable"]
+        );
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// A remote that answers the listing request with a status from 400 to 499
+/// serves no listing, and the query reads the refs from its summary: a
+/// static server that answers 404, and a server that answers 400 or 403.
+#[test]
+fn a_query_with_no_listing_reads_the_summary() {
+    block_on(async {
+        for status in [404, 400, 403] {
+            let dir = TmpDir::new("pull-collection-query-summary");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let server_a = match status {
+                404 => RepoServer::start(&dir.path().join("a"), false).await,
+                _ => listing_status(&dir.path().join("a"), status).await,
+            };
+            let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+            let listed = query(&dest, "a", &[REF, "os/absent"]).await.unwrap();
+            assert_eq!(listed, [(REF.to_owned(), tip)], "{status}");
+            assert_eq!(server_a.statuses_for(LISTING), [status]);
+            assert_eq!(server_a.seen(), [LISTING, "summary"], "{status}");
+        }
+    });
+}
+
+/// Under a summary policy, the query reads the refs from the verified
+/// summary, and sends no listing request. The listing names a newer commit
+/// of another repository, and the query gives the commit of the summary. A
+/// summary that a key that is not trusted signed, a summary with no
+/// `summary.sig`, and a remote with no summary give `Error::Signature`.
+#[test]
+fn a_query_under_a_summary_policy_reads_the_verified_summary() {
+    block_on(async {
+        for case in ["trusted", "other key", "no signature", "no summary"] {
+            let dir = TmpDir::new("pull-collection-query-policy");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            if case != "no summary" {
+                summarize(&a).await;
+            }
+            let secret = match case {
+                "trusted" => Some(SECRET_B64),
+                "other key" => Some(OTHER_SECRET_B64),
+                _ => None,
+            };
+            if let Some(secret) = secret {
+                let signer = Ed25519Signer::from_base64(secret).unwrap();
+                a.sign_summary(&signer).await.unwrap();
+            }
+            let decoy = create(dir.path(), "decoy", Some(ID)).await;
+            commit(&decoy, dir.path(), "d", None, REF, FIXED_TS + 10, BOUND).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            serve_listing(&server_a, &decoy, &[REF]).await;
+            let policy =
+                format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+            let dest = dest(dir.path(), None, &[("a", &server_a.url(), &policy)]).await;
+
+            let listed = query(&dest, "a", &[REF]).await;
+            if case == "trusted" {
+                assert_eq!(listed.unwrap(), [(REF.to_owned(), tip)]);
+                assert_eq!(server_a.requests_for("summary.sig"), 1);
+            } else {
+                assert!(
+                    matches!(listed, Err(Error::Signature(_))),
+                    "{case}: {listed:?}"
+                );
+            }
+            assert_eq!(server_a.requests_for(LISTING), 0, "{case}");
+            assert_eq!(server_a.requests_for("summary"), 1, "{case}");
+        }
+    });
+}
+
+/// A remote with no listing and no summary gives an empty vector, with a
+/// name and with no name. After a write of its summary, the same query
+/// gives the ref.
+#[test]
+fn a_remote_with_no_listing_and_no_summary_gives_no_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-none");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        for names in [&[REF][..], &[][..]] {
+            server_a.forget();
+            assert_eq!(query(&dest, "a", names).await.unwrap(), []);
+            assert_eq!(server_a.seen(), [LISTING, "summary"]);
+        }
+        summarize(&a).await;
+        assert_eq!(
+            query(&dest, "a", &[REF]).await.unwrap(),
+            [(REF.to_owned(), tip)]
+        );
+    });
+}
+
+/// A status from 500 to 599 on the listing, or on the summary of a remote
+/// with no listing, is the error of the query.
+#[test]
+fn a_server_error_fails_the_query() {
+    block_on(async {
+        for path in [LISTING, "summary"] {
+            let dir = TmpDir::new("pull-collection-query-5xx");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            server_a.answer_status(path, 503);
+            let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+            let err = query(&dest, "a", &[REF]).await.unwrap_err();
+            assert!(
+                matches!(err, Error::HttpStatus { status: 503, .. }),
+                "{path}: {err:?}"
+            );
+            assert_eq!(server_a.statuses_for(path), [503]);
+        }
+    });
+}
+
+/// The query reads the summary policy of the remote alone, and no commit
+/// policy. A remote with no `gpg-verify` key, whose GPG check of the commits
+/// is on, and a remote with `sign-verify=true` and no trusted key list the
+/// refs. A collection pull from the first remote reads its commit policy and
+/// fails. A remote whose `trust` names a trust group with the GPG check of
+/// the commits keeps its summary policy: the query reads the verified
+/// summary, and sends no listing request.
+#[test]
+fn a_query_reads_no_commit_policy() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-commit-policy");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        a.sign_summary(&Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        drop(create(dir.path(), "dest", None).await);
+        let url = server_a.url();
+        let dest = reconfigure(
+            dir.path(),
+            &format!(
+                "\n[remote \"gpg\"]\nurl={url}\n\
+                 [remote \"sign\"]\nurl={url}\ngpg-verify=false\nsign-verify=true\n\
+                 [remote \"trust\"]\nurl={url}\ntrust=t\nsign-verify-summary=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n\
+                 [ex-ostrya trust \"t\"]\ngpg-verify=true\n"
+            ),
+        )
+        .await;
+
+        for remote in ["gpg", "sign"] {
+            server_a.forget();
+            let listed = query(&dest, remote, &[REF]).await.unwrap();
+            assert_eq!(listed, [(REF.to_owned(), tip)], "{remote}");
+            assert_eq!(server_a.requests_for(LISTING), 1, "{remote}");
+        }
+        server_a.forget();
+        let listed = query(&dest, "trust", &[REF]).await.unwrap();
+        assert_eq!(listed, [(REF.to_owned(), tip)]);
+        assert_eq!(server_a.requests_for(LISTING), 0);
+        assert_eq!(server_a.requests_for("summary.sig"), 1);
+
+        let (opts, _) = options(&[REF]);
+        assert!(dest.pull_collection(ID, &["gpg"], opts).await.is_err());
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// A remote at a closed port gives the transport error of the request. The
+/// query makes no retry.
+#[test]
+fn a_closed_port_fails_the_query() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-closed");
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let url = format!("http://127.0.0.1:{port}/");
+        let dest = dest(dir.path(), None, &[("a", &url, "")]).await;
+
+        let err = query(&dest, "a", &[REF]).await.unwrap_err();
+        assert!(matches!(err, Error::Fetch(_)), "{err:?}");
+    });
+}
+
+/// A remote at a `file://` address is a local repository, and the query
+/// reads its ref files. The query returns each error of the local
+/// repository unchanged: a path with no repository, a ref whose commit the
+/// repository does not hold, and a summary policy with no summary. A host
+/// part in the address stops the query before it opens the path.
+#[test]
+fn a_query_reads_a_file_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-file");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let stable = commit(
+            &a,
+            dir.path(),
+            "a1",
+            Some(ID),
+            REF,
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let next = commit(
+            &a,
+            dir.path(),
+            "a2",
+            Some(ID),
+            "os/next",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        commit(
+            &a,
+            dir.path(),
+            "a3",
+            None,
+            "local",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let missing = dir.path().join("missing");
+        let policy =
+            format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let host = format!("file://host{}", dir.path().join("a").display());
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &file_url(dir.path(), "a"), ""),
+                ("missing", &file_url(dir.path(), "missing"), ""),
+                ("signed", &file_url(dir.path(), "a"), &policy),
+                ("host", &host, ""),
+            ],
+        )
+        .await;
+
+        let listed = dest
+            .remote_list_collection_refs("a", ID, &[])
+            .await
+            .unwrap();
+        assert_eq!(
+            listed,
+            [("os/next".to_owned(), next), (REF.to_owned(), stable)]
+        );
+        let listed = query(&dest, "a", &[REF, "os/absent"]).await.unwrap();
+        assert_eq!(listed, [(REF.to_owned(), stable)]);
+
+        let err = query(&dest, "missing", &[REF]).await.unwrap_err();
+        let opened = Repo::open(&missing).await.unwrap_err();
+        assert_eq!(err.to_string(), opened.to_string());
+        let err = query(&dest, "signed", &[REF]).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        let err = query(&dest, "host", &[REF]).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("names a host")),
+            "{err:?}"
+        );
+
+        let ghost = dir.path().join("a/refs/mirrors").join(ID).join("os/ghost");
+        std::fs::write(&ghost, format!("{}\n", "ab".repeat(32))).unwrap();
+        let err = query(&dest, "a", &["os/ghost"]).await.unwrap_err();
+        assert!(matches!(err, Error::ObjectNotFound { .. }), "{err:?}");
+        std::fs::remove_file(&ghost).unwrap();
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// The query of 300 names of a local repository reads the ref of each name,
+/// under the collection id of the repository and under another id.
+#[test]
+fn a_file_query_of_300_names_reads_each_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-file-many");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let tip = commit(
+            &a,
+            dir.path(),
+            "a",
+            Some(ID),
+            "pool/n000",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let names: Vec<String> = (0..300).map(|n| format!("pool/n{n:03}")).collect();
+        let txn = a.transaction().await.unwrap();
+        for name in &names {
+            txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&tip));
+            txn.set_ref(name, Some(&tip));
+        }
+        txn.commit().await.unwrap();
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+
+        let mut asked: Vec<&str> = names.iter().rev().map(String::as_str).collect();
+        asked.push("pool/absent");
+        let expected: Vec<(String, Checksum)> =
+            names.iter().map(|name| (name.clone(), tip)).collect();
+        for id in [ID, OTHER] {
+            let listed = dest
+                .remote_list_collection_refs_with("a", id, &asked, no_retry())
+                .await
+                .unwrap();
+            assert_eq!(listed, expected, "{id}");
+        }
+    });
+}
+
+/// A directory inside the selection that the query cannot read gives
+/// `Error::Io`. A directory outside the selection that it cannot read fails
+/// nothing. The test skips, with a message, for a user that ignores the
+/// mode.
+#[test]
+fn an_unreadable_directory_fails_a_file_query_only_inside_the_selection() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-file-perm");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let pool = commit(
+            &a,
+            dir.path(),
+            "a1",
+            Some(ID),
+            "pool/x",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        commit(
+            &a,
+            dir.path(),
+            "a2",
+            Some(ID),
+            "builds/locked/y",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+        let locked = dir
+            .path()
+            .join("a/refs/mirrors")
+            .join(ID)
+            .join("builds/locked");
+        if !lock(&locked, 0o000, 0o755) {
+            return;
+        }
+        let named = query(&dest, "a", &["pool/x"]).await;
+        let all = query(&dest, "a", &[]).await;
+        unlock(&locked, 0o755);
+
+        assert_eq!(named.unwrap(), [("pool/x".to_owned(), pool)]);
+        assert!(matches!(all, Err(Error::Io(_))), "{all:?}");
+    });
+}
+
+/// The query refuses a bad collection id, a bad ref name, a name that no
+/// listing request can hold, and a `url` override before its first request.
+/// With a `file://` remote, it refuses a field of another transport.
+#[test]
+fn a_query_refuses_bad_arguments_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-query-refusals");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("b", &file_url(dir.path(), "a"), ""),
+            ],
+        )
+        .await;
+
+        let long_id = "a.b".repeat(100);
+        let long_name = "x".repeat(4090);
+        let url = EndpointOverrides {
+            url: Some(server_a.url()),
+            ..EndpointOverrides::default()
+        };
+        let header = EndpointOverrides {
+            http_headers: vec![("X-A".to_owned(), "b".to_owned())],
+            ..EndpointOverrides::default()
+        };
+        let cases: Vec<(&str, &str, &str, Vec<&str>, EndpointOverrides)> = vec![
+            ("invalid id", "a", "fresh", vec![REF], no_retry()),
+            ("long id", "a", &long_id, vec![REF], no_retry()),
+            ("ref name", "a", ID, vec![REF, "a:b"], no_retry()),
+            ("long ref name", "a", ID, vec![REF, &long_name], no_retry()),
+            ("url", "a", ID, vec![REF], url),
+            ("header", "b", ID, vec![REF], header),
+        ];
+        for (tag, remote, id, names, overrides) in cases {
+            let err = dest
+                .remote_list_collection_refs_with(remote, id, &names, overrides)
+                .await
+                .unwrap_err();
+            let expected = match tag {
+                "ref name" => matches!(err, Error::InvalidRefspec(_)),
+                "header" => matches!(&err, Error::InvalidInput(m) if m.starts_with("http-header")),
+                _ => matches!(err, Error::InvalidInput(_)),
+            };
+            assert!(expected, "{tag}: {err:?}");
+            assert!(server_a.seen().is_empty(), "{tag}: {:?}", server_a.seen());
+        }
+    });
+}
+
 // --- interoperability with the `ostree` command ------------------------------
 
 /// The pull reads the summaries that the `ostree` command writes: field 0 of
@@ -2157,6 +2691,8 @@ mod s3_remote {
                 "absent-bucket" => absent_bucket().await,
                 "rclone" => rclone(false).await,
                 "rclone-wrong-secret" => rclone(true).await,
+                "query" => query_bucket().await,
+                "rclone-query" => rclone_query().await,
                 other => panic!("unknown case {other}"),
             }
         });
@@ -2693,5 +3229,113 @@ mod s3_remote {
             assert_eq!(mirror(&dest, REF).await, Some(tip));
             assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
         }
+    }
+
+    /// Returns the overrides that allow the `http://` endpoint of the
+    /// server.
+    fn cleartext() -> EndpointOverrides {
+        EndpointOverrides {
+            allow_cleartext_credentials: true,
+            ..EndpointOverrides::default()
+        }
+    }
+
+    /// The listing of collection refs reads the refs of a bucket repository
+    /// from its summary alone, with a name and with no name, and sends no
+    /// listing request. A bucket repository with no `summary` gives
+    /// `Error::Pull`. The call with the default overrides refuses the
+    /// `http://` endpoint of the server before its first request.
+    #[test]
+    fn a_query_reads_the_summary_of_a_bucket() {
+        run_case("query", SECRET_KEY);
+    }
+
+    async fn query_bucket() {
+        let dir = TmpDir::new("pull-collection-s3-query");
+        let source = create(dir.path(), "source", None).await;
+        let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        let bare = StandIn::start();
+        store_tree(&bare, &dir.path().join("source"));
+        summarize(&source).await;
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let bare_keys = bucket(&bare.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(
+            dir.path(),
+            "dest",
+            None,
+            &[("bkt", &keys), ("bare", &bare_keys)],
+        )
+        .await;
+
+        for names in [&[REF, "os/absent"][..], &[]] {
+            let listed = dest
+                .remote_list_collection_refs_with("bkt", ID, names, cleartext())
+                .await
+                .unwrap();
+            assert_eq!(listed, [(REF.to_owned(), tip)]);
+        }
+        assert_eq!(requests_for(&server, "summary"), 2);
+        assert_eq!(requests_for(&server, "summary.sig"), 0);
+        assert_signed_with_no_listing(&server);
+
+        let err = dest
+            .remote_list_collection_refs_with("bare", ID, &[REF], cleartext())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("the bucket repository has no summary")),
+            "{err:?}"
+        );
+        assert_eq!(requests_for(&bare, "summary"), 1);
+        assert_signed_with_no_listing(&bare);
+
+        let err = dest
+            .remote_list_collection_refs("bkt", ID, &[REF])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(requests_for(&server, "summary"), 2);
+        assert_nothing_written(&dest).await;
+    }
+
+    /// `rclone serve s3` checks the signature of each request. The listing
+    /// of collection refs reads the collection map of the summary of a
+    /// bucket directory.
+    #[test]
+    fn a_query_on_rclone_reads_the_summary_of_a_bucket() {
+        if !rclone_available("a_query_on_rclone_reads_the_summary_of_a_bucket") {
+            return;
+        }
+        run_case("rclone-query", SECRET_KEY);
+    }
+
+    async fn rclone_query() {
+        let dir = TmpDir::new("pull-collection-s3-rclone-query");
+        let source = create(dir.path(), "source", None).await;
+        let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        drop(source);
+        // rclone keeps the listing of each directory, so the files of the
+        // bucket directory are in place before the server starts.
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("bkt")).unwrap();
+        let status = Command::new("cp")
+            .arg("-r")
+            .arg(dir.path().join("source"))
+            .arg(root.join("bkt").join("repo"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -r");
+        let server = Rclone::start(dir.path(), &root);
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
+        let listed = dest
+            .remote_list_collection_refs_with("bkt", ID, &[], cleartext())
+            .await
+            .unwrap();
+        assert_eq!(listed, [(REF.to_owned(), tip)]);
+        assert_nothing_written(&dest).await;
     }
 }

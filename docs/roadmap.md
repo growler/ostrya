@@ -16,9 +16,10 @@ The `ostrya` command does not carry these commands of the `ostree` command.
 - `reset`.
 - `checksum`, with `--ignore-xattrs`.
 - `find-remotes`. `ostrya pull --collection` over `Repo::pull_collection`
-  does the work of `find-remotes --pull`, with the config finder alone. The
-  library has no entry point that finds the remotes of a collection and
-  pulls nothing.
+  does the work of `find-remotes --pull`, with the config finder alone.
+  `Repo::remote_list_collection_refs` lists the refs of a collection on one
+  named remote, and pulls nothing. The library has no entry point that
+  finds the remotes of a collection.
 - `create-usb`. It puts a `pull-local` or a mirror pull onto a destination
   repository, and needs no new library primitive.
 - The media of `create-usb` and the pull of `find-remotes` carry one static

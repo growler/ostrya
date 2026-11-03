@@ -489,3 +489,55 @@ fn a_file_candidate_is_a_local_repository() {
     );
     assert!(!other.join("refs/mirrors").join(ID).exists());
 }
+
+/// `Repo::remote_list_collection_refs` lists the refs of an ssh remote
+/// through the built `ostrya send`, and ends the session. After a clean end
+/// of the session, a remote command that exits with a failure status does
+/// not change the result. A remote command that exits with a failure status
+/// before it serves the session gives `Error::Remote` with that status.
+#[test]
+fn a_query_over_ssh_ends_the_session() {
+    let dir = TmpDir::new("query-ssh");
+    let b = dir.path().join("b");
+    let client = dir.path().join("client");
+    init(&b, Some(ID));
+    init(&client, None);
+    let stable = commit(&b, "b1", REF, TS);
+    let standin = dir.path().join("standin");
+    std::fs::write(&standin, STANDIN).unwrap();
+    let after = dir.path().join("after");
+    std::fs::write(&after, format!("{STANDIN}exit 3\n")).unwrap();
+    let before = dir.path().join("before");
+    std::fs::write(&before, "exit 3\n").unwrap();
+    configure(
+        &client,
+        &format!(
+            "{}{}{}",
+            ssh_remote("b", &b, &standin),
+            ssh_remote("after", &b, &after),
+            ssh_remote("before", &b, &before)
+        ),
+    );
+
+    ostrya_rt::block_on(async {
+        let repo = ostrya::Repo::open(&client).await.unwrap();
+        for remote in ["b", "after"] {
+            let refs: Vec<(String, String)> = repo
+                .remote_list_collection_refs(remote, ID, &[REF])
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(name, commit)| (name, commit.to_hex()))
+                .collect();
+            assert_eq!(refs, [(REF.to_owned(), stable.clone())], "{remote}");
+        }
+        let err = repo
+            .remote_list_collection_refs("before", ID, &[REF])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, ostrya::Error::Remote(_)) && err.to_string().contains("exit status: 3"),
+            "{err:?}"
+        );
+    });
+}

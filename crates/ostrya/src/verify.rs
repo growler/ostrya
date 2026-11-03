@@ -344,6 +344,39 @@ impl PullTrust {
         PullTrust::resolve(repo, Some(remote), verify, group, Defaults::Config).await
     }
 
+    /// Reads the summary policy of a pull from `remote`, as
+    /// [`from_remote`](PullTrust::from_remote) reads it, and no commit
+    /// policy.
+    ///
+    /// The keys `gpg-verify-summary` and `sign-verify-summary` of the section
+    /// of `remote` and the key sources that they read set the policy. A
+    /// section that holds the key `trust` takes the same policy. The call
+    /// reads no switch of the commits, no key `trust`, and no trust group. If
+    /// the config has no section for `remote`, the trust checks no signature.
+    ///
+    /// The call refuses a name that [`valid_remote_name`] refuses with
+    /// [`Error::InvalidInput`], before it reads a key source.
+    pub(crate) async fn for_summary(repo: &Repo, remote: &str) -> Result<PullTrust> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
+        let section = repo.config().remote(remote);
+        let (gpg, sign) = summary_switches(section.as_ref(), &PullVerify::default())?;
+        let source = KeySource::Remote {
+            name: remote,
+            section: section.as_ref(),
+            repo_keyring: true,
+            system_keys: true,
+        };
+        let summary = build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?;
+        Ok(PullTrust {
+            commit: None,
+            summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
+        })
+    }
+
     /// Resolves the trust of a pull of `remote` from its config in `repo` and
     /// the overrides in `verify`.
     ///

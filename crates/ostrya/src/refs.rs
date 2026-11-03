@@ -810,7 +810,9 @@ impl Repo {
     /// final `**` matches each name below a directory whose path starts with
     /// these parts. It applies the negative patterns to a name before it
     /// reads the ref file. A negative pattern `**` selects no ref, and the
-    /// call then opens no directory.
+    /// call then opens no directory. The call opens each directory that
+    /// literal leading parts name one time, also when more than one pattern
+    /// starts with these parts.
     ///
     /// For each other collection id, the call opens `refs/mirrors/` and
     /// `refs/mirrors/ID/`, and below `refs/mirrors/ID/` the directories that
@@ -1629,10 +1631,15 @@ fn walk_selected(
     if selector.positive().is_empty() {
         walk_ref_dir_skipping(dir, "", &skip, &mut &mut *take)?;
     } else {
-        for pattern in uncovered_patterns(selector.positive()) {
-            let parts: Vec<&str> = pattern.as_str().split('/').collect();
-            walk_ref_pattern(dir, "", &parts, pattern, &skip, take)?;
-        }
+        let split: Vec<(&RefPattern, Vec<&str>)> = uncovered_patterns(selector.positive())
+            .into_iter()
+            .map(|pattern| (pattern, pattern.as_str().split('/').collect()))
+            .collect();
+        let patterns: Vec<(&RefPattern, &[&str])> = split
+            .iter()
+            .map(|(pattern, parts)| (*pattern, parts.as_slice()))
+            .collect();
+        walk_ref_patterns(dir, "", &patterns, &skip, take)?;
     }
     Ok(())
 }
@@ -1757,6 +1764,8 @@ impl<'a> CollectionWalk<'a> {
                 })
             });
         }
+        // The patterns whose first part names `id`, with the parts below it.
+        let mut below: Vec<(&RefPattern, &[&str])> = Vec::new();
         for (pattern, parts) in &self.patterns {
             if !first_part_reaches(parts, id) {
                 continue;
@@ -1771,11 +1780,11 @@ impl<'a> CollectionWalk<'a> {
                         }
                     })?;
                 }
-                Some((_, rest)) => walk_ref_pattern(sub.as_fd(), id, rest, pattern, &skip, take)?,
+                Some((_, rest)) => below.push((*pattern, rest)),
                 None => {}
             }
         }
-        Ok(())
+        walk_ref_patterns(sub.as_fd(), id, &below, &skip, take)
     }
 }
 
@@ -2063,6 +2072,70 @@ fn walk_ref_dir_skipping(
             path: &path,
             file_type,
         })?;
+    }
+    Ok(())
+}
+
+/// Walks the parts of a ref tree that the patterns `patterns` can match, as
+/// [`walk_ref_pattern`] walks for each pattern. Each item holds a pattern and
+/// its parts that remain below `dir`, and `prefix` is the path of `dir` below
+/// the top, or empty for the top.
+///
+/// The patterns whose first part is the same literal share the read of the
+/// type of that entry and the open of that directory. So the walk opens each
+/// directory of the literal leading parts one time, whatever the number of
+/// patterns below it. Each pattern whose first part is `*` or `**` goes to
+/// `walk_ref_pattern`.
+fn walk_ref_patterns(
+    dir: BorrowedFd<'_>,
+    prefix: &str,
+    patterns: &[(&RefPattern, &[&str])],
+    skip: &dyn Fn(&str) -> bool,
+    visit: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
+) -> Result<()> {
+    // The patterns of each literal first part, with the parts after it.
+    let mut literal: BTreeMap<&str, Vec<(&RefPattern, &[&str])>> = BTreeMap::new();
+    for &(pattern, parts) in patterns {
+        match parts.split_first() {
+            Some((first, rest)) if *first != "*" && *first != "**" => {
+                literal.entry(first).or_default().push((pattern, rest));
+            }
+            Some(_) => walk_ref_pattern(dir, prefix, parts, pattern, skip, visit)?,
+            None => {}
+        }
+    }
+    for (name, group) in literal {
+        // A missing entry, or a name longer than a file name can be, has no
+        // type.
+        let Some(file_type) = ref_entry_type(dir, name)? else {
+            continue;
+        };
+        let path = if prefix.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if file_type == FileType::Directory {
+            let below: Vec<(&RefPattern, &[&str])> = group
+                .into_iter()
+                .filter(|(_, rest)| !rest.is_empty())
+                .collect();
+            // An entry that is no directory at the open matches no pattern
+            // with more parts.
+            if !below.is_empty()
+                && !skip(&path)
+                && let Some(sub) = open_ref_subdir(dir, name)?
+            {
+                walk_ref_patterns(sub.as_fd(), &path, &below, skip, visit)?;
+            }
+        } else if group.iter().any(|(_, rest)| rest.is_empty()) {
+            visit(RefEntry {
+                dir,
+                name,
+                path: &path,
+                file_type,
+            })?;
+        }
     }
     Ok(())
 }

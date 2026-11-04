@@ -2703,7 +2703,7 @@ pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> 
 
 /// Returns the text that an error about a collection ref holds: `ID:NAME`, or
 /// `NAME` alone for a ref with no collection id.
-fn collection_ref_label(cref: &CollectionRef) -> String {
+pub(crate) fn collection_ref_label(cref: &CollectionRef) -> String {
     match &cref.collection_id {
         Some(collection_id) => format!("{collection_id}:{}", cref.ref_name),
         None => cref.ref_name.clone(),

@@ -2780,6 +2780,14 @@ These alternatives were rejected:
 - The client groups of the source do not apply. The file permissions are
   the access.
 - Each error of the open and of the probe skips the candidate.
+- The probe of each candidate, local or remote, skips a listed ref whose
+  name fails the ref-name rule, for example `refs/heads/origin:main` under
+  the collection id of the source. The other refs of the candidate stay in
+  the selection. The probe reads no timestamp and no commit of a skipped
+  ref. `CollectionPullEvent::RefSkipped` reports each skipped ref, to
+  `CollectionPullOptions::on_event` of the pull and to the event callback of
+  `Repo::remote_list_collection_refs_with`. `ostrya pull --collection`
+  prints it as a warning.
 - `Repo::remote_list_collection_refs_with` lists the refs of one remote
   through the same probe as the pull, and drops the timestamps. So without
   a summary policy, the listing of a local candidate reads each tip commit
@@ -2868,6 +2876,12 @@ These alternatives were rejected:
   The pull and the listing then need two probes with different rules. The
   listing of `ostrya serve` reads each commit, and a missing commit fails
   the whole listing too.
+- A skip of a ref whose name fails the ref-name rule with no event, as the
+  `-c` listing of the `ostree` command does. The user then gets no sign that
+  a ref of the source is not in the pull.
+- The refusal of the whole candidate for one listed name that fails the
+  ref-name rule. One ref file that the user cannot pull then hides each
+  other ref of the candidate.
 
 ## The own collection id of a collection pull
 
@@ -2893,6 +2907,14 @@ reads. The rules:
   alone, through a crate-private entry of the ref queue of the transaction.
 - `Repo::list_collection_refs` gives both refs. The result of the pull does
   not state the path that the pull wrote.
+- `Repo::pull_local` with `PullOptions::collection_id` reads each name of the
+  source with the rule of `Repo::resolve_collection_ref`:
+  `refs/mirrors/ID/NAME`, and `refs/heads/NAME` when the source has the
+  collection id ID and `refs/mirrors/ID/NAME` holds no ref file. The probe of
+  a local candidate reads the source with `Repo::list_collection_refs_in`,
+  which has the same rule. A pull into a repository whose collection id is ID
+  writes by the same rule. A ref that the source does not hold gives
+  `Error::RefNotFound` with `ID:NAME`, the text of the resolve.
 - The resolve, `Repo::list_collection_refs_in`, and the summary read the
   written ref in each state of the ref store that the port and the `ostree`
   command write. Two states that neither writes are exceptions. If
@@ -2923,6 +2945,10 @@ These alternatives were rejected:
   selection then reads the ref store without the update lock, and a
   concurrent transaction or `Repo::set_collection_ref_immediate` can change
   the mirror path before the commit.
+- A mirror-only source read in `Repo::pull_local`. A name that a source of
+  the collection holds under `refs/heads` alone then fails the local pull,
+  and the probe of a `file://` candidate gives the same ref. The two readers
+  of one source then give different refs.
 
 ## The pull scheduler
 

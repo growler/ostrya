@@ -4976,18 +4976,27 @@ check.
 
 A candidate is skipped, with a warning, when a request fails, when a listing
 request gets a status from 500 to 599, when the listing or the summary does
-not parse, when the summary fails its signature check, when a listed name
-fails the ref-name rule, when a listed ref has no `ostree.commit.timestamp` of
-type `t`, or when a bucket repository has no `summary`. A local candidate is
-also skipped when its path holds no repository, or when the probe cannot read
-a directory or a ref file that the names reach. Without a summary policy, it
-is also skipped when the source does not hold the commit of a ref. The
-warning names the path. Under a summary policy, the probe reads no commit. A
-listed commit that the source does not hold then fails the pull from the
-candidate, as for a remote. The pull fails when
-each candidate is skipped, when no candidate lists a requested `REF`, and,
-with no `REF`, when no candidate lists a ref of `ID`. These failures come
+not parse, when the summary fails its signature check, when a listed ref has
+no `ostree.commit.timestamp` of type `t`, or when a bucket repository has no
+`summary`. A local candidate is also skipped when its path holds no
+repository, or when the probe cannot read a directory or a ref file that the
+names reach. Without a summary policy, it is also skipped when the source does
+not hold the commit of a ref. The warning names the path. Under a summary
+policy, the probe reads no commit. A listed commit that the source does not
+hold then fails the pull from the candidate, as for a remote. The pull fails
+when each candidate is skipped, when no candidate lists a requested `REF`,
+and, with no `REF`, when no candidate lists a ref of `ID`. These failures come
 before the first object request.
+
+A listed ref whose name fails the ref-name rule, for example `origin:main`,
+is skipped, with a warning that names the candidate and the ref. The other
+refs of the candidate stay in the selection. The skip applies to each source
+of the refs: a ref listing, a summary, and the ref files of a local
+candidate. The probe reads no timestamp and no commit of a skipped ref. Each
+requested `REF` passes the ref-name rule before the first request, so a ref
+is skipped only in a pull with no `REF`. The warning of the `ostrya` command
+is `warning: remote REMOTE skipped the ref NAME: the name fails the ref-name
+rule`.
 
 For each ref, the pull selects the candidate with the newest listed
 timestamp. A tie goes to the first candidate in the config. After the
@@ -5083,14 +5092,18 @@ the listing and the summary open the mirror tree with no symlink followed and
 do not give the written ref.
 
 The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
-collection refs from a local repository. It reads `refs/mirrors/ID/REF` of
-the source alone, also when `ID` is the `[core] collection-id` of the source.
-Each written ref names the commit that the pull read from the source. Unless
-the caller sets `no_ref_writes`, the pull writes the refs at the place above,
-and delta discovery reads the `from` commit of a delta at the same place. The
-pull refuses a tip commit whose `ostree.collection-binding` is absent, is not
-a string, or is not `ID`. It checks the `ostree.ref-binding` as each pull
-does, and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone.
+collection refs from a local repository. It reads each ref of the source with
+the rule of `Repo::resolve_collection_ref`: `refs/mirrors/ID/REF`, and
+`refs/heads/REF` when `ID` is the `[core] collection-id` of the source and
+`refs/mirrors/ID/REF` holds no ref file. The probe of a local candidate reads
+the ref files with the same rule. A ref that the source does not hold fails
+the pull with `Error::RefNotFound`, which holds `ID:REF`. Each written ref
+names the commit that the pull read from the source. Unless the caller sets
+`no_ref_writes`, the pull writes the refs at the place above, and delta
+discovery reads the `from` commit of a delta at the same place. The pull
+refuses a tip commit whose `ostree.collection-binding` is absent, is not a
+string, or is not `ID`. It checks the `ostree.ref-binding` as each pull does,
+and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone.
 `Repo::pull_local` makes no timestamp check. The pull makes each check before
 it writes an object, a `.commitpartial` marker, or a ref. With ref writes, the
 remote name of the call selects only the `[remote "NAME"]` section whose
@@ -5121,7 +5134,11 @@ returns:
 The result holds the name and the commit of each listed ref, sorted
 byte-wise by name. A name that the remote does not hold, or that the client
 cannot read, is not in the result. The call writes nothing to the repository,
-and checks no commit signature.
+and checks no commit signature. The call skips a listed ref whose name fails
+the ref-name rule, as the probe does, and gives the event callback of the
+caller one event for each skipped ref. For an ssh remote, the call can fail
+after it gave the events, when the end of the session fails.
+`Repo::remote_list_collection_refs` gives no callback.
 
 Each failure that skips a candidate of the pull is the error of the call. So
 a status from 500 to 599 fails the call, and a refusal of the client gives

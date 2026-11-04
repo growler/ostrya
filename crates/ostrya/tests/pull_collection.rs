@@ -1671,6 +1671,149 @@ fn a_file_remote_of_the_collection_gives_its_local_refs() {
     });
 }
 
+/// Returns the remote and the ref of each ref skip event of `events`, and
+/// fails on each other event.
+fn skipped_refs(events: &Mutex<Vec<CollectionPullEvent>>) -> Vec<(String, String)> {
+    events
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|event| match event {
+            CollectionPullEvent::RefSkipped { remote, name, .. } => (remote.clone(), name.clone()),
+            other => panic!("{other:?}"),
+        })
+        .collect()
+}
+
+/// Returns the remote and the ref of each ref skip event of a query of each
+/// ref of `ID` on the remote `remote` of `repo`, and the result of the query.
+async fn query_skipped(
+    repo: &Repo,
+    remote: &str,
+) -> (Vec<(String, Checksum)>, Vec<(String, String)>) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+    let listed = repo
+        .remote_list_collection_refs_with(
+            remote,
+            ID,
+            &[],
+            EndpointOverrides::default(),
+            Some(Box::new(move |event| sink.lock().unwrap().push(event))),
+        )
+        .await
+        .unwrap();
+    (listed, skipped_refs(&events))
+}
+
+/// A listed ref whose name fails the ref-name rule is skipped with an event,
+/// and the other refs of the remote stay in the selection. The skipped ref
+/// file names a commit that the repository does not hold, so the probe reads
+/// no commit of a skipped ref. This is true for a repository of the
+/// collection, which lists `refs/heads/origin:main`, and for a repository of
+/// another collection, which lists `refs/mirrors/ID/origin:main`. A query of
+/// the refs skips the same ref, with and without a callback.
+#[test]
+fn a_file_remote_skips_a_listed_name_that_fails_the_ref_name_rule() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-bad-name");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let stable = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let next = commit(
+            &b,
+            dir.path(),
+            "b",
+            Some(ID),
+            "os/next",
+            FIXED_TS,
+            COLLECTION_ONLY,
+        )
+        .await;
+        let ghost = format!("{}\n", "ab".repeat(32));
+        std::fs::write(dir.path().join("a/refs/heads/origin:main"), &ghost).unwrap();
+        let mirrors = dir.path().join("b/refs/mirrors").join(ID);
+        std::fs::write(mirrors.join("origin:main"), &ghost).unwrap();
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &file_url(dir.path(), "a"), ""),
+                ("b", &file_url(dir.path(), "b"), ""),
+            ],
+        )
+        .await;
+
+        let (opts, events) = options(&[]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        let bad = "origin:main".to_owned();
+        assert_eq!(
+            skipped_refs(&events),
+            [("a".to_owned(), bad.clone()), ("b".to_owned(), bad.clone())]
+        );
+        let mut got: Vec<(&str, &str, Checksum)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit))
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, [("os/next", "b", next), (REF, "a", stable)]);
+        assert_eq!(mirror(&dest, REF).await, Some(stable));
+        assert_eq!(mirror(&dest, "os/next").await, Some(next));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 2);
+
+        for (remote, name, tip) in [("a", REF, stable), ("b", "os/next", next)] {
+            let expected = [(name.to_owned(), tip)];
+            let (listed, skipped) = query_skipped(&dest, remote).await;
+            assert_eq!(listed, expected, "{remote}");
+            assert_eq!(skipped, [(remote.to_owned(), bad.clone())]);
+            let listed = dest
+                .remote_list_collection_refs(remote, ID, &[])
+                .await
+                .unwrap();
+            assert_eq!(listed, expected, "{remote}");
+        }
+    });
+}
+
+/// A served listing that lists a name that fails the ref-name rule gives the
+/// same skip, in a pull and in a query. The server answers each listing
+/// request with the local refs of a remote of the collection. So the probe
+/// sends the second request, and the event comes from the answer to that
+/// request alone.
+#[test]
+fn an_http_remote_skips_a_listed_name_that_fails_the_ref_name_rule() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-http-bad-name");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let stable = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        std::fs::write(
+            dir.path().join("a/refs/heads/origin:main"),
+            format!("{stable}\n"),
+        )
+        .unwrap();
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let refs = RefSelector::parse(std::iter::empty()).unwrap();
+        let listing = repo_listing(&a, &refs, None).await;
+        server_a.tamper(LISTING, listing);
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let skip = [("a".to_owned(), "origin:main".to_owned())];
+
+        let (listed, skipped) = query_skipped(&dest, "a").await;
+        assert_eq!(listed, [(REF.to_owned(), stable)]);
+        assert_eq!(skipped, skip);
+        assert_eq!(server_a.queries_for(LISTING).len(), 2);
+
+        let (opts, events) = options(&[]);
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert_eq!(skipped_refs(&events), skip);
+        assert_eq!(pulled.refs.len(), 1);
+        assert_eq!(pulled.refs[0].name, REF);
+        assert_eq!(mirror(&dest, REF).await, Some(stable));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+    });
+}
+
 /// The timestamp check applies to a pull from a `file://` remote.
 #[test]
 fn the_timestamp_check_applies_to_a_file_remote() {
@@ -2285,7 +2428,7 @@ async fn query(
     remote: &str,
     names: &[&str],
 ) -> ostrya::Result<Vec<(String, Checksum)>> {
-    repo.remote_list_collection_refs_with(remote, ID, names, no_retry())
+    repo.remote_list_collection_refs_with(remote, ID, names, no_retry(), None)
         .await
 }
 
@@ -2686,7 +2829,7 @@ fn a_file_query_of_300_names_reads_each_ref() {
             names.iter().map(|name| (name.clone(), tip)).collect();
         for id in [ID, OTHER] {
             let listed = dest
-                .remote_list_collection_refs_with("a", id, &asked, no_retry())
+                .remote_list_collection_refs_with("a", id, &asked, no_retry(), None)
                 .await
                 .unwrap();
             assert_eq!(listed, expected, "{id}");
@@ -2782,7 +2925,7 @@ fn a_query_refuses_bad_arguments_before_the_first_request() {
         ];
         for (tag, remote, id, names, overrides) in cases {
             let err = dest
-                .remote_list_collection_refs_with(remote, id, &names, overrides)
+                .remote_list_collection_refs_with(remote, id, &names, overrides, None)
                 .await
                 .unwrap_err();
             let expected = match tag {
@@ -3596,7 +3739,7 @@ mod s3_remote {
 
         for names in [&[REF, "os/absent"][..], &[]] {
             let listed = dest
-                .remote_list_collection_refs_with("bkt", ID, names, cleartext())
+                .remote_list_collection_refs_with("bkt", ID, names, cleartext(), None)
                 .await
                 .unwrap();
             assert_eq!(listed, [(REF.to_owned(), tip)]);
@@ -3606,7 +3749,7 @@ mod s3_remote {
         assert_signed_with_no_listing(&server);
 
         let err = dest
-            .remote_list_collection_refs_with("bare", ID, &[REF], cleartext())
+            .remote_list_collection_refs_with("bare", ID, &[REF], cleartext(), None)
             .await
             .unwrap_err();
         assert!(
@@ -3657,7 +3800,7 @@ mod s3_remote {
         let keys = bucket(&server.endpoint(), "s3://bkt/repo");
         let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
         let listed = dest
-            .remote_list_collection_refs_with("bkt", ID, &[], cleartext())
+            .remote_list_collection_refs_with("bkt", ID, &[], cleartext(), None)
             .await
             .unwrap();
         assert_eq!(listed, [(REF.to_owned(), tip)]);

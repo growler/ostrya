@@ -9,13 +9,15 @@
 //! 2. The find step: the probe of each remote, in the given order. The probe
 //!    reads the commit and the timestamp of each ref, from the ref listing or
 //!    from the summary. The probe of a remote at a `file://` address reads
-//!    the ref files of the local repository, or its summary. The find step
-//!    gives the refs and the session of each remote that answers, and the
-//!    error of each other remote. If the probe of a remote read the refs
-//!    from its `summary`, the find step also gives these bytes. The pull from
-//!    that remote reads them in place of the `summary` and the `summary.sig`.
-//!    The probe of a local repository gives no summary. The pull skips a
-//!    remote that fails.
+//!    the ref files of the local repository, or its summary. The probe skips
+//!    each listed ref whose name fails the ref-name rule. The find step
+//!    gives the refs, the names of the skipped refs, and the session of each
+//!    remote that answers, and the error of each other remote. If the probe
+//!    of a remote read the refs from its `summary`, the find step also gives
+//!    these bytes. The pull from that remote reads them in place of the
+//!    `summary` and the `summary.sig`. The probe of a local repository gives
+//!    no summary. The pull skips a remote that fails. It reports each
+//!    skipped remote and each skipped ref through its event callback.
 //! 3. The selection of a remote for each ref, and then one pull from each
 //!    selected remote, in the given order, through the engine of
 //!    [`Repo::pull`], over the session of its probe. A local repository goes
@@ -24,7 +26,8 @@
 //! [`Repo::remote_list_collection_refs_with`] makes the checks of part 1 and
 //! the find step of part 2 for its one remote. The error of that remote is
 //! the error of the call. The call returns the name and the commit of each
-//! ref that the find step read, and drops the timestamps.
+//! ref that the find step read, and drops the timestamps. Its event callback
+//! gets the name of each ref that the probe skipped.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -38,7 +41,7 @@ use ostrya_core::{Checksum, Commit, ObjectType, RefSelector, Value};
 use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
-use crate::refs::{check_ref_path, is_valid_collection_id};
+use crate::refs::{check_ref_path, is_ref_path, is_valid_collection_id};
 use crate::related::RelatedRule;
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
 #[cfg(feature = "s3")]
@@ -97,7 +100,10 @@ pub struct CollectionPullOptions {
     pub pull: PullOptions,
     /// The callback for each [`CollectionPullEvent`] of the pull, or `None`.
     ///
-    /// The pull calls it on its own task, so the callback must return soon.
+    /// The pull gives it each remote and each listed ref that the probe
+    /// skips, after the probe of the remote and before the probe of the next
+    /// remote. The pull calls it on its own task, so the callback must return
+    /// soon.
     /// A command writes the [`Display`](fmt::Display) text of the event as a
     /// warning on standard error. The default is `None`, which drops each
     /// event.
@@ -130,7 +136,9 @@ impl fmt::Debug for CollectionPullOptions {
 }
 
 /// An event of [`Repo::pull_collection`], which
-/// [`CollectionPullOptions::on_event`] receives.
+/// [`CollectionPullOptions::on_event`] receives, or of
+/// [`Repo::remote_list_collection_refs_with`], which its parameter `on_event`
+/// receives.
 ///
 /// [`Display`](fmt::Display) writes one line. It writes each ASCII control
 /// character as an escape sequence, for example `\n`, so the line holds no
@@ -159,6 +167,21 @@ pub enum CollectionPullEvent {
         /// The text of the failure.
         message: String,
     },
+    /// The probe of a remote skipped a ref that the remote lists, because
+    /// the name of the ref fails the ref-name rule. An example is
+    /// `origin:main`.
+    ///
+    /// The other refs of the remote stay in the selection. The probe reads
+    /// no commit and no timestamp of a skipped ref. A name that the caller
+    /// gives passes the ref-name rule before the first request, so the probe
+    /// skips a ref only when the caller gives no name.
+    #[non_exhaustive]
+    RefSkipped {
+        /// The name of the remote.
+        remote: String,
+        /// The name of the ref, as the remote lists it.
+        name: String,
+    },
 }
 
 impl fmt::Display for CollectionPullEvent {
@@ -169,6 +192,13 @@ impl fmt::Display for CollectionPullEvent {
                 write_escaped(f, remote)?;
                 f.write_str(" skipped: ")?;
                 write_escaped(f, message)
+            }
+            CollectionPullEvent::RefSkipped { remote, name } => {
+                f.write_str("remote ")?;
+                write_escaped(f, remote)?;
+                f.write_str(" skipped the ref ")?;
+                write_escaped(f, name)?;
+                f.write_str(": the name fails the ref-name rule")
             }
         }
     }
@@ -316,13 +346,31 @@ struct Listed {
 /// gives a `Result<Probed>` for each candidate: this value for a candidate
 /// that answers, or the error that skips the candidate.
 struct Probed {
-    /// The refs of the collection that the remote lists.
+    /// The refs of the collection that the remote lists, with names that
+    /// pass the ref-name rule.
     listed: Vec<Listed>,
+    /// Each name of a ref of the collection that the remote lists and that
+    /// fails the ref-name rule, in the listed order. The probe skipped these
+    /// refs. [`report_skipped_refs`] takes the list out after the probe, so
+    /// the list is empty after the find step.
+    skipped: Vec<String>,
     /// The `summary` of a remote, if the probe read the refs from it. `None`
     /// for a local candidate.
     summary: Option<Arc<Vec<u8>>>,
     /// The open session to the remote, for the pull from it.
     session: Session,
+}
+
+/// The refs of the collection that a listing, a summary, or the ref files
+/// of a local repository give.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ListedRefs {
+    /// Each ref whose name passes the ref-name rule.
+    listed: Vec<Listed>,
+    /// Each name that fails the ref-name rule, in the listed order. The
+    /// find step skips these refs, and reads no commit and no timestamp of
+    /// them.
+    skipped: Vec<String>,
 }
 
 /// The remote that the pull selected for one ref.
@@ -422,9 +470,16 @@ impl Repo {
     /// pull asks the next remote. The causes are a connection or a request
     /// that fails, for example a listing request that gets a status from 500
     /// to 599, a listing or a summary that does not parse, a summary that the
-    /// policy refuses, a listed name that the ref-name rule refuses, a listed
-    /// ref with no `ostree.commit.timestamp` of type `t`, and a bucket
-    /// repository with no `summary`.
+    /// policy refuses, a listed ref with no `ostree.commit.timestamp` of type
+    /// `t`, and a bucket repository with no `summary`.
+    ///
+    /// A listed ref whose name fails the ref-name rule, for example
+    /// `origin:main`, is skipped: `on_event` gets a
+    /// [`RefSkipped`](CollectionPullEvent::RefSkipped) event, and the other
+    /// refs of the remote stay in the selection. The probe reads no commit and
+    /// no timestamp of a skipped ref. Each name in
+    /// [`refs`](PullOptions::refs) passes the ref-name rule before the first
+    /// request, so the probe skips a ref only when `refs` is empty.
     ///
     /// # Access
     ///
@@ -556,9 +611,10 @@ impl Repo {
     ///   [`Repo::list_collection_refs_in`]. So a repository whose
     ///   `[core] collection-id` is `collection_id` gives its `refs/heads`
     ///   refs. The probe reads only the directories that the names can
-    ///   reach. The timestamp of each ref is the timestamp of the commit
-    ///   that the probe pins. The probe reads each such commit for its
-    ///   timestamp, and keeps no bytes of it for the pull.
+    ///   reach. It skips each ref whose name fails the ref-name rule, as
+    ///   "Probe" states. The timestamp of each other ref is the timestamp of
+    ///   the commit that the probe pins. The probe reads each such commit for
+    ///   its timestamp, and keeps no bytes of it for the pull.
     ///
     /// The client groups of the repository do not apply, because they govern
     /// `ostrya serve` and `ostrya send` alone. The file permissions are the
@@ -738,22 +794,31 @@ impl Repo {
             )));
         }
 
-        // The pull reports each remote that it skips before it probes the
-        // next one.
-        let found = find_refs(&candidates, collection_id, &names, |candidate, probed| {
-            if let (Err(e), Some(on_event)) = (probed, on_event.as_mut()) {
-                let message = match &candidate.transport {
-                    Transport::Local(path) => {
-                        format!("local repository '{}': {e}", path.display())
-                    }
-                    _ => e.to_string(),
-                };
-                on_event(CollectionPullEvent::RemoteSkipped {
-                    remote: candidate.name.to_owned(),
-                    message,
-                });
-            }
-        })
+        // The pull reports each remote and each ref that it skips before it
+        // probes the next remote.
+        let found = find_refs(
+            &candidates,
+            collection_id,
+            &names,
+            |candidate, probed| match probed {
+                Ok(probed) => report_skipped_refs(&mut on_event, candidate, probed),
+                Err(e) => {
+                    let Some(on_event) = on_event.as_mut() else {
+                        return;
+                    };
+                    let message = match &candidate.transport {
+                        Transport::Local(path) => {
+                            format!("local repository '{}': {e}", path.display())
+                        }
+                        _ => e.to_string(),
+                    };
+                    on_event(CollectionPullEvent::RemoteSkipped {
+                        remote: candidate.name.to_owned(),
+                        message,
+                    });
+                }
+            },
+        )
         .await;
         // The session and the summary of each remote that answered, by the
         // position of the remote.
@@ -878,7 +943,7 @@ impl Repo {
     /// Lists the refs of the collection `collection_id` that the remote
     /// `remote` serves, as
     /// [`remote_list_collection_refs_with`](Repo::remote_list_collection_refs_with)
-    /// does with the default overrides.
+    /// does with the default overrides and no event callback.
     ///
     /// The default overrides do not set `allow_cleartext_credentials`, so the
     /// call refuses an `http://` S3 endpoint.
@@ -898,6 +963,7 @@ impl Repo {
             collection_id,
             names,
             EndpointOverrides::default(),
+            None,
         )
         .await
     }
@@ -914,6 +980,17 @@ impl Repo {
     /// lists, sorted byte-wise by name. A name that the remote does not hold
     /// is absent from the result. The call writes nothing to this repository,
     /// and checks no commit signature.
+    ///
+    /// The call skips a listed ref whose name fails the ref-name rule, for
+    /// example `origin:main`, and reads no commit of it. The ref is absent
+    /// from the result, and `on_event`, if it is set, gets a
+    /// [`RefSkipped`](CollectionPullEvent::RefSkipped) event for it, in the
+    /// listed order, before the call returns. Each name in `names` passes the
+    /// ref-name rule before the first request, so the call skips a ref only
+    /// when `names` is empty. The call gives `on_event` no other event: the
+    /// error of the probe is the error of the call. For an ssh remote, the
+    /// call can fail after it gave the events, when the end of the session
+    /// fails.
     ///
     /// # Address and trust
     ///
@@ -1042,7 +1119,6 @@ impl Repo {
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if the listing or the
     ///   summary does not parse, and [`Error::InvalidFormat`] if a listed ref
     ///   has no `ostree.commit.timestamp` of type `t`.
-    /// - [`Error::InvalidRefspec`] if a listed name fails the ref-name rule.
     /// - For a local repository, the errors of [`Repo::open`],
     ///   [`Error::Io`] if a directory or a ref file that the names reach
     ///   cannot be read, and, without a summary policy,
@@ -1051,7 +1127,8 @@ impl Repo {
     ///
     /// # Examples
     ///
-    /// List two refs of a collection on one remote:
+    /// List each ref of a collection on one remote, with a warning for each
+    /// skipped ref:
     ///
     /// ```no_run
     /// # async fn run() -> ostrya::Result<()> {
@@ -1060,8 +1137,9 @@ impl Repo {
     ///     .remote_list_collection_refs_with(
     ///         "mirror1",
     ///         "org.example.Os",
-    ///         &["exampleos/stable", "exampleos/next"],
+    ///         &[],
     ///         ostrya::endpoint::EndpointOverrides::default(),
+    ///         Some(Box::new(|event| eprintln!("warning: {event}"))),
     ///     )
     ///     .await?;
     /// for (name, commit) in &refs {
@@ -1075,6 +1153,7 @@ impl Repo {
         collection_id: &str,
         names: &[&str],
         overrides: EndpointOverrides,
+        mut on_event: Option<Box<dyn FnMut(CollectionPullEvent) + Send>>,
     ) -> Result<Vec<(String, Checksum)>> {
         check_collection_id(collection_id)?;
         check_ref_names(collection_id, names)?;
@@ -1095,7 +1174,11 @@ impl Repo {
             std::slice::from_ref(&candidate),
             collection_id,
             &names,
-            |_, _| {},
+            |candidate, probed| {
+                if let Ok(probed) = probed {
+                    report_skipped_refs(&mut on_event, candidate, probed);
+                }
+            },
         )
         .await
         .pop() else {
@@ -1405,9 +1488,11 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
         Session::Remote(connection) => connection,
         Session::Local(src) => {
             let verification = Verification::from_trust(candidate.trust.clone());
-            let listed = probe_local(&src, &verification, id, names).await?;
+            let ListedRefs { listed, skipped } =
+                probe_local(&src, &verification, id, names).await?;
             return Ok(Probed {
                 listed,
+                skipped,
                 summary: None,
                 session: Session::Local(src),
             });
@@ -1419,8 +1504,9 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
     let source = RemoteSource::new(connection, Vec::new());
     let verification = Verification::from_trust(candidate.trust.clone());
     match probe_source(&source, &verification, id, names, http).await {
-        Ok((listed, summary)) => Ok(Probed {
+        Ok((ListedRefs { listed, skipped }, summary)) => Ok(Probed {
             listed,
+            skipped,
             summary,
             session: Session::Remote(source.into_connection()),
         }),
@@ -1434,7 +1520,8 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
 ///
 /// The step probes the candidates one at a time, in their order, through
 /// [`probe`]. After each probe, and before the next one, it calls
-/// `on_probed` with the candidate and the result of its probe.
+/// `on_probed` with the candidate and the result of its probe. `on_probed`
+/// can change the result, for example to take the skipped names out of it.
 ///
 /// The result holds the result of each candidate, at the position of the
 /// candidate: the [`Probed`] of a candidate that answered, or the error that
@@ -1443,19 +1530,43 @@ async fn find_refs(
     candidates: &[Candidate<'_>],
     id: &str,
     names: &[&str],
-    mut on_probed: impl FnMut(&Candidate<'_>, &Result<Probed>),
+    mut on_probed: impl FnMut(&Candidate<'_>, &mut Result<Probed>),
 ) -> Vec<Result<Probed>> {
     let mut found = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let probed = Box::pin(probe(candidate, id, names)).await;
-        on_probed(candidate, &probed);
+        let mut probed = Box::pin(probe(candidate, id, names)).await;
+        on_probed(candidate, &mut probed);
         found.push(probed);
     }
     found
 }
 
-/// The refs that a probe read, and the `summary` if the refs come from it.
-type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
+/// Takes the skipped names out of the probe `probed` of `candidate`, and
+/// gives `on_event` a [`RefSkipped`](CollectionPullEvent::RefSkipped) event
+/// for each of them, in the listed order.
+///
+/// Without `on_event`, the function drops the names. So the names do not
+/// stay in memory while the find step probes the next candidate.
+fn report_skipped_refs(
+    on_event: &mut Option<Box<dyn FnMut(CollectionPullEvent) + Send>>,
+    candidate: &Candidate<'_>,
+    probed: &mut Probed,
+) {
+    let skipped = std::mem::take(&mut probed.skipped);
+    let Some(on_event) = on_event.as_mut() else {
+        return;
+    };
+    for name in skipped {
+        on_event(CollectionPullEvent::RefSkipped {
+            remote: candidate.name.to_owned(),
+            name,
+        });
+    }
+}
+
+/// The refs and the skipped names that a probe read, and the `summary` if
+/// the refs come from it.
+type Refs = (ListedRefs, Option<Arc<Vec<u8>>>);
 
 /// Reads the refs of `names` in the collection `id` from the local
 /// repository `src`, or each ref of the collection if `names` is empty.
@@ -1469,12 +1580,13 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 /// Otherwise the refs come from the ref files of `src`, through
 /// [`Repo::list_collection_refs_in`]. So the collection id of `src` puts its
 /// `refs/heads` refs in the collection, and the probe reads only the
-/// directories that the names can reach. The timestamp of each ref is the
-/// timestamp of its commit in `src`. The probe reads each commit one time, on
-/// the blocking pool, under the size cap of a metadata object, and drops its
-/// bytes before it reads the next commit.
+/// directories that the names can reach. The probe puts each ref whose name
+/// fails the ref-name rule in the skipped names before it reads a commit. The
+/// timestamp of each other ref is the timestamp of its commit in `src`. The
+/// probe reads each commit one time, on the blocking pool, under the size cap
+/// of a metadata object, and drops its bytes before it reads the next commit.
 ///
-/// The result holds the refs alone.
+/// The result holds the refs and the skipped names alone.
 ///
 /// # Errors
 ///
@@ -1485,7 +1597,6 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 ///   a ref of the summary has no `ostree.commit.timestamp` of type `t`.
 /// - [`Error::Core`] or [`Error::InvalidFormat`] if the summary does not
 ///   parse.
-/// - [`Error::InvalidRefspec`] if a name fails the ref-name rule.
 /// - [`Error::ObjectNotFound`] if `src` does not hold the commit of a ref.
 /// - [`Error::Io`] if a directory or a ref file that the names reach cannot
 ///   be read, and the errors of the read of a ref file or a commit.
@@ -1494,22 +1605,22 @@ async fn probe_local(
     verification: &Verification,
     id: &str,
     names: &[&str],
-) -> Result<Vec<Listed>> {
+) -> Result<ListedRefs> {
     if verification.checks_summary() {
         let Some(bytes) = read_checked_local_summary(src, verification, false).await? else {
             unreachable!("the summary check needs a summary");
         };
-        let (_, listed) = parse_refs(bytes, id, names).await?;
-        return Ok(listed);
+        let (_, refs) = parse_refs(bytes, id, names).await?;
+        return Ok(refs);
     }
     let refs = src
         .list_collection_refs_in(id, &RefSelector::parse(names.iter().copied())?)
         .await?;
-    for (name, _) in &refs {
-        check_ref_path(name)?;
-    }
+    let (refs, invalid): (Vec<_>, Vec<_>) =
+        refs.into_iter().partition(|(name, _)| is_ref_path(name));
+    let skipped = invalid.into_iter().map(|(name, _)| name).collect();
     let src = src.clone();
-    ostrya_rt::unblock(move || {
+    let listed = ostrya_rt::unblock(move || {
         let mut timestamps: HashMap<Checksum, u64> = HashMap::new();
         refs.into_iter()
             .map(|(name, commit)| {
@@ -1528,7 +1639,8 @@ async fn probe_local(
             })
             .collect::<Result<Vec<Listed>>>()
     })
-    .await
+    .await?;
+    Ok(ListedRefs { listed, skipped })
 }
 
 /// Reads the refs of `names` in the collection `id` from `source`, or each
@@ -1555,7 +1667,7 @@ async fn probe_source(
     if names.is_empty() {
         return every_ref(source, verification, id).await;
     }
-    let mut listed = Vec::new();
+    let mut listed = ListedRefs::default();
     for chunk in listing_chunks(id, names, http) {
         let refs = RefSelector::parse(chunk.iter().copied())?;
         let entries: Vec<String> = chunk.iter().map(|name| format!("{id}/{name}")).collect();
@@ -1563,7 +1675,9 @@ async fn probe_source(
         let Some(bytes) = read_listing(source, &refs, Some(&collections)).await? else {
             return summary_refs(source, verification, id, names).await;
         };
-        listed.extend(parse_refs(Arc::new(bytes), id, chunk).await?.1);
+        let (_, parsed) = parse_refs(Arc::new(bytes), id, chunk).await?;
+        listed.listed.extend(parsed.listed);
+        listed.skipped.extend(parsed.skipped);
     }
     Ok((listed, None))
 }
@@ -1575,7 +1689,8 @@ async fn probe_source(
 /// ref of the collection, with the entry `ID/**`. If the listing states `id`
 /// as the collection id of the remote, the refs of the collection are its
 /// local refs. A second request then selects each local ref, and no
-/// collection ref. So a remote of another collection sends no local ref.
+/// collection ref. So a remote of another collection sends no local ref. The
+/// skipped names come from the listing of the refs that the call returns.
 async fn every_ref(source: &RemoteSource, verification: &Verification, id: &str) -> Result<Refs> {
     let no_local = RefSelector::parse(["!**"])?;
     let entry = format!("{id}/**");
@@ -1647,7 +1762,7 @@ async fn summary_refs(
                     .into(),
             ));
         }
-        return Ok((Vec::new(), None));
+        return Ok((ListedRefs::default(), None));
     };
     let (_, listed) = parse_refs(Arc::clone(&bytes), id, names).await?;
     Ok((listed, Some(bytes)))
@@ -1655,12 +1770,12 @@ async fn summary_refs(
 
 /// Parses the listing or the summary `bytes`, and returns the refs of the
 /// collection `id` that `names` names, or each ref of the collection if
-/// `names` is empty.
+/// `names` is empty, as [`collection_refs`] returns them.
 ///
 /// The result also tells if the bytes state `id` as the collection id of the
 /// remote. A summary can be as large as its read cap, so the parse runs on
 /// the blocking pool.
-async fn parse_refs(bytes: Arc<Vec<u8>>, id: &str, names: &[&str]) -> Result<(bool, Vec<Listed>)> {
+async fn parse_refs(bytes: Arc<Vec<u8>>, id: &str, names: &[&str]) -> Result<(bool, ListedRefs)> {
     let id = id.to_owned();
     let wanted: Option<HashSet<String>> =
         (!names.is_empty()).then(|| names.iter().map(|name| (*name).to_owned()).collect());
@@ -1678,18 +1793,20 @@ async fn parse_refs(bytes: Arc<Vec<u8>>, id: &str, names: &[&str]) -> Result<(bo
 /// call parses that entry alone and leaves field 0 undecoded. A name that
 /// occurs again keeps its first entry.
 ///
+/// The call puts each name that fails the ref-name rule in the skipped names,
+/// one time, and reads no timestamp of its ref.
+///
 /// # Errors
 ///
 /// - [`Error::Core`] or [`Error::InvalidFormat`] if the bytes do not parse,
 ///   or if the collection map is malformed.
-/// - [`Error::InvalidFormat`] if a ref has no `ostree.commit.timestamp` of
-///   type `t`.
-/// - [`Error::InvalidRefspec`] if a name fails the ref-name rule.
+/// - [`Error::InvalidFormat`] if a ref with a valid name has no
+///   `ostree.commit.timestamp` of type `t`.
 fn collection_refs(
     bytes: &[u8],
     id: &str,
     wanted: Option<&HashSet<String>>,
-) -> Result<(bool, Vec<Listed>)> {
+) -> Result<(bool, ListedRefs)> {
     let metadata = Summary::parse_metadata(bytes)?;
     let own = metadata
         .dict_get(COLLECTION_ID_KEY)
@@ -1703,15 +1820,18 @@ fn collection_refs(
         collection_map_refs(&metadata, id)?
     };
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut out = ListedRefs::default();
     for entry in &entries {
         if wanted.is_some_and(|wanted| !wanted.contains(&entry.name))
             || !seen.insert(entry.name.as_str())
         {
             continue;
         }
-        check_ref_path(&entry.name)?;
-        out.push(Listed {
+        if !is_ref_path(&entry.name) {
+            out.skipped.push(entry.name.clone());
+            continue;
+        }
+        out.listed.push(Listed {
             name: entry.name.clone(),
             commit: entry.commit,
             timestamp: listed_timestamp(entry)?,
@@ -1858,6 +1978,7 @@ const _: fn() = || {
             "org.example.Os",
             &[],
             EndpointOverrides::default(),
+            None,
         ))
     };
     assert_send_sync::<CollectionPullStats>();
@@ -2067,13 +2188,12 @@ mod tests {
             Some("org.example.Os"),
         );
         let refs = collection_refs(&s, "org.example.Os", None).unwrap();
+        assert!(refs.0);
         assert_eq!(
-            refs,
-            (
-                true,
-                vec![listed("os/stable", 1, 10), listed("os/next", 2, 20)]
-            )
+            refs.1.listed,
+            [listed("os/stable", 1, 10), listed("os/next", 2, 20)]
         );
+        assert!(refs.1.skipped.is_empty());
     }
 
     /// Another collection reads the entry of the map, ignores field 0, and
@@ -2094,12 +2214,21 @@ mod tests {
         );
         let wanted: HashSet<String> = ["os/stable".to_owned()].into();
         let refs = collection_refs(&s, "org.example.Os", Some(&wanted)).unwrap();
-        assert_eq!(refs, (false, vec![listed("os/stable", 3, 30)]));
+        assert_eq!(
+            refs,
+            (
+                false,
+                ListedRefs {
+                    listed: vec![listed("os/stable", 3, 30)],
+                    skipped: Vec::new(),
+                }
+            )
+        );
         // A summary with no collection id and no map entry lists nothing.
         let s = summary(&[("os/stable", 1, 10)], &[], None);
         assert_eq!(
             collection_refs(&s, "org.example.Os", None).unwrap(),
-            (false, Vec::new())
+            (false, ListedRefs::default())
         );
     }
 
@@ -2130,6 +2259,43 @@ mod tests {
                 Err(Error::InvalidFormat(_))
             ));
         }
+    }
+
+    /// A name that fails the ref-name rule goes to the skipped names one
+    /// time, in the listed order, and the other refs stay. The read takes no
+    /// timestamp of a skipped ref, so a skipped ref with no timestamp fails
+    /// nothing. This is true in field 0 and in the collection map.
+    #[test]
+    fn a_name_that_fails_the_ref_name_rule_is_skipped() {
+        let mut field0 = ref_values(&[
+            ("origin:main", 1, 10),
+            ("os/stable", 2, 20),
+            ("origin:main", 3, 30),
+        ]);
+        field0.push(ref_value("bad name", 4, Value::Array(Vec::new())));
+        let own = summary_of(field0, &[], Some("org.example.Os"));
+        let expected = ListedRefs {
+            listed: vec![listed("os/stable", 2, 20)],
+            skipped: vec!["origin:main".to_owned(), "bad name".to_owned()],
+        };
+        assert_eq!(
+            collection_refs(&own, "org.example.Os", None).unwrap(),
+            (true, expected)
+        );
+
+        let map = summary(
+            &[],
+            &[("org.example.Os", &[("os/next", 5, 50), ("a/../b", 6, 60)])],
+            None,
+        );
+        let expected = ListedRefs {
+            listed: vec![listed("os/next", 5, 50)],
+            skipped: vec!["a/../b".to_owned()],
+        };
+        assert_eq!(
+            collection_refs(&map, "org.example.Os", None).unwrap(),
+            (false, expected)
+        );
     }
 
     /// The newest timestamp wins, a tie goes to the earlier remote, and a
@@ -2301,6 +2467,20 @@ mod tests {
         assert_eq!(event.to_string(), "remote mirror skipped: bad\\nline");
     }
 
+    /// The text of a ref skip event names the remote and the ref, and
+    /// escapes each control character.
+    #[test]
+    fn the_ref_skip_event_escapes_control_characters() {
+        let event = CollectionPullEvent::RefSkipped {
+            remote: "mir\tror".to_owned(),
+            name: "origin:main\n".to_owned(),
+        };
+        assert_eq!(
+            event.to_string(),
+            "remote mir\\tror skipped the ref origin:main\\n: the name fails the ref-name rule"
+        );
+    }
+
     /// The collection of the local tests.
     const LOCAL_ID: &str = "org.example.Os";
     /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
@@ -2414,7 +2594,9 @@ mod tests {
         depth: i32,
     ) -> Result<PullStats> {
         let verification = Verification::from_trust(trust.clone());
-        let listed = probe_local(src, &verification, LOCAL_ID, names).await?;
+        let listed = probe_local(src, &verification, LOCAL_ID, names)
+            .await?
+            .listed;
         let run = PullOptions {
             refs: listed.iter().map(|l| l.name.clone()).collect(),
             flags,
@@ -2489,7 +2671,10 @@ mod tests {
             let two = local_commit(&src, &["os/c"], None, 1_700_000_002, b"two").await;
             let unverified = Verification::from_trust(PullTrust::unverified());
 
-            let listed = probe_local(&src, &unverified, LOCAL_ID, &[]).await.unwrap();
+            let listed = probe_local(&src, &unverified, LOCAL_ID, &[])
+                .await
+                .unwrap()
+                .listed;
             assert_eq!(listed.len(), 3);
             let timestamps: HashMap<Checksum, u64> =
                 listed.iter().map(|l| (l.commit, l.timestamp)).collect();
@@ -2504,7 +2689,10 @@ mod tests {
             src.sign_summary(&ed25519_signer()).await.unwrap();
             let policy =
                 Verification::from_trust(PullTrust::unverified().with_summary(ed25519_keys()));
-            let mut from_summary = probe_local(&src, &policy, LOCAL_ID, &[]).await.unwrap();
+            let mut from_summary = probe_local(&src, &policy, LOCAL_ID, &[])
+                .await
+                .unwrap()
+                .listed;
             let mut expected = listed;
             from_summary.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             expected.sort_unstable_by(|a, b| a.name.cmp(&b.name));
@@ -2535,7 +2723,8 @@ mod tests {
             let verification = Verification::from_trust(trust.clone());
             let listed = probe_local(&src, &verification, LOCAL_ID, &["os/a"])
                 .await
-                .unwrap();
+                .unwrap()
+                .listed;
             let run = PullOptions {
                 refs: vec!["os/a".to_owned()],
                 require_static_deltas: true,
@@ -2665,7 +2854,8 @@ mod tests {
             let unverified = Verification::from_trust(PullTrust::unverified());
             let listed = probe_local(&src, &unverified, LOCAL_ID, &["os/a"])
                 .await
-                .unwrap();
+                .unwrap()
+                .listed;
             assert_eq!(
                 listed,
                 [Listed {
@@ -2718,7 +2908,8 @@ mod tests {
             let unverified = Verification::from_trust(PullTrust::unverified());
             let listed = probe_local(&src, &unverified, LOCAL_ID, &names)
                 .await
-                .unwrap();
+                .unwrap()
+                .listed;
             let run = PullOptions {
                 refs: names.map(str::to_owned).to_vec(),
                 ..PullOptions::default()

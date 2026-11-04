@@ -3788,7 +3788,8 @@ struct PullArgs {
     /// and the low-speed options with a local candidate. For
     /// each ref, it selects the candidate with the newest commit, and a tie
     /// goes to the first candidate in the config. A candidate that fails to
-    /// answer is skipped with a warning. The pull from each selected
+    /// answer is skipped with a warning. A listed ref whose name fails the
+    /// ref-name rule is skipped with a warning. The pull from each selected
     /// candidate is a pull of its own, so a failure of a later candidate
     /// keeps the refs of the earlier ones. The keys of the selected candidate
     /// apply. If the keys of a `file://` candidate check the signatures of

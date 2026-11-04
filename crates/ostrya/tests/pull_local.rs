@@ -5397,8 +5397,9 @@ fn a_collection_pull_from_a_thin_source_into_an_empty_destination_fails() {
     });
 }
 
-/// A collection pull reads only the collection ref. It does not read the ref
-/// of the same name under `refs/heads`.
+/// A collection pull from a source with no collection id reads only the
+/// collection ref. It does not read the ref of the same name under
+/// `refs/heads`.
 #[test]
 fn a_collection_pull_reads_the_ref_under_refs_mirrors() {
     let tmp = TmpDir::new("pull-collection-mirrors");
@@ -5418,9 +5419,10 @@ fn a_collection_pull_reads_the_ref_under_refs_mirrors() {
     });
 }
 
-/// If the source has no collection ref for a name, the pull fails with the
-/// path of the collection ref. This is also true in these cases:
-/// - the source holds the name under `refs/heads`
+/// If the source has no collection ref for a name, the pull fails with
+/// `ID:NAME`. This is also true in these cases:
+/// - the source, which has no collection id, holds the name under
+///   `refs/heads`
 /// - the source holds the name under another collection
 /// - the name is a checksum, which the pull reads as a ref name
 #[test]
@@ -5439,13 +5441,154 @@ fn an_absent_collection_ref_is_not_found() {
                 .await
                 .unwrap_err();
             match err {
-                Error::RefNotFound(path) => {
-                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
-                }
+                Error::RefNotFound(pair) => assert_eq!(pair, format!("{COLLECTION}:{name}")),
                 other => panic!("{name}: {other:?}"),
             }
             assert_nothing_left(&dst_dir, &dst, &c2).await;
         }
+    });
+}
+
+/// Creates an archive source under `base/src` whose collection id is
+/// [`COLLECTION`], with one commit bound to the collection and to `name`.
+/// The local ref `name` points at the commit, and the source holds no
+/// collection ref. Returns the path, the handle, and the commit.
+async fn own_collection_source(base: &Path, name: &str) -> (PathBuf, Repo, Checksum) {
+    let path = base.join("src");
+    let src = Repo::create(
+        &path,
+        CreateOptions {
+            mode: RepoMode::Archive,
+            collection_id: Some(COLLECTION.to_owned()),
+        },
+    )
+    .await
+    .unwrap();
+    let commit = commit_collection_ref(
+        &src,
+        base,
+        "va",
+        name,
+        None,
+        bound_to(COLLECTION),
+        Some(&[name]),
+    )
+    .await;
+    let txn = src.transaction().await.unwrap();
+    txn.set_collection_ref(&CollectionRef::new(COLLECTION, name), None);
+    txn.set_ref(name, Some(&commit));
+    txn.commit().await.unwrap();
+    assert!(
+        !path
+            .join(format!("refs/mirrors/{COLLECTION}/{name}"))
+            .exists()
+    );
+    assert!(path.join(format!("refs/heads/{name}")).is_file());
+    (path, src, commit)
+}
+
+/// A source whose collection id is the id of the pull holds the refs of the
+/// collection under `refs/heads`. The pull reads a name there when the
+/// source holds no collection ref for it, and writes the collection ref.
+#[test]
+fn a_collection_pull_reads_the_local_ref_of_a_source_of_the_collection() {
+    let tmp = TmpDir::new("pull-collection-own-source");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commit) = own_collection_source(base, "app/a").await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        dst.pull_local(&src, collection_write_pull(&["app/a"]))
+            .await
+            .unwrap();
+
+        let cref = CollectionRef::new(COLLECTION, "app/a");
+        assert_eq!(
+            dst.resolve_collection_ref(&cref, false).await.unwrap(),
+            Some(commit)
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_complete(&src, &dst, &dst_dir, &commit).await;
+    });
+}
+
+/// In a source whose collection id is the id of the pull, the collection ref
+/// wins over the local ref of the same name. A name with neither ref fails
+/// with `ID:NAME`, and the pull writes nothing.
+#[test]
+fn the_collection_ref_of_a_source_of_the_collection_wins_over_its_local_ref() {
+    let tmp = TmpDir::new("pull-collection-own-source-mirror");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, local) = own_collection_source(base, "app/a").await;
+        let mirrored = commit_collection_ref(
+            &src,
+            base,
+            "vb",
+            "app/a",
+            None,
+            bound_to(COLLECTION),
+            Some(&["app/a"]),
+        )
+        .await;
+        assert_ne!(mirrored, local);
+        assert_eq!(src.resolve_rev("app/a", false).await.unwrap(), Some(local));
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        let err = dst
+            .pull_local(&src, collection_write_pull(&["app/none"]))
+            .await
+            .unwrap_err();
+        match err {
+            Error::RefNotFound(pair) => assert_eq!(pair, format!("{COLLECTION}:app/none")),
+            other => panic!("{other:?}"),
+        }
+        assert_nothing_left(&dst_dir, &dst, &mirrored).await;
+        assert!(dst.list_mirror_refs().await.unwrap().is_empty());
+
+        dst.pull_local(&src, collection_write_pull(&["app/a"]))
+            .await
+            .unwrap();
+
+        let cref = CollectionRef::new(COLLECTION, "app/a");
+        assert_eq!(
+            dst.resolve_collection_ref(&cref, false).await.unwrap(),
+            Some(mirrored)
+        );
+        assert_complete(&src, &dst, &dst_dir, &mirrored).await;
+        assert!(!dst.has_object(ObjectType::Commit, &local).await.unwrap());
+    });
+}
+
+/// In a source whose collection id is the id of the pull, a local ref file
+/// that the pull cannot read fails the pull with [`Error::Io`], and the pull
+/// writes nothing.
+#[test]
+fn an_unreadable_local_ref_of_a_source_of_the_collection_fails_the_pull() {
+    if is_root() {
+        eprintln!("skipping: root reads a directory of mode 0000");
+        return;
+    }
+    let tmp = TmpDir::new("pull-collection-own-source-eacces");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, commit) = own_collection_source(base, "app/a").await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let dir = src_dir.join("refs/heads/app");
+        let mode = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = dst
+            .pull_local(&src, collection_write_pull(&["app/a"]))
+            .await;
+        std::fs::set_permissions(&dir, mode).unwrap();
+
+        match result {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied),
+            other => panic!("{other:?}"),
+        }
+        assert_nothing_left(&dst_dir, &dst, &commit).await;
+        assert!(dst.list_mirror_refs().await.unwrap().is_empty());
     });
 }
 
@@ -6448,7 +6591,10 @@ fn a_collection_pull_is_refused_without_a_ref() {
 }
 
 /// A collection ref path to a directory, or through a file, holds no ref. The
-/// pull fails with the path of the collection ref, as for an absent ref.
+/// pull fails with `ID:NAME`, as for an absent ref. This is also true for the
+/// path under `refs/heads` of a source whose collection id is the id of the
+/// pull: there, `refs/heads/app` is a ref file, and the name `app/a` goes
+/// through it.
 #[test]
 fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
     let tmp = TmpDir::new("pull-collection-not-a-ref");
@@ -6464,13 +6610,24 @@ fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
                 .await
                 .unwrap_err();
             match err {
-                Error::RefNotFound(path) => {
-                    assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
-                }
+                Error::RefNotFound(pair) => assert_eq!(pair, format!("{COLLECTION}:{name}")),
                 other => panic!("{name}: {other:?}"),
             }
             assert_nothing_left(&dst_dir, &dst, &c2).await;
         }
+
+        let own_base = base.join("own");
+        std::fs::create_dir(&own_base).unwrap();
+        let (_own_dir, own, app) = own_collection_source(&own_base, "app").await;
+        let err = dst
+            .pull_local(&own, collection_pull(&["app/a"]))
+            .await
+            .unwrap_err();
+        match err {
+            Error::RefNotFound(pair) => assert_eq!(pair, format!("{COLLECTION}:app/a")),
+            other => panic!("app/a: {other:?}"),
+        }
+        assert_nothing_left(&dst_dir, &dst, &app).await;
     });
 }
 
@@ -6495,9 +6652,7 @@ fn a_collection_ref_name_takes_no_revision_syntax() {
             .await
             .unwrap_err();
         match err {
-            Error::RefNotFound(path) => {
-                assert_eq!(path, format!("refs/mirrors/{COLLECTION}/{name}"))
-            }
+            Error::RefNotFound(pair) => assert_eq!(pair, format!("{COLLECTION}:{name}")),
             other => panic!("{name}: {other:?}"),
         }
         assert_nothing_left(&dst_dir, &dst, &c2).await;

@@ -132,15 +132,19 @@ impl fmt::Display for SendEvent {
 }
 
 /// Writes `text` with each ASCII control character as its escape sequence.
+///
+/// The function writes each run of characters with no control character in
+/// one call, so a long name gives few writes to the sink of the formatter.
 pub(crate) fn write_escaped(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
-    for c in text.chars() {
-        if c.is_ascii_control() {
-            write!(f, "{}", c.escape_default())?;
-        } else {
-            write!(f, "{c}")?;
-        }
+    let mut rest = text;
+    while let Some(at) = rest.find(|c: char| c.is_ascii_control()) {
+        f.write_str(&rest[..at])?;
+        // A control character is ASCII, so it is one byte.
+        let c = char::from(rest.as_bytes()[at]);
+        write!(f, "{}", c.escape_default())?;
+        rest = &rest[at + 1..];
     }
-    Ok(())
+    f.write_str(rest)
 }
 
 /// The kind of failure that ends a session.
@@ -1031,6 +1035,31 @@ mod tests {
             "refs/mirrors/bad\\nforged line\\t\\u{7f}: the directory name is not a \
              collection id, and the ref listing leaves out the directory"
         );
+    }
+
+    /// The escaped text keeps each run of other characters and escapes each
+    /// control character at the start, in the middle, and at the end.
+    #[test]
+    fn the_escaped_text_keeps_the_runs_between_control_characters() {
+        struct Escaped {
+            inner: &'static str,
+        }
+        impl fmt::Display for Escaped {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write_escaped(f, self.inner)
+            }
+        }
+        for (text, expected) in [
+            ("", ""),
+            ("plain é name", "plain é name"),
+            ("\n", "\\n"),
+            ("\tab\r\ncd\u{1b}é\u{7f}", "\\tab\\r\\ncd\\u{1b}é\\u{7f}"),
+            ("\0start", "\\u{0}start"),
+            ("mid\u{1}dle", "mid\\u{1}dle"),
+            ("end\n", "end\\n"),
+        ] {
+            assert_eq!(Escaped { inner: text }.to_string(), expected, "{text:?}");
+        }
     }
 
     /// The chunk payload is equal to the chunk payload of the push, so the

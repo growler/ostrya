@@ -4389,6 +4389,12 @@ No matrix cell needs these. The shell suite invokes them.
     each candidate that it skips. When the pull fetched objects, and the
     local candidates imported objects and fetched nothing, the port prints
     two statistics lines.
+  - With no REF, the port skips each listed ref whose name fails the
+    ref-name rule, for example `refs/heads/origin:main` of a candidate whose
+    `[core] collection-id` is ID, and pulls the other refs of the candidate.
+    It prints one warning line for each skipped ref:
+    `warning: remote REMOTE skipped the ref NAME: the name fails the ref-name
+    rule`. The `-c` listing of the tool skips such a ref with no warning.
   - The port has no `--mirror` for a collection pull, and no command that
     finds the remotes and pulls nothing.
   - In a repository whose `[core] collection-id` is ID, the port writes

@@ -2840,7 +2840,7 @@ async fn listed_refs(
         ..Default::default()
     };
     let refs = repo
-        .remote_list_collection_refs_with(remote, id, names, overrides)
+        .remote_list_collection_refs_with(remote, id, names, overrides, None)
         .await?;
     Ok(refs.into_iter().map(|(name, _)| name).collect())
 }
@@ -3079,7 +3079,7 @@ fn a_bearer_token_in_the_headers_gives_a_query_access() {
             ..Default::default()
         };
         let refs = client
-            .remote_list_collection_refs_with("a", ID, &[], overrides)
+            .remote_list_collection_refs_with("a", ID, &[], overrides, None)
             .await
             .unwrap();
         assert_eq!(

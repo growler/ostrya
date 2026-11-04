@@ -246,6 +246,7 @@ A keyring of the directory that ostrya cannot open or read for a reason other th
 \fB\%ostrya remote gpg\-list\-keys\fR reads the same keyring.
 \fB\%ostrya remote gpg\-import\fR writes \fB\%<repo>/NAME.trustedkeys.gpg\fR, also for a remote of the directory, and never writes a keyring of the directory.
 \fB\%ostrya remote delete\fR does not remove a keyring of the directory.
+A later remote of the same name trusts that keyring.
 .PP
 \fB\%ostrya config get\fR, \fB\%ostrya config set\fR, and \fB\%ostrya config unset\fR read and write \fB\%config\fR alone.
 \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.

@@ -1542,6 +1542,82 @@ fn delete_remote_removes_the_group_from_its_conf_file() {
     assert_eq!(reopened.config().remotes().collect::<Vec<_>>(), ["p2"]);
 }
 
+/// A delete of a remote of a `.conf` file removes the repository keyring and
+/// keeps the keyring of the remotes directory. After a later add of a remote
+/// of the same name, a key listing of that remote gives the key of the kept
+/// keyring.
+#[cfg(feature = "verify-gpg")]
+#[test]
+fn delete_remote_keeps_the_keyring_of_the_remotes_directory() {
+    use std::os::unix::fs::DirBuilderExt;
+    use std::process::Command;
+
+    if !common::gnupg_available(&["gpg"]) {
+        return;
+    }
+    let tmp = TmpDir::new("guard-dir-delete-keyring");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(
+        &dir,
+        "os.conf",
+        "[remote \"os\"]\nurl=https://example.invalid/os\n",
+    );
+
+    let home = tmp.path().join("gnupg");
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&home)
+        .unwrap();
+    let gpg = || {
+        let mut cmd = Command::new("gpg");
+        cmd.arg("--homedir").arg(&home).arg("--batch");
+        cmd
+    };
+    let status = gpg()
+        .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+        .args(["--quick-gen-key", "Ostrya Guard <guard@example.invalid>"])
+        .args(["ed25519", "sign", "never"])
+        .status()
+        .unwrap();
+    let listing = gpg().args(["--with-colons", "--list-keys"]).output();
+    let export = gpg().arg("--export").output();
+    common::remove_gnupg_sockets(&home);
+    assert!(status.success(), "gpg --quick-gen-key failed");
+    let listing = listing.unwrap();
+    let export = export.unwrap();
+    assert!(listing.status.success());
+    assert!(export.status.success() && !export.stdout.is_empty());
+    let fingerprint = String::from_utf8(listing.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split(':');
+            (fields.next() == Some("fpr")).then(|| fields.nth(8).unwrap().to_owned())
+        })
+        .expect("a fpr record in the key listing");
+    let keyring = dir.join("os.trustedkeys.gpg");
+    std::fs::write(&keyring, &export.stdout).unwrap();
+    std::fs::write(path.join("os.trustedkeys.gpg"), b"keys").unwrap();
+
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard.delete_remote("os").await.unwrap();
+        assert_eq!(entry_names(&dir), ["os.trustedkeys.gpg"]);
+        guard
+            .add_remote("os", &[("url", "https://example.invalid/os")])
+            .await
+            .unwrap();
+    });
+    assert_eq!(entry_names(&dir), ["os.conf", "os.trustedkeys.gpg"]);
+    assert_eq!(std::fs::read(&keyring).unwrap(), export.stdout);
+    assert!(!path.join("os.trustedkeys.gpg").exists());
+
+    let keys = block_on(repo.gpg_list_keys("os")).unwrap();
+    let fingerprints: Vec<&str> = keys.iter().map(|key| key.fingerprint.as_str()).collect();
+    assert_eq!(fingerprints, [fingerprint.as_str()]);
+}
+
 /// A set, an unset, a replace, and a delete that writes the file back refuse
 /// a `.conf` file that is a symlink, with `InvalidFormat` that names the
 /// link. The link and its target stay, and the delete keeps the keyring.

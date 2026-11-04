@@ -250,7 +250,10 @@ removes the group and writes the new group at the end of the same file, as
 tool writes the file again with the new group alone, and a delete of the tool
 removes the whole file. Each of the two loses remotes that the user did not
 name, so the port edits the one group. A delete removes the file when no
-remote group stays in it.
+remote group stays in it. A delete removes `<repo>/<name>.trustedkeys.gpg`
+and keeps `<dir>/<name>.trustedkeys.gpg`, as the tool does. A later remote of
+the same name trusts the keys of the directory while the repository holds no
+keyring of that name.
 
 A rewrite of a `.conf` file keeps the permission bits of the old file, so a
 file that the administrator made private stays private. The owner is not

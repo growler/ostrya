@@ -63,7 +63,7 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// - [`unset_remote_key`](UpdateGuard::unset_remote_key)
 /// - [`replace_remote`](UpdateGuard::replace_remote)
 /// - [`delete_remote`](UpdateGuard::delete_remote), which also removes the
-///   trusted keyring of the remote
+///   repository keyring of the remote
 ///
 /// An add writes a new remote into the remotes directory if the handle has
 /// one and `[core] add-remotes-config-dir` of `config` is not `false`. Else
@@ -722,7 +722,7 @@ impl UpdateGuard {
     }
 
     /// Deletes the remote `name` from the file that holds it, together with
-    /// its trusted keyring.
+    /// its repository keyring.
     ///
     /// The call removes the trusted keyring `<name>.trustedkeys.gpg` at the
     /// repository root, and then the group of the remote from its file. An
@@ -736,10 +736,12 @@ impl UpdateGuard {
     /// the link, and the target stays. Else it writes the file back, as
     /// [`set_remote_key`](UpdateGuard::set_remote_key) does.
     ///
-    /// The keyring goes with the remote, so a later remote of the same name
-    /// does not trust the keys of this one. The keyring goes first, so a
-    /// failure between the two steps can leave a remote with no keys. It
-    /// cannot leave keys with no remote.
+    /// The repository keyring goes with the remote. A keyring of the remotes
+    /// directory stays, as the `ostree` command keeps it. A later remote of the
+    /// same name trusts the keys of that keyring while the repository holds no
+    /// keyring of that name. The repository keyring goes first, so a failure
+    /// between the two steps can leave a remote with no repository keyring. It
+    /// cannot leave a repository keyring with no remote.
     ///
     /// The removal is visible when the call returns. The sync of the
     /// repository directory waits for [`finish`](UpdateGuard::finish). The

@@ -46,7 +46,8 @@ API documentation: <https://docs.rs/ostrya-sign>
   `gpg_offered_keys`, and `gpg_merge_keyring`, with `GpgKey`,
   `GpgOfferedKeys`, and `MAX_KEYRING`. The feature holds no runtime.
 - `gpg-sign`: `GpgSigner`, which signs with the `gpg` command. It does
-  not turn on `gpg`.
+  not turn on `gpg`. With `gpg`, `GpgSigner::export_public` gives the
+  minimal public certificate of a signing key.
 - `x509`: the trait `X509Signer`. With `spki`, also `X509SpkiSigner`, the
   spki signer with an X.509 certificate chain, which
   `SpkiSigner::with_certificates` makes, and

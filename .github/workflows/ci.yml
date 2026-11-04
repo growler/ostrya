@@ -251,6 +251,12 @@ jobs:
       - name: The ostrya-sign unit tests pass with the GPG verifier feature alone
         run: cargo test -p ostrya-sign --no-default-features --features gpg --lib
 
+      # The feature `gpg-sign` holds the GPG signer and does not turn on
+      # `gpg`. This step builds the signer with no OpenPGP parser, with no
+      # warning, so an item of the signer that needs `gpg` fails here.
+      - name: ostrya-sign with the GPG signer feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features smol,gpg-sign --all-targets -- -D warnings
+
       # The feature `spki` turns on the spki engine with each key type. These
       # steps build the engine with no other feature, with no warning, run
       # the unit tests of `ostrya-sign` in that build, and run the spki tests

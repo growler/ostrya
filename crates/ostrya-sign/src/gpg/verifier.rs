@@ -630,7 +630,7 @@ fn keyring_stream<'a>(
 /// [`parse_keyring`] to `bytes` with no armor decode. If the blob does not
 /// frame and holds [`ARMOR_BEGIN`], the refusal states that it holds armor.
 /// `subject` names the source in a refusal.
-fn binary_keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+pub(super) fn binary_keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
     keyring_size(bytes, subject)?;
     refuse_keybox(bytes, subject)?;
     match parse_keyring(bytes, subject) {
@@ -645,6 +645,14 @@ fn binary_keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicK
         }
         Err(refusal) => Err(refusal.into()),
     }
+}
+
+/// Refuses a blob over [`MAX_KEYRING`] with the refusal that
+/// [`binary_keyring_certs`] gives for it. `subject` names the source in the
+/// refusal.
+#[cfg(feature = "gpg-sign")]
+pub(super) fn refuse_oversized_keyring(bytes: &[u8], subject: &str) -> Result<()> {
+    keyring_size(bytes, subject).map_err(Error::from)
 }
 
 /// Refuses a blob over [`MAX_KEYRING`] with [`KeyringRefusal::OverLimit`].
@@ -1371,7 +1379,7 @@ fn key_matches<K: KeyDetails>(key: &K, hex: &str) -> bool {
 }
 
 /// Returns the primary key fingerprint of a certificate, in uppercase hex.
-fn fingerprint_hex(cert: &SignedPublicKey) -> String {
+pub(super) fn fingerprint_hex(cert: &SignedPublicKey) -> String {
     format!("{:X}", cert.fingerprint())
 }
 
@@ -3821,5 +3829,376 @@ IHdvcmxk\n\
             assert_eq!(gpg_keyring_keys(&keyring, SUBJECT).unwrap(), reference);
         }
         assert!(gpg_keyring_keys(b"", SUBJECT).unwrap().is_empty());
+    }
+
+    /// The export of a public certificate through `gpg`.
+    #[cfg(feature = "gpg-sign")]
+    mod export {
+        use pgp::packet::SignatureType;
+
+        use super::*;
+        use crate::{GpgSigner, SignatureInfo, Signer};
+
+        /// The primary user id of the key of [`KeyFixture::with_subkeys`].
+        const PRIMARY_UID: &str = "Sealer <sealer@ostrya.example>";
+
+        /// The packet tags of a certificate with one user id, one subkey, and no
+        /// revocation.
+        const MINIMAL_TAGS: [Tag; 5] = [
+            Tag::PublicKey,
+            Tag::UserId,
+            Tag::Signature,
+            Tag::PublicSubkey,
+            Tag::Signature,
+        ];
+
+        impl KeyFixture {
+            /// Creates a home with one key: an ed25519 primary key that only
+            /// certifies, an ed25519 signing subkey, and a cv25519 encryption
+            /// subkey, in that order. The key has the user id `uid`, then each
+            /// user id of `more`. If `more` is not empty, `uid` is marked
+            /// primary.
+            fn with_subkeys(uid: &str, more: &[&str]) -> KeyFixture {
+                let fixture = KeyFixture {
+                    dir: KeyFixture::make_dir(),
+                    faked: false,
+                };
+                let status = fixture
+                    .gpg()
+                    .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                    .args(["--quick-gen-key", uid, "ed25519", "cert", "never"])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "gpg --quick-gen-key failed");
+                let primary = fixture.fingerprint();
+                for (algorithm, usage) in [("ed25519", "sign"), ("cv25519", "encr")] {
+                    let status = fixture
+                        .gpg()
+                        .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                        .args(["--quick-add-key", &primary, algorithm, usage, "never"])
+                        .status()
+                        .unwrap();
+                    assert!(status.success(), "gpg --quick-add-key failed");
+                }
+                for uid in more {
+                    fixture.add_uid(uid);
+                }
+                if !more.is_empty() {
+                    fixture.set_primary_uid(uid);
+                }
+                fixture
+            }
+
+            /// Returns each key fingerprint in the home, in listing order: each
+            /// primary key, then its subkeys.
+            fn fingerprints(&self) -> Vec<String> {
+                let out = self
+                    .gpg()
+                    .args(["--with-colons", "--list-keys"])
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "gpg --list-keys failed");
+                String::from_utf8_lossy(&out.stdout)
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("fpr:"))
+                    .filter_map(|rest| rest.split(':').nth(8).map(str::to_owned))
+                    .collect()
+            }
+
+            /// Marks the user id `uid` of the first key primary.
+            fn set_primary_uid(&self, uid: &str) {
+                let primary = self.fingerprint();
+                let status = self
+                    .gpg()
+                    .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                    .args(["--quick-set-primary-uid", &primary, uid])
+                    .status()
+                    .unwrap();
+                assert!(status.success(), "gpg --quick-set-primary-uid failed");
+            }
+
+            /// Revokes the first subkey of the first key.
+            fn revoke_subkey(&self) {
+                let primary = self.fingerprint();
+                let mut cmd = self.gpg();
+                cmd.args(["--pinentry-mode", "loopback", "--passphrase", ""])
+                    .args(["--command-fd", "0", "--edit-key", &primary]);
+                answer(
+                    cmd,
+                    b"key 1\nrevkey\ny\n1\n\ny\nsave\n",
+                    "gpg --edit-key revkey",
+                );
+            }
+
+            /// Returns a signer for `key` in this home.
+            fn signer(&self, key: &str) -> GpgSigner {
+                GpgSigner::new(key).with_homedir(&self.dir)
+            }
+        }
+
+        /// Returns the signature of `signer` over [`PAYLOAD`].
+        fn sign(signer: &GpgSigner) -> Vec<u8> {
+            ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap()
+        }
+
+        /// Returns the export of `fingerprint` through `signer`.
+        fn export(signer: &GpgSigner, fingerprint: &str) -> Result<Vec<u8>> {
+            ostrya_rt::block_on(signer.export_public(fingerprint))
+        }
+
+        /// Returns the record of `blob` over [`PAYLOAD`], with the certificates
+        /// of `export` as the trusted set.
+        fn record(export: &[u8], blob: Vec<u8>) -> SignatureInfo {
+            let mut verifier = GpgVerifier::default();
+            verifier.add_binary_keyring(export, "the export").unwrap();
+            let mut outcome = verifier.verify(PAYLOAD, &[blob]).unwrap();
+            assert_eq!(outcome.signatures.len(), 1);
+            outcome.signatures.remove(0)
+        }
+
+        /// Returns the message of an [`Error::Signature`].
+        fn message(err: Error) -> String {
+            match err {
+                Error::Signature(message) => message,
+                other => panic!("not a signature error: {other}"),
+            }
+        }
+
+        /// Returns the packet tags of `export`, and asserts that the packets
+        /// frame the whole export.
+        fn tags(export: &[u8]) -> Vec<Tag> {
+            let (spans, framed) = packet_spans(export);
+            assert_eq!(framed, export.len());
+            spans.into_iter().map(|(tag, _)| tag).collect()
+        }
+
+        /// Returns the one certificate of `export`.
+        fn certificate(export: &[u8]) -> SignedPublicKey {
+            let mut certs = binary_keyring_certs(export, "the export").unwrap();
+            assert_eq!(certs.len(), 1);
+            certs.remove(0)
+        }
+
+        /// Returns the user ids of `cert`.
+        fn user_ids(cert: &SignedPublicKey) -> Vec<String> {
+            cert.details
+                .users
+                .iter()
+                .map(|user| String::from_utf8_lossy(user.id.id()).into_owned())
+                .collect()
+        }
+
+        /// The export holds the primary key, the primary user id with its
+        /// self-signature, and the signing subkey with its binding signature.
+        /// It holds no other user id, no encryption subkey, and no
+        /// revocation.
+        #[test]
+        fn the_export_holds_the_primary_user_id_and_the_signing_subkey_alone() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &["Other <other@ostrya.example>"]);
+            let fingerprints = home.fingerprints();
+            assert_eq!(fingerprints.len(), 3);
+            let exported = export(&home.signer(&fingerprints[0]), &fingerprints[0]).unwrap();
+            assert_eq!(tags(&exported), MINIMAL_TAGS);
+
+            let cert = certificate(&exported);
+            assert_eq!(fingerprint_hex(&cert), fingerprints[0]);
+            assert!(cert.details.revocation_signatures.is_empty());
+            assert!(cert.details.direct_signatures.is_empty());
+            assert_eq!(user_ids(&cert), [PRIMARY_UID]);
+            let user = &cert.details.users[0];
+            assert_eq!(user.signatures.len(), 1);
+            assert!(user.signatures[0].is_primary());
+            assert_eq!(cert.public_subkeys.len(), 1);
+            let subkey = &cert.public_subkeys[0];
+            assert_eq!(format!("{:X}", subkey.fingerprint()), fingerprints[1]);
+            assert_eq!(subkey.signatures.len(), 1);
+            assert_eq!(
+                subkey.signatures[0].typ(),
+                Some(SignatureType::SubkeyBinding)
+            );
+        }
+
+        /// A detached signature of the key verifies over the export. The
+        /// signing subkey made it.
+        #[test]
+        fn a_signature_of_the_key_verifies_over_the_export() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let fingerprints = home.fingerprints();
+            let signer = home.signer(&fingerprints[0]);
+            let blob = sign(&signer);
+            let info = record(&export(&signer, &fingerprints[0]).unwrap(), blob);
+            assert!(info.valid);
+            assert_eq!(info.fingerprint.as_deref(), Some(&*fingerprints[1]));
+            assert_eq!(info.primary_fingerprint.as_deref(), Some(&*fingerprints[0]));
+        }
+
+        /// A fingerprint that names no key in the home is refused. `gpg`
+        /// writes no output and exits with status 0 for it.
+        #[test]
+        fn an_unknown_fingerprint_is_refused() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let unknown = "0123456789ABCDEF0123456789ABCDEF01234567";
+            let err = export(&home.signer(unknown), unknown).unwrap_err();
+            assert_eq!(
+                message(err),
+                format!("gpg --export wrote no certificate for {unknown}")
+            );
+        }
+
+        /// A value of 64 hex digits that names no key in the home is refused.
+        /// The value has the shape of a fingerprint, so the method runs `gpg`,
+        /// which writes no output and exits with status 0 for it.
+        #[test]
+        fn an_unknown_64_digit_fingerprint_is_refused() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let unknown = "0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF";
+            let err = export(&home.signer(unknown), unknown).unwrap_err();
+            assert_eq!(
+                message(err),
+                format!("gpg --export wrote no certificate for {unknown}")
+            );
+        }
+
+        /// The fingerprint of a subkey is refused. `gpg` writes the
+        /// certificate of its primary key for it.
+        #[test]
+        fn a_subkey_fingerprint_is_refused() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let fingerprints = home.fingerprints();
+            let subkey = &fingerprints[1];
+            let err = export(&home.signer(subkey), subkey).unwrap_err();
+            assert_eq!(
+                message(err),
+                format!(
+                    "gpg --export wrote the certificate {} for {subkey}",
+                    fingerprints[0]
+                )
+            );
+        }
+
+        /// The fingerprint in lowercase hex gives the bytes of the fingerprint
+        /// in uppercase hex.
+        #[test]
+        fn a_lowercase_fingerprint_gives_the_same_export() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let primary = home.fingerprint();
+            let signer = home.signer(&primary);
+            let upper = export(&signer, &primary).unwrap();
+            let lower = export(&signer, &primary.to_ascii_lowercase()).unwrap();
+            assert_eq!(lower, upper);
+        }
+
+        /// A key with one user id whose self-signature has no primary user id
+        /// subpacket: the export holds that user id, and a signature of the key
+        /// verifies over the export.
+        #[test]
+        fn a_single_user_id_with_no_primary_mark_is_exported() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let primary = home.fingerprint();
+            let signer = home.signer(&primary);
+            let exported = export(&signer, &primary).unwrap();
+            assert_eq!(tags(&exported), MINIMAL_TAGS);
+            let cert = certificate(&exported);
+            assert_eq!(user_ids(&cert), [PRIMARY_UID]);
+            let user = &cert.details.users[0];
+            assert_eq!(user.signatures.len(), 1);
+            assert!(!user.signatures[0].is_primary());
+            assert!(record(&exported, sign(&signer)).valid);
+        }
+
+        /// A key revoked after it signed: the export holds the key revocation,
+        /// and the signature is revoked and not valid over the export.
+        #[test]
+        fn a_key_revoked_after_it_signed_is_exported_with_its_revocation() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let primary = home.fingerprint();
+            let signer = home.signer(&primary);
+            let blob = sign(&signer);
+            home.revoke_primary();
+            let exported = export(&signer, &primary).unwrap();
+            let cert = certificate(&exported);
+            assert_eq!(cert.details.revocation_signatures.len(), 1);
+            assert_eq!(
+                cert.details.revocation_signatures[0].typ(),
+                Some(SignatureType::KeyRevocation)
+            );
+            let info = record(&exported, blob);
+            assert!(info.revoked);
+            assert!(!info.valid);
+        }
+
+        /// A signing subkey revoked after it signed: the export holds the
+        /// subkey revocation, and the signature is revoked and not valid over
+        /// the export.
+        #[test]
+        fn a_subkey_revoked_after_it_signed_is_exported_with_its_revocation() {
+            if !gpg_or_skip() {
+                return;
+            }
+            let home = KeyFixture::with_subkeys(PRIMARY_UID, &[]);
+            let fingerprints = home.fingerprints();
+            let signer = home.signer(&fingerprints[0]);
+            let blob = sign(&signer);
+            home.revoke_subkey();
+            let exported = export(&signer, &fingerprints[0]).unwrap();
+            let cert = certificate(&exported);
+            assert_eq!(cert.public_subkeys.len(), 1);
+            let subkey = &cert.public_subkeys[0];
+            assert_eq!(format!("{:X}", subkey.fingerprint()), fingerprints[1]);
+            assert!(
+                subkey
+                    .signatures
+                    .iter()
+                    .any(|sig| sig.typ() == Some(SignatureType::SubkeyRevocation))
+            );
+            let info = record(&exported, blob);
+            assert!(info.revoked);
+            assert!(!info.valid);
+        }
+
+        /// A value that is not 40 or 64 hex digits is refused before `gpg`
+        /// runs. The home directory of the signer does not exist, so a `gpg`
+        /// run gives a failure status and a different message.
+        #[test]
+        fn a_value_that_is_not_a_fingerprint_is_refused_before_gpg_runs() {
+            let signer = GpgSigner::new("unused").with_homedir(scratch_dir());
+            let primary = "0123456789ABCDEF0123456789ABCDEF01234567";
+            for value in [
+                String::new(),
+                "Sealer <sealer@ostrya.example>".to_owned(),
+                format!("0x{primary}"),
+                format!("{primary}!"),
+                primary[..39].to_owned(),
+                format!("{}G", &primary[..39]),
+                format!("{primary}{}", &primary[..25]),
+            ] {
+                let err = export(&signer, &value).unwrap_err();
+                assert_eq!(message(err), format!("{value} is not a key fingerprint"));
+            }
+        }
     }
 }

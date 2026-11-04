@@ -432,6 +432,23 @@ holds the constructors that read the ostree keyring paths, as the trait
 `FromOstreeKeyrings`. A second parse in `ostrya` for the import and the
 listing was rejected, because two crates would then parse OpenPGP.
 
+`GpgSigner::export_public` gives the minimal public certificate of a signing
+key, for a trust store such as the trust files of a sealed boot image. It runs
+`gpg --export` with `--export-options export-minimal`, keeps the primary user
+id, and drops each subkey that cannot sign. `--no-armor` keeps the output
+binary when a `gpg.conf` sets `armor`. Before `gpg` runs, the method refuses a
+value that is not 40 or 64 hex digits. The parse of
+`GpgVerifier::add_binary_keyring` checks the output in the process, so the
+method gives only bytes that the verifier loads. The method gives the bytes of
+`gpg` unchanged, so the returned bytes are the bytes that the parse accepted.
+A serialization of the parsed certificate was rejected for this reason. A
+second `gpg --show-keys` run to check the output was rejected, because the
+parse in the process already checks it. The read of the output stops at the
+keyring limit plus one byte, through the capped output read of `ostrya-rt`, so
+`gpg` cannot make the process hold a larger output. The method needs the
+feature `gpg` with `gpg-sign`. A `gpg-sign` that turns on `gpg` was rejected,
+so a build with the signer and no OpenPGP parser stays possible.
+
 ## The signature policy of a local pull
 
 `Repo::pull_local` takes each field of `PullVerify` that is `None` from the

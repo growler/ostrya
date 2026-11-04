@@ -3,6 +3,11 @@
 use std::path::{Path, PathBuf};
 
 use super::{GPG_METADATA_KEY, STATUS_PREFIX};
+#[cfg(all(feature = "gpg-sign", feature = "gpg"))]
+use super::{
+    MAX_KEYRING,
+    verifier::{binary_keyring_certs, fingerprint_hex, refuse_oversized_keyring},
+};
 use crate::{Error, Result, SignFuture, Signer};
 
 /// The short name of the GPG engine.
@@ -32,6 +37,12 @@ const GPG_SIGN_TYPE: &str = "gpg";
 /// `gpg` does the private-key operation. It uses `gpg-agent` and any hardware
 /// token behind it. The private key stays with GnuPG and its agent and never
 /// goes through this crate.
+///
+/// # Public certificate
+///
+/// With the feature `gpg`, `export_public` gives the minimal public
+/// certificate of a signing key, as `gpg --export` writes it. `GpgVerifier`
+/// loads the certificate.
 ///
 /// # Signature format
 ///
@@ -129,6 +140,140 @@ impl GpgSigner {
             return Ok(Vec::new());
         }
         Ok(primary_fingerprints(&output.stdout))
+    }
+}
+
+/// The subject that a refusal of the parse names for the output of
+/// `gpg --export`.
+#[cfg(all(feature = "gpg-sign", feature = "gpg"))]
+const EXPORT_SUBJECT: &str = "the gpg --export output";
+
+/// The export of a public certificate.
+#[cfg(all(feature = "gpg-sign", feature = "gpg"))]
+impl GpgSigner {
+    /// Returns the minimal public certificate of the primary key
+    /// `fingerprint`, as binary OpenPGP packets.
+    ///
+    /// `fingerprint` is the fingerprint of a primary key: 40 or 64 hex digits,
+    /// in uppercase or lowercase. The method runs this command, with
+    /// `--homedir <dir>` first if the signer has a home directory:
+    ///
+    /// ```text
+    /// gpg --batch --no-armor --export --export-options export-minimal
+    ///     --export-filter 'keep-uid=primary -t'
+    ///     --export-filter 'drop-subkey=usage !~ s'
+    ///     -- <fingerprint>
+    /// ```
+    ///
+    /// The method uses the home directory of the signer. It ignores the key
+    /// selector of the signer.
+    ///
+    /// The certificate holds the primary key, the primary user id with its
+    /// self-signature, and each signing subkey with its binding signature. A
+    /// revocation of the primary key or of a signing subkey stays in the
+    /// certificate. `--no-armor` makes the output binary when the `gpg.conf`
+    /// of the home sets `armor`.
+    ///
+    /// The method reads at most [`MAX_KEYRING`] bytes plus one byte of the
+    /// output. It checks the output with the parse of
+    /// [`GpgVerifier::add_binary_keyring`](crate::GpgVerifier::add_binary_keyring),
+    /// and returns the bytes of `gpg` unchanged. So
+    /// [`GpgVerifier::add_binary_keyring`](crate::GpgVerifier::add_binary_keyring)
+    /// loads the returned bytes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Signature`] in these cases, in this order:
+    ///
+    /// - `fingerprint` is not 40 or 64 hex digits. The message is
+    ///   `<fingerprint> is not a key fingerprint`. The method does not run
+    ///   `gpg`.
+    /// - `gpg` cannot start, a read of its output fails, or the wait for
+    ///   `gpg` to exit fails. If `gpg` is not in `PATH`, the message is
+    ///   `gpg: program not found in PATH`. For another failure, the message
+    ///   is `gpg: <io error>`.
+    /// - The output is over [`MAX_KEYRING`]. The message is
+    ///   `the gpg --export output is over the 4194304-byte ceiling`.
+    /// - `gpg` exits with a failure status. The message is
+    ///   `gpg --export failed: <text>`. The text has the rules of the failure
+    ///   text of [`sign`](Signer::sign).
+    /// - The output is empty. The message is
+    ///   `gpg --export wrote no certificate for <fingerprint>`. For a
+    ///   fingerprint that names no key, `gpg` writes no output and exits with
+    ///   status 0.
+    /// - The parse refuses the output: a GnuPG keybox, more than 256
+    ///   certificates, a stream that does not frame to its end, or a
+    ///   certificate that the parser refuses. The message holds
+    ///   `the gpg --export output`.
+    /// - The parse gives no certificate. The message is
+    ///   `gpg --export wrote no certificate for <fingerprint>`.
+    /// - The output holds more than one certificate. The message is
+    ///   `gpg --export wrote <n> certificates for <fingerprint>`.
+    /// - The primary fingerprint of the certificate is not `fingerprint`,
+    ///   with no regard to case. The message is
+    ///   `gpg --export wrote the certificate <FPR> for <fingerprint>`, with
+    ///   `<FPR>` in uppercase hex. For the fingerprint of a subkey, `gpg`
+    ///   writes the certificate of its primary key.
+    pub async fn export_public(&self, fingerprint: &str) -> Result<Vec<u8>> {
+        let shaped = matches!(fingerprint.len(), 40 | 64)
+            && fingerprint.bytes().all(|b| b.is_ascii_hexdigit());
+        if !shaped {
+            return Err(Error::Signature(format!(
+                "{fingerprint} is not a key fingerprint"
+            )));
+        }
+        let mut cmd = ostrya_rt::Command::new("gpg");
+        if let Some(dir) = &self.homedir {
+            cmd.arg("--homedir").arg(dir);
+        }
+        cmd.arg("--batch")
+            .arg("--no-armor")
+            .arg("--export")
+            .arg("--export-options")
+            .arg("export-minimal")
+            .arg("--export-filter")
+            .arg("keep-uid=primary -t")
+            .arg("--export-filter")
+            .arg("drop-subkey=usage !~ s")
+            .arg("--")
+            .arg(fingerprint);
+        let output = cmd
+            .output_capped(&[], MAX_KEYRING + 1)
+            .await
+            .map_err(|e| spawn_err("gpg", &e))?;
+        refuse_oversized_keyring(&output.stdout, EXPORT_SUBJECT)?;
+        if !output.status.success() {
+            return Err(Error::Signature(format!(
+                "gpg --export failed: {}",
+                failure_text(&output)
+            )));
+        }
+        let no_certificate = || {
+            Error::Signature(format!(
+                "gpg --export wrote no certificate for {fingerprint}"
+            ))
+        };
+        if output.stdout.is_empty() {
+            return Err(no_certificate());
+        }
+        let certs = binary_keyring_certs(&output.stdout, EXPORT_SUBJECT)?;
+        let cert = match certs.as_slice() {
+            [] => return Err(no_certificate()),
+            [cert] => cert,
+            more => {
+                return Err(Error::Signature(format!(
+                    "gpg --export wrote {} certificates for {fingerprint}",
+                    more.len()
+                )));
+            }
+        };
+        let exported = fingerprint_hex(cert);
+        if !exported.eq_ignore_ascii_case(fingerprint) {
+            return Err(Error::Signature(format!(
+                "gpg --export wrote the certificate {exported} for {fingerprint}"
+            )));
+        }
+        Ok(output.stdout)
     }
 }
 

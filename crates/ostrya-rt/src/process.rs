@@ -4,9 +4,16 @@
 //! backend: `smol::process` with the `smol` feature, and `tokio::process`
 //! with the `tokio` feature.
 //!
-//! The GPG signing engine runs the `gpg` binary through [`Command::output`].
-//! Its payloads are bounded metadata, so the whole-buffer input and output
-//! obey the streaming rules of the crate.
+//! [`Command::output`] holds the input and both outputs of a run in memory,
+//! and it applies no limit to an output. The GPG signing engine runs
+//! `gpg --detach-sign` and `gpg --list-secret-keys` through it, with metadata
+//! as the input.
+//!
+//! [`Command::output_capped`] keeps at most a given number of bytes of
+//! standard output and at most 64 KiB of standard error. So these caps set a
+//! limit on the memory that the run holds. A buffer grows in steps, and each
+//! step can double its size. So each buffer can grow to approximately two
+//! times its cap. The GPG signing engine runs `gpg --export` through it.
 
 use std::ffi::OsString;
 use std::io;
@@ -19,11 +26,15 @@ use smol::process as backend;
 #[cfg(feature = "tokio")]
 use tokio::process as backend;
 
+/// The number of bytes of standard error that [`Command::output_capped`]
+/// keeps.
+const STDERR_CAP: u64 = 64 * 1024;
+
 /// A program and its arguments to run as a child process.
 ///
 /// The command runs in one of two forms: a one-shot run with
-/// [`output`](Command::output), or a long-lived [`Child`] with
-/// [`spawn`](Command::spawn).
+/// [`output`](Command::output) or [`output_capped`](Command::output_capped),
+/// or a long-lived [`Child`] with [`spawn`](Command::spawn).
 pub struct Command {
     program: OsString,
     args: Vec<OsString>,
@@ -33,9 +44,9 @@ pub struct Command {
 impl Command {
     /// Creates a command that runs `program` with no arguments.
     ///
-    /// [`output`](Command::output) and [`spawn`](Command::spawn) give
-    /// `program` unchanged to the process API of the backend, which finds the
-    /// program file.
+    /// [`output`](Command::output), [`output_capped`](Command::output_capped),
+    /// and [`spawn`](Command::spawn) give `program` unchanged to the process
+    /// API of the backend, which finds the program file.
     pub fn new(program: impl Into<OsString>) -> Command {
         Command {
             program: program.into(),
@@ -138,6 +149,150 @@ impl Command {
         let read_err = async move {
             let mut buf = Vec::new();
             stderr.read_to_end(&mut buf).await.map(|_| buf)
+        };
+        let ((), (out, err)) =
+            smol::future::zip(write, smol::future::zip(read_out, read_err)).await;
+        let status = child.status().await?;
+        Ok(Output {
+            status,
+            stdout: out?,
+            stderr: err?,
+        })
+    }
+
+    /// Runs the command with `input` on standard input and collects its output,
+    /// with a limit on each output.
+    ///
+    /// The run reads at most `stdout_cap` bytes of standard output. When it
+    /// has read `stdout_cap` bytes, it closes the pipe and reads no more. A
+    /// child that then writes to standard output gets a broken pipe. The run
+    /// then waits for the child to exit. A child that does not exit makes the
+    /// run wait.
+    ///
+    /// To find an output that is longer than a limit, give the limit plus one
+    /// as `stdout_cap`. A standard output of the cap length is then longer
+    /// than the limit.
+    ///
+    /// The run keeps the first 64 KiB of standard error. It reads the remaining
+    /// bytes of standard error to the end and discards them. So a child that
+    /// writes much text to standard error does not block on a full pipe.
+    ///
+    /// The returned [`Output`] holds the exit status, the bytes of standard
+    /// output that the run read, and the bytes of standard error that it kept.
+    /// The run writes `input` as [`output`](Command::output) does.
+    ///
+    /// # Errors
+    ///
+    /// - An I/O error if the program does not start, for example if the
+    ///   program does not exist.
+    /// - An I/O error from the wait for the child, or from a read of standard
+    ///   output or standard error.
+    #[cfg(feature = "tokio")]
+    pub async fn output_capped(&self, input: &[u8], stdout_cap: u64) -> io::Result<Output> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut child = tokio::process::Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let input = input.to_vec();
+        let writer = tokio::spawn(async move {
+            let _ = stdin.write_all(&input).await;
+            let _ = stdin.shutdown().await;
+        });
+        let err_reader = tokio::spawn(async move {
+            let mut kept = Vec::new();
+            (&mut stderr)
+                .take(STDERR_CAP)
+                .read_to_end(&mut kept)
+                .await?;
+            tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await?;
+            Ok::<_, io::Error>(kept)
+        });
+        // The read takes the pipe and drops it at its end, so the child gets a
+        // broken pipe if it writes more.
+        let mut out = Vec::new();
+        let out_read = stdout.take(stdout_cap).read_to_end(&mut out).await;
+        let err_read = err_reader.await.map_err(io::Error::other);
+        let status = child.wait().await?;
+        let _ = writer.await;
+        out_read?;
+        Ok(Output {
+            status,
+            stdout: out,
+            stderr: err_read??,
+        })
+    }
+
+    /// Runs the command with `input` on standard input and collects its output,
+    /// with a limit on each output.
+    ///
+    /// The run reads at most `stdout_cap` bytes of standard output. When it
+    /// has read `stdout_cap` bytes, it closes the pipe and reads no more. A
+    /// child that then writes to standard output gets a broken pipe. The run
+    /// then waits for the child to exit. A child that does not exit makes the
+    /// run wait.
+    ///
+    /// To find an output that is longer than a limit, give the limit plus one
+    /// as `stdout_cap`. A standard output of the cap length is then longer
+    /// than the limit.
+    ///
+    /// The run keeps the first 64 KiB of standard error. It reads the remaining
+    /// bytes of standard error to the end and discards them. So a child that
+    /// writes much text to standard error does not block on a full pipe.
+    ///
+    /// The returned [`Output`] holds the exit status, the bytes of standard
+    /// output that the run read, and the bytes of standard error that it kept.
+    /// The run writes `input` as [`output`](Command::output) does.
+    ///
+    /// # Errors
+    ///
+    /// - An I/O error if the program does not start, for example if the
+    ///   program does not exist.
+    /// - An I/O error from the wait for the child, or from a read of standard
+    ///   output or standard error.
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    pub async fn output_capped(&self, input: &[u8], stdout_cap: u64) -> io::Result<Output> {
+        use smol::io::{AsyncReadExt, AsyncWriteExt};
+        use std::process::Stdio;
+
+        let mut child = smol::process::Command::new(&self.program)
+            .args(&self.args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut stdin = child.stdin.take().expect("stdin is piped");
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let write = async move {
+            let _ = stdin.write_all(input).await;
+            let _ = stdin.close().await;
+        };
+        // The read takes the pipe and drops it at its end, so the child gets a
+        // broken pipe if it writes more.
+        let read_out = async move {
+            let mut buf = Vec::new();
+            stdout
+                .take(stdout_cap)
+                .read_to_end(&mut buf)
+                .await
+                .map(|_| buf)
+        };
+        let read_err = async move {
+            let mut kept = Vec::new();
+            (&mut stderr)
+                .take(STDERR_CAP)
+                .read_to_end(&mut kept)
+                .await?;
+            smol::io::copy(&mut stderr, smol::io::sink()).await?;
+            Ok::<_, io::Error>(kept)
         };
         let ((), (out, err)) =
             smol::future::zip(write, smol::future::zip(read_out, read_err)).await;
@@ -397,6 +552,82 @@ mod tests {
         });
         let status = status.expect("wait did not close standard input");
         assert!(status.success());
+    }
+
+    /// Runs `script` with `sh -c` through [`Command::output_capped`], and
+    /// fails if the run takes more than ten seconds.
+    fn capped(script: &str, stdout_cap: u64) -> Output {
+        use std::time::Duration;
+
+        let output = block_on(async {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg(script);
+            let run = async { Some(cmd.output_capped(b"", stdout_cap).await.unwrap()) };
+            let timeout = async {
+                crate::Timer::after(Duration::from_secs(10)).await;
+                None
+            };
+            futures_lite::future::or(run, timeout).await
+        });
+        output.expect("the capped run did not finish")
+    }
+
+    #[test]
+    fn capped_output_under_the_caps_is_whole() {
+        use std::time::Duration;
+
+        let output = block_on(async {
+            let mut cmd = Command::new("sh");
+            cmd.arg("-c").arg("cat; echo two >&2");
+            let run = async { Some(cmd.output_capped(b"one", 4).await.unwrap()) };
+            let timeout = async {
+                crate::Timer::after(Duration::from_secs(10)).await;
+                None
+            };
+            futures_lite::future::or(run, timeout).await
+        });
+        let output = output.expect("the capped run did not finish");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"one");
+        assert_eq!(output.stderr, b"two\n");
+    }
+
+    #[test]
+    fn capped_output_stops_at_the_stdout_cap() {
+        let output = capped("head -c 1048576 /dev/zero", 1000);
+        assert_eq!(output.stdout, vec![0; 1000]);
+    }
+
+    #[test]
+    fn capped_output_closes_stdout_for_a_child_that_writes_without_end() {
+        let output = capped("yes", 4096);
+        assert_eq!(output.stdout.len(), 4096);
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn capped_output_keeps_the_start_of_stderr_and_drains_the_rest() {
+        let output = capped("head -c 1048576 /dev/zero >&2; echo done", 100);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"done\n");
+        assert_eq!(output.stderr.len() as u64, STDERR_CAP);
+    }
+
+    #[test]
+    fn capped_output_reports_the_exit_status() {
+        let output = capped("echo text; exit 3", 100);
+        assert_eq!(output.status.code(), Some(3));
+        assert_eq!(output.stdout, b"text\n");
+    }
+
+    #[test]
+    fn missing_program_is_a_spawn_error_of_the_capped_run() {
+        let result = block_on(async {
+            Command::new("ostrya-no-such-program")
+                .output_capped(b"", 1)
+                .await
+        });
+        assert!(result.is_err());
     }
 
     #[test]

@@ -5457,10 +5457,7 @@ async fn own_collection_source(base: &Path, name: &str) -> (PathBuf, Repo, Check
     let path = base.join("src");
     let src = Repo::create(
         &path,
-        CreateOptions {
-            mode: RepoMode::Archive,
-            collection_id: Some(COLLECTION.to_owned()),
-        },
+        CreateOptions::new(RepoMode::Archive).collection_id(COLLECTION),
     )
     .await
     .unwrap();
@@ -5899,10 +5896,7 @@ fn a_collection_pull_into_the_own_collection_writes_refs_heads() {
         let dst_dir = base.join("dst");
         let dst = Repo::create(
             &dst_dir,
-            CreateOptions {
-                mode: RepoMode::BareUser,
-                collection_id: Some(COLLECTION.to_owned()),
-            },
+            CreateOptions::new(RepoMode::BareUser).collection_id(COLLECTION),
         )
         .await
         .unwrap();
@@ -5956,10 +5950,7 @@ fn a_collection_pull_into_the_own_collection_writes_an_existing_mirror_ref() {
         let dst_dir = base.join("dst");
         let dst = Repo::create(
             &dst_dir,
-            CreateOptions {
-                mode: RepoMode::BareUser,
-                collection_id: Some(COLLECTION.to_owned()),
-            },
+            CreateOptions::new(RepoMode::BareUser).collection_id(COLLECTION),
         )
         .await
         .unwrap();
@@ -6303,16 +6294,11 @@ async fn dst_with_main(
     tip: &Checksum,
 ) -> (PathBuf, Repo) {
     let path = base.join(name);
-    let dst = Repo::create(
-        &path,
-        CreateOptions {
-            mode: RepoMode::BareUser,
-            collection_id: matches!(at, HeldAt::Own | HeldAt::OwnMirror | HeldAt::OwnBoth)
-                .then(|| COLLECTION.to_owned()),
-        },
-    )
-    .await
-    .unwrap();
+    let mut opts = CreateOptions::new(RepoMode::BareUser);
+    if matches!(at, HeldAt::Own | HeldAt::OwnMirror | HeldAt::OwnBoth) {
+        opts = opts.collection_id(COLLECTION);
+    }
+    let dst = Repo::create(&path, opts).await.unwrap();
     for commit in held {
         hold_commit(&dst, src, commit).await;
     }

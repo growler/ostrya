@@ -11,14 +11,18 @@
 
 mod common;
 
+use std::ffi::OsStr;
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{fixture_repo, ostree_available};
 use futures_lite::future::poll_once;
-use ostrya::{CreateOptions, Error, Repo, RepoMode};
+use ostrya::{CreateOptions, Error, OpenOptions, RemotesDir, Repo, RepoMode};
 use ostrya_rt::block_on;
 
 /// A temporary directory. `Drop` removes it.
@@ -71,10 +75,7 @@ fn create_writes_exact_config_bytes() {
             "[core]\nrepo_version=1\nmode=bare\n",
         ),
         (
-            CreateOptions {
-                mode: RepoMode::Bare,
-                collection_id: Some("org.example.Foo".to_owned()),
-            },
+            CreateOptions::new(RepoMode::Bare).collection_id("org.example.Foo"),
             "[core]\nrepo_version=1\nmode=bare\ncollection-id=org.example.Foo\n",
         ),
     ];
@@ -512,4 +513,279 @@ fn the_strict_open_refuses_a_symlinked_metadata_object() {
 /// Returns the error number `ELOOP`.
 fn eloop() -> i32 {
     rustix::io::Errno::LOOP.raw_os_error()
+}
+
+/// Asserts that `got` is `want`: the same variant and the same path, or for a
+/// descriptor, the same shared descriptor.
+fn assert_same_dir(got: Option<&RemotesDir>, want: &RemotesDir) {
+    match (got, want) {
+        (Some(RemotesDir::Path(a)), RemotesDir::Path(b)) => assert_eq!(a, b),
+        (Some(RemotesDir::InRepo(a)), RemotesDir::InRepo(b)) => assert_eq!(a, b),
+        (Some(RemotesDir::Fd(a)), RemotesDir::Fd(b)) => assert!(Arc::ptr_eq(a, b)),
+        (got, want) => panic!("got {got:?}, want {want:?}"),
+    }
+}
+
+/// Returns a descriptor of a new directory `name` under `tmp`.
+fn scratch_dir_fd(tmp: &TmpDir, name: &str) -> OwnedFd {
+    let path = tmp.path().join(name);
+    std::fs::create_dir(&path).unwrap();
+    std::fs::File::open(&path).unwrap().into()
+}
+
+/// Returns the value of `[ex-ostrya] remotes-config-dir` in the `config` of
+/// the repository at `path`.
+fn remotes_config_dir_key(path: &Path) -> Option<String> {
+    let repo = block_on(Repo::open(path)).expect("open");
+    repo.config()
+        .keyfile()
+        .get_string("ex-ostrya", "remotes-config-dir")
+        .unwrap()
+}
+
+/// The handle keeps the remotes directory of the options, in each form,
+/// through each setter, and through `open` and `open_at`.
+#[test]
+fn open_keeps_the_remotes_dir_of_the_options() {
+    let tmp = TmpDir::new("rdopen");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .expect("create");
+    let values = [
+        RemotesDir::path("remotes.d"),
+        RemotesDir::path(tmp.path().join("remotes.d")),
+        RemotesDir::InRepo(PathBuf::from("remotes.d")),
+        RemotesDir::from(scratch_dir_fd(&tmp, "scratch")),
+    ];
+    for value in &values {
+        for opts in [
+            OpenOptions::new().remotes_dir(value.clone()),
+            OpenOptions::new().default_remotes_dir(value.clone()),
+        ] {
+            let opened = block_on(opts.open(&tmp.path().join("repo"))).expect("open");
+            assert_same_dir(opened.remotes_dir(), value);
+            let opened =
+                block_on(opts.open_at(parent.as_fd(), Path::new("repo"))).expect("open_at");
+            assert_same_dir(opened.remotes_dir(), value);
+        }
+    }
+}
+
+/// `remotes_dir` comes before `default_remotes_dir`, in either call order.
+#[test]
+fn open_selects_remotes_dir_before_the_default() {
+    let tmp = TmpDir::new("rdorder");
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let chosen = RemotesDir::path("chosen.d");
+    for opts in [
+        OpenOptions::new()
+            .remotes_dir(chosen.clone())
+            .default_remotes_dir(RemotesDir::path("default.d")),
+        OpenOptions::new()
+            .default_remotes_dir(RemotesDir::path("default.d"))
+            .remotes_dir(chosen.clone()),
+    ] {
+        let opened = block_on(opts.open(&path)).expect("open");
+        assert_same_dir(opened.remotes_dir(), &chosen);
+    }
+}
+
+/// An open or a create with no remotes directory value gives a handle with
+/// no remotes directory.
+#[test]
+fn open_with_no_remotes_dir_gives_none() {
+    let tmp = TmpDir::new("rdnone");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let path = tmp.path().join("repo");
+    let created =
+        block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    assert!(created.remotes_dir().is_none());
+    let repo = Path::new("repo");
+    for opened in [
+        block_on(Repo::open(&path)),
+        block_on(Repo::open_at(parent.as_fd(), repo)),
+        block_on(OpenOptions::new().open(&path)),
+        block_on(OpenOptions::new().open_at(parent.as_fd(), repo)),
+        block_on(Repo::open_at_strict(parent.as_fd(), repo)),
+    ] {
+        assert!(opened.expect("open").remotes_dir().is_none());
+    }
+}
+
+/// An open with a remotes directory that does not exist succeeds and creates
+/// nothing. A value that is not valid UTF-8 opens too.
+#[test]
+fn open_takes_an_absent_remotes_dir_and_creates_nothing() {
+    let tmp = TmpDir::new("rdabsent");
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let absent = tmp.path().join("absent").join("remotes.d");
+    for value in [
+        RemotesDir::path(&absent),
+        RemotesDir::InRepo(PathBuf::from("absent.d")),
+        RemotesDir::path(OsStr::from_bytes(b"\xff")),
+    ] {
+        let opened = block_on(OpenOptions::new().remotes_dir(value.clone()).open(&path))
+            .expect("open with an absent remotes directory");
+        assert_same_dir(opened.remotes_dir(), &value);
+    }
+    assert!(!tmp.path().join("absent").exists());
+    assert!(!path.join("absent.d").exists());
+}
+
+/// The values that an open and a create refuse: an empty path, a path that
+/// holds a NUL byte, and an absolute in-repository path.
+fn refused_values() -> [RemotesDir; 5] {
+    [
+        RemotesDir::path(""),
+        RemotesDir::InRepo(PathBuf::new()),
+        RemotesDir::path("remotes\0.d"),
+        RemotesDir::InRepo(PathBuf::from("remotes\0.d")),
+        RemotesDir::InRepo(PathBuf::from("/abs/remotes.d")),
+    ]
+}
+
+/// An open refuses an empty path, a path that holds a NUL byte, and an
+/// absolute in-repository path in each setter, with `Error::InvalidInput`.
+#[test]
+fn open_refuses_an_empty_nul_or_absolute_in_repo_remotes_dir() {
+    let tmp = TmpDir::new("rdrefopen");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    for value in refused_values() {
+        for opts in [
+            OpenOptions::new().remotes_dir(value.clone()),
+            OpenOptions::new().default_remotes_dir(value.clone()),
+            OpenOptions::new()
+                .remotes_dir(RemotesDir::path("ok.d"))
+                .default_remotes_dir(value.clone()),
+        ] {
+            let err = block_on(opts.open(&path)).expect_err("open refuses");
+            assert!(matches!(err, Error::InvalidInput(_)), "{value:?}: {err}");
+            let err = block_on(opts.open_at(parent.as_fd(), Path::new("repo")))
+                .expect_err("open_at refuses");
+            assert!(matches!(err, Error::InvalidInput(_)), "{value:?}: {err}");
+        }
+    }
+}
+
+/// A create refuses an empty path, a path that holds a NUL byte, an absolute
+/// in-repository path, and a path that is not valid UTF-8, with
+/// `Error::InvalidInput`, and writes nothing.
+#[test]
+fn create_refuses_a_bad_remotes_dir_and_writes_nothing() {
+    let tmp = TmpDir::new("rdrefcreate");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let mut values = refused_values().to_vec();
+    values.push(RemotesDir::path(OsStr::from_bytes(b"\xff")));
+    values.push(RemotesDir::InRepo(PathBuf::from(OsStr::from_bytes(
+        b"\xff",
+    ))));
+    for value in values {
+        let opts = CreateOptions::new(RepoMode::Archive).remotes_dir(value.clone());
+        let err = block_on(opts.create(&tmp.path().join("repo"))).expect_err("create refuses");
+        assert!(matches!(err, Error::InvalidInput(_)), "{value:?}: {err}");
+        let err = block_on(opts.create_at(parent.as_fd(), Path::new("repo")))
+            .expect_err("create_at refuses");
+        assert!(matches!(err, Error::InvalidInput(_)), "{value:?}: {err}");
+        assert!(!tmp.path().join("repo").exists(), "{value:?}");
+    }
+}
+
+/// A create writes `[ex-ostrya] remotes-config-dir` in the form of the value,
+/// and the handle holds the value as given.
+#[test]
+fn create_writes_the_remotes_config_dir_key() {
+    let tmp = TmpDir::new("rdkey");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let absolute = tmp.path().join("remotes.d");
+    let relative = PathBuf::from("ostrya-test-relative-remotes.d");
+    let cwd = std::env::current_dir().expect("current dir");
+    let cases = [
+        (
+            "abs",
+            RemotesDir::path(&absolute),
+            Some(absolute.to_str().unwrap().to_owned()),
+        ),
+        (
+            "rel",
+            RemotesDir::path(&relative),
+            Some(cwd.join(&relative).to_str().unwrap().to_owned()),
+        ),
+        (
+            "inrepo",
+            RemotesDir::InRepo(PathBuf::from("etc/remotes.d")),
+            Some("etc/remotes.d".to_owned()),
+        ),
+        ("fd", RemotesDir::from(scratch_dir_fd(&tmp, "fd.d")), None),
+    ];
+    for (name, value, expected) in cases {
+        let opts = CreateOptions::new(RepoMode::Archive).remotes_dir(value.clone());
+        let created = block_on(opts.create(&tmp.path().join(name))).expect("create");
+        assert_same_dir(created.remotes_dir(), &value);
+        assert_eq!(
+            remotes_config_dir_key(&tmp.path().join(name)),
+            expected,
+            "{name}"
+        );
+
+        let at = format!("{name}-at");
+        let created = block_on(opts.create_at(parent.as_fd(), Path::new(&at))).expect("create_at");
+        assert_same_dir(created.remotes_dir(), &value);
+        assert_eq!(
+            remotes_config_dir_key(&tmp.path().join(&at)),
+            expected,
+            "{at}"
+        );
+    }
+    assert!(
+        !cwd.join(&relative).exists(),
+        "the create writes no remotes directory"
+    );
+
+    let bytes = std::fs::read(tmp.path().join("abs").join("config")).unwrap();
+    let expected = format!(
+        "[core]\nrepo_version=1\nmode=archive-z2\n\n[ex-ostrya]\nremotes-config-dir={}\n",
+        absolute.display()
+    );
+    assert_eq!(bytes, expected.as_bytes());
+    let bytes = std::fs::read(tmp.path().join("fd").join("config")).unwrap();
+    assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=archive-z2\n");
+}
+
+/// A create writes a key value with a leading space, an inner space, and a
+/// backslash, and the `config` of the repository gives back the same text.
+#[test]
+fn create_writes_a_key_value_that_reads_back() {
+    let tmp = TmpDir::new("rdescape");
+    let path = tmp.path().join("repo");
+    let text = " my remotes\\d";
+    let opts =
+        CreateOptions::new(RepoMode::Archive).remotes_dir(RemotesDir::InRepo(PathBuf::from(text)));
+    block_on(opts.create(&path)).expect("create");
+    assert_eq!(remotes_config_dir_key(&path).as_deref(), Some(text));
+}
+
+/// A create over an existing `config` writes no key, and the handle still
+/// holds the value.
+#[test]
+fn create_over_an_existing_config_writes_no_key() {
+    let tmp = TmpDir::new("rdidem");
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("first create");
+    let value = RemotesDir::path(tmp.path().join("remotes.d"));
+    let created = block_on(
+        CreateOptions::new(RepoMode::Archive)
+            .remotes_dir(value.clone())
+            .create(&path),
+    )
+    .expect("second create");
+    assert_same_dir(created.remotes_dir(), &value);
+    let bytes = std::fs::read(path.join("config")).unwrap();
+    assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=archive-z2\n");
 }

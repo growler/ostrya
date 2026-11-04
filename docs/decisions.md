@@ -102,6 +102,59 @@ keyed by the `(device, inode)` of the lock file, keeps one descriptor and one
 reference count for each repository. `crates/ostrya/src/lock.rs` documents
 the registry.
 
+## The options of an open and of a create
+
+`OpenOptions` holds the options of an open, in the form of
+`std::fs::OpenOptions`. `Repo::open` and `Repo::open_at` open with the default
+options. A new option is a new method of `OpenOptions`, and adds no
+constructor to `Repo`. These forms were rejected:
+
+- `Repo::open_with_config` and `Repo::open_at_with_config`. They give the
+  function of `OpenOptions` with two more methods on `Repo`. Also, a reader
+  can read `open_with_config` as "a config in place of `config`".
+- `Repo::open_with` and `Repo::open_at_with`. They also add two methods to
+  `Repo`.
+- A command that reads the config itself, or opens a repository two times,
+  to apply a default remotes directory. With
+  `OpenOptions::default_remotes_dir`, a library user with a default of its
+  own gets the order of selection from one open.
+
+`RemotesDir::Fd` holds an `Arc<OwnedFd>`. The handle keeps the value for its
+life, so the value owns the descriptor. `Arc` keeps a clone cheap, so
+`OpenOptions` and `CreateOptions` are `Clone`. A borrowed descriptor
+(`BorrowedFd<'a>`) was rejected: it gives each options type a lifetime, and
+the open must duplicate it.
+
+`RemotesDir::InRepo` holds a path relative to the repository directory. After
+`open_at`, no path from the working directory names that directory, so a
+`Path` value cannot hold it. A form with the two variants `Path` and `Fd` was
+rejected. In that form, `Repo::remotes_dir` gives a relative path as written,
+and the value names a different directory from each working directory.
+
+`CreateOptions` has private fields and the builder methods `collection_id`
+and `remotes_dir`, as `OpenOptions` has. So the two options types have one
+form, and a new option is a new method, which is additive. A struct
+expression of `CreateOptions` and an assignment to its fields do not compile
+outside the crate.
+
+A create with a `RemotesDir::Path` value writes the value of
+`std::path::absolute` of the path into `[ex-ostrya] remotes-config-dir`. A
+relative `Path` value is relative to the working directory of the process,
+which does not name a directory for another process. `std::path::absolute`
+needs no existing directory and resolves no symlink, so the key names the
+directory that the create took. A create with a `RemotesDir::InRepo` value
+writes its path as given, and a `RemotesDir::Fd` value writes no key.
+
+An open and a create refuse an empty path, a path that holds a NUL byte, and
+an absolute `InRepo` path with `Error::InvalidInput`, before they open or
+write a file. An empty path names no directory. A path with a NUL byte names
+no file for a system call, and a create would write the NUL byte into
+`config`, which the `ostree` tool then does not open. An `openat` call with an absolute path ignores the directory
+descriptor, so an absolute `InRepo` value acts as a `Path` value. The port
+refuses it and does not give it that meaning. A caller with an absolute
+directory gives a `RemotesDir::Path` value. A create also refuses a path that
+is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
+
 ## The GVariant codec
 
 `ostrya-gvariant` is a GVariant codec written in the tree for the fixed type

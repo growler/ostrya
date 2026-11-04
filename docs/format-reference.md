@@ -1185,7 +1185,10 @@ entry is byte-identical between the two writers. `conformance/cli-surface.md`,
 The file `config` is a key file. A new repository gets a `[core]` group with
 `repo_version=1`, `mode=<mode>`, and an optional `collection-id`. The `config`
 of a new archive repository is exactly
-`[core]\nrepo_version=1\nmode=archive-z2\n`.
+`[core]\nrepo_version=1\nmode=archive-z2\n`. A library create with a remotes
+directory given as a path also writes the group `[ex-ostrya]` with the key
+`remotes-config-dir`. "Configuration keys of the port" in "Port extensions"
+states the value.
 
 `ostrya-config(1)` lists each key of `config`, its type, and its default. The
 list includes the keys of the port, the client groups, and the server group.
@@ -2915,6 +2918,17 @@ group that the key names. A pull with `PullOptions::trust_group`, which
 field names, and does not read the key `trust`.
 `TrustedKeys::from_trust_group` reads the one trust group that its argument
 names.
+
+The key `[ex-ostrya] remotes-config-dir` names the remotes directory of the
+repository: a directory of `.conf` files that hold remotes. A library create
+with a remotes directory writes the key into the new `config`:
+
+- A path value gives the absolute form of the path, from
+  `std::path::absolute`. That call resolves no symlink.
+- An in-repository value gives its relative path as given.
+- A descriptor value gives no key.
+
+ostrya writes this key and does not read it. The `ostree` tool ignores it.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
 of a group itself. The server group has the exact name `ex-ostrya server`. The

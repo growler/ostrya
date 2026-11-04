@@ -6561,14 +6561,11 @@ async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
 async fn init(repo: Option<&Path>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
     let path = resolve_init_path(repo, name).await;
     let mode = parse_init_mode(&args.mode);
-    Repo::create(
-        &path,
-        CreateOptions {
-            mode,
-            collection_id: args.collection_id,
-        },
-    )
-    .await?;
+    let mut opts = CreateOptions::new(mode);
+    if let Some(id) = args.collection_id {
+        opts = opts.collection_id(id);
+    }
+    Repo::create(&path, opts).await?;
     if verbose {
         eprintln!("ostrya: using repository {}", path.display());
     }

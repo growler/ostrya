@@ -24,6 +24,8 @@ API documentation: <https://docs.rs/ostrya>
 ## Entry points
 
 - `Repo::open` and `Repo::create` give a `Repo`, the handle of a repository.
+- `OpenOptions` and `CreateOptions` give a `Repo` with options, such as a
+  `RemotesDir`.
 - `Repo::transaction` begins a `Transaction`, which publishes objects and refs at
   commit.
 - `StagingTree` and `MutableTree` build the tree of a new commit.

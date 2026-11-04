@@ -14,7 +14,10 @@ use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
 const EX_INTEGRITY: &str = "ex-integrity";
-const EX_OSTRYA: &str = "ex-ostrya";
+pub(crate) const EX_OSTRYA: &str = "ex-ostrya";
+/// The key of the `[ex-ostrya]` group that names the remotes directory of the
+/// repository.
+pub(crate) const REMOTES_CONFIG_DIR: &str = "remotes-config-dir";
 /// The name of the `config` file at the repository root.
 const CONFIG_FILE: &str = "config";
 

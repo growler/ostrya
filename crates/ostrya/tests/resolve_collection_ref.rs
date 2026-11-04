@@ -22,14 +22,11 @@ const OTHER: &str = "org.example.Other";
 /// and returns its path.
 fn create(tmp: &TmpDir, collection_id: Option<&str>) -> PathBuf {
     let path = tmp.path().join("repo");
-    block_on(Repo::create(
-        &path,
-        CreateOptions {
-            mode: RepoMode::BareUser,
-            collection_id: collection_id.map(str::to_owned),
-        },
-    ))
-    .unwrap();
+    let mut opts = CreateOptions::new(RepoMode::BareUser);
+    if let Some(id) = collection_id {
+        opts = opts.collection_id(id);
+    }
+    block_on(Repo::create(&path, opts)).unwrap();
     path
 }
 

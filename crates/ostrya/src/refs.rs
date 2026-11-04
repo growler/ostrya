@@ -3531,10 +3531,7 @@ mod tests {
     async fn own_repo(path: &std::path::Path) -> Repo {
         Repo::create(
             path,
-            crate::CreateOptions {
-                mode: RepoMode::Archive,
-                collection_id: Some(OWN.to_owned()),
-            },
+            crate::CreateOptions::new(RepoMode::Archive).collection_id(OWN),
         )
         .await
         .unwrap()

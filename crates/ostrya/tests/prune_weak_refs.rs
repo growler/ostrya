@@ -1112,10 +1112,7 @@ fn an_own_id_mirror_ref_is_classified_as_a_collection_ref() {
         }
         let repo = Repo::create(
             &tmp.path().join("repo"),
-            CreateOptions {
-                collection_id: Some("org.example.Own".to_owned()),
-                ..CreateOptions::new(RepoMode::Archive)
-            },
+            CreateOptions::new(RepoMode::Archive).collection_id("org.example.Own"),
         )
         .await
         .unwrap();

@@ -71,15 +71,11 @@ fn entry(key: &str, ty: &str, value: Value) -> Value {
 
 /// Creates an archive repository at `dir/name` with the collection id `own`.
 async fn create(dir: &Path, name: &str, own: Option<&str>) -> Repo {
-    Repo::create(
-        &dir.join(name),
-        CreateOptions {
-            mode: RepoMode::Archive,
-            collection_id: own.map(str::to_owned),
-        },
-    )
-    .await
-    .unwrap()
+    let mut opts = CreateOptions::new(RepoMode::Archive);
+    if let Some(id) = own {
+        opts = opts.collection_id(id);
+    }
+    Repo::create(&dir.join(name), opts).await.unwrap()
 }
 
 /// Commits a small tree with the marker `marker` into `repo`, with the

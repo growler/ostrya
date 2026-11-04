@@ -385,6 +385,14 @@ A pull refuses a value that is not a boolean before its first request.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR refuse it at the start of a session.
 In the \fB\%config\fR of a bucket repository, \fB\%ostrya push\fR to an \fB\%s3://\fR address reads the key and removes \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that it uploads.
 \fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote prune\fR, and \fB\%ostrya remote summary \-u\fR refuse a bucket repository whose value is not a boolean, and \fB\%ostrya remote fsck\fR reports it as a \fB\%config\fR error.
+.TP
+\fB\%remotes\-config\-dir\fR (string)
+The remotes directory of the repository: a directory of \fB\%.conf\fR files that hold remotes.
+A create of a repository through the ostrya library with a remotes directory writes the key into the new \fB\%config\fR.
+A path value gives the absolute form of the path, with no symlink resolution.
+An in-repository value gives its relative path as given.
+A descriptor value gives no key.
+ostrya writes this key and does not read it.
 .SH CLIENT AND SERVER GROUPS
 Client groups control the access to a repository through \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and \fB\%ostrya send\fR.
 A client group states how a client authenticates, which refs it can read and change in one namespace, how the server verifies its commits, and which keys sign them.

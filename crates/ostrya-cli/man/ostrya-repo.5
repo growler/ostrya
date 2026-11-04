@@ -124,6 +124,8 @@ The other entries below appear when a command first needs them.
 \fB\%<repo>/config\fR
 The configuration file, in the key file format.
 A new repository gets the group \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode\fR, and the optional \fB\%collection\-id\fR.
+A create through the ostrya library with a remotes directory also writes the key \fB\%remotes\-config\-dir\fR in the group \fB\%[ex\-ostrya]\fR.
+\fB\%ostrya init\fR does not write it.
 \fB\%ostrya\-config\fR(1) lists the keys.
 .TP
 \fB\%<repo>/.lock\fR

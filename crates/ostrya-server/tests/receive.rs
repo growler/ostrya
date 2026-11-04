@@ -2731,10 +2731,7 @@ async fn served(base: &Path) -> (Repo, Checksum) {
     let root = base.join("served");
     let repo = Repo::create(
         &root,
-        CreateOptions {
-            mode: RepoMode::Archive,
-            collection_id: Some(OWN.to_owned()),
-        },
+        CreateOptions::new(RepoMode::Archive).collection_id(OWN),
     )
     .await
     .unwrap();

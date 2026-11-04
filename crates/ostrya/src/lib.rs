@@ -18,6 +18,7 @@
 //!
 //! # Entry points
 //! - [`Repo::open`] and [`Repo::create`] give a [`Repo`], the handle of a repository.
+//! - [`OpenOptions`] and [`CreateOptions`] give a [`Repo`] with options, such as a [`RemotesDir`].
 //! - [`Repo::transaction`] begins a [`Transaction`], which publishes objects and refs at commit.
 //! - [`StagingTree`] and [`MutableTree`] build the tree of a new commit.
 //! - [`Repo::checkout_at`] writes the tree of a commit into a directory.
@@ -223,7 +224,7 @@ pub use receive::{
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 pub use related::{CommitRelated, RelatedField, RelatedWarning};
 #[doc(hidden)]
-pub use repo::{CreateOptions, Repo};
+pub use repo::{CreateOptions, OpenOptions, RemotesDir, Repo};
 pub use send::{SendEvent, SendEventFn, SendOptions};
 #[cfg(feature = "sign-x509")]
 #[doc(hidden)]

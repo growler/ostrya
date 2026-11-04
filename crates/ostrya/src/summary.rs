@@ -3329,8 +3329,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         ostrya_rt::block_on(async {
-            let mut create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive);
-            create.collection_id = Some("org.example.C".into());
+            let create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive)
+                .collection_id("org.example.C");
             let repo = Repo::create(&dir, create).await.unwrap();
             let opts = SummaryOptions {
                 last_modified: Some(1_700_000_000),
@@ -3376,8 +3376,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         ostrya_rt::block_on(async {
-            let mut create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive);
-            create.collection_id = Some("org.example.A".into());
+            let create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive)
+                .collection_id("org.example.A");
             let repo = Repo::create(&dir, create).await.unwrap();
             let first = commit_at(&repo, 1_700_000_000).await;
             let second = commit_at(&repo, 1_700_000_100).await;

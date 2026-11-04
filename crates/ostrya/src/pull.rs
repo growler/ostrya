@@ -4414,15 +4414,11 @@ mod tests {
                 ),
                 ("none", None, RefPlace::Collection("org.example.Os")),
             ] {
-                let repo = Repo::create(
-                    &dir.join(name),
-                    crate::CreateOptions {
-                        mode: crate::RepoMode::Archive,
-                        collection_id: own.map(str::to_owned),
-                    },
-                )
-                .await
-                .unwrap();
+                let mut opts = crate::CreateOptions::new(crate::RepoMode::Archive);
+                if let Some(id) = own {
+                    opts = opts.collection_id(id);
+                }
+                let repo = Repo::create(&dir.join(name), opts).await.unwrap();
                 assert_eq!(
                     RefPlace::of_collection(&repo, "org.example.Os"),
                     place,

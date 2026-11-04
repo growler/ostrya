@@ -95,6 +95,7 @@ mod tests {
     use ostrya_core::{Checksum, base64};
 
     use super::*;
+    use crate::ed25519::tests::{FINGERPRINT, PUBLIC_HEX, SEED_HEX, from_hex};
     use crate::{
         Ed25519Signer, Ed25519Verifier, Error, Result, Signer, SpkiSigner, SpkiVerifier, Verifier,
         spki_public_keys, spki_secret_key_lines, spki_secret_keys,
@@ -102,31 +103,17 @@ mod tests {
 
     // The key of test 1 in RFC 8032, section 7.1.
 
-    /// The seed of the key, in hex.
-    const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    /// The public key, in hex.
-    const PUBLIC_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
     /// The signature of the empty message, in hex.
     const RFC_SIGNATURE_HEX: &str = concat!(
         "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155",
         "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b",
     );
-    /// The lowercase hex SHA-256 of the SubjectPublicKeyInfo DER of the key.
-    const FINGERPRINT: &str = "06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9";
 
     /// The `AlgorithmIdentifier` DER of `id-Ed25519`, with no parameters.
     const ALGORITHM: [u8; 7] = [0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
 
     /// The subject of the key file readers in the tests.
     const SUBJECT: &str = "the key file 'k'";
-
-    /// Returns the bytes of the hex text `hex`.
-    fn from_hex(hex: &str) -> Vec<u8> {
-        (0..hex.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
-            .collect()
-    }
 
     /// Returns the DER of a TLV with the tag `tag` and the content `content`.
     fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {

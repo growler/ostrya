@@ -251,20 +251,25 @@ fn ed25519_public_bytes(key: &[u8]) -> Result<[u8; ED25519_PUBLIC_KEY_LEN]> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     // The key of test 1 in RFC 8032, section 7.1.
 
-    /// The seed of the key, in hex.
-    const SEED_HEX: &str = "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
-    /// The public key, in hex.
-    const PUBLIC_HEX: &str = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+    /// The seed of the key, in hex. The spki ed25519 tests use it too.
+    pub(crate) const SEED_HEX: &str =
+        "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60";
+    /// The public key, in hex. The spki ed25519 tests use it too.
+    pub(crate) const PUBLIC_HEX: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
     /// The lowercase hex SHA-256 of the SubjectPublicKeyInfo DER of the key.
-    const FINGERPRINT: &str = "06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9";
+    /// The spki ed25519 tests use it too.
+    pub(crate) const FINGERPRINT: &str =
+        "06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9";
 
-    /// Returns the bytes of the hex text `hex`.
-    fn from_hex(hex: &str) -> Vec<u8> {
+    /// Returns the bytes of the hex text `hex`. The spki ed25519 tests use it
+    /// too.
+    pub(crate) fn from_hex(hex: &str) -> Vec<u8> {
         (0..hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())

@@ -135,8 +135,12 @@ impl ServerSigner {
     /// home of `signer`. The function refuses a user id that matches two keys.
     /// The server key signs with the selected key by its fingerprint.
     ///
-    /// `gpg --export` reads the public certificate of the key from the same
-    /// home. The verifier trusts that certificate alone.
+    /// [`GpgSigner::export_public`](crate::gpg::GpgSigner::export_public) gives
+    /// the minimal public certificate of the key from the same home. The
+    /// certificate holds the primary key, the primary user id with its
+    /// self-signature, and each signing subkey with its binding signature. A
+    /// revocation of the primary key or of a signing subkey stays in the
+    /// certificate. The verifier trusts that certificate alone.
     ///
     /// # Errors
     ///
@@ -150,9 +154,8 @@ impl ServerSigner {
     /// - [`Error::Signature`] with the message
     ///   `the key selector names more than one secret key; use the fingerprint`
     ///   if the selector names two or more secret keys.
-    /// - [`Error::Signature`] if the export is over 4 MiB, if `gpg --export`
-    ///   fails, or if it writes nothing.
-    /// - [`Error::Io`] if the read of the export or the wait for `gpg` fails.
+    /// - [`Error::Signature`] for each error of
+    ///   [`GpgSigner::export_public`](crate::gpg::GpgSigner::export_public).
     /// - The errors of
     ///   [`GpgVerifier::from_keyring_bytes`](crate::gpg::GpgVerifier::from_keyring_bytes)
     ///   for the exported certificate.
@@ -176,7 +179,7 @@ impl ServerSigner {
         if let Some(dir) = signer.homedir() {
             bound = bound.with_homedir(dir);
         }
-        let certificate = crate::gpg::export_public_key(signer.homedir(), fingerprint).await?;
+        let certificate = bound.export_public(fingerprint).await?;
         let verifier = crate::gpg::GpgVerifier::from_keyring_bytes([certificate])?;
         Ok(ServerSigner {
             signer: Box::new(bound),

@@ -16,9 +16,9 @@
 //!
 //! - The signing run of `GpgSigner`.
 //! - The secret-key listing of `GpgSigner`.
-//! - `gpg --export` under the `receive` and `sign-gpg` features. It reads the
-//!   public certificate of a server signing key, so the receive path can
-//!   recognize a signature that this key made.
+//! - The export of `GpgSigner` under the `receive` and `sign-gpg` features.
+//!   It gives the minimal public certificate of a server signing key, so the
+//!   receive path can recognize a signature that this key made.
 //!
 //! The private key stays with GnuPG and its agent. It never goes through this
 //! crate.
@@ -616,70 +616,6 @@ fn keypath_dir_files(key: &str, entry: &str, dir: &Path) -> Result<Vec<PathBuf>>
 /// read. `key` is the configuration key of the entry.
 fn keypath_refusal(key: &str, entry: &str, e: &std::io::Error) -> Error {
     Error::Signature(format!("{key} entry '{entry}' cannot be read: {e}"))
-}
-
-/// Returns the public certificate of the key that `fingerprint` names, as
-/// `gpg --export` writes it.
-///
-/// `gpg` uses the GnuPG home `homedir`, or its own default home if `homedir`
-/// is `None`. The receive path trusts this certificate to recognize a
-/// signature that its own server key made.
-///
-/// The export has the limit [`MAX_KEYRING`]. The read stops one byte after
-/// the limit and refuses the export. So the output size of `gpg` cannot set
-/// the size of an allocation. The call also refuses an export that fails or
-/// writes nothing.
-///
-/// `gpg` writes its standard error to the standard error of this process. The
-/// call does not capture it. A refused export names the exit status of `gpg`,
-/// and does not hold the text that `gpg` wrote.
-///
-/// The fingerprint comes after `--`, so `gpg` reads it only as a key name.
-#[cfg(all(feature = "receive", feature = "sign-gpg"))]
-pub(crate) async fn export_public_key(
-    homedir: Option<&Path>,
-    fingerprint: &str,
-) -> Result<Vec<u8>> {
-    use futures_lite::AsyncReadExt;
-
-    let mut cmd = ostrya_rt::Command::new("gpg");
-    if let Some(dir) = homedir {
-        cmd.arg("--homedir").arg(dir);
-    }
-    cmd.arg("--batch")
-        .arg("--quiet")
-        .arg("--export")
-        .arg("--")
-        .arg(fingerprint);
-    let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            Error::Signature("gpg: program not found in PATH".into())
-        } else {
-            Error::Signature(format!("gpg: {e}"))
-        }
-    })?;
-    let mut exported = Vec::new();
-    let read = match child.take_stdout() {
-        Some(stdout) => stdout
-            .take(MAX_KEYRING + 1)
-            .read_to_end(&mut exported)
-            .await
-            .map(|_| ()),
-        None => Ok(()),
-    };
-    let status = child.wait().await?;
-    read?;
-    if exported.len() as u64 > MAX_KEYRING {
-        return Err(Error::Signature(format!(
-            "gpg --export of '{fingerprint}' is over the {MAX_KEYRING}-byte ceiling"
-        )));
-    }
-    if !status.success() || exported.is_empty() {
-        return Err(Error::Signature(format!(
-            "gpg --export of '{fingerprint}' gave no certificate: exit status {status}"
-        )));
-    }
-    Ok(exported)
 }
 
 /// Reads the keyring at `path`, up to [`MAX_KEYRING`].

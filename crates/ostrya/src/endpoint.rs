@@ -362,11 +362,7 @@ pub(crate) async fn resolve_pull_in(
 ) -> Result<Endpoint> {
     let mut o = overrides;
     let section = config.and_then(|config| config.remote(remote));
-    let push_fields = [
-        ("push-token-file", o.push_token_file.is_some()),
-        ("push-user", o.push_user.is_some()),
-    ];
-    if let Some((name, _)) = push_fields.iter().find(|(_, set)| *set) {
+    if let Some(name) = push_field(&o) {
         return Err(Error::InvalidInput(format!(
             "{name} applies to a push, and this is a pull"
         )));
@@ -580,11 +576,7 @@ pub(crate) fn local_pull_path(
     remote: &str,
     o: &EndpointOverrides,
 ) -> Result<Option<PathBuf>> {
-    let push_fields = [
-        ("push-token-file", o.push_token_file.is_some()),
-        ("push-user", o.push_user.is_some()),
-    ];
-    if let Some((name, _)) = push_fields.iter().find(|(_, set)| *set) {
+    if let Some(name) = push_field(o) {
         return Err(Error::InvalidInput(format!(
             "{name} applies to a push, and this is a pull"
         )));
@@ -630,7 +622,7 @@ pub(crate) fn local_pull_path(
     let field = http_field(o)
         .map(|name| (name, "a pull over HTTP"))
         .or_else(|| s3_field(o).map(|name| (name, "a pull from an s3:// address")))
-        .or_else(|| ssh_field(o).map(|name| (name, "a pull over ssh")));
+        .or_else(|| ssh_field(o, "send-command").map(|name| (name, "a pull over ssh")));
     if let Some((name, transport)) = field {
         return Err(Error::InvalidInput(format!(
             "{name} applies to {transport}, and the pull address of remote '{remote}' is a \
@@ -640,13 +632,25 @@ pub(crate) fn local_pull_path(
     Ok(Some(PathBuf::from(rest)))
 }
 
+/// Returns the name of the first field of `o` that applies to a push
+/// alone, or `None` if `o` sets no such field. Each name is the remote key
+/// of the field.
+fn push_field(o: &EndpointOverrides) -> Option<&'static str> {
+    let set = [
+        ("push-token-file", o.push_token_file.is_some()),
+        ("push-user", o.push_user.is_some()),
+    ];
+    set.iter().find(|(_, set)| *set).map(|(name, _)| *name)
+}
+
 /// Returns the name of the first field of `o` that applies to an ssh
 /// address alone, or `None` if `o` sets no such field. Each name is the
-/// remote key of the field.
-fn ssh_field(o: &EndpointOverrides) -> Option<&'static str> {
+/// remote key of the field. `command_key` is the remote key of the remote
+/// command: `send-command` for a pull, `receive-command` for a push.
+fn ssh_field(o: &EndpointOverrides, command_key: &'static str) -> Option<&'static str> {
     let set = [
         ("ssh-command", o.ssh_command.is_some()),
-        ("send-command", o.remote_command.is_some()),
+        (command_key, o.remote_command.is_some()),
     ];
     set.iter().find(|(_, set)| *set).map(|(name, _)| *name)
 }
@@ -697,12 +701,7 @@ async fn pull_http(
     mut http: FetcherOptions,
     o: EndpointOverrides,
 ) -> Result<Endpoint> {
-    // Each name is the remote key of the field.
-    let ssh_fields = [
-        ("ssh-command", o.ssh_command.is_some()),
-        ("send-command", o.remote_command.is_some()),
-    ];
-    if let Some((name, _)) = ssh_fields.iter().find(|(_, set)| *set) {
+    if let Some(name) = ssh_field(&o, "send-command") {
         return Err(Error::InvalidInput(format!(
             "{name} applies to a pull over ssh, and this pull runs over HTTP"
         )));
@@ -726,12 +725,7 @@ async fn pull_s3(
     o: EndpointOverrides,
     env: &S3Environment,
 ) -> Result<Endpoint> {
-    // Each name is the remote key of the field.
-    let ssh_fields = [
-        ("ssh-command", o.ssh_command.is_some()),
-        ("send-command", o.remote_command.is_some()),
-    ];
-    if let Some((name, _)) = ssh_fields.iter().find(|(_, set)| *set) {
+    if let Some(name) = ssh_field(&o, "send-command") {
         return Err(Error::InvalidInput(format!(
             "{name} applies to a pull over ssh, and this pull reads an s3:// address"
         )));
@@ -1204,11 +1198,7 @@ async fn push_s3(
             "{name} applies to an HTTP address, and '{shown}' is an s3:// address"
         )));
     }
-    let ssh_fields = [
-        ("ssh-command", o.ssh_command.is_some()),
-        ("receive-command", o.remote_command.is_some()),
-    ];
-    if let Some((name, _)) = ssh_fields.iter().find(|(_, set)| *set) {
+    if let Some(name) = ssh_field(&o, "receive-command") {
         return Err(push_invalid(format!(
             "{name} applies to an ssh address, and '{shown}' is an s3:// address"
         )));
@@ -1367,16 +1357,10 @@ async fn push_http(
              push verifies the certificate chain of the server"
         )));
     }
-    let not_http = |name: &str| {
-        push_invalid(format!(
+    if let Some(name) = ssh_field(&o, "receive-command") {
+        return Err(push_invalid(format!(
             "{name} applies to an ssh address, and '{address}' is an HTTP address"
-        ))
-    };
-    if o.ssh_command.is_some() {
-        return Err(not_http("ssh-command"));
-    }
-    if o.remote_command.is_some() {
-        return Err(not_http("receive-command"));
+        )));
     }
     if let Some(section) = section {
         let path = |key: Option<String>| key.map(PathBuf::from);
@@ -1468,14 +1452,7 @@ fn push_ssh(
     address: SshAddress,
     o: EndpointOverrides,
 ) -> Result<Endpoint> {
-    let set = [
-        ("push-token-file", o.push_token_file.is_some()),
-        ("push-user", o.push_user.is_some()),
-    ];
-    let name = match set.iter().find(|(_, set)| *set) {
-        Some((name, _)) => Some(*name),
-        None => http_field(&o),
-    };
+    let name = push_field(&o).or_else(|| http_field(&o));
     if let Some(name) = name {
         return Err(push_invalid(format!(
             "{name} applies to an HTTP address, and '{}' is an ssh address",

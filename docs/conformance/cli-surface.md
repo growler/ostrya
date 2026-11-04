@@ -3523,13 +3523,29 @@ lists a ref of ID fails at exit 1 and writes nothing. A candidate at a
 part, `localhost` included, with no path, or with `%`, `?`, or `#` fails the
 command at exit 1 before the first request. The command then also refuses
 `--subpath`, `--http-header`, `--network-retries` above 0, and the low-speed
-options at exit 1. When the pull fetched nothing and imported objects, the
-statistics line has the form of `pull-local`. When the pull fetched objects,
-and the local candidates imported objects and fetched nothing, the command
-prints two lines: the line of a fetch, and then the line of `pull-local`
-with the counts of the local candidates. The content written of the two
-lines adds up to the content written of the pull. The counterpart in the
-tool is `find-remotes --pull` ("P3").
+options at exit 1. The command selects the form of each statistics line from
+the counts of all its pulls. When the pull fetched nothing and imported
+objects, the statistics line has the form of `pull-local`. This is also true
+when no local candidate imported an object. An example is a pull from an HTTP
+candidate that takes each object of the commit, and its detached metadata if
+any, from `--localcache-repo`, and requests no delta index and no delta
+superblock. Such a pull runs, for example, under `--disable-static-deltas`,
+or from a remote whose summary states `ostree.summary.indexed-deltas: false`
+and names no delta to that commit. For a commit of 4 metadata and 3 content
+objects into `archive`, from an `archive` localcache repository on the same
+file system, the collection pull prints
+`4 metadata, 3 content objects imported; 0 bytes content written`. For the
+same work, `ostrya pull REMOTE REF` prints the line of a fetch:
+`0 metadata, 0 content objects fetched; 0 bytes content written`. A pull that
+requests a delta index or a delta superblock counts each request as a fetch,
+also when the file gets 404, so both commands then print the line of a fetch.
+The first difference in the paragraph
+"The statistics line a pull prints to a pipe", below, states this count. When
+the pull fetched objects, and the local candidates imported objects and
+fetched nothing, the command prints two lines: the line of a fetch, and then
+the line of `pull-local` with the counts of the local candidates. The content
+written of the two lines adds up to the content written of the pull. The
+counterpart in the tool is `find-remotes --pull` ("P3").
 
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port

@@ -5030,8 +5030,11 @@ covers the commit or the summary alone, and the hash carries the proof to
 the objects of the tree. Otherwise, without `--untrusted`, the pull links,
 clones, or copies an object with no hash, and an object that it writes again
 in another form always gets a hash. A pull from a local candidate counts no
-fetch, unless it reads static deltas. So when the pull fetched nothing and imported objects,
-`ostrya pull --collection` prints the statistics line of `pull-local`.
+fetch, unless it reads static deltas. When the pull fetched nothing and
+imported objects, `ostrya pull --collection` prints the statistics line of
+`pull-local`. The command reads the counts of all its pulls, so a remote
+candidate that fetched nothing and imported objects from a localcache
+repository also gives this line.
 `CollectionPullStats::local` holds the counts of the pulls from local
 candidates. When the pull fetched objects, and the local candidates
 imported objects and fetched nothing, `ostrya pull --collection` prints two

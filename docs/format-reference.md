@@ -2322,12 +2322,14 @@ binds no subkey, and ranks no user id. The first certificate that answers
 supplies the reported fingerprints and user id.
 
 The keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo.
-An import writes this keyring. The tool takes `/etc/ostree/remotes.d` as the
+An import writes this keyring, also when the remotes directory holds
+`<remote>.trustedkeys.gpg`. The tool takes `/etc/ostree/remotes.d` as the
 remotes directory of its system repository alone. Only when the repo holds no
 `<remote>.trustedkeys.gpg`, `remote gpg-list-keys` of the tool reads
-`<remote>.trustedkeys.gpg` in that directory. The read of that file in a
-verification of the tool is not observed, and its effect on the read of the
-global directory is not observed.
+`<remote>.trustedkeys.gpg` in that directory. So after an import,
+`remote gpg-list-keys` of the tool does not read the file of the directory.
+The read of that file in a verification of the tool is not observed, and its
+effect on the read of the global directory is not observed.
 
 The global trusted-keyring directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
@@ -2347,7 +2349,10 @@ repository handle only when the repo holds no `<remote>.trustedkeys.gpg`. It
 reads the file in `remote gpg-list-keys` and in a verification. A handle with
 no remotes directory reads no such keyring. In a verification of the port, a
 keyring of the remotes directory that exists stops the read of the global
-directory, as the keyring of the repo does. These are the rules of the port.
+directory, as the keyring of the repo does. An import of the port writes the
+keyring of the repo alone, and that keyring then hides the file of the remotes
+directory. The import refuses a symlink at `<remote>.trustedkeys.gpg` in the
+repo, also a symlink to no file. These are the rules of the port.
 
 The `<remote>.trustedkeys.gpg` keyring and each file of the global
 directory must be a binary OpenPGP packet stream. If such a keyring holds

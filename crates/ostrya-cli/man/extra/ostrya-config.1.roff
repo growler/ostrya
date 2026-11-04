@@ -215,8 +215,14 @@ A symlink to an absent file is no keyring.
 A keyring of the directory that ostrya cannot open or read for a reason other than its absence fails the verification, and the refusal names its path with the words "of the remotes directory".
 \fB\%ostrya remote gpg\-list\-keys\fR reads the same keyring.
 \fB\%ostrya remote gpg\-import\fR writes \fB\%<repo>/NAME.trustedkeys.gpg\fR, also for a remote of the directory, and never writes a keyring of the directory.
+When no file is at \fB\%<repo>/NAME.trustedkeys.gpg\fR, \fB\%ostrya \%remote \%gpg\-import\fR and \fB\%ostrya \%remote \%add \%\-\-gpg\-import\fR create it, and that keyring then hides the keyring of the directory.
+An import refuses a symlink at that path, also a symlink to no file.
+The import copies the keys, so a later change to the keyring of the directory has no effect.
+To trust the keys of the directory too, import that keyring into the repository keyring, before or after the other keys, with \fB\%ostrya \%remote \%gpg\-import \%\-\-keyring \%PATH \%NAME\fR.
+PATH is the keyring of NAME in the remotes directory, and a relative PATH is relative to the current directory.
+For \fB\%ostrya \%remote \%add \%\-\-gpg\-import\fR, run this command after the add.
 \fB\%ostrya remote delete\fR does not remove a keyring of the directory.
-A later remote of the same name trusts that keyring.
+A later remote of the same name trusts that keyring while no file is at \fB\%<repo>/NAME.trustedkeys.gpg\fR.
 .PP
 \fB\%ostrya config get\fR, \fB\%ostrya config set\fR, and \fB\%ostrya config unset\fR read and write \fB\%config\fR alone.
 \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.

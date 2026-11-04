@@ -464,6 +464,14 @@ impl Repo {
     /// public keyring is. The call returns the number of certificates that the
     /// keyring did not already hold.
     ///
+    /// The call reads and writes the repository keyring alone. When the
+    /// remotes directory of the handle ([`Repo::remotes_dir`]) holds the
+    /// keyring of `remote` and no file is at the path of the repository
+    /// keyring, the call creates the repository keyring. That keyring hides
+    /// the keyring of the directory. To trust the keys of the directory too,
+    /// import that keyring as well. The call copies the keys, so a later
+    /// change to the keyring of the directory has no effect.
+    ///
     /// If `key_ids` is not empty, the call imports only the keys that these
     /// selectors name. A selector is a fingerprint, a key id, or a user id
     /// substring.
@@ -542,6 +550,8 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes
     ///   `[core] lock-timeout-secs`.
+    /// - [`Error::Io`] if a symlink is at the path of the repository keyring,
+    ///   also a symlink to no file. The call refuses each such symlink.
     /// - [`Error::Io`] if a lock file, the read of the keyring, the write of
     ///   the keyring, or the sync of the repository directory fails.
     pub async fn gpg_import_keys(

@@ -3011,6 +3011,58 @@ fn sign_verify_of_a_section_checks_the_commits() {
     });
 }
 
+/// A remote of a `.conf` file of the remotes directory that the key of
+/// `config` names gives its keys to the pull. The pull refuses an unsigned
+/// commit and accepts it after the trusted key signs it.
+#[test]
+fn a_remote_of_the_remotes_dir_checks_the_commits() {
+    let tmp = TmpDir::new("pull-local-remotes-dir");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (path, repo) = make_repo(base, "dst", RepoMode::Archive).await;
+        drop(repo);
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[ex-ostrya]\nremotes-config-dir=remotes.d\n");
+        std::fs::write(&config, text).unwrap();
+        std::fs::create_dir(path.join("remotes.d")).unwrap();
+        std::fs::write(
+            path.join("remotes.d/origin.conf"),
+            format!(
+                "[remote \"origin\"]\nurl=file:///dev/null\ngpg-verify=false\n\
+                 sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .unwrap();
+        let dst = Repo::open(&path).await.unwrap();
+        assert_eq!(
+            dst.config().remote("origin").unwrap().source(),
+            ostrya::RemoteSource::File("origin.conf")
+        );
+
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("sign-api verification is enabled, but it carries no signature")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        src.sign_commit(&c2, &signer).await.unwrap();
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
 /// `sign-verify-summary` in the remote section turns on the sign-api check
 /// of the summary of the source. The pull refuses a summary with no
 /// `summary.sig` and accepts it after the trusted key signs it.

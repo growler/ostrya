@@ -104,6 +104,7 @@ pub mod read;
 pub mod receive;
 pub mod refs;
 mod related;
+mod remotes_dir;
 mod rollsum;
 mod send;
 #[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]
@@ -151,7 +152,8 @@ pub use composefs::{
 };
 #[doc(hidden)]
 pub use config::{
-    MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate, valid_remote_name,
+    MinFreeSpace, Remote, RemoteSource, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate,
+    valid_remote_name,
 };
 pub use delta::{
     DeltaEndianness, DeltaFallback, DeltaOpCounts, DeltaPart, DeltaPartStats, DeltaSuperblock,

@@ -12749,7 +12749,7 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     edit(repo.config())?;
     let guard = repo.begin_update().await?;
     let edited = async {
-        let keyfile = edit(&guard.read_config().await?)?;
+        let keyfile = edit(&guard.read_config_file().await?)?;
         guard.write_config(&keyfile).await
     }
     .await;
@@ -12777,7 +12777,7 @@ async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     }
     let guard = repo.begin_update().await?;
     let edited = async {
-        match edit(&guard.read_config().await?) {
+        match edit(&guard.read_config_file().await?) {
             Some(keyfile) => guard.write_config(&keyfile).await,
             None => Ok(()),
         }

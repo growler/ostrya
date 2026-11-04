@@ -155,6 +155,55 @@ refuses it and does not give it that meaning. A caller with an absolute
 directory gives a `RemotesDir::Path` value. A create also refuses a path that
 is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
+## The read of the remotes directory
+
+The open selects the remotes directory of the handle in this order: the value
+of `OpenOptions::remotes_dir`, the key `[ex-ostrya] remotes-config-dir` of
+`config`, the value of `OpenOptions::default_remotes_dir`, and no directory.
+No option turns off the key. The open reads and checks the key also when an
+option comes before it, so a repository with an invalid key fails each open,
+whatever the options.
+
+The key is in `[ex-ostrya]`, the group of the port keys, so that a later
+`[core]` key of libostree cannot clash with it. An absolute value gives a
+`RemotesDir::Path`. A relative value gives a `RemotesDir::InRepo`, so it names
+the same directory from each working directory. The open refuses an empty
+value and a value with a NUL byte with `Error::InvalidFormat`.
+`Repo::open_at_strict` reads no key and no directory, so `ostrya-mountd` reads
+no `.conf` file.
+
+The open reads `config` and each `.conf` file into the snapshot of
+`Repo::config`, and `UpdateGuard::read_config` reads both again. A read on
+first use was rejected: `Repo::config` is not async, so the read would block
+the task, or each reader would change. A create reads the directory of its
+value, or, with no value, the directory that the key of an existing `config`
+names, so the handle of a create agrees with its `Repo::remotes_dir`. A later
+open gives the same remotes when the key names the same directory. A `Fd`
+value writes no key, and a create over an existing `config` writes no key, so
+a later open can select another directory.
+
+`RepoConfig` keeps the name and the parsed key file of each `.conf` file.
+`RepoConfig::keyfile` gives `config` alone, so no write of `config` copies a
+remote of the directory into `config`. `Remote::source` gives the file that
+holds a remote.
+
+The read follows the rules of the tool for the names, the symlinks, and the
+entry types. It also refuses a file larger than 1 MiB and a file whose name or
+content is not valid UTF-8, as it refuses such a `config`. The tool reads such
+a file, and the cap bounds the memory of the read. The open skips a symlink to an
+absent file, as the tool does, and fails on each other failure of a symlink,
+such as a loop: the tool result for these is not observed, and a skip would
+hide an error of the administrator.
+
+The read takes the `[remote "NAME"]` groups of a file and ignores each other
+group, as the tool does. The trust groups stay in `config` alone. The open
+refuses a remote name that two sources define, as the tool does, because a
+choice of one of the two sources reinterprets the configuration.
+
+A create refuses a collection id with a line break. The create writes the id
+into `config` as text, so a line break would add groups to `config`, such as
+an `[ex-ostrya]` group with the key of the remotes directory.
+
 ## The GVariant codec
 
 `ostrya-gvariant` is a GVariant codec written in the tree for the fixed type

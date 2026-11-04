@@ -132,6 +132,28 @@ ostrya reads it for no other purpose.
 The keys of a group \fB\%[remote "NAME"]\fR.
 \fB\%ostrya remote add\fR writes the group.
 \fB\%NAME\fR has one or more letters, digits, \fB\%\-\fR, \fB\%_\fR, or \fB\%.\fR, and starts with a letter, a digit, or \fB\%_\fR.
+.SS "Remotes directory"
+A group \fB\%[remote "NAME"]\fR can also be in a \fB\%.conf\fR file of the remotes directory of the repository.
+The key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR names the directory.
+Each open of the repository reads the directory.
+.PP
+ostrya reads each entry whose name ends in \fB\%.conf\fR, in the byte order of the names.
+The match is case-sensitive.
+A name that starts with \fB\%.\fR is read.
+ostrya follows a symlink.
+It skips each entry that is not a regular file after the symlink: a directory, a symlink to an absent file, a FIFO, a socket, or a device.
+Each other failure of the symlink, such as a loop or a path through a file, fails the open.
+It does not read subdirectories.
+An absent directory gives no remotes.
+.PP
+ostrya takes the \fB\%[remote "NAME"]\fR groups of a file and ignores each other group.
+So a \fB\%[core]\fR key or an \fB\%[ex\-ostrya]\fR key in a \fB\%.conf\fR file has no effect, and a \fB\%trust\fR key of a remote in a file names a trust group of \fB\%config\fR.
+Two groups with one name in one file give one remote, and a key of the second group replaces the same key of the first.
+.PP
+These fail each open of the repository:
+a path that is not a directory, a directory or a file that ostrya cannot read, a symlink that ostrya cannot follow for a reason other than an absent target, a file larger than 1 MiB (1048576 bytes), a file name or a file content that is not valid UTF\-8, a file that is not a valid key file, and a remote name that two sources define.
+The sources are \fB\%config\fR and each \fB\%.conf\fR file.
+The \fB\%ostree\fR tool reads a larger file, and fails on a value that is not valid UTF\-8 only when it reads that value.
 .SS "Address"
 .TP
 \fB\%url\fR (string)
@@ -392,7 +414,17 @@ A create of a repository through the ostrya library with a remotes directory wri
 A path value gives the absolute form of the path, with no symlink resolution.
 An in-repository value gives its relative path as given.
 A descriptor value gives no key.
-ostrya writes this key and does not read it.
+Each open of the repository reads the key.
+A remotes directory that a program gives through the ostrya library comes before the key, and a default of the program comes after it.
+An absolute value is a path.
+A relative value is relative to the repository directory.
+ostrya refuses an empty value at each open, also when a program gives a remotes directory.
+\fB\%ostrya config set\fR writes an empty value with no check.
+The repository then does not open, so no \fB\%ostrya\fR command can change the value, \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR included.
+Edit \fB\%config\fR by hand to correct the value.
+A change of the key takes effect at the next open.
+The \fB\%ostree\fR tool ignores the key.
+"Remotes directory" under REMOTE KEYS gives the rules of the read.
 .SH CLIENT AND SERVER GROUPS
 Client groups control the access to a repository through \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and \fB\%ostrya send\fR.
 A client group states how a client authenticates, which refs it can read and change in one namespace, how the server verifies its commits, and which keys sign them.
@@ -853,7 +885,9 @@ The default of \fB\%default\-repo\-finders\fR is \fB\%config;mount\fR.
 \fB\%contenturl\fR, \fB\%metalink\fR, and \fB\%custom\-backend\fR of a remote
 \fB\%ostrya remote add\fR writes them, and a pull does not read them.
 .PP
-ostrya does not read the remote groups in \fB\%remotes.d/\fR directories.
+ostrya reads the remote groups of a remotes directory only when the repository has one.
+The \fB\%ostrya\fR command finds the directory through the key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR.
+A program that uses the ostrya library can also give the directory when it opens the repository.
 .SH ENVIRONMENT
 .TP
 \fB\%OSTRYA_SSH_COMMAND\fR

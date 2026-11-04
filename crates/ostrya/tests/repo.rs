@@ -632,6 +632,7 @@ fn open_takes_an_absent_remotes_dir_and_creates_nothing() {
         let opened = block_on(OpenOptions::new().remotes_dir(value.clone()).open(&path))
             .expect("open with an absent remotes directory");
         assert_same_dir(opened.remotes_dir(), &value);
+        assert!(opened.config().remotes().next().is_none());
     }
     assert!(!tmp.path().join("absent").exists());
     assert!(!path.join("absent.d").exists());
@@ -788,4 +789,520 @@ fn create_over_an_existing_config_writes_no_key() {
     assert_same_dir(created.remotes_dir(), &value);
     let bytes = std::fs::read(path.join("config")).unwrap();
     assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=archive-z2\n");
+}
+
+/// Writes the file `name` with `text` in the directory `dir`, and creates
+/// the directory if it is absent.
+fn write_conf(dir: &Path, name: &str, text: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(name), text).unwrap();
+}
+
+/// Returns the text of a `.conf` file with one remote `name`.
+fn remote_text(name: &str) -> String {
+    format!("[remote \"{name}\"]\nurl=https://example.com/{name}\n")
+}
+
+/// Creates an archive repository at `path` whose `config` ends with
+/// `[ex-ostrya] remotes-config-dir=` and `value`.
+fn create_with_key(path: &Path, value: &str) {
+    block_on(Repo::create(path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let mut config = std::fs::read_to_string(path.join("config")).unwrap();
+    config.push_str(&format!("\n[ex-ostrya]\nremotes-config-dir={value}\n"));
+    std::fs::write(path.join("config"), config).unwrap();
+}
+
+/// Returns the names of the remotes of `repo`.
+fn remote_names(repo: &Repo) -> Vec<String> {
+    repo.config().remotes().map(str::to_owned).collect()
+}
+
+/// Asserts that `result` is an `Error::InvalidFormat` whose message holds
+/// `part`.
+fn assert_invalid_format(result: ostrya::Result<Repo>, part: &str) {
+    match result {
+        Err(Error::InvalidFormat(m)) => assert!(m.contains(part), "{m:?} lacks {part:?}"),
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("the open succeeds"),
+    }
+}
+
+/// Returns the `std::io::Error` of an `Error::Io` result.
+fn io_error(result: ostrya::Result<Repo>) -> std::io::Error {
+    match result {
+        Err(Error::Io(e)) => e,
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("the open succeeds"),
+    }
+}
+
+/// Returns `true` if the test runs as root, which reads each file whatever
+/// its mode.
+fn is_root() -> bool {
+    rustix::process::geteuid().is_root()
+}
+
+/// The open selects the option, then the key, then the default, and reads
+/// the remotes of the selected directory alone.
+#[test]
+fn open_selects_the_option_then_the_key_then_the_default() {
+    let tmp = TmpDir::new("rdselect");
+    let path = tmp.path().join("repo");
+    let option = tmp.path().join("option.d");
+    let default = tmp.path().join("default.d");
+    create_with_key(&path, "key.d");
+    write_conf(&option, "o.conf", &remote_text("option"));
+    write_conf(&path.join("key.d"), "k.conf", &remote_text("key"));
+    write_conf(&default, "d.conf", &remote_text("default"));
+
+    let opened = block_on(
+        OpenOptions::new()
+            .remotes_dir(RemotesDir::path(&option))
+            .default_remotes_dir(RemotesDir::path(&default))
+            .open(&path),
+    )
+    .expect("open");
+    assert_same_dir(opened.remotes_dir(), &RemotesDir::path(&option));
+    assert_eq!(remote_names(&opened), ["option"]);
+
+    let opened = block_on(
+        OpenOptions::new()
+            .default_remotes_dir(RemotesDir::path(&default))
+            .open(&path),
+    )
+    .expect("open");
+    assert_same_dir(
+        opened.remotes_dir(),
+        &RemotesDir::InRepo(PathBuf::from("key.d")),
+    );
+    assert_eq!(remote_names(&opened), ["key"]);
+
+    let plain = tmp.path().join("plain");
+    block_on(Repo::create(&plain, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let opened = block_on(
+        OpenOptions::new()
+            .default_remotes_dir(RemotesDir::path(&default))
+            .open(&plain),
+    )
+    .expect("open");
+    assert_same_dir(opened.remotes_dir(), &RemotesDir::path(&default));
+    assert_eq!(remote_names(&opened), ["default"]);
+
+    let opened = block_on(Repo::open(&plain)).expect("open");
+    assert!(opened.remotes_dir().is_none());
+    assert!(remote_names(&opened).is_empty());
+}
+
+/// An absolute value of the key gives a path, and a relative value a path in
+/// the repository, also through `open_at` from another directory.
+#[test]
+fn open_reads_the_key_as_a_path_or_a_path_in_the_repository() {
+    let tmp = TmpDir::new("rdkeyread");
+    let absolute = tmp.path().join("abs.d");
+    write_conf(&absolute, "a.conf", &remote_text("abs"));
+    let path = tmp.path().join("abs");
+    create_with_key(&path, absolute.to_str().unwrap());
+    let opened = block_on(Repo::open(&path)).expect("open");
+    assert_same_dir(opened.remotes_dir(), &RemotesDir::path(&absolute));
+    assert_eq!(remote_names(&opened), ["abs"]);
+
+    let path = tmp.path().join("rel");
+    create_with_key(&path, "etc/remotes.d");
+    write_conf(&path.join("etc/remotes.d"), "r.conf", &remote_text("rel"));
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let opened = block_on(Repo::open_at(parent.as_fd(), Path::new("rel"))).expect("open_at");
+    assert_same_dir(
+        opened.remotes_dir(),
+        &RemotesDir::InRepo(PathBuf::from("etc/remotes.d")),
+    );
+    assert_eq!(remote_names(&opened), ["rel"]);
+}
+
+/// The open refuses an empty value of the key, also when an option comes
+/// before the key.
+#[test]
+fn open_refuses_an_empty_key() {
+    let tmp = TmpDir::new("rdkeyempty");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "");
+    assert_invalid_format(block_on(Repo::open(&path)), "is empty");
+    assert_invalid_format(
+        block_on(
+            OpenOptions::new()
+                .remotes_dir(RemotesDir::path(tmp.path().join("r.d")))
+                .open(&path),
+        ),
+        "is empty",
+    );
+}
+
+/// The strict open reads no key and no remotes directory.
+#[test]
+fn the_strict_open_reads_no_key() {
+    let tmp = TmpDir::new("rdstrict");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "remotes.d");
+    write_conf(&path.join("remotes.d"), "bad.conf", "not a key file\n");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let strict =
+        block_on(Repo::open_at_strict(parent.as_fd(), Path::new("repo"))).expect("strict open");
+    assert!(strict.remotes_dir().is_none());
+    assert!(remote_names(&strict).is_empty());
+    assert_invalid_format(
+        block_on(Repo::open_at(parent.as_fd(), Path::new("repo"))),
+        "bad.conf",
+    );
+
+    // A key that the open refuses does not stop the strict open.
+    let empty = tmp.path().join("empty");
+    create_with_key(&empty, "");
+    let strict =
+        block_on(Repo::open_at_strict(parent.as_fd(), Path::new("empty"))).expect("strict open");
+    assert!(strict.remotes_dir().is_none());
+    assert_invalid_format(
+        block_on(Repo::open_at(parent.as_fd(), Path::new("empty"))),
+        "remotes-config-dir",
+    );
+}
+
+/// The remotes of `config` come first, then the remotes of each file in the
+/// byte order of the file names. Two groups of one name in one file give one
+/// remote.
+#[test]
+fn open_lists_remotes_in_source_order() {
+    let tmp = TmpDir::new("rdlist");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "remotes.d");
+    let mut config = std::fs::read_to_string(path.join("config")).unwrap();
+    config.push_str(&format!("\n{}", remote_text("main")));
+    std::fs::write(path.join("config"), config).unwrap();
+    let dir = path.join("remotes.d");
+    write_conf(&dir, "b.conf", &remote_text("b"));
+    write_conf(
+        &dir,
+        "a.conf",
+        &format!(
+            "{}\n{}\n[remote \"a2\"]\nurl=https://example.com/second\n",
+            remote_text("a2"),
+            remote_text("a1")
+        ),
+    );
+    write_conf(&dir, "B.conf", &remote_text("upper"));
+    write_conf(&dir, ".x.conf", &remote_text("hidden"));
+
+    let opened = block_on(Repo::open(&path)).expect("open");
+    assert_eq!(
+        remote_names(&opened),
+        ["main", "hidden", "upper", "a2", "a1", "b"]
+    );
+    let a2 = opened.config().remote("a2").unwrap();
+    assert_eq!(
+        a2.url().unwrap().as_deref(),
+        Some("https://example.com/second")
+    );
+    assert_eq!(a2.source(), ostrya::RemoteSource::File("a.conf"));
+    assert_eq!(
+        opened.config().remote("main").unwrap().source(),
+        ostrya::RemoteSource::Config
+    );
+}
+
+/// The open skips each entry whose name does not end in `.conf` and each
+/// entry that is not a regular file after a symlink, and reads no
+/// subdirectory.
+#[test]
+fn open_skips_entries_that_are_not_conf_files() {
+    let tmp = TmpDir::new("rdskip");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    for name in ["x.CONF", "x.conf~", "x.conf.swp", "noconf"] {
+        write_conf(&dir, name, "not a key file\n");
+    }
+    std::fs::create_dir(dir.join("d.conf")).unwrap();
+    write_conf(&dir.join("sub"), "in.conf", "not a key file\n");
+    std::os::unix::fs::symlink("sub", dir.join("linkdir.conf")).unwrap();
+    std::os::unix::fs::symlink("absent", dir.join("dangling.conf")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        dir.join("f.conf"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+    // The path of a socket has a short length limit, so the bind uses a short
+    // path and a rename moves the socket into place.
+    let short = tmp.path().join("s");
+    let _socket = std::os::unix::net::UnixListener::bind(&short).unwrap();
+    std::fs::rename(&short, dir.join("s.conf")).unwrap();
+    write_conf(&tmp.path().join("real"), "target", &remote_text("linked"));
+    std::os::unix::fs::symlink("../real/target", dir.join("link.conf")).unwrap();
+    write_conf(&dir, ".conf", &remote_text("bare"));
+
+    let opened = open_in_time(move || block_on(Repo::open(&path))).expect("open");
+    assert_eq!(remote_names(&opened), ["bare", "linked"]);
+}
+
+/// The open fails on a `.conf` symlink loop.
+#[test]
+fn open_refuses_a_conf_symlink_loop() {
+    let tmp = TmpDir::new("rdloop");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink("loop.conf", dir.join("loop.conf")).unwrap();
+    let err = io_error(block_on(Repo::open(&path)));
+    assert!(
+        err.to_string()
+            .starts_with(&format!("{}: ", dir.join("loop.conf").display())),
+        "{err}"
+    );
+    assert_eq!(
+        err.kind(),
+        std::io::Error::from_raw_os_error(eloop()).kind(),
+        "{err}"
+    );
+}
+
+/// A `.conf` file of 1 MiB opens, and a larger file fails the open.
+#[test]
+fn open_refuses_a_conf_file_over_the_size_cap() {
+    let tmp = TmpDir::new("rdcap");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    let mut text = remote_text("big");
+    text.push('#');
+    text.push_str(&"x".repeat(1024 * 1024 - text.len() - 1));
+    text.push('\n');
+    assert_eq!(text.len(), 1024 * 1024);
+    write_conf(&dir, "big.conf", &text);
+    let opened = block_on(Repo::open(&path)).expect("a file of 1 MiB opens");
+    assert_eq!(remote_names(&opened), ["big"]);
+
+    text.push('\n');
+    write_conf(&dir, "big.conf", &text);
+    assert_invalid_format(
+        block_on(Repo::open(&path)),
+        &format!("{} exceeds", dir.join("big.conf").display()),
+    );
+}
+
+/// The open refuses a `.conf` file whose name is not valid UTF-8, and skips
+/// another entry with such a name.
+#[test]
+fn open_refuses_a_conf_name_that_is_not_utf8() {
+    let tmp = TmpDir::new("rdname");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join(OsStr::from_bytes(b"\xff.txt")), "x").unwrap();
+    std::fs::write(dir.join(OsStr::from_bytes(b"\xff.conf")), remote_text("x")).unwrap();
+    assert_invalid_format(
+        block_on(Repo::open(&path)),
+        "the file name is not valid UTF-8",
+    );
+    std::fs::remove_file(dir.join(OsStr::from_bytes(b"\xff.conf"))).unwrap();
+    block_on(Repo::open(&path)).expect("the other name is skipped");
+}
+
+/// The open refuses a `.conf` file whose content is not valid UTF-8, in a
+/// value or in a group name.
+#[test]
+fn open_refuses_conf_content_that_is_not_utf8() {
+    let tmp = TmpDir::new("rdcontent");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    std::fs::create_dir(&dir).unwrap();
+    for bytes in [
+        &b"[remote \"x\"]\nurl=\xff\n"[..],
+        &b"[remote \"\xff\"]\nurl=https://x\n"[..],
+    ] {
+        std::fs::write(dir.join("x.conf"), bytes).unwrap();
+        assert_invalid_format(
+            block_on(Repo::open(&path)),
+            &format!(
+                "{}: the content is not valid UTF-8",
+                dir.join("x.conf").display()
+            ),
+        );
+    }
+}
+
+/// The open refuses a remotes directory path that is not a directory.
+#[test]
+fn open_refuses_a_remotes_dir_that_is_not_a_directory() {
+    let tmp = TmpDir::new("rdnotdir");
+    let file = tmp.path().join("remotes.d");
+    std::fs::write(&file, "x").unwrap();
+    let path = tmp.path().join("repo");
+    create_with_key(&path, file.to_str().unwrap());
+    let err = io_error(block_on(Repo::open(&path)));
+    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err}");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("{}: ", file.display())),
+        "{err}"
+    );
+}
+
+/// The open fails on a remotes directory or a `.conf` file that it cannot
+/// read.
+#[test]
+fn open_refuses_an_unreadable_remotes_dir_or_conf_file() {
+    if is_root() {
+        eprintln!("skipped: root reads each file whatever its mode");
+        return;
+    }
+    let tmp = TmpDir::new("rdunread");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    write_conf(&dir, "x.conf", &remote_text("x"));
+
+    std::fs::set_permissions(dir.join("x.conf"), std::fs::Permissions::from_mode(0o0)).unwrap();
+    let err = io_error(block_on(Repo::open(&path)));
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(
+        err.to_string()
+            .starts_with(&format!("{}: ", dir.join("x.conf").display())),
+        "{err}"
+    );
+    std::fs::set_permissions(dir.join("x.conf"), std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o0)).unwrap();
+    let err = io_error(block_on(Repo::open(&path)));
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+    assert!(
+        err.to_string().starts_with(&format!("{}: ", dir.display())),
+        "{err}"
+    );
+}
+
+/// The open refuses a `.conf` file that is not a valid key file, and names
+/// the file.
+#[test]
+fn open_refuses_a_broken_conf_file() {
+    let tmp = TmpDir::new("rdbroken");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "remotes.d");
+    write_conf(&path.join("remotes.d"), "x.conf", "not a key file\n");
+    assert_invalid_format(block_on(Repo::open(&path)), "remotes.d/x.conf: ");
+}
+
+/// The open refuses a remote name that `config` and a file, or two files,
+/// define.
+#[test]
+fn open_refuses_a_name_in_two_sources() {
+    let tmp = TmpDir::new("rdtwice");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "remotes.d");
+    let dir = path.join("remotes.d");
+    write_conf(&dir, "a.conf", &remote_text("x"));
+    write_conf(&dir, "b.conf", &remote_text("x"));
+    assert_invalid_format(
+        block_on(Repo::open(&path)),
+        "remote \"x\" is defined in remotes.d/a.conf and in remotes.d/b.conf",
+    );
+
+    std::fs::remove_file(dir.join("b.conf")).unwrap();
+    let mut config = std::fs::read_to_string(path.join("config")).unwrap();
+    config.push_str(&format!("\n{}", remote_text("x")));
+    std::fs::write(path.join("config"), config).unwrap();
+    assert_invalid_format(
+        block_on(Repo::open(&path)),
+        "remote \"x\" is defined in config and in remotes.d/a.conf",
+    );
+}
+
+/// The open reads a remotes directory that a descriptor gives, and an error
+/// names a file by its name alone.
+#[test]
+fn open_reads_a_remotes_dir_given_by_descriptor() {
+    let tmp = TmpDir::new("rdfd");
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let fd = scratch_dir_fd(&tmp, "remotes.d");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "x.conf", &remote_text("x"));
+    let opts = OpenOptions::new().remotes_dir(RemotesDir::from(fd));
+    let opened = block_on(opts.open(&path)).expect("open");
+    assert_eq!(remote_names(&opened), ["x"]);
+    assert_eq!(
+        opened.config().remote("x").unwrap().source(),
+        ostrya::RemoteSource::File("x.conf")
+    );
+
+    write_conf(&dir, "y.conf", "not a key file\n");
+    match block_on(opts.open(&path)) {
+        Err(Error::InvalidFormat(m)) => assert!(m.starts_with("y.conf: "), "{m}"),
+        other => panic!("{:?}", other.map(|_| ())),
+    }
+}
+
+/// `UpdateGuard::read_config` reads the remotes directory again, and the
+/// handle keeps the remotes of the open.
+#[test]
+fn read_config_reads_the_remotes_dir_again() {
+    let tmp = TmpDir::new("rdreread");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, "remotes.d");
+    let dir = path.join("remotes.d");
+    write_conf(&dir, "a.conf", &remote_text("a"));
+    let repo = block_on(Repo::open(&path)).expect("open");
+    write_conf(&dir, "b.conf", &remote_text("b"));
+    assert_eq!(remote_names(&repo), ["a"]);
+    let guard = block_on(repo.begin_update()).expect("begin_update");
+    let read = block_on(guard.read_config()).expect("read_config");
+    assert_eq!(read.remotes().collect::<Vec<_>>(), ["a", "b"]);
+    let file = block_on(guard.read_config_file()).expect("read_config_file");
+    assert_eq!(file.remotes().count(), 0);
+}
+
+/// A create reads the remotes directory of its value. With no value, it
+/// takes the key of an existing `config`.
+#[test]
+fn create_reads_the_remotes_dir() {
+    let tmp = TmpDir::new("rdcreate");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "x.conf", &remote_text("x"));
+    let path = tmp.path().join("repo");
+    let created = block_on(
+        CreateOptions::new(RepoMode::Archive)
+            .remotes_dir(RemotesDir::path(&dir))
+            .create(&path),
+    )
+    .expect("create");
+    assert_eq!(remote_names(&created), ["x"]);
+
+    let again =
+        block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    assert_same_dir(again.remotes_dir(), &RemotesDir::path(&dir));
+    assert_eq!(remote_names(&again), ["x"]);
+}
+
+/// A create refuses a collection id that holds a line break, and writes
+/// nothing.
+#[test]
+fn create_refuses_a_collection_id_with_a_line_break() {
+    let tmp = TmpDir::new("rdcid");
+    let path = tmp.path().join("repo");
+    for id in [
+        "org.example.Os\n[ex-ostrya]\nremotes-config-dir=x",
+        "org.example\rOs",
+    ] {
+        let err = block_on(
+            CreateOptions::new(RepoMode::Archive)
+                .collection_id(id)
+                .create(&path),
+        )
+        .expect_err("create refuses");
+        assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+        assert!(!path.exists());
+    }
 }

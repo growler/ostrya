@@ -43,7 +43,8 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// `Send + Sync`.
 ///
 /// The guard reads and writes refs, collection refs, and ref aliases. It
-/// reads `config` from disk and writes `config`. It stages no object. Each
+/// reads `config` and the `.conf` files of the remotes directory from disk,
+/// and writes `config`. It stages no object. Each
 /// write of the guard is atomic and visible when the call returns.
 ///
 /// # Remotes
@@ -399,11 +400,14 @@ impl UpdateGuard {
         .await
     }
 
-    /// Reads the `config` file from disk and parses it.
+    /// Reads the `config` file and the `.conf` files of the remotes directory
+    /// of the handle from disk and parses them.
     ///
     /// The repository handle keeps the config that it read at open. A
     /// read-modify-write of `config` under the guard reads the file with this
-    /// call.
+    /// call. The call reads the directory of
+    /// [`Repo::remotes_dir`](crate::Repo::remotes_dir), and does not read the
+    /// key `[ex-ostrya] remotes-config-dir` again.
     ///
     /// # Errors
     ///
@@ -411,7 +415,26 @@ impl UpdateGuard {
     ///   UTF-8.
     /// - An error of [`RepoConfig::parse`] if `config` does not parse.
     /// - [`Error::Io`] if the read fails.
+    /// - The errors of [`OpenOptions::open`](crate::OpenOptions::open) for the
+    ///   remotes directory and its `.conf` files.
     pub async fn read_config(&self) -> Result<RepoConfig> {
+        self.repo().read_config_and_remotes().await
+    }
+
+    /// Reads the `config` file from disk and parses it, as
+    /// [`read_config`](UpdateGuard::read_config) does. The call does not read
+    /// the remotes directory, so the config has no remotes of the directory.
+    ///
+    /// The function is not a stable API.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB or is not
+    ///   UTF-8.
+    /// - An error of [`RepoConfig::parse`] if `config` does not parse.
+    /// - [`Error::Io`] if the read fails.
+    #[doc(hidden)]
+    pub async fn read_config_file(&self) -> Result<RepoConfig> {
         self.repo().read_config_file().await
     }
 

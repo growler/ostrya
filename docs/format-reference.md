@@ -1197,6 +1197,16 @@ what the verification keys of a remote select and how each value is spelled.
 `conformance/cli-surface.md`, "Global conventions", records the size cap that
 the port applies to `config`.
 
+A remotes directory holds remotes in `.conf` files. Each file is a key file
+with the rules of `config` below. The remotes of a file are its
+`[remote "NAME"]` groups, with the keys of a remote of `config`. A reader
+ignores each other group of a file. The tool reads the directory
+`/etc/ostree/remotes.d` for the system repository alone. The port reads the
+directory that `[ex-ostrya] remotes-config-dir` names ("Configuration keys of
+the port" in "Port extensions"), or the directory that a library caller gives
+at the open. `ostrya-config(1)`, "Remotes directory", states
+the rules of the read of the port.
+
 `RepoConfig::auto_update_summary` reads `auto-update-summary` and
 `commit-update-summary` together. Its caller in the port is the reader of the
 receive policies, `ReceivePolicies::from_config`.
@@ -2928,7 +2938,21 @@ with a remotes directory writes the key into the new `config`:
 - An in-repository value gives its relative path as given.
 - A descriptor value gives no key.
 
-ostrya writes this key and does not read it. The `ostree` tool ignores it.
+Each open of the repository reads the key, except an open in the strict open
+mode. The open selects the remotes directory in this order: the directory that
+the program gives through the library, the key, the default directory that the
+program gives, and no directory. An absolute value names a path. A relative
+value names a path relative to the repository directory. The open refuses an
+empty value, also when the program gives a directory. The open reads the key at
+the open alone, so a change of the key takes effect at the next open.
+
+The open reads the `.conf` files of the selected directory, by the rules of
+`ostrya-config(1)`, "Remotes directory". `RepoConfig::remotes` gives the
+remotes of `config` first, then the remotes of each file in the byte order of
+the file names. `Remote::source` gives the file that holds a remote. The open
+refuses a remote name that two sources define.
+
+The `ostree` tool ignores the key.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
 of a group itself. The server group has the exact name `ex-ostrya server`. The

@@ -21,6 +21,7 @@ use crate::config::{EX_OSTRYA, MinFreeSpace, REMOTES_CONFIG_DIR, RepoConfig};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
 use crate::perm;
+use crate::remotes_dir;
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
 
@@ -55,9 +56,9 @@ const LAYOUT_DIRS: &[&str] = &[
 /// The remotes directory of a repository handle: a directory of `.conf` files
 /// that hold remotes.
 ///
-/// An open does not open the value, so a directory that does not exist at the
-/// open can come into existence later. Each access to the directory resolves
-/// the value again.
+/// The open reads the directory into the snapshot of [`Repo::config`] and
+/// keeps no descriptor of it. Each later access resolves the value again, so
+/// a directory that does not exist at the open can come into existence later.
 ///
 /// A clone of a [`Fd`](RemotesDir::Fd) value shares one descriptor.
 #[derive(Debug, Clone)]
@@ -132,10 +133,30 @@ impl From<OwnedFd> for RemotesDir {
 /// The open selects the remotes directory of the handle in this order:
 ///
 /// 1. [`remotes_dir`](OpenOptions::remotes_dir);
-/// 2. [`default_remotes_dir`](OpenOptions::default_remotes_dir);
-/// 3. no remotes directory.
+/// 2. the key `[ex-ostrya] remotes-config-dir` of `config`;
+/// 3. [`default_remotes_dir`](OpenOptions::default_remotes_dir);
+/// 4. no remotes directory.
+///
+/// No option turns off the key. An absolute value of the key gives a
+/// [`Path`](RemotesDir::Path) value. A relative value gives an
+/// [`InRepo`](RemotesDir::InRepo) value, relative to the repository
+/// directory. The open refuses an empty value, also when an option comes
+/// before the key.
 ///
 /// [`Repo::remotes_dir`] gives the selected value.
+///
+/// The open reads the `.conf` files of the selected directory into
+/// [`Repo::config`]:
+///
+/// - It reads each entry whose name ends in `.conf`, in the byte order of the
+///   names. The match is case-sensitive. A name that starts with `.` is read.
+/// - It follows a symlink. It skips each entry that is not a regular file
+///   after the symlink, and it does not read a subdirectory. A symlink to an
+///   absent file is skipped. Each other failure of the symlink, such as a
+///   loop, fails the open.
+/// - It takes the `[remote "<name>"]` groups of each file and ignores each
+///   other group.
+/// - An absent directory, or an absent parent of it, gives no remotes.
 ///
 /// # Examples
 ///
@@ -176,19 +197,15 @@ impl OpenOptions {
         self
     }
 
-    /// Checks each value and returns the remotes directory that the open
-    /// selects.
-    fn selected_remotes_dir(&self) -> Result<Option<RemotesDir>> {
+    /// Refuses a remotes directory value that the open does not take.
+    fn check(&self) -> Result<()> {
         for dir in [&self.remotes_dir, &self.default_remotes_dir]
             .into_iter()
             .flatten()
         {
             dir.check()?;
         }
-        Ok(self
-            .remotes_dir
-            .clone()
-            .or_else(|| self.default_remotes_dir.clone()))
+        Ok(())
     }
 
     /// Opens the repository at `path`, relative to the current working
@@ -210,13 +227,30 @@ impl OpenOptions {
     ///   checks of [`RepoConfig::from_keyfile`].
     /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
     ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
+    /// - [`Error::InvalidFormat`] if `[ex-ostrya] remotes-config-dir` is
+    ///   empty or holds a NUL byte, and [`Error::Core`] if it holds a
+    ///   malformed escape sequence.
+    /// - [`Error::Io`] if the remotes directory is not a directory, or if it
+    ///   or one of its `.conf` files cannot be read. The message starts with
+    ///   the path of the directory or of the file. A
+    ///   [`Path`](RemotesDir::Path) value gives the path as given, and an
+    ///   [`InRepo`](RemotesDir::InRepo) value the path relative to the
+    ///   repository. A [`Fd`](RemotesDir::Fd) value gives the name of a file,
+    ///   and `.` for the directory.
+    /// - [`Error::InvalidFormat`] if a `.conf` file is larger than 1 MiB, if
+    ///   its name or its content is not valid UTF-8, or if it is not a valid
+    ///   key file. The message names the file.
+    /// - [`Error::InvalidFormat`] if `config` and a `.conf` file, or two
+    ///   `.conf` files, define one remote name.
     pub async fn open(&self, path: &Path) -> Result<Repo> {
-        let remotes_dir = self.selected_remotes_dir()?;
+        self.check()?;
+        let opts = self.clone();
         let path = path.to_owned();
         let stored = path.clone();
         let materials =
-            ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path, false)).await?;
-        Repo::assemble(materials, stored, remotes_dir)
+            ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path, false, &opts))
+                .await?;
+        Ok(Repo::assemble(materials, stored))
     }
 
     /// Opens the repository at `path`, relative to the directory `dir`.
@@ -238,13 +272,30 @@ impl OpenOptions {
     ///   checks of [`RepoConfig::from_keyfile`].
     /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
     ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
+    /// - [`Error::InvalidFormat`] if `[ex-ostrya] remotes-config-dir` is
+    ///   empty or holds a NUL byte, and [`Error::Core`] if it holds a
+    ///   malformed escape sequence.
+    /// - [`Error::Io`] if the remotes directory is not a directory, or if it
+    ///   or one of its `.conf` files cannot be read. The message starts with
+    ///   the path of the directory or of the file. A
+    ///   [`Path`](RemotesDir::Path) value gives the path as given, and an
+    ///   [`InRepo`](RemotesDir::InRepo) value the path relative to the
+    ///   repository. A [`Fd`](RemotesDir::Fd) value gives the name of a file,
+    ///   and `.` for the directory.
+    /// - [`Error::InvalidFormat`] if a `.conf` file is larger than 1 MiB, if
+    ///   its name or its content is not valid UTF-8, or if it is not a valid
+    ///   key file. The message names the file.
+    /// - [`Error::InvalidFormat`] if `config` and a `.conf` file, or two
+    ///   `.conf` files, define one remote name.
     pub async fn open_at(&self, dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
-        let remotes_dir = self.selected_remotes_dir()?;
+        self.check()?;
+        let opts = self.clone();
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
         let stored = path.clone();
-        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path, false)).await?;
-        Repo::assemble(materials, stored, remotes_dir)
+        let materials =
+            ostrya_rt::unblock(move || open_materials(&dir, &path, false, &opts)).await?;
+        Ok(Repo::assemble(materials, stored))
     }
 }
 
@@ -294,7 +345,8 @@ impl CreateOptions {
     }
 
     /// Sets the collection id. The create writes it to
-    /// `[core] collection-id`.
+    /// `[core] collection-id`. The create refuses an id that holds a line
+    /// break.
     pub fn collection_id(mut self, id: impl Into<String>) -> Self {
         self.collection_id = Some(id.into());
         self
@@ -313,7 +365,11 @@ impl CreateOptions {
     ///
     /// A create over an existing `config` writes no key. The handle that a
     /// create returns holds `dir` in each case, and
-    /// [`Repo::remotes_dir`] gives it.
+    /// [`Repo::remotes_dir`] gives it. The create reads the remotes of the
+    /// directory, as an open does.
+    ///
+    /// With no value, the handle takes the remotes directory that the key of
+    /// an existing `config` names, as [`OpenOptions`] describes.
     pub fn remotes_dir(mut self, dir: RemotesDir) -> Self {
         self.remotes_dir = Some(dir);
         self
@@ -331,6 +387,8 @@ impl CreateOptions {
     ///   path, a path that holds a NUL byte, or an absolute
     ///   [`InRepo`](RemotesDir::InRepo) path, or if the value of the key is
     ///   not valid UTF-8. The call checks the value before it writes.
+    /// - [`Error::InvalidInput`] if the collection id holds a line break. The
+    ///   call checks the id before it writes.
     /// - [`Error::Io`] if the call cannot make the absolute form of a
     ///   [`Path`](RemotesDir::Path) value.
     /// - [`Error::Io`] if the parent directory of `path` does not exist, or if
@@ -343,14 +401,18 @@ impl CreateOptions {
     /// - [`Error::Core`] if an existing `config` is not a valid key file, or if
     ///   a `[core]` value that [`RepoConfig::from_keyfile`] reads does not
     ///   parse.
+    /// - The errors of [`OpenOptions::open`] for the key
+    ///   `[ex-ostrya] remotes-config-dir`, the remotes directory, and its
+    ///   `.conf` files. The call reads them after it writes the layout and
+    ///   `config`, so a refusal leaves the new repository on disk.
     pub async fn create(&self, path: &Path) -> Result<Repo> {
-        check_create_remotes_dir(self.remotes_dir.as_ref())?;
+        self.check()?;
         let opts = self.clone();
         let path = path.to_owned();
         let stored = path.clone();
         let materials =
             ostrya_rt::unblock(move || create_materials(rustix::fs::CWD, &path, &opts)).await?;
-        Repo::assemble(materials, stored, self.remotes_dir.clone())
+        Ok(Repo::assemble(materials, stored))
     }
 
     /// Creates and opens a repository at `path`, relative to the directory
@@ -364,13 +426,35 @@ impl CreateOptions {
     /// - The errors of [`create`](CreateOptions::create).
     /// - [`Error::Io`] if the call cannot duplicate `dir`.
     pub async fn create_at(&self, dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
-        check_create_remotes_dir(self.remotes_dir.as_ref())?;
+        self.check()?;
         let opts = self.clone();
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
         let stored = path.clone();
         let materials = ostrya_rt::unblock(move || create_materials(&dir, &path, &opts)).await?;
-        Repo::assemble(materials, stored, self.remotes_dir.clone())
+        Ok(Repo::assemble(materials, stored))
+    }
+
+    /// Refuses a value that the create does not take: a collection id that
+    /// holds a line break, the remotes directory values that the open
+    /// refuses, and a remotes directory path that is not valid UTF-8, because
+    /// `config` is UTF-8.
+    fn check(&self) -> Result<()> {
+        if let Some(id) = &self.collection_id
+            && id.contains(['\n', '\r'])
+        {
+            return Err(Error::InvalidInput(format!(
+                "the collection id {id:?} holds a line break"
+            )));
+        }
+        let Some(dir) = &self.remotes_dir else {
+            return Ok(());
+        };
+        dir.check()?;
+        match dir {
+            RemotesDir::Path(path) | RemotesDir::InRepo(path) => utf8_key_value(path).map(drop),
+            RemotesDir::Fd(_) => Ok(()),
+        }
     }
 }
 
@@ -379,11 +463,13 @@ impl CreateOptions {
 /// A clone of a `Repo` is cheap. The clones share one `Arc` that holds the
 /// directory descriptors of the repository and its parsed [`RepoConfig`].
 /// A `Repo` is `Send + Sync`, so a handle can move into a task. The handle
-/// reads the config one time, when it opens.
+/// reads the config and the `.conf` files of its remotes directory one time,
+/// when it opens.
 ///
 /// The methods that do I/O are `async fn`. A call runs its file system work on
 /// the blocking pool through `ostrya_rt::unblock`, so the call does not block
-/// the executor. A config parse is CPU work only and runs on the calling task.
+/// the executor. The open parses `config` on the blocking pool, because the
+/// key that names the remotes directory selects the next read.
 ///
 /// # Entry points
 ///
@@ -416,8 +502,8 @@ struct RepoInner {
     // it. It is a record of the argument of the caller, and no I/O uses it.
     // Each access goes through `repo_fd` and `objects_fd`.
     path: PathBuf,
-    // The remotes directory that the open selected, or that the create took,
-    // stored as the caller gave it.
+    // The remotes directory that the open selected, or that the create took.
+    // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
     // The strict open mode of `Repo::open_at_strict`: the reads of `config`,
     // of the metadata objects, and of the composefs image follow no symlink,
@@ -469,8 +555,28 @@ impl RepoInner {
 struct Materials {
     repo_fd: OwnedFd,
     objects_fd: OwnedFd,
-    config: Vec<u8>,
+    config: RepoConfig,
+    remotes_dir: Option<RemotesDir>,
     strict: bool,
+}
+
+impl Materials {
+    /// Selects the remotes directory of the handle: `first`, then the key of
+    /// `config`, then `default`. Reads the remotes of the selected directory
+    /// into the config. Blocks the calling thread.
+    fn select_remotes_dir(
+        mut self,
+        first: Option<&RemotesDir>,
+        default: Option<&RemotesDir>,
+    ) -> Result<Materials> {
+        let key = remotes_dir::from_key(&self.config)?;
+        let selected = first.cloned().or(key).or_else(|| default.cloned());
+        if let Some(dir) = &selected {
+            self.config = remotes_dir::read_remotes(self.config, self.repo_fd.as_fd(), dir)?;
+        }
+        self.remotes_dir = selected;
+        Ok(self)
+    }
 }
 
 /// Methods that open or create a repository and begin a transaction.
@@ -478,7 +584,8 @@ impl Repo {
     /// Opens the repository at `path`, relative to the current working directory.
     ///
     /// The call is [`OpenOptions::open`] with the default options, so the
-    /// handle has no remotes directory.
+    /// handle takes the remotes directory that the key
+    /// `[ex-ostrya] remotes-config-dir` of `config` names.
     ///
     /// The handle stores `path` as given, and [`path`](Repo::path) returns it.
     ///
@@ -493,12 +600,7 @@ impl Repo {
     ///
     /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`
     ///   directory or no `config` file, or if a read fails.
-    /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB (1048576
-    ///   bytes) or is not valid UTF-8.
-    /// - [`Error::InvalidFormat`] if the `[core]` group of `config` fails the
-    ///   checks of [`RepoConfig::from_keyfile`].
-    /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
-    ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
+    /// - The errors of [`OpenOptions::open`].
     pub async fn open(path: &Path) -> Result<Repo> {
         OpenOptions::new().open(path).await
     }
@@ -506,21 +608,14 @@ impl Repo {
     /// Opens the repository at `path`, relative to the directory `dir`.
     ///
     /// The call is [`OpenOptions::open_at`] with the default options, so the
-    /// handle has no remotes directory.
+    /// handle takes the remotes directory that the key
+    /// `[ex-ostrya] remotes-config-dir` of `config` names.
     ///
     /// The handle stores `path` as given, and [`path`](Repo::path) returns it.
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the call cannot duplicate `dir`.
-    /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`
-    ///   directory or no `config` file, or if a read fails.
-    /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB (1048576
-    ///   bytes) or is not valid UTF-8.
-    /// - [`Error::InvalidFormat`] if the `[core]` group of `config` fails the
-    ///   checks of [`RepoConfig::from_keyfile`].
-    /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
-    ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
+    /// - The errors of [`OpenOptions::open_at`].
     pub async fn open_at(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
         OpenOptions::new().open_at(dir, path).await
     }
@@ -532,7 +627,8 @@ impl Repo {
     /// The handle is the handle of [`open_at`](Repo::open_at), with these
     /// changes:
     ///
-    /// - The handle has no remotes directory.
+    /// - The open reads no `[ex-ostrya] remotes-config-dir` key and no remotes
+    ///   directory, so the handle has no remotes directory.
     /// - The open of `objects` follows no symlink.
     /// - The reads of `config`, of each metadata object, and of the stored
     ///   composefs image open the file with `O_NOFOLLOW` and `O_NONBLOCK`,
@@ -543,7 +639,8 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - The errors of [`open_at`](Repo::open_at).
+    /// - The errors of [`open_at`](Repo::open_at), except the errors of the
+    ///   remotes directory.
     /// - [`Error::Io`] if `objects` or `config` is a symlink, or if `config`
     ///   is not a regular file.
     #[doc(hidden)]
@@ -551,8 +648,10 @@ impl Repo {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
         let stored = path.clone();
-        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path, true)).await?;
-        Repo::assemble(materials, stored, None)
+        let materials =
+            ostrya_rt::unblock(move || open_materials(&dir, &path, true, &OpenOptions::default()))
+                .await?;
+        Ok(Repo::assemble(materials, stored))
     }
 
     /// Creates and opens a repository at `path`, relative to the working directory.
@@ -629,7 +728,10 @@ impl Repo {
         self.inner.config.mode()
     }
 
-    /// Returns the parsed config of the repository, as the open read it.
+    /// Returns the parsed config of the repository and the remotes of its
+    /// remotes directory, as the open read them.
+    ///
+    /// A later change of the files does not change the value.
     pub fn config(&self) -> &RepoConfig {
         &self.inner.config
     }
@@ -663,12 +765,16 @@ impl Repo {
         &self.inner.path
     }
 
-    /// Returns the remotes directory of the handle, as the caller gave it.
+    /// Returns the remotes directory of the handle.
     ///
-    /// For an open, the value is the value that [`OpenOptions`] selected. For
-    /// a create, it is the value of [`CreateOptions::remotes_dir`]. A handle
-    /// with no remotes directory gives `None`, for example a handle of
-    /// [`Repo::open`].
+    /// For an open, the value is the value that [`OpenOptions`] selected. A
+    /// value of an option is as the caller gave it. The key
+    /// `[ex-ostrya] remotes-config-dir` gives a [`Path`](RemotesDir::Path)
+    /// value for an absolute path and an [`InRepo`](RemotesDir::InRepo) value
+    /// for a relative path. For a create, the value is the value of
+    /// [`CreateOptions::remotes_dir`], or else the value of the key of an
+    /// existing `config`. A handle with no remotes directory gives `None`,
+    /// for example a handle of [`Repo::open_at_strict`].
     pub fn remotes_dir(&self) -> Option<&RemotesDir> {
         self.inner.remotes_dir.as_ref()
     }
@@ -901,7 +1007,8 @@ impl Repo {
             .is_some_and(|lock| held.is_of(lock))
     }
 
-    /// Reads `config` from disk and parses it, as the open of a handle does.
+    /// Reads `config` from disk and parses it. The call does not read the
+    /// remotes directory.
     ///
     /// The handle keeps the config that it read at the open.
     pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
@@ -909,6 +1016,22 @@ impl Repo {
         ostrya_rt::unblock(move || {
             let bytes = read_file(repo.repo_fd(), CONFIG, repo.is_strict())?;
             parse_config(&bytes)
+        })
+        .await
+    }
+
+    /// Reads `config` and the `.conf` files of the remotes directory of the
+    /// handle from disk and parses them. The call does not read the key
+    /// `[ex-ostrya] remotes-config-dir` again.
+    pub(crate) async fn read_config_and_remotes(&self) -> Result<RepoConfig> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            let bytes = read_file(repo.repo_fd(), CONFIG, repo.is_strict())?;
+            let config = parse_config(&bytes)?;
+            match repo.remotes_dir() {
+                Some(dir) => remotes_dir::read_remotes(config, repo.repo_fd(), dir),
+                None => Ok(config),
+            }
         })
         .await
     }
@@ -931,29 +1054,22 @@ impl Repo {
         self.inner.objects_fd.as_fd()
     }
 
-    /// Parses the config bytes and assembles the handle. This step is CPU work
-    /// only. `path` is the argument that the caller gave the constructor,
-    /// stored as given for [`Repo::path`]. `remotes_dir` is the value of
-    /// [`Repo::remotes_dir`].
-    fn assemble(
-        materials: Materials,
-        path: PathBuf,
-        remotes_dir: Option<RemotesDir>,
-    ) -> Result<Repo> {
-        let config = parse_config(&materials.config)?;
-        Ok(Repo {
+    /// Assembles the handle. `path` is the argument that the caller gave the
+    /// constructor, stored as given for [`Repo::path`].
+    fn assemble(materials: Materials, path: PathBuf) -> Repo {
+        Repo {
             inner: Arc::new(RepoInner {
                 repo_fd: materials.repo_fd,
                 objects_fd: materials.objects_fd,
-                config,
+                config: materials.config,
                 path,
-                remotes_dir,
+                remotes_dir: materials.remotes_dir,
                 strict: materials.strict,
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
                 implicit_reads: OnceLock::new(),
             }),
-        })
+        }
     }
 }
 
@@ -1008,10 +1124,20 @@ fn free_budget(repo_fd: BorrowedFd<'_>, min_free: MinFreeSpace) -> Result<u64> {
 }
 
 /// Opens an existing repository directory and gathers its materials, in the
-/// strict open mode if `strict` is set.
-fn open_materials<Fd: AsFd>(dir: Fd, path: &Path, strict: bool) -> std::io::Result<Materials> {
+/// strict open mode if `strict` is set. The strict open mode reads no remotes
+/// directory.
+fn open_materials<Fd: AsFd>(
+    dir: Fd,
+    path: &Path,
+    strict: bool,
+    opts: &OpenOptions,
+) -> Result<Materials> {
     let repo_fd = open_dir(dir, path)?;
-    materials_from_repo(repo_fd, strict)
+    let materials = materials_from_repo(repo_fd, strict)?;
+    if strict {
+        return Ok(materials);
+    }
+    materials.select_remotes_dir(opts.remotes_dir.as_ref(), opts.default_remotes_dir.as_ref())
 }
 
 /// Makes sure that the repository layout and the config exist, then gathers
@@ -1027,13 +1153,13 @@ fn create_materials<Fd: AsFd>(dir: Fd, path: &Path, opts: &CreateOptions) -> Res
         mkdir_idempotent(&repo_fd, Path::new(sub), opts.mode)?;
     }
     write_initial_config(&repo_fd, &config)?;
-    Ok(materials_from_repo(repo_fd, false)?)
+    materials_from_repo(repo_fd, false)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
 }
 
-/// Opens the `objects/` directory and reads the config, given the descriptor
-/// of the repository root. In the strict open mode, the open of `objects/`
-/// follows no symlink.
-fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> std::io::Result<Materials> {
+/// Opens the `objects/` directory and reads and parses the config, given the
+/// descriptor of the repository root. In the strict open mode, the open of
+/// `objects/` follows no symlink. The materials have no remotes directory.
+fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> Result<Materials> {
     let objects_fd = match strict {
         true => rustix::fs::openat(
             &repo_fd,
@@ -1043,11 +1169,12 @@ fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> std::io::Result<Materi
         )?,
         false => open_dir(&repo_fd, Path::new("objects"))?,
     };
-    let config = read_file(&repo_fd, CONFIG, strict)?;
+    let config = parse_config(&read_file(&repo_fd, CONFIG, strict)?)?;
     Ok(Materials {
         repo_fd,
         objects_fd,
         config,
+        remotes_dir: None,
         strict,
     })
 }
@@ -1129,20 +1256,6 @@ fn initial_config_text(opts: &CreateOptions) -> Result<String> {
         text.push_str(&group);
     }
     Ok(text)
-}
-
-/// Refuses a remotes directory value that a create does not take: the
-/// refusals of the open, and a path that is not valid UTF-8, because `config`
-/// is UTF-8.
-fn check_create_remotes_dir(dir: Option<&RemotesDir>) -> Result<()> {
-    let Some(dir) = dir else {
-        return Ok(());
-    };
-    dir.check()?;
-    match dir {
-        RemotesDir::Path(path) | RemotesDir::InRepo(path) => utf8_key_value(path).map(drop),
-        RemotesDir::Fd(_) => Ok(()),
-    }
 }
 
 /// Returns `path` as the UTF-8 text of the key `remotes-config-dir`, or

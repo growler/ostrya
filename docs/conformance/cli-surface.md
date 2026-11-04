@@ -6393,6 +6393,20 @@ Observed by running the tool (2026.1).
   and at each later read of the file. The tool reads a `config` of any size.
   The cap bounds the memory of a read of `config` (`../../CLAUDE.md`,
   "Working conventions").
+- At each open of a repository, the port reads the `.conf` files of the
+  remotes directory that `[ex-ostrya] remotes-config-dir` names. The tool
+  ignores the key. The port reads at most 1048576 bytes of each file, and
+  refuses a larger file at the open. The tool reads a larger file: a file of
+  2,204,430 bytes opens. The port refuses a file whose name or content is not
+  valid UTF-8 at the open. The tool opens a repository with a value that is
+  not valid UTF-8, and fails only a command that reads that value. It skips a
+  group whose name is not valid UTF-8 with no message.
+- With no `--repo`, a current directory or an `OSTREE_REPO` path whose open
+  fails on its remotes directory does not open. The resolution then passes
+  over it with no message, as it passes over a directory whose `config` does
+  not parse. Examples are an empty `[ex-ostrya] remotes-config-dir`, a `.conf`
+  file that is not a valid key file, and a remote name in two sources. With
+  an explicit `--repo`, the command reports the error of the open.
 - Every subcommand that opens a transaction reaps `tmp/`, in the port and in
   the tool. Both skip `cache`, and both remove an entry that is not a staging
   entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole

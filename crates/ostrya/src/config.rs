@@ -1,9 +1,14 @@
 //! The typed view of the repository `config` file.
 //!
 //! - [`RepoConfig`] reads the keys of the repository groups.
-//! - [`Remote`] reads the keys of one `[remote "<name>"]` section.
+//! - [`Remote`] reads the keys of one `[remote "<name>"]` section, of
+//!   `config` or of a `.conf` file of the remotes directory.
+//! - [`RemoteSource`] names the file that holds a remote.
 //! - [`Repo::write_config`] writes an edited config back to the repository.
 //! - [`valid_remote_name`] checks a remote name.
+
+use std::collections::HashMap;
+use std::path::Path;
 
 use ostrya_core::{KeyFile, RepoMode};
 
@@ -25,6 +30,12 @@ const CONFIG_FILE: &str = "config";
 ///
 /// The type holds the [`KeyFile`] parsed from `<repo>/config`. It reads the
 /// values with the conventions of the `ostree` command.
+///
+/// The type also holds the `[remote "<name>"]` groups of the `.conf` files of
+/// the remotes directory of the handle, [`Repo::remotes_dir`]. The open reads
+/// these files with `config`. [`remotes`](RepoConfig::remotes) and
+/// [`remote`](RepoConfig::remote) give the remotes of both sources.
+/// [`keyfile`](RepoConfig::keyfile) gives `config` alone.
 ///
 /// # Groups
 ///
@@ -62,6 +73,25 @@ pub struct RepoConfig {
     repo_version: i64,
     collection_id: Option<String>,
     remotes: Vec<String>,
+    remote_files: Vec<RemoteFile>,
+}
+
+/// A `.conf` file of the remotes directory: its name in the directory and its
+/// parsed text.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteFile {
+    pub(crate) name: String,
+    pub(crate) keyfile: KeyFile,
+}
+
+/// The file that holds a remote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RemoteSource<'a> {
+    /// The `config` file of the repository.
+    Config,
+    /// A `.conf` file of the remotes directory, by its name in that
+    /// directory, for example `origin.conf`.
+    File(&'a str),
 }
 
 /// The minimum free space that a write must leave.
@@ -221,7 +251,50 @@ impl RepoConfig {
             repo_version,
             collection_id,
             remotes,
+            remote_files: Vec::new(),
         })
+    }
+
+    /// Adds the remotes of the `.conf` files of the remotes directory, in the
+    /// order of `files`. The read gives the files in the byte order of their
+    /// names. The call takes the `[remote "<name>"]` groups of each file and
+    /// ignores each other group.
+    ///
+    /// `base` is the path that names the directory in an error message. A
+    /// file is `base` joined with its name.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] if two sources define one remote name.
+    pub(crate) fn with_remote_files(
+        mut self,
+        base: &Path,
+        files: Vec<RemoteFile>,
+    ) -> Result<RepoConfig> {
+        let mut seen: HashMap<String, Option<usize>> = self
+            .remotes
+            .iter()
+            .map(|name| (name.clone(), None))
+            .collect();
+        for (index, file) in files.iter().enumerate() {
+            // A repeated group header merges into one group during parsing,
+            // so one file gives each name once.
+            for name in file.keyfile.groups().filter_map(remote_group_name) {
+                if let Some(other) = seen.insert(name.to_owned(), Some(index)) {
+                    let other = match other {
+                        None => CONFIG_FILE.to_owned(),
+                        Some(other) => base.join(&files[other].name).display().to_string(),
+                    };
+                    return Err(Error::InvalidFormat(format!(
+                        "remote \"{name}\" is defined in {other} and in {}",
+                        base.join(&file.name).display()
+                    )));
+                }
+                self.remotes.push(name.to_owned());
+            }
+        }
+        self.remote_files = files;
+        Ok(self)
     }
 
     /// Parses a config from its text.
@@ -251,15 +324,36 @@ impl RepoConfig {
         self.collection_id.as_deref()
     }
 
-    /// Returns the names of the remotes, in the order of their sections.
+    /// Returns the names of the remotes.
+    ///
+    /// The names of `config` come first, in the order of their sections.
+    /// Then come the names of each `.conf` file of the remotes directory, in
+    /// the byte order of the file names, and in the order of the sections of
+    /// each file.
     pub fn remotes(&self) -> impl Iterator<Item = &str> {
         self.remotes.iter().map(String::as_str)
     }
 
-    /// Returns the accessor of one remote, or `None` if the section does not
-    /// exist.
+    /// Returns the accessor of one remote, or `None` if no source has its
+    /// section.
+    ///
+    /// [`Remote::source`] gives the file that holds the section.
     pub fn remote(&self, name: &str) -> Option<Remote<'_>> {
-        Remote::in_keyfile(&self.keyfile, name)
+        let group = remote_group(name);
+        let (keyfile, source) = if self.keyfile.has_group(&group) {
+            (&self.keyfile, RemoteSource::Config)
+        } else {
+            let file = self
+                .remote_files
+                .iter()
+                .find(|file| file.keyfile.has_group(&group))?;
+            (&file.keyfile, RemoteSource::File(&file.name))
+        };
+        Some(Remote {
+            keyfile,
+            group,
+            source,
+        })
     }
 
     /// Returns `true` if `[core] fsync` is on.
@@ -562,15 +656,17 @@ impl RepoConfig {
         }
     }
 
-    /// Returns the parsed key file of this view.
+    /// Returns the parsed key file of `config`.
     ///
     /// A caller can read the keys that this type does not model. The key file
     /// keeps the order of the source text when it writes the config again.
+    /// The key file holds no group of the `.conf` files of the remotes
+    /// directory.
     pub fn keyfile(&self) -> &KeyFile {
         &self.keyfile
     }
 
-    /// Returns the parsed key file of this view by value.
+    /// Returns the parsed key file of `config` by value.
     pub(crate) fn into_keyfile(self) -> KeyFile {
         self.keyfile
     }
@@ -685,23 +781,25 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 pub struct Remote<'a> {
     keyfile: &'a KeyFile,
     group: String,
+    source: RemoteSource<'a>,
 }
 
 impl<'a> Remote<'a> {
-    /// Returns the `[remote "<name>"]` section of `keyfile`, or `None` if the
-    /// section does not exist.
-    pub(crate) fn in_keyfile(keyfile: &'a KeyFile, name: &str) -> Option<Remote<'a>> {
-        let group = remote_group(name);
-        keyfile
-            .has_group(&group)
-            .then_some(Remote { keyfile, group })
-    }
-
     /// Returns the accessors of a remote section over another group of
     /// `keyfile`. The group takes the key names and the value forms of a
     /// remote section.
     pub(crate) fn view(keyfile: &'a KeyFile, group: String) -> Remote<'a> {
-        Remote { keyfile, group }
+        Remote {
+            keyfile,
+            group,
+            source: RemoteSource::Config,
+        }
+    }
+
+    /// Returns the file that holds the section: `config`, or a `.conf` file
+    /// of the remotes directory.
+    pub fn source(&self) -> RemoteSource<'a> {
+        self.source
     }
 }
 
@@ -1489,6 +1587,139 @@ mod tests {
         );
 
         assert!(cfg.remote("absent").is_none());
+    }
+
+    /// Returns a remote file `name` with the text `text`.
+    fn remote_file(name: &str, text: &str) -> RemoteFile {
+        RemoteFile {
+            name: name.to_owned(),
+            keyfile: KeyFile::parse(text).unwrap(),
+        }
+    }
+
+    /// The config with the remote `origin` and the remote files `a.conf` and
+    /// `b.conf` under the directory `/etc/r.d`.
+    fn config_with_files() -> RepoConfig {
+        let text = format!("{ARCHIVE_CONFIG}\n[remote \"origin\"]\nurl=https://o\n");
+        RepoConfig::parse(&text)
+            .unwrap()
+            .with_remote_files(
+                Path::new("/etc/r.d"),
+                vec![
+                    remote_file(
+                        "a.conf",
+                        "[remote \"z\"]\nurl=https://z\n\n[remote \"y\"]\nurl=https://y\n",
+                    ),
+                    remote_file("b.conf", "[remote \"x\"]\nurl=https://x\n"),
+                ],
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn remotes_list_config_first_then_each_file_in_group_order() {
+        let cfg = config_with_files();
+        assert_eq!(cfg.remotes().collect::<Vec<_>>(), ["origin", "z", "y", "x"]);
+        assert_eq!(
+            cfg.remote("y").unwrap().url().unwrap().as_deref(),
+            Some("https://y")
+        );
+    }
+
+    #[test]
+    fn remote_source_is_config_or_the_file_name() {
+        let cfg = config_with_files();
+        assert_eq!(cfg.remote("origin").unwrap().source(), RemoteSource::Config);
+        assert_eq!(
+            cfg.remote("z").unwrap().source(),
+            RemoteSource::File("a.conf")
+        );
+        assert_eq!(
+            cfg.remote("x").unwrap().source(),
+            RemoteSource::File("b.conf")
+        );
+        assert!(cfg.remote("absent").is_none());
+    }
+
+    #[test]
+    fn a_name_in_two_sources_is_refused() {
+        let text = format!("{ARCHIVE_CONFIG}\n[remote \"origin\"]\nurl=https://o\n");
+        let base = Path::new("/etc/r.d");
+        let err = RepoConfig::parse(&text)
+            .unwrap()
+            .with_remote_files(
+                base,
+                vec![remote_file(
+                    "o.conf",
+                    "[remote \"origin\"]\nurl=https://f\n",
+                )],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m == "remote \"origin\" is defined in config and in /etc/r.d/o.conf"),
+            "{err}"
+        );
+        let err = RepoConfig::parse(ARCHIVE_CONFIG)
+            .unwrap()
+            .with_remote_files(
+                base,
+                vec![
+                    remote_file("a.conf", "[remote \"x\"]\nurl=https://a\n"),
+                    remote_file("b.conf", "[remote \"x\"]\nurl=https://b\n"),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m == "remote \"x\" is defined in /etc/r.d/a.conf and in /etc/r.d/b.conf"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn two_groups_of_one_name_in_one_file_give_one_remote() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG)
+            .unwrap()
+            .with_remote_files(
+                Path::new("r.d"),
+                vec![remote_file(
+                    "a.conf",
+                    "[remote \"x\"]\nurl=https://1\nbranches=main;\n\n\
+                     [remote \"x\"]\nurl=https://2\n",
+                )],
+            )
+            .unwrap();
+        assert_eq!(cfg.remotes().collect::<Vec<_>>(), ["x"]);
+        let remote = cfg.remote("x").unwrap();
+        assert_eq!(remote.url().unwrap().as_deref(), Some("https://2"));
+        assert_eq!(remote.keys().collect::<Vec<_>>(), ["url", "branches"]);
+    }
+
+    #[test]
+    fn a_file_skips_groups_that_are_not_remotes() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG)
+            .unwrap()
+            .with_remote_files(
+                Path::new("r.d"),
+                vec![remote_file(
+                    "a.conf",
+                    "[core]\nfsync=false\n\n[ex-ostrya]\nremotes-config-dir=x\n\n\
+                     [remote \"x\"]\nurl=https://x\n",
+                )],
+            )
+            .unwrap();
+        assert_eq!(cfg.remotes().collect::<Vec<_>>(), ["x"]);
+        assert!(cfg.fsync().unwrap());
+        assert!(!cfg.keyfile().has_group("ex-ostrya"));
+    }
+
+    #[test]
+    fn from_keyfile_and_parse_have_no_remote_files() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
+        assert!(cfg.remote_files.is_empty());
+        let cfg = RepoConfig::from_keyfile(KeyFile::parse(ARCHIVE_CONFIG).unwrap()).unwrap();
+        assert!(cfg.remote_files.is_empty());
     }
 
     /// The verification keys a pull reads its policy from: the two sign-api

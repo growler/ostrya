@@ -126,6 +126,7 @@ The configuration file, in the key file format.
 A new repository gets the group \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode\fR, and the optional \fB\%collection\-id\fR.
 A create through the ostrya library with a remotes directory also writes the key \fB\%remotes\-config\-dir\fR in the group \fB\%[ex\-ostrya]\fR.
 \fB\%ostrya init\fR does not write it.
+The key names the remotes directory that each open reads.
 \fB\%ostrya\-config\fR(1) lists the keys.
 .TP
 \fB\%<repo>/.lock\fR
@@ -459,6 +460,13 @@ The \fB\%ostree\fR tool keeps the extension keys when it writes \fB\%config\fR, 
 ostrya does not write these entries of the ostree layout: \fB\%tmp/cache/summaries/\fR, \fB\%uncompressed\-objects\-cache/\fR, \fB\%.payload\-link\fR objects, and \fB\%remotes.d/\fR configuration files.
 .SH FILES
 ostrya also reads these files outside the repository:
+.TP
+\fB\%<remotes\-dir>/*.conf\fR
+The remotes of the remotes directory of the repository.
+The key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR in \fB\%config\fR names it, or a program gives it through the ostrya library.
+A relative value names a directory in the repository directory.
+Each open of the repository reads each file, and refuses a file larger than 1 MiB.
+\fB\%ostrya\-config\fR(1), "Remotes directory", gives the rules of the read.
 .TP
 \fB\%/etc/ostree/remotes.d/<remote>.trustedkeys.gpg\fR
 The system keyring of the remote \fB\%<remote>\fR.

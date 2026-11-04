@@ -409,6 +409,21 @@ policy give each verdict.
 The GPG verifier verifies in the call to `Verifier::verify`, as the other
 verifiers do, and the caller selects the thread.
 
+`GpgVerifier::with_ignore_time` turns off the time checks of the GPG
+verifier. With the option, no expiry makes a signature invalid: the expiry of
+the data signature, the key expiry, and the expiry of a self-signature. A
+revocation still makes a signature invalid. The record still reports the
+expiry fields. Their values come from the certificate as the option reads it,
+with expired self-signatures in effect, and from the clock. The reason is a
+trust store that is written one time and not updated, for example the trust
+files of a sealed boot image. A key renewal cannot get into such a store, and
+the clock at an early boot stage can be wrong. A fixed instant in place of the
+clock was rejected. A key that expired before that instant is still refused,
+and the store has no instant to give. The tests compare the verdict without
+the option with `gpgv`. The tests with the option set use fixed expected
+values, because `gpgv` has no such option to compare with. The option is on the
+verifier alone. The keyring import applies the time checks at the clock.
+
 The GPG verifier, the parse of a keyring, the key listing, and the keyring
 merge of an import are in `ostrya-sign`, next to the GPG signer, under the
 feature `gpg`. So one crate parses OpenPGP, and a build with `gpg` holds no

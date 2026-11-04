@@ -124,9 +124,14 @@ pub struct SignatureInfo {
     /// The expiry time of the signing key in seconds since the Unix epoch.
     ///
     /// An engine sets the value only if the key has an expiry time and this time
-    /// is in the past.
+    /// is in the past. A verifier that skips the time checks also sets the
+    /// value for a valid signature, as `GpgVerifier::with_ignore_time` states.
     pub key_expires: Option<u64>,
     /// `true` if the signing key is expired.
+    ///
+    /// An expired key makes the signature not valid, except in a verifier that
+    /// skips the time checks (`GpgVerifier::with_ignore_time`). There, the
+    /// field can be `true` for a valid signature.
     pub expired: bool,
     /// `true` if the signing key is revoked.
     pub revoked: bool,

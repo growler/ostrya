@@ -6,7 +6,8 @@
 //! [`GpgVerifier`](super::GpgVerifier) loaded, the signed payload, and the
 //! `aay` blobs stored under `ostree.gpgsigs`. It reports one [`SignatureInfo`]
 //! for each signature packet. The `GpgVerifier` type doc states the rules that
-//! a caller sees, under `# Verdict` and `# Limits of a stored blob`.
+//! a caller sees, under `# Verdict`, `# Time checks`, and
+//! `# Limits of a stored blob`.
 //!
 //! The engine also owns the trust and validity policy:
 //!
@@ -49,14 +50,23 @@ const MAX_SIGNATURE_PACKETS: usize = 64;
 /// [`Verifier::verify`](crate::Verifier::verify) for
 /// [`GpgVerifier`](super::GpgVerifier) calls this function, and its caller
 /// selects the thread.
+///
+/// `rule` gives the clock, and states if the time checks apply.
 pub(super) fn verify_signatures(
     certs: &[SignedPublicKey],
     payload: &[u8],
     blobs: &[Vec<u8>],
+    rule: TimeRule,
 ) -> Result<VerifyOutcome> {
     let mut outcome = VerifyOutcome::default();
     for (index, blob) in blobs.iter().enumerate() {
-        let infos = verify_blob(certs, payload, blob, &format!("the signature blob {index}"))?;
+        let infos = verify_blob(
+            certs,
+            payload,
+            blob,
+            &format!("the signature blob {index}"),
+            rule,
+        )?;
         if infos.is_empty() {
             outcome.signatures.push(SignatureInfo::default());
         } else {
@@ -85,6 +95,7 @@ fn verify_blob(
     payload: &[u8],
     blob: &[u8],
     subject: &str,
+    rule: TimeRule,
 ) -> Result<Vec<SignatureInfo>> {
     if blob.len() > MAX_SIGNATURE_BLOB {
         return Err(Error::Signature(format!(
@@ -113,7 +124,7 @@ fn verify_blob(
                     "{subject} holds more than {MAX_SIGNATURE_PACKETS} signature packets"
                 )));
             }
-            infos.push(describe(certs, payload, &signature));
+            infos.push(describe(certs, payload, &signature, rule));
         }
         Ok(infos)
     };
@@ -145,6 +156,7 @@ fn describe(
     certs: &[SignedPublicKey],
     payload: &[u8],
     signature: &DetachedSignature,
+    rule: TimeRule,
 ) -> SignatureInfo {
     let sig = &signature.signature;
     let mut info = SignatureInfo::default();
@@ -154,7 +166,7 @@ fn describe(
     // names the digest as the cause only if the issuer resolved. No later rule
     // can make such a record valid. So a refused digest and a refused class
     // stay refused on every path.
-    let Some(issuers) = resolve_issuers(certs, sig) else {
+    let Some(issuers) = resolve_issuers(certs, sig, rule) else {
         info.key_missing = true;
         describe_packet(&mut info, sig);
         return info;
@@ -188,7 +200,7 @@ fn describe(
         describe_packet(&mut info, sig);
         return info;
     }
-    let (user_name, user_email) = reported_user_id(issuer.cert);
+    let (user_name, user_email) = reported_user_id(issuer.cert, rule);
     info.user_name = user_name;
     info.user_email = user_email;
     // The record names the signing key that the lookup resolved, and the
@@ -214,7 +226,6 @@ fn describe(
     info.expires = expires_at(sig);
     info.pubkey_algorithm = pubkey_algorithm_name(sig);
     info.hash_algorithm = hash_algorithm_name(sig);
-    let now = now();
     // `gpgv` reports an expired key as `EXPKEYSIG` with `KEYEXPIRED <instant>`.
     // It reports a revoked key as `REVKEYSIG`. In both cases it prints the
     // `VALIDSIG` detail line, so both records carry the fields set so far.
@@ -224,8 +235,8 @@ fn describe(
     // second. In a poll of each second across the expiry instant, `gpgv`
     // reports `GOODSIG` through that instant and `EXPKEYSIG` from the next
     // second.
-    let key_expires = issuers.key_expires_at();
-    if key_expires.is_some_and(|instant| instant < now) {
+    let key_expires = issuers.key_expires_at(rule);
+    if key_expires.is_some_and(|instant| instant < rule.now) {
         info.expired = true;
         info.key_expires = key_expires;
     }
@@ -235,8 +246,14 @@ fn describe(
     // more about it. The signature expires at the instant that it names. In a
     // poll of each second across that instant, `gpgv` reports `GOODSIG`
     // through the second before it, and `EXPSIG` from the instant on.
-    let signature_expired = info.expires.is_some_and(|instant| instant <= now);
-    info.valid = !signature_expired && !info.expired && !info.revoked;
+    //
+    // If the rule ignores the time, the record keeps `expired`, `key_expires`,
+    // and `expires`, and no expiry refuses the signature. A revocation still
+    // refuses it. With the time checks on, the verdict is the same as the
+    // verdict of `gpgv`.
+    let signature_expired = info.expires.is_some_and(|instant| instant <= rule.now);
+    let time_refused = !rule.ignore && (signature_expired || info.expired);
+    info.valid = !time_refused && !info.revoked;
     info
 }
 
@@ -284,6 +301,28 @@ fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())
+}
+
+/// The time rule of one verify call: the clock instant, and the state of the
+/// time checks.
+///
+/// A verify call reads the clock one time and gives the rule to each check.
+/// So two checks of one call cannot read two instants. The keyring import
+/// reads the clock with the time checks on.
+#[derive(Clone, Copy)]
+pub(super) struct TimeRule {
+    /// The clock, in seconds since the Unix epoch.
+    now: u64,
+    /// `true` if no expiry refuses a signature or a self-signature.
+    ignore: bool,
+}
+
+impl TimeRule {
+    /// Returns the rule at the clock. If `ignore` is `true`, the time checks
+    /// are off.
+    pub(super) fn clock(ignore: bool) -> TimeRule {
+        TimeRule { now: now(), ignore }
+    }
 }
 
 /// The key that a signature names as its issuer: a certificate, and the
@@ -447,8 +486,11 @@ impl<'a> Issuers<'a> {
     ///
     /// A group that states no expiry adds nothing here. It does not extend a
     /// life that another group limits.
-    fn key_expires_at(&self) -> Option<u64> {
-        self.groups().iter().filter_map(Group::key_expires_at).min()
+    fn key_expires_at(&self, rule: TimeRule) -> Option<u64> {
+        self.groups()
+            .iter()
+            .filter_map(|group| group.key_expires_at(rule))
+            .min()
     }
 
     /// Returns the matches as merged certificates.
@@ -527,13 +569,13 @@ impl Group<'_> {
     ///
     /// This is the earliest instant that its matches state. It is `None` if no
     /// match states an instant.
-    fn key_expires_at(&self) -> Option<u64> {
-        let primary = key_expiry_over(self.copies.iter().copied());
+    fn key_expires_at(&self, rule: TimeRule) -> Option<u64> {
+        let primary = key_expiry_over(self.copies.iter().copied(), rule);
         self.matched
             .iter()
             .filter_map(|issuer| match issuer.subkey {
                 None => primary,
-                Some((subkey, _)) => earlier(primary, self.subkey_expires_at(subkey)),
+                Some((subkey, _)) => earlier(primary, self.subkey_expires_at(subkey, rule)),
             })
             .min()
     }
@@ -543,7 +585,7 @@ impl Group<'_> {
     /// The instant is the creation time of the subkey plus a lifetime. The
     /// lifetime comes from the binding signature that [`verified_binding`]
     /// selects, from the bindings for that subkey in every copy.
-    fn subkey_expires_at(&self, subkey: &SignedPublicSubKey) -> Option<u64> {
+    fn subkey_expires_at(&self, subkey: &SignedPublicSubKey, rule: TimeRule) -> Option<u64> {
         let wanted = subkey.fingerprint();
         let bindings = self
             .copies
@@ -551,7 +593,10 @@ impl Group<'_> {
             .flat_map(|cert| &cert.public_subkeys)
             .filter(|held| held.fingerprint() == wanted)
             .flat_map(|held| &held.signatures);
-        let lifetime = key_lifetime(verified_binding(self.primary_key(), subkey, bindings)?)?;
+        let lifetime = key_lifetime(
+            verified_binding(self.primary_key(), subkey, bindings, rule)?,
+            rule,
+        )?;
         Some(u64::from(subkey.key.created_at().as_secs()) + lifetime)
     }
 
@@ -583,11 +628,16 @@ fn earlier(one: Option<u64>, two: Option<u64>) -> Option<u64> {
 ///
 /// - a subkey whose binding does not verify, for example a subkey taken from
 ///   another certificate with the binding that it carried there
-/// - a subkey whose binding signatures all expired.
+/// - a subkey whose binding signatures all expired, if `rule` applies the
+///   time checks.
 ///
 /// `gpgv` gives the same answer. For a signature by such a subkey, it reports
 /// `ERRSIG ... 9` and `NO_PUBKEY`.
-fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<Issuers<'a>> {
+fn resolve_issuers<'a>(
+    certs: &'a [SignedPublicKey],
+    sig: &Signature,
+    rule: TimeRule,
+) -> Option<Issuers<'a>> {
     for wanted in sig.issuer_fingerprint() {
         let mut matched: Vec<Issuer<'a>> = Vec::new();
         for cert in certs {
@@ -597,7 +647,7 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             for subkey in &cert.public_subkeys {
                 if &subkey.fingerprint() == wanted
                     && let Some(binding) =
-                        verified_binding(&cert.primary_key, subkey, &subkey.signatures)
+                        verified_binding(&cert.primary_key, subkey, &subkey.signatures, rule)
                 {
                     matched.push(Issuer {
                         cert,
@@ -622,7 +672,7 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
             for subkey in &cert.public_subkeys {
                 if &subkey.legacy_key_id() == wanted
                     && let Some(binding) =
-                        verified_binding(&cert.primary_key, subkey, &subkey.signatures)
+                        verified_binding(&cert.primary_key, subkey, &subkey.signatures, rule)
                 {
                     matched.push(Issuer {
                         cert,
@@ -642,14 +692,16 @@ fn resolve_issuers<'a>(certs: &'a [SignedPublicKey], sig: &Signature) -> Option<
 }
 
 /// Returns the newest binding signature in `signatures` that `primary` made
-/// over `subkey`, that verifies, and that is not expired.
+/// over `subkey`, that verifies, and that is not expired if `rule` applies the
+/// time checks.
 ///
 /// There are two sources of signatures. One is the signatures that a subkey
 /// carries. The other is the bindings over that subkey in every copy of one
 /// certificate. So the caller gives the set for the rule.
 ///
-/// A binding signature after its own expiration time binds nothing. A live
-/// older binding next to it still binds. `gpgv` 2.4.9 gives the same answers:
+/// If `rule` applies the time checks, a binding signature after its own
+/// expiration time binds nothing. A live older binding next to it still binds.
+/// `gpgv` 2.4.9 gives the same answers:
 ///
 /// - The certificate has one binding signature, with signature subpacket 3 at
 ///   an instant in the past. For a signature by that subkey, `gpgv` reports
@@ -662,6 +714,7 @@ fn verified_binding<'a, I>(
     primary: &PublicKey,
     subkey: &SignedPublicSubKey,
     signatures: I,
+    rule: TimeRule,
 ) -> Option<&'a Signature>
 where
     I: IntoIterator<Item = &'a Signature>,
@@ -670,7 +723,7 @@ where
         .into_iter()
         .filter(|sig| {
             sig.typ() == Some(SignatureType::SubkeyBinding)
-                && !signature_expired(sig)
+                && !signature_expired(sig, rule)
                 && sig.verify_subkey_binding(primary, &subkey.key).is_ok()
         })
         .max_by_key(|sig| created_secs(sig))
@@ -686,8 +739,9 @@ where
 /// Every copy states one primary key, which is the key that the caller grouped
 /// them by. So the first copy gives the key. The verdict reads a match group
 /// through this function. The keyring import reads the copies of one key in a
-/// keyring through it. So the two use the same signature.
-pub(super) fn key_expiry_over<'a, I>(copies: I) -> Option<u64>
+/// keyring through it. So with the same `rule`, the two use the same
+/// signature.
+pub(super) fn key_expiry_over<'a, I>(copies: I, rule: TimeRule) -> Option<u64>
 where
     I: IntoIterator<Item = &'a SignedPublicKey> + Clone,
 {
@@ -699,6 +753,7 @@ where
             .into_iter()
             .flat_map(|cert| &cert.details.direct_signatures),
         copies.into_iter().flat_map(|cert| &cert.details.users),
+        rule,
     )?;
     Some(u64::from(primary.created_at().as_secs()) + lifetime)
 }
@@ -746,16 +801,22 @@ where
 ///
 /// # Expired self-signatures
 ///
-/// A self-signature after its own expiration time states no lifetime (see
-/// [`key_lifetime`]). The two tiers apply this rule differently. `gpgv` 2.4.9
-/// gives the same answers in both tiers:
+/// If `rule` applies the time checks, a self-signature after its own
+/// expiration time states no lifetime (see [`key_lifetime`]). The two tiers
+/// apply this rule differently. `gpgv` 2.4.9 gives the same answers in both
+/// tiers:
 ///
 /// - The direct-key tier skips such a signature. The newest live one that
 ///   states a lifetime answers. If all direct-key self-signatures are
 ///   expired, the certification tier answers.
 /// - In the certification tier, the newest one answers, also if it is
 ///   expired. So an expired newest one makes the tier state nothing.
-fn primary_key_lifetime<'a, D, U>(primary: &PublicKey, direct: D, users: U) -> Option<u64>
+fn primary_key_lifetime<'a, D, U>(
+    primary: &PublicKey,
+    direct: D,
+    users: U,
+    rule: TimeRule,
+) -> Option<u64>
 where
     D: IntoIterator<Item = &'a Signature>,
     U: IntoIterator<Item = &'a SignedUser>,
@@ -763,7 +824,7 @@ where
     let newest = direct
         .into_iter()
         .filter(|sig| sig.typ() == Some(SignatureType::Key) && sig.verify_key(primary).is_ok())
-        .filter_map(|sig| Some((created_secs(sig), key_lifetime(sig)?)))
+        .filter_map(|sig| Some((created_secs(sig), key_lifetime(sig, rule)?)))
         .max_by_key(|(created, _)| *created);
     if let Some((_, lifetime)) = newest {
         return Some(lifetime);
@@ -778,7 +839,7 @@ where
                     .is_ok()
         })
         .max_by_key(|(_, sig)| created_secs(sig))
-        .and_then(|(_, sig)| key_lifetime(sig))
+        .and_then(|(_, sig)| key_lifetime(sig, rule))
 }
 
 /// Returns `true` if a signature is a certification over a user id.
@@ -804,10 +865,10 @@ fn is_certification(sig: &Signature) -> bool {
 /// A zero lifetime means no expiry, so it reads as absent. A zero `gpgv` status
 /// field has the same meaning.
 ///
-/// A self-signature after its own expiration time states no lifetime. `gpgv`
-/// 2.4.9 gives the same answer. The measurement used a certificate whose newest
-/// certification self-signature carries signature subpacket 3 with an instant
-/// in the past:
+/// If `rule` applies the time checks, a self-signature after its own
+/// expiration time states no lifetime. `gpgv` 2.4.9 gives the same answer. The
+/// measurement used a certificate whose newest certification self-signature
+/// carries signature subpacket 3 with an instant in the past:
 ///
 /// - If that signature states a one-day key lifetime and an older
 ///   certification self-signature states ten years, `gpgv` reports `GOODSIG`.
@@ -825,23 +886,27 @@ fn is_certification(sig: &Signature) -> bool {
 /// - A live older direct-key self-signature that states ten years is next to
 ///   it. `gpgv` reports `GOODSIG`. So the direct-key tier reads the newest one
 ///   that states a lifetime, and the expired one states none.
-fn key_lifetime(sig: &Signature) -> Option<u64> {
-    if signature_expired(sig) {
+fn key_lifetime(sig: &Signature, rule: TimeRule) -> Option<u64> {
+    if signature_expired(sig, rule) {
         return None;
     }
     epoch(sig.key_expiration_time()?.as_secs())
 }
 
-/// Returns `true` if the time is at or after the expiration time of the
-/// signature itself.
+/// Returns `true` if `rule` applies the time checks and the instant of `rule`
+/// is at or after the expiration time of the signature itself.
 ///
 /// A signature expires at the instant that it names. [`describe`] applies this
 /// boundary to a data signature, with the measurement of `gpgv` in its body.
 /// Signature subpacket 3 is the same field on a
 /// self-signature, so one boundary applies to both. The boundary second on a
 /// self-signature is not measured.
-fn signature_expired(sig: &Signature) -> bool {
-    expires_at(sig).is_some_and(|instant| instant <= now())
+///
+/// If `rule` ignores the time, no signature is expired. So each rule that
+/// reads this function reads a self-signature after its own expiry as a live
+/// one.
+fn signature_expired(sig: &Signature, rule: TimeRule) -> bool {
+    !rule.ignore && expires_at(sig).is_some_and(|instant| instant <= rule.now)
 }
 
 /// Returns `true` if a verified key revocation signature is over the primary
@@ -1103,7 +1168,7 @@ fn hash_algorithm_name(sig: &Signature) -> Option<String> {
 ///   self-signature.
 /// - The primary mark is on a self-signature that does not verify. `gpgv`
 ///   names the other user id.
-fn reported_user_id(cert: &SignedPublicKey) -> (Option<String>, Option<String>) {
+fn reported_user_id(cert: &SignedPublicKey, rule: TimeRule) -> (Option<String>, Option<String>) {
     let mut usable: Vec<&SignedUser> = cert
         .details
         .users
@@ -1116,12 +1181,12 @@ fn reported_user_id(cert: &SignedPublicKey) -> (Option<String>, Option<String>) 
     let user = usable
         .iter()
         .copied()
-        .find(|user| user_marked_primary(cert, user))
+        .find(|user| user_marked_primary(cert, user, rule))
         .or_else(|| {
             usable
                 .iter()
                 .copied()
-                .max_by_key(|user| newest_certification(cert, user))
+                .max_by_key(|user| newest_certification(cert, user, rule))
         });
     match user {
         Some(user) => split_uid(&String::from_utf8_lossy(user.id.id())),
@@ -1149,14 +1214,15 @@ fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
 }
 
 /// Returns the creation time of the newest certification over a user id that
-/// verifies under the primary key and is not expired.
+/// verifies under the primary key. If `rule` applies the time checks, the
+/// certification must also be live.
 ///
 /// A third-party certification and a packet that anyone stapled onto the
 /// certificate do not verify under that key. So neither ranks a user id. A
 /// user id with no such certification ranks at the epoch.
 ///
-/// A certification after its own expiration time ranks nothing. `gpgv` 2.4.9
-/// names the same user id:
+/// If `rule` applies the time checks, a certification after its own
+/// expiration time ranks nothing. `gpgv` 2.4.9 names the same user id:
 ///
 /// - The newest certification self-signature over one user id carries
 ///   signature subpacket 3 with an instant in the past. `gpgv` names the other
@@ -1167,13 +1233,13 @@ fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
 /// A certification that another signature revokes still ranks. The rule of
 /// `gpgv` for this case is not measured. The rule decides only the reported
 /// name.
-fn newest_certification(cert: &SignedPublicKey, user: &SignedUser) -> u32 {
+fn newest_certification(cert: &SignedPublicKey, user: &SignedUser, rule: TimeRule) -> u32 {
     let primary = &cert.primary_key;
     user.signatures
         .iter()
         .filter(|sig| {
             is_certification(sig)
-                && !signature_expired(sig)
+                && !signature_expired(sig, rule)
                 && sig
                     .verify_certification(primary, Tag::UserId, &user.id)
                     .is_ok()
@@ -1184,25 +1250,26 @@ fn newest_certification(cert: &SignedPublicKey, user: &SignedUser) -> u32 {
         .unwrap_or(0)
 }
 
-/// Returns `true` if a live certification that verifies under the primary key
-/// marks a user id primary.
+/// Returns `true` if a certification that verifies under the primary key marks
+/// a user id primary. If `rule` applies the time checks, the certification must
+/// also be live.
 ///
 /// A primary-user-id subpacket on a packet that the primary key did not make
 /// marks nothing. `gpgv` names the same user id. If the primary-marked
 /// self-signature of a certificate is altered, `gpgv` names the other user id.
 ///
-/// A certification after its own expiration time also marks nothing. `gpgv`
-/// 2.4.9 gives the same answer:
+/// If `rule` applies the time checks, a certification after its own expiration
+/// time also marks nothing. `gpgv` 2.4.9 gives the same answer:
 ///
 /// - The primary mark is on a self-signature with signature subpacket 3 at an
 ///   instant in the past. `gpgv` names the other user id.
 /// - The same signature without subpacket 3 makes `gpgv` name the marked one.
-fn user_marked_primary(cert: &SignedPublicKey, user: &SignedUser) -> bool {
+fn user_marked_primary(cert: &SignedPublicKey, user: &SignedUser, rule: TimeRule) -> bool {
     let primary = &cert.primary_key;
     user.signatures.iter().any(|sig| {
         sig.is_primary()
             && is_certification(sig)
-            && !signature_expired(sig)
+            && !signature_expired(sig, rule)
             && sig
                 .verify_certification(primary, Tag::UserId, &user.id)
                 .is_ok()
@@ -1223,6 +1290,7 @@ mod tests {
     use std::process::Command;
 
     use super::*;
+    use crate::Verifier;
     use crate::gpg::STATUS_PREFIX;
     use crate::gpg::verifier::{GpgVerifier, parse_epoch, remove_home_sockets, scratch_dir};
 
@@ -1230,6 +1298,16 @@ mod tests {
     const PAYLOAD: &[u8] = b"ostrya commit payload";
     /// A payload no fixture signs, for the changed-payload case.
     const OTHER_PAYLOAD: &[u8] = b"ostrya other payload";
+
+    /// Runs [`super::verify_signatures`] at the clock, with the time checks
+    /// on.
+    fn verify_signatures(
+        certs: &[SignedPublicKey],
+        payload: &[u8],
+        blobs: &[Vec<u8>],
+    ) -> Result<VerifyOutcome> {
+        super::verify_signatures(certs, payload, blobs, TimeRule::clock(false))
+    }
 
     /// Returns `true` if the named binary answers.
     ///
@@ -2682,12 +2760,12 @@ mod tests {
     /// Returns a subkey binding signature (type 0x18) that the primary key
     /// makes over the first subkey of the certificate.
     ///
-    /// The signature has the creation time `created`. It carries these items:
+    /// The signature has the creation time of `spec`. It carries these items:
     ///
     /// - the signing key flag
     /// - the back-signature that the subkey makes
-    /// - the signature lifetime `sig_lifetime`, if one is given
-    fn subkey_binding_signature(secret: &[u8], created: u64, sig_lifetime: Option<u64>) -> Vec<u8> {
+    /// - the key lifetime and the signature lifetime that `spec` states
+    fn subkey_binding_signature(secret: &[u8], spec: SelfSig) -> Vec<u8> {
         use pgp::packet::{KeyFlags, PacketTrait, SignatureConfig, Subpacket, SubpacketData};
         use pgp::types::Password;
 
@@ -2701,7 +2779,7 @@ mod tests {
             PublicKeyAlgorithm::EdDSALegacy,
             HashAlgorithm::Sha512,
         );
-        back.hashed_subpackets = self_signature_subpackets(SelfSig::at(created), &sub_public);
+        back.hashed_subpackets = self_signature_subpackets(SelfSig::at(spec.created), &sub_public);
         back.unhashed_subpackets = vec![
             Subpacket::regular(SubpacketData::IssuerKeyId(sub_public.legacy_key_id())).unwrap(),
         ];
@@ -2716,14 +2794,7 @@ mod tests {
             PublicKeyAlgorithm::EdDSALegacy,
             HashAlgorithm::Sha512,
         );
-        let spec = SelfSig::at(created);
-        config.hashed_subpackets = self_signature_subpackets(
-            match sig_lifetime {
-                Some(lifetime) => spec.expiring_after(lifetime),
-                None => spec,
-            },
-            &primary,
-        );
+        config.hashed_subpackets = self_signature_subpackets(spec, &primary);
         config
             .hashed_subpackets
             .push(Subpacket::regular(SubpacketData::KeyFlags(flags)).unwrap());
@@ -4485,7 +4556,7 @@ mod tests {
         // expiration time differs in the next case.
         let live = replace_subkey_binding(
             &home.keyring(),
-            &subkey_binding_signature(&secret, KEY_CREATED + 20, None),
+            &subkey_binding_signature(&secret, SelfSig::at(KEY_CREATED + 20)),
         );
         let certs = certs_of(&live);
         let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
@@ -4495,13 +4566,23 @@ mod tests {
         assert_agrees(&outcome.signatures[0], &reference[0]);
         assert!(outcome.signatures[0].valid);
         assert_eq!(outcome.signatures[0].fingerprint.as_deref(), Some(&*subkey));
-        assert!(resolve_issuers(&certs, &signature_of(&blob).signature).is_some());
+        assert!(
+            resolve_issuers(
+                &certs,
+                &signature_of(&blob).signature,
+                TimeRule::clock(false)
+            )
+            .is_some()
+        );
 
         // The same binding, expired. The subkey belongs to no loaded
         // certificate.
         let expired = replace_subkey_binding(
             &home.keyring(),
-            &subkey_binding_signature(&secret, KEY_CREATED + 20, Some(SPENT_LIFETIME)),
+            &subkey_binding_signature(
+                &secret,
+                SelfSig::at(KEY_CREATED + 20).expiring_after(SPENT_LIFETIME),
+            ),
         );
         let certs = certs_of(&expired);
         let outcome = verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&blob)).unwrap();
@@ -4519,13 +4600,23 @@ mod tests {
             "the fingerprint the signature packet names"
         );
         assert_eq!(info.user_name, None);
-        assert!(resolve_issuers(&certs, &signature_of(&blob).signature).is_none());
+        assert!(
+            resolve_issuers(
+                &certs,
+                &signature_of(&blob).signature,
+                TimeRule::clock(false)
+            )
+            .is_none()
+        );
 
         // The expired binding next to the live binding that `gpg` wrote. The
         // live binding binds, so one expired binding does not unbind a subkey.
         let both = append_packet(
             &home.keyring(),
-            &subkey_binding_signature(&secret, KEY_CREATED + 20, Some(SPENT_LIFETIME)),
+            &subkey_binding_signature(
+                &secret,
+                SelfSig::at(KEY_CREATED + 20).expiring_after(SPENT_LIFETIME),
+            ),
         );
         let outcome =
             verify_signatures(&certs_of(&both), PAYLOAD, std::slice::from_ref(&blob)).unwrap();
@@ -4607,6 +4698,318 @@ mod tests {
                 assert!(info.valid, "case {index}, expired {expired}");
             }
         }
+    }
+
+    /// Returns the one record that a verifier over `keyring` gives for `blob`
+    /// over [`PAYLOAD`], with the time checks off if `ignore_time` is `true`.
+    ///
+    /// The call goes through [`Verifier::verify`], so it reads the option of
+    /// the verifier. The verdict of the outcome is the verdict of the record.
+    fn record(keyring: &[u8], blob: &[u8], ignore_time: bool) -> SignatureInfo {
+        let mut outcome = GpgVerifier::from_keyring_bytes([keyring])
+            .unwrap()
+            .with_ignore_time(ignore_time)
+            .verify(PAYLOAD, &[blob.to_vec()])
+            .unwrap();
+        assert_eq!(outcome.signatures.len(), 1);
+        assert_eq!(outcome.valid, outcome.signatures[0].valid);
+        outcome.signatures.remove(0)
+    }
+
+    /// Asserts that two records state the same fields, except the verdict.
+    fn assert_same_but_valid(one: &SignatureInfo, two: &SignatureInfo) {
+        let mut one = one.clone();
+        one.valid = two.valid;
+        assert_agrees(&one, two);
+    }
+
+    /// With the time option, a signature by an expired primary key is valid.
+    /// The record still states the expired key and its expiry instant.
+    #[test]
+    fn the_time_option_accepts_a_signature_by_an_expired_key() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Iold <iold@ostrya.example>", "1d");
+        let keyring = home.keyring();
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert!(!clear.valid);
+        assert!(clear.expired);
+        assert_eq!(clear.key_expires, Some(KEY_CREATED + ONE_DAY));
+
+        let set = record(&keyring, &blob, true);
+        assert!(set.valid);
+        assert!(set.expired);
+        assert_eq!(set.key_expires, Some(KEY_CREATED + ONE_DAY));
+        assert!(!set.revoked);
+        assert_eq!(set.user_email.as_deref(), Some("iold@ostrya.example"));
+        assert_same_but_valid(&set, &clear);
+    }
+
+    /// With the time option, a signature by a signing subkey after the key
+    /// lifetime of its binding is valid. The record still states the expired
+    /// key and the expiry instant of the subkey.
+    #[test]
+    fn the_time_option_accepts_a_signature_by_an_expired_subkey() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Isub <isub@ostrya.example>", "never");
+        let subkey = home.add_signing_subkey_expiring("1d");
+        let keyring = home.keyring();
+        let blob = home.sign(&subkey, PAYLOAD);
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert!(!clear.valid);
+        assert!(clear.expired);
+        assert_eq!(clear.key_expires, Some(KEY_CREATED + ONE_DAY));
+        assert_eq!(clear.fingerprint.as_deref(), Some(&*subkey));
+
+        let set = record(&keyring, &blob, true);
+        assert!(set.valid);
+        assert!(set.expired);
+        assert_eq!(set.key_expires, Some(KEY_CREATED + ONE_DAY));
+        assert_eq!(set.fingerprint.as_deref(), Some(&*subkey));
+        assert_eq!(set.primary_fingerprint.as_deref(), Some(&*home.primary));
+        assert_same_but_valid(&set, &clear);
+    }
+
+    /// With the time option, a subkey binding signature after its own
+    /// expiration time binds the subkey. A signature of the subkey then
+    /// resolves to the certificate and is valid. A key lifetime that the
+    /// expired binding states sets the expiry of the subkey.
+    #[test]
+    fn the_time_option_binds_a_subkey_through_an_expired_binding() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Ibnd <ibnd@ostrya.example>", "never");
+        let subkey = home.add_signing_subkey();
+        let blob = home.sign(&subkey, PAYLOAD);
+        let spec = SelfSig::at(KEY_CREATED + 20).expiring_after(SPENT_LIFETIME);
+        let expired = replace_subkey_binding(
+            &home.keyring(),
+            &subkey_binding_signature(&home.secret_key(), spec),
+        );
+        let certs = certs_of(&expired);
+        let signature = signature_of(&blob).signature;
+        let reference = home.gpgv_records(&expired, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&expired, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert!(clear.key_missing);
+        assert!(!clear.valid);
+        assert_eq!(clear.user_name, None);
+        assert!(resolve_issuers(&certs, &signature, TimeRule::clock(false)).is_none());
+
+        let set = record(&expired, &blob, true);
+        assert!(!set.key_missing);
+        assert!(set.valid);
+        assert_eq!(set.fingerprint.as_deref(), Some(&*subkey));
+        assert_eq!(set.primary_fingerprint.as_deref(), Some(&*home.primary));
+        assert!(!set.expired);
+        assert_eq!(set.key_expires, None);
+        assert_eq!(set.user_email.as_deref(), Some("ibnd@ostrya.example"));
+        assert!(resolve_issuers(&certs, &signature, TimeRule::clock(true)).is_some());
+
+        // The same expired binding, which also states a key lifetime of one
+        // day. The lifetime counts from the creation of the subkey, which
+        // `gpg` made at `KEY_CREATED`.
+        let lifetime = replace_subkey_binding(
+            &home.keyring(),
+            &subkey_binding_signature(&home.secret_key(), spec.key_lifetime(Some(ONE_DAY))),
+        );
+        let reference = home.gpgv_records(&lifetime, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&lifetime, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert!(clear.key_missing);
+        assert!(!clear.valid);
+        assert!(!clear.expired);
+        assert_eq!(clear.key_expires, None);
+
+        let set = record(&lifetime, &blob, true);
+        assert!(!set.key_missing);
+        assert!(set.valid);
+        assert_eq!(set.fingerprint.as_deref(), Some(&*subkey));
+        assert!(set.expired);
+        assert_eq!(set.key_expires, Some(KEY_CREATED + ONE_DAY));
+    }
+
+    /// With the time option, a self-signature after its own expiration time
+    /// states its key lifetime. Both tiers of the key expiry rule apply this.
+    ///
+    /// - Certification tier: the expired newest certification states one
+    ///   day. The older one states ten years.
+    /// - Direct-key tier: the expired direct-key self-signature states ten
+    ///   years. The certification states one day.
+    #[test]
+    fn the_time_option_reads_the_key_lifetime_of_an_expired_self_signature() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Icrt <icrt@ostrya.example>", "10y");
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let spec = SelfSig::at(KEY_CREATED + 20)
+            .key_lifetime(Some(ONE_DAY))
+            .expiring_after(SPENT_LIFETIME);
+        let keyring = append_packet(
+            &home.keyring(),
+            &certification_self_signature(&home.secret_key(), spec),
+        );
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert_eq!(clear.key_expires, None);
+        assert!(!clear.expired);
+        assert!(clear.valid);
+
+        let set = record(&keyring, &blob, true);
+        assert_eq!(set.key_expires, Some(KEY_CREATED + ONE_DAY));
+        assert!(set.expired);
+        assert!(set.valid);
+
+        let home = Fixture::at("Idir <idir@ostrya.example>", "1d");
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let spec = SelfSig::at(KEY_CREATED + 20)
+            .key_lifetime(Some(TEN_YEARS))
+            .expiring_after(SPENT_LIFETIME);
+        let keyring = insert_after_primary(
+            &home.keyring(),
+            &direct_self_signature(&home.secret_key(), spec),
+        );
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        assert_eq!(clear.key_expires, Some(KEY_CREATED + ONE_DAY));
+        assert!(clear.expired);
+        assert!(!clear.valid);
+
+        let set = record(&keyring, &blob, true);
+        assert_eq!(set.key_expires, None);
+        assert!(!set.expired);
+        assert!(set.valid);
+    }
+
+    /// Returns the email that each of two verifiers reports for a signature
+    /// by a certificate with two user ids: first with the time checks on,
+    /// then with the time checks off.
+    ///
+    /// The certification of the second user id is 30 seconds after
+    /// [`KEY_CREATED`]. The certification `spec` goes onto the first user id.
+    /// The case makes it expired. With the time checks on, the first record
+    /// agrees with `gpgv`. Each signature is valid.
+    fn user_id_with_and_without_time_checks(spec: SelfSig) -> (String, String) {
+        const ALPHA: &str = "Alpha <alpha@ostrya.example>";
+        const BRAVO: &str = "Bravo <bravo@ostrya.example>";
+        let home = Fixture::at(ALPHA, "never");
+        home.add_uid_at("20250101T000030!", BRAVO);
+        let blob = home.sign(&home.primary, PAYLOAD);
+        let keyring = insert_after_user_id(
+            &home.keyring(),
+            ALPHA,
+            &certification_self_signature(&home.secret_key(), spec.expiring_after(SPENT_LIFETIME)),
+        );
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        let set = record(&keyring, &blob, true);
+        assert!(clear.valid);
+        assert!(set.valid);
+        (clear.user_email.unwrap(), set.user_email.unwrap())
+    }
+
+    /// With the time option, a certification self-signature after its own
+    /// expiration time ranks its user id. The newest one names the user id.
+    #[test]
+    fn the_time_option_ranks_a_user_id_by_an_expired_self_signature() {
+        if !tools_available() {
+            return;
+        }
+        let (clear, set) = user_id_with_and_without_time_checks(SelfSig::at(KEY_CREATED + 40));
+        assert_eq!(clear, "bravo@ostrya.example");
+        assert_eq!(set, "alpha@ostrya.example");
+    }
+
+    /// With the time option, a certification self-signature after its own
+    /// expiration time marks its user id as primary. The mark outranks a
+    /// newer certification of the other user id.
+    #[test]
+    fn the_time_option_reads_the_primary_mark_of_an_expired_self_signature() {
+        if !tools_available() {
+            return;
+        }
+        let (clear, set) =
+            user_id_with_and_without_time_checks(SelfSig::at(KEY_CREATED + 20).marking_primary());
+        assert_eq!(clear, "bravo@ostrya.example");
+        assert_eq!(set, "alpha@ostrya.example");
+    }
+
+    /// With the time option, a data signature after its own expiry is valid.
+    /// The record still states its expiry instant.
+    #[test]
+    fn the_time_option_accepts_an_expired_data_signature() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::at("Isig <isig@ostrya.example>", "never");
+        let keyring = home.keyring();
+        let blob = home.sign_with(&home.primary, PAYLOAD, &["--default-sig-expire", "1d"]);
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees_but_user_id(&clear, &reference[0]);
+        let set = record(&keyring, &blob, true);
+        for info in [&clear, &set] {
+            assert_eq!(info.expires, Some(KEY_CREATED + ONE_DAY));
+            assert!(!info.expired);
+            assert_eq!(info.key_expires, None);
+        }
+        assert!(!clear.valid);
+        assert!(set.valid);
+        assert_same_but_valid(&set, &clear);
+    }
+
+    /// The time option does not accept a signature by a revoked key. A
+    /// revocation does not read the time.
+    #[test]
+    fn the_time_option_does_not_accept_a_revoked_key() {
+        if !tools_available() {
+            return;
+        }
+        let home = Fixture::new("Irev <irev@ostrya.example>");
+        let blob = home.sign(&home.primary, PAYLOAD);
+        home.revoke_primary();
+        let keyring = home.keyring();
+        let reference = home.gpgv_records(&keyring, &blob, PAYLOAD);
+        assert_eq!(reference.len(), 1);
+
+        let clear = record(&keyring, &blob, false);
+        assert_agrees(&clear, &reference[0]);
+        let set = record(&keyring, &blob, true);
+        for info in [&clear, &set] {
+            assert!(info.revoked);
+            assert!(!info.valid);
+        }
+        assert!(!set.expired);
+        assert_eq!(set.user_email.as_deref(), Some("irev@ostrya.example"));
+        assert_agrees(&set, &clear);
     }
 
     /// A subkey revocation that verifies against nothing revokes nothing. The

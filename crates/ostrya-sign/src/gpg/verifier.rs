@@ -95,7 +95,8 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// gives the reported user id, the primary-key fingerprint, the cryptography,
 /// and the cross-certification check, so the load order sets these values.
 ///
-/// A signature is valid if all of these are true:
+/// With the default time checks, a signature is valid if all of these are
+/// true:
 ///
 /// - The signature verifies.
 /// - The certificate that holds the signing key is loaded.
@@ -106,9 +107,12 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// - The key is not expired and not revoked.
 ///
 /// The record of each signature reports an expired key, a revoked key, a bad
-/// signature, and an absent key. A self-signature whose own expiry time is in
-/// the past sets no key expiry, binds no subkey, and ranks no user id. These
-/// rules give the behavior of `gpgv` 2.4.9.
+/// signature, and an absent key. With the default time checks, a
+/// self-signature whose own expiry time is in the past sets no key expiry,
+/// binds no subkey, and ranks no user id. These rules give the behavior of
+/// `gpgv` 2.4.9.
+/// [Time checks](GpgVerifier#time-checks) states the option that turns off
+/// the rules that read the time.
 ///
 /// # Fields of a record
 ///
@@ -134,8 +138,38 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 ///   certificate. It gives no instant and no algorithm name, because the
 ///   verifier checked no claim of the packet.
 ///
-/// A signature after its own expiry is not valid and adds no field to the set
-/// of a verified signature.
+/// A signature after its own expiry adds no field to the set of a verified
+/// signature. If the time checks are on, it is not valid.
+///
+/// # Time checks
+///
+/// The verifier reads the clock one time in each call to
+/// [`Verifier::verify`]. Each check of the call uses that instant. With the
+/// default rules, the time has these effects, as in `gpgv` 2.4.9:
+///
+/// - A data signature after its own expiry time is not valid.
+/// - A signature by an expired key is not valid. A signing subkey expires
+///   at the earlier of its own expiry and the expiry of its primary key.
+/// - A self-signature after its own expiry time sets no key lifetime, binds
+///   no subkey, ranks no user id, and marks no user id as primary.
+///
+/// [`with_ignore_time`](GpgVerifier::with_ignore_time) turns off these
+/// checks. With the option set:
+///
+/// - A self-signature after its own expiry time has the effect of a live
+///   self-signature.
+/// - The key expiry and the expiry of the data signature do not make a
+///   signature invalid. All other conditions of the verdict apply.
+/// - The record still reports `expired`, `key_expires`, and `expires`. The
+///   values come from this view of the certificate and from the clock. So a
+///   valid signature can have `expired` set.
+/// - A revoked key still makes a signature invalid. A revocation does not
+///   read the time.
+///
+/// `gpgv` has no option of this kind. Use the option for a trust store that
+/// is written one time and is not updated, for example a store in a signed
+/// boot image. A key renewal cannot get into such a store, and a key expiry
+/// or a wrong clock must not refuse a signature that the store trusts.
 ///
 /// # Limits of a keyring
 ///
@@ -186,6 +220,9 @@ pub struct GpgVerifier {
     /// and shares the certificates. An add to a clone copies the set first,
     /// and the other clones keep their certificates.
     certs: Arc<Vec<SignedPublicKey>>,
+    /// `true` if no expiry makes a signature invalid.
+    /// [`with_ignore_time`](GpgVerifier::with_ignore_time) sets it.
+    ignore_time: bool,
 }
 
 impl GpgVerifier {
@@ -459,6 +496,16 @@ impl GpgVerifier {
     /// A verifier with no trusted certificate refuses every signature.
     pub fn is_empty(&self) -> bool {
         self.certs.is_empty()
+    }
+
+    /// Returns the verifier with the time checks on or off.
+    ///
+    /// If `ignore` is `true`, no expiry makes a signature invalid. A revocation
+    /// still makes a signature invalid. [Time checks](GpgVerifier#time-checks)
+    /// gives the rules. The default is `false`, and a clone keeps the value.
+    pub fn with_ignore_time(mut self, ignore: bool) -> GpgVerifier {
+        self.ignore_time = ignore;
+        self
     }
 }
 
@@ -801,7 +848,12 @@ impl Verifier for GpgVerifier {
     }
 
     fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
-        verify::verify_signatures(&self.certs, data, signatures)
+        verify::verify_signatures(
+            &self.certs,
+            data,
+            signatures,
+            verify::TimeRule::clock(self.ignore_time),
+        )
     }
 }
 
@@ -1083,7 +1135,7 @@ struct KeyState {
     /// expiry.
     ///
     /// The import reads the instant through the verify engine, so the import
-    /// and the verdict use the same signature.
+    /// and the verdict with the default time checks use the same signature.
     expires: Option<u64>,
 }
 
@@ -1109,7 +1161,7 @@ impl KeyState {
             revoked: copies
                 .iter()
                 .any(|cert| verify::key_revoked(cert, known.iter().copied())),
-            expires: verify::key_expiry_over(copies),
+            expires: verify::key_expiry_over(copies, verify::TimeRule::clock(false)),
         }
     }
 }
@@ -1514,6 +1566,17 @@ bG8=\n\
 IHdvcmxk\n\
 -----END PGP PUBLIC KEY BLOCK-----\n";
         assert_eq!(*dearmor(armored.as_bytes()).unwrap(), *b"hello world");
+    }
+
+    /// A verifier applies the time checks until the option turns them off.
+    /// A clone keeps the state of the option.
+    #[test]
+    fn the_time_option_is_off_by_default_and_a_clone_keeps_it() {
+        assert!(!GpgVerifier::default().ignore_time);
+        let set = GpgVerifier::default().with_ignore_time(true);
+        assert!(set.ignore_time);
+        assert!(set.clone().ignore_time);
+        assert!(!set.with_ignore_time(false).ignore_time);
     }
 
     /// Returns `true` if the `gpg` binary runs.
@@ -2746,9 +2809,14 @@ IHdvcmxk\n\
     /// The call reads it through the same engine as a verification.
     fn signature_is_valid(keyring: &[u8], blob: &[u8]) -> bool {
         let certs = GpgVerifier::from_keyring_bytes([keyring]).unwrap().certs;
-        verify::verify_signatures(&certs, PAYLOAD, &[blob.to_vec()])
-            .unwrap()
-            .valid
+        verify::verify_signatures(
+            &certs,
+            PAYLOAD,
+            &[blob.to_vec()],
+            verify::TimeRule::clock(false),
+        )
+        .unwrap()
+        .valid
     }
 
     /// An import into no keyring writes the offered stream as it is and counts
@@ -3057,9 +3125,13 @@ IHdvcmxk\n\
         /// the load is valid.
         fn verdict(&self, keyring: &[u8]) -> (bool, bool) {
             let certs = self.certs(keyring);
-            let outcome =
-                verify::verify_signatures(&certs, PAYLOAD, std::slice::from_ref(&self.blob))
-                    .unwrap();
+            let outcome = verify::verify_signatures(
+                &certs,
+                PAYLOAD,
+                std::slice::from_ref(&self.blob),
+                verify::TimeRule::clock(false),
+            )
+            .unwrap();
             assert_eq!(outcome.signatures.len(), 1);
             (outcome.signatures[0].revoked, outcome.valid)
         }

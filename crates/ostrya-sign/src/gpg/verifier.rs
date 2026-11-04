@@ -1060,9 +1060,14 @@ pub fn gpg_merge_keyring(
         // selector match (see [`KeyState`]).
         let known: Vec<&SignedPublicKey> =
             copies.values().flatten().chain(offered.iter()).collect();
+        // The import reads the clock one time. So `replaces` compares a held
+        // state and an offered state of the same instant.
+        let rule = verify::TimeRule::clock(false);
         let mut held: BTreeMap<String, KeyState> = copies
             .iter()
-            .map(|(fingerprint, copies)| (fingerprint.clone(), KeyState::over(copies, &known)))
+            .map(|(fingerprint, copies)| {
+                (fingerprint.clone(), KeyState::over(copies, &known, rule))
+            })
             .collect();
         // The certificates to append, in append order, each with its state,
         // and the held certificates that a replacement writes again.
@@ -1079,7 +1084,7 @@ pub fn gpg_merge_keyring(
             }
             let cert = &offered[index];
             let fingerprint = fingerprint_hex(cert);
-            let state = KeyState::of(cert, &known);
+            let state = KeyState::of(cert, &known, rule);
             if let Some(entry) = held.get_mut(&fingerprint) {
                 if replaces(entry, &state) {
                     *entry = state;
@@ -1135,9 +1140,11 @@ struct KeyState {
     ///   in the keyring that the import changes.
     /// - The revoker is imported after the revocation was offered.
     ///
-    /// The import is a function of its two byte streams only. So one import
-    /// writes the same bytes on each host. It writes no revocation that it
-    /// cannot verify, so an offered keyring cannot remove a held certificate.
+    /// The import reads no file of the host. Its result is a function of its
+    /// two byte streams, its selectors, and one read of the clock. So two hosts
+    /// that run one import with the same clock second write the same bytes. The
+    /// import writes no revocation that it cannot verify, so an offered keyring
+    /// cannot remove a held certificate.
     revoked: bool,
     /// The expiry instant of the key, or `None` if the certificates state no
     /// expiry.
@@ -1148,10 +1155,10 @@ struct KeyState {
 }
 
 impl KeyState {
-    /// Returns the state that `cert` gives, with designated revokers looked up
-    /// in `known`.
-    fn of(cert: &SignedPublicKey, known: &[&SignedPublicKey]) -> KeyState {
-        KeyState::over(std::slice::from_ref(cert), known)
+    /// Returns the state that `cert` gives under `rule`, with designated
+    /// revokers looked up in `known`.
+    fn of(cert: &SignedPublicKey, known: &[&SignedPublicKey], rule: verify::TimeRule) -> KeyState {
+        KeyState::over(std::slice::from_ref(cert), known, rule)
     }
 
     /// Returns the state that the copies of one certificate give together.
@@ -1164,12 +1171,19 @@ impl KeyState {
     /// [`KeyState::revoked`] describes. The copies and `known` are two
     /// different sets. A revocation applies to the key of the copies, and the
     /// revoker is a different key.
-    fn over(copies: &[SignedPublicKey], known: &[&SignedPublicKey]) -> KeyState {
+    ///
+    /// `rule` gives the instant of the expiry checks. The import gives one rule
+    /// to each state. So all states of one import use the same instant.
+    fn over(
+        copies: &[SignedPublicKey],
+        known: &[&SignedPublicKey],
+        rule: verify::TimeRule,
+    ) -> KeyState {
         KeyState {
             revoked: copies
                 .iter()
                 .any(|cert| verify::key_revoked(cert, known.iter().copied())),
-            expires: verify::key_expiry_over(copies, verify::TimeRule::clock(false)),
+            expires: verify::key_expiry_over(copies, rule),
         }
     }
 }
@@ -3462,10 +3476,11 @@ IHdvcmxk\n\
         // later expiry.
         let certs = GpgVerifier::from_keyring_bytes([&held]).unwrap().certs;
         assert_eq!(certs.len(), 1);
-        let held_state = KeyState::over(&certs, &known(&certs));
+        let rule = verify::TimeRule::clock(false);
+        let held_state = KeyState::over(&certs, &known(&certs), rule);
         assert!(held_state.revoked);
         let offered = GpgVerifier::from_keyring_bytes([&extended]).unwrap().certs;
-        let offered_state = KeyState::over(&offered, &known(&offered));
+        let offered_state = KeyState::over(&offered, &known(&offered), rule);
         assert!(!offered_state.revoked);
         assert!(states_later(offered_state.expires, held_state.expires));
 

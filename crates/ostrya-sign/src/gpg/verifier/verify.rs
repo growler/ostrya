@@ -303,12 +303,13 @@ fn now() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// The time rule of one verify call: the clock instant, and the state of the
-/// time checks.
+/// The time rule of one verify call or of one keyring import: the clock
+/// instant, and the state of the time checks.
 ///
 /// A verify call reads the clock one time and gives the rule to each check.
 /// So two checks of one call cannot read two instants. The keyring import
-/// reads the clock with the time checks on.
+/// also reads the clock one time in each import, with the time checks on. It
+/// gives the rule to the state of each key.
 #[derive(Clone, Copy)]
 pub(super) struct TimeRule {
     /// The clock, in seconds since the Unix epoch.

@@ -4623,11 +4623,12 @@ records. Thirteen divergences stand:
   A revocation another key made carries weight where a verified self-signature
   of the revoked certificate designates that key as a revoker through signature
   subpacket 12, and the certificate of that revoker stands in the keyring under
-  edit or in the offered stream. Those are the two streams the import reads, so
-  one import writes the same bytes on every host. The revoker is resolved among
-  every certificate the two streams hold, whatever key each of them states and
-  whether or not a `KEY-ID` selector names it: a selector governs what the
-  import writes and not what the import knows.
+  edit or in the offered stream. Those are the two streams the import reads,
+  and it reads no other file of the host. So one import with the same `KEY-ID`
+  selectors at the same clock second writes the same bytes on every host. The
+  revoker is resolved among every certificate the two streams hold, whatever
+  key each of them states and whether or not a `KEY-ID` selector names it:
+  a selector governs what the import writes and not what the import knows.
 
   Two states carry such a revocation into the tool's keyring and not into the
   port's, since the tool merges the offered packets into its keyblock whether

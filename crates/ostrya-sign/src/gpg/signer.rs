@@ -197,16 +197,14 @@ impl GpgSigner {
     /// - `gpg` exits with a failure status. The message is
     ///   `gpg --export failed: <text>`. The text has the rules of the failure
     ///   text of [`sign`](Signer::sign).
-    /// - The output is empty. The message is
-    ///   `gpg --export wrote no certificate for <fingerprint>`. For a
-    ///   fingerprint that names no key, `gpg` writes no output and exits with
-    ///   status 0.
     /// - The parse refuses the output: a GnuPG keybox, more than 256
     ///   certificates, a stream that does not frame to its end, or a
     ///   certificate that the parser refuses. The message holds
     ///   `the gpg --export output`.
     /// - The parse gives no certificate. The message is
-    ///   `gpg --export wrote no certificate for <fingerprint>`.
+    ///   `gpg --export wrote no certificate for <fingerprint>`. For a
+    ///   fingerprint that names no key, `gpg` writes no output and exits with
+    ///   status 0.
     /// - The output holds more than one certificate. The message is
     ///   `gpg --export wrote <n> certificates for <fingerprint>`.
     /// - The primary fingerprint of the certificate is not `fingerprint`,
@@ -241,6 +239,10 @@ impl GpgSigner {
             .output_capped(&[], MAX_KEYRING + 1)
             .await
             .map_err(|e| spawn_err("gpg", &e))?;
+        // This check comes before the check of the exit status. The read keeps
+        // at most `MAX_KEYRING` + 1 bytes and then closes the pipe, so a `gpg`
+        // that writes after the close gets a broken pipe and fails. An output
+        // over the limit must give this refusal, not the exit-status failure.
         refuse_oversized_keyring(&output.stdout, EXPORT_SUBJECT)?;
         if !output.status.success() {
             return Err(Error::Signature(format!(
@@ -248,17 +250,15 @@ impl GpgSigner {
                 failure_text(&output)
             )));
         }
-        let no_certificate = || {
-            Error::Signature(format!(
-                "gpg --export wrote no certificate for {fingerprint}"
-            ))
-        };
-        if output.stdout.is_empty() {
-            return Err(no_certificate());
-        }
+        // For a fingerprint that names no key, `gpg` writes no output and
+        // exits with status 0. An empty output parses to no certificate.
         let certs = binary_keyring_certs(&output.stdout, EXPORT_SUBJECT)?;
         let cert = match certs.as_slice() {
-            [] => return Err(no_certificate()),
+            [] => {
+                return Err(Error::Signature(format!(
+                    "gpg --export wrote no certificate for {fingerprint}"
+                )));
+            }
             [cert] => cert,
             more => {
                 return Err(Error::Signature(format!(

@@ -2644,10 +2644,12 @@ fn a_server_error_fails_the_query() {
 /// The query reads the summary policy of the remote alone, and no commit
 /// policy. A remote with no `gpg-verify` key, whose GPG check of the commits
 /// is on, and a remote with `sign-verify=true` and no trusted key list the
-/// refs. A collection pull from the first remote reads its commit policy and
-/// fails. A remote whose `trust` names a trust group with the GPG check of
-/// the commits keeps its summary policy: the query reads the verified
-/// summary, and sends no listing request.
+/// refs. A remote with a malformed `gpg-verify` value and a remote with a
+/// malformed `sign-verify` value also list the refs, in each feature set. A
+/// collection pull from the first remote reads its commit policy and fails.
+/// A remote whose `trust` names a trust group with the GPG check of the
+/// commits keeps its summary policy: the query reads the verified summary,
+/// and sends no listing request.
 #[test]
 fn a_query_reads_no_commit_policy() {
     block_on(async {
@@ -2666,14 +2668,19 @@ fn a_query_reads_no_commit_policy() {
             &format!(
                 "\n[remote \"gpg\"]\nurl={url}\n\
                  [remote \"sign\"]\nurl={url}\ngpg-verify=false\nsign-verify=true\n\
+                 [remote \"bad-gpg\"]\nurl={url}\ngpg-verify=maybe\n\
+                 [remote \"bad-sign\"]\nurl={url}\ngpg-verify=false\nsign-verify=\\q\n\
                  [remote \"trust\"]\nurl={url}\ntrust=t\nsign-verify-summary=ed25519\n\
                  verification-ed25519-key={PUBLIC_B64}\n\
                  [ex-ostrya trust \"t\"]\ngpg-verify=true\n"
             ),
         )
         .await;
+        let config = dest.config();
+        assert!(config.remote("bad-gpg").unwrap().gpg_verify().is_err());
+        assert!(config.remote("bad-sign").unwrap().sign_verify().is_err());
 
-        for remote in ["gpg", "sign"] {
+        for remote in ["gpg", "sign", "bad-gpg", "bad-sign"] {
             server_a.forget();
             let listed = query(&dest, remote, &[REF]).await.unwrap();
             assert_eq!(listed, [(REF.to_owned(), tip)], "{remote}");

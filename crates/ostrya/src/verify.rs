@@ -369,18 +369,21 @@ impl PullTrust {
             )));
         }
         let section = repo.config().remote(remote);
-        let (gpg, sign) = summary_switches(section.as_ref(), &PullVerify::default())?;
-        let source = KeySource::Remote {
-            name: remote,
-            section: section.as_ref(),
-            repo_keyring: true,
-            system_keys: true,
+        // `Some(false)` turns off each commit check, so the call reads no
+        // switch of the commits and no commit key source.
+        let verify = PullVerify {
+            gpg: Some(false),
+            sign: Some(false),
+            ..PullVerify::default()
         };
-        let summary = build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?;
-        Ok(PullTrust {
-            commit: None,
-            summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
-        })
+        PullTrust::from_section(
+            repo,
+            Some(remote),
+            section.as_ref(),
+            &verify,
+            Defaults::Config,
+        )
+        .await
     }
 
     /// Resolves the trust of a pull of `remote` from its config in `repo` and
@@ -432,18 +435,34 @@ impl PullTrust {
             return trust::pull_trust(repo, Some(remote), Some(section), name, verify, &mut None)
                 .await;
         }
+        PullTrust::from_section(repo, remote, section.as_ref(), verify, defaults).await
+    }
 
-        let gpg_commit = switch(verify.gpg, || match &section {
+    /// Resolves the trust of a pull of `remote` from `section`, its config
+    /// section, and the overrides in `verify`, with no trust group.
+    ///
+    /// The commit policy and the summary policy share each verifier that both
+    /// ask for. `defaults` gives the commit policy of a remote that has no
+    /// section. If the pull names no remote and asks for a check, the call
+    /// fails with [`Error::Pull`].
+    async fn from_section(
+        repo: &Repo,
+        remote: Option<&str>,
+        section: Option<&Remote<'_>>,
+        verify: &PullVerify,
+        defaults: Defaults,
+    ) -> Result<PullTrust> {
+        let gpg_commit = switch(verify.gpg, || match section {
             Some(section) => section.gpg_verify(),
             // If an HTTP pull names a remote that the config does not
             // describe, the remote takes the default of a described remote.
             None => Ok(defaults == Defaults::Config),
         })?;
-        let sign_commit = engines(verify.sign, || match &section {
+        let sign_commit = engines(verify.sign, || match section {
             Some(section) => section.sign_verify(),
             None => Ok(SignVerify::Off),
         })?;
-        let (gpg_summary, sign_summary) = summary_switches(section.as_ref(), verify)?;
+        let (gpg_summary, sign_summary) = summary_switches(section, verify)?;
 
         let asks_for_a_check = gpg_commit
             || gpg_summary
@@ -458,7 +477,7 @@ impl PullTrust {
 
         let source = KeySource::Remote {
             name,
-            section: section.as_ref(),
+            section,
             repo_keyring: true,
             system_keys: true,
         };

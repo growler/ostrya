@@ -425,22 +425,24 @@ pub enum TimestampCheck {
 ///
 /// # Keys
 ///
-/// - GPG: the trusted set of the remote. The set holds the
-///   `<remote>.trustedkeys.gpg` of the repository,
-///   `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, and the keyrings that
-///   `gpgkeypath` names. The global trusted directory takes part only when
-///   neither `<remote>.trustedkeys.gpg` exists.
+/// - GPG: the trusted set of the remote. The set holds the keyring of the
+///   remote and the keyrings that `gpgkeypath` names. The keyring of the
+///   remote is the `<remote>.trustedkeys.gpg` of the repository, or, only
+///   when that file is absent, the `<remote>.trustedkeys.gpg` of the remotes
+///   directory of the handle ([`Repo::remotes_dir`]). The global trusted
+///   directory takes part only when neither `<remote>.trustedkeys.gpg`
+///   exists.
 /// - The sign api: a value of `sign-verify` is a boolean or a list of engine
 ///   names. The keys of an engine are its `verification-<engine>-key` and
 ///   `verification-<engine>-file` entries and the system key store, less the
 ///   revoked set of the store.
 /// - A trust group: the commit keys are the keys that the group names, and
 ///   nothing else. The repository keyring `<repo>/<remote>.trustedkeys.gpg`,
-///   the system keyrings, the global trusted directory, and the system key
-///   store do not verify a commit of a remote with `trust`. So the keys that
-///   a GPG import for the remote writes to the repository keyring do not
-///   apply to its commits. The GPG check of the summary still reads these
-///   sources.
+///   the keyring of the remotes directory, the global trusted directory, and
+///   the system key store do not verify a commit of a remote with `trust`.
+///   So the keys that a GPG import for the remote writes to the repository
+///   keyring do not apply to its commits. The GPG check of the summary still
+///   reads these sources.
 ///
 /// The GPG axis and the sign-api axis are independent. If a policy asks for
 /// both, the pull verifies both. In the sign-api axis, one engine that

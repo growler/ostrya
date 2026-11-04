@@ -430,7 +430,7 @@ mod tests {
     /// `PullTrust::from_remote` refuses a name that `valid_remote_name`
     /// refuses, before it reads a key source. The keyring paths hold the
     /// name, so a name with `/` names a keyring outside the repository or
-    /// outside the system keyring directory.
+    /// outside the remotes directory.
     #[test]
     fn from_remote_refuses_an_invalid_remote_name() {
         let dir = std::env::temp_dir().join(format!(

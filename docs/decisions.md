@@ -200,6 +200,15 @@ group, as the tool does. The trust groups stay in `config` alone. The open
 refuses a remote name that two sources define, as the tool does, because a
 choice of one of the two sources reinterprets the configuration.
 
+The keys `verification-<type>-key`, `verification-<type>-file`, and
+`gpgkeypath` of a remote of a `.conf` file work as in `config`. A relative
+path in `verification-<type>-file` or in `gpgkeypath` is relative to the
+working directory of the process, as in `config` and as the tool does. So a
+remote keeps its meaning when it moves between `config` and a `.conf` file,
+and no reader of a path needs the source of the remote. A path relative to
+the `.conf` file or to the remotes directory was rejected: the same text
+would name another file when the remote moves between the two sources.
+
 A create refuses a collection id with a line break. The create writes the id
 into `config` as text, so a line break would add groups to `config`, such as
 an `[ex-ostrya]` group with the key of the remotes directory.

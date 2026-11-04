@@ -19,19 +19,13 @@
 // configuration section of a remote, or a trust group.
 // The pull and the receive path share this build.
 
-#[cfg(feature = "verify-gpg")]
-use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::Arc;
 
 use ostrya_core::{Value, base64};
 use rustix::fs::{Mode, OFlags};
-#[cfg(feature = "verify-gpg")]
-use rustix::io::Errno;
 
 use crate::config::{Remote, SignVerify, valid_remote_name};
 use crate::error::{Error, Result};
-#[cfg(feature = "verify-gpg")]
-use crate::gpg::read_keyring_fd;
 use crate::pull::PullVerify;
 use crate::repo::Repo;
 use crate::sign::{
@@ -251,9 +245,11 @@ impl PullTrust {
     /// config and from these key sources:
     ///
     /// - `gpgkeypath`
-    /// - the repository keyring `<repo>/NAME.trustedkeys.gpg`
-    /// - the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`
-    /// - the global GPG trusted directory
+    /// - the repository keyring `<repo>/NAME.trustedkeys.gpg`, or, only when
+    ///   that file is absent, `NAME.trustedkeys.gpg` in the remotes directory
+    ///   of the handle ([`Repo::remotes_dir`])
+    /// - the global GPG trusted directory, only when neither keyring of the
+    ///   remote exists
     /// - the `verification-*` keys
     /// - the system sign-api key store, minus its revoked set
     ///
@@ -271,10 +267,10 @@ impl PullTrust {
     /// the trust group `[ex-ostrya trust "NAME"]` that the key names sets the
     /// commit policy. The commit keys come from the group alone: no system
     /// key store, no repository keyring `<repo>/NAME.trustedkeys.gpg`, no
-    /// system keyring, and no global GPG trusted directory. The keys
-    /// `gpg-verify-summary` and `sign-verify-summary` of the section and the
-    /// key sources that they read set the summary policy, as without a trust
-    /// group. The two policies share no verifier.
+    /// keyring of the remotes directory, and no global GPG trusted directory.
+    /// The keys `gpg-verify-summary` and `sign-verify-summary` of the section
+    /// and the key sources that they read set the summary policy, as without
+    /// a trust group. The two policies share no verifier.
     ///
     /// The call checks the group as the receive side does, and builds only
     /// the axes that stay on. `Some(false)` in `verify.gpg` or `verify.sign`
@@ -518,8 +514,9 @@ impl PullTrust {
 ///
 /// The keys are the keys of the remote alone:
 ///
-/// - the repository keyring `<repo>/NAME.trustedkeys.gpg`
-/// - the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`
+/// - the repository keyring `<repo>/NAME.trustedkeys.gpg`, or, only when that
+///   file is absent, `NAME.trustedkeys.gpg` in the remotes directory of the
+///   handle ([`Repo::remotes_dir`])
 /// - each `gpgkeypath` entry
 /// - the `verification-ENGINE-key` and `verification-ENGINE-file` keys
 ///
@@ -1080,14 +1077,16 @@ pub(crate) enum KeySource<'a> {
         name: &'a str,
         /// The configuration section of the remote.
         section: Option<&'a Remote<'a>>,
-        /// If `true`, the `<remote>.trustedkeys.gpg` file of the repository
-        /// adds to the GPG trusted set.
+        /// If `true`, the keyring of the remote adds to the GPG trusted set:
+        /// the `<remote>.trustedkeys.gpg` file of the repository, or, only
+        /// when that file is absent, the file of that name in the remotes
+        /// directory of the handle. If `false`, the call reads neither file.
         #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
         repo_keyring: bool,
         /// If `true`, the system sign-api key store adds to the keys of the
         /// remote, as in a pull. The global GPG trusted directory also adds
-        /// its keys, but only when no keyring of the remote exists in the
-        /// repository or in `/etc/ostree/remotes.d`. If `false`, the keys are
+        /// its keys, but only when no keyring of the remote takes part. If
+        /// `false`, the keys are
         /// the keys of the remote alone, and a GPG axis whose keyrings hold no
         /// certificate is refused.
         system_keys: bool,
@@ -1257,14 +1256,14 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
 ///
 /// For a remote, the trusted set has these parts:
 ///
-/// - the keyring of the repository for the remote, read through the repository
-///   descriptor, if the source asks for it
-/// - the system keyring of the remote
-/// - the global trusted set, if the source asks for the system keys and
-///   neither keyring of the remote exists
+/// - the keyring of the remote, if the source asks for it: the keyring of the
+///   repository, read through the repository descriptor, or, only when that
+///   file is absent, the keyring of the remotes directory of the handle
+/// - the global trusted set, if the source asks for the system keys and no
+///   keyring of the remote takes part
 /// - the keyrings that `gpgkeypath` names
 ///
-/// The keyrings of the remote and the global keyring files must be binary
+/// The keyring of the remote and the global keyring files must be binary
 /// OpenPGP packet streams. The rules are those of
 /// [`for_remote_keyrings`](crate::gpg::FromOstreeKeyrings::for_remote_keyrings).
 ///
@@ -1282,18 +1281,23 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             repo_keyring,
             system_keys,
         } => {
-            let keyring = if *repo_keyring {
-                read_repo_keyring(repo, name).await?
-            } else {
-                None
-            };
             let keypath = match section {
                 Some(section) => section.gpgkeypath()?,
                 None => Vec::new(),
             };
+            let repo = repo.clone();
             let remote = (*name).to_owned();
+            let read_keyring = *repo_keyring;
             let global = *system_keys;
+            // The names resolve through descriptors on the blocking pool, in
+            // one job with the load. A keyring on a slow file system holds a
+            // pool thread and cannot hold an executor thread.
             let verifier = ostrya_rt::unblock(move || {
+                let keyring = if read_keyring {
+                    crate::gpg::read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), &remote)?
+                } else {
+                    None
+                };
                 crate::gpg::remote_keyrings(keyring, &remote, &keypath, global)
             })
             .await?;
@@ -1446,47 +1450,6 @@ fn read_sign_keys(
         return Ok(None);
     }
     Ok(Some(keys))
-}
-
-/// Reads the `<remote>.trustedkeys.gpg` file of the repository, up to
-/// [`MAX_KEYRING`](ostrya_sign::MAX_KEYRING) bytes.
-///
-/// Returns `None` if the repository holds no such file. The name resolves
-/// through the repository descriptor on the blocking pool. A keyring on a slow
-/// file system holds a pool thread and cannot hold an executor thread.
-#[cfg(feature = "verify-gpg")]
-async fn read_repo_keyring(repo: &Repo, remote: &str) -> Result<Option<Vec<u8>>> {
-    let repo_fd = repo.repo_fd().try_clone_to_owned()?;
-    let name = format!("{remote}.trustedkeys.gpg");
-    ostrya_rt::unblock(move || read_keyring_blocking(repo_fd.as_fd(), &name)).await
-}
-
-/// Runs the blocking half of [`read_repo_keyring`].
-///
-/// The name resolves against the repository descriptor. The bytes come through
-/// [`read_keyring_fd`], which applies the same rule to every other keyring
-/// source. If a symlink is at the name, the read follows it. The `ostree`
-/// command was observed to follow it too.
-#[cfg(feature = "verify-gpg")]
-fn read_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>> {
-    // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
-    // waits for a writer. On a regular file, the flag has no effect on the
-    // read that the reader makes.
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        name,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => {
-            return Err(Error::Signature(format!(
-                "the keyring '{name}' cannot be opened: {e}"
-            )));
-        }
-    };
-    read_keyring_fd(fd, name).map(Some)
 }
 
 /// Reads the keys of one `verification-<engine>-file`, up to [`MAX_KEY_FILE`]

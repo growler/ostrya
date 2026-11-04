@@ -1205,7 +1205,10 @@ ignores each other group of a file. The tool reads the directory
 directory that `[ex-ostrya] remotes-config-dir` names ("Configuration keys of
 the port" in "Port extensions"), or the directory that a library caller gives
 at the open. `ostrya-config(1)`, "Remotes directory", states
-the rules of the read and the write of the port.
+the rules of the read and the write of the port. A remotes directory can also
+hold the GPG keyring `<remote>.trustedkeys.gpg` of a remote, which the
+verification reads only when the repository holds no keyring of the remote
+("GPG").
 
 The port writes a file of the remotes directory in this form. An add of the
 remote `NAME` writes the file `<dir>/NAME.conf` with the one group
@@ -2304,21 +2307,35 @@ A self-signature whose own expiration time has passed states no key expiry,
 binds no subkey, and ranks no user id. The first certificate that answers
 supplies the reported fingerprints and user id.
 
-The keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo or
-under `/etc/ostree/remotes.d/`. The global trusted-keyring directory is
+The keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo.
+An import writes this keyring. The tool takes `/etc/ostree/remotes.d` as the
+remotes directory of its system repository alone. Only when the repo holds no
+`<remote>.trustedkeys.gpg`, `remote gpg-list-keys` of the tool reads
+`<remote>.trustedkeys.gpg` in that directory. The read of that file in a
+verification of the tool is not observed, and its effect on the read of the
+global directory is not observed.
+
+The global trusted-keyring directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
 `OSTREE_GPG_HOME` environment variable replaces it with the directory that it
 names. The global directory is a fallback: a remote trusts its keyrings only
-when neither `<remote>.trustedkeys.gpg` exists. A keyring exists if its open
-does not give "No such file or directory". So an empty file is a keyring with
-no key and stops the read of the global directory, and a symlink to no file
-is no keyring. The read of the global directory takes each regular file whose
-name ends in `.gpg`, a hidden name and the name `.gpg` included, in name
-order. It skips a name that ends in `.GPG`, a symlink, a fifo, and a
+when the repo holds no `<remote>.trustedkeys.gpg`. A keyring exists if its
+open does not give "No such file or directory". So an empty file is a keyring
+with no key and stops the read of the global directory, and a symlink to no
+file is no keyring. The read of the global directory takes each regular file
+whose name ends in `.gpg`, a hidden name and the name `.gpg` included, in
+name order. It skips a name that ends in `.GPG`, a symlink, a fifo, and a
 subdirectory. The port refuses a global directory that it cannot list, other
 than an absent one, and the refusal names the directory.
 
-The two `<remote>.trustedkeys.gpg` keyrings and each file of the global
+The port reads `<remote>.trustedkeys.gpg` in the remotes directory of the
+repository handle only when the repo holds no `<remote>.trustedkeys.gpg`. It
+reads the file in `remote gpg-list-keys` and in a verification. A handle with
+no remotes directory reads no such keyring. In a verification of the port, a
+keyring of the remotes directory that exists stops the read of the global
+directory, as the keyring of the repo does. These are the rules of the port.
+
+The `<remote>.trustedkeys.gpg` keyring and each file of the global
 directory must be a binary OpenPGP packet stream. If such a keyring holds
 other bytes, the port refuses it by its name. Armor, a GnuPG keybox, text, a
 keyring with bytes after its last packet, and a keyring over a limit are

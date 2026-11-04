@@ -21,8 +21,8 @@ use std::process::Command;
 use common::TmpDir;
 use ostrya::{
     AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
-    CreateOptions, DeltaOptions, Error, GpgSigner, MutableTree, PullOptions, PullVerify, Repo,
-    RepoMode,
+    CreateOptions, DeltaOptions, Error, GpgSigner, MutableTree, OpenOptions, PullOptions,
+    PullVerify, RemotesDir, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -540,6 +540,207 @@ fn a_symlinked_repository_keyring_is_followed() {
             dst.resolve_rev("origin:main", true).await.unwrap(),
             Some(commit)
         );
+    });
+}
+
+/// Opens the repository at `path` with the remotes directory `dir`.
+async fn open_with_dir(path: &Path, dir: RemotesDir) -> Repo {
+    OpenOptions::new()
+        .remotes_dir(dir)
+        .open(path)
+        .await
+        .unwrap()
+}
+
+/// When the repository holds no `<remote>.trustedkeys.gpg`, the trusted set
+/// of a remote starts with the file of that name in the remotes directory of
+/// the handle. A commit that the key of this keyring signed passes:
+///
+/// - for a remote of `config`, with a [`RemotesDir::Path`] value;
+/// - for a remote of a `.conf` file of the remotes directory;
+/// - with a [`RemotesDir::InRepo`] value;
+/// - with a [`RemotesDir::Fd`] value.
+#[test]
+fn a_keyring_of_the_remotes_directory_is_what_a_remote_trusts() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-dir-keyring");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+
+    block_on(async {
+        let (src, commit) = source_repo(base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+        let mut handles = Vec::new();
+
+        let (path, dst) = dest_with_remote(base, "dst-config", "").await;
+        drop(dst);
+        let dir = base.join("remotes-config.d");
+        std::fs::create_dir(&dir).unwrap();
+        signer_home.export_to(&dir.join("origin.trustedkeys.gpg"));
+        handles.push(("config", open_with_dir(&path, RemotesDir::path(&dir)).await));
+
+        let path = base.join("dst-file");
+        Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let dir = base.join("remotes-file.d");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("origin.conf"),
+            "[remote \"origin\"]\nurl=file:///dev/null\n",
+        )
+        .unwrap();
+        signer_home.export_to(&dir.join("origin.trustedkeys.gpg"));
+        handles.push(("file", open_with_dir(&path, RemotesDir::path(&dir)).await));
+
+        let (path, dst) = dest_with_remote(base, "dst-in-repo", "").await;
+        drop(dst);
+        std::fs::create_dir(path.join("remotes.d")).unwrap();
+        signer_home.export_to(&path.join("remotes.d").join("origin.trustedkeys.gpg"));
+        let in_repo = RemotesDir::InRepo(PathBuf::from("remotes.d"));
+        handles.push(("in-repo", open_with_dir(&path, in_repo).await));
+
+        let (path, dst) = dest_with_remote(base, "dst-fd", "").await;
+        drop(dst);
+        let dir = base.join("remotes-fd.d");
+        std::fs::create_dir(&dir).unwrap();
+        signer_home.export_to(&dir.join("origin.trustedkeys.gpg"));
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&dir).unwrap());
+        handles.push(("fd", open_with_dir(&path, RemotesDir::from(fd)).await));
+
+        for (label, dst) in handles {
+            gpg_pull(&dst, &src)
+                .await
+                .unwrap_or_else(|e| panic!("{label}: {e}"));
+            assert_eq!(
+                dst.resolve_rev("origin:main", true).await.unwrap(),
+                Some(commit),
+                "{label}"
+            );
+        }
+    });
+}
+
+/// A repository keyring that exists hides the keyring of the remotes
+/// directory. The keyring of the remotes directory holds the key of the
+/// commit. The pull refuses the commit and writes no ref:
+///
+/// - when the repository keyring holds another key;
+/// - when the repository keyring is empty.
+#[test]
+fn the_repository_keyring_hides_the_keyring_of_the_remotes_directory() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-dir-hidden");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+    let other_home = GpgHome::create(base, "gnupg-other", "Other <other@example.invalid>");
+    let dir = base.join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    signer_home.export_to(&dir.join("origin.trustedkeys.gpg"));
+
+    block_on(async {
+        let (src, commit) = source_repo(base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+        for (name, other) in [("dst-other", true), ("dst-empty", false)] {
+            let (path, dst) = dest_with_remote(base, name, "").await;
+            drop(dst);
+            let keyring = path.join("origin.trustedkeys.gpg");
+            if other {
+                other_home.export_to(&keyring);
+            } else {
+                std::fs::write(&keyring, b"").unwrap();
+            }
+            let dst = open_with_dir(&path, RemotesDir::path(&dir)).await;
+            let err = gpg_pull(&dst, &src).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+                "{name}: {err}"
+            );
+            assert!(dst.list_refs(None).await.unwrap().is_empty(), "{name}");
+        }
+    });
+}
+
+/// The environment variable that tells the child process of
+/// [`a_handle_with_no_remotes_directory_reads_no_keyring_of_a_directory`]
+/// where its scratch tree is.
+const NO_DIR_CHILD_ENV: &str = "OSTRYA_NO_REMOTES_DIR_TEST";
+
+/// A handle with no remotes directory reads no keyring of a directory.
+///
+/// The test runs this test binary again with `OSTREE_GPG_HOME` set to an
+/// empty directory, so the global trusted directory of the host takes no
+/// part. [`no_remotes_directory_subprocess`] does the pull.
+#[test]
+fn a_handle_with_no_remotes_directory_reads_no_keyring_of_a_directory() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-no-dir");
+    let global = tmp.path().join("global");
+    std::fs::create_dir(&global).unwrap();
+    let child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "no_remotes_directory_subprocess",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("OSTREE_GPG_HOME", &global)
+        .env(NO_DIR_CHILD_ENV, tmp.path())
+        .output()
+        .expect("re-execute this test binary");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        child.status.success() && stdout.contains("1 passed"),
+        "the child reported {}:\n{stdout}{}",
+        child.status,
+        String::from_utf8_lossy(&child.stderr),
+    );
+}
+
+/// The half of
+/// [`a_handle_with_no_remotes_directory_reads_no_keyring_of_a_directory`]
+/// that does the pull. It runs only if this test binary runs again with the
+/// environment set.
+///
+/// The repository holds no keyring of the remote, and the handle has no
+/// remotes directory. `<repo>/remotes.d/origin.trustedkeys.gpg` holds the key
+/// of the commit. A handle that took `remotes.d` in the repository as its
+/// remotes directory when none is set would trust the commit, so the file
+/// finds that fault. The trusted set is empty, so the pull refuses the commit
+/// and writes no ref.
+#[test]
+#[ignore = "helper process for a_handle_with_no_remotes_directory_reads_no_keyring_of_a_directory"]
+fn no_remotes_directory_subprocess() {
+    let Some(base) = std::env::var_os(NO_DIR_CHILD_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let signer_home = GpgHome::create(&base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+
+    block_on(async {
+        let (src, commit) = source_repo(&base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+        let (path, dst) = dest_with_remote(&base, "dst", "").await;
+        std::fs::create_dir(path.join("remotes.d")).unwrap();
+        signer_home.export_to(&path.join("remotes.d").join("origin.trustedkeys.gpg"));
+        assert!(dst.remotes_dir().is_none());
+        let err = gpg_pull(&dst, &src).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
     });
 }
 

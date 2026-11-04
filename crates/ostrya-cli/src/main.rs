@@ -1619,10 +1619,11 @@ struct ShowArgs {
     gpg_homedir: Option<PathBuf>,
     /// Use the GPG configuration of this remote to verify signatures.
     ///
-    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
-    /// `/etc/ostree/remotes.d/`, and each `gpgkeypath` entry of the remote.
-    /// When neither `<remote>.trustedkeys.gpg` exists, the global trusted
-    /// keyrings take part too. The global keyrings are the files whose names
+    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository, or,
+    /// when that file is absent, in the remotes directory of the repository,
+    /// and each `gpgkeypath` entry of the remote. When neither
+    /// `<remote>.trustedkeys.gpg` exists, the global trusted keyrings take
+    /// part too. The global keyrings are the files whose names
     /// end in `.gpg` in the directory that `OSTREE_GPG_HOME` names, or in
     /// `/usr/share/ostree/trusted.gpg.d/`. Each keyring of the remote and
     /// each global keyring must be a binary OpenPGP keyring. The command
@@ -2005,9 +2006,11 @@ enum RemoteCommand {
     /// List the GPG keys in the trusted keyring of a remote.
     ///
     /// The command reads the file `NAME.trustedkeys.gpg` at the root of the
-    /// repository. For each key, it prints a `Key:` line with the fingerprint,
-    /// a `Created:` line with the creation time in UTC, and one `UID:` line for
-    /// each user id. If the keyring does not exist, the command prints nothing.
+    /// repository, or, when that file is absent, in the remotes directory of
+    /// the repository. For each key, it prints a `Key:` line with the
+    /// fingerprint, a `Created:` line with the creation time in UTC, and one
+    /// `UID:` line for each user id. If neither file exists, the command
+    /// prints nothing.
     #[command(name = "gpg-list-keys")]
     GpgListKeys(RemoteNameArgs),
 }
@@ -3008,16 +3011,17 @@ struct SignArgs {
     /// The engines are the engines that the config of the remote turns on for
     /// its commits: `gpg-verify` and `sign-verify`, or the trust group that
     /// the key `trust` names. The keys are the keys of the remote alone:
-    /// `<remote>.trustedkeys.gpg` in the repository and in
-    /// `/etc/ostree/remotes.d/`, each `gpgkeypath` entry, and the
-    /// `verification-<type>-key` and `verification-<type>-file` keys, or the
-    /// keys of the trust group. Each `<remote>.trustedkeys.gpg` must be a
-    /// binary OpenPGP keyring, so the command refuses an armored one. The
-    /// command reads no global GPG trusted directory and no key directory. A
-    /// --sign-type selects its engine. The command then reads the keys of the
-    /// selected engines alone, and refuses an engine that the config does not
-    /// turn on. The command refuses this option with a KEY-ID, a --keys-file,
-    /// or a --keys-dir, and without --verify.
+    /// `<remote>.trustedkeys.gpg` in the repository, or, when that file is
+    /// absent, in the remotes directory of the repository, each `gpgkeypath`
+    /// entry, and the `verification-<type>-key` and
+    /// `verification-<type>-file` keys, or the keys of the trust group. The
+    /// `<remote>.trustedkeys.gpg` must be a binary OpenPGP keyring, so the
+    /// command refuses an armored one. The command reads no global GPG trusted
+    /// directory and no key directory. A --sign-type selects its engine. The
+    /// command then reads the keys of the selected engines alone, and refuses
+    /// an engine that the config does not turn on. The command refuses this
+    /// option with a KEY-ID, a --keys-file, or a --keys-dir, and without
+    /// --verify.
     #[arg(long)]
     remote: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
@@ -3216,10 +3220,11 @@ struct SummaryArgs {
     /// The engines are the engines that the config of the remote turns on for
     /// its summary: `gpg-verify-summary` and `sign-verify-summary`. The keys
     /// are the keys of the remote alone: `<remote>.trustedkeys.gpg` in the
-    /// repository and in `/etc/ostree/remotes.d/`, each `gpgkeypath` entry,
-    /// and the `verification-<type>-key` and `verification-<type>-file` keys.
-    /// Each `<remote>.trustedkeys.gpg` must be a binary OpenPGP keyring, so
-    /// the command refuses an armored one. The command reads no global GPG
+    /// repository, or, when that file is absent, in the remotes directory of
+    /// the repository, each `gpgkeypath` entry, and the
+    /// `verification-<type>-key` and `verification-<type>-file` keys. The
+    /// `<remote>.trustedkeys.gpg` must be a binary OpenPGP keyring, so the
+    /// command refuses an armored one. The command reads no global GPG
     /// trusted directory and no key directory. A --sign-type selects its
     /// engine. The command then reads the keys of the selected engines alone,
     /// and refuses an engine that the config does not turn on. The command
@@ -4002,12 +4007,12 @@ struct PullArgs {
     /// `--gpg-verify=false` requires none. The pull checks no signature of a
     /// dependency, unless the dependency is also a target, a parent that
     /// --depth takes, or a commit of a chain of static deltas. The trusted keys
-    /// are `<remote>.trustedkeys.gpg` of the repository and of
-    /// `/etc/ostree/remotes.d/`, and the keyrings that the `gpgkeypath` key of
-    /// the remote names. When neither `<remote>.trustedkeys.gpg` exists, the
-    /// global trusted keyrings take part too. If
-    /// the remote has the key `trust`, the keys of the commits come from its
-    /// trust group (see ostrya-config(1)). The command then refuses
+    /// are `<remote>.trustedkeys.gpg` of the repository, or, when that file is
+    /// absent, of the remotes directory of the repository, and the keyrings
+    /// that the `gpgkeypath` key of the remote names. When neither
+    /// `<remote>.trustedkeys.gpg` exists, the global trusted keyrings take part
+    /// too. If the remote has the key `trust`, the keys of the commits come
+    /// from its trust group (see ostrya-config(1)). The command then refuses
     /// `--gpg-verify`, and `--gpg-verify=false` turns off the GPG check of the
     /// group.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
@@ -12316,8 +12321,9 @@ async fn report_commit_signatures(
 /// Under `--gpg-verify-remote`, the keyrings are the full trusted set of that
 /// remote, in this load order:
 ///
-/// - `<remote>.trustedkeys.gpg` in the repository and in
-///   `/etc/ostree/remotes.d/`. Each must be a binary OpenPGP packet stream.
+/// - `<remote>.trustedkeys.gpg` in the repository, or, only when that file is
+///   absent, in the remotes directory of the repository. It must be a binary
+///   OpenPGP packet stream.
 /// - The global trusted set, only when neither keyring of the remote exists.
 ///   Each of its files must be a binary OpenPGP packet stream.
 /// - Each `gpgkeypath` entry of the remote.
@@ -12339,7 +12345,7 @@ fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<G
             )));
         }
         let keypath = remote_section(repo, remote).gpgkeypath()?;
-        return GpgVerifier::for_remote_keypath(repo_path, remote, &keypath);
+        return GpgVerifier::for_remote_in(repo, remote, &keypath);
     }
     let mut paths = vec![repo_path.join("gpgkeys.gpg")];
     if let Some(homedir) = args.gpg_homedir.as_deref() {

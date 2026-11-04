@@ -51,10 +51,6 @@ for it.
   summary`. The decision is to carry the summary cache or to refuse the
   option at each site.
 - The pull does not write the summary cache `tmp/cache/summaries/`.
-- `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg` acts as the repository
-  keyring of the remote: it takes binary keyrings alone, and it stops the
-  read of the global trusted directory. The answer of the `ostree` command
-  to this file is not observed, because the probe needs root.
 - The pull does not read the remote keys `contenturl` and `metalink`, and
   refuses a `metalink=` or `mirrorlist=` URL.
 - `Repo::pull` over HTTP refuses `collection_id`. `Repo::pull_collection`

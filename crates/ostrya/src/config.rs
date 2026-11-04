@@ -905,7 +905,8 @@ impl Remote<'_> {
     /// Returns the `gpgkeypath` entries: more trusted GPG keyrings.
     ///
     /// The remote also trusts the keyring `<remote>.trustedkeys.gpg` of the
-    /// repository and the system trusted set. The call reads the raw value of
+    /// repository, or of the remotes directory when the repository holds no
+    /// such file, and the system trusted set. The call reads the raw value of
     /// the key and does not decode the escape sequences of the key file, so
     /// `\s` is two characters of a path. A `;` separates the entries. The call
     /// removes one empty entry at the end of the list and keeps each other

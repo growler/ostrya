@@ -199,6 +199,22 @@ fn display_base(dir: &RemotesDir) -> &Path {
     }
 }
 
+/// Returns the descriptor and the path that open the entry `name` of `dir`,
+/// and the path that names the entry in an error message.
+///
+/// The error path is the path of a [`Path`](RemotesDir::Path) value as
+/// given, or of an [`InRepo`](RemotesDir::InRepo) value, joined with `name`.
+/// For a [`Fd`](RemotesDir::Fd) value, it is `name` alone.
+#[cfg(feature = "verify-gpg")]
+pub(crate) fn entry<'a>(
+    repo_fd: BorrowedFd<'a>,
+    dir: &'a RemotesDir,
+    name: &str,
+) -> (BorrowedFd<'a>, PathBuf, PathBuf) {
+    let (base, at) = locate(repo_fd, dir);
+    (base, at.join(name), display_base(dir).join(name))
+}
+
 /// Opens the directory `dir`. Returns `None` if the directory or a parent of
 /// it is absent.
 fn open_dir(repo_fd: BorrowedFd<'_>, dir: &RemotesDir) -> Result<Option<OwnedFd>> {

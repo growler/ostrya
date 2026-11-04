@@ -222,6 +222,16 @@ Each write changes one entry of the directory, so a race of the two loses at mos
 Each command that edits a remote or \fB\%config\fR reads the directory again under the update lock.
 So a \fB\%.conf\fR file that fails the open, and that comes into the directory after the open, makes the edit fail.
 .PP
+The remotes directory can also hold the GPG keyring \fB\%NAME.trustedkeys.gpg\fR of a remote.
+ostrya reads it only when the repository holds no \fB\%NAME.trustedkeys.gpg\fR.
+An empty repository keyring hides it.
+A repository keyring that ostrya cannot read fails the verification, and ostrya does not read the keyring of the directory.
+A symlink to an absent file is no keyring.
+A keyring of the directory that ostrya cannot open or read for a reason other than its absence fails the verification, and the refusal names its path with the words "of the remotes directory".
+\fB\%ostrya remote gpg\-list\-keys\fR reads the same keyring.
+\fB\%ostrya remote gpg\-import\fR writes \fB\%<repo>/NAME.trustedkeys.gpg\fR, also for a remote of the directory, and never writes a keyring of the directory.
+\fB\%ostrya remote delete\fR does not remove a keyring of the directory.
+.PP
 \fB\%ostrya config get\fR, \fB\%ostrya config set\fR, and \fB\%ostrya config unset\fR read and write \fB\%config\fR alone.
 \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.
 .SS "Address"
@@ -261,9 +271,10 @@ When the config has no group for \fB\%NAME\fR, \fB\%ostrya pull\-local\fR makes 
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)
 A pull checks the GPG signatures of its commits.
-The trusted keys are in \fB\%gpgkeypath\fR, \fB\%<repo>/NAME.trustedkeys.gpg\fR, and \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR.
+The trusted keys are in \fB\%gpgkeypath\fR and in the keyring of the remote.
+The keyring of the remote is \fB\%<repo>/NAME.trustedkeys.gpg\fR, or, only when that file is absent, \fB\%NAME.trustedkeys.gpg\fR in the remotes directory of the repository.
 When neither \fB\%NAME.trustedkeys.gpg\fR exists, the global trusted keyrings take part too.
-The two \fB\%NAME.trustedkeys.gpg\fR keyrings and the global keyrings must be binary OpenPGP keyrings.
+The keyring of the remote and the global keyrings must be binary OpenPGP keyrings.
 A pull refuses an armored one: the repository keyring by its name, and each other keyring by its path.
 A build without GPG support refuses \fB\%true\fR.
 .TP
@@ -314,7 +325,7 @@ In an \fB\%spki\fR file, white space is space, horizontal tab, line feed, form f
 \fB\%trust\fR (string)
 The name of a trust group \fB\%[ex\-ostrya trust "NAME"]\fR.
 The keys of the group check the commits of a pull from the remote: \fB\%ostrya pull\fR over each transport, \fB\%ostrya pull \-\-collection\fR, and \fB\%ostrya pull\-local \-\-remote=NAME\fR.
-The group alone supplies the keys of the commits: no system key store, no \fB\%<repo>/NAME.trustedkeys.gpg\fR, no \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and no global trusted keyring.
+The group alone supplies the keys of the commits: no system key store, no \fB\%<repo>/NAME.trustedkeys.gpg\fR, no \fB\%NAME.trustedkeys.gpg\fR of the remotes directory, and no global trusted keyring.
 \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the keys that they read still set the check of the summary, and that check still reads these key sources.
 A pull refuses a value that is empty, holds \fB\%"\fR or a control character, or names no group.
 Beside this key, a pull refuses \fB\%gpg\-verify=true\fR and a \fB\%sign\-verify\fR value other than false, because the group sets the checks of the commits.

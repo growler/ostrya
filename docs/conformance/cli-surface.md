@@ -552,9 +552,10 @@ observed and deliberately not reproduced:
   of one certificate carry rather than as the statement the first export makes,
   and the armor that the port does not decode.
 
-`show --gpg-verify-remote=REMOTE` reads `REMOTE.trustedkeys.gpg` in the
-repository and in `/etc/ostree/remotes.d/`, the global trusted set, and each
-`gpgkeypath` entry. The tool reads keyrings from the same kinds of source.
+`show --gpg-verify-remote=REMOTE` of the port reads `REMOTE.trustedkeys.gpg`
+in the repository, or, only when that file is absent, in the remotes
+directory of the repository, the global trusted set, and each `gpgkeypath`
+entry. The tool reads keyrings from the same kinds of source.
 Both commands read the global trusted set only when the repository holds no
 `REMOTE.trustedkeys.gpg` (`show/gpg-verify-remote-global-fallback`). An
 empty file at that path stops the read, and a symlink to no file does not.
@@ -563,7 +564,7 @@ directory, so a file there that cannot be read or that is not a keyring
 gives no error. So when the repository keyring and the global trusted set
 hold two exports of one key, the export in the repository keyring supplies
 the user id in both. The port also reads the global trusted set only when
-`/etc/ostree/remotes.d/REMOTE.trustedkeys.gpg` does not exist. The read of
+the remotes directory holds no `REMOTE.trustedkeys.gpg`. The read of
 `/etc/ostree/remotes.d/` by the tool is not observed (`cli-behavior.md`,
 "`show`"). Both commands also read the repository keyring before the
 `gpgkeypath` entries. When a directory is at the path of the repository
@@ -4192,17 +4193,18 @@ PKCS#8 DER, and each block adds one signature. Twenty-six differences stand.
   The port verifies with the engines that the config of the remote turns on
   for its commits: `gpg-verify` and `sign-verify`, or the trust group that
   the key `trust` names, as a pull reads them. The keys are the keys of the
-  remote alone: `<remote>.trustedkeys.gpg` in the repository and in
-  `/etc/ostree/remotes.d/`, each `gpgkeypath` entry, and the
-  `verification-<engine>-key` and `verification-<engine>-file` keys, or the
-  keys of the trust group. Each `<remote>.trustedkeys.gpg` must be a binary
-  OpenPGP packet stream, and the port refuses an armored one at exit 1. The
-  refusal names the repository keyring as `the keyring
-  '<remote>.trustedkeys.gpg'`, and the keyring of `/etc/ostree/remotes.d/` by
-  its path. The port reads no global GPG trusted directory and no system key
-  directory for `--remote`. It refuses a remote with no section, a remote
-  whose config turns on no check, and a remote whose config turns on the GPG
-  check with no certificate in its keyrings. A `-s` with no key
+  remote alone: `<remote>.trustedkeys.gpg` in the repository, or, only when
+  that file is absent, in the remotes directory of the repository, each
+  `gpgkeypath` entry, and the `verification-<engine>-key` and
+  `verification-<engine>-file` keys, or the keys of the trust group. The
+  `<remote>.trustedkeys.gpg` must be a binary OpenPGP packet stream, and the
+  port refuses an armored one at exit 1. The refusal names the repository
+  keyring as `the keyring '<remote>.trustedkeys.gpg'`, and the keyring of the
+  remotes directory as `the keyring '<path>' of the remotes directory`. The
+  port reads no global GPG trusted directory and no system key directory for
+  `--remote`. It refuses a remote with no section, a remote whose config
+  turns on no check, and a remote whose config turns on the GPG check with no
+  certificate in its keyrings. A `-s` with no key
   selects its engine. The port then reads the keys of the selected engines
   alone, and refuses an engine that the config does not turn on with `error:
   signature: remote '<remote>' turns on no <engine> check of its commits`.

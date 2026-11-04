@@ -540,7 +540,7 @@ This option conflicts with \%\-\-keyring.
 .SS "gpg\-list\-keys"
 List the GPG keys in the trusted keyring of a remote.
 .PP
-The command reads the file \fB\%NAME.trustedkeys.gpg\fR at the root of the repository. For each key, it prints a \fB\%Key:\fR line with the fingerprint, a \fB\%Created:\fR line with the creation time in UTC, and one \fB\%UID:\fR line for each user id. If the keyring does not exist, the command prints nothing.
+The command reads the file \fB\%NAME.trustedkeys.gpg\fR at the root of the repository, or, when that file is absent, in the remotes directory of the repository. For each key, it prints a \fB\%Key:\fR line with the fingerprint, a \fB\%Created:\fR line with the creation time in UTC, and one \fB\%UID:\fR line for each user id. If neither file exists, the command prints nothing.
 .PP
 .nf
 ostrya remote gpg\-list\-keys [OPTIONS] [NAME]

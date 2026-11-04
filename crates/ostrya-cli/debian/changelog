@@ -1,3 +1,20 @@
+ostrya (0.9.0) unstable; urgency=medium
+
+  * pull --collection reads a file:// candidate as a local repository.
+    It hashes each object it imports from such a candidate when the keys
+    of the candidate check the signatures of the commits or the summary.
+  * pull --collection skips a listed ref whose name fails the ref-name
+    rule, with a warning.
+  * pull --collection prints the pull-local statistics line for the
+    objects it imports from local candidates.
+  * pull --collection under the own collection id writes
+    refs/mirrors/ID/REF when that file holds a ref, and refs/heads/REF
+    otherwise.
+  * refs -c --delete checks each ref before it deletes a ref, and
+    refuses a local name with ':'.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 14:46:14 +0100
+
 ostrya (0.8.0) unstable; urgency=medium
 
   * commit --tree=tar gives the uid, gid, and xattr records of a pax

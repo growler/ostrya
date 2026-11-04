@@ -9,7 +9,7 @@
 #
 # Run:  debles check build.les   (then: debles lock / fetch / build / cp)
 
-_SNAPSHOT = datetime.from_iso("2026-09-12").to_iso()
+_SNAPSHOT = datetime.from_iso("2026-11-01").to_iso()
 _RUST_VERSION = ["1.92.0", "2025-12-11"]
 _DEBEMAIL = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
 

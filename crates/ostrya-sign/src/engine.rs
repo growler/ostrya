@@ -101,14 +101,17 @@ pub struct SignatureInfo {
     /// The fingerprint of the signing key, if the engine gives one.
     ///
     /// The GPG engine gives the fingerprint of the key in uppercase hex. The
-    /// spki engine gives the SHA-256 of the SubjectPublicKeyInfo DER of the
-    /// key in lowercase hex, for a valid signature alone.
+    /// ed25519 engine and the spki engine give the SHA-256 of the
+    /// SubjectPublicKeyInfo DER of the key in lowercase hex, for a valid
+    /// signature alone. The two engines give the same value for one Ed25519
+    /// key.
     pub fingerprint: Option<String>,
     /// The fingerprint of the primary key of the certificate of the signer.
     ///
-    /// If a subkey made the signature (GPG), this is the fingerprint of the
-    /// primary key of the subkey. If the primary key made the signature, this
-    /// value is equal to [`fingerprint`](Self::fingerprint).
+    /// The GPG engine sets this field. If a subkey made the signature, this is
+    /// the fingerprint of the primary key of the subkey. If the primary key
+    /// made the signature, this value is equal to
+    /// [`fingerprint`](Self::fingerprint). The other engines leave it unset.
     pub primary_fingerprint: Option<String>,
     /// The creation time of the signature in seconds since the Unix epoch.
     ///

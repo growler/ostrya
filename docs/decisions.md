@@ -283,9 +283,13 @@ trusted. The fingerprint of a verified signature is the SHA-256 of this DER
 in lowercase hex. So two forms of one key give one key and one fingerprint. A
 compare of the typed values of each key type was rejected: the DER is a
 function of the decoded key and holds the algorithm OID, so one compare serves
-each key type. The GPG engine keeps its uppercase hex fingerprint. The report
-of `sign --verify` and `summary --verify` prints the fingerprint under the
-GPG engine alone.
+each key type. The ed25519 engine gives the same fingerprint for an Ed25519
+key. It puts the 32 bytes of the key, as they were given, after a DER prefix
+constant of its own, the 12 bytes of RFC 8410. The encoder of the feature
+`pkcs8` of `ed25519-dalek` was rejected: the feature is behind `spki`, and
+the ed25519 engine has no feature gate. The GPG engine keeps its uppercase hex
+fingerprint. The report of `sign --verify` and `summary --verify` prints the
+fingerprint under the GPG engine alone.
 
 The OpenSSL build of the `ostree` command on the development host has the
 spki engine. The tests in `crates/ostrya/tests/sign_spki_fixtures.rs` compare

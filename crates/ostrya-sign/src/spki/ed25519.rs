@@ -96,8 +96,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Ed25519Signer, Error, Result, Signer, SpkiSigner, SpkiVerifier, Verifier, spki_public_keys,
-        spki_secret_key_lines, spki_secret_keys,
+        Ed25519Signer, Ed25519Verifier, Error, Result, Signer, SpkiSigner, SpkiVerifier, Verifier,
+        spki_public_keys, spki_secret_key_lines, spki_secret_keys,
     };
 
     // The key of test 1 in RFC 8032, section 7.1.
@@ -249,6 +249,23 @@ mod tests {
                 block_on(spki.sign(data)).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn the_ed25519_engine_and_the_spki_engine_give_one_fingerprint() {
+        let keypair = [from_hex(SEED_HEX), from_hex(PUBLIC_HEX)].concat();
+        let signer = Ed25519Signer::from_secret_key(&keypair).unwrap();
+        let signature = block_on(signer.sign(b"data")).unwrap();
+        let ed25519 = Ed25519Verifier::new([from_hex(PUBLIC_HEX)], Vec::<Vec<u8>>::new())
+            .unwrap()
+            .verify(b"data", std::slice::from_ref(&signature))
+            .unwrap();
+        let spki = outcome(&verifier(), b"data", &signature);
+        let (ed25519, spki) = (&ed25519.signatures[0], &spki.signatures[0]);
+        assert!(ed25519.valid);
+        assert!(spki.valid);
+        assert_eq!(ed25519.fingerprint.as_deref(), Some(FINGERPRINT));
+        assert_eq!(ed25519.fingerprint, spki.fingerprint);
     }
 
     #[test]

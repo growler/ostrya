@@ -366,7 +366,9 @@ impl Signer for SpkiSigner {
 ///   of one EC or RSA key give one fingerprint. The DER of an Ed25519 key
 ///   holds the 32 bytes of the key as they were given. The verifier does not
 ///   encode a point again, so a non-canonical encoding of a point gives a
-///   fingerprint of its own.
+///   fingerprint of its own. The ed25519 engine,
+///   [`Ed25519Verifier`](crate::Ed25519Verifier), gives the same fingerprint
+///   for an Ed25519 key.
 ///
 /// The verifier verifies in the call to [`Verifier::verify`], and the call
 /// holds its thread for the time of the verification. An ECDSA key and an RSA

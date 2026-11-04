@@ -16662,6 +16662,221 @@ fn remote_add_and_delete_write_the_remotes_dir() {
     assert_eq!(config_text(&repo), before, "a command wrote `config`");
 }
 
+/// `--remotes-config-dir` comes before the key `[ex-ostrya]
+/// remotes-config-dir`, before and after the subcommand name, for an explicit
+/// `--repo` and for the repository of the current directory. `remote add`
+/// writes into the directory of the option. A relative value is relative to
+/// the current directory. Without the option, the key gives the directory.
+#[test]
+fn the_remotes_config_dir_option_comes_before_the_key() {
+    let tmp = TmpDir::new("remote-dir-option");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let key_dir = tmp.path().join("key.d");
+    let opt_dir = tmp.path().join("opt.d");
+    for (dir, name) in [
+        (&key_dir, "a"),
+        (&opt_dir, "b"),
+        (&tmp.path().join("rel.d"), "r"),
+    ] {
+        std::fs::create_dir(dir).unwrap();
+        std::fs::write(
+            dir.join(format!("{name}.conf")),
+            format!("[remote \"{name}\"]\nurl=https://example.invalid/{name}\n"),
+        )
+        .unwrap();
+    }
+    set_remotes_config_dir(&repo, &key_dir);
+    let before = config_text(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    let opt_arg = format!("--remotes-config-dir={}", opt_dir.display());
+    let list = |args: &[&str]| {
+        ostrya_in(Some(tmp.path()), args, None, &[])
+            .ok()
+            .stdout_trimmed()
+    };
+
+    assert_eq!(list(&[&repo_arg, "remote", "list"]), "a");
+    assert_eq!(list(&[&repo_arg, &opt_arg, "remote", "list"]), "b");
+    assert_eq!(list(&["remote", "list", &repo_arg, &opt_arg]), "b");
+    assert_eq!(
+        list(&[&repo_arg, "--remotes-config-dir=rel.d", "remote", "list"]),
+        "r"
+    );
+
+    ostrya(
+        &[
+            &repo_arg,
+            &opt_arg,
+            "remote",
+            "add",
+            "x",
+            "https://example.invalid/x",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        std::fs::read_to_string(opt_dir.join("x.conf")).unwrap(),
+        "[remote \"x\"]\nurl=https://example.invalid/x\n"
+    );
+    let discovered = ostrya_in(Some(&repo), &[&opt_arg, "remote", "list"], None, &[]);
+    assert_eq!(discovered.ok().stdout_trimmed(), "b\nx");
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+}
+
+/// With no option and no key, a repository that is not the system
+/// repository has no remotes directory. `remote add` writes into `config`
+/// with `[core] add-remotes-config-dir=true`, and creates no directory.
+#[test]
+fn remote_add_without_a_remotes_dir_writes_config() {
+    let tmp = TmpDir::new("remote-dir-none");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = |args: &[&str]| {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(args);
+        ostrya(&full, None, &[]).ok();
+    };
+    run(&["config", "set", "core.add-remotes-config-dir", "true"]);
+    let entries = || {
+        let mut names: Vec<_> = std::fs::read_dir(&repo)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = entries();
+    run(&["remote", "add", "x", "https://example.invalid/x"]);
+    assert!(
+        config_text(&repo).ends_with("[remote \"x\"]\nurl=https://example.invalid/x\n"),
+        "{}",
+        config_text(&repo)
+    );
+    assert_eq!(entries(), before);
+    let top: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(top, ["repo"]);
+}
+
+/// `init --remotes-config-dir` writes the absolute path of a relative value
+/// into the key, and a later `remote add` with no option writes into that
+/// directory. An `init` over an existing `config` leaves it unchanged. An
+/// empty value is refused at exit 1.
+#[test]
+fn init_writes_the_remotes_config_dir_key() {
+    let tmp = TmpDir::new("init-remote-dir");
+    let in_tmp = |args: &[&str]| ostrya_in(Some(tmp.path()), args, None, &[]);
+    in_tmp(&[
+        "init",
+        "--repo=repo",
+        "--mode=archive",
+        "--remotes-config-dir=rel.d",
+    ])
+    .ok();
+    let repo = tmp.path().join("repo");
+    let dir = tmp.path().canonicalize().unwrap().join("rel.d");
+    let config = format!(
+        "[core]\nrepo_version=1\nmode=archive-z2\n\n[ex-ostrya]\nremotes-config-dir={}\n",
+        dir.display()
+    );
+    assert_eq!(config_text(&repo), config);
+    assert!(!dir.exists(), "init created the remotes directory");
+
+    in_tmp(&[
+        "--repo=repo",
+        "remote",
+        "add",
+        "x",
+        "https://example.invalid/x",
+    ])
+    .ok();
+    assert!(dir.join("x.conf").is_file());
+    in_tmp(&[
+        "init",
+        "--repo=repo",
+        "--mode=archive",
+        "--remotes-config-dir=other.d",
+    ])
+    .ok();
+    assert_eq!(config_text(&repo), config);
+
+    let refused = in_tmp(&["init", "--repo=empty", "--remotes-config-dir="]);
+    let (code, stderr) = code_and_stderr(&refused);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("--remotes-config-dir"), "{stderr}");
+    assert!(!tmp.path().join("empty").exists());
+}
+
+/// `init` with no `--repo` finds the repository of the current directory with
+/// `--remotes-config-dir`, as other subcommands do. The key of the repository
+/// names a regular file, so an open without the option fails.
+#[test]
+fn init_finds_the_current_repository_with_the_remotes_config_dir_option() {
+    let tmp = TmpDir::new("init-remote-dir-cwd");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let file = tmp.path().join("file");
+    std::fs::write(&file, "").unwrap();
+    set_remotes_config_dir(&repo, &file);
+    let before = config_text(&repo);
+    let opt_arg = format!("--remotes-config-dir={}", tmp.path().join("sub").display());
+    let in_repo = |args: &[&str]| ostrya_in(Some(&repo), args, None, &[]);
+
+    in_repo(&[&opt_arg, "remote", "list"]).ok();
+    in_repo(&["init", "--mode=archive", &opt_arg]).ok();
+    assert_eq!(config_text(&repo), before);
+}
+
+/// `pull-local` opens its source repository and each --localcache-repo
+/// without `--remotes-config-dir`. The `config` of each holds a remote that a
+/// file of the option directory also holds, so an open with the option fails.
+#[test]
+fn pull_local_opens_the_source_without_the_remotes_config_dir_option() {
+    let tmp = TmpDir::new("remote-dir-pull-local");
+    let (src, dest) = (tmp.path().join("src"), tmp.path().join("dest"));
+    let cache = tmp.path().join("cache");
+    for path in [&src, &dest, &cache] {
+        block_on(Repo::create(path, CreateOptions::new(RepoMode::Archive))).unwrap();
+    }
+    let dir = tmp.path().join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    let group = "[remote \"x\"]\nurl=https://example.invalid/x\n";
+    std::fs::write(dir.join("x.conf"), group).unwrap();
+    for path in [&src, &cache] {
+        let mut config = config_text(path);
+        config.push_str(&format!("\n{group}"));
+        std::fs::write(path.join("config"), config).unwrap();
+    }
+    let opt_arg = format!("--remotes-config-dir={}", dir.display());
+
+    let src_open = ostrya(
+        &[
+            &format!("--repo={}", src.display()),
+            &opt_arg,
+            "remote",
+            "list",
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(src_open.status.code(), Some(1));
+    ostrya(
+        &[
+            &format!("--repo={}", dest.display()),
+            &opt_arg,
+            "pull-local",
+            &format!("--localcache-repo={}", cache.display()),
+            &src.display().to_string(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+}
+
 /// `config set` and `config unset` of a key of a remote of the remotes
 /// directory refuse at exit 1 in the words of the `ostree` command, and
 /// write nothing.

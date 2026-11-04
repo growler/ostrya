@@ -60,9 +60,9 @@ use ostrya::{
     DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, RemoteSource, RemotesDir,
-    Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
+    FsckPhase, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags,
+    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, RemoteSource,
+    RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
     TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
     Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
@@ -126,6 +126,26 @@ struct Cli {
     /// explicit --repo does not open as a repository.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
+    /// The remotes directory of the repository.
+    ///
+    /// This option is an extension of ostrya. The remotes directory holds one
+    /// `NAME.conf` file for each remote. A relative PATH is relative to the
+    /// current directory. The command refuses an empty PATH. The option has
+    /// no environment variable.
+    ///
+    /// The command selects the remotes directory of the repository in this
+    /// order: this option, then the key `[ex-ostrya] remotes-config-dir` in
+    /// `config`, then `/etc/ostree/remotes.d` if the repository is the system
+    /// repository, then no remotes directory. A relative value of the key is
+    /// relative to the repository directory. The system repository is the
+    /// directory of `/ostree/repo`, also through a symlink or a bind mount.
+    ///
+    /// `init` writes the absolute path of PATH into the key of a new `config`.
+    /// The option applies to the repository of the command alone. The source
+    /// repository of `pull-local` and each --localcache-repo take their
+    /// remotes directory from the key alone.
+    #[arg(long, value_name = "PATH", global = true)]
+    remotes_config_dir: Option<PathBuf>,
     /// Write extra information to standard error.
     ///
     /// Most subcommands write the line `ostrya: using repository PATH` when
@@ -154,7 +174,9 @@ enum Command {
     /// exist. The parent directory must exist. Then the command writes the
     /// directories of the repository layout and the `config` file. The
     /// `[core]` group of `config` holds `repo_version=1`, `mode`, and
-    /// `collection-id` if --collection-id is given.
+    /// `collection-id` if --collection-id is given. With the global option
+    /// --remotes-config-dir, the `[ex-ostrya]` group holds
+    /// `remotes-config-dir` with the absolute path of its value.
     ///
     /// The command is idempotent. It keeps each part of the layout that
     /// exists. If the `config` file exists, the command keeps it unchanged,
@@ -5144,7 +5166,11 @@ fn main() -> std::process::ExitCode {
     let Some(command) = cli.command else {
         exit_no_command();
     };
-    match ostrya_rt::block_on(run(cli.repo.as_deref(), cli.verbose, command)) {
+    let repo = RepoArgs {
+        path: cli.repo.as_deref(),
+        remotes_dir: cli.remotes_config_dir.as_deref(),
+    };
+    match ostrya_rt::block_on(run(repo, cli.verbose, command)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("error: {}", error_line(&err));
@@ -5171,8 +5197,18 @@ fn error_line(err: &Error) -> String {
     }
 }
 
+/// The global options that select the repository of a subcommand and its
+/// remotes directory.
+#[derive(Clone, Copy)]
+struct RepoArgs<'a> {
+    /// The value of `--repo`.
+    path: Option<&'a Path>,
+    /// The value of `--remotes-config-dir`.
+    remotes_dir: Option<&'a Path>,
+}
+
 /// Runs one subcommand with the global options.
-async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()> {
+async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> {
     let name = command.name();
     match command {
         Command::Init(args) => init(repo, verbose, name, args).await,
@@ -6012,7 +6048,7 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
 /// [`PushBar`] while the push runs.
 #[cfg(feature = "push")]
 async fn push_tree(
-    repo: Option<&Path>,
+    repo: RepoArgs<'_>,
     verbose: bool,
     name: &str,
     args: PushTreeArgs,
@@ -6488,6 +6524,48 @@ fn exit_requires_repo(subcommand: &str) -> ! {
     exit_with_error(subcommand, "Command requires a --repo argument")
 }
 
+/// The path of the system repository of an ostree host.
+const SYSTEM_REPO: &str = "/ostree/repo";
+
+/// The remotes directory of the system repository.
+const SYSTEM_REMOTES_DIR: &str = "/etc/ostree/remotes.d";
+
+/// Returns true if `path` and `system_repo` name one directory.
+///
+/// The check compares the device and the inode, and it follows symlinks. So a
+/// symlink to the system repository and a bind mount of it match. A path that
+/// does not stat is not the system repository.
+fn is_system_repo(path: &Path, system_repo: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Ok(b) = std::fs::metadata(system_repo) else {
+        return false;
+    };
+    std::fs::metadata(path).is_ok_and(|a| a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+/// Returns the options of the open of the repository at `path`.
+///
+/// The open selects the remotes directory in this order:
+///
+/// 1. `remotes_dir`, the value of `--remotes-config-dir`;
+/// 2. the key `[ex-ostrya] remotes-config-dir` in `config`;
+/// 3. [`SYSTEM_REMOTES_DIR`], if `path` is the system repository by
+///    [`is_system_repo`];
+/// 4. no remotes directory.
+///
+/// `system_repo` is the path of the system repository, [`SYSTEM_REPO`] in
+/// production. With `remotes_dir` set, the function does not stat `path`.
+fn open_options(path: &Path, remotes_dir: Option<&Path>, system_repo: &Path) -> OpenOptions {
+    let opts = OpenOptions::new();
+    match remotes_dir {
+        Some(dir) => opts.remotes_dir(RemotesDir::path(dir)),
+        None if is_system_repo(path, system_repo) => {
+            opts.default_remotes_dir(RemotesDir::path(SYSTEM_REMOTES_DIR))
+        }
+        None => opts,
+    }
+}
+
 /// Resolves the repository of a subcommand and the file system path to it.
 ///
 /// # Precedence
@@ -6498,9 +6576,13 @@ fn exit_requires_repo(subcommand: &str) -> ! {
 /// 3. `OSTREE_REPO`, if it opens as a repository.
 ///
 /// The chain ends there. The `ostree` command has one more source after
-/// `OSTREE_REPO`, the compiled-in `/sysroot/ostree/repo`. ostrya does not use
-/// this source, so an omitted `--repo` never makes `ostrya` act on a live
-/// system repository.
+/// `OSTREE_REPO`. Its help text names `/sysroot/ostree/repo`, and the observed
+/// source is `/ostree/repo`. ostrya does not use this source, so an omitted
+/// `--repo` never makes `ostrya` act on a live system repository.
+///
+/// Each candidate opens with the options of [`open_options`], which select
+/// the remotes directory. A candidate of step 2 or 3 that does not open is
+/// skipped, also when its remotes directory fails the open.
 ///
 /// If no source gives a repository, the function prints the usage text of
 /// `subcommand` and the error line of `ostree`, then exits.
@@ -6508,9 +6590,10 @@ fn exit_requires_repo(subcommand: &str) -> ! {
 /// `init` uses the same precedence through [`resolve_init_path`]. That function
 /// returns a path, because the explicit `--repo` path of `init` does not need
 /// to exist.
-async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (Repo, PathBuf) {
-    if let Some(path) = repo {
-        match Repo::open(path).await {
+async fn resolve_repo(repo: RepoArgs<'_>, verbose: bool, subcommand: &str) -> (Repo, PathBuf) {
+    let open = |path: &Path| open_options(path, repo.remotes_dir, Path::new(SYSTEM_REPO));
+    if let Some(path) = repo.path {
+        match open(path).open(path).await {
             Ok(repo) => {
                 if verbose {
                     eprintln!("ostrya: using repository {}", path.display());
@@ -6524,7 +6607,7 @@ async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (
         }
     }
     let cwd = Path::new(".");
-    if let Ok(repo) = Repo::open(cwd).await {
+    if let Ok(repo) = open(cwd).open(cwd).await {
         if verbose {
             eprintln!("ostrya: using repository {}", cwd.display());
         }
@@ -6532,7 +6615,7 @@ async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (
     }
     if let Ok(val) = std::env::var("OSTREE_REPO") {
         let path = PathBuf::from(val);
-        if let Ok(repo) = Repo::open(&path).await {
+        if let Ok(repo) = open(&path).open(&path).await {
             if verbose {
                 eprintln!("ostrya: using repository {}", path.display());
             }
@@ -6549,22 +6632,24 @@ async fn resolve_repo(repo: Option<&Path>, verbose: bool, subcommand: &str) -> (
 /// - An explicit `--repo` path is used as given, valid or not, because the new
 ///   repository does not need to exist there.
 /// - The current directory and `OSTREE_REPO` apply only if the path opens as a
-///   repository. Then the call is an idempotent re-init.
+///   repository with the options of [`open_options`]. Then the call is an
+///   idempotent re-init.
 ///
 /// `init` never creates a new repository at a path that it did not get
 /// explicitly. If no source gives a path, [`exit_requires_repo`] ends the
 /// process.
-async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
-    if let Some(path) = repo {
+async fn resolve_init_path(repo: RepoArgs<'_>, subcommand: &str) -> PathBuf {
+    if let Some(path) = repo.path {
         return path.to_owned();
     }
+    let open = |path: &Path| open_options(path, repo.remotes_dir, Path::new(SYSTEM_REPO));
     let cwd = Path::new(".");
-    if Repo::open(cwd).await.is_ok() {
+    if open(cwd).open(cwd).await.is_ok() {
         return cwd.to_owned();
     }
     if let Ok(val) = std::env::var("OSTREE_REPO") {
         let path = PathBuf::from(val);
-        if Repo::open(&path).await.is_ok() {
+        if open(&path).open(&path).await.is_ok() {
             return path;
         }
     }
@@ -6574,12 +6659,15 @@ async fn resolve_init_path(repo: Option<&Path>, subcommand: &str) -> PathBuf {
 /// Creates a new empty repository, or reuses one at the resolved path.
 ///
 /// The reuse is idempotent, as in `Repo::create`.
-async fn init(repo: Option<&Path>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
+async fn init(repo: RepoArgs<'_>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
     let path = resolve_init_path(repo, name).await;
     let mode = parse_init_mode(&args.mode);
     let mut opts = CreateOptions::new(mode);
     if let Some(id) = args.collection_id {
         opts = opts.collection_id(id);
+    }
+    if let Some(dir) = repo.remotes_dir {
+        opts = opts.remotes_dir(RemotesDir::path(dir));
     }
     Repo::create(&path, opts).await?;
     if verbose {
@@ -17356,5 +17444,86 @@ mod tests {
         assert_eq!(seen[1].1.mode, 0o42775);
         assert!(seen.iter().all(|(_, m)| m.uid == 0), "{seen:?}");
         assert_eq!(seen[0].1.gid, gid);
+    }
+
+    /// A directory is the system repository when it is the directory of the
+    /// system path, by device and inode. A symlink to it and a path with `.`
+    /// match. Another directory and an absent system path do not match.
+    #[test]
+    fn the_system_repository_is_the_directory_of_its_path() {
+        let root =
+            std::env::temp_dir().join(format!("ostrya-cli-system-repo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (system, other) = (root.join("system"), root.join("other"));
+        for path in [&system, &other] {
+            std::fs::create_dir_all(path).unwrap();
+        }
+        std::os::unix::fs::symlink("system", root.join("link")).unwrap();
+
+        let matched = [
+            is_system_repo(&system, &system),
+            is_system_repo(&root.join("link"), &system),
+            is_system_repo(&system.join("."), &system),
+            is_system_repo(&system, &root.join("link")),
+        ];
+        let unmatched = [
+            is_system_repo(&other, &system),
+            is_system_repo(&system, &root.join("absent")),
+            is_system_repo(&root.join("absent"), &root.join("absent")),
+        ];
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(matched, [true; 4]);
+        assert_eq!(unmatched, [false; 3]);
+    }
+
+    /// `--remotes-config-dir` gives the remotes directory of the open, also
+    /// for the system repository. Without the option, a repository that is
+    /// not the system repository opens with no remotes directory.
+    #[test]
+    fn the_remotes_config_dir_option_selects_the_remotes_directory() {
+        let root =
+            std::env::temp_dir().join(format!("ostrya-cli-open-options-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("repo");
+        ostrya_rt::block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).unwrap();
+        let dir = root.join("remotes.d");
+
+        let absent = root.join("absent");
+
+        let with = ostrya_rt::block_on(open_options(&path, Some(&dir), &path).open(&path)).unwrap();
+        let without = ostrya_rt::block_on(open_options(&path, None, &absent).open(&path)).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(with.remotes_dir(), Some(RemotesDir::Path(p)) if *p == dir));
+        assert!(without.remotes_dir().is_none());
+    }
+
+    /// Without `--remotes-config-dir`, the system repository takes the key
+    /// `[ex-ostrya] remotes-config-dir` of its `config`. With no key, it takes
+    /// [`SYSTEM_REMOTES_DIR`].
+    #[test]
+    fn the_system_repository_takes_the_key_before_the_default_directory() {
+        let root =
+            std::env::temp_dir().join(format!("ostrya-cli-system-key-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let (keyed, plain, key) = (root.join("keyed"), root.join("plain"), root.join("key.d"));
+        let opts = CreateOptions::new(RepoMode::Archive);
+        ostrya_rt::block_on(Repo::create(
+            &keyed,
+            opts.clone().remotes_dir(RemotesDir::path(&key)),
+        ))
+        .unwrap();
+        ostrya_rt::block_on(Repo::create(&plain, opts)).unwrap();
+        let open =
+            |path: &Path| ostrya_rt::block_on(open_options(path, None, path).open(path)).unwrap();
+
+        let (keyed, plain) = (open(&keyed), open(&plain));
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(matches!(keyed.remotes_dir(), Some(RemotesDir::Path(p)) if *p == key));
+        assert!(matches!(
+            plain.remotes_dir(),
+            Some(RemotesDir::Path(p)) if p == Path::new(SYSTEM_REMOTES_DIR)
+        ));
     }
 }

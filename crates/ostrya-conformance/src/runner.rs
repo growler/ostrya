@@ -454,14 +454,14 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
     }
 
     // If an invocation binds no repository, the `ostree` command opens the
-    // compiled-in `tier::SYSTEM_REPO`. On a host with that repository, the
-    // premise of the cell fails, and the run acts on live system state. If
-    // the premise fails for one of the two implementations, the whole cell
-    // skips, so this check reads the two invocations. A declared cell runs in
-    // the scratch root of its side. The setups bind `$REPO` to a path under
-    // that root, and no setup makes the root itself a repository. The
-    // current directory thus resolves no repository, and the run line is the
-    // only input to read.
+    // compiled-in `tier::SYSTEM_REPO`. On a host with `tier::SYSTEM_REPO` or
+    // `tier::SYSROOT_REPO`, the premise of the cell fails, and the run acts
+    // on live system state. If the premise fails for one of the two
+    // implementations, the whole cell skips, so this check reads the two
+    // invocations. A declared cell runs in the scratch root of its side.
+    // The setups bind `$REPO` to a path under that root, and no setup makes
+    // the root itself a repository. The current directory thus resolves no
+    // repository, and the run line is the only input to read.
     //
     // A `probe:` cell has no `run:` line, so the guard in `exec::run` checks
     // each invocation of the probe. Of the two registered probes,
@@ -536,8 +536,8 @@ fn system_repo_premise(
         };
         if exec::system_repo_refusal(directory, &args, &[], Some(system_repo)).is_some() {
             return Some(format!(
-                "`{line}` binds no repository, and this host carries {}, which \
-                 the reference tool resolves; the claim cannot be made here",
+                "`{line}` binds no repository, and this host carries the \
+                 system repository {}; the claim cannot be made here",
                 system_repo.display()
             ));
         }

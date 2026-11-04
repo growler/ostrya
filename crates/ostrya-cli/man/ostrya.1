@@ -22,6 +22,15 @@ The option is accepted before and after the subcommand name. If both positions g
 .IP
 \fB\%init\fR creates a new repository only at an explicit \%\-\-repo. Without the option, \fB\%init\fR reuses a repository that it finds in the current directory or at \fB\%OSTREE_REPO\fR\&. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
 .TP
+\fB\-\-remotes\-config\-dir\fR \fIPATH\fR
+The remotes directory of the repository.
+.IP
+This option is an extension of ostrya. The remotes directory holds one \fB\%NAME.conf\fR file for each remote. A relative PATH is relative to the current directory. The command refuses an empty PATH. The option has no environment variable.
+.IP
+The command selects the remotes directory of the repository in this order: this option, then the key \fB\%[ex\-ostrya] remotes\-config\-dir\fR in \fB\%config\fR, then \fB\%/etc/ostree/remotes.d\fR if the repository is the system repository, then no remotes directory. A relative value of the key is relative to the repository directory. The system repository is the directory of \fB\%/ostree/repo\fR, also through a symlink or a bind mount.
+.IP
+\fB\%init\fR writes the absolute path of PATH into the key of a new \fB\%config\fR\&. The option applies to the repository of the command alone. The source repository of \fB\%pull\-local\fR and each \%\-\-localcache\-repo take their remotes directory from the key alone.
+.TP
 \fB\-v\fR, \fB\-\-verbose\fR
 Write extra information to standard error.
 .IP

@@ -257,11 +257,14 @@ applies where a reference is present, since only the reference converts its
 messages through the locale.
 
 The reference tool resolves a repository from the current directory, then
-`OSTREE_REPO`, then the compiled-in `/sysroot/ostree/repo`, and the third
-source stands outside the environment's reach. The harness reads it from the
-host: startup records whether `/sysroot/ostree/repo` is present, and the
-`host:` banner line ends with `system repo /sysroot/ostree/repo` or `no system
-repo` on every run. Where the host carries one, every invocation the harness
+`OSTREE_REPO`, then the compiled-in `/ostree/repo`, and the third source stands
+outside the environment's reach. The help text of the tool names
+`/sysroot/ostree/repo`, and the observed third source is `/ostree/repo`. On an
+ostree host, `/ostree` leads to `/sysroot/ostree`, so the two paths name one
+repository. The harness reads the two paths from the host: startup records the
+first of `/ostree/repo` and `/sysroot/ostree/repo` that is present, and the
+`host:` banner line ends with `system repo PATH` or `no system repo` on every
+run. Where the host carries one, every invocation the harness
 makes binds a repository -- through `--repo`, through `OSTREE_REPO`, or through
 a working directory that opens as one -- and an invocation binding none is
 refused before the process starts. Declared cells, probes, setups, oracles, and
@@ -390,9 +393,10 @@ Three verdicts. A cell reports exactly one.
   `reference-absent`, `unimplemented-cli`, `proved-elsewhere`, `declaration`,
   `filtered`, or `system-repo`.
 
-A `system-repo` skip states that the host carries `/sysroot/ostree/repo` and
-the cell holds an invocation binding no repository, which the reference tool
-resolves against that path, so the claim the cell states cannot be made here.
+A `system-repo` skip states that the host carries `/ostree/repo` or
+`/sysroot/ostree/repo` and the cell holds an invocation binding no repository,
+which the reference tool resolves against the system repository, so the claim
+the cell states cannot be made here.
 The skip names the path and the invocation. It is decided for both
 implementation handles together, so a cell whose premise fails for either side
 skips whole. The host decides it, and `--require` carries no flag that promotes

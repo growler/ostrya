@@ -1201,10 +1201,24 @@ A remotes directory holds remotes in `.conf` files. Each file is a key file
 with the rules of `config` below. The remotes of a file are its
 `[remote "NAME"]` groups, with the keys of a remote of `config`. A reader
 ignores each other group of a file. The tool reads the directory
-`/etc/ostree/remotes.d` for the system repository alone. The port reads the
-directory that `[ex-ostrya] remotes-config-dir` names ("Configuration keys of
-the port" in "Port extensions"), or the directory that a library caller gives
-at the open. `ostrya-config(1)`, "Remotes directory", states
+`/etc/ostree/remotes.d` for the system repository alone. The system repository
+of the tool is the directory of `/ostree/repo`. A symlink to that directory and
+a bind mount of it also give the system repository. `/sysroot/ostree/repo` is
+the system repository only when `/ostree` leads to the same directory.
+
+The port library reads the directory that `[ex-ostrya] remotes-config-dir`
+names ("Configuration keys of the port" in "Port extensions"), or the
+directory that a library caller gives at the open. The library detects no
+system repository. The `ostrya` command selects the remotes directory in this
+order:
+
+1. the global option `--remotes-config-dir`;
+2. the key `[ex-ostrya] remotes-config-dir`;
+3. `/etc/ostree/remotes.d`, when the repository and `/ostree/repo` have one
+   device and one inode;
+4. no remotes directory.
+
+`ostrya-config(1)`, "Remotes directory", states
 the rules of the read and the write of the port. A remotes directory can also
 hold the GPG keyring `<remote>.trustedkeys.gpg` of a remote, which the
 verification reads only when the repository holds no keyring of the remote
@@ -2967,13 +2981,19 @@ with a remotes directory writes the key into the new `config`:
 - An in-repository value gives its relative path as given.
 - A descriptor value gives no key.
 
+`ostrya init --remotes-config-dir=PATH` writes the key with the absolute form
+of PATH.
+
 Each open of the repository reads the key, except an open in the strict open
 mode. The open selects the remotes directory in this order: the directory that
 the program gives through the library, the key, the default directory that the
 program gives, and no directory. An absolute value names a path. A relative
 value names a path relative to the repository directory. The open refuses an
 empty value, also when the program gives a directory. The open reads the key at
-the open alone, so a change of the key takes effect at the next open.
+the open alone, so a change of the key takes effect at the next open. The
+`ostrya` command gives `--remotes-config-dir` as the directory of the program,
+and `/etc/ostree/remotes.d` as the default directory for the system repository
+("Config file (`<repo>/config`, GKeyFile / INI)").
 
 The open reads the `.conf` files of the selected directory, by the rules of
 `ostrya-config(1)`, "Remotes directory". `RepoConfig::remotes` gives the

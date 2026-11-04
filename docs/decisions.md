@@ -283,6 +283,63 @@ of the document alone, so a document with no `[core]` group still writes.
 `ostrya config set` and `config unset` of a key in such a group refuse before
 the lock, as the tool refuses `config set`.
 
+## The remotes directory of the `ostrya` command
+
+The `ostrya` command selects the remotes directory of a repository in this
+order:
+
+1. the global option `--remotes-config-dir`, through
+   `OpenOptions::remotes_dir`;
+2. the key `[ex-ostrya] remotes-config-dir` of `config`;
+3. `/etc/ostree/remotes.d`, when the repository is the system repository,
+   through `OpenOptions::default_remotes_dir`;
+4. no remotes directory.
+
+`ostrya init` gives the option to `CreateOptions::remotes_dir`, so the create
+writes the key. The create does not apply step 3. With no `--repo`, `init`
+opens the current directory and `OSTREE_REPO` in the four steps, as each
+other subcommand does. The option has no environment variable. These forms
+were rejected:
+
+- A command that reads the key alone. The tool reads the remotes of the
+  system repository from `/etc/ostree/remotes.d` with no key, and it ignores
+  the key. So that command does not see the remotes that the tool reads on an
+  ostree host.
+- A command that gives `/etc/ostree/remotes.d` to each repository. Then a
+  `remote add` on a scratch repository writes into `/etc/ostree/remotes.d`,
+  each `remote add` cell of the conformance harness changes the live
+  directory of the test host, and each command fails on a repository whose
+  `config` has a remote name of the directory. With the default for the
+  system repository alone, the harness never reaches the directory, and the
+  command needs no option to turn the default off.
+
+The system repository is the directory of `/ostree/repo`, as the tool selects
+it. The command compares the device and the inode of the two paths, and it
+follows symlinks. A compare of the path text was rejected: it misses a
+symlink to the repository and a bind mount of it, which the tool takes as the
+system repository. The command makes the check before the one open of the
+repository, because `default_remotes_dir` is an option of the open, and
+`Repo` gives no descriptor of its directory. A path that does not stat is not
+the system repository. With `--remotes-config-dir`, the command makes no
+check.
+
+The library detects no system repository. It takes a remotes directory from
+`OpenOptions` or from the key alone, so the remotes of a handle follow from
+the inputs of the open. A program for an ostree host gives
+`RemotesDir::path("/etc/ostree/remotes.d")` for the system repository.
+
+The source repository of `ostrya pull-local` and each `--localcache-repo`
+open with the key alone, with no option and no default. An open of such a
+repository with the option was rejected: the option names the remotes of the
+repository of the command, and a second repository that defines one of these
+names in its `config` then fails its open with a name in two sources.
+
+The command refuses an empty `--remotes-config-dir` when it parses the
+command line, with the usage error of the parser at exit 1. A refusal at the
+open, from the check of the library, was rejected: the parse refusal comes
+before the command resolves a repository, as the refusal of an empty
+`--repo` does.
+
 ## The GVariant codec
 
 `ostrya-gvariant` is a GVariant codec written in the tree for the fixed type

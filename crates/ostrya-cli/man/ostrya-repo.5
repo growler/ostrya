@@ -125,7 +125,7 @@ The other entries below appear when a command first needs them.
 The configuration file, in the key file format.
 A new repository gets the group \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode\fR, and the optional \fB\%collection\-id\fR.
 A create through the ostrya library with a remotes directory also writes the key \fB\%remotes\-config\-dir\fR in the group \fB\%[ex\-ostrya]\fR.
-\fB\%ostrya init\fR does not write it.
+\fB\%ostrya init \-\-remotes\-config\-dir\fR writes it.
 The key names the remotes directory that each open reads.
 \fB\%ostrya\-config\fR(1) lists the keys.
 .TP
@@ -464,8 +464,9 @@ ostrya also reads these files outside the repository, and writes the files of th
 .TP
 \fB\%<remotes\-dir>/*.conf\fR
 The remotes of the remotes directory of the repository.
-The key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR in \fB\%config\fR names it, or a program gives it through the ostrya library.
-A relative value names a directory in the repository directory.
+The \fB\%ostrya\fR command selects the directory in this order: the option \fB\%\-\-remotes\-config\-dir\fR, the key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR in \fB\%config\fR, then \fB\%/etc/ostree/remotes.d\fR for the system repository.
+A relative value of the key names a directory in the repository directory.
+A program gives the directory through the ostrya library, and the library detects no system repository.
 Each open of the repository reads each file, and refuses a file larger than 1 MiB.
 \fB\%ostrya remote add\fR writes a new remote into the file \fB\%<remote>.conf\fR, at mode 0666 with the umask applied.
 It creates an absent directory and each absent parent at mode 0777 with the umask applied.
@@ -475,6 +476,12 @@ A crash can leave a temporary file, and ostrya does not remove it.
 The update lock of the repository covers each write.
 Two repositories that share one remotes directory do not exclude each other.
 \fB\%ostrya\-config\fR(1), "Remotes directory", gives the rules of the read and the write.
+.TP
+\fB\%/etc/ostree/remotes.d/*.conf\fR
+The remotes directory of the system repository.
+The system repository is the directory of \fB\%/ostree/repo\fR, by device and inode, also through a symlink or a bind mount.
+The \fB\%ostrya\fR command uses this directory for the system repository when no option and no key give a remotes directory.
+The \fB\%ostree\fR tool uses it for the system repository alone.
 .TP
 \fB\%<remotes\-dir>/<remote>.trustedkeys.gpg\fR
 The trusted GPG keyring of the remote \fB\%<remote>\fR in the remotes directory of the repository.

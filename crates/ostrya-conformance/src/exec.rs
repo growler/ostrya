@@ -133,7 +133,9 @@ impl Outcome {
 ///
 /// If an invocation binds no repository, it reaches the system repository on a
 /// host that has one. A subcommand that writes then changes live state. This
-/// function refuses that invocation.
+/// function refuses that invocation. [`tier::system_repo`] also gives
+/// [`SYSROOT_REPO`](tier::SYSROOT_REPO) as the system repository, so the
+/// function refuses the invocation on a host with either path.
 ///
 /// # Binding rules
 ///
@@ -167,9 +169,9 @@ pub fn system_repo_refusal(
         return None;
     }
     Some(format!(
-        "this invocation binds no repository, and the host carries {}, which \
-         the reference tool resolves as its third `--repo` source: the run \
-         would act on the host's own system repository",
+        "this invocation binds no repository, and the host carries the \
+         system repository {}: the run would act on the host's own system \
+         repository",
         system_repo.display()
     ))
 }

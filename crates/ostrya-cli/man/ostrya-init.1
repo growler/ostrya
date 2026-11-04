@@ -8,7 +8,7 @@ ostrya init [OPTIONS]
 .SH DESCRIPTION
 Initialize a new empty repository.
 .PP
-The command creates the directory at the \%\-\-repo path if it does not exist. The parent directory must exist. Then the command writes the directories of the repository layout and the \fB\%config\fR file. The \fB\%[core]\fR group of \fB\%config\fR holds \fB\%repo_version=1\fR, \fB\%mode\fR, and \fB\%collection\-id\fR if \%\-\-collection\-id is given.
+The command creates the directory at the \%\-\-repo path if it does not exist. The parent directory must exist. Then the command writes the directories of the repository layout and the \fB\%config\fR file. The \fB\%[core]\fR group of \fB\%config\fR holds \fB\%repo_version=1\fR, \fB\%mode\fR, and \fB\%collection\-id\fR if \%\-\-collection\-id is given. With the global option \%\-\-remotes\-config\-dir, the \fB\%[ex\-ostrya]\fR group holds \fB\%remotes\-config\-dir\fR with the absolute path of its value.
 .PP
 The command is idempotent. It keeps each part of the layout that exists. If the \fB\%config\fR file exists, the command keeps it unchanged, and the repository keeps its mode and its collection id. Without \%\-\-repo, the command reuses a repository in the current directory or at \fB\%OSTREE_REPO\fR\&. It prints nothing on success.
 .SH OPTIONS

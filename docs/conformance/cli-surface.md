@@ -564,12 +564,16 @@ directory, so a file there that cannot be read or that is not a keyring
 gives no error. So when the repository keyring and the global trusted set
 hold two exports of one key, the export in the repository keyring supplies
 the user id in both. The port also reads the global trusted set only when
-the remotes directory holds no `REMOTE.trustedkeys.gpg`. The read of
-`/etc/ostree/remotes.d/` by the tool is not observed (`cli-behavior.md`,
-"`show`"). Both commands also read the repository keyring before the
-`gpgkeypath` entries. When a directory is at the path of the repository
-keyring and a `gpgkeypath` entry does not exist, the refusal names the
-repository keyring in the port, and the tool writes `error: Is a
+the remotes directory holds no `REMOTE.trustedkeys.gpg`. The tool takes
+`/etc/ostree/remotes.d/` as the remotes directory of the system repository
+alone, and the port gives that directory to the system repository by the same
+rule ("Global conventions"). `remote gpg-list-keys` of the tool reads a
+keyring of that directory when the repository keyring is absent. Not observed:
+the read of that keyring by the tool in `show` (`cli-behavior.md`, "`show`",
+and `remote`, "The remotes directory"). Both commands also read the repository
+keyring before the `gpgkeypath` entries. When a directory is at the path of
+the repository keyring and a `gpgkeypath` entry does not exist, the refusal
+names the repository keyring in the port, and the tool writes `error: Is a
 directory`. `sign --verify --remote` reads no global trusted set (`sign`,
 "`--remote` of `--verify`"), so a key of the global trusted set verifies a
 commit of a remote with no keyring in `show` and not in `sign`.
@@ -729,7 +733,7 @@ tar stream from standard input, which is the form it has carried since Phase 10.
 standard input by, are accepted by both and are how a script states the stdin
 source in either. The port keeps its own default because an omitted argument
 would otherwise walk and commit whatever directory the caller happens to stand
-in, which is the class of accident the omitted `/sysroot/ostree/repo` fallback
+in, which is the class of accident the omitted `/ostree/repo` fallback
 is left out for ("Global conventions"). Two consequences: `ostrya commit -b b
 --base=REV` with no source reads standard input where `ostree commit -b b
 --base=REV` overlays the working directory on the base, and `ostrya commit -b b`
@@ -4810,12 +4814,11 @@ records. Eighteen divergences stand:
   observed: the answer of the tool to the pair. The port refuses the pair with
   `error: Cannot specify both --sign-verify and --no-sign-verify` at exit 1,
   and writes nothing;
-- `remote add --gpg-import=FILE`. Not observed: the answer of the tool to
-  `--gpg-import`. The port imports the keys of `FILE` into the keyring of the
-  remote after it writes the section, the same way as `remote gpg-import` with
-  `--keyring`. It then prints `Imported <n> GPG key to remote "<name>"`, with
-  `keys` for each count other than 1. If `--if-not-exists` leaves the section
-  in place, the port imports nothing;
+- `remote add --gpg-import=FILE` with `--if-not-exists`, when the section
+  exists. Not observed: the answer of the tool. The port leaves the section
+  in place and imports nothing. In each other case, both import the keys of
+  `FILE` into `<repo>/<name>.trustedkeys.gpg` after they write the section,
+  and print the import count in the form of `remote gpg-import`;
 - `remote add` of a remote that no source holds, when the remotes directory
   holds an entry `<name>.conf` of any type: a regular file with another
   remote or with no remote, a directory, a symlink to no file, or a FIFO. The
@@ -6302,7 +6305,7 @@ Observed by running the tool (2026.1).
   matrix cell exercises.
 - With no `--repo`, the precedence is: the current directory, when it is a
   repository the tool can open; otherwise `OSTREE_REPO`, when set and openable;
-  otherwise the compiled-in path `/sysroot/ostree/repo`, when the host carries
+  otherwise the compiled-in path `/ostree/repo`, when the host carries
   one; otherwise the tool prints the subcommand's usage text to standard error,
   followed by `error: Command requires a --repo argument`, and exits 1. A
   current directory that opens (has a `[core]` section with a recognized
@@ -6319,18 +6322,23 @@ Observed by running the tool (2026.1).
 - The third source is a path the tool compiles in, and its help text states the
   chain: `--repo=PATH   Path to OSTree repository (defaults to current
   directory or /sysroot/ostree/repo)`, with `OSTREE_REPO` sitting between the
-  two paths that line names. An `OSTREE_REPO` value that does not open as a
-  repository leaves the chain running: with `OSTREE_REPO` set to an empty
-  directory and to an absent path, the tool reports `error: Command requires a
-  --repo argument` on a host with no system repository, so it passes over the
-  value and continues. No environment variable closes the third source. A
-  repo-less tool invocation on an ostree-managed host therefore resolves the
-  system repository, and a writing subcommand acts on it. The port's chain is
-  the current directory, then `OSTREE_REPO`, and it ends there. Resolving no
-  third source keeps `ostrya` from acting on a live system repository through
-  an omitted `--repo`, and it costs `ostrya prune` an explicit `--repo` where
-  `ostree prune` needs none on an ostree-managed host. The port holds this
-  divergence by intent.
+  two paths that line names. The observed third source is `/ostree/repo`, and
+  the help text names `/sysroot/ostree/repo`. With `/ostree` absent and
+  `/sysroot/ostree/repo` present, a repo-less `remote list` reports `error:
+  Command requires a --repo argument` at exit 1 (`cli-behavior.md`, `remote`,
+  "The remotes directory"). On an ostree host, `/ostree` leads to
+  `/sysroot/ostree`, so the two paths name one repository. An `OSTREE_REPO`
+  value that does not open as a repository leaves the chain running: with
+  `OSTREE_REPO` set to an empty directory and to an absent path, the tool
+  reports `error: Command requires a --repo argument` on a host with no system
+  repository, so it passes over the value and continues. No environment
+  variable closes the third source. A repo-less tool invocation on an
+  ostree-managed host therefore resolves the system repository, and a writing
+  subcommand acts on it. The port's chain is the current directory, then
+  `OSTREE_REPO`, and it ends there. Resolving no third source keeps `ostrya`
+  from acting on a live system repository through an omitted `--repo`, and it
+  costs `ostrya prune` an explicit `--repo` where `ostree prune` needs none on
+  an ostree-managed host. The port holds this divergence by intent.
 - `init` uses this same precedence, not a special case: with no explicit
   `--repo`, a current directory or an `OSTREE_REPO` target that already opens
   as a repository is reused (an idempotent re-init, same as passing that path
@@ -6431,9 +6439,26 @@ Observed by running the tool (2026.1).
   and at each later read of the file. The tool reads a `config` of any size.
   The cap bounds the memory of a read of `config` (`../../CLAUDE.md`,
   "Working conventions").
-- At each open of a repository, the port reads the `.conf` files of the
-  remotes directory that `[ex-ostrya] remotes-config-dir` names. The tool
-  ignores the key. The port reads at most 1048576 bytes of each file, and
+- The global option `--remotes-config-dir=PATH` and the key `[ex-ostrya]
+  remotes-config-dir` are port extensions. The tool has no such option and
+  ignores the key. The `ostrya` command selects the remotes directory of a
+  repository in this order: the option, the key, `/etc/ostree/remotes.d` when
+  the repository is the system repository, and no remotes directory. The
+  system repository is the directory of `/ostree/repo`, by device and inode,
+  so a symlink to it and a bind mount of it also match. This is the rule of
+  the tool (`cli-behavior.md`, `remote`, "The remotes directory"), so with no
+  option and no key the port and the tool read one remotes directory. A
+  relative PATH is relative to the current directory, and a relative value of
+  the key is relative to the repository directory. `ostrya init
+  --remotes-config-dir=PATH` writes the key with the absolute form of PATH.
+  The port refuses an empty PATH at exit 1 when it parses the command line.
+  The option has no environment variable.
+- `--remotes-config-dir` applies to the repository of the command alone. The
+  source repository of `pull-local` and each `--localcache-repo` of `pull`
+  and `pull-local` open with the key alone, with no option and no
+  `/etc/ostree/remotes.d` default.
+- At each open of a repository, the port reads the `.conf` files of its
+  remotes directory. The port reads at most 1048576 bytes of each file, and
   refuses a larger file at the open. The tool reads a larger file: a file of
   2,204,430 bytes opens. The port refuses a file whose name or content is not
   valid UTF-8 at the open. The tool opens a repository with a value that is
@@ -6444,7 +6469,14 @@ Observed by running the tool (2026.1).
   over it with no message, as it passes over a directory whose `config` does
   not parse. Examples are an empty `[ex-ostrya] remotes-config-dir`, a `.conf`
   file that is not a valid key file, and a remote name in two sources. With
-  an explicit `--repo`, the command reports the error of the open.
+  an explicit `--repo`, the command reports the error of the open. The rule
+  also applies to `/etc/ostree/remotes.d` when the current directory or the
+  `OSTREE_REPO` path is the system repository. If that directory fails the
+  open, the resolution passes over the system repository, and with no other
+  source the command reports `error: Command requires a --repo argument` at
+  exit 1. With an explicit `--repo`, the tool reports the error of the open
+  (`cli-behavior.md`, `remote`, "The remotes directory"). Not observed: the
+  answer of the tool with no `--repo`.
 - Every subcommand that opens a transaction reaps `tmp/`, in the port and in
   the tool. Both skip `cache`, and both remove an entry that is not a staging
   entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole

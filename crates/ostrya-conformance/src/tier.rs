@@ -11,21 +11,32 @@ use crate::record::Tier;
 
 /// The path of the system repository.
 ///
-/// The `ostree` command has this path compiled in as its third `--repo`
-/// source, after the current directory and `OSTREE_REPO`.
-pub const SYSTEM_REPO: &str = "/sysroot/ostree/repo";
+/// The `ostree` command opens this path as its third `--repo` source, after
+/// the current directory and `OSTREE_REPO`. Its help text names
+/// [`SYSROOT_REPO`].
+pub const SYSTEM_REPO: &str = "/ostree/repo";
+
+/// The path of the system repository in the sysroot of an ostree host.
+///
+/// On an ostree host, `/ostree` leads to `/sysroot/ostree`, so this path names
+/// the repository of [`SYSTEM_REPO`].
+pub const SYSROOT_REPO: &str = "/sysroot/ostree/repo";
 
 /// Returns the system repository, if the host has one.
 ///
-/// The host has one if [`SYSTEM_REPO`] exists and is a directory.
+/// The host has one if [`SYSTEM_REPO`] or [`SYSROOT_REPO`] exists and is a
+/// directory. The function gives the first of the two that exists.
 /// [`exec::run`](crate::exec::run) reads this fact for each invocation, so the
 /// function checks it one time for each process and keeps the result.
 pub fn system_repo() -> Option<&'static Path> {
     static DETECTED: OnceLock<Option<PathBuf>> = OnceLock::new();
     DETECTED
         .get_or_init(|| {
-            let path = Path::new(SYSTEM_REPO);
-            path.is_dir().then(|| path.to_path_buf())
+            [SYSTEM_REPO, SYSROOT_REPO]
+                .into_iter()
+                .map(Path::new)
+                .find(|path| path.is_dir())
+                .map(Path::to_path_buf)
         })
         .as_deref()
 }
@@ -51,7 +62,7 @@ pub struct Host {
     pub namespaces_available: bool,
     /// The system repository, if the host has one.
     ///
-    /// The `ostree` command resolves it as its third `--repo` source.
+    /// [`system_repo`] gives the path.
     pub system_repo: Option<PathBuf>,
 }
 

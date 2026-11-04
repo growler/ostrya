@@ -149,6 +149,12 @@ impl From<OwnedFd> for RemotesDir {
 ///
 /// [`Repo::remotes_dir`] gives the selected value.
 ///
+/// The open detects no system repository, so it reads `/etc/ostree/remotes.d`
+/// only when an option or the key names that directory. The `ostree` command
+/// uses `/etc/ostree/remotes.d` as the remotes directory of the system
+/// repository, the directory of `/ostree/repo`. A program for an ostree host
+/// gives `RemotesDir::path("/etc/ostree/remotes.d")` for that repository.
+///
 /// The open reads the `.conf` files of the selected directory into
 /// [`Repo::config`]:
 ///

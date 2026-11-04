@@ -147,3 +147,8 @@ crate maps that API to Rust as follows:
   handles give live counters.
 - RAII guards hold the scoped state: a transaction aborts when it drops without a
   commit, a lock releases when its guard drops, and `Checksum` is a typed value.
+- The remotes directory of a repository comes from `OpenOptions::remotes_dir`,
+  `CreateOptions::remotes_dir`, or the key `[ex-ostrya] remotes-config-dir` of
+  `config`. The crate detects no system repository, so it reads
+  `/etc/ostree/remotes.d` only when the caller or the key names that
+  directory.

@@ -1619,8 +1619,10 @@ order of creation on the btrfs file system of the probe host.
   - A directory: `error: Is a directory` at exit 1. A file with mode 000:
     `error: openat(<remote>.trustedkeys.gpg): Permission denied` at exit 1.
 
-`/etc/ostree/remotes.d/<remote>.trustedkeys.gpg` is not observed, because the
-probe had no root access.
+Not observed: `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg` in a
+verification. `remote gpg-list-keys` reads that file for the system
+repository when the repository keyring is absent (`remote`, "The remotes
+directory").
 
 #### Rules common to the verification axes
 
@@ -4167,8 +4169,9 @@ directory that holds `a.gpg` gives `Good signature from "<user id>"`, and a
 text file created after `a.gpg` and `z.gpg` keeps the key of `a.gpg` and
 loses the key of `z.gpg`.
 
-The keyrings of `/etc/ostree/remotes.d/` are not observed, because the probe
-had no root access.
+Not observed: the keyrings of `/etc/ostree/remotes.d/` in `show`. `remote
+gpg-list-keys` reads such a keyring for the system repository when the
+repository keyring is absent (`remote`, "The remotes directory").
 
 ### `log`
 
@@ -4354,12 +4357,15 @@ Not observed: the answer of the tool to `--sign-verify` together with
 `--no-sign-verify`. The port refuses the pair (`cli-surface.md`, "P3",
 `remote`).
 
-Not observed: the answer of the tool to `--gpg-import=FILE`. The port takes
-the option. After the port writes the section, it imports the keys of `FILE`
-into the keyring of the remote, the same way as `remote gpg-import` with
-`--keyring`. It then prints the import count in the form of `remote
-gpg-import`. If `--if-not-exists` leaves the section in place, the port
-imports nothing (`cli-surface.md`, "P3", `remote`).
+`--gpg-import=FILE` imports the keys of `FILE` into
+`<repo>/<name>.trustedkeys.gpg` after the command writes the section. The
+command then prints the import count in the form of `remote gpg-import`. "The
+remotes directory" gives the keyring that the import writes for a remote of
+the directory.
+
+Not observed: the answer of the tool to `--gpg-import=FILE` when
+`--if-not-exists` leaves the section in place. The port then imports nothing
+(`cli-surface.md`, "P3", `remote`).
 
 #### Remote names
 
@@ -4571,6 +4577,160 @@ these lines too:
   revoked user id
 
 `cli-surface.md`, "P3", `remote`, records the port side.
+
+#### The remotes directory
+
+These records come from libostree 2026.1 on a NixOS host, observed on
+2026-11-03. The tool ran as uid 1000 in a user namespace, with a private
+`/etc` and a scratch sysroot from `ostree admin init-fs`. `strace` recorded
+the file calls.
+
+The tool reads and writes the directory `/etc/ostree/remotes.d` for the
+system repository alone. A repository is the system repository when it is the
+same directory as `/ostree/repo`:
+
+- `--repo=/ostree/repo`, a symlink to that directory, and a bind mount of
+  that directory at another path each select the system repository.
+- `/sysroot/ostree/repo` is the system repository only when `/ostree` leads
+  to the same directory. When `/ostree` leads to another repository,
+  `/sysroot/ostree/repo` is not the system repository.
+- The uid of the process has no effect.
+
+For each other repository, the tool reads no file of `/etc/ostree/remotes.d`.
+`remote add` then writes into `config`, also with `[core]
+add-remotes-config-dir=true`.
+
+With no `--repo`, in a directory that is not a repository, `remote list`
+opens `/ostree/repo`. When `/ostree` is absent and `/sysroot/ostree/repo`
+exists, the command reports the usage text and `error: Command requires a
+--repo argument` at exit 1.
+
+The tool reads these entries of the directory:
+
+- Each entry whose name ends in `.conf`. A file named `.conf` and a name that
+  starts with `.` are read. The match is case-sensitive, so `x.CONF`,
+  `x.conf~`, and `x.conf.swp` are skipped.
+- A symlink to a regular file.
+
+The tool skips these entries with no message: a directory named `x.conf`, a
+symlink to a directory, a symlink to no file, and a FIFO. The FIFO does not
+block the command. The tool does not read the files of a subdirectory.
+
+In a file, the tool takes each `[remote "NAME"]` group:
+
+- It ignores each other group, `[core]` included. `[core]
+  add-remotes-config-dir=false` in a `.conf` file does not change the target
+  of `remote add`.
+- Two groups with one name in one file give one remote. A key of the second
+  group replaces the same key of the first group.
+- An empty file gives no remote and no error.
+- A file of 2,204,430 bytes is read.
+
+`remote list` sorts the names, so the order of the files and of the groups
+has no visible effect.
+
+Each command that opens the repository has these refusals, at exit 1:
+
+- One name in two sources, `config` and a file or two files: `error: opening
+  repo: Reloading remotes: Multiple specifications found for remote
+  "<name>"`.
+- A file that does not parse: `error: opening repo: Reloading remotes:
+  Failed to parse /etc/ostree/remotes.d/<file>: Key file contains line
+  “<line>” which is not a key-value pair, group, or comment`.
+- A file that cannot be read: `error: opening repo: Reloading remotes: Failed
+  to parse /etc/ostree/remotes.d/<file>: Permission denied`.
+- A `remotes.d` that is not a directory: `error: opening repo: Reloading
+  remotes: Error opening directory '/etc/ostree/remotes.d': Not a directory`.
+  A `remotes.d` that cannot be read gives `Permission denied` in the same
+  form.
+
+An absent `remotes.d` and an absent `/etc/ostree` give no remote and no
+error.
+
+A file that is not UTF-8 has these results:
+
+- A value that is not UTF-8: the open succeeds, and `remote list` lists the
+  remote. A read of the value, as `remote show-url` or `remote list -u` makes
+  it, reports `error: Key file contains key “url” with value “<value>” which
+  is not UTF-8` at exit 1. `remote list -u` first prints the names before
+  that remote.
+- A group name that is not UTF-8: the tool skips the group with no message.
+
+`remote add` writes into the directory when the repository is the system
+repository and `[core] add-remotes-config-dir` in `config` is not `false`.
+Else it writes into `config`. In the directory, the add has these results:
+
+- The file is `<name>.conf`. It holds the one group `[remote "<name>"]`, with
+  the keys in the order of "`remote add`", and no blank line before the
+  group.
+- A new file is created in place with `O_CREAT|O_EXCL`. The tool writes no
+  temporary file and does not sync the file.
+- When `<name>.conf` exists and no source holds the remote, the tool writes a
+  temporary file `.goutputstream-XXXXXX` in the directory, syncs it, and
+  renames it over `<name>.conf`. The content of the old file is lost. A
+  `z.conf` that holds a comment and the remote `y` becomes the group of `z`
+  alone.
+- The file mode is `0666` with the umask applied: `0644` at umask `022`, and
+  `0600` at umask `077`.
+- The tool creates `/etc/ostree` and `/etc/ostree/remotes.d` where they are
+  absent, at mode `0777` with the umask applied.
+
+A remote that a file holds reports `error: Remote configuration for
+"<name>" already exists: /etc/ostree/remotes.d/<file>` at exit 1.
+`--if-not-exists` then exits 0 and changes nothing.
+
+`--force` writes into the source that holds the remote:
+
+- For a remote of `config`, the new section replaces the old section in
+  `config`.
+- For a remote of a file, the tool writes that file again, under its own
+  name, with the new group alone. The tool uses a temporary file, a sync, and
+  a rename. The other groups of the file, remotes included, and its comments
+  are lost.
+
+`remote delete` of a remote of a file has these results:
+
+- The tool removes the whole file, with each other group in it. After the
+  delete of `a` from a file that holds `a`, `b`, and `[core]`, `remote delete
+  b` reports `error: Remote "b" not found`.
+- For a symlink, the tool removes the link. The target stays.
+- After the file, the tool removes `<repo>/<name>.trustedkeys.gpg`. It does
+  not remove `/etc/ostree/remotes.d/<name>.trustedkeys.gpg`.
+
+`config get`, `config set`, and `config unset` read and write `config` alone.
+For a remote of a file:
+
+- `config get 'remote "<name>".url'` reports `error: Key file does not have
+  group “remote "<name>"”` at exit 1.
+- `config set` of a key of that group reports `error: Reloading remotes:
+  Multiple specifications found for remote "<name>"` at exit 1, and `config`
+  does not change.
+- `--group='remote "<name>"'` gives the same results.
+
+`remote gpg-list-keys NAME` reads `<repo>/<name>.trustedkeys.gpg`. When that
+file is absent and the repository is the system repository, the command reads
+`/etc/ostree/remotes.d/<name>.trustedkeys.gpg`. When the repository file
+exists, the command does not open the file of the directory. For another
+repository, the command does not open the file of the directory.
+
+Not observed: the keyring of the directory in a verification, in `pull` and
+`show`, and its effect on the read of the global trusted directory.
+
+`remote gpg-import` and `remote add --gpg-import` write
+`<repo>/<name>.trustedkeys.gpg` with a temporary file and a rename, also for
+a remote of a file and also when the keyring of the directory exists. After
+the import, the repository keyring hides the keyring of the directory.
+
+A relative path in `verification-ed25519-file` and in `gpgkeypath` of a
+`.conf` file resolves against the working directory of the process, as in
+`config`. From `/` and from `/tmp`, a pull with
+`verification-ed25519-file=keys/ed.pub` looks up `keys/ed.pub` in the working
+directory, and `remote gpg-list-keys` with `gpgkeypath=gkeys/g.asc` opens
+`gkeys/g.asc` in the working directory.
+
+The tool ignores the key `remotes-config-dir`, in `[core]` and in each other
+group. With the key set to a directory that holds a `.conf` file, `remote
+list` does not list its remote, and `remote add` writes into `config`.
 
 ### `export`
 

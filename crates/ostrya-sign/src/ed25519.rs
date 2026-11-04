@@ -70,6 +70,16 @@ impl Ed25519Signer {
     pub fn from_base64(secret_b64: &str) -> Result<Ed25519Signer> {
         Ed25519Signer::from_secret_key(&base64::decode(secret_b64.trim())?)
     }
+
+    /// Returns the 32 bytes of the public key.
+    ///
+    /// The value is the second half of the secret key that
+    /// [`from_secret_key`](Self::from_secret_key) takes. Give this value to
+    /// [`Ed25519Verifier::new`] as a trusted key to verify the signatures of
+    /// this signer.
+    pub fn public_key(&self) -> [u8; ED25519_PUBLIC_KEY_LEN] {
+        self.signing_key.verifying_key().to_bytes()
+    }
 }
 
 impl Signer for Ed25519Signer {
@@ -224,6 +234,22 @@ mod tests {
         let signer = Ed25519Signer::from_secret_key(&secret).unwrap();
         let signature = futures_lite::future::block_on(signer.sign(b"payload")).unwrap();
         let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
+        let outcome = verifier.verify(b"payload", &[signature]).unwrap();
+        assert!(outcome.valid);
+    }
+
+    #[test]
+    fn the_public_key_is_the_second_half_of_the_secret_key() {
+        let mut secret = [0u8; ED25519_SECRET_KEY_LEN];
+        secret[..32].copy_from_slice(&[7u8; 32]);
+        let public = SigningKey::from_bytes(&[7u8; 32])
+            .verifying_key()
+            .to_bytes();
+        secret[32..].copy_from_slice(&public);
+        let signer = Ed25519Signer::from_secret_key(&secret).unwrap();
+        assert_eq!(signer.public_key(), secret[32..]);
+        let signature = futures_lite::future::block_on(signer.sign(b"payload")).unwrap();
+        let verifier = Ed25519Verifier::new([signer.public_key()], Vec::<Vec<u8>>::new()).unwrap();
         let outcome = verifier.verify(b"payload", &[signature]).unwrap();
         assert!(outcome.valid);
     }

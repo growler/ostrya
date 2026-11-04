@@ -2,8 +2,9 @@
 //!
 //! [`Repo::begin_update`] takes the update lock on `<repo>/.update.lock` and
 //! returns an [`UpdateGuard`]. The guard writes refs, ref aliases, and
-//! `config`, and edits the remotes of `config`. [`UpdateGuard::finish`] syncs
-//! the changed directories and releases the guard.
+//! `config`, and edits the remotes of `config` and of the remotes directory.
+//! [`UpdateGuard::finish`] syncs the changed directories and releases the
+//! guard.
 
 use std::collections::BTreeSet;
 use std::os::fd::BorrowedFd;
@@ -13,14 +14,18 @@ use ostrya_core::{Checksum, KeyFile};
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
-use crate::config::{RepoConfig, remote_group, remote_keyring_name, valid_remote_name};
+use crate::config::{
+    RemoteSource, RepoConfig, remote_group, remote_group_name, remote_keyring_name,
+    valid_remote_name,
+};
 use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
     CollectionRef, collection_ref_to_relpath, put_alias_blocking, put_ref_blocking,
     refspec_to_relpath, relative_link, sync_dirs_all,
 };
-use crate::repo::{Repo, check_config_size, read_config_blocking};
+use crate::remotes_dir::{self, DirWriter};
+use crate::repo::{RemotesDir, Repo, check_config_size, read_config_blocking};
 use crate::summary::put_root_file_blocking;
 
 /// The config file name at the repository root.
@@ -43,20 +48,45 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// `Send + Sync`.
 ///
 /// The guard reads and writes refs, collection refs, and ref aliases. It
-/// reads `config` and the `.conf` files of the remotes directory from disk,
-/// and writes `config`. It stages no object. Each
-/// write of the guard is atomic and visible when the call returns.
+/// reads and writes `config` and the `.conf` files of the remotes directory.
+/// It stages no object. Each write of the guard is atomic and visible when
+/// the call returns.
 ///
 /// # Remotes
 ///
-/// The guard edits the remotes of `config` as a read-modify-write of the file
-/// on disk:
+/// The guard edits the remotes of `config` and of the `.conf` files of the
+/// remotes directory, [`Repo::remotes_dir`], as a read-modify-write of the
+/// files on disk:
 ///
 /// - [`add_remote`](UpdateGuard::add_remote)
 /// - [`set_remote_key`](UpdateGuard::set_remote_key)
 /// - [`unset_remote_key`](UpdateGuard::unset_remote_key)
+/// - [`replace_remote`](UpdateGuard::replace_remote)
 /// - [`delete_remote`](UpdateGuard::delete_remote), which also removes the
 ///   trusted keyring of the remote
+///
+/// An add writes a new remote into the remotes directory if the handle has
+/// one and `[core] add-remotes-config-dir` of `config` is not `false`. Else
+/// it writes into `config`. Each other call edits the file that holds the
+/// remote, so a remote stays in its file.
+///
+/// Each of these calls reads `config` and the remotes directory again, and
+/// [`write_config`](UpdateGuard::write_config) reads the remotes directory
+/// again. A `.conf` file that an open refuses, and that comes into the
+/// directory after the open, makes each of these calls fail.
+///
+/// A write of a `.conf` file is atomic: the guard writes a temporary file in
+/// the directory, whose name does not end in `.conf`, and renames it over the
+/// file. With `[core] fsync` on, the write syncs the file and the directory
+/// before the call returns. A rewrite of a file keeps its permission bits,
+/// and does not keep its owner. The guard refuses a rewrite of a `.conf` file
+/// that is a symlink, because the rename replaces the link with a regular
+/// file.
+///
+/// The update lock is the lock of one repository. Two repositories that
+/// share one remotes directory do not exclude each other. Each write changes
+/// one entry of the directory, so a race of the two loses at most the edit
+/// of one file.
 ///
 /// These calls and [`write_config`](UpdateGuard::write_config) run one at a
 /// time on one guard.
@@ -449,33 +479,55 @@ impl UpdateGuard {
     /// repository reads the new values. The write does not interleave with a
     /// remote call of the same guard.
     ///
+    /// The call refuses a document with a `[remote "NAME"]` group when a
+    /// `.conf` file of the remotes directory defines `NAME`, as
+    /// [`Repo::write_config`] does. It reads the directory again for this
+    /// check.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if the document is larger than 1 MiB, the
     ///   size that an open accepts. The call then writes nothing.
+    /// - [`Error::RemoteExists`] if the document has a group of a remote of
+    ///   the remotes directory. The call then writes nothing.
+    /// - The errors of [`OpenOptions::open`](crate::OpenOptions::open) for the
+    ///   remotes directory and its `.conf` files.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let bytes = config_bytes(keyfile)?;
+        let names = remotes_dir::config_remote_names(keyfile);
+        let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |repo_fd, fsync, dirs| {
+            remotes_dir::check_config_remotes(repo_fd, dir.as_ref(), &names)?;
             put_config_blocking(repo_fd, &bytes, fsync, dirs)
         })
         .await
     }
 
-    /// Adds the remote `name` to `config`, with the keys of `keys` in order.
+    /// Adds the remote `name`, with the keys of `keys` in order.
     ///
-    /// The `[remote "<name>"]` group goes at the end of the file. The call
-    /// does not touch a trusted keyring of the name. A refusal writes nothing.
+    /// If the handle has a remotes directory and `[core]
+    /// add-remotes-config-dir` of `config` is not `false`, the call writes
+    /// the file `<name>.conf` into the directory. The file holds the one
+    /// group `[remote "<name>"]`. Its mode is `0666` with the umask applied.
+    /// If the directory is absent, the call creates it and each absent
+    /// parent, at mode `0777` with the umask applied. The call refuses the
+    /// name if the directory holds an entry `<name>.conf` of any type.
     ///
-    /// The call reads `config` from disk, edits it, and writes it in one step
-    /// on the blocking pool. It writes the file as
-    /// [`write_config`](UpdateGuard::write_config) does: atomically, with the
-    /// sync of the repository directory left to
-    /// [`finish`](UpdateGuard::finish). [`Repo::config`] keeps the copy that
-    /// the handle read at open.
+    /// Else the `[remote "<name>"]` group goes at the end of `config`. The
+    /// call does not touch a trusted keyring of the name. A refusal writes
+    /// nothing.
     ///
-    /// The rewrite keeps the groups and keys of the file in their order. It
-    /// drops the comment lines and the blank lines of the file.
+    /// The call reads `config` and the remotes directory from disk, edits
+    /// the target, and writes it in one step on the blocking pool. It writes
+    /// `config` as [`write_config`](UpdateGuard::write_config) does:
+    /// atomically, with the sync of the repository directory left to
+    /// [`finish`](UpdateGuard::finish). It writes a `.conf` file as
+    /// [`UpdateGuard`] states in "Remotes". [`Repo::config`] keeps the copy
+    /// that the handle read at open.
+    ///
+    /// The rewrite of `config` keeps the groups and keys of the file in their
+    /// order. It drops the comment lines and the blank lines of the file.
     ///
     /// The remote calls and [`write_config`](UpdateGuard::write_config) of one
     /// guard run one at a time, so concurrent calls on one guard lose no edit.
@@ -486,11 +538,17 @@ impl UpdateGuard {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `name`, if
-    ///   `keys` is empty, or if `config` cannot hold a key name of `keys`.
-    /// - [`Error::RemoteExists`] if `config` has a remote of that name.
-    /// - [`Error::InvalidFormat`] if `config` on disk is larger than 1 MiB or
-    ///   is not UTF-8, or if the new `config` is larger than 1 MiB.
-    /// - An error of [`RepoConfig::parse`] if `config` on disk does not parse.
+    ///   `keys` is empty, or if a key file cannot hold a key name of `keys`.
+    /// - [`Error::RemoteExists`] if `config` or a `.conf` file has a remote
+    ///   of that name.
+    /// - [`Error::Io`] of the kind
+    ///   [`AlreadyExists`](std::io::ErrorKind::AlreadyExists) if the call
+    ///   writes into the remotes directory and the directory holds an entry
+    ///   `<name>.conf`. The message starts with the path of the entry.
+    /// - [`Error::Core`] if `[core] add-remotes-config-dir` is not a boolean.
+    ///   The call reads the key only for a handle with a remotes directory.
+    /// - The errors of [`read_config`](UpdateGuard::read_config).
+    /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn add_remote(&self, name: &str, keys: &[(&str, &str)]) -> Result<()> {
         if !valid_remote_name(name) {
@@ -506,100 +564,177 @@ impl UpdateGuard {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
+        let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |repo_fd, fsync, dirs| {
-            let group = remote_group(&name);
-            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
-            if keyfile.has_group(&group) {
+            let (config, writer) = read_sources(repo_fd, dir.as_ref(), fsync)?;
+            if config.remote(&name).is_some() {
                 return Err(Error::RemoteExists(name));
             }
+            let writer = match writer {
+                Some(writer) if config.add_remotes_config_dir()? => Some(writer),
+                _ => None,
+            };
+            let group = remote_group(&name);
+            let mut keyfile = match writer {
+                Some(_) => KeyFile::default(),
+                None => config.into_keyfile(),
+            };
             for (key, value) in &keys {
                 check_key(key)?;
                 keyfile.set_string(&group, key, value)?;
             }
-            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)
+            match writer {
+                Some(writer) => {
+                    let file = remote_file_name(&name);
+                    writer.check_absent(&file)?;
+                    writer.put(&file, keyfile.to_string().as_bytes(), None)
+                }
+                None => put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs),
+            }
         })
         .await
     }
 
-    /// Sets the key `key` of the remote `name` in `config` to `value`.
+    /// Sets the key `key` of the remote `name` to `value`, in the file that
+    /// holds the remote: `config` or a `.conf` file of the remotes directory.
     ///
     /// A key that exists keeps its position. A new key goes at the end of the
     /// group. If the key holds `value` already, the call writes nothing.
     ///
-    /// The call reads and writes `config` as
-    /// [`add_remote`](UpdateGuard::add_remote) does. A refusal writes
-    /// nothing.
+    /// The call reads the files and writes `config` as
+    /// [`add_remote`](UpdateGuard::add_remote) does. A rewrite of a `.conf`
+    /// file keeps the other groups of the file and the groups and keys in
+    /// their order, and drops the comment lines and the blank lines. A
+    /// refusal writes nothing.
     ///
     /// # Errors
     ///
-    /// - [`Error::RemoteNotFound`] if `config` does not hold the remote.
-    /// - [`Error::InvalidInput`] if `config` cannot hold the key name.
-    /// - [`Error::InvalidFormat`] if `config` on disk is larger than 1 MiB or
-    ///   is not UTF-8, or if the new `config` is larger than 1 MiB.
-    /// - An error of [`RepoConfig::parse`] if `config` on disk does not parse.
+    /// - [`Error::RemoteNotFound`] if no source holds the remote.
+    /// - [`Error::InvalidInput`] if a key file cannot hold the key name.
+    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
+    ///   symlink.
+    /// - The errors of [`read_config`](UpdateGuard::read_config).
+    /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_remote_key(&self, name: &str, key: &str, value: &str) -> Result<()> {
         let name = name.to_owned();
         let key = key.to_owned();
         let value = value.to_owned();
+        let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |repo_fd, fsync, dirs| {
             let group = remote_group(&name);
-            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
-            if !keyfile.has_group(&group) {
-                return Err(Error::RemoteNotFound(name));
-            }
+            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
             check_key(&key)?;
+            let keyfile = source.keyfile_mut();
             if matches!(keyfile.get_string(&group, &key), Ok(Some(held)) if held == value) {
                 return Ok(());
             }
             keyfile.set_string(&group, &key, &value)?;
-            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)
+            source.put(repo_fd, fsync, dirs)
         })
         .await
     }
 
-    /// Removes the key `key` of the remote `name` from `config`.
+    /// Removes the key `key` of the remote `name` from the file that holds
+    /// the remote.
     ///
     /// The call returns `true` if it removed the key. If the key is absent,
     /// the call returns `false` and writes nothing. The group stays, also when
     /// it has no key left.
     ///
-    /// The call reads and writes `config` as
-    /// [`add_remote`](UpdateGuard::add_remote) does.
+    /// The call reads and writes the files as
+    /// [`set_remote_key`](UpdateGuard::set_remote_key) does.
     ///
     /// # Errors
     ///
-    /// - [`Error::RemoteNotFound`] if `config` does not hold the remote. The
-    ///   call then writes nothing.
-    /// - [`Error::InvalidFormat`] if `config` on disk is larger than 1 MiB or
-    ///   is not UTF-8, or if the new `config` is larger than 1 MiB.
-    /// - An error of [`RepoConfig::parse`] if `config` on disk does not parse.
+    /// - [`Error::RemoteNotFound`] if no source holds the remote. The call
+    ///   then writes nothing.
+    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
+    ///   symlink.
+    /// - The errors of [`read_config`](UpdateGuard::read_config).
+    /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn unset_remote_key(&self, name: &str, key: &str) -> Result<bool> {
         let name = name.to_owned();
         let key = key.to_owned();
+        let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |repo_fd, fsync, dirs| {
             let group = remote_group(&name);
-            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
-            if !keyfile.has_group(&group) {
-                return Err(Error::RemoteNotFound(name));
-            }
-            if !keyfile.remove_key(&group, &key) {
+            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
+            if !source.keyfile_mut().remove_key(&group, &key) {
                 return Ok(false);
             }
-            put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs)?;
+            source.put(repo_fd, fsync, dirs)?;
             Ok(true)
         })
         .await
     }
 
-    /// Deletes the remote `name` from `config`, together with its trusted
-    /// keyring.
+    /// Replaces the remote `name` with a remote of the keys of `keys`, in
+    /// order, in the file that holds it.
+    ///
+    /// The call removes the `[remote "<name>"]` group from its source,
+    /// `config` or a `.conf` file of the remotes directory, and writes a new
+    /// group with `keys` at the end of the same source. The other groups of
+    /// the source stay. The call does not touch a trusted keyring of the
+    /// name. A refusal writes nothing.
+    ///
+    /// The call reads and writes the source as
+    /// [`set_remote_key`](UpdateGuard::set_remote_key) does.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `name`, if
+    ///   `keys` is empty, or if a key file cannot hold a key name of `keys`.
+    /// - [`Error::RemoteNotFound`] if no source holds the remote.
+    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
+    ///   symlink.
+    /// - The errors of [`read_config`](UpdateGuard::read_config).
+    /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
+    /// - [`Error::Io`] if a file system operation fails.
+    pub async fn replace_remote(&self, name: &str, keys: &[(&str, &str)]) -> Result<()> {
+        if !valid_remote_name(name) {
+            return Err(Error::InvalidInput(format!("invalid remote name: {name}")));
+        }
+        if keys.is_empty() {
+            return Err(Error::InvalidInput(format!(
+                "remote {name} is replaced with no keys"
+            )));
+        }
+        let name = name.to_owned();
+        let keys: Vec<(String, String)> = keys
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect();
+        let dir = self.repo().remotes_dir().cloned();
+        self.edit_config(move |repo_fd, fsync, dirs| {
+            let group = remote_group(&name);
+            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
+            let keyfile = source.keyfile_mut();
+            keyfile.remove_group(&group);
+            for (key, value) in &keys {
+                check_key(key)?;
+                keyfile.set_string(&group, key, value)?;
+            }
+            source.put(repo_fd, fsync, dirs)
+        })
+        .await
+    }
+
+    /// Deletes the remote `name` from the file that holds it, together with
+    /// its trusted keyring.
     ///
     /// The call removes the trusted keyring `<name>.trustedkeys.gpg` at the
-    /// repository root, and then the group of the remote from `config`. An
+    /// repository root, and then the group of the remote from its file. An
     /// absent keyring is not an error. A keyring name that is too long for the
-    /// file system is not an error, because no file can have that name.
+    /// file system is not an error, because no file can have that name. The
+    /// call does not remove a keyring of the remotes directory.
+    ///
+    /// In a `.conf` file of the remotes directory, the call removes the group.
+    /// If the file then holds no `[remote "NAME"]` group, the call removes the
+    /// file, together with each other group of it. For a symlink, it removes
+    /// the link, and the target stays. Else it writes the file back, as
+    /// [`set_remote_key`](UpdateGuard::set_remote_key) does.
     ///
     /// The keyring goes with the remote, so a later remote of the same name
     /// does not trust the keys of this one. The keyring goes first, so a
@@ -608,36 +743,63 @@ impl UpdateGuard {
     ///
     /// The removal is visible when the call returns. The sync of the
     /// repository directory waits for [`finish`](UpdateGuard::finish). The
-    /// call reads and writes `config` as
+    /// call reads the files and writes `config` as
     /// [`add_remote`](UpdateGuard::add_remote) does. A refusal removes no
     /// file and writes nothing.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `name`.
-    /// - [`Error::RemoteNotFound`] if `config` does not hold the remote.
-    /// - [`Error::InvalidFormat`] if `config` on disk is larger than 1 MiB or
-    ///   is not UTF-8, or if the new `config` is larger than 1 MiB.
-    /// - An error of [`RepoConfig::parse`] if `config` on disk does not parse.
-    /// - [`Error::Io`] if the removal of the keyring or the write of `config`
+    /// - [`Error::RemoteNotFound`] if no source holds the remote.
+    /// - [`Error::InvalidFormat`] if the call writes back a `.conf` file that
+    ///   is a symlink.
+    /// - The errors of [`read_config`](UpdateGuard::read_config).
+    /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
+    /// - [`Error::Io`] if the removal of the keyring or the write of the file
     ///   fails.
     pub async fn delete_remote(&self, name: &str) -> Result<()> {
         if !valid_remote_name(name) {
             return Err(Error::InvalidInput(format!("invalid remote name: {name}")));
         }
         let name = name.to_owned();
+        let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |repo_fd, fsync, dirs| {
-            let mut keyfile = read_config_blocking(repo_fd)?.into_keyfile();
-            if !keyfile.remove_group(&remote_group(&name)) {
-                return Err(Error::RemoteNotFound(name));
+            let group = remote_group(&name);
+            let keyring = remote_keyring_name(&name);
+            match Source::read(repo_fd, dir.as_ref(), fsync, &name)? {
+                Source::Config(mut keyfile) => {
+                    keyfile.remove_group(&group);
+                    let bytes = config_bytes(&keyfile)?;
+                    let removed = remove_keyring_blocking(repo_fd, &keyring)?;
+                    let put = put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync);
+                    if fsync && (removed || put.is_ok()) {
+                        dirs.push(ROOT_DIR.to_owned());
+                    }
+                    put
+                }
+                Source::File {
+                    writer,
+                    file,
+                    mut keyfile,
+                } => {
+                    keyfile.remove_group(&group);
+                    // Each check comes before the removal of the keyring.
+                    let rewrite = if keyfile.groups().any(|g| remote_group_name(g).is_some()) {
+                        let bytes = keyfile.to_string().into_bytes();
+                        writer.check_size(&file, &bytes)?;
+                        Some((writer.mode_of(&file)?, bytes))
+                    } else {
+                        None
+                    };
+                    if remove_keyring_blocking(repo_fd, &keyring)? && fsync {
+                        dirs.push(ROOT_DIR.to_owned());
+                    }
+                    match rewrite {
+                        Some((mode, bytes)) => writer.put(&file, &bytes, Some(mode)),
+                        None => writer.remove(&file),
+                    }
+                }
             }
-            let bytes = config_bytes(&keyfile)?;
-            let removed = remove_keyring_blocking(repo_fd, &remote_keyring_name(&name))?;
-            let put = put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync);
-            if fsync && (removed || put.is_ok()) {
-                dirs.push(ROOT_DIR.to_owned());
-            }
-            put
         })
         .await
     }
@@ -736,6 +898,100 @@ fn check_key(key: &str) -> Result<()> {
         .map_err(|e| Error::InvalidInput(e.to_string()))
 }
 
+/// Returns the name of the `.conf` file that an add writes for the remote
+/// `name`.
+fn remote_file_name(name: &str) -> String {
+    format!("{name}.conf")
+}
+
+/// Reads `config` and the `.conf` files of the remotes directory `dir` from
+/// disk, as [`UpdateGuard::read_config`] reads them. Returns the directory
+/// open for a write if the handle has one.
+fn read_sources<'a>(
+    repo_fd: BorrowedFd<'a>,
+    dir: Option<&'a RemotesDir>,
+    fsync: bool,
+) -> Result<(RepoConfig, Option<DirWriter<'a>>)> {
+    let config = read_config_blocking(repo_fd)?;
+    match dir {
+        Some(dir) => remotes_dir::open_for_write(config, repo_fd, dir, fsync)
+            .map(|(config, writer)| (config, Some(writer))),
+        None => Ok((config, None)),
+    }
+}
+
+/// The file on disk that holds a remote, with its parsed text.
+enum Source<'a> {
+    /// The `config` file of the repository.
+    Config(KeyFile),
+    /// The `.conf` file `file` of the remotes directory.
+    File {
+        writer: DirWriter<'a>,
+        file: String,
+        keyfile: KeyFile,
+    },
+}
+
+impl<'a> Source<'a> {
+    /// Reads the sources from disk, as [`read_sources`] does, and returns the
+    /// source that holds the remote `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::RemoteNotFound`] if no source holds the remote, and the
+    /// errors of the read.
+    fn read(
+        repo_fd: BorrowedFd<'a>,
+        dir: Option<&'a RemotesDir>,
+        fsync: bool,
+        name: &str,
+    ) -> Result<Source<'a>> {
+        let (config, writer) = read_sources(repo_fd, dir, fsync)?;
+        let not_found = || Error::RemoteNotFound(name.to_owned());
+        let file = match config.remote(name).ok_or_else(not_found)?.source() {
+            RemoteSource::Config => None,
+            RemoteSource::File(file) => Some(file.to_owned()),
+        };
+        let Some(file) = file else {
+            return Ok(Source::Config(config.into_keyfile()));
+        };
+        let keyfile = config.remote_file(&file).ok_or_else(not_found)?.clone();
+        Ok(Source::File {
+            writer: writer.ok_or_else(not_found)?,
+            file,
+            keyfile,
+        })
+    }
+
+    fn keyfile_mut(&mut self) -> &mut KeyFile {
+        match self {
+            Source::Config(keyfile) | Source::File { keyfile, .. } => keyfile,
+        }
+    }
+
+    /// Writes the edited text back to its file.
+    ///
+    /// A write of `config` records the repository root for the sync of
+    /// [`UpdateGuard::finish`]. A write of a `.conf` file keeps the permission
+    /// bits of the file, syncs before it returns, and refuses a file that is
+    /// a symlink.
+    fn put(&self, repo_fd: BorrowedFd<'_>, fsync: bool, dirs: &mut Vec<String>) -> Result<()> {
+        match self {
+            Source::Config(keyfile) => {
+                put_config_blocking(repo_fd, &config_bytes(keyfile)?, fsync, dirs)
+            }
+            Source::File {
+                writer,
+                file,
+                keyfile,
+            } => {
+                let mode = writer.mode_of(file)?;
+                writer.put(file, keyfile.to_string().as_bytes(), Some(mode))
+            }
+        }
+    }
+}
+
 /// Returns the bytes of `keyfile` as `config` holds them. Refuses a document
 /// larger than the size that an open accepts.
 fn config_bytes(keyfile: &KeyFile) -> Result<Vec<u8>> {
@@ -782,6 +1038,7 @@ const _: fn() = || {
     let _ = |guard: &UpdateGuard| assert_send(&guard.add_remote("r", &[("url", "u")]));
     let _ = |guard: &UpdateGuard| assert_send(&guard.set_remote_key("r", "url", "u"));
     let _ = |guard: &UpdateGuard| assert_send(&guard.unset_remote_key("r", "url"));
+    let _ = |guard: &UpdateGuard| assert_send(&guard.replace_remote("r", &[("url", "u")]));
     let _ = |guard: &UpdateGuard| assert_send(&guard.delete_remote("r"));
     let _ = |guard: UpdateGuard| assert_send(&guard.finish());
 };

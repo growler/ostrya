@@ -18,8 +18,8 @@ use common::{
 };
 use futures_lite::future::poll_once;
 use ostrya::{
-    Checksum, CollectionRef, CreateOptions, Error, LockKind, ObjectType, PruneOptions, Repo,
-    RepoMode, UpdateGuard,
+    Checksum, CollectionRef, CreateOptions, Error, LockKind, ObjectType, OpenOptions, PruneOptions,
+    RemoteSource, RemotesDir, Repo, RepoMode, UpdateGuard,
 };
 use ostrya_rt::block_on;
 use rustix::process::{Flock, FlockType, Pid};
@@ -995,6 +995,675 @@ fn set_remote_key_passes_on_an_error_of_the_group() {
         guard.finish().await.unwrap();
     });
     assert_eq!(config_file(&path), before);
+}
+
+// ---------------------------------------------------------------------------
+// Remotes of the remotes directory.
+// ---------------------------------------------------------------------------
+
+/// The environment variable that names the marker file of the umask child of
+/// the remotes directory test.
+const DIR_UMASK_ENV: &str = "OSTRYA_TEST_UPDATE_GUARD_DIR_UMASK_CHILD";
+
+/// Opens the repository at `path` with the remotes directory `dir`.
+fn open_with_dir(path: &Path, dir: RemotesDir) -> Repo {
+    block_on(OpenOptions::new().remotes_dir(dir).open(path)).unwrap()
+}
+
+/// Runs `edit` on a guard of `repo`, finishes the guard, and returns the
+/// result of `edit`.
+fn guarded<T>(repo: &Repo, edit: impl AsyncFnOnce(&UpdateGuard) -> T) -> T {
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        let result = edit(&guard).await;
+        guard.finish().await.unwrap();
+        result
+    })
+}
+
+/// Returns the mode of a file that this process creates in `dir` with the
+/// requested mode `mode`, under the umask of this process.
+fn masked_mode(dir: &Path, mode: u32) -> u32 {
+    use std::os::unix::fs::OpenOptionsExt;
+    let probe = dir.join("probe-masked");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&probe)
+        .unwrap();
+    let got = mode_of(&probe);
+    std::fs::remove_file(&probe).unwrap();
+    got
+}
+
+/// Returns the bytes and the inode of the file at `path`.
+fn file_state(path: &Path) -> (Vec<u8>, u64) {
+    let ino = std::fs::symlink_metadata(path).unwrap().ino();
+    (std::fs::read(path).unwrap(), ino)
+}
+
+/// Returns the sorted names of the entries of the directory `dir`.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort_unstable();
+    names
+}
+
+/// Writes `text` into the file `name` of the directory `dir`, and creates
+/// the directory if it is absent.
+fn write_conf(dir: &Path, name: &str, text: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join(name), text).unwrap();
+}
+
+/// Returns the message of an `Error::InvalidFormat` result.
+fn invalid_format<T: std::fmt::Debug>(result: ostrya::Result<T>) -> String {
+    match result {
+        Err(Error::InvalidFormat(message)) => message,
+        other => panic!("expected InvalidFormat, got {other:?}"),
+    }
+}
+
+/// An add into a remotes directory writes `<name>.conf` with the one group
+/// of the remote, at mode 0666 with the umask applied, and leaves `config` as
+/// it was. The add creates the absent directory and its absent parent at
+/// mode 0777 with the umask applied. A new open reads the remote from the
+/// file, and no temporary file stays.
+#[test]
+fn add_remote_writes_a_conf_file_into_the_remotes_dir() {
+    let tmp = TmpDir::new("guard-dir-add");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("etc/remotes.d");
+    let before = config_file(&path);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .add_remote(
+                "n",
+                &[("url", "https://example.invalid/n"), ("note", " a\nb")],
+            )
+            .await
+    })
+    .unwrap();
+
+    let file = dir.join("n.conf");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "[remote \"n\"]\nurl=https://example.invalid/n\nnote=\\sa\\nb\n"
+    );
+    assert_eq!(config_file(&path), before);
+    assert_eq!(mode_of(&file), masked_mode(tmp.path(), 0o666));
+    assert_eq!(mode_of(&dir), masked_mode(tmp.path(), 0o777));
+    assert_eq!(
+        mode_of(&tmp.path().join("etc")),
+        masked_mode(tmp.path(), 0o777)
+    );
+    assert_eq!(entry_names(&dir), ["n.conf"]);
+    let reopened = open_with_dir(&path, RemotesDir::path(&dir));
+    let remote = reopened.config().remote("n").unwrap();
+    assert_eq!(remote.source(), RemoteSource::File("n.conf"));
+    assert_eq!(
+        remote.url().unwrap().as_deref(),
+        Some("https://example.invalid/n")
+    );
+}
+
+/// An add creates an in-repository directory and its absent parents, and
+/// writes into a directory given by descriptor.
+#[test]
+fn add_remote_writes_into_an_in_repo_dir_and_a_descriptor() {
+    let tmp = TmpDir::new("guard-dir-add-forms");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let in_repo = RemotesDir::InRepo(PathBuf::from("a/b/remotes.d"));
+    let repo = open_with_dir(&path, in_repo.clone());
+    guarded(&repo, async |guard| {
+        guard
+            .add_remote("r", &[("url", "https://example.invalid/r")])
+            .await
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(path.join("a/b/remotes.d/r.conf")).unwrap(),
+        "[remote \"r\"]\nurl=https://example.invalid/r\n"
+    );
+    let reopened = open_with_dir(&path, in_repo);
+    assert_eq!(
+        reopened.config().remote("r").unwrap().source(),
+        RemoteSource::File("r.conf")
+    );
+
+    let fd_dir = tmp.path().join("by-fd");
+    std::fs::create_dir(&fd_dir).unwrap();
+    let fd: std::os::fd::OwnedFd = std::fs::File::open(&fd_dir).unwrap().into();
+    let repo = open_with_dir(&path, RemotesDir::from(fd));
+    guarded(&repo, async |guard| {
+        guard
+            .add_remote("f", &[("url", "https://example.invalid/f")])
+            .await
+    })
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(fd_dir.join("f.conf")).unwrap(),
+        "[remote \"f\"]\nurl=https://example.invalid/f\n"
+    );
+}
+
+/// An add creates the remotes directory below a parent that gives search
+/// permission and no read permission, as `mkdir -p` does. With `[core]
+/// fsync` on, the add creates the last directory below a readable parent.
+/// With `[core] fsync` off, it also creates a directory in the parent with
+/// no read permission. Root reads each directory whatever its mode, so the
+/// test does not run as root.
+#[test]
+fn add_remote_creates_the_dir_below_a_parent_with_no_read_permission() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping: root reads each directory whatever its mode");
+        return;
+    }
+    let tmp = TmpDir::new("guard-dir-add-noread");
+    let unsynced = TmpDir::new("guard-dir-add-noread-unsynced");
+    let noread = tmp.path().join("noread");
+    std::fs::create_dir_all(noread.join("sub")).unwrap();
+    std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o311)).unwrap();
+    let cases = [
+        (
+            create(&tmp, RepoMode::BareUser, ""),
+            noread.join("sub/remotes.d"),
+        ),
+        (
+            create(&unsynced, RepoMode::BareUser, "fsync=false\n"),
+            noread.join("new/remotes.d"),
+        ),
+    ];
+    let mut added = Vec::new();
+    for (path, dir) in &cases {
+        let repo = open_with_dir(path, RemotesDir::path(dir));
+        added.push(guarded(&repo, async |guard| {
+            guard
+                .add_remote("n", &[("url", "https://example.invalid/n")])
+                .await
+        }));
+    }
+    // The cleanup of the temporary directory reads each directory.
+    std::fs::set_permissions(&noread, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (added, (_, dir)) in added.into_iter().zip(&cases) {
+        added.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("n.conf")).unwrap(),
+            "[remote \"n\"]\nurl=https://example.invalid/n\n"
+        );
+    }
+}
+
+/// An add and a set write `<name>.conf` for a name whose file name is 245
+/// bytes, which is in the limit of 255 bytes for a file name. The temporary
+/// file of a write does not have a longer name than the file.
+#[test]
+fn the_writes_take_a_name_that_fills_a_file_name() {
+    let tmp = TmpDir::new("guard-dir-long-name");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    let name = "a".repeat(240);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .add_remote(&name, &[("url", "https://example.invalid/a")])
+            .await?;
+        guard
+            .set_remote_key(&name, "url", "https://example.invalid/moved")
+            .await
+    })
+    .unwrap();
+    let file = format!("{name}.conf");
+    assert_eq!(
+        std::fs::read_to_string(dir.join(&file)).unwrap(),
+        format!("[remote \"{name}\"]\nurl=https://example.invalid/moved\n")
+    );
+    assert_eq!(entry_names(&dir), [file]);
+}
+
+/// Under a umask of 0077, an add writes the file at mode 0600 and creates the
+/// directories at mode 0700. The umask is a property of the process, so the
+/// check runs in a child process. The child is this test binary, which runs
+/// this test alone.
+#[test]
+fn add_remote_applies_the_umask_to_the_file_and_the_dirs() {
+    if let Some(marker) = std::env::var_os(DIR_UMASK_ENV) {
+        let marker = PathBuf::from(marker);
+        rustix::process::umask(rustix::fs::Mode::from_raw_mode(0o077));
+        let base = marker.with_file_name("child");
+        std::fs::create_dir_all(&base).unwrap();
+        let path = base.join("repo");
+        block_on(Repo::create(&path, CreateOptions::new(RepoMode::BareUser))).unwrap();
+        let dir = base.join("etc/remotes.d");
+        let repo = open_with_dir(&path, RemotesDir::path(&dir));
+        guarded(&repo, async |guard| {
+            guard
+                .add_remote("n", &[("url", "https://example.invalid/n")])
+                .await
+        })
+        .unwrap();
+        assert_eq!(mode_of(&dir.join("n.conf")), 0o600);
+        assert_eq!(mode_of(&dir), 0o700);
+        assert_eq!(mode_of(&base.join("etc")), 0o700);
+        std::fs::write(marker, b"ran").unwrap();
+        return;
+    }
+    let tmp = TmpDir::new("guard-dir-umask");
+    let marker = tmp.path().join("ran");
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "add_remote_applies_the_umask_to_the_file_and_the_dirs",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(DIR_UMASK_ENV, &marker)
+        .status()
+        .expect("re-execute this test binary");
+    assert!(status.success(), "the child failed: {status}");
+    // If the filter matches no test name, the child runs nothing and exits
+    // 0. Only the marker proves that the check ran.
+    assert!(marker.exists(), "the child ran no check");
+}
+
+/// With `[core] add-remotes-config-dir=false`, an add writes into `config`
+/// and creates no directory. A value that is not a boolean fails the add of
+/// a handle with a remotes directory, and has no effect for a handle with
+/// none.
+#[test]
+fn add_remote_follows_add_remotes_config_dir() {
+    let tmp = TmpDir::new("guard-dir-add-key");
+    let path = create(&tmp, RepoMode::BareUser, "add-remotes-config-dir=false\n");
+    let dir = tmp.path().join("remotes.d");
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .add_remote("c", &[("url", "https://example.invalid/c")])
+            .await
+    })
+    .unwrap();
+    assert_eq!(
+        remote_keys(&path, "c"),
+        [("url".to_owned(), "https://example.invalid/c".to_owned())]
+    );
+    assert!(!dir.exists(), "the add created the remotes directory");
+
+    let tmp = TmpDir::new("guard-dir-add-bad-key");
+    let path = create(&tmp, RepoMode::BareUser, "add-remotes-config-dir=maybe\n");
+    let before = config_file(&path);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    let added = guarded(&repo, async |guard| {
+        guard
+            .add_remote("c", &[("url", "https://example.invalid/c")])
+            .await
+    });
+    assert!(matches!(added, Err(Error::Core(_))), "{added:?}");
+    assert_eq!(config_file(&path), before);
+    add_remote(&path, "c", &[("url", "https://example.invalid/c")]);
+    assert_eq!(remote_keys(&path, "c").len(), 1);
+}
+
+/// An add into the directory refuses a name when the directory holds an
+/// entry `<name>.conf` of any type and no source holds the remote. The error
+/// is of the kind `AlreadyExists` and names the entry. The add writes
+/// nothing.
+#[test]
+fn add_remote_refuses_an_existing_conf_entry() {
+    let tmp = TmpDir::new("guard-dir-add-exists");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "file.conf", "[remote \"other\"]\nurl=x\n");
+    write_conf(&dir, "empty.conf", "");
+    std::fs::create_dir(dir.join("dir.conf")).unwrap();
+    std::os::unix::fs::symlink("absent", dir.join("dangling.conf")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        dir.join("fifo.conf"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+    let names = entry_names(&dir);
+    let other = file_state(&dir.join("file.conf"));
+    let before = config_file(&path);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    for name in ["file", "empty", "dir", "dangling", "fifo"] {
+        let added = guarded(&repo, async |guard| {
+            guard
+                .add_remote(name, &[("url", "https://example.invalid/r")])
+                .await
+        });
+        match added {
+            Err(Error::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists, "{err}");
+                let entry = dir.join(format!("{name}.conf"));
+                assert!(
+                    err.to_string()
+                        .starts_with(&format!("{}: ", entry.display())),
+                    "{err}"
+                );
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+    assert_eq!(entry_names(&dir), names);
+    assert_eq!(file_state(&dir.join("file.conf")), other);
+    assert_eq!(config_file(&path), before);
+}
+
+/// An add refuses a name that a remote of `config` or of a `.conf` file has,
+/// and writes nothing.
+#[test]
+fn add_remote_refuses_a_name_of_either_source() {
+    let tmp = TmpDir::new("guard-dir-add-either");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "c", &[("url", "https://example.invalid/c")]);
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "f.conf", "[remote \"f\"]\nurl=x\n");
+    let before = (config_file(&path), file_state(&dir.join("f.conf")));
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    for name in ["c", "f"] {
+        let added = guarded(&repo, async |guard| {
+            guard
+                .add_remote(name, &[("url", "https://example.invalid/r")])
+                .await
+        });
+        match added {
+            Err(Error::RemoteExists(n)) => assert_eq!(n, name),
+            other => panic!("expected RemoteExists, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        (config_file(&path), file_state(&dir.join("f.conf"))),
+        before
+    );
+    assert_eq!(entry_names(&dir), ["f.conf"]);
+}
+
+/// A set and an unset edit the `.conf` file that holds the remote. The
+/// rewrite keeps the other groups, the keys in their order, and the
+/// permission bits of the file, and drops the comments and the blank lines.
+/// `config` does not change. A set of the held value and an unset of an
+/// absent key write nothing.
+#[test]
+fn set_and_unset_remote_key_edit_the_conf_file() {
+    let tmp = TmpDir::new("guard-dir-set");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    let file = dir.join("multi.conf");
+    write_conf(
+        &dir,
+        "multi.conf",
+        "# a comment\n[remote \"a\"]\nurl=https://example.invalid/a\n\
+         gpg-verify=false\n\n[core]\nx=1\n\n[remote \"b\"]\nurl=https://example.invalid/b\n",
+    );
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+    let before = config_file(&path);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .set_remote_key("a", "url", "https://example.invalid/moved")
+            .await
+            .unwrap();
+        guard
+            .set_remote_key("a", "branches", "main;")
+            .await
+            .unwrap();
+        assert!(guard.unset_remote_key("a", "gpg-verify").await.unwrap());
+
+        let held = file_state(&file);
+        guard
+            .set_remote_key("a", "url", "https://example.invalid/moved")
+            .await
+            .unwrap();
+        assert!(!guard.unset_remote_key("a", "gpg-verify").await.unwrap());
+        assert_eq!(file_state(&file), held);
+    });
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "[remote \"a\"]\nurl=https://example.invalid/moved\nbranches=main;\n\n\
+         [core]\nx=1\n\n[remote \"b\"]\nurl=https://example.invalid/b\n"
+    );
+    assert_eq!(mode_of(&file), 0o640);
+    assert_eq!(config_file(&path), before);
+    assert_eq!(entry_names(&dir), ["multi.conf"]);
+}
+
+/// A replace writes the new group at the end of the source that holds the
+/// remote, and keeps the other groups of the source and the keyring of the
+/// remote. A replace of an absent remote fails with `RemoteNotFound`, and a
+/// replace with no keys or with a bad name fails with `InvalidInput`.
+#[test]
+fn replace_remote_replaces_the_group_in_its_source() {
+    let tmp = TmpDir::new("guard-dir-replace");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "c1", &[("url", "https://example.invalid/c1")]);
+    add_remote(&path, "c2", &[("url", "https://example.invalid/c2")]);
+    let keyring = path.join("c1.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    let dir = tmp.path().join("remotes.d");
+    let file = dir.join("two.conf");
+    write_conf(
+        &dir,
+        "two.conf",
+        "[remote \"a\"]\nurl=https://example.invalid/a\nnote=n\n\n\
+         [remote \"b\"]\nurl=https://example.invalid/b\n",
+    );
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .replace_remote("c1", &[("url", "https://example.invalid/new")])
+            .await
+            .unwrap();
+        guard
+            .replace_remote("a", &[("url", "https://example.invalid/new-a")])
+            .await
+            .unwrap();
+        assert_remote_not_found(
+            guard.replace_remote("absent", &[("url", "u")]).await,
+            "absent",
+        );
+        assert_invalid_input(guard.replace_remote("a", &[]).await);
+        assert_invalid_input(guard.replace_remote("a/b", &[("url", "u")]).await);
+        assert_invalid_input(guard.replace_remote("a", &[("a=b", "u")]).await);
+    });
+    let reopened = open(&path);
+    assert_eq!(
+        reopened.config().remotes().collect::<Vec<_>>(),
+        ["c2", "c1"]
+    );
+    assert_eq!(
+        remote_keys(&path, "c1"),
+        [("url".to_owned(), "https://example.invalid/new".to_owned())]
+    );
+    assert_eq!(std::fs::read(&keyring).unwrap(), b"keys");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "[remote \"b\"]\nurl=https://example.invalid/b\n\n\
+         [remote \"a\"]\nurl=https://example.invalid/new-a\n"
+    );
+}
+
+/// A delete of a remote of a `.conf` file removes the file when no remote
+/// group stays in it, also with a `[core]` group in it, and removes a
+/// symlink and not its target. It writes back a file that keeps another
+/// remote. It removes the keyring of the repository and keeps the keyring of
+/// the remotes directory.
+#[test]
+fn delete_remote_removes_the_group_from_its_conf_file() {
+    let tmp = TmpDir::new("guard-dir-delete");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(
+        &dir,
+        "solo.conf",
+        "[core]\nx=1\n\n[remote \"solo\"]\nurl=https://example.invalid/solo\n",
+    );
+    write_conf(
+        &dir,
+        "pair.conf",
+        "[remote \"p1\"]\nurl=https://example.invalid/p1\n\n\
+         [remote \"p2\"]\nurl=https://example.invalid/p2\n",
+    );
+    std::fs::set_permissions(
+        dir.join("pair.conf"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let target = tmp.path().join("target.conf");
+    std::fs::write(&target, "[remote \"l\"]\nurl=https://example.invalid/l\n").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("link.conf")).unwrap();
+    let target_before = file_state(&target);
+    std::fs::write(path.join("solo.trustedkeys.gpg"), b"keys").unwrap();
+    std::fs::write(dir.join("solo.trustedkeys.gpg"), b"keys").unwrap();
+    let before = config_file(&path);
+
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard.delete_remote("solo").await.unwrap();
+        guard.delete_remote("p1").await.unwrap();
+        guard.delete_remote("l").await.unwrap();
+    });
+    assert_eq!(entry_names(&dir), ["pair.conf", "solo.trustedkeys.gpg"]);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("pair.conf")).unwrap(),
+        "[remote \"p2\"]\nurl=https://example.invalid/p2\n"
+    );
+    assert_eq!(mode_of(&dir.join("pair.conf")), 0o600);
+    assert_eq!(file_state(&target), target_before);
+    assert!(!path.join("solo.trustedkeys.gpg").exists());
+    assert_eq!(config_file(&path), before);
+    let reopened = open_with_dir(&path, RemotesDir::path(&dir));
+    assert_eq!(reopened.config().remotes().collect::<Vec<_>>(), ["p2"]);
+}
+
+/// A set, an unset, a replace, and a delete that writes the file back refuse
+/// a `.conf` file that is a symlink, with `InvalidFormat` that names the
+/// link. The link and its target stay, and the delete keeps the keyring.
+#[test]
+fn the_writes_refuse_a_conf_symlink() {
+    let tmp = TmpDir::new("guard-dir-symlink");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    let target = tmp.path().join("real.conf");
+    std::fs::write(
+        &target,
+        "[remote \"s1\"]\nurl=https://example.invalid/s1\n\n\
+         [remote \"s2\"]\nurl=https://example.invalid/s2\n",
+    )
+    .unwrap();
+    let link = dir.join("ln.conf");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let keyring = path.join("s1.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    let before = file_state(&target);
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    let messages = guarded(&repo, async |guard| {
+        vec![
+            invalid_format(guard.set_remote_key("s1", "url", "u").await),
+            invalid_format(guard.unset_remote_key("s1", "url").await),
+            invalid_format(guard.replace_remote("s1", &[("url", "u")]).await),
+            invalid_format(guard.delete_remote("s1").await),
+        ]
+    });
+    for message in messages {
+        assert!(
+            message.starts_with(&link.display().to_string()),
+            "{message}"
+        );
+    }
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!(file_state(&target), before);
+    assert_eq!(std::fs::read(&keyring).unwrap(), b"keys");
+}
+
+/// A set of the held value on a remote of a `.conf` symlink writes nothing
+/// and succeeds. The link and its target stay.
+#[test]
+fn set_remote_key_to_the_held_value_on_a_conf_symlink_writes_nothing() {
+    let tmp = TmpDir::new("guard-dir-symlink-same");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    let target = tmp.path().join("real.conf");
+    std::fs::write(&target, "[remote \"s\"]\nurl=https://example.invalid/s\n").unwrap();
+    let link = dir.join("ln.conf");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let before = (file_state(&target), file_state(&link));
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard
+            .set_remote_key("s", "url", "https://example.invalid/s")
+            .await
+    })
+    .unwrap();
+    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+    assert_eq!((file_state(&target), file_state(&link)), before);
+    assert_eq!(entry_names(&dir), ["ln.conf"]);
+}
+
+/// `UpdateGuard::write_config` and `Repo::write_config` refuse a document
+/// with a group of a remote of the remotes directory, with `RemoteExists`,
+/// and write nothing. They write a document with a group of a remote of
+/// `config`.
+#[test]
+fn write_config_refuses_a_group_of_a_remote_of_the_dir() {
+    let tmp = TmpDir::new("guard-dir-write-config");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "c", &[("url", "https://example.invalid/c")]);
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "d.conf", "[remote \"d\"]\nurl=x\n");
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    let mut clash = repo.config().keyfile().clone();
+    clash.set_string(&group("d"), "url", "y").unwrap();
+    let mut edit = repo.config().keyfile().clone();
+    edit.set_string(&group("c"), "url", "https://example.invalid/moved")
+        .unwrap();
+    let before = config_file(&path);
+
+    let written = guarded(&repo, async |guard| guard.write_config(&clash).await);
+    assert!(
+        matches!(&written, Err(Error::RemoteExists(n)) if n == "d"),
+        "{written:?}"
+    );
+    let written = block_on(repo.write_config(&clash));
+    assert!(
+        matches!(&written, Err(Error::RemoteExists(n)) if n == "d"),
+        "{written:?}"
+    );
+    assert_eq!(config_file(&path), before);
+
+    guarded(&repo, async |guard| guard.write_config(&edit).await).unwrap();
+    block_on(repo.write_config(&edit)).unwrap();
+    assert_eq!(
+        remote_keys(&path, "c"),
+        [("url".to_owned(), "https://example.invalid/moved".to_owned())]
+    );
+}
+
+/// `UpdateGuard::write_config` and `Repo::write_config` of a handle with a
+/// remotes directory write a document with no `[core]` group.
+#[test]
+fn write_config_takes_a_document_with_no_core_group() {
+    let tmp = TmpDir::new("guard-dir-write-no-core");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let dir = tmp.path().join("remotes.d");
+    write_conf(&dir, "d.conf", "[remote \"d\"]\nurl=x\n");
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    let text = "[remote \"c\"]\nurl=https://example.invalid/c\n";
+    let document = ostrya_core::KeyFile::parse(text).unwrap();
+
+    guarded(&repo, async |guard| guard.write_config(&document).await).unwrap();
+    assert_eq!(std::fs::read_to_string(path.join("config")).unwrap(), text);
+    std::fs::write(path.join("config"), "").unwrap();
+    block_on(repo.write_config(&document)).unwrap();
+    assert_eq!(std::fs::read_to_string(path.join("config")).unwrap(), text);
 }
 
 // ---------------------------------------------------------------------------

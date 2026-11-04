@@ -608,6 +608,14 @@ a `GLib-CRITICAL` line, writes nothing, and exits 0, where the port refuses the
 name (`keyfile: group name is empty`, `keyfile: key is empty`), writes nothing,
 and exits 1. Both leave the file as it stands.
 
+`config set` and `config unset` of a key in the group `remote "<name>"`,
+where `<name>` is a remote of a `.conf` file of the remotes directory, refuse
+at exit 1 with `error: Reloading remotes: Multiple specifications found for
+remote "<name>"`, and write nothing. The tool refuses `config set` in the
+same words. Not observed: the answer of the tool to `config unset` in this
+case. `config get` reads `config` alone in both, so it reports a group that
+`config` does not hold.
+
 `config get` unescapes a value by the rules of `../format-reference.md`,
 "Config file (`<repo>/config`, GKeyFile / INI)". Not observed: the answer of
 the tool to two values. The first value holds an escape that these rules do
@@ -4434,7 +4442,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `cli-behavior.md`, "`remote`",
-records. Thirteen divergences stand:
+records. Eighteen divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -4805,7 +4813,35 @@ records. Thirteen divergences stand:
   remote after it writes the section, the same way as `remote gpg-import` with
   `--keyring`. It then prints `Imported <n> GPG key to remote "<name>"`, with
   `keys` for each count other than 1. If `--if-not-exists` leaves the section
-  in place, the port imports nothing.
+  in place, the port imports nothing;
+- `remote add` of a remote that no source holds, when the remotes directory
+  holds an entry `<name>.conf` of any type: a regular file with another
+  remote or with no remote, a directory, a symlink to no file, or a FIFO. The
+  port refuses the add with `error: i/o error: <dir>/<name>.conf: File
+  exists` at exit 1 and writes nothing, also with `--if-not-exists` and
+  `--force`. The tool writes a temporary file, syncs it, and renames it over
+  `<name>.conf`, so the remotes and the comments of the old file are lost. A
+  new `<name>.conf` holds the same bytes in both. The port writes it through
+  a temporary file and a rename, and the tool creates it in place;
+- `remote add --force` of a remote of a `.conf` file that holds other
+  groups. The port removes the group, writes the new group at the end of the
+  file, and keeps the other groups. The tool writes the file again with the
+  new group alone. In both, the remote stays in its file, and `--force` of a
+  remote of `config` replaces the section in `config`;
+- `remote delete` of a remote of a `.conf` file that holds another remote.
+  The port removes the group and writes the file back with the other groups.
+  The tool removes the whole file, so a later `remote delete` of the other
+  remote reports `error: Remote "<other>" not found`. When the file then holds
+  no remote group, both remove the file, and for a symlink both remove the
+  link and keep the target;
+- a rewrite of a `.conf` file that is a symlink, by `remote add --force` or
+  by a `remote delete` that writes the file back. The port refuses it with
+  `error: invalid format: <dir>/<name>.conf is a symlink, and a write would
+  replace it with a regular file` at exit 1, writes nothing, and keeps the
+  keyring of the remote. Not observed: the answer of the tool;
+- the mode of a rewritten `.conf` file. The port keeps the permission bits
+  of the old file, and the owner of the new file is the user of the command.
+  Not observed: the mode that the tool gives a rewritten file.
 
 Three messages the port words for itself, each reporting a condition the tool
 reports through gpgme: `remote gpg-import` with no `--keyring` and no `--stdin`

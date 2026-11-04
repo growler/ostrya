@@ -13,6 +13,7 @@ use std::path::Path;
 use ostrya_core::{KeyFile, RepoMode};
 
 use crate::error::{Error, Result};
+use crate::remotes_dir;
 use crate::repo::{Repo, check_config_size};
 use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
 
@@ -356,6 +357,31 @@ impl RepoConfig {
         })
     }
 
+    /// Returns the parsed text of the `.conf` file `file` of the remotes
+    /// directory, or `None` if the config holds no file of that name.
+    pub(crate) fn remote_file(&self, file: &str) -> Option<&KeyFile> {
+        self.remote_files
+            .iter()
+            .find(|held| held.name == file)
+            .map(|held| &held.keyfile)
+    }
+
+    /// Returns `true` if `[core] add-remotes-config-dir` lets an add write a
+    /// new remote into the remotes directory.
+    ///
+    /// The default is `true`. The key has an effect only for a handle with a
+    /// remotes directory.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
+    pub(crate) fn add_remotes_config_dir(&self) -> Result<bool> {
+        Ok(self
+            .keyfile
+            .get_bool(CORE, "add-remotes-config-dir")?
+            .unwrap_or(true))
+    }
+
     /// Returns `true` if `[core] fsync` is on.
     ///
     /// The default is `true`.
@@ -688,13 +714,19 @@ impl Repo {
     ///
     /// # Edits
     ///
-    /// The call writes the document as given and does not check it. The
-    /// `ostree` command also writes the document of `config unset core.mode`
-    /// with no check. If a caller removes `[core] mode` or
-    /// `[core] repo_version`, [`Repo::open`] refuses the written file. To
-    /// change a key, a caller reads the current document through
+    /// The call writes the document as given and does not check its
+    /// `[core]` keys. The `ostree` command also writes the document of
+    /// `config unset core.mode` with no check. If a caller removes `[core]
+    /// mode` or `[core] repo_version`, [`Repo::open`] refuses the written
+    /// file. To change a key, a caller reads the current document through
     /// [`RepoConfig::keyfile`], changes it with the setters and removers of
     /// [`KeyFile`], and writes it back.
+    ///
+    /// The call refuses a document with a `[remote "NAME"]` group when a
+    /// `.conf` file of the remotes directory of the handle defines `NAME`,
+    /// because each later open refuses a remote name in two sources. Under
+    /// the locks, the call reads the files of the directory again for this
+    /// check.
     ///
     /// This handle keeps the configuration that it was opened with. To read
     /// the new values, open the repository again.
@@ -715,6 +747,10 @@ impl Repo {
     ///
     /// - [`Error::InvalidFormat`] if the document is larger than 1 MiB, the
     ///   size that an open accepts. The call then writes nothing.
+    /// - [`Error::RemoteExists`] if the document has a group of a remote of
+    ///   the remotes directory. The call then writes nothing.
+    /// - The errors of [`OpenOptions::open`](crate::OpenOptions::open) for the
+    ///   remotes directory and its `.conf` files.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`. Each of the two waits gets the full timeout.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` of this handle
@@ -727,7 +763,9 @@ impl Repo {
         let fsync = self.config().fsync()?;
         let bytes = keyfile.to_string().into_bytes();
         check_config_size(&bytes)?;
+        let names = remotes_dir::config_remote_names(keyfile);
         self.write_locked(move |repo| {
+            remotes_dir::check_config_remotes(repo.repo_fd(), repo.remotes_dir(), &names)?;
             write_root_file_blocking(repo.repo_fd(), CONFIG_FILE, &bytes, fsync)
         })
         .await

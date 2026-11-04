@@ -1205,7 +1205,19 @@ ignores each other group of a file. The tool reads the directory
 directory that `[ex-ostrya] remotes-config-dir` names ("Configuration keys of
 the port" in "Port extensions"), or the directory that a library caller gives
 at the open. `ostrya-config(1)`, "Remotes directory", states
-the rules of the read of the port.
+the rules of the read and the write of the port.
+
+The port writes a file of the remotes directory in this form. An add of the
+remote `NAME` writes the file `<dir>/NAME.conf` with the one group
+`[remote "NAME"]` and no blank line before it, as the tool writes it. The
+keys follow in the order of `remote add` (`conformance/cli-behavior.md`,
+"`remote add`"). The file mode is `0666` with the umask applied. An add
+creates an absent directory and each absent parent at mode `0777` with the
+umask applied. An add writes into the directory when `[core]
+add-remotes-config-dir` of `config` is not `false`, and into `config` when it
+is `false`. The key has no effect in a `.conf` file. A rewrite of a file
+writes the groups in the layout of `config`, with one blank line between two
+groups.
 
 `RepoConfig::auto_update_summary` reads `auto-update-summary` and
 `commit-update-summary` together. Its caller in the port is the reader of the

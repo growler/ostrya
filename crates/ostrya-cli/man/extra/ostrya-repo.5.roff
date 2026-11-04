@@ -454,16 +454,23 @@ the remote keys \fB\%push\-url\fR, \fB\%ssh\-command\fR, \fB\%receive\-command\f
 .PP
 The \fB\%ostree\fR tool keeps the extension keys when it writes \fB\%config\fR, and ignores them.
 .PP
-ostrya does not write these entries of the ostree layout: \fB\%tmp/cache/summaries/\fR, \fB\%uncompressed\-objects\-cache/\fR, \fB\%.payload\-link\fR objects, and \fB\%remotes.d/\fR configuration files.
+ostrya does not write these entries of the ostree layout: \fB\%tmp/cache/summaries/\fR, \fB\%uncompressed\-objects\-cache/\fR, and \fB\%.payload\-link\fR objects.
 .SH FILES
-ostrya also reads these files outside the repository:
+ostrya also reads these files outside the repository, and writes the files of the remotes directory:
 .TP
 \fB\%<remotes\-dir>/*.conf\fR
 The remotes of the remotes directory of the repository.
 The key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR in \fB\%config\fR names it, or a program gives it through the ostrya library.
 A relative value names a directory in the repository directory.
 Each open of the repository reads each file, and refuses a file larger than 1 MiB.
-\fB\%ostrya\-config\fR(1), "Remotes directory", gives the rules of the read.
+\fB\%ostrya remote add\fR writes a new remote into the file \fB\%<remote>.conf\fR, at mode 0666 with the umask applied.
+It creates an absent directory and each absent parent at mode 0777 with the umask applied.
+ostrya writes each file through a temporary file \fB\%.ostrya\-tmp\-<pid>\-<n>\fR in the directory and a rename.
+A rewrite of a file keeps its permission bits, and does not keep its owner.
+A crash can leave a temporary file, and ostrya does not remove it.
+The update lock of the repository covers each write.
+Two repositories that share one remotes directory do not exclude each other.
+\fB\%ostrya\-config\fR(1), "Remotes directory", gives the rules of the read and the write.
 .TP
 \fB\%/etc/ostree/remotes.d/<remote>.trustedkeys.gpg\fR
 The system keyring of the remote \fB\%<remote>\fR.

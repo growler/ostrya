@@ -204,6 +204,76 @@ A create refuses a collection id with a line break. The create writes the id
 into `config` as text, so a line break would add groups to `config`, such as
 an `[ex-ostrya]` group with the key of the remotes directory.
 
+## The write of the remotes directory
+
+`UpdateGuard::add_remote` writes into the remotes directory when the handle
+has one and `[core] add-remotes-config-dir` of `config` is not `false`. Else
+it writes into `config`. The default of the key is `true` for a handle with a
+remotes directory, so a user of the directory needs no key in `config`. This
+is the documented default of the tool for a system repository. The key stays
+in `[core]`, where the tool reads it.
+
+The add writes `<dir>/<name>.conf` with the one group of the remote, through
+a temporary file in the directory and a rename. The name of the temporary
+file starts with `.` and does not end in `.conf`, so an open, which takes no
+lock, never reads a partial file. The name is `.ostrya-tmp-<pid>-<n>`, and its
+length does not depend on the name of the remote, so the write takes each
+name whose `<name>.conf` fits in a file name. The tool creates the file in
+place with `O_EXCL`, and the result on disk is the same. The file mode is
+`0666` with the umask applied, and an absent directory and its absent parents
+get `0777` with the umask applied, as the tool gives them.
+
+The add refuses a name when the directory holds an entry `<name>.conf` of any
+type and no source holds the remote. The check is a `stat` that does not
+follow a symlink, then a plain rename. The tool replaces such a file, and the
+remotes in it are lost. The rule "refuse rather than reinterpret" applies: the
+entry can hold remotes of the administrator, or a symlink that a rename would
+replace. The add uses a plain rename after the check: the update lock
+excludes each other writer of the repository, and `RENAME_NOREPLACE` is
+specific to Linux.
+
+`set_remote_key`, `unset_remote_key`, `delete_remote`, and
+`UpdateGuard::replace_remote` edit the file that holds the remote: `config` or
+its `.conf` file. A remote never moves between two sources, so `--force` of
+`remote add` replaces the remote where it is, as the tool does. The replace
+removes the group and writes the new group at the end of the same file, as
+`--force` writes it in `config`. The other groups of a `.conf` file stay. The
+tool writes the file again with the new group alone, and a delete of the tool
+removes the whole file. Each of the two loses remotes that the user did not
+name, so the port edits the one group. A delete removes the file when no
+remote group stays in it.
+
+A rewrite of a `.conf` file keeps the permission bits of the old file, so a
+file that the administrator made private stays private. The owner is not
+kept, because a change of the owner needs a privilege that the writer can
+lack. The port refuses a rewrite of a `.conf` file that is a symlink: a
+rename replaces the link with a regular file, and the target, which holds the
+remote, keeps the old text. A delete of a file that is a symlink removes the
+link, as the tool does.
+
+With `[core] fsync` on, each write of the directory syncs the file and the
+directory before the call returns. The directory is outside the repository,
+so the syncs of `UpdateGuard::finish`, which name directories relative to the
+repository, cannot hold it.
+
+The update lock covers the writes of the directory. It is the lock of one
+repository, so two repositories that share one directory do not exclude each
+other. Each write changes one entry with one rename or one unlink, so a race
+of the two loses at most the edit of one file. A lock in the directory was
+rejected for this reason. Each guard call reads `config` and the directory
+again under the lock, so a `.conf` file that fails the open and that comes in
+after the open fails each edit. The edit then reports the file that the
+administrator must correct.
+
+`UpdateGuard::write_config` and `Repo::write_config` refuse a document with a
+`[remote "NAME"]` group when a `.conf` file defines `NAME`, with
+`Error::RemoteExists`. A write of such a document gives a name in two
+sources, which fails each later open. Both writers share one check, which
+reads the directory again under the lock. The check reads the remote groups
+of the document alone, so a document with no `[core]` group still writes.
+`ostrya config set` and `config unset` of a key in such a group refuse before
+the lock, as the tool refuses `config set`.
+
 ## The GVariant codec
 
 `ostrya-gvariant` is a GVariant codec written in the tree for the fixed type

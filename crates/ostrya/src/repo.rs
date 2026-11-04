@@ -59,6 +59,10 @@ const LAYOUT_DIRS: &[&str] = &[
 /// The open reads the directory into the snapshot of [`Repo::config`] and
 /// keeps no descriptor of it. Each later access resolves the value again, so
 /// a directory that does not exist at the open can come into existence later.
+/// The remote calls of an [`UpdateGuard`](crate::UpdateGuard) write the
+/// `.conf` files of the directory. An add creates the directory of a
+/// [`Path`](RemotesDir::Path) or an [`InRepo`](RemotesDir::InRepo) value if
+/// it is absent.
 ///
 /// A clone of a [`Fd`](RemotesDir::Fd) value shares one descriptor.
 #[derive(Debug, Clone)]

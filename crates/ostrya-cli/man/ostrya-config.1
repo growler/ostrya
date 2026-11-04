@@ -14,7 +14,7 @@ The command reads and writes the \fB\%config\fR file of the repository. \fB\%get
 \fIOPERATION\fR
 The operation: \fB\%get\fR, \fB\%set\fR, or \fB\%unset\fR\&.
 .IP
-\fB\%get\fR prints the value. \fB\%set\fR writes the value, and creates the group if it does not exist. \fB\%unset\fR removes the key. If the key or its group does not exist, \fB\%unset\fR changes nothing and exits \%0. \fB\%set\fR and \fB\%unset\fR write the whole \fB\%config\fR file of the repository again. This write drops the comment lines and the blank lines of the file.
+\fB\%get\fR prints the value. \fB\%set\fR writes the value, and creates the group if it does not exist. \fB\%unset\fR removes the key. If the key or its group does not exist, \fB\%unset\fR changes nothing and exits \%0. \fB\%set\fR and \fB\%unset\fR write the whole \fB\%config\fR file of the repository again. This write drops the comment lines and the blank lines of the file. \fB\%set\fR and \fB\%unset\fR refuse a key of the group \fB\%remote "NAME"\fR when NAME is a remote of the remotes directory.
 .TP
 \fIARGS...\fR
 The key to read or write, and for \fB\%set\fR the value.
@@ -135,6 +135,13 @@ Write each summary again after a push changes a ref, as \fB\%ostrya summary \-u\
 A deprecated name of \fB\%auto\-update\-summary\fR.
 If one of the two keys is true, the summary is written.
 A value that is not a boolean in one of the two keys is refused.
+.TP
+\fB\%add\-remotes\-config\-dir\fR (boolean, default true)
+Write a new remote of \fB\%ostrya remote add\fR into the remotes directory of the repository.
+With false, the add writes the group into \fB\%config\fR.
+The key has an effect only for a repository with a remotes directory, and only in \fB\%config\fR.
+A value that is not a boolean makes the add fail.
+"Remotes directory" under REMOTE KEYS gives the rules of the write.
 .SH ARCHIVE KEYS
 The keys of the group \fB\%[archive]\fR.
 .TP
@@ -160,7 +167,7 @@ Sets the default of \fB\%fsverity\fR.
 ostrya reads it for no other purpose.
 .SH REMOTE KEYS
 The keys of a group \fB\%[remote "NAME"]\fR.
-\fB\%ostrya remote add\fR writes the group.
+\fB\%ostrya remote add\fR writes the group into \fB\%config\fR, or into a file of the remotes directory.
 \fB\%NAME\fR has one or more letters, digits, \fB\%\-\fR, \fB\%_\fR, or \fB\%.\fR, and starts with a letter, a digit, or \fB\%_\fR.
 .SS "Remotes directory"
 A group \fB\%[remote "NAME"]\fR can also be in a \fB\%.conf\fR file of the remotes directory of the repository.
@@ -184,6 +191,39 @@ These fail each open of the repository:
 a path that is not a directory, a directory or a file that ostrya cannot read, a symlink that ostrya cannot follow for a reason other than an absent target, a file larger than 1 MiB (1048576 bytes), a file name or a file content that is not valid UTF\-8, a file that is not a valid key file, and a remote name that two sources define.
 The sources are \fB\%config\fR and each \fB\%.conf\fR file.
 The \fB\%ostree\fR tool reads a larger file, and fails on a value that is not valid UTF\-8 only when it reads that value.
+.PP
+\fB\%ostrya remote add\fR writes a new remote into the remotes directory when the repository has one and \fB\%add\-remotes\-config\-dir\fR of \fB\%[core]\fR is not false.
+Else it writes the group into \fB\%config\fR.
+The add writes the file \fB\%NAME.conf\fR with the one group \fB\%[remote "NAME"]\fR, at mode 0666 with the umask applied.
+If the directory is absent, the add creates it and each absent parent, at mode 0777 with the umask applied.
+The add needs search permission on each parent that exists, as \fB\%mkdir \-p\fR does.
+With \fB\%fsync\fR on, it also needs read permission on the parent of each directory that it creates, because it syncs that parent.
+The add refuses NAME when a source holds the remote, and when the directory holds an entry \fB\%NAME.conf\fR of any type.
+\fB\%\-\-if\-not\-exists\fR and \fB\%\-\-force\fR do not change the refusal of such an entry.
+The \fB\%ostree\fR tool writes over the entry, and the remotes in it are lost.
+.PP
+\fB\%ostrya remote add \-\-force\fR and \fB\%ostrya remote delete\fR edit the file that holds the remote: \fB\%config\fR or a \fB\%.conf\fR file.
+\fB\%\-\-force\fR writes the new group at the end of the file, and the other groups of the file stay.
+A delete removes the group.
+If the file then holds no remote group, the delete removes the file, with each other group of it.
+For a symlink, the delete removes the link, and the target stays.
+The \fB\%ostree\fR tool writes a \fB\%.conf\fR file again with the new group alone, and removes the whole file of a deleted remote, with each other remote in it.
+.PP
+A write of a \fB\%.conf\fR file drops its comment lines and its blank lines, and keeps its groups and keys in their order.
+ostrya writes a temporary file in the directory, whose name does not end in \fB\%.conf\fR, and renames it over the file.
+A rewrite keeps the permission bits of the file, and does not keep its owner.
+ostrya refuses to write a \fB\%.conf\fR file that is a symlink, because the rename replaces the link with a regular file.
+With \fB\%fsync\fR on, the write syncs the file and the directory before the command completes.
+.PP
+The update lock of the repository covers each write.
+It is the lock of one repository, so two repositories that share one remotes directory do not exclude each other.
+Each write changes one entry of the directory, so a race of the two loses at most the edit of one file.
+.PP
+Each command that edits a remote or \fB\%config\fR reads the directory again under the update lock.
+So a \fB\%.conf\fR file that fails the open, and that comes into the directory after the open, makes the edit fail.
+.PP
+\fB\%ostrya config get\fR, \fB\%ostrya config set\fR, and \fB\%ostrya config unset\fR read and write \fB\%config\fR alone.
+\fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.
 .SS "Address"
 .TP
 \fB\%url\fR (string)
@@ -915,7 +955,7 @@ The default of \fB\%default\-repo\-finders\fR is \fB\%config;mount\fR.
 \fB\%contenturl\fR, \fB\%metalink\fR, and \fB\%custom\-backend\fR of a remote
 \fB\%ostrya remote add\fR writes them, and a pull does not read them.
 .PP
-ostrya reads the remote groups of a remotes directory only when the repository has one.
+ostrya reads and writes the remote groups of a remotes directory only when the repository has one.
 The \fB\%ostrya\fR command finds the directory through the key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR.
 A program that uses the ostrya library can also give the directory when it opens the repository.
 .SH ENVIRONMENT

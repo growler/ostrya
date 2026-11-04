@@ -16425,9 +16425,10 @@ fn remote_add_if_not_exists_keeps_a_remote_added_under_a_held_guard() {
 }
 
 /// The no-op paths and the refusals of `config set`, `config unset`, `remote
-/// add`, and `remote delete` decide from the configuration read at open, and
-/// take no lock. Another holder of the update lock and `lock-timeout-secs=0`
-/// do not change their exit status or their output.
+/// add`, and `remote delete` decide from the configuration read at open, also
+/// for a remote of the remotes directory, and take no lock. Another holder of
+/// the update lock and `lock-timeout-secs=0` do not change their exit status
+/// or their output.
 #[test]
 fn config_no_ops_and_refusals_take_no_lock() {
     let tmp = TmpDir::new("config-no-lock");
@@ -16440,9 +16441,37 @@ fn config_no_ops_and_refusals_take_no_lock() {
     )
     .ok();
     set_core_key(&repo, "lock-timeout-secs=0");
+    let dir = tmp.path().join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    let f_text = "[remote \"f\"]\nurl=https://example.invalid/f\n";
+    std::fs::write(dir.join("f.conf"), f_text).unwrap();
+    set_remotes_config_dir(&repo, &dir);
     let before = config_text(&repo);
+    let f_exists = format!(
+        "error: Remote configuration for \"f\" already exists: {}\n",
+        dir.join("f.conf").display()
+    );
+    let f_refusal = "error: Reloading remotes: Multiple specifications found for remote \"f\"\n";
 
     let cases: &[(&[&str], i32, &str)] = &[
+        (
+            &["remote", "add", "f", "https://example.invalid/other"],
+            1,
+            &f_exists,
+        ),
+        (
+            &[
+                "remote",
+                "add",
+                "--if-not-exists",
+                "f",
+                "https://example.invalid/other",
+            ],
+            0,
+            "",
+        ),
+        (&["config", "set", "remote \"f\".url", "v"], 1, f_refusal),
+        (&["config", "unset", "remote \"f\".url"], 1, f_refusal),
         (&["config", "unset", "core.absent"], 0, ""),
         (
             &["config", "set", "core.a=b", "v"],
@@ -16514,6 +16543,170 @@ fn config_no_ops_and_refusals_take_no_lock() {
     block_on(guard.finish()).unwrap();
     assert!(wrong.is_empty(), "wrong results:\n{}", wrong.join("\n"));
     assert_eq!(config_text(&repo), before, "a command wrote `config`");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("f.conf")).unwrap(),
+        f_text,
+        "a command wrote f.conf"
+    );
+}
+
+/// Adds `[ex-ostrya] remotes-config-dir=<dir>` at the end of the `config` of
+/// the repository `repo`.
+fn set_remotes_config_dir(repo: &Path, dir: &Path) {
+    let mut config = config_text(repo);
+    config.push_str(&format!(
+        "\n[ex-ostrya]\nremotes-config-dir={}\n",
+        dir.display()
+    ));
+    std::fs::write(repo.join("config"), config).unwrap();
+}
+
+/// Returns the exit code and the standard error of a run.
+fn code_and_stderr(run: &Run) -> (Option<i32>, String) {
+    (
+        run.status.code(),
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+    )
+}
+
+/// `remote add` writes a new remote into the remotes directory, refuses a
+/// remote of a file with the path of the file, and leaves it with
+/// `--if-not-exists`. `--force` replaces the remote in its file and keeps
+/// the other remote of the file. `remote delete` removes the file of a
+/// remote. An entry `<name>.conf` that holds no such remote fails the add,
+/// also with `--if-not-exists` and `--force`. `config` does not change.
+#[test]
+fn remote_add_and_delete_write_the_remotes_dir() {
+    let tmp = TmpDir::new("remote-dir");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let dir = tmp.path().join("remotes.d");
+    set_remotes_config_dir(&repo, &dir);
+    let before = config_text(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = |args: &[&str]| {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(args);
+        ostrya(&full, None, &[])
+    };
+
+    run(&["remote", "add", "x", "https://example.invalid/x"]).ok();
+    let x_conf = dir.join("x.conf");
+    let x_text = "[remote \"x\"]\nurl=https://example.invalid/x\n";
+    assert_eq!(std::fs::read_to_string(&x_conf).unwrap(), x_text);
+    assert_eq!(
+        code_and_stderr(&run(&["remote", "add", "x", "https://example.invalid/y"])),
+        (
+            Some(1),
+            format!(
+                "error: Remote configuration for \"x\" already exists: {}\n",
+                x_conf.display()
+            )
+        )
+    );
+    run(&[
+        "remote",
+        "add",
+        "--if-not-exists",
+        "x",
+        "https://example.invalid/y",
+    ])
+    .ok();
+    assert_eq!(std::fs::read_to_string(&x_conf).unwrap(), x_text);
+
+    std::fs::write(
+        dir.join("two.conf"),
+        "[remote \"a\"]\nurl=https://example.invalid/a\n\n\
+         [remote \"b\"]\nurl=https://example.invalid/b\n",
+    )
+    .unwrap();
+    run(&[
+        "remote",
+        "add",
+        "--force",
+        "--no-gpg-verify",
+        "a",
+        "https://example.invalid/new",
+    ])
+    .ok();
+    assert_eq!(
+        std::fs::read_to_string(dir.join("two.conf")).unwrap(),
+        "[remote \"b\"]\nurl=https://example.invalid/b\n\n\
+         [remote \"a\"]\nurl=https://example.invalid/new\ngpg-verify=false\n"
+    );
+
+    run(&["remote", "delete", "x"]).ok();
+    assert!(!x_conf.exists(), "the delete left x.conf");
+    run(&["remote", "delete", "--if-exists", "x"]).ok();
+    assert_eq!(
+        code_and_stderr(&run(&["remote", "delete", "x"])),
+        (Some(1), "error: Remote \"x\" not found\n".to_owned())
+    );
+
+    std::fs::write(dir.join("stray.conf"), "[remote \"other\"]\nurl=x\n").unwrap();
+    let refusal = (
+        Some(1),
+        format!(
+            "error: i/o error: {}: File exists\n",
+            dir.join("stray.conf").display()
+        ),
+    );
+    for extra in [None, Some("--if-not-exists"), Some("--force")] {
+        let mut args = vec!["remote", "add", "stray", "https://example.invalid/s"];
+        args.extend(extra);
+        assert_eq!(code_and_stderr(&run(&args)), refusal, "{args:?}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(dir.join("stray.conf")).unwrap(),
+        "[remote \"other\"]\nurl=x\n"
+    );
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+}
+
+/// `config set` and `config unset` of a key of a remote of the remotes
+/// directory refuse at exit 1 in the words of the `ostree` command, and
+/// write nothing.
+#[test]
+fn config_set_and_unset_refuse_a_remote_of_the_remotes_dir() {
+    let tmp = TmpDir::new("config-remote-dir");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let dir = tmp.path().join("remotes.d");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(
+        dir.join("x.conf"),
+        "[remote \"x\"]\nurl=https://example.invalid/x\n",
+    )
+    .unwrap();
+    set_remotes_config_dir(&repo, &dir);
+    let before = config_text(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    let refusal = (
+        Some(1),
+        "error: Reloading remotes: Multiple specifications found for remote \"x\"\n".to_owned(),
+    );
+    for args in [
+        vec![
+            "config",
+            "set",
+            "remote \"x\".url",
+            "https://example.invalid/y",
+        ],
+        vec!["config", "unset", "remote \"x\".url"],
+        vec!["config", "set", "--group=remote \"x\"", "url", "y"],
+        vec!["config", "unset", "--group=remote \"x\"", "url"],
+    ] {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(&args);
+        assert_eq!(
+            code_and_stderr(&ostrya(&full, None, &[])),
+            refusal,
+            "{args:?}"
+        );
+    }
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+    assert_eq!(
+        std::fs::read_to_string(dir.join("x.conf")).unwrap(),
+        "[remote \"x\"]\nurl=https://example.invalid/x\n"
+    );
 }
 
 /// `remote refs` and `remote summary` read a live remote over HTTP: the ref

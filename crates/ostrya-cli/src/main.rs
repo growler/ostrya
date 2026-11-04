@@ -61,11 +61,11 @@ use ostrya::{
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
     FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
-    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
-    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
-    Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from,
-    to_text, to_text_unannotated, validate_refspec,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, RemoteSource, RemotesDir,
+    Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -1709,7 +1709,9 @@ struct ConfigArgs {
     /// if it does not exist. `unset` removes the key. If the key or its group
     /// does not exist, `unset` changes nothing and exits 0. `set` and `unset`
     /// write the whole `config` file of the repository again. This write
-    /// drops the comment lines and the blank lines of the file.
+    /// drops the comment lines and the blank lines of the file. `set` and
+    /// `unset` refuse a key of the group `remote "NAME"` when NAME is a
+    /// remote of the remotes directory.
     operation: Option<String>,
     /// The key to read or write, and for `set` the value.
     ///
@@ -1729,10 +1731,15 @@ struct RemoteArgs {
 enum RemoteCommand {
     /// Add a remote repository.
     ///
-    /// The command writes the `[remote "NAME"]` section of the `config` file
-    /// of the repository, and prints nothing. It refuses a name that is not a
-    /// valid remote name. If the remote exists, the command fails, unless
-    /// --if-not-exists or --force is given.
+    /// The command writes the `[remote "NAME"]` section, and prints nothing.
+    /// If the repository has a remotes directory and `[core]
+    /// add-remotes-config-dir` is not false, the command writes the section
+    /// into the new file `NAME.conf` of that directory. Else it writes the
+    /// section into the `config` file of the repository. It refuses a name
+    /// that is not a valid remote name. If the remote exists, the command
+    /// fails, unless --if-not-exists or --force is given. If no source holds
+    /// the remote and the remotes directory holds an entry `NAME.conf`, the
+    /// command fails, also with --if-not-exists or --force.
     Add(RemoteAddArgs),
     /// Create a bucket repository in an S3 bucket.
     ///
@@ -1908,9 +1915,11 @@ enum RemoteCommand {
     /// Delete a remote repository and its trusted GPG keyring.
     ///
     /// The command removes the keyring `NAME.trustedkeys.gpg` at the root of
-    /// the repository, and then the `[remote "NAME"]` section of `config`. It
-    /// prints nothing. If the remote does not exist, the command fails, unless
-    /// --if-exists is given.
+    /// the repository, and then the `[remote "NAME"]` section from the file
+    /// that holds it: `config` or a `.conf` file of the remotes directory. If
+    /// a `.conf` file then holds no remote section, the command removes the
+    /// file. It prints nothing. If the remote does not exist, the command
+    /// fails, unless --if-exists is given.
     Delete(RemoteDeleteArgs),
     /// List the configured remote names, sorted.
     ///
@@ -2071,7 +2080,9 @@ struct RemoteAddArgs {
     if_not_exists: bool,
     /// If the remote exists, replace its section.
     ///
-    /// The command removes the full section and writes a new one. This option
+    /// The command removes the full section and writes a new one at the end
+    /// of the file that holds the remote: `config` or a `.conf` file of the
+    /// remotes directory. The other sections of the file stay. This option
     /// conflicts with --if-not-exists.
     #[arg(long)]
     force: bool,
@@ -12721,6 +12732,30 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuses a `config` operation on the group `[remote "NAME"]` when `NAME`
+/// is a remote of a `.conf` file of the remotes directory. A write of the
+/// group into `config` defines the remote in two sources, and the `ostree`
+/// command refuses `config set` in the same case.
+fn refuse_remotes_dir_group(config: &RepoConfig, group: &str) {
+    let Some(name) = group
+        .strip_prefix("remote \"")
+        .and_then(|rest| rest.strip_suffix('"'))
+    else {
+        return;
+    };
+    if let Some(remote) = config.remote(name)
+        && matches!(remote.source(), RemoteSource::File(_))
+    {
+        exit_error(&remotes_dir_group_refusal(name));
+    }
+}
+
+/// Returns the refusal of a `config` operation on the group of the remote
+/// `name` of the remotes directory, in the words of the `ostree` command.
+fn remotes_dir_group_refusal(name: &str) -> String {
+    format!("Reloading remotes: Multiple specifications found for remote \"{name}\"")
+}
+
 /// Sets one configuration value and writes the document back.
 ///
 /// If the group is new, the command creates it. The value is escaped as the
@@ -12732,6 +12767,10 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
 /// takes no lock. The command then takes one update guard, reads the document
 /// from disk, makes the edit again, and writes the document. As a result, an
 /// edit that another writer made before the guard is kept.
+///
+/// The command refuses a key of the group of a remote of the remotes
+/// directory, as [`refuse_remotes_dir_group`] states, before it takes a lock,
+/// and again if the write under the guard refuses the group.
 async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     if args.args.len() < 2 {
         if args.group.is_some() {
@@ -12740,6 +12779,7 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
         exit_error("KEY and VALUE must be specified");
     }
     let (group, key) = config_target(args);
+    refuse_remotes_dir_group(repo.config(), group);
     let value = &args.args[1];
     let edit = |config: &RepoConfig| -> Result<_> {
         let mut keyfile = config.keyfile().clone();
@@ -12754,6 +12794,10 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     }
     .await;
     let finished = guard.finish().await;
+    if let Err(Error::RemoteExists(name)) = &edited {
+        finished?;
+        exit_error(&remotes_dir_group_refusal(name));
+    }
     edited.and(finished)
 }
 
@@ -12766,8 +12810,12 @@ async fn config_set(repo: &Repo, args: &ConfigArgs) -> Result<()> {
 /// key takes no lock. Otherwise, the document is read from disk, edited, and
 /// written under one update guard, as in [`config_set`]. If the key is not in
 /// the document on disk, the result is success with no write.
+///
+/// The command refuses a key of the group of a remote of the remotes
+/// directory, as [`config_set`] does, before it takes a lock.
 async fn config_unset(repo: &Repo, args: &ConfigArgs) -> Result<()> {
     let (group, key) = config_target(args);
+    refuse_remotes_dir_group(repo.config(), group);
     let edit = |config: &RepoConfig| {
         let mut keyfile = config.keyfile().clone();
         keyfile.remove_key(group, key).then_some(keyfile)
@@ -12898,13 +12946,18 @@ fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
 /// 8. the verification keys of the ed25519 and spki engines
 /// 9. the collection id
 ///
+/// The library selects the file of a new remote: a `.conf` file of the
+/// remotes directory, or `config`. `--force` replaces the remote in the file
+/// that holds it.
+///
 /// # Locks
 ///
-/// The edit is made first on the configuration read at open. As a result, no
-/// refusal takes a lock, and a remote that `--if-not-exists` leaves as it is
-/// takes no lock. The command then takes one update guard, reads the document
-/// from disk, makes the edit again, and writes the document. As a result, an
-/// edit that another writer made before the guard is kept.
+/// The command first decides on the configuration read at open, and checks
+/// the keys. As a result, no refusal takes a lock, and a remote that
+/// `--if-not-exists` leaves as it is takes no lock. The command then takes
+/// one update guard, decides again on the files on disk, and adds or
+/// replaces the remote. As a result, an edit that another writer made before
+/// the guard is kept.
 ///
 /// The command imports the keyring of `--gpg-import` only if it wrote the
 /// remote. The import comes after the guard is finished, because the import
@@ -12927,88 +12980,46 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
         exit_error(&format!("Invalid remote name {name}"));
     }
 
-    let group = remote_group(name);
-    // The edited document, or `None` for a remote that `--if-not-exists` leaves
-    // as it is.
-    let edit = |config: &RepoConfig| -> Result<Option<_>> {
-        let mut keyfile = config.keyfile().clone();
-        if keyfile.has_group(&group) {
-            if args.if_not_exists {
-                return Ok(None);
-            }
-            if !args.force {
-                exit_error(&format!(
-                    "Remote configuration for \"{name}\" already exists: (in config)"
-                ));
-            }
-            keyfile.remove_group(&group);
+    /// The step of the command for the remote.
+    enum Step {
+        /// `--if-not-exists` leaves the remote as it is.
+        Keep,
+        Add,
+        /// `--force` replaces the remote.
+        Replace,
+    }
+    let step = |config: &RepoConfig| -> Step {
+        let Some(remote) = config.remote(name) else {
+            return Step::Add;
+        };
+        if args.if_not_exists {
+            return Step::Keep;
         }
-
-        // The `ostree` command also reads `url`, and it reads no `s3://`
-        // address, so an `s3://` address goes to the keys of the port alone.
-        let s3 = url.starts_with("s3://");
-        match url.strip_prefix("metalink=") {
-            Some(metalink) => keyfile.set_string(&group, "metalink", metalink)?,
-            None if s3 => {}
-            None => keyfile.set_string(&group, "url", url)?,
-        }
-        if !args.branches.is_empty() {
-            // The separator follows each branch, also the last one. This is
-            // the list form that the `ostree` command writes.
-            let mut list = String::new();
-            for branch in &args.branches {
-                list.push_str(branch);
-                list.push(';');
-            }
-            keyfile.set_string(&group, "branches", &list)?;
-        }
-        if s3 {
-            keyfile.set_string(&group, "pull-url", url)?;
-            keyfile.set_string(&group, "push-url", url)?;
-        }
-        if let Some(contenturl) = &args.contenturl {
-            keyfile.set_string(&group, "contenturl", contenturl)?;
-        }
-        if let Some(backend) = &args.custom_backend {
-            keyfile.set_string(&group, "custom-backend", backend)?;
-        }
-        for pair in &args.set {
-            let Some((key, value)) = pair.split_once('=') else {
-                exit_error("Missing '=' in KEY=VALUE for --set");
+        if !args.force {
+            let place = match remote.source() {
+                RemoteSource::Config => "(in config)".to_owned(),
+                RemoteSource::File(file) => remote_file_path(repo, file),
             };
-            keyfile.set_string(&group, key, value)?;
+            exit_error(&format!(
+                "Remote configuration for \"{name}\" already exists: {place}"
+            ));
         }
-        // `--no-sign-verify` also turns the GPG check off. The `ostree`
-        // command writes the same for it.
-        if args.no_gpg_verify || args.no_sign_verify {
-            keyfile.set_string(&group, "gpg-verify", "false")?;
-        }
-        if args.no_sign_verify {
-            keyfile.set_string(&group, "sign-verify", "false")?;
-        }
-        if !args.sign_verify.is_empty() {
-            let mut engines: Vec<&str> = Vec::new();
-            for spec in &args.sign_verify {
-                let (engine, key, from_file) = parse_sign_verify_spec(spec);
-                let suffix = if from_file { "file" } else { "key" };
-                keyfile.set_string(&group, &format!("verification-{engine}-{suffix}"), key)?;
-                engines.push(engine);
-            }
-            keyfile.set_string(&group, "sign-verify", &engines.join(","))?;
-        }
-        if let Some(collection_id) = &args.collection_id {
-            keyfile.set_string(&group, "collection-id", collection_id)?;
-        }
-        Ok(Some(keyfile))
+        Step::Replace
     };
-    if edit(repo.config())?.is_none() {
+    if matches!(step(repo.config()), Step::Keep) {
         return Ok(());
     }
+    let keys = remote_add_keys(repo.config(), &args, name, url)?;
+    let keys: Vec<(&str, &str)> = keys
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
     let guard = repo.begin_update().await?;
     let edited = async {
-        match edit(&guard.read_config().await?)? {
-            Some(keyfile) => guard.write_config(&keyfile).await.map(|()| true),
-            None => Ok(false),
+        match step(&guard.read_config().await?) {
+            Step::Keep => Ok(false),
+            Step::Add => guard.add_remote(name, &keys).await.map(|()| true),
+            Step::Replace => guard.replace_remote(name, &keys).await.map(|()| true),
         }
     }
     .await;
@@ -13024,6 +13035,101 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
         report_gpg_import(gpg_import(repo, name, &keys, &[]).await?, name);
     }
     Ok(())
+}
+
+/// Returns the keys of the section that `remote add` writes for the remote
+/// `name`, in the order of the `ostree` command.
+///
+/// The call sets each key in a copy of `config` with no group of the remote,
+/// so a key name that a key file cannot hold is refused before the command
+/// takes a lock. A later key of one name replaces the value of the earlier
+/// key and keeps its position.
+fn remote_add_keys(
+    config: &RepoConfig,
+    args: &RemoteAddArgs,
+    name: &str,
+    url: &str,
+) -> Result<Vec<(String, String)>> {
+    let group = remote_group(name);
+    let mut keyfile = config.keyfile().clone();
+    keyfile.remove_group(&group);
+    let mut set = |key: &str, value: &str| keyfile.set_string(&group, key, value);
+
+    // The `ostree` command also reads `url`, and it reads no `s3://`
+    // address, so an `s3://` address goes to the keys of the port alone.
+    let s3 = url.starts_with("s3://");
+    match url.strip_prefix("metalink=") {
+        Some(metalink) => set("metalink", metalink)?,
+        None if s3 => {}
+        None => set("url", url)?,
+    }
+    if !args.branches.is_empty() {
+        // The separator follows each branch, also the last one. This is
+        // the list form that the `ostree` command writes.
+        let mut list = String::new();
+        for branch in &args.branches {
+            list.push_str(branch);
+            list.push(';');
+        }
+        set("branches", &list)?;
+    }
+    if s3 {
+        set("pull-url", url)?;
+        set("push-url", url)?;
+    }
+    if let Some(contenturl) = &args.contenturl {
+        set("contenturl", contenturl)?;
+    }
+    if let Some(backend) = &args.custom_backend {
+        set("custom-backend", backend)?;
+    }
+    for pair in &args.set {
+        let Some((key, value)) = pair.split_once('=') else {
+            exit_error("Missing '=' in KEY=VALUE for --set");
+        };
+        set(key, value)?;
+    }
+    // `--no-sign-verify` also turns the GPG check off. The `ostree`
+    // command writes the same for it.
+    if args.no_gpg_verify || args.no_sign_verify {
+        set("gpg-verify", "false")?;
+    }
+    if args.no_sign_verify {
+        set("sign-verify", "false")?;
+    }
+    if !args.sign_verify.is_empty() {
+        let mut engines: Vec<&str> = Vec::new();
+        for spec in &args.sign_verify {
+            let (engine, key, from_file) = parse_sign_verify_spec(spec);
+            let suffix = if from_file { "file" } else { "key" };
+            set(&format!("verification-{engine}-{suffix}"), key)?;
+            engines.push(engine);
+        }
+        set("sign-verify", &engines.join(","))?;
+    }
+    if let Some(collection_id) = &args.collection_id {
+        set("collection-id", collection_id)?;
+    }
+    keyfile
+        .keys(&group)
+        .map(|key| {
+            let value = keyfile.get_string(&group, key)?.unwrap_or_default();
+            Ok((key.to_owned(), value))
+        })
+        .collect()
+}
+
+/// Returns the path that names the `.conf` file `file` of the remotes
+/// directory of `repo` in a message: the path of the directory joined with
+/// the file name, or the file name alone for a directory given by
+/// descriptor.
+fn remote_file_path(repo: &Repo, file: &str) -> String {
+    match repo.remotes_dir() {
+        Some(RemotesDir::Path(dir) | RemotesDir::InRepo(dir)) => {
+            dir.join(file).display().to_string()
+        }
+        _ => file.to_owned(),
+    }
 }
 
 /// Reads one `--sign-verify` engine spec.
@@ -13322,9 +13428,10 @@ fn print_bucket_fsck(report: &ostrya::bucket::BucketFsckReport, quiet: bool) -> 
 ///
 /// Both steps run under one update guard. The section is looked up first in
 /// the configuration read at open, so an absent section takes no lock. When
-/// the guard is taken, the section is looked up again in `config` as it is on
-/// disk. A failure between the two steps leaves the section with no keyring,
-/// and never a keyring with no section.
+/// the guard is taken, the library looks up the section again in the files on
+/// disk, and removes it from the file that holds it. A failure between the
+/// two steps leaves the section with no keyring, and never a keyring with no
+/// section.
 async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     if !ostrya::valid_remote_name(name) {
@@ -13336,7 +13443,7 @@ async fn remote_delete(repo: &Repo, nested: &str, args: RemoteDeleteArgs) -> Res
         }
         exit_error(&format!("Remote \"{name}\" not found"));
     };
-    if !repo.config().keyfile().has_group(&remote_group(name)) {
+    if repo.config().remote(name).is_none() {
         return absent();
     }
     let guard = repo.begin_update().await?;

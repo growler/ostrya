@@ -16,7 +16,7 @@ The global options are listed in \fBostrya\fR(1).
 .SS "add"
 Add a remote repository.
 .PP
-The command writes the \fB\%[remote "NAME"]\fR section of the \fB\%config\fR file of the repository, and prints nothing. It refuses a name that is not a valid remote name. If the remote exists, the command fails, unless \%\-\-if\-not\-exists or \%\-\-force is given.
+The command writes the \fB\%[remote "NAME"]\fR section, and prints nothing. If the repository has a remotes directory and \fB\%[core] add\-remotes\-config\-dir\fR is not false, the command writes the section into the new file \fB\%NAME.conf\fR of that directory. Else it writes the section into the \fB\%config\fR file of the repository. It refuses a name that is not a valid remote name. If the remote exists, the command fails, unless \%\-\-if\-not\-exists or \%\-\-force is given. If no source holds the remote and the remotes directory holds an entry \fB\%NAME.conf\fR, the command fails, also with \%\-\-if\-not\-exists or \%\-\-force.
 .PP
 .nf
 ostrya remote add [OPTIONS] [NAME] [URL] [BRANCHES]...
@@ -71,7 +71,7 @@ The command then also imports no keys for \%\-\-gpg\-import, and it exits \%0. T
 \fB\-\-force\fR
 If the remote exists, replace its section.
 .IP
-The command removes the full section and writes a new one. This option conflicts with \%\-\-if\-not\-exists.
+The command removes the full section and writes a new one at the end of the file that holds the remote: \fB\%config\fR or a \fB\%\&.conf\fR file of the remotes directory. The other sections of the file stay. This option conflicts with \%\-\-if\-not\-exists.
 .TP
 \fB\-\-gpg\-import\fR \fIFILE\fR
 Import the keys of this keyring file into the trusted keyring.
@@ -312,7 +312,7 @@ The signature is a credential. Without this switch, the command refuses an \fB\%
 .SS "delete"
 Delete a remote repository and its trusted GPG keyring.
 .PP
-The command removes the keyring \fB\%NAME.trustedkeys.gpg\fR at the root of the repository, and then the \fB\%[remote "NAME"]\fR section of \fB\%config\fR\&. It prints nothing. If the remote does not exist, the command fails, unless \%\-\-if\-exists is given.
+The command removes the keyring \fB\%NAME.trustedkeys.gpg\fR at the root of the repository, and then the \fB\%[remote "NAME"]\fR section from the file that holds it: \fB\%config\fR or a \fB\%\&.conf\fR file of the remotes directory. If a \fB\%\&.conf\fR file then holds no remote section, the command removes the file. It prints nothing. If the remote does not exist, the command fails, unless \%\-\-if\-exists is given.
 .PP
 .nf
 ostrya remote delete [OPTIONS] [NAME]

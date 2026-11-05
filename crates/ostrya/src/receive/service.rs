@@ -443,6 +443,10 @@ impl ReceiveService {
     ///   message is the text of [`Error::InvalidRelated`]. A new commit that
     ///   the repository holds with a partial marker gets the checks of a
     ///   staged commit, here and for `missing-objects`.
+    /// - [`remote::Error::Protocol`] if `[ex-ostrya] generate-composefs` of
+    ///   the repository is `true`, and `ostree.composefs.digest.v0` of a new
+    ///   commit of the session or of the server commit is not a variant of
+    ///   type `ay` with 32 bytes.
     /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an
     ///   update writes a commit to a ref name of 64 lowercase hex characters.
     ///   This applies to the branch and each tag of a server commit too. A
@@ -498,6 +502,10 @@ impl ReceiveService {
     ///   gives `w` and `d` on the ref, this check does not run. A server commit
     ///   with `orphan` on a branch that is present, where the policy gives no
     ///   `d` on the branch, also gives this error.
+    /// - [`remote::Error::ChecksumMismatch`] if `[ex-ostrya] generate-composefs`
+    ///   of the repository is `true`, and the composefs image of a new commit of
+    ///   the session or of the server commit does not have the fs-verity
+    ///   digest that its `ostree.composefs.digest.v0` records.
     /// - [`remote::Error::Internal`] if `after_update` returns an error.
     /// - [`Error::InvalidInput`] if the plan of `before_update` breaks a rule
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.

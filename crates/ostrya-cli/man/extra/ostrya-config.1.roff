@@ -484,6 +484,7 @@ With true, \fB\%ostrya commit \-\-generate\-composefs\-metadata\fR also stores t
 A malformed key or an image whose fs\-verity digest is not the key fails the write, and the write adds no object and no ref.
 For a pull, one such commit fails the whole pull, also when the image of each target is correct.
 A later pull of the same commits fetches each object again.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR refuse a malformed key with the code \fB\%protocol\fR, and an image whose digest is not the key with the code \fB\%checksum\-mismatch\fR.
 .IP
 A value that is not a boolean fails each write before its first write, and a pull before its first request.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR refuse it at the start of a session.

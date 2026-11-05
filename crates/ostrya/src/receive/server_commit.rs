@@ -71,9 +71,10 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// After the checks, if `[ex-ostrya] generate-composefs` of the repository is
 /// `true` and the metadata of the commit carries `ostree.composefs.digest.v0`,
 /// this function builds the composefs image of the tree and checks its digest
-/// against the key. A malformed key, an image whose digest is not the key, and
-/// a failure of the build are `internal`, and nothing is published. Then the
-/// staged objects and the image become durable. If `hooks` are given,
+/// against the key. A malformed key is `protocol`, and an image whose digest
+/// is not the key is `checksum-mismatch`. Each other failure of the build is
+/// `internal`. After a failure, nothing is published. Then the staged objects
+/// and the image become durable. If `hooks` are given,
 /// [`ReceiveHooks::before_server_commit`] runs next with `sc`, immediately
 /// before the update lock. If the hook refuses, the session ends with the
 /// code of the refusal. The default method of the trait refuses with
@@ -287,32 +288,37 @@ pub(super) async fn finish(
 ///
 /// Returns `None` with the key `false` or with no digest key. The build runs
 /// before the update lock, so the other writers of refs do not wait for it.
-/// A malformed key, an image whose digest is not the key, and each error of
-/// the build are `internal`.
+/// A malformed key is `protocol`, and an image whose digest is not the key is
+/// `checksum-mismatch`. Each other error of the build is `internal`.
 async fn build_image<'t>(
     txn: &'t Transaction,
     sc: &ServerCommit,
 ) -> Checked<Option<StagedComposefsImage<'t>>> {
-    let built = async {
-        if !txn.repo().config().generate_composefs()? {
-            return Ok(None);
-        }
-        let Some(key) = entries_digest(&sc.metadata)? else {
-            return Ok(None);
-        };
-        let tree = RepoTree::from_parts(txn.repo().clone(), sc.root_dirtree, sc.root_dirmeta);
-        let image = txn.build_composefs_image(&tree).await?;
-        if *image.digest() != key {
-            return Err(Error::InvalidInput(format!(
-                "the composefs image of the tree of the server commit has the fs-verity digest \
-                 {}, and ostree.composefs.digest.v0 records {}",
-                digest_hex(image.digest()),
-                digest_hex(&key)
-            )));
-        }
-        Ok(Some(image))
+    if !txn
+        .repo()
+        .config()
+        .generate_composefs()
+        .map_err(Failure::Internal)?
+    {
+        return Ok(None);
+    }
+    let Some(key) = entries_digest(&sc.metadata).map_err(|e| protocol(e.to_string()))? else {
+        return Ok(None);
     };
-    built.await.map_err(Failure::Internal)
+    let tree = RepoTree::from_parts(txn.repo().clone(), sc.root_dirtree, sc.root_dirmeta);
+    let image = txn
+        .build_composefs_image(&tree)
+        .await
+        .map_err(Failure::Internal)?;
+    if *image.digest() != key {
+        return Err(Failure::Wire(remote::Error::ChecksumMismatch(format!(
+            "the composefs image of the tree of the server commit has the fs-verity digest {}, \
+             and ostree.composefs.digest.v0 records {}",
+            digest_hex(image.digest()),
+            digest_hex(&key)
+        ))));
+    }
+    Ok(Some(image))
 }
 
 /// Returns the names of the refs of `sc`: the branch, then each tag.

@@ -42,6 +42,11 @@ pub enum Error {
     #[error("limit-exceeded: {0}")]
     LimitExceeded(String),
     /// An object whose bytes do not hash to its name.
+    ///
+    /// An ostrya server whose `[ex-ostrya] generate-composefs` is `true` also
+    /// sends this code if the composefs image of a commit does not have the
+    /// fs-verity digest that `ostree.composefs.digest.v0` of the commit
+    /// records.
     #[error("checksum-mismatch: {0}")]
     ChecksumMismatch(String),
     /// Content that the server refuses to store.

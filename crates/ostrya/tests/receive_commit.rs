@@ -593,12 +593,49 @@ fn a_push_that_completes_a_partial_commit_stores_its_image() {
     );
 }
 
-/// A pushed commit whose digest key is not the digest of its tree, or whose
-/// key is malformed, fails the session with `internal`. The session
-/// publishes no object, writes no ref, and stores no image.
+/// Pushes `commit` with the fixture tree to a repository under
+/// `generate-composefs`, and asserts that the session fails with `code`. The
+/// message names the commit, and the session publishes no object, writes no
+/// ref, and stores no image.
+fn assert_keyed_push_refused(commit: Obj, code: ErrorCode) {
+    let tmp = TmpDir::new("recv-cfs-refused");
+    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE);
+    let before = snapshot(&repo);
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &objects,
+            &[],
+            vec![update("test/main", Expected::Absent, Some(commit.checksum))],
+            false,
+        ),
+        code,
+    );
+    assert!(
+        error.message.contains(&commit.checksum.to_hex()),
+        "{error:?}"
+    );
+    assert_unchanged(&repo, &before);
+    assert!(!repo.path().join("extensions/ostrya/composefs").exists());
+}
+
+/// A pushed commit whose digest key is not the digest of its tree fails the
+/// session with `checksum-mismatch`.
 #[test]
-fn a_pushed_commit_with_a_wrong_digest_is_internal() {
-    let wrong = keyed_commit(None, "wrong", &[0x5a; 32]);
+fn a_pushed_commit_with_a_wrong_digest_is_checksum_mismatch() {
+    assert_keyed_push_refused(
+        keyed_commit(None, "wrong", &[0x5a; 32]),
+        ErrorCode::ChecksumMismatch,
+    );
+}
+
+/// A pushed commit whose digest key is not a variant of type `ay` with 32
+/// bytes fails the session with `protocol`.
+#[test]
+fn a_pushed_commit_with_a_malformed_digest_is_protocol() {
     let malformed = build_commit(
         None,
         "malformed",
@@ -609,30 +646,7 @@ fn a_pushed_commit_with_a_wrong_digest_is_internal() {
         ),
         &[],
     );
-    for commit in [wrong, malformed] {
-        let tmp = TmpDir::new("recv-cfs-wrong");
-        let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE);
-        let before = snapshot(&repo);
-        let mut objects = tree_objects();
-        objects.push(commit.clone());
-        let error = refused(
-            push(
-                &repo,
-                &policy(),
-                &objects,
-                &[],
-                vec![update("test/main", Expected::Absent, Some(commit.checksum))],
-                false,
-            ),
-            ErrorCode::Internal,
-        );
-        assert!(
-            error.message.contains(&commit.checksum.to_hex()),
-            "{error:?}"
-        );
-        assert_unchanged(&repo, &before);
-        assert!(!repo.path().join("extensions/ostrya/composefs").exists());
-    }
+    assert_keyed_push_refused(malformed, ErrorCode::Protocol);
 }
 
 /// If the session cannot remove a partial marker, the report holds a warning,

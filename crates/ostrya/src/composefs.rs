@@ -323,6 +323,37 @@ impl Drop for StagedComposefsImage<'_> {
     }
 }
 
+/// An error of [`Transaction::build_recorded_images_classified`], with the
+/// part of the build that failed.
+///
+/// A receive session gives each variant its own wire code.
+pub(crate) enum RecordedBuildError {
+    /// `ostree.composefs.digest.v0` of a commit is not a variant of type `ay`
+    /// with 32 bytes.
+    Key(Error),
+    /// The image of a tree does not have the digest that its commit records:
+    /// [`Error::ComposefsDigestMismatch`].
+    Mismatch(Error),
+    /// Each other error of the build.
+    Other(Error),
+}
+
+impl From<Error> for RecordedBuildError {
+    fn from(e: Error) -> RecordedBuildError {
+        RecordedBuildError::Other(e)
+    }
+}
+
+impl From<RecordedBuildError> for Error {
+    fn from(e: RecordedBuildError) -> Error {
+        match e {
+            RecordedBuildError::Key(e)
+            | RecordedBuildError::Mismatch(e)
+            | RecordedBuildError::Other(e) => e,
+        }
+    }
+}
+
 /// Methods that compute the composefs digest of a staged tree and stage the
 /// composefs image of a commit.
 impl Transaction {
@@ -548,16 +579,39 @@ impl Transaction {
     /// Builds the composefs image of each commit that the writers recorded as
     /// complete, under `[ex-ostrya] generate-composefs`.
     ///
-    /// The commit of the transaction calls it before the publication. With the
-    /// key `false`, the call builds nothing. The call skips a commit that this
-    /// transaction did not stage and that has no `.commitpartial` marker, a
-    /// commit whose image is staged, and a commit with no digest key. For each
-    /// other commit, it makes the steps of
+    /// The commit of the transaction calls it before the publication. The call
+    /// makes the steps of
+    /// [`build_recorded_images_classified`](Transaction::build_recorded_images_classified)
+    /// and gives each error as it is.
+    pub(crate) async fn build_recorded_images(&self) -> Result<()> {
+        self.build_recorded_images_classified()
+            .await
+            .map_err(Error::from)
+    }
+
+    /// Builds the composefs image of each commit that the writers recorded as
+    /// complete, under `[ex-ostrya] generate-composefs`. Each error tells the
+    /// part of the build that failed.
+    ///
+    /// With the key `false`, the call builds nothing. The call skips a commit
+    /// that this transaction did not stage and that has no `.commitpartial`
+    /// marker, a commit whose image is staged, and a commit with no digest
+    /// key. For each other commit, it makes the steps of
     /// [`write_composefs_image`](Transaction::write_composefs_image).
     ///
     /// The first error stops the call. The caller then drops the transaction,
     /// so it publishes nothing.
-    pub(crate) async fn build_recorded_images(&self) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// - [`RecordedBuildError::Key`] if `ostree.composefs.digest.v0` of a
+    ///   commit is not a variant of type `ay` with 32 bytes.
+    /// - [`RecordedBuildError::Mismatch`] if the image of a tree does not have
+    ///   the digest that its commit records.
+    /// - [`RecordedBuildError::Other`] for each other error.
+    pub(crate) async fn build_recorded_images_classified(
+        &self,
+    ) -> std::result::Result<(), RecordedBuildError> {
         let commits = self.take_complete();
         if commits.is_empty() || !self.repo().config().generate_composefs()? {
             return Ok(());
@@ -572,16 +626,23 @@ impl Transaction {
                 continue;
             }
             let commit_obj = self.load_commit_staged_first(commit).await?;
-            let key = recorded_digest(&commit_obj).map_err(|e| match e {
-                Error::InvalidFormat(message) => {
-                    Error::InvalidFormat(format!("commit {commit}: {message}"))
-                }
-                e => e,
+            let key = recorded_digest(&commit_obj).map_err(|e| {
+                RecordedBuildError::Key(match e {
+                    Error::InvalidFormat(message) => {
+                        Error::InvalidFormat(format!("commit {commit}: {message}"))
+                    }
+                    e => e,
+                })
             })?;
             let Some(key) = key else {
                 continue;
             };
-            self.write_keyed_image(commit, commit_obj, &key).await?;
+            self.write_keyed_image(commit, commit_obj, &key)
+                .await
+                .map_err(|e| match e {
+                    e @ Error::ComposefsDigestMismatch { .. } => RecordedBuildError::Mismatch(e),
+                    e => RecordedBuildError::Other(e),
+                })?;
         }
         Ok(())
     }

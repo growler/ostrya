@@ -390,9 +390,9 @@ fn keyed_server_commit(branch: &str, digest: &[u8; 32]) -> ServerCommit {
 
 /// With `[ex-ostrya] generate-composefs=true`, a server commit whose
 /// metadata carries the digest of its tree stores a valid composefs image of
-/// the new commit. A digest that is not the digest of the tree, and a
-/// malformed key, fail the session with `internal`, and the session
-/// publishes nothing.
+/// the new commit. A digest that is not the digest of the tree fails the
+/// session with `checksum-mismatch`, and a malformed key fails it with
+/// `protocol`. The session then publishes nothing.
 #[test]
 fn a_keyed_server_commit_stores_its_image() {
     let config = "[ex-ostrya]\ngenerate-composefs=true\n";
@@ -422,7 +422,7 @@ fn a_keyed_server_commit_stores_its_image() {
         keyed_server_commit("main", &[0x5a; 32]),
     );
     let error = reply.expect_err("the push is refused");
-    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+    assert_eq!(error.code, ErrorCode::ChecksumMismatch, "{error:?}");
     assert!(result.is_err(), "{result:?}");
     assert_unchanged(&repo, &before);
     assert!(!repo.path().join("extensions/ostrya/composefs").exists());
@@ -435,7 +435,7 @@ fn a_keyed_server_commit_stores_its_image() {
         .push((common::composefs::DIGEST_KEY.into(), text("digest")));
     let (result, reply) = push_sc(&repo, &policy_allowing(&["c:**"]), &tree_objects(), sc);
     let error = reply.expect_err("the push is refused");
-    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+    assert_eq!(error.code, ErrorCode::Protocol, "{error:?}");
     assert!(result.is_err(), "{result:?}");
     assert_unchanged(&repo, &before);
     assert!(!repo.path().join("extensions/ostrya/composefs").exists());

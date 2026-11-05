@@ -25,6 +25,7 @@ use super::walk::{self, Missing};
 use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
 use crate::access::{ClientAccess, Namespace};
+use crate::composefs::RecordedBuildError;
 use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
@@ -199,11 +200,12 @@ struct Edit<'a> {
 /// `[ex-ostrya] generate-composefs` of the repository is `true`, this step
 /// then builds the composefs image of each commit of the session that the
 /// session staged or that has a partial marker, and that carries
-/// `ostree.composefs.digest.v0`. A failure of the build is `internal`, and
-/// nothing is published. Then the staged objects and the staged images become
-/// durable. At the same time, each new commit gets a
-/// signature from each server key of its rules. No other commit gets a server
-/// signature. Each other commit with a filtered incoming dict, a staged
+/// `ostree.composefs.digest.v0`. A malformed key is `protocol`, and an image
+/// whose digest is not the key is `checksum-mismatch`. Each other failure of
+/// the build is `internal`. After a failure, nothing is published. Then the
+/// staged objects and the staged images become durable. At the same time,
+/// each new commit gets a signature from each server key of its rules. No
+/// other commit gets a server signature. Each other commit with a filtered incoming dict, a staged
 /// dependency included, gets the merge of that dict alone. A key makes no
 /// signature if it already signed the commit in one of these places:
 ///
@@ -780,16 +782,26 @@ fn select_rules<'a>(
 /// Records each commit of `session_commits` as complete in `txn`, and builds
 /// the composefs images of the recorded commits.
 ///
-/// `Transaction::build_recorded_images` reads `[ex-ostrya] generate-composefs`.
-/// With the key `false`, it builds nothing. It skips a commit that the
-/// session did not stage and that has no partial marker. The build runs
-/// before the update lock, so the other writers of refs do not wait for it.
-/// A failure is `internal`.
+/// `Transaction::build_recorded_images_classified` reads
+/// `[ex-ostrya] generate-composefs`. With the key `false`, it builds nothing.
+/// It skips a commit that the session did not stage and that has no partial
+/// marker. The build runs before the update lock, so the other writers of
+/// refs do not wait for it. A malformed digest key is `protocol`, and an image
+/// whose digest is not the key is `checksum-mismatch`. Each other failure is
+/// `internal`.
 async fn build_images(txn: &Transaction, session_commits: &[Checksum]) -> Checked<()> {
     for commit in session_commits {
         txn.mark_complete(commit);
     }
-    txn.build_recorded_images().await.map_err(Failure::Internal)
+    txn.build_recorded_images_classified()
+        .await
+        .map_err(|e| match e {
+            RecordedBuildError::Key(e) => protocol(e.to_string()),
+            RecordedBuildError::Mismatch(e) => {
+                Failure::Wire(remote::Error::ChecksumMismatch(e.to_string()))
+            }
+            RecordedBuildError::Other(e) => Failure::Internal(e),
+        })
 }
 
 /// The commits of the session, as [`load_commits`] reads them.
@@ -2562,5 +2574,47 @@ mod tests {
         drop(scratch);
         recorder.assert_one_foreign_call();
         recorder.assert_no_copy_of(&payload);
+    }
+
+    /// An image build that fails for a reason other than the digest key is
+    /// `internal`. The commit carries a valid key, and its root dirtree is
+    /// absent.
+    #[test]
+    fn a_build_error_of_the_server_is_internal() {
+        let scratch = Scratch::new("build-error");
+        let path = scratch.0.join("repo");
+        ostrya_rt::block_on(async {
+            Repo::create(&path, crate::CreateOptions::new(crate::RepoMode::BareUser))
+                .await
+                .unwrap();
+            let mut config = std::fs::read_to_string(path.join("config")).unwrap();
+            config.push_str("[ex-ostrya]\ngenerate-composefs=true\n");
+            std::fs::write(path.join("config"), config).unwrap();
+            let repo = Repo::open(&path).await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let digest = Value::variant(Type::array(Type::Byte), Value::Bytes(vec![0x5a; 32]));
+            let commit = Commit {
+                metadata: Value::Array(vec![Value::Tuple(vec![
+                    Value::Str("ostree.composefs.digest.v0".into()),
+                    digest,
+                ])]),
+                parent: None,
+                related: Vec::new(),
+                subject: "absent tree".into(),
+                body: String::new(),
+                timestamp: 0,
+                root_dirtree: Checksum::from_bytes([2; 32]),
+                root_dirmeta: Checksum::from_bytes([3; 32]),
+            };
+            let checksum = txn
+                .write_metadata(ObjectType::Commit, None, &commit.serialize().unwrap())
+                .await
+                .unwrap();
+            assert!(matches!(
+                build_images(&txn, &[checksum]).await,
+                Err(Failure::Internal(_))
+            ));
+            txn.abort().await.unwrap();
+        });
     }
 }

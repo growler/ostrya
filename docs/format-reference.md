@@ -3907,10 +3907,14 @@ give the condition of each refusal.
   `[core] locking=false`.
 - `unauthorized` -- the server refuses the credential of an HTTP request.
 - `protocol` -- a frame is malformed, a kind is unknown, a message comes out
-  of order, or a message breaks a rule of the session.
+  of order, or a message breaks a rule of the session. Under
+  `[ex-ostrya] generate-composefs`, a malformed `ostree.composefs.digest.v0`
+  of a commit or of a server commit gets this code too.
 - `limit-exceeded` -- a frame, a chunk, a batch, a reply, a metadata object,
   a listing, or a session is over its limit.
-- `checksum-mismatch` -- the bytes of an object do not hash to its name.
+- `checksum-mismatch` -- the bytes of an object do not hash to its name, or
+  the composefs image of a commit or of a server commit has a digest that is
+  not its `ostree.composefs.digest.v0`.
 - `mode-refused` -- the repository mode cannot store the content, or the
   client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
@@ -4263,7 +4267,12 @@ Each failed check ends the session, and the session writes nothing:
    updates alone, and the message names it as a new commit.
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
-   destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
+   destination"). Under `[ex-ostrya] generate-composefs`, the server then
+   builds the composefs images of the session ("The composefs image store"),
+   with these codes: `protocol` for a malformed `ostree.composefs.digest.v0`,
+   `checksum-mismatch` for an image whose digest is not the key, and
+   `internal` for each other failure.
+   The server then makes the staged objects durable, and signs each new commit one time with each key
    of the key `sign` of the client group. The server signs no other commit,
    a staged parent and a dependency included. The incoming dict of each
    other commit of the session, a staged dependency included, merges into
@@ -4340,11 +4349,15 @@ do not apply. The trust in a server commit comes from the authentication of
 the client and from `sign`. A client group that must verify the commits of
 its clients takes a mirror push.
 
-The server then makes the staged objects durable. In a session with the
-hooks of a host application, the hook of the host gets the server commit
-next. The hook can refuse with `ref-denied` or `internal`, and no ref
-changes. A host whose hooks take no server commit refuses with `ref-denied`
-at this step.
+Under `[ex-ostrya] generate-composefs`, the server then builds the composefs
+image of the tree of a server commit that carries
+`ostree.composefs.digest.v0`, with these codes: `protocol` for a malformed
+key, `checksum-mismatch` for an image whose digest is not the key, and
+`internal` for each other failure. The server then makes the staged objects
+durable. In a session with the hooks of a host application, the hook of the
+host gets the server commit next. The hook can refuse with `ref-denied` or
+`internal`, and no ref changes. A host whose hooks take no server commit
+refuses with `ref-denied` at this step.
 
 The server then takes the update lock. Under the lock it reads the branch and
 the tags in the namespace of the session, and check 10 applies, with a write
@@ -6315,7 +6328,10 @@ The generation:
   image is staged. There is no backfill.
 - A malformed key, or an image whose digest is not the key, fails the
   transaction. It publishes no object and writes no ref. For a pull, the rule
-  covers each recorded commit, so one such commit fails the whole pull.
+  covers each recorded commit, so one such commit fails the whole pull. A
+  receive refuses a malformed key with `protocol` and an image whose digest
+  is not the key with `checksum-mismatch`. Each other failure of the build in
+  a receive is `internal`.
 - A value of the key that is not a boolean fails each write through a
   transaction at the open of the transaction. A pull from a remote reads the
   key before its first request. A receive fails at `Hello`.

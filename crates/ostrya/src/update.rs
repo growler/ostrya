@@ -914,7 +914,7 @@ fn read_sources<'a>(
     dir: Option<&'a RemotesDir>,
     fsync: bool,
 ) -> Result<(RepoConfig, Option<DirWriter<'a>>)> {
-    let config = read_config_blocking(repo_fd)?;
+    let config = read_config_blocking(repo_fd, false)?;
     match dir {
         Some(dir) => remotes_dir::open_for_write(config, repo_fd, dir, fsync)
             .map(|(config, writer)| (config, Some(writer))),

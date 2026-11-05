@@ -1023,11 +1023,7 @@ impl Repo {
     /// The handle keeps the config that it read at the open.
     pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || {
-            let bytes = read_file(repo.repo_fd(), CONFIG, repo.is_strict())?;
-            parse_config(&bytes)
-        })
-        .await
+        ostrya_rt::unblock(move || read_config_blocking(repo.repo_fd(), repo.is_strict())).await
     }
 
     /// Reads `config` and the `.conf` files of the remotes directory of the
@@ -1036,8 +1032,7 @@ impl Repo {
     pub(crate) async fn read_config_and_remotes(&self) -> Result<RepoConfig> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            let bytes = read_file(repo.repo_fd(), CONFIG, repo.is_strict())?;
-            let config = parse_config(&bytes)?;
+            let config = read_config_blocking(repo.repo_fd(), repo.is_strict())?;
             match repo.remotes_dir() {
                 Some(dir) => remotes_dir::read_remotes(config, repo.repo_fd(), dir),
                 None => Ok(config),
@@ -1096,9 +1091,12 @@ pub(crate) fn check_config_size(bytes: &[u8]) -> Result<()> {
 
 /// Reads `config` at the repository root and parses it, as the open of a
 /// handle does. Blocks the calling thread.
-pub(crate) fn read_config_blocking(repo_fd: BorrowedFd<'_>) -> Result<RepoConfig> {
-    let bytes = read_file(repo_fd, CONFIG, false)?;
-    parse_config(&bytes)
+///
+/// If `strict` is set, the read uses the strict open mode: the open follows no
+/// symlink and does not block, and a file that is not a regular file is
+/// refused.
+pub(crate) fn read_config_blocking(repo_fd: BorrowedFd<'_>, strict: bool) -> Result<RepoConfig> {
+    parse_config(&read_file(repo_fd, CONFIG, strict)?)
 }
 
 /// Parses the bytes of `config`. This step is CPU work only.
@@ -1179,7 +1177,7 @@ fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> Result<Materials> {
         )?,
         false => open_dir(&repo_fd, Path::new("objects"))?,
     };
-    let config = parse_config(&read_file(&repo_fd, CONFIG, strict)?)?;
+    let config = read_config_blocking(repo_fd.as_fd(), strict)?;
     Ok(Materials {
         repo_fd,
         objects_fd,

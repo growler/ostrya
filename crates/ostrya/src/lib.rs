@@ -45,7 +45,7 @@
 //! - `smol` (default): the `smol` backend of `ostrya-rt`.
 //! - `tokio`: the `tokio` backend of `ostrya-rt`.
 //! - `sign-spki`: the `spki` module, the spki signing engine with each of its key types: ECDSA P-256, ECDSA P-384, Ed25519, and RSA. It turns on the feature `spki` of `ostrya-sign`.
-//! - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with the trait `FromOstreeKeyrings`, which reads the ostree keyring paths, and the keyring management of a remote. It turns on the feature `gpg` of `ostrya-sign`.
+//! - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with the trait `FromOstreeKeyrings`, which reads the keyrings of a remote through a repository handle, and the keyring management of a remote. It turns on the feature `gpg` of `ostrya-sign`.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate chain for a CMS signature. With `sign-spki`, also `X509SpkiSigner`, `SpkiSigner::with_certificates`, and `SpkiVerifier::from_certificates`.
 //! - `receive`: the `receive` module, the receive side of a push.

@@ -669,9 +669,20 @@ The GPG verifier, the parse of a keyring, the key listing, and the keyring
 merge of an import are in `ostrya-sign`, next to the GPG signer, under the
 feature `gpg`. So one crate parses OpenPGP, and a build with `gpg` holds no
 runtime. `ostrya` reads and writes the keyring files, takes the locks, and
-holds the constructors that read the ostree keyring paths, as the trait
+holds the constructors that read the ostree keyrings, as the trait
 `FromOstreeKeyrings`. A second parse in `ostrya` for the import and the
 listing was rejected, because two crates would then parse OpenPGP.
+
+`FromOstreeKeyrings` reads the keyring of a remote through a repository handle
+alone. `for_remote_in` reads `<repo>/<remote>.trustedkeys.gpg` and, only when
+that file is absent, the keyring of the remote in the remotes directory of the
+handle. `for_remote_keyrings` takes the bytes of the keyring from the caller.
+So `for_remote_in` reads the same keyring of a remote as a pull. Constructors
+that take the path of a repository were rejected. A path does not give the
+remotes directory of the handle. When the keyring of a remote is only in that
+directory, such a constructor trusts the global trusted set, and a pull trusts
+the keyring of the directory. The two trusted sets of one remote are then
+different, with no message.
 
 `GpgSigner::export_public` gives the minimal public certificate of a signing
 key, for a trust store such as the trust files of a sealed boot image. It runs

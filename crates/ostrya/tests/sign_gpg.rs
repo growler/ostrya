@@ -422,7 +422,6 @@ fn a_revoked_re_export_revokes_the_held_key() {
     let base = tmp.path();
     let home = GpgHome::create(base, "gnupghome", "Revoked <revoked@ostrya.example>");
     let fpr = home.fingerprint();
-    let root = base.join("repo");
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
         let signer = GpgSigner::new(&fpr).with_homedir(&home.dir);
@@ -435,7 +434,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .await
             .unwrap();
         assert_eq!(count, 1);
-        let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
+        let verifier = GpgVerifier::for_remote_in(&repo, "origin", &[]).unwrap();
         let outcome = repo
             .verify_commit(&commit, &[Arc::new(verifier)])
             .await
@@ -451,7 +450,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .await
             .unwrap();
         assert_eq!(count, 0);
-        let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
+        let verifier = GpgVerifier::for_remote_in(&repo, "origin", &[]).unwrap();
         let outcome = repo
             .verify_commit(&commit, &[Arc::new(verifier)])
             .await

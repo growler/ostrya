@@ -70,9 +70,9 @@ API documentation: <https://docs.rs/ostrya>
   key types: ECDSA P-256, ECDSA P-384, Ed25519, and RSA. It turns on the
   feature `spki` of `ostrya-sign`.
 - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with
-  the trait `FromOstreeKeyrings`, which reads the ostree keyring paths, and
-  the keyring management of a remote. It turns on the feature `gpg` of
-  `ostrya-sign`.
+  the trait `FromOstreeKeyrings`, which reads the keyrings of a remote
+  through a repository handle, and the keyring management of a remote. It
+  turns on the feature `gpg` of `ostrya-sign`.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.
 - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate

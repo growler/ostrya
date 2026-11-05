@@ -4,9 +4,10 @@
 //! [`GpgKey`] are items of the `ostrya-sign` crate, re-exported here. The
 //! verifier parses keyrings and verifies signatures in the process, with
 //! rPGP. This module adds the items that read ostree paths and the keyring
-//! files of a repository: the trait [`FromOstreeKeyrings`], which builds a
-//! verifier from the ostree keyring paths, [`Repo::gpg_import_keys`], and
-//! [`Repo::gpg_list_keys`].
+//! files of a repository: the trait [`FromOstreeKeyrings`],
+//! [`Repo::gpg_import_keys`], and [`Repo::gpg_list_keys`]. The trait builds a
+//! verifier from the keyrings of a repository handle, from the bytes of a
+//! keyring, or from the global trusted keyrings.
 //!
 //! The `sign-gpg` feature adds `GpgSigner`, which signs with
 //! `gpg --detach-sign`. This feature also turns on `verify-gpg`. `GpgSigner` is
@@ -34,7 +35,7 @@ use crate::config::{remote_keyring_name, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::remotes_dir;
 use crate::repo::{RemotesDir, Repo};
-use crate::sign::{read_key_path, read_key_source};
+use crate::sign::read_key_source;
 use crate::summary::{read_root_file_blocking, write_root_file_blocking};
 
 #[cfg(feature = "sign-gpg")]
@@ -47,90 +48,22 @@ const GLOBAL_TRUSTED_GPG_D: &str = "/usr/share/ostree/trusted.gpg.d";
 /// directory. The `ostree` command reads the same variable.
 const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 
-/// A GPG verifier that loads its keyrings from the ostree keyring paths.
+/// A GPG verifier that loads the keyrings that ostree trusts.
 ///
 /// The `ostrya-sign` crate has no ostree search path, so this crate adds the
 /// constructors as a trait. A caller brings the trait into scope to call them.
 ///
 /// The keyring of a remote is `<remote>.trustedkeys.gpg` in the repository.
-/// [`for_remote_in`](FromOstreeKeyrings::for_remote_in) reads the keyrings of
-/// a repository handle. When the repository holds no keyring of the remote,
-/// it reads the keyring of the remote in the remotes directory of the handle.
-/// The other constructors take a repository path or the bytes of a keyring,
-/// and read no keyring of a remotes directory.
+/// When the repository holds no keyring of the remote, the keyring is the file
+/// of that name in the remotes directory of the handle.
+/// [`for_remote_in`](FromOstreeKeyrings::for_remote_in) reads the keyring of a
+/// remote through a repository handle, so it reads the same keyring as a pull
+/// of that remote.
+/// [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings) takes the
+/// bytes of that keyring from the caller.
+/// [`from_system_trust`](FromOstreeKeyrings::from_system_trust) reads the
+/// global trusted keyrings alone.
 pub trait FromOstreeKeyrings: Sized {
-    /// Creates a verifier from the keyrings that `remote` trusts.
-    ///
-    /// The trusted set is the union of these keyrings:
-    ///
-    /// - `<remote>.trustedkeys.gpg` in the repository at `repo_path`.
-    /// - The global trusted set of
-    ///   [`from_system_trust`](FromOstreeKeyrings::from_system_trust), only
-    ///   when the keyring of the remote does not exist.
-    ///
-    /// The call reads no keyring of a remotes directory.
-    /// [`for_remote_in`](FromOstreeKeyrings::for_remote_in) reads it.
-    ///
-    /// If a path does not exist, the load skips it. Each keyring must be a
-    /// binary OpenPGP packet stream, so an armored keyring is refused.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
-    ///   The call refuses the name before it reads a keyring.
-    /// - The errors of
-    ///   [`for_remote_keypath`](FromOstreeKeyrings::for_remote_keypath).
-    fn for_remote(repo_path: &Path, remote: &str) -> Result<Self>;
-
-    /// Creates a verifier from the keyrings that `remote` trusts, together
-    /// with the `gpgkeypath` entries of the remote.
-    ///
-    /// The trusted set is the union of these keyrings, in load order:
-    ///
-    /// - `<remote>.trustedkeys.gpg` in the repository at `repo_path`.
-    /// - The global trusted set of
-    ///   [`from_system_trust`](FromOstreeKeyrings::from_system_trust), only
-    ///   when the keyring of the remote does not exist.
-    /// - Each entry of `keypath`, which holds the values of the `gpgkeypath`
-    ///   key of the remote.
-    ///
-    /// The call reads no keyring of a remotes directory.
-    /// [`for_remote_in`](FromOstreeKeyrings::for_remote_in) reads it.
-    ///
-    /// Where two keyrings hold one key, the first certificate in load order
-    /// supplies the user id of a signature report.
-    ///
-    /// The rules of
-    /// [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings) apply
-    /// to each source. The keyring of the remote exists if the open of its
-    /// path does not give "No such file or directory". So an empty file is a
-    /// keyring with no key, and a symlink to no file is no keyring.
-    ///
-    /// The provided method reads the repository keyring and gives its bytes
-    /// to [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings).
-    /// [`for_remote`](FromOstreeKeyrings::for_remote) of [`GpgVerifier`] is
-    /// this call with an empty `keypath`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
-    ///   The call refuses the name before it reads a keyring.
-    /// - [`Error::Signature`] if the repository keyring cannot be read, for
-    ///   example because it is a directory. The call reads this keyring
-    ///   before the other sources, so this error comes first.
-    /// - The errors of
-    ///   [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings).
-    fn for_remote_keypath(repo_path: &Path, remote: &str, keypath: &[String]) -> Result<Self> {
-        if !valid_remote_name(remote) {
-            return Err(Error::InvalidInput(format!(
-                "invalid remote name: {remote}"
-            )));
-        }
-        let keyring = repo_path.join(format!("{remote}.trustedkeys.gpg"));
-        let repo_keyring = read_keyring_path(&keyring)?;
-        Self::for_remote_keyrings(repo_keyring, remote, keypath)
-    }
-
     /// Creates a verifier from the keyrings that `remote` of the repository
     /// handle `repo` trusts, together with the `gpgkeypath` entries of the
     /// remote.
@@ -188,9 +121,13 @@ pub trait FromOstreeKeyrings: Sized {
     /// Creates a verifier from the whole trusted set of a remote.
     ///
     /// `repo_keyring` holds the bytes of the keyring of the remote, or `None`
-    /// if the remote has no keyring. A caller that holds a descriptor and no
-    /// path reads this file itself. A pull trusts the union of these keyrings,
-    /// in load order:
+    /// if the remote has no keyring. A caller with no repository handle reads
+    /// this file itself and gives its bytes. To give the keyring that a pull
+    /// reads, the caller reads `<remote>.trustedkeys.gpg` in the repository.
+    /// If the open of that file gives "No such file or directory", the caller
+    /// reads the file of that name in the remotes directory. A symlink to no
+    /// file is an absent file. If neither file exists, `repo_keyring` is
+    /// `None`. A pull trusts the union of these keyrings, in load order:
     ///
     /// - `repo_keyring`.
     /// - The global trusted set of
@@ -281,10 +218,6 @@ pub trait FromOstreeKeyrings: Sized {
 }
 
 impl FromOstreeKeyrings for GpgVerifier {
-    fn for_remote(repo_path: &Path, remote: &str) -> Result<GpgVerifier> {
-        GpgVerifier::for_remote_keypath(repo_path, remote, &[])
-    }
-
     fn for_remote_in(repo: &Repo, remote: &str, keypath: &[String]) -> Result<GpgVerifier> {
         let keyring = read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), remote)?;
         remote_keyrings(keyring, remote, keypath, true)
@@ -757,14 +690,6 @@ fn keypath_dir_files(key: &str, entry: &str, dir: &Path) -> Result<Vec<PathBuf>>
 /// read. `key` is the configuration key of the entry.
 fn keypath_refusal(key: &str, entry: &str, e: &std::io::Error) -> Error {
     Error::Signature(format!("{key} entry '{entry}' cannot be read: {e}"))
-}
-
-/// Reads the keyring at `path`, up to [`MAX_KEYRING`].
-///
-/// Returns `None` if no file is at `path`.
-fn read_keyring_path(path: &Path) -> Result<Option<Vec<u8>>> {
-    let subject = format!("the keyring '{}'", path.display());
-    read_key_path(path, &subject, MAX_KEYRING)
 }
 
 /// Reads the keyring at `path`, resolved against `base`, through
@@ -1454,13 +1379,11 @@ pub(crate) mod tests {
                 .await
                 .unwrap()
         });
-        let repo = GpgVerifier::for_remote(&root, "../x");
-        let keypath = GpgVerifier::for_remote_keypath(&root, "../x", &[]);
         let keyrings = GpgVerifier::for_remote_keyrings(None, "../x", &[]);
         let in_handle = GpgVerifier::for_remote_in(&handle, "../x", &[]);
         drop(handle);
         std::fs::remove_dir_all(&dir).unwrap();
-        for result in [repo, keypath, keyrings, in_handle] {
+        for result in [keyrings, in_handle] {
             assert!(
                 matches!(
                     &result,
@@ -1478,15 +1401,27 @@ pub(crate) mod tests {
     /// repository keyring.
     #[test]
     fn a_keypath_load_refuses_the_repository_keyring_first() {
+        use crate::{CreateOptions, RepoMode};
+
         let dir = scratch_dir();
-        let keyring = dir.join("keypath-order.trustedkeys.gpg");
-        std::fs::create_dir_all(&keyring).unwrap();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = ostrya_rt::block_on(async {
+            Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap()
+        });
+        std::fs::create_dir(root.join("keypath-order.trustedkeys.gpg")).unwrap();
         let entry = dir.join("absent.gpg").to_string_lossy().into_owned();
-        let result = GpgVerifier::for_remote_keypath(&dir, "keypath-order", &[entry]);
+        let result = GpgVerifier::for_remote_in(&repo, "keypath-order", &[entry]);
+        drop(repo);
         std::fs::remove_dir_all(&dir).unwrap();
-        let expected = format!("the keyring '{}' is not a regular file", keyring.display());
         assert!(
-            matches!(&result, Err(Error::Signature(m)) if *m == expected),
+            matches!(
+                &result,
+                Err(Error::Signature(m))
+                    if m == "the keyring 'keypath-order.trustedkeys.gpg' is not a regular file"
+            ),
             "{:?}",
             result.err()
         );
@@ -1497,6 +1432,7 @@ pub(crate) mod tests {
     /// entry does not trust the key.
     #[test]
     fn a_keypath_load_trusts_the_keypath_entries() {
+        use crate::{CreateOptions, RepoMode};
         use ostrya_sign::Verifier as _;
 
         if !gpg_available() {
@@ -1511,18 +1447,25 @@ pub(crate) mod tests {
         let payload = b"keypath payload";
         let signature = key.sign(payload);
         let dir = scratch_dir();
+        let root = dir.join("repo");
         std::fs::create_dir_all(&dir).unwrap();
+        let repo = ostrya_rt::block_on(async {
+            Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap()
+        });
         let keyring = dir.join("k.gpg");
         std::fs::write(&keyring, key.export(false)).unwrap();
         let entry = keyring.to_string_lossy().into_owned();
-        let trusted = GpgVerifier::for_remote_keypath(&dir, "keypath-trust", &[entry])
+        let trusted = GpgVerifier::for_remote_in(&repo, "keypath-trust", &[entry])
             .unwrap()
             .verify(payload, std::slice::from_ref(&signature))
             .unwrap();
-        let untrusted = GpgVerifier::for_remote_keypath(&dir, "keypath-trust", &[])
+        let untrusted = GpgVerifier::for_remote_in(&repo, "keypath-trust", &[])
             .unwrap()
             .verify(payload, std::slice::from_ref(&signature))
             .unwrap();
+        drop(repo);
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(trusted.valid, "{:?}", trusted.signatures);
         assert!(!untrusted.valid, "{:?}", untrusted.signatures);

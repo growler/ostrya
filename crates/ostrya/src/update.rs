@@ -957,7 +957,7 @@ impl<'a> Source<'a> {
         let Some(file) = file else {
             return Ok(Source::Config(config.into_keyfile()));
         };
-        let keyfile = config.remote_file(&file).ok_or_else(not_found)?.clone();
+        let keyfile = config.into_remote_file(&file).ok_or_else(not_found)?;
         Ok(Source::File {
             writer: writer.ok_or_else(not_found)?,
             file,

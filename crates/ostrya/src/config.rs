@@ -358,12 +358,13 @@ impl RepoConfig {
     }
 
     /// Returns the parsed text of the `.conf` file `file` of the remotes
-    /// directory, or `None` if the config holds no file of that name.
-    pub(crate) fn remote_file(&self, file: &str) -> Option<&KeyFile> {
+    /// directory by value, or `None` if the config holds no file of that
+    /// name.
+    pub(crate) fn into_remote_file(self, file: &str) -> Option<KeyFile> {
         self.remote_files
-            .iter()
+            .into_iter()
             .find(|held| held.name == file)
-            .map(|held| &held.keyfile)
+            .map(|held| held.keyfile)
     }
 
     /// Returns `true` if `[core] add-remotes-config-dir` lets an add write a

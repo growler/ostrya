@@ -778,21 +778,14 @@ fn select_rules<'a>(
 }
 
 /// Records each commit of `session_commits` as complete in `txn`, and builds
-/// the composefs images of the recorded commits, under
-/// `[ex-ostrya] generate-composefs`.
+/// the composefs images of the recorded commits.
 ///
-/// The build skips a commit that the session did not stage and that has no
-/// partial marker. The build runs before the update lock, so the other
-/// writers of refs do not wait for it. A failure is `internal`.
+/// `Transaction::build_recorded_images` reads `[ex-ostrya] generate-composefs`.
+/// With the key `false`, it builds nothing. It skips a commit that the
+/// session did not stage and that has no partial marker. The build runs
+/// before the update lock, so the other writers of refs do not wait for it.
+/// A failure is `internal`.
 async fn build_images(txn: &Transaction, session_commits: &[Checksum]) -> Checked<()> {
-    if !txn
-        .repo()
-        .config()
-        .generate_composefs()
-        .map_err(Failure::Internal)?
-    {
-        return Ok(());
-    }
     for commit in session_commits {
         txn.mark_complete(commit);
     }

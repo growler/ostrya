@@ -1048,8 +1048,7 @@ impl DeltaSuperblock {
     ///
     /// - [`Error::Core`] if the bytes are not a GVariant of the superblock type
     ///   or of the envelope type.
-    /// - [`Error::Core`] if a checksum or an object type does not decode, or if
-    ///   an entry has the object type 100.
+    /// - [`Error::Core`] if a checksum or an object type does not decode.
     /// - [`Error::InvalidFormat`] if a field has the wrong type, or if an
     ///   object list is not a multiple of 33 bytes.
     /// - [`Error::InvalidFormat`] if the embedded commit does not hash to the
@@ -1599,17 +1598,6 @@ fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
     Ok(if big_endian { raw.swap_bytes() } else { raw })
 }
 
-/// Reads the type byte of a part object or of a fallback entry.
-///
-/// Each type of [`ObjectType::from_u32`] is accepted but the type 100, which
-/// no static delta carries.
-fn delta_object_type(byte: u8) -> Result<ObjectType> {
-    match ObjectType::from_u32(u32::from(byte))? {
-        ObjectType::ComposefsImage => Err(ostrya_core::Error::InvalidObjectType(100).into()),
-        objtype => Ok(objtype),
-    }
-}
-
 /// Parses the stride-33 `objtype + 32-byte checksum` object array, which gives
 /// the object order and types of a part.
 fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
@@ -1620,7 +1608,7 @@ fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 33);
     for chunk in bytes.chunks_exact(33) {
-        let objtype = delta_object_type(chunk[0])?;
+        let objtype = ObjectType::from_u32(u32::from(chunk[0]))?;
         let checksum = Checksum::from_ay(&chunk[1..33])?;
         out.push((objtype, checksum));
     }
@@ -1632,7 +1620,7 @@ fn parse_fallbacks(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaFallb
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let fields = tuple(entry)?;
-        let objtype = delta_object_type(byte_field(&fields[0], "fallback objtype")?)?;
+        let objtype = ObjectType::from_u32(u32::from(byte_field(&fields[0], "fallback objtype")?))?;
         let checksum = Checksum::from_ay(bytes_field(&fields[1], "fallback checksum")?)?;
         let size = size_field(&fields[2], "fallback size", big_endian)?;
         let uncompressed_size = size_field(&fields[3], "fallback uncompressed size", big_endian)?;

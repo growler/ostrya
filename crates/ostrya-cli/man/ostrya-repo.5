@@ -98,14 +98,6 @@ The key \fB\%ostrya.related\fR, an extension of ostrya, holds the build sources 
 \fB\%ostrya prune\fR keeps the build sources of each commit that it keeps.
 A transfer into a repository whose \fB\%config\fR sets \fB\%keep\-detached\-related=false\fR does not store the key, as \fB\%ostrya\-config\fR(1) states.
 .TP
-\fB\%.cfs\fR
-The composefs image of a commit, an extension of ostrya.
-Its name is the checksum of the commit, as for \fB\%.commitmeta\fR.
-Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
-Each mode stores it uncompressed, with the inode mode 0644.
-\fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it, and \fB\%ostrya prune\fR removes it with its commit.
-No transfer carries it.
-.TP
 \fB\%.tombstone\-commit\fR
 A marker that records a commit that a prune deleted.
 \fB\%ostrya prune\fR writes it when the key \fB\%core.tombstone\-commits\fR is true.
@@ -197,6 +189,18 @@ The access digest of an item, in 64 lowercase hex digits and a newline.
 Each item with a summary has this file, \fB\%anonymous\fR included.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR serve the summary of the item only when the file holds the access digest of the current client groups.
 .TP
+\fB\%<repo>/extensions/ostrya/composefs/<first 2 hex>/<last 62 hex>.cfs\fR
+The composefs image of a commit, an extension of ostrya.
+Its name is the checksum of the commit.
+Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
+Each mode stores it uncompressed, with the mode 0644 and no extended attribute.
+\fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it after the objects of the transaction, and make the directories at the first write.
+\fB\%ostrya prune\fR removes the images of the commits that it removes before the first commit, and keeps an image whose commit is absent.
+\fB\%ostrya fsck\fR checks it against the key of its commit, and notes an image whose commit is absent.
+ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, and \fB\%RESOLVE_NO_SYMLINKS\fR, so a symbolic link in its path stops each read.
+No transfer carries it, and \fB\%ostrya serve\fR does not serve it.
+The \fB\%ostree\fR tool does not check, count, or remove it.
+.TP
 \fB\%<repo>/deltas/\fR
 The static deltas.
 \fB\%ostrya static\-delta generate\fR writes them.
@@ -256,7 +260,7 @@ In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>
 .SH PERMISSIONS
 In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775 less the umask.
 An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
-It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
 .PP
 In every mode, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
 In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of their parent directory.
@@ -264,7 +268,7 @@ In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of thei
 In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
 .TP
 Directories: 02770
-The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, and \fB\%extensions/ostrya/summary/\fR.
+The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, \fB\%extensions/ostrya/composefs/\fR, and each directory below it.
 The setgid bit makes each new entry take the group of its directory.
 .TP
 Lock files: 0660
@@ -272,7 +276,7 @@ Lock files: 0660
 Each member of the group can then take the locks.
 .TP
 Objects: 0644
-Each object and each \fB\%.commitmeta\fR.
+Each object, each \fB\%.commitmeta\fR, and each composefs image.
 .TP
 Markers: 0644
 Each \fB\%state/<checksum>.commitpartial\fR.
@@ -436,7 +440,7 @@ These parts of the layout are extensions of ostrya:
 .IP \(bu 2
 the mode \fB\%bare\-user\-shared\fR and its permissions;
 .IP \(bu 2
-the object type \fB\%.cfs\fR, the composefs image of a commit;
+the directory \fB\%extensions/ostrya/composefs/\fR and its files;
 .IP \(bu 2
 the lock file \fB\%.update.lock\fR;
 .IP \(bu 2

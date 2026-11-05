@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
-//! Tests of the composefs image object, `objects/<xx>/<commit>.cfs`.
+//! Tests of the composefs image store,
+//! `extensions/ostrya/composefs/<xx>/<rest>.cfs`.
 //!
 //! The tests check these facts:
 //!
@@ -8,21 +9,30 @@
 //!   `ostree.composefs.digest.v0` in its commit, and the image bytes are the
 //!   bytes of an export with [`ComposefsOptions::RECORDED`]. With the golden
 //!   fixture, the image of the fixture commit is the golden image `tree.cfs`.
+//! - The image is the file of the store with the mode 0644, and `objects/`
+//!   holds no image. In a `bare-user-shared` repository, the directories of
+//!   the store get the shared mode.
+//! - A symlink at a component of the path of an image stops each read and
+//!   each write of the image.
 //! - A write refuses a commit without the key, a malformed key, and an image
 //!   of another tree, and stores nothing.
 //! - A changed image fails the check and fsck, and a second write replaces
 //!   it. An image that does not read fails in the same way, and a write
 //!   replaces it too. fsck with `delete` removes both, and keeps the image of
 //!   a commit that does not load.
-//! - Prune removes the image with its commit, and removes an image whose
-//!   commit is absent. The image changes no prune statistic.
+//! - Each commit that fsck deletes, with `delete` or `add_tombstones`, loses
+//!   its image, and the report names no orphan for it.
+//! - Prune removes the image with its commit, before the commit, and keeps an
+//!   image whose commit is absent. fsck notes such an image. The image
+//!   changes no prune statistic.
 //! - The image bytes are the same in `bare`, `bare-user`, and `archive`.
 //! - The checked open returns the image that it checked, at offset 0, and
 //!   refuses a commit without the key, an absent image, and a changed image.
 //!
 //! The test of the golden image skips if the composefs fixture is absent. The
 //! tests that seal the image skip if the file system has no fs-verity. The
-//! tests that make a file unreadable with the mode 000 skip as root.
+//! tests that make a file unreadable with the mode 000, or a directory
+//! read-only with the mode 0555, skip as root.
 
 mod common;
 
@@ -114,13 +124,14 @@ fn a_stored_image_has_the_digest_the_commit_records() {
 
         let key = recorded(&repo, &commit).await;
         let path = repo.composefs_image_path(&commit);
+        let hex = commit.to_hex();
         assert_eq!(
             path,
-            scratch.path().join("image/objects").join(loose_path(
-                &commit,
-                ObjectType::ComposefsImage,
-                RepoMode::BareUser
-            ))
+            scratch
+                .path()
+                .join("image/extensions/ostrya/composefs")
+                .join(&hex[..2])
+                .join(format!("{}.cfs", &hex[2..]))
         );
         assert_eq!(file_digest(&path), key, "the image digest is the key");
         let export = repo
@@ -134,8 +145,12 @@ fn a_stored_image_has_the_digest_the_commit_records() {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o7777, 0o644, "mode {mode:o}");
 
-        let listed = repo.list_objects().await.unwrap();
-        assert!(listed.contains(&ObjectName::new(commit, ObjectType::ComposefsImage)));
+        let objects = file_inventory(&scratch.path().join("image"), "objects");
+        assert!(
+            objects.iter().all(|(name, _)| !name.ends_with(".cfs")),
+            "objects/ holds no image"
+        );
+        assert!(repo.has_composefs_image(&commit).await.unwrap());
         assert_eq!(
             repo.check_composefs_image(&commit).await.unwrap(),
             ComposefsImageState::Valid
@@ -195,10 +210,7 @@ fn the_image_of_the_fixture_commit_is_the_golden_image() {
             .unwrap();
         txn.commit().await.unwrap();
         assert!(
-            !repo
-                .has_object(ObjectType::ComposefsImage, &commit)
-                .await
-                .unwrap(),
+            !repo.has_composefs_image(&commit).await.unwrap(),
             "the metadata alone stores no image"
         );
 
@@ -281,6 +293,7 @@ fn a_write_needs_the_key_of_the_commit() {
         txn.abort().await.unwrap();
 
         assert_eq!(file_inventory(&root, "objects"), before);
+        assert!(!root.join("extensions/ostrya/composefs").exists());
         let staging = std::fs::read_dir(root.join("tmp"))
             .unwrap()
             .flatten()
@@ -353,10 +366,7 @@ fn a_changed_image_fails_the_check_and_a_write_replaces_it() {
         };
         let report = repo.fsck(&opts).await.unwrap();
         assert_eq!(report.image_errors.len(), 1);
-        assert_eq!(
-            report.deleted,
-            vec![ObjectName::new(commit, ObjectType::ComposefsImage)]
-        );
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
         assert!(report.marked_partial.is_empty());
         assert!(!path.exists());
         assert_eq!(
@@ -434,10 +444,7 @@ fn an_image_that_does_not_read_is_replaced_and_fsck_delete_removes_it() {
         };
         let report = repo.fsck(&opts).await.unwrap();
         assert_eq!(report.image_errors.len(), 1);
-        assert_eq!(
-            report.deleted,
-            vec![ObjectName::new(commit, ObjectType::ComposefsImage)]
-        );
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
         assert!(!path.exists());
     });
 }
@@ -488,11 +495,7 @@ fn fsck_delete_keeps_the_image_of_a_commit_that_does_not_load() {
             matches!(image.kind, FsckImageErrorKind::CommitUnreadable(_)),
             "{report:?}"
         );
-        assert!(
-            !report
-                .deleted
-                .contains(&ObjectName::new(commit, ObjectType::ComposefsImage))
-        );
+        assert!(report.deleted.is_empty(), "{:?}", report.deleted);
         assert!(repo.composefs_image_path(&commit).exists());
     });
 }
@@ -593,7 +596,8 @@ impl Twins {
 }
 
 /// Prune removes the image with its commit, and keeps the image of a kept
-/// commit. Each run gives the statistics of the same run without images.
+/// commit. It keeps an image whose commit is absent, and fsck notes that
+/// image. Each run gives the statistics of the same run without images.
 #[test]
 fn prune_removes_the_image_with_its_commit() {
     block_on(async {
@@ -646,7 +650,10 @@ fn prune_removes_the_image_with_its_commit() {
         assert!(t.has_image(&t.loose), "a dry run removes nothing");
         assert_eq!(t.prune(&PruneOptions::default()).await, dry);
         assert!(t.has_image(&t.kept));
-        assert!(!t.has_image(&t.loose));
+        assert!(t.has_image(&t.loose), "the prune lists no image");
+        let report = t.with.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(report.is_ok(), "{report:?}");
+        assert_eq!(report.orphan_images, vec![t.loose]);
     });
 }
 
@@ -779,12 +786,12 @@ fn the_checked_open_returns_the_image_it_checked() {
 
         let err = repo.open_composefs_image_checked(&keyed).await.unwrap_err();
         assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound { checksum, ty: ObjectType::ComposefsImage }
-                    if checksum == keyed
-            ),
+            matches!(err, Error::ComposefsImageNotFound { commit } if commit == keyed),
             "{err}"
+        );
+        assert_eq!(
+            std::io::Error::from(err).kind(),
+            std::io::ErrorKind::NotFound
         );
 
         let expected = recorded(&repo, &commit).await;
@@ -849,5 +856,219 @@ fn a_required_seal_that_fails_stores_no_image() {
         assert!(matches!(err, Error::Unsupported(_)), "{err}");
         assert_eq!(file_inventory(&root, "objects"), before);
         assert!(!repo.composefs_image_path(&commit).exists());
+    });
+}
+
+/// Returns the error number of an `Error::Io`, or panics.
+fn io_errno(err: Error) -> i32 {
+    match err {
+        Error::Io(e) => e.raw_os_error().unwrap_or_else(|| panic!("{e}")),
+        other => panic!("{other}"),
+    }
+}
+
+/// In a `bare-user-shared` repository, the directories that the image write
+/// creates get the shared mode `02770`.
+#[test]
+fn the_store_directories_take_the_shared_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = TmpDir::new("cfs-shared");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let root = scratch.path().join("repo");
+    block_on(async {
+        let repo = new_repo(&root, RepoMode::BareUserShared, "").await;
+        let (commit, _) = commit_tree(&repo, &base, 1, true, None).await;
+        let hex = commit.to_hex();
+        let store = root.join("extensions/ostrya/composefs");
+        for dir in [store.clone(), store.join(&hex[..2])] {
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o2770, "{}: {mode:o}", dir.display());
+        }
+        let image = repo.composefs_image_path(&commit);
+        let mode = std::fs::metadata(&image).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o644, "mode {mode:o}");
+    });
+}
+
+/// A symlink at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/` stops the
+/// check, the checked open, and the presence test with `ELOOP`. A write of
+/// the image refuses the symlink and changes no file behind it.
+#[test]
+fn a_symlink_in_the_image_path_stops_each_read_and_write() {
+    let scratch = TmpDir::new("cfs-symlink");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let root = scratch.path().join("repo");
+    block_on(async {
+        let repo = new_repo(&root, RepoMode::BareUser, "").await;
+        let (commit, _) = commit_tree(&repo, &base, 1, true, None).await;
+        let image = repo.composefs_image_path(&commit);
+        let bytes = std::fs::read(&image).unwrap();
+        let hex = commit.to_hex();
+        let parts = [
+            "extensions".to_owned(),
+            "extensions/ostrya".to_owned(),
+            "extensions/ostrya/composefs".to_owned(),
+            format!("extensions/ostrya/composefs/{}", &hex[..2]),
+        ];
+        let moved = scratch.path().join("moved");
+        for part in &parts {
+            let path = root.join(part);
+            std::fs::rename(&path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &path).unwrap();
+
+            let eloop = rustix::io::Errno::LOOP.raw_os_error();
+            let err = repo.check_composefs_image(&commit).await.unwrap_err();
+            assert_eq!(io_errno(err), eloop, "{part}");
+            let err = repo
+                .open_composefs_image_checked(&commit)
+                .await
+                .unwrap_err();
+            assert_eq!(io_errno(err), eloop, "{part}");
+            let err = repo.has_composefs_image(&commit).await.unwrap_err();
+            assert_eq!(io_errno(err), eloop, "{part}");
+            let err = repo.add_composefs_image(&commit).await.unwrap_err();
+            assert!(matches!(err, Error::InvalidFormat(_)), "{part}: {err}");
+            assert_eq!(std::fs::read(&image).unwrap(), bytes, "{part}");
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&moved, &path).unwrap();
+        }
+        assert_eq!(
+            repo.check_composefs_image(&commit).await.unwrap(),
+            ComposefsImageState::Valid
+        );
+    });
+}
+
+/// Replaces the commit object `commit` with the bytes of the commit object
+/// `other`, so the object parses and its checksum is not its name.
+fn replace_commit_object(repo: &Repo, commit: &Checksum, other: &Checksum) {
+    let path = |c: &Checksum| {
+        repo.path()
+            .join("objects")
+            .join(loose_path(c, ObjectType::Commit, RepoMode::BareUser))
+    };
+    let bytes = std::fs::read(path(other)).unwrap();
+    std::fs::remove_file(path(commit)).unwrap();
+    std::fs::write(path(commit), bytes).unwrap();
+}
+
+/// fsck with `delete` removes the image of a corrupt commit that a ref names
+/// and of a corrupt commit that the walk finds, and `add_tombstones` removes
+/// the image of the commit that it deletes. No report names an orphan for
+/// these images.
+#[test]
+fn fsck_removes_the_image_of_each_commit_that_it_deletes() {
+    let delete = FsckOptions {
+        delete: true,
+        ..FsckOptions::default()
+    };
+    block_on(async {
+        // A corrupt commit that a ref names.
+        let t = twins("cfs-fsck-ref").await;
+        replace_commit_object(&t.with, &t.kept, &t.loose);
+        let report = t.with.fsck(&delete).await.unwrap();
+        assert!(
+            report
+                .deleted
+                .contains(&ObjectName::new(t.kept, ObjectType::Commit)),
+            "{report:?}"
+        );
+        assert!(!t.has_image(&t.kept));
+        assert!(t.has_image(&t.loose));
+        assert!(report.orphan_images.is_empty(), "{report:?}");
+        // The run ends at the ref, before the image check, so a second run
+        // with no ref to the removed commit checks the images.
+        std::fs::remove_file(t.with.path().join("refs/heads/main")).unwrap();
+        let report = t.with.fsck(&FsckOptions::default()).await.unwrap();
+        assert_eq!(report.images_checked, 1, "{report:?}");
+        assert!(report.orphan_images.is_empty(), "{report:?}");
+        assert!(!t.has_image(&t.kept));
+
+        // A corrupt commit that the walk finds.
+        let t = twins("cfs-fsck-walk").await;
+        replace_commit_object(&t.with, &t.loose, &t.kept);
+        let report = t.with.fsck(&delete).await.unwrap();
+        assert!(
+            report
+                .deleted
+                .contains(&ObjectName::new(t.loose, ObjectType::Commit)),
+            "{report:?}"
+        );
+        assert!(!t.has_image(&t.loose));
+        assert!(t.has_image(&t.kept));
+        assert!(report.orphan_images.is_empty(), "{report:?}");
+        assert!(report.image_errors.is_empty(), "{report:?}");
+
+        // A commit whose parent is absent.
+        let scratch = TmpDir::new("cfs-fsck-tombstone");
+        let base = scratch.path().join("tree");
+        build_owned_source(&base);
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
+        let (parent, _) = commit_tree(&repo, &base, 1, false, None).await;
+        let (tree, _) = repo.read_commit(&parent.to_hex()).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let image = txn.build_composefs_image(&tree).await.unwrap();
+        let child = txn
+            .write_commit(
+                CommitOptions {
+                    parent: Some(parent),
+                    timestamp: Some(2),
+                    metadata: Some(common::composefs::key_dict(image.digest())),
+                    ..CommitOptions::default()
+                },
+                &tree,
+            )
+            .await
+            .unwrap();
+        txn.attach_composefs_image(&child, image).await.unwrap();
+        txn.commit().await.unwrap();
+        std::fs::remove_file(repo.path().join("objects").join(loose_path(
+            &parent,
+            ObjectType::Commit,
+            RepoMode::BareUser,
+        )))
+        .unwrap();
+        let report = repo
+            .fsck(&FsckOptions {
+                add_tombstones: true,
+                ..FsckOptions::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.tombstoned, vec![child], "{report:?}");
+        assert!(!repo.composefs_image_path(&child).exists());
+        assert!(report.orphan_images.is_empty(), "{report:?}");
+    });
+}
+
+/// The prune removes the image before its commit: if the removal of the
+/// image fails, the commit object stays. The mode 0555 of the directory of
+/// the image makes the removal fail.
+#[test]
+fn prune_removes_the_image_before_the_commit() {
+    if rustix::process::geteuid().is_root() {
+        eprintln!("skipping: root removes a file in a directory with the mode 0555");
+        return;
+    }
+    block_on(async {
+        let t = twins("cfs-prune-order").await;
+        let image = t.with.composefs_image_path(&t.loose);
+        let dir = image.parent().unwrap().to_owned();
+        chmod(&dir, 0o555);
+        let result = t
+            .with
+            .prune(&PruneOptions {
+                refs_only: true,
+                ..PruneOptions::default()
+            })
+            .await;
+        chmod(&dir, 0o755);
+        assert!(result.is_err(), "{result:?}");
+        assert!(image.exists());
+        assert!(t.commit_paths(&t.loose)[0].exists(), "the commit stays");
     });
 }

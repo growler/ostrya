@@ -1318,18 +1318,18 @@ pub(crate) fn write_image_temp_blocking(
 }
 
 /// Links a composefs image temp into the staging directory as the image of
-/// `commit`.
+/// `commit`, under the name `<checksum>.cfs`.
 ///
-/// The function returns the outcome for the record of the object. The image
+/// The function returns the outcome for the record of the image. Its `dest`
+/// is the path of the image under `extensions/ostrya/composefs/`. The image
 /// is never a dedup hit: the caller decides if a stored image stays. On a
 /// failure, the function removes the temp file.
 pub(crate) fn link_image_blocking(
     staging_fd: BorrowedFd<'_>,
     image: ImageTemp,
     commit: &Checksum,
-    mode: RepoMode,
 ) -> Result<StageOutcome> {
-    let staging_name = flat_name(commit, ObjectType::ComposefsImage, mode);
+    let staging_name = crate::image_store::staging_name(commit);
     materialize(staging_fd, image.fd.as_fd(), &image.temp, &staging_name)
         .inspect_err(|_| cleanup_temp(staging_fd, &image.temp))?;
     Ok(StageOutcome {
@@ -1338,7 +1338,7 @@ pub(crate) fn link_image_blocking(
         blocks: Blocks::Written,
         unpacked: 0,
         staging_name,
-        dest: loose_path(commit, ObjectType::ComposefsImage, mode),
+        dest: crate::image_store::rel_path(commit),
     })
 }
 
@@ -1663,21 +1663,26 @@ fn clone_metadata(
     apply().inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))
 }
 
-/// Publishes staged objects into `objects/` in the order of the durability
-/// rules.
+/// Publishes staged objects into `objects/`, and then staged composefs images
+/// into `extensions/ostrya/composefs/`, in the order of the durability rules.
 ///
 /// 1. If `syncfs` is set, the function runs `syncfs` on the repository.
 /// 2. It renames each object into `objects/<xx>/`.
 /// 3. If `fsync` is set, it runs `fsync` on each fanout directory that it
 ///    changed, and on `objects/`.
+/// 4. It renames each image into the store, as
+///    [`image_store::publish_blocking`](crate::image_store::publish_blocking)
+///    states, with the same `fsync`.
 ///
 /// A caller clears `syncfs` with fsync on only if a `syncfs` after the staging
-/// of the last object already made the objects durable.
+/// of the last object and the last image already made them durable.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_blocking(
     repo_fd: BorrowedFd<'_>,
     objects_fd: BorrowedFd<'_>,
     staging_fd: BorrowedFd<'_>,
     objects: &[(String, String)],
+    images: &[(String, String)],
     syncfs: bool,
     fsync: bool,
     repo_mode: RepoMode,
@@ -1704,9 +1709,11 @@ pub(crate) fn publish_blocking(
             )?;
             rustix::fs::fsync(&dir)?;
         }
-        rustix::fs::fsync(objects_fd)?;
+        if !objects.is_empty() {
+            rustix::fs::fsync(objects_fd)?;
+        }
     }
-    Ok(())
+    crate::image_store::publish_blocking(repo_fd, staging_fd, images, fsync, repo_mode)
 }
 
 /// Creates the fanout directory `objects/<xx>/` if it does not exist.

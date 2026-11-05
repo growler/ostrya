@@ -4850,6 +4850,26 @@ So `prune --refs-only` keeps no commit for an entry of the array. After the
 prune, `show <A>` and `show <B>` give the error of an absent object at exit 1.
 `fsck` exits 0 with no finding (`fsck`, "Related commits in fsck").
 
+#### Composefs images in a prune
+
+The repositories are a `bare-user` and an `archive` repository. Each holds a
+commit on the ref `main`, a commit with no ref and no parent, and three files
+under `extensions/ostrya/composefs/`: `<xx>/<rest>.cfs` of each of the two
+commits, and one of the checksum `00...01`, which names no commit.
+
+- `prune --refs-only` writes `Total objects: 9` and `Deleted 3 objects, 284
+  bytes freed` in the `bare-user` repository, and `Total objects: 9` and
+  `Deleted 3 objects, 320 bytes freed` in the `archive` repository. It exits
+  0. It removes the commit object with no ref.
+- A second `prune --refs-only` writes `Total objects: 6` and `No unreachable
+  objects`, and exits 0.
+- The three files under `extensions/ostrya/composefs/` stay after both runs,
+  also the file of the removed commit. The modes of the directories do not
+  change.
+
+So the tool counts no file under `extensions/ostrya/composefs/`, and its
+prune removes none.
+
 ### `fsck`
 
 `fsck` writes its phase lines and its summary lines to standard output. It
@@ -5098,6 +5118,20 @@ commit. The repositories are the repositories of "Related commits in a pull",
 
 So the object walk does not follow the array, and the absence of a commit that
 the array names is not a fault.
+
+#### Composefs images in fsck
+
+The repositories are the repositories of "Composefs images in a prune".
+
+- Before the prune, the run writes `Verifying content integrity of 2 commit
+  objects...` and `object fsck of 2 commits completed successfully - no
+  errors found.`, writes nothing to standard error, and exits 0, in both
+  modes.
+- After the prune, the run checks 1 commit, writes the success line, and
+  exits 0.
+
+So the tool checks no file under `extensions/ostrya/composefs/` and reports
+none, also a file whose commit is absent.
 
 #### Exit status
 

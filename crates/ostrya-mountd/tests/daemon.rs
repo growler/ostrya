@@ -21,6 +21,12 @@
 //! - A request from the initial user namespace is refused.
 //! - An `objects` directory that is a mount of its own is refused.
 //! - A built image over the size limit of the daemon is refused.
+//! - A symlink at each component of the path of a stored image, at the
+//!   fan-out directory of the commit for a stored image, and at the fan-out
+//!   directory of a commit, a dirtree, a dirmeta, or a file for a built
+//!   image, is refused with the class `repository`.
+//! - The refusal of a stored image that is not the key of its commit names
+//!   the commit and neither digest.
 //! - Each mount of the daemon has `nosuid` and `nodev`. A setuid file in a
 //!   read-only and in a read-write mount does not change the user id of a
 //!   process that runs it, and a device node in the image does not open.
@@ -406,7 +412,9 @@ async fn commit_with_image(
     };
     let commit = txn.write_commit(opts, root).await.unwrap();
     txn.commit().await.unwrap();
-    std::fs::write(repo.composefs_image_path(&commit), image).unwrap();
+    let path = repo.composefs_image_path(&commit);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, image).unwrap();
     commit
 }
 
@@ -1008,4 +1016,128 @@ fn the_standalone_mode_exits_when_the_parent_exits() {
         .expect("the daemon exits");
     assert_eq!(status.code(), Some(1));
     assert!(!sock.exists(), "the daemon removes its socket");
+}
+
+/// Replaces the directory `path` with a symlink to `moved`, runs `f`, and
+/// puts the directory back.
+fn with_symlink(path: &Path, moved: &Path, f: impl FnOnce()) {
+    std::fs::rename(path, moved).unwrap();
+    std::os::unix::fs::symlink(moved, path).unwrap();
+    f();
+    std::fs::remove_file(path).unwrap();
+    std::fs::rename(moved, path).unwrap();
+}
+
+/// Returns the `.file` object of `repo` that holds [`HELLO`].
+fn hello_object(repo: &Path) -> PathBuf {
+    for dir in std::fs::read_dir(repo.join("objects")).unwrap().flatten() {
+        for obj in std::fs::read_dir(dir.path()).unwrap().flatten() {
+            let path = obj.path();
+            if path.extension().is_some_and(|e| e == "file")
+                && obj.file_type().unwrap().is_file()
+                && std::fs::read(&path).unwrap() == HELLO
+            {
+                return path;
+            }
+        }
+    }
+    panic!("no object holds the content");
+}
+
+/// A symlink at a component of the path of a stored image, or at the
+/// fan-out directory of an object that the daemon reads, is refused with the
+/// class `repository`, and the target stays empty. Op 1 reads the commit
+/// and the image. Op 2 reads the commit, the dirtrees, the dirmetas, and the
+/// files.
+#[test]
+fn a_symlink_in_the_repository_is_refused() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("symlinks");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let target = fx.target("mnt");
+    let moved = fx.scratch.path().join("moved");
+    let refused = |built: bool, what: &str| {
+        let req = ClientRequest::new(&fx, &target, built, Access::ReadOnly);
+        let outcome = fx.client(&sock, &req, true);
+        assert!(
+            outcome.starts_with(&format!("refused {}", HelperCode::Repository)),
+            "{what}: {outcome}"
+        );
+        assert!(mounts_at(&target).is_empty(), "{what}");
+    };
+
+    let hex = fx.commit.to_hex();
+    for part in [
+        "extensions".to_owned(),
+        "extensions/ostrya".to_owned(),
+        "extensions/ostrya/composefs".to_owned(),
+        format!("extensions/ostrya/composefs/{}", &hex[..2]),
+    ] {
+        with_symlink(&fx.repo.join(&part), &moved, || refused(false, &part));
+    }
+
+    let (commit_obj, _) = ostrya_rt::block_on(async {
+        let repo = Repo::open(&fx.repo).await.unwrap();
+        repo.load_commit(&fx.commit).await.unwrap()
+    });
+    let objects = fx.repo.join("objects");
+    let fanout = |hex: String| objects.join(&hex[..2]);
+    with_symlink(&fanout(hex.clone()), &moved, || {
+        refused(false, "stored commit")
+    });
+    let hello = hello_object(&fx.repo);
+    for (what, dir) in [
+        ("commit", fanout(hex.clone())),
+        ("dirtree", fanout(commit_obj.root_dirtree.to_hex())),
+        ("dirmeta", fanout(commit_obj.root_dirmeta.to_hex())),
+        ("file", hello.parent().unwrap().to_owned()),
+    ] {
+        with_symlink(&dir, &moved, || refused(true, what));
+    }
+    let req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    assert!(fx.client(&sock, &req, true).starts_with("mounted 1 "));
+    assert_no_temp_dirs(&fx);
+}
+
+/// The refusal of a stored image that is not the key of its commit names
+/// the commit and neither digest.
+#[test]
+fn the_refusal_of_a_changed_image_names_no_digest() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("mismatch");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let (expected, actual) = ostrya_rt::block_on(async {
+        let repo = Repo::open(&fx.repo).await.unwrap();
+        let path = repo.composefs_image_path(&fx.commit);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        match repo.open_composefs_image_checked(&fx.commit).await {
+            Err(ostrya::Error::ComposefsDigestMismatch {
+                expected, actual, ..
+            }) => (expected, actual),
+            other => panic!("the changed image has the key: {:?}", other.map(|_| ())),
+        }
+    });
+    let target = fx.target("mnt");
+    let req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    let outcome = fx.client(&sock, &req, true);
+    assert!(
+        outcome.starts_with(&format!("refused {}", HelperCode::Repository)),
+        "{outcome}"
+    );
+    assert!(outcome.contains(&fx.commit.to_hex()), "{outcome}");
+    for digest in [expected, actual] {
+        let hex = Checksum::from_bytes(digest).to_hex();
+        assert!(!outcome.contains(&hex), "{outcome}");
+    }
+    assert!(mounts_at(&target).is_empty());
 }

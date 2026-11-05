@@ -457,9 +457,8 @@ impl PruneOptions {
 
 /// Returns `true` if an object of this type is in the counts of a run.
 ///
-/// The sidecars of a commit -- detached commit metadata and composefs
-/// images -- and tombstone markers are outside both counts. `commit_only`
-/// narrows the counts to commit objects, which is what the
+/// Detached commit metadata and tombstone markers are outside both counts.
+/// `commit_only` narrows the counts to commit objects, which is what the
 /// `ostree` command reports. Static deltas are not loose objects, so they are
 /// outside both counts.
 pub(crate) fn counted(ty: ObjectType, commit_only: bool) -> bool {
@@ -477,9 +476,8 @@ pub struct PruneStats {
     ///
     /// It is the total of the store after a
     /// [`delete_commit`](PruneOptions::delete_commit) removal. It leaves out
-    /// detached commit metadata, composefs images, and tombstone markers.
-    /// Static deltas are not
-    /// loose objects, so they are outside it. If
+    /// detached commit metadata and tombstone markers. Static deltas and
+    /// composefs images are not loose objects, so they are outside it. If
     /// [`commit_only`](PruneOptions::commit_only) is set, it counts commit
     /// objects alone.
     pub total_objects: usize,
@@ -487,14 +485,15 @@ pub struct PruneStats {
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, it is the number that
     /// the run deletes without `no_prune`. It counts on the terms of
-    /// [`total_objects`](PruneStats::total_objects). A `.commitmeta` or a
-    /// `.cfs` removed with its commit or as an orphan is not in the number,
-    /// and a static delta is not in it.
+    /// [`total_objects`](PruneStats::total_objects). A `.commitmeta` removed
+    /// with its commit or as an orphan is not in the number, and a static
+    /// delta and a composefs image are not in it.
     pub pruned_objects: usize,
     /// The on-disk bytes of the objects that
     /// [`pruned_objects`](PruneStats::pruned_objects) counts.
     ///
-    /// The bytes of a removed `.commitmeta` or `.cfs` are not in the number.
+    /// The bytes of a removed `.commitmeta` or composefs image are not in the
+    /// number.
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, it is the number of
     /// bytes that the run frees without `no_prune`.
@@ -630,8 +629,9 @@ struct Sweep {
     /// The switch that writes a `.tombstone-commit` for each removed commit.
     tombstones: bool,
     /// The switch that syncs each tombstone before its link into place. It
-    /// also syncs the directories that the commit removals changed before the
-    /// first content object goes.
+    /// also syncs the directories of the removed composefs images before the
+    /// first commit goes, and the directories that the commit removals
+    /// changed before the first content object goes.
     fsync: bool,
     /// The switch that counts commit objects alone.
     commit_only: bool,
@@ -642,11 +642,13 @@ impl Repo {
     /// Removes the objects that no root reaches and returns the statistics.
     ///
     /// The run walks from the roots, keeps each object that the walk reaches,
-    /// and removes each other loose object. A kept commit keeps its sidecars:
-    /// its detached metadata (`.commitmeta`) and its composefs image (`.cfs`).
-    /// The run removes the sidecars of each commit that it removes. It also
-    /// removes each sidecar whose commit is absent, if the walk does not
-    /// reach the name of that commit. The walk reaches the name of an absent
+    /// and removes each other loose object. A kept commit keeps its detached
+    /// metadata (`.commitmeta`). The run removes the detached metadata of each
+    /// commit that it removes, and its composefs image, the file
+    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs`. It also removes each
+    /// detached metadata whose commit is absent, if the walk does not reach
+    /// the name of that commit. It keeps each composefs image whose commit is
+    /// absent: the run does not list the images. The walk reaches the name of an absent
     /// commit that a reached commit names as its parent within the bound, or
     /// as a related commit. [`PruneOptions`] sets the roots, the bounds, and
     /// the dry run.
@@ -701,8 +703,7 @@ impl Repo {
     /// A related entry that names a commit that the repository does not hold
     /// gives no error, and the walk reads nothing below it. The run keeps the
     /// name of that commit, as it keeps the name of an absent parent. So the
-    /// run keeps the `.commitmeta` and the `.cfs` of that commit if the
-    /// store holds them. A weak ref
+    /// run keeps the `.commitmeta` of that commit if the store holds it. A weak ref
     /// ([`weak_ref_filter`](PruneOptions::weak_ref_filter)) whose commit a
     /// related field names survives.
     ///
@@ -779,11 +780,20 @@ impl Repo {
     ///
     /// # Sweep order
     ///
-    /// The sweep removes the commits first and their content after them. For
-    /// each commit, it writes the tombstone, unlinks the commit object, and
-    /// then unlinks its detached metadata and its composefs image. Next, it
-    /// removes each detached metadata and each composefs image whose commit is
-    /// absent.
+    /// The sweep removes the composefs images of the doomed commits first,
+    /// the commits next, and their content after them. It unlinks the image
+    /// of each doomed commit. If `[core] fsync` is `true`, it then syncs one
+    /// time each directory from which it removed an image. Next, for each
+    /// commit, it writes the tombstone, unlinks the commit object, and then
+    /// unlinks its detached metadata. Next, it removes each detached metadata
+    /// whose commit is absent.
+    ///
+    /// Each image goes before its commit, so the run leaves no image whose
+    /// commit it deleted. If `[core] fsync` is `true`, each image removal is
+    /// durable before the run unlinks the first commit object. A stop or a
+    /// crash between the two steps leaves unreachable commits with no image,
+    /// and the next run deletes these commits. The run opens and syncs each
+    /// directory of the images one time, and not one time for each commit.
     ///
     /// If `[core] fsync` is `true`, the run syncs the `objects/` directories
     /// that these removals changed before it removes the first dirtree,
@@ -832,6 +842,9 @@ impl Repo {
     ///   this before the walk and again before the unlink.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than `-1`,
     ///   or if a ref file holds bytes that are not UTF-8.
+    /// - [`Error::InvalidFormat`] if the run removes a commit and a directory
+    ///   of the path of its composefs image is a symlink or no directory. The
+    ///   run then removes no commit object of the sweep.
     /// - [`Error::Core`] if a `[core]` key that the run reads holds a value of
     ///   the wrong type.
     /// - [`Error::Core`] if a ref file holds no valid checksum.
@@ -1002,7 +1015,6 @@ impl Repo {
         if let Some(commit) = opts.delete_commit {
             all_objects.remove(&ObjectName::new(commit, ObjectType::Commit));
             all_objects.remove(&ObjectName::new(commit, ObjectType::CommitMeta));
-            all_objects.remove(&ObjectName::new(commit, ObjectType::ComposefsImage));
         }
         let global_bound = opts.global_bound();
         if !opts.roots_on_refs_alone() {
@@ -1033,8 +1045,7 @@ impl Repo {
                 &all_objects,
             )
             .await?;
-        // A kept commit keeps its sidecars: the detached metadata and the
-        // composefs image.
+        // A kept commit keeps its detached metadata.
         let kept = |o: &ObjectName| {
             keep.contains(o)
                 || (o.ty.is_commit_sidecar()
@@ -1044,7 +1055,7 @@ impl Repo {
         // Each present object that the walk did not reach is a candidate,
         // except tombstone markers, which the `ostree` command never prunes.
         // `commit_only` narrows the candidates to commit objects and the
-        // sidecars removed with one.
+        // detached metadata removed with one.
         // The objects of the store less the reachable ones is the largest size
         // of the list, so one allocation holds it.
         let mut doomed: Vec<ObjectName> =
@@ -1195,9 +1206,11 @@ impl Repo {
         Ok(())
     }
 
-    /// Removes the object and the sidecars of a named commit: the detached
-    /// metadata and the composefs image. If the run writes tombstones, the
-    /// tombstone comes first.
+    /// Removes the composefs image, the object, and the detached metadata of
+    /// a named commit. The image goes first, and the call syncs its directory
+    /// if the run syncs. Then [`remove_commit`] removes the commit and its
+    /// detached metadata. If the run writes tombstones, the tombstone comes
+    /// before the commit.
     ///
     /// The ref check runs again next to the unlink, so a ref published while
     /// the prune walked the store still refuses the deletion. If the run
@@ -1213,6 +1226,7 @@ impl Repo {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let objects_fd = repo.objects_fd();
+            crate::image_store::unlink_blocking(repo.repo_fd(), [commit], sweep.fsync)?;
             let tmp = tombstone_tmp(&repo, &sweep)?;
             let mut touched = BTreeSet::new();
             remove_commit(
@@ -1220,7 +1234,7 @@ impl Repo {
                 objects_fd,
                 &sweep,
                 &commit,
-                |_| true,
+                true,
                 &mut touched,
             )?;
             if sweep.fsync {
@@ -1294,17 +1308,15 @@ fn tombstone_tmp(repo: &Repo, sweep: &Sweep) -> Result<Option<OwnedFd>> {
     )?))
 }
 
-/// The sidecar types of a commit, in the order in which [`remove_commit`]
-/// unlinks them.
-const SIDECARS: [ObjectType; 2] = [ObjectType::CommitMeta, ObjectType::ComposefsImage];
-
 /// Removes one commit, in this order:
 ///
 /// 1. If `tmp_fd`, the open `tmp/` of the repository, is given, writes the
 ///    tombstone of the commit.
 /// 2. Unlinks the commit object.
-/// 3. Unlinks each sidecar of the commit whose type `sidecar` accepts, in the
-///    order of [`SIDECARS`]: the detached metadata, then the composefs image.
+/// 3. If `meta` is true, unlinks its detached metadata.
+///
+/// The caller removes the composefs image of the commit before the call. If
+/// the run syncs, that removal is durable before the call.
 ///
 /// The function adds to `touched` each `objects/` fanout directory in which it
 /// unlinked an entry, named relative to `objects/`.
@@ -1316,15 +1328,20 @@ const SIDECARS: [ObjectType; 2] = [ObjectType::CommitMeta, ObjectType::Composefs
 /// commit is absent. The next run removes a marker that a failed or crashed
 /// run leaves.
 ///
-/// The commit goes before its sidecars. A sidecar with no commit is
-/// unreachable, and the next prune removes it. The reverse order leaves a
-/// commit with no signatures or with no image.
+/// The image goes before the commit. A crash between the two removals leaves
+/// an unreachable commit with no image, and the next prune removes that
+/// commit. The reverse order leaves an image whose commit is absent, and no
+/// prune lists the images to remove it.
+///
+/// The commit goes before its detached metadata. Detached metadata with no
+/// commit is unreachable, and the next prune removes it. The reverse order
+/// leaves a commit with no signatures.
 fn remove_commit(
     tmp_fd: Option<BorrowedFd<'_>>,
     objects_fd: BorrowedFd<'_>,
     sweep: &Sweep,
     commit: &Checksum,
-    sidecar: impl Fn(ObjectType) -> bool,
+    meta: bool,
     touched: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let Some(tmp_fd) = tmp_fd {
@@ -1332,8 +1349,9 @@ fn remove_commit(
     }
     let commit_path = loose_path(commit, ObjectType::Commit, sweep.mode);
     let mut unlinked = unlink_optional(objects_fd, &commit_path)?;
-    for ty in SIDECARS.into_iter().filter(|ty| sidecar(*ty)) {
-        unlinked |= unlink_optional(objects_fd, &loose_path(commit, ty, sweep.mode))?;
+    if meta {
+        let meta_path = loose_path(commit, ObjectType::CommitMeta, sweep.mode);
+        unlinked |= unlink_optional(objects_fd, &meta_path)?;
     }
     if unlinked {
         touched.insert(objects_fanout(commit));
@@ -1369,24 +1387,38 @@ fn object_size(objects_fd: BorrowedFd<'_>, path: &str) -> Result<Option<u64>> {
 /// Stats each doomed object, unlinks it unless `no_prune` is set, and returns
 /// the count and the sum of the freed bytes.
 ///
-/// The sweep runs in two phases:
+/// The sweep runs in three phases:
 ///
-/// 1. The commit phase removes each doomed commit with [`remove_commit`],
-///    together with each of its sidecars -- the detached metadata and the
-///    composefs image -- that is doomed too. Then it removes each doomed
-///    sidecar whose commit the phase did not remove.
-/// 2. The content phase removes every other doomed object, in any order.
+/// 1. The image phase removes the composefs image of each doomed commit. It
+///    opens the directory of the images and each `<xx>/` directory one time.
+///    If the run syncs, it then syncs one time each `<xx>/` directory from
+///    which it removed an image.
+/// 2. The commit phase removes each doomed commit with [`remove_commit`]:
+///    the commit, and then its detached metadata if that is doomed too. Then
+///    it removes each doomed detached metadata whose commit the phase did not
+///    remove.
+/// 3. The content phase removes every other doomed object, in any order.
 ///
 /// If the run syncs, the sweep syncs the `objects/` directories that the
-/// commit phase changed between the two phases. A sweep that stops at an error
-/// or a crash then leaves no commit object whose tree it started to remove. If
-/// the run does not sync, a crash gives no guarantee of which removals reached
-/// the disk, in which order. The sweep removes no `.commitpartial` marker.
+/// commit phase changed between the commit phase and the content phase. A
+/// sweep that stops at an error or a crash then leaves no commit object whose
+/// tree it started to remove. If the run does not sync, a crash gives no
+/// guarantee of which removals reached the disk, in which order. The sweep
+/// removes no `.commitpartial` marker.
 ///
-/// The sweep stats each doomed object before its unlink. A sidecar that the
-/// commit phase removes with its commit is the exception. Neither number
-/// counts a sidecar. The sweep skips an object that is already absent at its
-/// stat and counts it in neither number.
+/// Each image goes before its commit, so the sweep leaves no image whose
+/// commit it removed. If the run syncs, each image removal is durable before
+/// the first commit goes. A stop or a crash between the image phase and the
+/// commit phase leaves unreachable commits with no image, and the next prune
+/// removes these commits. The image phase opens and syncs each directory one
+/// time, and not one time for each commit. The sweep does not list the
+/// images, so an image whose commit is absent stays.
+///
+/// The sweep stats each doomed object before its unlink. The detached metadata
+/// that the commit phase removes with its commit is the exception. Neither
+/// number counts detached metadata or a composefs image. The sweep skips an
+/// object that is already absent at its stat and counts it in neither
+/// number.
 fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(usize, u64)> {
     let objects_fd = repo.objects_fd();
     let mut count = 0usize;
@@ -1398,20 +1430,32 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         }
     };
 
+    let doomed_commits = || doomed.iter().filter(|o| o.ty == ObjectType::Commit);
+    let removes_commits = !sweep.no_prune && doomed_commits().next().is_some();
+
+    // The image phase.
+    if removes_commits {
+        crate::image_store::unlink_blocking(
+            repo.repo_fd(),
+            doomed_commits().map(|o| o.checksum),
+            sweep.fsync,
+        )?;
+    }
+
     // The commit phase.
-    let doomed_sidecars: HashSet<ObjectName> = doomed
+    let doomed_meta: HashSet<Checksum> = doomed
         .iter()
-        .filter(|o| o.ty.is_commit_sidecar())
-        .copied()
+        .filter(|o| o.ty == ObjectType::CommitMeta)
+        .map(|o| o.checksum)
         .collect();
     let mut touched = BTreeSet::new();
     let mut removed_commits = HashSet::new();
-    let tmp = if sweep.no_prune || !doomed.iter().any(|o| o.ty == ObjectType::Commit) {
-        None
-    } else {
+    let tmp = if removes_commits {
         tombstone_tmp(repo, sweep)?
+    } else {
+        None
     };
-    for name in doomed.iter().filter(|o| o.ty == ObjectType::Commit) {
+    for name in doomed_commits() {
         let Some(size) = object_size(objects_fd, &name.loose_path(sweep.mode))? else {
             continue;
         };
@@ -1421,14 +1465,15 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
                 objects_fd,
                 sweep,
                 &name.checksum,
-                |ty| doomed_sidecars.contains(&ObjectName::new(name.checksum, ty)),
+                doomed_meta.contains(&name.checksum),
                 &mut touched,
             )?;
         }
         removed_commits.insert(name.checksum);
         tally(name.ty, size);
     }
-    // Sidecars whose commit is absent, which no commit removal took with it.
+    // Detached metadata whose commit is absent, which no commit removal took
+    // with it.
     for name in doomed
         .iter()
         .filter(|o| o.ty.is_commit_sidecar() && !removed_commits.contains(&o.checksum))

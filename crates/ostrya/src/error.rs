@@ -569,6 +569,15 @@ pub enum Error {
         /// The fs-verity digest of the image.
         actual: [u8; 32],
     },
+    /// A commit whose composefs image the repository does not hold.
+    ///
+    /// The image is the file
+    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository.
+    #[error("no composefs image of commit {commit}")]
+    ComposefsImageNotFound {
+        /// The commit of the image.
+        commit: Checksum,
+    },
     /// The writer lock of a bucket repository that another writer holds.
     ///
     /// The take of the lock found a lock. A take with no break of the lock
@@ -767,6 +776,7 @@ impl From<Error> for std::io::Error {
             Error::PathNotFound { .. }
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
+            | Error::ComposefsImageNotFound { .. }
             | Error::RefNotFound(_)
             | Error::RemoteNotFound(_)
             | Error::StaticDeltaNotFound { .. }
@@ -819,6 +829,12 @@ mod tests {
                 Error::ObjectNotFound {
                     checksum: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
                     ty: ObjectType::Commit,
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                Error::ComposefsImageNotFound {
+                    commit: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
                 },
                 ErrorKind::NotFound,
             ),

@@ -60,8 +60,10 @@
 //!   on FUSE, and an `objects` directory that is the root of a mount or that
 //!   is on another mount than the repository directory.
 //! - It reads the repository through a copy of its mount with no mount below
-//!   it. Each read of a file follows no symlink, does not wait on a FIFO, and
-//!   refuses a file that is not a regular file.
+//!   it. Each read of a file opens it with `openat2`, `RESOLVE_BENEATH`, and
+//!   `RESOLVE_NO_SYMLINKS`, so a symlink at any component of its path stops
+//!   the read. The read does not wait on a FIFO, and it refuses a file that is
+//!   not a regular file.
 //! - It checks the digest of a stored image against the key of the commit.
 //!   It does not check a signature of the commit.
 //! - Each mount has `nosuid` and `nodev`. The EROFS layer takes the ID
@@ -76,12 +78,21 @@
 //! - A connection has 60 seconds for the request and the reply. At that
 //!   time, the daemon stops the request and replies with an error.
 //!
-//! The daemon reads the objects with its own credentials, as overlayfs
+//! The daemon reads the repository with its own credentials, as overlayfs
 //! reads the data layer with the credentials of the mounter. The access to
-//! the socket is therefore the trust boundary. A member of the group of the
-//! socket can read each file below a directory named `objects` that it can
-//! open in a directory that it can open. The mode of the file does not stop
-//! the read.
+//! the socket is therefore the trust boundary. A member of the group of
+//! the socket can make the daemon read these files of a repository
+//! directory whose `objects` directory it can open:
+//!
+//! - each file below `objects`;
+//! - the file `config`;
+//! - the file `extensions/ostrya/composefs/<aa>/<62 hex>.cfs`.
+//!
+//! The modes of these files, and of the directories between them and the
+//! repository directory, do not stop the read. The daemon mounts a stored
+//! image only if its fs-verity digest is the key of a commit that it reads
+//! from `objects`. That image holds the tree that a built mount makes from
+//! `objects`. A refusal tells the caller if the image exists.
 //!
 //! # Verity
 //!
@@ -102,8 +113,7 @@
 //! The repository modes `bare`, `bare-user`, `bare-user-only`,
 //! `bare-split-xattrs`, and `bare-user-shared` can be mounted: each of them
 //! stores the raw content of a file at the loose path that the image names.
-//! An `archive` repository can hold and serve images, but it cannot be
-//! mounted.
+//! An `archive` repository can hold images, but it cannot be mounted.
 //!
 //! # Read-write mounts
 //!

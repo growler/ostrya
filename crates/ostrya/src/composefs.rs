@@ -12,14 +12,15 @@
 //! [`ComposefsOptions`] and [`VerityPolicy`] select the verity form of the
 //! image.
 //!
-//! # The image object
+//! # The image store
 //!
-//! A repository can store the image of a commit as an object of the type
-//! [`ObjectType::ComposefsImage`], at `objects/<xx>/<commit>.cfs`. The object
-//! is a sidecar of the commit, as the detached metadata is. Its name is the
-//! checksum of the commit, and its bytes are the image that an export with
-//! [`ComposefsOptions::RECORDED`] writes. So its fs-verity digest is the value
-//! of the `ostree.composefs.digest.v0` key of the commit.
+//! A repository can store the image of a commit in the file
+//! `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside `objects/`. The
+//! name of the file is the checksum of the commit, and its bytes are the image
+//! that an export with [`ComposefsOptions::RECORDED`] writes. So its fs-verity
+//! digest is the value of the `ostree.composefs.digest.v0` key of the commit.
+//! The file has the mode `0644` and no extended attribute in each repository
+//! mode.
 //!
 //! - [`Transaction::build_composefs_image`] writes the image of a tree to the
 //!   staging directory, and [`Transaction::attach_composefs_image`] stages it
@@ -29,14 +30,21 @@
 //! - [`Repo::add_composefs_image`] stores the image of a commit in its own
 //!   transaction.
 //! - [`Repo::check_composefs_image`] compares a stored image with the key of
-//!   its commit, and [`Repo::composefs_image_path`] gives its path.
+//!   its commit, [`Repo::has_composefs_image`] tells if the repository holds
+//!   one, and [`Repo::composefs_image_path`] gives its path.
 //! - [`Repo::open_composefs_image_checked`] opens a stored image and compares
 //!   it with the key through the descriptor that it returns.
 //! - [`Repo::objects_dir`] gives the descriptor of the object store. A
 //!   composefs mount reads the backing objects of the image through it.
 //!
 //! Each write refuses a commit without the key and an image whose digest is
-//! not the key. A write never holds the whole image in memory.
+//! not the key. A write never holds the whole image in memory. Each read
+//! opens the image with `openat2` under the root of the repository, with
+//! `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so a symlink at any component
+//! of its path stops the read.
+//!
+//! The prune deletes the image of each commit that it deletes, before the
+//! commit. The fsck checks each image against the key of its commit.
 //!
 //! No transfer carries the image. A pull, a push, a one-way stream, and a
 //! static delta carry no composefs image.
@@ -58,6 +66,7 @@ use ostrya_core::{
 use crate::commit::append_dict_entry;
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
+use crate::image_store;
 use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
@@ -433,12 +442,12 @@ impl Transaction {
     ///
     /// If the call does not stage the image, it removes the image file.
     ///
-    /// [`commit`](Transaction::commit) publishes a staged image after all the
-    /// other objects of the transaction. Its rename replaces the stored image
-    /// in one step. The image is a sidecar of the commit, so no field of
-    /// [`TransactionStats`](crate::TransactionStats) counts it, and
-    /// `ostree.sizes` has no entry for it. The image takes its size from the
-    /// free-space budget of the transaction.
+    /// [`commit`](Transaction::commit) renames a staged image into
+    /// `extensions/ostrya/composefs/<xx>/` after it renames the objects of the
+    /// transaction into `objects/`. The rename replaces the stored image in
+    /// one step. No field of [`TransactionStats`](crate::TransactionStats)
+    /// counts the image, and `ostree.sizes` has no entry for it. The image
+    /// takes its size from the free-space budget of the transaction.
     ///
     /// # Errors
     ///
@@ -567,10 +576,9 @@ impl Transaction {
             .image
             .take()
             .expect("a staged composefs image holds its file until attached");
-        let mode = self.repo().mode();
         let key = *commit;
         let outcome = self
-            .unblock(move || link_image_blocking(staging.as_fd(), temp, &key, mode))
+            .unblock(move || link_image_blocking(staging.as_fd(), temp, &key))
             .await?;
         self.record_image(*commit, outcome)?;
         Ok(result)
@@ -588,7 +596,7 @@ impl Transaction {
         commit: &Checksum,
         key: &[u8; 32],
     ) -> Result<Option<ComposefsImageAdd>> {
-        if self.is_staged(commit, ObjectType::ComposefsImage) {
+        if self.is_image_staged(commit) {
             return Ok(None);
         }
         Ok(match self.repo().stored_image_digest(commit).await {
@@ -947,17 +955,33 @@ impl Repo {
         Ok(result)
     }
 
-    /// Returns the path of the composefs image object of `commit`.
+    /// Returns the path of the composefs image of `commit`.
     ///
     /// The path is [`path`](Repo::path) joined with
-    /// `objects/<xx>/<rest>.cfs`. The call does no I/O, so the image need not
+    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs`, where `<xx><rest>` is
+    /// the checksum of the commit. The call does no I/O, so the image need not
     /// exist. A relative [`path`](Repo::path) gives a relative result.
     pub fn composefs_image_path(&self, commit: &Checksum) -> PathBuf {
-        self.path().join("objects").join(loose_path(
-            commit,
-            ObjectType::ComposefsImage,
-            self.mode(),
-        ))
+        self.path()
+            .join(image_store::IMAGE_DIR)
+            .join(image_store::rel_path(commit))
+    }
+
+    /// Returns `true` if the repository holds a composefs image of `commit`.
+    ///
+    /// The call opens the image as
+    /// [`open_composefs_image_checked`](Repo::open_composefs_image_checked)
+    /// does, and reads none of its bytes. It does not read the commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the open fails for a reason other than an absent
+    ///   file. A symlink at a component of the path fails the open with
+    ///   `ELOOP`.
+    pub async fn has_composefs_image(&self, commit: &Checksum) -> Result<bool> {
+        let repo = self.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || Ok(image_store::open_blocking(&repo, &commit)?.is_some())).await
     }
 
     /// Compares the stored composefs image of `commit` with the key
@@ -999,6 +1023,12 @@ impl Repo {
     /// returns, so a caller that reads the image through this file reads the
     /// inode that the call checked.
     ///
+    /// The call opens `extensions/ostrya/composefs/<xx>/<rest>.cfs` with one
+    /// `openat2` under the root of the repository, with `RESOLVE_BENEATH` and
+    /// `RESOLVE_NO_SYMLINKS`. A symlink at any component of the path fails the
+    /// open with `ELOOP`. The open has no fallback: an error of `openat2`,
+    /// `ENOSYS` included, fails the call.
+    ///
     /// If the image is sealed with fs-verity with SHA-256, 4096-byte blocks,
     /// no salt, and its full size, the call reads the digest from the kernel.
     /// The kernel then refuses each change of the image. Otherwise the call
@@ -1013,10 +1043,10 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the first entry of
     ///   `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
     ///   bytes.
-    /// - [`Error::ObjectNotFound`] with the type
-    ///   [`ObjectType::ComposefsImage`] if the repository holds no image of
-    ///   `commit`, or with the type [`ObjectType::Commit`] if the commit object
-    ///   is not in the object store.
+    /// - [`Error::ComposefsImageNotFound`] if the repository holds no image of
+    ///   `commit`.
+    /// - [`Error::ObjectNotFound`] if the commit object is not in the object
+    ///   store.
     /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
     ///   the key.
     /// - [`Error::Core`] if the commit object does not parse.
@@ -1041,10 +1071,7 @@ impl Repo {
                 sealed,
             }) = open_stored_image_blocking(&repo, &commit)?
             else {
-                return Err(Error::ObjectNotFound {
-                    checksum: commit,
-                    ty: ObjectType::ComposefsImage,
-                });
+                return Err(Error::ComposefsImageNotFound { commit });
             };
             let actual = match crate::file::sealed_digest(file.as_fd(), len, sealed) {
                 Some(digest) => digest,
@@ -1092,7 +1119,7 @@ struct StoredImage {
 /// reads its size and its fs-verity attribute with one `statx` of the open
 /// file. Returns `None` if the image is absent.
 fn open_stored_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<StoredImage>> {
-    let Some(file) = open_image_blocking(repo, commit)? else {
+    let Some(file) = image_store::open_blocking(repo, commit)? else {
         return Ok(None);
     };
     let stat = rustix::fs::statx(
@@ -1108,36 +1135,6 @@ fn open_stored_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<S
     }))
 }
 
-/// Opens the stored composefs image of `commit` in `repo` for reading, or
-/// returns `None` if the image is absent.
-///
-/// The open follows no symlink. In the strict open mode of
-/// [`Repo::open_at_strict`], it also does not wait on a FIFO, and it refuses
-/// a file that is not a regular file.
-fn open_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<std::fs::File>> {
-    use rustix::fs::{FileType, Mode, OFlags};
-
-    let path = loose_path(commit, ObjectType::ComposefsImage, repo.mode());
-    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
-    if repo.is_strict() {
-        flags |= OFlags::NONBLOCK | OFlags::NOCTTY;
-    }
-    let fd = match rustix::fs::openat(repo.objects_fd(), path.as_str(), flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    if repo.is_strict()
-        && FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile
-    {
-        return Err(Error::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "the composefs image is not a regular file",
-        )));
-    }
-    Ok(Some(std::fs::File::from(fd)))
-}
-
 /// Returns the fs-verity digest of the stored composefs image of `commit` in
 /// `repo`, or `None` if the image is absent.
 ///
@@ -1147,7 +1144,7 @@ pub(crate) fn stored_image_digest_blocking(
     repo: &Repo,
     commit: &Checksum,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(mut file) = open_image_blocking(repo, commit)? else {
+    let Some(mut file) = image_store::open_blocking(repo, commit)? else {
         return Ok(None);
     };
     Ok(Some(image_file_digest(&mut file)?))

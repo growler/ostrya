@@ -309,8 +309,7 @@ enum Command {
     /// key `ostrya.related` holds its build sources. The walk reads the two
     /// fields of each related commit too. An entry that names a commit that
     /// is not in the store gives no error. The command then keeps the
-    /// detached metadata and the composefs image of that commit if they are
-    /// in the store. For each defective value, the command writes a warning
+    /// detached metadata of that commit if it is in the store. For each defective value, the command writes a warning
     /// on standard error, and the defective value roots nothing. A detached
     /// metadata file that holds the key `ostrya.related` and does not parse
     /// fails the command. The command parses no detached metadata file that
@@ -324,6 +323,11 @@ enum Command {
     /// marker whose commit is not in the store. If `[core] tombstone-commits`
     /// is true, the command writes a `.tombstone-commit` for each deleted
     /// commit.
+    ///
+    /// The command deletes the composefs image of each commit that it
+    /// deletes, the file `extensions/ostrya/composefs/<xx>/<rest>.cfs`. It
+    /// deletes these images before it deletes the first commit. It keeps each
+    /// image whose commit is not in the store. No count includes an image.
     ///
     /// The command prints the total number of objects. It then prints the
     /// number of deleted objects and the freed size, or
@@ -350,13 +354,15 @@ enum Command {
     /// pull fetches the dependency. --no-mark-partial and
     /// --no-mark-dependencies each stop these marks.
     ///
-    /// After the walk, the command checks each composefs image object against
-    /// the key `ostree.composefs.digest.v0` of its commit. A faulty image is
-    /// an error, and --delete removes it: an image whose digest is not the
-    /// key, an image that does not read, and an image whose commit has no key
-    /// or a malformed key. If the commit of an image does not load, the
-    /// command reports an error and keeps the image. An image whose commit is
-    /// absent gets one line on standard output and is not an error.
+    /// After the walk, the command checks each composefs image in
+    /// `extensions/ostrya/composefs/` against the key
+    /// `ostree.composefs.digest.v0` of its commit. A faulty image is an
+    /// error, and --delete removes it: an image whose digest is not the key,
+    /// an image that does not read, and an image whose commit has no key or a
+    /// malformed key. If the commit of an image does not load, the command
+    /// reports an error and keeps the image. An image whose commit is absent
+    /// gets one line on standard output and is not an error. Each commit that
+    /// --delete or --add-tombstones deletes loses its image first.
     Fsck(FsckArgs),
     /// Report the paths that changed between two revisions or directories.
     ///
@@ -454,9 +460,10 @@ enum Command {
     PullLocal(PullLocalArgs),
     /// Store, locate, or check the composefs image of a commit.
     ///
-    /// The image of a commit is the object `objects/<xx>/<commit>.cfs`. Its
-    /// fs-verity digest is the value of `ostree.composefs.digest.v0` in the
-    /// metadata of the commit. The command takes exactly one of --add,
+    /// The image of a commit is the file
+    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository, where
+    /// `<xx><rest>` is the checksum of the commit. Its fs-verity digest is the
+    /// value of `ostree.composefs.digest.v0` in the metadata of the commit. The command takes exactly one of --add,
     /// --get-path, and --check.
     ///
     /// --add and --check print nothing on success, and --get-path prints one
@@ -1143,8 +1150,9 @@ struct CommitArgs {
     /// Store the composefs image of the tree with the commit.
     ///
     /// The option turns on --generate-composefs-metadata. The image is the
-    /// object `objects/<xx>/<commit>.cfs` of the repository, and its
-    /// fs-verity digest is the value of `ostree.composefs.digest.v0`. The
+    /// file `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository,
+    /// where `<xx><rest>` is the checksum of the commit, and its fs-verity
+    /// digest is the value of `ostree.composefs.digest.v0`. The
     /// command reads the tree one time for the digest and the image. This
     /// option is an extension of ostrya.
     #[arg(long)]
@@ -7190,7 +7198,7 @@ async fn composefs_image(repo: Repo, args: ComposefsImageArgs) -> Result<()> {
     }
     if let Some(rev) = args.get_path {
         let commit = resolve(&repo, &rev).await?;
-        if !repo.has_object(ObjectType::ComposefsImage, &commit).await? {
+        if !repo.has_composefs_image(&commit).await? {
             exit_error(&format!("commit {commit} has no composefs image"));
         }
         let path = std::path::absolute(repo.composefs_image_path(&commit))?;
@@ -12250,7 +12258,6 @@ fn object_type_name(ty: ObjectType) -> &'static str {
         ObjectType::FileXattrsLink => "file-xattrs-link",
         ObjectType::PayloadLink => "payload-link",
         ObjectType::TombstoneCommit => "tombstone-commit",
-        ObjectType::ComposefsImage => "composefs-image",
         _ => ty.type_str(),
     }
 }

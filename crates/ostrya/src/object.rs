@@ -12,7 +12,7 @@ use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
 
 use ostrya_core::Xattrs;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
@@ -42,20 +42,28 @@ pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::i
 
 /// Opens the file at `path` under `dir` for reading.
 ///
-/// If `strict` is set, the open follows no symlink and does not wait on a
-/// FIFO, and a file that is not a regular file is refused with the kind
-/// `ErrorKind::InvalidData`. A symlink fails the open with `ELOOP`. This is
-/// the strict open mode of [`Repo::open_at_strict`](crate::Repo::open_at_strict).
+/// If `strict` is set, the open is an `openat2` with `RESOLVE_BENEATH` and
+/// `RESOLVE_NO_SYMLINKS`. It follows no symlink in any component of `path`,
+/// it does not leave `dir`, and it does not wait on a FIFO. A file that is not
+/// a regular file is refused with the kind `ErrorKind::InvalidData`. A symlink
+/// fails the open with `ELOOP`. This is the strict open mode of
+/// [`Repo::open_at_strict`](crate::Repo::open_at_strict).
 pub(crate) fn open_regular_file(
     dir: rustix::fd::BorrowedFd<'_>,
     path: &str,
     strict: bool,
 ) -> std::io::Result<OwnedFd> {
-    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC;
-    if strict {
-        flags |= OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
-    }
-    let fd = rustix::fs::openat(dir, path, flags, Mode::empty())?;
+    let fd = if strict {
+        rustix::fs::openat2(
+            dir,
+            path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )?
+    } else {
+        rustix::fs::openat(dir, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?
+    };
     if strict && FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,

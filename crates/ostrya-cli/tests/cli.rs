@@ -23955,7 +23955,7 @@ fn flip_middle_byte(path: &Path) {
 
 /// The path of the composefs image of `commit` under the repository `repo`.
 fn image_path(repo: &Path, commit: &str) -> PathBuf {
-    repo.join("objects")
+    repo.join("extensions/ostrya/composefs")
         .join(&commit[..2])
         .join(format!("{}.cfs", &commit[2..]))
 }

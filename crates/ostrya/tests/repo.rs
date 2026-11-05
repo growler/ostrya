@@ -510,6 +510,143 @@ fn the_strict_open_refuses_a_symlinked_metadata_object() {
     assert!(matches!(err, ostrya::Error::Io(_)), "{err}");
 }
 
+/// A handle in the strict open mode refuses each object whose fan-out
+/// directory `objects/<xx>` is a symlink: a commit, a dirtree, a dirmeta, and
+/// a file, in `bare-user` and in `bare`. A handle of the default open follows
+/// the symlink.
+#[test]
+fn the_strict_open_refuses_a_symlinked_fanout() {
+    use ostrya::ObjectType;
+
+    for mode in ["bare-user", "bare"] {
+        let tmp = TmpDir::new("strict-fanout");
+        let status = Command::new("cp")
+            .arg("-a")
+            .arg(fixture_repo(mode))
+            .arg(tmp.path().join("repo"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -a of the {mode} fixture");
+        let parent = std::fs::File::open(tmp.path()).unwrap();
+        let fd = parent.as_fd();
+        let plain = block_on(Repo::open_at(fd, Path::new("repo"))).unwrap();
+        let strict = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap();
+        // The commit of the fixture, its root dirtree and dirmeta, and the
+        // first file that a walk of the tree finds.
+        let commit = block_on(plain.list_objects())
+            .unwrap()
+            .into_iter()
+            .find(|name| name.ty == ObjectType::Commit)
+            .expect("the fixture holds a commit")
+            .checksum;
+        let (commit_obj, _) = block_on(plain.load_commit(&commit)).unwrap();
+        let mut dirtree = commit_obj.root_dirtree;
+        let file = loop {
+            let tree = block_on(plain.load_dirtree(&dirtree)).unwrap();
+            if let Some((_, file)) = tree.files.first() {
+                break *file;
+            }
+            dirtree = tree.dirs.first().expect("the tree holds a file").1;
+        };
+        let objects = [
+            (ObjectType::Commit, commit),
+            (ObjectType::DirTree, commit_obj.root_dirtree),
+            (ObjectType::DirMeta, commit_obj.root_dirmeta),
+            (ObjectType::File, file),
+        ];
+        for (ty, checksum) in objects {
+            let hex = checksum.to_hex();
+            let fanout = tmp.path().join("repo/objects").join(&hex[..2]);
+            let moved = tmp.path().join("moved");
+            std::fs::rename(&fanout, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &fanout).unwrap();
+
+            if ty == ObjectType::File {
+                block_on(plain.load_file(&checksum)).expect("the default handle follows");
+                let err = block_on(strict.load_file(&checksum)).err().unwrap();
+                match err {
+                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
+                    other => panic!("{mode} {ty:?}: {other}"),
+                }
+            } else {
+                block_on(plain.load_object_bytes(ty, &checksum))
+                    .expect("the default handle follows");
+                let err = block_on(strict.load_object_bytes(ty, &checksum)).unwrap_err();
+                match err {
+                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
+                    other => panic!("{mode} {ty:?}: {other}"),
+                }
+                let err = block_on(strict.metadata_reader(ty, &checksum))
+                    .err()
+                    .expect("the strict reader refuses the symlink");
+                match err {
+                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
+                    other => panic!("{mode} {ty:?}: {other}"),
+                }
+            }
+
+            std::fs::remove_file(&fanout).unwrap();
+            std::fs::rename(&moved, &fanout).unwrap();
+        }
+    }
+}
+
+/// The reader of a regular file that a strict handle loaded opens the object
+/// again through its fan-out directory, and follows no symlink there. A
+/// symlink that replaces `objects/<xx>` after the load fails the reader with
+/// `ELOOP`. The reader of a handle of the default open follows the symlink.
+#[test]
+fn the_strict_reader_refuses_a_fanout_symlinked_after_the_load() {
+    use ostrya::ObjectType;
+
+    for mode in ["bare-user", "bare"] {
+        let tmp = TmpDir::new("strict-reader-fanout");
+        let status = Command::new("cp")
+            .arg("-a")
+            .arg(fixture_repo(mode))
+            .arg(tmp.path().join("repo"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -a of the {mode} fixture");
+        let parent = std::fs::File::open(tmp.path()).unwrap();
+        let fd = parent.as_fd();
+        let plain = block_on(Repo::open_at(fd, Path::new("repo"))).unwrap();
+        let strict = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap();
+        let (strict_file, plain_file) = block_on(strict.list_objects())
+            .unwrap()
+            .into_iter()
+            .filter(|name| name.ty == ObjectType::File)
+            .find_map(|name| {
+                let file = block_on(strict.load_file(&name.checksum)).unwrap();
+                (!file.is_symlink())
+                    .then(|| (file, block_on(plain.load_file(&name.checksum)).unwrap()))
+            })
+            .expect("the fixture holds a regular file");
+
+        let hex = strict_file.checksum().to_hex();
+        let fanout = tmp.path().join("repo/objects").join(&hex[..2]);
+        let copy = tmp.path().join("copy");
+        let status = Command::new("cp")
+            .arg("-a")
+            .arg(&fanout)
+            .arg(&copy)
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -a of objects/{}", &hex[..2]);
+        std::fs::remove_dir_all(&fanout).unwrap();
+        std::os::unix::fs::symlink(&copy, &fanout).unwrap();
+
+        block_on(plain_file.reader()).expect("the default handle follows");
+        let err = block_on(strict_file.reader())
+            .err()
+            .expect("the strict reader refuses the symlink");
+        match err {
+            Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
+            other => panic!("{mode}: {other}"),
+        }
+    }
+}
+
 /// Returns the error number `ELOOP`.
 fn eloop() -> i32 {
     rustix::io::Errno::LOOP.raw_os_error()

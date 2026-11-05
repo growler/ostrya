@@ -90,12 +90,13 @@ Ostrya adds these functions, which the `ostree` command does not have:
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
-- composefs image objects. `ostrya commit --generate-composefs` and
+- The composefs image store. `ostrya commit --generate-composefs` and
   `ostrya composefs-image --add` store the composefs image of a commit in the
-  repository, as `objects/<xx>/<commit>.cfs`. The fs-verity digest of the
-  image is the digest that the commit records. `ostrya composefs-image`
-  also checks a stored image and prints its path. Prune removes the image
-  with its commit, and fsck checks it. No transfer carries the image.
+  repository, as `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside
+  `objects/`. The fs-verity digest of the image is the digest that the commit
+  records. `ostrya composefs-image` also checks a stored image and prints its
+  path. Prune removes the image of each commit that it removes, and fsck
+  checks each image. No transfer carries the image.
 - composefs mounts. The library `ostrya-mount` mounts a commit as a composefs
   tree on Linux, from its stored image or from an image that it builds in
   memory. The mount reads the objects of the repository in place. Root in the
@@ -111,9 +112,8 @@ the protocols of these functions.
 
 Ostrya and the `ostree` command use the same repository format. The `ostree`
 command reads each repository that Ostrya writes, and Ostrya reads each
-repository that the `ostree` command writes. The `bare-user-shared` mode and a
-repository that holds a composefs image object are the exceptions, because
-only Ostrya writes them.
+repository that the `ostree` command writes. The `bare-user-shared` mode is the
+exception, because only Ostrya writes it.
 
 The `ostrya` command is functionally compatible with the `ostree` command. A
 command that `ostrya` carries takes the same option names and values, does the

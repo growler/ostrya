@@ -1038,7 +1038,16 @@ fn errno_of(e: &std::io::Error) -> Errno {
 
 /// Returns the failure that the daemon reports for the error `e` of a
 /// mount step or of the repository.
+///
+/// The failure of a stored image whose fs-verity digest is not the key of
+/// its commit names the commit and neither digest.
 fn failure_of(e: Error) -> Failure {
+    if let Error::Repo(ostrya::Error::ComposefsDigestMismatch { commit, .. }) = &e {
+        return Failure::new(
+            HelperCode::Repository,
+            format!("the stored composefs image of commit {commit} does not match its key"),
+        );
+    }
     let code = match &e {
         Error::Repo(_) | Error::UnsupportedMode(_) | Error::InvalidImage(_) => {
             HelperCode::Repository

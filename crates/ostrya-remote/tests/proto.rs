@@ -408,7 +408,6 @@ fn an_object_header_frame_equals_the_generic_encoding() {
     for msg in [
         header(DirTree, 0, Encoding::Deflate),
         header(CommitMeta, 0, Encoding::Deflate),
-        header(ComposefsImage, 0, Encoding::Deflate),
         header(TombstoneCommit, 0, Encoding::Raw),
     ] {
         let mut w = FrameWriter::new(Vec::new());

@@ -12,7 +12,9 @@ use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::FileReader;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags};
+use rustix::fs::{
+    AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxAttributes, StatxFlags,
+};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
@@ -173,7 +175,11 @@ impl FileObject {
     /// # Errors
     ///
     /// - [`Error::Io`] if the open of the object file fails. A missing object
-    ///   file also gives this variant.
+    ///   file also gives this variant. In the strict open mode of
+    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` gives this
+    ///   variant with `ELOOP`.
+    /// - [`Error::ObjectNotFound`] in the strict open mode if the fan-out
+    ///   directory `objects/<xx>` of the object is absent.
     pub async fn reader(&self) -> Result<ContentReader> {
         let payload = match &self.source {
             ReaderSource::None => None,
@@ -206,6 +212,9 @@ impl FileObject {
     /// - [`Error::Io`] if the open of the object file, a read of the payload,
     ///   or a write to `writer` fails. An `archive` payload that does not
     ///   inflate also gives this variant.
+    /// - [`Error::ObjectNotFound`] in the strict open mode of
+    ///   [`Repo::open_at_strict`] if the fan-out directory `objects/<xx>` of
+    ///   the object is absent.
     pub async fn write_to<W: futures_io::AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
         let reader = self.reader().await?;
         crate::write::copy_stream(reader, writer)
@@ -250,10 +259,24 @@ impl FileObject {
     /// `payload_offset` bytes. If `measure` is set, the same pool call also
     /// reads the number of bytes from there to the end of the file. If it is
     /// clear, that number is 0.
+    ///
+    /// In the strict open mode of [`Repo::open_at_strict`], the fan-out
+    /// directory of a loose object opens first, as [`open_fanout_beneath`]
+    /// states, and the object file opens relative to it. So a symlink at
+    /// `objects/<xx>` fails the open with `ELOOP`, also if it replaced the
+    /// directory after the load.
     async fn open_payload(&self, payload_offset: u64, measure: bool) -> Result<Payload> {
         let (dir, path) = self.payload_location()?;
+        let beneath = matches!(self.store, ObjectStore::Repo) && self.repo.is_strict();
+        let checksum = self.checksum;
         ostrya_rt::unblock(move || {
-            let file = object::open_content_file(dir.as_fd(), &path, payload_offset)?;
+            let file = match path.split_once('/').filter(|_| beneath) {
+                Some((fanout, name)) => {
+                    let sub = open_fanout_beneath(dir.as_fd(), fanout, &checksum)?;
+                    object::open_content_file(sub.as_fd(), name, payload_offset)?
+                }
+                None => object::open_content_file(dir.as_fd(), &path, payload_offset)?,
+            };
             let len = if measure {
                 file.metadata()?.len().saturating_sub(payload_offset)
             } else {
@@ -262,7 +285,6 @@ impl FileObject {
             Ok((file, len))
         })
         .await
-        .map_err(Error::Io)
     }
 }
 
@@ -357,10 +379,9 @@ impl Repo {
         let path = loose_path(checksum, ObjectType::File, mode);
         let repo = self.clone();
         let key = *checksum;
-        let loaded = ostrya_rt::unblock(move || {
-            load_by_mode(repo.objects_fd(), &path, &key, mode, measure, false)
-        })
-        .await?;
+        let loaded =
+            ostrya_rt::unblock(move || load_loose(&repo, &path, &key, mode, measure, false))
+                .await?;
         Ok(FileObject {
             repo: self.clone(),
             checksum: *checksum,
@@ -388,10 +409,8 @@ impl Repo {
         let path = loose_path(checksum, ObjectType::File, mode);
         let repo = self.clone();
         let key = *checksum;
-        let loaded = ostrya_rt::unblock(move || {
-            load_by_mode(repo.objects_fd(), &path, &key, mode, false, true)
-        })
-        .await?;
+        let loaded =
+            ostrya_rt::unblock(move || load_loose(&repo, &path, &key, mode, false, true)).await?;
         Ok(self.opened(checksum, loaded))
     }
 
@@ -639,6 +658,31 @@ fn load_by_mode(
     }
 }
 
+/// Calls the loader of the repository mode for the loose object at `path`
+/// under `objects/` of `repo`, as [`load_by_mode`] does.
+///
+/// In the strict open mode of [`Repo::open_at_strict`], the fan-out directory
+/// opens first, as [`open_fanout_beneath`] states, and the object loads
+/// relative to it. So a symlink at `objects/<xx>` fails the load with
+/// `ELOOP`.
+fn load_loose(
+    repo: &Repo,
+    path: &str,
+    checksum: &Checksum,
+    mode: RepoMode,
+    measure: bool,
+    keep: bool,
+) -> Result<Loaded> {
+    if !repo.is_strict() {
+        return load_by_mode(repo.objects_fd(), path, checksum, mode, measure, keep);
+    }
+    let (fanout, name) = path
+        .split_once('/')
+        .expect("a loose path names its fan-out directory");
+    let dir = open_fanout_beneath(repo.objects_fd(), fanout, checksum)?;
+    load_by_mode(dir.as_fd(), name, checksum, mode, measure, keep)
+}
+
 /// Maps a syscall error to `ObjectNotFound` for a missing object, and to `Io`
 /// for all other errors.
 fn map_object_error(err: Errno, checksum: &Checksum, ty: ObjectType) -> Error {
@@ -692,6 +736,24 @@ fn open_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, checksum: &Checksum) ->
         }
         Err(e) => Err(map_object_error(e, checksum, ObjectType::File)),
     }
+}
+
+/// Opens the fan-out directory `fanout` of `objects/` as a path descriptor
+/// with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. A symlink
+/// there fails with `ELOOP`. A missing entry gives `ObjectNotFound`.
+fn open_fanout_beneath(
+    objects_fd: BorrowedFd<'_>,
+    fanout: &str,
+    checksum: &Checksum,
+) -> Result<OwnedFd> {
+    rustix::fs::openat2(
+        objects_fd,
+        fanout,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )
+    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
 }
 
 /// Opens a regular-file object and follows no symlink. A missing object gives

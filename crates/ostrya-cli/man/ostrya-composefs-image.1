@@ -8,7 +8,7 @@ ostrya composefs\-image [OPTIONS] <\-\-add <REV>|\-\-get\-path <REV>|\-\-check <
 .SH DESCRIPTION
 Store, locate, or check the composefs image of a commit.
 .PP
-The image of a commit is the object \fB\%objects/<xx>/<commit>.cfs\fR\&. Its \%fs\-verity digest is the value of \fB\%ostree.composefs.digest.v0\fR in the metadata of the commit. The command takes exactly one of \%\-\-add, \%\-\-get\-path, and \%\-\-check.
+The image of a commit is the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR of the repository, where \fB\%<xx><rest>\fR is the checksum of the commit. Its \%fs\-verity digest is the value of \fB\%ostree.composefs.digest.v0\fR in the metadata of the commit. The command takes exactly one of \%\-\-add, \%\-\-get\-path, and \%\-\-check.
 .PP
 \%\-\-add and \%\-\-check print nothing on success, and \%\-\-get\-path prints one line. If the action fails, the command writes one \fB\%error:\fR line to standard error and exits \%1. This command is an extension of ostrya.
 .SH OPTIONS

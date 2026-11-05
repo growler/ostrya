@@ -5054,7 +5054,7 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 ## Port extensions with no counterpart in the tool
 
 The tool has no push, no pull over ssh, no server, no composefs image
-object, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
+store, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
 `send`, `composefs-image`, `remote init`, `remote fsck`, and `remote prune`
 are commands of the port alone, so no matrix cell compares them with the
 tool. `pull`, `remote
@@ -6197,7 +6197,8 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   `--get-path`, and `--check`. With none or with two, the option parser
   writes the usage text and the error, and the command exits 1.
 - `--add` builds the composefs image of the commit and stores it as
-  `objects/<xx>/<commit>.cfs`. The commit must carry
+  `extensions/ostrya/composefs/<xx>/<rest>.cfs`, where `<xx><rest>` is the
+  checksum of the commit. The commit must carry
   `ostree.composefs.digest.v0`. A commit without the key, or with a value
   that is not an `ay` of 32 bytes, gets `error: MESSAGE` at exit 1, and the
   command stores nothing. The command checks the digest of the image
@@ -6218,19 +6219,25 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   option turns on `--generate-composefs-metadata`, so the commit is the
   commit that the tool writes with `--generate-composefs-metadata`. The tool
   refuses `--generate-composefs` as an unknown option.
-- The tool has no image object. A repository that holds an image is a port
-  repository, and the cross-checks with the tool run on repositories with
-  no image. `../format-reference.md`, "The composefs image object", states
-  the object.
-- `prune` removes an image with its commit and removes an image whose
-  commit is absent. No count of its output includes an image.
+- The tool has no image store. `objects/` of a repository that holds images
+  holds only the object types of the tool, so the tool reads the
+  repository. `ostree fsck` and `ostree prune` neither check, count, nor
+  remove an image (`cli-behavior.md`, "CLI output formats", "Composefs
+  images in a prune" and "Composefs images in fsck"). So a prune of the tool
+  keeps the image of each commit that it deletes, and the `fsck` of the port
+  then notes the image. `../format-reference.md`, "The composefs image
+  store", states the store.
+- `prune` removes the image of each commit that it removes. It removes
+  these images before the first commit. It keeps an image whose commit is absent, because it does not
+  list the images. No count of its output includes an image.
 - `fsck` checks each image against the key of its commit after the object
   walk. For an image whose digest is not the key, an image that does not
   read, or an image whose commit has no key or a malformed key, it writes
   one `composefs image of commit CHECKSUM: REASON` line to standard error,
   and the run ends with `error: Repository corruption encountered` at exit
   1. `--delete` unlinks such an image, and no image marks a commit as
-  partial. If the commit of an image is present and does not load, `fsck`
+  partial. Each commit that `--delete` or `--add-tombstones` deletes loses
+  its image first, and the run writes no line for that image. If the commit of an image is present and does not load, `fsck`
   writes the same line and keeps the image. For an image whose commit is
   absent, it writes `Composefs image with no commit: CHECKSUM` to standard
   output, and this line is not an error. A repository with no image gets

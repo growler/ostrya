@@ -90,7 +90,8 @@ pub struct TransactionStats {
 struct StagedObject {
     /// The flat name of the object in the staging directory.
     staging_name: String,
-    /// The loose path under `objects/` that the object publishes to.
+    /// The loose path under `objects/` that the object publishes to. For a
+    /// composefs image, the path under `extensions/ostrya/composefs/`.
     dest: String,
 }
 
@@ -117,6 +118,9 @@ struct Staged {
     /// The objects staged so far, by identity and type, for the dedup in the
     /// transaction and for publication at commit.
     objects: HashMap<(Checksum, ObjectType), StagedObject>,
+    /// The composefs images staged so far, by the checksum of their commit,
+    /// for publication into `extensions/ostrya/composefs/` at commit.
+    images: HashMap<Checksum, StagedObject>,
     /// The size record of each object in archive mode, by checksum. The
     /// records cover content and metadata objects, the input of `ostree.sizes`.
     sizes: HashMap<Checksum, SizeRecord>,
@@ -348,6 +352,7 @@ impl Transaction {
             generate_sizes_override: None,
             staged: Mutex::new(Staged {
                 objects: HashMap::new(),
+                images: HashMap::new(),
                 sizes: HashMap::new(),
                 size_scope: None,
                 free_budget,
@@ -580,6 +585,12 @@ impl Transaction {
             .unwrap()
             .objects
             .contains_key(&(*checksum, ty))
+    }
+
+    /// Returns `true` if a composefs image of `commit` is staged in this
+    /// transaction.
+    pub(crate) fn is_image_staged(&self, commit: &Checksum) -> bool {
+        self.staged.lock().unwrap().images.contains_key(commit)
     }
 
     /// Returns, for each checksum of `checksums`, `true` if an object of that
@@ -1285,19 +1296,27 @@ impl Transaction {
     /// directory as the image of `commit`.
     ///
     /// The image takes its size from the free-space budget. It adds no size
-    /// record and no statistic.
+    /// record and no statistic. A second record of an image of the same
+    /// commit does nothing.
     pub(crate) fn record_image(&self, commit: Checksum, outcome: StageOutcome) -> Result<()> {
-        let mode = self.repo.mode();
-        self.record_object(
+        let mut staged = self.staged.lock().unwrap();
+        if staged.images.contains_key(&commit) {
+            return Ok(());
+        }
+        if outcome.on_disk_size > staged.free_budget {
+            return Err(Error::InsufficientFreeSpace {
+                shortfall: outcome.on_disk_size - staged.free_budget,
+            });
+        }
+        staged.free_budget -= outcome.on_disk_size;
+        staged.images.insert(
             commit,
-            ObjectType::ComposefsImage,
-            mode,
-            outcome,
-            false,
-            false,
-            false,
-        )
-        .map(|_| ())
+            StagedObject {
+                staging_name: outcome.staging_name,
+                dest: outcome.dest,
+            },
+        );
+        Ok(())
     }
 
     /// Records the outcome of a staged object, as [`record`](Transaction::record)
@@ -1324,10 +1343,8 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mut staged = self.staged.lock().unwrap();
         // The totals count each object offered, dedup hits included. They are
-        // the work that the caller asked for. A composefs image is a sidecar
-        // of its commit, as `.commitmeta` is, and no statistic counts it.
+        // the work that the caller asked for.
         match ty {
-            ObjectType::ComposefsImage => {}
             ObjectType::File => staged.stats.content_total += 1,
             _ => staged.stats.metadata_total += 1,
         }
@@ -1390,7 +1407,6 @@ impl Transaction {
             );
         }
         match ty {
-            ObjectType::ComposefsImage => {}
             ObjectType::File => {
                 staged.stats.content_written += 1;
                 staged.stats.content_bytes_written += outcome.on_disk_size;
@@ -1443,8 +1459,10 @@ impl Transaction {
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     ///    queued, as [`Repo::write_commit_detached_metadata`] does. On a
     ///    refusal the call publishes no object and writes nothing.
-    /// 2. The call renames each staged object into `objects/<xx>/`. The
-    ///    composefs images go after all other objects. The rename of an image
+    /// 2. The call renames each staged object into `objects/<xx>/`, and then
+    ///    each staged composefs image into
+    ///    `extensions/ostrya/composefs/<xx>/`. So an image is in place only
+    ///    after each object of the transaction. The rename of an image
     ///    replaces a stored image of the same commit.
     /// 3. The call writes the queued detached-metadata edits.
     /// 4. The call writes the queued refs. Each ref write is atomic: a temp
@@ -1461,8 +1479,12 @@ impl Transaction {
     /// repository config. With fsync on, the call syncs as follows:
     ///
     /// - Before the renames of step 2, it runs `syncfs` on the repository.
-    /// - After the renames, it runs `fsync` on each fanout directory that got
-    ///   an object, and on `objects/`.
+    /// - After the renames of the objects, it runs `fsync` on each fanout
+    ///   directory that got an object, and on `objects/`.
+    /// - After the renames of the images, it runs `fsync` on each
+    ///   `extensions/ostrya/composefs/<xx>/` directory that got an image, and
+    ///   on `extensions/ostrya/composefs/`. It syncs each directory that the
+    ///   call creates into its parent.
     /// - Before the rename of each ref, it runs `fdatasync` on the temp file.
     /// - After the last ref rename, it runs `fsync` once on each directory that
     ///   gained or lost a ref name, deepest first.
@@ -1505,6 +1527,10 @@ impl Transaction {
     ///   [`add_detached_related`](Transaction::add_detached_related) queued
     ///   meets a defective stored `ostrya.related` value. The published
     ///   objects stay, and the call writes no ref.
+    /// - [`Error::InvalidFormat`] if a staged composefs image meets a
+    ///   component of `extensions/ostrya/composefs/<xx>/` that is a symlink or
+    ///   no directory. The objects and the images that the call renamed
+    ///   before stay, and the call writes no detached metadata and no ref.
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`. The published objects stay, and the call
     ///   writes no detached metadata and no ref.
@@ -1628,8 +1654,12 @@ impl Transaction {
             return Ok(());
         }
         // Each object in the count is in the staging directory before the
-        // `syncfs` starts, because an object is recorded after its write.
-        let count = self.staged.lock().unwrap().objects.len();
+        // `syncfs` starts, because an object is recorded after its write. A
+        // composefs image is in the staging directory too.
+        let count = {
+            let staged = self.staged.lock().unwrap();
+            staged.objects.len() + staged.images.len()
+        };
         let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
         ostrya_rt::unblock(move || rustix::fs::syncfs(repo_fd.as_fd())).await?;
         self.staged.lock().unwrap().presynced = Some(count);
@@ -1642,7 +1672,7 @@ impl Transaction {
     /// object durable already.
     fn syncfs_at_publish(&self, fsync: bool) -> bool {
         let staged = self.staged.lock().unwrap();
-        fsync && staged.presynced != Some(staged.objects.len())
+        fsync && staged.presynced != Some(staged.objects.len() + staged.images.len())
     }
 
     /// Discards the transaction and its staged objects, and releases the lock.
@@ -1659,25 +1689,20 @@ impl Transaction {
         Ok(())
     }
 
-    /// Renames each staged object into `objects/` on the blocking pool.
+    /// Renames each staged object into `objects/`, and then each staged
+    /// composefs image into `extensions/ostrya/composefs/`, on the blocking
+    /// pool.
     ///
     /// Returns `true` if the step ran its `syncfs`.
     async fn publish(&self) -> Result<bool> {
-        let objects: Vec<(String, String)> = {
+        let (objects, images) = {
             let staged = self.staged.lock().unwrap();
-            // The composefs images go last. An image is then in `objects/`
-            // only after each object that its commit reaches.
-            let (images, others): (Vec<_>, Vec<_>) = staged
-                .objects
-                .iter()
-                .partition(|((_, ty), _)| *ty == ObjectType::ComposefsImage);
-            others
-                .into_iter()
-                .chain(images)
-                .map(|(_, o)| (o.staging_name.clone(), o.dest.clone()))
-                .collect()
+            (
+                rename_pairs(staged.objects.values()),
+                rename_pairs(staged.images.values()),
+            )
         };
-        if objects.is_empty() {
+        if objects.is_empty() && images.is_empty() {
             return Ok(false);
         }
         let (fsync, _) = self.fsync_flags()?;
@@ -1692,6 +1717,7 @@ impl Transaction {
                 objects_fd.as_fd(),
                 staging_fd.as_fd(),
                 &objects,
+                &images,
                 syncfs,
                 fsync,
                 repo_mode,
@@ -1708,6 +1734,13 @@ impl Transaction {
             ostrya_rt::unblock(move || drop(staging)).await;
         }
     }
+}
+
+/// Returns the staging name and the destination of each staged entry.
+fn rename_pairs<'a>(staged: impl Iterator<Item = &'a StagedObject>) -> Vec<(String, String)> {
+    staged
+        .map(|o| (o.staging_name.clone(), o.dest.clone()))
+        .collect()
 }
 
 /// The queued detached-metadata edits of a commit, taken from the

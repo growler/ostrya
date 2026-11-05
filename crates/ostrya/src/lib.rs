@@ -86,6 +86,7 @@ pub mod fsck;
 #[cfg(feature = "verify-gpg")]
 pub mod gpg;
 mod hashing;
+mod image_store;
 mod inflate;
 mod ingest;
 mod jobs;

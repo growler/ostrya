@@ -516,8 +516,9 @@ struct RepoInner {
     // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
     // The strict open mode of `Repo::open_at_strict`: the reads of `config`,
-    // of the metadata objects, and of the composefs image follow no symlink,
-    // do not block on a FIFO, and refuse a file that is not a regular file.
+    // of the objects, and of the composefs image follow no symlink in any
+    // component of their path, do not block on a FIFO, and refuse a file that
+    // is not a regular file.
     strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
@@ -641,9 +642,19 @@ impl Repo {
     ///   directory, so the handle has no remotes directory.
     /// - The open of `objects` follows no symlink.
     /// - The reads of `config`, of each metadata object, and of the stored
-    ///   composefs image open the file with `O_NOFOLLOW` and `O_NONBLOCK`,
-    ///   and refuse a file that is not a regular file. A symlink, a FIFO, or
-    ///   a device at such a path fails the read and does not block it.
+    ///   composefs image open the file with `openat2`, `RESOLVE_BENEATH`,
+    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is
+    ///   not a regular file. A symlink at any component of the path, a FIFO,
+    ///   or a device fails the read and does not block it.
+    /// - The load of a file object opens its fan-out directory
+    ///   `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
+    ///   `RESOLVE_NO_SYMLINKS`, and loads the object relative to it. A symlink
+    ///   at `objects/<xx>` fails the load. Each open of the payload by the
+    ///   [`FileObject`](crate::FileObject) of the load opens `objects/<xx>`
+    ///   again in the same way.
+    ///
+    /// The open of `openat2` has no fallback. On a kernel without the call,
+    /// each of these reads fails.
     ///
     /// The function is not a stable API.
     ///

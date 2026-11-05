@@ -6,6 +6,10 @@
 //! - an `archive` repository;
 //! - a commit without the composefs key, a commit with no stored image, and
 //!   a stored image with one byte changed;
+//! - a symlink at each component of the path of a stored image;
+//! - in the strict open mode, a symlink at the fan-out directory of the
+//!   commit for a stored mount, and of the commit, a dirtree, a dirmeta, and a
+//!   file for a built mount;
 //! - an image of the caller that is empty or whose size is not a multiple of
 //!   4096 bytes;
 //! - a built mount with `[ex-integrity] fsverity=yes` and an object with no
@@ -19,7 +23,7 @@ mod common;
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use ostrya::{ObjectType, RepoMode};
+use ostrya::RepoMode;
 use ostrya_mount::{Access, Direct, Error, Helper, HelperCode, MountOptions, Mounter};
 use ostrya_rt::block_on;
 
@@ -136,10 +140,7 @@ fn a_stored_mount_needs_a_valid_image() {
         assert!(
             matches!(
                 err,
-                Error::Repo(ostrya::Error::ObjectNotFound {
-                    ty: ObjectType::ComposefsImage,
-                    ..
-                })
+                Error::Repo(ostrya::Error::ComposefsImageNotFound { commit }) if commit == keyed
             ),
             "{err}"
         );
@@ -160,6 +161,118 @@ fn a_stored_mount_needs_a_valid_image() {
             ),
             "{err}"
         );
+    });
+    assert_empty(&target);
+}
+
+/// Returns `true` if `err` is a repository error with the error number
+/// `ELOOP`.
+fn is_eloop(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Repo(ostrya::Error::Io(e)) if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+    )
+}
+
+/// Replaces the directory `path` with a symlink to `moved`, runs `f`, and
+/// puts the directory back.
+async fn with_symlink<F: std::future::Future<Output = ()>>(path: &Path, moved: &Path, f: F) {
+    std::fs::rename(path, moved).unwrap();
+    std::os::unix::fs::symlink(moved, path).unwrap();
+    f.await;
+    std::fs::remove_file(path).unwrap();
+    std::fs::rename(moved, path).unwrap();
+}
+
+/// A symlink at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/` of the
+/// path of a stored image stops a stored mount with `ELOOP`.
+#[test]
+fn a_symlink_in_the_image_path_stops_a_stored_mount() {
+    let scratch = TmpDir::new("image-symlink");
+    let base = scratch.path().join("tree");
+    build_source(&base);
+    let target = scratch.path().join("mnt");
+    std::fs::create_dir(&target).unwrap();
+    block_on(async {
+        let root = scratch.path().join("repo");
+        let repo = new_repo(&root, RepoMode::BareUser, "").await;
+        let commit = commit_tree(&repo, &base, 1, Key::Image).await;
+        let hex = commit.to_hex();
+        let moved = scratch.path().join("moved");
+        for part in [
+            "extensions".to_owned(),
+            "extensions/ostrya".to_owned(),
+            "extensions/ostrya/composefs".to_owned(),
+            format!("extensions/ostrya/composefs/{}", &hex[..2]),
+        ] {
+            with_symlink(&root.join(&part), &moved, async {
+                let err = Direct::new()
+                    .mount_stored(&repo, &commit, &target, &MountOptions::default())
+                    .await
+                    .unwrap_err();
+                assert!(is_eloop(&err), "{part}: {err}");
+            })
+            .await;
+        }
+    });
+    assert_empty(&target);
+}
+
+/// With a handle of the strict open mode, a symlink at the fan-out directory
+/// of the commit stops a stored mount, and a symlink at the fan-out
+/// directory of the commit, of the root dirtree, of the root dirmeta, or of a
+/// file stops a built mount, each with `ELOOP`.
+#[test]
+fn a_symlinked_fanout_stops_a_mount_of_a_strict_handle() {
+    let scratch = TmpDir::new("fanout-symlink");
+    let base = scratch.path().join("tree");
+    build_source(&base);
+    let target = scratch.path().join("mnt");
+    std::fs::create_dir(&target).unwrap();
+    block_on(async {
+        let root = scratch.path().join("repo");
+        let commit = {
+            let repo = new_repo(&root, RepoMode::BareUser, "").await;
+            commit_tree(&repo, &base, 1, Key::Image).await
+        };
+        let parent = std::fs::File::open(scratch.path()).unwrap();
+        let repo = ostrya::Repo::open_at_strict(parent.as_fd(), Path::new("repo"))
+            .await
+            .unwrap();
+        let (commit_obj, _) = repo.load_commit(&commit).await.unwrap();
+        let file = common::object_with_content(
+            &root,
+            b"hello composefs
+",
+        );
+        let objects = root.join("objects");
+        let fanout = |hex: String| objects.join(&hex[..2]);
+        let moved = scratch.path().join("moved");
+        let opts = MountOptions::default();
+
+        with_symlink(&fanout(commit.to_hex()), &moved, async {
+            let err = Direct::new()
+                .mount_stored(&repo, &commit, &target, &opts)
+                .await
+                .unwrap_err();
+            assert!(is_eloop(&err), "stored commit: {err}");
+        })
+        .await;
+        for (what, dir) in [
+            ("commit", fanout(commit.to_hex())),
+            ("dirtree", fanout(commit_obj.root_dirtree.to_hex())),
+            ("dirmeta", fanout(commit_obj.root_dirmeta.to_hex())),
+            ("file", file.parent().unwrap().to_owned()),
+        ] {
+            with_symlink(&dir, &moved, async {
+                let err = Direct::new()
+                    .mount_built(&repo, &commit, &target, &opts)
+                    .await
+                    .unwrap_err();
+                assert!(is_eloop(&err), "built {what}: {err}");
+            })
+            .await;
+        }
     });
     assert_empty(&target);
 }

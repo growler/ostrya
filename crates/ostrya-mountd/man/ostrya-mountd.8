@@ -98,12 +98,18 @@ The worker refuses a target or a repository on FUSE, and an
 mount than the repository directory.
 .IP 3. 4
 The daemon reads the repository through a copy of its mount that holds no
-mount below it. Each read of a file of the repository follows no symlink,
-does not wait on a FIFO, and refuses a file that is not a regular file.
+mount below it. Each read of a file of the repository opens it with
+\fBopenat2\fR(2), \fBRESOLVE_BENEATH\fR, and \fBRESOLVE_NO_SYMLINKS\fR, so a
+symlink at any component of its path stops the read. The read does not
+wait on a FIFO, and it refuses a file that is not a regular file. The
+daemon has no fallback for a kernel without \fBopenat2\fR(2).
 The daemon checks that the \fBobjects\fR directory of the repository is the
 directory that the worker opened, and refuses an \fBarchive\fR repository.
-For a stored image, it compares the fs-verity digest of the image with the
-key \fBostree.composefs.digest.v0\fR of the commit. For a built image, it
+For a stored image, it opens
+\fBextensions/ostrya/composefs/\fIaa\fB/\fIrest\fB.cfs\fR under the
+repository directory and compares the fs-verity digest of the image with
+the key \fBostree.composefs.digest.v0\fR of the commit. If the two are
+different, the reply names the commit and neither digest. For a built image, it
 writes the image to a sealed memory file. It refuses a built image larger
 than \fB\-\-max\-image\-size\fR before it writes the image.
 .IP 4. 4
@@ -157,16 +163,20 @@ that is root in the initial user namespace does not read it, and a client
 whose real user or group id is not its effective one does not read it.
 .SH SECURITY
 .IP \(bu 2
-The access to the socket is the trust boundary. A member of the group of
-the socket can read each file below a directory named \fBobjects\fR that
-it can open, in a directory that it can open, because overlayfs reads the
-data layer with the credentials of the mounter, the daemon. This includes
-objects of other commits, and files whose mode refuses a read by the
-caller.
+The access to the socket is the trust boundary. The daemon reads the
+repository with its own credentials, as overlayfs reads the data layer
+with the credentials of the mounter. A member of the group of the socket
+can make the daemon read these files of a repository directory whose
+\fBobjects\fR directory it can open: each file below \fBobjects\fR, the
+file \fBconfig\fR, and the file
+\fBextensions/ostrya/composefs/\fIaa\fB/\fIrest\fB.cfs\fR. The modes of
+these files, and of the directories between them and the repository
+directory, do not stop the read. This includes objects of other commits.
 .IP \(bu 2
 The daemon mounts a stored image only after its digest matches the key
 of the commit. The caller can write both the image and the commit, so the
-check does not limit the objects that an image can name.
+check does not limit the objects that an image can name. A refusal tells
+the caller if the image exists.
 .IP \(bu 2
 Each mount of the daemon has \fBnosuid\fR and \fBnodev\fR. The top overlay
 belongs to the user namespace of the caller, so the caller can clear the

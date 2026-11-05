@@ -2709,9 +2709,9 @@ pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> 
 pub(crate) const SUMMARY_DIR: &str = "extensions/ostrya/summary";
 /// The components of [`SUMMARY_DIR`], from the repository root.
 const SUMMARY_DIR_PARTS: [&str; 3] = ["extensions", "ostrya", "summary"];
-/// The mode of each directory of [`SUMMARY_DIR`] that the writer creates,
-/// before the file-creation mask.
-const SUMMARY_DIR_MODE: u32 = 0o775;
+/// The mode of each directory under `extensions/ostrya/` that a writer
+/// creates, before the file-creation mask.
+pub(crate) const EXTENSION_DIR_MODE: u32 = 0o775;
 /// The suffix of the signature file of the summary of an item.
 pub(crate) const SIG_SUFFIX: &str = ".sig";
 /// The suffix of the file that holds the access digest of an item.
@@ -2728,25 +2728,37 @@ pub(crate) fn access_file_bytes(digest: &Checksum) -> Vec<u8> {
     format!("{}\n", digest.to_hex()).into_bytes()
 }
 
-/// Opens [`SUMMARY_DIR`] under `repo_fd`, one component at a time, with no
-/// symlink followed.
-///
-/// With `create`, the mode of the repository, the call creates each
-/// component that does not exist, with [`SUMMARY_DIR_MODE`], and forces the
-/// shared mode on it in a `bare-user-shared` repository. With `fsync`, it
-/// then syncs the parent of each directory that it creates. Without
-/// `create`, a component that does not exist gives `None`.
-///
-/// A component that is a symlink, or that is no directory, gives
-/// [`Error::InvalidFormat`].
+/// Opens [`SUMMARY_DIR`] under `repo_fd`, as [`open_extension_dir`] does.
 fn open_summary_dir(
     repo_fd: BorrowedFd<'_>,
     create: Option<RepoMode>,
     fsync: bool,
 ) -> Result<Option<OwnedFd>> {
+    open_extension_dir(repo_fd, &SUMMARY_DIR_PARTS, "the summaries", create, fsync)
+}
+
+/// Opens the directory `parts` under `repo_fd`, one component at a time,
+/// with no symlink followed.
+///
+/// With `create`, the mode of the repository, the call creates each
+/// component that does not exist, with [`EXTENSION_DIR_MODE`], and forces the
+/// shared mode on it in a `bare-user-shared` repository. With `fsync`, it
+/// then syncs the parent of each directory that it creates. Without
+/// `create`, a component that does not exist gives `None`.
+///
+/// A component that is a symlink, or that is no directory, gives
+/// [`Error::InvalidFormat`]. The message names the path and `what`, the files
+/// of the directory.
+pub(crate) fn open_extension_dir(
+    repo_fd: BorrowedFd<'_>,
+    parts: &[&str],
+    what: &str,
+    create: Option<RepoMode>,
+    fsync: bool,
+) -> Result<Option<OwnedFd>> {
     let mut dir: Option<OwnedFd> = None;
     let mut path = String::new();
-    for part in SUMMARY_DIR_PARTS {
+    for &part in parts {
         let parent = dir.as_ref().map_or(repo_fd, AsFd::as_fd);
         if !path.is_empty() {
             path.push('/');
@@ -2763,7 +2775,7 @@ fn open_summary_dir(
         let opened = match (open(), create) {
             (Err(Errno::NOENT), None) => return Ok(None),
             (Err(Errno::NOENT), Some(mode)) => {
-                match rustix::fs::mkdirat(parent, part, Mode::from_raw_mode(SUMMARY_DIR_MODE)) {
+                match rustix::fs::mkdirat(parent, part, Mode::from_raw_mode(EXTENSION_DIR_MODE)) {
                     Ok(()) => {
                         perm::force_created_dir(parent, part, mode)?;
                         if fsync {
@@ -2781,7 +2793,7 @@ fn open_summary_dir(
             Ok(fd) => fd,
             Err(Errno::NOTDIR | Errno::LOOP) => {
                 return Err(Error::InvalidFormat(format!(
-                    "{path} is not a directory; the summaries follow no symlink"
+                    "{path} is not a directory; {what} follow no symlink"
                 )));
             }
             Err(e) => return Err(e.into()),

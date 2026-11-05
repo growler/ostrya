@@ -381,15 +381,39 @@ The XATTR_FILTER field hashes each xattr name with xxHash32. The xxHash32 in
 `crates/ostrya-composefs/src/xxhash.rs` is written in the tree to add no
 crate. The golden filter bytes verify it.
 
-## The composefs image object
+## The composefs image store
 
-The port stores the composefs image of a commit as an object of the type 100
-(`format-reference.md`, "The composefs image object"). The `ostree` command
-does not know this type. A read of a port repository that holds images by
-the `ostree` command is not a goal. The cross-checks in which the `ostree`
-command reads the output of the port cover repositories and static deltas
-with no image. The port reads the repositories and the static deltas of the
-`ostree` command.
+The port stores the composefs image of a commit as a file of the repository
+outside `objects/`, `extensions/ostrya/composefs/<xx>/<rest>.cfs`
+(`format-reference.md`, "The composefs image store"). So `objects/` holds
+only the object types that the `ostree` command knows. No transfer carries an
+image: a repository that needs an image builds it.
+
+The name of the file is the checksum of the commit. Two commits that share
+one tree each have their own file, with the same bytes, because the image
+depends on the tree alone.
+
+Rejected alternatives:
+
+- An image commit that the commit names by `root/composefs` in field 2. A
+  commit that is a dependency then cannot carry an image, because a
+  dependency names no dependency.
+- An image commit that the commit names by `root/composefs` in
+  `ostrya.related`. No transfer follows a build source,
+  `keep-detached-related=false` drops the entry, and the prune of a bucket
+  repository reads no `.commitmeta`. So the image stays local, with more
+  indirection than a file.
+- A file named by the fs-verity digest of the image. The prune must then
+  check each kept commit before it deletes an image.
+
+The prune deletes the image of a commit before the commit, so it leaves no
+image whose commit it deleted. It deletes the images of all the commits that
+it deletes in one pass before the first commit, and syncs each directory of
+the images one time. One sync for each commit costs one open and one sync
+of the directories for each deleted commit. A stop between the pass and the
+commits leaves unreachable commits with no image, and the next prune deletes
+them. The prune does not list the images. An image whose commit is absent
+comes only from a change outside the port, and the fsck notes it.
 
 ## The mount daemon
 
@@ -416,6 +440,32 @@ The daemon checks that the sent user namespace owns the sent mount
 namespace, and that it is not the initial user namespace. It does not check
 that the peer is a member of the namespaces that it sends. A client such as
 ostree-podman sends the namespaces of podman, which are not its own.
+
+The daemon opens the repository in the strict open mode. Each read of an
+object, of `config`, and of the stored image takes `openat2` with
+`RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so a symlink at any component of
+the path stops the read. The open has no fallback to `openat`: kernels older
+than 5.6 are not a target of the port, and `ENOSYS` is an error of the open,
+as each other errno is.
+
+The daemon reads the stored image as root, and the check of the `objects`
+directory does not cover its path. The access to the socket is the trust
+boundary, and the documents state the files that a member of the group of
+the socket can make the daemon read. Two alternatives were rejected:
+
+- The worker opens the image with the credentials of the caller and gives
+  the descriptor to the daemon. This needs a new message between the worker
+  and the daemon, and a variant of `Repo::open_composefs_image_checked` that
+  takes an open file. The image adds little that the read of `objects/` does
+  not give: the daemon mounts an image only if its digest is the key of a
+  commit that it reads from `objects/`, and that image holds the tree that a
+  built mount makes from `objects/`.
+- The worker reads `config` with the credentials of the caller. That change
+  is outside the image store.
+
+The reply of the daemon for a stored image that is not the key of its commit
+names the commit and neither digest. The error of the library keeps both
+digests for `composefs-image --check` and the fsck.
 
 ## The spki sign engine
 
@@ -2693,7 +2743,7 @@ the rules.
   gives no error, and the walk reads nothing below it. The prune keeps the
   name of that commit, as it keeps the name of an absent parent within the
   bound. So it keeps the
-  `.commitmeta` and the `.cfs` of that commit if the store holds them.
+  `.commitmeta` of that commit if the store holds it.
 - A prune that reads a defective related value gives a warning and
   continues. The warning names the commit, the field, and the reason. The
   defective value or entry roots nothing, and the other entries of the field

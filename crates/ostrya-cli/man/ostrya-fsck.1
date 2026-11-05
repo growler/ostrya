@@ -14,7 +14,7 @@ The walk runs to its end and writes each finding on standard error. A ref to a m
 .PP
 After the walk, the command checks the dependencies in field \%2 of each commit that it verified. It writes one line on standard error for each dependency that is absent, partial, or defective, and exits \%1. It marks a commit with an absent or a partial dependency as partial, so a later pull fetches the dependency. \%\-\-no\-mark\-partial and \%\-\-no\-mark\-dependencies each stop these marks.
 .PP
-After the walk, the command checks each composefs image object against the key \fB\%ostree.composefs.digest.v0\fR of its commit. A faulty image is an error, and \%\-\-delete removes it: an image whose digest is not the key, an image that does not read, and an image whose commit has no key or a malformed key. If the commit of an image does not load, the command reports an error and keeps the image. An image whose commit is absent gets one line on standard output and is not an error.
+After the walk, the command checks each composefs image in \fB\%extensions/ostrya/composefs/\fR against the key \fB\%ostree.composefs.digest.v0\fR of its commit. A faulty image is an error, and \%\-\-delete removes it: an image whose digest is not the key, an image that does not read, and an image whose commit has no key or a malformed key. If the commit of an image does not load, the command reports an error and keeps the image. An image whose commit is absent gets one line on standard output and is not an error. Each commit that \%\-\-delete or \%\-\-add\-tombstones deletes loses its image first.
 .SH OPTIONS
 .TP
 \fB\-\-no\-mark\-partial\fR

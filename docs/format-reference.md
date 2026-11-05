@@ -81,9 +81,6 @@ superblock meta-entry, and in a superblock fallback entry.
 
 The is-meta predicate is `t` in 2..=6, and the checksum rules use it ("Checksum
 computation"). Types 7, 8, and 9 are auxiliary types outside the metadata set.
-The port also has the type 100, `.cfs`, the composefs image of a commit. The
-tool does not know it. "The composefs image object" in "Port extensions"
-states it.
 The string form of an object name is `<hexchecksum>.<typestr>`. "Repository
 modes and on-disk storage" states which objects take the `z` suffix.
 
@@ -1081,24 +1078,40 @@ stops part way through leaves no commit object whose tree it started to
 remove. A pull reads a commit with no `.commitpartial` marker as complete, so
 such a commit is damage that no reader reports.
 
-1. The commit phase. For each doomed commit, the port writes the tombstone
+1. The image phase. The port unlinks the composefs image of each doomed
+   commit. It opens `extensions/ostrya/composefs/` and each `<xx>/`
+   directory one time. If `[core] fsync` is true, it then syncs each `<xx>/`
+   directory from which it removed an image, one time for each directory.
+2. The commit phase. For each doomed commit, the port writes the tombstone
    where the run writes tombstones, unlinks the commit object, and then
-   unlinks its `.commitmeta` and its composefs image. Then it unlinks each
-   `.commitmeta` and each composefs image whose commit is absent.
-2. The barrier. If `[core] fsync` is true, the port syncs each `objects/`
+   unlinks its `.commitmeta`. Then it unlinks each `.commitmeta` whose
+   commit is absent.
+3. The barrier. If `[core] fsync` is true, the port syncs each `objects/`
    fanout directory in which the commit phase removed an entry, one time for
    each directory. If `[core] fsync` is false, a crash gives no guarantee of
    the order in which the removals reach the disk.
-3. The content phase. The port removes each other doomed object, in any
+4. The content phase. The port removes each other doomed object, in any
    order.
-4. The leftover sweep. See below.
+5. The leftover sweep. See below.
+
+Each image goes before its commit. If `[core] fsync` is true, each image
+removal is durable before the port unlinks the first commit object. A stop or
+a crash between the image phase and the commit phase leaves unreachable
+commits with no image, and the next prune removes these commits. The reverse
+order leaves an image whose commit is absent. The prune does not list
+`extensions/ostrya/composefs/`, so no prune removes such an image ("The
+composefs image store"). The image phase is one pass before the commit phase,
+so the port opens and syncs each directory of the images one time, and not
+one time for each commit.
 
 The commit goes before its `.commitmeta`. A `.commitmeta` with no commit is
 unreachable, and the next prune removes it. The reverse order leaves a commit
 with no signatures.
 
-A `--delete-commit` run removes the named commit in the order of the commit
-phase, and syncs its fanout directory before the other phases start.
+A `--delete-commit` run removes the image of the named commit, and then the
+commit in the order of the commit phase. It syncs the directory of the image
+before it removes the commit, and the fanout directory of the commit before
+the other phases start.
 
 No phase before the leftover sweep removes a `state/<commit>.commitpartial`
 marker. The commit can already be partial. If a crash made the unlink of the
@@ -1106,8 +1119,9 @@ marker durable and not the unlink of the commit, a partial commit would look
 complete.
 
 The order changes no count. The port reads the size of each doomed object
-before its unlink and counts the object one time. A `.commitmeta` or a
-composefs image that the commit phase removes with its commit is in no count.
+before its unlink and counts the object one time. A `.commitmeta` that the
+commit phase removes with its commit is in no count, and no count includes a
+composefs image.
 An object that is absent when the port reads its size is in no count. A
 `--no-prune` run goes through the same phases, removes nothing, and reports
 the counts that the removal would give.
@@ -1780,9 +1794,7 @@ The superblock embeds the target commit object whole, in the
 hashes to the `to` checksum. A part produces each other object, except a
 fallback object. The meta-entry of a part carries the ordered objtype+csum
 array. The operation stream produces the objects in that order. The object type
-at the current position selects how an operation decodes. The port refuses a
-superblock with an entry of the object type 100 in the object array of a part
-or in the fallback array.
+at the current position selects how an operation decodes.
 
 The `part-checksum` is the SHA-256 of the part file on disk, the `(y@ay)`
 framing bytes. A fallback object travels outside the parts as a plain loose
@@ -2937,7 +2949,7 @@ The part holds these items:
 - the credential file of a push over HTTP;
 - the ssh transport;
 - the commit of `push-tree`;
-- the composefs image object;
+- the composefs image store;
 - the protocol of the composefs mount daemon;
 - the mode `bare-user-shared`;
 - the S3 bucket repository.
@@ -3184,8 +3196,8 @@ that they reach:
 - A related entry that names a commit that the repository does not hold
   gives no error, and the walk reads nothing below it. The prune keeps the
   name of that commit, as it keeps the name of an absent parent within the
-  bound. So the prune keeps the `.commitmeta` and the `.cfs` of that commit
-  if the store holds them.
+  bound. So the prune keeps the `.commitmeta` of that commit if the store
+  holds it.
 - The prune accepts field 2 entries that are not sorted, two entries with one
   name, and a dependency whose own field 2 is not empty. It roots on each
   such entry.
@@ -6223,20 +6235,19 @@ and next to `-m`, an explicit `--timestamp`, a second push onto the same
 branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
 `--orphan` on a new branch against `--parent=none`.
 
-## The composefs image object
+## The composefs image store
 
-A repository of the port can store the composefs image of a commit as a
-loose object. The tool has no such object type. A run of `ostrya commit
+A repository of the port can store the composefs image of a commit as a file
+outside `objects/`. The tool has no such file. A run of `ostrya commit
 --generate-composefs` or `ostrya composefs-image --add` and a check of the
 stored file can verify each fact below.
 
-The object:
+The file:
 
-- The type number is 100. The type string is `composefs-image`, and the
-  extension is `cfs` in every mode. So the string form of the object name is
-  `<commit>.composefs-image`.
-- The object name is the checksum of its commit, as for `.commitmeta`. The
-  loose path is `objects/<first 2 hex>/<remaining 62 hex>.cfs`.
+- The path is `extensions/ostrya/composefs/<first 2 hex>/<remaining 62
+  hex>.cfs` under the repository root. The name is the checksum of the
+  commit. Two commits that share one tree each have their own file, and the
+  two files hold the same bytes.
 - The content is the image that an export of the commit with the verity
   digests of the files writes ("composefs"). The repository stores it raw in
   every mode, `archive` included, with no header and no compression. The
@@ -6244,6 +6255,10 @@ The object:
   store the same bytes for the same tree.
 - The file has the mode `0644` in every mode, whatever the umask, and no
   extended attribute.
+- The write creates `extensions/ostrya/composefs/` and each `<xx>/` at the
+  first write into them, with the mode `0775` reduced by the umask. In a
+  `bare-user-shared` repository each directory that the write creates gets
+  `02770` ("bare-user-shared mode"). A directory that exists keeps its mode.
 
 The key rule:
 
@@ -6262,22 +6277,50 @@ The write:
 - The writer computes the fs-verity digest of the bytes as it writes them, so
   no step holds the whole image.
 - With `[ex-integrity] fsverity` not `no`, the write seals the image as it
-  seals the other objects ("Write path: fs-verity"). After the seal, it
-  compares the digest that the kernel measures with the digest of the writer.
-- A transaction renames its images into `objects/` after all its other
-  objects and before its refs. The rename replaces a stored image of the same
+  seals the objects ("Write path: fs-verity"). After the seal, it compares the
+  digest that the kernel measures with the digest of the writer.
+- A transaction renames its objects into `objects/` first and its images
+  into `extensions/ostrya/composefs/<xx>/` next. So an image is in place
+  only after each object of the transaction. The detached metadata and the
+  refs come after the images. The rename replaces a stored image of the same
   commit in one step.
+- With `[core] fsync` true, the transaction syncs each `<xx>/` directory that
+  got an image, and then `extensions/ostrya/composefs/`, after the renames of
+  the images. It syncs each directory that it creates into its parent.
+
+The read:
+
+- Each read opens the image with one `openat2` of its path under the
+  repository root, with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. A symlink
+  at `extensions/`, `ostrya/`, `composefs/`, `<xx>/`, or the file fails the
+  read with `ELOOP`. Only `ENOENT` reads as an absent image. Each other error
+  of `openat2`, `ENOSYS` included, fails the read.
+- The write opens each directory of the path one component at a time with
+  `O_NOFOLLOW`, and refuses a component that is a symlink or no directory.
 
 No transfer carries the image. A pull, a push, a one-way stream, a static
-delta, the archive view, and a bucket repository carry no `.cfs` object.
+delta, the archive view, `ostrya serve`, and a bucket repository carry no
+image. A repository that needs an image builds it.
 
-`ostree.sizes` has no entry for the image, and the decoder refuses the type
-byte 100.
+`ostree.sizes` has no entry for the image.
 
-Prune removes the image with its commit, and removes an image whose commit is
-absent. A kept commit keeps its image. No prune count and no byte count of
-freed space includes the image. "Prune removal order" states the order of
-the removals.
+The prune and the fsck:
+
+- The prune deletes the image of each commit that it deletes. It deletes
+  these images before the first commit ("Prune removal order"). A kept
+  commit keeps its image. The prune does not list
+  `extensions/ostrya/composefs/`, so it keeps an image whose commit is
+  absent. No prune count and no byte count of freed space includes
+  the image.
+- The fsck lists the commits and the images one time, after the checks of
+  the refs. It checks each image whose commit is present against the key of
+  the commit, and notes each image whose commit is absent. Each commit that the fsck deletes loses its
+  image first. No fsck count includes an image.
+
+`ostree fsck` and `ostree prune` on a repository that holds images neither
+check, count, nor remove an image, and they keep the modes of the directories
+(`conformance/cli-behavior.md`, "CLI output formats", "Composefs images in a
+prune" and "Composefs images in fsck").
 
 ## The mount daemon protocol
 
@@ -6391,10 +6434,20 @@ The checks of the daemon, in order:
    `objects` directory that the repository opens must have the device and
    the inode of the directory that the client opened. Else the request is
    `access`. The reads of `config`, of the metadata objects, and of the
-   image open each file with `O_NOFOLLOW` and `O_NONBLOCK`, and refuse a
-   file that is not a regular file.
+   image open each file with `openat2`, `RESOLVE_BENEATH`,
+   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is not a
+   regular file. The load of a file object opens its fan-out directory
+   `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
+   `RESOLVE_NO_SYMLINKS`. So a symlink at any component of the path stops
+   the read, and the request is `repository`. The daemon opens the image
+   `extensions/ostrya/composefs/<xx>/<rest>.cfs` under the repository
+   directory. An error of `openat2`, `ENOSYS` included, fails the read: the
+   daemon has no fallback to `openat`.
 7. A stored image must have the digest that the commit key records. The
-   daemon checks no signature of the commit.
+   daemon checks no signature of the commit. If the digest is not the key,
+   the request is `repository`, and the text is `the stored composefs image
+   of commit <commit> does not match its key`. The text holds neither
+   digest.
 8. A built image larger than the limit of the daemon is `repository`. The
    daemon computes the size before it writes the image. The default limit
    is 104857600 bytes.
@@ -6489,6 +6542,7 @@ the file-creation mask of the process has no effect:
 - A directory gets 02770. This rule applies to these directories:
   - the repository root and each layout directory at `init`;
   - the `objects/<xx>` fanout directories;
+  - `extensions/ostrya/composefs/` and its `<xx>/` directories;
   - the parent directories under `refs/`;
   - `tmp/`, and each staging directory of a transaction.
 

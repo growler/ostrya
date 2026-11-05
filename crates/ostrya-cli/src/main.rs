@@ -60,12 +60,13 @@ use ostrya::{
     DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags,
-    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, RemoteSource,
-    RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
-    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions,
+    PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias,
+    RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary,
+    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
+    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
+    from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -13103,7 +13104,7 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     if matches!(step(repo.config()), Step::Keep) {
         return Ok(());
     }
-    let keys = remote_add_keys(repo.config(), &args, name, url)?;
+    let keys = remote_add_keys(&args, name, url)?;
     let keys: Vec<(&str, &str)> = keys
         .iter()
         .map(|(key, value)| (key.as_str(), value.as_str()))
@@ -13134,19 +13135,12 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
 /// Returns the keys of the section that `remote add` writes for the remote
 /// `name`, in the order of the `ostree` command.
 ///
-/// The call sets each key in a copy of `config` with no group of the remote,
-/// so a key name that a key file cannot hold is refused before the command
-/// takes a lock. A later key of one name replaces the value of the earlier
-/// key and keeps its position.
-fn remote_add_keys(
-    config: &RepoConfig,
-    args: &RemoteAddArgs,
-    name: &str,
-    url: &str,
-) -> Result<Vec<(String, String)>> {
+/// The call sets each key in an empty key file, so a key name that a key file
+/// cannot hold is refused before the command takes a lock. A later key of one
+/// name replaces the value of the earlier key and keeps its position.
+fn remote_add_keys(args: &RemoteAddArgs, name: &str, url: &str) -> Result<Vec<(String, String)>> {
     let group = remote_group(name);
-    let mut keyfile = config.keyfile().clone();
-    keyfile.remove_group(&group);
+    let mut keyfile = KeyFile::default();
     let mut set = |key: &str, value: &str| keyfile.set_string(&group, key, value);
 
     // The `ostree` command also reads `url`, and it reads no `s3://`

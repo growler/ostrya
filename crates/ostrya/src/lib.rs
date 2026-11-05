@@ -196,7 +196,7 @@ pub use object::MAX_METADATA_SIZE;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
-    Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RefPattern,
+    Checksum, Commit, DictBuilder, DirMeta, DirTree, KeyFile, ObjectName, ObjectType, RefPattern,
     RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
     is_checksum_shaped, is_collection_id, loose_path, source_date_epoch, to_text,
     to_text_unannotated,

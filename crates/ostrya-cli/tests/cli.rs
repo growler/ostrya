@@ -16550,6 +16550,83 @@ fn config_no_ops_and_refusals_take_no_lock() {
     );
 }
 
+/// `remote add` refuses a `--set` key that a key file cannot hold before it
+/// takes a lock. Another holder of the update lock and `lock-timeout-secs=0`
+/// do not change the exit status or the output. A later `--set` of one key
+/// replaces the value of the earlier key and keeps its position, also for a
+/// key that the command sets itself.
+#[test]
+fn remote_add_refuses_bad_set_keys_and_takes_no_lock() {
+    let tmp = TmpDir::new("remote-add-set-keys");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    set_core_key(&repo, "lock-timeout-secs=0");
+    let before = config_text(&repo);
+
+    let cases: &[(&str, &str)] = &[
+        ("--set==v", "error: keyfile: key is empty\n"),
+        (
+            "--set= k=v",
+            "error: keyfile: key ' k' has leading or trailing whitespace\n",
+        ),
+        (
+            "--set=#k=v",
+            "error: keyfile: key '#k' begins with '#' or '[' and would not reparse\n",
+        ),
+    ];
+    let handle = block_on(Repo::open(&repo)).unwrap();
+    let guard = block_on(handle.begin_update()).unwrap();
+    let mut wrong = Vec::new();
+    for (set, stderr) in cases {
+        let run = ostrya(
+            &[
+                &repo_arg,
+                "remote",
+                "add",
+                "p",
+                "https://example.invalid/p",
+                "--set=a=1",
+                set,
+            ],
+            None,
+            &[],
+        );
+        let got = (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        );
+        if got != (Some(1), String::new(), (*stderr).to_owned()) {
+            wrong.push(format!("{set:?}: {got:?}"));
+        }
+    }
+    block_on(guard.finish()).unwrap();
+    assert!(wrong.is_empty(), "wrong results:\n{}", wrong.join("\n"));
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "p",
+            "https://example.invalid/p",
+            "--set=a=1",
+            "--set=b=2",
+            "--set=a=3",
+            "--set=url=https://example.invalid/q",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let config = config_text(&repo);
+    assert!(
+        config.ends_with("[remote \"p\"]\nurl=https://example.invalid/q\na=3\nb=2\n"),
+        "{config}"
+    );
+}
+
 /// Adds `[ex-ostrya] remotes-config-dir=<dir>` at the end of the `config` of
 /// the repository `repo`.
 fn set_remotes_config_dir(repo: &Path, dir: &Path) {

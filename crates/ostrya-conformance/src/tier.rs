@@ -20,6 +20,14 @@ pub const SYSTEM_REPO: &str = "/ostree/repo";
 ///
 /// On an ostree host, `/ostree` leads to `/sysroot/ostree`, so this path names
 /// the repository of [`SYSTEM_REPO`].
+///
+/// The `ostree` command does not open this path as a repository source. If
+/// `/ostree` is absent and this path exists, an invocation that binds no
+/// repository fails with `Command requires a --repo argument`. The help text
+/// of the command names this path, so [`system_repo`] also gives it. On a host
+/// that has this path alone, [`exec::run`](crate::exec::run) also refuses an
+/// invocation that binds no repository. This guard is wider than the rule of
+/// the command.
 pub const SYSROOT_REPO: &str = "/sysroot/ostree/repo";
 
 /// Returns the system repository, if the host has one.

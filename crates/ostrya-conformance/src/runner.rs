@@ -454,9 +454,11 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
     }
 
     // If an invocation binds no repository, the `ostree` command opens the
-    // compiled-in `tier::SYSTEM_REPO`. On a host with `tier::SYSTEM_REPO` or
-    // `tier::SYSROOT_REPO`, the premise of the cell fails, and the run acts
-    // on live system state. If the premise fails for one of the two
+    // compiled-in `tier::SYSTEM_REPO`. On a host with `tier::SYSTEM_REPO`,
+    // the premise of the cell fails, and the run acts on live system state.
+    // On a host with `tier::SYSROOT_REPO` alone, the command refuses the
+    // invocation, and the check skips the cell too. This guard is wider than
+    // the rule of the command. If the premise fails for one of the two
     // implementations, the whole cell skips, so this check reads the two
     // invocations. A declared cell runs in the scratch root of its side.
     // The setups bind `$REPO` to a path under that root, and no setup makes

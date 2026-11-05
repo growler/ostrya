@@ -394,9 +394,13 @@ Three verdicts. A cell reports exactly one.
   `filtered`, or `system-repo`.
 
 A `system-repo` skip states that the host carries `/ostree/repo` or
-`/sysroot/ostree/repo` and the cell holds an invocation binding no repository,
-which the reference tool resolves against the system repository, so the claim
-the cell states cannot be made here.
+`/sysroot/ostree/repo` and the cell holds an invocation binding no repository.
+When `/ostree/repo` exists, the reference tool opens it for such an invocation,
+so the claim the cell states cannot be made here. When `/sysroot/ostree/repo`
+exists and `/ostree` does not, the tool reports
+`Command requires a --repo argument` for such an invocation. The harness skips
+the cell on that host too, because the help text of the tool names
+`/sysroot/ostree/repo`. This guard is wider than the rule of the tool.
 The skip names the path and the invocation. It is decided for both
 implementation handles together, so a cell whose premise fails for either side
 skips whole. The host decides it, and `--require` carries no flag that promotes

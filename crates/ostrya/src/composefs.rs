@@ -43,6 +43,14 @@
 //! `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so a symlink at any component
 //! of its path stops the read.
 //!
+//! If `[ex-ostrya] generate-composefs` is `true`
+//! ([`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)),
+//! the commit of a transaction builds and stores the image of each complete
+//! commit that its writer records and that carries the key.
+//! [`Transaction::commit`] states the rule, and [`Repo::seals_objects`] tells
+//! if the build can read the fs-verity digests of the objects from the
+//! kernel.
+//!
 //! The prune deletes the image of each commit that it deletes, before the
 //! commit. The fsck checks each image against the key of its commit.
 //!
@@ -67,6 +75,7 @@ use crate::commit::append_dict_entry;
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::image_store;
+use crate::read::CommitState;
 use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
@@ -533,7 +542,63 @@ impl Transaction {
     pub async fn write_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageAdd> {
         let commit_obj = self.load_commit_staged_first(commit).await?;
         let key = require_recorded_digest(&commit_obj, commit)?;
-        let Some(result) = self.image_state(commit, &key).await? else {
+        self.write_keyed_image(commit, commit_obj, &key).await
+    }
+
+    /// Builds the composefs image of each commit that the writers recorded as
+    /// complete, under `[ex-ostrya] generate-composefs`.
+    ///
+    /// The commit of the transaction calls it before the publication. With the
+    /// key `false`, the call builds nothing. The call skips a commit that this
+    /// transaction did not stage and that has no `.commitpartial` marker, a
+    /// commit whose image is staged, and a commit with no digest key. For each
+    /// other commit, it makes the steps of
+    /// [`write_composefs_image`](Transaction::write_composefs_image).
+    ///
+    /// The first error stops the call. The caller then drops the transaction,
+    /// so it publishes nothing.
+    pub(crate) async fn build_recorded_images(&self) -> Result<()> {
+        let commits = self.take_complete();
+        if commits.is_empty() || !self.repo().config().generate_composefs()? {
+            return Ok(());
+        }
+        for commit in &commits {
+            if self.is_image_staged(commit) {
+                continue;
+            }
+            if !self.is_staged(commit, ObjectType::Commit)
+                && self.repo().commit_state(commit).await? != CommitState::Partial
+            {
+                continue;
+            }
+            let commit_obj = self.load_commit_staged_first(commit).await?;
+            let key = recorded_digest(&commit_obj).map_err(|e| match e {
+                Error::InvalidFormat(message) => {
+                    Error::InvalidFormat(format!("commit {commit}: {message}"))
+                }
+                e => e,
+            })?;
+            let Some(key) = key else {
+                continue;
+            };
+            self.write_keyed_image(commit, commit_obj, &key).await?;
+        }
+        Ok(())
+    }
+
+    /// Builds and stages the composefs image of `commit`, with `key` as the
+    /// digest that `commit_obj`, the commit object, records.
+    ///
+    /// The call makes the steps of
+    /// [`write_composefs_image`](Transaction::write_composefs_image) that
+    /// come after the read of the key.
+    async fn write_keyed_image(
+        &self,
+        commit: &Checksum,
+        commit_obj: Commit,
+        key: &[u8; 32],
+    ) -> Result<ComposefsImageAdd> {
+        let Some(result) = self.image_state(commit, key).await? else {
             return Ok(ComposefsImageAdd::AlreadyValid);
         };
         let tree = RepoTree::from_parts(
@@ -542,7 +607,7 @@ impl Transaction {
             commit_obj.root_dirmeta,
         );
         let image = self.build_composefs_image(&tree).await?;
-        let checked = check_image_digest(commit, &key, &image).map(|()| Some(result));
+        let checked = check_image_digest(commit, key, &image).map(|()| Some(result));
         self.finish_attach(commit, checked, image).await
     }
 
@@ -868,11 +933,22 @@ impl Repo {
     /// dependency of its own.
     ///
     /// The image depends on the tree of the commit alone, so the metadata of
-    /// the commit and the repository mode do not change the digest. The image
-    /// goes to [`std::io::sink`], so the digest needs no image-sized buffer.
+    /// the commit and the repository mode do not change the digest.
+    ///
+    /// If `[ex-ostrya] generate-composefs` is `false`, the image goes to
+    /// [`std::io::sink`], so the digest needs no image-sized buffer, and the
+    /// call stores no image. If the key is `true`, the call builds the image
+    /// in `txn` with
+    /// [`build_composefs_image`](Transaction::build_composefs_image), takes
+    /// the digest from it, and stages it as the image of the new commit with
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image). So
+    /// the call reads the tree one time, and the commit of `txn` stores the
+    /// image.
     ///
     /// # Errors
     ///
+    /// - The errors of
+    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs).
     /// - [`Error::InvalidFormat`] if `commit` already carries
     ///   `ostree.composefs.digest.v0`.
     /// - [`Error::InvalidRelated`] with `commit` if field 2 of `commit` is
@@ -901,6 +977,9 @@ impl Repo {
     /// - [`Error::Io`] if a file system operation fails, if a metadata object
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
     ///   an `archive` payload does not inflate.
+    /// - If `[ex-ostrya] generate-composefs` is `true`, the errors of
+    ///   [`build_composefs_image`](Transaction::build_composefs_image) and of
+    ///   [`attach_composefs_image`](Transaction::attach_composefs_image).
     pub async fn commit_add_composefs_metadata(
         &self,
         txn: &Transaction,
@@ -919,15 +998,36 @@ impl Repo {
         )?;
         related::check_order(Some(*commit), deps.iter().map(|(name, _)| name.as_str()))?;
         related::check_dependencies(txn, Some(*commit), &deps).await?;
-        let dir = self
-            .composefs_commit_model(&commit_obj, ComposefsOptions::RECORDED.verity.into())
-            .await?;
-        let fs_verity = image_digest(dir).await?;
+        // With the key, the one build gives the digest and the image, so the
+        // commit of `txn` does not build the image again.
+        let image = if self.config().generate_composefs()? {
+            let tree = RepoTree::from_parts(
+                self.clone(),
+                commit_obj.root_dirtree,
+                commit_obj.root_dirmeta,
+            );
+            Some(txn.build_composefs_image(&tree).await?)
+        } else {
+            None
+        };
+        let fs_verity = match &image {
+            Some(image) => *image.digest(),
+            None => {
+                let dir = self
+                    .composefs_commit_model(&commit_obj, ComposefsOptions::RECORDED.verity.into())
+                    .await?;
+                image_digest(dir).await?
+            }
+        };
         let digest_type = Type::parse(DIGEST_SIGNATURE).map_err(ostrya_core::Error::from)?;
         let value = Value::variant(digest_type, Value::Bytes(fs_verity.to_vec()));
         append_dict_entry(&mut commit_obj.metadata, COMPOSEFS_DIGEST_KEY, value)?;
         let bytes = commit_obj.serialize()?;
-        txn.write_metadata(ObjectType::Commit, None, &bytes).await
+        let new = txn.write_metadata(ObjectType::Commit, None, &bytes).await?;
+        if let Some(image) = image {
+            txn.attach_composefs_image(&new, image).await?;
+        }
+        Ok(new)
     }
 
     /// Builds and stores the composefs image of `commit`.
@@ -941,7 +1041,8 @@ impl Repo {
     ///
     /// The commit must carry `ostree.composefs.digest.v0`.
     /// [`commit_add_composefs_metadata`](Repo::commit_add_composefs_metadata)
-    /// writes a commit with the key and does not store the image.
+    /// writes a commit with the key. It stores the image only if
+    /// `[ex-ostrya] generate-composefs` is `true`.
     ///
     /// # Errors
     ///
@@ -1181,12 +1282,35 @@ pub(crate) fn recorded_digest(commit: &Commit) -> Result<Option<[u8; 32]>> {
     let Some(entry) = commit.metadata.dict_get(COMPOSEFS_DIGEST_KEY) else {
         return Ok(None);
     };
+    entry_digest(entry).map(Some)
+}
+
+/// Returns the digest that the metadata `entries` record under
+/// `ostree.composefs.digest.v0`, or `None` if no entry has the key.
+///
+/// Each entry is a key and the bytes of a `v`, as the client of a server
+/// commit sends them. The value is the first entry of the key, which is the
+/// entry that [`recorded_digest`] reads from a commit with these entries. It
+/// must be a variant of type `ay` with 32 bytes, or the call fails with
+/// [`Error::InvalidFormat`].
+#[cfg(feature = "receive")]
+pub(crate) fn entries_digest(entries: &[(String, Vec<u8>)]) -> Result<Option<[u8; 32]>> {
+    let Some((_, bytes)) = entries.iter().find(|(key, _)| key == COMPOSEFS_DIGEST_KEY) else {
+        return Ok(None);
+    };
+    let entry = ostrya_core::from_bytes(&Type::Variant, bytes).map_err(ostrya_core::Error::from)?;
+    entry_digest(&entry).map(Some)
+}
+
+/// Returns the digest that `entry`, the value of an entry under
+/// `ostree.composefs.digest.v0`, holds: a variant of type `ay` with 32 bytes.
+/// Each other value fails with [`Error::InvalidFormat`].
+fn entry_digest(entry: &Value) -> Result<[u8; 32]> {
     entry
         .as_variant()
         .filter(|(ty, _)| ty.signature() == DIGEST_SIGNATURE)
         .and_then(|(_, value)| value.as_bytes())
         .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
-        .map(Some)
         .ok_or_else(|| {
             Error::InvalidFormat(format!(
                 "the value of {COMPOSEFS_DIGEST_KEY} is not a variant of type \

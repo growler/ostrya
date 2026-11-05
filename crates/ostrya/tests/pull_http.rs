@@ -44,9 +44,10 @@ use ostrya::sign::Ed25519Verifier;
 use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
-    CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error,
-    FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
-    SummaryOptions, TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
+    ComposefsImageState, CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock,
+    Ed25519Signer, Error, FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify,
+    Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -10756,4 +10757,249 @@ fn a_dependency_that_the_run_reaches_gets_no_delta_search() {
             assert_complete(&remote, &dest, dest.path(), &commit).await;
         }
     });
+}
+
+// --- composefs images --------------------------------------------------------
+
+/// The `[ex-ostrya]` group that turns the image generation on.
+const GENERATE: &str = "\n[ex-ostrya]\ngenerate-composefs=true\n";
+
+/// Builds an archive remote under `dir/remote`, with a summary. `test/main`
+/// names a tip whose parent is a root commit. Both commits carry the composefs
+/// image key. If `wrong_parent` is set, the key of the parent is not the
+/// digest of its tree. Returns the remote, the tip, and the parent.
+async fn build_keyed_remote(dir: &Path, wrong_parent: bool) -> (Repo, Checksum, Checksum) {
+    build_tree(&dir.join("p"), b"parent\n");
+    build_tree(&dir.join("t"), b"tip\n");
+    let remote = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let parent = commit_tree_keyed(
+        &remote,
+        dir,
+        "p",
+        "test/main",
+        None,
+        FIXED_TS,
+        &[],
+        wrong_parent,
+    )
+    .await;
+    let tip = commit_tree_keyed(
+        &remote,
+        dir,
+        "t",
+        "test/main",
+        Some(parent),
+        FIXED_TS + 1,
+        &[],
+        false,
+    )
+    .await;
+    summarize(&remote).await;
+    (remote, tip, parent)
+}
+
+/// Returns `true` if `repo` holds a composefs image of `commit` whose digest
+/// is the key of the commit.
+async fn has_valid_image(repo: &Repo, commit: &Checksum) -> bool {
+    repo.check_composefs_image(commit).await.unwrap() == ComposefsImageState::Valid
+}
+
+/// The options of a pull of `test/main` with `depth`.
+fn main_at_depth(depth: i32) -> PullOptions {
+    PullOptions {
+        refs: vec!["test/main".to_owned()],
+        depth,
+        ..PullOptions::default()
+    }
+}
+
+/// With `generate-composefs=true`, a pull stores a valid image of the target
+/// and of the parent within the depth. With the default `false`, it stores
+/// none.
+#[test]
+fn a_pull_with_the_key_stores_the_image_of_each_pulled_commit() {
+    for (extra, stored) in [(GENERATE, true), ("", false)] {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-cfs");
+            let (_remote, tip, parent) = build_keyed_remote(dir.path(), false).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), extra).await;
+
+            dest.pull("origin", main_at_depth(1)).await.unwrap();
+            for commit in [tip, parent] {
+                assert_eq!(dest.has_composefs_image(&commit).await.unwrap(), stored);
+                if stored {
+                    assert!(has_valid_image(&dest, &commit).await);
+                }
+            }
+        });
+    }
+}
+
+/// A parent within the depth whose key is not the digest of its tree fails the
+/// whole pull, also for a target whose image is correct. No ref moves, and
+/// `objects/` holds neither commit. A pull whose depth does not reach the
+/// parent takes the target.
+#[test]
+fn a_parent_with_a_wrong_key_fails_the_whole_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-cfs-wrong-parent");
+        let (_remote, tip, parent) = build_keyed_remote(dir.path(), true).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), GENERATE).await;
+
+        let err = dest.pull("origin", main_at_depth(1)).await.unwrap_err();
+        match &err {
+            Error::ComposefsDigestMismatch { commit, .. } => assert_eq!(*commit, parent),
+            other => panic!("{other:?}"),
+        }
+        assert_left_nothing(&dest).await;
+        for commit in [tip, parent] {
+            assert!(!dest.path().join(meta_path(&commit, "commit")).exists());
+        }
+        assert!(!dest.path().join("extensions/ostrya/composefs").exists());
+
+        dest.pull("origin", main_at_depth(0)).await.unwrap();
+        assert!(has_valid_image(&dest, &tip).await);
+        assert!(!dest.has_composefs_image(&parent).await.unwrap());
+    });
+}
+
+/// A commit-only pull and a subpath pull store no image. A full pull of the
+/// same commit after either completes the held partial commit and stores its
+/// image.
+#[test]
+fn a_full_pull_after_a_partial_pull_stores_the_image() {
+    let partial = [
+        PullOptions {
+            flags: PullFlags::COMMIT_ONLY,
+            ..main_at_depth(0)
+        },
+        PullOptions {
+            subpaths: vec!["/subdir".to_owned()],
+            ..main_at_depth(0)
+        },
+    ];
+    for first in partial {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-cfs-partial");
+            let (_remote, tip, _parent) = build_keyed_remote(dir.path(), false).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), GENERATE).await;
+
+            dest.pull("origin", first).await.unwrap();
+            assert_eq!(dest.commit_state(&tip).await.unwrap(), CommitState::Partial);
+            assert!(!dest.has_composefs_image(&tip).await.unwrap());
+
+            dest.pull("origin", main_at_depth(0)).await.unwrap();
+            assert_eq!(dest.commit_state(&tip).await.unwrap(), CommitState::Normal);
+            assert!(has_valid_image(&dest, &tip).await);
+        });
+    }
+}
+
+/// A pull of a commit that the destination holds complete from a pull with the
+/// key `false` stores no image after the key turns `true`.
+#[test]
+fn a_pull_of_a_held_complete_commit_stores_no_image() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-cfs-held");
+        let (_remote, tip, _parent) = build_keyed_remote(dir.path(), false).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", main_at_depth(0)).await.unwrap();
+        drop(dest);
+
+        let dest = reconfigure_dest(dir.path(), &server.url(), GENERATE).await;
+        dest.pull("origin", main_at_depth(0)).await.unwrap();
+        assert!(!dest.has_composefs_image(&tip).await.unwrap());
+    });
+}
+
+/// A full pull stores the image of a dependency that carries the key, beside
+/// the image of the target.
+#[test]
+fn a_dependency_of_a_full_pull_gets_an_image() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-cfs-dependency");
+        build_tree(&dir.path().join("uki"), b"uki\n");
+        build_tree(&dir.path().join("main"), b"main\n");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let dep = commit_tree_keyed(
+            &remote,
+            dir.path(),
+            "uki",
+            "dep/uki",
+            None,
+            FIXED_TS,
+            &[],
+            false,
+        )
+        .await;
+        let tip = commit_tree_keyed(
+            &remote,
+            dir.path(),
+            "main",
+            "test/main",
+            None,
+            FIXED_TS,
+            &[("boot/uki", dep)],
+            false,
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), GENERATE).await;
+
+        dest.pull("origin", main_at_depth(0)).await.unwrap();
+        assert!(has_valid_image(&dest, &tip).await);
+        assert!(has_valid_image(&dest, &dep).await);
+    });
+}
+
+/// A value of the key that is not a boolean, and the value `true` in an
+/// `archive` destination, stop a pull before its first request.
+#[test]
+fn a_bad_generate_composefs_value_refuses_an_http_pull() {
+    let cases = [
+        (
+            RepoMode::BareUser,
+            "\n[ex-ostrya]\ngenerate-composefs=maybe\n",
+        ),
+        (RepoMode::Archive, GENERATE),
+    ];
+    for (mode, extra) in cases {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-cfs-bad-value");
+            let (_remote, _tip, _parent) = build_keyed_remote(dir.path(), false).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), mode, &server.url(), extra).await;
+            let check = |err: &Error| match mode {
+                RepoMode::Archive => assert!(matches!(err, Error::Unsupported(_)), "{err}"),
+                _ => assert!(matches!(err, Error::Core(_)), "{err}"),
+            };
+
+            let err = dest.pull("origin", main_at_depth(0)).await.unwrap_err();
+            check(&err);
+            let err = dest
+                .pull_with_session(
+                    http_session(&server).await,
+                    PullTrust::unverified(),
+                    main_at_depth(0),
+                )
+                .await
+                .unwrap_err();
+            check(&err);
+
+            assert!(server.seen().is_empty(), "{:?}", server.seen());
+            assert_left_nothing(&dest).await;
+        });
+    }
 }

@@ -403,6 +403,24 @@ pub fn build_commit(
     }
 }
 
+/// Returns the composefs image digest of the fixture tree, the value of
+/// `ostree.composefs.digest.v0` for a commit over that tree.
+pub fn fixture_tree_digest() -> [u8; 32] {
+    let repo = block_on(Repo::open(&fixture_repo("archive"))).unwrap();
+    block_on(repo.export_composefs(
+        &Checksum::from_hex(COMMIT).unwrap(),
+        &ostrya::ComposefsOptions::RECORDED,
+    ))
+    .unwrap()
+    .fs_verity
+}
+
+/// Builds a commit over the fixture tree, as [`build_commit`] does, whose
+/// metadata records `digest` under `ostree.composefs.digest.v0`.
+pub fn keyed_commit(parent: Option<Checksum>, subject: &str, digest: &[u8; 32]) -> Obj {
+    build_commit(parent, subject, super::composefs::key_dict(digest), &[])
+}
+
 // ---------------------------------------------------------------------------
 // Signatures.
 // ---------------------------------------------------------------------------

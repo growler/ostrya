@@ -371,6 +371,44 @@ fn a_malformed_write_setting_is_internal_at_hello() {
     }
 }
 
+/// A value of `[ex-ostrya] generate-composefs` that is not a boolean, and the
+/// value `true` in an `archive` repository, are a fault of the server. The
+/// session refuses each at `Hello` with `internal`, before it stages an
+/// object.
+#[test]
+fn a_refused_generate_composefs_is_internal_at_hello() {
+    for (mode, extra) in [
+        (
+            RepoMode::BareUser,
+            "[ex-ostrya]\ngenerate-composefs=maybe\n",
+        ),
+        (RepoMode::Archive, "[ex-ostrya]\ngenerate-composefs=true\n"),
+    ] {
+        let tmp = TmpDir::new("recv-badcfs");
+        let repo = new_repo(&tmp, mode, extra);
+        let (result, error) = session(&repo, &policy(), |mut c| async move {
+            c.hello(&[]).await.unwrap();
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::Internal, "{extra}: {error:?}");
+        let Err(e) = &result else {
+            panic!("{extra}: expected an error, {result:?}");
+        };
+        assert!(
+            !matches!(e, Error::Remote(_)),
+            "{extra}: the caller gets the server error, {e}"
+        );
+        if mode == RepoMode::Archive {
+            assert!(matches!(e, Error::Unsupported(_)), "{e}");
+            assert!(error.message.contains("generate-composefs"), "{error:?}");
+        } else {
+            assert!(matches!(e, Error::Core(_)), "{e}");
+        }
+        assert!(staging_entries(repo.path()).is_empty());
+        assert!(file_inventory(repo.path(), "objects").is_empty());
+    }
+}
+
 /// If the reply to a `Hello` can need a frame over the limit, the session
 /// refuses with `limit-exceeded`, on the wire and to the caller. The refusal
 /// comes before the session transaction opens. Under a foreign exclusive

@@ -694,6 +694,9 @@ impl Repo {
     ///   alone over HTTP is longer than 16 KiB.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
+    /// - The errors of
+    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
+    ///   for this repository.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
     ///   for each remote, and the errors of
     ///   [`trust_group`](PullOptions::trust_group).
@@ -768,6 +771,9 @@ impl Repo {
         // boolean stops the pull before its first request. Each run of each
         // remote takes this value.
         let related = RelatedRule::of(self.config())?;
+        // The commit of each transaction reads the key again. This read fails
+        // a bad value before the first request.
+        self.config().generate_composefs()?;
         let names = first_of_each(opts.refs.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come

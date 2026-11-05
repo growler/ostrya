@@ -195,8 +195,13 @@ struct Edit<'a> {
 /// # Before the update lock
 ///
 /// After the checks, if `[ex-ostrya] keep-detached-related` of the repository
-/// is `false`, this step drops `ostrya.related` from each incoming dict. Then
-/// the staged objects become durable. At the same time, each new commit gets a
+/// is `false`, this step drops `ostrya.related` from each incoming dict. If
+/// `[ex-ostrya] generate-composefs` of the repository is `true`, this step
+/// then builds the composefs image of each commit of the session that the
+/// session staged or that has a partial marker, and that carries
+/// `ostree.composefs.digest.v0`. A failure of the build is `internal`, and
+/// nothing is published. Then the staged objects and the staged images become
+/// durable. At the same time, each new commit gets a
 /// signature from each server key of its rules. No other commit gets a server
 /// signature. Each other commit with a filtered incoming dict, a staged
 /// dependency included, gets the merge of that dict alone. A key makes no
@@ -360,6 +365,9 @@ pub(super) async fn finish(
         }
     };
 
+    // The future of the build is large. The box keeps it out of the future
+    // of the session.
+    Box::pin(build_images(&txn, &session_commits)).await?;
     let (synced, edits) = futures_lite::future::zip(
         txn.sync_staged(),
         prepare_signatures(edits, hooks.is_none()),
@@ -767,6 +775,28 @@ fn select_rules<'a>(
             policy.rule(update)
         })
         .collect()
+}
+
+/// Records each commit of `session_commits` as complete in `txn`, and builds
+/// the composefs images of the recorded commits, under
+/// `[ex-ostrya] generate-composefs`.
+///
+/// The build skips a commit that the session did not stage and that has no
+/// partial marker. The build runs before the update lock, so the other
+/// writers of refs do not wait for it. A failure is `internal`.
+async fn build_images(txn: &Transaction, session_commits: &[Checksum]) -> Checked<()> {
+    if !txn
+        .repo()
+        .config()
+        .generate_composefs()
+        .map_err(Failure::Internal)?
+    {
+        return Ok(());
+    }
+    for commit in session_commits {
+        txn.mark_complete(commit);
+    }
+    txn.build_recorded_images().await.map_err(Failure::Internal)
 }
 
 /// The commits of the session, as [`load_commits`] reads them.

@@ -6239,8 +6239,9 @@ branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
 
 A repository of the port can store the composefs image of a commit as a file
 outside `objects/`. The tool has no such file. A run of `ostrya commit
---generate-composefs` or `ostrya composefs-image --add` and a check of the
-stored file can verify each fact below.
+--generate-composefs`, `ostrya composefs-image --add`, or a write under
+`[ex-ostrya] generate-composefs`, and a check of the stored file can verify
+each fact below.
 
 The file:
 
@@ -6288,6 +6289,39 @@ The write:
   got an image, and then `extensions/ostrya/composefs/`, after the renames of
   the images. It syncs each directory that it creates into its parent.
 
+The generation:
+
+- The key `[ex-ostrya] generate-composefs` is a boolean, and the default is
+  `false`. The key `true` in an `archive` repository is refused.
+- With the key `true`, the commit of a transaction builds the image of each
+  commit that its writer records as complete and that carries
+  `ostree.composefs.digest.v0`. The writers are `ostrya commit`, a pull from a
+  remote, a local pull, a receive (the push session, the one-way stream, and
+  the server commit), and `ostrya static-delta apply-offline`. A pull records
+  its targets, the parents within its depth, the dependencies, and each held
+  partial commit that it completes. A commit-only pull and a subpath pull
+  record no commit.
+- The build runs after the transaction stages its objects and before it
+  renames them into `objects/`. A receive builds before it takes the update
+  lock. For a server commit, the receive builds the image of the tree and
+  checks its digest against the key of the client before the lock. Under the
+  lock, it writes the commit and stages the image as the image of the commit.
+- The build skips a commit that the transaction did not stage and that has no
+  `.commitpartial` marker. So a commit that the repository holds complete
+  before the transaction gets no image. `ostrya commit` and
+  `ostrya static-delta apply-offline` record a commit only if the transaction
+  stages it, so a commit that the repository holds partial also gets no image
+  from them. The build also skips a commit with no key and a commit whose
+  image is staged. There is no backfill.
+- A malformed key, or an image whose digest is not the key, fails the
+  transaction. It publishes no object and writes no ref. For a pull, the rule
+  covers each recorded commit, so one such commit fails the whole pull.
+- A value of the key that is not a boolean fails each write through a
+  transaction at the open of the transaction. A pull from a remote reads the
+  key before its first request. A receive fails at `Hello`.
+- The build reads the fs-verity digest of a sealed object from the kernel, and
+  reads and hashes each other object.
+
 The read:
 
 - Each read opens the image with one `openat2` of its path under the
@@ -6316,6 +6350,9 @@ The prune and the fsck:
   the refs. It checks each image whose commit is present against the key of
   the commit, and notes each image whose commit is absent. Each commit that the fsck deletes loses its
   image first. No fsck count includes an image.
+- With `[ex-ostrya] generate-composefs` true, the fsck also notes each
+  complete commit whose key reads, that has no image, and that the run did not
+  delete, tombstone, or mark partial. A note is not an error.
 
 `ostree fsck` and `ostree prune` on a repository that holds images neither
 check, count, nor remove an image, and they keep the modes of the directories

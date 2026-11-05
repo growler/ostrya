@@ -824,6 +824,73 @@ async fn commit_tree_full(
     commit
 }
 
+/// The commit metadata key that holds the composefs image digest.
+pub const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
+
+/// Commits the subtree `sub` of `base` into `repo` under `branch`, as
+/// [`commit_tree_related`] does, with `ostree.composefs.digest.v0` in the
+/// metadata.
+///
+/// The key holds the composefs digest of the tree. If `wrong` is set, it holds
+/// 32 bytes that are not that digest. The function sets `branch` to the commit.
+#[allow(clippy::too_many_arguments)]
+pub async fn commit_tree_keyed(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    branch: &str,
+    parent: Option<Checksum>,
+    timestamp: u64,
+    related: &[(&str, Checksum)],
+    wrong: bool,
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(
+        CommitModifierFlags::SKIP_XATTRS | CommitModifierFlags::CANONICAL_PERMISSIONS,
+    );
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let digest = if wrong {
+        [0x5a; 32]
+    } else {
+        txn.composefs_digest(&root).await.unwrap()
+    };
+    let Value::Array(mut metadata) = ref_binding(branch) else {
+        unreachable!("the ref binding is an a{{sv}} array")
+    };
+    metadata.push(Value::Tuple(vec![
+        Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("ay").unwrap(),
+            Value::Bytes(digest.to_vec()),
+        ))),
+    ]));
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                subject: Some(format!("{branch} {sub}")),
+                timestamp: Some(timestamp),
+                metadata: Some(Value::Array(metadata)),
+                related: related
+                    .iter()
+                    .map(|(name, checksum)| ((*name).to_owned(), *checksum))
+                    .collect(),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref(branch, Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
 /// Builds a remote archive repository under `dir/remote`, with a summary.
 ///
 /// The ref `test/main` names a commit of the small tree that `build_tree`

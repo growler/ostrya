@@ -47,8 +47,9 @@ const CONFIG_FILE: &str = "config";
 ///   [`fsverity`](RepoConfig::fsverity).
 /// - `[remote "<name>"]`: one section for each remote, read through
 ///   [`Remote`].
-/// - `[ex-ostrya]`: the key that is an ostrya extension,
-///   [`keep_detached_related`](RepoConfig::keep_detached_related).
+/// - `[ex-ostrya]`: the keys that are ostrya extensions,
+///   [`keep_detached_related`](RepoConfig::keep_detached_related) and
+///   [`generate_composefs`](RepoConfig::generate_composefs).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
 ///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
 ///   the keys that verify and sign the commits that it receives.
@@ -604,6 +605,43 @@ impl RepoConfig {
             .keyfile
             .get_bool(EX_OSTRYA, "keep-detached-related")?
             .unwrap_or(true))
+    }
+
+    /// Returns `true` if the commit of a transaction builds the composefs
+    /// image of each complete commit that it writes.
+    ///
+    /// The key is `[ex-ostrya] generate-composefs`, and the default is
+    /// `false`. The key is an ostrya extension. If it is `true`, the commit of
+    /// a transaction builds, checks, and stores the image of each commit that
+    /// the writer records as complete and that carries
+    /// `ostree.composefs.digest.v0`. [`Transaction::commit`] states the rule.
+    /// A commit that the repository holds complete before the transaction gets
+    /// no image from it.
+    ///
+    /// [`Repo::transaction`] reads the key before it takes the lock, so a bad
+    /// value fails the open of each transaction. [`Repo::pull`],
+    /// [`Repo::pull_with_session`], and [`Repo::pull_collection`] also read
+    /// the key at their start, before the first request. [`Repo::fsck`] reads
+    /// the key at its start.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the value is not a boolean.
+    /// - [`Error::Unsupported`] if the value is `true` and the repository mode
+    ///   is `archive`.
+    ///
+    /// [`Transaction::commit`]: crate::Transaction::commit
+    pub fn generate_composefs(&self) -> Result<bool> {
+        let on = self
+            .keyfile
+            .get_bool(EX_OSTRYA, "generate-composefs")?
+            .unwrap_or(false);
+        if on && self.mode.is_archive() {
+            return Err(Error::Unsupported(
+                "[ex-ostrya] generate-composefs=true in an archive repository".into(),
+            ));
+        }
+        Ok(on)
     }
 
     /// Returns `true` if a ref change regenerates the summary.
@@ -1563,6 +1601,33 @@ mod tests {
         assert!(read("1").unwrap());
         assert!(read("maybe").is_err());
         assert!(read("yes").is_err());
+    }
+
+    #[test]
+    fn generate_composefs_is_false_when_absent() {
+        let cfg = RepoConfig::parse("[core]\nrepo_version=1\nmode=bare\n").unwrap();
+        assert!(!cfg.generate_composefs().unwrap());
+    }
+
+    #[test]
+    fn generate_composefs_reads_a_boolean() {
+        let read = |mode: &str, value: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode={mode}\n[ex-ostrya]\n\
+                 generate-composefs={value}\n"
+            ))
+            .unwrap()
+            .generate_composefs()
+        };
+        assert!(!read("bare", "false").unwrap());
+        assert!(read("bare", "true").unwrap());
+        assert!(read("bare-user", "1").unwrap());
+        assert!(matches!(read("bare", "maybe"), Err(Error::Core(_))));
+        assert!(!read("archive", "false").unwrap());
+        assert!(matches!(
+            read("archive", "true"),
+            Err(Error::Unsupported(_))
+        ));
     }
 
     /// Summary regeneration is off by default, each key alone turns it on, and

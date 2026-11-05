@@ -751,6 +751,12 @@ impl Transaction {
     /// [`write_commit_checked`](Transaction::write_commit_checked) writes the
     /// entries that [`check_related`](Transaction::check_related) checked.
     ///
+    /// The call does not record a commit as complete, because a pull writes
+    /// partial commits through it. So a commit that it writes gets no
+    /// composefs image under `[ex-ostrya] generate-composefs`. A caller that
+    /// writes a complete commit uses
+    /// [`write_commit_checked`](Transaction::write_commit_checked).
+    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
@@ -2004,6 +2010,39 @@ fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
     Err(Error::Unsupported(format!(
         "fsverity required but could not be enabled: {err}"
     )))
+}
+
+/// Returns `true` if the file system of `tmp_fd` accepts an fs-verity seal.
+///
+/// The function makes a temp file in `tmp_fd`, writes one byte, closes the
+/// writable descriptor, and enables fs-verity on a read-only descriptor. It
+/// tries again after an `ETXTBSY` error, as [`seal_regular`] does. Each other
+/// enable error gives `false`. The function removes the temp file.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the open or the write of the temp file fails.
+pub(crate) fn probe_seal_blocking(tmp_fd: BorrowedFd<'_>) -> Result<bool> {
+    let (fd, temp) = open_temp(tmp_fd)?;
+    let sealed = rustix::io::write(&fd, &[0])
+        .map_err(Error::from)
+        .and_then(|_| reopen_ro(fd.as_fd()))
+        .map(|ro| {
+            drop(fd);
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match ostrya_sys::enable_verity(&ro) {
+                    Ok(()) => break true,
+                    Err(rustix::io::Errno::TXTBSY) if attempts < SEAL_ATTEMPTS => {
+                        std::thread::sleep(SEAL_PAUSE);
+                    }
+                    Err(_) => break false,
+                }
+            }
+        });
+    cleanup_temp(tmp_fd, &temp);
+    sealed
 }
 
 /// Links an ingestion temp file into the staging directory under

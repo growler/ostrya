@@ -24171,6 +24171,145 @@ fn composefs_image_check_fails_on_a_changed_image() {
     ostrya_repo(&repo, &["fsck"]).ok();
 }
 
+/// The warning of `[ex-ostrya] generate-composefs` true in a repository that
+/// does not seal its objects.
+const UNSEALED_WARNING: &str = "warning: [ex-ostrya] generate-composefs is true, but the \
+     repository does not seal its objects with fs-verity; each image build reads each file of \
+     the commit";
+
+/// With `[ex-ostrya] generate-composefs` true, `commit
+/// --generate-composefs-metadata` stores the image of the commit, and a
+/// commit with no digest key stores none. With `fsverity=no`, the command
+/// writes the warning and exits 0. With the key false, the command writes no
+/// warning and stores no image.
+#[test]
+fn the_generate_composefs_key_stores_the_image_of_a_commit() {
+    let tmp = TmpDir::new("composefs-generate-key");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+
+    let on = base.join("on");
+    std::fs::create_dir_all(&on).unwrap();
+    let on = create_repo(&on, RepoMode::BareUser);
+    append_config(
+        &on,
+        "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n",
+    );
+    let run = ostrya_repo(
+        &on,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    let checksum = run.ok().stdout_trimmed();
+    assert_eq!(stderr, format!("{UNSEALED_WARNING}\n"));
+    assert!(image_path(&on, &checksum).exists());
+    ostrya_repo(&on, &["composefs-image", "--check", "m"]).ok();
+    let plain = ostrya_repo(&on, &["commit", "-b", "p", FIXED_TIMESTAMP, src])
+        .ok()
+        .stdout_trimmed();
+    assert!(!image_path(&on, &plain).exists());
+
+    let off = base.join("off");
+    std::fs::create_dir_all(&off).unwrap();
+    let off = create_repo(&off, RepoMode::BareUser);
+    append_config(&off, "[ex-integrity]\nfsverity=no\n");
+    let run = ostrya_repo(
+        &off,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src,
+        ],
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let same = run.ok().stdout_trimmed();
+    assert_eq!(same, checksum);
+    assert!(!image_path(&off, &same).exists());
+}
+
+/// With `[ex-ostrya] generate-composefs` true, fsck writes one line on
+/// standard output for a commit with the digest key and no image, and exits
+/// 0. A value of the key that is not a boolean fails `commit` and `fsck`, and
+/// the commit writes no object.
+#[test]
+fn fsck_notes_a_commit_with_no_composefs_image() {
+    let tmp = TmpDir::new("composefs-generate-fsck");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let repo = create_repo(base, RepoMode::BareUser);
+    append_config(&repo, "[ex-integrity]\nfsverity=no\n");
+    let checksum = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src,
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    assert!(
+        !fsck
+            .ok()
+            .stdout_trimmed()
+            .contains("Commit with no composefs image")
+    );
+
+    let config = config_text(&repo);
+    append_config(&repo, "[ex-ostrya]\ngenerate-composefs=true\n");
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    fsck.ok();
+    let line = format!("Commit with no composefs image: {checksum}");
+    assert!(
+        fsck.stdout_trimmed().lines().any(|l| l == line),
+        "{}",
+        fsck.stdout_trimmed()
+    );
+    ostrya_repo(&repo, &["composefs-image", "--add", "m"]).ok();
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    assert!(
+        !fsck
+            .ok()
+            .stdout_trimmed()
+            .contains("Commit with no composefs image")
+    );
+
+    std::fs::write(
+        repo.join("config"),
+        format!("{config}[ex-ostrya]\ngenerate-composefs=maybe\n"),
+    )
+    .unwrap();
+    let before = files_under(&repo.join("objects"));
+    std::fs::write(base.join("src/new.txt"), b"new\n").unwrap();
+    let commit = ostrya_repo(&repo, &["commit", "-b", "n", FIXED_TIMESTAMP, src]);
+    assert_eq!(commit.status.code(), Some(1));
+    assert_eq!(files_under(&repo.join("objects")), before);
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    assert_eq!(fsck.status.code(), Some(1));
+}
+
 /// `composefs-image --check` and `--get-path` fail for a commit that carries
 /// the key and has no image. `--check` writes the reason in one line.
 #[test]

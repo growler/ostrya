@@ -9878,3 +9878,189 @@ fn a_local_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
         assert_left_nothing(&dst).await;
     });
 }
+
+// --- composefs images ----------------------------------------------------
+
+/// The `[ex-ostrya]` group that turns the image generation on.
+const GENERATE: &str = "[ex-ostrya]\ngenerate-composefs=true\n";
+
+/// Commits subtree `sub` of `base` into `repo` under `main`, as
+/// [`commit_tree`] does, with `ostree.composefs.digest.v0` set to the
+/// composefs digest of the tree.
+async fn commit_keyed(repo: &Repo, base: &Path, sub: &str, parent: Option<Checksum>) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(CommitModifierFlags::SKIP_XATTRS);
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let digest = txn.composefs_digest(&root).await.unwrap();
+    let Value::Array(mut metadata) = ref_binding("main") else {
+        unreachable!("the ref binding is an a{{sv}} array")
+    };
+    metadata.push(Value::Tuple(vec![
+        Value::Str("ostree.composefs.digest.v0".to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("ay").unwrap(),
+            Value::Bytes(digest.to_vec()),
+        ))),
+    ]));
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                subject: Some(format!("main {sub}")),
+                timestamp: Some(FIXED_TS),
+                metadata: Some(Value::Array(metadata)),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref("main", Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Creates an archive source under `base/src` with two commits on `main` that
+/// carry the composefs image key, and a summary. Returns the source and the
+/// two commits.
+async fn keyed_source(base: &Path) -> (Repo, Checksum, Checksum) {
+    build_tree(&base.join("v1"), b"hello one\n");
+    build_tree(&base.join("v2"), b"hello two\n");
+    let (_path, repo) = make_repo(base, "src", RepoMode::Archive).await;
+    let c1 = commit_keyed(&repo, base, "v1", None).await;
+    let c2 = commit_keyed(&repo, base, "v2", Some(c1)).await;
+    summarize(&repo).await;
+    (repo, c1, c2)
+}
+
+/// Creates a `bare-user` destination under `base/<name>` with `config` added
+/// to its config file.
+async fn keyed_dest(base: &Path, name: &str, config: &str) -> Repo {
+    common::composefs::new_repo(&base.join(name), RepoMode::BareUser, config).await
+}
+
+/// Returns `true` if `repo` holds a composefs image of `commit` whose digest
+/// is the key of the commit.
+async fn has_valid_image(repo: &Repo, commit: &Checksum) -> bool {
+    repo.check_composefs_image(commit).await.unwrap() == ostrya::ComposefsImageState::Valid
+}
+
+/// With `generate-composefs=true`, a local pull stores a valid image of each
+/// commit that it pulls. With the default `false`, it stores none.
+#[test]
+fn a_local_pull_with_the_key_stores_the_image() {
+    let tmp = TmpDir::new("pull-local-cfs");
+    block_on(async {
+        let base = tmp.path();
+        let (src, c1, c2) = keyed_source(base).await;
+        for (name, config, stored) in [("on", GENERATE, true), ("off", "", false)] {
+            let dst = keyed_dest(base, name, config).await;
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    depth: 1,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for commit in [c1, c2] {
+                assert_eq!(
+                    dst.has_composefs_image(&commit).await.unwrap(),
+                    stored,
+                    "{name}"
+                );
+                if stored {
+                    assert!(has_valid_image(&dst, &commit).await, "{name}");
+                }
+            }
+        }
+    });
+}
+
+/// A local pull through a static delta stores the image of its target.
+#[test]
+fn a_local_pull_through_a_static_delta_stores_the_image() {
+    let tmp = TmpDir::new("pull-local-cfs-delta");
+    block_on(async {
+        let base = tmp.path();
+        let (src, _c1, c2) = keyed_source(base).await;
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        src.reindex_static_deltas().await.unwrap();
+        summarize(&src).await;
+        let dst = keyed_dest(base, "dst", GENERATE).await;
+
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert!(stats.delta_parts > 0, "{stats:?}");
+        assert!(has_valid_image(&dst, &c2).await);
+    });
+}
+
+/// A commit-only pull stores no image. A full pull that completes the held
+/// partial commit stores its image.
+#[test]
+fn a_local_pull_that_completes_a_held_partial_commit_stores_the_image() {
+    let tmp = TmpDir::new("pull-local-cfs-partial");
+    block_on(async {
+        let base = tmp.path();
+        let (src, _c1, c2) = keyed_source(base).await;
+        let dst = keyed_dest(base, "dst", GENERATE).await;
+
+        pull_main(&dst, &src, PullFlags::COMMIT_ONLY).await;
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Partial);
+        assert!(!dst.has_composefs_image(&c2).await.unwrap());
+
+        pull_main(&dst, &src, PullFlags::empty()).await;
+        assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
+        assert!(has_valid_image(&dst, &c2).await);
+    });
+}
+
+/// A value of the key that is not a boolean, and the value `true` in an
+/// `archive` destination, fail a local pull at the open of its transaction.
+/// The pull publishes nothing.
+#[test]
+fn a_bad_generate_composefs_value_fails_a_local_pull() {
+    let tmp = TmpDir::new("pull-local-cfs-bad-value");
+    block_on(async {
+        let base = tmp.path();
+        let (src, _c1, _c2) = keyed_source(base).await;
+        let cases = [
+            (
+                "maybe",
+                RepoMode::BareUser,
+                "[ex-ostrya]\ngenerate-composefs=maybe\n",
+            ),
+            ("archive", RepoMode::Archive, GENERATE),
+        ];
+        for (name, mode, config) in cases {
+            let dst = common::composefs::new_repo(&base.join(name), mode, config).await;
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            match mode {
+                RepoMode::Archive => assert!(matches!(err, Error::Unsupported(_)), "{err}"),
+                _ => assert!(matches!(err, Error::Core(_)), "{err}"),
+            }
+            assert!(dst.list_objects().await.unwrap().is_empty(), "{name}");
+            assert!(dst.list_refs(None).await.unwrap().is_empty(), "{name}");
+            assert_eq!(file_inventory(dst.path(), "state"), Vec::new(), "{name}");
+        }
+    });
+}

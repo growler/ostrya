@@ -415,6 +415,76 @@ commits leaves unreachable commits with no image, and the next prune deletes
 them. The prune does not list the images. An image whose commit is absent
 comes only from a change outside the port, and the fsck notes it.
 
+## The generation of the composefs image
+
+The key `[ex-ostrya] generate-composefs`, default `false`, makes the commit
+of a transaction build the image of each complete commit that carries the
+digest key. The rule is in `Transaction`, so each writer gets it from one
+place.
+
+The writer records its complete commits with the crate-internal
+`Transaction::mark_complete`. The transaction cannot find them alone: it
+does not see a held partial commit that a pull completes, and at its commit
+each commit that a pull staged has a `.commitpartial` marker. The writers
+are the commit writes of `Transaction` (`write_commit` and
+`write_commit_checked`), the pull from a remote and the local pull, the
+receive with ref updates, and `Repo::apply_static_delta`. A pull records the
+commits of its markers under the condition that removes the markers after
+the commit, and one helper holds that condition.
+`Transaction::write_metadata` records no commit, because a pull writes
+partial commits through it. `Repo::commit_add_composefs_metadata` and the
+server commit of a receive build the image themselves and stage it, as
+`commit --generate-composefs` does, so each of them reads the tree one time.
+
+The build skips a commit that the transaction did not stage and that has no
+marker. So a commit that the repository holds complete before the
+transaction gets no image from it, also when a writer writes it again. The
+commit writes and `Repo::apply_static_delta` record a commit only if the
+transaction stages it. A commit that the repository holds partial is not
+staged again, so it gets no image from them. There is no backfill:
+`composefs-image --add` builds the image of a held commit.
+
+The build runs in the commit of the transaction, after the transaction
+stages its objects and before the publication. `publish()` renames the
+images after the objects, so an image is in place only after each object
+that its commit reaches. A malformed key, or an image whose digest is not
+the key, fails the transaction, so it publishes no object and writes no ref.
+For a pull this covers each recorded commit: a target, a parent within the
+depth, a dependency, or a held partial commit. One such commit fails the
+whole pull, also for a target whose image is correct. A failed pull keeps
+no staged object, so a retry fetches each object again.
+
+A receive builds before it takes the update lock, so the other writers of
+refs do not wait for the build. A server commit gets its parent from the tip
+that the receive reads under the lock. The image depends on the tree alone,
+so the receive builds the image of the tree before the lock and checks its
+digest against the key of the client. Under the lock, it writes the commit
+and stages the image as the image of the commit.
+
+`Repo::transaction_with_lock` reads the key before it takes the lock and
+discards the value, so a value that is not a boolean fails each writer
+before its first write. A pull from a remote opens its transaction after its
+first requests, so the pulls also read the key at their start. The fsck
+reads the key at its start for its note of a commit with no image.
+
+The key `true` in an `archive` repository is refused. The generation is for
+production repositories, and the mount refuses `archive`. In the other modes
+the key is accepted. Where the objects have no fs-verity seal, each build
+reads and hashes each file of the commit. `Repo::seals_objects` tells if the
+repository seals its objects, and the commands that write warn of the cost.
+An object that the repository holds from before can have no seal, and the
+build reads it. The port does not seal an object at the dedup of a write,
+and the fsck does not check the seals.
+
+`commit --generate-composefs` stores the image also with the key `false`.
+With the key `true`, `commit --generate-composefs-metadata` takes the same
+path, so the command reads the tree one time.
+
+Rejected alternative: the transaction removes the markers of a pull, so that
+one call decides the marker and the image. It changes the error handling of
+three writers and the order of the removal and the refs. The writers keep
+the removal of the markers.
+
 ## The mount daemon
 
 `ostrya-mountd` mounts a commit as composefs for a caller in a user

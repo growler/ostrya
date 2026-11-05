@@ -1159,6 +1159,39 @@ fn the_switch_drops_the_related_key_of_a_collection_pull() {
     });
 }
 
+// --- composefs images --------------------------------------------------------
+
+/// A value of `[ex-ostrya] generate-composefs` that is not a boolean, and the
+/// value `true` in the `archive` destination, stop a collection pull before
+/// its first request.
+#[test]
+fn a_bad_generate_composefs_value_refuses_a_collection_pull() {
+    for value in ["maybe", "true"] {
+        block_on(async {
+            let dir = TmpDir::new("pull-collection-cfs-bad-value");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            drop(dest(dir.path(), None, &[("a", &server_a.url(), "")]).await);
+            let dest = reconfigure(
+                dir.path(),
+                &format!("\n[ex-ostrya]\ngenerate-composefs={value}\n"),
+            )
+            .await;
+
+            let (opts, _) = options(&[REF]);
+            let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+            match value {
+                "true" => assert!(matches!(err, Error::Unsupported(_)), "{err}"),
+                _ => assert!(matches!(err, Error::Core(_)), "{err}"),
+            }
+            assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+            assert_nothing_written(&dest).await;
+        });
+    }
+}
+
 // --- dependencies ------------------------------------------------------------
 
 /// A collection pull fetches the dependency that field 2 of the pulled commit

@@ -21,8 +21,8 @@ use std::time::{Duration, Instant};
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, PIPE_CAP, SECRET_B64, SERVER_SECRET_B64,
     assert_nothing_published, build_commit, ed25519_signature, ed25519_signatures, fixture_objects,
-    new_repo, pipe, policy_allowing, returned_code, server_signer, session, signed_dict,
-    staging_entries, trust,
+    fixture_tree_digest, keyed_commit, new_repo, pipe, policy_allowing, returned_code,
+    server_signer, session, signed_dict, staging_entries, trust,
 };
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
@@ -33,9 +33,9 @@ use ostrya::remote::proto::{
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::verify::TrustedKeys;
 use ostrya::{
-    Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
-    ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Repo, RepoMode, ServerSigner,
-    StreamPolicy, StreamRule, Type, Value,
+    Checksum, ComposefsImageState, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName,
+    ObjectType, ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Repo, RepoMode,
+    ServerSigner, StreamPolicy, StreamRule, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -344,6 +344,36 @@ fn a_stream_commits_the_fixture_commit() {
             tool_fsck(repo.path());
         }
     }
+}
+
+/// With `[ex-ostrya] generate-composefs=true`, a stream of a commit that
+/// carries the digest key stores a valid composefs image of the commit.
+#[test]
+fn a_stream_stores_the_image_of_a_keyed_commit() {
+    let tmp = TmpDir::new("one-way-cfs");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::BareUser,
+        "[ex-ostrya]\ngenerate-composefs=true\n",
+    );
+    let commit = keyed_commit(None, "keyed", &fixture_tree_digest());
+    let mut objects: Vec<Obj> = fixture_objects(Encoding::Raw)
+        .into_iter()
+        .filter(|o| o.ty != ObjectType::Commit)
+        .collect();
+    objects.push(commit.clone());
+    let mut stream = Stream::hello(&["test/main"], true);
+    stream.objects_with(&objects, &[]).commit(vec![update(
+        "test/main",
+        Expected::Absent,
+        Some(commit.checksum),
+    )]);
+    receive_piped(&repo, &policy(), stream.bytes()).unwrap();
+    assert_eq!(
+        block_on(repo.check_composefs_image(&commit.checksum)).unwrap(),
+        ComposefsImageState::Valid
+    );
+    assert!(staging_entries(repo.path()).is_empty());
 }
 
 /// The longest time that `receive_stream_to_commit` can take for the stream

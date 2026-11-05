@@ -8,6 +8,8 @@
 //! - The write path skips real symlink objects.
 //! - `maybe` is best effort.
 //! - `yes` fails where the file system cannot provide verity.
+//! - `Repo::seals_objects` follows the setting. Its probe for `maybe` matches
+//!   the support of the file system and leaves no entry in `tmp/`.
 //!
 //! A test finds a sealed regular file by a rejected open for write. This needs
 //! no privileged syscall. Each check that needs a working verity kernel runs
@@ -304,4 +306,67 @@ fn tool_reads_a_port_written_verity_repo() {
             String::from_utf8_lossy(&ls.stderr)
         );
     });
+}
+
+/// Returns the sorted names of the entries of `root/tmp`.
+fn tmp_entries(root: &Path) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<_> = std::fs::read_dir(root.join("tmp"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    names.sort();
+    names
+}
+
+/// `seals_objects` gives `true` for `yes`, `false` for `no`, and for `maybe`
+/// the result of a probe that matches the support of the file system. The
+/// probe leaves no entry in `tmp/`.
+#[test]
+fn seals_objects_follows_the_setting() {
+    block_on(async {
+        let tmp = TmpDir::new("fsverity-seals");
+        let supported = fs_supports_verity(&tmp).await;
+        let yes = make_repo(&tmp.path().join("yes"), RepoMode::BareUser, "yes").await;
+        assert!(yes.seals_objects().await.unwrap());
+        let no = make_repo(&tmp.path().join("no"), RepoMode::BareUser, "no").await;
+        assert!(!no.seals_objects().await.unwrap());
+
+        let root = tmp.path().join("maybe");
+        let maybe = make_repo(&root, RepoMode::BareUser, "maybe").await;
+        let before = tmp_entries(&root);
+        assert_eq!(maybe.seals_objects().await.unwrap(), supported);
+        assert_eq!(tmp_entries(&root), before, "the probe leaves no entry");
+    });
+}
+
+/// `seals_objects` gives `false` for `maybe` on tmpfs, which has no fs-verity.
+/// The test skips if `/dev/shm` is absent or seals a file.
+#[test]
+fn seals_objects_is_false_for_maybe_without_support() {
+    let shm = PathBuf::from("/dev/shm");
+    if !shm.is_dir() {
+        eprintln!("skipping: no tmpfs at /dev/shm");
+        return;
+    }
+    let dir = shm.join(format!("ostrya-seals-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let result = block_on(async {
+        if common::composefs::verity_supported(&dir) {
+            return None;
+        }
+        let root = dir.join("repo");
+        let repo = make_repo(&root, RepoMode::BareUser, "maybe").await;
+        let before = tmp_entries(&root);
+        let sealed = repo.seals_objects().await.unwrap();
+        Some((sealed, before == tmp_entries(&root)))
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    match result {
+        None => eprintln!("skipping: /dev/shm unexpectedly supports fs-verity"),
+        Some((sealed, clean)) => {
+            assert!(!sealed);
+            assert!(clean, "the probe leaves no entry");
+        }
+    }
 }

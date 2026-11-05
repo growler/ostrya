@@ -374,6 +374,73 @@ fn a_server_commit_on_an_absent_branch_has_no_parent() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
+/// A server commit whose metadata carries `digest` under
+/// `ostree.composefs.digest.v0`, over the fixture tree, on `branch`.
+fn keyed_server_commit(branch: &str, digest: &[u8; 32]) -> ServerCommit {
+    let mut sc = server_commit(branch);
+    sc.metadata.push((
+        common::composefs::DIGEST_KEY.into(),
+        v(&Value::variant(
+            Type::array(Type::Byte),
+            Value::Bytes(digest.to_vec()),
+        )),
+    ));
+    sc
+}
+
+/// With `[ex-ostrya] generate-composefs=true`, a server commit whose
+/// metadata carries the digest of its tree stores a valid composefs image of
+/// the new commit. A digest that is not the digest of the tree, and a
+/// malformed key, fail the session with `internal`, and the session
+/// publishes nothing.
+#[test]
+fn a_keyed_server_commit_stores_its_image() {
+    let config = "[ex-ostrya]\ngenerate-composefs=true\n";
+    let tmp = TmpDir::new("sc-cfs");
+    let repo = new_repo(&tmp, RepoMode::BareUser, config);
+    let digest = common::receive::fixture_tree_digest();
+    let report = committed(push_sc(
+        &repo,
+        &policy_allowing(&["c:**"]),
+        &tree_objects(),
+        keyed_server_commit("main", &digest),
+    ));
+    let commit = new_commit(&report);
+    assert_eq!(
+        block_on(repo.check_composefs_image(&commit)).unwrap(),
+        ostrya::ComposefsImageState::Valid
+    );
+    assert!(staging_entries(repo.path()).is_empty());
+
+    let tmp = TmpDir::new("sc-cfs-wrong");
+    let repo = new_repo(&tmp, RepoMode::BareUser, config);
+    let before = snapshot(&repo);
+    let (result, reply) = push_sc(
+        &repo,
+        &policy_allowing(&["c:**"]),
+        &tree_objects(),
+        keyed_server_commit("main", &[0x5a; 32]),
+    );
+    let error = reply.expect_err("the push is refused");
+    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+    assert!(result.is_err(), "{result:?}");
+    assert_unchanged(&repo, &before);
+    assert!(!repo.path().join("extensions/ostrya/composefs").exists());
+
+    let tmp = TmpDir::new("sc-cfs-malformed");
+    let repo = new_repo(&tmp, RepoMode::BareUser, config);
+    let before = snapshot(&repo);
+    let mut sc = server_commit("main");
+    sc.metadata
+        .push((common::composefs::DIGEST_KEY.into(), text("digest")));
+    let (result, reply) = push_sc(&repo, &policy_allowing(&["c:**"]), &tree_objects(), sc);
+    let error = reply.expect_err("the push is refused");
+    assert_eq!(error.code, ErrorCode::Internal, "{error:?}");
+    assert!(result.is_err(), "{result:?}");
+    assert_unchanged(&repo, &before);
+    assert!(!repo.path().join("extensions/ostrya/composefs").exists());
+}
+
 /// A second server commit on a branch takes the tip as its parent. The reply
 /// gives the tip as the old commit of the branch.
 #[test]

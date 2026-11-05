@@ -159,6 +159,15 @@ impl Transaction {
     /// In each other mode the call writes no key. The bytes of the commit are
     /// the same with and without the request.
     ///
+    /// # Composefs image
+    ///
+    /// If the call stages the commit object, it records the commit as
+    /// complete. If `[ex-ostrya] generate-composefs` is `true` and the commit
+    /// carries `ostree.composefs.digest.v0`, [`commit`](Transaction::commit)
+    /// then builds and stores the composefs image of the commit. A commit that
+    /// the repository holds already, complete or partial, is not staged, so it
+    /// gets no image.
+    ///
     /// # Dependencies
     ///
     /// Field 2 of the commit object holds the entries of `opts.related`,
@@ -235,6 +244,9 @@ impl Transaction {
     /// does. Field 2 of the commit object holds the entries of `related`,
     /// sorted by name in byte order. `opts.related` must be empty. For the
     /// same inputs, the call and `write_commit` give the same commit.
+    ///
+    /// The call records the commit for the composefs image as `write_commit`
+    /// does.
     ///
     /// The call does not check the dependencies again.
     /// [`check_related`](Transaction::check_related) checked them. A process
@@ -410,7 +422,15 @@ impl Transaction {
             root_dirmeta: *root.dirmeta_checksum(),
         };
         let bytes = commit.serialize()?;
-        self.write_metadata(ObjectType::Commit, None, &bytes).await
+        let checksum = self
+            .write_metadata(ObjectType::Commit, None, &bytes)
+            .await?;
+        // A commit that the repository holds already, complete or partial, is
+        // not staged, and gets no image.
+        if self.is_staged(&checksum, ObjectType::Commit) {
+            self.mark_complete(&checksum);
+        }
+        Ok(checksum)
     }
 
     /// Builds the `ostree.sizes` entries for `root`.

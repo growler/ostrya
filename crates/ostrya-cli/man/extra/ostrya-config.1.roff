@@ -470,6 +470,40 @@ If ostrya cannot read a file that a TLS key or \fB\%push\-token\-file\fR names, 
 The keys of the group \fB\%[ex\-ostrya]\fR.
 The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 .TP
+\fB\%generate\-composefs\fR (boolean, default false)
+Store the composefs image of each complete commit that a write adds and that carries the key \fB\%ostree.composefs.digest.v0\fR.
+\fB\%ostrya\-repo\fR(5) describes the image file.
+The writers are \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR and \fB\%ostrya serve\fR (a push, a one\-way stream, and a server commit), and \fB\%ostrya static\-delta apply\-offline\fR.
+A pull builds the image of each target, of each parent within the depth, of each dependency, and of each held partial commit that it completes.
+A commit\-only pull and a pull with subpaths build no image.
+A commit that the repository holds complete before the write gets no image.
+\fB\%ostrya composefs\-image \-\-add\fR stores the image of such a commit.
+\fB\%ostrya commit\fR and \fB\%ostrya static\-delta apply\-offline\fR also give no image to a commit that the repository holds partial.
+With true, \fB\%ostrya commit \-\-generate\-composefs\-metadata\fR also stores the image, as \fB\%\-\-generate\-composefs\fR does.
+.IP
+A malformed key or an image whose fs\-verity digest is not the key fails the write, and the write adds no object and no ref.
+For a pull, one such commit fails the whole pull, also when the image of each target is correct.
+A later pull of the same commits fetches each object again.
+.IP
+A value that is not a boolean fails each write before its first write, and a pull before its first request.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR refuse it at the start of a session.
+\fB\%ostrya fsck\fR refuses it before its first phase.
+ostrya refuses the value true in an \fB\%archive\fR repository in the same places.
+.IP
+Each image build reads the fs\-verity digest of a sealed object from the kernel, and reads and hashes each other object.
+With \fB\%[ex\-integrity] fsverity=no\fR, or \fB\%maybe\fR on a file system with no fs\-verity, each build reads each file of the commit.
+With true, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya static\-delta apply\-offline\fR, and \fB\%ostrya receive\fR then write this warning on standard error:
+.IP
+\fB\%warning: [ex\-ostrya] generate\-composefs is true, but the repository does not seal its objects with fs\-verity; each image build reads each file of the commit\fR
+.IP
+With \fB\%maybe\fR, the command makes a probe file in \fB\%tmp/\fR to find the result.
+The warning does not change the exit status.
+The fs\-verity setting applies to the objects that a write adds.
+An object that the repository holds from before can have no seal, and each build reads it.
+.IP
+With true, \fB\%ostrya fsck\fR writes the line \fB\%Commit with no composefs image: COMMIT\fR on standard output for each complete commit with the key and no image.
+The line does not change the exit status.
+.TP
 \fB\%keep\-detached\-related\fR (boolean, default true)
 Store the detached metadata key \fB\%ostrya.related\fR that a transfer gives.
 With false, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR remove \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that they write.

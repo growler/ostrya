@@ -17,7 +17,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess};
-use crate::config::{EX_OSTRYA, MinFreeSpace, REMOTES_CONFIG_DIR, RepoConfig};
+use crate::config::{EX_OSTRYA, MinFreeSpace, REMOTES_CONFIG_DIR, RepoConfig, Tristate};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
 use crate::perm;
@@ -811,6 +811,43 @@ impl Repo {
         self.objects_fd()
     }
 
+    /// Returns `true` if the repository seals its objects with fs-verity.
+    ///
+    /// The result comes from [`RepoConfig::fsverity`]:
+    ///
+    /// - `yes` gives `true`. A write fails if a seal fails.
+    /// - `no` gives `false`.
+    /// - `maybe` gives the result of a probe. The probe makes a temp file in
+    ///   `tmp/`, writes one byte, and enables fs-verity on it. If the enable
+    ///   fails, the result is `false`. The probe removes the file.
+    ///
+    /// The result covers the objects that a write stages. An object that the
+    /// repository holds from before, for example from a write with
+    /// `fsverity=no`, can have no seal. A composefs image build reads the
+    /// digest of a sealed object from the kernel, and reads and hashes each
+    /// other object. So with the result `false`, each build under
+    /// `[ex-ostrya] generate-composefs` reads each file of its commit.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`RepoConfig::fsverity`].
+    /// - [`Error::Io`] if the probe cannot create `tmp/`, or cannot open or
+    ///   write its temp file.
+    pub async fn seals_objects(&self) -> Result<bool> {
+        match self.inner.config.fsverity()? {
+            Tristate::Yes => Ok(true),
+            Tristate::No => Ok(false),
+            Tristate::Maybe => {
+                let repo = self.clone();
+                ostrya_rt::unblock(move || {
+                    let tmp = crate::staging::open_tmp_dir(repo.repo_fd(), repo.mode())?;
+                    crate::write::probe_seal_blocking(tmp.as_fd())
+                })
+                .await
+            }
+        }
+    }
+
     /// Begins a transaction that holds the repository lock shared.
     ///
     /// A shared lock matches the read lock that the `ostree` command holds
@@ -832,6 +869,9 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `lock-timeout-secs` is less than `-1`,
     ///   if `min-free-space-size` is malformed, or if `min-free-space-percent`
     ///   is outside the range `0` to `100`.
+    /// - The errors of [`RepoConfig::generate_composefs`]: a value of
+    ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
+    ///   `true` in an `archive` repository.
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction(&self) -> Result<Transaction> {
@@ -873,6 +913,9 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `lock-timeout-secs` is less than `-1`,
     ///   if `min-free-space-size` is malformed, or if `min-free-space-percent`
     ///   is outside the range `0` to `100`.
+    /// - The errors of [`RepoConfig::generate_composefs`]: a value of
+    ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
+    ///   `true` in an `archive` repository.
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
@@ -881,6 +924,9 @@ impl Repo {
         // any wait on a contended repository.
         let expiry_secs = self.inner.config.tmp_expiry_secs()?;
         let min_free = self.inner.config.min_free_space()?;
+        // The commit of the transaction reads the key again. This read fails
+        // a bad value before the first write.
+        self.inner.config.generate_composefs()?;
         let guard = self.lock_repo(kind).await?;
 
         let repo = self.clone();

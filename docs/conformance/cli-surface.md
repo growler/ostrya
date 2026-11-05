@@ -6218,7 +6218,18 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
 - `commit --generate-composefs` stores the image with a new commit. The
   option turns on `--generate-composefs-metadata`, so the commit is the
   commit that the tool writes with `--generate-composefs-metadata`. The tool
-  refuses `--generate-composefs` as an unknown option.
+  refuses `--generate-composefs` as an unknown option. The option stores
+  the image also with `[ex-ostrya] generate-composefs` false. With the key
+  true, `commit --generate-composefs-metadata` also stores the image and
+  reads the tree one time. Each of the two options writes the commit of the
+  tool.
+- With `[ex-ostrya] generate-composefs` true, `commit`, `pull`,
+  `pull-local`, `receive`, `serve`, and `static-delta apply-offline` store
+  the image of each complete commit that they add and that carries the key
+  (`ostrya-config(1)`). If the repository does not seal its objects,
+  `commit`, `pull`, `pull-local`, `receive`, and `static-delta
+  apply-offline` write one `warning:` line to standard error, and the exit
+  status does not change. The tool ignores the group `[ex-ostrya]`.
 - The tool has no image store. `objects/` of a repository that holds images
   holds only the object types of the tool, so the tool reads the
   repository. `ostree fsck` and `ostree prune` neither check, count, nor
@@ -6241,7 +6252,10 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   writes the same line and keeps the image. For an image whose commit is
   absent, it writes `Composefs image with no commit: CHECKSUM` to standard
   output, and this line is not an error. A repository with no image gets
-  none of these lines.
+  none of these lines. With `[ex-ostrya] generate-composefs` true, `fsck`
+  also writes `Commit with no composefs image: CHECKSUM` to standard output
+  for each complete commit that carries the key and has no image, after the
+  lines of the images whose commit is absent. This line is not an error.
 - `crates/ostrya/tests/composefs_image.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 

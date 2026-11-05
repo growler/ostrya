@@ -2301,6 +2301,11 @@ impl Repo {
                     place.queue(&txn, ref_name, tip);
                 }
             }
+            if completes_marked(&opts) {
+                for commit in &marked {
+                    txn.mark_complete(commit);
+                }
+            }
             txn.commit().await
         }
         .await;
@@ -2314,7 +2319,7 @@ impl Repo {
 
         // The content that a marker guarded is published. A commit-only pull
         // keeps its markers, because it did not walk the trees.
-        if !flags.contains(PullFlags::COMMIT_ONLY) {
+        if completes_marked(&opts) {
             for commit in &marked {
                 self.remove_partial_marker(commit).await?;
             }
@@ -2653,6 +2658,17 @@ impl Repo {
         #[cfg(test)]
         crate::jobs::job_gate::release(self.repo_fd());
     }
+}
+
+/// Returns `true` if a pull with `opts` completes each commit that it marks
+/// partial.
+///
+/// A commit-only pull fetches no tree, and a pull with subpaths fetches part
+/// of each tree, so both keep their markers. Each other pull removes its
+/// markers after the commit of its transaction, and records each marked
+/// commit as complete before it.
+pub(crate) fn completes_marked(opts: &PullOptions) -> bool {
+    !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty()
 }
 
 /// Returns the `state/` path of the partial marker of a commit, relative to

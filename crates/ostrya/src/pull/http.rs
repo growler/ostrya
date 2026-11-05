@@ -65,7 +65,7 @@ use super::{
     CheckedMeta, ModeChecks, Pinned, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
     READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, refuse_remote_collection, take_static_deltas,
+    check_tip_refs, completes_marked, refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -559,6 +559,9 @@ impl Repo {
     ///   [`subpaths`](PullOptions::subpaths).
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
+    /// - The errors of
+    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
+    ///   for this repository.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
     ///   over 1 MiB is [`Error::InvalidInput`].
@@ -708,6 +711,9 @@ impl Repo {
         // The pull reads the rule one time, here. A value that is not a
         // boolean stops the pull before its first request.
         let related = RelatedRule::of(self.config())?;
+        // The commit of the transaction reads the key again. This read fails
+        // a bad value before the first request.
+        self.config().generate_composefs()?;
         let edges = take_static_deltas(&mut opts).await?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -802,6 +808,9 @@ impl Repo {
     ///
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
+    /// - The errors of
+    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
+    ///   for this repository.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
@@ -861,7 +870,9 @@ impl Repo {
         mut opts: PullOptions,
     ) -> Result<PullStats> {
         let started = Instant::now();
-        let checked = match RelatedRule::of(self.config()) {
+        let checked = match RelatedRule::of(self.config())
+            .and_then(|related| self.config().generate_composefs().map(|_| related))
+        {
             Ok(related) => check_session_pull(&mut opts)
                 .await
                 .map(|checked| (related, checked)),
@@ -986,6 +997,11 @@ impl Repo {
                         place.queue(&txn, name, tip);
                     }
                 }
+                if completes_marked(opts) {
+                    for commit in &marked {
+                        txn.mark_complete(commit);
+                    }
+                }
                 txn.commit().await.map(|stats| (stats, summary, signature))
             }
             Err(e) => Err(e),
@@ -1001,7 +1017,7 @@ impl Repo {
         // The content that a marker guarded is published. A commit-only pull
         // keeps its markers, because it fetched no tree. A pull with subpaths
         // keeps them too, because it fetched part of each tree.
-        if !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty() {
+        if completes_marked(opts) {
             for commit in &marked {
                 self.remove_partial_marker(commit).await?;
             }

@@ -498,6 +498,13 @@ pub struct FsckReport {
     ///
     /// Such an image is not an error. No prune removes it.
     pub orphan_images: Vec<Checksum>,
+    /// The complete commits that carry `ostree.composefs.digest.v0` and have
+    /// no composefs image, sorted.
+    ///
+    /// The run fills the list only if `[ex-ostrya] generate-composefs` is
+    /// `true`. Such a commit is not an error. [`Repo::fsck`] states the rule
+    /// under "Composefs images".
+    pub missing_images: Vec<Checksum>,
     /// The dependencies that are absent, partial, or defective, sorted by
     /// the commit that names them, then in the stored order of its field 2.
     ///
@@ -549,6 +556,8 @@ struct Ctx {
     image_errors: Vec<FsckImageError>,
     /// The composefs images with no commit object.
     orphan_images: Vec<Checksum>,
+    /// The complete commits with a digest key and no composefs image.
+    missing_images: Vec<Checksum>,
     /// The commits that reach an absent or a deleted object, also when the
     /// run marks no commit.
     incomplete: HashSet<Checksum>,
@@ -587,6 +596,7 @@ impl Ctx {
         self.tombstoned.sort();
         self.image_errors.sort_by_key(|e| e.commit);
         self.orphan_images.sort();
+        self.missing_images.sort();
         FsckReport {
             reached,
             commits_checked: self.verified.len(),
@@ -600,8 +610,27 @@ impl Ctx {
             images_checked: self.images_checked,
             image_errors: self.image_errors,
             orphan_images: self.orphan_images,
+            missing_images: self.missing_images,
             dependency_errors: self.dependency_errors,
         }
+    }
+
+    /// Notes each commit of `keyed`, the commits with a digest key and no
+    /// composefs image, that the run did not remove, that is complete, and
+    /// that the run did not mark partial.
+    fn note_missing_images(&mut self, keyed: Vec<Checksum>) {
+        let missing: Vec<Checksum> = keyed
+            .into_iter()
+            .filter(|c| {
+                !self
+                    .deleted
+                    .contains(&ObjectName::new(*c, ObjectType::Commit))
+                    && !self.tombstoned.contains(c)
+                    && !self.incomplete.contains(c)
+                    && !self.marked_partial.contains(c)
+            })
+            .collect();
+        self.missing_images = missing;
     }
 }
 
@@ -710,6 +739,18 @@ impl Repo {
     /// The run reads the key of a commit that phase 4 walked from the read of
     /// that walk, so it reads each of these commit objects once.
     ///
+    /// If `[ex-ostrya] generate-composefs` is `true`, the run also reads the
+    /// key of each commit that phase 4 walked and that has no image in the
+    /// listing. [`FsckReport::missing_images`] holds each such commit whose
+    /// key reads, that is complete, and that the run did not remove or mark
+    /// partial. A commit with a malformed key gets no note, and a partial
+    /// commit gets no note. A commit that the run marks partial for an absent
+    /// or a partial dependency gets no note.
+    /// A note is not an error, and the run repairs nothing for it. The run
+    /// takes no lock, so a transaction that publishes an image during the run
+    /// can make a note that is already stale. With the key `false`, the list
+    /// is empty.
+    ///
     /// No count of the run includes an image. A run that ends early does not
     /// reach this check.
     ///
@@ -761,6 +802,9 @@ impl Repo {
     /// - [`Error::Core`] if a ref file holds no checksum, if the header of a
     ///   content object does not serialize, or if `[core] fsync` is not a
     ///   boolean.
+    /// - The errors of
+    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs),
+    ///   before the first phase.
     /// - [`Error::Io`] if a read or a write on the file system fails. These
     ///   are the listing of the refs and of the objects, the read of a commit
     ///   that a ref names or of a dirtree, the check for a `.commitpartial`
@@ -769,6 +813,7 @@ impl Repo {
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) also gives this
     ///   error.
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport> {
+        let note = self.config().generate_composefs()?;
         let mut ctx = Ctx::default();
         // Every phase that reads a ref reads this one listing.
         let (ref_targets, collection_refs) = self.fsck_read_refs().await?;
@@ -810,9 +855,16 @@ impl Repo {
         // Phase 4: collect the object set the verified commits reference, then
         // verify each object in it.
         let mut image_keys = HashMap::new();
+        let mut keyed = note.then(Vec::new);
         let mut dependencies = Vec::new();
         let order = match self
-            .fsck_collect_objects(&ctx.verified, &images, &mut image_keys, &mut dependencies)
+            .fsck_collect_objects(
+                &ctx.verified,
+                &images,
+                &mut image_keys,
+                keyed.as_mut(),
+                &mut dependencies,
+            )
             .await?
         {
             Ok(order) => order,
@@ -848,6 +900,9 @@ impl Repo {
         // The composefs images, against the commits that are still present.
         self.fsck_check_images(&commits, &images, image_keys, opts, &mut ctx)
             .await?;
+        if let Some(keyed) = keyed {
+            ctx.note_missing_images(keyed);
+        }
 
         Ok(ctx.finish(FsckPhase::VerifyObjects, objects_checked, None))
     }
@@ -1048,7 +1103,9 @@ impl Repo {
     /// For each commit in `images`, the sorted list of the commits that have
     /// a composefs image, the function adds the key
     /// `ostree.composefs.digest.v0` of the commit to `image_keys`, if the key
-    /// reads. The image check then does not read the commit again.
+    /// reads. The image check then does not read the commit again. If
+    /// `keyed` is given, the function adds each other commit whose key reads
+    /// and has a value to it.
     ///
     /// For each commit whose field 2 is not empty, the function adds the
     /// commit and the entries of field 2 to `dependencies`, in the order of
@@ -1058,6 +1115,7 @@ impl Repo {
         commits: &[Checksum],
         images: &[Checksum],
         image_keys: &mut HashMap<Checksum, Option<[u8; 32]>>,
+        mut keyed: Option<&mut Vec<Checksum>>,
         dependencies: &mut Vec<(Checksum, Vec<RelatedEntry>)>,
     ) -> Result<std::result::Result<Vec<ObjectName>, FsckFailure>> {
         let mut order = Vec::new();
@@ -1072,10 +1130,17 @@ impl Repo {
             let Ok(mut parsed) = Commit::parse(&bytes) else {
                 continue;
             };
-            if images.binary_search(commit).is_ok()
+            let has_image = images.binary_search(commit).is_ok();
+            if (has_image || keyed.is_some())
                 && let Ok(key) = crate::composefs::recorded_digest(&parsed)
             {
-                image_keys.insert(*commit, key);
+                if has_image {
+                    image_keys.insert(*commit, key);
+                } else if key.is_some()
+                    && let Some(keyed) = keyed.as_deref_mut()
+                {
+                    keyed.push(*commit);
+                }
             }
             if !parsed.related.is_empty() {
                 dependencies.push((

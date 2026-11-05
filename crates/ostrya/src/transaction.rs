@@ -9,7 +9,7 @@
 //! transaction. [`FileMeta`] holds the uid, the gid, the mode, and the
 //! extended attributes of a file object.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -121,6 +121,9 @@ struct Staged {
     /// The composefs images staged so far, by the checksum of their commit,
     /// for publication into `extensions/ostrya/composefs/` at commit.
     images: HashMap<Checksum, StagedObject>,
+    /// The commits that the writers recorded as complete, for the image build
+    /// of the commit.
+    complete: BTreeSet<Checksum>,
     /// The size record of each object in archive mode, by checksum. The
     /// records cover content and metadata objects, the input of `ostree.sizes`.
     sizes: HashMap<Checksum, SizeRecord>,
@@ -353,6 +356,7 @@ impl Transaction {
             staged: Mutex::new(Staged {
                 objects: HashMap::new(),
                 images: HashMap::new(),
+                complete: BTreeSet::new(),
                 sizes: HashMap::new(),
                 size_scope: None,
                 free_budget,
@@ -591,6 +595,22 @@ impl Transaction {
     /// transaction.
     pub(crate) fn is_image_staged(&self, commit: &Checksum) -> bool {
         self.staged.lock().unwrap().images.contains_key(commit)
+    }
+
+    /// Records `commit` as a complete commit of this transaction.
+    ///
+    /// Each writer of a complete commit calls it. Under
+    /// `[ex-ostrya] generate-composefs`, the commit of the transaction builds
+    /// the composefs image of each recorded commit that this transaction
+    /// staged or that has a `.commitpartial` marker.
+    pub(crate) fn mark_complete(&self, commit: &Checksum) {
+        self.staged.lock().unwrap().complete.insert(*commit);
+    }
+
+    /// Takes the commits that [`mark_complete`](Transaction::mark_complete)
+    /// recorded.
+    pub(crate) fn take_complete(&self) -> BTreeSet<Checksum> {
+        std::mem::take(&mut self.staged.lock().unwrap().complete)
     }
 
     /// Returns, for each checksum of `checksums`, `true` if an object of that
@@ -1459,18 +1479,49 @@ impl Transaction {
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     ///    queued, as [`Repo::write_commit_detached_metadata`] does. On a
     ///    refusal the call publishes no object and writes nothing.
-    /// 2. The call renames each staged object into `objects/<xx>/`, and then
+    /// 2. If `[ex-ostrya] generate-composefs` is `true`, the call builds the
+    ///    composefs image of each commit that the writer recorded as complete,
+    ///    as `# Composefs images` states. If a build fails, the call publishes
+    ///    no object and writes nothing.
+    /// 3. The call renames each staged object into `objects/<xx>/`, and then
     ///    each staged composefs image into
     ///    `extensions/ostrya/composefs/<xx>/`. So an image is in place only
     ///    after each object of the transaction. The rename of an image
     ///    replaces a stored image of the same commit.
-    /// 3. The call writes the queued detached-metadata edits.
-    /// 4. The call writes the queued refs. Each ref write is atomic: a temp
+    /// 4. The call writes the queued detached-metadata edits.
+    /// 5. The call writes the queued refs. Each ref write is atomic: a temp
     ///    file, then a rename. The set of ref writes is not atomic as a whole.
-    /// 5. The call removes the staging directory and releases the repository
+    /// 6. The call removes the staging directory and releases the repository
     ///    lock.
     ///
-    /// Steps 3 and 4 run in one trip to the blocking pool.
+    /// Steps 4 and 5 run in one trip to the blocking pool.
+    ///
+    /// # Composefs images
+    ///
+    /// Each writer of a complete commit records the commit for the build of
+    /// step 2: [`write_commit`](Transaction::write_commit),
+    /// [`write_commit_checked`](Transaction::write_commit_checked), a pull
+    /// from a remote, a local pull, a receive with ref updates, and
+    /// [`Repo::apply_static_delta`]. The commit writes and
+    /// [`Repo::apply_static_delta`] record a commit only if they stage its
+    /// object, so a commit that the repository holds already, complete or
+    /// partial, gets no image from them. A pull records each commit that it
+    /// completes: the targets, the parents within the depth, the
+    /// dependencies, and each held partial commit. A partial commit is not
+    /// recorded. [`write_metadata`](Transaction::write_metadata) records no
+    /// commit. [`Repo::commit_add_composefs_metadata`] and the server commit
+    /// of a receive build and stage the image of their commit themselves, so
+    /// step 2 does not build it again.
+    ///
+    /// The build reads each recorded commit, staged first. It skips a commit
+    /// that the transaction did not stage and that has no `.commitpartial`
+    /// marker, so a commit that the repository holds complete before the
+    /// transaction gets no image. It also skips a commit with no
+    /// `ostree.composefs.digest.v0` key and a commit whose image is staged.
+    /// For each other commit, it makes the steps of
+    /// [`write_composefs_image`](Transaction::write_composefs_image). The
+    /// build reads the fs-verity digest of a sealed object from the kernel,
+    /// and reads and hashes each other object.
     ///
     /// # Durability
     ///
@@ -1478,7 +1529,7 @@ impl Transaction {
     /// [`set_fsync`](Transaction::set_fsync), or else `[core] fsync` of the
     /// repository config. With fsync on, the call syncs as follows:
     ///
-    /// - Before the renames of step 2, it runs `syncfs` on the repository.
+    /// - Before the renames of step 3, it runs `syncfs` on the repository.
     /// - After the renames of the objects, it runs `fsync` on each fanout
     ///   directory that got an object, and on `objects/`.
     /// - After the renames of the images, it runs `fsync` on each
@@ -1496,11 +1547,11 @@ impl Transaction {
     /// # Locks
     ///
     /// The transaction holds the repository lock from its begin to the end of
-    /// this call, in the [`LockKind`](crate::LockKind) of its begin. Step 2
-    /// runs with no update lock.
+    /// this call, in the [`LockKind`](crate::LockKind) of its begin. Steps 2
+    /// and 3 run with no update lock.
     ///
     /// If the transaction writes a ref, a ref removal included, or detached
-    /// metadata, the call takes the update lock for steps 3 and 4. The update
+    /// metadata, the call takes the update lock for steps 4 and 5. The update
     /// lock excludes the other writers of refs and detached metadata, as
     /// [`UpdateGuard`](crate::UpdateGuard) states. The wait is for the update
     /// lock alone, because the transaction holds the repository lock already. A
@@ -1509,7 +1560,7 @@ impl Transaction {
     /// # Cancellation
     ///
     /// The update lock, the repository lock, and the staging directory move
-    /// into the blocking closure of steps 3 and 4. The closure releases them
+    /// into the blocking closure of steps 4 and 5. The closure releases them
     /// when its writes end. If a caller drops the returned future, the writes
     /// complete, and the locks and the staged files stay until the writes end.
     ///
@@ -1527,6 +1578,15 @@ impl Transaction {
     ///   [`add_detached_related`](Transaction::add_detached_related) queued
     ///   meets a defective stored `ostrya.related` value. The published
     ///   objects stay, and the call writes no ref.
+    /// - Under `[ex-ostrya] generate-composefs`, the errors of
+    ///   [`write_composefs_image`](Transaction::write_composefs_image) for a
+    ///   recorded commit. Among them, [`Error::InvalidFormat`] if the value of
+    ///   the digest key of the commit is malformed, and
+    ///   [`Error::ComposefsDigestMismatch`] if the image of its tree does not
+    ///   have the digest that the key records. The call publishes no object
+    ///   and writes nothing.
+    /// - The errors of [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
+    ///   if a writer recorded a commit.
     /// - [`Error::InvalidFormat`] if a staged composefs image meets a
     ///   component of `extensions/ostrya/composefs/<xx>/` that is a symlink or
     ///   no directory. The objects and the images that the call renamed
@@ -1546,6 +1606,7 @@ impl Transaction {
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
+        Box::pin(self.build_recorded_images()).await?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
             let stats = self.staged.lock().unwrap().stats;
@@ -1568,6 +1629,7 @@ impl Transaction {
         );
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
+        Box::pin(self.build_recorded_images()).await?;
         let synced = self.publish().await?;
         self.write_tail(refs, synced, None).await
     }

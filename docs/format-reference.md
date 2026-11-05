@@ -2351,8 +2351,11 @@ no remotes directory reads no such keyring. In a verification of the port, a
 keyring of the remotes directory that exists stops the read of the global
 directory, as the keyring of the repo does. An import of the port writes the
 keyring of the repo alone, and that keyring then hides the file of the remotes
-directory. The import refuses a symlink at `<remote>.trustedkeys.gpg` in the
-repo, also a symlink to no file. These are the rules of the port.
+directory. The import reads `<remote>.trustedkeys.gpg` of the repo as a
+verification does: the read follows a symlink, and a symlink to no file is no
+keyring. The import writes a temp file and renames it at that path, so a
+symlink there becomes a regular file, and the target of the symlink does not
+change. These are the rules of the port.
 
 The `<remote>.trustedkeys.gpg` keyring and each file of the global
 directory must be a binary OpenPGP packet stream. If such a keyring holds

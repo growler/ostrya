@@ -246,7 +246,8 @@ A keyring of the directory that ostrya cannot open or read for a reason other th
 \fB\%ostrya remote gpg\-list\-keys\fR reads the same keyring.
 \fB\%ostrya remote gpg\-import\fR writes \fB\%<repo>/NAME.trustedkeys.gpg\fR, also for a remote of the directory, and never writes a keyring of the directory.
 When no file is at \fB\%<repo>/NAME.trustedkeys.gpg\fR, \fB\%ostrya \%remote \%gpg\-import\fR and \fB\%ostrya \%remote \%add \%\-\-gpg\-import\fR create it, and that keyring then hides the keyring of the directory.
-An import refuses a symlink at that path, also a symlink to no file.
+An import reads that path as a verification does: the read follows a symlink, and a symlink to an absent file is no keyring.
+The import writes a temporary file and renames it at that path, so a symlink there becomes a regular file, and the target of the symlink does not change.
 The import copies the keys, so a later change to the keyring of the directory has no effect.
 To trust the keys of the directory too, import that keyring into the repository keyring, before or after the other keys, with \fB\%ostrya \%remote \%gpg\-import \%\-\-keyring \%PATH \%NAME\fR.
 PATH is the keyring of NAME in the remotes directory, and a relative PATH is relative to the current directory.

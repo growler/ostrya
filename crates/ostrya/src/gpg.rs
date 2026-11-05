@@ -36,7 +36,7 @@ use crate::error::{Error, Result};
 use crate::remotes_dir;
 use crate::repo::{RemotesDir, Repo};
 use crate::sign::read_key_source;
-use crate::summary::{read_root_file_blocking, write_root_file_blocking};
+use crate::summary::write_root_file_blocking;
 
 #[cfg(feature = "sign-gpg")]
 pub use ostrya_sign::GpgSigner;
@@ -413,12 +413,14 @@ impl Repo {
     ///
     /// # Import rules
     ///
-    /// The call replaces the keyring atomically. The keyring keeps the packet
-    /// stream that it already held. The packets of each added certificate
-    /// follow, as `keys` wrote them, with no Trust packets. The keyring is
-    /// written in the binary form, so an armored keyring keeps its packets and
-    /// loses its armor. `gpg` and the `ostree` command both read a keyring of
-    /// this form.
+    /// The call replaces the keyring atomically. The read of the keyring
+    /// follows a symlink, and a symlink to no file is no keyring. The write
+    /// puts a regular file at the path of the symlink, and does not change the
+    /// target. The keyring keeps the packet stream that it already held. The
+    /// packets of each added certificate follow, as `keys` wrote them, with no
+    /// Trust packets. The keyring is written in the binary form, so an armored
+    /// keyring keeps its packets and loses its armor. `gpg` and the `ostree`
+    /// command both read a keyring of this form.
     ///
     /// If the keyring already holds a key, the call keeps the certificate of
     /// that key as it is, and counts the key as already held. So a new user id
@@ -469,13 +471,15 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
     ///   The call refuses the name before it parses `keys` and before it
     ///   takes a lock.
+    /// - [`Error::Signature`] if the keyring cannot be opened or read for a
+    ///   reason other than its absence, or is not a regular file. The message
+    ///   names the keyring.
     /// - [`Error::Signature`] if the keyring is over 4 MiB, or the streams of
-    ///   `keys` together are over 4 MiB.
+    ///   `keys` together are over 4 MiB. The call refuses the size of the
+    ///   keyring before it reads the keyring.
     /// - [`Error::Signature`] if the offered stream or the keyring holds more
     ///   than 256 certificates, or if a stream of `keys` or the keyring is a
     ///   GnuPG keybox.
-    /// - [`Error::InvalidFormat`] if the keyring is larger than 64 MiB, the
-    ///   cap of its read.
     /// - [`Error::Signature`] if the offered stream or the keyring does not
     ///   parse as an OpenPGP keyring.
     /// - [`Error::Signature`] if the offered stream holds no certificate, or a
@@ -489,10 +493,8 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes
     ///   `[core] lock-timeout-secs`.
-    /// - [`Error::Io`] if a symlink is at the path of the repository keyring,
-    ///   also a symlink to no file. The call refuses each such symlink.
-    /// - [`Error::Io`] if a lock file, the read of the keyring, the write of
-    ///   the keyring, or the sync of the repository directory fails.
+    /// - [`Error::Io`] if a lock file, the write of the keyring, or the sync
+    ///   of the repository directory fails.
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
@@ -527,7 +529,8 @@ impl Repo {
             .await
         };
         self.write_locked(move |repo| {
-            let existing = read_root_file_blocking(repo.repo_fd(), &name)?.unwrap_or_default();
+            let existing =
+                read_keyring_at(repo.repo_fd(), Path::new(&name), &subject)?.unwrap_or_default();
             let (imported, keyring) = gpg_merge_keyring(&existing, offered, &subject)?;
             write_root_file_blocking(repo.repo_fd(), &name, &keyring, fsync)?;
             Ok(imported)

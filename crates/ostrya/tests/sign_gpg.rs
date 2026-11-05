@@ -519,3 +519,112 @@ fn an_unframeable_remote_keyring_is_refused() {
         }
     });
 }
+
+/// An import through a symlink at the path of the repository keyring reads
+/// the target of the symlink.
+///
+/// - The keyring keeps the key of the target and adds the offered key.
+/// - The path holds a regular file after the import.
+/// - The target keeps its bytes.
+#[test]
+fn an_import_reads_a_keyring_symlink() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("gpg-import-symlink");
+    let base = tmp.path();
+    let held = GpgHome::create(base, "heldgnupghome", "Held <held@ostrya.example>");
+    let offered = GpgHome::create(base, "offeredgnupghome", "Offered <offered@ostrya.example>");
+    let target = base.join("target.gpg");
+    std::fs::write(&target, held.export()).unwrap();
+    let keyring = base.join("repo").join("origin.trustedkeys.gpg");
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &keyring).unwrap();
+        let count = repo
+            .gpg_import_keys("origin", &[&offered.export()], &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let keys = repo.gpg_list_keys("origin").await.unwrap();
+        let fingerprints: Vec<&str> = keys.iter().map(|key| key.fingerprint.as_str()).collect();
+        assert_eq!(fingerprints, [held.fingerprint(), offered.fingerprint()]);
+        assert!(std::fs::symlink_metadata(&keyring).unwrap().is_file());
+        assert_eq!(std::fs::read(&target).unwrap(), held.export());
+    });
+}
+
+/// An import through a symlink to no file takes the path as no keyring.
+///
+/// - The keyring holds the offered key alone.
+/// - The path holds a regular file after the import.
+/// - The target of the symlink still does not exist.
+#[test]
+fn an_import_takes_a_dangling_keyring_symlink_as_no_keyring() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("gpg-import-dangling");
+    let base = tmp.path();
+    let offered = GpgHome::create(base, "gnupghome", "Offered <offered@ostrya.example>");
+    let target = base.join("absent.gpg");
+    let keyring = base.join("repo").join("origin.trustedkeys.gpg");
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(&target, &keyring).unwrap();
+        let count = repo
+            .gpg_import_keys("origin", &[&offered.export()], &[])
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        let keys = repo.gpg_list_keys("origin").await.unwrap();
+        let fingerprints: Vec<&str> = keys.iter().map(|key| key.fingerprint.as_str()).collect();
+        assert_eq!(fingerprints, [offered.fingerprint()]);
+        assert!(std::fs::symlink_metadata(&keyring).unwrap().is_file());
+        assert!(!target.exists());
+    });
+}
+
+/// An import refuses a repository keyring over the ceiling by its size.
+///
+/// The keyring is a sparse file of 64 MiB and 1 byte.
+///
+/// - The refusal names the keyring and the ceiling.
+/// - The path holds a regular file of the same size after the import.
+#[test]
+fn an_import_refuses_an_oversized_keyring() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("gpg-import-oversized");
+    let base = tmp.path();
+    let offered = GpgHome::create(base, "gnupghome", "Offered <offered@ostrya.example>");
+    let keyring = base.join("repo").join("origin.trustedkeys.gpg");
+    let oversized: u64 = 64 * 1024 * 1024 + 1;
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        std::fs::File::create(&keyring)
+            .unwrap()
+            .set_len(oversized)
+            .unwrap();
+        let err = repo
+            .gpg_import_keys("origin", &[&offered.export()], &[])
+            .await
+            .unwrap_err();
+        let ostrya::Error::Signature(refusal) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(refusal.contains("origin.trustedkeys.gpg"), "{refusal}");
+        let ceiling = format!("{}-byte ceiling", ostrya::gpg::MAX_KEYRING);
+        assert!(refusal.contains(&ceiling), "{refusal}");
+        let metadata = std::fs::symlink_metadata(&keyring).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.len(), oversized);
+    });
+}

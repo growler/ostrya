@@ -4,6 +4,10 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     keyring by itself. A mix of binary and armored files imports.
   * remote gpg-import and remote add --gpg-import refuse key input over
     4 MiB before they read all of it.
+  * remote gpg-import and remote add --gpg-import read the repository
+    keyring through a symlink, and take a symlink to no file as no
+    keyring. They refuse a repository keyring over 4 MiB before they read
+    it.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

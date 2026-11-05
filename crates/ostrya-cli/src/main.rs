@@ -12362,7 +12362,7 @@ async fn report_commit_signatures(
     }
     let verifier = match verifier {
         Some(verifier) => verifier,
-        None => verifier.insert(show_gpg_verifier(repo, repo_path, args)?),
+        None => verifier.insert(show_gpg_verifier(repo, repo_path, args).await?),
     };
     let outcome = verifier.verify(data, &signatures)?;
     println!();
@@ -12429,7 +12429,7 @@ async fn report_commit_signatures(
 /// `ostree` command. A `gpgkeypath` entry that cannot be read gives
 /// [`Error::Signature`].
 #[cfg(feature = "gpg")]
-fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
+async fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
     if let Some(remote) = args.gpg_verify_remote.as_deref() {
         if !valid_remote_name(remote) {
             return Err(Error::InvalidInput(format!(
@@ -12437,21 +12437,29 @@ fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<G
             )));
         }
         let keypath = remote_section(repo, remote).gpgkeypath()?;
-        return GpgVerifier::for_remote_in(repo, remote, &keypath);
+        let repo = repo.clone();
+        let remote = remote.to_owned();
+        return ostrya_rt::unblock(move || GpgVerifier::for_remote_in(&repo, &remote, &keypath))
+            .await;
     }
-    let mut paths = vec![repo_path.join("gpgkeys.gpg")];
-    if let Some(homedir) = args.gpg_homedir.as_deref() {
-        let mut found: Vec<PathBuf> = std::fs::read_dir(homedir)
-            .map_err(Error::Io)?
-            .filter_map(|entry| {
-                let path = entry.ok()?.path();
-                (path.extension()? == "gpg").then_some(path)
-            })
-            .collect();
-        found.sort();
-        paths.extend(found);
-    }
-    Ok(GpgVerifier::from_keyring_files(paths)?)
+    let keyring = repo_path.join("gpgkeys.gpg");
+    let homedir = args.gpg_homedir.clone();
+    ostrya_rt::unblock(move || {
+        let mut paths = vec![keyring];
+        if let Some(homedir) = homedir {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(&homedir)
+                .map_err(Error::Io)?
+                .filter_map(|entry| {
+                    let path = entry.ok()?.path();
+                    (path.extension()? == "gpg").then_some(path)
+                })
+                .collect();
+            found.sort();
+            paths.extend(found);
+        }
+        Ok(GpgVerifier::from_keyring_files(paths)?)
+    })
+    .await
 }
 
 /// Returns the last 16 hex digits of a fingerprint.

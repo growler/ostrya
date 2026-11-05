@@ -54,9 +54,8 @@ impl Repo {
     /// new commits once. With each commit, it carries each object that the
     /// tree of the commit reaches. It also carries the stored `.commitmeta`
     /// bytes of the commit with no parse, so the receiver refuses a
-    /// `.commitmeta` that is not an `a{sv}` dict. If the repository holds the
-    /// composefs image of a sent commit, the stream carries the image after
-    /// the trees. The stream carries no parent commit.
+    /// `.commitmeta` that is not an `a{sv}` dict. The stream carries no parent
+    /// commit.
     ///
     /// The call does no negotiation, so it sends each object, also the
     /// objects that the receiver holds.
@@ -78,10 +77,8 @@ impl Repo {
     ///   commit.
     /// - The `Commit` frame holds no ref update for a dependency.
     /// - For each dependency, the stream carries the commit object, the
-    ///   objects of its tree, and its detached metadata. If the repository
-    ///   holds the composefs image of the dependency, the stream carries it.
-    ///   An object that a new commit and a dependency share goes in the stream
-    ///   one time.
+    ///   objects of its tree, and its detached metadata. An object that a new
+    ///   commit and a dependency share goes in the stream one time.
     /// - The call does no negotiation, so it sends a dependency that the
     ///   receiver holds. The receiver accepts it, and drops its
     ///   `.commitmeta`: a held dependency gets no merge of detached metadata
@@ -294,21 +291,6 @@ impl Repo {
         }
         drop(seen);
         drop(commits);
-        // The composefs image of each sent commit that this repository holds
-        // goes after the trees.
-        let repo = self.clone();
-        let wanted = sent.clone();
-        let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
-            let mut images = Vec::new();
-            for commit in wanted {
-                if repo.has_object_blocking(ObjectType::ComposefsImage, &commit)? {
-                    images.push(ObjectName::new(commit, ObjectType::ComposefsImage));
-                }
-            }
-            Ok(images)
-        })
-        .await?;
-        names.extend(images);
 
         let source = RepoSource::new(self.clone(), RelatedRule::default());
         Ok(crate::remote::session::export_stream(

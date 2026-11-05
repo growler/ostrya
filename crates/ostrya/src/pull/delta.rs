@@ -89,9 +89,9 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::delta::{
-    Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, carries_image,
-    check_inline_part, concat_to_blob, decode_inline_part, decode_part_stream, image_key,
-    inline_part_at, open_rw_temp, verify_inline_part,
+    Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, check_inline_part,
+    concat_to_blob, decode_inline_part, decode_part_stream, inline_part_at, open_rw_temp,
+    verify_inline_part,
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
@@ -181,10 +181,6 @@ pub(crate) struct DeltaJob {
     meta_entries: Vec<DeltaPart>,
     /// The objects that the delta references and hands over loose.
     fallbacks: Vec<DeltaFallback>,
-    /// The key `ostree.composefs.digest.v0` of the target commit, if a part
-    /// carries the composefs image. `None` if no part carries the image, or
-    /// if the commit has no valid key.
-    image_key: Option<[u8; 32]>,
     /// One slot for each part, in part order. A slot holds the part if the
     /// superblock carries it inline, already verified against its meta-entry.
     /// A slot is `None` if the pull fetches the part as a file.
@@ -207,9 +203,7 @@ struct InlinePart {
 impl DeltaJob {
     /// Returns the objects that the delta names and does not carry.
     ///
-    /// The pull fetches these objects loose. The list holds no composefs
-    /// image: the pull requests the image of the commit by its own rules,
-    /// after the other objects of the pull.
+    /// The pull fetches these objects loose.
     pub(crate) fn fallbacks(&self) -> Vec<ObjectName> {
         loose_fallbacks(&self.fallbacks)
     }
@@ -234,12 +228,11 @@ impl DeltaJob {
     }
 }
 
-/// Returns the objects of `fallbacks` that the pull fetches loose, as
-/// [`DeltaJob::fallbacks`] states.
+/// Returns the names of the objects of `fallbacks`, which the pull fetches
+/// loose.
 fn loose_fallbacks(fallbacks: &[DeltaFallback]) -> Vec<ObjectName> {
     fallbacks
         .iter()
-        .filter(|fallback| fallback.objtype != ObjectType::ComposefsImage)
         .map(|fallback| ObjectName::new(fallback.checksum, fallback.objtype))
         .collect()
 }
@@ -712,9 +705,6 @@ struct FetchedDelta {
 
 impl FetchedDelta {
     /// Copies the inline parts out of the metadata dict, and returns the job.
-    ///
-    /// If a part carries the composefs image, the call parses the target
-    /// commit on the blocking pool and keeps its image key in the job.
     async fn into_job(self, repo: &Repo) -> Result<DeltaJob> {
         let (inline, inline_bodies) = take_inline_parts(
             repo,
@@ -734,20 +724,12 @@ impl FetchedDelta {
             ..
         } = self;
         drop(metadata);
-        let commit_bytes = Arc::new(commit_bytes);
-        let image_key = if carries_image(&meta_entries) {
-            let bytes = Arc::clone(&commit_bytes);
-            ostrya_rt::unblock(move || image_key(&bytes)).await
-        } else {
-            None
-        };
         Ok(DeltaJob {
             dir,
             name,
-            commit_bytes,
+            commit_bytes: Arc::new(commit_bytes),
             meta_entries,
             fallbacks,
-            image_key,
             inline,
             inline_bodies,
         })
@@ -3011,15 +2993,7 @@ pub(crate) async fn apply_job_part(
         let staging = txn.staging_fd().try_clone_to_owned()?;
         let body = &job.inline_bodies.as_slice()[part.start..part.start + part.len];
         let payload = decode_inline_part(part.compression, body, &staging).await?;
-        return apply_part(
-            txn,
-            payload.as_slice(),
-            &entry.objects,
-            &staging,
-            checks,
-            job.image_key,
-        )
-        .await;
+        return apply_part(txn, payload.as_slice(), &entry.objects, &staging, checks).await;
     }
     let path = format!("{}/{index}", job.dir);
     let staging = txn.staging_fd().try_clone_to_owned()?;
@@ -3063,15 +3037,7 @@ pub(crate) async fn apply_job_part(
         }
     };
     progress.part_fetched(entry.size);
-    apply_part(
-        txn,
-        blob.as_slice(),
-        &entry.objects,
-        &staging,
-        checks,
-        job.image_key,
-    )
-    .await
+    apply_part(txn, blob.as_slice(), &entry.objects, &staging, checks).await
 }
 
 /// Fetches the part file at `path` into a verified, decompressed blob.

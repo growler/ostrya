@@ -20,14 +20,13 @@ const SINGLE_KEYS: [&str; 5] = [
 
 /// The extensions of an object key. A bucket repository is in `archive`
 /// form, so a file object is `filez`.
-const OBJECT_EXTENSIONS: [&str; 7] = [
+const OBJECT_EXTENSIONS: [&str; 6] = [
     "commit",
     "commitmeta",
     "dirtree",
     "dirmeta",
     "filez",
     "tombstone-commit",
-    "cfs",
 ];
 
 /// Returns `true` if `key`, relative to the prefix of the repository, is a
@@ -40,8 +39,8 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// - `config`, `summary`, `summary.sig`, `extensions/ostrya/lock`, and
 ///   `extensions/ostrya/lock-probe`
 /// - `objects/XX/<62 hex digits>.<ext>`, with lowercase hex digits and an
-///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`,
-///   `tombstone-commit`, or `cfs`
+///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`, or
+///   `tombstone-commit`
 /// - `refs/heads/<name>`, with a name that [`is_ref_name`] accepts
 /// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that
 ///   [`is_collection_id`] accepts, and a name that [`is_ref_name`] accepts

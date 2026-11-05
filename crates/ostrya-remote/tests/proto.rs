@@ -238,11 +238,7 @@ fn every_message_round_trips() {
     round_trip(header(DirTree, 7, Encoding::Raw));
     round_trip(header(Commit, 7, Encoding::Raw));
     round_trip(header(CommitMeta, 7, Encoding::Raw));
-    round_trip(header(ComposefsImage, 7, Encoding::Raw));
-    round_trip(Message::Have(vec![
-        name(Commit, 1),
-        name(ComposefsImage, 1),
-    ]));
+    round_trip(Message::Have(vec![name(Commit, 1)]));
     round_trip(Message::Commit(CommitRequest {
         updates: vec![],
         force: false,
@@ -255,7 +251,7 @@ fn every_message_round_trips() {
     }
     round_trip(Message::Error(error(ErrorCode::RefDenied, "main")));
     let mut e = error(ErrorCode::MissingObjects, "2 missing");
-    e.missing = vec![name(File, 1), name(Commit, 2), name(ComposefsImage, 2)];
+    e.missing = vec![name(File, 1), name(Commit, 2)];
     round_trip(Message::Error(e));
     for commit in [Some(ck(9)), None] {
         let mut e = error(ErrorCode::RefMismatch, "moved");
@@ -399,7 +395,6 @@ fn an_object_header_frame_equals_the_generic_encoding() {
         (DirMeta, &[Encoding::Raw][..]),
         (Commit, &[Encoding::Raw][..]),
         (CommitMeta, &[Encoding::Raw][..]),
-        (ComposefsImage, &[Encoding::Raw][..]),
     ] {
         for &encoding in encodings {
             for n in [0, 0x7f, 0xff] {

@@ -1780,7 +1780,9 @@ The superblock embeds the target commit object whole, in the
 hashes to the `to` checksum. A part produces each other object, except a
 fallback object. The meta-entry of a part carries the ordered objtype+csum
 array. The operation stream produces the objects in that order. The object type
-at the current position selects how an operation decodes.
+at the current position selects how an operation decodes. The port refuses a
+superblock with an entry of the object type 100 in the object array of a part
+or in the fallback array.
 
 The `part-checksum` is the SHA-256 of the part file on disk, the `(y@ay)`
 framing bytes. A fallback object travels outside the parts as a plain loose
@@ -1788,11 +1790,6 @@ object. A reader takes the fallback array as the superblock lists it, with no
 threshold. An offline application requires each fallback object to be present
 already. `conformance/cli-surface.md`, "P2", `static-delta`, records the limits
 of the tool's `apply-offline`.
-
-A delta of the port can also list the composefs image of the target commit,
-the object type 100, in the object array of a part or in the fallback array.
-The tool writes no such entry. "The composefs image in a static delta" states
-the rules.
 
 A delta carries its target commit alone, and no field of the superblock names
 a dependency. A pull of the port looks for one delta for each dependency of
@@ -1813,9 +1810,7 @@ threshold of `--min-fallback-size`. It puts the object into a part otherwise.
 The unit is the decimal megabyte, 1,000,000 bytes. The default is 4, so the
 default threshold is 4,000,000 bytes. An object whose size equals the threshold
 is a fallback. The value is read as a whole number of megabytes, and 0 turns
-fallbacks off. The composefs image that a delta of the port carries has a
-selection rule of its own, and an inline delta lists the image as a fallback
-always ("The composefs image in a static delta").
+fallbacks off.
 
 Observed behavior: over a commit that holds one 5,000,000-byte object,
 `--min-fallback-size=0.1` reports `Number of fallback entries: 0`, and
@@ -1918,9 +1913,6 @@ The operands, as the tool writes them:
   `(mode-index, xattr-index, length, offset)`. The mode and xattr tables supply
   the metadata of the object. A symlink (mode `S_IFLNK`) takes the spliced
   bytes as its target, and a regular file as its content.
-- `S` for the composefs image, the object type 100 of the port: `(length,
-  offset)`, as for a metadata object. The image travels in one `S` alone, and
-  the port refuses an `o` for it.
 - `o` (open) for a content object: `(mode-index, xattr-index, output-size)`.
 - `r` (set-read-source): `(offset)`. The 32 bytes at `offset` in the data
   source are the checksum of a source object. The content of that object is the
@@ -3263,8 +3255,7 @@ caller, and to a pull of collection refs:
 - A localcache repository can supply a dependency.
 - The pull fetches the dependencies after the commits that name them, in one
   more run. It looks for a static delta of each dependency ("Static deltas of
-  dependencies"). A dependency with no delta comes as loose objects. The
-  composefs images of the pull wait for the run of the dependencies.
+  dependencies"). A dependency with no delta comes as loose objects.
 - The pull does not follow a build source.
 - A commit-only pull and a pull with subpaths fetch no dependency.
 
@@ -3455,12 +3446,11 @@ a bucket repository:
 - The push writes no ref for a dependency.
 - The push makes no ref-binding check and no collection-binding check on a
   dependency.
-- A dependency is an offered commit for each other rule. For a dependency
-  that the server lacks, the push sends the commit object, the objects of
-  its tree, its composefs image, and its `.commitmeta`. The push walks no
-  tree of a dependency that the server holds. A dependency that a bucket
-  repository holds with a partial-commit marker gets the walk of its whole
-  tree, and the push deletes the marker.
+- A dependency is an offered commit for each other rule. For a dependency that
+  the server lacks, the push sends the commit object, the objects of its tree,
+  and its `.commitmeta`. The push walks no tree of a dependency that the server
+  holds. A dependency that a bucket repository holds with a partial-commit
+  marker gets the walk of its whole tree, and the push deletes the marker.
 - The push does not follow a build source. `ostrya.related` goes with the
   `.commitmeta` of its commit.
 
@@ -3502,10 +3492,9 @@ commit of the stream: each commit that an update of `Commit` sets.
   several new commits name it, or if it is also a new commit.
 - `Commit` holds no update for a dependency.
 - The sender makes no ref-binding check on a dependency.
-- For each dependency, the stream carries the commit object, the objects of
-  its tree, and its `.commitmeta`. If the repository of the sender holds the
-  composefs image of the dependency, the stream carries it. An object that a
-  new commit and a dependency share goes in the stream one time.
+- For each dependency, the stream carries the commit object, the objects of its
+  tree, and its `.commitmeta`. An object that a new commit and a dependency
+  share goes in the stream one time.
 - The sender does no negotiation, so it sends a dependency that the server
   holds. The server accepts that dependency and drops its `.commitmeta`
   ("Commit and CommitReply", check 5).
@@ -3644,8 +3633,7 @@ to each message:
 - A ref name in a message is `NAME` for a local ref and `REMOTE:NAME` for a
   remote ref.
 - An object type is one byte. The values are 1 for a file, 2 for a dirtree,
-  3 for a dirmeta, 4 for a commit, 6 for detached metadata, and 100 for a
-  composefs image.
+  3 for a dirmeta, 4 for a commit, and 6 for detached metadata.
 - An encoding is one byte: 0 for `raw` and 1 for `deflate`. In the
   `encodings` list of `HelloReply`, the names are `raw` and `deflate`.
 
@@ -3711,10 +3699,8 @@ The length of a chunk has these meanings:
   chunk limit and the frame limit are the same number.
 
 The sender selects the length of each chunk, up to the limit. A body has no
-limit on its number of chunks. The body of a composefs image (type 100) has
-no size limit of the protocol. The free-space reserve of the receiving
-repository is its only bound ("Object streams"). In the push, after the end
-chunk of an object, the next frame is one of these:
+limit on its number of chunks. In the push, after the end chunk of an object,
+the next frame is one of these:
 
 - the `ObjectHeader` of the next object;
 - `ObjectsEnd`, which closes the object stream;
@@ -3799,8 +3785,8 @@ no `collection`. A `Hello` with the collection `ID` needs a reply with the
 `collection` `ID`, or a reply with no `collection` and the `collection-id`
 `ID`.
 
-`Have` is a list of object names: the object type (1 to 4, or 100) and the
-checksum. Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
+`Have` is a list of object names: the object type (1 to 4) and the checksum.
+Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
 of the `Have`:
 
 - Bit `i` is bit `i % 8` of byte `i / 8`, with bit 0 the least significant.
@@ -3812,21 +3798,17 @@ A client refuses a `HaveReply` of another length, or with a set bit after the
 last entry, with `protocol`.
 
 `ObjectHeader` holds the object type, the checksum, and the encoding. For type
-6, the checksum is the checksum of the commit that the detached metadata
-belongs to. For type 100, the checksum is the checksum of the commit that the
-composefs image belongs to. Only type 1 can have the encoding `deflate`. These
-headers are `protocol`:
+6, the checksum is the checksum of the commit that the detached metadata belongs
+to. Only type 1 can have the encoding `deflate`. These headers are `protocol`:
 
-- a type other than 1, 2, 3, 4, 6, and 100;
+- a type other than 1, 2, 3, 4, and 6;
 - an encoding byte other than 0 and 1;
 - the encoding `deflate` with a type other than 1.
 
 The body of the object follows as chunks:
 
 - `raw` -- for a file, the framed header and the payload of "File content
-  object header". For a composefs image, the bytes of the stored image
-  ("The composefs image object"). For each other type, the bytes of the
-  object.
+  object header". For each other type, the bytes of the object.
 - `deflate` -- the framed archive header and the payload in raw DEFLATE, as a
   `.filez` object stores them.
 
@@ -3880,7 +3862,7 @@ each tag is absent. A bound name has no entry.
 `Error` holds the code, a message for a person, and a dict of details:
 
 - `missing` (`a(yay)`): the objects that a `missing-objects` error names, of
-  the types 1 to 4 and 100. An entry of another type is `protocol`.
+  the types 1 to 4. An entry of another type is `protocol`.
 - `ref` (`s`) and `current` (`may`): the name and the current commit of the
   ref of a `ref-mismatch` error.
 
@@ -3916,8 +3898,7 @@ give the condition of each refusal.
   of order, or a message breaks a rule of the session.
 - `limit-exceeded` -- a frame, a chunk, a batch, a reply, a metadata object,
   a listing, or a session is over its limit.
-- `checksum-mismatch` -- the bytes of an object do not hash to its name, or
-  the fs-verity digest of a composefs image is not the key of its commit.
+- `checksum-mismatch` -- the bytes of an object do not hash to its name.
 - `mode-refused` -- the repository mode cannot store the content, or the
   client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
@@ -3986,22 +3967,20 @@ them:
 - The refs of `Commit` are a subset of the refs of `Hello`. The subset is not
   empty and names no ref two times. The refs of a server commit are its
   branch and its tags.
-- `Have` and `missing` name objects of the types 1 to 4 and 100.
+- `Have` and `missing` name objects of the types 1 to 4.
 - An object has the encoding `deflate` only if it is a file and `HelloReply`
   lists `deflate`.
 - A `Have` holds at most `max-have` entries, and its frame fits in
   `max-frame`.
 - A session sends at most one detached metadata dict for each commit. The
   commit is a commit that the session sends, or the new commit of an update.
-- A session sends at most one composefs image for each commit. The commit is
-  a commit that the session sends, or a commit that the server holds.
 - Before `Commit`, a session sends each object that the tree of a commit of
   the session reaches, unless the server holds the object. The commits of the
   session are the commits that it sends and the new commits of the updates.
   The session does not need to send the parent commits. A session with a
   server commit sends the objects of its tree.
-- A session with a server commit sends no commit object, no detached
-  metadata, and no composefs image.
+- A session with a server commit sends no commit object and no detached
+  metadata.
 - To cancel an object, a client sends the abandon marker and then `Abort`.
 - On a stream, a client sends one request and reads its reply before it sends
   the next one.
@@ -4112,16 +4091,6 @@ bit of an object when the session did not stage the object and `objects/`
 does not hold it. Each entry gets its own bit, also an entry that the `Have`
 holds two times. An empty `Have` gets an empty bitmap.
 
-For a composefs image (type 100), the object is `<commit>.cfs`. The server
-does not read a stored image, so it does not set the bit of an image that
-`objects/` holds, also when its digest is not the key of its commit.
-
-A session of version 1 can carry the type 100. A receiver that does not
-accept the type 100 refuses a session that offers it, in a `Have` or in an
-`ObjectHeader`, with `protocol`. So a receiver must accept the type 100
-before a sender that holds composefs images pushes to it or sends it a
-one-way stream.
-
 ### Object streams
 
 The server reads, hashes, and checks each object of a stream, also an object
@@ -4175,30 +4144,13 @@ A detached metadata object (type 6) follows these rules:
   under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
   `ostree.sign.dummy` is an `aay`. Each other dict is `protocol`.
 
-A composefs image (type 100, "The composefs image object") follows these
-rules:
-
-- The encoding is `raw`, and the body is the bytes of the image. The image
-  has no size limit beyond the free-space reserve of the repository.
-- A second image for one commit is `protocol`, also from another stream.
-- If `objects/` holds an image of the commit, the server reads the body to
-  its end and drops it. It does not read the stored image.
-- Else the server streams the image to its staging directory and computes
-  its fs-verity digest as it writes it. It seals the image as it seals a new
-  image. No step holds the whole image. The commit of the image need not be
-  staged or held when the image arrives.
-- At `Commit`, the server checks each image against its commit (check 5 of
-  "Commit and CommitReply").
-
 The server writes no object and no dict to `objects/` before `Commit`.
 
-`ObjectsReply` counts the objects of one stream that the server staged and
-the dicts that it kept. `payload_bytes` counts the body bytes of these
-objects, with the chunk framing removed, in the encoding of the wire. An
-object that the server held already does not count. A composefs image that
-the server staged adds its bytes to `payload_bytes` and does not count in
-`objects`. Over HTTP, an object that two `objects` requests send at the same
-time can count in both replies.
+`ObjectsReply` counts the objects of one stream that the server staged and the
+dicts that it kept. `payload_bytes` counts the body bytes of these objects, with
+the chunk framing removed, in the encoding of the wire. An object that the
+server held already does not count. Over HTTP, an object that two `objects`
+requests send at the same time can count in both replies.
 
 ### Commit and CommitReply
 
@@ -4236,14 +4188,7 @@ Each failed check ends the session, and the session writes nothing:
    that commit, the commit is a dependency that the repository holds, and
    the server drops the dict with no merge and no write. An entry with an
    empty name or with a checksum that is not 32 bytes names no commit. Each
-   other such dict is `protocol`. Then the server checks each composefs
-   image of the session, in the order of the checksums of their commits. An
-   image for a commit that the session did not stage and that the repository
-   does not hold is `protocol`. For an image that the session staged, a
-   commit without
-   `ostree.composefs.digest.v0`, or with a value that is not a variant of
-   type `ay` with 32 bytes, is `protocol`. An image whose fs-verity digest is
-   not that value is `checksum-mismatch`.
+   other such dict is `protocol`.
 6. Each object that the tree of a commit of the session reaches must be
    staged or present, else `missing-objects`. The parents of a commit are not
    required. The `missing` detail names at most 16384 objects. A staged
@@ -4364,8 +4309,8 @@ failed check ends the session, and the session writes nothing:
    levels fewer than in the message.
 2. A `CommitReply` with a commit in `old` of the branch that needs a frame
    over 1 MiB is `limit-exceeded`.
-3. A detached metadata dict of the session, a composefs image of the
-   session, and a commit object that the session staged, are `protocol`.
+3. A detached metadata dict of the session and a commit object that the
+   session staged are `protocol`.
 4. These are `ref-denied`:
    - a branch or a tag `ostree-metadata` in the local refs of a repository
      with a collection id;
@@ -4630,11 +4575,7 @@ If a client cannot complete an object, it sends the abandon marker and then
 with no change.
 
 An ostrya sender also sends the dependencies of each new commit, with no
-ref update ("Dependencies in a one-way stream"). An object stream can carry
-the composefs image of a sent commit. An ostrya sender sends the image of
-each new commit and of each dependency that its repository holds, after the
-trees of the commits. The server reads and checks the image as in a push
-session ("Object streams").
+ref update ("Dependencies in a one-way stream").
 
 The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
 HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
@@ -4769,49 +4710,6 @@ A pull of the port requests the dependencies of a commit over both
 transports, as `.commitmeta` and `.commit` requests of their own ("Dependencies
 in a pull from a remote"). For a dependency that the repository holds
 complete, it requests neither file.
-
-A pull of the port requests the composefs image of a commit,
-`objects/<first 2 hex>/<remaining 62 hex>.cfs`, over both transports when
-each of these is true:
-
-- The commit carries `ostree.composefs.digest.v0`, and its value is a
-  variant of type `ay` with 32 bytes. A malformed value counts as no key.
-- The pull is not commit-only and has no subpath.
-- The repository does not hold an image of the commit, and the transaction
-  of the pull did not stage one. The pull does not read a stored image.
-
-The pull requests the image also for a commit that the repository holds
-complete. The requests of the images come after the requests of all other
-objects of the pull: the pull sends the first image request when no request
-of another object is queued or in flight. In a pull
-through a chain of static deltas, the images of all commits of the chain
-wait for the last step. A 404, or a `GetReply` with `found` false, leaves
-the commit with no image, and the pull goes on. A remote of the tool holds
-no image, so it answers 404.
-
-A static delta can carry the image of its target commit in a part ("The
-composefs image in a static delta"). The application of the part stages the
-image, so the pull sends no request for it. The pull does not fetch a
-fallback image entry as a fallback object. The image of the commit follows
-the rules above. A pull with a subpath requests no image, and stages the
-image that a part carries.
-
-After the first image that the remote does not serve, the pull requests no
-image of a commit that the repository holds complete. The pull requests the
-image of each commit whose objects it takes all the same. The images of the
-held commits come after the images of the other commits, and the pull sends
-one request for a held commit at a time until the remote serves one. So a
-remote that serves no image gets at most one request for the held commits
-of a pull. A local pull reads each source for each image, because a source
-that holds no image costs only a failed open.
-
-The pull streams the body to its staging directory, computes the fs-verity
-digest as it writes it, and installs the image only when the digest is the
-key ("The composefs image object"). A digest that is not the key fails the
-pull, and the pull writes no ref. The pull fetches that image no second
-time. A local pull takes the image from the first source repository that
-holds it, with a `FICLONE` reflink or a byte copy, never with a hardlink, and
-checks the digest of the copy in the same way.
 
 ## The ref listing
 
@@ -5494,12 +5392,11 @@ repository root in this way:
   change time differs from the last parse. The next answer then shows the
   change.
 - The view serves these files as stored: the files under `refs/` and
-  `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`, `.commitmeta`,
-  and `.cfs` objects. A `.cfs` object is the composefs image of a commit, in
-  every mode. In an `archive` repository, it also serves the
-  `.filez` objects and the files under `deltas/` and `delta-indexes/` as
-  stored. "Read access" states which of these files a client gets.
-  `extensions/ostrya` and each path under it are absent.
+  `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta`
+  objects. In an `archive` repository, it also serves the `.filez` objects and
+  the files under `deltas/` and `delta-indexes/` as stored. "Read access" states
+  which of these files a client gets. `extensions/ostrya` and each path under it
+  are absent.
 - `summary` and `summary.sig` are the files of the summary of the auth item
   of the client, as stored ("The serve of a summary"). The root summary is
   never served.
@@ -5795,8 +5692,7 @@ session ends:
 - a byte after `ObjectsEnd`;
 - an `Abort` frame in the body, with or without the abandon marker before it.
 
-The body of `objects` has no size limit of its own. It can carry a composefs
-image of any size ("Object streams").
+The body of `objects` has no size limit of its own.
 
 A request body that fails, for example with a malformed chunked encoding,
 gets 500 with `internal`. The session ends as for a request that ends before
@@ -6372,25 +6268,8 @@ The write:
   objects and before its refs. The rename replaces a stored image of the same
   commit in one step.
 
-The transfer:
-
-- A pull, a push, and a one-way stream carry the image as the object type
-  100, after the other objects of the transfer. "The pull over HTTP and over
-  a stream", "Have and HaveReply", and "Object streams" state the rules. A
-  push with a server commit carries no image.
-- Each receiver computes the fs-verity digest of the bytes and installs the
-  image only when the digest is the key of the commit. A local pull copies
-  the image with a reflink or a byte copy, never with a hardlink, and checks
-  the copy in the same way.
-- A receiver that holds an image of the commit takes no second copy. It does
-  not read the stored image.
-- No key of a client group applies to the image. A push session that may
-  write a commit may also send its image.
-- A pull and a push send the image also for a commit that the receiver holds
-  with no image.
-- No object count of a pull, a push, or a receive includes the image. Each
-  byte count that the transfer keeps includes it. A local pull keeps a
-  byte count only when it reads static deltas.
+No transfer carries the image. A pull, a push, a one-way stream, a static
+delta, the archive view, and a bucket repository carry no `.cfs` object.
 
 `ostree.sizes` has no entry for the image, and the decoder refuses the type
 byte 100.
@@ -6399,60 +6278,6 @@ Prune removes the image with its commit, and removes an image whose commit is
 absent. A kept commit keeps its image. No prune count and no byte count of
 freed space includes the image. "Prune removal order" states the order of
 the removals.
-
-### The composefs image in a static delta
-
-A static delta to a commit `T` carries the image of `T` if `T` carries a
-valid `ostree.composefs.digest.v0` and the repository stores the image. A
-delta of a commit with no key or with no stored image has no image entry,
-and the image rule changes none of its bytes. A run of `ostrya static-delta
-generate` and a check of the superblock and the parts that it writes can
-verify the facts of the entry and the selection. `ostrya static-delta show`
-prints the count of fallback entries and the object count of each part, and
-no type byte. A run of `ostrya static-delta apply-offline` and of a pull can
-verify the facts of the application.
-
-The entry:
-
-- The image entry has the type byte 100, and its checksum is `T`. The object
-  array of a part or the fallback array can hold it, and the superblock holds
-  one image entry at most. The parser refuses an image entry that names
-  another commit and a second image entry.
-- The image goes into the delta whole. The generator makes no rollsum and no
-  bspatch against the image of the source commit, and it does not read the
-  image to check its digest.
-
-The selection, where `n` is the size of the image in bytes:
-
-- The image is a fallback entry if `--min-fallback-size` is not 0 and `n` is
-  at least its threshold. It is also a fallback entry if `n` is larger than
-  `--max-chunk-size` or larger than 128 MiB. So the bound applies also when
-  `--min-fallback-size` is 0. The applier holds a whole part in memory, so
-  the bound limits the memory that an image in a part needs.
-- The image is a fallback entry in each delta of `--inline`, whatever `n`
-  is. The generator and the applier hold an inline part in memory, so no
-  inline part carries the image.
-- Else the image is the last object that the parts carry, under the part
-  packing rule ("Part packing"). It can share the last part with other
-  objects. Its `S` has the operands `(n, offset)` ("Opcodes").
-- A fallback entry states `n` as its compressed size and as its uncompressed
-  size.
-
-The application:
-
-- An image in a part needs the key of `T`. An application refuses the delta
-  if `T` has no key or a malformed key, or if the `S` of the image states
-  more than 128 MiB.
-- If the destination stages or holds an image of `T`, the application does
-  not read the image in the part.
-- Else the application streams the image from the part to the staging
-  directory, computes its fs-verity digest, and installs it only when the
-  digest is the key. A digest that is not the key fails the application,
-  and it writes no commit and no ref.
-- The image is optional. An offline application does not need a fallback
-  image to be present. A pull does not fetch a fallback image as a fallback.
-  It requests the image of the commit by the rules of "The pull over HTTP and
-  over a stream".
 
 ## The mount daemon protocol
 
@@ -6781,7 +6606,7 @@ are:
   `extensions/ostrya/lock-probe`
 - `objects/XX/<62 hex digits>.<ext>`, in lowercase hex, with `XX` the first
   two digits of the checksum, and `<ext>` one of `commit`, `commitmeta`,
-  `dirtree`, `dirmeta`, `filez`, `tombstone-commit`, and `cfs`
+  `dirtree`, `dirmeta`, `filez`, and `tombstone-commit`
 - `refs/heads/<name>`, with a ref name of "Ref name validation"
 - `refs/mirrors/<id>/<name>`, with a collection id of at most 255 bytes that
   the collection id rule of "Ref name validation" accepts, and a ref name of
@@ -7096,20 +6921,17 @@ are:
    forced. A tip that the local repository does not hold, or marks partial,
    is no ancestor. The fast-forward rule and the force apply to each ref in
    its own namespace.
-5. The walk: each source commit, its history, cut at the tip of the ref in
-   the bucket, and the dependencies of each offered commit, as a push over a
-   session offers them ("Dependencies in a push"). The trees of the
-   commits that the bucket lacks and of the offered commits with a
-   partial-commit marker under `state/`, and the composefs image of each
-   source commit and of each walked commit, if the local repository holds
-   the image. The walk reads no tree of another commit that the listing
-   holds, because a commit object in the bucket has its whole tree in the
-   bucket. The push lists `state/` only if the listing holds an offered
-   commit. Each ref of the new ref set of the ref directory of the
-   namespace must name a commit that the bucket holds or that the push
-   uploads, else the push is refused.
-6. The upload of each tree object and image that the listing lacks, and of
-   the `.commitmeta` of each commit that the bucket lacks and of each source
+5. The walk: each source commit, its history, cut at the tip of the ref in the
+   bucket, and the dependencies of each offered commit, as a push over a session
+   offers them ("Dependencies in a push"). The trees of the commits that the
+   bucket lacks and of the offered commits with a partial-commit marker under
+   `state/`. The walk reads no tree of another commit that the listing holds,
+   because a commit object in the bucket has its whole tree in the bucket. The
+   push lists `state/` only if the listing holds an offered commit. Each ref of
+   the new ref set of the ref directory of the namespace must name a commit that
+   the bucket holds or that the push uploads, else the push is refused.
+6. The upload of each tree object that the listing lacks, and of the
+   `.commitmeta` of each commit that the bucket lacks and of each source
    commit, at most `max_outstanding` uploads at a time. The bytes of a
    `.commitmeta` are the stored `.commitmeta`, without `ostrya.related` if
    `[ex-ostrya] keep-detached-related` of the `config` of the bucket is
@@ -7401,21 +7223,16 @@ The steps of the fsck are:
    declares, with no bytes after its DEFLATE end, and the content checksum
    must be the checksum of the name. A body that fails in transit is read
    again once from its start. A second failure in transit fails the run.
-8. The read of each `.cfs` whose commit is in the listing, as a stream. Its
-   fs-verity digest must be the value of `ostree.composefs.digest.v0` of the
-   commit. A `.cfs` whose commit is not in the listing is counted and is no
-   finding. With the repair, so is a `.cfs` whose commit object the repair
-   deletes. A body that fails in transit is read again as for a `.filez`.
-9. The count of the objects of the listing that no commit reaches. A
-   `.commitmeta` and a `.cfs` of a commit of the listing are reached. The
-   run reads no such object.
-10. Without the repair, the read again of each object of a `missing`
-    finding that the listing does not hold, and of the commit of each
-    `Absent` dependency of a `dependency` finding, one time for each
-    commit. Then the read again of the commits of each object of a
-    `missing` finding that is still absent. Each read is a `GET` with
-    `Range: bytes=0-0`, by the strict rule of an absent key.
-11. With the repair, the check of field 2 of step 5 against the state
+8. The count of the objects of the listing that no commit reaches. A
+   `.commitmeta` of a commit of the listing is reached. The run reads no
+   such object.
+9. Without the repair, the read again of each object of a `missing`
+   finding that the listing does not hold, and of the commit of each
+   `Absent` dependency of a `dependency` finding, one time for each
+   commit. Then the read again of the commits of each object of a
+   `missing` finding that is still absent. Each read is a `GET` with
+   `Range: bytes=0-0`, by the strict rule of an absent key.
+10. With the repair, the check of field 2 of step 5 against the state
     after the repair, then the repair below and the release of the lock.
     The markers after the repair are the markers of the list of `state/`
     that the repair does not delete, and the markers that the repair
@@ -7436,9 +7253,9 @@ records a `missing` finding for an object that the listing does not hold,
 it reads the object again. If the key holds an object now, the finding is a
 note. Else the run reads each commit of the finding again, and the finding
 names only the commits that the bucket still holds. If the bucket holds
-none of them, the run records no finding. A commit or a `.cfs` that is
-gone at its read gives no finding. A run with the repair holds the lock, so
-no writer changes the bucket during the run.
+none of them, the run records no finding. A commit that is gone at its read
+gives no finding. A run with the repair holds the lock, so no writer changes the
+bucket during the run.
 
 Each finding has one kind, and is an error or a note:
 
@@ -7469,15 +7286,15 @@ Each finding has one kind, and is an error or a note:
 - `missing`, a note: without the repair, an object of a tree that the
   listing does not hold, and that the read again finds.
 - `mismatch`, an error: an object whose bytes do not have the checksum of
-  its name, or a `.cfs` with another fs-verity digest.
+  its name.
 - `corrupt`, an error: an object that does not parse, a `.filez` that does
-  not inflate as its header declares, an object over the metadata size cap,
-  or a `.cfs` whose commit records no digest that the run reads.
+  not inflate as its header declares, or an object over the metadata size
+  cap.
 - `dependency`, an error: an entry of field 2 of a commit that is
   `Absent`, `Partial`, or `Defective`. The key is the object key of the
   commit that holds the entry, and the detail is the reason of the finding
   of the local fsck. With the repair, the run classifies the entry against
-  the state after the repair (step 11). The repair writes and deletes no
+  the state after the repair (step 10). The repair writes and deletes no
   key for it.
 - `dependency`, a note: without the repair, an `Absent` dependency whose
   commit the read again finds.
@@ -7505,10 +7322,9 @@ The repair runs after the checks:
    that the listing does not hold stays until a prune ("The prune of a
    bucket repository").
 2. A check of the lock, and the delete of each object of a `mismatch` and a
-   `corrupt` finding: the commit objects, then the objects of the trees,
-   then the composefs images. A bad commit object goes also when a ref names
-   it, and the report names each such ref. A bad `.cfs` goes, and its
-   commit stays.
+   `corrupt` finding: the commit objects, then the objects of the trees. A
+   bad commit object goes also when a ref names it, and the report names
+   each such ref.
 
 At most `max_outstanding` writes and deletes run at a time. After a failed
 write or delete, the repair starts no new one, and waits for the ones in
@@ -7543,19 +7359,18 @@ same refs and objects, and also the objects of the commits that the summary
 names and of their dependencies, under the bound of the run. Two
 differences apply:
 
-- The prune reads field 2 of each commit that the walk reaches, and keeps
-  the dependencies as the local prune keeps them ("Related commits"). It
-  reads no `.commitmeta`, so it reads no build source. So it deletes a build
-  source that no other root reaches, and the objects that only that commit
-  reaches. It also deletes the `.commitmeta` and the `.cfs` of a build
-  source that the listing does not hold. The local prune keeps these. With
-  `--refs-only` or `--keep-younger-than`, the local prune keeps each build
-  source of a reached commit. Without these options, each commit of the
-  listing is a root, and the difference is the `.commitmeta` and the `.cfs`
-  of an absent build source alone.
-- Without `--refs-only` and `--keep-younger-than`, the prune also deletes
-  the `.commitmeta` and the `.cfs` of a parent commit that the listing does
-  not hold. The local prune keeps these when its bound reaches that parent.
+- The prune reads field 2 of each commit that the walk reaches, and keeps the
+  dependencies as the local prune keeps them ("Related commits"). It reads no
+  `.commitmeta`, so it reads no build source. So it deletes a build source that
+  no other root reaches, and the objects that only that commit reaches. It also
+  deletes the `.commitmeta` of a build source that the listing does not hold.
+  The local prune keeps it. With `--refs-only` or `--keep-younger-than`, the
+  local prune keeps each build source of a reached commit. Without these
+  options, each commit of the listing is a root, and the difference is the
+  `.commitmeta` of an absent build source alone.
+- Without `--refs-only` and `--keep-younger-than`, the prune also deletes the
+  `.commitmeta` of a parent commit that the listing does not hold. The local
+  prune keeps it when its bound reaches that parent.
 
 The roots are:
 
@@ -7571,7 +7386,7 @@ The roots are:
   listing is a root of its own. The walk reads each commit one time. The
   kept objects of the listing do not change, with one exception: the walk
   does not reach a parent commit that the listing does not hold, so the
-  prune deletes the `.commitmeta` and the `.cfs` of that commit.
+  prune deletes the `.commitmeta` of that commit.
 - the commit of each field 2 entry of a commit that the walk reaches: the
   dependencies. With `--refs-only` or `--keep-younger-than`, a dependency is
   a root under the bound of `--depth` or `--keep-younger-than`, also a
@@ -7590,7 +7405,7 @@ other entries of the field root as usual. The text of the warning is
 `warning: `, before the lines on standard output, and exits 0. An entry
 that names a commit that the listing does not hold roots nothing and gives
 no warning. The walk keeps the name of that commit, so the prune keeps its
-`.commitmeta` and its `.cfs`.
+`.commitmeta`.
 
 The walk reads each commit and each dirtree that it reaches with one `GET`.
 It reads the commits one at a time. It reads the dirtrees of the tree of
@@ -7611,10 +7426,10 @@ when the time bound rejected the commit as a parent and the walk then
 reaches the commit as a root, for example as a dependency. The walk reads
 each other commit one time.
 
-A kept commit keeps its `.commitmeta` and its `.cfs`. A partial commit that
-the prune keeps keeps its marker. An object that only a dirtree that the
-fsck deleted reaches is not reachable, so the prune deletes it. A push of
-the commit of that dirtree uploads the object again.
+A kept commit keeps its `.commitmeta`. A partial commit that the prune keeps
+keeps its marker. An object that only a dirtree that the fsck deleted reaches is
+not reachable, so the prune deletes it. A push of the commit of that dirtree
+uploads the object again.
 
 The steps of the prune are:
 
@@ -7634,9 +7449,8 @@ The steps of the prune are:
 4. The walk. A run with `--no-prune` then releases the lock, and reports
    the counts and the deletes that a run without it does.
 5. The commits. One `DELETE` of each commit object to delete, then of its
-   `.commitmeta` and then of its `.cfs` if these go too, in one slot for
-   each commit. Then the `.commitmeta` and the `.cfs` of each commit that
-   the listing does not hold.
+   `.commitmeta` if it goes too, in one slot for each commit. Then the
+   `.commitmeta` of each commit that the listing does not hold.
 6. Each other object to delete. A `.tombstone-commit` stays.
 7. The static deltas whose target commit is not in the bucket after the
    run: first the `superblock` of each, and then each other key of these
@@ -7661,8 +7475,8 @@ success.
 
 The counts are the counts of "Prune removal order": the total of the objects
 of the listing, the objects to delete, and their size in the listing. The
-counts leave out each `.commitmeta`, each `.cfs`, each `.tombstone-commit`,
-and the static deltas. A delete of a key that holds no object counts too.
+counts leave out each `.commitmeta`, each `.tombstone-commit`, and the
+static deltas. A delete of a key that holds no object counts too.
 The prune deletes no ref.
 
 A run that stops after its first delete leaves a bucket repository that a

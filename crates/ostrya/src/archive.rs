@@ -59,10 +59,9 @@ pub const MAX_COMPRESSORS: usize = 16;
 ///   `archive-z2`. The view never serves `summary` and `summary.sig` at the
 ///   repository root.
 /// - The files under `refs/` and `extensions/`, and the `.commit`,
-///   `.dirtree`, `.dirmeta`, `.commitmeta`, and `.cfs` objects: the view
-///   serves them as stored, to a client that reads them. A `.cfs` object is
-///   the composefs image of a commit, in each mode. `extensions/ostrya` and
-///   each path under it are not found.
+///   `.dirtree`, `.dirmeta`, and `.commitmeta` objects: the view serves them
+///   as stored, to a client that reads them. `extensions/ostrya` and each
+///   path under it are not found.
 /// - In an `archive` repository, the view also serves the `.filez` objects
 ///   and the files under `deltas/` and `delta-indexes/` as stored.
 /// - In every other mode, the view builds a `.filez` object on request from
@@ -832,7 +831,7 @@ fn object_route(fanout: &str, name: &str, archive: bool) -> Route {
         alias_ok: false,
     };
     match ext {
-        "commit" | "dirtree" | "dirmeta" | "commitmeta" | "cfs" => stored(),
+        "commit" | "dirtree" | "dirmeta" | "commitmeta" => stored(),
         "filez" if archive => stored(),
         "filez" => Route::BuiltFilez(checksum),
         _ => Route::NotFound,
@@ -1270,7 +1269,7 @@ mod tests {
             ] {
                 assert_eq!(route(path, mode), Route::NotFound, "{path}");
             }
-            for ext in ["commit", "dirtree", "dirmeta", "commitmeta", "cfs"] {
+            for ext in ["commit", "dirtree", "dirmeta", "commitmeta"] {
                 assert_eq!(
                     route(&object(ext), mode),
                     stored(Anchor::Objects, &format!("{fanout}/{rest}.{ext}"), false)

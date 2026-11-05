@@ -173,8 +173,7 @@ impl HaveReply {
 pub struct ObjectHeader {
     /// The type and the checksum of the object.
     ///
-    /// For a `CommitMeta` object and a `ComposefsImage` object, the checksum
-    /// is the checksum of its commit.
+    /// For a `CommitMeta` object, the checksum is the checksum of its commit.
     pub name: ObjectName,
     /// The encoding of the object bytes.
     ///
@@ -186,18 +185,13 @@ pub struct ObjectHeader {
 ///
 /// The counts are those of one stream. If two streams of one session send the
 /// same content, dirtree, dirmeta, or commit object at the same time, both
-/// can count it. A second detached metadata object or a second composefs
-/// image for one commit is [`Error::Protocol`], also from another stream, and
-/// the session ends.
+/// can count it. A second detached metadata object for one commit is
+/// [`Error::Protocol`], also from another stream, and the session ends.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectsReply {
     /// The number of objects that the server stored.
-    ///
-    /// A composefs image does not count.
     pub objects: u32,
     /// The number of payload bytes that the server wrote.
-    ///
-    /// The bytes of a composefs image count.
     pub payload_bytes: u64,
 }
 
@@ -290,7 +284,7 @@ pub struct ErrorMessage {
     /// The missing objects, for the code `missing-objects`.
     ///
     /// The key is `missing`. The encoder writes the key only if the list is
-    /// not empty. Each object is of type 1 to 4 or 100. For another type,
+    /// not empty. Each object is of type 1 to 4. For another type,
     /// encode and decode return [`Error::Protocol`].
     pub missing: Vec<ObjectName>,
     /// The current state of the ref, for the code `ref-mismatch`.
@@ -377,7 +371,7 @@ pub enum Message {
     HelloReply(HelloReply),
     /// The `Have` message, with the objects that the client offers.
     ///
-    /// Each object is of type 1 to 4 or 100.
+    /// Each object is of type 1 to 4.
     Have(Vec<ObjectName>),
     /// The `HaveReply` message.
     HaveReply(HaveReply),
@@ -441,9 +435,9 @@ impl Message {
     ///
     /// - a `HelloReply` whose `max_frame`, `max_have`, or `parallel_uploads`
     ///   is out of range
-    /// - a `Have` entry or a `missing` object of a type other than 1 to 4 and
-    ///   100, for example type 6
-    /// - an `ObjectHeader` of a type other than 1 to 4, 6, and 100, or with
+    /// - a `Have` entry or a `missing` object of a type other than 1 to 4, for
+    ///   example type 6
+    /// - an `ObjectHeader` of a type other than 1 to 4 and 6, or with
     ///   [`Encoding::Deflate`] for an object that is not a file
     /// - an `Error` message with the code `ref-mismatch` and no `current`
     ///   state

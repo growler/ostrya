@@ -101,8 +101,8 @@ const UNBLOCK_SIZE: usize = 1024 * 1024;
 /// - `config`, `summary`, `summary.sig`, `extensions/ostrya/lock`, and
 ///   `extensions/ostrya/lock-probe`
 /// - `objects/XX/<62 hex digits>.<ext>`, in lowercase hex, with the
-///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`,
-///   `tombstone-commit`, or `cfs`
+///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`, or
+///   `tombstone-commit`
 /// - `refs/heads/<name>`, with a ref name that
 ///   [`is_ref_name`](ostrya_core::is_ref_name) accepts
 /// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that

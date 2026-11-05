@@ -14,9 +14,7 @@ use crate::repo::Repo;
 /// The [`ObjectSource`] over a local repository.
 ///
 /// A metadata object is [`ObjectData::Encoded`] in `raw`. The source reads it
-/// whole, because the format caps its size. A composefs image is
-/// [`ObjectData::Encoded`] in `raw` too, with a stream over the stored `.cfs`
-/// file.
+/// whole, because the format caps its size.
 ///
 /// If the encoding is `deflate` and the repository is in `archive` mode, a file
 /// object is [`ObjectData::Encoded`] in `deflate`. Its reader is a stream over
@@ -52,9 +50,6 @@ impl RepoSource {
     }
 
     async fn load(&self, name: &ObjectName, encoding: Encoding) -> Result<ObjectData> {
-        if name.ty == ObjectType::ComposefsImage {
-            return self.stored_image(&name.checksum).await;
-        }
         if name.ty != ObjectType::File {
             let bytes = self.repo.load_object_bytes(name.ty, &name.checksum).await?;
             return Ok(ObjectData::Encoded {
@@ -125,23 +120,6 @@ impl RepoSource {
         };
         Ok(ObjectData::Encoded {
             encoding: Encoding::Deflate,
-            reader: Box::new(FileReader::with_len_hint(file, len)),
-        })
-    }
-
-    /// Opens a stream over the stored composefs image of `commit`.
-    ///
-    /// The image has no size cap, so the source never reads it whole.
-    async fn stored_image(&self, commit: &Checksum) -> Result<ObjectData> {
-        // The size bounds the read-ahead.
-        let Some((file, len)) = self.repo.open_composefs_image(commit).await? else {
-            return Err(Error::ObjectNotFound {
-                checksum: *commit,
-                ty: ObjectType::ComposefsImage,
-            });
-        };
-        Ok(ObjectData::Encoded {
-            encoding: Encoding::Raw,
             reader: Box::new(FileReader::with_len_hint(file, len)),
         })
     }

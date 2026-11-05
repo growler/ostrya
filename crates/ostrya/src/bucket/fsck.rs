@@ -7,9 +7,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use futures_io::AsyncRead;
-use futures_lite::AsyncReadExt;
 use futures_lite::future::zip;
-use ostrya_composefs::FsVerityHasher;
 use ostrya_core::{
     Checksum, Commit, ContentHasher, DirMetaRef, DirTree, DirTreeRef, ObjectName, ObjectType,
 };
@@ -34,9 +32,6 @@ use crate::related::{self, RelatedEntry};
 use crate::summary::{SUMMARY_READ_CAP, Summary};
 use crate::verify::TrustedKeys;
 use crate::write::{COPY_CHUNK, check_archive_payload};
-
-/// The size of the chunks in which the run reads a composefs image: 64 KiB.
-const IMAGE_CHUNK: usize = 64 * 1024;
 
 /// The most ref keys that one summary note names. The note gives the count
 /// of the others.
@@ -94,28 +89,23 @@ pub struct BucketFsckReport {
     pub objects_listed: u64,
     /// The number of commit objects that the run read and checked.
     pub commits_checked: u64,
-    /// The number of tree objects and composefs images that the run read and
-    /// checked, each one time.
+    /// The number of tree objects that the run read and checked, each one
+    /// time.
     pub objects_checked: u64,
     /// The bytes of the object reads of the checks. A read again of an
     /// object after a failure in transit counts too.
     pub bytes_read: u64,
     /// The number of objects of the listing that no commit of the listing
-    /// reaches. The run does not read them. A `.commitmeta` and a `.cfs` of a
-    /// commit of the listing count as reached.
+    /// reaches. The run does not read them. A `.commitmeta` of a commit of
+    /// the listing counts as reached.
     pub objects_unreached: u64,
-    /// The composefs images whose commit object is not in the listing, or
-    /// whose commit object the repair deletes, sorted. The run does not
-    /// check such an image, and it is not a finding.
-    pub orphan_images: Vec<Checksum>,
     /// The commits that have a partial-commit marker
     /// `state/<checksum>.commitpartial` at the start of the run, sorted.
     pub commits_partial: Vec<Checksum>,
     /// The findings, sorted by key, then by kind.
     pub findings: Vec<BucketFinding>,
     /// The key of each object that the run deleted: the commit objects, then
-    /// the tree objects, then the composefs images. The keys of each of the
-    /// three groups are sorted.
+    /// the tree objects. The keys of each of the two groups are sorted.
     pub deleted: Vec<String>,
     /// Each commit object that the run deleted and that a ref names, with
     /// the key of each ref that names it, sorted by commit.
@@ -177,8 +167,7 @@ pub struct BucketFinding {
     /// The commits of the listing that reach the object of a `Missing`, a
     /// `Mismatch`, or a `Corrupt` finding, sorted.
     ///
-    /// The list is empty for a commit object. For a composefs image, it
-    /// holds the commit of the image.
+    /// The list is empty for a commit object.
     pub commits: Vec<Checksum>,
     /// The reason, in words.
     pub detail: String,
@@ -231,13 +220,10 @@ pub enum BucketFindingKind {
     /// An object of the tree of a commit is not in the listing, or is gone at
     /// its read.
     Missing,
-    /// The bytes of an object do not have the checksum of its name, or the
-    /// fs-verity digest of a composefs image is not the digest that its
-    /// commit records.
+    /// The bytes of an object do not have the checksum of its name.
     Mismatch,
-    /// An object that does not parse, a `.filez` that does not inflate to
-    /// its declared size, or a composefs image whose commit records no
-    /// digest that the run can read.
+    /// An object that does not parse, or a `.filez` that does not inflate to
+    /// its declared size.
     Corrupt,
     /// A dependency in field 2 of a commit that is absent, partial, or
     /// defective. [`BucketFinding::dependency`] holds it. A run with
@@ -438,9 +424,6 @@ struct Root {
 struct Commits {
     /// The root of each commit that parses, sorted by commit.
     roots: Vec<Root>,
-    /// The digest that each commit with a composefs image in the listing
-    /// records, or the reason that the digest does not read.
-    digests: HashMap<Checksum, std::result::Result<Option<[u8; 32]>, String>>,
     /// Each commit that parses and whose field 2 is not empty, with the
     /// entries of its field 2, sorted by commit.
     dependencies: Vec<(Checksum, Vec<RelatedEntry>)>,
@@ -485,8 +468,7 @@ enum Whole {
     Bytes(Vec<u8>),
 }
 
-/// The result of one check read of a content object or of a composefs
-/// image.
+/// The result of one check read of a content object.
 enum Checked<T> {
     /// The key holds no object at the read.
     Gone,
@@ -516,24 +498,21 @@ struct DeletePlan {
     commits: Vec<ObjectName>,
     /// The tree objects to delete, sorted.
     tree: Vec<ObjectName>,
-    /// The composefs images to delete, sorted.
-    images: Vec<ObjectName>,
 }
 
 impl BucketRepo {
     /// Checks the bucket repository, and with
     /// [`delete`](BucketFsckOptions::delete) repairs it.
     ///
-    /// The run reads each commit, each object of the tree of each commit,
-    /// and each composefs image of a commit, and checks each one against its
-    /// name. Its cost is the download of the reachable objects of the
-    /// repository. At most `max_outstanding` reads run at a time, as
-    /// [`new`](BucketRepo::new) states, and each read of a `.filez`, of a
-    /// `.cfs`, or of a superblock is a stream that the run reads in chunks of
-    /// 64 KiB. Each read of the `config`, of a ref file, of the summary, of a
-    /// superblock, and of an object takes the strict rule of an absent key of
-    /// [`get_strict`](crate::remote::s3::Bucket::get_strict). The bucket
-    /// repository module states the checks under "The fsck".
+    /// The run reads each commit and each object of the tree of each commit,
+    /// and checks each one against its name. Its cost is the download of the
+    /// reachable objects of the repository. At most `max_outstanding` reads
+    /// run at a time, as [`new`](BucketRepo::new) states, and each read of a
+    /// `.filez` or of a superblock is a stream that the run reads in chunks
+    /// of 64 KiB. Each read of the `config`, of a ref file, of the summary,
+    /// of a superblock, and of an object takes the strict rule of an absent
+    /// key of [`get_strict`](crate::remote::s3::Bucket::get_strict). The
+    /// bucket repository module states the checks under "The fsck".
     ///
     /// # Steps
     ///
@@ -550,11 +529,11 @@ impl BucketRepo {
     /// 4. The summary, and at the same time its signature with
     ///    [`summary_keys`](BucketFsckOptions::summary_keys).
     /// 5. The commits, then the dirtrees and the dirmetas, then the
-    ///    `.filez` objects, then the composefs images. A phase starts after
-    ///    the phase before it ends. Without `delete`, after the commits, the
-    ///    run checks the dependencies in field 2 of each commit that parses,
-    ///    the commits with a partial-commit marker included, against the
-    ///    listing and the markers. This check reads no object.
+    ///    `.filez` objects. A phase starts after the phase before it ends.
+    ///    Without `delete`, after the commits, the run checks the
+    ///    dependencies in field 2 of each commit that parses, the commits
+    ///    with a partial-commit marker included, against the listing and the
+    ///    markers. This check reads no object.
     /// 6. The count of the objects that no commit reaches.
     /// 7. Without `delete`, a read again of each object that the listing
     ///    does not hold and that a `Missing` finding names, because a writer
@@ -575,13 +554,13 @@ impl BucketRepo {
     ///    the delete of the marker of each commit whose tree the run finds
     ///    whole, a check of the lock, and the delete of each object of a
     ///    `Mismatch` and a `Corrupt` finding: the commit objects, then the
-    ///    tree objects, then the composefs images. A commit that holds a
-    ///    marker gets no new one, and a commit whose own object the run
-    ///    deletes gets none. The run deletes no commit because of a bad tree
-    ///    object, and writes and deletes no key for a `Dependency` finding.
-    ///    Then the release of the lock. Without `delete`, a marker of
-    ///    a commit whose tree the run finds whole gives a `Marker` note, and
-    ///    the run reads the lock again: a new lock gives a `Lock` note.
+    ///    tree objects. A commit that holds a marker gets no new one, and a
+    ///    commit whose own object the run deletes gets none. The run deletes
+    ///    no commit because of a bad tree object, and writes and deletes no
+    ///    key for a `Dependency` finding. Then the release of the lock.
+    ///    Without `delete`, a marker of a commit whose tree the run finds
+    ///    whole gives a `Marker` note, and the run reads the lock again: a new
+    ///    lock gives a `Lock` note.
     ///
     /// # Errors
     ///
@@ -761,7 +740,6 @@ impl BucketRepo {
             .await?;
         let Commits {
             roots,
-            digests,
             mut dependencies,
         } = self.fsck_commits(run, &listing).await?;
         // With the lock, the check waits for the plan of the repair.
@@ -771,8 +749,6 @@ impl BucketRepo {
         }
         let (seen, files) = self.fsck_trees(run, &listing, &roots).await?;
         self.fsck_contents(run, &listing, &files).await?;
-        self.fsck_images(run, &listing, &digests, lock.is_some())
-            .await?;
         run.report.objects_unreached = listing
             .objects
             .keys()
@@ -1209,9 +1185,7 @@ impl BucketRepo {
     /// Reads and checks each commit object of the listing.
     ///
     /// Returns the root and the field 2 of each commit that parses, also of
-    /// a commit whose bytes do not match its name, and the digest that each
-    /// commit with a composefs image in the listing records, or the reason
-    /// that the digest does not read.
+    /// a commit whose bytes do not match its name.
     async fn fsck_commits(&self, run: &mut Run, listing: &ObjectListing) -> Result<Commits> {
         let mut commits: Vec<(ObjectName, u64)> = listing
             .objects
@@ -1221,7 +1195,6 @@ impl BucketRepo {
             .collect();
         commits.sort_by_key(|(name, _)| name.checksum);
         let mut roots = Vec::new();
-        let mut digests = HashMap::new();
         let mut dependencies = Vec::new();
         let mut reads = Slots::new(self.max_outstanding);
         let mut pending = commits.into_iter();
@@ -1237,20 +1210,11 @@ impl BucketRepo {
             let Some((name, read)) = reads.next_ready().await else {
                 break;
             };
-            let has_image = listing
-                .objects
-                .contains_key(&ObjectName::new(name.checksum, ObjectType::ComposefsImage));
             let (len, actual, parsed) = match read? {
                 // A writer removed the commit after the listing.
                 Metadata::Gone => continue,
                 Metadata::TooLarge => {
                     run.object(Corrupt, name, too_large());
-                    if has_image {
-                        digests.insert(
-                            name.checksum,
-                            Err("the commit object is larger than the cap".to_owned()),
-                        );
-                    }
                     continue;
                 }
                 Metadata::Checked {
@@ -1262,38 +1226,22 @@ impl BucketRepo {
             run.report.commits_checked += 1;
             run.report.bytes_read += len;
             run.check_metadata(name, actual, &parsed);
-            match parsed {
-                Ok(mut commit) => {
-                    roots.push(Root {
-                        commit: name.checksum,
-                        dirtree: commit.root_dirtree,
-                        dirmeta: commit.root_dirmeta,
-                    });
-                    if !commit.related.is_empty() {
-                        let related = std::mem::take(&mut commit.related);
-                        dependencies.push((name.checksum, related::into_entries(related)));
-                    }
-                    if has_image {
-                        digests.insert(
-                            name.checksum,
-                            crate::composefs::recorded_digest(&commit).map_err(|e| e.to_string()),
-                        );
-                    }
+            if let Ok(mut commit) = parsed {
+                roots.push(Root {
+                    commit: name.checksum,
+                    dirtree: commit.root_dirtree,
+                    dirmeta: commit.root_dirmeta,
+                });
+                if !commit.related.is_empty() {
+                    let related = std::mem::take(&mut commit.related);
+                    dependencies.push((name.checksum, related::into_entries(related)));
                 }
-                Err(e) if has_image => {
-                    digests.insert(
-                        name.checksum,
-                        Err(format!("the commit does not parse: {e}")),
-                    );
-                }
-                Err(_) => {}
             }
         }
         roots.sort_by_key(|root| root.commit);
         dependencies.sort_by_key(|(commit, _)| *commit);
         Ok(Commits {
             roots,
-            digests,
             dependencies,
         })
     }
@@ -1550,134 +1498,6 @@ impl BucketRepo {
         let mut transit = Transit::new(stream);
         let verdict = content_verdict(&checksum, &mut transit, buf).await;
         Ok((transit.finish(verdict), buf))
-    }
-
-    /// Checks each composefs image of the listing against the digest that
-    /// its commit records.
-    ///
-    /// With `deleting`, the run is a repair: the image of a commit whose own
-    /// object has a `Mismatch` or a `Corrupt` finding is an orphan, because
-    /// the repair deletes the commit, and the run does not check it.
-    async fn fsck_images(
-        &self,
-        run: &mut Run,
-        listing: &ObjectListing,
-        digests: &HashMap<Checksum, std::result::Result<Option<[u8; 32]>, String>>,
-        deleting: bool,
-    ) -> Result<()> {
-        let doomed: HashSet<Checksum> = if deleting {
-            run.findings
-                .iter()
-                .filter(|finding| matches!(finding.kind, Mismatch | Corrupt))
-                .filter_map(|finding| finding.object)
-                .filter(|name| name.ty == ObjectType::Commit)
-                .map(|name| name.checksum)
-                .collect()
-        } else {
-            HashSet::new()
-        };
-        let mut images: Vec<Checksum> = listing
-            .objects
-            .keys()
-            .filter(|name| name.ty == ObjectType::ComposefsImage)
-            .map(|name| name.checksum)
-            .collect();
-        images.sort();
-        let mut checks = Vec::new();
-        for commit in images {
-            let name = ObjectName::new(commit, ObjectType::ComposefsImage);
-            if doomed.contains(&commit) {
-                run.report.orphan_images.push(commit);
-                continue;
-            }
-            match digests.get(&commit) {
-                // The commit is not in the listing, or a writer removed it
-                // after the listing.
-                None => run.report.orphan_images.push(commit),
-                Some(Err(why)) => {
-                    let mut finding = image_finding(Corrupt, name, why.clone());
-                    finding.commits.push(commit);
-                    run.findings.push(finding);
-                }
-                Some(Ok(None)) => {
-                    let mut finding = image_finding(
-                        Corrupt,
-                        name,
-                        "the commit does not carry ostree.composefs.digest.v0".to_owned(),
-                    );
-                    finding.commits.push(commit);
-                    run.findings.push(finding);
-                }
-                Some(Ok(Some(expected))) => checks.push((name, *expected)),
-            }
-        }
-        let mut buffers: Vec<Vec<u8>> = Vec::new();
-        let mut reads = Slots::new(self.max_outstanding);
-        let mut pending = checks.into_iter();
-        loop {
-            while reads.has_room()
-                && let Some((name, expected)) = pending.next()
-            {
-                let mut buf = buffers.pop().unwrap_or_default();
-                reads.push(async move {
-                    let checked = self
-                        .read_twice(name, |buf| self.image_digest(name.checksum, buf), &mut buf)
-                        .await;
-                    (name, expected, checked, buf)
-                });
-            }
-            let Some((name, expected, checked, buf)) = reads.next_ready().await else {
-                break;
-            };
-            buffers.push(buf);
-            let (checked, bytes) = checked?;
-            run.report.bytes_read += bytes;
-            // A writer removed the image after the listing.
-            let Some(actual) = checked else {
-                continue;
-            };
-            run.report.objects_checked += 1;
-            if actual != expected {
-                let mut finding = image_finding(
-                    Mismatch,
-                    name,
-                    format!(
-                        "the commit records the digest {}, and the image has the digest {}",
-                        crate::composefs::digest_hex(&expected),
-                        crate::composefs::digest_hex(&actual)
-                    ),
-                );
-                finding.commits.push(name.checksum);
-                run.findings.push(finding);
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads the composefs image of `commit` as a stream, and returns its
-    /// fs-verity digest.
-    async fn image_digest<'b>(
-        &self,
-        commit: Checksum,
-        buf: &'b mut Vec<u8>,
-    ) -> Result<(Checked<[u8; 32]>, &'b mut Vec<u8>)> {
-        let key = object_key(&ObjectName::new(commit, ObjectType::ComposefsImage));
-        let Some(stream) = self.bucket.get_stream_strict(&key).await? else {
-            return Ok((Checked::Gone, buf));
-        };
-        if buf.len() < IMAGE_CHUNK {
-            buf.resize(IMAGE_CHUNK, 0);
-        }
-        let mut transit = Transit::new(stream);
-        let mut hasher = FsVerityHasher::new();
-        loop {
-            match transit.read(&mut buf[..]).await {
-                Ok(0) => break,
-                Ok(n) => hasher.update(&buf[..n]),
-                Err(_) => break,
-            }
-        }
-        Ok((transit.finish(hasher.finalize()), buf))
     }
 
     /// Names the commits that reach each tree object of a `Missing`, a
@@ -1967,11 +1787,11 @@ impl BucketRepo {
         .await;
         report.cleared_partial.sort();
         cleared?;
-        if plan.commits.is_empty() && plan.tree.is_empty() && plan.images.is_empty() {
+        if plan.commits.is_empty() && plan.tree.is_empty() {
             return Ok(());
         }
         lock.check().await?;
-        for group in [&plan.commits, &plan.tree, &plan.images] {
+        for group in [&plan.commits, &plan.tree] {
             let start = report.deleted.len();
             let deleted = each_slot(
                 max,
@@ -2059,12 +1879,11 @@ fn delete_plan(findings: &[BucketFinding], partial: &BTreeSet<Checksum>) -> Dele
         }
         match name.ty {
             ObjectType::Commit => plan.commits.push(name),
-            ObjectType::ComposefsImage => plan.images.push(name),
             ty if is_tree_object(ty) => plan.tree.push(name),
             _ => {}
         }
     }
-    for list in [&mut plan.commits, &mut plan.tree, &mut plan.images] {
+    for list in [&mut plan.commits, &mut plan.tree] {
         list.sort_by_cached_key(object_key);
         list.dedup();
     }
@@ -2137,7 +1956,7 @@ fn is_reached(
         ObjectType::Commit => true,
         ObjectType::DirTree | ObjectType::DirMeta => seen.contains(name),
         ObjectType::File => files.contains(&name.checksum),
-        ObjectType::CommitMeta | ObjectType::ComposefsImage => listing
+        ObjectType::CommitMeta => listing
             .objects
             .contains_key(&ObjectName::new(name.checksum, ObjectType::Commit)),
         _ => false,
@@ -2191,19 +2010,6 @@ fn named_list(names: &[String]) -> String {
         ));
     }
     text
-}
-
-/// Returns an error on the composefs image `name`.
-fn image_finding(kind: BucketFindingKind, name: ObjectName, detail: String) -> BucketFinding {
-    BucketFinding {
-        kind,
-        error: true,
-        key: object_key(&name),
-        object: Some(name),
-        commits: Vec::new(),
-        detail,
-        dependency: None,
-    }
 }
 
 /// Checks the content object `checksum` from its stream `stream`.
@@ -2333,7 +2139,6 @@ mod tests {
             found(Corrupt, ObjectType::File, 12, &[4]),
             found(Mismatch, ObjectType::Commit, 2, &[]),
             found(Corrupt, ObjectType::Commit, 5, &[]),
-            found(Mismatch, ObjectType::ComposefsImage, 6, &[6]),
             found(Missing, ObjectType::DirMeta, 13, &[1, 7]),
             BucketFinding {
                 kind: Stray,
@@ -2347,8 +2152,7 @@ mod tests {
         ];
         let partial: BTreeSet<Checksum> = [csum(7)].into();
         let plan = delete_plan(&findings, &partial);
-        // `2` is a bad commit object, and `7` has a marker. The commit of an
-        // image gets no marker.
+        // `2` is a bad commit object, and `7` has a marker.
         assert_eq!(plan.markers, [csum(1), csum(3), csum(4)]);
         assert_eq!(
             plan.commits,
@@ -2363,10 +2167,6 @@ mod tests {
                 ObjectName::new(csum(11), ObjectType::DirTree),
                 ObjectName::new(csum(12), ObjectType::File),
             ]
-        );
-        assert_eq!(
-            plan.images,
-            [ObjectName::new(csum(6), ObjectType::ComposefsImage)]
         );
         assert_eq!(delete_plan(&[], &partial), DeletePlan::default());
     }
@@ -2384,9 +2184,7 @@ mod tests {
         let findings = [
             found(Missing, ObjectType::File, 10, &[2]),
             found(Mismatch, ObjectType::Commit, 3, &[]),
-            found(Mismatch, ObjectType::ComposefsImage, 4, &[4]),
         ];
-        // The image of `4` is no object of its tree.
         assert_eq!(
             whole_marked(&findings, &roots, &partial),
             [csum(1), csum(4)]

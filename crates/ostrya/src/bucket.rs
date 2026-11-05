@@ -124,11 +124,9 @@
 //!   only with [`BucketRepo::update_summary`].
 //! - The keys under `objects/` that are no object keys.
 //! - Each commit object of the listing, each dirtree and dirmeta of the tree
-//!   of each commit, each `.filez` of these trees, and each composefs image
-//!   of a commit. Each object must be in the listing, have the checksum of
-//!   its name, and parse. A `.filez` must inflate to its declared size with
-//!   no bytes after its payload. The fs-verity digest of an image must be the
-//!   digest that its commit records.
+//!   of each commit, and each `.filez` of these trees. Each object must be
+//!   in the listing, have the checksum of its name, and parse. A `.filez`
+//!   must inflate to its declared size with no bytes after its payload.
 //! - The dependencies in field 2 of each commit that parses, the commits
 //!   with a partial-commit marker included. Each entry must have a name that
 //!   is not empty and a checksum of 32 bytes. The listing must hold the
@@ -187,8 +185,8 @@
 //!   them. It reads no detached metadata, so it deletes a build source that
 //!   no other root reaches, which a local prune keeps. Each defective
 //!   field 2 entry gives a warning in the report. Unless the roots are on
-//!   the refs alone, the run also deletes the detached metadata and the
-//!   composefs image of a parent commit that the listing does not hold.
+//!   the refs alone, the run also deletes the detached metadata of a parent
+//!   commit that the listing does not hold.
 //! - The walk reads each commit and dirtree that it reaches, and checks
 //!   each one against its name. It reads the commits one at a time, and at
 //!   most `max_outstanding` dirtrees of the tree of one commit at a time,
@@ -196,15 +194,14 @@
 //!   not hold is absent, and the walk sends no request for it. A commit or a
 //!   dirtree whose bytes do not match its name stops the run before its
 //!   first delete. A run of the fsck with `delete` repairs such an object.
-//! - The run deletes the commits first, each with its detached metadata and
-//!   its composefs image, then the detached metadata and the composefs images
-//!   whose commits are absent, then each other object, then the static
-//!   deltas whose target commits are absent, each superblock before the
-//!   other keys of its delta, then the partial-commit markers whose commits
-//!   are absent. Then it aborts each incomplete multipart upload. The run
-//!   checks the lock before each of these steps that has a change to make,
-//!   and after each 1000 deletes or aborts of a step. The four steps are:
-//!   the commits with the detached metadata and the composefs images of
+//! - The run deletes the commits first, each with its detached metadata,
+//!   then the detached metadata whose commits are absent, then each other
+//!   object, then the static deltas whose target commits are absent, each
+//!   superblock before the other keys of its delta, then the partial-commit
+//!   markers whose commits are absent. Then it aborts each incomplete
+//!   multipart upload. The run checks the lock before each of these steps
+//!   that has a change to make, and after each 1000 deletes or aborts of a
+//!   step. The four steps are: the commits with the detached metadata of
 //!   absent commits, the other objects, the static deltas with the markers,
 //!   and the aborts.
 //! - The run deletes no ref, no `.tombstone-commit`, and no key under

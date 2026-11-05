@@ -39,7 +39,7 @@ The session serves the refs of the client group that carries the item \fB\%ssh:N
 \fB\-\-one\-way\fR
 Write the commits of the refspecs to standard output as one \%one\-way stream.
 .IP
-The stream carries each commit, the objects of its tree, and its detached metadata. It also carries each dependency that field \%2 of a commit names, with no ref update, and each stored composefs image of a sent commit. It ends with a \fB\%Commit\fR frame that holds one ref update for each refspec. The stream carries no parent commit. The command does no negotiation, so it sends each object.
+The stream carries each commit, the objects of its tree, and its detached metadata. It also carries each dependency that field \%2 of a commit names, with no ref update. It ends with a \fB\%Commit\fR frame that holds one ref update for each refspec. The stream carries no parent commit. The command does no negotiation, so it sends each object.
 .IP
 Each update expects any state of the ref, so the receiver applies its own rules. A failure before the first byte writes nothing to standard output. A failure after the first byte ends the stream with \fB\%Abort\fR, and a receiver changes nothing. The option conflicts with \%\-\-client.
 .TP

@@ -116,8 +116,7 @@ impl Fixture {
     /// local repository and in the bucket: a commit that no ref names,
     /// the deltas `c2-c3` and `c1`, the partial-commit markers of `c1`,
     /// `c3`, and of an absent commit, the detached metadata of `c1` and of
-    /// an absent commit, the composefs image of `c1`, and the tombstone of
-    /// an absent commit.
+    /// an absent commit, and the tombstone of an absent commit.
     async fn rich() -> (Fixture, Checksum) {
         let f = Fixture::new(None).await;
         let loose = commit(&f.local, f.tmp.path(), None, "loose", None, T0 + 50).await;
@@ -140,7 +139,6 @@ impl Fixture {
         }
         for (ty, commit) in [
             (ObjectType::CommitMeta, f.c1),
-            (ObjectType::ComposefsImage, f.c1),
             (ObjectType::CommitMeta, absent),
             (ObjectType::TombstoneCommit, absent),
         ] {
@@ -580,8 +578,8 @@ fn a_run_deletes_what_the_local_prune_deletes() {
         });
     }
     // A parent commit that the listing does not hold: without the roots on
-    // the refs alone, the run deletes its detached metadata and its
-    // composefs image, which the local prune keeps.
+    // the refs alone, the run deletes its detached metadata, which the local
+    // prune keeps.
     block_on(async {
         let (f, _) = Fixture::rich().await;
         let commit = key(ObjectType::Commit, &f.c1);
@@ -594,10 +592,7 @@ fn a_run_deletes_what_the_local_prune_deletes() {
         let stats = local.prune(&opts).await.unwrap();
         let report = f.prune(&opts).await.unwrap();
         assert_eq!(report.stats, stats);
-        let sidecars: BTreeSet<String> = [ObjectType::CommitMeta, ObjectType::ComposefsImage]
-            .iter()
-            .map(|ty| key(*ty, &f.c1))
-            .collect();
+        let sidecars: BTreeSet<String> = [key(ObjectType::CommitMeta, &f.c1)].into();
         let deletes = f.deletes();
         for sidecar in &sidecars {
             assert!(f.get(sidecar).is_none(), "{sidecar}");
@@ -873,7 +868,6 @@ fn the_sidecars_go_after_their_commit_and_the_counts_leave_them_out() {
         let counted = |key: &String| {
             key.starts_with("objects/")
                 && !key.ends_with(".commitmeta")
-                && !key.ends_with(".cfs")
                 && !key.ends_with(".tombstone-commit")
         };
         let total = f.keys("objects").iter().filter(|key| counted(key)).count();
@@ -881,8 +875,7 @@ fn the_sidecars_go_after_their_commit_and_the_counts_leave_them_out() {
         let deletes = f.deletes();
         let commit = at(&deletes, &key(ObjectType::Commit, &f.c1));
         let meta = at(&deletes, &key(ObjectType::CommitMeta, &f.c1));
-        let image = at(&deletes, &key(ObjectType::ComposefsImage, &f.c1));
-        assert!(commit < meta && meta < image, "{deletes:?}");
+        assert!(commit < meta, "{deletes:?}");
         at(&deletes, &key(ObjectType::CommitMeta, &absent));
         let tombstone = key(ObjectType::TombstoneCommit, &absent);
         assert!(f.get(&tombstone).is_some());

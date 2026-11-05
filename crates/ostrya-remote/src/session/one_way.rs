@@ -87,8 +87,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 ///
 /// - `opts.agent` is the `agent` of `Hello`.
 /// - `opts.progress` receives the counters.
-/// - The statistics count each name of `names` as offered and as needed. A
-///   composefs image does not count.
+/// - The statistics count each name of `names` as offered and as needed.
 /// - The phases are [`PushPhase::Uploading`] and then
 ///   [`PushPhase::Committing`].
 ///
@@ -126,7 +125,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// - [`Error::InvalidInput`] if `compression` is [`Compression::Deflate`]
 ///   with a level outside 1 through 9.
 /// - [`Error::InvalidInput`] if the type of a name of `names` is not a file,
-///   a dirtree, a dirmeta, a commit, or a composefs image.
+///   a dirtree, a dirmeta, or a commit.
 /// - [`Error::InvalidInput`] if the `Hello` frame or the `Commit` frame is
 ///   more than [`MIN_FRAME_LIMIT`].
 /// - [`Error::Protocol`] if `opts.agent` holds a NUL byte, because the

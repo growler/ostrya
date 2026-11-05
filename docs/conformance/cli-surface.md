@@ -3094,9 +3094,7 @@ details", "spki"). Forty-nine differences stand on `show`,
   the applier, so they also apply to a delta that the tool generates. The
   port has neither limit. It applies rollsum and bspatch objects into an
   `archive` repository. It applies a delta with fallbacks where the objects
-  that they name are already in the repository. A fallback entry of the
-  composefs image need not be present (`../format-reference.md`, "The
-  composefs image in a static delta");
+  that they name are already in the repository;
 - the dependencies of the target under `apply-offline`. The port reads field
   2 of the target commit before it writes an object
   (`../format-reference.md`, "Object delivery"). It refuses a defective
@@ -3285,15 +3283,7 @@ refusal writes no object.
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries twenty-four differences. Two of them are open.
-
-- the composefs image of the target commit. The port puts the stored image
-  of a commit that carries `ostree.composefs.digest.v0` in the delta, in a
-  part or as a fallback entry of the type 100 (`../format-reference.md`,
-  "The composefs image in a static delta"). A delta of `--inline` lists the
-  image as a fallback entry. The tool has no image object. A delta of a
-  commit with no key or with no stored image has no image entry, and this
-  rule changes none of its bytes;
+`static-delta generate` carries twenty-three differences. Two of them are open.
 
 - an inline superblock over the 128 MiB ceiling. The port refuses at exit 1
   after the block, with one of two messages. The inline parts share the
@@ -3496,20 +3486,6 @@ The port reads the remote key `trust=NAME`, and the trust group
 `[ex-ostrya trust "NAME"]` then checks the commits of the pull
 (`ostrya-config(1)`, "REMOTE KEYS"). The tool keeps the key and ignores it
 (`cli-behavior.md`, "Signature verification during a pull").
-
-`pull` and `pull-local` also take the composefs image of each commit that
-carries `ostree.composefs.digest.v0`, unless the pull is commit-only or has a
-subpath (`format-reference.md`, "The pull over HTTP and over a stream"). A
-remote of the tool holds no image and answers 404, and the pull goes on.
-`pull-local` copies the image with a reflink or a byte copy and never with a
-hardlink. On `pull`, the image adds its bytes to the transferred count of the
-statistics line. On `pull-local`, it adds its bytes there only when the pull
-reads static deltas, under `--require-static-deltas` or a list of deltas,
-because only that pull counts the bytes that it reads. The image adds no
-object to a count. A static delta of the port can carry the image in a part.
-The pull then stores the image from the part and requests no `.cfs`, a pull
-with a subpath included (`format-reference.md`, "The composefs image in a
-static delta").
 
 `pull` also fetches the dependencies that field 2 of each pulled commit
 names, each at depth 0 and with no ref, unless the pull is commit-only or has a
@@ -5281,12 +5257,6 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   1, at the same step. A commit with no binding in the namespace of a
   collection is refused with `error: binding-mismatch: ...` after the server
   reports the namespace, and before the push sends an object.
-- The push offers the composefs image of each commit whose tree it walks,
-  where the local repository holds the image, also for a source commit that
-  the server holds (`../format-reference.md`, "Have and HaveReply"). A push
-  with `--onto` sends no image. A server that does not accept the object
-  type 100 refuses the session with `protocol`, so the server must accept
-  the type before a push with images goes to it.
 - `--tag=NAME` creates the ref `NAME` on the server at the source commit.
   The option can repeat. The refspecs that are not deletes must give one
   commit, and its `ostree.ref-binding` must hold `NAME`. `NAME` passes the
@@ -5532,20 +5502,19 @@ allow-cleartext-credentials`.
   `remote init` does, with no repository for an address. Unless `-q` is
   given, it first writes `Listed N objects`, `Checked C commits and O
   objects, B bytes`, and `N objects not reached by a commit` to standard
-  output, then `N composefs images with no commit` and `N partial commits`
-  when the count is not zero. It writes one line for each finding to
-  standard error, sorted by key and then by kind: `KIND KEY: DETAIL`, then
-  `; in commits C1, C2` when the finding names commits. A note starts with
-  `note: `. A dependency in field 2 of a commit that is absent, partial, or
-  defective gives a `dependency` error on the key of that commit, with the
-  reason of the finding of `fsck` as its detail (`../format-reference.md`,
-  "Dependencies in the fsck"). A report with an error ends with `error: Bucket
-  repository corruption encountered` and exit status 1. Else the command
-  writes `fsck of the bucket repository ADDRESS: no errors found` and exits 0.
-  Notes alone give exit status 0. A failed write to standard output, for example
-  on a full device, gives `error: i/o error: ...` and exit status 1. With
-  a remote name, the command verifies the signature of the summary with
-  the summary keys of the remote, `gpg-verify-summary` and
+  output, then `N partial commits` when the count is not zero. It writes one
+  line for each finding to standard error, sorted by key and then by kind:
+  `KIND KEY: DETAIL`, then `; in commits C1, C2` when the finding names
+  commits. A note starts with `note: `. A dependency in field 2 of a commit
+  that is absent, partial, or defective gives a `dependency` error on the
+  key of that commit, with the reason of the finding of `fsck` as its detail
+  (`../format-reference.md`, "Dependencies in the fsck"). A report with an
+  error ends with `error: Bucket repository corruption encountered` and exit
+  status 1. Else the command writes `fsck of the bucket repository ADDRESS: no
+  errors found` and exits 0. Notes alone give exit status 0. A failed write to
+  standard output, for example on a full device, gives `error: i/o error: ...`
+  and exit status 1. With a remote name, the command verifies the signature of
+  the summary with the summary keys of the remote, `gpg-verify-summary` and
   `sign-verify-summary`. A remote with `trust=NAME` keeps this check. The
   command checks the trust group and the keys beside `trust` as a pull does,
   and reads no key of the group. With an address, it verifies no signature,
@@ -5901,8 +5870,7 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   repository, `indexed-deltas=VALUE\n` comes next when the repository config
   sets it. In a mode other than `archive` each `.filez` object is built on
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
-  not served. The `.cfs` composefs image of a commit is served as stored in
-  every mode. A path the server refuses and a path it does not find both get
+  not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
 - The command also answers `GET /_ostrya/refs/v1?pattern=P&collection=C`.
   The body is the ref listing, a summary GVariant built for each request, of
@@ -6097,8 +6065,6 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
   `push` feature, which is in the default set. A build without `push`
   refuses `--one-way`, `--remote`, `--compress`, and a refspec as unknown
   arguments.
-- The session serves the `.cfs` composefs image of a commit as stored, as
-  `serve` does.
 - The client name is `--client`, else the value of `LOGNAME`, as for
   `receive`. With no name, the command writes `error: send needs a client
   name: give --client, or set LOGNAME` and exits 1 before it opens the
@@ -6203,9 +6169,9 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
 - Each update of the `Commit` frame expects any state of its ref, so the
   receiver applies its own rules to the state of the ref. The stream
   carries each commit of a refspec, the objects of its tree, its detached
-  metadata, each dependency that field 2 names with no ref update, and
-  each stored composefs image of a sent commit. It carries no parent
-  commit. The command does no negotiation, so it sends each object.
+  metadata, and each dependency that field 2 names with no ref update. It
+  carries no parent commit. The command does no negotiation, so it sends
+  each object.
 - The command holds the repository lock as shared while it writes the
   stream. Standard output carries the stream alone. A failure before the
   first byte writes nothing to standard output. A failure after the first
@@ -6269,14 +6235,7 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   absent, it writes `Composefs image with no commit: CHECKSUM` to standard
   output, and this line is not an error. A repository with no image gets
   none of these lines.
-- `pull`, `pull-local`, `push`, `send`, and `serve` carry the image
-  (`../format-reference.md`, "The composefs image object").
-- `static-delta generate` puts the image of the target commit in the delta,
-  and `static-delta apply-offline` stores it after it checks the digest
-  against the key (`../format-reference.md`, "The composefs image in a
-  static delta").
-- `crates/ostrya/tests/composefs_image.rs`,
-  `crates/ostrya/tests/composefs_transfer.rs`, and
+- `crates/ostrya/tests/composefs_image.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### ssh access with `authorized_keys`

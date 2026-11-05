@@ -38,11 +38,8 @@
 //! Each write refuses a commit without the key and an image whose digest is
 //! not the key. A write never holds the whole image in memory.
 //!
-//! A pull ([`Repo::pull`], [`Repo::pull_local`]), a push, a one-way stream,
-//! and the application of a static delta
-//! ([`Repo::apply_static_delta_offline`]) carry the image with its commit.
-//! Each of them computes the digest of the bytes that it writes, and installs
-//! the image only when the digest is the key.
+//! No transfer carries the image. A pull, a push, a one-way stream, and a
+//! static delta carry no composefs image.
 
 use std::future::Future;
 use std::io::BufWriter;
@@ -50,7 +47,6 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::pin::Pin;
 
-use futures_io::AsyncRead;
 use ostrya_composefs::{
     Content, Directory, Error as WriterError, FsVerityHasher, Image, Metadata, Node, Regular,
     Symlink, build_image, write_image_to, write_image_unhashed_to,
@@ -66,10 +62,7 @@ use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
-use crate::write::{
-    ImageTemp, clone_image_temp_blocking, discard_image_temp, link_image_blocking,
-    write_image_stream_temp, write_image_temp_blocking,
-};
+use crate::write::{ImageTemp, discard_image_temp, link_image_blocking, write_image_temp_blocking};
 
 /// The empty top-level directories that the `ostree` command adds to each
 /// exported image.
@@ -605,164 +598,6 @@ impl Transaction {
             Err(e) => return Err(e),
         })
     }
-
-    /// Stages the stored composefs image of `commit` in `src` as the image of
-    /// `commit` in this transaction.
-    ///
-    /// The call copies the image with a `FICLONE` reflink if the file system
-    /// supports one, and with a byte copy in the kernel otherwise. It never
-    /// shares the inode of the source. It seals the copy as
-    /// [`build_composefs_image`](Transaction::build_composefs_image) seals a
-    /// new image. The fs-verity digest of the copy is the kernel digest of
-    /// the seal. If the call does not seal the copy, it reads the copy to
-    /// compute the digest. Then
-    /// [`attach_composefs_image`](Transaction::attach_composefs_image) checks
-    /// the digest against the key of the commit and stages the copy.
-    ///
-    /// Returns the size of the image in bytes, or `None` if `src` holds no
-    /// image of `commit`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
-    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
-    ///   the key of the commit.
-    /// - The errors of [`attach_composefs_image`](Transaction::attach_composefs_image).
-    pub(crate) async fn import_composefs_image(
-        &self,
-        src: &Repo,
-        commit: &Checksum,
-    ) -> Result<Option<u64>> {
-        if self.repo().mode() == RepoMode::BareSplitXattrs {
-            return Err(Error::Unsupported(
-                "bare-split-xattrs is read-only; the port does not write it".into(),
-            ));
-        }
-        let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.repo().config().fsverity()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let src = src.clone();
-        let key = *commit;
-        let image = self
-            .unblock(move || {
-                clone_image_temp_blocking(
-                    staging.as_fd(),
-                    src.objects_fd(),
-                    src.mode(),
-                    &key,
-                    fsync && per_object_fsync,
-                    verity,
-                )
-            })
-            .await?;
-        let Some(image) = image else {
-            return Ok(None);
-        };
-        let size = image.size;
-        let staged = StagedComposefsImage {
-            txn: self,
-            digest: image.digest,
-            image: Some(image),
-        };
-        self.attach_composefs_image(commit, staged).await?;
-        Ok(Some(size))
-    }
-
-    /// Streams a composefs image from `reader` and stages it as the image of
-    /// `commit`.
-    ///
-    /// The bytes go through `buf`, so no step holds the whole image. The call
-    /// computes the fs-verity digest as it writes the image, and seals the
-    /// image as [`build_composefs_image`](Transaction::build_composefs_image)
-    /// seals a new image. Then
-    /// [`attach_composefs_image`](Transaction::attach_composefs_image) checks
-    /// the digest against the key of the commit and stages the image.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
-    /// - [`Error::Io`] if a read from `reader` fails, or if a file system
-    ///   operation fails.
-    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
-    ///   the key of the commit.
-    /// - The errors of [`attach_composefs_image`](Transaction::attach_composefs_image).
-    pub(crate) async fn stage_composefs_image_from<R: AsyncRead + Unpin>(
-        &self,
-        commit: &Checksum,
-        reader: R,
-        buf: &mut Vec<u8>,
-    ) -> Result<ComposefsImageAdd> {
-        let image = write_image_stream_temp(self, reader, buf).await?;
-        let staged = StagedComposefsImage {
-            txn: self,
-            digest: image.digest,
-            image: Some(image),
-        };
-        self.attach_composefs_image(commit, staged).await
-    }
-
-    /// Streams a composefs image from `reader` and stages it as the image of
-    /// `commit`, with `key` as the digest that the commit records.
-    ///
-    /// The call writes and seals the image as
-    /// [`stage_composefs_image_from`](Transaction::stage_composefs_image_from)
-    /// does. It does not read the commit, so the commit need not be staged or
-    /// stored yet. The caller reads `key` from the commit. Then the call
-    /// checks the digest of the image against `key` and stages the image as
-    /// [`attach_composefs_image`](Transaction::attach_composefs_image) does.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
-    /// - [`Error::Io`] if a read from `reader` fails, or if a file system
-    ///   operation fails.
-    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
-    ///   `key`.
-    /// - [`Error::InsufficientFreeSpace`] if the image needs more space than
-    ///   the free-space budget of the transaction holds.
-    pub(crate) async fn stage_composefs_image_keyed<R: AsyncRead + Unpin>(
-        &self,
-        commit: &Checksum,
-        key: &[u8; 32],
-        reader: R,
-        buf: &mut Vec<u8>,
-    ) -> Result<ComposefsImageAdd> {
-        let image = write_image_stream_temp(self, reader, buf).await?;
-        let staged = StagedComposefsImage {
-            txn: self,
-            digest: image.digest,
-            image: Some(image),
-        };
-        self.attach_keyed(commit, key, staged).await
-    }
-
-    /// Streams a composefs image from `reader` and stages it as the image of
-    /// `commit`, with no check against the key of the commit.
-    ///
-    /// The call writes and seals the image as
-    /// [`stage_composefs_image_from`](Transaction::stage_composefs_image_from)
-    /// does, and returns its fs-verity digest. The commit need not be staged
-    /// or stored yet. The caller compares the digest with the key of the
-    /// commit before the transaction commits, and drops the transaction on a
-    /// mismatch.
-    #[cfg(feature = "receive")]
-    pub(crate) async fn stage_composefs_image_unchecked<R: AsyncRead + Unpin>(
-        &self,
-        commit: &Checksum,
-        reader: R,
-        buf: &mut Vec<u8>,
-    ) -> Result<[u8; 32]> {
-        let image = write_image_stream_temp(self, reader, buf).await?;
-        let digest = image.digest;
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let mode = self.repo().mode();
-        let key = *commit;
-        let outcome = self
-            .unblock(move || link_image_blocking(staging.as_fd(), image, &key, mode))
-            .await?;
-        self.record_image(*commit, outcome)?;
-        Ok(digest)
-    }
 }
 
 /// Methods that export a commit as a composefs image.
@@ -1240,25 +1075,6 @@ impl Repo {
         let repo = self.clone();
         let commit = *commit;
         ostrya_rt::unblock(move || stored_image_digest_blocking(&repo, &commit)).await
-    }
-
-    /// Opens the stored composefs image of `commit` for reading, and returns
-    /// the file and its size in bytes. Returns `None` if the repository holds
-    /// no image of `commit`.
-    ///
-    /// The open and the `fstat` run on the blocking pool. The call reads no
-    /// byte of the image.
-    pub(crate) async fn open_composefs_image(
-        &self,
-        commit: &Checksum,
-    ) -> Result<Option<(std::fs::File, u64)>> {
-        let repo = self.clone();
-        let commit = *commit;
-        ostrya_rt::unblock(move || {
-            let image = open_stored_image_blocking(&repo, &commit)?;
-            Ok(image.map(|image| (image.file, image.len)))
-        })
-        .await
     }
 }
 

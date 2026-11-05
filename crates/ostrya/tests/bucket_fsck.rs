@@ -384,7 +384,7 @@ fn a_clean_bucket_gives_the_counts_of_the_local_repository() {
         );
         assert_eq!(report.objects_unreached, 0);
         assert!(report.deleted.is_empty() && report.marked_partial.is_empty());
-        assert!(report.commits_partial.is_empty() && report.orphan_images.is_empty());
+        assert!(report.commits_partial.is_empty());
         // A run with no delete takes no lock and changes nothing.
         assert!(
             f.server
@@ -1089,53 +1089,6 @@ fn the_delta_map_of_the_summary_is_checked_against_the_superblocks() {
 }
 
 // ---------------------------------------------------------------------------
-// Composefs images.
-// ---------------------------------------------------------------------------
-
-#[test]
-fn each_image_is_checked_against_the_digest_of_its_commit() {
-    block_on(async {
-        let f = Fixture::new(None).await;
-        let base = f.tmp.path().join("owned");
-        std::fs::create_dir_all(&base).unwrap();
-        common::composefs::build_owned_source(&base);
-        let (image, _) =
-            common::composefs::commit_tree(&f.local, &base, 1_700_000_000, true, Some("img")).await;
-        f.copy("objects");
-        f.put_ref("refs/heads/img", &image);
-        let report = f.fsck().await;
-        assert!(!report.has_errors(), "{:#?}", report.findings);
-        // A `.cfs` of a commit that the bucket does not hold is no finding.
-        let orphan = Checksum::sha256(b"no such commit");
-        f.replace(ObjectType::ComposefsImage, &orphan, b"image");
-        // A `.cfs` of a commit with no digest key.
-        f.replace(ObjectType::ComposefsImage, &f.head, b"image");
-        let mut bytes = f.object(ObjectType::ComposefsImage, &image);
-        bytes[0] ^= 1;
-        f.replace(ObjectType::ComposefsImage, &image, &bytes);
-        let report = f.fsck().await;
-        assert_eq!(report.orphan_images, [orphan]);
-        let found = finding(&report, Mismatch, ObjectType::ComposefsImage, &image);
-        assert_eq!(found.commits, [image]);
-        assert!(
-            found.detail.starts_with("the commit records the digest"),
-            "{found}"
-        );
-        let found = finding(&report, Corrupt, ObjectType::ComposefsImage, &f.head);
-        assert_eq!(
-            found.detail,
-            "the commit does not carry ostree.composefs.digest.v0"
-        );
-        assert_eq!(
-            without_summary_note(&report).len(),
-            2,
-            "{:#?}",
-            report.findings
-        );
-    });
-}
-
-// ---------------------------------------------------------------------------
 // Notes, strict reads, and reads in transit.
 // ---------------------------------------------------------------------------
 
@@ -1618,22 +1571,8 @@ fn a_summary_update_after_a_repair_lists_a_marked_ref_target_and_refuses_a_delet
 }
 
 // ---------------------------------------------------------------------------
-// Writers during a run, refused lists, strict reads of images, and large
-// summaries.
+// Writers during a run, refused lists, and large summaries.
 // ---------------------------------------------------------------------------
-
-/// Commits a tree with a composefs image to the ref `img`, copies the
-/// objects into the bucket, and writes the ref file. Returns the commit.
-async fn image_commit(f: &Fixture) -> Checksum {
-    let base = f.tmp.path().join("owned");
-    std::fs::create_dir_all(&base).unwrap();
-    common::composefs::build_owned_source(&base);
-    let (image, _) =
-        common::composefs::commit_tree(&f.local, &base, 1_700_000_000, true, Some("img")).await;
-    f.copy("objects");
-    f.put_ref("refs/heads/img", &image);
-    image
-}
 
 #[test]
 fn an_object_that_a_writer_adds_during_the_run_is_a_note() {
@@ -1838,55 +1777,6 @@ fn a_refused_list_fails_the_run_before_an_object_read() {
                 f.requests()
             );
         }
-    });
-}
-
-#[test]
-fn an_image_read_takes_the_strict_rule_and_is_read_again_after_a_cut() {
-    block_on(async {
-        let f = Fixture::new(None).await;
-        let image = image_commit(&f).await;
-        let key = format!("repo/{}", object_path(ObjectType::ComposefsImage, &image));
-        f.server.state().truncate = Some((key.clone(), 10, 1));
-        f.server.state().requests.clear();
-        let report = f.fsck().await;
-        assert!(!report.has_errors(), "{:#?}", report.findings);
-        let gets = f
-            .server
-            .state()
-            .requests
-            .iter()
-            .filter(|(method, target)| method == "GET" && target == &format!("/bkt/{key}"))
-            .count();
-        assert_eq!(gets, 2);
-        f.server.state().truncate = Some((key.clone(), 10, 2));
-        let err = f
-            .bucket
-            .fsck(&BucketFsckOptions::default())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::Io(e) if e.to_string().contains("failed in transit two times")),
-            "{err}"
-        );
-        f.server.state().truncate = None;
-        f.server.state().not_found = Some((key, Vec::new()));
-        let err = f
-            .bucket
-            .fsck(&BucketFsckOptions::default())
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                &err,
-                Error::Remote(ostrya::remote::Error::S3 {
-                    status: 404,
-                    code: None,
-                    ..
-                })
-            ),
-            "{err}"
-        );
     });
 }
 
@@ -2448,34 +2338,6 @@ fn a_failed_delete_keeps_the_record_of_each_change_and_names_the_ref_of_a_delete
                 .filter(|(kind, _, _)| *kind == Ref)
                 .collect::<Vec<_>>(),
             [(Ref, "refs/heads/side".to_owned(), true)]
-        );
-    });
-}
-
-#[test]
-fn the_repair_leaves_the_image_of_a_commit_that_it_deletes() {
-    block_on(async {
-        let f = Fixture::new(None).await;
-        let image = image_commit(&f).await;
-        let other = f.object(ObjectType::Commit, &f.side);
-        f.replace(ObjectType::Commit, &image, &other);
-        let report = f.repair().await.unwrap();
-        assert_eq!(report.orphan_images, [image]);
-        assert!(
-            !report.findings.iter().any(|found| found
-                .object
-                .is_some_and(|name| name.ty == ObjectType::ComposefsImage)),
-            "{:#?}",
-            report.findings
-        );
-        assert_eq!(report.deleted, [object_path(ObjectType::Commit, &image)]);
-        assert_eq!(
-            report.deleted_ref_targets,
-            [(image, vec!["refs/heads/img".to_owned()])]
-        );
-        assert!(
-            f.get(&object_path(ObjectType::ComposefsImage, &image))
-                .is_some()
         );
     });
 }

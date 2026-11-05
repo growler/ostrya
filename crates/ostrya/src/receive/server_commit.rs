@@ -54,8 +54,8 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 ///    limit of 128 levels of containers (`protocol`).
 /// 2. The `CommitReply` fits in a frame of [`MAX_FRAME`], with an old commit
 ///    on the branch (`limit-exceeded`).
-/// 3. The session holds no detached metadata dict and no composefs image,
-///    and staged no commit object (`protocol`).
+/// 3. The session holds no detached metadata dict and staged no commit
+///    object (`protocol`).
 /// 4. No ref is the collection anchor ref of the local refs of a repository
 ///    with a collection id, and `policy` gives the rule of the server commit
 ///    (`ref-denied`).
@@ -104,7 +104,6 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// value. An error of the hook is `internal`, with the message cut at 4096
 /// bytes at a character boundary. After an error of the hook, the refs stay
 /// written.
-#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish(
     repo: &Repo,
     policy: &dyn SessionPolicy,
@@ -112,7 +111,6 @@ pub(super) async fn finish(
     txn: Transaction,
     named: Named<'_>,
     commit_meta: HashMap<Checksum, Vec<u8>>,
-    images: HashMap<Checksum, Option<[u8; 32]>>,
     request: CommitRequest,
 ) -> Checked<ReceiveReport> {
     let CommitRequest {
@@ -126,7 +124,7 @@ pub(super) async fn finish(
     let paths: Arc<[String]> = check_names(&named, &sc, updates.len(), force)?.into();
     check_metadata(&sc)?;
     check_reply_fits(&sc)?;
-    check_session_objects(&txn, &commit_meta, &images)?;
+    check_session_objects(&txn, &commit_meta)?;
     if named.is_local() && repo.config().collection_id().is_some() {
         for name in refs(&sc) {
             if name == OSTREE_METADATA_REF {
@@ -405,24 +403,18 @@ fn check_reply_fits(sc: &ServerCommit) -> Checked<()> {
     Ok(())
 }
 
-/// Checks that the session sent no detached metadata dict and no composefs
-/// image, and staged no commit object (`protocol`).
+/// Checks that the session sent no detached metadata dict and staged no
+/// commit object (`protocol`).
 ///
 /// A server commit is the one commit of its session, and the server signs
 /// it alone.
 fn check_session_objects(
     txn: &Transaction,
     commit_meta: &HashMap<Checksum, Vec<u8>>,
-    images: &HashMap<Checksum, Option<[u8; 32]>>,
 ) -> Checked<()> {
     if let Some(commit) = commit_meta.keys().min() {
         return Err(protocol(format!(
             "detached metadata for commit {commit} in a session with a server commit"
-        )));
-    }
-    if let Some(commit) = images.keys().min() {
-        return Err(protocol(format!(
-            "a composefs image for commit {commit} in a session with a server commit"
         )));
     }
     if let Some(commit) = txn.staged_of_type(ObjectType::Commit).into_iter().min() {

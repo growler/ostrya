@@ -8,14 +8,14 @@
 //! and the bindings of the source commits select the namespace of the refs,
 //! `refs/heads/` or `refs/mirrors/ID/`.
 //!
-//! The writes go in this order: the tree objects, the composefs images, and
-//! the detached metadata, then the commit objects and the ref files. The push
-//! writes no `summary` and no `summary.sig`. A commit object goes up only
-//! after each object of its tree, so a commit object in the bucket has its
-//! whole tree in the bucket at each point of a run, also of a run that
-//! failed, or a partial-commit marker that the fsck wrote. A run again lists
-//! the objects and uploads only the rest, and it walks no tree of a commit
-//! that the bucket holds with no marker.
+//! The writes go in this order: the tree objects and the detached metadata,
+//! then the commit objects and the ref files. The push writes no `summary`
+//! and no `summary.sig`. A commit object goes up only after each object of
+//! its tree, so a commit object in the bucket has its whole tree in the
+//! bucket at each point of a run, also of a run that failed, or a
+//! partial-commit marker that the fsck wrote. A run again lists the objects
+//! and uploads only the rest, and it walks no tree of a commit that the
+//! bucket holds with no marker.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
@@ -219,7 +219,7 @@ pub(super) struct Counts {
     /// The bytes of each object body and detached metadata that the push
     /// read and uploaded.
     pub(super) bytes: AtomicU64,
-    /// The objects other than composefs images that the push uploaded.
+    /// The objects that the push uploaded.
     pub(super) objects: AtomicU64,
 }
 
@@ -270,16 +270,14 @@ impl Repo {
     ///    the dependencies of the offered history here, as "Dependencies" of
     ///    [`Repo::push_over_stream`] states. It walks the tree of
     ///    each offered commit that the listing lacks, and of each offered
-    ///    commit with a partial-commit marker `state/<checksum>.commitpartial`,
-    ///    and adds the composefs image of each source commit and of each
-    ///    walked commit that the local repository holds. It walks no tree of
-    ///    another commit that the listing holds: each writer uploads a commit
-    ///    object after its tree, so a commit object in the bucket has its
-    ///    whole tree in the bucket, or a marker that
+    ///    commit with a partial-commit marker `state/<checksum>.commitpartial`.
+    ///    It walks no tree of another commit that the listing holds: each
+    ///    writer uploads a commit object after its tree, so a commit object in
+    ///    the bucket has its whole tree in the bucket, or a marker that
     ///    [`BucketRepo::fsck`] wrote.
-    /// 5. It uploads each tree object and image that the listing lacks, and
-    ///    the detached metadata of each commit that the bucket lacks and of
-    ///    each source commit, at most `max_outstanding` uploads at a time. If
+    /// 5. It uploads each tree object that the listing lacks, and the
+    ///    detached metadata of each commit that the bucket lacks and of each
+    ///    source commit, at most `max_outstanding` uploads at a time. If
     ///    `[ex-ostrya] keep-detached-related` of the `config` of the bucket is
     ///    `false`, it drops `ostrya.related` from each dict that it uploads.
     ///    It skips a `.commitmeta` that the bucket holds with the same bytes,
@@ -316,11 +314,11 @@ impl Repo {
     /// then gives the total of the content, also in `Scanning`. A failure of
     /// that pass gives no total, and the push goes on. The push sets
     /// `Uploading` before the uploads of steps 5 and 6, and `Committing`
-    /// before step 7, which writes the refs. The objects that it uploads,
-    /// other than the composefs images, count as needed and as sent. The
-    /// content of an `archive` repository counts with the stored bytes of
-    /// each `.filez` as the push reads them. In each other mode, the payload
-    /// size of a file counts after the upload of its `.filez`.
+    /// before step 7, which writes the refs. The objects that it uploads
+    /// count as needed and as sent. The content of an `archive` repository
+    /// counts with the stored bytes of each `.filez` as the push reads them.
+    /// In each other mode, the payload size of a file counts after the upload
+    /// of its `.filez`.
     ///
     /// # Failure states
     ///
@@ -350,7 +348,7 @@ impl Repo {
     /// for a ref that did not move. The statistics count the commits that
     /// the push offered and the tree objects of its walk, the objects that
     /// it uploaded, and the bytes of each object and detached metadata that
-    /// it uploaded. A composefs image counts in the bytes alone.
+    /// it uploaded.
     ///
     /// # Errors
     ///
@@ -526,13 +524,7 @@ impl Repo {
         let counts = Counts::default();
         let progress = opts.progress.as_ref();
         let (sizes, content) = self.content_sizes(&walk.upload, opts).await;
-        let counted = |names: &[ObjectName]| -> u64 {
-            names
-                .iter()
-                .filter(|name| name.ty != ObjectType::ComposefsImage)
-                .count() as u64
-        };
-        let needed = counted(&walk.upload) + walk.missing_commits.len() as u64;
+        let needed = (walk.upload.len() + walk.missing_commits.len()) as u64;
         if let Some(progress) = progress {
             progress.add_upload(needed, content);
             progress.set_phase(PushPhase::Uploading);
@@ -560,8 +552,8 @@ impl Repo {
             progress,
             counts: &counts,
         };
-        // The tree objects, the images, and the detached metadata share one
-        // pool of uploads. Each commit object goes up after the pool ends.
+        // The tree objects and the detached metadata share one pool of
+        // uploads. Each commit object goes up after the pool ends.
         uploads
             .all(
                 walk.upload
@@ -725,32 +717,6 @@ impl Repo {
         }
         drop(seen);
         let tree_objects = tree_names.len();
-        // The composefs image of each walked commit and of each source
-        // commit. A source commit that the bucket holds can have an image
-        // that the local repository made after the commit went up.
-        let repo = self.clone();
-        let images_of: Vec<Checksum> = missing_commits
-            .iter()
-            .chain(&marked)
-            .copied()
-            .chain(
-                plan.sources
-                    .iter()
-                    .map(|(c, _)| *c)
-                    .filter(|c| !missing.contains(c) && !marked.contains(c)),
-            )
-            .collect();
-        let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
-            let mut images = Vec::new();
-            for commit in images_of {
-                if repo.has_object_blocking(ObjectType::ComposefsImage, &commit)? {
-                    images.push(ObjectName::new(commit, ObjectType::ComposefsImage));
-                }
-            }
-            Ok(images)
-        })
-        .await?;
-        tree_names.extend(images);
         let upload = tree_names
             .into_iter()
             .filter(|name| !listing.objects.contains_key(name))
@@ -817,7 +783,7 @@ struct Walk {
     marked: Vec<Checksum>,
     /// The number of tree objects of the walk.
     tree_objects: usize,
-    /// The tree objects and the composefs images that the listing lacks.
+    /// The tree objects that the listing lacks.
     upload: Vec<ObjectName>,
     /// The commits whose detached metadata the push uploads: each missing
     /// commit, then each source commit, each once.
@@ -1082,14 +1048,12 @@ impl Uploads<'_> {
         self.counts
             .bytes
             .fetch_add(read.load(Ordering::Relaxed), Ordering::Relaxed);
-        if name.ty != ObjectType::ComposefsImage {
-            self.counts.objects.fetch_add(1, Ordering::Relaxed);
-            if let Some(progress) = self.progress {
-                if let Some(payload) = payload.filter(|_| file) {
-                    progress.add_content(payload);
-                }
-                progress.object_uploaded();
+        self.counts.objects.fetch_add(1, Ordering::Relaxed);
+        if let Some(progress) = self.progress {
+            if let Some(payload) = payload.filter(|_| file) {
+                progress.add_content(payload);
             }
+            progress.object_uploaded();
         }
         Ok(())
     }

@@ -108,7 +108,6 @@ mod tests {
             ("dirmeta", ObjectType::DirMeta),
             ("filez", ObjectType::File),
             ("tombstone-commit", ObjectType::TombstoneCommit),
-            ("cfs", ObjectType::ComposefsImage),
         ] {
             let name = object_name(&format!("objects/ab/{digits}.{ext}"));
             assert_eq!(

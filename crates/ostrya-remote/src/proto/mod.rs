@@ -431,21 +431,17 @@ pub(crate) fn have_entries_within(limit: u32) -> u32 {
 
 /// Returns `true` if a `Have` entry or a `missing` entry can name the type.
 ///
-/// These are the types 1 to 4 and 100.
+/// These are the types 1 to 4.
 pub(crate) fn have_type(ty: ObjectType) -> bool {
     matches!(
         ty,
-        ObjectType::File
-            | ObjectType::DirTree
-            | ObjectType::DirMeta
-            | ObjectType::Commit
-            | ObjectType::ComposefsImage
+        ObjectType::File | ObjectType::DirTree | ObjectType::DirMeta | ObjectType::Commit
     )
 }
 
 /// Returns `true` if an `ObjectHeader` can name the type.
 ///
-/// These are the types 1 to 4, 6, and 100.
+/// These are the types 1 to 4 and 6.
 fn header_type(ty: ObjectType) -> bool {
     have_type(ty) || ty == ObjectType::CommitMeta
 }

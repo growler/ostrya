@@ -739,8 +739,8 @@ impl PushSession {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if the type of a name is not a file, a
-    ///   dirtree, a dirmeta, a commit, or a composefs image. The call sends
-    ///   nothing, and the session stays usable.
+    ///   dirtree, a dirmeta, or a commit. The call sends nothing, and the
+    ///   session stays usable.
     /// - [`Error::InvalidInput`] if another call runs, as the rules of
     ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
     ///   session is broken.
@@ -831,8 +831,8 @@ impl PushSession {
     ///
     /// - [`Error::InvalidInput`] if the level of `compression` is not 1
     ///   through 9, or if the type of a name is not a file, a dirtree, a
-    ///   dirmeta, a commit, or a composefs image. The call sends nothing, and
-    ///   the session stays usable.
+    ///   dirmeta, or a commit. The call sends nothing, and the session stays
+    ///   usable.
     /// - [`Error::InvalidInput`] if another call runs, as the rules of
     ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
     ///   session is broken.

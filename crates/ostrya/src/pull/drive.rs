@@ -59,11 +59,6 @@ impl<'a, T> Slots<'a, T> {
         self.slots.push(Box::pin(future));
     }
 
-    /// Returns the number of futures in flight.
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
     /// Waits for the first slot to finish, removes it, and returns its output.
     ///
     /// If the set is empty, it returns `None` at once.
@@ -150,7 +145,7 @@ mod tests {
                 {
                     slots.push(async move { item });
                 }
-                high_water = high_water.max(slots.len());
+                high_water = high_water.max(slots.slots.len());
                 let Some(output) = slots.next_ready().await else {
                     break;
                 };
@@ -224,7 +219,7 @@ mod tests {
                 let outcome = slots.next_ready().await;
                 // The set still holds the three pending slots here.
                 assert_eq!(dropped.load(Ordering::SeqCst), 0);
-                assert_eq!(slots.len(), 3);
+                assert_eq!(slots.slots.len(), 3);
                 outcome
             };
             assert_eq!(outcome, Some(Err("object not found")));

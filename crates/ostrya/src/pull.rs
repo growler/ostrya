@@ -214,7 +214,6 @@ use ostrya_core::{
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
 
-use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
@@ -1347,13 +1346,13 @@ impl Repo {
     ///   reads no commit object of a dependency that a chain of static deltas
     ///   makes, so the source can hold that commit in the delta alone.
     /// - A dependency is a commit of the pull for each other rule: its
-    ///   `.commitpartial` marker, the walk of its tree, its detached metadata,
-    ///   and its composefs image. For a dependency that this repository holds
-    ///   complete, the pull walks no tree and copies no `.commitmeta`. So the
-    ///   dependency does not get the signatures that the source added after
-    ///   this repository stored it. A pull that takes the dependency as a
-    ///   target copies its `.commitmeta`. A dependency that this repository
-    ///   holds partial gets the walk of its whole tree and its `.commitmeta`.
+    ///   `.commitpartial` marker, the walk of its tree, and its detached
+    ///   metadata. For a dependency that this repository holds complete, the
+    ///   pull walks no tree and copies no `.commitmeta`. So the dependency
+    ///   does not get the signatures that the source added after this
+    ///   repository stored it. A pull that takes the dependency as a target
+    ///   copies its `.commitmeta`. A dependency that this repository holds
+    ///   partial gets the walk of its whole tree and its `.commitmeta`.
     /// - A pull that reads static deltas looks for a delta of each dependency
     ///   that it appends and that this repository does not hold complete, as
     ///   "Static deltas" states. The pull imports the objects of a dependency
@@ -1611,28 +1610,6 @@ impl Repo {
     /// at the install of a later `.commitmeta` or at a ref write. Then the
     /// `.commitmeta` files that the step installed before it stay.
     ///
-    /// # Composefs image
-    ///
-    /// For each commit that carries `ostree.composefs.digest.v0`, the pull
-    /// stages the composefs image of the first source that holds one, also
-    /// for a commit that this repository holds complete. A
-    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull stages no image. A
-    /// malformed value of the key counts as no key. If this repository holds
-    /// an image of the commit, the pull does not read it and copies nothing.
-    /// A source with no image leaves the commit with no image, and the pull
-    /// goes on.
-    ///
-    /// The pull copies the image with a `FICLONE` reflink or a byte copy,
-    /// never with a hardlink, whatever the flags say. It computes the
-    /// fs-verity digest of the copy and stages the copy only when the digest
-    /// is the key. The image adds its size to
-    /// [`bytes_transferred`](PullStats::bytes_transferred) when the pull
-    /// counts a fetch, and adds no object count.
-    ///
-    /// A static delta can carry the image of its target commit in a part.
-    /// The pull then stages the image from the part, with the same digest
-    /// check, and copies no image from a source.
-    ///
     /// # Static deltas
     ///
     /// Under [`require_static_deltas`](PullOptions::require_static_deltas),
@@ -1788,8 +1765,6 @@ impl Repo {
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the re-ingest
     ///   path. Also if a delta superblock does not match its advertised digest
     ///   or its digest in the list.
-    /// - [`Error::ComposefsDigestMismatch`] if the fs-verity digest of a source
-    ///   image is not the key of its commit.
     /// - [`Error::InsufficientFreeSpace`] if an imported object needs more
     ///   space than the free-space budget of the transaction holds.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
@@ -2225,7 +2200,6 @@ impl Repo {
                         root_dirmeta: parsed.root_dirmeta,
                         held,
                         dependency: false,
-                        image_key: recorded_digest(&parsed).ok().flatten(),
                     });
                 }
                 // Discovery counted the `.commitmeta` of each intermediate
@@ -2248,14 +2222,6 @@ impl Repo {
                         related,
                         None,
                     )
-                    .await?;
-                    Box::pin(self.import_composefs_image(
-                        &txn,
-                        &sources,
-                        chain_commit,
-                        flags,
-                        count,
-                    ))
                     .await?;
                 }
             }
@@ -2329,8 +2295,6 @@ impl Repo {
                     self.import_detached_metadata(&txn, &sources, commit, related, count)
                         .await?;
                 }
-                Box::pin(self.import_composefs_image(&txn, &sources, chain_commit, flags, count))
-                    .await?;
             }
             if !opts.no_ref_writes {
                 for (ref_name, tip) in targets {
@@ -2571,59 +2535,6 @@ impl Repo {
         }
         if let Some(bytes) = kept? {
             txn.stage_commit_detached_bytes(commit, bytes).await?;
-        }
-        Ok(())
-    }
-
-    /// Stages the composefs image of a commit in `txn`, from the first source
-    /// that holds it.
-    ///
-    /// The call stages nothing in these cases:
-    ///
-    /// - The pull is commit-only.
-    /// - The commit does not carry `ostree.composefs.digest.v0`, or carries a
-    ///   malformed value.
-    /// - `txn` staged an image of the commit, or this repository holds one.
-    ///   The call does not read a stored image.
-    /// - No source holds an image of the commit.
-    ///
-    /// The call stages the image also for a commit that this repository holds
-    /// complete. It copies the image with a reflink or a byte copy, never
-    /// with a hardlink, and checks its digest against the key of the commit,
-    /// whatever the flags of the pull. A digest that is not the key fails the
-    /// pull with [`Error::ComposefsDigestMismatch`].
-    ///
-    /// If `count` is set, the call adds the size of an image from the first
-    /// of `sources` to the transferred bytes. It counts no object.
-    async fn import_composefs_image(
-        &self,
-        txn: &Transaction,
-        sources: &[&Repo],
-        commit: &ChainCommit,
-        flags: PullFlags,
-        count: Option<&PullCounters>,
-    ) -> Result<()> {
-        if flags.contains(PullFlags::COMMIT_ONLY) || commit.image_key.is_none() {
-            return Ok(());
-        }
-        let checksum = &commit.checksum;
-        if txn.is_staged(checksum, ObjectType::ComposefsImage)
-            || self
-                .has_object(ObjectType::ComposefsImage, checksum)
-                .await?
-        {
-            return Ok(());
-        }
-        for (position, src) in sources.iter().enumerate() {
-            let Some(size) = txn.import_composefs_image(src, checksum).await? else {
-                continue;
-            };
-            if position == 0
-                && let Some(counters) = count
-            {
-                count_fetched(counters, ObjectType::ComposefsImage, size);
-            }
-            return Ok(());
         }
         Ok(())
     }
@@ -2955,7 +2866,6 @@ async fn collect_chain(
                 root_dirmeta: commit.root_dirmeta,
                 held: false,
                 dependency: false,
-                image_key: recorded_digest(&commit).ok().flatten(),
             });
             if let Some(check) = check.as_deref_mut() {
                 check.check(&checksum, &bytes).await;
@@ -2997,9 +2907,6 @@ struct ChainCommit {
     /// a commit is a dependency alone: a target, a parent, and a commit of a
     /// chain are not appended.
     dependency: bool,
-    /// The value of `ostree.composefs.digest.v0` of the commit, or `None` if
-    /// the commit does not carry the key or carries a malformed value.
-    image_key: Option<[u8; 32]>,
 }
 
 /// The dependencies that the walk of the chains of a local pull met, and the
@@ -3115,7 +3022,6 @@ async fn collect_dependencies(
             root_dirmeta: dependency.root_dirmeta,
             held: false,
             dependency: true,
-            image_key: dependency.image_key,
         });
     }
     Ok(appended)
@@ -3465,11 +3371,10 @@ async fn plan_absent(
 /// it.
 ///
 /// The count is one metadata or content object fetched, and `size`, the stored
-/// size in the source, transferred. A composefs image counts its size alone.
+/// size in the source, transferred.
 fn count_fetched(counters: &PullCounters, ty: ObjectType, size: u64) {
     match ty {
         ObjectType::File => counters.content_fetched(),
-        ObjectType::ComposefsImage => {}
         _ => counters.metadata_fetched(),
     }
     counters.add_transferred(size);
@@ -3501,12 +3406,10 @@ struct LoadedCommit {
 }
 
 /// What a local pull keeps of a dependency that it read: the root of its
-/// tree, and the value of `ostree.composefs.digest.v0` of the commit, or
-/// `None` if the commit does not carry the key or carries a malformed value.
+/// tree.
 struct LoadedDependency {
     root_dirtree: Checksum,
     root_dirmeta: Checksum,
-    image_key: Option<[u8; 32]>,
 }
 
 /// Parses the bytes of the commit `checksum` and checks the format of its
@@ -3553,10 +3456,10 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Load
 /// of `holders` that holds it.
 ///
 /// For each dependency, the call parses the commit and checks the format of
-/// its field 2. It keeps the root of the tree and the composefs digest of the
-/// commit alone, and drops the bytes before it reads the next dependency. It
-/// stops at the first failure. The inner `Err` holds the position in `wanted`
-/// of a dependency that names dependencies of its own.
+/// its field 2. It keeps the root of the tree of the commit alone, and drops
+/// the bytes before it reads the next dependency. It stops at the first
+/// failure. The inner `Err` holds the position in `wanted` of a dependency
+/// that names dependencies of its own.
 ///
 /// The function reads on the calling thread. A caller on the executor calls
 /// it in one call on the blocking pool for all dependencies.
@@ -3604,7 +3507,6 @@ fn load_dependencies_blocking(
         loaded.push(LoadedDependency {
             root_dirtree: commit.root_dirtree,
             root_dirmeta: commit.root_dirmeta,
-            image_key: recorded_digest(&commit).ok().flatten(),
         });
     }
     Ok(Ok(loaded))

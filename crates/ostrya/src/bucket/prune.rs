@@ -147,12 +147,11 @@ impl MetadataSource for ListedObjects<'_> {
 /// The changes of one run, in the order of the run.
 #[derive(Debug, PartialEq, Eq)]
 struct Plan {
-    /// The key of each commit object to delete, each with the keys of its
-    /// detached metadata and of its composefs image when these go too,
-    /// sorted by commit.
+    /// The key of each commit object to delete, each with the key of its
+    /// detached metadata when it goes too, sorted by commit.
     commits: Vec<Vec<String>>,
-    /// Each detached metadata and each composefs image to delete whose
-    /// commit object the listing does not hold, in the order of the keys.
+    /// Each detached metadata to delete whose commit object the listing does
+    /// not hold, in the order of the keys.
     orphans: Vec<ObjectName>,
     /// Each other object to delete, in the order of the keys.
     content: Vec<ObjectName>,
@@ -178,19 +177,18 @@ impl BucketRepo {
     /// keeps with the same options in a local repository with the same
     /// objects and refs, and the commits that the summary names, with their
     /// dependencies under the bound of the run. A kept commit keeps its
-    /// detached metadata and its composefs image. Two differences apply:
+    /// detached metadata. Two differences apply:
     ///
     /// - The run reads field 2 of each commit that the walk reaches, and keeps
     ///   the dependencies as [`Repo::prune`](crate::Repo::prune) keeps them
     ///   ("Related commits"). It reads no detached metadata, so it reads no
     ///   build source. Thus it deletes a build source that no other root
     ///   reaches, and the objects that only that commit reaches. It also
-    ///   deletes the detached metadata and the composefs image of a build
-    ///   source that the listing does not hold. `Repo::prune` keeps these.
+    ///   deletes the detached metadata of a build source that the listing
+    ///   does not hold. `Repo::prune` keeps it.
     /// - Unless the roots are on the refs alone, the run also deletes the
-    ///   detached metadata and the composefs image of a parent commit that
-    ///   the listing does not hold. `Repo::prune` keeps these when its bound
-    ///   reaches that parent.
+    ///   detached metadata of a parent commit that the listing does not hold.
+    ///   `Repo::prune` keeps it when its bound reaches that parent.
     ///
     /// The run deletes no ref, writes no summary, and leaves the `summary`, the
     /// `summary.sig`, the `delta-indexes/`, and each `.tombstone-commit` as
@@ -237,7 +235,7 @@ impl BucketRepo {
     ///   defective.
     /// - An entry that names a commit that the listing does not hold roots
     ///   nothing and gives no warning. The walk keeps the name of that commit,
-    ///   so the run keeps its detached metadata and its composefs image.
+    ///   so the run keeps its detached metadata.
     ///
     /// The walk reads each commit and dirtree that it reaches with one `GET`,
     /// and checks its SHA-256 against its name. It reads the commits one at
@@ -260,10 +258,9 @@ impl BucketRepo {
     ///    multipart uploads, and the read of the `summary`.
     /// 4. The walk. With `no_prune`, the run then releases the lock and
     ///    returns the report.
-    /// 5. The commits: each commit object, and then its detached metadata
-    ///    and its composefs image, one slot for each commit. Then each
-    ///    detached metadata and each composefs image whose commit object the
-    ///    listing does not hold.
+    /// 5. The commits: each commit object, and then its detached metadata,
+    ///    one slot for each commit. Then each detached metadata whose commit
+    ///    object the listing does not hold.
     /// 6. Each other object.
     /// 7. The superblock of each static delta whose target commit is not in
     ///    the bucket after the run, and then each other key of these
@@ -473,7 +470,7 @@ impl BucketRepo {
             // parent keeps the same objects of the listing, and the walk
             // reads each commit once. The name of a parent commit that the
             // listing does not hold is then not kept, so the plan deletes
-            // the detached metadata and the composefs image of that commit.
+            // the detached metadata of that commit.
             roots.extend(
                 targets
                     .iter()
@@ -719,11 +716,9 @@ fn plan(
         match name.ty {
             ObjectType::Commit => {
                 let mut keys = vec![object_key(name)];
-                for ty in [ObjectType::CommitMeta, ObjectType::ComposefsImage] {
-                    let sidecar = ObjectName::new(name.checksum, ty);
-                    if doomed(&sidecar) {
-                        keys.push(object_key(&sidecar));
-                    }
+                let sidecar = ObjectName::new(name.checksum, ObjectType::CommitMeta);
+                if doomed(&sidecar) {
+                    keys.push(object_key(&sidecar));
                 }
                 out.commits.push(keys);
             }
@@ -862,7 +857,6 @@ mod tests {
     fn a_doomed_commit_takes_its_sidecars_and_the_counts_leave_them_out() {
         let commit = name(1, ObjectType::Commit);
         let meta = name(1, ObjectType::CommitMeta);
-        let image = name(1, ObjectType::ComposefsImage);
         let tombstone = name(1, ObjectType::TombstoneCommit);
         let orphan = name(2, ObjectType::CommitMeta);
         let tree = name(3, ObjectType::DirTree);
@@ -872,7 +866,6 @@ mod tests {
         let listing = listing(&[
             (commit, 10),
             (meta, 20),
-            (image, 30),
             (tombstone, 40),
             (orphan, 50),
             (tree, 60),
@@ -882,14 +875,7 @@ mod tests {
         ]);
         let keep: HashSet<ObjectName> = [kept].into_iter().collect();
         let plan = plan(&listing, &keep, &[], &BTreeSet::new());
-        assert_eq!(
-            plan.commits,
-            [vec![
-                object_key(&commit),
-                object_key(&meta),
-                object_key(&image)
-            ]]
-        );
+        assert_eq!(plan.commits, [vec![object_key(&commit), object_key(&meta)]]);
         assert_eq!(plan.orphans, [orphan]);
         assert_eq!(plan.content, [tree, file]);
         assert_eq!(plan.stats.total_objects, 4);

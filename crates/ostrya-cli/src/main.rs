@@ -1798,24 +1798,22 @@ enum RemoteCommand {
     ///
     /// The command reads the bucket repository at the `s3://` address of NAME,
     /// or at the address `s3://BUCKET[/PREFIX]`, and checks the `config`, the
-    /// ref files, the summary, the keys under `objects/`, each commit, each
-    /// object of the tree of each commit, and each composefs image of a
-    /// commit. It reads each object that a commit reaches, so its cost is the
-    /// download of these objects.
+    /// ref files, the summary, the keys under `objects/`, each commit, and
+    /// each object of the tree of each commit. It reads each object that a
+    /// commit reaches, so its cost is the download of these objects.
     ///
     /// Unless -q is given, the command first prints the counts: `Listed N
     /// objects`, `Checked C commits and O objects, B bytes`, and `N objects
-    /// not reached by a commit`, then `N composefs images with no commit` and
-    /// `N partial commits` when the count is not zero. It writes one line for
-    /// each finding to standard error, sorted by key: `KIND KEY: DETAIL`, and
-    /// `; in commits C1, C2` when the finding names commits. A note starts
-    /// with `note: `. A report with an error ends with `error: Bucket
-    /// repository corruption encountered` on standard error, and the command
-    /// exits 1. Else the command prints `fsck of the bucket repository
-    /// ADDRESS: no errors found`, and exits 0. A stale summary, an absent
-    /// summary, a marker of a commit whose tree is whole, an incomplete
-    /// multipart upload, and a writer lock are notes. A failed write to
-    /// standard output gives an error line and exit 1.
+    /// not reached by a commit`, then `N partial commits` when the count is not
+    /// zero. It writes one line for each finding to standard error, sorted by
+    /// key: `KIND KEY: DETAIL`, and `; in commits C1, C2` when the finding
+    /// names commits. A note starts with `note: `. A report with an error ends
+    /// with `error: Bucket repository corruption encountered` on standard
+    /// error, and the command exits 1. Else the command prints `fsck of the
+    /// bucket repository ADDRESS: no errors found`, and exits 0. A stale
+    /// summary, an absent summary, a marker of a commit whose tree is whole, an
+    /// incomplete multipart upload, and a writer lock are notes. A failed write
+    /// to standard output gives an error line and exit 1.
     ///
     /// With a remote name, the command verifies the signature of the summary
     /// with the summary keys of the remote, as a pull with
@@ -1870,7 +1868,7 @@ enum RemoteCommand {
     /// ref is a root. Without --refs-only and --keep-younger-than, each
     /// commit of the bucket is a root too. The commits that the summary names
     /// are roots, and the command keeps them with no parent. A kept commit
-    /// keeps its detached metadata and its composefs image.
+    /// keeps its detached metadata.
     ///
     /// The dependencies in field 2 of each commit that the walk reaches are
     /// also roots, as in `ostrya prune`. With --refs-only or
@@ -1880,19 +1878,18 @@ enum RemoteCommand {
     /// that keeps no parent, and a dependency keeps no parent too. The
     /// command reads field 2 from the commit object, with no other request.
     /// An entry that names a commit that is not in the bucket gives no error,
-    /// and the command keeps the detached metadata and the composefs image of
-    /// that commit if they are in the bucket. For each defective field 2
-    /// entry, the command writes one
-    /// `warning: related commits in field 2 of commit CHECKSUM: REASON` line
-    /// to standard error before the lines on standard output, and the
-    /// defective entry roots nothing.
+    /// and the command keeps the detached metadata of that commit if it is in
+    /// the bucket. For each defective field 2 entry, the command writes one
+    /// `warning: related commits in field 2 of commit CHECKSUM: REASON` line to
+    /// standard error before the lines on standard output, and the defective
+    /// entry roots nothing.
     ///
     /// The command reads no detached metadata, so it reads no build source in
     /// the detached metadata key `ostrya.related`. It deletes a build source
     /// that no root reaches, which `ostrya prune` keeps. Without --refs-only
     /// and --keep-younger-than, the command also deletes the detached
-    /// metadata and the composefs image of a parent commit that the bucket
-    /// does not hold, which `ostrya prune` can keep.
+    /// metadata of a parent commit that the bucket does not hold, which
+    /// `ostrya prune` can keep.
     ///
     /// The command deletes each object that no root reaches, then each
     /// static delta and each `state/<commit>.commitpartial` marker whose
@@ -1916,12 +1913,12 @@ enum RemoteCommand {
     /// The command prints the lines of `ostrya prune`: `Total objects: N`,
     /// then `Deleted N objects, SIZE freed`, or with --no-prune `Would
     /// delete: N objects, freeing SIZE`, or `No unreachable objects`. The
-    /// counts leave out the detached metadata, the composefs images, and the
-    /// static deltas. Then, for each count that is not zero, it prints
-    /// `Deleted N static deltas`, `Deleted N partial-commit markers`, and
-    /// `Aborted N incomplete multipart uploads`, or with --no-prune `Would
-    /// delete N static deltas`, `Would delete N partial-commit markers`, and
-    /// `Would abort N incomplete multipart uploads`.
+    /// counts leave out the detached metadata and the static deltas. Then, for
+    /// each count that is not zero, it prints `Deleted N static deltas`,
+    /// `Deleted N partial-commit markers`, and `Aborted N incomplete multipart
+    /// uploads`, or with --no-prune `Would delete N static deltas`, `Would
+    /// delete N partial-commit markers`, and `Would abort N incomplete
+    /// multipart uploads`.
     ///
     /// The command takes the writer lock of the bucket repository, also with
     /// --no-prune, and removes it at the end. It needs the S3 permissions of
@@ -3538,12 +3535,6 @@ struct DeltaGenerateArgs {
     /// header and the content. A loose fallback goes outside the parts, and
     /// the receiver fetches it whole. The value is a whole number. A value of
     /// `0` turns fallbacks off for content objects.
-    ///
-    /// The composefs image of the target commit goes in the delta if the
-    /// commit carries a valid `ostree.composefs.digest.v0` and the repository
-    /// stores the image. The image is a fallback if this value is not `0` and
-    /// the image is this size or larger. It is also a fallback if it is
-    /// larger than --max-chunk-size or 128 MiB, or with --inline.
     #[arg(long, value_name = "MB", default_value = "4", value_parser = parse_megabytes)]
     min_fallback_size: u64,
     /// The largest content size, in decimal megabytes, for a bspatch stream.
@@ -3554,9 +3545,8 @@ struct DeltaGenerateArgs {
     max_bsdiff_size: u64,
     /// Close a part before its payload passes this many decimal megabytes.
     ///
-    /// A part that holds one large object can pass this size. A composefs
-    /// image larger than this size is a fallback. The command refuses a value
-    /// of `0`.
+    /// A part that holds one large object can pass this size. The command
+    /// refuses a value of `0`.
     #[arg(long, value_name = "MB", default_value = "32", value_parser = parse_megabytes)]
     max_chunk_size: u64,
     /// Emit no bspatch stream.
@@ -3626,8 +3616,7 @@ struct DeltaGenerateArgs {
     ///
     /// The parts count toward the superblock limit of 128 MiB. If the
     /// superblock passes this limit, the command fails before it writes the
-    /// superblock. With this switch, the composefs image of the target
-    /// commit is a fallback, and no part carries it.
+    /// superblock.
     #[arg(long)]
     inline: bool,
     /// The byte order of the superblock size fields: `l` or `B`.
@@ -4210,10 +4199,9 @@ struct SendArgs {
     ///
     /// The stream carries each commit, the objects of its tree, and its
     /// detached metadata. It also carries each dependency that field 2 of a
-    /// commit names, with no ref update, and each stored composefs image of
-    /// a sent commit. It ends with a `Commit` frame that holds one ref update
-    /// for each refspec. The stream carries no parent commit. The command
-    /// does no negotiation, so it sends each object.
+    /// commit names, with no ref update. It ends with a `Commit` frame that
+    /// holds one ref update for each refspec. The stream carries no parent
+    /// commit. The command does no negotiation, so it sends each object.
     ///
     /// Each update expects any state of the ref, so the receiver applies its
     /// own rules. A failure before the first byte writes nothing to standard
@@ -13453,14 +13441,6 @@ fn print_bucket_fsck(report: &ostrya::bucket::BucketFsckReport, quiet: bool) -> 
             report.objects_unreached
         )
         .map_err(Error::Io)?;
-        if !report.orphan_images.is_empty() {
-            writeln!(
-                out,
-                "{} composefs images with no commit",
-                report.orphan_images.len()
-            )
-            .map_err(Error::Io)?;
-        }
         if !report.commits_partial.is_empty() {
             writeln!(out, "{} partial commits", report.commits_partial.len()).map_err(Error::Io)?;
         }

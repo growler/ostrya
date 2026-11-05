@@ -1221,11 +1221,11 @@ object of that subtree then reads as unreachable. So in the walk, a 404
 with an empty body, or with a body that is not an S3 `Error` document, for
 example a page of a proxy, is an error. The fsck of a bucket repository
 reads each object with the strict rule too: `Bucket::get_strict` for a
-metadata object and `Bucket::get_stream_strict` for a `.filez` and a
-`.cfs`. A false absent key there gives a false finding, and with the repair
-a marker on a commit whose tree is whole. `get_stream_strict` shares the
-code of `get_stream`, as `get_strict` shares the code of `get`. The other
-readers of a bucket keep the rule above.
+metadata object and `Bucket::get_stream_strict` for a `.filez`. A false absent
+key there gives a false finding, and with the repair a marker on a commit
+whose tree is whole. `get_stream_strict` shares the code of `get_stream`, as
+`get_strict` shares the code of `get`. The other readers of a bucket keep the
+rule above.
 
 `Bucket::exists` and `Bucket::exists_strict` check that a key holds an
 object, by the rule of `get` and by the rule of `get_strict`. A check is a
@@ -1864,9 +1864,7 @@ then reads each dirtree of its commits and uploads nothing. The push lists
 each offered commit with a marker, uploads the objects that the listing
 lacks, and deletes the marker after a check of the lock and before the ref
 writes. The commit object of such a commit does not go up again. A tree
-push lists no `state/`: the tree of its parent does not change. The push
-still adds the composefs image of each source commit, because the local
-repository can make the image after the commit went up.
+push lists no `state/`: the tree of its parent does not change.
 
 The holder of a lock that `break_lock` deleted is in `BucketPushOutcome`
 and in the result of `BucketRepo::init` on success alone. A push or an
@@ -2093,9 +2091,7 @@ reader can use it: a pull and the build of a summary both check its
 checksum. A push of the ref uploads it again, because the listing does not
 hold it. A commit whose object goes gets no marker. The report names each
 ref of such a commit, because until the push of the ref, each push to its
-namespace is refused. The repair does not check the `.cfs` of such a
-commit, and does not delete it: the digest of bad bytes has no meaning, and
-the local fsck keeps the image of a commit that it deletes as an orphan.
+namespace is refused.
 
 The repair also deletes the marker of each commit whose tree the run finds
 whole, and a run without the repair gives a note for such a marker. The
@@ -2174,10 +2170,10 @@ parse of a summary, run on the blocking pool, as the parse of a commit and
 of a summary of a pull does. The reads of the other slots go on in the
 meantime.
 
-A body of a `.filez` or a `.cfs` that fails in transit is read again once
-from its start, and a second failure fails the run. A failure of the run on
-the first failure was rejected: the fsck reads the whole bucket, and one
-failed connection then stops the run.
+A body of a `.filez` that fails in transit is read again once from its start,
+and a second failure fails the run. A failure of the run on the first failure
+was rejected: the fsck reads the whole bucket, and one failed connection then
+stops the run.
 
 `ostrya remote fsck` prints the counts and the result line on standard
 output, and one line for each finding on standard error, as `ostrya fsck`
@@ -2198,8 +2194,8 @@ both give. So the bucket prune has the roots and the bounds of
 The bucket prune follows the field 2 edge of the walk and does not follow
 the `ostrya.related` edge ("Related commits"). With `refs_only` or
 `keep_younger_than`, it deletes a build source that the local prune keeps.
-In each case, it deletes the `.commitmeta` and the `.cfs` of a build source
-that the listing does not hold, which the local prune keeps. A walk for the
+In each case, it deletes the `.commitmeta` of a build source that the
+listing does not hold, which the local prune keeps. A walk for the
 bucket alone, with a copy of the rules of the bounds, was rejected: a
 later change to one copy can miss the other.
 
@@ -2250,10 +2246,10 @@ too. Each commit of the listing is already a root, so a parent bound adds
 no commit of the listing to the kept set. The kept objects of the listing
 are the same as in the local prune, with one exception, apart from the
 build sources. The walk does not reach a parent commit that the listing
-does not hold, so the prune deletes the `.commitmeta` and the `.cfs` of
-that commit. The local prune keeps them when its bound reaches that parent.
-These objects have no commit object in the bucket, and a push of that
-commit uploads them again. So the prune treats them as objects that no root
+does not hold, so the prune deletes the `.commitmeta` of that commit. The
+local prune keeps it when its bound reaches that parent. Such a
+`.commitmeta` has no commit object in the bucket, and a push of that commit
+uploads it again. So the prune treats it as an object that no root
 reaches. The bound of the local prune for these roots was rejected: it
 keeps these objects, and it adds no object of the listing to the kept set.
 With `refs_only` or `keep_younger_than`, the walk takes the bounds of the
@@ -2311,12 +2307,12 @@ superblock, and the next run deletes it. A key under `deltas/` that fails
 is exported for this check, so the prune and the bucket client take one
 rule. `delta-indexes/` does not change, as in the local prune.
 
-The run checks the lock before each step that has a change to make, and
-after each 1000 deletes or aborts of a step. The steps are the commits with
-the `.commitmeta` and the `.cfs` of absent commits, the other objects, the
-static deltas with the markers, and the aborts. One check for each delete was
-rejected: it doubles the requests of a run. The check gives no exclusion of
-its own, as "The writer lock of a bucket repository" states.
+The run checks the lock before each step that has a change to make, and after
+each 1000 deletes or aborts of a step. The steps are the commits with the
+`.commitmeta` of absent commits, the other objects, the static deltas with the
+markers, and the aborts. One check for each delete was rejected: it doubles
+the requests of a run. The check gives no exclusion of its own, as "The writer
+lock of a bucket repository" states.
 
 Each delete is one `DELETE` of one key, in parallel under the admission
 limit of the fetcher. `DeleteObjects` was rejected: AWS needs a
@@ -2540,10 +2536,8 @@ stand-in, which makes each corruption with no write through S3.
 ## The protocol versions
 
 Protocol version 1 changed in place for the client groups, the server
-commit, the collection selectors of the ref listing, and the object type
-100. No deployment ran version 1 when these changes came, so the version
-number did not change. Thus a receiver that does not take the type 100
-refuses a sender that sends an image.
+commit, and the collection selectors of the ref listing. No deployment ran
+version 1 when these changes came, so the version number did not change.
 
 ## The one-way stream in the command
 

@@ -76,7 +76,7 @@ The command removes the full section and writes a new one at the end of the file
 \fB\-\-gpg\-import\fR \fIFILE\fR
 Import the keys of this keyring file into the trusted keyring.
 .IP
-The import is the same as \fB\%remote gpg\-import\fR with \%\-\-keyring. The command imports the keys only after it writes the section of the remote, and then prints the number of imported keys.
+The import is the same as \fB\%remote gpg\-import\fR with \%\-\-keyring. The file is at most \%4 MiB. The command imports the keys only after it writes the section of the remote, and then prints the number of imported keys.
 .TP
 \fB\-\-custom\-backend\fR \fINAME\fR
 Name a program other than ostrya that fetches this remote.
@@ -531,12 +531,12 @@ Options:
 \fB\-k\fR, \fB\-\-keyring\fR \fIFILE\fR
 Import the keys of this keyring file.
 .IP
-The file is a binary or an \%ASCII\-armored public keyring. The option can occur more than once, and it conflicts with \%\-\-stdin.
+The file is a binary or an \%ASCII\-armored public keyring. The option can occur more than once, and it conflicts with \%\-\-stdin. The files together are at most \%4 MiB.
 .TP
 \fB\-\-stdin\fR
 Import the keys from standard input.
 .IP
-This option conflicts with \%\-\-keyring.
+The input is at most \%4 MiB. This option conflicts with \%\-\-keyring.
 .SS "gpg\-list\-keys"
 List the GPG keys in the trusted keyring of a remote.
 .PP

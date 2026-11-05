@@ -2,6 +2,8 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
 
   * remote gpg-import reads each -k file as a binary or an ASCII-armored
     keyring by itself. A mix of binary and armored files imports.
+  * remote gpg-import and remote add --gpg-import refuse key input over
+    4 MiB before they read all of it.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

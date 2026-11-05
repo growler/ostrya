@@ -17267,6 +17267,149 @@ fn remote_gpg_import_reads_each_key_file_by_itself() {
     }
 }
 
+/// The refusal of key input over 4 MiB, which `remote gpg-import` and
+/// `remote add --gpg-import` give.
+#[cfg(feature = "gpg")]
+const KEYRING_OVER_CEILING: &str =
+    "error: signature: the keyring to import is over the 4194304-byte ceiling\n";
+
+/// Runs `remote gpg-import` with `args` and `stdin` into the remote `origin`
+/// of a new repository, while another holder keeps the update lock. The
+/// repository sets `lock-timeout-secs=0`, so a read under the lock fails with
+/// a lock timeout.
+///
+/// The result is the run and the path of the keyring of `origin`.
+#[cfg(feature = "gpg")]
+fn gpg_import_under_held_lock(base: &Path, args: &[&str], stdin: Option<&[u8]>) -> (Run, PathBuf) {
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/r",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    set_core_key(&repo, "lock-timeout-secs=0");
+    let mut full = vec![repo_arg.as_str(), "remote", "gpg-import", "origin"];
+    full.extend_from_slice(args);
+    let handle = block_on(Repo::open(&repo)).unwrap();
+    let guard = block_on(handle.begin_update()).unwrap();
+    let run = ostrya(&full, stdin, &[]);
+    block_on(guard.finish()).unwrap();
+    (run, repo.join("origin.trustedkeys.gpg"))
+}
+
+/// Asserts that `run` gives the refusal of key input over 4 MiB, and that
+/// no keyring exists at `keyring`.
+#[cfg(feature = "gpg")]
+fn assert_keyring_over_ceiling(run: &Run, keyring: &Path) {
+    assert_eq!(
+        (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        ),
+        (Some(1), String::new(), KEYRING_OVER_CEILING.to_owned())
+    );
+    assert!(!keyring.exists(), "the refused import wrote a keyring");
+}
+
+/// `remote gpg-import` stops the read of a `-k` file after 4 MiB, and refuses
+/// the file before it takes a lock.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_refuses_an_endless_keyring_file() {
+    let tmp = TmpDir::new("remote-gpg-import-endless");
+    let (run, keyring) = gpg_import_under_held_lock(tmp.path(), &["--keyring=/dev/zero"], None);
+    assert_keyring_over_ceiling(&run, &keyring);
+}
+
+/// `remote gpg-import --stdin` refuses an input over 4 MiB before it takes a
+/// lock.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_refuses_stdin_over_the_cap() {
+    let tmp = TmpDir::new("remote-gpg-import-stdin-cap");
+    let input = vec![0u8; 4 * 1024 * 1024 + 1];
+    let (run, keyring) = gpg_import_under_held_lock(tmp.path(), &["--stdin"], Some(&input));
+    assert_keyring_over_ceiling(&run, &keyring);
+}
+
+/// `remote gpg-import --stdin` accepts an input of exactly 4 MiB: the read
+/// passes the cap, and the import then fails at the held update lock.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_accepts_stdin_at_the_cap() {
+    let tmp = TmpDir::new("remote-gpg-import-stdin-at-cap");
+    let input = vec![0u8; 4 * 1024 * 1024];
+    let (run, keyring) = gpg_import_under_held_lock(tmp.path(), &["--stdin"], Some(&input));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_ne!(run.status.code(), Some(0), "the import succeeded");
+    assert_ne!(stderr, KEYRING_OVER_CEILING, "the read refused the input");
+    assert!(
+        stderr.contains("timed out acquiring repository lock after 0s"),
+        "the import did not fail at the lock:\n{stderr}"
+    );
+    assert!(!keyring.exists(), "the failed import wrote a keyring");
+}
+
+/// The cap of `remote gpg-import` applies to the `-k` files together. Two
+/// files that are each under 4 MiB, and together over it, are refused before
+/// the command takes a lock.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_caps_the_sum_of_the_key_files() {
+    let tmp = TmpDir::new("remote-gpg-import-sum-cap");
+    let base = tmp.path();
+    let half = vec![0u8; 2 * 1024 * 1024 + 1];
+    let (first, second) = (base.join("first.gpg"), base.join("second.gpg"));
+    std::fs::write(&first, &half).unwrap();
+    std::fs::write(&second, &half).unwrap();
+    let args = [
+        "-k",
+        first.to_str().unwrap(),
+        "-k",
+        second.to_str().unwrap(),
+    ];
+    let (run, keyring) = gpg_import_under_held_lock(base, &args, None);
+    assert_keyring_over_ceiling(&run, &keyring);
+}
+
+/// `remote add --gpg-import` stops the read of the file after 4 MiB, and
+/// refuses the file. The command writes the section of the remote before it
+/// reads the file, so the remote stays in `config`.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_add_refuses_an_endless_gpg_import_file() {
+    let tmp = TmpDir::new("remote-add-gpg-import-endless");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "--gpg-import=/dev/zero",
+            "origin",
+            "https://example.invalid/r",
+        ],
+        None,
+        &[],
+    );
+    assert_keyring_over_ceiling(&run, &repo.join("origin.trustedkeys.gpg"));
+    let config = config_text(&repo);
+    assert!(
+        config.contains("[remote \"origin\"]\nurl=https://example.invalid/r\n"),
+        "the command did not write the remote:\n{config}"
+    );
+}
+
 /// In ostrya and the `ostree` command, a re-export with a later key expiry
 /// reaches the trusted keyring of a remote:
 ///

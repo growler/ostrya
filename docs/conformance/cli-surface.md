@@ -4770,10 +4770,12 @@ records. Eighteen divergences stand:
   states of one key the port keeps the first, unless a later one revokes the key
   or states a later expiry. The revoked export alone and the two exports
   concatenated in either order therefore reach one keyring, which the port's own
-  test states, and every `--keyring` option of one invocation reaches the import
-  as one stream. The tool answers the same way: over each of those three streams
+  test states. The tool answers the same way: over each of those three streams
   it reported `Imported 1 GPG key`, wrote three byte-identical keyrings, and
-  reported the signature `Key revoked`.
+  reported the signature `Key revoked`. Each `--keyring` option of one
+  invocation is one stream. The port decodes the armor of each stream by
+  itself and joins the packets of the streams in order into one stream, so the
+  two rules also hold over the streams of one invocation.
 
   A trusted set holding both certificates parts a second way -- `cert1.gpg`
   and `cert2.gpg` concatenated in one keyring, or in two files of the
@@ -4981,7 +4983,14 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    four shapes and reports on it. The port also refuses a file of a
    `gpgkeypath` entry over these two keyring limits. In a `gpgkeypath`
    directory, `ostree` 2026.1 reads a file of 5 MiB that holds blank lines
-   and then the armored keyring, and trusts the key.
+   and then the armored keyring, and trusts the key. The port reads at most
+   4 MiB of key input from the `-k` files of `remote gpg-import` together,
+   from its standard input, and from the file of `remote add --gpg-import`.
+   It refuses more with
+   `error: signature: the keyring to import is over the 4194304-byte ceiling`
+   at exit 1, before the import takes a lock or writes a keyring.
+   `remote add` writes the section of the remote before it reads the file.
+   The limit of the `ostree` tool on this input is not observed.
 6. A revocation in a second certificate of a key. The trusted set can hold
    several certificates for one key. The port reads each of them for a
    revocation, so a revocation in any one of them refuses the signature.

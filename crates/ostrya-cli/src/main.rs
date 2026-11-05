@@ -53,6 +53,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::{Args, CommandFactory, Parser, Subcommand};
+#[cfg(feature = "gpg")]
+use ostrya::gpg::MAX_KEYRING;
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
@@ -2114,9 +2116,9 @@ struct RemoteAddArgs {
     force: bool,
     /// Import the keys of this keyring file into the trusted keyring.
     ///
-    /// The import is the same as `remote gpg-import` with --keyring. The
-    /// command imports the keys only after it writes the section of the
-    /// remote, and then prints the number of imported keys.
+    /// The import is the same as `remote gpg-import` with --keyring. The file
+    /// is at most 4 MiB. The command imports the keys only after it writes
+    /// the section of the remote, and then prints the number of imported keys.
     #[arg(long, value_name = "FILE")]
     gpg_import: Option<PathBuf>,
     /// Name a program other than ostrya that fetches this remote.
@@ -2420,12 +2422,13 @@ struct RemoteGpgImportArgs {
     /// Import the keys of this keyring file.
     ///
     /// The file is a binary or an ASCII-armored public keyring. The option can
-    /// occur more than once, and it conflicts with --stdin.
+    /// occur more than once, and it conflicts with --stdin. The files together
+    /// are at most 4 MiB.
     #[arg(short = 'k', long = "keyring", value_name = "FILE")]
     keyring: Vec<PathBuf>,
     /// Import the keys from standard input.
     ///
-    /// This option conflicts with --keyring.
+    /// The input is at most 4 MiB. This option conflicts with --keyring.
     #[arg(long)]
     stdin: bool,
     // ostrya checks this operand after the repository resolves.
@@ -13118,8 +13121,9 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     }
 
     if let Some(path) = &args.gpg_import {
-        let keys = read_keyring_file(path)?;
-        report_gpg_import(gpg_import(repo, name, &[&keys], &[]).await?, name);
+        let keys = read_keyrings(false, std::slice::from_ref(path))?;
+        let streams: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+        report_gpg_import(gpg_import(repo, name, &streams, &[]).await?, name);
     }
     Ok(())
 }
@@ -13934,17 +13938,74 @@ fn format_iso_utc(timestamp: u64) -> String {
     format!("{year}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}+00")
 }
 
-/// Reads a full keyring file.
+/// Reads the key streams of an import: standard input if `stdin` is set, and
+/// else each file of `paths`. Each source is one stream.
 ///
-/// A file that does not open is refused in the words of the `ostree` command.
-fn read_keyring_file(path: &Path) -> Result<Vec<u8>> {
-    std::fs::read(path).map_err(|err| {
+/// The streams together are at most [`MAX_KEYRING`] bytes. Each read stops
+/// one byte after the limit, and a larger input is refused before the import
+/// takes a lock.
+#[cfg(feature = "gpg")]
+fn read_keyrings(stdin: bool, paths: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    if stdin {
+        let mut stream = Vec::new();
+        let mut bounded = std::io::Read::take(std::io::stdin().lock(), MAX_KEYRING + 1);
+        std::io::Read::read_to_end(&mut bounded, &mut stream)?;
+        if stream.len() as u64 > MAX_KEYRING {
+            return Err(keyring_over_ceiling());
+        }
+        return Ok(vec![stream]);
+    }
+    let mut remaining = MAX_KEYRING;
+    let mut keys = Vec::new();
+    for path in paths {
+        let stream = read_keyring_file(path, remaining)?;
+        remaining -= stream.len() as u64;
+        keys.push(stream);
+    }
+    Ok(keys)
+}
+
+/// Returns an error, because this build has no gpg engine.
+#[cfg(not(feature = "gpg"))]
+fn read_keyrings(_: bool, _: &[PathBuf]) -> Result<Vec<Vec<u8>>> {
+    Err(unsupported_type("gpg"))
+}
+
+/// Reads a keyring file of at most `remaining` bytes.
+///
+/// A file that does not open or read is refused in the words of the `ostree`
+/// command. The read stops one byte after `remaining`, and a larger file is
+/// refused.
+#[cfg(feature = "gpg")]
+fn read_keyring_file(path: &Path, remaining: u64) -> Result<Vec<u8>> {
+    let refuse = |err: std::io::Error| -> Error {
         exit_error(&format!(
             "Error opening file {}: {}",
             path.display(),
             io_reason(&err)
         ))
-    })
+    };
+    let file = std::fs::File::open(path).map_err(refuse)?;
+    let size = file
+        .metadata()
+        .map_or(0, |meta| meta.len())
+        .min(remaining + 1);
+    let mut bytes = Vec::with_capacity(usize::try_from(size).unwrap_or(0));
+    let mut bounded = std::io::Read::take(file, remaining + 1);
+    std::io::Read::read_to_end(&mut bounded, &mut bytes).map_err(refuse)?;
+    if bytes.len() as u64 > remaining {
+        return Err(keyring_over_ceiling());
+    }
+    Ok(bytes)
+}
+
+/// Returns the refusal of key input over [`MAX_KEYRING`], in the words of the
+/// library.
+#[cfg(feature = "gpg")]
+fn keyring_over_ceiling() -> Error {
+    Error::Signature(format!(
+        "the keyring to import is over the {MAX_KEYRING}-byte ceiling"
+    ))
 }
 
 /// Imports keys into the trusted keyring of a remote.
@@ -13959,19 +14020,8 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
     }
     // The key sources are read before the remote is looked up, in the order
     // of the `ostree` command. A `--keyring` that names no file is reported
-    // also for a remote that the configuration does not describe. Each source
-    // is one stream.
-    let mut keys = Vec::new();
-    if args.stdin {
-        use std::io::Read;
-        let mut stream = Vec::new();
-        std::io::stdin().read_to_end(&mut stream)?;
-        keys.push(stream);
-    } else {
-        for path in &args.keyring {
-            keys.push(read_keyring_file(path)?);
-        }
-    }
+    // also for a remote that the configuration does not describe.
+    let keys = read_keyrings(args.stdin, &args.keyring)?;
     // Only this subcommand prefixes its refusal of an unknown remote. The
     // message of the `ostree` command has the same prefix.
     if repo.config().remote(name).is_none() {

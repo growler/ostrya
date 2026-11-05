@@ -1,10 +1,10 @@
 //! GPG (OpenPGP) signature verification, keyring management, and signing.
 //!
-//! The `verify-gpg` feature turns on this module. [`GpgVerifier`] and
-//! [`GpgKey`] are items of the `ostrya-sign` crate, re-exported here. The
-//! verifier parses keyrings and verifies signatures in the process, with
-//! rPGP. This module adds the items that read ostree paths and the keyring
-//! files of a repository: the trait [`FromOstreeKeyrings`],
+//! The `verify-gpg` feature turns on this module. [`GpgVerifier`],
+//! [`GpgKey`], and [`MAX_KEYRING`] are items of the `ostrya-sign` crate,
+//! re-exported here. The verifier parses keyrings and verifies signatures in
+//! the process, with rPGP. This module adds the items that read ostree paths
+//! and the keyring files of a repository: the trait [`FromOstreeKeyrings`],
 //! [`Repo::gpg_import_keys`], and [`Repo::gpg_list_keys`]. The trait builds a
 //! verifier from the keyrings of a repository handle, from the bytes of a
 //! keyring, or from the global trusted keyrings.
@@ -27,7 +27,7 @@
 use std::os::fd::BorrowedFd;
 use std::path::{Path, PathBuf};
 
-use ostrya_sign::{MAX_KEYRING, gpg_keyring_keys, gpg_merge_keyring, gpg_offered_keys};
+use ostrya_sign::{gpg_keyring_keys, gpg_merge_keyring, gpg_offered_keys};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -40,7 +40,7 @@ use crate::summary::{read_root_file_blocking, write_root_file_blocking};
 
 #[cfg(feature = "sign-gpg")]
 pub use ostrya_sign::GpgSigner;
-pub use ostrya_sign::{GpgKey, GpgVerifier};
+pub use ostrya_sign::{GpgKey, GpgVerifier, MAX_KEYRING};
 
 /// The system directory of the keyrings that every remote trusts.
 const GLOBAL_TRUSTED_GPG_D: &str = "/usr/share/ostree/trusted.gpg.d";

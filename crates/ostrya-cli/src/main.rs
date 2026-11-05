@@ -12832,10 +12832,7 @@ fn config_get(repo: &Repo, args: &ConfigArgs) -> Result<()> {
 /// group into `config` defines the remote in two sources, and the `ostree`
 /// command refuses `config set` in the same case.
 fn refuse_remotes_dir_group(config: &RepoConfig, group: &str) {
-    let Some(name) = group
-        .strip_prefix("remote \"")
-        .and_then(|rest| rest.strip_suffix('"'))
-    else {
+    let Some(name) = ostrya::config::remote_group_name(group) else {
         return;
     };
     if let Some(remote) = config.remote(name)
@@ -12975,11 +12972,6 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
         RemoteCommand::GpgImport(args) => remote_gpg_import(&repo, nested, args).await,
         RemoteCommand::GpgListKeys(args) => remote_gpg_list_keys(&repo, nested, &args).await,
     }
-}
-
-/// Returns the key-file group that holds the configuration of one remote.
-fn remote_group(name: &str) -> String {
-    format!("remote \"{name}\"")
 }
 
 /// Returns the operand that names the remote.
@@ -13139,7 +13131,7 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
 /// cannot hold is refused before the command takes a lock. A later key of one
 /// name replaces the value of the earlier key and keeps its position.
 fn remote_add_keys(args: &RemoteAddArgs, name: &str, url: &str) -> Result<Vec<(String, String)>> {
-    let group = remote_group(name);
+    let group = ostrya::config::remote_group(name);
     let mut keyfile = KeyFile::default();
     let mut set = |key: &str, value: &str| keyfile.set_string(&group, key, value);
 

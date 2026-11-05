@@ -1287,7 +1287,10 @@ fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
 }
 
 /// Returns the key-file group name of a remote: `remote "<name>"`.
-pub(crate) fn remote_group(name: &str) -> String {
+///
+/// The function is not a stable API.
+#[doc(hidden)]
+pub fn remote_group(name: &str) -> String {
     format!("remote \"{name}\"")
 }
 
@@ -1315,7 +1318,10 @@ pub fn valid_remote_name(name: &str) -> bool {
 
 /// Returns the remote name in a `remote "<name>"` group header, or `None` for
 /// another group.
-pub(crate) fn remote_group_name(group: &str) -> Option<&str> {
+///
+/// The function is not a stable API.
+#[doc(hidden)]
+pub fn remote_group_name(group: &str) -> Option<&str> {
     group
         .strip_prefix("remote \"")
         .and_then(|rest| rest.strip_suffix('"'))

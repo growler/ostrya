@@ -1429,7 +1429,7 @@ fn imported_keyring(base: &Path, keys: &[u8]) -> Vec<u8> {
         let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        let count = repo.gpg_import_keys("origin", keys, &[]).await.unwrap();
+        let count = repo.gpg_import_keys("origin", &[keys], &[]).await.unwrap();
         assert_eq!(count, 1, "the import added no key");
     });
     std::fs::read(root.join("origin.trustedkeys.gpg")).unwrap()

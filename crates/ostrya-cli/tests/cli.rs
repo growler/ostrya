@@ -17204,6 +17204,69 @@ fn remote_gpg_keyring_round_trips_with_the_tool() {
     }
 }
 
+/// `remote gpg-import` reads each `-k` file as a binary or an ASCII-armored
+/// keyring by itself. A binary file and an armored file import in each order,
+/// and the keyring of the remote holds both keys.
+#[cfg(feature = "gpg")]
+#[test]
+fn remote_gpg_import_reads_each_key_file_by_itself() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("remote-gpg-import-mixed");
+    let base = tmp.path();
+    let home = GpgHome::create(base, "Binary <binary@ostrya.example>");
+    home.add_key("Armored <armored@ostrya.example>");
+    let binary_fpr = home.fingerprint_of("binary@ostrya.example");
+    let armored_fpr = home.fingerprint_of("armored@ostrya.example");
+    let binary = base.join("binary.gpg");
+    home.export_one_to("binary@ostrya.example", &binary);
+    let out = home
+        .gpg()
+        .args(["--armor", "--export", "--", "armored@ostrya.example"])
+        .output()
+        .unwrap();
+    assert!(out.status.success() && out.stdout.starts_with(b"-----BEGIN PGP"));
+    let armored = base.join("armored.asc");
+    std::fs::write(&armored, out.stdout).unwrap();
+    let (binary, armored) = (binary.to_str().unwrap(), armored.to_str().unwrap());
+
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    for (remote, first, second) in [("one", binary, armored), ("two", armored, binary)] {
+        let url = format!("https://example.invalid/{remote}");
+        ostrya(&[&repo_arg, "remote", "add", remote, &url], None, &[]).ok();
+        let args = [
+            &repo_arg,
+            "remote",
+            "gpg-import",
+            remote,
+            "-k",
+            first,
+            "-k",
+            second,
+        ];
+        let run = ostrya(&args, None, &[]);
+        assert_eq!(
+            run.ok().stdout_trimmed(),
+            format!("Imported 2 GPG keys to remote \"{remote}\"")
+        );
+        let listing = ostrya(&[&repo_arg, "remote", "gpg-list-keys", remote], None, &[]);
+        let text = listing.ok().stdout_trimmed();
+        for fpr in [&binary_fpr, &armored_fpr] {
+            assert!(
+                text.contains(&format!("Key: {fpr}")),
+                "the keyring of {remote} lacks {fpr}:\n{text}"
+            );
+        }
+    }
+}
+
 /// In ostrya and the `ostree` command, a re-export with a later key expiry
 /// reaches the trusted keyring of a remote:
 ///

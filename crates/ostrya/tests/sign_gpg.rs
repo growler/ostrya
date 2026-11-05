@@ -430,7 +430,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
         // The certificate without the revocation goes into the keyring of the
         // remote. The signature of its key is good.
         let count = repo
-            .gpg_import_keys("origin", &home.export(), &[])
+            .gpg_import_keys("origin", &[&home.export()], &[])
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -446,7 +446,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
         // into the keyring.
         home.revoke_primary();
         let count = repo
-            .gpg_import_keys("origin", &home.export(), &[])
+            .gpg_import_keys("origin", &[&home.export()], &[])
             .await
             .unwrap();
         assert_eq!(count, 0);
@@ -490,7 +490,7 @@ fn an_unframeable_remote_keyring_is_refused() {
     block_on(async {
         let (repo, _) = build_committed_repo(base).await;
         let count = repo
-            .gpg_import_keys("origin", &home.export(), &[])
+            .gpg_import_keys("origin", &[&home.export()], &[])
             .await
             .unwrap();
         assert_eq!(count, 1);
@@ -509,7 +509,7 @@ fn an_unframeable_remote_keyring_is_refused() {
         home.revoke_primary();
         for offered in [home.export(), other.export()] {
             let refusal = repo
-                .gpg_import_keys("origin", &offered, &[])
+                .gpg_import_keys("origin", &[&offered], &[])
                 .await
                 .unwrap_err()
                 .to_string();

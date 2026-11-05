@@ -264,7 +264,7 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
         }
         "remove_remote_keyring" => repo.remove_remote_keyring("origin").await,
         #[cfg(feature = "verify-gpg")]
-        "gpg_import_keys" => match repo.gpg_import_keys("origin", b"", &[]).await {
+        "gpg_import_keys" => match repo.gpg_import_keys("origin", &[b"".as_slice()], &[]).await {
             // The empty stream holds no certificate, so the import refuses
             // the stream after it takes the lock.
             Err(Error::LockTimeout { secs }) => Err(Error::LockTimeout { secs }),

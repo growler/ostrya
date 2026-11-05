@@ -272,7 +272,10 @@ async fn dest(scratch: &Path, name: &str, endpoint: &str) -> (PathBuf, Repo) {
     let repo = Repo::open(&path).await.unwrap();
     let keys = std::fs::read(scratch.join("key.gpg")).unwrap();
     for remote in ["origin", "tampered"] {
-        assert_eq!(repo.gpg_import_keys(remote, &keys, &[]).await.unwrap(), 1);
+        assert_eq!(
+            repo.gpg_import_keys(remote, &[&keys], &[]).await.unwrap(),
+            1
+        );
     }
     (path, repo)
 }

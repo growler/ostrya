@@ -13119,7 +13119,7 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
 
     if let Some(path) = &args.gpg_import {
         let keys = read_keyring_file(path)?;
-        report_gpg_import(gpg_import(repo, name, &keys, &[]).await?, name);
+        report_gpg_import(gpg_import(repo, name, &[&keys], &[]).await?, name);
     }
     Ok(())
 }
@@ -13959,14 +13959,17 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
     }
     // The key sources are read before the remote is looked up, in the order
     // of the `ostree` command. A `--keyring` that names no file is reported
-    // also for a remote that the configuration does not describe.
+    // also for a remote that the configuration does not describe. Each source
+    // is one stream.
     let mut keys = Vec::new();
     if args.stdin {
         use std::io::Read;
-        std::io::stdin().read_to_end(&mut keys)?;
+        let mut stream = Vec::new();
+        std::io::stdin().read_to_end(&mut stream)?;
+        keys.push(stream);
     } else {
         for path in &args.keyring {
-            keys.extend_from_slice(&read_keyring_file(path)?);
+            keys.push(read_keyring_file(path)?);
         }
     }
     // Only this subcommand prefixes its refusal of an unknown remote. The
@@ -13974,10 +13977,11 @@ async fn remote_gpg_import(repo: &Repo, nested: &str, args: RemoteGpgImportArgs)
     if repo.config().remote(name).is_none() {
         exit_error(&format!("GPG: Remote \"{name}\" not found"));
     }
-    if keys.is_empty() {
+    if keys.iter().all(Vec::is_empty) {
         exit_error("No keys to import; pass --keyring or --stdin");
     }
-    let imported = gpg_import(repo, name, &keys, &args.key_ids).await?;
+    let streams: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    let imported = gpg_import(repo, name, &streams, &args.key_ids).await?;
     report_gpg_import(imported, name);
     Ok(())
 }
@@ -14006,17 +14010,22 @@ async fn remote_gpg_list_keys(repo: &Repo, nested: &str, args: &RemoteNameArgs) 
     Ok(())
 }
 
-/// Imports `keys` into the trusted keyring of `remote`.
+/// Imports the streams of `keys` into the trusted keyring of `remote`.
 ///
 /// The result is the number of new keys.
 #[cfg(feature = "gpg")]
-async fn gpg_import(repo: &Repo, remote: &str, keys: &[u8], key_ids: &[String]) -> Result<usize> {
+async fn gpg_import(
+    repo: &Repo,
+    remote: &str,
+    keys: &[&[u8]],
+    key_ids: &[String],
+) -> Result<usize> {
     repo.gpg_import_keys(remote, keys, key_ids).await
 }
 
 /// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
-async fn gpg_import(_: &Repo, _: &str, _: &[u8], _: &[String]) -> Result<usize> {
+async fn gpg_import(_: &Repo, _: &str, _: &[&[u8]], _: &[String]) -> Result<usize> {
     Err(unsupported_type("gpg"))
 }
 

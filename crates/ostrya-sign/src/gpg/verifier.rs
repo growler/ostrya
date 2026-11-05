@@ -623,6 +623,34 @@ fn keyring_stream<'a>(
     Ok(binary)
 }
 
+/// Returns the joined binary packet stream of the offered streams of an
+/// import.
+///
+/// The call applies [`MAX_KEYRING`] to the sum of the stream lengths. It
+/// then decodes the armor of each stream by itself and refuses a GnuPG
+/// keybox. The binary packets of the streams are joined in order. `subject`
+/// names the source in a refusal. One binary stream comes back as a borrow,
+/// with no copy.
+///
+/// The refusals are those of [`keyring_stream`].
+fn offered_stream<'a>(
+    offered: &[&'a [u8]],
+    subject: &str,
+) -> std::result::Result<Cow<'a, [u8]>, KeyringRefusal> {
+    if let [one] = offered {
+        return keyring_stream(one, subject);
+    }
+    let len = offered.iter().map(|stream| stream.len() as u64).sum();
+    keyring_len(len, subject)?;
+    let mut joined = Vec::with_capacity(len as usize);
+    for stream in offered {
+        let binary = dearmor(stream).map_err(KeyringRefusal::Armor)?;
+        refuse_keybox(&binary, subject)?;
+        joined.extend_from_slice(&binary);
+    }
+    Ok(Cow::Owned(joined))
+}
+
 /// Returns the certificates of one binary keyring blob, as
 /// [`GpgVerifier::add_binary_keyring`] reads it.
 ///
@@ -658,7 +686,13 @@ pub(super) fn refuse_oversized_keyring(bytes: &[u8], subject: &str) -> Result<()
 /// Refuses a blob over [`MAX_KEYRING`] with [`KeyringRefusal::OverLimit`].
 /// `subject` names the source in the refusal.
 fn keyring_size(bytes: &[u8], subject: &str) -> std::result::Result<(), KeyringRefusal> {
-    if bytes.len() as u64 > MAX_KEYRING {
+    keyring_len(bytes.len() as u64, subject)
+}
+
+/// Refuses a length over [`MAX_KEYRING`] with [`KeyringRefusal::OverLimit`].
+/// `subject` names the source in the refusal.
+fn keyring_len(len: u64, subject: &str) -> std::result::Result<(), KeyringRefusal> {
+    if len > MAX_KEYRING {
         return Err(KeyringRefusal::OverLimit(Error::Signature(format!(
             "{subject} is over the {MAX_KEYRING}-byte ceiling"
         ))));
@@ -743,8 +777,8 @@ enum Chunks {
 /// for each packet. If the walk then reaches a byte that does not frame, the
 /// result is [`Chunks::Unframed`]. A truncated keyring gives this result, and
 /// the `ostree` command also refuses such a keyring. The certificates are not
-/// longer than the input, and [`keyring_stream`] already applied
-/// [`MAX_KEYRING`] to the input.
+/// longer than the input, and [`keyring_stream`] or [`offered_stream`]
+/// already applied [`MAX_KEYRING`] to the input.
 fn certificate_chunks(binary: &[u8]) -> Chunks {
     let mut chunks: Vec<Vec<u8>> = Vec::new();
     let mut at = 0usize;
@@ -896,27 +930,28 @@ fn merge_keyring(
 ) -> Result<(usize, Vec<u8>)> {
     gpg_merge_keyring(
         existing,
-        gpg_offered_keys(offered, key_ids, subject),
+        gpg_offered_keys(&[offered], key_ids, subject),
         subject,
     )
 }
 
-/// The offered stream of a keyring import, read and not merged yet.
+/// The offered streams of a keyring import, read and not merged yet.
 ///
-/// [`gpg_offered_keys`] reads the stream before the read of the keyring that
-/// the import changes. [`gpg_merge_keyring`] merges it into that keyring. The
-/// value holds the certificates of the stream that the selectors take, or the
-/// refusal of the stream, which the merge reports.
+/// [`gpg_offered_keys`] reads the streams before the read of the keyring that
+/// the import changes. [`gpg_merge_keyring`] merges them into that keyring.
+/// The value holds the certificates of the joined stream that the selectors
+/// take, or the refusal of the streams, which the merge reports.
 #[derive(Debug)]
 pub struct GpgOfferedKeys {
     inner: OfferedKeys,
 }
 
-/// The offered stream of an import, as [`gpg_offered_keys`] read it.
+/// The offered streams of an import, as [`gpg_offered_keys`] read them.
 #[derive(Debug)]
 enum OfferedKeys {
-    /// A stream that is refused before the read of its packets. It is over
-    /// [`MAX_KEYRING`], its armor does not decode, or it is a keybox.
+    /// Streams that are refused before the read of their packets. The sum of
+    /// their lengths is over [`MAX_KEYRING`], the armor of a stream does not
+    /// decode, or a stream is a keybox.
     Refused(Error),
     /// The packets of the stream: each certificate with its packets, and the
     /// indices of the certificates that the selectors take.
@@ -931,26 +966,30 @@ enum OfferedKeys {
 /// order.
 type OfferedCerts = (Vec<SignedPublicKey>, Vec<Vec<u8>>, Vec<usize>);
 
-/// Reads the offered stream of an import into the keyring that `subject`
+/// Reads the offered streams of an import into the keyring that `subject`
 /// names, and selects the certificates that `key_ids` names.
 ///
-/// `offered` is a binary or ASCII-armored certificate stream, as an exported
-/// public keyring is. If `key_ids` is not empty, the import takes only the
-/// keys that these selectors name. A selector is a fingerprint, a key id, or
-/// a user id substring, as `gpg --export` reads a key name.
+/// Each stream of `offered` is a binary or ASCII-armored certificate stream,
+/// as an exported public keyring is. The call decodes each stream by itself,
+/// and joins the binary packets of the streams in order into one stream. If
+/// `key_ids` is not empty, the import takes only the keys of the joined
+/// stream that these selectors name. A selector is a fingerprint, a key id,
+/// or a user id substring, as `gpg --export` reads a key name.
 ///
 /// The call uses no byte of the keyring, so an import runs it before it takes
-/// its locks. The call cannot fail. It keeps a refusal of the stream in the
+/// its locks. The call cannot fail. It keeps a refusal of the streams in the
 /// result, and [`gpg_merge_keyring`] reports it after the refusals of the
 /// keyring. So the result of an import does not change with the place where
 /// the stream was read.
 ///
-/// The stream is untrusted input. It has
-/// [the limits of a keyring](GpgVerifier#limits-of-a-keyring), and must frame
-/// to its end.
-pub fn gpg_offered_keys(offered: &[u8], key_ids: &[String], subject: &str) -> GpgOfferedKeys {
+/// The streams are untrusted input. The sum of their lengths is capped at
+/// [`MAX_KEYRING`]. No stream may be a GnuPG keybox. The joined stream holds
+/// at most 256 certificates, as
+/// [the limits of a keyring](GpgVerifier#limits-of-a-keyring) state, and must
+/// frame to its end.
+pub fn gpg_offered_keys(offered: &[&[u8]], key_ids: &[String], subject: &str) -> GpgOfferedKeys {
     let source = "the keyring to import";
-    let stream = match keyring_stream(offered, source) {
+    let stream = match offered_stream(offered, source) {
         Ok(stream) => stream,
         Err(err) => {
             return GpgOfferedKeys {
@@ -1022,9 +1061,11 @@ pub fn gpg_offered_keys(offered: &[u8], key_ids: &[String], subject: &str) -> Gp
 /// The call reports a refusal of `existing` first, and then the refusal that
 /// `offered` holds.
 ///
-/// - [`Error::Signature`] if `existing` or the offered stream is over 4 MiB,
-///   is a GnuPG keybox, holds more than 256 certificates, or does not parse
-///   as an OpenPGP keyring.
+/// - [`Error::Signature`] if `existing` is over 4 MiB, or the offered
+///   streams together are over 4 MiB.
+/// - [`Error::Signature`] if `existing` or an offered stream is a GnuPG
+///   keybox, or if `existing` or the joined offered stream holds more than
+///   256 certificates or does not parse as an OpenPGP keyring.
 /// - [`Error::Signature`] if the offered stream holds no certificate, or a
 ///   selector names no key in it.
 /// - [`Error::Signature`] if an armored stream is not valid UTF-8.
@@ -2863,6 +2904,45 @@ IHdvcmxk\n\
         let (again, repeated) = merge_keyring(&keyring, &offered, &[], SUBJECT).unwrap();
         assert_eq!(again, 0);
         assert_eq!(repeated, keyring);
+    }
+
+    /// An import decodes each offered stream by itself. A binary stream and
+    /// an armored stream import in each order, and the keyring holds the
+    /// binary packets of the streams in that order.
+    #[test]
+    fn an_import_dearmors_each_stream() {
+        if !gpg_or_skip() {
+            return;
+        }
+        let first = KeyFixture::new("First <first@ostrya.example>");
+        let second = KeyFixture::new("Second <second@ostrya.example>");
+        let binary = first.export(false);
+        let armored = second.export(true);
+        let packets = second.export(false);
+        assert!(armored.starts_with(b"-----BEGIN PGP"));
+
+        let offered = gpg_offered_keys(&[&binary, &armored], &[], SUBJECT);
+        let (imported, keyring) = gpg_merge_keyring(b"", offered, SUBJECT).unwrap();
+        assert_eq!(imported, 2);
+        assert_eq!(keyring, [&binary[..], &packets[..]].concat());
+
+        let offered = gpg_offered_keys(&[&armored, &binary], &[], SUBJECT);
+        let (imported, keyring) = gpg_merge_keyring(b"", offered, SUBJECT).unwrap();
+        assert_eq!(imported, 2);
+        assert_eq!(keyring, [&packets[..], &binary[..]].concat());
+    }
+
+    /// An import applies the size limit to the sum of the offered streams.
+    /// Each stream is under the limit, and the two together are over it.
+    #[test]
+    fn an_import_limits_the_sum_of_the_streams() {
+        let half = vec![0u8; MAX_KEYRING as usize / 2 + 1];
+        let offered = gpg_offered_keys(&[&half, &half], &[], SUBJECT);
+        let err = gpg_merge_keyring(b"", offered, SUBJECT).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("ceiling")),
+            "{err}"
+        );
     }
 
     /// An import into a keyring that GnuPG wrote keeps that keyring byte for

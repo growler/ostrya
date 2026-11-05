@@ -393,9 +393,11 @@ impl Repo {
     /// Imports OpenPGP certificates into the trusted keyring of `remote`.
     ///
     /// The keyring is `<remote>.trustedkeys.gpg` at the repository root.
-    /// `keys` is a binary or ASCII-armored certificate stream, as an exported
-    /// public keyring is. The call returns the number of certificates that the
-    /// keyring did not already hold.
+    /// Each stream of `keys` is a binary or ASCII-armored certificate stream,
+    /// as an exported public keyring is. The call decodes each stream by
+    /// itself, and joins the streams in order into one offered stream. The
+    /// call returns the number of certificates that the keyring did not
+    /// already hold.
     ///
     /// The call reads and writes the repository keyring alone. When the
     /// remotes directory of the handle ([`Repo::remotes_dir`]) holds the
@@ -405,9 +407,9 @@ impl Repo {
     /// import that keyring as well. The call copies the keys, so a later
     /// change to the keyring of the directory has no effect.
     ///
-    /// If `key_ids` is not empty, the call imports only the keys that these
-    /// selectors name. A selector is a fingerprint, a key id, or a user id
-    /// substring.
+    /// If `key_ids` is not empty, the call imports only the keys of the
+    /// offered stream that these selectors name. A selector is a fingerprint,
+    /// a key id, or a user id substring.
     ///
     /// # Import rules
     ///
@@ -441,11 +443,12 @@ impl Repo {
     /// and no certificate, so the call refuses it. The re-export of the revoked
     /// key is the stream that brings a revocation in.
     ///
-    /// The offered stream is untrusted input. It has
-    /// [the limits of a keyring](GpgVerifier#limits-of-a-keyring). The offered
-    /// stream and the keyring of the remote both go through the reader of a
-    /// verification load. So if either stream does not frame to its end, the
-    /// import fails, and the keyring does not change.
+    /// The offered streams are untrusted input. The sum of their lengths is
+    /// at most 4 MiB, and the joined stream holds at most 256 certificates.
+    /// No stream may be a GnuPG keybox. The offered stream and the keyring of
+    /// the remote both go through the reader of a verification load. So if
+    /// either stream does not frame to its end, the import fails, and the
+    /// keyring does not change.
     ///
     /// # Locks
     ///
@@ -453,7 +456,7 @@ impl Repo {
     /// [`LockKind`](crate::LockKind) describes. It then takes the update lock,
     /// as [`Repo::begin_update`] does. It reads, merges, and writes the keyring
     /// under both locks, so two imports into one keyring keep the keys of
-    /// both. The call parses the offered stream before it takes the locks.
+    /// both. The call parses the offered streams before it takes the locks.
     /// [`UpdateGuard`](crate::UpdateGuard) describes a caller that holds a
     /// guard of this repository.
     ///
@@ -466,14 +469,17 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
     ///   The call refuses the name before it parses `keys` and before it
     ///   takes a lock.
-    /// - [`Error::Signature`] if `keys` or the keyring is over 4 MiB, holds
-    ///   more than 256 certificates, or is a GnuPG keybox.
+    /// - [`Error::Signature`] if the keyring is over 4 MiB, or the streams of
+    ///   `keys` together are over 4 MiB.
+    /// - [`Error::Signature`] if the offered stream or the keyring holds more
+    ///   than 256 certificates, or if a stream of `keys` or the keyring is a
+    ///   GnuPG keybox.
     /// - [`Error::InvalidFormat`] if the keyring is larger than 64 MiB, the
     ///   cap of its read.
-    /// - [`Error::Signature`] if `keys` or the keyring does not parse as an
-    ///   OpenPGP keyring.
-    /// - [`Error::Signature`] if `keys` holds no certificate, or a selector in
-    ///   `key_ids` names no key in `keys`.
+    /// - [`Error::Signature`] if the offered stream or the keyring does not
+    ///   parse as an OpenPGP keyring.
+    /// - [`Error::Signature`] if the offered stream holds no certificate, or a
+    ///   selector in `key_ids` names no key in it.
     /// - [`Error::Signature`] if an armored stream is not valid UTF-8.
     /// - [`Error::Core`] if the armor of a stream holds text that is not valid
     ///   base64.
@@ -490,7 +496,7 @@ impl Repo {
     pub async fn gpg_import_keys(
         &self,
         remote: &str,
-        keys: &[u8],
+        keys: &[&[u8]],
         key_ids: &[String],
     ) -> Result<usize> {
         if !valid_remote_name(remote) {
@@ -502,18 +508,23 @@ impl Repo {
         let fsync = self.config().fsync()?;
         let subject = format!("the keyring '{name}'");
         // Parsing untrusted certificate streams is CPU work over owned copies
-        // of its inputs, so it runs on the blocking pool. The offered stream
-        // is read before the locks, and only the read of the keyring, the
-        // merge, and the write run under them. The read refuses a stream over
-        // `MAX_KEYRING` before it reads a byte. So such a stream gets no copy,
-        // and its read runs here.
-        let offered = if keys.len() as u64 > MAX_KEYRING {
+        // of its inputs, so it runs on the blocking pool. The offered streams
+        // are read before the locks, and only the read of the keyring, the
+        // merge, and the write run under them. The read refuses streams over
+        // `MAX_KEYRING` together before it reads a byte. So such streams get
+        // no copy, and their read runs here.
+        let len: u64 = keys.iter().map(|stream| stream.len() as u64).sum();
+        let offered = if len > MAX_KEYRING {
             gpg_offered_keys(keys, key_ids, &subject)
         } else {
-            let offered = keys.to_vec();
+            let offered: Vec<Vec<u8>> = keys.iter().map(|stream| stream.to_vec()).collect();
             let ids = key_ids.to_vec();
             let read_subject = subject.clone();
-            ostrya_rt::unblock(move || gpg_offered_keys(&offered, &ids, &read_subject)).await
+            ostrya_rt::unblock(move || {
+                let streams: Vec<&[u8]> = offered.iter().map(Vec::as_slice).collect();
+                gpg_offered_keys(&streams, &ids, &read_subject)
+            })
+            .await
         };
         self.write_locked(move |repo| {
             let existing = read_root_file_blocking(repo.repo_fd(), &name)?.unwrap_or_default();
@@ -1487,10 +1498,10 @@ pub(crate) mod tests {
             let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
                 .await
                 .unwrap();
-            let absent = repo.gpg_import_keys("origin", &oversized, &[]).await;
+            let absent = repo.gpg_import_keys("origin", &[&oversized], &[]).await;
             let absent_after = std::fs::exists(&keyring).unwrap();
             std::fs::write(&keyring, b"").unwrap();
-            let empty = repo.gpg_import_keys("origin", &oversized, &[]).await;
+            let empty = repo.gpg_import_keys("origin", &[&oversized], &[]).await;
             let empty_after = std::fs::read(&keyring).unwrap();
             (absent, absent_after, empty, empty_after)
         });
@@ -1523,7 +1534,7 @@ pub(crate) mod tests {
             let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
                 .await
                 .unwrap();
-            repo.gpg_import_keys("../x", b"", &[]).await
+            repo.gpg_import_keys("../x", &[], &[]).await
         });
         let decoy_stays = decoy.is_dir();
         std::fs::remove_dir_all(&dir).unwrap();

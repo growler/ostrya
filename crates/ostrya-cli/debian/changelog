@@ -1,6 +1,7 @@
 ostrya (0.10.0) UNRELEASED; urgency=medium
 
-  * New upstream release.
+  * remote gpg-import reads each -k file as a binary or an ASCII-armored
+    keyring by itself. A mix of binary and armored files imports.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

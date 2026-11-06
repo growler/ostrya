@@ -537,11 +537,11 @@ struct Ctx {
     /// name. The run reports each one and acts on none.
     unparsable: HashSet<ObjectName>,
     /// The commits that this run marked as partial.
-    marked_partial: Vec<Checksum>,
+    marked_partial: HashSet<Checksum>,
     /// The objects that this run unlinked.
     deleted: HashSet<ObjectName>,
     /// The commits that this run tombstoned.
-    tombstoned: Vec<Checksum>,
+    tombstoned: HashSet<Checksum>,
     /// The number of leading entries of `errors` that the ref phase made.
     /// These keep an empty `in_commits`, because the ref phase reaches no
     /// commit through the object that it read.
@@ -590,10 +590,12 @@ impl Ctx {
                 e.in_commits.is_empty(),
             )
         });
-        self.marked_partial.sort();
+        let mut marked_partial: Vec<Checksum> = self.marked_partial.into_iter().collect();
+        marked_partial.sort();
         let mut deleted: Vec<ObjectName> = self.deleted.into_iter().collect();
         deleted.sort_by_key(|name| (name.checksum, name.ty as u32));
-        self.tombstoned.sort();
+        let mut tombstoned: Vec<Checksum> = self.tombstoned.into_iter().collect();
+        tombstoned.sort();
         self.image_errors.sort_by_key(|e| e.commit);
         self.orphan_images.sort();
         self.missing_images.sort();
@@ -603,9 +605,9 @@ impl Ctx {
             commits_partial: self.commits_partial,
             objects_checked,
             errors: self.errors,
-            marked_partial: self.marked_partial,
+            marked_partial,
             deleted,
-            tombstoned: self.tombstoned,
+            tombstoned,
             failure,
             images_checked: self.images_checked,
             image_errors: self.image_errors,
@@ -1344,7 +1346,7 @@ impl Repo {
         if opts.mark_partial {
             for commit in incomplete {
                 self.mark_commit_partial(&commit).await?;
-                ctx.marked_partial.push(commit);
+                ctx.marked_partial.insert(commit);
             }
         }
         Ok(())
@@ -1401,7 +1403,7 @@ impl Repo {
                     continue;
                 }
                 self.mark_commit_partial(&commit).await?;
-                ctx.marked_partial.push(commit);
+                ctx.marked_partial.insert(commit);
             }
         }
         ctx.dependency_errors = findings;
@@ -1544,7 +1546,7 @@ impl Repo {
             .await?;
             self.fsck_unlink_object(ObjectName::new(commit, ObjectType::Commit))
                 .await?;
-            ctx.tombstoned.push(commit);
+            ctx.tombstoned.insert(commit);
         }
         Ok(())
     }

@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Commit, CommitLink, ObjectName, ObjectType};
+use ostrya_core::{Checksum, Commit, CommitLink, MAX_COLLECTION_ID_LEN, ObjectName, ObjectType};
 
 use super::invalid;
 use super::refspec::PushTarget;
@@ -12,7 +12,6 @@ use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
-use crate::refs::MAX_COLLECTION_ID_LEN;
 use crate::related::{self, HeldDependency, RelatedField, RelatedRule};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,

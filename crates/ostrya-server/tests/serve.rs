@@ -27,7 +27,7 @@ use ostrya::remote::PullSession;
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    MutableTree, ObjectType, PullOptions, PullProgress, ReceivePolicies, RefSelector, Repo,
+    MutableTree, ObjectType, PullOptions, PullProgress, ReceivePolicies, Ref, RefSelector, Repo,
     RepoMode, Summary, Type, Value, loose_path,
 };
 use ostrya_rt::block_on;
@@ -98,7 +98,7 @@ async fn repo(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     let file = repo
         .traverse_commit(&commit, 0)
@@ -611,7 +611,7 @@ fn a_stalled_body_releases_its_compressor() {
 async fn add_refs(repo: &Repo, commit: &Checksum) {
     let txn = repo.transaction().await.unwrap();
     for name in ["a/b/c", "a/b/d", "a/bc"] {
-        txn.set_ref(name, Some(commit));
+        txn.set_ref(&Ref::local(name), Some(commit));
     }
     txn.commit().await.unwrap();
 }
@@ -881,7 +881,7 @@ fn fetch_refs_over_http_gives_the_built_listing() {
         add_refs(&repo, &commit).await;
         let txn = repo.transaction().await.unwrap();
         for name in ESCAPED_REFS {
-            txn.set_ref(name, Some(&commit));
+            txn.set_ref(&Ref::local(name), Some(&commit));
         }
         txn.commit().await.unwrap();
     });
@@ -1111,7 +1111,7 @@ async fn commit_marker(repo: &Repo, base: &Path, name: &str, parent: Option<Chec
         )
         .await
         .unwrap();
-    txn.set_ref("test/main", Some(&commit));
+    txn.set_ref(&Ref::local("test/main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

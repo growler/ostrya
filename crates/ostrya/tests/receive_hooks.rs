@@ -27,8 +27,8 @@ use ostrya::remote::proto::{CommitRequest, Hello, ServerCommit};
 use ostrya::remote::{self, Encoding, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, Commit, Error, HookFuture, HookRefusal, HostEntry, LockKind, MAX_METADATA_SIZE,
-    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService, Repo, RepoMode, Type,
-    UpdatePlan, Value,
+    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService, Ref, Repo, RepoMode,
+    Type, UpdatePlan, Value,
 };
 use ostrya_rt::block_on;
 
@@ -474,7 +474,7 @@ fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
             let repo = repo.clone();
             Box::pin(async move {
                 let written = repo
-                    .set_ref_immediate("test/after", Some(&fixture_commit()))
+                    .set_ref_immediate(&Ref::local("test/after"), Some(&fixture_commit()))
                     .await;
                 drop(carried);
                 written.map_err(|e| e.to_string())
@@ -1659,7 +1659,7 @@ fn after_update_runs_with_the_update_lock_free() {
     let tmp = TmpDir::new("hooks-after-free");
     let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
     let guard = block_on(repo.begin_update()).unwrap();
-    let held = block_on(repo.set_ref_immediate("test/after", Some(&fixture_commit())));
+    let held = block_on(repo.set_ref_immediate(&Ref::local("test/after"), Some(&fixture_commit())));
     block_on(guard.finish()).unwrap();
     assert!(
         matches!(&held, Err(Error::LockTimeout { .. })),
@@ -1927,7 +1927,7 @@ fn after_update_does_not_run_when_the_transaction_commit_fails() {
     let tmp = TmpDir::new("hooks-after-partial");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     push(&repo, None, &[]).unwrap();
-    block_on(repo.set_ref_immediate("ro/x", Some(&fixture_commit()))).unwrap();
+    block_on(repo.set_ref_immediate(&Ref::local("ro/x"), Some(&fixture_commit()))).unwrap();
     let ro = repo.path().join("refs/heads/ro");
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));

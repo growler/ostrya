@@ -11,7 +11,7 @@ use std::os::fd::AsFd;
 use std::sync::Arc;
 
 use ostrya_core::{
-    Checksum, Commit, ObjectName, ObjectType, Type, Value, loose_path, to_bytes, validate,
+    Checksum, Commit, ObjectName, ObjectType, Ref, Type, Value, loose_path, to_bytes, validate,
 };
 
 use super::ancestry::{Parents, Walks};
@@ -30,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
 use crate::read::CommitState;
-use crate::refs::{CollectionRef, RefFileState};
+use crate::refs::{RefFileState, refspec_ref};
 use crate::related::{self, HeldDependency, RelatedRule};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
@@ -489,10 +489,8 @@ pub(super) fn queue_ref(
     new: Option<&Checksum>,
 ) {
     match namespace {
-        Some(Namespace::Collection(id)) => {
-            txn.set_collection_ref(&CollectionRef::new(id.as_str(), name), new)
-        }
-        _ => txn.set_ref(name, new),
+        Some(Namespace::Collection(id)) => txn.set_ref(&Ref::collection(id.as_str(), name), new),
+        _ => txn.set_ref(&refspec_ref(name), new),
     }
 }
 

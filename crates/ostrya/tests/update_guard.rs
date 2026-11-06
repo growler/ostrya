@@ -18,7 +18,7 @@ use common::{
 };
 use futures_lite::future::poll_once;
 use ostrya::{
-    Checksum, CollectionRef, CreateOptions, Error, LockKind, ObjectType, OpenOptions, PruneOptions,
+    Checksum, CreateOptions, Error, LockKind, ObjectType, OpenOptions, PruneOptions, Ref,
     RemoteSource, RemotesDir, Repo, RepoMode, UpdateGuard,
 };
 use ostrya_rt::block_on;
@@ -427,33 +427,36 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
     let path = create(&tmp, RepoMode::BareUser, "");
     let repo = open(&path);
     let other = open(&path);
-    let cref = CollectionRef::new("org.example.C", "app/main");
+    let cref = Ref::collection("org.example.C", "app/main");
     block_on(async {
         let guard = repo.begin_update().await.unwrap();
         guard
-            .set_ref("host/main", Some(&checksum(1)))
+            .set_ref(&Ref::local("host/main"), Some(&checksum(1)))
             .await
             .unwrap();
         guard
-            .set_ref("origin:host/main", Some(&checksum(2)))
+            .set_ref(&Ref::remote("origin", "host/main"), Some(&checksum(2)))
             .await
             .unwrap();
-        guard
-            .set_collection_ref(&cref, Some(&checksum(3)))
-            .await
-            .unwrap();
+        guard.set_ref(&cref, Some(&checksum(3))).await.unwrap();
         guard.set_ref_alias("current", "host/main").await.unwrap();
 
         assert_eq!(
-            other.resolve_ref_tip("host/main").await.unwrap(),
+            other
+                .resolve_ref_tip(&Ref::local("host/main"))
+                .await
+                .unwrap(),
             Some(checksum(1))
         );
         assert_eq!(
-            other.resolve_ref_tip("origin:host/main").await.unwrap(),
+            other
+                .resolve_ref_tip(&Ref::remote("origin", "host/main"))
+                .await
+                .unwrap(),
             Some(checksum(2))
         );
         assert_eq!(
-            other.resolve_ref_tip("current").await.unwrap(),
+            other.resolve_ref_tip(&Ref::local("current")).await.unwrap(),
             Some(checksum(1))
         );
         let mirrors = other.list_mirror_refs().await.unwrap();
@@ -469,12 +472,12 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
         assert_eq!(aliases.len(), 1);
         assert_eq!(aliases[0].refspec, "current");
 
-        assert_eq!(guard.read_ref("current").await.unwrap(), Some(checksum(1)));
         assert_eq!(
-            guard.read_collection_ref(&cref).await.unwrap(),
-            Some(checksum(3))
+            guard.read_ref(&Ref::local("current")).await.unwrap(),
+            Some(checksum(1))
         );
-        assert_eq!(guard.read_ref("absent").await.unwrap(), None);
+        assert_eq!(guard.read_ref(&cref).await.unwrap(), Some(checksum(3)));
+        assert_eq!(guard.read_ref(&Ref::local("absent")).await.unwrap(), None);
 
         let mut keyfile = guard.read_config().await.unwrap().keyfile().clone();
         keyfile
@@ -491,8 +494,14 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
             None
         );
 
-        guard.set_ref("host/main", None).await.unwrap();
-        assert_eq!(other.resolve_ref_tip("host/main").await.unwrap(), None);
+        guard.set_ref(&Ref::local("host/main"), None).await.unwrap();
+        assert_eq!(
+            other
+                .resolve_ref_tip(&Ref::local("host/main"))
+                .await
+                .unwrap(),
+            None
+        );
         guard.finish().await.unwrap();
     });
     let reopened = open(&path);
@@ -1757,7 +1766,7 @@ fn finish_returns_a_sync_error_and_releases_the_locks() {
     block_on(async {
         let guard = repo.begin_update().await.unwrap();
         guard
-            .set_ref("deep/main", Some(&checksum(1)))
+            .set_ref(&Ref::local("deep/main"), Some(&checksum(1)))
             .await
             .unwrap();
         let dir = path.join("refs/heads/deep");
@@ -1784,7 +1793,10 @@ fn a_dropped_guard_releases_both_locks() {
     let repo = open(&path);
     block_on(async {
         let guard = repo.begin_update().await.unwrap();
-        guard.set_ref("main", Some(&checksum(1))).await.unwrap();
+        guard
+            .set_ref(&Ref::local("main"), Some(&checksum(1)))
+            .await
+            .unwrap();
         drop(guard);
         assert_locks_free(&path).await;
     });
@@ -1800,7 +1812,10 @@ fn a_dropped_finish_releases_both_locks() {
     let repo = open(&path);
     block_on(async {
         let guard = repo.begin_update().await.unwrap();
-        guard.set_ref("a/main", Some(&checksum(1))).await.unwrap();
+        guard
+            .set_ref(&Ref::local("a/main"), Some(&checksum(1)))
+            .await
+            .unwrap();
         let mut finish = Box::pin(guard.finish());
         let _ = poll_once(&mut finish).await;
         drop(finish);

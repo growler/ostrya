@@ -18,6 +18,7 @@
 //! - [`ObjectType`] and [`RepoMode`] select the [`loose_path`] of an object.
 //! - [`DeflateSink`] compresses the payload of an archive-mode content object.
 //! - [`KeyFile`] reads and writes the repository `config` file.
+//! - [`Ref`] is one ref of a repository: local, remote, or collection.
 //! - [`RefPattern`] checks and matches one ref pattern with `*` and `**`.
 //! - [`RefSelector`] selects ref names with a list of positive and negative
 //!   patterns.
@@ -82,8 +83,8 @@ pub use mode::RepoMode;
 pub use objname::ObjectName;
 pub use objtype::ObjectType;
 pub use refname::{
-    is_checksum_shaped, is_collection_id, is_ref_component, is_ref_name, is_ref_name_component,
-    is_refspec,
+    MAX_COLLECTION_ID_LEN, ParseRefError, Ref, is_checksum_shaped, is_collection_id,
+    is_ref_component, is_ref_name, is_ref_name_component, is_refspec,
 };
 pub use refpattern::{RefPattern, RefSelector};
 pub use xattr::{Xattrs, XattrsRef};

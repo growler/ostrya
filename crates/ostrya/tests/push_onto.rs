@@ -23,8 +23,8 @@ use futures_lite::future::zip;
 use ostrya::remote::{self, PushOutcome};
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, Ed25519Signer, Error,
-    MutableTree, ObjectType, PushOntoOptions, ReceivePolicy, ReceiveReport, Repo, RepoMode, Type,
-    Value,
+    MutableTree, ObjectType, PushOntoOptions, ReceivePolicy, ReceiveReport, Ref, Repo, RepoMode,
+    Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -163,7 +163,7 @@ fn commit_with(
             .await
             .unwrap();
         txn.sign_commit(&checksum, &signer).await.unwrap();
-        txn.set_ref(branch, Some(&checksum));
+        txn.set_ref(&Ref::local(branch), Some(&checksum));
         txn.commit().await.unwrap();
         checksum
     })

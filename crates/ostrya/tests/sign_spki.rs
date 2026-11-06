@@ -30,7 +30,7 @@ use std::sync::Arc;
 use common::{TmpDir, openssl_available, wrap_pem};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
-    MutableTree, Repo, RepoMode, Signer, SpkiSigner, SpkiVerifier, Verifier, base64,
+    MutableTree, Ref, Repo, RepoMode, Signer, SpkiSigner, SpkiVerifier, Verifier, base64,
     load_sign_keys_from,
 };
 use ostrya_rt::block_on;
@@ -111,7 +111,7 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
         ..CommitOptions::default()
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
-    txn.set_ref("test/main", Some(&commit));
+    txn.set_ref(&Ref::local("test/main"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }

@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 use common::modes::object_path;
 use common::{TmpDir, file_inventory};
 use ostrya::{
-    Checksum, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
-    CommitOptions, CreateOptions, DictBuilder, FsckBindingErrorKind, FsckFailure, FsckOptions,
-    MutableTree, ObjectType, Repo, RepoMode,
+    Checksum, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
+    CreateOptions, DictBuilder, FsckBindingErrorKind, FsckFailure, FsckOptions, MutableTree,
+    ObjectType, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -136,49 +136,37 @@ fn each_writer_of_the_own_collection_id_writes_the_local_ref() {
     let tmp = TmpDir::new("own-id-writers");
     block_on(async {
         let (path, repo) = create(&tmp).await;
-        let cref = CollectionRef::new(OWN, "app/main");
+        let cref = Ref::collection(OWN, "app/main");
         let commit = checksum(1);
 
         let txn = repo.transaction().await.unwrap();
-        txn.set_collection_ref(&cref, Some(&commit));
+        txn.set_ref(&cref, Some(&commit));
         txn.commit().await.unwrap();
         assert_local_alone(&path, "app/main", &commit, "transaction");
         let txn = repo.transaction().await.unwrap();
-        txn.set_collection_ref(&cref, None);
+        txn.set_ref(&cref, None);
         txn.commit().await.unwrap();
         assert!(heads(&path).is_empty(), "transaction removal");
 
-        repo.set_collection_ref_immediate(&cref, Some(&commit))
-            .await
-            .unwrap();
+        repo.set_ref_immediate(&cref, Some(&commit)).await.unwrap();
         assert_local_alone(&path, "app/main", &commit, "immediate");
-        repo.set_collection_ref_immediate(&cref, None)
-            .await
-            .unwrap();
+        repo.set_ref_immediate(&cref, None).await.unwrap();
         assert!(heads(&path).is_empty(), "immediate removal");
 
         let guard = repo.begin_update().await.unwrap();
-        guard
-            .set_collection_ref(&cref, Some(&commit))
-            .await
-            .unwrap();
-        assert_eq!(
-            guard.read_collection_ref(&cref).await.unwrap(),
-            Some(commit)
-        );
+        guard.set_ref(&cref, Some(&commit)).await.unwrap();
+        assert_eq!(guard.read_ref(&cref).await.unwrap(), Some(commit));
         guard.finish().await.unwrap();
         assert_local_alone(&path, "app/main", &commit, "guard");
         let guard = repo.begin_update().await.unwrap();
-        guard.set_collection_ref(&cref, None).await.unwrap();
-        assert_eq!(guard.read_collection_ref(&cref).await.unwrap(), None);
+        guard.set_ref(&cref, None).await.unwrap();
+        assert_eq!(guard.read_ref(&cref).await.unwrap(), None);
         guard.finish().await.unwrap();
         assert!(heads(&path).is_empty(), "guard removal");
 
         // Another collection id writes its mirror ref.
-        let other = CollectionRef::new(OTHER, "app/main");
-        repo.set_collection_ref_immediate(&other, Some(&commit))
-            .await
-            .unwrap();
+        let other = Ref::collection(OTHER, "app/main");
+        repo.set_ref_immediate(&other, Some(&commit)).await.unwrap();
         assert!(heads(&path).is_empty());
         assert_eq!(
             file_inventory(&path, "refs/mirrors"),
@@ -198,10 +186,10 @@ fn a_removal_of_the_own_collection_id_keeps_the_mirror_ref() {
     block_on(async {
         let (path, repo) = create(&tmp).await;
         put_own_mirror(&path, "main", &checksum(1));
-        repo.set_ref_immediate("main", Some(&checksum(2)))
+        repo.set_ref_immediate(&Ref::local("main"), Some(&checksum(2)))
             .await
             .unwrap();
-        repo.set_collection_ref_immediate(&CollectionRef::new(OWN, "main"), None)
+        repo.set_ref_immediate(&Ref::collection(OWN, "main"), None)
             .await
             .unwrap();
         assert!(heads(&path).is_empty());
@@ -224,21 +212,17 @@ fn the_readers_of_the_own_collection_id_ignore_the_mirror_refs() {
         let (path, repo) = create(&tmp).await;
         put_own_mirror(&path, "main", &checksum(1));
         put_own_mirror(&path, "shadow", &checksum(1));
-        repo.set_ref_immediate("main", Some(&checksum(2)))
+        repo.set_ref_immediate(&Ref::local("main"), Some(&checksum(2)))
             .await
             .unwrap();
-        repo.set_collection_ref_immediate(&CollectionRef::new(OTHER, "x"), Some(&checksum(3)))
+        repo.set_ref_immediate(&Ref::collection(OTHER, "x"), Some(&checksum(3)))
             .await
             .unwrap();
 
         let guard = repo.begin_update().await.unwrap();
         for (name, want) in [("main", Some(checksum(2))), ("shadow", None)] {
-            let cref = CollectionRef::new(OWN, name);
-            assert_eq!(
-                guard.read_collection_ref(&cref).await.unwrap(),
-                want,
-                "{name}"
-            );
+            let cref = Ref::collection(OWN, name);
+            assert_eq!(guard.read_ref(&cref).await.unwrap(), want, "{name}");
         }
         guard.finish().await.unwrap();
 
@@ -270,10 +254,10 @@ fn the_collection_ref_listing_does_not_read_the_mirror_refs_of_the_own_id() {
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("text"), "no checksum\n").unwrap();
         std::fs::write(dir.join("sub/bytes"), [0xff, 0xfe, b'\n']).unwrap();
-        repo.set_ref_immediate("main", Some(&checksum(2)))
+        repo.set_ref_immediate(&Ref::local("main"), Some(&checksum(2)))
             .await
             .unwrap();
-        repo.set_collection_ref_immediate(&CollectionRef::new(OTHER, "x"), Some(&checksum(3)))
+        repo.set_ref_immediate(&Ref::collection(OTHER, "x"), Some(&checksum(3)))
             .await
             .unwrap();
 
@@ -301,7 +285,9 @@ fn the_fsck_back_ref_check_ignores_the_mirror_refs_of_the_own_id() {
         let (path, repo) = create(&tmp).await;
         let main = commit(&repo, tmp.path(), "main", Some(OWN), &["main"]).await;
         let mirrored = commit(&repo, tmp.path(), "mirrored", Some(OTHER), &[]).await;
-        repo.set_ref_immediate("main", Some(&main)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&main))
+            .await
+            .unwrap();
         put_own_mirror(&path, "main", &mirrored);
         let opts = FsckOptions {
             verify_back_refs: true,
@@ -314,7 +300,9 @@ fn the_fsck_back_ref_check_ignores_the_mirror_refs_of_the_own_id() {
 
         // A remote ref gives the ref binding a ref, and `refs/heads` holds no
         // collection ref of the name.
-        repo.set_ref_immediate("main", None).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), None)
+            .await
+            .unwrap();
         let remote = path.join("refs/remotes/origin/main");
         std::fs::create_dir_all(remote.parent().unwrap()).unwrap();
         std::fs::write(&remote, format!("{}\n", main.to_hex())).unwrap();
@@ -348,7 +336,9 @@ fn the_fsck_lists_the_mirror_refs_of_the_own_collection_id() {
     block_on(async {
         let (path, repo) = create(&tmp).await;
         let main = commit(&repo, tmp.path(), "main", Some(OWN), &[]).await;
-        repo.set_ref_immediate("main", Some(&main)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&main))
+            .await
+            .unwrap();
         let mirrored = commit(&repo, tmp.path(), "mirrored", Some(OTHER), &[]).await;
         put_own_mirror(&path, "main", &mirrored);
         put_own_mirror(&path, "a/b", &mirrored);

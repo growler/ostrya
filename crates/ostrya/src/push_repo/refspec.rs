@@ -262,6 +262,7 @@ fn named_twice(dst: &str) -> Error {
 mod tests {
     use super::super::test_repo::{Scratch, commit_tree};
     use super::*;
+    use crate::Ref;
     use ostrya_core::RepoMode;
 
     fn refspecs(specs: &[&str]) -> Vec<String> {
@@ -487,7 +488,9 @@ mod tests {
             } else {
                 "aaaa"
             };
-            repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+            repo.set_ref_immediate(&Ref::local(name), Some(&commit))
+                .await
+                .unwrap();
 
             let got = repo.push_targets(&refspecs(&[name])).await.unwrap();
             assert_eq!(got, vec![target(name, Some(commit))]);

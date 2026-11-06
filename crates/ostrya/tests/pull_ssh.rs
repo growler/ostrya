@@ -872,9 +872,9 @@ fn a_pull_session_fetches_collection_refs_over_a_stream() {
         let dir = TmpDir::new("pull-ssh-session-fetch-collections");
         let (remote, commit) = build_remote(dir.path()).await;
         for (id, name) in [("org.a", "x"), ("org.a", "y/z"), ("org.b", "main")] {
-            let cref = ostrya::CollectionRef::new(id, name);
+            let cref = ostrya::Ref::collection(id, name);
             remote
-                .set_collection_ref_immediate(&cref, Some(&commit))
+                .set_ref_immediate(&cref, Some(&commit))
                 .await
                 .unwrap();
         }

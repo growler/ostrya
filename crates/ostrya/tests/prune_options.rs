@@ -21,7 +21,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, RefLocation, Repo,
+    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Ref, RefLocation, Repo,
     RepoMode, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
@@ -78,7 +78,7 @@ async fn commit(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&Ref::local(branch), Some(&commit));
     }
     txn.commit().await.unwrap();
     commit
@@ -121,7 +121,7 @@ async fn shared_chain(repo: &Repo, base: &Path, branch: &str, mid: &str) -> [Che
         out.push(c);
     }
     let txn = repo.transaction().await.unwrap();
-    txn.set_ref(mid, Some(&out[2]));
+    txn.set_ref(&Ref::local(mid), Some(&out[2]));
     txn.commit().await.unwrap();
     [out[0], out[1], out[2], out[3], out[4]]
 }
@@ -505,7 +505,7 @@ fn two_refs_at_one_commit_keep_what_either_bound_reaches() {
         let repo = repo_at(tmp.path()).await;
         let c = shared_chain(&repo, tmp.path(), "main", "alpha").await;
         let txn = repo.transaction().await.unwrap();
-        txn.set_ref("beta", Some(&c[2]));
+        txn.set_ref(&Ref::local("beta"), Some(&c[2]));
         txn.commit().await.unwrap();
 
         // `alpha` and `beta` name the same commit. The run cuts `alpha` to

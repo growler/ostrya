@@ -32,7 +32,7 @@ use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitState, CreateOptions, DeltaEndianness, DeltaSuperblock, Ed25519Verifier, Error,
-    FileKind, Repo, RepoMode, TreeEntry, base64, static_delta_relative_dir,
+    FileKind, Ref, Repo, RepoMode, TreeEntry, base64, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -266,7 +266,9 @@ fn applies_from_scratch_delta() {
         );
 
         // `ostree fsck` verifies the objects that ostrya wrote.
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     ostree(&[&format!("--repo={}", dst.display()), "fsck"]);
 }
@@ -316,7 +318,9 @@ fn applies_from_to_delta_with_bspatch() {
         // The unchanged symlink comes from the source commit and resolves.
         assert_eq!(read_symlink(&repo, &c2, "usr/bin/applink").await, "app");
 
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     ostree(&[&dst_arg, "fsck"]);
 }
@@ -551,7 +555,9 @@ fn the_port_applies_the_tools_inline_delta() {
                 data_bin()
             );
             assert_eq!(read_symlink(&repo, &c1, "usr/bin/applink").await, "app");
-            repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+            repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+                .await
+                .unwrap();
         });
         ostree(&[&format!("--repo={}", dst.display()), "fsck"]);
     }
@@ -587,7 +593,9 @@ fn the_port_applies_the_tools_big_endian_inline_delta() {
             patch_bin(true)
         );
         assert_eq!(read_file(&repo, &c2, "usr/bin/app").await, APP_V2);
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     ostree(&[&dst_arg, "fsck"]);
 }
@@ -788,7 +796,9 @@ fn applies_from_to_delta_with_rollsum() {
             read_file(&repo, &c2, "bigfile.dat").await,
             rollsum_bin(true)
         );
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     ostree(&[&dst_arg, "fsck"]);
 }
@@ -921,7 +931,9 @@ fn applies_delta_naming_one_read_source_many_times() {
             scattered_bin(40),
             "every copied run lands, so the reused source stayed correct"
         );
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     ostree(&[&dst_arg, "fsck"]);
 }
@@ -1023,7 +1035,9 @@ fn applies_delta_with_object_over_half_gib_packed() {
             .unwrap();
         let to = repo.apply_static_delta_offline(&scratch).await.unwrap();
         assert_eq!(to.to_hex(), c, "applied delta reproduces the target commit");
-        repo.set_ref_immediate("test", Some(&to)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test"), Some(&to))
+            .await
+            .unwrap();
     });
     // `ostree fsck` verifies the checksums of the objects that ostrya wrote.
     ostree(&[&dst_arg, "fsck"]);

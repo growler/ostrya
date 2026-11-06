@@ -348,9 +348,9 @@ read that directory. Its field 0 holds the refs of `refs/heads/` alone, so
 it differs from the field 0 of the tool when `refs/mirrors/ID/` holds a
 ref. `docs/conformance/cli-surface.md` records the divergence.
 
-`Repo::resolve_collection_ref` reads one ref of the collection `ID` at
-`refs/heads/NAME`, and does not read `refs/mirrors/ID/`. For each other
-collection id, it reads `refs/mirrors/ID/NAME`. The read takes no lock.
+`Repo::resolve_ref_tip` reads the collection ref `@ID:NAME` of the
+collection `ID` at `refs/heads/NAME`, and does not read `refs/mirrors/ID/`.
+For each other collection id, it reads `refs/mirrors/ID/NAME`. The read takes no lock.
 `Repo::list_collection_refs_in` lists the refs of the collection `ID` by
 the same rule.
 
@@ -631,7 +631,7 @@ letter or `_`, and continues with ASCII letters, ASCII digits, or `_`. The ref
 store takes a collection id that passes this rule and is at most 255 bytes. The
 id is one name under `refs/mirrors/`, and a file system takes a name of 255
 bytes at most. A write or a read of a collection ref with another id fails with
-`InvalidRefspec`, which holds `<id>:<name>`, and writes nothing.
+`InvalidRefspec`, which holds `@<id>:<name>`, and writes nothing.
 
 A directory under `refs/mirrors/` whose name fails the collection id rule stays
 in the repository. Prune and the ref writers of the port do not change it.
@@ -684,12 +684,22 @@ tool replaces. The `PREFIX` form of the path rule is in
 
 ### Revision syntax
 
-A revision names a commit in four ways:
+A revision names a commit in five ways:
 
 - a 64-character lowercase hex checksum;
 - an abbreviated checksum ("Abbreviated checksums");
 - a refspec;
-- one of these three, followed by one or more `^` characters.
+- a collection ref `@ID:NAME`, which is a port extension;
+- one of these four, followed by one or more `^` characters.
+
+The port reads `@ID:NAME` as the ref `NAME` of the collection `ID`:
+`refs/mirrors/ID/NAME`, or `refs/heads/NAME` when `ID` is the `[core]
+collection-id` of the repository. So `@ID:NAME` and `NAME` name the same ref
+in a repository whose collection id is `ID`. The text after `@` splits at its
+first `:`. `ID` follows the collection id rule, and `NAME` follows the
+ref-name rule ("Ref name validation"). The ref-name rule refuses `@`, so no
+refspec starts with `@`, and the form gives a new meaning to no refspec. An
+error of the port names a collection ref as `@ID:NAME`.
 
 Each `^` steps one generation back along the `parent` field of the commit. A
 walk past a root commit reports `error: Commit <checksum> has no parent` and
@@ -5084,8 +5094,8 @@ The pull writes `refs/mirrors/ID/REF`. It writes no ref under
 In a repository with `[core] collection-id=ID`, the pull writes
 `refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. Delta discovery
 and the timestamp check read the current commit of `refs/heads/REF`. A
-write of a collection ref through `Transaction::set_collection_ref`,
-`Repo::set_collection_ref_immediate`, `UpdateGuard::set_collection_ref`, or
+write of a collection ref through `Transaction::set_ref`,
+`Repo::set_ref_immediate`, `UpdateGuard::set_ref`, or
 `ostrya refs -c --create` follows the same rule. `ostree refs --collections
 --create=ID:REF` writes `refs/heads/REF` for the own collection id too
 (observed).
@@ -5103,11 +5113,11 @@ The port has no repair for such a ref. Remove it by hand.
 
 The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
 collection refs from a local repository. It reads each ref of the source with
-the rule of `Repo::resolve_collection_ref`: `refs/mirrors/ID/REF`, or
+the rule of `Repo::resolve_ref_tip`: `refs/mirrors/ID/REF`, or
 `refs/heads/REF` when `ID` is the `[core] collection-id` of the source. The
 probe of a local candidate reads
 the ref files with the same rule. A ref that the source does not hold fails
-the pull with `Error::RefNotFound`, which holds `ID:REF`. Each written ref
+the pull with `Error::RefNotFound`, which holds `@ID:REF`. Each written ref
 names the commit that the pull read from the source. Unless the caller sets
 `no_ref_writes`, the pull writes the refs at the place above, and delta
 discovery reads the `from` commit of a delta at the same place. The pull

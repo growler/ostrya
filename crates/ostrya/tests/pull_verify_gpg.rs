@@ -22,7 +22,7 @@ use common::TmpDir;
 use ostrya::{
     AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
     CreateOptions, DeltaOptions, Error, GpgSigner, MutableTree, OpenOptions, PullOptions,
-    PullVerify, RemotesDir, Repo, RepoMode,
+    PullVerify, Ref, RemotesDir, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -142,7 +142,7 @@ async fn source_repo(base: &Path) -> (Repo, Checksum) {
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }
@@ -216,7 +216,7 @@ async fn commit_marker(repo: &Repo, base: &Path, name: &str, parent: Option<Chec
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

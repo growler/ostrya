@@ -19,7 +19,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    MutableTree, ObjectType, Repo, RepoMode,
+    MutableTree, ObjectType, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -61,7 +61,7 @@ async fn commit_body(
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&commit));
+    txn.set_ref(&Ref::local(branch), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -219,7 +219,9 @@ fn a_prefix_stands_ahead_of_a_ref_of_the_same_name() {
             repo.resolve_rev(free, false).await,
             Err(Error::RefNotFound(_))
         ));
-        repo.set_ref_immediate(free, Some(&first)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local(free), Some(&first))
+            .await
+            .unwrap();
         assert_eq!(repo.resolve_rev(free, false).await.unwrap(), Some(first));
 
         // If the name of a ref is a prefix of a commit, the name resolves to

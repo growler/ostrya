@@ -46,7 +46,7 @@ use ostrya::{
     AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
     ComposefsImageState, CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock,
     Ed25519Signer, Error, FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify,
-    Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    Ref, Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
     static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
@@ -339,7 +339,9 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
         assert_partial_marker(&dest_dir, &commit);
         assert!(!commitmeta(&dest_dir).exists(), "no detached metadata");
         assert_eq!(
-            dest.resolve_ref_tip("origin:test/main").await.unwrap(),
+            dest.resolve_ref_tip(&Ref::remote("origin", "test/main"))
+                .await
+                .unwrap(),
             None
         );
         guard.finish().await.unwrap();
@@ -356,7 +358,9 @@ fn a_pull_that_times_out_at_the_ref_step_keeps_its_markers() {
             std::fs::read(commitmeta(&dir.path().join("remote"))).unwrap()
         );
         assert_eq!(
-            dest.resolve_ref_tip("origin:test/main").await.unwrap(),
+            dest.resolve_ref_tip(&Ref::remote("origin", "test/main"))
+                .await
+                .unwrap(),
             Some(commit)
         );
     });
@@ -398,7 +402,12 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
             b.pull("origin", opts).await
         });
         wait_for_commit_under_guard(&a, &commit, &mut task).await;
-        assert_eq!(a.resolve_ref_tip("origin:test/main").await.unwrap(), None);
+        assert_eq!(
+            a.resolve_ref_tip(&Ref::remote("origin", "test/main"))
+                .await
+                .unwrap(),
+            None
+        );
         assert_partial_marker(&dest_dir, &commit);
         assert!(!commitmeta(&dest_dir).exists(), "no detached metadata");
         assert!(poll_once(&mut task).await.is_none(), "the pull waits");
@@ -406,7 +415,9 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
 
         within("the pull", task).await.unwrap();
         assert_eq!(
-            a.resolve_ref_tip("origin:test/main").await.unwrap(),
+            a.resolve_ref_tip(&Ref::remote("origin", "test/main"))
+                .await
+                .unwrap(),
             Some(commit)
         );
         assert!(
@@ -6244,7 +6255,7 @@ async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
     // A local pull of a checksum writes a ref with that name. This destination
     // does not keep the ref.
     let txn = dest.transaction().await.unwrap();
-    txn.set_ref(&commit.to_hex(), None);
+    txn.set_ref(&Ref::local(commit.to_hex()), None);
     txn.commit().await.unwrap();
     assert!(dest.list_refs(None).await.unwrap().is_empty());
     dest
@@ -6427,7 +6438,7 @@ fn required_deltas_pass_a_declined_from_scratch_delta() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = dest_holding(dir.path(), &server.url(), &first).await;
         let txn = dest.transaction().await.unwrap();
-        txn.set_ref("origin:test/main", Some(&first));
+        txn.set_ref(&Ref::remote("origin", "test/main"), Some(&first));
         txn.commit().await.unwrap();
         server.forget();
 
@@ -6961,7 +6972,7 @@ fn a_target_that_is_an_intermediate_commit_of_another_target() {
         let c = chain_commit(&remote, dir.path(), "c", "test/mid", Some(b), 2).await;
         let d = chain_commit(&remote, dir.path(), "d", "test/main", Some(c), 3).await;
         let txn = remote.transaction().await.unwrap();
-        txn.set_ref("test/alias", Some(&c));
+        txn.set_ref(&Ref::local("test/alias"), Some(&c));
         txn.commit().await.unwrap();
         sign_commits(&remote, &[a, b, c, d]).await;
         let mut list = Vec::new();
@@ -7463,7 +7474,7 @@ fn a_target_refused_by_its_ref_binding_requests_no_part() {
         let dir = TmpDir::new("pull-http-chain-target-binding");
         let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
         let txn = remote.transaction().await.unwrap();
-        txn.set_ref("test/alias", Some(&d));
+        txn.set_ref(&Ref::local("test/alias"), Some(&d));
         txn.commit().await.unwrap();
         let mut list = Vec::new();
         for (from, to) in [(a, b), (b, c), (c, d)] {
@@ -7503,7 +7514,7 @@ fn a_target_with_another_ref_binding_pulls_with_the_check_disabled() {
         let dir = TmpDir::new("pull-http-chain-target-binding-off");
         let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
         let txn = remote.transaction().await.unwrap();
-        txn.set_ref("test/alias", Some(&d));
+        txn.set_ref(&Ref::local("test/alias"), Some(&d));
         txn.commit().await.unwrap();
         let mut list = Vec::new();
         for (from, to) in [(a, b), (b, c), (c, d)] {
@@ -7926,7 +7937,7 @@ fn a_pull_with_no_ref_writes_keeps_the_ref_and_completes_the_commit() {
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
         let txn = dest.transaction().await.unwrap();
-        txn.set_ref("origin:test/main", Some(&first));
+        txn.set_ref(&Ref::remote("origin", "test/main"), Some(&first));
         txn.commit().await.unwrap();
         let dest_dir = dir.path().join("dest");
         let refs = file_inventory(&dest_dir, "refs");
@@ -9277,7 +9288,7 @@ async fn build_dependency_remote(dir: &Path) -> (Repo, Checksum, Checksum) {
 /// Sets the ref `name` of `repo` to `commit` and regenerates the summary.
 async fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
     let txn = repo.transaction().await.unwrap();
-    txn.set_ref(name, Some(commit));
+    txn.set_ref(&Ref::local(name), Some(commit));
     txn.commit().await.unwrap();
     summarize(repo).await;
 }

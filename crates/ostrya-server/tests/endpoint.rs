@@ -46,7 +46,7 @@ use ostrya::remote::{
 };
 use ostrya::{
     Checksum, Commit, CreateOptions, HookFuture, HookRefusal, HostEntry, ObjectName, ObjectType,
-    ReceiveHooks, ReceivePolicy, ReceiveReport, Repo, RepoMode, Type, UpdatePlan, Value,
+    ReceiveHooks, ReceivePolicy, ReceiveReport, Ref, Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_fetch::{
     BearerToken, FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer, TrustRoots,
@@ -492,7 +492,7 @@ impl ReceiveHooks for HostHooks {
             let moved = self.state.move_ref.lock().unwrap().take();
             if let Some((name, commit)) = moved {
                 self.repo
-                    .set_ref_immediate(&name, Some(&commit))
+                    .set_ref_immediate(&Ref::local(&name), Some(&commit))
                     .await
                     .map_err(|e| HookRefusal::internal(e.to_string()))?;
             }

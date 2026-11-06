@@ -3077,6 +3077,7 @@ async fn fetch_part_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Ref;
     use crate::pull::TimestampBase;
     use ostrya_core::Type;
 
@@ -3269,7 +3270,9 @@ mod tests {
             let d = commit(&src, Some(c), b"d").await;
             let x = commit(&src, Some(a), b"x").await;
             let y = commit(&src, Some(x), b"y").await;
-            src.set_ref_immediate("main", Some(&a)).await.unwrap();
+            src.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
             let opts = PullOptions {
                 refs: vec!["main".to_owned()],
                 ..PullOptions::default()

@@ -197,10 +197,10 @@ pub use object::MAX_METADATA_SIZE;
 pub use ostrya_composefs::Image;
 pub use ostrya_core::base64;
 pub use ostrya_core::{
-    Checksum, Commit, DictBuilder, DirMeta, DirTree, KeyFile, ObjectName, ObjectType, RefPattern,
-    RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
-    is_checksum_shaped, is_collection_id, loose_path, source_date_epoch, to_text,
-    to_text_unannotated,
+    Checksum, Commit, DictBuilder, DirMeta, DirTree, KeyFile, ObjectName, ObjectType,
+    ParseRefError, Ref, RefPattern, RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs,
+    from_bytes, from_text, is_checksum_shaped, is_collection_id, loose_path, source_date_epoch,
+    to_text, to_text_unannotated,
 };
 pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,
@@ -224,7 +224,7 @@ pub use receive::{
     ServerSigner, StreamPolicy, StreamRule, UpdatePlan,
 };
 #[doc(hidden)]
-pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
+pub use refs::{CollectionRefEntry, RefAlias, validate_refspec};
 pub use related::{CommitRelated, RelatedField, RelatedWarning};
 #[doc(hidden)]
 pub use repo::{CreateOptions, OpenOptions, RemotesDir, Repo};

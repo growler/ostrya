@@ -25,7 +25,7 @@ use std::process::Command;
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    MutableTree, Repo, RepoMode,
+    MutableTree, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 use std::os::fd::AsFd;
@@ -78,7 +78,7 @@ async fn commit_source(repo: &Repo, base: &Path) -> Result<Checksum, Error> {
     .await?;
     let root = txn.write_mtree(&mut mtree).await?;
     let commit = txn.write_commit(CommitOptions::default(), &root).await?;
-    txn.set_ref("test/main", Some(&commit));
+    txn.set_ref(&Ref::local("test/main"), Some(&commit));
     txn.commit().await?;
     Ok(commit)
 }

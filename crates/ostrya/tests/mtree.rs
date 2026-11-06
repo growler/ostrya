@@ -23,7 +23,7 @@ use common::{
 };
 use futures_lite::io::Cursor;
 use ostrya::{
-    Checksum, CommitOptions, CreateOptions, Error, FileMeta, MutableTree, Repo, RepoMode,
+    Checksum, CommitOptions, CreateOptions, Error, FileMeta, MutableTree, Ref, Repo, RepoMode,
 };
 use ostrya_core::{DirMeta, ObjectType, Xattrs, loose_path};
 use ostrya_rt::block_on;
@@ -287,7 +287,7 @@ async fn two_level_repo(root: &Path) -> (Repo, Checksum) {
         .write_commit(CommitOptions::default(), &rt)
         .await
         .unwrap();
-    txn.set_ref("test/main", Some(&commit));
+    txn.set_ref(&Ref::local("test/main"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, root_dirtree)
 }

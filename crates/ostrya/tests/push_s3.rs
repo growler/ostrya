@@ -41,7 +41,7 @@ use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
     DictBuilder, DirTree, Ed25519Signer, Error, MutableTree, ObjectType, PullOptions,
-    PushOntoOptions, Repo, RepoMode, RepoPushOptions, Value,
+    PushOntoOptions, Ref, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -167,7 +167,7 @@ async fn commit_related(
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&checksum));
+    txn.set_ref(&Ref::local(branch), Some(&checksum));
     txn.commit().await.unwrap();
     checksum
 }
@@ -964,7 +964,7 @@ fn holds_commit(server: &StandIn, commit: &Checksum) -> bool {
 /// Points the ref `name` of `repo` at `commit`.
 async fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
     let txn = repo.transaction().await.unwrap();
-    txn.set_ref(name, Some(commit));
+    txn.set_ref(&Ref::local(name), Some(commit));
     txn.commit().await.unwrap();
 }
 

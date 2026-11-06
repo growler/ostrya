@@ -30,7 +30,7 @@ use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, ComposefsImageState, DictBuilder, Ed25519Verifier, Error, FsckOptions,
     ObjectName, ObjectType, ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep,
-    ReceiveVerify, Repo, RepoMode, Summary, SummaryOptions, Type, Value,
+    ReceiveVerify, Ref, Repo, RepoMode, Summary, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -1015,7 +1015,7 @@ fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
     let tmp = TmpDir::new("recv-hex-delete");
     let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
     let hex = "a".repeat(64);
-    block_on(repo.set_ref_immediate(&hex, Some(&fixture_commit()))).unwrap();
+    block_on(repo.set_ref_immediate(&Ref::local(&hex), Some(&fixture_commit()))).unwrap();
     let path = format!("refs/heads/{hex}");
     assert_eq!(ref_file(&repo, &path), Some(format!("{COMMIT}\n")));
     let allow = policy_allowing(&["rd:**"]);
@@ -3229,11 +3229,11 @@ fn a_session_and_a_regeneration_complete_with_no_self_wait() {
         false,
     ));
     assert_eq!(report.warnings, vec![]);
-    let first = block_on(repo.resolve_ref_tip("ostree-metadata"))
+    let first = block_on(repo.resolve_ref_tip(&Ref::local("ostree-metadata")))
         .unwrap()
         .unwrap();
     block_on(repo.regenerate_summary(&SummaryOptions::default())).unwrap();
-    let second = block_on(repo.resolve_ref_tip("ostree-metadata"))
+    let second = block_on(repo.resolve_ref_tip(&Ref::local("ostree-metadata")))
         .unwrap()
         .unwrap();
     assert_ne!(first, second, "the regeneration refreshed the anchor");
@@ -3246,7 +3246,7 @@ fn a_session_and_a_regeneration_complete_with_no_self_wait() {
 /// root anchor.
 fn anchor_chain(repo: &Repo) -> Vec<Checksum> {
     let mut chain = Vec::new();
-    let mut next = block_on(repo.resolve_ref_tip("ostree-metadata")).unwrap();
+    let mut next = block_on(repo.resolve_ref_tip(&Ref::local("ostree-metadata"))).unwrap();
     while let Some(anchor) = next {
         chain.push(anchor);
         let bytes = block_on(repo.load_object_bytes(ObjectType::Commit, &anchor)).unwrap();
@@ -3615,7 +3615,7 @@ fn a_collection_repo_writes_the_anchor_in_the_session() {
     ));
     assert_eq!(report.warnings, vec![]);
     let anchor = |repo: &Repo| {
-        let tip = block_on(repo.resolve_ref_tip("ostree-metadata"))
+        let tip = block_on(repo.resolve_ref_tip(&Ref::local("ostree-metadata")))
             .unwrap()
             .expect("the anchor ref");
         let bytes = block_on(repo.load_object_bytes(ObjectType::Commit, &tip)).unwrap();

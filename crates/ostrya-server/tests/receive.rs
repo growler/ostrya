@@ -31,9 +31,9 @@ use ostrya::remote::proto::{
 };
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    MutableTree, ObjectName, ObjectType, PruneOptions, ReceivePolicies, ReceiveReport, RefSelector,
-    Repo, RepoMode, loose_path,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
+    ObjectName, ObjectType, PruneOptions, ReceivePolicies, ReceiveReport, Ref, RefSelector, Repo,
+    RepoMode, loose_path,
 };
 use ostrya_rt::{Timer, block_on};
 use ostrya_server::{ServeOptions, ServerEvent, ServerTls};
@@ -2752,12 +2752,12 @@ async fn served(base: &Path) -> (Repo, Checksum) {
     };
     let commit = txn.write_commit(options, &tree).await.unwrap();
     for name in ["main", "pool/a"] {
-        txn.set_ref(name, Some(&commit));
+        txn.set_ref(&Ref::local(name), Some(&commit));
     }
     for name in ["main", "pool/a", "pool/x/b"] {
-        txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&commit));
+        txn.set_ref(&Ref::collection(ID, name), Some(&commit));
     }
-    txn.set_collection_ref(&CollectionRef::new(OTHER, "c"), Some(&commit));
+    txn.set_ref(&Ref::collection(OTHER, "c"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }

@@ -25,7 +25,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    FilterResult, MutableTree, Repo, RepoMode, TreeEntry,
+    FilterResult, MutableTree, Ref, Repo, RepoMode, TreeEntry,
 };
 use ostrya_rt::block_on;
 
@@ -93,7 +93,7 @@ async fn commit_dir(
         .write_commit(CommitOptions::default(), &root)
         .await
         .unwrap();
-    txn.set_ref(refname, Some(&commit));
+    txn.set_ref(&Ref::local(refname), Some(&commit));
     txn.commit().await.unwrap();
 }
 

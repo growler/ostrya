@@ -40,7 +40,8 @@ use std::path::Path;
 
 use ostrya::{
     Checksum, CommitOptions, CommitState, ComposefsImageState, DeltaOptions, Error, FsckOptions,
-    MutableTree, ObjectType, PullFlags, PullOptions, Repo, RepoMode, RepoTree, Transaction, Value,
+    MutableTree, ObjectType, PullFlags, PullOptions, Ref, Repo, RepoMode, RepoTree, Transaction,
+    Value,
 };
 use ostrya_rt::block_on;
 
@@ -108,7 +109,7 @@ async fn commit_keyed(
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -135,7 +136,7 @@ async fn commit_with(
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     (commit, txn.commit().await)
 }
 

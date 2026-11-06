@@ -25,7 +25,7 @@ use ostrya::remote;
 use ostrya::remote::s3::Bucket;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    MutableTree, ObjectName, ObjectType, Repo, RepoMode,
+    MutableTree, ObjectName, ObjectType, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -184,7 +184,10 @@ async fn commit_tree(repo: &Repo, tree: &Path, name: &str, parent: Option<Checks
         )
         .await
         .unwrap();
-    txn.set_ref(name.trim_end_matches(char::is_numeric), Some(&checksum));
+    txn.set_ref(
+        &Ref::local(name.trim_end_matches(char::is_numeric)),
+        Some(&checksum),
+    );
     txn.commit().await.unwrap();
     checksum
 }

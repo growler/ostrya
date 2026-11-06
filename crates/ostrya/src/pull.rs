@@ -209,7 +209,7 @@ use std::time::{Duration, Instant};
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{
-    Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, RepoMode, Value,
+    Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, Ref, RepoMode, Value,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
 use sha2::{Digest, Sha256};
@@ -217,9 +217,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
-use crate::refs::{
-    CollectionRef, collection_ref_label, collection_ref_to_relpath, refspec_to_relpath,
-};
+use crate::refs::{ref_relpath, refspec_ref};
 use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
@@ -366,7 +364,7 @@ pub enum TimestampCheck {
     ///
     /// The check reads the ref that the pull writes. Under the
     /// `[core] collection-id` of this repository, a collection pull reads
-    /// `refs/heads/<name>`, as [`Repo::resolve_collection_ref`] does.
+    /// `refs/heads/<name>`, as [`Repo::resolve_ref_tip`] does.
     ///
     /// A ref that this repository does not hold passes.
     CurrentRef,
@@ -625,14 +623,14 @@ pub struct PullOptions {
     ///
     /// With an id, [`Repo::pull_local`] resolves each name in
     /// [`refs`](PullOptions::refs) as the collection ref of the id in the
-    /// source, with the rule of [`Repo::resolve_collection_ref`]. It reads
+    /// source, with the rule of [`Repo::resolve_ref_tip`]. It reads
     /// `refs/mirrors/<id>/<name>`. If the `[core] collection-id` of the source
     /// is the id, it reads `refs/heads/<name>` of the source, and it does not
     /// read `refs/mirrors/<id>/`. The name is a ref name alone: the pull reads a checksum,
     /// an abbreviated checksum, and an ancestry suffix as part of the name.
     ///
     /// If the source holds no collection ref for a name, the pull fails with
-    /// [`Error::RefNotFound`], which carries `<id>:<name>`. A ref path that
+    /// [`Error::RefNotFound`], which carries `@<id>:<name>`. A ref path that
     /// names a directory, or that goes through a file, fails the same way. If
     /// the read of a ref file fails with another error, for example `EACCES`,
     /// the pull fails with [`Error::Io`].
@@ -666,7 +664,7 @@ pub struct PullOptions {
     /// The id needs at least one name in [`refs`](PullOptions::refs). Without
     /// a name the local pull fails with [`Error::Unsupported`]. If the ref
     /// store refuses the id or a name, or if a name holds `:`, the pull fails
-    /// with [`Error::InvalidRefspec`], which carries `<id>:<name>`. The local
+    /// with [`Error::InvalidRefspec`], which carries `@<id>:<name>`. The local
     /// pull makes these checks in this order, before it reads the source.
     ///
     /// The pull refuses a `:` with and without `no_ref_writes`. With
@@ -1289,7 +1287,7 @@ impl Repo {
     /// With [`collection_id`](PullOptions::collection_id), each name in
     /// [`refs`](PullOptions::refs) is the collection ref of the id in `src`,
     /// read as a ref name alone with the rule of
-    /// [`Repo::resolve_collection_ref`]: `refs/mirrors/<id>/<name>`, or
+    /// [`Repo::resolve_ref_tip`]: `refs/mirrors/<id>/<name>`, or
     /// `refs/heads/<name>` if the `[core] collection-id` of `src` is the id.
     /// Without
     /// `no_ref_writes`, the pull writes the refs of the collection and checks
@@ -1737,7 +1735,7 @@ impl Repo {
     ///   superblock of a target or of a step fail the policy, or if the policy
     ///   covers the summary and `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
-    ///   collection ref. For a collection ref, the error holds `ID:NAME`.
+    ///   collection ref. For a collection ref, the error holds `@ID:NAME`.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
     ///   holds a dependency or an object that a pulled commit reaches. Also if
     ///   a dirtree that this repository holds is a symlink that points to no
@@ -2653,15 +2651,6 @@ pub(crate) fn partial_path(commit: &Checksum) -> String {
     format!("state/{}.commitpartial", commit.to_hex())
 }
 
-/// Returns the refspec of a pulled ref: `remote:ref` if a remote name is
-/// given, and the bare ref name otherwise.
-fn refspec(remote: Option<&str>, ref_name: &str) -> String {
-    match remote {
-        Some(remote) => format!("{remote}:{ref_name}"),
-        None => ref_name.to_owned(),
-    }
-}
-
 /// The place of the refs of a pull.
 ///
 /// The pull writes each pulled ref at this place. Delta discovery, the
@@ -2704,22 +2693,22 @@ impl<'a> RefPlace<'a> {
     /// [`Error::InvalidRefspec`] if the place and the name give no valid ref
     /// path.
     pub(crate) fn ref_path(self, name: &str) -> Result<String> {
-        match self {
-            RefPlace::Heads => refspec_to_relpath(name),
-            RefPlace::Remote(remote) => refspec_to_relpath(&refspec(Some(remote), name)),
-            RefPlace::Collection(id) => collection_ref_to_relpath(&CollectionRef::new(id, name)),
-        }
+        ref_relpath(None, &self.named(name))
     }
 
     /// Queues the write of the ref `name` at this place, to the commit `tip`,
     /// in `txn`.
     pub(crate) fn queue(self, txn: &Transaction, name: &str, tip: &Checksum) {
+        txn.set_ref(&self.named(name), Some(tip));
+    }
+
+    /// Returns the ref `name` at this place. At [`RefPlace::Heads`], `name`
+    /// is a refspec.
+    fn named(self, name: &str) -> Ref {
         match self {
-            RefPlace::Heads => txn.set_ref(name, Some(tip)),
-            RefPlace::Remote(remote) => txn.set_ref(&refspec(Some(remote), name), Some(tip)),
-            RefPlace::Collection(id) => {
-                txn.set_collection_ref(&CollectionRef::new(id, name), Some(tip));
-            }
+            RefPlace::Heads => refspec_ref(name),
+            RefPlace::Remote(remote) => Ref::remote(remote, name),
+            RefPlace::Collection(id) => Ref::collection(id, name),
         }
     }
 }
@@ -2729,10 +2718,10 @@ impl<'a> RefPlace<'a> {
 ///
 /// With [`collection_id`](PullOptions::collection_id), each name is the
 /// collection ref of the id in `src`, which the function reads as
-/// [`Repo::resolve_collection_ref`] does, and the target keeps the name
-/// alone. [`check_local_collection`] checked the names. A ref path that names
-/// a directory, or that goes through a file, holds no ref and fails as an
-/// absent ref does, with [`Error::RefNotFound`] and the text `ID:NAME`.
+/// [`Repo::resolve_ref_tip`] does, and the target keeps the name alone.
+/// [`check_local_collection`] checked the names. A ref path that names a
+/// directory, or that goes through a file, holds no ref and fails as an
+/// absent ref does, with [`Error::RefNotFound`] and the text `@ID:NAME`.
 async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, Checksum)>> {
     if opts.refs.is_empty() {
         return src.list_refs(None).await;
@@ -2741,8 +2730,8 @@ async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, 
     match opts.collection_id.as_deref() {
         Some(id) => {
             for name in &opts.refs {
-                let cref = CollectionRef::new(id, name.as_str());
-                let checksum = match src.resolve_collection_ref(&cref, true).await {
+                let r = Ref::collection(id, name.as_str());
+                let checksum = match src.resolve_ref_tip(&r).await {
                     Err(Error::Io(e))
                         if matches!(
                             e.kind(),
@@ -2753,8 +2742,7 @@ async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, 
                     }
                     other => other?,
                 };
-                let checksum =
-                    checksum.ok_or_else(|| Error::RefNotFound(collection_ref_label(&cref)))?;
+                let checksum = checksum.ok_or_else(|| Error::RefNotFound(r.to_string()))?;
                 out.push((name.clone(), checksum));
             }
         }
@@ -3559,7 +3547,7 @@ enum LocalWanted<'a> {
     /// The refs of [`refs`](PullOptions::refs), or each ref under
     /// `refs/heads` of the source if the list is empty. The pull reads the
     /// commit of each ref from the source. With a collection id, it reads
-    /// each name as [`Repo::resolve_collection_ref`] reads the collection ref
+    /// each name as [`Repo::resolve_ref_tip`] reads the collection ref
     /// of the id ([`resolve_targets`]).
     Named,
     /// The refs of a collection pull from a local candidate, each at the
@@ -3576,7 +3564,7 @@ enum LocalWanted<'a> {
 ///
 /// The function refuses a pull that names no ref, because an empty list reads
 /// `refs/heads` and no collection ref. It then refuses each name that holds
-/// `:`, and each name that [`CollectionRef::validate`] refuses with the id.
+/// `:`, and each name that [`Ref::validate`] refuses with the id.
 /// Delta discovery reads the name as a refspec, where a `:` changes what the
 /// name refers to.
 ///
@@ -3593,9 +3581,9 @@ fn check_local_collection(opts: &PullOptions) -> Result<()> {
     }
     for name in &opts.refs {
         if name.contains(':') {
-            return Err(Error::InvalidRefspec(format!("{id}:{name}")));
+            return Err(Error::InvalidRefspec(format!("@{id}:{name}")));
         }
-        CollectionRef::new(id.as_str(), name.as_str()).validate()?;
+        Ref::collection(id.as_str(), name.as_str()).validate()?;
     }
     Ok(())
 }
@@ -4210,12 +4198,6 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn refspec_uses_the_remote_when_given() {
-        assert_eq!(refspec(None, "test/main"), "test/main");
-        assert_eq!(refspec(Some("origin"), "test/main"), "origin:test/main");
-    }
 
     #[test]
     fn a_ref_place_gives_the_path_of_its_refs() {

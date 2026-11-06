@@ -33,6 +33,9 @@ pub enum Error {
         ty: ObjectType,
     },
     /// A refspec that does not resolve to a commit.
+    ///
+    /// The payload is the ref as text: `<name>`, `<remote>:<name>`, or
+    /// `@<collection-id>:<name>` for a collection ref.
     #[error("ref not found: {0}")]
     RefNotFound(String),
     /// A remote with no `[remote "<name>"]` group in the configuration.
@@ -55,9 +58,11 @@ pub enum Error {
     /// - a remote element or a collection element that holds a `/`
     /// - an interior NUL
     ///
-    /// The payload is the refspec as the caller gave it. If the refspec has a
-    /// remote or a collection, the payload has the form `<remote>:<name>` or
-    /// `<collection-id>:<name>`.
+    /// The payload is the refspec as the caller gave it. A [`Ref`] value
+    /// gives its text: `<name>`, `<remote>:<name>`, or
+    /// `@<collection-id>:<name>` for a collection ref.
+    ///
+    /// [`Ref`]: crate::Ref
     #[error("invalid refspec: {0}")]
     InvalidRefspec(String),
     /// An abbreviated checksum that is the prefix of two or more commit
@@ -701,6 +706,14 @@ pub enum Error {
 impl From<rustix::io::Errno> for Error {
     fn from(errno: rustix::io::Errno) -> Error {
         Error::Io(errno.into())
+    }
+}
+
+impl From<ostrya_core::ParseRefError> for Error {
+    /// Maps a ref that fails the ref-name rule to [`Error::InvalidRefspec`]
+    /// with the text of the ref.
+    fn from(err: ostrya_core::ParseRefError) -> Error {
+        Error::InvalidRefspec(err.as_str().to_owned())
     }
 }
 

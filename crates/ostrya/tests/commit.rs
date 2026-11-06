@@ -27,9 +27,8 @@ use common::{
     ostree_available,
 };
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    DirMeta, FileMeta, MutableTree, ObjectType, Repo, RepoMode, RepoTree, Transaction, TreeEntry,
-    Type, Value,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, FileMeta,
+    MutableTree, ObjectType, Ref, Repo, RepoMode, RepoTree, Transaction, TreeEntry, Type, Value,
 };
 use ostrya_core::{Xattrs, loose_path};
 use ostrya_rt::block_on;
@@ -158,7 +157,7 @@ fn commit_object_is_byte_identical_across_modes() {
                 csum(COMMIT),
                 "{mode:?} commit checksum matches the tool"
             );
-            txn.set_ref("test/main", Some(&commit));
+            txn.set_ref(&Ref::local("test/main"), Some(&commit));
             txn.commit().await.unwrap();
 
             assert_eq!(
@@ -209,7 +208,7 @@ fn generate_sizes_commit_matches_the_fixture() {
             .await
             .unwrap();
         assert_eq!(commit, csum(SIZES_COMMIT), "generate-sizes commit checksum");
-        txn.set_ref("test/main", Some(&commit));
+        txn.set_ref(&Ref::local("test/main"), Some(&commit));
         txn.commit().await.unwrap();
 
         assert_eq!(
@@ -395,7 +394,7 @@ fn set_ref_immediate_writes_and_removes() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("branch/one", Some(&commit))
+        repo.set_ref_immediate(&Ref::local("branch/one"), Some(&commit))
             .await
             .unwrap();
         assert_eq!(
@@ -406,7 +405,9 @@ fn set_ref_immediate_writes_and_removes() {
         let ref_path = root_dir.join("refs/heads/branch/one");
         assert_eq!(std::fs::metadata(&ref_path).unwrap().len(), 65);
 
-        repo.set_ref_immediate("branch/one", None).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("branch/one"), None)
+            .await
+            .unwrap();
         assert!(!ref_path.exists(), "a None checksum removes the ref");
         assert_eq!(repo.resolve_rev("branch/one", true).await.unwrap(), None);
     });
@@ -441,16 +442,14 @@ fn ref_writes_run_under_both_fsync_settings() {
 
             // A nested local ref, a remote ref, and a collection ref. Their parents are
             // one, two, and two levels under `refs/`.
-            repo.set_ref_immediate("branch/one", Some(&a))
+            repo.set_ref_immediate(&Ref::local("branch/one"), Some(&a))
                 .await
                 .unwrap();
-            repo.set_ref_immediate("origin:branch/two", Some(&b))
+            repo.set_ref_immediate(&Ref::remote("origin", "branch/two"), Some(&b))
                 .await
                 .unwrap();
-            let cref = CollectionRef::new("org.example.Coll", "three");
-            repo.set_collection_ref_immediate(&cref, Some(&a))
-                .await
-                .unwrap();
+            let cref = Ref::collection("org.example.Coll", "three");
+            repo.set_ref_immediate(&cref, Some(&a)).await.unwrap();
             assert_eq!(
                 repo.resolve_rev("branch/one", false).await.unwrap(),
                 Some(a)
@@ -471,8 +470,10 @@ fn ref_writes_run_under_both_fsync_settings() {
                 Some(a)
             );
 
-            repo.set_ref_immediate("branch/alias", None).await.unwrap();
-            repo.set_ref_immediate("origin:branch/two", None)
+            repo.set_ref_immediate(&Ref::local("branch/alias"), None)
+                .await
+                .unwrap();
+            repo.set_ref_immediate(&Ref::remote("origin", "branch/two"), None)
                 .await
                 .unwrap();
             assert!(!alias.exists());
@@ -483,7 +484,7 @@ fn ref_writes_run_under_both_fsync_settings() {
 
             // A ref write of a transaction takes the same path.
             let txn = repo.transaction().await.unwrap();
-            txn.set_ref("branch/four", Some(&b));
+            txn.set_ref(&Ref::local("branch/four"), Some(&b));
             txn.commit().await.unwrap();
             assert_eq!(
                 repo.resolve_rev("branch/four", false).await.unwrap(),
@@ -510,14 +511,18 @@ fn set_ref_over_alias_replaces_symlink() {
             .unwrap();
         // A concrete ref test/bar -> A, then an alias test/foo -> bar. The alias is a
         // relative symlink, as the `ostree` command writes it.
-        repo.set_ref_immediate("test/bar", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test/bar"), Some(&a))
+            .await
+            .unwrap();
         let heads = root_dir.join("refs/heads/test");
         std::os::unix::fs::symlink("bar", heads.join("foo")).unwrap();
         // The read path follows the alias to A.
         assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(a));
 
         // A write of B onto the alias replaces the symlink with a regular file.
-        repo.set_ref_immediate("test/foo", Some(&b)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("test/foo"), Some(&b))
+            .await
+            .unwrap();
         let foo_meta = std::fs::symlink_metadata(heads.join("foo")).unwrap();
         assert!(
             foo_meta.file_type().is_file(),
@@ -545,11 +550,13 @@ fn check_refs_path_reports_a_path_through_a_ref_file() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("plain", Some(&a)).await.unwrap();
-        repo.set_ref_immediate("deep/nest/ing", Some(&a))
+        repo.set_ref_immediate(&Ref::local("plain"), Some(&a))
             .await
             .unwrap();
-        repo.set_ref_immediate("origin:rr/x", Some(&a))
+        repo.set_ref_immediate(&Ref::local("deep/nest/ing"), Some(&a))
+            .await
+            .unwrap();
+        repo.set_ref_immediate(&Ref::remote("origin", "rr/x"), Some(&a))
             .await
             .unwrap();
         repo.set_ref_alias_immediate("al", "plain").await.unwrap();
@@ -604,7 +611,9 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("plain", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("plain"), Some(&a))
+            .await
+            .unwrap();
 
         // The lowercase form resolves to itself, also if the object store does not
         // hold the commit.
@@ -621,7 +630,9 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
         }
 
         // A ref with such a name resolves through the ref file.
-        repo.set_ref_immediate(&upper, Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local(&upper), Some(&a))
+            .await
+            .unwrap();
         assert_eq!(repo.resolve_rev(&upper, false).await.unwrap(), Some(a));
 
         // The lenient parser reads the content of a ref file. This is the one case
@@ -649,7 +660,7 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("deep/nest/ing", Some(&a))
+        repo.set_ref_immediate(&Ref::local("deep/nest/ing"), Some(&a))
             .await
             .unwrap();
         assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
@@ -715,7 +726,9 @@ fn ref_writes_place_no_temp_beside_the_target() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("base", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("base"), Some(&a))
+            .await
+            .unwrap();
         let fanout = root_dir.join("objects").join(&COMMIT[..2]);
         assert!(!fanout.exists(), "the fanout directory starts absent");
 
@@ -724,7 +737,8 @@ fn ref_writes_place_no_temp_beside_the_target() {
 
         let notdir = rustix::io::Errno::NOTDIR;
         assert_errno(
-            repo.set_ref_immediate("dir/one", Some(&a)).await,
+            repo.set_ref_immediate(&Ref::local("dir/one"), Some(&a))
+                .await,
             notdir,
             "immediate ref write",
         );
@@ -735,7 +749,7 @@ fn ref_writes_place_no_temp_beside_the_target() {
         );
         let guard = repo.begin_update().await.unwrap();
         assert_errno(
-            guard.set_ref("dir/two", Some(&a)).await,
+            guard.set_ref(&Ref::local("dir/two"), Some(&a)).await,
             notdir,
             "guarded ref write",
         );
@@ -770,13 +784,19 @@ fn ref_writes_create_a_missing_tmp() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("gone", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("gone"), Some(&a))
+            .await
+            .unwrap();
 
         std::fs::remove_dir_all(&tmp_dir).unwrap();
-        repo.set_ref_immediate("gone", None).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("gone"), None)
+            .await
+            .unwrap();
         assert!(!tmp_dir.exists(), "a ref removal does not create tmp/");
 
-        repo.set_ref_immediate("dir/one", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("dir/one"), Some(&a))
+            .await
+            .unwrap();
         assert!(tmp_dir.is_dir());
         assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
 
@@ -822,7 +842,9 @@ fn a_ref_name_of_name_max_bytes_is_written() {
             .unwrap();
         let name = format!("long/{leaf}");
         let alias_name = format!("long/{alias}");
-        repo.set_ref_immediate(&name, Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local(&name), Some(&a))
+            .await
+            .unwrap();
         repo.set_ref_alias_immediate(&alias_name, &name)
             .await
             .unwrap();
@@ -857,11 +879,13 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        repo.set_ref_immediate("kept", Some(&a)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("kept"), Some(&a))
+            .await
+            .unwrap();
         std::fs::remove_dir_all(root_dir.join("tmp")).unwrap();
         std::os::unix::fs::symlink(&other, root_dir.join("tmp")).unwrap();
 
-        let first = repo.set_ref_immediate("kept", Some(&b)).await;
+        let first = repo.set_ref_immediate(&Ref::local("kept"), Some(&b)).await;
         if first.is_ok() {
             use std::os::unix::fs::MetadataExt;
             let same_device = std::fs::metadata(&other).unwrap().dev()
@@ -874,7 +898,8 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
         let xdev = rustix::io::Errno::XDEV;
         assert_errno(first, xdev, "ref write over an existing ref");
         assert_errno(
-            repo.set_ref_immediate("dir/new", Some(&b)).await,
+            repo.set_ref_immediate(&Ref::local("dir/new"), Some(&b))
+                .await,
             xdev,
             "ref write of a new ref",
         );
@@ -953,7 +978,7 @@ fn two_transactions_commit_concurrently() {
                     )
                     .await
                     .unwrap();
-                txn.set_ref(branch, Some(&commit));
+                txn.set_ref(&Ref::local(branch), Some(&commit));
                 txn.commit().await.unwrap();
                 commit
             })
@@ -1011,7 +1036,7 @@ fn bare_user_only_commit_matches_the_tool() {
             .write_commit(fixture_commit_options(), &root)
             .await
             .unwrap();
-        txn.set_ref("test/main", Some(&commit));
+        txn.set_ref(&Ref::local("test/main"), Some(&commit));
         txn.commit().await.unwrap();
     });
 
@@ -1109,7 +1134,7 @@ fn tool_accepts_a_port_created_commit() {
             .write_commit(fixture_commit_options(), &root)
             .await
             .unwrap();
-        txn.set_ref("test/main", Some(&commit));
+        txn.set_ref(&Ref::local("test/main"), Some(&commit));
         txn.commit().await.unwrap();
     });
 
@@ -1179,8 +1204,8 @@ fn multi_commit_sizes_are_scoped_to_each_root() {
             .await
             .unwrap();
         assert_ne!(commit_a, commit_b);
-        txn.set_ref("multi/a", Some(&commit_a));
-        txn.set_ref("multi/b", Some(&commit_b));
+        txn.set_ref(&Ref::local("multi/a"), Some(&commit_a));
+        txn.set_ref(&Ref::local("multi/b"), Some(&commit_b));
         txn.commit().await.unwrap();
 
         let sizes_a = decode_sizes_checksums(&repo, &commit_a).await;
@@ -1293,7 +1318,7 @@ fn incremental_commit_sizes_cover_deduplicated_objects() {
             .write_commit(multi_commit_options(), &root_v1)
             .await
             .unwrap();
-        txn.set_ref("inc/main", Some(&commit_v1));
+        txn.set_ref(&Ref::local("inc/main"), Some(&commit_v1));
         txn.commit().await.unwrap();
 
         // v2 in a new transaction: the shared objects deduplicate against objects/,
@@ -1310,7 +1335,7 @@ fn incremental_commit_sizes_cover_deduplicated_objects() {
             )
             .await
             .unwrap();
-        txn.set_ref("inc/main", Some(&commit_v2));
+        txn.set_ref(&Ref::local("inc/main"), Some(&commit_v2));
         txn.commit().await.unwrap();
         assert_ne!(commit_v1, commit_v2, "v2 is a distinct revision");
 

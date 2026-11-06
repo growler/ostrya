@@ -44,7 +44,7 @@ use ostrya::remote::proto::{
 };
 use ostrya::{
     ArchiveAnswer, ArchiveView, Checksum, CreateOptions, Ed25519Signer, Error, FileKind,
-    ObjectType, Repo, RepoMode, SummaryOptions, loose_path,
+    ObjectType, Ref, Repo, RepoMode, SummaryOptions, loose_path,
 };
 use ostrya_core::Xattrs;
 use ostrya_rt::block_on;
@@ -765,7 +765,7 @@ fn listing_repo(tmp: &TmpDir) -> Repo {
     let src = build_tree(tmp.path());
     let (_, repo, commit) = block_on(repo_of(tmp.path(), RepoMode::BareUser, &src));
     for name in ["a/b", "a/bc", "z"] {
-        block_on(repo.set_ref_immediate(name, Some(&commit))).unwrap();
+        block_on(repo.set_ref_immediate(&Ref::local(name), Some(&commit))).unwrap();
     }
     repo
 }
@@ -828,7 +828,7 @@ fn list_refs_holds_the_readable_refs_alone() {
     let tmp = TmpDir::new("send-list-refs-rights");
     let repo = with_groups(&listing_repo(&tmp), PULLER_GROUPS);
     let missing = Checksum::from_bytes([7; 32]);
-    block_on(repo.set_ref_immediate("broken", Some(&missing))).unwrap();
+    block_on(repo.set_ref_immediate(&Ref::local("broken"), Some(&missing))).unwrap();
     let access = repo_access(&repo, "ssh:puller");
     let (result, reply) = session_as(&repo, &access, PIPE_CAP, |mut c| async move {
         c.open().await;
@@ -1073,8 +1073,8 @@ fn mirror_repo(tmp: &TmpDir) -> Repo {
     let repo = listing_repo(tmp);
     let commit = block_on(repo.resolve_rev("z", false)).unwrap().unwrap();
     for (id, name) in [("org.a", "x"), ("org.a", "y/z"), ("org.b", "main")] {
-        let cref = ostrya::CollectionRef::new(id, name);
-        block_on(repo.set_collection_ref_immediate(&cref, Some(&commit))).unwrap();
+        let cref = ostrya::Ref::collection(id, name);
+        block_on(repo.set_ref_immediate(&cref, Some(&commit))).unwrap();
     }
     repo
 }

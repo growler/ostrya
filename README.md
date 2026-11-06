@@ -203,7 +203,7 @@ commit. The ingest takes a parent directory and a path relative to it:
 use std::os::fd::AsFd;
 use std::path::Path;
 
-use ostrya::{CommitOptions, MutableTree, Repo};
+use ostrya::{CommitOptions, MutableTree, Ref, Repo};
 
 let repo = Repo::open(Path::new("/srv/repo")).await?;
 let txn = repo.transaction().await?;
@@ -219,7 +219,7 @@ let opts = CommitOptions {
     ..CommitOptions::default()
 };
 let commit = txn.write_commit(opts, &root).await?;
-txn.set_ref("exampleos/stable", Some(&commit));
+txn.set_ref(&Ref::local("exampleos/stable"), Some(&commit));
 let stats = txn.commit().await?;
 println!("{} content objects written", stats.content_written);
 ```

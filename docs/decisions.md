@@ -3100,10 +3100,9 @@ The rules of the classification:
   keeps it too. The bound of a mirror ref comes from its listed name,
   `ID/NAME`.
 - `PruneStats::deleted_collection_refs` names each deleted collection ref
-  as a `CollectionRef`. It is sorted with `sort_by` on
-  `(collection_id, ref_name)`, in byte order. `CollectionRef` has no `Ord`:
-  the prune is the one caller that sorts the type. `deleted_refs` names the
-  deleted local and remote refs alone. Under `no_prune`, both lists name
+  as a `Ref::Collection`. It is sorted with `sort`, by collection id and
+  then by ref name, in byte order. `deleted_refs` names the deleted local
+  and remote refs alone. Under `no_prune`, both lists name
   what a run deletes, and the run deletes nothing.
 - One helper deletes the weak refs of each space.
   `delete_matching_refs_blocking` takes a key and a closure that gives the
@@ -3321,28 +3320,77 @@ These alternatives were rejected:
   ref-name rule. One ref file that the user cannot pull then hides each
   other ref of the candidate.
 
+## The ref syntax
+
+A ref has three text forms. A revision adds zero or more `^` to each form.
+
+- `NAME` is the local ref `refs/heads/NAME`.
+- `REMOTE:NAME` is the remote ref `refs/remotes/REMOTE/NAME`.
+- `@ID:NAME` is the collection ref `refs/mirrors/ID/NAME`, or
+  `refs/heads/NAME` when `ID` is the own collection id ("The own
+  collection id").
+
+`@OWN:NAME` and `NAME` name the same ref. The ref-name rule refuses `@`, so
+the third form gives a new meaning to no refspec. Error text names a
+collection ref as `@ID:NAME`. `refs -c --create=ID:REF` and the listing
+form `(ID, REF)` of `refs -c` keep the meaning of the `ostree` command.
+
+The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
+`Remote`, and `Collection`. The rules:
+
+- The constructors do not check the value. `Ref::validate` checks it, and
+  the ref store checks it before it reads or writes a file. `FromStr` reads
+  the three forms and checks the result. `Display` gives the same text
+  back. A failure is `ParseRefError`, which holds the text. The `ostrya`
+  crate maps it to `Error::InvalidRefspec` with the same text.
+- The ref store has one method for each operation, and it takes `&Ref`:
+  `Transaction::set_ref`, `Repo::set_ref_immediate`,
+  `UpdateGuard::read_ref`, `UpdateGuard::set_ref`, and
+  `Repo::resolve_ref_tip`. `resolve_ref_tip` gives `None` for an absent
+  ref. A caller that needs an error gives `Error::RefNotFound` with the
+  text of the ref.
+- A value from a caller can be `@OWN:NAME`, and the ref store maps it to
+  the local ref. A value that the library gives is canonical: a ref of the
+  own id is `Local`.
+- An operand that can hold a revision stays text: `Repo::resolve_rev`,
+  `PullOptions::refs`, and the refspecs of a push. `resolve_rev` reads
+  `@ID:NAME[^...]`.
+- The names of a local pull and of a one-way receive stream are refspecs.
+  The library reads such a name as a local or a remote ref, split at the
+  first `:`, and it does not read `@` there.
+
+These alternatives were rejected:
+
+- A typed value for each operand. `PullOptions::refs` as `Vec<Ref>` loses
+  the checksum and the `^` pins of a local pull, so it needs a second
+  field. A typed push refspec moves the parser of the refspec into each
+  caller.
+- A typed value only for a collection ref, beside a refspec `&str` for a
+  local or a remote ref. The API then has two names for one ref, for
+  example a refspec setter for `main` and a collection ref setter for the
+  local ref `main`.
+
 ## The own collection id
 
 The `[core] collection-id` of a repository is its local namespace. The
 refs of that id are the local refs, under `refs/heads/`. The rules:
 
-- Each writer of the collection ref `(ID, NAME)` of the own id writes
-  `refs/heads/NAME`: `Transaction::set_collection_ref`,
-  `Repo::set_collection_ref_immediate`, `UpdateGuard::set_collection_ref`,
-  `refs -c --create`, `Repo::pull_collection`, `Repo::pull_local` with
+- Each writer of the collection ref `@ID:NAME` of the own id writes
+  `refs/heads/NAME`: `Transaction::set_ref`, `Repo::set_ref_immediate`,
+  `UpdateGuard::set_ref`, `refs -c --create`, `Repo::pull_collection`, `Repo::pull_local` with
   `PullOptions::collection_id`, the receive path, and the S3 push. The same
   writers remove `refs/heads/NAME` for a removal. No writer creates
   `refs/mirrors/ID/` of the own id. `ostree refs --collections
   --create=ID:NAME` writes `refs/heads/NAME` for the own id too (observed).
 - The readers ignore `refs/mirrors/ID/` of the own id:
-  `Repo::resolve_collection_ref`, `UpdateGuard::read_collection_ref`,
+  `Repo::resolve_ref_tip`, `Repo::resolve_rev`, `UpdateGuard::read_ref`,
   `Repo::list_collection_refs`, `Repo::list_collection_refs_in`, the ref
   listing, and the summary. Delta discovery, the search for the delta of a
   dependency, and `TimestampCheck::CurrentRef` read `refs/heads/NAME`.
   `Repo::list_mirror_refs` lists the directory, and the fsck and the
   prune read it.
 - `Repo::pull_local` with `PullOptions::collection_id` reads each name of
-  the source with the rule of `Repo::resolve_collection_ref`:
+  the source with the rule of `Repo::resolve_ref_tip`:
   `refs/heads/NAME` when the source has the collection id, and
   `refs/mirrors/ID/NAME` otherwise. The probe of a local candidate reads
   the source with `Repo::list_collection_refs_in`, which has the same rule.

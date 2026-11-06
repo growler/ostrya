@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    MutableTree, ObjectName, ObjectType, PruneOptions, Repo, RepoMode,
+    MutableTree, ObjectName, ObjectType, PruneOptions, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -64,7 +64,7 @@ async fn commit(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&Ref::local(branch), Some(&commit));
     }
     txn.commit().await.unwrap();
     commit

@@ -5,9 +5,8 @@
 //!
 //! - [`Repo::resolve_rev`] resolves a revision string to a commit. Its doc
 //!   gives the revision syntax.
-//! - [`Repo::resolve_ref_tip`] reads one ref from the ref store.
-//! - [`Repo::resolve_collection_ref`] reads one collection ref from the ref
-//!   store.
+//! - [`Repo::resolve_ref_tip`] reads one [`Ref`] from the ref store: a local
+//!   ref, a remote ref, or a collection ref.
 //! - [`Repo::list_refs`], [`Repo::list_remote_refs`],
 //!   [`Repo::list_mirror_refs`], [`Repo::list_collection_refs`],
 //!   [`Repo::list_collection_refs_in`], and [`Repo::list_ref_aliases`] list
@@ -22,7 +21,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(feature = "receive")]
 use std::sync::Arc;
 
-use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
+use ostrya_core::{Checksum, MAX_COLLECTION_ID_LEN, Ref, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -35,78 +34,6 @@ use crate::staging::{REF_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::summary::SelectionFloor;
 use crate::transaction::Transaction;
 use crate::traverse::read_dir_names;
-
-/// A ref name with an optional collection id.
-///
-/// A ref with a collection id maps to `refs/mirrors/<collection>/<name>`. A
-/// ref with no collection id maps to the local ref `refs/heads/<name>`. The
-/// `[core] collection-id` of the repository is the local namespace: a ref
-/// with that collection id maps to `refs/heads/<name>`. The ref store takes
-/// a pair that passes [`validate`](CollectionRef::validate) and refuses
-/// another pair.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CollectionRef {
-    /// The collection id, or `None` for a local ref.
-    pub collection_id: Option<String>,
-    /// The ref name, which can contain `/`.
-    pub ref_name: String,
-}
-
-impl CollectionRef {
-    /// Creates a ref bound to a collection id.
-    pub fn new(collection_id: impl Into<String>, ref_name: impl Into<String>) -> CollectionRef {
-        CollectionRef {
-            collection_id: Some(collection_id.into()),
-            ref_name: ref_name.into(),
-        }
-    }
-
-    /// Creates a local ref with no collection id.
-    pub fn local(ref_name: impl Into<String>) -> CollectionRef {
-        CollectionRef {
-            collection_id: None,
-            ref_name: ref_name.into(),
-        }
-    }
-
-    /// Checks the pair against the rule of the ref store.
-    ///
-    /// The collection id, if there is one, must pass
-    /// [`is_collection_id`](crate::is_collection_id) and be at most 255
-    /// bytes. The ref name must pass the ref-name rule: the rule of
-    /// [`validate_refspec`] for a name with no remote, so a name with `:`
-    /// fails. A ref with no collection id takes the ref-name rule alone. The
-    /// ref store applies this check where it maps a `CollectionRef` to its
-    /// file under `refs/`.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::InvalidRefspec`] if the id or the name fails its rule. The
-    /// error holds `ID:NAME`, or `NAME` alone for a ref with no collection
-    /// id.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use ostrya::CollectionRef;
-    ///
-    /// assert!(CollectionRef::new("org.example.Os", "os/x86_64").validate().is_ok());
-    /// assert!(CollectionRef::local("main").validate().is_ok());
-    /// assert!(CollectionRef::local("origin:main").validate().is_err());
-    /// ```
-    pub fn validate(&self) -> Result<()> {
-        let valid = self
-            .collection_id
-            .as_deref()
-            .is_none_or(is_valid_collection_id)
-            && is_ref_path(&self.ref_name);
-        if valid {
-            Ok(())
-        } else {
-            Err(Error::InvalidRefspec(collection_ref_label(self)))
-        }
-    }
-}
 
 /// One collection-qualified ref of a repository.
 ///
@@ -139,24 +66,6 @@ pub struct RefAlias {
     pub target: String,
 }
 
-/// A queued ref target: a refspec or a collection ref.
-enum QueuedRef {
-    Ref(String),
-    Collection(CollectionRef),
-}
-
-impl QueuedRef {
-    /// Returns the path under the repository that this target writes to, in
-    /// a repository whose `[core] collection-id` is `own`. Refuses a name
-    /// that leaves the tree.
-    fn ref_path(&self, own: Option<&str>) -> Result<String> {
-        match self {
-            QueuedRef::Ref(refspec) => refspec_to_relpath(refspec),
-            QueuedRef::Collection(cref) => collection_ref_path(own, cref),
-        }
-    }
-}
-
 /// The state of one ref path, as the receive path reads it under its lock.
 #[cfg(feature = "receive")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,7 +84,7 @@ pub(crate) enum RefFileState {
 /// One queued ref write: a target and the checksum to point it at (`None`
 /// removes the ref).
 pub(crate) struct RefWrite {
-    target: QueuedRef,
+    target: Ref,
     checksum: Option<Checksum>,
 }
 
@@ -184,55 +93,38 @@ impl Transaction {
     /// Queues a ref write for the transaction commit.
     ///
     /// [`commit`](Transaction::commit) writes the ref after it publishes the
-    /// objects. If `checksum` is `None`, the commit removes the ref. The
-    /// commit checks the refspec before it publishes any object.
-    pub fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>) {
-        self.refs.lock().unwrap().push(RefWrite {
-            target: QueuedRef::Ref(refspec.to_owned()),
-            checksum: checksum.copied(),
-        });
-    }
-
-    /// Queues a collection ref write for the transaction commit.
+    /// objects. If `checksum` is `None`, the commit removes the ref.
     ///
-    /// [`commit`](Transaction::commit) writes the ref after it publishes the
-    /// objects. If `checksum` is `None`, the commit removes the ref. The
-    /// commit checks the collection id and the ref name before it publishes
-    /// any object.
+    /// The ref gives the path, as
+    /// [`set_ref_immediate`](Repo::set_ref_immediate) states. A collection
+    /// ref of the `[core] collection-id` of the repository is at
+    /// `refs/heads/<name>`, so the commit writes or removes that file, and it
+    /// does not touch `refs/mirrors/<collection>/`.
     ///
-    /// A ref with a collection id is at `refs/mirrors/<collection>/<name>`. A
-    /// ref with no collection id, and a ref of the `[core] collection-id` of
-    /// the repository, is at `refs/heads/<name>`. So the commit writes or
-    /// removes `refs/heads/<name>` for that collection id, and it does not
-    /// touch `refs/mirrors/<collection>/`.
-    ///
-    /// The call itself does not check the ref. If the collection id does not
-    /// pass [`is_collection_id`](crate::is_collection_id), if it is longer
-    /// than 255 bytes, or if the ref name is not valid, the commit fails with
-    /// [`Error::InvalidRefspec`]. The error holds `collection:name`, or the
-    /// ref name alone for a local ref. The commit then publishes no object
+    /// The call itself does not check the ref. If the ref fails
+    /// [`Ref::validate`], the commit fails with [`Error::InvalidRefspec`],
+    /// which holds the text of the ref. The commit then publishes no object
     /// and writes no ref.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
     /// such a ref by hand.
-    pub fn set_collection_ref(&self, cref: &CollectionRef, checksum: Option<&Checksum>) {
+    pub fn set_ref(&self, r: &Ref, checksum: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
-            target: QueuedRef::Collection(cref.clone()),
+            target: r.clone(),
             checksum: checksum.copied(),
         });
     }
 
     /// Maps each queued ref to its path under the repository. A malformed
-    /// refspec fails the call. [`commit`](Transaction::commit) calls it
-    /// first, so a malformed refspec fails before the commit publishes any
-    /// object.
+    /// ref fails the call. [`commit`](Transaction::commit) calls it first,
+    /// so a malformed ref fails before the commit publishes any object.
     pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(String, Option<Checksum>)>> {
         let own = self.repo().config().collection_id();
         let queue = self.refs.lock().unwrap();
         queue
             .iter()
-            .map(|w| Ok((w.target.ref_path(own)?, w.checksum)))
+            .map(|w| Ok((ref_relpath(own, &w.target)?, w.checksum)))
             .collect()
     }
 }
@@ -297,8 +189,11 @@ impl Repo {
     ///    The call does not check that the commit object exists.
     /// 2. An abbreviated checksum: 1 to 63 lowercase hex characters. It
     ///    resolves to the one commit object whose checksum starts with it.
-    /// 3. A refspec. It resolves to the commit that the ref names, as
-    ///    [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it.
+    /// 3. A ref in a text form of [`Ref`]: `NAME`, `REMOTE:NAME`, or
+    ///    `@ID:NAME`. It resolves to the commit that the ref names, as
+    ///    [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. `@ID:NAME`
+    ///    reads `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when `ID` is the
+    ///    `[core] collection-id` of the repository.
     ///
     /// A checksum is in lowercase hex only. A 64-character name with an
     /// uppercase character is a refspec.
@@ -319,7 +214,7 @@ impl Repo {
     /// - [`Error::RefNotFound`] if the base names no ref and `allow_noent` is
     ///   `false`.
     /// - [`Error::InvalidRefspec`] if the base is not a checksum and not a
-    ///   valid refspec.
+    ///   valid ref.
     /// - [`Error::AmbiguousRefspec`] if more than one commit checksum starts
     ///   with the abbreviated checksum.
     /// - [`Error::NoParentCommit`] if a `^` steps back from a commit with no
@@ -393,51 +288,34 @@ impl Repo {
             }
         }
 
-        match self.resolve_ref_tip(rev).await? {
+        let r: Ref = rev.parse()?;
+        match self.resolve_ref_tip(&r).await? {
             Some(checksum) => Ok(Some((checksum, RevKind::Ref))),
             None if allow_noent => Ok(None),
             None => Err(Error::RefNotFound(rev.to_owned())),
         }
     }
 
-    /// Returns the commit that a refspec names, read from the ref store only.
+    /// Returns the commit that a ref names, read from the ref store only.
     ///
-    /// The call does not read `refspec` as a checksum, as an abbreviated
+    /// The ref selects the path, as
+    /// [`set_ref_immediate`](Repo::set_ref_immediate) states. A collection
+    /// ref of the `[core] collection-id` of the repository reads
+    /// `refs/heads/NAME`, and the call does not read `refs/mirrors/ID/`. The
+    /// call reads `[core] collection-id` from the config that the handle read
+    /// at the open.
+    ///
+    /// The call does not read the name as a checksum, as an abbreviated
     /// checksum, or with a `^` suffix. If the ref is an alias, the call
-    /// follows the link. The result is `None` if the store holds no such ref.
+    /// follows the link. An alias whose target is absent reads as an absent
+    /// ref. The result is `None` if the store holds no such ref. A caller
+    /// that needs an error for an absent ref gives
+    /// [`Error::RefNotFound`] with the text of the ref.
     ///
     /// Callers that hold a ref name and not a revision use this call. These
     /// are a pull for its local tip, a summary for the metadata ref that it
     /// chains, and the CLI for its alias-target check. An alias records a
     /// name, so the CLI uses this call.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
-    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
-    /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example if the ref path names a
-    ///   directory.
-    pub async fn resolve_ref_tip(&self, refspec: &str) -> Result<Option<Checksum>> {
-        self.resolve_relpath_tip(refspec_to_relpath(refspec)?).await
-    }
-
-    /// Returns the commit that a collection ref names, read from the ref store
-    /// with no lock.
-    ///
-    /// The collection id of `cref` selects the ref path:
-    ///
-    /// - No collection id reads `refs/heads/NAME`.
-    /// - The `[core] collection-id` of the repository reads
-    ///   `refs/heads/NAME`. The call does not read `refs/mirrors/ID/`.
-    /// - Each other collection id reads `refs/mirrors/ID/NAME`.
-    ///
-    /// The call reads `[core] collection-id` from the config that the handle
-    /// read at the open.
-    ///
-    /// If the ref is an alias, the call follows the link, as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) does. An alias whose target
-    /// is absent reads as an absent ref.
     ///
     /// A symlink that the port does not write can make the call and the ref
     /// listing give different results. Examples are a symlink to a directory
@@ -450,37 +328,21 @@ impl Repo {
     /// renames a complete file over the ref, so the read gives the old commit
     /// or the new commit.
     ///
-    /// If the ref is absent, `allow_noent` selects the result: `Ok(None)` if
-    /// it is `true`, and [`Error::RefNotFound`] if it is `false`. No other
-    /// failure depends on `allow_noent`.
-    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if the collection id does not pass
-    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
-    ///   bytes, or if the ref name is not valid. The call reads no file.
-    /// - [`Error::RefNotFound`] if the ref is absent and `allow_noent` is
-    ///   `false`. The error holds `ID:NAME`, or `NAME` alone for a ref with no
-    ///   collection id.
+    /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
+    ///   error holds the text of the ref, and the call reads no file.
     /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
     /// - [`Error::Core`] if the ref file holds no checksum.
     /// - [`Error::Io`] if the read fails, for example if the ref path names a
-    ///   directory. `allow_noent` does not change this.
-    pub async fn resolve_collection_ref(
-        &self,
-        cref: &CollectionRef,
-        allow_noent: bool,
-    ) -> Result<Option<Checksum>> {
-        let relpath = collection_ref_path(self.config().collection_id(), cref)?;
-        match self.resolve_relpath_tip(relpath).await? {
-            Some(checksum) => Ok(Some(checksum)),
-            None if allow_noent => Ok(None),
-            None => Err(Error::RefNotFound(collection_ref_label(cref))),
-        }
+    ///   directory.
+    pub async fn resolve_ref_tip(&self, r: &Ref) -> Result<Option<Checksum>> {
+        self.resolve_relpath_tip(ref_relpath(self.config().collection_id(), r)?)
+            .await
     }
 
     /// Returns the commit that the ref file at `relpath` names, read as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec. The call
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a ref. The call
     /// follows an alias. The result is `None` if no file is at the path.
     ///
     /// The read and the parse run in one call on the blocking pool.
@@ -994,19 +856,23 @@ impl Repo {
     ///
     /// A ref is a file under `refs/`. It holds a 64-character hex checksum and
     /// a newline, 65 bytes in all. The file mode is `0644`, independent of the
-    /// umask. The refspec gives the path:
+    /// umask. The [`Ref`] gives the path:
     ///
     /// - The local ref `name` is at `refs/heads/name`.
     /// - The remote ref `remote:name` is at `refs/remotes/remote/name`.
-    /// - A collection ref is at `refs/mirrors/collection/name`, or at
-    ///   `refs/heads/name` for the `[core] collection-id` of the repository
-    ///   (see
-    ///   [`set_collection_ref_immediate`](Repo::set_collection_ref_immediate)).
+    /// - The collection ref `@collection:name` is at
+    ///   `refs/mirrors/collection/name`. A collection ref of the `[core]
+    ///   collection-id` of the repository is at `refs/heads/name`, so
+    ///   `@collection:name` and `name` name the same file there. The call
+    ///   reads `[core] collection-id` from the config that the handle read at
+    ///   the open.
     ///
     /// A ref can also be an alias: a relative symlink to the file of another
     /// ref. A read follows the link and reads the checksum of the target ref.
-    /// [`validate_refspec`] checks each component of the name against the
-    /// ref-name rule, so a ref path stays inside `refs/`.
+    /// [`Ref::validate`] checks each component of the ref against the
+    /// ref-name rule, so a ref path stays inside `refs/`. If a directory of
+    /// `refs/mirrors/` has a name that fails the rule, a ref under it cannot
+    /// be written or removed through this call. Remove such a ref by hand.
     ///
     /// The call creates the missing parent directories of a name with `/` in
     /// it. It requests mode `0777` for them, which the umask reduces. In a
@@ -1050,55 +916,16 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
+    ///   error holds the text of the ref, and the call writes nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn set_ref_immediate(
-        &self,
-        refspec: &str,
-        checksum: Option<&Checksum>,
-    ) -> Result<()> {
-        let relpath = refspec_to_relpath(refspec)?;
-        self.write_ref_relpath(relpath, checksum).await
-    }
-
-    /// Writes one collection ref outside a transaction.
-    ///
-    /// A ref with a collection id is at `refs/mirrors/<collection>/<name>`. A
-    /// ref with no collection id, and a ref of the `[core] collection-id` of
-    /// the repository, is at `refs/heads/<name>`. The call reads
-    /// `[core] collection-id` from the config that the handle read at the
-    /// open. If `checksum` is `None`, the call removes the ref file. The file format, the durability
-    /// rules, and the locks are those of
-    /// [`set_ref_immediate`](Repo::set_ref_immediate).
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidRefspec`] if the collection id does not pass
-    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
-    ///   bytes, or if the ref name is not valid. The error holds
-    ///   `collection:name`, or the ref name alone for a local ref. The call
-    ///   writes nothing.
-    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
-    ///   lock-timeout-secs` does not parse.
-    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
-    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
-    ///   lock-timeout-secs`.
-    /// - [`Error::Io`] if a file system operation fails.
-    ///
-    /// If a directory of `refs/mirrors/` has a name that fails the rule, a
-    /// ref under it cannot be written or removed through this call. Remove
-    /// such a ref by hand.
-    pub async fn set_collection_ref_immediate(
-        &self,
-        cref: &CollectionRef,
-        checksum: Option<&Checksum>,
-    ) -> Result<()> {
-        let relpath = collection_ref_path(self.config().collection_id(), cref)?;
+    pub async fn set_ref_immediate(&self, r: &Ref, checksum: Option<&Checksum>) -> Result<()> {
+        let relpath = ref_relpath(self.config().collection_id(), r)?;
         self.write_ref_relpath(relpath, checksum).await
     }
 
@@ -2416,7 +2243,7 @@ pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
 /// No refspec maps to a path below `refs/mirrors`, so a mirror ref always
 /// gives `false`. Prune classifies a mirror ref by its own rule: the path
 /// must split into a valid collection id and a valid ref name, which
-/// [`collection_ref_to_relpath`] maps back to the same file.
+/// [`ref_relpath`] with no own id maps back to the same file.
 ///
 /// The body mirrors [`refspec_to_relpath`] branch for branch and allocates
 /// nothing, because prune calls it once for each ref in the repository.
@@ -2472,13 +2299,6 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 pub(crate) use ostrya_core::is_ref_component as is_component;
 pub(crate) use ostrya_core::is_ref_name as is_ref_path;
 
-/// The longest collection id, in bytes, that the ref store, a push session,
-/// or a collection pull takes.
-///
-/// The id is one path component under `refs/mirrors/`, and a Linux file
-/// system takes a name of 255 bytes at most (`NAME_MAX`).
-pub(crate) const MAX_COLLECTION_ID_LEN: usize = 255;
-
 /// Returns `true` if `id` is a collection id that the ref store takes: it
 /// passes [`is_collection_id`](ostrya_core::is_collection_id) and is at most
 /// [`MAX_COLLECTION_ID_LEN`] bytes.
@@ -2486,41 +2306,36 @@ pub(crate) fn is_valid_collection_id(id: &str) -> bool {
     id.len() <= MAX_COLLECTION_ID_LEN && ostrya_core::is_collection_id(id)
 }
 
-/// Maps a collection ref to its path under `refs/`. A collection id puts the
-/// ref under `refs/mirrors/<collection>/`. A `None` id gives a local ref under
-/// `refs/heads/`. The pair must pass [`CollectionRef::validate`]. A failure
-/// gives [`Error::InvalidRefspec`], and the caller writes nothing.
-pub(crate) fn collection_ref_to_relpath(cref: &CollectionRef) -> Result<String> {
-    cref.validate()?;
-    let name = &cref.ref_name;
-    Ok(match &cref.collection_id {
-        Some(collection_id) => format!("refs/mirrors/{collection_id}/{name}"),
-        None => format!("refs/heads/{name}"),
+/// Maps a ref to the path under the repository that the ref store reads and
+/// writes, in a repository whose `[core] collection-id` is `own`.
+///
+/// A local ref gives `refs/heads/<name>`, and a remote ref gives
+/// `refs/remotes/<remote>/<name>`. A collection ref gives
+/// `refs/mirrors/<id>/<name>`, or `refs/heads/<name>` when `id` is `own`. A
+/// caller that needs the mirror path of each id passes `None`. The ref must
+/// pass [`Ref::validate`]. A failure gives [`Error::InvalidRefspec`] with the
+/// text of the ref, and the caller writes nothing.
+pub(crate) fn ref_relpath(own: Option<&str>, r: &Ref) -> Result<String> {
+    r.validate()?;
+    Ok(match r {
+        Ref::Local { name } => format!("{HEADS_DIR}/{name}"),
+        Ref::Remote { remote, name } => format!("refs/remotes/{remote}/{name}"),
+        Ref::Collection { id, name } if Some(id.as_str()) == own => {
+            format!("{HEADS_DIR}/{name}")
+        }
+        Ref::Collection { id, name } => format!("{MIRRORS_DIR}/{id}/{name}"),
     })
 }
 
-/// Maps a collection ref to the path under `refs/` that the ref store reads
-/// and writes, in a repository whose `[core] collection-id` is `own`. The
-/// collection id `own` is the local namespace and gives `refs/heads/<name>`.
-/// Each other pair gives the path of [`collection_ref_to_relpath`]. The pair
-/// must pass [`CollectionRef::validate`]. A failure gives
-/// [`Error::InvalidRefspec`], and the caller writes nothing.
-pub(crate) fn collection_ref_path(own: Option<&str>, cref: &CollectionRef) -> Result<String> {
-    match cref.collection_id.as_deref() {
-        Some(id) if Some(id) == own => {
-            cref.validate()?;
-            Ok(format!("{HEADS_DIR}/{}", cref.ref_name))
-        }
-        _ => collection_ref_to_relpath(cref),
-    }
-}
-
-/// Returns the text that an error about a collection ref holds: `ID:NAME`, or
-/// `NAME` alone for a ref with no collection id.
-pub(crate) fn collection_ref_label(cref: &CollectionRef) -> String {
-    match &cref.collection_id {
-        Some(collection_id) => format!("{collection_id}:{}", cref.ref_name),
-        None => cref.ref_name.clone(),
+/// Reads a refspec as a [`Ref`] with no check: `REMOTE:NAME`, split at the
+/// first `:`, is a remote ref, and other text is a local ref.
+///
+/// The ref store checks the result where it maps it to a path, so a refspec
+/// that fails the rule fails there with [`Error::InvalidRefspec`].
+pub(crate) fn refspec_ref(refspec: &str) -> Ref {
+    match refspec.split_once(':') {
+        Some((remote, name)) => Ref::remote(remote, name),
+        None => Ref::local(refspec),
     }
 }
 
@@ -2799,7 +2614,7 @@ pub(crate) fn put_alias_blocking(
 ///
 /// The call maps each key to its path with `relpath`. The caller passes the
 /// path rule of the asynchronous writes, for example [`refspec_to_relpath`]
-/// for a refspec or [`collection_ref_to_relpath`] for a collection ref. So
+/// for a refspec or [`ref_relpath`] for a [`Ref`]. So
 /// the read and the unlink address the same file as the rest of the library.
 /// One pass can hold keys of more than one space under `refs/`.
 ///
@@ -3062,55 +2877,46 @@ mod tests {
     }
 
     #[test]
-    fn collection_ref_names_the_pair_it_rejects() {
-        let err = collection_ref_to_relpath(&CollectionRef::new("org.example.Foo", "a/../b"))
-            .unwrap_err();
+    fn ref_relpath_names_the_ref_it_rejects() {
+        for (r, label) in [
+            (
+                Ref::collection("org.example.Foo", "a/../b"),
+                "@org.example.Foo:a/../b",
+            ),
+            (Ref::collection("a", "main"), "@a:main"),
+            (Ref::local("a/../b"), "a/../b"),
+            (Ref::local("origin:main"), "origin:main"),
+            (Ref::remote("o/r", "main"), "o/r:main"),
+            (
+                Ref::collection("org.example.B", "-bad"),
+                "@org.example.B:-bad",
+            ),
+        ] {
+            let err = ref_relpath(None, &r).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(name) if name == label),
+                "{err}"
+            );
+        }
+        let longest = format!("org.{}", "a".repeat(251));
+        assert_eq!(longest.len(), MAX_COLLECTION_ID_LEN);
+        assert!(ref_relpath(None, &Ref::collection(longest.as_str(), "main")).is_ok());
+        let too_long = format!("org.{}", "a".repeat(252));
+        let err = ref_relpath(None, &Ref::collection(too_long.as_str(), "main")).unwrap_err();
         assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name == "org.example.Foo:a/../b"),
-            "{err}"
-        );
-        let err = collection_ref_to_relpath(&CollectionRef::new("a", "main")).unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name == "a:main"),
-            "{err}"
-        );
-        let err = collection_ref_to_relpath(&CollectionRef::local("a/../b")).unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name == "a/../b"),
+            matches!(&err, Error::InvalidRefspec(name) if *name == format!("@{too_long}:main")),
             "{err}"
         );
     }
 
     #[test]
-    fn validate_applies_the_ref_store_rule() {
-        let err = CollectionRef::local("origin:main").validate().unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name == "origin:main"),
-            "{err}"
-        );
-        let err = CollectionRef::new("org.example.B", "-bad")
-            .validate()
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidRefspec(name) if name == "org.example.B:-bad"),
-            "{err}"
-        );
-        let longest = format!("org.{}", "a".repeat(251));
-        assert_eq!(longest.len(), MAX_COLLECTION_ID_LEN);
-        assert!(
-            CollectionRef::new(longest.as_str(), "main")
-                .validate()
-                .is_ok()
-        );
-        let too_long = format!("org.{}", "a".repeat(252));
-        let err = CollectionRef::new(too_long.as_str(), "main")
-            .validate()
-            .unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidRefspec(name) if *name == format!("{too_long}:main")),
-            "{err}"
-        );
-        assert!(CollectionRef::local("main").validate().is_ok());
+    fn a_refspec_reads_as_a_ref_with_no_check() {
+        assert_eq!(refspec_ref("a/b"), Ref::local("a/b"));
+        assert_eq!(refspec_ref("origin:a/b"), Ref::remote("origin", "a/b"));
+        assert_eq!(refspec_ref("o:a:b"), Ref::remote("o", "a:b"));
+        let at = refspec_ref("@org.example.A:x");
+        assert_eq!(at, Ref::remote("@org.example.A", "x"));
+        assert!(at.validate().is_err());
     }
 
     #[test]
@@ -3370,7 +3176,7 @@ mod tests {
     /// that fails the rule fails the call with its label.
     #[test]
     fn a_collection_ref_of_the_own_id_maps_to_the_local_path() {
-        let path = |own, id, name| collection_ref_path(own, &CollectionRef::new(id, name));
+        let path = |own, id, name| ref_relpath(own, &Ref::collection(id, name));
         assert_eq!(
             path(Some(OWN), OWN, NAME).unwrap(),
             format!("refs/heads/{NAME}")
@@ -3384,13 +3190,17 @@ mod tests {
             format!("refs/mirrors/{OWN}/{NAME}")
         );
         assert_eq!(
-            collection_ref_path(Some(OWN), &CollectionRef::local(NAME)).unwrap(),
+            ref_relpath(Some(OWN), &Ref::local(NAME)).unwrap(),
             format!("refs/heads/{NAME}")
+        );
+        assert_eq!(
+            ref_relpath(Some(OWN), &Ref::remote("origin", NAME)).unwrap(),
+            format!("refs/remotes/origin/{NAME}")
         );
         for name in ["../x", "origin:x"] {
             let err = path(Some(OWN), OWN, name).unwrap_err();
             assert!(
-                matches!(&err, Error::InvalidRefspec(label) if *label == format!("{OWN}:{name}")),
+                matches!(&err, Error::InvalidRefspec(label) if *label == format!("@{OWN}:{name}")),
                 "{err:?}"
             );
         }

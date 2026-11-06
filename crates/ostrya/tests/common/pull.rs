@@ -40,7 +40,7 @@ use hyper::{Request, Response, StatusCode};
 use ostrya::fetch::{FetcherOptions, Proxy, TrustRoots};
 use ostrya::{
     AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, PullOptions, Repo, RepoMode, SummaryOptions, Type, Value,
+    Error, MutableTree, PullOptions, Ref, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::{TcpListener, spawn};
 
@@ -819,7 +819,7 @@ async fn commit_tree_full(
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&commit));
+    txn.set_ref(&branch.parse::<Ref>().unwrap(), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -886,7 +886,7 @@ pub async fn commit_tree_keyed(
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&commit));
+    txn.set_ref(&Ref::local(branch), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -925,7 +925,7 @@ pub async fn build_remote_two_refs(dir: &Path) -> (Repo, Checksum) {
         .unwrap();
     let commit = commit_tree(&repo, dir, "src", "test/main", None, FIXED_TS).await;
     let txn = repo.transaction().await.unwrap();
-    txn.set_ref("test/other", Some(&commit));
+    txn.set_ref(&Ref::local("test/other"), Some(&commit));
     txn.commit().await.unwrap();
     repo.regenerate_summary(&SummaryOptions {
         last_modified: Some(FIXED_TS),

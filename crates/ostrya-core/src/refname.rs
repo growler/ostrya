@@ -9,6 +9,13 @@
 //! component. `is_ref_component` is a wider check for a part that is not a
 //! ref name. `is_checksum_shaped` marks a valid ref name that a revision
 //! reads as a checksum. `is_collection_id` checks a collection id.
+//!
+//! [`Ref`] is one ref of a repository: a local ref, a remote ref, or a
+//! collection ref. It reads and gives back the text forms `NAME`,
+//! `REMOTE:NAME`, and `@ID:NAME`.
+
+use std::fmt;
+use std::str::FromStr;
 
 use crate::Checksum;
 
@@ -302,6 +309,193 @@ pub fn is_collection_id(id: &str) -> bool {
         })
 }
 
+/// The longest collection id, in bytes, that [`Ref::validate`] accepts.
+///
+/// The id is one path component under `refs/mirrors/`, and a Linux file
+/// system takes a name of 255 bytes at most (`NAME_MAX`).
+pub const MAX_COLLECTION_ID_LEN: usize = 255;
+
+/// One ref of a repository.
+///
+/// A ref has three cases, and each case has a text form:
+///
+/// - `NAME` is the local ref [`Ref::Local`], at `refs/heads/NAME`.
+/// - `REMOTE:NAME` is the remote ref [`Ref::Remote`], at
+///   `refs/remotes/REMOTE/NAME`.
+/// - `@ID:NAME` is the collection ref [`Ref::Collection`], at
+///   `refs/mirrors/ID/NAME`. A repository whose `[core] collection-id` is
+///   `ID` keeps the ref at `refs/heads/NAME`, so `@ID:NAME` and `NAME` name
+///   the same ref there.
+///
+/// No valid ref name holds `@` or `:`, so the three forms do not overlap.
+///
+/// The constructors do not check the value. [`validate`](Ref::validate)
+/// checks it, and a ref store checks it before it reads or writes a file.
+/// [`FromStr`] reads the text and checks it. [`Display`](fmt::Display) gives
+/// the same text back.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_core::Ref;
+///
+/// let r: Ref = "@org.example.Os:os/x86_64".parse()?;
+/// assert_eq!(r, Ref::collection("org.example.Os", "os/x86_64"));
+/// assert_eq!(r.name(), "os/x86_64");
+/// assert_eq!(r.to_string(), "@org.example.Os:os/x86_64");
+/// assert_eq!("origin:main".parse::<Ref>()?, Ref::remote("origin", "main"));
+/// assert!("@org.example.Os:a:b".parse::<Ref>().is_err());
+/// # Ok::<(), ostrya_core::ParseRefError>(())
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Ref {
+    /// A local ref, at `refs/heads/<name>`.
+    Local {
+        /// The ref name, which can contain `/`.
+        name: String,
+    },
+    /// A remote ref, at `refs/remotes/<remote>/<name>`.
+    Remote {
+        /// The name of the remote.
+        remote: String,
+        /// The ref name, which can contain `/`.
+        name: String,
+    },
+    /// A collection ref, at `refs/mirrors/<id>/<name>`, or at
+    /// `refs/heads/<name>` when `id` is the `[core] collection-id` of the
+    /// repository.
+    Collection {
+        /// The collection id.
+        id: String,
+        /// The ref name, which can contain `/`.
+        name: String,
+    },
+}
+
+impl Ref {
+    /// Creates a local ref. The call does not check the name.
+    pub fn local(name: impl Into<String>) -> Ref {
+        Ref::Local { name: name.into() }
+    }
+
+    /// Creates a remote ref. The call does not check the values.
+    pub fn remote(remote: impl Into<String>, name: impl Into<String>) -> Ref {
+        Ref::Remote {
+            remote: remote.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Creates a collection ref. The call does not check the values.
+    pub fn collection(id: impl Into<String>, name: impl Into<String>) -> Ref {
+        Ref::Collection {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    /// Returns the ref name, without the remote or the collection id.
+    pub fn name(&self) -> &str {
+        match self {
+            Ref::Local { name } | Ref::Remote { name, .. } | Ref::Collection { name, .. } => name,
+        }
+    }
+
+    /// Checks the ref against the ref-name rule.
+    ///
+    /// The ref name must pass [`is_ref_name`] in each case. The remote of
+    /// [`Ref::Remote`] must pass [`is_ref_name_component`]. The id of
+    /// [`Ref::Collection`] must pass [`is_collection_id`] and be at most
+    /// [`MAX_COLLECTION_ID_LEN`] bytes. So the path of a valid ref stays
+    /// inside the `refs/` tree.
+    ///
+    /// # Errors
+    ///
+    /// [`ParseRefError`] if a part fails its rule. The error holds the text
+    /// of the ref.
+    pub fn validate(&self) -> Result<(), ParseRefError> {
+        let valid = match self {
+            Ref::Local { name } => is_ref_name(name),
+            Ref::Remote { remote, name } => is_ref_name_component(remote) && is_ref_name(name),
+            Ref::Collection { id, name } => {
+                id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id) && is_ref_name(name)
+            }
+        };
+        if valid {
+            Ok(())
+        } else {
+            Err(ParseRefError {
+                text: self.to_string(),
+            })
+        }
+    }
+}
+
+impl FromStr for Ref {
+    type Err = ParseRefError;
+
+    /// Reads the text form of a ref and checks it with
+    /// [`validate`](Ref::validate).
+    ///
+    /// Text that starts with `@` is a collection ref, split at the first `:`
+    /// after the `@`. Other text with a `:` is a remote ref, split at the
+    /// first `:`. Text with no `:` is a local ref.
+    ///
+    /// # Errors
+    ///
+    /// [`ParseRefError`] if the text has no form or a part fails its rule.
+    /// The error holds the text as given.
+    fn from_str(text: &str) -> Result<Ref, ParseRefError> {
+        let parsed = match text.strip_prefix('@') {
+            Some(rest) => rest
+                .split_once(':')
+                .map(|(id, name)| Ref::collection(id, name)),
+            None => Some(match text.split_once(':') {
+                Some((remote, name)) => Ref::remote(remote, name),
+                None => Ref::local(text),
+            }),
+        };
+        match parsed {
+            Some(r) if r.validate().is_ok() => Ok(r),
+            _ => Err(ParseRefError {
+                text: text.to_owned(),
+            }),
+        }
+    }
+}
+
+impl fmt::Display for Ref {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Ref::Local { name } => f.write_str(name),
+            Ref::Remote { remote, name } => write!(f, "{remote}:{name}"),
+            Ref::Collection { id, name } => write!(f, "@{id}:{name}"),
+        }
+    }
+}
+
+/// The error of a ref that fails the rule of [`Ref::validate`], or text that
+/// [`Ref`] does not read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseRefError {
+    text: String,
+}
+
+impl ParseRefError {
+    /// Returns the text of the ref that failed.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+}
+
+impl fmt::Display for ParseRefError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid ref: {}", self.text)
+    }
+}
+
+impl std::error::Error for ParseRefError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -489,5 +683,63 @@ mod tests {
         ] {
             assert!(!is_collection_id(id), "{id:?}");
         }
+    }
+
+    #[test]
+    fn a_ref_reads_each_text_form_and_gives_the_text_back() {
+        for (text, expected) in [
+            ("main", Ref::local("main")),
+            ("a/b", Ref::local("a/b")),
+            ("origin:main", Ref::remote("origin", "main")),
+            (
+                "@org.example.Os:os/x86_64",
+                Ref::collection("org.example.Os", "os/x86_64"),
+            ),
+        ] {
+            let parsed: Ref = text.parse().unwrap();
+            assert_eq!(parsed, expected, "{text}");
+            assert_eq!(parsed.to_string(), text);
+            assert_eq!(parsed.to_string().parse::<Ref>().unwrap(), parsed);
+        }
+    }
+
+    #[test]
+    fn a_ref_refuses_text_that_has_no_form_or_fails_the_rule() {
+        let longest_id = format!("a.{}", "b".repeat(MAX_COLLECTION_ID_LEN - 2));
+        assert!(format!("@{longest_id}:x").parse::<Ref>().is_ok());
+        let too_long_id = format!("@{longest_id}b:x");
+        for text in [
+            "@",
+            "@org.example.Os",
+            "@org.example.Os:",
+            "@bad-id:x",
+            "@org.example.Os:a:b",
+            too_long_id.as_str(),
+            "",
+            "a:b:c",
+            ":a",
+        ] {
+            let err = text.parse::<Ref>().unwrap_err();
+            assert_eq!(err.as_str(), text);
+            assert_eq!(err.to_string(), format!("invalid ref: {text}"));
+        }
+    }
+
+    #[test]
+    fn a_ref_that_fails_the_rule_gives_its_text_in_the_error() {
+        for (r, text) in [
+            (Ref::local("a/../b"), "a/../b"),
+            (Ref::local("origin:main"), "origin:main"),
+            (Ref::remote("a/b", "main"), "a/b:main"),
+            (Ref::collection("a", "main"), "@a:main"),
+            (
+                Ref::collection("org.example.B", "-bad"),
+                "@org.example.B:-bad",
+            ),
+        ] {
+            assert_eq!(r.validate().unwrap_err().as_str(), text);
+        }
+        assert!(Ref::local("main").validate().is_ok());
+        assert_eq!(Ref::remote("origin", "a/b").name(), "a/b");
     }
 }

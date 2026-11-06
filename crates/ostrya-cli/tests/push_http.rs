@@ -40,7 +40,7 @@ use ostrya::remote::{
 };
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectName, ObjectType, ReceivePolicies, Repo, RepoMode, RepoPushOptions, Value,
+    ObjectName, ObjectType, ReceivePolicies, Ref, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -817,7 +817,7 @@ fn a_repository_push_over_http() {
             ..CommitOptions::default()
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
-        txn.set_ref("main", Some(&commit));
+        txn.set_ref(&Ref::local("main"), Some(&commit));
         txn.commit().await.unwrap();
         commit
     });

@@ -291,7 +291,7 @@ async fn commit_related(
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&checksum));
+    txn.set_ref(&ostrya::Ref::local(branch), Some(&checksum));
     txn.commit().await.unwrap();
     checksum
 }

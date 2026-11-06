@@ -24,7 +24,7 @@ use common::TmpDir;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, Error,
-    FileKind, FileMeta, FileObject, MergeOptions, MutableTree, Repo, RepoMode, RootDirmeta,
+    FileKind, FileMeta, FileObject, MergeOptions, MutableTree, Ref, Repo, RepoMode, RootDirmeta,
     StagingEntry, StagingLookup, Transaction, TreeEntry,
 };
 use ostrya_core::{ObjectType, Xattrs};
@@ -112,7 +112,7 @@ async fn commit_dir(repo: &Repo, dfd: std::os::fd::BorrowedFd<'_>, path: &Path, 
         .write_commit(CommitOptions::default(), &root)
         .await
         .unwrap();
-    txn.set_ref(refname, Some(&commit));
+    txn.set_ref(&Ref::local(refname), Some(&commit));
     txn.commit().await.unwrap();
 }
 
@@ -396,7 +396,7 @@ fn package_merges_through_opt_symlink() {
             .write_commit(CommitOptions::default(), &root)
             .await
             .unwrap();
-        txn.set_ref("test/merged", Some(&commit));
+        txn.set_ref(&Ref::local("test/merged"), Some(&commit));
         txn.commit().await.unwrap();
 
         let repo = Repo::open(&base.join("repo")).await.unwrap();
@@ -476,7 +476,7 @@ fn file_over_localtime_symlink_replaces_without_writing_through() {
             .write_commit(CommitOptions::default(), &root)
             .await
             .unwrap();
-        txn.set_ref("test/merged", Some(&commit));
+        txn.set_ref(&Ref::local("test/merged"), Some(&commit));
         txn.commit().await.unwrap();
 
         let repo = Repo::open(&base.join("repo")).await.unwrap();
@@ -553,7 +553,7 @@ fn merge_resolves_a_symlink_staged_in_this_transaction() {
             .write_commit(CommitOptions::default(), &root_tree)
             .await
             .unwrap();
-        txn.set_ref("test/merged", Some(&commit));
+        txn.set_ref(&Ref::local("test/merged"), Some(&commit));
         txn.commit().await.unwrap();
 
         let repo = Repo::open(&root).await.unwrap();
@@ -625,7 +625,7 @@ fn merge_reads_committed_right_side_subtrees() {
             .write_commit(CommitOptions::default(), &root)
             .await
             .unwrap();
-        txn.set_ref("test/merged", Some(&commit));
+        txn.set_ref(&Ref::local("test/merged"), Some(&commit));
         txn.commit().await.unwrap();
 
         let repo = Repo::open(&base.join("repo")).await.unwrap();
@@ -1762,7 +1762,7 @@ fn ensure_dir_stamps_and_restamps_the_tree_root() {
             .write_commit(CommitOptions::default(), &tree)
             .await
             .unwrap();
-        txn.set_ref("test/root", Some(&commit));
+        txn.set_ref(&Ref::local("test/root"), Some(&commit));
         txn.commit().await.unwrap();
 
         let repo = Repo::open(&root).await.unwrap();
@@ -1904,7 +1904,7 @@ fn root_ensure_dir_restamps_a_committed_root() {
             .write_commit(CommitOptions::default(), &rebuilt)
             .await
             .unwrap();
-        txn.set_ref("test/restamped", Some(&recommit));
+        txn.set_ref(&Ref::local("test/restamped"), Some(&recommit));
         let stats = txn.commit().await.unwrap();
 
         // The offers: the stamped dirmeta and the commit object. A root

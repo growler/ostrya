@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use common::TmpDir;
 use ostrya::{
     CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error, LockKind,
-    MutableTree, ObjectType, PruneOptions, Repo, RepoMode,
+    MutableTree, ObjectType, PruneOptions, Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -81,7 +81,7 @@ async fn commit_tree(repo: &Repo, base: &Path, name: &str, branch: &str) {
         )
         .await
         .unwrap();
-    txn.set_ref(branch, Some(&commit));
+    txn.set_ref(&Ref::local(branch), Some(&commit));
     txn.commit().await.unwrap();
 }
 

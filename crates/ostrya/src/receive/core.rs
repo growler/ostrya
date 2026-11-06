@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use futures_io::AsyncRead;
 use ostrya_core::{
-    Checksum, ObjectName, ObjectType, RepoMode, choose_offset_size, loose_path, offset_size_for,
+    Checksum, MAX_COLLECTION_ID_LEN, ObjectName, ObjectType, Ref, RepoMode, choose_offset_size,
+    loose_path, offset_size_for,
 };
 
 use super::hooks::ReceiveHooks;
@@ -21,9 +22,7 @@ use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order}
 use crate::access::Namespace;
 use crate::error::{Error, Result};
 use crate::object::{MAX_METADATA_SIZE, object_exists};
-use crate::refs::{
-    CollectionRef, MAX_COLLECTION_ID_LEN, collection_ref_to_relpath, refspec_to_relpath,
-};
+use crate::refs::{ref_relpath, refspec_to_relpath};
 use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
     ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
@@ -486,9 +485,7 @@ fn namespace(repo: &Repo, hello: &Hello) -> Namespace {
 fn ref_path(namespace: Option<&Namespace>, name: &str) -> Result<String> {
     match namespace {
         None | Some(Namespace::Local) => refspec_to_relpath(name),
-        Some(Namespace::Collection(id)) => {
-            collection_ref_to_relpath(&CollectionRef::new(id.as_str(), name))
-        }
+        Some(Namespace::Collection(id)) => ref_relpath(None, &Ref::collection(id.as_str(), name)),
     }
 }
 

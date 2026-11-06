@@ -30,8 +30,8 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use ostrya_core::{
-    Checksum, Commit, DirMeta, ObjectType, RefSelector, RepoMode, Type, Value, choose_offset_size,
-    from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
+    Checksum, Commit, DirMeta, ObjectType, Ref, RefSelector, RepoMode, Type, Value,
+    choose_offset_size, from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
 };
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -1805,7 +1805,9 @@ impl Repo {
         opts: &SummaryOptions,
         held: &UpdateLockHeld,
     ) -> Result<Checksum> {
-        let parent = self.resolve_ref_tip(OSTREE_METADATA_REF).await?;
+        let parent = self
+            .resolve_ref_tip(&Ref::local(OSTREE_METADATA_REF))
+            .await?;
         let commit = self
             .stage_anchor_commit(&txn, collection_id, parent, opts.metadata_commit_timestamp)
             .await?;
@@ -1867,7 +1869,7 @@ impl Repo {
                 &root,
             )
             .await?;
-        txn.set_ref(OSTREE_METADATA_REF, Some(&commit));
+        txn.set_ref(&Ref::local(OSTREE_METADATA_REF), Some(&commit));
         Ok(commit)
     }
 
@@ -3355,7 +3357,10 @@ mod tests {
             };
             repo.regenerate_summary(&opts).await.unwrap();
             let written = repo.read_summary().await.unwrap().unwrap();
-            let anchor = repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap();
+            let anchor = repo
+                .resolve_ref_tip(&Ref::local(OSTREE_METADATA_REF))
+                .await
+                .unwrap();
             assert!(anchor.is_some(), "the regeneration wrote the anchor");
             let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
             let run = repo.summary_run(access, &opts).await.unwrap();
@@ -3365,7 +3370,9 @@ mod tests {
                 .unwrap();
             assert_eq!(built, written);
             assert_eq!(
-                repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap(),
+                repo.resolve_ref_tip(&Ref::local(OSTREE_METADATA_REF))
+                    .await
+                    .unwrap(),
                 anchor,
                 "the build refreshes no anchor"
             );
@@ -3382,8 +3389,8 @@ mod tests {
     #[cfg(feature = "s3")]
     #[test]
     fn the_bucket_summary_has_the_bytes_of_the_local_root_summary() {
+        use crate::Ref;
         use crate::bucket::BucketRefs;
-        use crate::refs::CollectionRef;
 
         let dir = std::env::temp_dir().join(format!(
             "ostrya-bucket-summary-{}-{}",
@@ -3399,14 +3406,14 @@ mod tests {
             let second = commit_at(&repo, 1_700_000_100).await;
             let mut refs = BucketRefs::default();
             for (name, commit) in [("main", first), ("a/b", second)] {
-                repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+                repo.set_ref_immediate(&Ref::local(name), Some(&commit))
+                    .await
+                    .unwrap();
                 refs.heads.insert(name.into(), commit);
             }
             for (name, commit) in [("main", second), ("z", first)] {
-                let cref = CollectionRef::new("org.example.B", name);
-                repo.set_collection_ref_immediate(&cref, Some(&commit))
-                    .await
-                    .unwrap();
+                let cref = Ref::collection("org.example.B", name);
+                repo.set_ref_immediate(&cref, Some(&commit)).await.unwrap();
                 refs.mirrors
                     .entry("org.example.B".into())
                     .or_default()
@@ -3885,7 +3892,9 @@ mod tests {
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();
         for name in names {
-            repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+            repo.set_ref_immediate(&Ref::local(*name), Some(&commit))
+                .await
+                .unwrap();
         }
         let options = crate::DeltaOptions {
             timestamp: Some(1_700_000_000),
@@ -3923,15 +3932,16 @@ mod tests {
         ostrya_rt::block_on(async {
             let names = ["a/b", "a/c", "z"];
             let repo = repo_with_refs(&dir, &names).await;
-            let commit = repo.resolve_ref_tip("z").await.unwrap().unwrap();
+            let commit = repo
+                .resolve_ref_tip(&Ref::local("z"))
+                .await
+                .unwrap()
+                .unwrap();
             let mirrors = [("org.a", "x"), ("org.a", "y/z"), ("org.b", "main")];
             for (id, name) in mirrors {
-                repo.set_collection_ref_immediate(
-                    &crate::CollectionRef::new(id, name),
-                    Some(&commit),
-                )
-                .await
-                .unwrap();
+                repo.set_ref_immediate(&crate::Ref::collection(id, name), Some(&commit))
+                    .await
+                    .unwrap();
             }
             let all = all_refs();
             let anyone = anyone();
@@ -4130,10 +4140,16 @@ mod tests {
                 &["main", "pub/a", "pub/b/c", "pub/secret/s", "shadow", "free"],
             )
             .await;
-            let first = repo.resolve_ref_tip("main").await.unwrap().unwrap();
+            let first = repo
+                .resolve_ref_tip(&Ref::local("main"))
+                .await
+                .unwrap()
+                .unwrap();
             let second = commit_at(&repo, 1_700_000_100).await;
             for name in ["priv/p", "pub/secret/t"] {
-                repo.set_ref_immediate(name, Some(&second)).await.unwrap();
+                repo.set_ref_immediate(&Ref::local(name), Some(&second))
+                    .await
+                    .unwrap();
             }
             repo.set_ref_alias_immediate("pub/link", "priv/p")
                 .await
@@ -4148,10 +4164,8 @@ mod tests {
                 ("org.example.A", "hidden/h", &second),
                 ("org.example.B", "b", &second),
             ] {
-                let cref = crate::CollectionRef::new(id, name);
-                repo.set_collection_ref_immediate(&cref, Some(commit))
-                    .await
-                    .unwrap();
+                let cref = crate::Ref::collection(id, name);
+                repo.set_ref_immediate(&cref, Some(commit)).await.unwrap();
             }
             // A mirror ref and a mirror alias of the own id, which the
             // summaries ignore, and aliases under the directory of a

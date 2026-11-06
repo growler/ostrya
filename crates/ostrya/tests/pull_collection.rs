@@ -21,10 +21,10 @@ use std::sync::{Arc, Mutex};
 use common::{TmpDir, anyone, store_with_field2};
 use ostrya::endpoint::EndpointOverrides;
 use ostrya::{
-    Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
-    CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer,
-    Error, FileKind, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectName, ObjectType, PullFlags,
-    PullOptions, PullStats, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type,
+    Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CommitModifier,
+    CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer, Error,
+    FileKind, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectName, ObjectType, PullFlags,
+    PullOptions, PullStats, Ref, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type,
     Value,
 };
 use ostrya_rt::block_on;
@@ -133,8 +133,8 @@ async fn commit(
         .await
         .unwrap();
     match collection {
-        Some(id) => txn.set_collection_ref(&CollectionRef::new(id, name), Some(&checksum)),
-        None => txn.set_ref(name, Some(&checksum)),
+        Some(id) => txn.set_ref(&Ref::collection(id, name), Some(&checksum)),
+        None => txn.set_ref(&Ref::local(name), Some(&checksum)),
     }
     txn.commit().await.unwrap();
     checksum
@@ -944,7 +944,10 @@ fn the_own_collection_writes_the_local_ref() {
         let (mut opts, _) = options(&[REF]);
         opts.pull.timestamp_check = TimestampCheck::CurrentRef;
         dest.pull_collection(ID, &["a"], opts).await.unwrap();
-        assert_eq!(dest.resolve_ref_tip(REF).await.unwrap(), Some(tip));
+        assert_eq!(
+            dest.resolve_ref_tip(&Ref::local(REF)).await.unwrap(),
+            Some(tip)
+        );
         assert!(dest.list_mirror_refs().await.unwrap().is_empty());
 
         // An older commit on the remote now fails the timestamp check against
@@ -971,7 +974,10 @@ fn the_own_collection_writes_the_local_ref() {
             matches!(&err, Error::Pull(m) if m.contains("chronologically older")),
             "{err:?}"
         );
-        assert_eq!(dest.resolve_ref_tip(REF).await.unwrap(), Some(tip));
+        assert_eq!(
+            dest.resolve_ref_tip(&Ref::local(REF)).await.unwrap(),
+            Some(tip)
+        );
     });
 }
 
@@ -1002,12 +1008,12 @@ async fn assert_own_refs(dir: &Path, dest: &Repo, held: Checksum, local: Checksu
     let path = dir.join(format!("dest/refs/mirrors/{ID}/{REF}"));
     let file = std::fs::read_to_string(path).unwrap();
     assert_eq!(file.trim(), held.to_hex());
-    assert_eq!(dest.resolve_ref_tip(REF).await.unwrap(), Some(local));
-    let cref = CollectionRef::new(ID, REF);
     assert_eq!(
-        dest.resolve_collection_ref(&cref, false).await.unwrap(),
+        dest.resolve_ref_tip(&Ref::local(REF)).await.unwrap(),
         Some(local)
     );
+    let cref = Ref::collection(ID, REF);
+    assert_eq!(dest.resolve_ref_tip(&cref).await.unwrap(), Some(local));
     let all = RefSelector::parse([]).unwrap();
     assert_eq!(
         dest.list_collection_refs_in(ID, &all).await.unwrap(),
@@ -1212,7 +1218,7 @@ fn a_collection_pull_fetches_the_dependency() {
         let plain = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
         let tip = store_with_field2(&a, &plain, &[("boot/uki", dep.as_bytes())]).await;
         let txn = a.transaction().await.unwrap();
-        txn.set_ref(REF, Some(&tip));
+        txn.set_ref(&Ref::local(REF), Some(&tip));
         txn.commit().await.unwrap();
         summarize(&a).await;
         let server_a = RepoServer::start(&dir.path().join("a"), false).await;
@@ -2485,7 +2491,7 @@ fn a_query_of_300_names_takes_more_than_one_request() {
         let names: Vec<String> = (0..300).map(|n| format!("pool/n{n:03}")).collect();
         let txn = b.transaction().await.unwrap();
         for name in &names[1..] {
-            txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&tip));
+            txn.set_ref(&Ref::collection(ID, name), Some(&tip));
         }
         txn.commit().await.unwrap();
         let server_b = RepoServer::start(&dir.path().join("b"), false).await;
@@ -2855,8 +2861,8 @@ fn a_file_query_of_300_names_reads_each_ref() {
         let names: Vec<String> = (0..300).map(|n| format!("pool/n{n:03}")).collect();
         let txn = a.transaction().await.unwrap();
         for name in &names {
-            txn.set_collection_ref(&CollectionRef::new(ID, name), Some(&tip));
-            txn.set_ref(name, Some(&tip));
+            txn.set_ref(&Ref::collection(ID, name), Some(&tip));
+            txn.set_ref(&Ref::local(name), Some(&tip));
         }
         txn.commit().await.unwrap();
         let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;

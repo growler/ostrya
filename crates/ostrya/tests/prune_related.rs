@@ -14,9 +14,9 @@ use std::path::Path;
 
 use common::{TmpDir, dependency_warning, store_with_field2};
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    DictBuilder, Error, MutableTree, ObjectType, PruneOptions, RefLocation, RelatedField,
-    RelatedWarning, Repo, RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
+    Error, MutableTree, ObjectType, PruneOptions, Ref, RefLocation, RelatedField, RelatedWarning,
+    Repo, RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -87,7 +87,7 @@ async fn commit(
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&Ref::local(branch), Some(&commit));
     }
     txn.commit().await.unwrap();
     commit
@@ -253,7 +253,9 @@ fn a_related_entry_that_names_an_absent_commit_roots_nothing() {
         let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
         let absent = [0x44; 32];
         let head = store_with_field2(&repo, &plain, &[("boot/gone", &absent)]).await;
-        repo.set_ref_immediate("main", Some(&head)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&head))
+            .await
+            .unwrap();
         repo.add_detached_related(
             &head,
             "layer/gone",
@@ -318,11 +320,9 @@ fn collection_refs_are_weak() -> PruneOptions {
 
 /// Sets the collection ref `org.example.Cache`, `name` to `commit` and
 /// returns it.
-async fn set_cache_ref(repo: &Repo, name: &str, commit: &Checksum) -> CollectionRef {
-    let cref = CollectionRef::new("org.example.Cache", name);
-    repo.set_collection_ref_immediate(&cref, Some(commit))
-        .await
-        .unwrap();
+async fn set_cache_ref(repo: &Repo, name: &str, commit: &Checksum) -> Ref {
+    let cref = Ref::collection("org.example.Cache", name);
+    repo.set_ref_immediate(&cref, Some(commit)).await.unwrap();
     cref
 }
 
@@ -350,7 +350,7 @@ fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
         assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
         assert!(holds(&repo, &dep).await, "the dependency survives");
         assert_eq!(
-            repo.resolve_collection_ref(&kept, true).await.unwrap(),
+            repo.resolve_ref_tip(&kept).await.unwrap(),
             Some(dep),
             "the weak collection ref of the dependency survives"
         );
@@ -358,10 +358,7 @@ fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
             !holds(&repo, &other).await,
             "the commit of the other weak collection ref is pruned"
         );
-        assert_eq!(
-            repo.resolve_collection_ref(&dropped, true).await.unwrap(),
-            None
-        );
+        assert_eq!(repo.resolve_ref_tip(&dropped).await.unwrap(), None);
     });
 }
 
@@ -384,7 +381,7 @@ fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
         assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
         assert!(holds(&repo, &src).await, "the build source survives");
         assert_eq!(
-            repo.resolve_collection_ref(&kept, true).await.unwrap(),
+            repo.resolve_ref_tip(&kept).await.unwrap(),
             Some(src),
             "the weak collection ref of the build source survives"
         );
@@ -392,10 +389,7 @@ fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
             !holds(&repo, &other).await,
             "the commit of the other weak collection ref is pruned"
         );
-        assert_eq!(
-            repo.resolve_collection_ref(&dropped, true).await.unwrap(),
-            None
-        );
+        assert_eq!(repo.resolve_ref_tip(&dropped).await.unwrap(), None);
     });
 }
 
@@ -455,7 +449,9 @@ fn a_nested_dependency_roots_its_dependencies_with_no_warning() {
         // stored as metadata objects.
         let b = store_with_field2(&repo, &plain_b, &[("x/c", c.as_bytes())]).await;
         let head = store_with_field2(&repo, &plain_head, &[("x/b", b.as_bytes())]).await;
-        repo.set_ref_immediate("main", Some(&head)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&head))
+            .await
+            .unwrap();
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
@@ -488,7 +484,9 @@ fn unsorted_and_repeated_dependency_names_root_each_entry() {
             ],
         )
         .await;
-        repo.set_ref_immediate("main", Some(&head)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&head))
+            .await
+            .unwrap();
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
@@ -572,7 +570,9 @@ fn a_defective_dependency_entry_gives_a_warning() {
             ],
         )
         .await;
-        repo.set_ref_immediate("main", Some(&head)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&head))
+            .await
+            .unwrap();
         // The build sources of the same commit are defective too. The
         // warnings of field 2 come first.
         write_raw_detached(
@@ -1170,7 +1170,7 @@ fn a_config_key_that_names_metadata_keys_changes_no_write_and_no_prune() {
                 ..CommitOptions::default()
             };
             let head = txn.write_commit(opts, &root).await.unwrap();
-            txn.set_ref("main", Some(&head));
+            txn.set_ref(&Ref::local("main"), Some(&head));
             txn.commit().await.unwrap();
 
             // Each write path takes a string value of the key.
@@ -1195,7 +1195,7 @@ fn a_config_key_that_names_metadata_keys_changes_no_write_and_no_prune() {
                 .commit_add_composefs_metadata(&txn, &plain)
                 .await
                 .unwrap();
-            txn.set_ref("cfs", Some(&cfs));
+            txn.set_ref(&Ref::local("cfs"), Some(&cfs));
             txn.commit().await.unwrap();
 
             // A defective build-source value on a reached commit.

@@ -3638,6 +3638,7 @@ mod test_pipe;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Ref;
     use async_compression::futures::bufread::DeflateEncoder;
     use futures_lite::io::Cursor;
     use ostrya_core::Xattrs;
@@ -4848,7 +4849,7 @@ mod tests {
             related: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
-        txn.set_ref(name, Some(&commit));
+        txn.set_ref(&Ref::local(name), Some(&commit));
         txn.commit().await.unwrap();
         commit
     }

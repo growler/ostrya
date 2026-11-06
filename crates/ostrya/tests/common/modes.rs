@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectType, Repo, RepoMode, loose_path,
+    ObjectType, Ref, Repo, RepoMode, loose_path,
 };
 use ostrya_core::{ContentHasher, FileHeader, Xattrs};
 
@@ -67,7 +67,7 @@ pub async fn commit(repo: &Repo, src: &Path) -> Checksum {
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

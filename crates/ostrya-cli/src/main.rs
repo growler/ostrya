@@ -57,18 +57,17 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 use ostrya::gpg::MAX_KEYRING;
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
-    CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness,
-    DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
-    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
-    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions,
-    PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias,
-    RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary,
-    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
-    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
-    from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
-    validate_refspec,
+    CollectionPullOptions, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
+    ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions,
+    DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer,
+    Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult, FsckBindingError,
+    FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, KeyFile,
+    MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RemoteSource,
+    RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -8938,10 +8937,10 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         }
     }
     if let Some(branch) = args.branch.as_deref() {
-        txn.set_ref(branch, Some(&checksum));
+        txn.set_ref(&branch.parse::<Ref>()?, Some(&checksum));
     }
     for tag in &args.tags {
-        txn.set_ref(tag, Some(&checksum));
+        txn.set_ref(&tag.parse::<Ref>()?, Some(&checksum));
     }
     let stats = txn.commit().await?;
 
@@ -11235,7 +11234,8 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
         return repo.set_ref_alias_immediate(newref, existing).await;
     }
     let commit = resolve(repo, existing).await?;
-    repo.set_ref_immediate(newref, Some(&commit)).await
+    repo.set_ref_immediate(&newref.parse::<Ref>()?, Some(&commit))
+        .await
 }
 
 /// Writes a collection ref for `-c` from a `<collection-id>:<ref>` NEWREF.
@@ -11270,8 +11270,7 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
     if !ostrya::is_collection_id(collection_id) {
         exit_error(&format!("Invalid collection ID {collection_id}"));
     }
-    let cref = CollectionRef::new(collection_id, ref_name);
-    repo.set_collection_ref_immediate(&cref, Some(&commit))
+    repo.set_ref_immediate(&Ref::collection(collection_id, ref_name), Some(&commit))
         .await
 }
 
@@ -11295,19 +11294,17 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
 /// file, is a refusal or a miss.
 ///
 /// The lookup reads only the ref store ([`Repo::resolve_ref_tip`]), so no
-/// revision syntax applies here.
+/// revision syntax applies here. An alias target is a refspec, so a name that
+/// [`validate_refspec`] refuses names no ref.
 async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     // A 64-character name is a checksum only in lowercase hex, as the split
     // resolution reads it. An uppercase one is looked up as a ref name, and an
     // alias to it is written.
-    if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() {
+    if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() || validate_refspec(rev).is_err()
+    {
         return Ok(None);
     }
-    match repo.resolve_ref_tip(rev).await {
-        Ok(found) => Ok(found),
-        Err(Error::InvalidRefspec(_)) => Ok(None),
-        Err(err) => Err(err),
-    }
+    repo.resolve_ref_tip(&rev.parse::<Ref>()?).await
 }
 
 /// Returns `true` if `rev` names a ref file, by the rules of
@@ -11361,12 +11358,11 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// `collection-id` of the repository removes only the refs under
 /// `refs/heads`. The `-c` listing ignores the mirror refs with that id, so
 /// they stay. The command checks each
-/// selected ref that it removes with [`CollectionRef::validate`] before it
-/// removes the first ref. A ref under `refs/heads` is a `CollectionRef` with
-/// no id and takes the ref-name rule, so a name with `:` fails. A mirror ref
-/// takes the collection-id rule and the ref-name rule. If one selected ref
-/// fails, the command fails with [`Error::InvalidRefspec`] and removes no
-/// ref.
+/// selected ref that it removes with [`Ref::validate`] before it removes the
+/// first ref. A ref under `refs/heads` is a [`Ref::Local`] and takes the
+/// ref-name rule, so a name with `:` fails. A mirror ref takes the
+/// collection-id rule and the ref-name rule. If one selected ref fails, the
+/// command fails with [`Error::InvalidRefspec`] and removes no ref.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -11377,13 +11373,13 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // that id. A foreign id removes the mirror refs that it names.
         let selected = select_collection_refs(repo, &args.prefix).await?;
         // The refs to remove. A ref under `refs/heads` has no id.
-        let removed: Vec<CollectionRef> = selected
+        let removed: Vec<Ref> = selected
             .into_iter()
             .map(|entry| {
                 if entry.local {
-                    CollectionRef::local(entry.name)
+                    Ref::local(entry.name)
                 } else {
-                    CollectionRef::new(entry.collection, entry.name)
+                    Ref::collection(entry.collection, entry.name)
                 }
             })
             .collect();
@@ -11391,11 +11387,11 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // first removal. A ref under `refs/heads` takes the ref-name rule, so
         // a name with `:` fails. A mirror ref takes the collection-id rule
         // and the ref-name rule.
-        for cref in &removed {
-            cref.validate()?;
+        for r in &removed {
+            r.validate()?;
         }
-        for cref in &removed {
-            repo.set_collection_ref_immediate(cref, None).await?;
+        for r in &removed {
+            repo.set_ref_immediate(r, None).await?;
         }
         return Ok(());
     }
@@ -11436,7 +11432,11 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
             }
         }
         for refspec in &selected {
-            repo.set_ref_immediate(refspec, None).await?;
+            // A listed name is a refspec. A name with `@` from outside the
+            // port fails here, and it is not read as a collection ref.
+            validate_refspec(refspec)?;
+            repo.set_ref_immediate(&refspec.parse::<Ref>()?, None)
+                .await?;
         }
         all.retain(|(name, _)| !selected.contains(name));
         aliases.retain(|(alias, _)| !selected.contains(alias));

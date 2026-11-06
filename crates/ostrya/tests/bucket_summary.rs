@@ -29,8 +29,8 @@ use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Ed25519Signer, Ed25519Verifier, Error, MutableTree, ObjectType, PullOptions, Repo, RepoMode,
-    SignFuture, Signer, Summary, SummaryOptions, Value,
+    Ed25519Signer, Ed25519Verifier, Error, MutableTree, ObjectType, PullOptions, Ref, Repo,
+    RepoMode, SignFuture, Signer, Summary, SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -272,7 +272,7 @@ async fn commit(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&checksum));
+        txn.set_ref(&Ref::local(branch), Some(&checksum));
     }
     txn.commit().await.unwrap();
     checksum

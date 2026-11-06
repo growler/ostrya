@@ -24,7 +24,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     BootableRefusal, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    MutableTree, Repo, RepoMode, RepoTree, Transaction,
+    MutableTree, Ref, Repo, RepoMode, RepoTree, Transaction,
 };
 use ostrya_rt::block_on;
 
@@ -234,7 +234,7 @@ fn the_published_form_reads_a_committed_tree() {
             .write_commit(CommitOptions::default(), &root)
             .await
             .unwrap();
-        txn.set_ref("kernel", Some(&checksum));
+        txn.set_ref(&Ref::local("kernel"), Some(&checksum));
         txn.commit().await.unwrap();
 
         let reopened = Repo::open(&repo_dir).await.unwrap();

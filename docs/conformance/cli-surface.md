@@ -193,7 +193,7 @@ are observed and deliberately not reproduced:
   store refuses one selected ref by its id or its name, the
   command removes no ref and exits 1. A mirror ref whose id fails the
   collection-id rule or is longer than 255 bytes, or whose name fails the
-  ref-name rule, gives `error: Invalid refspec <id>:<name>`. A ref under
+  ref-name rule, gives `error: Invalid refspec @<id>:<name>`. A ref under
   `refs/heads` whose name fails the ref-name rule gives `error: Invalid refspec
   <name>`. The ref-name rule refuses a name with `:`;
 - a file under `refs/heads` whose name holds `:`, for example
@@ -350,6 +350,10 @@ are observed and deliberately not reproduced:
   because the same parser reads a checksum out of delta metadata. The rule for a
   64-character name agrees in both, and is in `../format-reference.md`,
   "Revision syntax".
+
+Each revision operand of the port also reads `@ID:NAME`, the ref `NAME` of
+the collection `ID`. This form is a port extension. `../format-reference.md`,
+"Revision syntax", states its rule.
 
 Abbreviated checksum resolution is shared: a run of one to 63 lowercase hex
 characters names the one commit object whose checksum starts with it, wherever a

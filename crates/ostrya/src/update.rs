@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::os::fd::BorrowedFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use ostrya_core::{Checksum, KeyFile};
+use ostrya_core::{Checksum, KeyFile, Ref};
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
@@ -21,8 +21,8 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
-    CollectionRef, collection_ref_path, put_alias_blocking, put_ref_blocking, refspec_to_relpath,
-    relative_link, sync_dirs_all,
+    put_alias_blocking, put_ref_blocking, ref_relpath, refspec_to_relpath, relative_link,
+    sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config_blocking};
@@ -99,8 +99,7 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// - [`Transaction::commit`](crate::Transaction::commit) of a transaction
 ///   that writes a ref or detached metadata, at the step that writes them. A
 ///   pull and the transaction commit of a receive session wait at this step.
-/// - [`Repo::set_ref_immediate`], [`Repo::set_collection_ref_immediate`],
-///   and [`Repo::set_ref_alias_immediate`].
+/// - [`Repo::set_ref_immediate`] and [`Repo::set_ref_alias_immediate`].
 /// - [`Repo::write_config`], [`Repo::remove_remote_keyring`], and, under the
 ///   `verify-gpg` feature, `Repo::gpg_import_keys`.
 /// - [`Repo::regenerate_summary`], [`Repo::regenerate_summaries`],
@@ -327,85 +326,46 @@ impl UpdateGuard {
         &self.held.repo
     }
 
-    /// Returns the commit that a refspec names in the ref store.
+    /// Returns the commit that a ref names in the ref store.
     ///
-    /// The call reads the ref as [`Repo::resolve_ref_tip`] reads it. If the
-    /// store holds the ref as an alias, the call follows the alias to the ref
-    /// that it names. The result is `None` if the store holds no such ref.
+    /// The call reads the ref as [`Repo::resolve_ref_tip`] reads it. For a
+    /// collection ref of the `[core] collection-id` of the repository, the
+    /// call reads `refs/heads/NAME`, and it does not read
+    /// `refs/mirrors/ID/`. If the store holds the ref as an alias, the call
+    /// follows the alias to the ref that it names. The result is `None` if
+    /// the store holds no such ref.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
+    ///   call reads no file.
     /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
     /// - [`Error::Core`] if the ref file holds no checksum.
     /// - [`Error::Io`] if the read fails, for example if the ref path names a
     ///   directory.
-    pub async fn read_ref(&self, refspec: &str) -> Result<Option<Checksum>> {
-        self.repo().resolve_ref_tip(refspec).await
-    }
-
-    /// Returns the commit that a collection ref names in the ref store.
-    ///
-    /// The call reads the ref as [`read_ref`](UpdateGuard::read_ref) reads a
-    /// refspec, at the path that [`Repo::resolve_collection_ref`] reads. For
-    /// the `[core] collection-id` of the repository, the call reads
-    /// `refs/heads/NAME`, and it does not read `refs/mirrors/ID/`.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidRefspec`] if the collection id does not pass
-    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
-    ///   bytes, or if the ref name is not valid. The call reads no file.
-    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
-    /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example if the ref path names a
-    ///   directory.
-    pub async fn read_collection_ref(&self, cref: &CollectionRef) -> Result<Option<Checksum>> {
-        let own = self.repo().config().collection_id();
-        self.repo()
-            .resolve_relpath_tip(collection_ref_path(own, cref)?)
-            .await
+    pub async fn read_ref(&self, r: &Ref) -> Result<Option<Checksum>> {
+        self.repo().resolve_ref_tip(r).await
     }
 
     /// Writes one ref atomically, as [`Repo::set_ref_immediate`] writes it.
     ///
-    /// If `checksum` is `None`, the call removes the ref file. The ref is
-    /// visible when the call returns. The sync of each directory that changed
-    /// waits for [`finish`](UpdateGuard::finish).
+    /// The ref gives the path that [`Repo::set_ref_immediate`] writes:
+    /// `refs/heads/NAME` for a collection ref of the `[core] collection-id`
+    /// of the repository. If `checksum` is `None`, the call removes the ref
+    /// file. The ref is visible when the call returns. The sync of each
+    /// directory that changed waits for [`finish`](UpdateGuard::finish).
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
-    /// - [`Error::Io`] if a file system operation fails.
-    pub async fn set_ref(&self, refspec: &str, checksum: Option<&Checksum>) -> Result<()> {
-        let relpath = refspec_to_relpath(refspec)?;
-        self.set_relpath(relpath, checksum).await
-    }
-
-    /// Writes one collection ref atomically, as
-    /// [`set_ref`](UpdateGuard::set_ref) writes a refspec.
-    ///
-    /// The call writes the path that
-    /// [`Repo::set_collection_ref_immediate`] writes: `refs/heads/NAME` for
-    /// the `[core] collection-id` of the repository. If `checksum` is `None`,
-    /// the call removes the ref file.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidRefspec`] if the collection id does not pass
-    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
-    ///   bytes, or if the ref name is not valid. The call writes nothing.
+    /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
+    ///   call writes nothing.
     /// - [`Error::Io`] if a file system operation fails.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
     /// such a ref by hand.
-    pub async fn set_collection_ref(
-        &self,
-        cref: &CollectionRef,
-        checksum: Option<&Checksum>,
-    ) -> Result<()> {
-        let relpath = collection_ref_path(self.repo().config().collection_id(), cref)?;
+    pub async fn set_ref(&self, r: &Ref, checksum: Option<&Checksum>) -> Result<()> {
+        let relpath = ref_relpath(self.repo().config().collection_id(), r)?;
         self.set_relpath(relpath, checksum).await
     }
 
@@ -1036,7 +996,7 @@ const _: fn() = || {
     fn assert_send<T: Send>(_: &T) {}
     assert_send_sync::<UpdateGuard>();
     let _ = |repo: &Repo| assert_send(&repo.begin_update());
-    let _ = |guard: &UpdateGuard, c: &Checksum| assert_send(&guard.set_ref("r", Some(c)));
+    let _ = |guard: &UpdateGuard, r: &Ref, c: &Checksum| assert_send(&guard.set_ref(r, Some(c)));
     let _ = |guard: &UpdateGuard, k: &KeyFile| assert_send(&guard.write_config(k));
     let _ = |guard: &UpdateGuard| assert_send(&guard.add_remote("r", &[("url", "u")]));
     let _ = |guard: &UpdateGuard| assert_send(&guard.set_remote_key("r", "url", "u"));
@@ -1119,8 +1079,14 @@ mod tests {
     /// Writes two refs in two directories and a config through `guard`, so
     /// the guard records three directories.
     async fn write_three_dirs(guard: &UpdateGuard) {
-        guard.set_ref("a/one", Some(&checksum())).await.unwrap();
-        guard.set_ref("b", Some(&checksum())).await.unwrap();
+        guard
+            .set_ref(&Ref::local("a/one"), Some(&checksum()))
+            .await
+            .unwrap();
+        guard
+            .set_ref(&Ref::local("b"), Some(&checksum()))
+            .await
+            .unwrap();
         let keyfile = guard.read_config().await.unwrap().keyfile().clone();
         guard.write_config(&keyfile).await.unwrap();
     }
@@ -1177,7 +1143,10 @@ mod tests {
         ostrya_rt::block_on(async {
             let guard = repo.begin_update().await.unwrap();
             write_three_dirs(&guard).await;
-            guard.set_ref("a/two", Some(&checksum())).await.unwrap();
+            guard
+                .set_ref(&Ref::local("a/two"), Some(&checksum()))
+                .await
+                .unwrap();
             let before = test_syncs::count(&scratch.path());
             guard.finish().await.unwrap();
             assert_eq!(test_syncs::count(&scratch.path()), before + 3);

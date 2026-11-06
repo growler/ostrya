@@ -34,7 +34,7 @@ use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate}
 use ostrya::verify::TrustedKeys;
 use ostrya::{
     Checksum, ComposefsImageState, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName,
-    ObjectType, ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Repo, RepoMode,
+    ObjectType, ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Ref, Repo, RepoMode,
     ServerSigner, StreamPolicy, StreamRule, Type, Value,
 };
 use ostrya_rt::block_on;
@@ -1702,7 +1702,12 @@ mod export {
     #[test]
     fn the_updates_of_a_set_of_refspecs_commit_into_a_repository() {
         let source = Source::new("one-way-export-updates-source");
-        block_on(source.repo.set_ref_immediate("main", Some(&source.commit))).unwrap();
+        block_on(
+            source
+                .repo
+                .set_ref_immediate(&Ref::local("main"), Some(&source.commit)),
+        )
+        .unwrap();
         let refspecs = ["main".to_owned(), "main:copy".to_owned()];
         let updates = block_on(source.repo.export_updates(&refspecs, Some("origin"))).unwrap();
         assert_eq!(

@@ -25,7 +25,7 @@ use ostrya::access::CollectionScope;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DictBuilder, Ed25519Signer,
-    Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, ReceiveVerify,
+    Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, ReceiveVerify, Ref,
     Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
@@ -129,7 +129,7 @@ fn commit_related(
             )
             .await
             .unwrap();
-        txn.set_ref(branch, Some(&checksum));
+        txn.set_ref(&Ref::local(branch), Some(&checksum));
         txn.commit().await.unwrap();
         checksum
     })
@@ -422,7 +422,10 @@ fn a_push_onto_a_moved_ref_fails_with_ref_mismatch() {
     let (report, outcome) = push_through(&pair, opts(&["main"]), move |kind| {
         if kind == COMMIT_FRAME {
             let server = server.clone();
-            on_own_thread(move || block_on(server.set_ref_immediate("main", Some(&side)))).unwrap();
+            on_own_thread(move || {
+                block_on(server.set_ref_immediate(&Ref::local("main"), Some(&side)))
+            })
+            .unwrap();
         }
     });
     assert!(report.is_err());
@@ -1312,8 +1315,10 @@ fn a_forced_push_expects_any_state_of_the_ref() {
         move |kind| {
             if kind == COMMIT_FRAME {
                 let server = server.clone();
-                on_own_thread(move || block_on(server.set_ref_immediate("main", Some(&side))))
-                    .unwrap();
+                on_own_thread(move || {
+                    block_on(server.set_ref_immediate(&Ref::local("main"), Some(&side)))
+                })
+                .unwrap();
             }
         },
     );
@@ -1351,7 +1356,7 @@ fn a_delete_of_a_destination_of_64_lowercase_hex_characters_removes_the_ref() {
     report.unwrap();
     outcome.unwrap();
     let hex = "a".repeat(64);
-    block_on(pair.server.set_ref_immediate(&hex, Some(&c1))).unwrap();
+    block_on(pair.server.set_ref_immediate(&Ref::local(&hex), Some(&c1))).unwrap();
     let path = pair.server.path().join("refs/heads").join(&hex);
     assert!(path.exists());
 
@@ -1501,7 +1506,7 @@ fn remove_commit_object(repo: &Repo, commit: &Checksum) {
 fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
     block_on(async {
         let txn = repo.transaction().await.unwrap();
-        txn.set_ref(name, Some(commit));
+        txn.set_ref(&Ref::local(name), Some(commit));
         txn.commit().await.unwrap();
     });
 }

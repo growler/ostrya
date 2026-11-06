@@ -28,8 +28,8 @@ use ostrya::remote::proto::{CommitRequest, ErrorMessage, Message, ServerCommit};
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, Commit, Ed25519Signer, Ed25519Verifier, ObjectType, ReceivePolicies, ReceivePolicy,
-    ReceiveReport, ReceiveVerify, Repo, RepoMode, ServerSigner, Signer, Summary, TrustedKeys, Type,
-    Value, Verifier,
+    ReceiveReport, ReceiveVerify, Ref, Repo, RepoMode, ServerSigner, Signer, Summary, TrustedKeys,
+    Type, Value, Verifier,
 };
 use ostrya_rt::block_on;
 
@@ -1321,7 +1321,7 @@ fn a_collection_repo_writes_the_anchor_after_a_server_commit() {
         load(&repo, &commit).1.collection_binding(),
         Some("org.example.C")
     );
-    let anchor = block_on(repo.resolve_ref_tip("ostree-metadata"))
+    let anchor = block_on(repo.resolve_ref_tip(&Ref::local("ostree-metadata")))
         .unwrap()
         .expect("the anchor ref");
     let summary = Summary::parse(&block_on(repo.read_summary()).unwrap().unwrap()).unwrap();

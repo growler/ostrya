@@ -267,7 +267,7 @@ pub enum StagingLookup {
 /// # async fn run() -> ostrya::Result<()> {
 /// use std::path::Path;
 ///
-/// use ostrya::{CommitOptions, DirMeta, FileMeta, Repo, Xattrs};
+/// use ostrya::{CommitOptions, DirMeta, FileMeta, Ref, Repo, Xattrs};
 ///
 /// let repo = Repo::open("/srv/repo".as_ref()).await?;
 /// let txn = repo.transaction().await?;
@@ -279,7 +279,7 @@ pub enum StagingLookup {
 /// let mut tree = st.close()?;
 /// let root = txn.write_mtree(&mut tree).await?;
 /// let commit = txn.write_commit(CommitOptions::default(), &root).await?;
-/// txn.set_ref("exampleos/stable", Some(&commit));
+/// txn.set_ref(&Ref::local("exampleos/stable"), Some(&commit));
 /// txn.commit().await?;
 /// # Ok(()) }
 /// ```

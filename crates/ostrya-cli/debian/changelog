@@ -16,6 +16,8 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
   * push to a bucket and remote summary -u skip the keys of
     refs/mirrors/ID/ of the collection id of the bucket. remote fsck
     gives each such key a note, and remote prune keeps its commit.
+  * A revision takes @ID:NAME, the ref NAME of the collection ID. An
+    error names a collection ref as @ID:NAME.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

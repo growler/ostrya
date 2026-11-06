@@ -38,7 +38,7 @@ use ostrya::remote::{
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
     FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType, ReceivePolicy, ReceiveReport,
-    Repo, RepoMode, Type, Value,
+    Ref, Repo, RepoMode, Type, Value,
 };
 use ostrya_core::commit_metadata;
 use ostrya_rt::block_on;
@@ -898,7 +898,7 @@ fn the_server_commit_of_a_tree_push_names_no_dependency() {
         let named =
             common::store_with_field2(&repo, &first, &[("boot/first", first.as_bytes())]).await;
         let txn = repo.transaction().await.unwrap();
-        txn.set_ref(REF, Some(&named));
+        txn.set_ref(&Ref::local(REF), Some(&named));
         txn.commit().await.unwrap();
         named
     });

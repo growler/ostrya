@@ -25,8 +25,8 @@ use common::{
 };
 use ostrya::base64;
 use ostrya::{
-    AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, RefSelector, Repo,
-    RepoMode, Summary, SummaryOptions, Value,
+    AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, Ref, RefSelector,
+    Repo, RepoMode, Summary, SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -752,7 +752,10 @@ fn a_regeneration_with_no_guard_takes_its_locks_at_once() {
         repo.regenerate_summary(&SummaryOptions::default())
             .await
             .unwrap();
-        let anchor = repo.resolve_ref_tip("ostree-metadata").await.unwrap();
+        let anchor = repo
+            .resolve_ref_tip(&Ref::local("ostree-metadata"))
+            .await
+            .unwrap();
         assert!(anchor.is_some(), "the anchor was written");
         assert!(repo_dir.join("summary").exists());
     });
@@ -842,7 +845,9 @@ async fn add_prefix_refs(repo: &Repo) -> (Checksum, Checksum) {
         ("ab", other),
         ("x/y", other),
     ] {
-        repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local(name), Some(&commit))
+            .await
+            .unwrap();
     }
     repo.set_ref_alias_immediate("x/al", "a/b").await.unwrap();
     (main, other)
@@ -1228,8 +1233,8 @@ fn a_ref_listing_names_the_collection_and_no_mirror_ref() {
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let (_, commit) = repo.list_refs(None).await.unwrap()[0].clone();
-        repo.set_collection_ref_immediate(
-            &ostrya::CollectionRef::new("org.ostrya.Other", "mirrored"),
+        repo.set_ref_immediate(
+            &ostrya::Ref::collection("org.ostrya.Other", "mirrored"),
             Some(&commit),
         )
         .await
@@ -1263,7 +1268,7 @@ fn a_ref_listing_reads_only_the_refs_that_it_selects() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         add_prefix_refs(&repo).await;
         let missing = Checksum::from_bytes([7; 32]);
-        repo.set_ref_immediate("broken", Some(&missing))
+        repo.set_ref_immediate(&Ref::local("broken"), Some(&missing))
             .await
             .unwrap();
         let heads = repo_dir.join("refs/heads");
@@ -1339,7 +1344,7 @@ fn a_ref_listing_holds_the_readable_refs_alone() {
         let heads = repo_dir.join("refs/heads");
         std::fs::write(heads.join("garbage"), "no checksum\n").unwrap();
         let missing = Checksum::from_bytes([7; 32]);
-        repo.set_ref_immediate("broken", Some(&missing))
+        repo.set_ref_immediate(&Ref::local("broken"), Some(&missing))
             .await
             .unwrap();
         let reader = read_access(
@@ -1584,7 +1589,9 @@ fn a_ref_listing_walks_the_directories_that_the_client_reads() {
             ("priv/p", other),
             ("locked/l", main),
         ] {
-            repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+            repo.set_ref_immediate(&Ref::local(name), Some(&commit))
+                .await
+                .unwrap();
         }
         repo.set_ref_alias_immediate("pub/al", "main")
             .await
@@ -1721,7 +1728,7 @@ fn names_of(map: Map<'_>) -> Vec<(String, Vec<String>)> {
 
 /// Sets the mirror ref `id/name` of `repo` to `commit`.
 async fn set_mirror(repo: &Repo, id: &str, name: &str, commit: &Checksum) {
-    repo.set_collection_ref_immediate(&ostrya::CollectionRef::new(id, name), Some(commit))
+    repo.set_ref_immediate(&ostrya::Ref::collection(id, name), Some(commit))
         .await
         .unwrap();
 }
@@ -2511,7 +2518,9 @@ fn the_delta_map_follows_the_refs_of_the_summary() {
             .unwrap();
         // No ref names `other` now, so only a summary of each ref lists the
         // delta to it.
-        repo.set_ref_immediate("other", Some(&main)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("other"), Some(&main))
+            .await
+            .unwrap();
         set_mirror(&repo, "org.example.M", "m", &main).await;
         let repo = with_groups(
             &repo_dir,
@@ -2807,7 +2816,9 @@ fn the_summaries_of_the_auth_items_alone_leave_the_root_summary() {
         }
 
         let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
-        repo.set_ref_immediate("added", Some(&main)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("added"), Some(&main))
+            .await
+            .unwrap();
         let config = repo_dir.join("config");
         let text = std::fs::read_to_string(&config).unwrap();
         let text = text.replace(
@@ -2947,7 +2958,10 @@ fn the_summaries_of_the_auth_items_alone_write_no_anchor_commit() {
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         repo.regenerate_summary(&fixed()).await.unwrap();
-        let tip = repo.resolve_ref_tip("ostree-metadata").await.unwrap();
+        let tip = repo
+            .resolve_ref_tip(&Ref::local("ostree-metadata"))
+            .await
+            .unwrap();
         let tip = tip.expect("the anchor was written");
         let summary = std::fs::read(repo_dir.join("summary")).unwrap();
         let refs = common::file_inventory(&repo_dir, "refs");
@@ -2960,7 +2974,9 @@ fn the_summaries_of_the_auth_items_alone_write_no_anchor_commit() {
         .await
         .unwrap();
         assert_eq!(
-            repo.resolve_ref_tip("ostree-metadata").await.unwrap(),
+            repo.resolve_ref_tip(&Ref::local("ostree-metadata"))
+                .await
+                .unwrap(),
             Some(tip)
         );
         assert_eq!(common::file_inventory(&repo_dir, "refs"), refs);
@@ -3134,7 +3150,9 @@ fn an_access_file_that_holds_the_digest_is_not_written_again() {
                 )
             })
             .collect();
-        repo.set_ref_immediate("main", None).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), None)
+            .await
+            .unwrap();
         repo.regenerate_summary(&fixed()).await.unwrap();
         for (file, (ino, bytes)) in files.iter().zip(&before) {
             assert_eq!(std::fs::metadata(file).unwrap().ino(), *ino, "{file:?}");

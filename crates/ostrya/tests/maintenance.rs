@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use common::{TmpDir, ostree_available};
 use ostrya::{
     Checksum, CreateOptions, DiffChange, DiffEntry, FsckOptions, LockKind, ObjectName, ObjectType,
-    Repo, RepoMode,
+    Ref, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -805,7 +805,7 @@ async fn build_library_repo(base: &Path) -> (Repo, Checksum) {
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }
@@ -840,7 +840,7 @@ async fn library_commit(repo: &Repo, base: &Path, rel: &str, parent: Option<Chec
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -1462,10 +1462,12 @@ fn fsck_binding_checks_report_each_kind() {
         .unwrap();
         let commit =
             commit_with_metadata(&repo, base, "one", binding_metadata(&["alpha"], None)).await;
-        repo.set_ref_immediate("alpha", Some(&commit))
+        repo.set_ref_immediate(&Ref::local("alpha"), Some(&commit))
             .await
             .unwrap();
-        repo.set_ref_immediate("beta", Some(&commit)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("beta"), Some(&commit))
+            .await
+            .unwrap();
         let report = repo.fsck(&bindings(false)).await.unwrap();
         match kind(report.failure) {
             FsckBindingErrorKind::RefNotBound { ref_name, bindings } => {
@@ -1490,10 +1492,8 @@ fn fsck_binding_checks_report_each_kind() {
             binding_metadata(&["main"], Some("org.test.Coll")),
         )
         .await;
-        let cref = ostrya::CollectionRef::new("org.test.Other", "main");
-        repo.set_collection_ref_immediate(&cref, Some(&commit))
-            .await
-            .unwrap();
+        let cref = ostrya::Ref::collection("org.test.Other", "main");
+        repo.set_ref_immediate(&cref, Some(&commit)).await.unwrap();
         let report = repo.fsck(&bindings(false)).await.unwrap();
         match kind(report.failure) {
             FsckBindingErrorKind::CollectionMismatch { bound, found_under } => {
@@ -1514,7 +1514,7 @@ fn fsck_binding_checks_report_each_kind() {
             binding_metadata(&["alpha", "delta"], None),
         )
         .await;
-        repo.set_ref_immediate("alpha", Some(&commit))
+        repo.set_ref_immediate(&Ref::local("alpha"), Some(&commit))
             .await
             .unwrap();
         let report = repo.fsck(&bindings(true)).await.unwrap();
@@ -1531,7 +1531,7 @@ fn fsck_binding_checks_report_each_kind() {
             commit_with_metadata(&repo, base, "one", binding_metadata(&["alpha"], None)).await;
         let second =
             commit_with_metadata(&repo, base, "two", binding_metadata(&["alpha"], None)).await;
-        repo.set_ref_immediate("alpha", Some(&second))
+        repo.set_ref_immediate(&Ref::local("alpha"), Some(&second))
             .await
             .unwrap();
         let report = repo.fsck(&bindings(true)).await.unwrap();
@@ -1556,7 +1556,9 @@ fn fsck_binding_checks_report_each_kind() {
             binding_metadata(&["main"], Some("org.test.Coll")),
         )
         .await;
-        repo.set_ref_immediate("main", Some(&commit)).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&commit))
+            .await
+            .unwrap();
         let report = repo.fsck(&bindings(true)).await.unwrap();
         match kind(report.failure) {
             FsckBindingErrorKind::BackCollectionRefMissing {
@@ -1588,11 +1590,11 @@ fn fsck_binding_checks_report_each_kind() {
             binding_metadata(&["main"], Some("org.test.Coll")),
         )
         .await;
-        repo.set_ref_immediate("main", Some(&second)).await.unwrap();
-        let cref = ostrya::CollectionRef::new("org.test.Coll", "main");
-        repo.set_collection_ref_immediate(&cref, Some(&first))
+        repo.set_ref_immediate(&Ref::local("main"), Some(&second))
             .await
             .unwrap();
+        let cref = ostrya::Ref::collection("org.test.Coll", "main");
+        repo.set_ref_immediate(&cref, Some(&first)).await.unwrap();
         let report = repo.fsck(&bindings(true)).await.unwrap();
         match kind(report.failure) {
             FsckBindingErrorKind::BackCollectionRefMismatch {
@@ -1646,7 +1648,7 @@ async fn dependency_commit(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&Ref::local(branch), Some(&commit));
     }
     txn.commit().await.unwrap();
     commit

@@ -20,8 +20,8 @@ use std::path::Path;
 use common::{Field2Entry, TmpDir, file_inventory, store_with_field2};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelated, CreateOptions,
-    DictBuilder, DummySigner, Error, LockKind, MutableTree, ObjectType, PullOptions, RelatedField,
-    Repo, RepoMode, RepoTree, Transaction, Type, Value,
+    DictBuilder, DummySigner, Error, LockKind, MutableTree, ObjectType, PullOptions, Ref,
+    RelatedField, Repo, RepoMode, RepoTree, Transaction, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -310,7 +310,7 @@ fn write_commit_refuses_defective_or_incomplete_dependencies() {
                 .write_commit(options("head", &[("a/x", dep)]), &root)
                 .await
                 .unwrap();
-            txn.set_ref("main", Some(&written));
+            txn.set_ref(&Ref::local("main"), Some(&written));
             txn.abort().await.unwrap();
             assert_eq!(objects(&repo), objects_before, "no new object");
             assert_eq!(refs(&repo), refs_before, "no new ref");
@@ -1049,7 +1049,7 @@ fn add_detached_related_refuses_a_defective_stored_value() {
         let refs_before = refs(&repo);
         let txn = repo.transaction().await.unwrap();
         txn.add_detached_related(&head, "source/src", &src).unwrap();
-        txn.set_ref("main", Some(&head));
+        txn.set_ref(&Ref::local("main"), Some(&head));
         let err = txn.commit().await.unwrap_err();
         assert_eq!(related_error(err), expected);
         assert_eq!(objects(&repo), before);
@@ -1322,7 +1322,7 @@ fn a_queued_defective_dict_fails_the_commit() {
             let root = stage_tree(&txn, tmp.path(), "head").await;
             let head = txn.write_commit(options("head", &[]), &root).await.unwrap();
             txn.set_commit_detached_metadata(&head, dict(vec![(RELATED_KEY, value)]));
-            txn.set_ref("main", Some(&head));
+            txn.set_ref(&Ref::local("main"), Some(&head));
             let err = txn.commit().await.unwrap_err();
             assert_eq!(
                 related_error(err),
@@ -1365,7 +1365,7 @@ fn a_local_pull_stores_a_defective_value() {
         let txn = src.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
         let head = txn.write_commit(options("head", &[]), &root).await.unwrap();
-        txn.set_ref("main", Some(&head));
+        txn.set_ref(&Ref::local("main"), Some(&head));
         txn.commit().await.unwrap();
         let meta = dict(vec![(
             RELATED_KEY,

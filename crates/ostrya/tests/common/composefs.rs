@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use ostrya::{
-    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Repo, RepoMode,
+    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Ref, Repo, RepoMode,
     TransactionStats, Type, Value,
 };
 
@@ -202,7 +202,7 @@ pub async fn commit_tree(
         commit
     };
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&Ref::local(branch), Some(&commit));
     }
     let stats = txn.commit().await.unwrap();
     (commit, stats)

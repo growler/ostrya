@@ -23,7 +23,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use common::TmpDir;
-use ostrya::{CreateOptions, FileMeta, Repo, RepoMode};
+use ostrya::{CreateOptions, FileMeta, Ref, Repo, RepoMode};
 use ostrya_core::{ObjectType, loose_path};
 use ostrya_rt::block_on;
 
@@ -164,7 +164,7 @@ fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
             .await
             .expect("create the repository");
         std::fs::remove_dir_all(&tmp).expect("remove tmp/");
-        repo.set_ref_immediate("dir/one", Some(&checksum))
+        repo.set_ref_immediate(&Ref::local("dir/one"), Some(&checksum))
             .await
             .expect("write the ref");
         assert_eq!(mode_of(&tmp), 0o2770, "the tmp directory");

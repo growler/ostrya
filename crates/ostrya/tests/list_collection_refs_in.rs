@@ -11,7 +11,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use common::TmpDir;
-use ostrya::{Checksum, CollectionRef, CreateOptions, Error, RefSelector, Repo, RepoMode};
+use ostrya::{Checksum, CreateOptions, Error, Ref, RefSelector, Repo, RepoMode};
 use ostrya_rt::block_on;
 
 /// The `[core] collection-id` of the repositories of the tests.
@@ -45,7 +45,7 @@ fn checksum(byte: u8) -> Checksum {
 
 /// Writes `checksum` to the collection ref `id:name`.
 async fn put(repo: &Repo, id: &str, name: &str, checksum: &Checksum) {
-    repo.set_collection_ref_immediate(&CollectionRef::new(id, name), Some(checksum))
+    repo.set_ref_immediate(&Ref::collection(id, name), Some(checksum))
         .await
         .unwrap();
 }
@@ -60,7 +60,9 @@ fn put_own_mirror(path: &Path, name: &str, checksum: &Checksum) {
 
 /// Writes `checksum` to the local ref `name`.
 async fn put_local(repo: &Repo, name: &str, checksum: &Checksum) {
-    repo.set_ref_immediate(name, Some(checksum)).await.unwrap();
+    repo.set_ref_immediate(&Ref::local(name), Some(checksum))
+        .await
+        .unwrap();
 }
 
 fn selector(entries: &[&str]) -> RefSelector {
@@ -483,7 +485,7 @@ fn an_alias_lists_the_commit_of_its_target() {
     let repo = open(&path);
     block_on(async {
         put(&repo, OTHER, "stable", &checksum(1)).await;
-        repo.set_ref_immediate("origin:main", Some(&checksum(2)))
+        repo.set_ref_immediate(&Ref::remote("origin", "main"), Some(&checksum(2)))
             .await
             .unwrap();
         let mirror = path.join("refs/mirrors").join(OTHER);

@@ -31,8 +31,8 @@ use std::sync::Arc;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DummySigner,
-    DummyVerifier, FromOstreeKeyrings, GpgSigner, GpgVerifier, MutableTree, Repo, RepoMode, Signer,
-    Verifier,
+    DummyVerifier, FromOstreeKeyrings, GpgSigner, GpgVerifier, MutableTree, Ref, Repo, RepoMode,
+    Signer, Verifier,
 };
 use ostrya_rt::block_on;
 
@@ -181,7 +181,7 @@ async fn build_committed_repo(base: &Path) -> (Repo, Checksum) {
         ..CommitOptions::default()
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
-    txn.set_ref("test/main", Some(&commit));
+    txn.set_ref(&Ref::local("test/main"), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }

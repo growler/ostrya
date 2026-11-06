@@ -19,13 +19,12 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
+use ostrya_core::{Checksum, ObjectName, ObjectType, Ref, RepoMode, loose_path};
 use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::lock::LockKind;
-use crate::refs::CollectionRef;
 use crate::related::RelatedWarning;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
@@ -542,8 +541,7 @@ pub struct PruneStats {
     ///
     /// Each entry is a ref under `refs/mirrors` that
     /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) got as a
-    /// [`RefLocation::Collection`], so its
-    /// [`collection_id`](CollectionRef::collection_id) is always `Some`. A
+    /// [`RefLocation::Collection`], so it is always a [`Ref::Collection`]. A
     /// collection ref is never in [`deleted_refs`](PruneStats::deleted_refs).
     ///
     /// The list follows the rules of
@@ -553,7 +551,7 @@ pub struct PruneStats {
     /// not name a ref that the compare-and-delete guard skipped. A
     /// [`static_deltas_only`](PruneOptions::static_deltas_only) run gives an
     /// empty list.
-    pub deleted_collection_refs: Vec<CollectionRef>,
+    pub deleted_collection_refs: Vec<Ref>,
     /// The defective related values that the walk read, as
     /// [`Repo::prune`], "Related commits", states.
     ///
@@ -572,7 +570,7 @@ enum WeakRef {
     /// A local ref or a remote ref, by its refspec.
     Refspec(String),
     /// A collection ref under `refs/mirrors`.
-    Collection(CollectionRef),
+    Collection(Ref),
 }
 
 impl WeakRef {
@@ -588,7 +586,7 @@ impl WeakRef {
                 let mut collection_id = name;
                 let ref_name = collection_id.split_off(slash + 1);
                 collection_id.truncate(slash);
-                WeakRef::Collection(CollectionRef::new(collection_id, ref_name))
+                WeakRef::Collection(Ref::collection(collection_id, ref_name))
             }
             _ => WeakRef::Refspec(name),
         }
@@ -599,7 +597,7 @@ impl WeakRef {
     fn relpath(&self) -> Result<String> {
         match self {
             WeakRef::Refspec(refspec) => crate::refs::refspec_to_relpath(refspec),
-            WeakRef::Collection(cref) => crate::refs::collection_ref_to_relpath(cref),
+            WeakRef::Collection(r) => crate::refs::ref_relpath(None, r),
         }
     }
 }
@@ -1161,16 +1159,15 @@ impl Repo {
             .await?
         };
         let mut deleted_refs: Vec<String> = Vec::new();
-        let mut deleted_collection_refs: Vec<CollectionRef> = Vec::new();
+        let mut deleted_collection_refs: Vec<Ref> = Vec::new();
         for weak in removed {
             match weak {
                 WeakRef::Refspec(refspec) => deleted_refs.push(refspec),
-                WeakRef::Collection(cref) => deleted_collection_refs.push(cref),
+                WeakRef::Collection(r) => deleted_collection_refs.push(r),
             }
         }
         deleted_refs.sort();
-        deleted_collection_refs
-            .sort_by(|a, b| (&a.collection_id, &a.ref_name).cmp(&(&b.collection_id, &b.ref_name)));
+        deleted_collection_refs.sort();
 
         // The walk succeeded, so no data that the prune reads can refuse it
         // now. Remove the named commit, then sweep what it orphaned. A dry run

@@ -21,8 +21,8 @@ use common::{
 };
 use futures_lite::future::poll_once;
 use ostrya::{
-    Checksum, CollectionRef, CommitOptions, CreateOptions, DirMeta, Ed25519Signer, Ed25519Verifier,
-    Error, MutableTree, ObjectType, Repo, RepoMode, SummaryOptions, Value,
+    Checksum, CommitOptions, CreateOptions, DirMeta, Ed25519Signer, Ed25519Verifier, Error,
+    MutableTree, ObjectType, Ref, Repo, RepoMode, SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -145,7 +145,7 @@ async fn commit_empty(repo: &Repo, subject: &str) -> Checksum {
         )
         .await
         .unwrap();
-    txn.set_ref("main", Some(&commit));
+    txn.set_ref(&Ref::local("main"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -227,7 +227,7 @@ fn assert_timeout<T: std::fmt::Debug>(result: ostrya::Result<T>) {
 /// `verify-gpg` feature.
 const WRITERS: [&str; 12] = [
     "set_ref_immediate",
-    "set_collection_ref_immediate",
+    "set_ref_immediate_collection",
     "set_ref_alias_immediate",
     "write_config",
     "remove_remote_keyring",
@@ -251,10 +251,13 @@ fn writers() -> impl Iterator<Item = &'static str> {
 async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Result<()> {
     let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
     match name {
-        "set_ref_immediate" => repo.set_ref_immediate("other", Some(commit)).await,
-        "set_collection_ref_immediate" => {
-            let cref = CollectionRef::new("org.example.C", "app/main");
-            repo.set_collection_ref_immediate(&cref, Some(commit)).await
+        "set_ref_immediate" => {
+            repo.set_ref_immediate(&Ref::local("other"), Some(commit))
+                .await
+        }
+        "set_ref_immediate_collection" => {
+            let cref = Ref::collection("org.example.C", "app/main");
+            repo.set_ref_immediate(&cref, Some(commit)).await
         }
         "set_ref_alias_immediate" => repo.set_ref_alias_immediate("current", "main").await,
         "write_config" => {
@@ -286,7 +289,7 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
             .map(drop),
         "transaction_commit" => {
             let txn = repo.transaction().await?;
-            txn.set_ref("other", Some(commit));
+            txn.set_ref(&Ref::local("other"), Some(commit));
             txn.commit().await.map(drop)
         }
         other => panic!("no writer {other}"),
@@ -398,7 +401,7 @@ fn a_transaction_publishes_under_a_guard_and_waits_at_the_ref_step() {
     let refused = block_on(async {
         let txn = no_wait.transaction().await.unwrap();
         let commit = commit_in(&txn, "refused").await;
-        txn.set_ref("refused", Some(&commit));
+        txn.set_ref(&Ref::local("refused"), Some(&commit));
         assert_timeout(txn.commit().await);
         commit
     });
@@ -409,21 +412,27 @@ fn a_transaction_publishes_under_a_guard_and_waits_at_the_ref_step() {
                 .await
                 .unwrap()
         );
-        assert_eq!(no_wait.resolve_ref_tip("refused").await.unwrap(), None);
+        assert_eq!(
+            no_wait
+                .resolve_ref_tip(&Ref::local("refused"))
+                .await
+                .unwrap(),
+            None
+        );
     });
 
     let release = std::thread::spawn(move || holder.release());
     let commit = block_on(async {
         let txn = no_limit.transaction().await.unwrap();
         let commit = commit_in(&txn, "waited").await;
-        txn.set_ref("waited", Some(&commit));
+        txn.set_ref(&Ref::local("waited"), Some(&commit));
         txn.commit().await.unwrap();
         commit
     });
     assert!(path.join(GUARD_RELEASING_MARKER).exists());
     release.join().unwrap();
     assert_eq!(
-        block_on(no_limit.resolve_ref_tip("waited")).unwrap(),
+        block_on(no_limit.resolve_ref_tip(&Ref::local("waited"))).unwrap(),
         Some(commit)
     );
 }

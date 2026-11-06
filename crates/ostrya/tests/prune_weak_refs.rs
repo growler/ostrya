@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use common::TmpDir;
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, ObjectType, PruneOptions, RefLocation, Repo, RepoMode, WeakRefFilter,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
+    MutableTree, ObjectType, PruneOptions, Ref, RefLocation, Repo, RepoMode, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -75,7 +75,7 @@ async fn commit(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&commit));
+        txn.set_ref(&branch.parse::<Ref>().unwrap(), Some(&commit));
     }
     txn.commit().await.unwrap();
     commit
@@ -185,7 +185,9 @@ fn recording_pool_is_weak() -> (WeakRefFilter, Arc<Mutex<Vec<String>>>) {
 /// Returns the commit that a ref names, or `None` if the repository has no
 /// such ref.
 async fn tip(repo: &Repo, name: &str) -> Option<Checksum> {
-    repo.resolve_ref_tip(name).await.unwrap()
+    repo.resolve_ref_tip(&name.parse::<Ref>().unwrap())
+        .await
+        .unwrap()
 }
 
 #[test]
@@ -767,23 +769,16 @@ fn collection_is_weak(collection_id: &'static str) -> WeakRefFilter {
 }
 
 /// Sets the collection ref `collection_id`, `name` to `commit` and returns it.
-async fn set_collection_ref(
-    repo: &Repo,
-    collection_id: &str,
-    name: &str,
-    commit: &Checksum,
-) -> CollectionRef {
-    let cref = CollectionRef::new(collection_id, name);
-    repo.set_collection_ref_immediate(&cref, Some(commit))
-        .await
-        .unwrap();
+async fn set_ref(repo: &Repo, collection_id: &str, name: &str, commit: &Checksum) -> Ref {
+    let cref = Ref::collection(collection_id, name);
+    repo.set_ref_immediate(&cref, Some(commit)).await.unwrap();
     cref
 }
 
 /// Returns the commit that a collection ref names, or `None` if the
 /// repository has no such ref.
-async fn collection_tip(repo: &Repo, cref: &CollectionRef) -> Option<Checksum> {
-    repo.resolve_collection_ref(cref, true).await.unwrap()
+async fn collection_tip(repo: &Repo, cref: &Ref) -> Option<Checksum> {
+    repo.resolve_ref_tip(cref).await.unwrap()
 }
 
 /// A weak collection ref whose commit no strong root reaches is deleted, and
@@ -797,7 +792,7 @@ fn an_unreached_weak_collection_ref_is_deleted_and_its_objects_swept() {
         let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let cached = commit(&repo, tmp.path(), "cached", None, None).await;
         let cached_root = commit_root(&repo, &cached).await;
-        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
+        let cref = set_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
 
         let stats = repo
             .prune(&weak_options(collection_is_weak("org.example.Cache")))
@@ -841,8 +836,8 @@ fn a_weak_collection_ref_reached_through_a_parent_survives() {
         let base = commit(&repo, tmp.path(), "base", None, None).await;
         let head = commit(&repo, tmp.path(), "head", Some(base), Some("main")).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, None).await;
-        let cref = set_collection_ref(&repo, "org.example.Cache", "base", &base).await;
-        let unreached = set_collection_ref(&repo, "org.example.Cache", "orphan", &orphan).await;
+        let cref = set_ref(&repo, "org.example.Cache", "base", &base).await;
+        let unreached = set_ref(&repo, "org.example.Cache", "orphan", &orphan).await;
 
         let (filter, seen) =
             recording_filter(|name: &str| !name.starts_with("org.example.Cache::"));
@@ -880,7 +875,7 @@ fn with_no_filter_each_collection_ref_is_strong() {
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let mirrored = commit(&repo, tmp.path(), "m", None, None).await;
         let mirrored_root = commit_root(&repo, &mirrored).await;
-        let cref = set_collection_ref(&repo, "org.example.Coll", "pool/m", &mirrored).await;
+        let cref = set_ref(&repo, "org.example.Coll", "pool/m", &mirrored).await;
         let loose = commit(&repo, tmp.path(), "loose", None, None).await;
 
         let opts = PruneOptions {
@@ -925,8 +920,8 @@ fn a_filter_on_one_collection_leaves_another_collection_strong() {
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let cached = commit(&repo, tmp.path(), "cache", None, None).await;
         let kept = commit(&repo, tmp.path(), "keep", None, None).await;
-        let weak = set_collection_ref(&repo, "org.example.Cache", "app/main", &cached).await;
-        let strong = set_collection_ref(&repo, "org.example.Keep", "app/main", &kept).await;
+        let weak = set_ref(&repo, "org.example.Cache", "app/main", &cached).await;
+        let strong = set_ref(&repo, "org.example.Keep", "app/main", &kept).await;
 
         let (filter, seen) =
             recording_filter(|name: &str| !name.starts_with("org.example.Cache::"));
@@ -968,7 +963,7 @@ fn a_mirror_ref_outside_the_name_rule_is_never_classified() {
         let repo = repo_with_trees(tmp.path(), &["head", "valid", "invalid"]).await;
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let valid = commit(&repo, tmp.path(), "valid", None, None).await;
-        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/ok", &valid).await;
+        let cref = set_ref(&repo, "org.example.Cache", "pool/ok", &valid).await;
         let invalid = commit(&repo, tmp.path(), "invalid", None, None).await;
         let invalid_root = commit_root(&repo, &invalid).await;
 
@@ -1032,7 +1027,7 @@ fn a_dry_run_lists_weak_collection_refs_and_deletes_nothing() {
         let repo = repo_with_trees(tmp.path(), &["head", "cached"]).await;
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let cached = commit(&repo, tmp.path(), "cached", None, None).await;
-        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
+        let cref = set_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
 
         let opts = PruneOptions {
             no_prune: true,
@@ -1077,7 +1072,7 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         for (i, (collection_id, name)) in refs.iter().enumerate() {
             let target = commit(&repo, tmp.path(), &format!("t{i}"), None, None).await;
-            set_collection_ref(&repo, collection_id, name, &target).await;
+            set_ref(&repo, collection_id, name, &target).await;
         }
 
         let filter = WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
@@ -1085,7 +1080,7 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
         });
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
-        let expected: Vec<CollectionRef> = [
+        let expected: Vec<Ref> = [
             ("org.alpha.C", "pool/0"),
             ("org.alpha.C", "pool/9"),
             ("org.ex", "x"),
@@ -1094,7 +1089,7 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
             ("org.zeta.C", "b"),
         ]
         .iter()
-        .map(|(collection_id, name)| CollectionRef::new(*collection_id, *name))
+        .map(|(collection_id, name)| Ref::collection(*collection_id, *name))
         .collect();
         assert_eq!(stats.deleted_collection_refs, expected);
     });
@@ -1364,7 +1359,7 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
         // The refspec `a:pool/x` is valid and addresses its own file.
         let addressed = commit(&repo, tmp.path(), "addressed", None, None).await;
         let addressed_root = commit_root(&repo, &addressed).await;
-        repo.set_ref_immediate("a:pool/x", Some(&addressed))
+        repo.set_ref_immediate(&Ref::remote("a", "pool/x"), Some(&addressed))
             .await
             .unwrap();
         let addressed_path = tmp.path().join("repo/refs/remotes/a/pool/x");
@@ -1378,7 +1373,7 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
         let stray = commit(&repo, tmp.path(), "stray", None, None).await;
         let stray_path = tmp.path().join("repo/refs/remotes/poolstray");
         std::fs::write(&stray_path, format!("{}\n", stray.to_hex())).unwrap();
-        repo.set_ref_immediate("poolstray", Some(&stray))
+        repo.set_ref_immediate(&Ref::local("poolstray"), Some(&stray))
             .await
             .unwrap();
 

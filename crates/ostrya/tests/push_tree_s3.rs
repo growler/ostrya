@@ -32,7 +32,7 @@ use ostrya::remote::{
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirTree,
-    Error, MutableTree, ObjectType, PullOptions, Repo, RepoMode, RepoPushOptions, Type, Value,
+    Error, MutableTree, ObjectType, PullOptions, Ref, Repo, RepoMode, RepoPushOptions, Type, Value,
 };
 use ostrya_core::{ContentHasher, FileHeader, Xattrs, commit_metadata};
 use ostrya_rt::block_on;
@@ -224,7 +224,7 @@ async fn local_commit(
         related: Vec::new(),
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
-    txn.set_ref(BRANCH, Some(&commit));
+    txn.set_ref(&Ref::local(BRANCH), Some(&commit));
     txn.commit().await.unwrap();
     (repo, commit)
 }

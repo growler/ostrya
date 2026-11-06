@@ -566,7 +566,7 @@ impl Repo {
     /// Delta discovery and
     /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) read
     /// the current commit of a ref at the same place, as
-    /// [`resolve_collection_ref`](Repo::resolve_collection_ref) reads it.
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it.
     ///
     /// # Local repository
     ///
@@ -2557,10 +2557,8 @@ mod tests {
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();
         for name in names {
-            let cref = crate::CollectionRef::new(LOCAL_ID, *name);
-            repo.set_collection_ref_immediate(&cref, Some(&commit))
-                .await
-                .unwrap();
+            let cref = crate::Ref::collection(LOCAL_ID, *name);
+            repo.set_ref_immediate(&cref, Some(&commit)).await.unwrap();
         }
         commit
     }
@@ -2723,11 +2721,8 @@ mod tests {
                 .await
                 .unwrap();
             assert!(stats.delta_parts > 0, "{stats:?}");
-            let cref = crate::CollectionRef::new(LOCAL_ID, "os/a");
-            assert_eq!(
-                dst.resolve_collection_ref(&cref, false).await.unwrap(),
-                Some(tip)
-            );
+            let cref = crate::Ref::collection(LOCAL_ID, "os/a");
+            assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(tip));
 
             std::fs::remove_file(scratch.root.join("src").join("summary.sig")).unwrap();
             // A pull that reads no static delta also reads and checks the
@@ -2781,11 +2776,8 @@ mod tests {
                 .await
                 .unwrap();
                 for (name, commit) in [(child_ref, child), (parent_ref, parent)] {
-                    let cref = crate::CollectionRef::new(LOCAL_ID, name);
-                    assert_eq!(
-                        dst.resolve_collection_ref(&cref, false).await.unwrap(),
-                        Some(commit)
-                    );
+                    let cref = crate::Ref::collection(LOCAL_ID, name);
+                    assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(commit));
                 }
             }
         });
@@ -2930,11 +2922,8 @@ mod tests {
                 .await
                 .unwrap();
             for name in names {
-                let cref = crate::CollectionRef::new(LOCAL_ID, name);
-                assert_eq!(
-                    dst.resolve_collection_ref(&cref, false).await.unwrap(),
-                    Some(tip)
-                );
+                let cref = crate::Ref::collection(LOCAL_ID, name);
+                assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(tip));
             }
         });
     }

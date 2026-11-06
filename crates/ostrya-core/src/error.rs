@@ -9,8 +9,10 @@ use std::fmt;
 /// An error of the format primitives.
 ///
 /// Each fallible function of this crate returns it, except
-/// [`commit_timestamp`](crate::commit_timestamp). The I/O trait methods of
-/// [`DeflateSink`](crate::DeflateSink) and
+/// [`commit_timestamp`](crate::commit_timestamp).
+/// [`Ref::validate`](crate::Ref::validate) and the parse of a
+/// [`Ref`](crate::Ref) return [`ParseRefError`](crate::ParseRefError). The
+/// I/O trait methods of [`DeflateSink`](crate::DeflateSink) and
 /// [`DeflateReader`](crate::DeflateReader) return [`std::io::Error`]. Most
 /// variants hold a fixed message that names the reason.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -79,7 +79,7 @@ pub(super) async fn commit_tree(
         )
         .await
         .unwrap();
-    txn.set_ref(name, Some(&commit));
+    txn.set_ref(&crate::refs::refspec_ref(name), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

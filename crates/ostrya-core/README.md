@@ -24,6 +24,7 @@ API documentation: <https://docs.rs/ostrya-core>
 - `ObjectType` and `RepoMode` select the `loose_path` of an object.
 - `DeflateSink` compresses the payload of an archive-mode content object.
 - `KeyFile` reads and writes the repository `config` file.
+- `Ref` is one ref of a repository: local, remote, or collection.
 - `RefPattern` checks and matches one ref pattern with `*` and `**`.
 - `RefSelector` selects ref names with a list of positive and negative
   patterns.

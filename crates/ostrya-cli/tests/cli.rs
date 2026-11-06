@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
-    LockKind, MutableTree, ObjectName, ObjectType, Repo, RepoMode, Type, Value, base64,
+    LockKind, MutableTree, ObjectName, ObjectType, Ref, Repo, RepoMode, Type, Value, base64,
 };
 use ostrya_rt::block_on;
 
@@ -12413,7 +12413,7 @@ fn refs_delete_collection_refuses_an_invalid_id_before_it_removes_a_ref() {
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(!run.status.success(), "the port exited 0: {stderr}");
     assert!(
-        stderr.contains("error: Invalid refspec fresh:x"),
+        stderr.contains("error: Invalid refspec @fresh:x"),
         "the port gave: {stderr}"
     );
     for path in ["refs/mirrors/org.example.Valid/mm", "refs/mirrors/fresh/x"] {
@@ -12481,7 +12481,7 @@ fn refs_delete_collection_refuses_an_invalid_name_before_it_removes_a_ref() {
     let stderr = String::from_utf8_lossy(&run.stderr);
     assert!(!run.status.success(), "the port exited 0: {stderr}");
     assert!(
-        stderr.contains("error: Invalid refspec org.example.B:-bad"),
+        stderr.contains("error: Invalid refspec @org.example.B:-bad"),
         "the port gave: {stderr}"
     );
     for path in [
@@ -28391,7 +28391,7 @@ fn ex_ostrya_commit(repo: &Path, base: &Path, name: &str, branch: Option<&str>) 
             .await
             .unwrap();
         if let Some(branch) = branch {
-            txn.set_ref(branch, Some(&commit));
+            txn.set_ref(&Ref::local(branch), Some(&commit));
         }
         txn.commit().await.unwrap();
         commit

@@ -264,7 +264,7 @@ struct DetachedQueue {
 /// use std::os::fd::AsFd;
 /// use std::path::Path;
 ///
-/// use ostrya::{CommitOptions, MutableTree, Repo};
+/// use ostrya::{CommitOptions, MutableTree, Ref, Repo};
 ///
 /// let repo = Repo::open(Path::new("/srv/repo")).await?;
 /// let txn = repo.transaction().await?;
@@ -280,7 +280,7 @@ struct DetachedQueue {
 ///     ..CommitOptions::default()
 /// };
 /// let commit = txn.write_commit(opts, &root).await?;
-/// txn.set_ref("exampleos/stable", Some(&commit));
+/// txn.set_ref(&Ref::local("exampleos/stable"), Some(&commit));
 /// let stats = txn.commit().await?;
 /// println!("{} content objects written", stats.content_written);
 /// # Ok(()) }
@@ -1956,6 +1956,7 @@ mod test_tail {
 mod tests {
     use super::*;
     use crate::CreateOptions;
+    use crate::Ref;
     use crate::write::FileMeta;
     use ostrya_rt::block_on;
 
@@ -2103,7 +2104,7 @@ mod tests {
             assert!(!txn.syncfs_at_publish(true));
             txn.commit().await.unwrap();
             assert_eq!(
-                repo.resolve_ref_tip(crate::summary::OSTREE_METADATA_REF)
+                repo.resolve_ref_tip(&Ref::local(crate::summary::OSTREE_METADATA_REF))
                     .await
                     .unwrap(),
                 Some(anchor)
@@ -2415,8 +2416,8 @@ mod tests {
 
             let commit = Checksum::from_bytes([0x34; 32]);
             let refused: [&dyn Fn(&Transaction); 3] = [
-                &|txn| txn.set_ref("main", Some(&commit)),
-                &|txn| txn.set_ref("main", None),
+                &|txn| txn.set_ref(&Ref::local("main"), Some(&commit)),
+                &|txn| txn.set_ref(&Ref::local("main"), None),
                 &|txn| txn.set_commit_detached_metadata(&commit, string_dict("a", "x")),
             ];
             for queue in refused {
@@ -2426,7 +2427,10 @@ mod tests {
                 let err = txn.commit().await.unwrap_err();
                 assert!(matches!(err, Error::LockTimeout { secs: 0 }), "{err:?}");
                 assert!(repo.has_object(ObjectType::File, &object).await.unwrap());
-                assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), None);
+                assert_eq!(
+                    repo.resolve_ref_tip(&Ref::local("main")).await.unwrap(),
+                    None
+                );
                 assert!(!commitmeta(&root, &commit).exists());
             }
             drop(held);
@@ -2479,7 +2483,7 @@ mod tests {
             let root = scratch.0.join("repo");
             let commit = Checksum::from_bytes([0x35; 32]);
             let txn = repo.transaction().await.unwrap();
-            txn.set_ref("main", Some(&commit));
+            txn.set_ref(&Ref::local("main"), Some(&commit));
             let (started, go) = test_tail::arm(&root);
             drop_commit_at_the_tail(txn, &started).await;
 
@@ -2489,7 +2493,10 @@ mod tests {
 
             go.send(()).unwrap();
             drop(retry_lock(|| repo.lock_update()).await);
-            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+            assert_eq!(
+                repo.resolve_ref_tip(&Ref::local("main")).await.unwrap(),
+                Some(commit)
+            );
         });
     }
 
@@ -2506,7 +2513,7 @@ mod tests {
             let root = scratch.0.join("repo");
             let commit = Checksum::from_bytes([0x36; 32]);
             let txn = repo.transaction().await.unwrap();
-            txn.set_ref("main", Some(&commit));
+            txn.set_ref(&Ref::local("main"), Some(&commit));
             let (started, go) = test_tail::arm(&root);
             drop_commit_at_the_tail(txn, &started).await;
 
@@ -2515,7 +2522,10 @@ mod tests {
 
             go.send(()).unwrap();
             drop(retry_lock(|| repo.lock_repo(LockKind::Exclusive)).await);
-            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+            assert_eq!(
+                repo.resolve_ref_tip(&Ref::local("main")).await.unwrap(),
+                Some(commit)
+            );
         });
     }
 
@@ -2533,13 +2543,16 @@ mod tests {
             txn.stage_commit_detached_bytes(&commit, staged.clone())
                 .await
                 .unwrap();
-            txn.set_ref("main", Some(&commit));
+            txn.set_ref(&Ref::local("main"), Some(&commit));
             let (started, go) = test_tail::arm(&root);
             drop_commit_at_the_tail(txn, &started).await;
 
             go.send(()).unwrap();
             drop(retry_lock(|| repo.lock_update()).await);
-            assert_eq!(repo.resolve_ref_tip("main").await.unwrap(), Some(commit));
+            assert_eq!(
+                repo.resolve_ref_tip(&Ref::local("main")).await.unwrap(),
+                Some(commit)
+            );
             assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
         });
     }

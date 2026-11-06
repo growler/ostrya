@@ -31,8 +31,8 @@ use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaEndianness,
     DeltaOptions, DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error,
-    MutableTree, ObjectType, Repo, RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, Type,
-    Value, base64, from_bytes, static_delta_relative_dir,
+    MutableTree, ObjectType, Ref, Repo, RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry,
+    Type, Value, base64, from_bytes, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -124,7 +124,7 @@ async fn commit_tree_related(
         )
         .await
         .unwrap();
-    txn.set_ref("test", Some(&commit));
+    txn.set_ref(&Ref::local("test"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -155,7 +155,7 @@ async fn commit_tree_with_xattrs(repo: &Repo, tree: &Path, parent: Option<Checks
         )
         .await
         .unwrap();
-    txn.set_ref("test", Some(&commit));
+    txn.set_ref(&Ref::local("test"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }
@@ -294,7 +294,7 @@ fn from_scratch_delta_round_trips_and_the_tool_applies_it() {
                 .is_empty()
         );
         target
-            .set_ref_immediate("test", Some(&applied))
+            .set_ref_immediate(&Ref::local("test"), Some(&applied))
             .await
             .unwrap();
         delta
@@ -1179,7 +1179,7 @@ fn a_large_object_travels_as_a_fallback() {
             b"extra\n"
         );
         target
-            .set_ref_immediate("test", Some(&applied))
+            .set_ref_immediate(&Ref::local("test"), Some(&applied))
             .await
             .unwrap();
         (fallback_delta, c2)
@@ -3433,7 +3433,7 @@ async fn commit_tree_keyed(
         )
         .await
         .unwrap();
-    txn.set_ref("test", Some(&commit));
+    txn.set_ref(&Ref::local("test"), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

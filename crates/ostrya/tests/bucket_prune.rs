@@ -28,9 +28,9 @@ use ostrya::remote::s3::Bucket;
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
-    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    DeltaOptions, Error, MutableTree, ObjectType, PruneOptions, PruneStats, PullOptions, Repo,
-    RepoMode, Summary, SummaryOptions, Type, Value, WeakRefFilter,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
+    Error, MutableTree, ObjectType, PruneOptions, PruneStats, PullOptions, Ref, Repo, RepoMode,
+    Summary, SummaryOptions, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -265,7 +265,7 @@ impl Fixture {
     /// Sets the local ref `branch` to `commit`.
     async fn set_local_ref(&self, branch: &str, commit: &Checksum) {
         let txn = self.local.transaction().await.unwrap();
-        txn.set_ref(branch, Some(commit));
+        txn.set_ref(&Ref::local(branch), Some(commit));
         txn.commit().await.unwrap();
     }
 }
@@ -345,7 +345,7 @@ async fn commit_tree(
         .await
         .unwrap();
     if let Some(branch) = branch {
-        txn.set_ref(branch, Some(&checksum));
+        txn.set_ref(&Ref::local(branch), Some(&checksum));
     }
     txn.commit().await.unwrap();
     checksum
@@ -1360,10 +1360,7 @@ fn the_commits_of_the_collection_map_of_the_summary_are_roots() {
     block_on(async {
         let f = Fixture::new(None).await;
         f.local
-            .set_collection_ref_immediate(
-                &CollectionRef::new("org.example.Other", "old"),
-                Some(&f.c1),
-            )
+            .set_ref_immediate(&Ref::collection("org.example.Other", "old"), Some(&f.c1))
             .await
             .unwrap();
         f.local

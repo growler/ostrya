@@ -231,10 +231,10 @@ pub struct SessionSetup {
     ///
     /// The endpoint opens the session with
     /// [`ReceiveService::hello_with_hooks`](ostrya::ReceiveService::hello_with_hooks).
-    /// The commit of the session calls [`ReceiveHooks::before_update`] just
-    /// before the update lock, or [`ReceiveHooks::before_server_commit`] for
-    /// a server commit. It calls [`ReceiveHooks::after_update`] after it
-    /// releases the update lock.
+    /// The commit of the session calls [`ReceiveHooks::before_update`], or
+    /// [`ReceiveHooks::before_server_commit`] for a server commit, before the
+    /// update lock. It calls [`ReceiveHooks::after_update`] after it releases
+    /// the update lock.
     ///
     /// # Refusals and errors of a hook
     ///
@@ -289,11 +289,18 @@ pub struct SessionSetup {
     ///   merged dict over the size limit gets 422 with `limit-exceeded`.
     ///
     /// The commit of a server commit runs these checks after
-    /// `before_server_commit` returns, under the update lock:
+    /// `before_server_commit` returns:
     ///
-    /// - The checks of the ref paths get 422 with `ref-denied`.
-    /// - `orphan` on a branch that is present, which the policy does not
-    ///   allow, gets 409 with `non-fast-forward`.
-    /// - A tag that is present gets 409 with `ref-mismatch`.
+    /// - Before the update lock, under `[ex-ostrya] generate-composefs`, the
+    ///   commit builds the composefs image of the tree. An image whose digest
+    ///   is not the key `ostree.composefs.digest.v0` gets 422 with
+    ///   `checksum-mismatch`, and each other failure of the build gets 500
+    ///   with `internal`.
+    /// - Under the update lock, the checks of the ref paths get 422 with
+    ///   `ref-denied`.
+    /// - Under the update lock, `orphan` on a branch that is present, which
+    ///   the policy does not allow, gets 409 with `non-fast-forward`.
+    /// - Under the update lock, a tag that is present gets 409 with
+    ///   `ref-mismatch`.
     pub hooks: Option<Arc<dyn ReceiveHooks>>,
 }

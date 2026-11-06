@@ -197,8 +197,8 @@ impl ReceiveService {
     /// host.
     ///
     /// [`commit`](Self::commit) calls [`ReceiveHooks::before_update`] of
-    /// `hooks` just before the update lock, or
-    /// [`ReceiveHooks::before_server_commit`] for a server commit. It calls
+    /// `hooks`, or [`ReceiveHooks::before_server_commit`] for a server
+    /// commit, before the update lock. It calls
     /// [`ReceiveHooks::after_update`] after the release of the update lock.
     /// `None` gives a session with no hooks.
     ///
@@ -372,9 +372,9 @@ impl ReceiveService {
     ///
     /// In a session with hooks, the call runs [`ReceiveHooks::before_update`]
     /// just before the update lock. For a server commit, it runs
-    /// [`ReceiveHooks::before_server_commit`] in its place. It runs
-    /// [`ReceiveHooks::after_update`] after the release of the update lock,
-    /// also when no ref changes.
+    /// [`ReceiveHooks::before_server_commit`] in its place, before the update
+    /// lock. It runs [`ReceiveHooks::after_update`] after the release of the
+    /// update lock, also when no ref changes.
     /// [`ReceiveHooks`] states when each hook runs, the entries of the host,
     /// the locks, and the result of an error or a panic in a hook.
     ///

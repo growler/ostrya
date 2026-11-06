@@ -915,6 +915,118 @@ fn an_after_update_error_of_a_server_commit_is_internal_with_the_refs_written() 
     assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
+/// The config of a repository that builds the composefs image of a keyed
+/// commit.
+const GENERATE_COMPOSEFS: &str = "[ex-ostrya]\ngenerate-composefs=true\n";
+
+/// [`server_commit`] on `main` with no tag, whose metadata carries `value`
+/// under `ostree.composefs.digest.v0`.
+fn keyed_server_commit(value: Value) -> ServerCommit {
+    let mut sc = server_commit("main", &[]);
+    sc.metadata.push((
+        common::composefs::DIGEST_KEY.into(),
+        ostrya_core::to_bytes(&Type::Variant, &value).unwrap(),
+    ));
+    sc
+}
+
+/// A digest of 32 bytes that is not the digest of the fixture tree, as the
+/// `ay` value of the key.
+fn wrong_digest() -> Value {
+    Value::variant(Type::array(Type::Byte), Value::Bytes(vec![0x5a; 32]))
+}
+
+/// Asserts that a keyed server commit of `repo` wrote no ref and no image,
+/// and that the session removed the staging directory and ended.
+fn assert_no_image(repo: &Repo, service: &ReceiveService, case: &str) {
+    assert!(common::file_inventory(repo.path(), "refs").is_empty());
+    assert!(!repo.path().join("extensions/ostrya/composefs").exists());
+    assert_staging_removed(repo.path());
+    assert_aborted(service, case);
+}
+
+/// A host that does not implement `before_server_commit` refuses a keyed
+/// server commit with `ref-denied` before the image build. A digest that is
+/// not the digest of the tree does not change the refusal.
+#[test]
+fn a_refused_server_commit_builds_no_image() {
+    let tmp = TmpDir::new("hooks-sc-cfs-refused");
+    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE_COMPOSEFS);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let (service, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        keyed_server_commit(wrong_digest()),
+    );
+    match result {
+        Err(Error::Remote(remote::Error::RefDenied(m))) => {
+            assert!(m.contains("take no server commit"), "{m}")
+        }
+        other => panic!("expected ref-denied, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 0);
+    assert_eq!(hook.after_calls(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_no_image(&repo, &service, "refused");
+}
+
+/// The image of a keyed server commit is built after the server-commit hook.
+/// A digest that is not the digest of the tree fails as `checksum-mismatch`
+/// after the hook. The carried value drops once, `after_update` does not
+/// run, and no ref is written.
+#[test]
+fn a_wrong_digest_after_the_server_commit_hook_drops_the_carried_value() {
+    let tmp = TmpDir::new("hooks-sc-cfs-wrong");
+    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE_COMPOSEFS);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = ServerHook::giving(&drops);
+    let (service, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        keyed_server_commit(wrong_digest()),
+    );
+    match result {
+        Err(Error::Remote(remote::Error::ChecksumMismatch(m))) => {
+            assert!(m.contains(&"5a".repeat(32)), "{m}")
+        }
+        other => panic!("expected checksum-mismatch, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.inner.after_calls(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+    assert_no_image(&repo, &service, "wrong digest");
+}
+
+/// A malformed key of a server commit fails as `protocol` before the
+/// server-commit hook. A host that does not implement the hook gets the
+/// same code as each other host.
+#[test]
+fn a_malformed_digest_of_a_server_commit_fails_before_the_hook() {
+    let tmp = TmpDir::new("hooks-sc-cfs-malformed");
+    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE_COMPOSEFS);
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let (service, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        keyed_server_commit(text("digest")),
+    );
+    match result {
+        Err(Error::Remote(remote::Error::Protocol(m))) => {
+            assert!(m.contains("is not a variant of type ay"), "{m}")
+        }
+        other => panic!("expected protocol, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 0);
+    assert_eq!(hook.after_calls(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 0);
+    assert_no_image(&repo, &service, "malformed");
+}
+
 // ---------------------------------------------------------------------------
 // The entries of the host.
 // ---------------------------------------------------------------------------

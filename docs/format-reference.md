@@ -4349,15 +4349,18 @@ do not apply. The trust in a server commit comes from the authentication of
 the client and from `sign`. A client group that must verify the commits of
 its clients takes a mirror push.
 
-Under `[ex-ostrya] generate-composefs`, the server then builds the composefs
-image of the tree of a server commit that carries
-`ostree.composefs.digest.v0`, with these codes: `protocol` for a malformed
-key, `checksum-mismatch` for an image whose digest is not the key, and
-`internal` for each other failure. The server then makes the staged objects
-durable. In a session with the hooks of a host application, the hook of the
-host gets the server commit next. The hook can refuse with `ref-denied` or
-`internal`, and no ref changes. A host whose hooks take no server commit
-refuses with `ref-denied` at this step.
+Under `[ex-ostrya] generate-composefs`, the server then reads the key
+`ostree.composefs.digest.v0` of a server commit. A malformed key is
+`protocol`. The server then makes the staged objects durable. In a session
+with the hooks of a host application, the hook of the host gets the server
+commit next. The hook can refuse with `ref-denied` or `internal`, and no ref
+changes. A host whose hooks take no server commit refuses with `ref-denied`
+at this step.
+
+If the server commit carries the key, the server then builds the composefs
+image of its tree, with these codes: `checksum-mismatch` for an image whose
+digest is not the key, and `internal` for each other failure. So a request
+that the host refuses reads no tree.
 
 The server then takes the update lock. Under the lock it reads the branch and
 the tags in the namespace of the session, and check 10 applies, with a write
@@ -4527,11 +4530,11 @@ that a receive uses. A receive uses them in this order:
    no repository lock.
 2. At `Commit`, after check 9, the server takes the update lock. Under the
    lock it reads the refs again and runs checks 10 to 12. For a server commit,
-   the server takes the update lock after check 5 of "Server commit" and
-   after the hook of the host application. The server also builds, writes,
-   and signs the commit under the lock, because the commit bytes exist only
-   after the read of the tip ("Server commit"). A GPG signature then holds the
-   lock for the time of the `gpg` run.
+   the server takes the update lock after check 5 of "Server commit", after
+   the hook of the host application, and after the image build. The server
+   also builds, writes, and signs the commit under the lock, because the
+   commit bytes exist only after the read of the tip ("Server commit"). A GPG
+   signature then holds the lock for the time of the `gpg` run.
 3. The server queues the detached metadata and the ref writes in the
    transaction. The policy regenerates the summary when
    `[core] auto-update-summary` is true ("Config file (`<repo>/config`,
@@ -6317,8 +6320,9 @@ The generation:
 - The build runs after the transaction stages its objects and before it
   renames them into `objects/`. A receive builds before it takes the update
   lock. For a server commit, the receive builds the image of the tree and
-  checks its digest against the key of the client before the lock. Under the
-  lock, it writes the commit and stages the image as the image of the commit.
+  checks its digest against the key of the client after the hook of the host
+  application and before the lock. Under the lock, it writes the commit and
+  stages the image as the image of the commit.
 - The build skips a commit that the transaction did not stage and that has no
   `.commitpartial` marker. So a commit that the repository holds complete
   before the transaction gets no image. `ostrya commit` and

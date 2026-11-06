@@ -6341,8 +6341,10 @@ The generation:
 - A value of the key that is not a boolean fails each write through a
   transaction at the open of the transaction. A pull from a remote reads the
   key before its first request. A receive fails at `Hello`.
-- The build reads the fs-verity digest of a sealed object from the kernel, and
-  reads and hashes each other object.
+- The build reads the fs-verity digest of a sealed object from the kernel. It
+  reads and hashes each other object one time for each build of the recorded
+  images of a transaction, and uses that digest for each commit of the build
+  and each path that names the object.
 
 The read:
 

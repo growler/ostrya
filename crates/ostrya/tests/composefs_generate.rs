@@ -30,6 +30,8 @@
 //! - In a repository that seals its objects, each object and the image are
 //!   sealed after the commit. The test skips if the file system has no
 //!   fs-verity.
+//! - A local pull of a chain of commits that share most of their files
+//!   stores a valid image of each commit.
 
 mod common;
 
@@ -74,6 +76,41 @@ async fn stage_tree(txn: &Transaction, base: &Path) -> RepoTree {
         .await
         .unwrap();
     txn.write_mtree(&mut mtree).await.unwrap()
+}
+
+/// Walks `base/sub` into a new transaction of `repo`, and commits the tree on
+/// `main` at `timestamp` with `parent` and the composefs digest key of the
+/// tree. Returns the commit.
+async fn commit_keyed(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    timestamp: u64,
+    parent: Option<Checksum>,
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, None)
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let digest = txn.composefs_digest(&root).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                timestamp: Some(timestamp),
+                metadata: Some(key_dict(&digest)),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref("main", Some(&commit));
+    txn.commit().await.unwrap();
+    commit
 }
 
 /// Writes a commit of `base/src` with `metadata` at `timestamp` in a new
@@ -525,5 +562,48 @@ fn a_sealing_repository_seals_each_object_the_build_reads() {
             assert!(is_sealed(&object), "{} has no seal", object.display());
         }
         assert!(is_sealed(&repo.composefs_image_path(&commit)));
+    });
+}
+
+/// A local pull of a chain of three commits stores a valid image of each
+/// commit. The commits share most of their files, and two paths of each tree
+/// name one object.
+#[test]
+fn a_local_pull_of_a_commit_chain_stores_each_image() {
+    let scratch = TmpDir::new("cfs-gen-chain");
+    let base = scratch.path().join("tree");
+    let big: Vec<u8> = (0..9000).map(|i| i as u8).collect();
+    for (n, sub) in ["v1", "v2", "v3"].iter().enumerate() {
+        let dir = base.join(sub);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("big.bin"), &big).unwrap();
+        std::fs::write(dir.join("shared.txt"), b"shared\n").unwrap();
+        std::fs::write(dir.join("sub/copy.txt"), b"shared\n").unwrap();
+        std::fs::write(dir.join("empty"), b"").unwrap();
+        std::fs::write(dir.join("version"), format!("version {n}\n")).unwrap();
+    }
+    block_on(async {
+        let src = new_repo(&scratch.path().join("src"), RepoMode::Archive, "").await;
+        let c1 = commit_keyed(&src, &base, "v1", 1, None).await;
+        let c2 = commit_keyed(&src, &base, "v2", 2, Some(c1)).await;
+        let c3 = commit_keyed(&src, &base, "v3", 3, Some(c2)).await;
+
+        let dst = new_repo(&scratch.path().join("dst"), RepoMode::BareUser, GENERATE).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                depth: 2,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        for commit in [c1, c2, c3] {
+            assert_eq!(
+                dst.check_composefs_image(&commit).await.unwrap(),
+                ComposefsImageState::Valid
+            );
+        }
     });
 }

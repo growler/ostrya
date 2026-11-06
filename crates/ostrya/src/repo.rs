@@ -824,9 +824,11 @@ impl Repo {
     /// The result covers the objects that a write stages. An object that the
     /// repository holds from before, for example from a write with
     /// `fsverity=no`, can have no seal. A composefs image build reads the
-    /// digest of a sealed object from the kernel, and reads and hashes each
-    /// other object. So with the result `false`, each build under
-    /// `[ex-ostrya] generate-composefs` reads each file of its commit.
+    /// digest of a sealed object from the kernel. The build of the recorded
+    /// images of a transaction reads and hashes each other object one time.
+    /// So with the result `false`, that build under
+    /// `[ex-ostrya] generate-composefs` reads and hashes each object of its
+    /// commits one time.
     ///
     /// # Errors
     ///

@@ -57,6 +57,7 @@
 //! No transfer carries the image. A pull, a push, a one-way stream, and a
 //! static delta carry no composefs image.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io::BufWriter;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -216,6 +217,20 @@ enum Digests {
     Sealed,
     /// No digest. [`VerityPolicy::Disabled`] gives it.
     Disabled,
+}
+
+/// The fs-verity digests that one build pass computed, keyed by the checksum
+/// of the file object.
+///
+/// A digest that the kernel gives for a sealed object does not go into the
+/// cache, because the load of the object reads it at no cost. Each other
+/// object is read and hashed one time for each cache.
+#[derive(Default)]
+struct VerityCache {
+    digests: HashMap<Checksum, [u8; 32]>,
+    /// The number of objects that the cache read and hashed.
+    #[cfg(test)]
+    hashed: usize,
 }
 
 impl From<VerityPolicy> for Digests {
@@ -393,6 +408,7 @@ impl Transaction {
             ObjectSource::Staged(self),
             root,
             ComposefsOptions::RECORDED.verity.into(),
+            &mut VerityCache::default(),
         )
         .await?;
         image_digest(dir).await
@@ -437,6 +453,19 @@ impl Transaction {
     /// - [`Error::Io`] if a write to the image file or another file system
     ///   operation fails.
     pub async fn build_composefs_image(&self, root: &RepoTree) -> Result<StagedComposefsImage<'_>> {
+        self.build_composefs_image_with(root, &mut VerityCache::default())
+            .await
+    }
+
+    /// Makes the steps of
+    /// [`build_composefs_image`](Transaction::build_composefs_image), and
+    /// takes the fs-verity digest of each object with no seal from `cache`
+    /// if it holds one.
+    async fn build_composefs_image_with(
+        &self,
+        root: &RepoTree,
+        cache: &mut VerityCache,
+    ) -> Result<StagedComposefsImage<'_>> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
             return Err(Error::Unsupported(
                 "bare-split-xattrs is read-only; the port does not write it".into(),
@@ -448,6 +477,7 @@ impl Transaction {
             ObjectSource::Staged(self),
             root,
             ComposefsOptions::RECORDED.verity.into(),
+            cache,
         )
         .await?;
         let staging = self.staging_fd().try_clone_to_owned()?;
@@ -573,7 +603,8 @@ impl Transaction {
     pub async fn write_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageAdd> {
         let commit_obj = self.load_commit_staged_first(commit).await?;
         let key = require_recorded_digest(&commit_obj, commit)?;
-        self.write_keyed_image(commit, commit_obj, &key).await
+        self.write_keyed_image(commit, commit_obj, &key, &mut VerityCache::default())
+            .await
     }
 
     /// Builds the composefs image of each commit that the writers recorded as
@@ -599,6 +630,11 @@ impl Transaction {
     /// key. For each other commit, it makes the steps of
     /// [`write_composefs_image`](Transaction::write_composefs_image).
     ///
+    /// The build reads the fs-verity digest of a sealed object from the
+    /// kernel. It reads and hashes each other object one time for each call,
+    /// and uses that digest for each commit and each path that names the
+    /// object.
+    ///
     /// The first error stops the call. The caller then drops the transaction,
     /// so it publishes nothing.
     ///
@@ -611,6 +647,16 @@ impl Transaction {
     /// - [`RecordedBuildError::Other`] for each other error.
     pub(crate) async fn build_recorded_images_classified(
         &self,
+    ) -> std::result::Result<(), RecordedBuildError> {
+        self.build_recorded_with(&mut VerityCache::default()).await
+    }
+
+    /// Makes the steps of
+    /// [`build_recorded_images_classified`](Transaction::build_recorded_images_classified)
+    /// with `cache` for the fs-verity digests of the objects with no seal.
+    async fn build_recorded_with(
+        &self,
+        cache: &mut VerityCache,
     ) -> std::result::Result<(), RecordedBuildError> {
         let commits = self.take_complete();
         if commits.is_empty() || !self.repo().config().generate_composefs()? {
@@ -637,7 +683,7 @@ impl Transaction {
             let Some(key) = key else {
                 continue;
             };
-            self.write_keyed_image(commit, commit_obj, &key)
+            self.write_keyed_image(commit, commit_obj, &key, cache)
                 .await
                 .map_err(|e| match e {
                     e @ Error::ComposefsDigestMismatch { .. } => RecordedBuildError::Mismatch(e),
@@ -652,12 +698,14 @@ impl Transaction {
     ///
     /// The call makes the steps of
     /// [`write_composefs_image`](Transaction::write_composefs_image) that
-    /// come after the read of the key.
+    /// come after the read of the key. The build takes the fs-verity digest
+    /// of each object with no seal from `cache` if it holds one.
     async fn write_keyed_image(
         &self,
         commit: &Checksum,
         commit_obj: Commit,
         key: &[u8; 32],
+        cache: &mut VerityCache,
     ) -> Result<ComposefsImageAdd> {
         let Some(result) = self.image_state(commit, key).await? else {
             return Ok(ComposefsImageAdd::AlreadyValid);
@@ -667,7 +715,7 @@ impl Transaction {
             commit_obj.root_dirtree,
             commit_obj.root_dirmeta,
         );
-        let image = self.build_composefs_image(&tree).await?;
+        let image = self.build_composefs_image_with(&tree, cache).await?;
         let checked = check_image_digest(commit, key, &image).map(|()| Some(result));
         self.finish_attach(commit, checked, image).await
     }
@@ -968,7 +1016,13 @@ impl Repo {
             commit_obj.root_dirtree,
             commit_obj.root_dirmeta,
         );
-        composefs_model(ObjectSource::Repo(self), &tree, digests).await
+        composefs_model(
+            ObjectSource::Repo(self),
+            &tree,
+            digests,
+            &mut VerityCache::default(),
+        )
+        .await
     }
 
     /// Stages a new commit that records the composefs image digest of
@@ -1428,17 +1482,20 @@ pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
 
 /// Builds the composefs tree model of `root` from the objects in `source`.
 /// The model holds the metadata and the backing redirect of each file, and no
-/// file content, so the shape of the tree bounds its size.
+/// file content, so the shape of the tree bounds its size. The walk takes the
+/// fs-verity digest of each object with no seal from `cache` if it holds one.
 async fn composefs_model(
     source: ObjectSource<'_>,
     root: &RepoTree,
     digests: Digests,
+    cache: &mut VerityCache,
 ) -> Result<Directory> {
     let mut dir = build_directory(
         source,
         *root.dirtree_checksum(),
         *root.dirmeta_checksum(),
         digests,
+        cache,
     )
     .await?;
     inject_top_level_dirs(&mut dir);
@@ -1475,22 +1532,23 @@ pub(crate) fn writer_error(err: WriterError) -> Error {
 /// Builds the composefs [`Directory`] model of one directory of a committed
 /// tree, and recurses into its subdirectories. The future is boxed because the
 /// recursion is async.
-fn build_directory(
-    source: ObjectSource<'_>,
+fn build_directory<'a>(
+    source: ObjectSource<'a>,
     dirtree: Checksum,
     dirmeta: Checksum,
     digests: Digests,
-) -> TreeFuture<'_> {
+    cache: &'a mut VerityCache,
+) -> TreeFuture<'a> {
     Box::pin(async move {
         let meta = source.dirmeta(&dirmeta).await?;
         let mut dir = Directory::new(dirmeta_to_metadata(&meta)?);
         let tree = source.dirtree(&dirtree).await?;
         for (name, checksum) in tree.files {
-            let node = file_node(source, &checksum, digests).await?;
+            let node = file_node(source, &checksum, digests, &mut *cache).await?;
             dir.children.insert(name.into_bytes(), node);
         }
         for (name, subtree, submeta) in tree.dirs {
-            let sub = build_directory(source, subtree, submeta, digests).await?;
+            let sub = build_directory(source, subtree, submeta, digests, &mut *cache).await?;
             dir.children.insert(name.into_bytes(), Node::Directory(sub));
         }
         Ok(dir)
@@ -1506,11 +1564,13 @@ fn build_directory(
 ///   digest of its content.
 ///
 /// The call reads the file object in each mode, because the metadata of the
-/// inode comes from it.
+/// inode comes from it. Under [`Digests::Computed`], it takes the digest of an
+/// object with no seal from `cache` if it holds one.
 async fn file_node(
     source: ObjectSource<'_>,
     checksum: &Checksum,
     digests: Digests,
+    cache: &mut VerityCache,
 ) -> Result<Node> {
     let file = source.file(checksum, digests != Digests::Disabled).await?;
     let meta = file_to_metadata(&file)?;
@@ -1524,7 +1584,7 @@ async fn file_node(
                 Content::Empty
             } else {
                 let digest = match digests {
-                    Digests::Computed => Some(content_fs_verity(&file).await?),
+                    Digests::Computed => Some(content_fs_verity(&file, cache).await?),
                     Digests::Sealed => Some(file.kernel_fs_verity().ok_or_else(|| {
                         Error::Unsupported(format!(
                             "the file object {checksum} has no fs-verity seal with SHA-256, \
@@ -1547,17 +1607,25 @@ async fn file_node(
 /// Returns the fs-verity digest of the content of a regular file.
 ///
 /// If the object file is a sealed raw payload, the value is the digest that
-/// the kernel gave at load. The call then reads no payload byte. The seal must
-/// name SHA-256, 4096-byte blocks, no salt, and the payload size. In all other
-/// cases, the call streams the payload of the object through the hasher in
-/// bounded chunks. The digest
-/// covers the content, so a repository that stores the object compressed gives
-/// the same value as one that stores it raw.
-async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
+/// the kernel gave at load. The call then reads no payload byte, and it does
+/// not put the digest in `cache`. The seal must name SHA-256, 4096-byte
+/// blocks, no salt, and the payload size.
+///
+/// In all other cases, the call looks for the checksum of the file object in
+/// `cache`, and gives the digest that the cache holds. If the cache holds no
+/// digest of the object, the call streams the payload of the object through
+/// the hasher in bounded chunks, and puts the digest in `cache`. The checksum
+/// of the file object covers the content, so it is a key of the digest. The
+/// digest covers the content, so a repository that stores the object
+/// compressed gives the same value as one that stores it raw.
+async fn content_fs_verity(file: &FileObject, cache: &mut VerityCache) -> Result<[u8; 32]> {
     use futures_lite::AsyncReadExt;
 
     if let Some(digest) = file.kernel_fs_verity() {
         return Ok(digest);
+    }
+    if let Some(digest) = cache.digests.get(file.checksum()) {
+        return Ok(*digest);
     }
     let mut reader = file.reader().await?;
     let mut hasher = FsVerityHasher::new();
@@ -1569,7 +1637,13 @@ async fn content_fs_verity(file: &FileObject) -> Result<[u8; 32]> {
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hasher.finalize())
+    let digest = hasher.finalize();
+    cache.digests.insert(*file.checksum(), digest);
+    #[cfg(test)]
+    {
+        cache.hashed += 1;
+    }
+    Ok(digest)
 }
 
 /// Inserts the five top-level directories that the `ostree` command adds. If
@@ -1648,4 +1722,128 @@ fn xattrs_to_model(xattrs: &Xattrs) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
             Ok((name, value.to_vec()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::AsFd;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::{Path, PathBuf};
+
+    use ostrya_core::{Checksum, RepoMode, Type, Value};
+    use ostrya_rt::block_on;
+
+    use super::{COMPOSEFS_DIGEST_KEY, ComposefsImageState, VerityCache};
+    use crate::{CommitOptions, CreateOptions, MutableTree, Repo, Transaction};
+
+    /// A scratch directory that the drop removes.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let path = std::env::temp_dir().join(format!(
+                "ostrya-composefs-{tag}-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            let _ = std::fs::remove_dir_all(&path);
+            std::fs::create_dir_all(&path).unwrap();
+            Scratch { path }
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Writes the regular file `name` under `dir` with `bytes` and the mode
+    /// 0644.
+    fn write_file(dir: &Path, name: &str, bytes: &[u8]) {
+        let path = dir.join(name);
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// Walks `base/src` into `txn`, and writes a commit of the tree at
+    /// `timestamp` with the composefs digest key of the tree.
+    async fn keyed_commit(txn: &Transaction, base: &Path, timestamp: u64) -> Checksum {
+        let mut mtree = MutableTree::new();
+        let dfd = std::fs::File::open(base).unwrap();
+        txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
+            .await
+            .unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let digest = txn.composefs_digest(&root).await.unwrap();
+        let metadata = Value::Array(vec![Value::Tuple(vec![
+            Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
+            Value::variant(Type::parse("ay").unwrap(), Value::Bytes(digest.to_vec())),
+        ])]);
+        txn.write_commit(
+            CommitOptions {
+                timestamp: Some(timestamp),
+                metadata: Some(metadata),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// One build pass of the recorded images reads and hashes each object
+    /// with no seal one time. Two paths of one tree name one object, and a
+    /// second commit shares objects with the first. An empty file has no
+    /// backing, so the pass hashes no empty object.
+    #[test]
+    fn one_build_pass_hashes_each_unsealed_object_one_time() {
+        let scratch = Scratch::new("verity-cache");
+        let root = scratch.path.join("repo");
+        block_on(async {
+            drop(
+                Repo::create(&root, CreateOptions::new(RepoMode::BareUser))
+                    .await
+                    .unwrap(),
+            );
+            let cfg = root.join("config");
+            let mut text = std::fs::read_to_string(&cfg).unwrap();
+            text.push_str("[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n");
+            std::fs::write(&cfg, text).unwrap();
+            let repo = Repo::open(&root).await.unwrap();
+
+            let big: Vec<u8> = (0..9000).map(|i| i as u8).collect();
+            let first = scratch.path.join("first");
+            let src = first.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            write_file(&src, "a", b"shared bytes\n");
+            write_file(&src, "b", b"shared bytes\n");
+            write_file(&src, "big", &big);
+            write_file(&src, "empty", b"");
+            let second = scratch.path.join("second");
+            let src = second.join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            write_file(&src, "a", b"shared bytes\n");
+            write_file(&src, "new", b"new bytes\n");
+            write_file(&src, "empty", b"");
+
+            let txn = repo.transaction().await.unwrap();
+            let one = keyed_commit(&txn, &first, 1).await;
+            let two = keyed_commit(&txn, &second, 2).await;
+            let mut cache = VerityCache::default();
+            if let Err(e) = txn.build_recorded_with(&mut cache).await {
+                panic!("{}", crate::Error::from(e));
+            }
+            assert_eq!(cache.hashed, 3);
+            txn.commit().await.unwrap();
+            for commit in [one, two] {
+                assert_eq!(
+                    repo.check_composefs_image(&commit).await.unwrap(),
+                    ComposefsImageState::Valid
+                );
+            }
+        });
+    }
 }

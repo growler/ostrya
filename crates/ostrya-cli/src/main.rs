@@ -5673,17 +5673,19 @@ async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
 /// `repo` is true and the repository does not seal its objects with
 /// fs-verity.
 ///
-/// Each image build then reads each file of its commit. A value of the key
-/// that is not true gives no warning and no probe. The warning does not
-/// change the exit status: an error of the key or of the probe gives no
-/// warning, and the writer of the command reports a bad setting itself.
+/// The image build then reads and hashes each object with no seal. A value
+/// of the key that is not true gives no warning and no probe. The warning
+/// does not change the exit status: an error of the key or of the probe
+/// gives no warning, and the writer of the command reports a bad setting
+/// itself.
 async fn warn_unsealed(repo: &Repo) {
     if matches!(repo.config().generate_composefs(), Ok(true))
         && matches!(repo.seals_objects().await, Ok(false))
     {
         eprintln!(
             "warning: [ex-ostrya] generate-composefs is true, but the repository does not seal \
-             its objects with fs-verity; each image build reads each file of the commit"
+             its objects with fs-verity; the image build reads and hashes each object with no \
+             seal"
         );
     }
 }

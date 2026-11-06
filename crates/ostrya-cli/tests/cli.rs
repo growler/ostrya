@@ -24174,8 +24174,8 @@ fn composefs_image_check_fails_on_a_changed_image() {
 /// The warning of `[ex-ostrya] generate-composefs` true in a repository that
 /// does not seal its objects.
 const UNSEALED_WARNING: &str = "warning: [ex-ostrya] generate-composefs is true, but the \
-     repository does not seal its objects with fs-verity; each image build reads each file of \
-     the commit";
+     repository does not seal its objects with fs-verity; the image build reads and hashes each \
+     object with no seal";
 
 /// With `[ex-ostrya] generate-composefs` true, `commit
 /// --generate-composefs-metadata` stores the image of the commit, and a

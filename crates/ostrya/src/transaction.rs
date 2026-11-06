@@ -1538,8 +1538,9 @@ impl Transaction {
     /// `ostree.composefs.digest.v0` key and a commit whose image is staged.
     /// For each other commit, it makes the steps of
     /// [`write_composefs_image`](Transaction::write_composefs_image). The
-    /// build reads the fs-verity digest of a sealed object from the kernel,
-    /// and reads and hashes each other object.
+    /// build reads the fs-verity digest of a sealed object from the kernel.
+    /// It reads and hashes each other object one time, and uses that digest
+    /// for each commit and each path that names the object.
     ///
     /// # Durability
     ///

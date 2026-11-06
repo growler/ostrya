@@ -493,11 +493,12 @@ A value that is not a boolean fails each write before its first write, and a pul
 \fB\%ostrya fsck\fR refuses it before its first phase.
 ostrya refuses the value true in an \fB\%archive\fR repository in the same places.
 .IP
-Each image build reads the fs\-verity digest of a sealed object from the kernel, and reads and hashes each other object.
-With \fB\%[ex\-integrity] fsverity=no\fR, or \fB\%maybe\fR on a file system with no fs\-verity, each build reads each file of the commit.
+Each image build reads the fs\-verity digest of a sealed object from the kernel.
+The build of the images of a transaction reads and hashes each other object one time, and uses that digest for each commit of the transaction and each path that names the object.
+With \fB\%[ex\-integrity] fsverity=no\fR, or \fB\%maybe\fR on a file system with no fs\-verity, the build reads and hashes each object of the commits one time.
 With true, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya static\-delta apply\-offline\fR, and \fB\%ostrya receive\fR then write this warning on standard error:
 .IP
-\fB\%warning: [ex\-ostrya] generate\-composefs is true, but the repository does not seal its objects with fs\-verity; each image build reads each file of the commit\fR
+\fB\%warning: [ex\-ostrya] generate\-composefs is true, but the repository does not seal its objects with fs\-verity; the image build reads and hashes each object with no seal\fR
 .IP
 With \fB\%maybe\fR, the command makes a probe file in \fB\%tmp/\fR to find the result.
 The warning does not change the exit status.

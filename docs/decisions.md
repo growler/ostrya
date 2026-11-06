@@ -471,8 +471,10 @@ reads the key at its start for its note of a commit with no image.
 
 The key `true` in an `archive` repository is refused. The generation is for
 production repositories, and the mount refuses `archive`. In the other modes
-the key is accepted. Where the objects have no fs-verity seal, each build
-reads and hashes each file of the commit. `Repo::seals_objects` tells if the
+the key is accepted. Where the objects have no fs-verity seal, the build of
+the recorded images of a transaction reads and hashes each object one time.
+It uses that digest for each commit of the build and each path that names
+the object. `Repo::seals_objects` tells if the
 repository seals its objects, and the commands that write warn of the cost.
 An object that the repository holds from before can have no seal, and the
 build reads it. The port does not seal an object at the dedup of a write,

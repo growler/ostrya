@@ -3657,11 +3657,41 @@ is ID, and else `refs/mirrors/ID/REF`. It writes the ref to
 `refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the collection id
 of the repository. The tip commit of `@ID:REF` must hold the
 `ostree.collection-binding` `ID`, and `--disable-verify-bindings` does not
-skip this check. `--mirror` refuses `@ID:REF` with `error: invalid input: a
-mirror pull takes no collection ref: @ID:REF` at exit 1. An operand
+skip this check. An operand
 `REMOTE:REF`, an operand with a `^` suffix, and an operand that starts with
 `@` and is not an `@ID:REF` ref give `error: Invalid refspec <operand>` at
 exit 1. The port refuses each of these operands before the first request.
+
+Under `--mirror`, the port writes a plain operand REF as the tool does: as
+`@ID:REF` when the summary of the remote states the collection id ID, and as
+`refs/heads/REF` when the remote serves no summary or a summary that states
+no collection id (`cli-behavior.md`, "The pulled ref under the own
+collection id"). An `@ID:REF` operand keeps its collection. With no
+operand, the port takes each ref of field 0 of the summary by the same rule,
+and each ref of the collection map in its collection. The port takes this
+rule also for an ssh remote and a bucket, which the tool does not have.
+These points differ from the tool:
+
+- The tip of a plain operand that the port writes as `@ID:REF`, and of each
+  such ref of the summary, must hold the `ostree.collection-binding` ID, as
+  for an `@ID:REF` operand. The tool checks the binding against the
+  `[core] collection-id` of the source over `file://`, and against the
+  remote key `collection-id` over HTTP. Over HTTP with no such key, the tool
+  checks no collection binding and writes a commit with no binding to
+  `refs/mirrors/ID/REF`. The port refuses that commit with `error: pull:
+  commit <checksum>: no collection binding metadata for the requested
+  collection 'ID'` at exit 1, also with `--disable-verify-bindings`. The
+  tool refuses a ref of the collection map over `file://` when the source
+  has a `[core] collection-id`, and the port pulls it.
+- The port refuses two different operands that write one ref file, for
+  example `REF` and `@ID:REF` under `--mirror` from a remote whose summary
+  states ID. It refuses two refs of the summary that give different texts
+  and write one ref file in a pull with no operand in the same way. The
+  error is `error: pull: the refs A and B write one ref <path>` at exit 1.
+  The port makes this check after it reads the summary and the config of
+  the remote, and before it reads a ref file or an object. It writes no
+  ref. An operand that occurs two times counts one time, as in the tool.
+  Refs of the summary that give the same text keep the first entry.
 
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port

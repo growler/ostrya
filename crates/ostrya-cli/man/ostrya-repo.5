@@ -151,6 +151,7 @@ The summary lists these refs in its collection map.
 A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
 A pull with \fB\%\-\-collection\fR and \fB\%refs \-c \-\-create\fR write it by the same rule.
+A pull with \fB\%\-\-mirror\fR writes it by the same rule for each ref of the collection \fB\%<collection\-id>\fR that the summary of the remote states, and for each ref of the collection map of that summary.
 The refs of the own collection id are the local refs: each writer writes \fB\%refs/heads/<ref>\fR for that id.
 A directory \fB\%refs/mirrors/\fR of the own collection id comes from outside ostrya, for example from a hand edit or from the \fB\%ostree\fR command.
 The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the summary, and the ref listing.

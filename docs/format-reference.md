@@ -5274,9 +5274,8 @@ summary gives an empty result.
 pull takes both forms, and the refs of more than one collection. Before its
 first request, the pull refuses `REMOTE:NAME`, a `^` suffix, and an
 `@ID:NAME` whose `ID` fails the collection-id rule or whose `NAME` fails the
-ref-name rule, with `Error::InvalidRefspec`. A mirror pull refuses `@ID:NAME`
-with `Error::InvalidInput`. The `branches` key of a remote holds plain names
-alone. The pull of a plain `NAME` reads the summary, and else
+ref-name rule, with `Error::InvalidRefspec`. The `branches` key of a remote
+holds plain names alone. The pull of a plain `NAME` reads the summary, and else
 `refs/heads/NAME` of the remote.
 
 The pull resolves `@ID:NAME` in this order:
@@ -5308,6 +5307,29 @@ not `ID`. This is also true when `ID` is the `[core] collection-id` of the
 client. `PullFlags::DISABLE_VERIFY_BINDINGS` (`--disable-verify-bindings`)
 does not skip this check. The ref-binding check reads `NAME`, and the flag
 skips it. The pull makes these checks before the transaction writes a ref.
+
+A mirror pull (`PullFlags::MIRROR`, `pull --mirror`) writes the refs in the
+collections of the remote:
+
+- A plain `NAME` is the ref `@ID:NAME` when the summary of the remote states
+  the `ostree.summary.collection-id` `ID`. The pull reads it as a plain
+  `NAME`: from field 0 of the summary, and else from `refs/heads/NAME` of the
+  remote. It writes it and checks the bindings of its tip as an `@ID:NAME`
+  ref. The `[core] collection-id` of the `config` of the remote and the
+  `collection-id` key of the remote section do not change the collection.
+- A plain `NAME` of a remote with no summary, or with a summary that states
+  no collection id, is the local ref `refs/heads/NAME`.
+- An `@ID:NAME` ref keeps its collection.
+- With no ref, the pull takes each ref of field 0 of the summary by the rule
+  above, and each ref `NAME` of the entry of `ID` of
+  `ostree.summary.collection-map` as the ref `@ID:NAME`. A summary that
+  lists one of these refs two times gives the first entry.
+
+A name that occurs two times counts one time. The pull refuses two other
+names that write one ref file with `Error::Pull`, also two refs of the
+summary in a mirror pull with no ref. It makes this check after it reads
+the summary and the `config` of the remote, and before it reads a ref file
+or an object.
 
 ## Summaries of auth items
 

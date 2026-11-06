@@ -580,6 +580,43 @@ fn a_pull_that_names_the_remote_does_not_read_mirrored_collection_ids() {
     );
 }
 
+/// `pull --mirror` writes a plain ref of a server whose summary states the
+/// collection id ID to `refs/mirrors/ID/REF`. A ref named two times counts
+/// one time. REF and @ID:REF write one ref, so the command refuses them
+/// with exit 1 and writes no ref.
+#[test]
+fn a_mirror_pull_writes_the_collection_of_the_summary() {
+    let dir = TmpDir::new("mirror");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    let stable = commit(&a, "a1", REF, TS);
+    ok(&a, &["summary", "-u"]);
+    let serving = Serving::start(&a);
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", &serving.url, ID));
+
+    let at_ref = format!("@{ID}:{REF}");
+    let out = ostrya(&client, &["pull", "--mirror", "a", REF, &at_ref]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "error: pull: the refs {REF} and {at_ref} write one ref refs/mirrors/{ID}/{REF}
+"
+        )
+    );
+    assert_eq!(ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")), None);
+
+    let out = ostrya(&client, &["pull", "--mirror", "a", REF, REF]);
+    assert_pulled(&out, 0);
+    assert_eq!(
+        ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")),
+        Some(stable)
+    );
+    assert_eq!(ref_file(&client, &format!("refs/heads/{REF}")), None);
+}
+
 /// A candidate at a `file://` address is a local repository. The pull reads
 /// its refs and objects through the file system, and prints the statistics
 /// line of `pull-local`. A pull of the same remote with no `--collection`

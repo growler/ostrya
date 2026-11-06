@@ -30,7 +30,7 @@ use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::AsyncRead;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya_core::{
-    Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, RepoMode, Value, loose_path,
+    Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, Ref, RepoMode, Value, loose_path,
 };
 
 use crate::config::RepoConfig;
@@ -146,8 +146,7 @@ impl Repo {
     ///
     /// A requested ref is a ref `NAME` or a collection ref `@ID:NAME`. One
     /// pull takes both forms, and the refs of more than one collection. The
-    /// pull refuses a remote ref `REMOTE:NAME` and a `^` suffix. Under
-    /// [`MIRROR`](PullFlags::MIRROR), it refuses an `@ID:NAME` ref. For an
+    /// pull refuses a remote ref `REMOTE:NAME` and a `^` suffix. For an
     /// `@ID:NAME` ref:
     ///
     /// - The pull reads field 0 of the summary if the
@@ -169,6 +168,26 @@ impl Repo {
     ///   [`no_ref_writes`](PullOptions::no_ref_writes), the pull does not
     ///   make it.
     /// - The ref-binding check reads `NAME`.
+    ///
+    /// Under [`MIRROR`](PullFlags::MIRROR), a plain ref `NAME` of a remote
+    /// whose summary states the `ostree.summary.collection-id` `ID` is the
+    /// ref `@ID:NAME`. The pull reads it as the plain ref `NAME`: from field
+    /// 0 of the summary, and else from `refs/heads/<NAME>` of the remote. It
+    /// writes the ref and checks the bindings of its tip as for an `@ID:NAME`
+    /// ref. A plain ref of a remote with no summary, or with a summary that
+    /// states no collection id, is the local ref `refs/heads/<NAME>`. A
+    /// mirror pull of every ref takes each ref of field 0 by the same rule,
+    /// and each ref `NAME` of the entry of `ID` of
+    /// `ostree.summary.collection-map` as the ref `@ID:NAME`.
+    ///
+    /// A name that occurs two times counts one time. Two other names that
+    /// write one ref stop the pull with [`Error::Pull`]. Examples under
+    /// `MIRROR` are `NAME` and `@ID:NAME` from a remote whose summary states
+    /// the collection id `ID`, and `NAME` and `@OWN:NAME`, where `OWN` is the
+    /// `[core] collection-id` of this repository, from a remote whose summary
+    /// states no collection id. The pull makes this check after it reads the
+    /// summary and the `config` of the remote, and before it reads a ref file
+    /// or an object.
     ///
     /// # Proxy
     ///
@@ -584,11 +603,9 @@ impl Repo {
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
     ///   [`subpaths`](PullOptions::subpaths).
     /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs) is
-    ///   not a ref `NAME` or `@ID:NAME` that [`Ref`](crate::Ref) reads: a
+    ///   not a ref `NAME` or `@ID:NAME` that [`Ref`] reads: a
     ///   remote ref `REMOTE:NAME`, a `^` suffix, or a part that fails its
     ///   rule.
-    /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) holds an
-    ///   `@ID:NAME` name under `MIRROR`.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
     /// - The errors of
@@ -625,14 +642,19 @@ impl Repo {
     ///   UTF-8.
     /// - [`Error::InvalidFormat`] if the summary holds an
     ///   `ostree.summary.collection-map` that is malformed, and the pull reads
-    ///   it for an `@ID:NAME` ref.
+    ///   it for an `@ID:NAME` ref or for a `MIRROR` pull of every ref.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a ref file of the remote holds no checksum.
     /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, or
     ///   a name of the `branches` key of the remote, is not a valid ref name.
     ///   A `MIRROR` pull of every ref
     ///   fails with this error if the summary lists one name that the ref-name
-    ///   rule refuses. The pull does not skip the name.
+    ///   rule refuses, or one collection id that the collection-id rule
+    ///   refuses. The pull does not skip the name. A `MIRROR` pull of a plain
+    ///   name in [`refs`](PullOptions::refs) fails with this error if the
+    ///   `ostree.summary.collection-id` of the summary fails the
+    ///   collection-id rule.
+    /// - [`Error::Pull`] if two names of the pull write one ref.
     /// - [`Error::RefNotFound`] if neither the summary nor the ref file of the
     ///   remote names a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
@@ -801,10 +823,15 @@ impl Repo {
     /// - `None` writes local refs, `refs/heads/<ref>`, as
     ///   [`pull_local`](Repo::pull_local) does.
     /// - `Some(name)` writes `refs/remotes/<name>/<ref>`.
-    /// - [`MIRROR`](PullFlags::MIRROR) writes local refs, whatever `remote`
-    ///   holds.
+    /// - [`MIRROR`](PullFlags::MIRROR) writes each plain ref as
+    ///   [`pull`](Repo::pull) states, whatever `remote` holds: as the ref of
+    ///   the collection that the summary of the remote states, or as a local
+    ///   ref.
     /// - An `@ID:NAME` ref writes the collection ref, as
     ///   [`pull`](Repo::pull) states, whatever `remote` holds.
+    ///
+    /// Two names that write one ref stop the pull, as [`pull`](Repo::pull)
+    /// states.
     ///
     /// The pull does not protect the local refs of this repository. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes), the pull writes no ref,
@@ -863,8 +890,7 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) is empty, also
     ///   under `MIRROR`.
     /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs) is
-    ///   not a ref `NAME` or `@ID:NAME`, and [`Error::InvalidInput`] for an
-    ///   `@ID:NAME` name under `MIRROR`, as for [`pull`](Repo::pull).
+    ///   not a ref `NAME` or `@ID:NAME`, as for [`pull`](Repo::pull).
     /// - [`Error::InvalidInput`] if [`verify`](PullOptions::verify) is not the
     ///   default, or if [`trust_group`](PullOptions::trust_group) is set.
     ///   `trust` holds the keys.
@@ -994,11 +1020,12 @@ impl Repo {
         started: Instant,
     ) -> Result<PullStats> {
         let mirror = opts.flags.contains(PullFlags::MIRROR);
+        // A mirror pull writes a plain name as a local ref. Its targets name
+        // the ref of a collection as `@ID:NAME`.
         let place = match wanted {
             Wanted::Pinned(pinned) => pinned.place,
-            _ if mirror => RefPlace::Heads,
             _ => RefPlace::Operands {
-                remote: opts.remote.as_deref(),
+                remote: opts.remote.as_deref().filter(|_| !mirror),
                 own: self.config().collection_id(),
             },
         };
@@ -1187,7 +1214,14 @@ impl Repo {
         };
         let remote_id = check_remote_mode(root.config(source).await?)?;
         let targets = self
-            .remote_targets(wanted, opts, summary.as_ref(), remote_id.as_deref(), source)
+            .remote_targets(
+                wanted,
+                opts,
+                place,
+                summary.as_ref(),
+                remote_id.as_deref(),
+                source,
+            )
             .await?;
         // Discovery reads two values of the summary alone. The pull keeps
         // them for the deltas of the dependencies, and drops the rest of the
@@ -1486,10 +1520,15 @@ impl Repo {
     ///
     /// `remote_id` is the `[core] collection-id` of the `config` of the
     /// remote. The target of an `@ID:NAME` name keeps the name as given.
+    /// Under `MIRROR`, the target of a plain name is `@ID:NAME` if the
+    /// summary states the collection id `ID`. Names that are the same text
+    /// count one time. Two other names that write one ref at `place` stop the
+    /// pull before it reads a ref file.
     async fn remote_targets(
         &self,
         wanted: Wanted<'_>,
         opts: &PullOptions,
+        place: RefPlace<'_>,
         summary: Option<&Summary>,
         remote_id: Option<&str>,
         source: &RemoteSource,
@@ -1497,9 +1536,16 @@ impl Repo {
         if let Wanted::Pinned(pinned) = wanted {
             return Ok(pinned.targets.clone());
         }
+        let mirror = opts.flags.contains(PullFlags::MIRROR);
+        // Under `MIRROR`, a plain name and each ref of field 0 of the summary
+        // are refs of the collection that the summary states.
+        let summary_id = summary
+            .filter(|_| mirror)
+            .and_then(|summary| summary.metadata_value(COLLECTION_ID_KEY))
+            .and_then(Value::as_str);
         let names = if !opts.refs.is_empty() {
             opts.refs.clone()
-        } else if opts.flags.contains(PullFlags::MIRROR) {
+        } else if mirror {
             let Some(summary) = summary else {
                 return Err(Error::Pull(
                     "fetching all refs was requested in mirror mode, but the remote \
@@ -1507,18 +1553,7 @@ impl Repo {
                         .into(),
                 ));
             };
-            // A summary name becomes a ref that this pull writes. The pull
-            // checks it against the rule of the ref store here, before the
-            // first object request. Without this check, the first check comes
-            // when the transaction resolves the ref at publication.
-            for entry in &summary.refs {
-                crate::refs::check_ref_path(&entry.name)?;
-            }
-            return Ok(summary
-                .refs
-                .iter()
-                .map(|entry| (entry.name.clone(), entry.commit))
-                .collect());
+            return mirror_targets(summary, summary_id, place);
         } else {
             let Wanted::Config(remote) = wanted else {
                 return Err(no_refs());
@@ -1539,28 +1574,50 @@ impl Repo {
         // valid id and a valid name. A name of the `branches` key is a plain
         // name, and the ref-name rule below refuses each other name.
         let operands = !opts.refs.is_empty();
-        let mut listed = HashMap::new();
-        let mut out = Vec::with_capacity(names.len());
+        let mut seen = HashSet::new();
+        let mut wanted_refs = Vec::with_capacity(names.len());
         for name in names {
-            let checksum = match operand_collection(&name).filter(|_| operands) {
-                Some((id, ref_name)) => {
-                    remote_collection_ref(summary, &mut listed, remote_id, id, ref_name, source)
-                        .await?
-                }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            let target = match operand_collection(&name).filter(|_| operands) {
+                Some(_) => name.clone(),
                 None => {
                     // The name goes on the wire as a request path, so the pull
                     // checks it against the rule of the ref store. A component
                     // that the rule refuses, such as a traversal, can ask the
                     // server for a resource that the ref does not name.
                     crate::refs::check_ref_path(&name)?;
-                    match summary.and_then(|summary| summary.lookup(&name)) {
-                        Some(checksum) => Some(checksum),
-                        None => fetch_remote_ref(source, HEADS_DIR, &name).await?,
+                    match summary_id {
+                        Some(id) => Ref::collection(id, name.as_str()).to_string(),
+                        None => name.clone(),
                     }
                 }
             };
+            wanted_refs.push((name, target));
+        }
+        check_one_place(
+            place,
+            wanted_refs
+                .iter()
+                .map(|(name, target)| (name.as_str(), target.as_str())),
+        )?;
+
+        let mut listed = HashMap::new();
+        let mut out = Vec::with_capacity(wanted_refs.len());
+        for (name, target) in wanted_refs {
+            let checksum = match operand_collection(&name).filter(|_| operands) {
+                Some((id, ref_name)) => {
+                    remote_collection_ref(summary, &mut listed, remote_id, id, ref_name, source)
+                        .await?
+                }
+                None => match summary.and_then(|summary| summary.lookup(&name)) {
+                    Some(checksum) => Some(checksum),
+                    None => fetch_remote_ref(source, HEADS_DIR, &name).await?,
+                },
+            };
             let checksum = checksum.ok_or_else(|| Error::RefNotFound(name.clone()))?;
-            out.push((name, checksum));
+            out.push((target, checksum));
         }
         Ok(out)
     }
@@ -3268,6 +3325,86 @@ fn check_remote_mode(config: Option<Vec<u8>>) -> Result<Option<String>> {
          form a client can store",
         config.mode().as_mode_str()
     )))
+}
+
+/// Returns the targets of a [`MIRROR`](PullFlags::MIRROR) pull of each ref
+/// that `summary` lists.
+///
+/// A ref of field 0 is the target `@ID:NAME` if `summary_id`, the collection
+/// id that the summary states, is `ID`, and else the target `NAME`. A ref of
+/// the entry of `ID` in `ostree.summary.collection-map` is the target
+/// `@ID:NAME`. If the summary lists one target two times, the first ref
+/// counts.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the collection map is malformed.
+/// - [`Error::InvalidRefspec`] if a target fails the rule of
+///   [`Ref::validate`].
+/// - [`Error::Pull`] if two targets write one ref at `place`.
+fn mirror_targets(
+    summary: &Summary,
+    summary_id: Option<&str>,
+    place: RefPlace<'_>,
+) -> Result<Vec<(String, Checksum)>> {
+    let mut refs = Vec::with_capacity(summary.refs.len());
+    for entry in &summary.refs {
+        let r = match summary_id {
+            Some(id) => Ref::collection(id, entry.name.as_str()),
+            None => Ref::local(entry.name.as_str()),
+        };
+        refs.push((r, entry.commit));
+    }
+    for (id, entries) in summary.collection_map()? {
+        for entry in entries {
+            refs.push((Ref::collection(id.as_str(), entry.name), entry.commit));
+        }
+    }
+    // A target becomes a ref that this pull writes. The pull checks it
+    // against the rule of the ref store here, before the first object
+    // request. Without this check, the first check comes when the
+    // transaction resolves the ref at publication.
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for (r, commit) in refs {
+        r.validate()?;
+        let text = r.to_string();
+        if seen.insert(text.clone()) {
+            out.push((text, commit));
+        }
+    }
+    check_one_place(
+        place,
+        out.iter().map(|(text, _)| (text.as_str(), text.as_str())),
+    )?;
+    Ok(out)
+}
+
+/// Refuses two refs of a pull that write one ref at `place`.
+///
+/// Each item is a name of the pull and its target. No two items have the
+/// same name.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if a target gives no valid ref path.
+/// - [`Error::Pull`] if two targets write one ref. The error names both
+///   names and the ref path.
+fn check_one_place<'a>(
+    place: RefPlace<'_>,
+    refs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let mut paths: HashMap<String, &str> = HashMap::new();
+    for (name, target) in refs {
+        let path = place.ref_path(target)?;
+        if let Some(first) = paths.get(path.as_str()) {
+            return Err(Error::Pull(format!(
+                "the refs {first} and {name} write one ref {path}"
+            )));
+        }
+        paths.insert(path, name);
+    }
+    Ok(())
 }
 
 /// Returns the commit of the ref `name` of the collection `id` on the remote,

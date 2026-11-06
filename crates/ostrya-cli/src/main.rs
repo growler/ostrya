@@ -3947,14 +3947,22 @@ struct PullArgs {
         conflicts_with_all = ["url", "mirror", "disable_verify_bindings"]
     )]
     collection: Option<String>,
-    /// Write the pulled refs as local refs under `refs/heads/`.
+    /// Write the pulled refs in the collections of the remote, not under
+    /// `refs/remotes/`.
+    ///
+    /// A ref REF is the ref @ID:REF if the summary of the remote states the
+    /// collection id ID. The pull writes it to `refs/mirrors/ID/REF`, or to
+    /// `refs/heads/REF` if the `collection-id` of this repository is ID, and
+    /// the commit must be bound to ID. If the remote serves no summary, or
+    /// its summary states no collection id, the pull writes
+    /// `refs/heads/REF`. A ref @ID:REF keeps its collection.
     ///
     /// If no ref is named, the pull takes every ref that the summary of the
-    /// remote lists, and fails if the remote serves no summary. This pull also
-    /// copies the `summary` and `summary.sig` of the remote to this
-    /// repository. If the remote has no `summary.sig`, the `summary.sig` of
-    /// this repository stays as it is. A pull of named refs copies no
-    /// summary. The command refuses a ref @ID:REF with this option.
+    /// remote lists, in its ref list and in its collection map, and fails if
+    /// the remote serves no summary. This pull also copies the `summary` and
+    /// `summary.sig` of the remote to this repository. If the remote has no
+    /// `summary.sig`, the `summary.sig` of this repository stays as it is. A
+    /// pull of named refs copies no summary.
     #[arg(long)]
     mirror: bool,
     /// The number of parents of each pulled commit to follow.
@@ -4196,7 +4204,9 @@ struct PullArgs {
     /// `refs/mirrors/ID/REF`. The pull writes `refs/mirrors/ID/REF`, or
     /// `refs/heads/REF` if the `collection-id` of this repository is ID. The
     /// commit must be bound to ID, also with --disable-verify-bindings. The
-    /// ref-binding check reads REF. --mirror refuses @ID:REF.
+    /// ref-binding check reads REF. A ref named two times counts one time.
+    /// The command refuses two other refs that write one ref, after it reads
+    /// the summary and before it reads a ref file.
     refs: Vec<String>,
 }
 

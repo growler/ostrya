@@ -1211,6 +1211,65 @@ fn a_pull_from_a_bucket_takes_plain_and_collection_refs() {
     }
 }
 
+/// `pull --mirror` from a bucket whose summary states the collection id ID
+/// writes a plain ref REF to `refs/mirrors/ID/REF`, or to `refs/heads/REF`
+/// in a repository with the collection id ID.
+#[cfg(feature = "push")]
+#[test]
+fn a_mirror_pull_from_a_bucket_writes_the_collection_of_the_summary() {
+    let scratch = Scratch::new("pull-mirror-collection");
+    let server = StandIn::start();
+    init(&scratch, &server, Some(ID));
+    let src = scratch.repo("src");
+    scratch.ok(&[&src, "config", "set", "core.collection-id", ID]);
+    let tip = scratch.commit(&src, "main", "one");
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&[
+        &src,
+        "push",
+        ADDRESS,
+        "main",
+        &endpoint,
+        CLEARTEXT,
+        &format!("--collection={ID}"),
+    ]);
+
+    for (name, own) in [("dest", None), ("dest-own", Some(ID))] {
+        let dest = scratch.repo(name);
+        if let Some(own) = own {
+            scratch.ok(&[&dest, "config", "set", "core.collection-id", own]);
+        }
+        scratch.ok(&[
+            &dest,
+            "remote",
+            "add",
+            "--no-gpg-verify",
+            "r",
+            ADDRESS,
+            &format!("--set=s3-endpoint={}", server.endpoint()),
+        ]);
+        scratch.ok(&[&dest, "remote", "summary", "-u", "r", CLEARTEXT]);
+        scratch.ok(&[&dest, "pull", "--mirror", "r", "main", CLEARTEXT]);
+        let path = scratch.path().join(name);
+        let (written, absent) = match own {
+            None => (
+                format!("refs/mirrors/{ID}/main"),
+                "refs/heads/main".to_owned(),
+            ),
+            Some(_) => (
+                "refs/heads/main".to_owned(),
+                format!("refs/mirrors/{ID}/main"),
+            ),
+        };
+        assert_eq!(
+            std::fs::read_to_string(path.join(&written)).unwrap().trim(),
+            tip,
+            "{name}"
+        );
+        assert!(!path.join(absent).exists(), "{name}");
+    }
+}
+
 #[test]
 fn a_pull_refuses_an_s3_address_in_url() {
     let scratch = Scratch::new("pull-url-key");

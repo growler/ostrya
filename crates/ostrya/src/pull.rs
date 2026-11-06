@@ -303,14 +303,17 @@ impl PullFlags {
     /// without this flag too. The pull copies a content object through its
     /// header, so the object gets the inode policy of this repository.
     pub const FORCE_COPY: PullFlags = PullFlags(1 << 4);
-    /// A mirror of a remote: local refs, and a copy of the summary.
+    /// A mirror of a remote: the refs of the remote in their collections,
+    /// and a copy of the summary.
     ///
-    /// [`Repo::pull`] writes the pulled refs as local refs under
-    /// `refs/heads/`, and refuses an `@ID:NAME` name in
-    /// [`refs`](PullOptions::refs). If `refs` is empty, the pull takes
-    /// each ref that the summary of the remote lists. If the pull takes each
-    /// such ref, it copies the `summary` and `summary.sig` bytes of the remote
-    /// to this repository.
+    /// [`Repo::pull`] writes a plain name as a ref of the collection that the
+    /// summary of the remote states, and as a local ref under `refs/heads/`
+    /// if the summary states no collection id. It writes an `@ID:NAME` name
+    /// as without this flag. If [`refs`](PullOptions::refs) is empty, the
+    /// pull takes each ref that the summary of the remote lists, in field 0
+    /// and in its collection map. If the pull takes each such ref, it copies
+    /// the `summary` and `summary.sig` bytes of the remote to this
+    /// repository. [`Repo::pull`] states the rules in "Refs".
     ///
     /// [`Repo::pull_local`] ignores this flag. It writes the pulled refs under
     /// the prefix that [`remote`](PullOptions::remote) names, or as local refs
@@ -568,7 +571,8 @@ pub struct PullOptions {
     /// and a `^` suffix included, as [`Repo::pull_local`] states.
     /// [`Repo::pull`] and [`Repo::pull_with_session`] read each name as a ref
     /// `NAME` or a collection ref `@ID:NAME`, and refuse each other form, as
-    /// [`Repo::pull`] states in "Refs".
+    /// [`Repo::pull`] states in "Refs". They take a name that occurs two
+    /// times one time.
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
@@ -578,8 +582,9 @@ pub struct PullOptions {
     ///
     /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
     /// write local refs under `refs/heads/`. [`Repo::pull`] then writes the
-    /// refs under the name of the remote. A pull from a remote writes local
-    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. Each
+    /// refs under the name of the remote. A pull from a remote does not read
+    /// the value under [`MIRROR`](PullFlags::MIRROR), and writes each plain
+    /// name as [`Repo::pull`] states in "Refs". Each
     /// pull writes the ref of an `@ID:NAME` name as the collection ref of
     /// `ID`, whatever the value. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
@@ -2707,8 +2712,8 @@ async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, 
 /// Returns the collection id and the rest of an `@ID:NAME` name of a pull,
 /// or `None` if the name does not start with `@`. The rest of a name of a
 /// local pull can hold a `^` suffix. [`check_local_operands`] and
-/// [`check_remote_operands`] checked each name that starts with `@`, so it
-/// holds a `:`.
+/// [`check_remote_operands`] checked each name that starts with `@`, and a
+/// mirror pull makes each other such name from a [`Ref`], so it holds a `:`.
 fn operand_collection(name: &str) -> Option<(&str, &str)> {
     name.strip_prefix('@')?.split_once(':')
 }
@@ -3533,20 +3538,12 @@ fn check_local_operands(opts: &PullOptions) -> Result<()> {
 /// Each name must be a ref `NAME` or a collection ref `@ID:NAME` that
 /// [`Ref`] reads. The function refuses each other name with
 /// [`Error::InvalidRefspec`], which holds the name as given: a remote ref
-/// `REMOTE:NAME`, a `^` suffix, and a part that fails its rule. Under
-/// [`MIRROR`](PullFlags::MIRROR), it refuses an `@ID:NAME` name with
-/// [`Error::InvalidInput`]. The check reads nothing.
+/// `REMOTE:NAME`, a `^` suffix, and a part that fails its rule. The check
+/// reads nothing.
 fn check_remote_operands(opts: &PullOptions) -> Result<()> {
-    let mirror = opts.flags.contains(PullFlags::MIRROR);
     for name in &opts.refs {
         match name.parse::<Ref>() {
-            Ok(Ref::Local { .. }) => {}
-            Ok(Ref::Collection { .. }) if !mirror => {}
-            Ok(Ref::Collection { .. }) => {
-                return Err(Error::InvalidInput(format!(
-                    "a mirror pull takes no collection ref: {name}"
-                )));
-            }
+            Ok(Ref::Local { .. } | Ref::Collection { .. }) => {}
             _ => return Err(Error::InvalidRefspec(name.clone())),
         }
     }

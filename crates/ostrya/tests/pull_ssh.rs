@@ -21,7 +21,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use common::pipe::{PipeReader, pipe};
-use common::{TmpDir, anyone};
+use common::{TmpDir, anyone, repo_access};
 use futures_lite::future;
 use futures_lite::io::AsyncRead;
 use ostrya::RefSelector;
@@ -36,9 +36,9 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 use pull::{
-    FIXED_TS, ID_X, ID_Y, RepoServer, assert_list_refusal, build_collection_remote, build_remote,
-    build_tree, commit_tree, commit_tree_related, commit_tree_with, content_checksums,
-    detached_dict, filez_path, incompressible, static_delta_list_cases,
+    FIXED_TS, ID_X, ID_Y, REMOTE_ID, RepoServer, assert_list_refusal, build_collection_remote,
+    build_remote, build_tree, commit_tree, commit_tree_related, commit_tree_with,
+    content_checksums, detached_dict, filez_path, incompressible, static_delta_list_cases,
 };
 
 /// The capacity of each pipe.
@@ -1320,6 +1320,65 @@ fn the_stream_source_pulls_plain_and_collection_refs() {
                 "{path}"
             );
         }
+    });
+}
+
+/// A mirror pull through the stream source writes a plain ref in the
+/// collection that the served summary states, and an `@ID:NAME` ref in its
+/// collection, whatever the remote name is.
+#[test]
+fn a_mirror_pull_over_the_stream_source_writes_the_collection_of_the_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-mirror-collection");
+        let (remote, [_, c, _, b]) = build_collection_remote(dir.path()).await;
+        // The server serves the summary of the item of the client.
+        remote
+            .regenerate_summaries(&SummaryOptions::default(), &[])
+            .await
+            .unwrap();
+        let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
+        let y_b = format!("@{ID_Y}:b");
+        let opts = PullOptions {
+            refs: vec!["c".to_owned(), y_b],
+            remote: Some("origin".to_owned()),
+            flags: PullFlags::MIRROR,
+            ..PullOptions::default()
+        };
+
+        // The access digest of the served summary comes from the config of
+        // the remote, which states its collection id.
+        let access = repo_access(&remote, "anonymous");
+        let (to_server, server_in) = pipe(PIPE_CAP);
+        let (server_out, from_server) = pipe(PIPE_CAP);
+        let (pulled, served) = within(
+            "the mirror pull through a stream session",
+            future::zip(
+                async {
+                    let session = PullSession::over_stream(
+                        from_server,
+                        to_server,
+                        StreamSessionOptions::default(),
+                    )
+                    .await?;
+                    dest.pull_with_session(session, PullTrust::unverified(), opts)
+                        .await
+                },
+                remote.send(server_in, server_out, &access),
+            ),
+        )
+        .await;
+        pulled.unwrap();
+        served.unwrap();
+
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [
+                (REMOTE_ID.to_owned(), "c".to_owned(), c),
+                (ID_Y.to_owned(), "b".to_owned(), b)
+            ]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
     });
 }
 

@@ -11113,8 +11113,7 @@ fn a_collection_ref_of_the_own_id_lands_in_refs_heads() {
 }
 
 /// A pull from a named remote refuses each name that is not `NAME` or
-/// `@ID:NAME` before its first request, also through a session. A mirror
-/// pull refuses an `@ID:NAME` name.
+/// `@ID:NAME` before its first request, also through a session.
 #[test]
 fn a_remote_ref_operand_is_refused_before_the_first_request() {
     block_on(async {
@@ -11153,13 +11152,6 @@ fn a_remote_ref_operand_is_refused_before_the_first_request() {
                 "{name}: {err}"
             );
         }
-        let mirror = PullOptions {
-            flags: PullFlags::MIRROR,
-            ..refs_of(&["main", &x_a])
-        };
-        let err = dest.pull("origin", mirror).await.unwrap_err();
-        assert!(matches!(err, Error::InvalidInput(_)), "{err}");
-
         assert!(server.seen().is_empty(), "{:?}", server.seen());
         assert_nothing_published(&dest).await;
         assert!(dest.list_mirror_refs().await.unwrap().is_empty());
@@ -11287,5 +11279,267 @@ fn the_collection_binding_of_each_collection_ref_is_checked() {
         .await
         .unwrap();
         assert_eq!(dest.resolve_rev(&alias, false).await.unwrap(), Some(q));
+    });
+}
+
+/// Returns the options of a mirror pull of the refs `names`.
+fn mirror_of(names: &[&str]) -> PullOptions {
+    PullOptions {
+        flags: PullFlags::MIRROR,
+        ..refs_of(names)
+    }
+}
+
+/// Creates the repository `dir/dest` again, with the collection id `own`
+/// and the remote `origin` at `url`.
+async fn mirror_dest(dir: &Path, own: Option<&str>, url: &str) -> Repo {
+    let path = dir.join("dest");
+    if path.exists() {
+        std::fs::remove_dir_all(&path).unwrap();
+    }
+    let mut opts = CreateOptions::new(RepoMode::Archive);
+    if let Some(own) = own {
+        opts = opts.collection_id(own);
+    }
+    drop(Repo::create(&path, opts).await.unwrap());
+    reconfigure_dest(dir, url, "").await
+}
+
+/// Asserts that the server got no request other than for `summary`,
+/// `summary.sig`, and `config`.
+fn assert_root_files_alone(server: &RepoServer) {
+    let seen = server.seen();
+    assert!(
+        seen.iter()
+            .all(|path| ["summary", "summary.sig", "config"].contains(&path.as_str())),
+        "{seen:?}"
+    );
+}
+
+/// Under `MIRROR`, a plain ref of a remote whose summary states the
+/// collection id `ID` is the ref `@ID:NAME`. The pull writes it to
+/// `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` if `ID` is the collection
+/// id of this repository. The `collection-id` key of the remote does not
+/// change the collection. A remote with no summary gives a local ref. An
+/// `@ID:NAME` ref keeps its collection.
+#[test]
+fn a_mirror_pull_writes_a_plain_ref_in_the_collection_of_the_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-mirror-collection");
+        let (_remote, [_, c, _, b]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let url = server.url();
+
+        for own in [None, Some(ID_X)] {
+            let dest = mirror_dest(dir.path(), own, &url).await;
+            dest.pull("origin", mirror_of(&["c"])).await.unwrap();
+            assert_eq!(
+                dest.list_mirror_refs().await.unwrap(),
+                [(REMOTE_ID.to_owned(), "c".to_owned(), c)],
+                "{own:?}"
+            );
+            assert!(dest.list_refs(None).await.unwrap().is_empty(), "{own:?}");
+        }
+
+        let dest = mirror_dest(dir.path(), Some(REMOTE_ID), &url).await;
+        dest.pull("origin", mirror_of(&["c"])).await.unwrap();
+        assert_eq!(dest.list_refs(None).await.unwrap(), [("c".to_owned(), c)]);
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+
+        mirror_dest(dir.path(), None, &url).await;
+        let dest = reconfigure_dest(dir.path(), &url, &format!("collection-id={ID_Y}\n")).await;
+        dest.pull("origin", mirror_of(&["c", &at(ID_Y, "b")]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [
+                (REMOTE_ID.to_owned(), "c".to_owned(), c),
+                (ID_Y.to_owned(), "b".to_owned(), b)
+            ]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", mirror_of(&["c"])).await.unwrap();
+        assert_eq!(dest.list_refs(None).await.unwrap(), [("c".to_owned(), c)]);
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// Under `MIRROR`, the tip of a plain ref of a remote whose summary states
+/// the collection id `ID` must be bound to `ID`, as the tip of an `@ID:NAME`
+/// ref. `DISABLE_VERIFY_BINDINGS` does not turn this check off.
+#[test]
+fn a_mirror_pull_checks_the_collection_binding_of_a_plain_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-mirror-binding");
+        let (_remote, [main, ..]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let expected = format!(
+            "commit {main}: no collection binding metadata for the requested collection \
+             '{REMOTE_ID}'"
+        );
+        for flags in [
+            PullFlags::MIRROR,
+            PullFlags::MIRROR | PullFlags::DISABLE_VERIFY_BINDINGS,
+        ] {
+            for names in [&["main"][..], &[][..]] {
+                let opts = PullOptions {
+                    flags,
+                    ..refs_of(names)
+                };
+                match dest.pull("origin", opts).await {
+                    Err(Error::Pull(msg)) => assert_eq!(msg, expected, "{names:?}"),
+                    other => panic!("{names:?}: {other:?}"),
+                }
+            }
+        }
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// A mirror pull of every ref takes each ref of field 0 of the summary as a
+/// ref of the collection that the summary states, and each ref of the
+/// collection map in its collection. The own-id rule of this repository
+/// applies to each, and the pull copies the summary.
+#[test]
+fn a_mirror_pull_of_every_ref_takes_the_collection_map() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-mirror-map");
+        let (remote, [_, c, a, b]) = build_collection_remote(dir.path()).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref(&Ref::local("main"), None);
+        txn.commit().await.unwrap();
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        // The summary of a repository with a collection id names the commit
+        // of the ref `ostree-metadata` in field 0.
+        let metadata = remote
+            .resolve_rev("ostree-metadata", false)
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = std::fs::read(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let url = server.url();
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", mirror_of(&[])).await.unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [
+                (REMOTE_ID.to_owned(), "c".to_owned(), c),
+                (REMOTE_ID.to_owned(), "ostree-metadata".to_owned(), metadata),
+                (ID_X.to_owned(), "a".to_owned(), a),
+                (ID_Y.to_owned(), "b".to_owned(), b)
+            ]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            std::fs::read(dir.path().join("dest/summary")).unwrap(),
+            summary
+        );
+
+        let dest = mirror_dest(dir.path(), Some(ID_X), &url).await;
+        dest.pull("origin", mirror_of(&[])).await.unwrap();
+        assert_eq!(dest.list_refs(None).await.unwrap(), [("a".to_owned(), a)]);
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [
+                (REMOTE_ID.to_owned(), "c".to_owned(), c),
+                (REMOTE_ID.to_owned(), "ostree-metadata".to_owned(), metadata),
+                (ID_Y.to_owned(), "b".to_owned(), b)
+            ]
+        );
+    });
+}
+
+/// A name that occurs two times counts one time. Two other names that write
+/// one ref stop the pull after it reads the summary and the config, and
+/// before it reads a ref file or an object. Under `MIRROR`, a plain name
+/// and the `@ID:NAME` name of the collection of the summary write one ref.
+/// From a summary that states no collection id, a plain name and the
+/// `@OWN:NAME` name of the own collection id write one ref, also in a
+/// mirror pull of every ref.
+#[test]
+fn two_names_that_write_one_ref_are_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-mirror-one-place");
+        let (_remote, [_, c, ..]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let url = server.url();
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", mirror_of(&["c", "c"])).await.unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(REMOTE_ID.to_owned(), "c".to_owned(), c)]
+        );
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        server.forget();
+        let r_c = at(REMOTE_ID, "c");
+        match dest.pull("origin", mirror_of(&["c", &r_c])).await {
+            Err(Error::Pull(msg)) => assert_eq!(
+                msg,
+                format!("the refs c and {r_c} write one ref refs/mirrors/{REMOTE_ID}/c")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_root_files_alone(&server);
+        assert_nothing_published(&dest).await;
+
+        // A remote with no collection id. Its summary lists `a` in field 0
+        // and `a` of `ID_X` in the collection map.
+        let other = dir.path().join("plain");
+        build_tree(&other.join("src"), b"hello\n");
+        let plain = Repo::create(&other.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        commit_bound(&plain, &other, "src", &Ref::local("a"), None).await;
+        commit_bound(
+            &plain,
+            &other,
+            "src",
+            &Ref::collection(ID_X, "a"),
+            Some(ID_X),
+        )
+        .await;
+        plain
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        let plain_server = RepoServer::start(&other.join("remote"), false).await;
+        let dest = mirror_dest(dir.path(), Some(ID_X), &plain_server.url()).await;
+        let x_a = at(ID_X, "a");
+        for (names, first, second) in [
+            (vec!["a", x_a.as_str()], "a", x_a.as_str()),
+            (vec![], "a", x_a.as_str()),
+        ] {
+            plain_server.forget();
+            match dest.pull("origin", mirror_of(&names)).await {
+                Err(Error::Pull(msg)) => assert_eq!(
+                    msg,
+                    format!("the refs {first} and {second} write one ref refs/heads/a"),
+                    "{names:?}"
+                ),
+                other => panic!("{names:?}: {other:?}"),
+            }
+            assert_root_files_alone(&plain_server);
+        }
+        assert_nothing_published(&dest).await;
     });
 }

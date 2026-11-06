@@ -1121,8 +1121,10 @@ The tool resolves an empty ref list by the kind of pull:
   summary, the pull fails with `error: Fetching all refs was requested in
   mirror mode, but remote repository does not have a summary`.
 
-Under `--mirror`, the tool writes `refs/heads/<ref>`. A plain pull writes
-`refs/remotes/<remote>/<ref>`.
+Under `--mirror`, the tool writes `refs/heads/<ref>` when the remote serves
+no summary, or a summary that states no collection id. Otherwise it writes
+the ref in the collection of the summary ("The pulled ref under the own
+collection id"). A plain pull writes `refs/remotes/<remote>/<ref>`.
 
 A mirror pull of the tool that fetched every ref copies the bytes of the remote
 summary to `<repo>/summary` with no change. It copies the bytes of the remote
@@ -1170,6 +1172,66 @@ With a destination of another collection id, or of no collection id,
 `find-remotes --finders=config --pull --mirror ID REF` and
 `pull --mirror origin REF` write `refs/mirrors/ID/REF`.
 `cli-surface.md`, "P3", `find-remotes`, records the port side.
+
+These records of `pull --mirror` come from libostree 2026.1 on a NixOS host,
+observed on 2026-11-06. The source is an `archive` repository made with
+`init --collection-id=org.example.Src`. Its refs `main` and `other` hold
+commits bound to `org.example.Src`. `refs --collections
+--create=org.example.Mir:m1` gives it the ref `m1` of `org.example.Mir`, at a
+commit bound to `org.example.Mir` and to `m1`. After `summary -u`, field 0
+of the summary lists `main`, `ostree-metadata`, and `other`, and the
+collection map lists `(org.example.Mir, m1)`. The destination is a
+`bare-user` repository with no collection id, with `org.example.Dst`, with
+`org.example.Src`, or with `org.example.Mir`. The remote `origin` is at the
+`file://` address of the source, or at an HTTP address that serves it.
+
+- The `ostree.summary.collection-id` of the summary gives the collection of
+  a ref. `pull --mirror origin main` writes `refs/mirrors/org.example.Src/main`
+  into a destination with no collection id or with `org.example.Dst`, and
+  `refs/heads/main` into a destination with `org.example.Src`. This is true
+  when the remote key `collection-id` is `org.example.Src`, is absent, or is
+  `org.example.Two`, over `file://`. This is also true when the
+  `[core] collection-id` of the source is absent and the summary states
+  `org.example.Src`.
+- With no summary, or with a summary that states no collection id, the pull
+  writes `refs/heads/main`, also when the `[core] collection-id` of the
+  source and the remote key `collection-id` are `org.example.Src`.
+- `pull --mirror origin` with no ref writes each ref of field 0 in the
+  collection of the summary and each ref of the collection map in its
+  collection: `refs/mirrors/org.example.Src/main`,
+  `refs/mirrors/org.example.Src/other`,
+  `refs/mirrors/org.example.Src/ostree-metadata`, and
+  `refs/mirrors/org.example.Mir/m1`. A destination with `org.example.Src`
+  gets `refs/heads/main`, `refs/heads/other`, and
+  `refs/heads/ostree-metadata`, and a destination with `org.example.Mir`
+  gets `refs/heads/m1`. The pull copies the summary with no change. From a
+  summary that states no collection id, the refs of field 0 go to
+  `refs/heads/`, and `m1` goes to `refs/mirrors/org.example.Mir/m1`.
+- `pull --mirror origin m1` fails with `error: No such branch 'm1' in
+  repository summary`.
+- The collection-binding check reads another value than the collection of
+  the ref. Over `file://`, it reads the `[core] collection-id` of the source.
+  So `pull --mirror origin` fails on `m1` with `error: Commit <checksum>:
+  Commit has collection ID ‘org.example.Mir’ in collection binding
+  metadata, while the remote it came from has collection ID
+  ‘org.example.Src’`, and writes no ref. Over HTTP, it reads the remote key
+  `collection-id`. With the key `org.example.Two`, `pull --mirror origin
+  main` and `pull origin main` fail with the same message for
+  `org.example.Src`. With no key, the HTTP pull checks no collection binding:
+  `pull --mirror origin` writes `m1`. For a ref `free` of field 0 at a commit
+  with no binding, `pull --mirror origin free` writes
+  `refs/mirrors/org.example.Src/free`.
+- Over `file://`, with the `[core] collection-id` of the source set, the
+  ref `free` fails `pull --mirror origin free` and `pull origin free` with `error: Commit <checksum>: Expected commit
+  metadata to have ref binding information, found none`. A commit with a
+  ref binding and no collection binding fails with `error: Commit
+  <checksum>: Expected commit metadata to have collection ID binding
+  information, found none`.
+- `pull --mirror origin main main` and `pull origin main main` exit 0 and
+  write one ref.
+- `pull-local SRC main` and `pull-local SRC` write `refs/heads/` into a
+  destination with no collection id and with `org.example.Dst`. With no
+  ref, `pull-local` takes the refs of `refs/heads/` of the source alone.
 
 #### Timestamp check
 

@@ -3560,9 +3560,8 @@ rules:
   each name as `NAME` or `@ID:NAME`. One pull takes both forms, and the
   refs of more than one collection. Before the first request, the pull
   refuses `REMOTE:NAME`, a `^` suffix, and a name that fails the rule of
-  `Ref`, with `Error::InvalidRefspec`. A mirror pull refuses `@ID:NAME`
-  with `Error::InvalidInput`. The `branches` key of a remote holds plain
-  names alone.
+  `Ref`, with `Error::InvalidRefspec`. The `branches` key of a remote
+  holds plain names alone.
 - The pull resolves `@ID:NAME` from the summary first: field 0 when the
   summary states the collection id `ID`, and else the entry of `ID` in the
   collection map. Then it reads one ref file: `refs/heads/NAME` when the
@@ -3589,6 +3588,43 @@ These alternatives were rejected:
 - A read of `refs/mirrors/ID/NAME` for each id. A server keeps the refs of
   its own id under `refs/heads/`, so the pull would not find them when the
   remote serves no summary.
+
+## The collection of a mirror pull
+
+A mirror pull writes the refs of a remote in their collections, as the
+`ostree` command does (`conformance/cli-behavior.md`, "The pulled ref under
+the own collection id"). The rules:
+
+- The `ostree.summary.collection-id` of the summary of the remote gives the
+  collection of a plain name and of each ref of field 0. A plain `NAME` is
+  then `@ID:NAME`, and the pull writes it by the own-id rule of the client.
+  With no summary, or with a summary that states no collection id, the pull
+  writes `refs/heads/NAME`.
+- An `@ID:NAME` name keeps its collection.
+- A mirror pull of every ref also takes the refs of the collection map.
+- The tip of each ref that the pull writes as `@ID:NAME` must hold the
+  collection binding `ID`. This is the check of an `@ID:NAME` operand. The
+  `ostree` command checks against another value, the `[core] collection-id`
+  of the source or the remote key `collection-id`, and with neither it
+  checks nothing. The check against the collection of the written ref
+  makes sure that each collection ref that the pull writes holds a commit
+  bound to that collection.
+- Two different names that write one ref file stop the pull. Two such
+  names can read different refs of the remote, so the pull does not select
+  one. The check needs the collection of the summary, so it runs after the
+  read of the summary and of the `config`, and before the first read of a
+  ref file or an object. A name that occurs two times counts one time.
+
+These alternatives were rejected:
+
+- The remote key `collection-id` as the collection of a plain name. The
+  `ostree` command reads the collection from the summary, and does not read
+  the key for this purpose. A key with another value would write the refs
+  in another collection than the tool writes. A pull from a remote with no
+  such key would write no collection ref.
+- The check of two names that write one ref file before the first request.
+  Without the summary, the pull does not know the collection of a plain
+  name.
 
 ## The mirrored collections of a remote
 

@@ -4943,8 +4943,20 @@ client cannot read it. The client cannot tell the two cases apart.
 
 `ostrya pull --collection ID [REF]...` pulls refs of the collection `ID` from
 the remotes that serve it. The candidates are the `[remote "NAME"]` groups
-with `collection-id=ID`, in the order of the config. The `ostree` command does
-this work with `find-remotes --pull`.
+with `collection-id=ID`, and the groups whose `mirrored-collection-ids` holds
+`ID`, in the order of the config. The command reads both keys of each remote.
+A `collection-id` value with a malformed escape sequence in any remote fails
+the command, and a value that breaks the collection-id rule does not. A
+`mirrored-collection-ids` value that breaks a rule of that key in any remote
+fails the command. The `ostree` command does this work with
+`find-remotes --pull`.
+
+Each `REF` is `NAME` or `@ID:NAME`, and both forms name the ref `NAME` of
+`ID`. A name that occurs again in either form adds nothing. Before its first
+request, the pull refuses an operand `@C:NAME` of another collection `C` with
+`Error::InvalidInput`, and an operand that starts with `@` and is not an
+`@ID:NAME` ref with `Error::InvalidRefspec`. The library call
+`Repo::pull_collection` reads `PullOptions::refs` with the same rules.
 
 Before its first request, the pull refuses a `REF` whose entry `ID/REF` is
 longer than 4,096 bytes or has more than 256 parts, or whose request target
@@ -5254,6 +5266,48 @@ when no summary policy applies, because the summary is the one source of its
 refs. The call returns the
 errors of a local candidate unchanged. A remote with no listing and no
 summary gives an empty result.
+
+### Collection refs from a named remote
+
+`ostrya pull REMOTE` and the library calls `Repo::pull` and
+`Repo::pull_with_session` take each ref operand as `NAME` or `@ID:NAME`. One
+pull takes both forms, and the refs of more than one collection. Before its
+first request, the pull refuses `REMOTE:NAME`, a `^` suffix, and an
+`@ID:NAME` whose `ID` fails the collection-id rule or whose `NAME` fails the
+ref-name rule, with `Error::InvalidRefspec`. A mirror pull refuses `@ID:NAME`
+with `Error::InvalidInput`. The `branches` key of a remote holds plain names
+alone. The pull of a plain `NAME` reads the summary, and else
+`refs/heads/NAME` of the remote.
+
+The pull resolves `@ID:NAME` in this order:
+
+1. If the remote serves a summary, the pull reads field 0 when the
+   `ostree.summary.collection-id` of the summary is `ID`. Otherwise it reads
+   the entry of `ID` in `ostree.summary.collection-map`.
+2. If the summary does not list the ref, or the remote serves no summary,
+   the pull reads one ref file: `refs/heads/NAME` when the
+   `[core] collection-id` of the `config` of the remote is `ID`, and else
+   `refs/mirrors/ID/NAME`. The HTTP source percent-encodes `NAME` in the
+   request path, as for `refs/heads/NAME`.
+
+The pull sends no ref listing request. A ref that neither source names fails
+the pull with `Error::RefNotFound`, which holds `@ID:NAME`. `ostrya serve`
+and `ostrya send` serve `refs/mirrors/ID/NAME` to a client that reads the ref
+("Read access"). The pull reads the summary and the ref files of a bucket
+repository through the clients of the bucket, as for a plain ref.
+
+Unless the caller sets `no_ref_writes`, the pull writes `@ID:NAME` to
+`refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the
+`[core] collection-id` of the client. The remote name does not change this
+place. A plain `NAME` goes to `refs/remotes/REMOTE/NAME`. Delta discovery and
+the timestamp check read the current commit at the place of the ref.
+
+Unless the caller sets `no_ref_writes`, the pull refuses the tip commit of
+`@ID:NAME` whose `ostree.collection-binding` is absent, is not a string, or is
+not `ID`. This is also true when `ID` is the `[core] collection-id` of the
+client. `PullFlags::DISABLE_VERIFY_BINDINGS` (`--disable-verify-bindings`)
+does not skip this check. The ref-binding check reads `NAME`, and the flag
+skips it. The pull makes these checks before the transaction writes a ref.
 
 ## Summaries of auth items
 

@@ -36,7 +36,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ostrya_core::{Checksum, Commit, ObjectType, RefSelector, Value};
+use ostrya_core::{Checksum, Commit, ObjectType, Ref, RefSelector, Value};
 
 use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
@@ -388,15 +388,20 @@ impl Repo {
     ///
     /// Each name in `remotes` is a `[remote "<name>"]` section of the config
     /// of this repository. These are the candidates: remotes that serve the
-    /// collection. The call does not read the `collection-id` key of a
-    /// remote. The `ostrya` command gives the remotes whose `collection-id`
-    /// is `collection_id`, in the order of the config. The order of
+    /// collection. The call does not read the `collection-id` key or the
+    /// `mirrored-collection-ids` key of a remote. The `ostrya` command gives
+    /// the remotes whose `collection-id` is `collection_id`, or whose
+    /// `mirrored-collection-ids` holds it, in the order of the config. The
+    /// order of
     /// `remotes` is the order of the probe, of the ties, and of the pulls. A
     /// name that occurs again in `remotes` adds nothing.
     ///
     /// [`refs`](PullOptions::refs) of [`CollectionPullOptions::pull`] names
-    /// the refs. An empty list takes each ref of the collection that a
-    /// remote lists. A name that occurs again adds nothing.
+    /// the refs. A name is `NAME` or `@ID:NAME`, where `ID` is
+    /// `collection_id`, and both forms name the ref `NAME` of the
+    /// collection. An empty list takes each ref of the collection that a
+    /// remote lists. A name that occurs again adds nothing, also in the
+    /// other form.
     ///
     /// # Address and trust
     ///
@@ -660,8 +665,10 @@ impl Repo {
     ///   [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS), if
     ///   [`static_deltas`](PullOptions::static_deltas) is set, or if
     ///   [`overrides`](PullOptions::overrides) holds a `url`.
+    /// - [`Error::InvalidInput`] if a name in [`refs`](PullOptions::refs)
+    ///   is an `@ID:NAME` ref of a collection other than `collection_id`.
     /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs)
-    ///   is not a valid ref name.
+    ///   is not a valid ref name or a valid `@ID:NAME` ref.
     /// - [`Error::InvalidInput`] if a name in [`refs`](PullOptions::refs)
     ///   does not fit in a ref listing request alone: if its entry `ID/NAME`
     ///   is longer than [`MAX_REF_ENTRY_LEN`] bytes or has more than
@@ -741,7 +748,7 @@ impl Repo {
             mut on_event,
             allow_unbound,
         } = opts;
-        let subpaths = check_collection_pull(collection_id, remotes, &opts)?;
+        let (subpaths, names) = check_collection_pull(collection_id, remotes, &opts)?;
         // The pull reads the rule one time, here. A value that is not a
         // boolean stops the pull before its first request. Each run of each
         // remote takes this value.
@@ -749,7 +756,7 @@ impl Repo {
         // The commit of each transaction reads the key again. This read fails
         // a bad value before the first request.
         self.config().generate_composefs()?;
-        let names = first_of_each(opts.refs.iter().map(String::as_str));
+        let names = first_of_each(names.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come
         // before the first request, so an error in the config of one remote
@@ -1316,12 +1323,14 @@ async fn resolve_candidate<'a>(
 }
 
 /// Makes the checks of [`Repo::pull_collection`] that read the arguments
-/// alone, in the order of its `# Errors`, and returns the parsed subpaths.
+/// alone, in the order of its `# Errors`, and returns the parsed subpaths and
+/// the ref names of [`refs`](PullOptions::refs), as [`collection_names`]
+/// returns them.
 fn check_collection_pull(
     collection_id: &str,
     remotes: &[&str],
     opts: &PullOptions,
-) -> Result<Option<Subpaths>> {
+) -> Result<(Option<Subpaths>, Vec<String>)> {
     check_collection_id(collection_id)?;
     if remotes.is_empty() {
         return Err(Error::InvalidInput(
@@ -1360,8 +1369,43 @@ fn check_collection_pull(
                 .into(),
         ));
     }
-    check_ref_names(collection_id, &opts.refs)?;
-    Ok(subpaths)
+    let names = collection_names(collection_id, &opts.refs)?;
+    Ok((subpaths, names))
+}
+
+/// Returns the ref name of each name of `names` of a pull of the collection
+/// `collection_id`, in order.
+///
+/// A name `NAME` gives itself. A name `@ID:NAME`, where `ID` is
+/// `collection_id`, gives `NAME`. Each ref name then passes the checks of
+/// [`check_ref_names`].
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if a name is an `@ID:NAME` ref of another
+///   collection.
+/// - [`Error::InvalidRefspec`] if a name that starts with `@` is not an
+///   `@ID:NAME` ref that [`Ref`] reads. The error holds the name as given.
+/// - The errors of [`check_ref_names`].
+fn collection_names(collection_id: &str, names: &[String]) -> Result<Vec<String>> {
+    let mut out = Vec::with_capacity(names.len());
+    for name in names {
+        if !name.starts_with('@') {
+            out.push(name.clone());
+            continue;
+        }
+        match name.parse::<Ref>() {
+            Ok(Ref::Collection { id, name }) if id == collection_id => out.push(name),
+            Ok(Ref::Collection { .. }) => {
+                return Err(Error::InvalidInput(format!(
+                    "the ref {name} is not a ref of the collection {collection_id}"
+                )));
+            }
+            _ => return Err(Error::InvalidRefspec(name.clone())),
+        }
+    }
+    check_ref_names(collection_id, &out)?;
+    Ok(out)
 }
 
 /// Checks the collection id `collection_id` of a pull or a listing of

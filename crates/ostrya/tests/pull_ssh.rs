@@ -36,9 +36,9 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 use pull::{
-    FIXED_TS, RepoServer, assert_list_refusal, build_remote, build_tree, commit_tree,
-    commit_tree_related, commit_tree_with, content_checksums, detached_dict, filez_path,
-    incompressible, static_delta_list_cases,
+    FIXED_TS, ID_X, ID_Y, RepoServer, assert_list_refusal, build_collection_remote, build_remote,
+    build_tree, commit_tree, commit_tree_related, commit_tree_with, content_checksums,
+    detached_dict, filez_path, incompressible, static_delta_list_cases,
 };
 
 /// The capacity of each pipe.
@@ -1268,6 +1268,57 @@ fn the_stream_source_with_no_ref_writes_writes_no_ref() {
             for name in &remote.traverse_commit(commit, 0).await.unwrap() {
                 assert!(dest.has_object(name.ty, &name.checksum).await.unwrap());
             }
+        }
+    });
+}
+
+/// One pull through the stream source takes a plain ref and the refs of two
+/// collections, and writes them under `refs/remotes/` and `refs/mirrors/`.
+/// The remote serves no summary, so the pull asks for each ref file by its
+/// name as written.
+#[test]
+fn the_stream_source_pulls_plain_and_collection_refs() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-collection-refs");
+        let (remote, [main, _, a, b]) = build_collection_remote(dir.path()).await;
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
+        let (x_a, y_b) = (format!("@{ID_X}:a"), format!("@{ID_Y}:b"));
+        let opts = PullOptions {
+            refs: vec!["main".to_owned(), x_a.clone(), y_b.clone()],
+            remote: Some("origin".to_owned()),
+            ..PullOptions::default()
+        };
+
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            StreamSessionOptions::default(),
+            opts,
+        )
+        .await;
+        pulled.unwrap();
+        served.unwrap();
+
+        assert_eq!(
+            dest.resolve_rev("origin:main", false).await.unwrap(),
+            Some(main)
+        );
+        assert_eq!(dest.resolve_rev(&x_a, false).await.unwrap(), Some(a));
+        assert_eq!(dest.resolve_rev(&y_b, false).await.unwrap(), Some(b));
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        for path in [
+            "refs/heads/main".to_owned(),
+            format!("refs/mirrors/{ID_X}/a"),
+            format!("refs/mirrors/{ID_Y}/b"),
+        ] {
+            assert!(
+                messages
+                    .iter()
+                    .any(|message| matches!(message, Message::Get(got) if *got == path)),
+                "{path}"
+            );
         }
     });
 }

@@ -53,8 +53,8 @@ for it.
 - The pull does not write the summary cache `tmp/cache/summaries/`.
 - The pull does not read the remote keys `contenturl` and `metalink`, and
   refuses a `metalink=` or `mirrorlist=` URL.
-- `Repo::pull` from a named remote reads no `@ID:NAME` ref.
-  `Repo::pull_collection` pulls collection refs.
+- A mirror pull (`pull --mirror`, `PullFlags::MIRROR`) refuses an
+  `@ID:NAME` ref.
 - `Repo::pull_local` refuses a subpath.
 - `ostrya pull REMOTE`, `remote refs`, and `remote summary` refuse a
   `file://` address, which the `ostree` command reads. `ostrya pull

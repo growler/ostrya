@@ -2150,9 +2150,9 @@ struct RemoteAddArgs {
     /// The option can occur more than once. The command writes the pairs in
     /// the order of the command line. They come after the URL, the branches,
     /// --contenturl, and --custom-backend, and before the keys of
-    /// --no-gpg-verify, --no-sign-verify, --sign-verify, and --collection-id.
-    /// A later write of a key replaces the earlier value. The command refuses
-    /// a value with no `=`.
+    /// --no-gpg-verify, --no-sign-verify, --sign-verify, --collection-id, and
+    /// --mirrored-collection-id. A later write of a key replaces the earlier
+    /// value. The command refuses a value with no `=`.
     #[arg(long = "set", value_name = "KEY=VALUE")]
     set: Vec<String>,
     /// Do not require a GPG signature on the commits pulled from this remote.
@@ -2219,6 +2219,18 @@ struct RemoteAddArgs {
     /// The command writes the value to the `collection-id` key of the remote.
     #[arg(long, value_name = "COLLECTION-ID")]
     collection_id: Option<String>,
+    /// A collection that the remote serves from `refs/mirrors/COLLECTION-ID/`.
+    ///
+    /// The option can occur more than once. The command writes the ids to
+    /// the `mirrored-collection-ids` key, in the order of the command line.
+    /// It writes an id given two times one time.
+    /// `pull --collection=COLLECTION-ID` then takes the remote as a
+    /// candidate. The command refuses an empty value, an id that fails the
+    /// collection-id rule or is longer than 255 bytes, and the
+    /// `collection-id` of the remote. It applies the same rules to a
+    /// `mirrored-collection-ids` value of --set.
+    #[arg(long = "mirrored-collection-id", value_name = "COLLECTION-ID")]
+    mirrored_collection_id: Vec<String>,
     // ostrya checks this operand and URL after the repository resolves, in
     // the order of the `ostree` command.
     /// The remote name. Required, with the URL.
@@ -3876,13 +3888,18 @@ struct PullArgs {
     url: Option<String>,
     /// Pull refs of the collection ID from each remote that serves it.
     ///
-    /// The candidates are the remotes whose `collection-id` key is ID. If no
-    /// remote has the key, the command fails. The command reads the key of
-    /// each remote, so a `collection-id` value with a malformed escape
-    /// sequence in any remote fails the command. With this option, each
-    /// operand is a ref of the collection, and the command takes no REMOTE.
-    /// With no ref, the pull takes each ref of the collection that a
-    /// candidate lists, and fails if no candidate lists a ref. The pull asks
+    /// The candidates are the remotes whose `collection-id` key is ID or
+    /// whose `mirrored-collection-ids` key holds ID, in the order of the
+    /// config. If no remote has ID in either key, the command fails. The
+    /// command reads both keys of each remote. A `collection-id` value with a
+    /// malformed escape sequence in any remote fails the command, and a value
+    /// that breaks the collection-id rule does not. A
+    /// `mirrored-collection-ids` value that breaks a rule of that key in any
+    /// remote fails the command. With this option, each operand is a ref of
+    /// the collection, REF or @ID:REF, and the command takes no REMOTE. An operand @C:REF of another collection C is refused before
+    /// the first request. With no ref, the pull takes each ref of the
+    /// collection that a candidate lists, and fails if no candidate lists a
+    /// ref. The pull asks
     /// each candidate for the commit of each ref, through the ref listing of
     /// the server or else through its summary. Under `gpg-verify-summary` or
     /// `sign-verify-summary`, it reads the refs from the verified summary
@@ -3937,7 +3954,7 @@ struct PullArgs {
     /// copies the `summary` and `summary.sig` of the remote to this
     /// repository. If the remote has no `summary.sig`, the `summary.sig` of
     /// this repository stays as it is. A pull of named refs copies no
-    /// summary.
+    /// summary. The command refuses a ref @ID:REF with this option.
     #[arg(long)]
     mirror: bool,
     /// The number of parents of each pulled commit to follow.
@@ -3991,7 +4008,8 @@ struct PullArgs {
     ///
     /// Without this switch, the list must name the ref that the commit is
     /// pulled under, or the pull fails. A commit with no ostree.ref-binding
-    /// key passes.
+    /// key passes. The switch does not skip the collection-binding check of
+    /// a ref @ID:REF.
     #[arg(long)]
     disable_verify_bindings: bool,
     /// Copy each object from a localcache repository, and make no hardlink.
@@ -4167,6 +4185,18 @@ struct PullArgs {
     /// ref in the summary of the remote. If the summary does not list the ref,
     /// the pull reads `refs/heads/<ref>` of the remote. With --collection,
     /// these are the other refs of the collection.
+    ///
+    /// A ref is REF or @ID:REF, the ref REF of the collection ID. One pull
+    /// takes both forms, and the refs of more than one collection. The
+    /// command refuses REMOTE:REF and a `^` suffix before the first request.
+    /// The pull looks up @ID:REF in the summary: in the ref list if the
+    /// summary states the collection id ID, else in its collection map. If
+    /// the summary does not list the ref, the pull reads `refs/heads/REF` of
+    /// the remote if the `collection-id` of the remote config is ID, else
+    /// `refs/mirrors/ID/REF`. The pull writes `refs/mirrors/ID/REF`, or
+    /// `refs/heads/REF` if the `collection-id` of this repository is ID. The
+    /// commit must be bound to ID, also with --disable-verify-bindings. The
+    /// ref-binding check reads REF. --mirror refuses @ID:REF.
     refs: Vec<String>,
 }
 
@@ -7137,17 +7167,21 @@ async fn pull(
 enum PullFrom {
     /// One remote, a section of the config.
     Remote(String),
-    /// The remotes of the config whose `collection-id` is `id`, in the order
-    /// of the config.
+    /// The remotes of the config whose `collection-id` is `id`, or whose
+    /// `mirrored-collection-ids` holds `id`, in the order of the config.
     Collection { id: String, remotes: Vec<String> },
 }
 
 /// Returns the remotes of the config of `repo` whose `collection-id` is `id`,
-/// in the order of the config.
+/// or whose `mirrored-collection-ids` holds `id`, in the order of the
+/// config.
 ///
 /// If no remote has the id, the command ends with an error. A refused id
-/// goes on to the pull, which states the refusal. The function reads the key
-/// of each remote, so a malformed value in any remote fails the command.
+/// goes on to the pull, which states the refusal. The function reads both
+/// keys of each remote. A `collection-id` value with a malformed escape
+/// sequence in any remote fails the command, and a value that breaks the
+/// collection-id rule does not. A `mirrored-collection-ids` value that
+/// breaks a rule of that key in any remote fails the command.
 fn collection_candidates(repo: &Repo, id: &str) -> Result<Vec<String>> {
     let config = repo.config();
     let mut candidates = Vec::new();
@@ -7155,12 +7189,16 @@ fn collection_candidates(repo: &Repo, id: &str) -> Result<Vec<String>> {
         let Some(remote) = config.remote(name) else {
             continue;
         };
-        if remote.collection_id()?.as_deref() == Some(id) {
+        let own = remote.collection_id()?;
+        let mirrored = remote.mirrored_collection_ids()?;
+        if own.as_deref() == Some(id) || mirrored.iter().any(|m| m == id) {
             candidates.push(name.to_owned());
         }
     }
     if candidates.is_empty() && ostrya::is_collection_id(id) {
-        exit_error(&format!("no remote has collection-id {id}"));
+        exit_error(&format!(
+            "no remote has collection-id or mirrored-collection-ids {id}"
+        ));
     }
     Ok(candidates)
 }
@@ -13658,6 +13696,9 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
     Ok(())
 }
 
+/// The key of a remote that lists the collections that it mirrors.
+const MIRRORED_KEY: &str = "mirrored-collection-ids";
+
 /// Returns the keys of the section that `remote add` writes for the remote
 /// `name`, in the order of the `ostree` command.
 ///
@@ -13723,6 +13764,18 @@ fn remote_add_keys(args: &RemoteAddArgs, name: &str, url: &str) -> Result<Vec<(S
     }
     if let Some(collection_id) = &args.collection_id {
         set("collection-id", collection_id)?;
+    }
+    if !args.mirrored_collection_id.is_empty() {
+        keyfile.set_string_list(&group, MIRRORED_KEY, &args.mirrored_collection_id)?;
+    }
+    // The key comes from the option or from --set. Its final value takes the
+    // rules of the key against the final `collection-id`, and the command
+    // writes it again with each id one time.
+    if let Some(ids) = keyfile.get_string_list(&group, MIRRORED_KEY)? {
+        let own = keyfile.get_string(&group, "collection-id")?;
+        let ids = ostrya::config::check_mirrored_collection_ids(own.as_deref(), ids)
+            .unwrap_or_else(|e| exit_error(&e.to_string()));
+        keyfile.set_string_list(&group, MIRRORED_KEY, &ids)?;
     }
     keyfile
         .keys(&group)

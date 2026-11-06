@@ -1,7 +1,8 @@
 //! `ostrya pull --collection`: the pull of the refs of a collection from the
-//! remotes whose `collection-id` names it. An HTTP candidate is an `ostrya
-//! serve` process. An ssh candidate runs the built `ostrya send` through a
-//! stand-in ssh client, which runs the remote command locally.
+//! remotes whose `collection-id` or `mirrored-collection-ids` names it. An
+//! HTTP candidate is an `ostrya serve` process. An ssh candidate runs the
+//! built `ostrya send` through a stand-in ssh client, which runs the remote
+//! command locally.
 
 #![cfg(all(feature = "serve", feature = "send"))]
 
@@ -347,7 +348,7 @@ fn the_command_refuses_what_a_collection_pull_cannot_take() {
     assert_eq!(stdout(&out), "");
     assert_eq!(
         stderr(&out),
-        "error: no remote has collection-id org.example.None\n"
+        "error: no remote has collection-id or mirrored-collection-ids org.example.None\n"
     );
 
     let out = ostrya(&client, &["pull", "--collection", "fresh", REF]);
@@ -432,6 +433,151 @@ fn no_operand_and_no_listed_ref_fails() {
         format!("error: pull: no remote lists a ref of collection '{ID}'\n")
     );
     assert!(!client.join("refs/mirrors").join(ID).exists());
+}
+
+/// An operand is REF or @ID:REF, and both forms name the ref REF of the
+/// collection, from an HTTP candidate and from a `file://` candidate. The
+/// pull writes `refs/mirrors/ID/REF`, or `refs/heads/REF` into a repository
+/// whose `collection-id` is ID.
+#[test]
+fn collection_operands_take_plain_and_at_id_forms() {
+    let dir = TmpDir::new("operands");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    let stable = commit(&a, "a1", REF, TS);
+    let next = commit(&a, "a2", "os/next", TS);
+    let serving = Serving::start(&a);
+    let next_operand = format!("@{ID}:os/next");
+
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", &serving.url, ID));
+    let out = ostrya(&client, &["pull", "--collection", ID, REF, &next_operand]);
+    assert_pulled(&out, 0);
+    let mirrors = format!("refs/mirrors/{ID}");
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/{REF}")),
+        Some(stable.clone())
+    );
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/os/next")),
+        Some(next.clone())
+    );
+
+    let own = dir.path().join("own");
+    init(&own, Some(ID));
+    configure(
+        &own,
+        &http_remote("a", &format!("file://{}", a.display()), ID),
+    );
+    let out = ostrya(&own, &["pull", "--collection", ID, REF, &next_operand]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(ref_file(&own, &format!("refs/heads/{REF}")), Some(stable));
+    assert_eq!(ref_file(&own, "refs/heads/os/next"), Some(next));
+    assert!(!own.join("refs/mirrors").join(ID).exists());
+}
+
+/// An operand @C:REF of another collection fails the pull with exit 1
+/// before the first request, so the candidate at a closed port gives no
+/// warning.
+#[test]
+fn an_operand_of_another_collection_is_refused_before_a_request() {
+    let dir = TmpDir::new("other-operand");
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", "http://127.0.0.1:1/", ID));
+
+    let out = ostrya(
+        &client,
+        &[
+            "pull",
+            "--collection",
+            ID,
+            REF,
+            "@org.example.Other:os/next",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "error: invalid input: the ref @org.example.Other:os/next is not a ref of the \
+             collection {ID}\n"
+        )
+    );
+    assert!(!client.join("refs/mirrors").join(ID).exists());
+}
+
+/// A remote whose `mirrored-collection-ids` holds ID, with no
+/// `collection-id`, is a candidate, and its server gives the ref from
+/// `refs/mirrors/ID/`. A remote of another collection that does not mirror
+/// ID is not a candidate: its closed port gives no warning.
+#[test]
+fn a_mirrored_collection_remote_is_a_candidate() {
+    let dir = TmpDir::new("mirrored");
+    let b = dir.path().join("b");
+    init(&b, Some("org.example.Other"));
+    let mirrored = commit(&b, "b1", &format!("@{ID}:{REF}"), TS);
+    let serving = Serving::start(&b);
+
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(
+        &client,
+        &format!(
+            "{}\n[remote \"b\"]\nurl={}\ngpg-verify=false\nmirrored-collection-ids={ID};\n",
+            http_remote("other", "http://127.0.0.1:1/", "org.example.Other"),
+            serving.url
+        ),
+    );
+    let out = ostrya(&client, &["pull", "--collection", ID, REF]);
+    assert_pulled(&out, 0);
+    assert_eq!(
+        ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")),
+        Some(mirrored)
+    );
+    ok(&client, &["fsck"]);
+}
+
+/// A pull that names the remote does not read `mirrored-collection-ids`, so
+/// a bad value does not stop it. The pull takes REF and @ID:REF. A pull with
+/// --collection reads the key of each remote and fails on the bad value.
+#[test]
+fn a_pull_that_names_the_remote_does_not_read_mirrored_collection_ids() {
+    let dir = TmpDir::new("names-remote");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    let stable = commit(&a, "a1", REF, TS);
+    let next = commit(&a, "a2", "os/next", TS);
+    let serving = Serving::start(&a);
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(
+        &client,
+        &format!(
+            "{}mirrored-collection-ids=\n",
+            http_remote("a", &serving.url, ID)
+        ),
+    );
+
+    let out = ostrya(&client, &["pull", "a", REF, &format!("@{ID}:os/next")]);
+    assert_pulled(&out, 0);
+    assert_eq!(
+        ref_file(&client, &format!("refs/remotes/a/{REF}")),
+        Some(stable)
+    );
+    assert_eq!(
+        ref_file(&client, &format!("refs/mirrors/{ID}/os/next")),
+        Some(next)
+    );
+
+    let out = ostrya(&client, &["pull", "--collection", ID, REF]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "error: invalid format: mirrored-collection-ids holds no collection id\n"
+    );
 }
 
 /// A candidate at a `file://` address is a local repository. The pull reads

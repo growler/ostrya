@@ -16712,6 +16712,126 @@ fn remote_add_refuses_bad_set_keys_and_takes_no_lock() {
     );
 }
 
+/// `remote add --mirrored-collection-id` writes the ids to
+/// `mirrored-collection-ids` in the order of the command line, each id one
+/// time, after `collection-id`. The option replaces a value of `--set`.
+#[test]
+fn remote_add_writes_mirrored_collection_ids() {
+    let tmp = TmpDir::new("remote-add-mirrored");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "p",
+            "https://example.invalid/p",
+            "--set=mirrored-collection-ids=org.ex.Z",
+            "--collection-id=org.ex.C",
+            "--mirrored-collection-id=org.ex.X",
+            "--mirrored-collection-id=org.ex.Y",
+            "--mirrored-collection-id=org.ex.X",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostrya(
+        &[
+            &repo_arg,
+            "remote",
+            "add",
+            "q",
+            "https://example.invalid/q",
+            "--set=mirrored-collection-ids=org.ex.A;org.ex.A",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let config = config_text(&repo);
+    assert!(
+        config.ends_with(
+            "[remote \"p\"]\nurl=https://example.invalid/p\n\
+             mirrored-collection-ids=org.ex.X;org.ex.Y;\ncollection-id=org.ex.C\n\n\
+             [remote \"q\"]\nurl=https://example.invalid/q\n\
+             mirrored-collection-ids=org.ex.A;\n"
+        ),
+        "{config}"
+    );
+}
+
+/// `remote add` refuses a mirrored id that fails the collection-id rule, the
+/// `collection-id` of the remote, and an empty value, from the option and
+/// from `--set`, and writes no remote.
+#[test]
+fn remote_add_refuses_a_bad_mirrored_collection_id() {
+    let tmp = TmpDir::new("remote-add-mirrored-bad");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let before = config_text(&repo);
+
+    let cases: &[(&[&str], &str)] = &[
+        (
+            &["--mirrored-collection-id=org/ex"],
+            "error: invalid format: mirrored-collection-ids: invalid collection id: 'org/ex'\n",
+        ),
+        (
+            &["--mirrored-collection-id="],
+            "error: invalid format: mirrored-collection-ids: invalid collection id: ''\n",
+        ),
+        (
+            &[
+                "--collection-id=org.ex.C",
+                "--mirrored-collection-id=org.ex.X",
+                "--mirrored-collection-id=org.ex.C",
+            ],
+            "error: invalid format: mirrored-collection-ids: org.ex.C is the collection-id \
+             of the remote\n",
+        ),
+        (
+            &["--set=mirrored-collection-ids="],
+            "error: invalid format: mirrored-collection-ids holds no collection id\n",
+        ),
+        (
+            &["--set=mirrored-collection-ids=org.ex.X;;"],
+            "error: invalid format: mirrored-collection-ids: invalid collection id: ''\n",
+        ),
+        (
+            &[
+                "--set=collection-id=org.ex.C",
+                "--set=mirrored-collection-ids=org.ex.C",
+            ],
+            "error: invalid format: mirrored-collection-ids: org.ex.C is the collection-id \
+             of the remote\n",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (options, stderr) in cases {
+        let mut args = vec![
+            repo_arg.as_str(),
+            "remote",
+            "add",
+            "p",
+            "https://example.invalid/p",
+        ];
+        args.extend_from_slice(options);
+        let run = ostrya(&args, None, &[]);
+        let got = (
+            run.status.code(),
+            String::from_utf8_lossy(&run.stdout).into_owned(),
+            String::from_utf8_lossy(&run.stderr).into_owned(),
+        );
+        if got != (Some(1), String::new(), (*stderr).to_owned()) {
+            wrong.push(format!("{options:?}: {got:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "wrong results:\n{}", wrong.join("\n"));
+    assert_eq!(config_text(&repo), before, "a command wrote `config`");
+}
+
 /// Adds `[ex-ostrya] remotes-config-dir=<dir>` at the end of the `config` of
 /// the repository `repo`.
 fn set_remotes_config_dir(repo: &Path, dir: &Path) {

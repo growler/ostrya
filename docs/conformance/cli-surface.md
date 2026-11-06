@@ -3597,13 +3597,19 @@ dependencies"). The tool fetches no dependency (`cli-behavior.md`, "Related
 commits in a pull").
 
 The port adds `--collection=ID`, the pull of the refs of the collection ID
-from each remote whose `collection-id` is ID (`format-reference.md`, "The
-pull of collection refs"). With it, each operand is a ref of the collection,
-and the command takes no REMOTE. `clap` refuses it together with `--url`,
+from each remote whose `collection-id` is ID or whose
+`mirrored-collection-ids` holds ID (`format-reference.md`, "The pull of
+collection refs"). With it, each operand is a ref of the collection, `REF` or
+`@ID:REF`, and the command takes no REMOTE. An operand `@C:REF` of another
+collection C fails the command at exit 1 before the first request. `clap`
+refuses it together with `--url`,
 `--mirror`, or `--disable-verify-bindings`. A collection pull always checks
-the bindings of each commit. The command reads the `collection-id` key of
-each remote, so a value with a malformed escape sequence in any remote fails
-the command at exit 1. With no ref operand, a pull in which no candidate
+the bindings of each commit. The command reads the `collection-id` key and
+the `mirrored-collection-ids` key of each remote. A `collection-id` value
+with a malformed escape sequence in any remote fails the command at exit 1,
+and a value that breaks the collection-id rule does not. A
+`mirrored-collection-ids` value that breaks a rule of that key in any remote
+fails the command at exit 1. With no ref operand, a pull in which no candidate
 lists a ref of ID fails at exit 1 and writes nothing. A candidate at a
 `file://` address is a local repository. A `file://` address with a host
 part, `localhost` included, with no path, or with `%`, `?`, or `#` fails the
@@ -3632,6 +3638,30 @@ fetched nothing, the command prints two lines: the line of a fetch, and then
 the line of `pull-local` with the counts of the local candidates. The content
 written of the two lines adds up to the content written of the pull. The
 counterpart in the tool is `find-remotes --pull` ("P3").
+
+`remote add --mirrored-collection-id=ID` is a port extension. The option can
+occur more than once, and writes the ids to the key `mirrored-collection-ids`
+in the order of the command line, each id one time (`ostrya-config(1)`). The
+command refuses an empty value, an id that fails the collection-id rule, and
+the `collection-id` of the remote, at exit 1 before it writes the config. It
+applies the same rules to a `mirrored-collection-ids` value of `--set`.
+
+The ref operands of `pull REMOTE` of the port also take `@ID:REF` as a port
+extension (`../format-reference.md`, "Collection refs from a named remote").
+One run takes plain operands and `@ID:REF` operands of more than one
+collection. The port reads `@ID:REF` from the summary of the remote: from
+field 0 when the summary states the collection id ID, and else from its
+collection map. If the summary does not list the ref, the port reads
+`refs/heads/REF` of the remote when the `collection-id` of the remote config
+is ID, and else `refs/mirrors/ID/REF`. It writes the ref to
+`refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the collection id
+of the repository. The tip commit of `@ID:REF` must hold the
+`ostree.collection-binding` `ID`, and `--disable-verify-bindings` does not
+skip this check. `--mirror` refuses `@ID:REF` with `error: invalid input: a
+mirror pull takes no collection ref: @ID:REF` at exit 1. An operand
+`REMOTE:REF`, an operand with a `^` suffix, and an operand that starts with
+`@` and is not an `@ID:REF` ref give `error: Invalid refspec <operand>` at
+exit 1. The port refuses each of these operands before the first request.
 
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port
@@ -4496,10 +4526,12 @@ No matrix cell needs these. The shell suite invokes them.
   `--pull`, `--mirror`. The port's counterpart of `find-remotes --pull` is
   `pull --collection=ID [REF]...` ("P2", `pull`). It differs from the tool in
   these points:
-  - The port reads the candidates from the config alone. It has no
+  - The port reads the candidates from the config alone: the keys
+    `collection-id` and `mirrored-collection-ids` of each remote. It has no
     `--finders`, no mount finder, and no LAN (Avahi) finder.
   - The operands are refs of one collection. The tool takes
-    `COLLECTION-ID REF` pairs.
+    `COLLECTION-ID REF` pairs. The port pulls the refs of more than one
+    collection from one named remote with `pull REMOTE @ID:REF...`.
   - The port prints the statistics line of a pull, and one warning line for
     each candidate that it skips. When the pull fetched objects, and the
     local candidates imported objects and fetched nothing, the port prints

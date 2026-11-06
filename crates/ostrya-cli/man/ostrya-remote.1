@@ -46,7 +46,7 @@ Options:
 \fB\-\-set\fR \fIKEY=VALUE\fR
 Set this configuration key in the section of the remote.
 .IP
-The option can occur more than once. The command writes the pairs in the order of the command line. They come after the URL, the branches, \%\-\-contenturl, and \%\-\-custom\-backend, and before the keys of \%\-\-no\-gpg\-verify, \%\-\-no\-sign\-verify, \%\-\-sign\-verify, and \%\-\-collection\-id. A later write of a key replaces the earlier value. The command refuses a value with no \fB\%=\fR\&.
+The option can occur more than once. The command writes the pairs in the order of the command line. They come after the URL, the branches, \%\-\-contenturl, and \%\-\-custom\-backend, and before the keys of \%\-\-no\-gpg\-verify, \%\-\-no\-sign\-verify, \%\-\-sign\-verify, \%\-\-collection\-id, and \%\-\-mirrored\-collection\-id. A later write of a key replaces the earlier value. The command refuses a value with no \fB\%=\fR\&.
 .TP
 \fB\-\-no\-gpg\-verify\fR
 Do not require a GPG signature on the commits pulled from this remote.
@@ -92,6 +92,11 @@ The key names a different URL for the content objects. The pull of ostrya does n
 A globally unique id for the remote as a collection of refs.
 .IP
 The command writes the value to the \fB\%collection\-id\fR key of the remote.
+.TP
+\fB\-\-mirrored\-collection\-id\fR \fICOLLECTION\-ID\fR
+A collection that the remote serves from \fB\%refs/mirrors/COLLECTION\-ID/\fR\&.
+.IP
+The option can occur more than once. The command writes the ids to the \fB\%mirrored\-collection\-ids\fR key, in the order of the command line. It writes an id given two times one time. \fB\%pull \-\-collection=COLLECTION\-ID\fR then takes the remote as a candidate. The command refuses an empty value, an id that fails the \%collection\-id rule or is longer than \%255 bytes, and the \fB\%collection\-id\fR of the remote. It applies the same rules to a \fB\%mirrored\-collection\-ids\fR value of \%\-\-set.
 .SS "init"
 Create a bucket repository in an \%S3 bucket.
 .PP

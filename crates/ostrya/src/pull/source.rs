@@ -277,14 +277,14 @@ impl RemoteSource {
             .map_err(http_error)
     }
 
-    /// Returns the path of the remote ref `name`.
+    /// Returns the path of the remote ref `name` in the ref directory `dir`.
     ///
-    /// An HTTP request takes the path percent-encoded. The stream source
+    /// An HTTP request takes the name percent-encoded. The stream source
     /// takes the name as written, because its `Get` carries no escape.
-    pub(crate) fn ref_path(&self, name: &str) -> String {
+    pub(crate) fn ref_path(&self, dir: &str, name: &str) -> String {
         match self.transfer() {
-            Transfer::Http(_) => ref_request_path(name),
-            Transfer::Stream(_) => format!("refs/heads/{name}"),
+            Transfer::Http(_) => ref_request_path(dir, name),
+            Transfer::Stream(_) => format!("{dir}/{name}"),
         }
     }
 

@@ -3410,6 +3410,9 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   ref-binding check reads the part after `@ID:`. Delta discovery reads the
   `from` commit at the ref that the name gives in the destination, with
   and without `no_ref_writes`. `PullOptions` has no collection id field.
+- `Repo::pull` and `Repo::pull_with_session` read each name of
+  `PullOptions::refs` as `NAME` or `@ID:NAME`, and refuse each other form
+  before the first request ("The collection refs of a named remote").
 - Each name field of the push protocol holds the text of a ref: `NAME` or
   `@ID:NAME`, and in a one-way stream also `REMOTE:NAME`. The receive path
   reads each name with the parser of `Ref` ("The namespace of each pushed
@@ -3491,8 +3494,8 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
 - Each writer of the collection ref `@ID:NAME` of the own id writes
   `refs/heads/NAME`: `Transaction::set_ref`, `Repo::set_ref_immediate`,
   `UpdateGuard::set_ref`, `refs -c --create`, `refs --create`, `commit`,
-  `Repo::pull_collection`, `Repo::pull_local` with an `@ID:NAME` name, the
-  receive path, and the S3 push. The same
+  `Repo::pull_collection`, `Repo::pull_local` and `Repo::pull` with an
+  `@ID:NAME` name, the receive path, and the S3 push. The same
   writers remove `refs/heads/NAME` for a removal. No writer creates
   `refs/mirrors/ID/` of the own id. `ostree refs --collections
   --create=ID:NAME` writes `refs/heads/NAME` for the own id too (observed).
@@ -3547,6 +3550,68 @@ These alternatives were rejected:
   port holds the directory.
 - An fsck error for such a ref. The ref breaks no object, the prune keeps
   its commit, and the `ostree` command exits 0 for the same state.
+
+## The collection refs of a named remote
+
+A pull from a named remote takes collection refs beside plain refs. The
+rules:
+
+- `Repo::pull`, `Repo::pull_with_session`, and `ostrya pull REMOTE` read
+  each name as `NAME` or `@ID:NAME`. One pull takes both forms, and the
+  refs of more than one collection. Before the first request, the pull
+  refuses `REMOTE:NAME`, a `^` suffix, and a name that fails the rule of
+  `Ref`, with `Error::InvalidRefspec`. A mirror pull refuses `@ID:NAME`
+  with `Error::InvalidInput`. The `branches` key of a remote holds plain
+  names alone.
+- The pull resolves `@ID:NAME` from the summary first: field 0 when the
+  summary states the collection id `ID`, and else the entry of `ID` in the
+  collection map. Then it reads one ref file: `refs/heads/NAME` when the
+  `[core] collection-id` of the `config` of the remote is `ID`, and else
+  `refs/mirrors/ID/NAME`. The server keeps the refs of its own id under
+  `refs/heads/` ("The own collection id"), and its summary lists them in
+  field 0.
+- The pull writes `@ID:NAME` by the own-id rule of the client: to
+  `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the own id.
+  The remote name gives the place of a plain name alone.
+- Unless the pull writes no ref, the tip of `@ID:NAME` must hold the
+  `ostree.collection-binding` `ID`, as in `Repo::pull_local`.
+  `DISABLE_VERIFY_BINDINGS` skips the ref-binding check alone, which reads
+  `NAME`.
+- `Repo::pull` keeps its refusal of a `file://` address. A pull of
+  collection refs from a local repository is `Repo::pull_local`, or
+  `pull --collection` with a local candidate.
+
+These alternatives were rejected:
+
+- A ref listing request for the collection refs. The summary and the ref
+  file give each ref, as for a plain name, so a pull from a named remote
+  needs no other request kind.
+- A read of `refs/mirrors/ID/NAME` for each id. A server keeps the refs of
+  its own id under `refs/heads/`, so the pull would not find them when the
+  remote serves no summary.
+
+## The mirrored collections of a remote
+
+The remote key `mirrored-collection-ids` lists the collections that a
+remote serves from `refs/mirrors/ID/`, which its summary lists in
+`ostree.summary.collection-map`. The rules:
+
+- `pull --collection=ID` takes as a candidate each remote whose
+  `collection-id` is `ID` or whose `mirrored-collection-ids` holds `ID`, in
+  the order of the config. The command fails when no remote has `ID` in
+  either key. The probe of a candidate does not change: it reads the
+  collection map when the summary or the listing states another own id.
+- The key does not need `collection-id`. Each id passes the collection-id
+  rule. The key refuses the `collection-id` of the same remote and an empty
+  list. An id that occurs again counts one time.
+  `Remote::mirrored_collection_ids` reads the key with these rules, and
+  `config::check_mirrored_collection_ids` applies them to a value.
+- `remote add --mirrored-collection-id=ID` can occur more than once. The
+  command writes the ids in the order of the command line, and applies the
+  same rules to the final value of the key, from the option or from
+  `--set`.
+- `pull --collection` reads both keys of each remote, so a bad value in any
+  remote fails the command. A pull that names the remote reads neither key.
 
 ## The access items of each namespace
 

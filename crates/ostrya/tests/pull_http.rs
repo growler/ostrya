@@ -10957,3 +10957,335 @@ fn a_bad_generate_composefs_value_refuses_an_http_pull() {
         });
     }
 }
+
+// --- collection refs from a named remote --------------------------------------
+
+/// Returns the options of a pull of the refs `names`.
+fn refs_of(names: &[&str]) -> PullOptions {
+    PullOptions {
+        refs: names.iter().map(|name| (*name).to_owned()).collect(),
+        ..PullOptions::default()
+    }
+}
+
+/// Returns the collection ref `name` of the collection `id` as text.
+fn at(id: &str, name: &str) -> String {
+    format!("@{id}:{name}")
+}
+
+/// One pull from a named remote takes a plain ref and the refs of two
+/// collections. The plain ref goes under `refs/remotes/`, and each
+/// collection ref under `refs/mirrors/`. The summary lists each ref, in the
+/// collection map for a collection ref, so the pull reads no ref file.
+#[test]
+fn a_pull_from_a_remote_takes_plain_and_collection_refs() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-refs");
+        let (_remote, [main, _, a, b]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let (x_a, y_b) = (at(ID_X, "a"), at(ID_Y, "b"));
+        dest.pull("origin", refs_of(&["main", &x_a, &y_b]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dest.resolve_rev("origin:main", false).await.unwrap(),
+            Some(main)
+        );
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [
+                (ID_X.to_owned(), "a".to_owned(), a),
+                (ID_Y.to_owned(), "b".to_owned(), b)
+            ]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/")),
+            "{seen:?}"
+        );
+    });
+}
+
+/// With no summary, the pull reads `refs/heads/NAME` for a plain ref and
+/// `refs/mirrors/ID/NAME` for a collection ref of a collection that the
+/// remote mirrors.
+#[test]
+fn a_collection_ref_with_no_summary_reads_the_mirror_ref_file() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-no-summary");
+        let (_remote, [main, _, a, b]) = build_collection_remote(dir.path()).await;
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let (x_a, y_b) = (at(ID_X, "a"), at(ID_Y, "b"));
+        dest.pull("origin", refs_of(&["main", &x_a, &y_b]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dest.resolve_rev("origin:main", false).await.unwrap(),
+            Some(main)
+        );
+        assert_eq!(dest.resolve_rev(&x_a, false).await.unwrap(), Some(a));
+        assert_eq!(dest.resolve_rev(&y_b, false).await.unwrap(), Some(b));
+        let seen = server.seen_set();
+        for path in [
+            "refs/heads/main".to_owned(),
+            format!("refs/mirrors/{ID_X}/a"),
+            format!("refs/mirrors/{ID_Y}/b"),
+        ] {
+            assert!(seen.contains(&path), "{path}: {seen:?}");
+        }
+    });
+}
+
+/// A collection ref of the collection id of the remote is a local ref of the
+/// remote: the pull reads it from field 0 of the summary, or with no
+/// summary from `refs/heads/NAME`, and never from `refs/mirrors/`. It writes
+/// the collection ref here.
+#[test]
+fn a_collection_ref_of_the_remote_id_reads_its_local_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-remote-id");
+        let (_remote, [_, c, _, _]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let r_c = at(REMOTE_ID, "c");
+
+        dest.pull("origin", refs_of(&[&r_c])).await.unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(REMOTE_ID.to_owned(), "c".to_owned(), c)]
+        );
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/")),
+            "{seen:?}"
+        );
+
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        server.forget();
+        dest.pull("origin", refs_of(&[&r_c])).await.unwrap();
+        let seen = server.seen();
+        assert!(seen.contains(&"refs/heads/c".to_owned()), "{seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/mirrors/")),
+            "{seen:?}"
+        );
+    });
+}
+
+/// A collection ref of the collection id of this repository is a local ref
+/// here: the pull writes `refs/heads/NAME`, and no `refs/mirrors/` entry of
+/// that id.
+#[test]
+fn a_collection_ref_of_the_own_id_lands_in_refs_heads() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-own-id");
+        let (_remote, [_, _, a, b]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        drop(
+            Repo::create(
+                &dir.path().join("dest"),
+                CreateOptions::new(RepoMode::Archive).collection_id(ID_X),
+            )
+            .await
+            .unwrap(),
+        );
+        let dest = reconfigure_dest(dir.path(), &server.url(), "").await;
+
+        let (x_a, y_b) = (at(ID_X, "a"), at(ID_Y, "b"));
+        dest.pull("origin", refs_of(&[&x_a, &y_b])).await.unwrap();
+
+        assert_eq!(dest.list_refs(None).await.unwrap(), [("a".to_owned(), a)]);
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(ID_Y.to_owned(), "b".to_owned(), b)]
+        );
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+    });
+}
+
+/// A pull from a named remote refuses each name that is not `NAME` or
+/// `@ID:NAME` before its first request, also through a session. A mirror
+/// pull refuses an `@ID:NAME` name.
+#[test]
+fn a_remote_ref_operand_is_refused_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-refused");
+        build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let x_a = at(ID_X, "a");
+        let x_a_parent = format!("{x_a}^");
+        let x_a_b = format!("{x_a}:b");
+        for name in [
+            "origin:main",
+            "main^",
+            "@org.example.X",
+            "@:a",
+            "@1x:a",
+            x_a_parent.as_str(),
+            x_a_b.as_str(),
+        ] {
+            let err = dest.pull("origin", refs_of(&[name])).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(got) if got == name),
+                "{name}: {err}"
+            );
+            let err = dest
+                .pull_with_session(
+                    http_session(&server).await,
+                    PullTrust::unverified(),
+                    refs_of(&[name]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(got) if got == name),
+                "{name}: {err}"
+            );
+        }
+        let mirror = PullOptions {
+            flags: PullFlags::MIRROR,
+            ..refs_of(&["main", &x_a])
+        };
+        let err = dest.pull("origin", mirror).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// The `branches` key holds plain names alone. A pull with no ref refuses a
+/// collection ref in the key, and requests no ref file.
+#[test]
+fn a_collection_ref_in_the_branches_key_is_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-branches");
+        build_collection_remote(dir.path()).await;
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let x_a = at(ID_X, "a");
+        let extra = format!("branches={x_a};\n");
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+
+        let err = dest
+            .pull("origin", PullOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(got) if *got == x_a),
+            "{err}"
+        );
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/")),
+            "{seen:?}"
+        );
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// The tip of each collection ref must be bound to its collection. A tip
+/// bound to another collection, an unbound tip, and a tip whose binding is
+/// not a string fail the pull, also under `DISABLE_VERIFY_BINDINGS`. The
+/// ref-binding check reads the name after `@ID:`, and the flag turns it off.
+#[test]
+fn the_collection_binding_of_each_collection_ref_is_checked() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-binding");
+        build_tree(&dir.path().join("src"), b"hello\n");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let bound = |name: &str| Ref::collection(ID_X, name);
+        let base = dir.path();
+        let wrong = commit_bound(&remote, base, "src", &bound("wrong"), Some(ID_Y)).await;
+        let none = commit_bound(&remote, base, "src", &bound("none"), None).await;
+        let number = commit_bound_value(
+            &remote,
+            base,
+            "src",
+            &bound("number"),
+            Some(("u", Value::U32(7))),
+        )
+        .await;
+        let q = commit_bound(&remote, base, "src", &bound("q"), Some(ID_X)).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref(&bound("alias"), Some(&q));
+        txn.commit().await.unwrap();
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        for (name, expected) in [
+            (
+                "wrong",
+                format!(
+                    "commit {wrong}: collection binding '{ID_Y}' is not the requested \
+                     collection '{ID_X}'"
+                ),
+            ),
+            (
+                "none",
+                format!(
+                    "commit {none}: no collection binding metadata for the requested \
+                     collection '{ID_X}'"
+                ),
+            ),
+            (
+                "number",
+                format!("commit {number}: collection binding metadata is not a string"),
+            ),
+        ] {
+            for flags in [PullFlags::empty(), PullFlags::DISABLE_VERIFY_BINDINGS] {
+                let opts = PullOptions {
+                    flags,
+                    ..refs_of(&[&at(ID_X, name)])
+                };
+                match dest.pull("origin", opts).await {
+                    Err(Error::Pull(msg)) => assert_eq!(msg, expected, "{name}"),
+                    other => panic!("{name}: {other:?}"),
+                }
+            }
+        }
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+
+        let alias = at(ID_X, "alias");
+        let err = dest.pull("origin", refs_of(&[&alias])).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(msg) if msg.contains("no requested ref 'alias'")),
+            "{err}"
+        );
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..refs_of(&[&alias])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest.resolve_rev(&alias, false).await.unwrap(), Some(q));
+    });
+}

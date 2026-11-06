@@ -2399,6 +2399,80 @@ fn refused_options_send_no_request() {
     });
 }
 
+/// A name of the pull is `NAME` or `@ID:NAME` of the pulled collection, and
+/// both forms name one ref. The pull writes `refs/mirrors/ID/NAME`, or
+/// `refs/heads/NAME` into a repository whose own id is the pulled id.
+#[test]
+fn a_collection_pull_takes_plain_and_id_operands() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-operands");
+        let b = create(dir.path(), "b", Some(OTHER)).await;
+        let bind_a = Bind {
+            collection: Some(ID),
+            refs: Some(&["A"]),
+        };
+        let bind_b = Bind {
+            collection: Some(ID),
+            refs: Some(&["B"]),
+        };
+        let a_tip = commit(&b, dir.path(), "a", Some(ID), "A", FIXED_TS, bind_a).await;
+        let b_tip = commit(&b, dir.path(), "b", Some(ID), "B", FIXED_TS, bind_b).await;
+        summarize(&b).await;
+        let server = RepoServer::start(&dir.path().join("b"), false).await;
+        let at_a = format!("@{ID}:A");
+        let at_b = format!("@{ID}:B");
+
+        let plain = dest(dir.path(), None, &[("b", &server.url(), "")]).await;
+        let (opts, _) = options(&["A", &at_b, &at_a]);
+        let pulled = plain.pull_collection(ID, &["b"], opts).await.unwrap();
+        let names: Vec<&str> = pulled.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["A", "B"]);
+        assert_eq!(mirror(&plain, "A").await, Some(a_tip));
+        assert_eq!(mirror(&plain, "B").await, Some(b_tip));
+        assert!(plain.list_refs(None).await.unwrap().is_empty());
+        drop(plain);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let own = dest(dir.path(), Some(ID), &[("b", &server.url(), "")]).await;
+        let (opts, _) = options(&["A", &at_b]);
+        own.pull_collection(ID, &["b"], opts).await.unwrap();
+        assert_eq!(
+            own.list_refs(None).await.unwrap(),
+            [("A".to_owned(), a_tip), ("B".to_owned(), b_tip)]
+        );
+        assert!(own.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// The pull refuses an `@ID:NAME` name of another collection, and a name
+/// that starts with `@` and is no `@ID:NAME` ref, before its first request.
+#[test]
+fn a_collection_pull_refuses_an_operand_of_another_collection() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-other-operand");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let other = format!("@{OTHER}:{REF}");
+        let (opts, _) = options(&[REF, &other]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        for name in [format!("@{ID}:{REF}^"), format!("@{ID}"), format!("@{ID}:")] {
+            let (opts, _) = options(&[&name]);
+            let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(got) if *got == name),
+                "{name}: {err:?}"
+            );
+        }
+        assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+        assert_nothing_written(&dest).await;
+    });
+}
+
 /// An empty ssh command or send command of a later remote fails the pull
 /// before the request to the first remote, and the pull starts no ssh
 /// client.

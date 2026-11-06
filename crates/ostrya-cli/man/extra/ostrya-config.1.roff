@@ -245,7 +245,7 @@ The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
 .TP
 \fB\%collection\-id\fR (string)
 The collection that the remote serves.
-\fB\%ostrya pull \-\-collection ID\fR takes each remote whose \fB\%collection\-id\fR is \fB\%ID\fR as a candidate, in the order of the config.
+\fB\%ostrya pull \-\-collection ID\fR takes each remote whose \fB\%collection\-id\fR is \fB\%ID\fR, or whose \fB\%mirrored\-collection\-ids\fR holds \fB\%ID\fR, as a candidate, in the order of the config.
 A pull that names the remote does not read this key.
 \fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
 A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs that the summary of its bucket repository lists, and the pull skips such a candidate if its bucket repository has no summary.
@@ -400,6 +400,18 @@ The remote shell parses it.
 \fB\%send\-command\fR (string, default ostrya send)
 The command that the remote side runs for a pull over ssh.
 The remote shell parses it.
+.TP
+\fB\%mirrored\-collection\-ids\fR (list)
+The collections that the remote serves from \fB\%refs/mirrors/ID/\fR.
+The summary of the remote lists the refs of each of these collections in \fB\%ostree.summary.collection\-map\fR.
+\fB\%ostrya pull \-\-collection ID\fR takes the remote as a candidate when the list holds \fB\%ID\fR.
+The key does not need \fB\%collection\-id\fR.
+Each id passes the collection\-id rule and is at most 255 bytes.
+An empty list, an empty id, and the \fB\%collection\-id\fR of the same remote are refused.
+An id that occurs two times counts one time.
+\fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a refused value in any remote fails that command.
+A pull that names the remote does not read this key.
+\fB\%ostrya remote add \-\-mirrored\-collection\-id\fR writes the key.
 .TP
 \fB\%push\-token\-file\fR (string)
 A file whose first line is the token of a push over HTTP.

@@ -30,7 +30,7 @@ use async_compression::futures::bufread::DeflateDecoder;
 use futures_io::AsyncRead;
 use futures_lite::{AsyncReadExt, AsyncWriteExt};
 use ostrya_core::{
-    Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, RepoMode, loose_path,
+    Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, RepoMode, Value, loose_path,
 };
 
 use crate::config::RepoConfig;
@@ -42,10 +42,14 @@ use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
+use crate::refs::{HEADS_DIR, MIRRORS_DIR};
 use crate::related::{self, RelatedRule};
 use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
-use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
+use crate::summary::{
+    COLLECTION_ID_KEY, SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, collection_map_refs,
+    put_root_file_blocking,
+};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::verify::PullTrust;
@@ -64,8 +68,8 @@ use super::verify::Verification;
 use super::{
     CheckedMeta, ModeChecks, Pinned, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
     READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
-    check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, completes_marked, take_static_deltas,
+    check_commit_signatures_filtered, check_depth, check_remote_operands, check_remote_option,
+    check_static_deltas, check_tip_refs, completes_marked, operand_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -75,7 +79,7 @@ const WRITE_THROTTLE: usize = 3;
 /// The cap on the repository-root files that a pull fetches (`summary`,
 /// `summary.sig`, `config`). The local summary reader applies the same cap.
 pub(super) const MAX_ROOT_FILE: u64 = 64 * 1024 * 1024;
-/// The cap on a fetched `refs/heads/<ref>` file, which holds 64 hex characters
+/// The cap on a fetched ref file of a remote, which holds 64 hex characters
 /// and a newline.
 const MAX_REF_FILE: u64 = 1024;
 
@@ -139,6 +143,32 @@ impl Repo {
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
     /// select the prefix of the written refs.
     /// [`no_ref_writes`](PullOptions::no_ref_writes) turns the ref writes off.
+    ///
+    /// A requested ref is a ref `NAME` or a collection ref `@ID:NAME`. One
+    /// pull takes both forms, and the refs of more than one collection. The
+    /// pull refuses a remote ref `REMOTE:NAME` and a `^` suffix. Under
+    /// [`MIRROR`](PullFlags::MIRROR), it refuses an `@ID:NAME` ref. For an
+    /// `@ID:NAME` ref:
+    ///
+    /// - The pull reads field 0 of the summary if the
+    ///   `ostree.summary.collection-id` of the summary is `ID`, and else the
+    ///   entry of `ID` of `ostree.summary.collection-map`.
+    /// - If the summary does not list the ref, or the remote serves no
+    ///   summary, the pull reads `refs/heads/<NAME>` of the remote if the
+    ///   `[core] collection-id` of the `config` of the remote is `ID`, and
+    ///   else `refs/mirrors/<ID>/<NAME>`.
+    /// - The pull writes the collection ref `refs/mirrors/<ID>/<NAME>`, or
+    ///   the local ref `refs/heads/<NAME>` if `ID` is the
+    ///   `[core] collection-id` of this repository, whatever
+    ///   [`remote`](PullOptions::remote) holds.
+    /// - The `ostree.collection-binding` of the tip must state `ID`. A tip
+    ///   with another binding, with no binding, or with a binding that is not
+    ///   a string fails the pull with [`Error::Pull`].
+    ///   [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS) does
+    ///   not turn this check off. Under
+    ///   [`no_ref_writes`](PullOptions::no_ref_writes), the pull does not
+    ///   make it.
+    /// - The ref-binding check reads `NAME`.
     ///
     /// # Proxy
     ///
@@ -553,6 +583,12 @@ impl Repo {
     ///   one delta, or is set together with
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
     ///   [`subpaths`](PullOptions::subpaths).
+    /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs) is
+    ///   not a ref `NAME` or `@ID:NAME` that [`Ref`](crate::Ref) reads: a
+    ///   remote ref `REMOTE:NAME`, a `^` suffix, or a part that fails its
+    ///   rule.
+    /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) holds an
+    ///   `@ID:NAME` name under `MIRROR`.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
     /// - The errors of
@@ -585,17 +621,20 @@ impl Repo {
     ///   other than `archive`.
     /// - [`Error::InvalidFormat`] if the `config` of the remote is not valid
     ///   UTF-8 or has no valid `[core]` group.
-    /// - [`Error::InvalidFormat`] if a `refs/heads/<ref>` file is not valid
+    /// - [`Error::InvalidFormat`] if a ref file of the remote is not valid
     ///   UTF-8.
+    /// - [`Error::InvalidFormat`] if the summary holds an
+    ///   `ostree.summary.collection-map` that is malformed, and the pull reads
+    ///   it for an `@ID:NAME` ref.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
-    ///   file, or if a `refs/heads/<ref>` file holds no checksum.
-    /// - [`Error::InvalidRefspec`] if a requested ref, a ref of the summary
-    ///   under `MIRROR`, or a name of the `branches` key of the remote is not
-    ///   a valid ref name. A `MIRROR` pull of every ref
+    ///   file, or if a ref file of the remote holds no checksum.
+    /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, or
+    ///   a name of the `branches` key of the remote, is not a valid ref name.
+    ///   A `MIRROR` pull of every ref
     ///   fails with this error if the summary lists one name that the ref-name
     ///   rule refuses. The pull does not skip the name.
-    /// - [`Error::RefNotFound`] if neither the summary nor `refs/heads/<ref>`
-    ///   names a requested ref.
+    /// - [`Error::RefNotFound`] if neither the summary nor the ref file of the
+    ///   remote names a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
     ///   serves no summary under `MIRROR`, or the remote has no `branches`.
     /// - These errors of the commit of
@@ -644,7 +683,8 @@ impl Repo {
     ///   pull fetches and checks the superblock first, and the error comes
     ///   when the pull reads the commit from the superblock.
     /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
-    ///   the ref.
+    ///   the ref, or if the `ostree.collection-binding` of the tip of an
+    ///   `@ID:NAME` ref does not state `ID`.
     /// - [`Error::Pull`] if a tip is older than the
     ///   [`timestamp_check`](PullOptions::timestamp_check) allows, or if a
     ///   content object fails a mode check.
@@ -703,6 +743,7 @@ impl Repo {
         check_depth(opts.depth)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
+        check_remote_operands(&opts)?;
         // The pull reads the rule one time, here. A value that is not a
         // boolean stops the pull before its first request.
         let related = RelatedRule::of(self.config())?;
@@ -762,6 +803,8 @@ impl Repo {
     /// - `Some(name)` writes `refs/remotes/<name>/<ref>`.
     /// - [`MIRROR`](PullFlags::MIRROR) writes local refs, whatever `remote`
     ///   holds.
+    /// - An `@ID:NAME` ref writes the collection ref, as
+    ///   [`pull`](Repo::pull) states, whatever `remote` holds.
     ///
     /// The pull does not protect the local refs of this repository. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes), the pull writes no ref,
@@ -819,6 +862,9 @@ impl Repo {
     ///   [`subpaths`](PullOptions::subpaths).
     /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) is empty, also
     ///   under `MIRROR`.
+    /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs) is
+    ///   not a ref `NAME` or `@ID:NAME`, and [`Error::InvalidInput`] for an
+    ///   `@ID:NAME` name under `MIRROR`, as for [`pull`](Repo::pull).
     /// - [`Error::InvalidInput`] if [`verify`](PullOptions::verify) is not the
     ///   default, or if [`trust_group`](PullOptions::trust_group) is set.
     ///   `trust` holds the keys.
@@ -951,7 +997,10 @@ impl Repo {
         let place = match wanted {
             Wanted::Pinned(pinned) => pinned.place,
             _ if mirror => RefPlace::Heads,
-            _ => RefPlace::of_remote(opts.remote.as_deref()),
+            _ => RefPlace::Operands {
+                remote: opts.remote.as_deref(),
+                own: self.config().collection_id(),
+            },
         };
 
         // The markers that the pull writes. They stay outside the span that
@@ -1136,9 +1185,9 @@ impl Repo {
                 None => None,
             }
         };
-        check_remote_mode(root.config(source).await?)?;
+        let remote_id = check_remote_mode(root.config(source).await?)?;
         let targets = self
-            .remote_targets(wanted, opts, summary.as_ref(), source)
+            .remote_targets(wanted, opts, summary.as_ref(), remote_id.as_deref(), source)
             .await?;
         // Discovery reads two values of the summary alone. The pull keeps
         // them for the deltas of the dependencies, and drops the rest of the
@@ -1160,7 +1209,8 @@ impl Repo {
         };
         // The checks of each requested ref. A collection pull adds the check
         // of the collection binding and of the timestamp that the remote
-        // listed.
+        // listed. Each other pull checks the collection binding of each
+        // `@ID:NAME` name, unless it writes no ref.
         let tip_checks = match wanted {
             Wanted::Pinned(pinned) => TipChecks {
                 collection: Some(pinned.collection),
@@ -1168,7 +1218,10 @@ impl Repo {
                 listed: Some(&pinned.listed),
                 ..TipChecks::new(opts.flags, timestamp, place)
             },
-            _ => TipChecks::new(opts.flags, timestamp, place),
+            _ => TipChecks {
+                operand_collections: !opts.no_ref_writes,
+                ..TipChecks::new(opts.flags, timestamp, place)
+            },
         };
 
         // The deltas that can deliver these commits, found before the first
@@ -1430,11 +1483,15 @@ impl Repo {
     /// Resolves what to pull: the requested refs, the summary refs of the
     /// remote under [`MIRROR`](PullFlags::MIRROR), or the `branches` key of
     /// the remote that `wanted` names.
+    ///
+    /// `remote_id` is the `[core] collection-id` of the `config` of the
+    /// remote. The target of an `@ID:NAME` name keeps the name as given.
     async fn remote_targets(
         &self,
         wanted: Wanted<'_>,
         opts: &PullOptions,
         summary: Option<&Summary>,
+        remote_id: Option<&str>,
         source: &RemoteSource,
     ) -> Result<Vec<(String, Checksum)>> {
         if let Wanted::Pinned(pinned) = wanted {
@@ -1478,19 +1535,31 @@ impl Repo {
             branches
         };
 
+        // The entry checked each name of `refs`, so an `@ID:NAME` name holds a
+        // valid id and a valid name. A name of the `branches` key is a plain
+        // name, and the ref-name rule below refuses each other name.
+        let operands = !opts.refs.is_empty();
+        let mut listed = HashMap::new();
         let mut out = Vec::with_capacity(names.len());
         for name in names {
-            // The name goes on the wire as a request path, so the pull checks
-            // it against the rule of the ref store. A component that the rule
-            // refuses, such as a traversal, can ask the server for a resource
-            // that the ref does not name.
-            crate::refs::check_ref_path(&name)?;
-            let checksum = match summary.and_then(|summary| summary.lookup(&name)) {
-                Some(checksum) => checksum,
-                None => fetch_remote_ref(source, &name)
-                    .await?
-                    .ok_or_else(|| Error::RefNotFound(name.clone()))?,
+            let checksum = match operand_collection(&name).filter(|_| operands) {
+                Some((id, ref_name)) => {
+                    remote_collection_ref(summary, &mut listed, remote_id, id, ref_name, source)
+                        .await?
+                }
+                None => {
+                    // The name goes on the wire as a request path, so the pull
+                    // checks it against the rule of the ref store. A component
+                    // that the rule refuses, such as a traversal, can ask the
+                    // server for a resource that the ref does not name.
+                    crate::refs::check_ref_path(&name)?;
+                    match summary.and_then(|summary| summary.lookup(&name)) {
+                        Some(checksum) => Some(checksum),
+                        None => fetch_remote_ref(source, HEADS_DIR, &name).await?,
+                    }
+                }
             };
+            let checksum = checksum.ok_or_else(|| Error::RefNotFound(name.clone()))?;
             out.push((name, checksum));
         }
         Ok(out)
@@ -2357,6 +2426,7 @@ async fn check_session_pull(opts: &mut PullOptions) -> Result<(Option<Subpaths>,
     if opts.refs.is_empty() {
         return Err(no_refs());
     }
+    check_remote_operands(opts)?;
     if opts.verify != PullVerify::default() {
         return Err(Error::InvalidInput(
             "a pull with a session takes its signature policy from its trust, and \
@@ -3179,18 +3249,18 @@ fn object_not_found(error: Error, name: ObjectName) -> Error {
 }
 
 /// Refuses a remote whose `[core] mode` is not archive, from the bytes of its
-/// `config`.
-fn check_remote_mode(config: Option<Vec<u8>>) -> Result<()> {
+/// `config`, and returns the `[core] collection-id` of that `config`.
+fn check_remote_mode(config: Option<Vec<u8>>) -> Result<Option<String>> {
     let Some(bytes) = config else {
         // The pull reads a remote that serves no config as an archive,
         // because the remote serves `.filez` objects.
-        return Ok(());
+        return Ok(None);
     };
     let text = String::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("the remote config is not valid utf-8".into()))?;
     let config = RepoConfig::parse(&text)?;
     if config.mode().is_archive() {
-        return Ok(());
+        return Ok(config.collection_id().map(str::to_owned));
     }
     Err(Error::Unsupported(format!(
         "can't pull from a remote in mode {}: an http pull reads an archive \
@@ -3200,10 +3270,73 @@ fn check_remote_mode(config: Option<Vec<u8>>) -> Result<()> {
     )))
 }
 
-/// Returns the commit that `refs/heads/<name>` of the remote names, or `None`
-/// if the remote serves no such ref.
-async fn fetch_remote_ref(source: &RemoteSource, name: &str) -> Result<Option<Checksum>> {
-    let path = source.ref_path(name);
+/// Returns the commit of the ref `name` of the collection `id` on the remote,
+/// or `None` if the remote names no such commit.
+///
+/// The ref of the collection that the `ostree.summary.collection-id` of
+/// `summary` states is in field 0 of the summary. The ref of each other
+/// collection is in the entry of `id` of `ostree.summary.collection-map`. If
+/// the summary does not list the ref, or the remote serves no summary, the
+/// call reads the ref file of the remote: `refs/heads/<name>` if `remote_id`,
+/// the `[core] collection-id` of the remote, is `id`, else
+/// `refs/mirrors/<id>/<name>`.
+///
+/// `listed` holds the refs of each collection whose entry of the collection
+/// map an earlier call parsed, by collection id and then by name. The call
+/// parses the entry of `id` only if `listed` does not hold `id`, and then
+/// adds it. If the entry holds a name two times, the first ref counts.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the collection map of the summary is
+///   malformed.
+/// - The errors of [`fetch_remote_ref`].
+async fn remote_collection_ref(
+    summary: Option<&Summary>,
+    listed: &mut HashMap<String, HashMap<String, Checksum>>,
+    remote_id: Option<&str>,
+    id: &str,
+    name: &str,
+    source: &RemoteSource,
+) -> Result<Option<Checksum>> {
+    if let Some(summary) = summary {
+        let summary_id = summary
+            .metadata_value(COLLECTION_ID_KEY)
+            .and_then(Value::as_str);
+        let commit = if summary_id == Some(id) {
+            summary.lookup(name)
+        } else {
+            let refs = match listed.get(id) {
+                Some(refs) => refs,
+                None => {
+                    let mut refs = HashMap::new();
+                    for entry in collection_map_refs(&summary.metadata, id)? {
+                        refs.entry(entry.name).or_insert(entry.commit);
+                    }
+                    listed.entry(id.to_owned()).or_insert(refs)
+                }
+            };
+            refs.get(name).copied()
+        };
+        if commit.is_some() {
+            return Ok(commit);
+        }
+    }
+    if remote_id == Some(id) {
+        fetch_remote_ref(source, HEADS_DIR, name).await
+    } else {
+        fetch_remote_ref(source, &format!("{MIRRORS_DIR}/{id}"), name).await
+    }
+}
+
+/// Returns the commit that the ref file `<dir>/<name>` of the remote names,
+/// or `None` if the remote serves no such ref.
+async fn fetch_remote_ref(
+    source: &RemoteSource,
+    dir: &str,
+    name: &str,
+) -> Result<Option<Checksum>> {
+    let path = source.ref_path(dir, name);
     let Some(bytes) = source
         .read_optional(&path, Priority::High, MAX_REF_FILE)
         .await?
@@ -3215,8 +3348,8 @@ async fn fetch_remote_ref(source: &RemoteSource, name: &str) -> Result<Option<Ch
     Ok(Some(Checksum::from_hex(text.trim())?))
 }
 
-/// Returns the request path of a remote ref: `refs/heads/` and the
-/// percent-encoded name.
+/// Returns the request path of the remote ref `name` in the ref directory
+/// `dir`: `dir`, a `/`, and the percent-encoded name.
 ///
 /// A request path goes on the wire as written, so this function encodes the
 /// name. It encodes each byte outside the unreserved set of RFC 3986: the
@@ -3226,9 +3359,9 @@ async fn fetch_remote_ref(source: &RemoteSource, name: &str) -> Result<Option<Ch
 /// A `?`, `#`, or `%` in a name is so part of the ref name. The server cannot
 /// read it as a query, a fragment, or an escape that decodes into a different
 /// name.
-pub(super) fn ref_request_path(name: &str) -> String {
+pub(super) fn ref_request_path(dir: &str, name: &str) -> String {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::from("refs/heads/");
+    let mut out = format!("{dir}/");
     for byte in name.bytes() {
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
@@ -3267,7 +3400,7 @@ pub(crate) async fn fetch_optional(
 ///
 /// - [`MAX_METADATA_SIZE`] for a metadata object
 /// - [`MAX_ROOT_FILE`] for a repository-root file
-/// - [`MAX_REF_FILE`] for a `refs/heads/<ref>` file
+/// - [`MAX_REF_FILE`] for a ref file
 ///
 /// The size of the buffer comes from the declared length, which the fetcher
 /// held to the cap. The body so goes into one allocation of its own size, and
@@ -3957,17 +4090,23 @@ mod tests {
     /// character that names something else in a URL is encoded.
     #[test]
     fn a_ref_request_path_encodes_the_name() {
-        assert_eq!(ref_request_path("test/main"), "refs/heads/test/main");
+        let heads = |name| ref_request_path("refs/heads", name);
+        assert_eq!(heads("test/main"), "refs/heads/test/main");
         // The unreserved set passes through as itself.
-        assert_eq!(ref_request_path("a-b.c_d~e"), "refs/heads/a-b.c_d~e");
+        assert_eq!(heads("a-b.c_d~e"), "refs/heads/a-b.c_d~e");
         // A query, a fragment, and an escape name the ref, not a request target.
-        assert_eq!(ref_request_path("a?b"), "refs/heads/a%3Fb");
-        assert_eq!(ref_request_path("a#b"), "refs/heads/a%23b");
-        assert_eq!(ref_request_path("a%2fb"), "refs/heads/a%252fb");
+        assert_eq!(heads("a?b"), "refs/heads/a%3Fb");
+        assert_eq!(heads("a#b"), "refs/heads/a%23b");
+        assert_eq!(heads("a%2fb"), "refs/heads/a%252fb");
         // A space and a CRLF are bytes of the name.
-        assert_eq!(ref_request_path("a b\r\n"), "refs/heads/a%20b%0D%0A");
+        assert_eq!(heads("a b\r\n"), "refs/heads/a%20b%0D%0A");
         // A non-ASCII name is encoded as its UTF-8 bytes.
-        assert_eq!(ref_request_path("é"), "refs/heads/%C3%A9");
+        assert_eq!(heads("é"), "refs/heads/%C3%A9");
+        // The directory of a collection ref stays as given.
+        assert_eq!(
+            ref_request_path("refs/mirrors/org.example.Os", "a b"),
+            "refs/mirrors/org.example.Os/a%20b"
+        );
     }
 
     // --- the plan ---------------------------------------------------------

@@ -1131,10 +1131,10 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
 }
 
 /// The directory of the local refs.
-const HEADS_DIR: &str = "refs/heads";
+pub(crate) const HEADS_DIR: &str = "refs/heads";
 
 /// The directory of the mirror refs, one subdirectory for each collection id.
-const MIRRORS_DIR: &str = "refs/mirrors";
+pub(crate) const MIRRORS_DIR: &str = "refs/mirrors";
 
 /// The refs of one ref listing, which [`Repo::select_refs`] returns.
 #[derive(Default)]

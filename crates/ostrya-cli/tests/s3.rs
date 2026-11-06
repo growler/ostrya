@@ -1151,6 +1151,66 @@ fn a_pull_from_an_s3_remote_takes_the_pushed_refs() {
     assert_eq!(scratch.ok(&[&other, "rev-parse", "x:main"]).trim(), tip);
 }
 
+/// A pull from a bucket takes a plain ref and the refs of two collections
+/// in one call. With no summary, it reads the ref files of the bucket. After
+/// `remote summary -u`, it reads the summary, which lists the collection
+/// refs in its collection map.
+#[cfg(feature = "push")]
+#[test]
+fn a_pull_from_a_bucket_takes_plain_and_collection_refs() {
+    let scratch = Scratch::new("pull-collection-refs");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    let src = scratch.repo("src");
+    let (x_a, y_b) = ("@org.example.X:a", "@org.example.Y:b");
+    let main = scratch.commit(&src, "main", "one");
+    let a = scratch.commit(&src, x_a, "two");
+    let b = scratch.commit(&src, y_b, "three");
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&[
+        &src, "push", ADDRESS, "main", x_a, y_b, &endpoint, CLEARTEXT,
+    ]);
+    assert_eq!(
+        ref_of(&server, "repo/refs/mirrors/org.example.X/a").unwrap(),
+        a
+    );
+
+    for (name, summary) in [("dest", false), ("dest-summary", true)] {
+        let dest = scratch.repo(name);
+        scratch.ok(&[
+            &dest,
+            "remote",
+            "add",
+            "--no-gpg-verify",
+            "r",
+            ADDRESS,
+            &format!("--set=s3-endpoint={}", server.endpoint()),
+        ]);
+        if summary {
+            scratch.ok(&[&dest, "remote", "summary", "-u", "r", CLEARTEXT]);
+        }
+        let before = server.state().requests.len();
+        scratch.ok(&[&dest, "pull", "r", "main", x_a, y_b, CLEARTEXT]);
+        let reads_ref_files = server.state().requests[before..]
+            .iter()
+            .any(|(_, target)| target.contains("/refs/mirrors/"));
+        assert_eq!(reads_ref_files, !summary, "{name}");
+        assert_eq!(
+            scratch.ok(&[&dest, "rev-parse", "r:main"]).trim(),
+            main,
+            "{name}"
+        );
+        assert_eq!(scratch.ok(&[&dest, "rev-parse", x_a]).trim(), a, "{name}");
+        assert_eq!(scratch.ok(&[&dest, "rev-parse", y_b]).trim(), b, "{name}");
+        let path = scratch.path().join(name);
+        assert!(
+            path.join("refs/mirrors/org.example.X/a").is_file(),
+            "{name}"
+        );
+        assert!(!path.join("refs/heads/a").exists(), "{name}");
+    }
+}
+
 #[test]
 fn a_pull_refuses_an_s3_address_in_url() {
     let scratch = Scratch::new("pull-url-key");

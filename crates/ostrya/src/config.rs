@@ -1053,6 +1053,30 @@ impl Remote<'_> {
         self.string("collection-id")
     }
 
+    /// Returns the `mirrored-collection-ids` key: the collections that the
+    /// remote serves from `refs/mirrors/<id>/`, in the order of the key.
+    ///
+    /// The summary of such a remote lists the refs of each of these
+    /// collections in `ostree.summary.collection-map`. The key does not need
+    /// `collection-id`. An absent key gives an empty list. An id that occurs
+    /// again counts one time. The key is an ostrya extension.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the value of the key or of `collection-id` holds
+    ///   a malformed escape sequence.
+    /// - The errors of [`check_mirrored_collection_ids`], with the
+    ///   `collection-id` of this remote.
+    pub fn mirrored_collection_ids(&self) -> Result<Vec<String>> {
+        let Some(ids) = self
+            .keyfile
+            .get_string_list(&self.group, MIRRORED_COLLECTION_IDS)?
+        else {
+            return Ok(Vec::new());
+        };
+        check_mirrored_collection_ids(self.collection_id()?.as_deref(), ids)
+    }
+
     /// Returns the `branches` key: the refs of a pull that names no ref.
     ///
     /// # Errors
@@ -1322,6 +1346,43 @@ fn parse_sign_verify(raw: Option<&str>) -> SignVerify {
         return SignVerify::Off;
     }
     SignVerify::Engines(engines)
+}
+
+/// The key of a remote that lists the collections that it mirrors.
+const MIRRORED_COLLECTION_IDS: &str = "mirrored-collection-ids";
+
+/// Checks the ids `ids` of a `mirrored-collection-ids` value of a remote
+/// whose `collection-id` is `own`, and returns them in order, with each id
+/// that occurs again removed.
+///
+/// # Errors
+///
+/// [`Error::InvalidFormat`] if `ids` is empty, if an id fails the
+/// collection-id rule ([`is_collection_id`](crate::is_collection_id)) or is
+/// longer than 255 bytes, or if an id is `own`.
+pub fn check_mirrored_collection_ids(own: Option<&str>, ids: Vec<String>) -> Result<Vec<String>> {
+    if ids.is_empty() {
+        return Err(Error::InvalidFormat(format!(
+            "{MIRRORED_COLLECTION_IDS} holds no collection id"
+        )));
+    }
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !crate::refs::is_valid_collection_id(&id) {
+            return Err(Error::InvalidFormat(format!(
+                "{MIRRORED_COLLECTION_IDS}: invalid collection id: '{id}'"
+            )));
+        }
+        if Some(id.as_str()) == own {
+            return Err(Error::InvalidFormat(format!(
+                "{MIRRORED_COLLECTION_IDS}: {id} is the collection-id of the remote"
+            )));
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// Returns the key-file group name of a remote: `remote "<name>"`.
@@ -2044,5 +2105,42 @@ mod tests {
         assert_eq!(plain.push_user().unwrap(), None);
         assert_eq!(plain.pull_url().unwrap(), None);
         assert_eq!(plain.send_command().unwrap(), None);
+    }
+
+    /// The key keeps the order of its ids and drops a repeated id. It needs
+    /// no `collection-id`, and refuses an empty list, an empty id, an id that
+    /// fails the rule, and the `collection-id` of the remote.
+    #[test]
+    fn mirrored_collection_ids_reads_the_checked_ids() {
+        let ids = |keys: &str| {
+            let text = format!("[core]\nrepo_version=1\nmode=archive-z2\n\n[remote \"r\"]\n{keys}");
+            RepoConfig::parse(&text)
+                .unwrap()
+                .remote("r")
+                .unwrap()
+                .mirrored_collection_ids()
+        };
+        assert_eq!(ids("url=https://ex.com/r\n").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            ids("mirrored-collection-ids=org.ex.B;org.ex.A;org.ex.B;\n").unwrap(),
+            ["org.ex.B", "org.ex.A"]
+        );
+        assert_eq!(
+            ids("collection-id=org.ex.C\nmirrored-collection-ids=org.ex.A\n").unwrap(),
+            ["org.ex.A"]
+        );
+        for keys in [
+            "mirrored-collection-ids=\n",
+            "mirrored-collection-ids=;\n",
+            "mirrored-collection-ids=org.ex.A;;org.ex.B\n",
+            "mirrored-collection-ids=org/ex\n",
+            "mirrored-collection-ids=1org.ex\n",
+            "collection-id=org.ex.C\nmirrored-collection-ids=org.ex.A;org.ex.C\n",
+        ] {
+            assert!(
+                matches!(ids(keys), Err(Error::InvalidFormat(_))),
+                "{keys:?}"
+            );
+        }
     }
 }

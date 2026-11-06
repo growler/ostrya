@@ -289,8 +289,9 @@ impl PullFlags {
     /// each pulled commit names the ref that the pull reads. A commit with no
     /// binding key passes. A commit with a list that does not name the ref
     /// fails the pull with [`Error::Pull`]. The flag does not skip the
-    /// collection-binding check of an `@ID:NAME` name in a local pull without
-    /// [`no_ref_writes`](PullOptions::no_ref_writes) ([`Repo::pull_local`]).
+    /// collection-binding check of an `@ID:NAME` name in a pull without
+    /// [`no_ref_writes`](PullOptions::no_ref_writes) ([`Repo::pull_local`],
+    /// [`Repo::pull`]).
     /// [`Repo::pull_collection`] refuses this flag, because it always checks
     /// the bindings. To pull a tip with no
     /// collection binding, set
@@ -305,7 +306,8 @@ impl PullFlags {
     /// A mirror of a remote: local refs, and a copy of the summary.
     ///
     /// [`Repo::pull`] writes the pulled refs as local refs under
-    /// `refs/heads/`. If [`refs`](PullOptions::refs) is empty, the pull takes
+    /// `refs/heads/`, and refuses an `@ID:NAME` name in
+    /// [`refs`](PullOptions::refs). If `refs` is empty, the pull takes
     /// each ref that the summary of the remote lists. If the pull takes each
     /// such ref, it copies the `summary` and `summary.sig` bytes of the remote
     /// to this repository.
@@ -564,6 +566,9 @@ pub struct PullOptions {
     ///
     /// A local pull reads each name as a revision of the source, `@ID:NAME`
     /// and a `^` suffix included, as [`Repo::pull_local`] states.
+    /// [`Repo::pull`] and [`Repo::pull_with_session`] read each name as a ref
+    /// `NAME` or a collection ref `@ID:NAME`, and refuse each other form, as
+    /// [`Repo::pull`] states in "Refs".
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
@@ -574,7 +579,7 @@ pub struct PullOptions {
     /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
     /// write local refs under `refs/heads/`. [`Repo::pull`] then writes the
     /// refs under the name of the remote. A pull from a remote writes local
-    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. A local
+    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. Each
     /// pull writes the ref of an `@ID:NAME` name as the collection ref of
     /// `ID`, whatever the value. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
@@ -2620,13 +2625,11 @@ pub(crate) fn partial_path(commit: &Checksum) -> String {
 pub(crate) enum RefPlace<'a> {
     /// The local refs, `refs/heads/<name>`.
     Heads,
-    /// The refs of a remote, `refs/remotes/<remote>/<name>`.
-    Remote(&'a str),
     /// The refs of a collection, `refs/mirrors/<id>/<name>`.
     Collection(&'a str),
-    /// The refs that the names of a local pull give, as
-    /// [`Repo::pull_local`] states. An `@ID:NAME` name is the collection ref
-    /// of `ID`, or the local ref `NAME` if `ID` is `own`, the
+    /// The refs that the names of a pull give, as [`Repo::pull_local`] and
+    /// [`Repo::pull`] state. An `@ID:NAME` name is the collection ref of
+    /// `ID`, or the local ref `NAME` if `ID` is `own`, the
     /// `[core] collection-id` of the repository. Each other name is a ref
     /// of the remote `remote`, or a refspec if `remote` is `None`.
     Operands {
@@ -2638,15 +2641,6 @@ pub(crate) enum RefPlace<'a> {
 }
 
 impl<'a> RefPlace<'a> {
-    /// Returns the refs of the remote `remote`, or the local refs if `remote`
-    /// is `None`.
-    pub(crate) fn of_remote(remote: Option<&'a str>) -> RefPlace<'a> {
-        match remote {
-            Some(remote) => RefPlace::Remote(remote),
-            None => RefPlace::Heads,
-        }
-    }
-
     /// Returns the refs of the collection `id` in `repo`: the local refs if
     /// `id` is the `[core] collection-id` of `repo`, else the collection refs.
     pub(crate) fn of_collection(repo: &Repo, id: &'a str) -> RefPlace<'a> {
@@ -2678,7 +2672,6 @@ impl<'a> RefPlace<'a> {
     fn named(self, name: &str) -> Ref {
         match self {
             RefPlace::Heads => refspec_ref(name),
-            RefPlace::Remote(remote) => Ref::remote(remote, name),
             RefPlace::Collection(id) => Ref::collection(id, name),
             RefPlace::Operands { remote, own } => match operand_collection(name) {
                 Some((id, name)) => canonical_ref(own, Ref::collection(id, name)),
@@ -2711,10 +2704,11 @@ async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, 
     Ok(out)
 }
 
-/// Returns the collection id and the rest of an `@ID:NAME` name of a local
-/// pull, or `None` if the name does not start with `@`. The rest can hold a
-/// `^` suffix. [`check_local_operands`] checked each name that starts with
-/// `@`, so it holds a `:`.
+/// Returns the collection id and the rest of an `@ID:NAME` name of a pull,
+/// or `None` if the name does not start with `@`. The rest of a name of a
+/// local pull can hold a `^` suffix. [`check_local_operands`] and
+/// [`check_remote_operands`] checked each name that starts with `@`, so it
+/// holds a `:`.
 fn operand_collection(name: &str) -> Option<(&str, &str)> {
     name.strip_prefix('@')?.split_once(':')
 }
@@ -3534,6 +3528,31 @@ fn check_local_operands(opts: &PullOptions) -> Result<()> {
     Ok(())
 }
 
+/// Checks each name of a pull from a remote.
+///
+/// Each name must be a ref `NAME` or a collection ref `@ID:NAME` that
+/// [`Ref`] reads. The function refuses each other name with
+/// [`Error::InvalidRefspec`], which holds the name as given: a remote ref
+/// `REMOTE:NAME`, a `^` suffix, and a part that fails its rule. Under
+/// [`MIRROR`](PullFlags::MIRROR), it refuses an `@ID:NAME` name with
+/// [`Error::InvalidInput`]. The check reads nothing.
+fn check_remote_operands(opts: &PullOptions) -> Result<()> {
+    let mirror = opts.flags.contains(PullFlags::MIRROR);
+    for name in &opts.refs {
+        match name.parse::<Ref>() {
+            Ok(Ref::Local { .. }) => {}
+            Ok(Ref::Collection { .. }) if !mirror => {}
+            Ok(Ref::Collection { .. }) => {
+                return Err(Error::InvalidInput(format!(
+                    "a mirror pull takes no collection ref: {name}"
+                )));
+            }
+            _ => return Err(Error::InvalidRefspec(name.clone())),
+        }
+    }
+    Ok(())
+}
+
 /// Refuses a [`remote`](PullOptions::remote) that
 /// [`valid_remote_name`](crate::config::valid_remote_name) refuses.
 ///
@@ -3774,7 +3793,8 @@ struct TipChecks<'a> {
     /// must state, or `None` for no collection-binding check of each ref.
     collection: Option<&'a str>,
     /// `true` if the `ostree.collection-binding` of the tip of an `@ID:NAME`
-    /// name must state `ID`, as [`Repo::pull_local`] states.
+    /// name must state `ID`, as [`Repo::pull_local`] and [`Repo::pull`]
+    /// state.
     operand_collections: bool,
     /// `true` if a tip with no `ostree.collection-binding` key passes the
     /// collection-binding check.
@@ -4151,20 +4171,27 @@ mod tests {
             "refs/heads/os/stable"
         );
         assert_eq!(
-            RefPlace::Remote("origin").ref_path("os/stable").unwrap(),
-            "refs/remotes/origin/os/stable"
-        );
-        assert_eq!(
             RefPlace::Collection("org.example.Os")
                 .ref_path("os/stable")
                 .unwrap(),
             "refs/mirrors/org.example.Os/os/stable"
         );
-        assert_eq!(RefPlace::of_remote(None), RefPlace::Heads);
-        assert_eq!(
-            RefPlace::of_remote(Some("origin")),
-            RefPlace::Remote("origin")
-        );
+        // The names of a pull from the remote `origin` into a repository
+        // whose own id is `org.example.Own`.
+        let operands = RefPlace::Operands {
+            remote: Some("origin"),
+            own: Some("org.example.Own"),
+        };
+        for (name, path) in [
+            ("os/stable", "refs/remotes/origin/os/stable"),
+            (
+                "@org.example.Os:os/stable",
+                "refs/mirrors/org.example.Os/os/stable",
+            ),
+            ("@org.example.Own:os/stable", "refs/heads/os/stable"),
+        ] {
+            assert_eq!(operands.ref_path(name).unwrap(), path, "{name}");
+        }
         for name in ["../x", "origin:x"] {
             assert!(
                 matches!(

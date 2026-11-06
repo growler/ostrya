@@ -911,6 +911,106 @@ pub async fn build_remote(dir: &Path) -> (Repo, Checksum) {
     (repo, commit)
 }
 
+/// The collection id of the remote that [`build_collection_remote`] builds.
+pub const REMOTE_ID: &str = "org.example.Remote";
+/// A collection that the remote of [`build_collection_remote`] mirrors.
+pub const ID_X: &str = "org.example.X";
+/// A second collection that the remote of [`build_collection_remote`]
+/// mirrors.
+pub const ID_Y: &str = "org.example.Y";
+
+/// Commits the subtree `sub` of `base` into `repo`, with the timestamp
+/// [`FIXED_TS`], the ref binding of the name of `r`, and the collection
+/// binding `collection` if it is set. The function sets `r` to the commit.
+pub async fn commit_bound(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    r: &Ref,
+    collection: Option<&str>,
+) -> Checksum {
+    let binding = collection.map(|id| ("s", Value::Str(id.to_owned())));
+    commit_bound_value(repo, base, sub, r, binding).await
+}
+
+/// Commits the subtree `sub` as [`commit_bound`] does, with the
+/// `ostree.collection-binding` value `binding`, a type and a value, if it is
+/// set.
+pub async fn commit_bound_value(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    r: &Ref,
+    binding: Option<(&str, Value)>,
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let mut modifier = CommitModifier::new(
+        CommitModifierFlags::SKIP_XATTRS | CommitModifierFlags::CANONICAL_PERMISSIONS,
+    );
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new(sub), &mut mtree, Some(&mut modifier))
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let Value::Array(mut metadata) = ref_binding(r.name()) else {
+        unreachable!("the ref binding is an a{{sv}} array")
+    };
+    if let Some((ty, value)) = binding {
+        metadata.push(Value::Tuple(vec![
+            Value::Str("ostree.collection-binding".to_owned()),
+            Value::Variant(Box::new((Type::parse(ty).unwrap(), value))),
+        ]));
+    }
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                subject: Some(r.to_string()),
+                timestamp: Some(FIXED_TS),
+                metadata: Some(Value::Array(metadata)),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref(r, Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Builds a remote archive repository under `dir/remote` with the collection
+/// id [`REMOTE_ID`] and a summary.
+///
+/// Each commit binds the name of its ref, and holds the tree of `dir/src`:
+///
+/// - the local ref `main`, with no collection binding;
+/// - the local ref `c`, bound to [`REMOTE_ID`];
+/// - the collection ref `@ID_X:a`, bound to [`ID_X`];
+/// - the collection ref `@ID_Y:b`, bound to [`ID_Y`].
+///
+/// Returns the repository and the commits in this order.
+pub async fn build_collection_remote(dir: &Path) -> (Repo, [Checksum; 4]) {
+    build_tree(&dir.join("src"), b"hello\n");
+    let repo = Repo::create(
+        &dir.join("remote"),
+        CreateOptions::new(RepoMode::Archive).collection_id(REMOTE_ID),
+    )
+    .await
+    .unwrap();
+    let main = commit_bound(&repo, dir, "src", &Ref::local("main"), None).await;
+    let c = commit_bound(&repo, dir, "src", &Ref::local("c"), Some(REMOTE_ID)).await;
+    let a = commit_bound(&repo, dir, "src", &Ref::collection(ID_X, "a"), Some(ID_X)).await;
+    let b = commit_bound(&repo, dir, "src", &Ref::collection(ID_Y, "b"), Some(ID_Y)).await;
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(FIXED_TS),
+        ..SummaryOptions::default()
+    })
+    .await
+    .unwrap();
+    (repo, [main, c, a, b])
+}
+
 /// Builds a remote archive repository under `dir/remote` with one commit and
 /// two refs.
 ///

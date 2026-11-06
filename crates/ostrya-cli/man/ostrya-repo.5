@@ -171,6 +171,13 @@ It removes a staging directory with no lock file, and each other entry except a 
 \fB\%<repo>/extensions/\fR
 Reserved.
 \fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored, except \fB\%extensions/ostrya/\fR.
+The repository holds no symbolic link.
+A ref alias and a symbolic link object of a \fB\%bare\fR repository are entries of the format, and the rule does not apply to them.
+Each read and write of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, and these two directories.
+Each prune and fsck of the composefs images refuses the same symbolic links.
+The error names the path relative to the repository: \fB\%invalid format: <path> is a symlink; ostrya refuses a symlink in the repository\fR.
+A read of a composefs image refuses it with the error \fB\%ELOOP\fR, and the error names no path.
+A read of a summary by \fB\%ostrya serve\fR refuses it with no error, and the server answers 404, as for a summary that does not exist.
 .TP
 \fB\%<repo>/extensions/ostrya/summary/\fR
 The summaries of the authentication items of the client groups.
@@ -200,7 +207,7 @@ With \fB\%[ex\-ostrya] generate\-composefs=true\fR, \fB\%ostrya commit\fR, \fB\%
 \fB\%ostrya prune\fR removes the images of the commits that it removes before the first commit, and keeps an image whose commit is absent.
 \fB\%ostrya fsck\fR checks it against the key of its commit, and notes an image whose commit is absent.
 With \fB\%generate\-composefs=true\fR, it also notes a complete commit with the key and no image.
-ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, and \fB\%RESOLVE_NO_SYMLINKS\fR, so a symbolic link in its path stops each read.
+ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, and \fB\%RESOLVE_NO_SYMLINKS\fR, so a symbolic link in its path stops each read with the error \fB\%ELOOP\fR.
 No transfer carries it, and \fB\%ostrya serve\fR does not serve it.
 The \fB\%ostree\fR tool does not check, count, or remove it.
 .TP

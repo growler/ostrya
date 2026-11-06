@@ -23,14 +23,12 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::perm;
 use crate::repo::Repo;
-use crate::summary::{EXTENSION_DIR_MODE, open_extension_dir};
+use crate::summary::{EXTENSION_DIR_MODE, extension_entry_error, open_extension_dir};
 
 /// The directory of the images, relative to the root of the repository.
 pub(crate) const IMAGE_DIR: &str = "extensions/ostrya/composefs";
 /// The components of [`IMAGE_DIR`], from the root of the repository.
 const IMAGE_DIR_PARTS: [&str; 3] = ["extensions", "ostrya", "composefs"];
-/// The files of [`IMAGE_DIR`], as the error of a symlink names them.
-const WHAT: &str = "the composefs images";
 /// The extension of an image file.
 const EXTENSION: &str = "cfs";
 
@@ -100,7 +98,7 @@ pub(crate) fn open_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<std
 ///   no directory.
 /// - [`Error::Io`] if a read of a directory fails.
 pub(crate) fn list_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>> {
-    let Some(dir) = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, WHAT, None, false)? else {
+    let Some(dir) = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, None, false)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -152,7 +150,7 @@ pub(crate) fn unlink_blocking(
     commits: impl IntoIterator<Item = Checksum>,
     fsync: bool,
 ) -> Result<()> {
-    let Some(dir) = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, WHAT, None, false)? else {
+    let Some(dir) = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, None, false)? else {
         return Ok(());
     };
     // Each `<xx>/` that the call opened, with the switch that it removed an
@@ -166,7 +164,7 @@ pub(crate) fn unlink_blocking(
             Entry::Vacant(entry) => entry.insert(match open_fanout(dir.as_fd(), fanout) {
                 Ok(fd) => Some((fd, false)),
                 Err(Errno::NOENT) => None,
-                Err(e) => return Err(fanout_error(fanout, e)),
+                Err(e) => return Err(fanout_error(dir.as_fd(), fanout, e)),
             }),
         };
         let Some((sub, removed)) = entry else {
@@ -212,7 +210,7 @@ pub(crate) fn publish_blocking(
     if images.is_empty() {
         return Ok(());
     }
-    let dir = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, WHAT, Some(repo_mode), fsync)?
+    let dir = open_extension_dir(repo_fd, &IMAGE_DIR_PARTS, Some(repo_mode), fsync)?
         .expect("a create of the image directory gives the directory");
     let mut fanouts: Vec<(String, OwnedFd)> = Vec::new();
     for (staging, dest) in images {
@@ -225,7 +223,8 @@ pub(crate) fn publish_blocking(
                     Err(Errno::EXIST) => {}
                     Err(e) => return Err(e.into()),
                 }
-                let sub = open_fanout(dir.as_fd(), fanout).map_err(|e| fanout_error(fanout, e))?;
+                let sub = open_fanout(dir.as_fd(), fanout)
+                    .map_err(|e| fanout_error(dir.as_fd(), fanout, e))?;
                 fanouts.push((fanout.to_owned(), sub));
                 fanouts.len() - 1
             }
@@ -252,13 +251,13 @@ fn open_fanout(dir: BorrowedFd<'_>, fanout: &str) -> rustix::io::Result<OwnedFd>
     )
 }
 
-/// Returns the error of an open of the `<xx>/` directory `fanout` that
-/// failed with `err`.
-fn fanout_error(fanout: &str, err: Errno) -> Error {
+/// Returns the error of an open of the `<xx>/` directory `fanout` of `dir`
+/// that failed with `err`, as [`extension_entry_error`] states.
+fn fanout_error(dir: BorrowedFd<'_>, fanout: &str, err: Errno) -> Error {
     match err {
-        Errno::NOTDIR | Errno::LOOP => Error::InvalidFormat(format!(
-            "{IMAGE_DIR}/{fanout} is not a directory; {WHAT} follow no symlink"
-        )),
+        Errno::NOTDIR | Errno::LOOP => {
+            extension_entry_error(dir, fanout, &format!("{IMAGE_DIR}/{fanout}"))
+        }
         e => e.into(),
     }
 }

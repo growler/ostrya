@@ -415,6 +415,21 @@ commits leaves unreachable commits with no image, and the next prune deletes
 them. The prune does not list the images. An image whose commit is absent
 comes only from a change outside the port, and the fsck notes it.
 
+The repository holds no symlink. A ref alias and a symlink object of a
+`bare` repository are symlinks that the format allows. They are entries of
+the format, so the rule does not apply to them. Each read and write of the
+composefs images and of the summaries of the client groups refuses a symlink
+at `extensions/`, `extensions/ostrya/`, `extensions/ostrya/composefs/`, and
+`extensions/ostrya/summary/`. Each prune and fsck of the composefs images
+refuses the same symlinks. A symlink there makes a write or a removal reach
+a file outside the repository. The error names the path relative to the
+repository root:
+`invalid format: PATH is a symlink; ostrya refuses a symlink in the repository`.
+The read of a stored image is one `openat2` with `RESOLVE_NO_SYMLINKS`, so
+a symlink in its path fails the read with `ELOOP`. `ostrya serve` reads a
+summary with a walk that opens each component with `O_NOFOLLOW`. A symlink
+there gives no error, and the server answers 404, as for an absent summary.
+
 ## The generation of the composefs image
 
 The key `[ex-ostrya] generate-composefs`, default `false`, makes the commit

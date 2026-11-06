@@ -6355,6 +6355,11 @@ The read:
   of `openat2`, `ENOSYS` included, fails the read.
 - The write opens each directory of the path one component at a time with
   `O_NOFOLLOW`, and refuses a component that is a symlink or no directory.
+  A symlink gives the error
+  `invalid format: PATH is a symlink; ostrya refuses a symlink in the repository`.
+  Each other entry that is no directory gives the error
+  `invalid format: PATH is not a directory`. `PATH` is the path of the
+  component relative to the repository root, for example `extensions/ostrya`.
 
 No transfer carries the image. A pull, a push, a one-way stream, a static
 delta, the archive view, `ostrya serve`, and a bucket repository carry no
@@ -6369,11 +6374,16 @@ The prune and the fsck:
   commit keeps its image. The prune does not list
   `extensions/ostrya/composefs/`, so it keeps an image whose commit is
   absent. No prune count and no byte count of freed space includes
-  the image.
+  the image. The removal refuses a symlink or an entry that is no directory
+  at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/`, with the error of
+  the write.
 - The fsck lists the commits and the images one time, after the checks of
   the refs. It checks each image whose commit is present against the key of
   the commit, and notes each image whose commit is absent. Each commit that the fsck deletes loses its
-  image first. No fsck count includes an image.
+  image first. No fsck count includes an image. The listing refuses a
+  symlink or an entry that is no directory at `extensions/`, `ostrya/`, or
+  `composefs/`, with the error of the write, and skips such an entry at
+  `<xx>/`. The removal refuses it at each of the four, with the same error.
 - With `[ex-ostrya] generate-composefs` true, the fsck also notes each
   complete commit whose key reads, that has no image, and that the run did not
   delete, tombstone, or mark partial. A note is not an error.

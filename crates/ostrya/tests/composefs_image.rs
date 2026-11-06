@@ -13,7 +13,9 @@
 //!   holds no image. In a `bare-user-shared` repository, the directories of
 //!   the store get the shared mode.
 //! - A symlink at a component of the path of an image stops each read and
-//!   each write of the image.
+//!   each write of the image. fsck and prune refuse a symlink or a file that
+//!   is no directory at a component of the store, and the message names the
+//!   path.
 //! - A write refuses a commit without the key, a malformed key, and an image
 //!   of another tree, and stores nothing.
 //! - A changed image fails the check and fsck, and a second write replaces
@@ -940,6 +942,57 @@ fn a_symlink_in_the_image_path_stops_each_read_and_write() {
             repo.check_composefs_image(&commit).await.unwrap(),
             ComposefsImageState::Valid
         );
+    });
+}
+
+/// A symlink at `extensions/`, `ostrya/`, or `composefs/` stops fsck and a
+/// prune that deletes a commit, and the message names the path and the
+/// symlink. A regular file in place of `composefs/` gives a message that
+/// names the path and no directory.
+#[test]
+fn a_symlink_in_extensions_names_the_path_in_fsck_and_prune() {
+    let scratch = TmpDir::new("cfs-symlink-message");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let root = scratch.path().join("repo");
+    block_on(async {
+        let repo = new_repo(&root, RepoMode::BareUser, "").await;
+        let commit = commit_owned(&repo, &base).await;
+        std::fs::create_dir_all(root.join("extensions/ostrya/composefs")).unwrap();
+        let prune = PruneOptions {
+            delete_commit: Some(commit),
+            ..PruneOptions::default()
+        };
+        let moved = scratch.path().join("moved");
+        for part in [
+            "extensions",
+            "extensions/ostrya",
+            "extensions/ostrya/composefs",
+        ] {
+            let path = root.join(part);
+            std::fs::rename(&path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &path).unwrap();
+
+            let want = format!(
+                "invalid format: {part} is a symlink; ostrya refuses a symlink in the repository"
+            );
+            let err = repo.fsck(&FsckOptions::default()).await.unwrap_err();
+            assert_eq!(err.to_string(), want, "fsck");
+            let err = repo.prune(&prune).await.unwrap_err();
+            assert_eq!(err.to_string(), want, "prune");
+
+            std::fs::remove_file(&path).unwrap();
+            std::fs::rename(&moved, &path).unwrap();
+        }
+
+        let path = root.join("extensions/ostrya/composefs");
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let want = "invalid format: extensions/ostrya/composefs is not a directory";
+        let err = repo.fsck(&FsckOptions::default()).await.unwrap_err();
+        assert_eq!(err.to_string(), want, "fsck");
+        let err = repo.prune(&prune).await.unwrap_err();
+        assert_eq!(err.to_string(), want, "prune");
     });
 }
 

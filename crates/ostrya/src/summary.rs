@@ -33,7 +33,7 @@ use ostrya_core::{
     Checksum, Commit, DirMeta, ObjectType, RefSelector, RepoMode, Type, Value, choose_offset_size,
     from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
 };
-use rustix::fs::{AtFlags, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess, SummaryFiles};
@@ -2734,7 +2734,7 @@ fn open_summary_dir(
     create: Option<RepoMode>,
     fsync: bool,
 ) -> Result<Option<OwnedFd>> {
-    open_extension_dir(repo_fd, &SUMMARY_DIR_PARTS, "the summaries", create, fsync)
+    open_extension_dir(repo_fd, &SUMMARY_DIR_PARTS, create, fsync)
 }
 
 /// Opens the directory `parts` under `repo_fd`, one component at a time,
@@ -2747,12 +2747,10 @@ fn open_summary_dir(
 /// `create`, a component that does not exist gives `None`.
 ///
 /// A component that is a symlink, or that is no directory, gives
-/// [`Error::InvalidFormat`]. The message names the path and `what`, the files
-/// of the directory.
+/// [`Error::InvalidFormat`], as [`extension_entry_error`] states.
 pub(crate) fn open_extension_dir(
     repo_fd: BorrowedFd<'_>,
     parts: &[&str],
-    what: &str,
     create: Option<RepoMode>,
     fsync: bool,
 ) -> Result<Option<OwnedFd>> {
@@ -2792,14 +2790,33 @@ pub(crate) fn open_extension_dir(
         dir = Some(match opened {
             Ok(fd) => fd,
             Err(Errno::NOTDIR | Errno::LOOP) => {
-                return Err(Error::InvalidFormat(format!(
-                    "{path} is not a directory; {what} follow no symlink"
-                )));
+                return Err(extension_entry_error(parent, part, &path));
             }
             Err(e) => return Err(e.into()),
         });
     }
     Ok(dir)
+}
+
+/// Returns the error of the entry `part` of `parent`, at the path `path`
+/// relative to the root of the repository, which an open as a directory with
+/// no symlink followed refused.
+///
+/// A symlink gives [`Error::InvalidFormat`] with the text
+/// `{path} is a symlink; ostrya refuses a symlink in the repository`. Each
+/// other entry gives [`Error::InvalidFormat`] with the text
+/// `{path} is not a directory`. A stat of the entry that fails gives its
+/// errno.
+pub(crate) fn extension_entry_error(parent: BorrowedFd<'_>, part: &str, path: &str) -> Error {
+    match rustix::fs::statat(parent, part, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
+            Error::InvalidFormat(format!(
+                "{path} is a symlink; ostrya refuses a symlink in the repository"
+            ))
+        }
+        Ok(_) => Error::InvalidFormat(format!("{path} is not a directory")),
+        Err(e) => e.into(),
+    }
 }
 
 /// Returns `true` if `name` is 64 lowercase hex digits.

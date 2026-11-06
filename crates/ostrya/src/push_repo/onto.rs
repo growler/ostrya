@@ -4,10 +4,11 @@
 use std::collections::HashSet;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Commit, ObjectName, ObjectType};
+use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Ref};
 
 use super::invalid;
 use super::negotiate::{check_tag_names, collection_id_refusal};
+use super::refspec::in_collection;
 use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
@@ -26,31 +27,38 @@ const BINDING_KEYS: [&str; 2] = ["ostree.ref-binding", "ostree.collection-bindin
 /// The options of [`Repo::push_onto`] and [`Repo::push_onto_over_stream`].
 ///
 /// The struct is not `#[non_exhaustive]`. A caller can build it with
-/// `..Default::default()`.
-#[derive(Debug, Clone, Default)]
+/// `..Default::default()`. The default branch is the local ref with an
+/// empty name, which the push refuses, so a caller sets
+/// [`onto`](PushOntoOptions::onto).
+#[derive(Debug, Clone)]
 pub struct PushOntoOptions {
     /// The revision of the local commit, as
     /// [`resolve_rev`](Repo::resolve_rev) reads it.
     pub rev: String,
-    /// The branch of the server that the server moves to the new commit.
+    /// The branch of the server that the server moves to the new commit: a
+    /// local ref `NAME`, or a ref `@ID:NAME` of the collection `ID`.
     ///
     /// The parent of the new commit is the commit of the branch on the
     /// server when the server writes the commit. If the branch is absent,
     /// the commit has no parent.
-    pub onto: String,
-    /// The collection id of the namespace of the server that the push
-    /// writes.
+    pub onto: Ref,
+    /// The collection id that a plain branch and each plain tag take.
     ///
-    /// `None` writes the local refs of the server. The collection id of the
-    /// server also writes its local refs. The bindings of the local commit
-    /// do not select the namespace.
+    /// With `Some(ID)`, a plain branch or tag `NAME` is the ref `@ID:NAME`. A
+    /// branch or tag `@ID:NAME` stays, and a branch or tag `@Y:NAME`, with
+    /// `Y` other than `ID`, refuses the push before the session opens. The
+    /// collection does not change [`bind_refs`](PushOntoOptions::bind_refs).
+    /// The bindings of the local commit do not select the namespace.
     pub collection: Option<String>,
     /// The tags that the server creates at the new commit, in order.
     ///
-    /// The server binds each tag. A tag that exists on the server refuses
-    /// the push.
-    pub tags: Vec<String>,
+    /// A tag is a local ref `NAME` or a ref `@ID:NAME`. The branch and each
+    /// tag are in one namespace of the server. The server binds the name
+    /// part of each tag. A tag that exists on the server refuses the push.
+    pub tags: Vec<Ref>,
     /// The names that the new commit binds and that get no ref, in order.
+    ///
+    /// Each name is a plain ref name.
     pub bind_refs: Vec<String>,
     /// The switch that makes a commit with no parent.
     ///
@@ -65,6 +73,22 @@ pub struct PushOntoOptions {
     pub compression: Compression,
     /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,
+}
+
+impl Default for PushOntoOptions {
+    fn default() -> PushOntoOptions {
+        PushOntoOptions {
+            rev: String::new(),
+            onto: Ref::local(String::new()),
+            collection: None,
+            tags: Vec::new(),
+            bind_refs: Vec::new(),
+            orphan: false,
+            timestamp: None,
+            compression: Compression::default(),
+            progress: None,
+        }
+    }
 }
 
 /// The local work of a server commit before the session opens.
@@ -134,8 +158,10 @@ impl Repo {
     ///
     /// # Before the session
     ///
-    /// The push checks the names and the collection id before it writes a
-    /// byte. Then it takes the repository lock as [`LockKind::Shared`] and
+    /// The push checks the collection id and the names before it writes a
+    /// byte. [`collection`](PushOntoOptions::collection) applies to the
+    /// branch and to each tag. The push refuses a branch and tags of two
+    /// collections, `@X:NAME` and `@Y:NAME`. Then it takes the repository lock as [`LockKind::Shared`] and
     /// holds it until the push sent the objects that the server lacks.
     /// `Commit` reads no local object. The push resolves
     /// [`rev`](PushOntoOptions::rev) and reads its commit. The commit must not
@@ -157,13 +183,16 @@ impl Repo {
     ///
     /// # Session
     ///
-    /// The session opens with the branch, then each tag, and with
-    /// [`collection`](PushOntoOptions::collection) in `Hello`. After
-    /// `HelloReply`, the push refuses a tag that the server holds. Then it
-    /// checks the `Commit` frame of the server commit and the longest
-    /// `CommitReply` against the `max-frame` of the server with
-    /// [`PushSession::check_server_commit`]. Each refusal comes before the
-    /// push offers an object.
+    /// The session opens with the text of the branch, then of each tag.
+    /// After `HelloReply`, the push refuses a tag that the server holds. Then
+    /// it runs [`PushSession::check_server_commit`]: the branch and each tag
+    /// must be in one namespace after the server maps the refs of its
+    /// collection id to its local refs, and the `Commit` frame of the server
+    /// commit and the longest `CommitReply` must fit in the `max-frame` of
+    /// the server. Each refusal comes before the push offers an object.
+    ///
+    /// The push does not check the bindings of the local commit. The server
+    /// writes the bindings of the namespace of the branch.
     ///
     /// The push walks the tree of the commit and offers each of its objects
     /// in one round of `Have`. It sends the objects that the server lacks,
@@ -177,15 +206,18 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] with the name if
-    ///   [`validate_refspec`](crate::validate_refspec) refuses the branch or a
-    ///   tag, or if the name holds a `:` or is 64 lowercase hex characters.
-    ///   The same error is given for a bound name that
-    ///   `validate_refspec` refuses or that holds a `:`.
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
-    ///   if a tag is named twice or is the branch, or if `collection` fails
-    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
-    ///   bytes.
+    ///   if `collection` fails [`is_collection_id`](crate::is_collection_id)
+    ///   or is longer than 255 bytes.
+    /// - [`Error::InvalidRefspec`] with the text of the ref if the branch or
+    ///   a tag fails [`Ref::validate`], is a remote ref, or is a local ref of
+    ///   64 lowercase hex characters. The same error is given for a bound
+    ///   name that [`validate_refspec`](crate::validate_refspec) refuses or
+    ///   that holds a `:`.
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
+    ///   if the branch or a tag names a collection other than `collection`,
+    ///   if a tag is named twice or is the branch, or if the branch and the
+    ///   tags name two collections.
     /// - [`Error::RefNotFound`], [`Error::AmbiguousRefspec`],
     ///   [`Error::NoParentCommit`], or another error of
     ///   [`resolve_rev`](Repo::resolve_rev) if `rev` does not resolve.
@@ -201,6 +233,9 @@ impl Repo {
     /// - [`Error::Remote`] with
     ///   [`RefMismatch`](crate::remote::Error::RefMismatch) if `HelloReply`
     ///   reports a commit for a tag.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the branch
+    ///   and the tags are in two namespaces of the server.
     /// - [`Error::Remote`] with
     ///   [`LimitExceeded`](crate::remote::Error::LimitExceeded) if the
     ///   `Commit` frame of the server commit, or the longest `CommitReply`
@@ -234,22 +269,24 @@ impl Repo {
     /// Runs the refusals of a server commit and reads the local commit, under
     /// the repository lock held shared.
     async fn plan_onto(&self, opts: &PushOntoOptions) -> Result<Onto> {
-        check_ref_name(&opts.onto)?;
-        check_tag_names(&opts.tags)?;
-        if opts.tags.contains(&opts.onto) {
-            return Err(invalid(format!(
-                "the tag '{}' is also the branch",
-                opts.onto
-            )));
+        let collection = opts.collection.as_deref();
+        if let Some(reason) = collection.and_then(collection_id_refusal) {
+            return Err(invalid(reason));
         }
+        let [branch] = &check_tag_names(std::slice::from_ref(&opts.onto), None)?[..] else {
+            unreachable!("one branch gives one ref");
+        };
+        let branch = in_collection(branch.clone(), collection, "branch")?;
+        let tags = check_tag_names(&opts.tags, collection)?;
+        if tags.contains(&branch) {
+            return Err(invalid(format!("the tag '{branch}' is also the branch")));
+        }
+        check_one_collection(&branch, &tags)?;
         for name in &opts.bind_refs {
             crate::validate_refspec(name)?;
             if name.contains(':') {
                 return Err(Error::InvalidRefspec(name.clone()));
             }
-        }
-        if let Some(reason) = opts.collection.as_deref().and_then(collection_id_refusal) {
-            return Err(invalid(reason));
         }
         let lock = self.lock_repo(LockKind::Shared).await?;
         let checksum = self
@@ -271,38 +308,57 @@ impl Repo {
                 "commit {checksum} has related objects, which a server commit cannot carry"
             )));
         }
+        let commit = server_commit(commit, metadata, &branch, &tags, opts);
         Ok(Onto {
             repo: self.clone(),
             lock,
-            refs: std::iter::once(opts.onto.clone())
-                .chain(opts.tags.iter().cloned())
+            refs: std::iter::once(commit.branch.clone())
+                .chain(commit.tags.iter().cloned())
                 .collect(),
-            commit: server_commit(commit, metadata, opts),
+            commit,
         })
     }
 }
 
-/// Refuses a branch name that a server commit cannot write.
+/// Refuses a branch and tags of two collections, before the session opens.
 ///
-/// The name passes [`validate_refspec`](crate::validate_refspec), holds no
-/// `:`, and is not 64 lowercase hex characters. Each refusal is
-/// [`Error::InvalidRefspec`] with the name.
-fn check_ref_name(name: &str) -> Result<()> {
-    crate::validate_refspec(name)?;
-    if name.contains(':') || ostrya_core::is_checksum_shaped(name) {
-        return Err(Error::InvalidRefspec(name.to_owned()));
+/// The branch and each tag of a server commit are in one namespace of the
+/// server. Two refs `@X:NAME` and `@Y:NAME`, with `X` other than `Y`, are in
+/// two namespaces on each server. A local ref and a ref `@X:NAME` are in one
+/// namespace if `X` is the collection id of the server, so
+/// [`PushSession::check_server_commit`] checks them after `HelloReply`. The
+/// error is [`InvalidInput`](crate::remote::Error::InvalidInput).
+fn check_one_collection(branch: &Ref, tags: &[Ref]) -> Result<()> {
+    let mut first: Option<(&Ref, &str)> = None;
+    for r in std::iter::once(branch).chain(tags) {
+        let Ref::Collection { id, .. } = r else {
+            continue;
+        };
+        match first {
+            Some((other, other_id)) if other_id != id => {
+                return Err(invalid(format!(
+                    "the refs '{other}' and '{r}' of the server commit are in two namespaces"
+                )));
+            }
+            Some(_) => {}
+            None => first = Some((r, id)),
+        }
     }
     Ok(())
 }
 
-/// Returns the server commit of the local commit `commit` under `opts`.
+/// Returns the server commit of the local commit `commit` onto `branch`
+/// with the tags `tags`, under `opts`.
 ///
 /// `metadata` holds the metadata entries of the local commit as bytes, from
 /// [`Commit::parse_with_metadata_entries`]. The entries keep their order and
-/// their bytes, without the binding keys.
+/// their bytes, without the binding keys. The branch and each tag are the
+/// text of their refs, after the collection of `opts` applied.
 fn server_commit(
     commit: Commit,
     mut metadata: Vec<(String, Vec<u8>)>,
+    branch: &Ref,
+    tags: &[Ref],
     opts: &PushOntoOptions,
 ) -> ServerCommit {
     let Commit {
@@ -315,8 +371,8 @@ fn server_commit(
     } = commit;
     metadata.retain(|(key, _)| !BINDING_KEYS.contains(&key.as_str()));
     ServerCommit {
-        branch: opts.onto.clone(),
-        tags: opts.tags.clone(),
+        branch: branch.to_string(),
+        tags: tags.iter().map(Ref::to_string).collect(),
         bind_refs: opts.bind_refs.clone(),
         root_dirtree,
         root_dirmeta,
@@ -331,7 +387,6 @@ fn server_commit(
 /// Returns the options of the session of a server commit.
 fn session_options(opts: &PushOntoOptions) -> SessionOptions {
     SessionOptions {
-        collection: opts.collection.clone(),
         progress: opts.progress.clone(),
         ..SessionOptions::default()
     }
@@ -408,7 +463,7 @@ mod tests {
     fn from_local(local: &Commit, opts: &PushOntoOptions) -> ServerCommit {
         let bytes = local.serialize().unwrap();
         let (commit, metadata) = Commit::parse_with_metadata_entries(&bytes).unwrap();
-        server_commit(commit, metadata, opts)
+        server_commit(commit, metadata, &opts.onto, &opts.tags, opts)
     }
 
     fn string(s: &str) -> Value {
@@ -446,8 +501,8 @@ mod tests {
             entry("ostree.sizes", sizes.clone()),
         ]);
         let opts = PushOntoOptions {
-            onto: "main".into(),
-            tags: vec!["t".into()],
+            onto: Ref::local("main"),
+            tags: vec![Ref::collection("org.example.C", "t")],
             bind_refs: vec!["b".into()],
             orphan: true,
             ..Default::default()
@@ -464,7 +519,7 @@ mod tests {
             ]
         );
         assert_eq!(sc.branch, "main");
-        assert_eq!(sc.tags, ["t"]);
+        assert_eq!(sc.tags, ["@org.example.C:t"]);
         assert_eq!(sc.bind_refs, ["b"]);
         assert!(sc.orphan);
         assert_eq!((sc.subject.as_str(), sc.body.as_str()), ("subject", "body"));
@@ -477,5 +532,21 @@ mod tests {
             ..opts
         };
         assert_eq!(from_local(&commit(Vec::new()), &opts).timestamp, Some(5));
+    }
+
+    /// The branch and the tags of two collections are refused before the
+    /// session. A local ref passes with a ref of any one collection.
+    #[test]
+    fn a_server_commit_names_one_collection_before_the_session() {
+        let r = |text: &str| -> Ref { text.parse().unwrap() };
+        check_one_collection(&r("main"), &[r("t"), r("@org.example.X:u")]).unwrap();
+        check_one_collection(&r("@org.example.X:a"), &[r("@org.example.X:t"), r("u")]).unwrap();
+        match check_one_collection(&r("@org.example.X:a"), &[r("t"), r("@org.example.Y:u")]) {
+            Err(Error::Remote(crate::remote::Error::InvalidInput(message))) => assert!(
+                message.contains("'@org.example.X:a' and '@org.example.Y:u'"),
+                "{message}"
+            ),
+            other => panic!("{other:?}"),
+        }
     }
 }

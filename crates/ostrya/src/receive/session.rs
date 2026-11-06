@@ -5,11 +5,10 @@ use std::io;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{BufReader, BufWriter};
-use ostrya_core::ObjectName;
+use ostrya_core::{Checksum, ObjectName, Ref};
 
 use super::ReceivePolicy;
 use super::core::SessionCore;
-use crate::access::Namespace;
 use crate::error::{Error, Result};
 use crate::remote::proto::{CommitRequest, FrameReader, FrameWriter, Hello, Message, ObjectHeader};
 use crate::remote::{self, RefOutcome};
@@ -28,7 +27,7 @@ pub struct ReceiveReport {
     /// For a server commit, the first outcome is the branch, and one outcome
     /// for each tag follows, in order. The `new` commit of each outcome is the
     /// commit that the server wrote, and a tag has no `old` commit.
-    pub refs: Vec<RefOutcome>,
+    pub refs: Vec<ReceiveRefOutcome>,
     /// The statistics of the session transaction.
     pub stats: TransactionStats,
     /// The steps after the transaction commit that failed.
@@ -40,11 +39,32 @@ pub struct ReceiveReport {
     /// [`ReceivePolicy::group`]. A one-way stream has no client group, so
     /// its report has `None`.
     pub group: Option<String>,
-    /// The collection of the namespace of the session.
+}
+
+/// The result of one ref update of a session that committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveRefOutcome {
+    /// The ref, in its canonical form.
     ///
-    /// `None` is the local refs. A one-way stream writes no collection ref,
-    /// so its report has `None`.
-    pub collection: Option<String>,
+    /// A ref of the collection id of the repository is [`Ref::Local`], so
+    /// the client text `main` and `@ID:main` give the same value.
+    pub name: Ref,
+    /// The commit before the write, or `None` if the ref was absent.
+    pub old: Option<Checksum>,
+    /// The commit after the write, or `None` if the ref is now absent.
+    pub new: Option<Checksum>,
+}
+
+/// The result of [`ReceiveService::commit`](super::ReceiveService::commit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveCommit {
+    /// The report of the session.
+    pub report: ReceiveReport,
+    /// The outcomes of the `CommitReply` that the host sends, in the order
+    /// of [`ReceiveReport::refs`].
+    ///
+    /// The name of each outcome is the text that the client sent.
+    pub reply: Vec<RefOutcome>,
 }
 
 /// A failure of one step after the transaction commit of a session.
@@ -151,16 +171,16 @@ impl Repo {
     /// - A ref of `Hello` is a remote ref `REMOTE:NAME`.
     /// - A ref of `Hello` has no `r` in the
     ///   [rights](super::ReceivePolicy::rights) of the policy in the
-    ///   namespace of `Hello`. `Hello` names the namespace with its
-    ///   collection id. No collection, and the collection id of the
-    ///   repository, name the local refs.
+    ///   namespace of the ref.
     ///
     /// All these checks run before the transaction opens.
     ///
-    /// The session reads and writes the refs of its namespace: the local refs
-    /// under `refs/heads/`, or the refs of a collection under
-    /// `refs/mirrors/ID/`. `HelloReply` reports the collection of a
-    /// collection namespace, and no collection for the local refs.
+    /// Each ref of `Hello` is in its own namespace. A plain `NAME` is the
+    /// local ref under `refs/heads/`. `@ID:NAME` is the ref of the collection
+    /// `ID` under `refs/mirrors/ID/`, or the local ref `NAME` when `ID` is
+    /// the collection id of the repository. One session can read and write
+    /// refs of more than one namespace. `HelloReply` gives each name as the
+    /// client sent it.
     ///
     /// After the checks, the session opens a transaction. The transaction
     /// holds the repository lock shared until the session ends with no
@@ -206,9 +226,14 @@ impl Repo {
     ///    complete (`missing-objects`), and no dependency has dependencies of
     ///    its own (`protocol`).
     /// 6. The ref binding and the collection binding of each new commit
-    ///    (`binding-mismatch`). The collection binding must be the collection
-    ///    of the namespace, or the collection id of the repository for the
-    ///    local refs. A commit with no collection binding passes.
+    ///    (`binding-mismatch`), for each ref in its namespace. The ref binding
+    ///    must hold the name of the ref, without the `@ID:` part. A commit
+    ///    with no ref binding passes, and a commit with an empty list fails.
+    ///    [`disable_verify_bindings`](super::ReceivePolicy::disable_verify_bindings)
+    ///    skips this part. The collection binding must be the collection
+    ///    `ID` of a ref `@ID:NAME`, or the collection id of the repository
+    ///    for a local ref. A commit with no collection binding passes for a
+    ///    local ref, and fails for a ref of another collection.
     /// 7. The signature verification of the policy (`signature-required`).
     ///    The verification applies to each new commit alone. A staged parent
     ///    and a dependency get no verification, unless an update names them.
@@ -267,19 +292,20 @@ impl Repo {
     /// A `Commit` with a server commit holds no update and no `force`. The
     /// session runs these checks in this order:
     ///
-    /// 1. The names (`invalid-ref`): the branch and each tag pass the refspec
-    ///    rule and are not 64 lowercase hex characters, and each bound name
+    /// 1. The names (`invalid-ref`): the branch and each tag are refs, and a
+    ///    local ref is not 64 lowercase hex characters, and each bound name
     ///    passes the refspec rule and has no `:`. Then the form of the message
     ///    (`protocol`): no update, no `force`, the branch and each tag are refs
-    ///    of `Hello`, no ref occurs two times among them, and a commit can
-    ///    hold each metadata value within the depth limit of 128 levels of
-    ///    containers.
+    ///    of `Hello`, no ref occurs two times among them, the branch and each
+    ///    tag are in one namespace, and a commit can hold each metadata value
+    ///    within the depth limit of 128 levels of containers.
     /// 2. The size of `CommitReply` (`limit-exceeded`).
     /// 3. The session holds no detached metadata and staged no commit object
     ///    (`protocol`).
-    /// 4. The rights (`ref-denied`): the branch needs `c`, and each tag needs
-    ///    `t` or `w`. A branch or a tag `ostree-metadata` in the local refs of
-    ///    a repository with a collection id is refused.
+    /// 4. The rights (`ref-denied`), each in the namespace of its ref: the
+    ///    branch needs `c`, and each tag needs `t` or `w`. A branch or a tag
+    ///    `ostree-metadata` in the local refs of a repository with a
+    ///    collection id is refused.
     /// 5. The tree of the commit is complete (`missing-objects`).
     ///
     /// The bindings and the signature verification of the policy do not
@@ -397,20 +423,19 @@ impl Repo {
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
-        self.receive_selected(input, output, |_| Some(policy)).await
+        self.receive_selected(input, output, || Some(policy)).await
     }
 
     /// Runs one push session as [`receive`](Repo::receive) does, under the
-    /// policy that `select` gives for the namespace of `Hello`.
+    /// policy that `select` gives.
     ///
     /// The session calls `select` once, after the checks of
     /// [`check_hello`](super::ReceiveService::check_hello) and before the
-    /// checks of the policy. `Hello` names the namespace with its collection
-    /// id. No collection, and the collection id of the repository, give
-    /// [`Namespace::Local`]. Each other id gives [`Namespace::Collection`].
-    /// A host selects the policy of the client group of the client in that
-    /// namespace, as [`ReceivePolicies::select`](super::ReceivePolicies::select)
-    /// does.
+    /// checks of the policy. A host selects the policy of the client group of
+    /// the client, as
+    /// [`ReceivePolicies::select`](super::ReceivePolicies::select) does. The
+    /// policy applies to each ref of the session, in the namespace of the
+    /// ref.
     ///
     /// # Errors
     ///
@@ -425,7 +450,7 @@ impl Repo {
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
-        S: FnOnce(&Namespace) -> Option<&'p ReceivePolicy> + Send,
+        S: FnOnce() -> Option<&'p ReceivePolicy> + Send,
     {
         let mut session = Session {
             repo: self,
@@ -473,10 +498,10 @@ where
     W: AsyncWrite + Unpin + Send,
 {
     /// Runs the session until it commits or fails. `select` gives the policy
-    /// of the namespace of `Hello`.
+    /// of the session.
     async fn run(
         &mut self,
-        select: impl FnOnce(&Namespace) -> Option<&'p ReceivePolicy>,
+        select: impl FnOnce() -> Option<&'p ReceivePolicy>,
     ) -> std::result::Result<ReceiveReport, Failure> {
         match next(&mut self.reader).await? {
             Message::Hello(hello) => self.hello(hello, select).await?,
@@ -527,7 +552,7 @@ where
     async fn hello(
         &mut self,
         hello: Hello,
-        select: impl FnOnce(&Namespace) -> Option<&'p ReceivePolicy>,
+        select: impl FnOnce() -> Option<&'p ReceivePolicy>,
     ) -> std::result::Result<(), Failure> {
         let (core, reply) = SessionCore::open(self.repo.clone(), select, None, 1, hello).await?;
         self.core = Some(core);
@@ -557,8 +582,8 @@ where
         request: CommitRequest,
     ) -> std::result::Result<ReceiveReport, Failure> {
         let core = self.core.take().expect("the session is open after Hello");
-        let mut report = core.finish(request).await?;
-        let reply = Message::CommitReply(report.refs.clone());
+        let ReceiveCommit { mut report, reply } = core.finish(request).await?;
+        let reply = Message::CommitReply(reply);
         let sent = match self.writer.write_message(&reply).await {
             Ok(()) => self.writer.flush().await,
             Err(e) => Err(e),
@@ -580,7 +605,7 @@ const _: fn() = || {
         assert_send(repo.receive(futures_lite::io::empty(), futures_lite::io::sink(), policy))
     };
     let _ = |repo: &Repo, policy: &ReceivePolicy| {
-        let select = move |_: &Namespace| Some(policy);
+        let select = move || Some(policy);
         assert_send(repo.receive_selected(
             futures_lite::io::empty(),
             futures_lite::io::sink(),

@@ -5176,8 +5176,10 @@ pull`.
 
 ```text
 ostrya receive [--repo=PATH] [--client=NAME]
-ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
-               [--allow-privileged] [--stop-at-commit] [--input=FILE]
+ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]...
+               [--allow-collection=ID]... [--trust=NAME]
+               [--allow-privileged] [--disable-verify-bindings]
+               [--stop-at-commit] [--input=FILE]
 ```
 
 - The `receive` feature of `ostrya-cli` builds the command. It is in the
@@ -5196,15 +5198,22 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
   with white space at its start, ends the command with `error: MESSAGE` at
   exit 1 at the same step. The message shows the name in escaped form, so a
   name with a line feed gives one line.
-- `Hello` names the namespace of the session: the local refs, or one
-  collection. The collection id of the repository names the local refs. The
-  session takes the policy of the client group that carries `ssh:NAME`,
-  with the allow items and the deny items of that namespace. With no such
-  group, the `Hello` gets `ref-denied`, and the command exits 1. A session of a collection
-  reads and writes the refs under `refs/mirrors/ID/`. The session uses no
+- Each ref of `Hello` names its own namespace: `NAME` is a local ref, and
+  `@ID:NAME` is a ref of the collection `ID`, under `refs/mirrors/ID/`. The
+  collection id of the repository names the local refs, so `@ID:NAME` of
+  that id is the local ref `NAME`. One session reads and writes local refs
+  and the refs of more than one collection. The session takes the policy of
+  the client group that carries `ssh:NAME`, with the allow items and the
+  deny items of the namespace of each ref. With no such group, the `Hello`
+  gets `ref-denied`, and the command exits 1. The session uses no
   `anonymous` item and no `net:` item.
   `../format-reference.md`, "Authentication of the receive endpoint",
   states the rules.
+- The session checks the bindings of each new commit against the namespace
+  of its ref (`../format-reference.md`, "Commit and CommitReply", check 7).
+  With `disable-verify-bindings=true` in the client group, the session skips
+  the check of `ostree.ref-binding` (`ostrya-config(1)`, "Client keys"). The
+  check of `ostree.collection-binding` stays on.
 - `--client` is safe only under a forced `command=` in `authorized_keys`,
   because a user with a shell can give any name.
 - The command takes no `--policy`, and the option parser refuses it at
@@ -5222,8 +5231,9 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
   runs no session and writes nothing to standard output. It reads no client
   group, no server group, no key group, and no `LOGNAME`, so it runs with
   neither `--client` nor `LOGNAME`. It reads the trust group of `--trust`
-  alone. `--one-way` conflicts with `--client`. `--allow-remote`, `--trust`,
-  `--allow-privileged`, `--stop-at-commit`, and `--input` each need
+  alone. `--one-way` conflicts with `--client`. `--allow-remote`,
+  `--allow-collection`, `--trust`, `--allow-privileged`,
+  `--disable-verify-bindings`, `--stop-at-commit`, and `--input` each need
   `--one-way`. The option parser refuses each of these cases at exit 1.
 - The repository must exist: `ostrya init` makes it. A `bare` repository
   refuses the stream with `mode-refused` unless the process runs as root,
@@ -5242,10 +5252,27 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
   of `remote add`, and `*` also passes, before the repository opens. A value
   that the rule refuses gets the usage error `error: invalid value 'REMOTE'
   for '--allow-remote <REMOTE>'` with the rule, and exit 1.
+- Each `--allow-collection=ID` adds the pattern rule `@ID:**` with the rule
+  of a plain ref. `ID` is one literal collection id, so no value names each
+  collection. A ref `@ID:NAME` of a collection other than the collection id
+  of the repository takes no default rule, and a ref that no value covers
+  gets `ref-denied`. A ref `@ID:NAME` of the collection id of the
+  repository is a local ref, and takes the rule of a plain ref. A value
+  that is the collection id of the repository adds a rule that matches the
+  local refs, with the rule of a plain ref. The option parser
+  checks `ID` with the collection-id rule before the repository opens, and
+  a value that the rule refuses gets a usage error and exit 1.
+- `--disable-verify-bindings` sets the flag of `StreamPolicy` that skips the
+  check of `ostree.ref-binding`. A commit whose collection binding does not
+  name the namespace of its ref still gets `binding-mismatch`, and so does
+  a commit with no collection binding on a ref of a collection other than
+  the collection id of the repository. Without `--one-way`, the key
+  `disable-verify-bindings` of the client group applies.
 - `--trust=NAME` puts the keys of `[ex-ostrya trust "NAME"]`, from
   `TrustedKeys::from_trust_group`, on the default rule and on each rule of
-  `--allow-remote`. Each commit that is the new value of a ref must pass the
-  keys, and a commit with no signature gets `signature-required`. A
+  `--allow-remote` and of `--allow-collection`. Each commit that is the new
+  value of a ref must pass the keys, and a commit with no signature gets
+  `signature-required`. A
   dependency that field 2 of the commit names gets no verification of its
   own, because the signature of the commit covers field 2. A name with no
   group gets `error: invalid input: the config has no [ex-ostrya trust
@@ -5297,19 +5324,21 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
 
 ```text
 ostrya push [--repo=PATH] REMOTE SRC[:DST]...
-            [--collection=ID] [--tag=NAME]...
+            [--collection=ID] [--tag=NAME|@ID:NAME]...
+            [--disable-verify-bindings]
             [--depth=N] [--force] [--compress[=LEVEL]]
             [--ssh-command=CMD] [--receive-command=CMD]
             [--push-token-file=FILE] [--push-user=NAME]
             [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
             [--tls-ca-path=FILE] [--allow-cleartext-credentials]
 ostrya push [--repo=PATH] REMOTE|s3://BUCKET[/PREFIX] SRC[:DST]...
-            [--collection=ID] [--depth=N] [--force] [--break-lock]
+            [--collection=ID] [--disable-verify-bindings]
+            [--depth=N] [--force] [--break-lock]
             [--s3-region=REGION] [--s3-endpoint=URL]
             [--s3-addressing=path|virtual] [--s3-profile=PROFILE]
             [--allow-cleartext-credentials]
-ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
-            [--collection=ID] [--tag=NAME]... [--bind-ref=NAME]...
+ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
+            [--collection=ID] [--tag=NAME|@ID:NAME]... [--bind-ref=NAME]...
             [--orphan] [--timestamp=TIME] [--compress[=LEVEL]]
             [the transport options of the first form]
 ```
@@ -5323,11 +5352,30 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   requests to the receive endpoint of `serve`. To an `s3://` address the
   push writes a bucket repository ("Bucket repositories").
 - Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
-  `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
-  ref. `:DST` deletes the ref `DST` of the server.
-- A `DST` that the ref-name rule refuses, which includes a `DST` that holds
-  `^`, and a `DST` of 64 lowercase hex characters after a `SRC`, which a
-  revision reads as a commit checksum, are refused with `error: Invalid
+  `DST` is the ref of the server, `NAME` or `@ID:NAME`, and it defaults to
+  the text of `SRC` when `SRC` is a ref. `:DST` deletes the ref `DST` of the
+  server. `DST` is the last ref of the refspec: if the field before the last
+  `:` starts with `@`, `DST` is `@ID:NAME`, else `DST` is the text after the
+  last `:`. A refspec with no `@` thus splits at its last `:`. Examples:
+  - `main` sends `main` to `main`;
+  - `origin:main` sends the revision `origin` to `main`;
+  - `R:main:dst` sends `R:main` to `dst`;
+  - `@X:a` sends `@X:a` to `@X:a`;
+  - `main:@X:a` sends `main` to `@X:a`;
+  - `R:main:@X:a` sends `R:main` to `@X:a`;
+  - `@X:a:b` sends `@X:a` to `b`;
+  - `@X:a:@Y:b` sends `@X:a` to `@Y:b`;
+  - `@X:main^:b` sends the parent of `@X:main` to `b`;
+  - `:@X:a` deletes `@X:a`;
+  - `a:@X` names the `DST` `@X`, which the ref-name rule refuses.
+
+  `send --one-way` and the push to a bucket repository split a refspec with
+  the same parser. `../decisions.md`, "The ref syntax", states the
+  grammar.
+- A `DST` that is neither `NAME` nor `@ID:NAME` under the ref-name rule,
+  which includes a `DST` that holds `^`, and a plain `DST` of 64 lowercase
+  hex characters after a `SRC`, which a revision reads as a commit
+  checksum, are refused with `error: Invalid
   refspec DST` at exit 1. The refusal comes after `REMOTE` resolves and before the ssh client
   starts or the first HTTP request. A delete `:DST` of a `DST` of 64
   lowercase hex characters passes, and the server removes the ref where the
@@ -5343,35 +5391,63 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   and the TLS files of an `https://` push. So
   `push --push-user=bob https://HOST/ nosuchref` fails with the refusal of
   `--push-user`, and does not name the refspec.
-- The push reads the `ostree.collection-binding` of each source commit
-  before the ssh client starts and before the first HTTP request. The
-  bindings, or `--collection=ID`, give the namespace on the server. A commit
-  with no binding goes to the local refs, and a commit bound to `ID` goes to
-  the refs of `ID`. The server writes the refs of its own collection id
+- Each `DST` and each tag names its namespace on the server: a plain
+  `NAME` is a local ref of the server, and `@ID:NAME` is a ref of the
+  collection `ID`. The server writes the refs of its own collection id
   under `refs/heads/`, and the refs of each other collection under
-  `refs/mirrors/ID/`. So a commit of a repository with a collection id goes
-  to `refs/mirrors/ID/NAME` of a server with another collection id or with
-  none.
-- Two source commits with different bindings, and a binding that differs
-  from `--collection`, are refused with `error: binding-mismatch: ...` at
-  exit 1, before the ssh client starts and before the first HTTP request.
-  An `ID` that fails the collection-id rule or is longer than 255 bytes is
-  refused with `error: Invalid collection ID ID` at exit 1, at the same
-  step. A binding of a source commit that fails the collection-id rule or is
-  longer than 255 bytes is refused with `error: invalid input: ...` at exit
-  1, at the same step. A commit with no binding in the namespace of a
-  collection is refused with `error: binding-mismatch: ...` after the server
-  reports the namespace, and before the push sends an object.
-- `--tag=NAME` creates the ref `NAME` on the server at the source commit.
-  The option can repeat. The refspecs that are not deletes must give one
-  commit, and its `ostree.ref-binding` must hold `NAME`. `NAME` passes the
-  ref-name rule, holds no `:`, is not 64 lowercase hex characters, is not a
-  `DST`, and is named once. Each of these refusals comes before the ssh
-  client starts and before the first HTTP request. A tag is an update that
-  expects no ref, also under `--force`. So a tag that exists gets
-  `error: ref-mismatch: ...` after the server reports its refs, and before
-  the push sends an object. The client group of the push needs `t` or `w`
-  on `NAME`.
+  `refs/mirrors/ID/`. One push can write local refs and the refs of more
+  than one collection. The bindings of a source commit select no namespace.
+  To write a commit bound to `X` to a server with another collection id, the
+  user writes `main:@X:main`, or `@X:main` when the source is the
+  collection ref `@X:main` of the local repository.
+- `--collection=ID` adds `@ID:` to each plain `DST` and to each plain tag.
+  An `@ID:` `DST` or tag stays, and a `DST` or a tag `@Y:NAME`, with `Y`
+  other than `ID`, is refused at exit 1. A `DST` that defaults from a `SRC`
+  `@Y:NAME` is such a `DST`. An `ID` that fails the collection-id rule or
+  is longer than 255 bytes is refused with `error: Invalid collection ID
+  ID` at exit 1. Each of these refusals comes before the ssh client starts
+  and before the first HTTP request.
+- The push reads the `ostree.collection-binding` of each source commit
+  before the ssh client starts and before the first HTTP request. A binding
+  that fails the collection-id rule or is longer than 255 bytes is refused
+  with `error: invalid input: ...` at exit 1. A commit bound to `Y` for a
+  `DST` or a tag `@X:NAME`, with `Y` other than `X`, is refused with
+  `error: binding-mismatch: ...` at exit 1, at the same step. After the
+  server reports its collection id, and before the push sends an object,
+  these get `error: binding-mismatch: ...`:
+  - a commit bound to `X` for a plain `DST`, unless `X` is the collection id
+    of the server;
+  - a commit with no collection binding for a `DST` or a tag `@X:NAME`,
+    unless `X` is the collection id of the server.
+- The `ostree.ref-binding` list of the commit of each `DST` must hold the
+  name part of the `DST`: `stable` for `@X:stable`. A commit with no
+  `ostree.ref-binding` passes, and a commit with an empty list is refused.
+  A failure gets `error: binding-mismatch: ...` at exit 1, before the ssh
+  client starts and before the first HTTP request.
+- `--disable-verify-bindings` skips the checks of `ostree.ref-binding` on
+  the client, for each `DST` and each tag. The server then applies the key
+  `disable-verify-bindings` of the client group (`ostrya-config(1)`,
+  "Client keys"), and without the key it refuses such a commit with
+  `error: binding-mismatch: ...`. The option does not skip a check of the
+  collection binding. A ref that the push writes with the option fails a
+  pull without `--disable-verify-bindings`.
+- Two refspecs or tags with one `DST` text are refused before the ssh client
+  starts. `main` and `@OWN:main`, where `OWN` is the collection id of the
+  server, name one ref, and the server refuses such a push with
+  `error: protocol: ...` before the push sends an object.
+- `--tag=NAME` or `--tag=@ID:NAME` creates the ref on the server at the
+  source commit. The option can repeat. The refspecs that are not deletes
+  must give one commit, and its `ostree.ref-binding` must hold the name
+  part of the tag, unless `--disable-verify-bindings` is given. Without the
+  option, a commit with no `ostree.ref-binding` is refused for a tag. A tag
+  passes the rules of a `DST`: it is `NAME` or `@ID:NAME`, a remote ref
+  `REMOTE:NAME` is refused, and a plain tag is not 64 lowercase hex
+  characters. A tag is not a `DST`, and is named once. Each of these
+  refusals comes before the ssh client starts and before the first HTTP
+  request. A tag is an update that expects no ref, also under `--force`. So
+  a tag that exists gets `error: ref-mismatch: ...` after the server
+  reports its refs, and before the push sends an object. The client group
+  of the push needs `t` or `w` on the tag in its namespace.
 - `--onto=BRANCH` makes a server commit
   (`../format-reference.md`, "Server commit"). The push sends the objects of
   the tree of the local commit of `REF` that the server does not hold. The
@@ -5381,7 +5457,8 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   `BRANCH`. The new commit takes the subject, the body, the metadata, and
   the timestamp of the local commit. The push drops the local
   `ostree.ref-binding` and `ostree.collection-binding`, and the server
-  writes the bindings of its namespace. The push sends no parent, no commit
+  writes the bindings of the namespace of `BRANCH`. The push does not check
+  the bindings of the local commit. The push sends no parent, no commit
   object, and no detached metadata, so the server signs the new commit with
   the keys of the client group.
 - Under `--onto`:
@@ -5392,25 +5469,38 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   - `--onto` with `--depth` or with `--force` is refused by the option
     parser at exit 1. `--bind-ref`, `--orphan`, and `--timestamp` without
     `--onto` are refused in the same way.
-  - `--tag=NAME` creates the ref `NAME` at the new commit, and the server
-    binds `NAME`. A tag equal to `BRANCH` is refused with `error: invalid
-    input: ...`. A tag that exists gets `error: ref-mismatch: ...` before
-    the push sends an object.
+  - `BRANCH` is `NAME` or `@ID:NAME`.
+  - `--tag=NAME` or `--tag=@ID:NAME` creates the ref at the new commit, and
+    the server binds the name part of the tag. A tag equal to `BRANCH` is
+    refused with `error: invalid input: ...`. A tag that exists gets
+    `error: ref-mismatch: ...` before the push sends an object.
   - `--bind-ref=NAME` binds `NAME` and creates no ref. It can repeat. `NAME`
-    passes the ref-name rule and holds no `:`.
+    is a plain name: it passes the ref-name rule and holds no `:`.
   - `--orphan` makes a commit with no parent. On a `BRANCH` that exists,
     the server refuses it with `error: non-fast-forward: ...` unless the
     client group has `c` and `d` on `BRANCH`.
   - `--timestamp=TIME` takes the value forms of `commit --timestamp`.
     Without it, the new commit takes the timestamp of the local commit.
-  - `--collection=ID` alone names the namespace. Without it, the server
-    commit goes to the local refs of the server. The bindings of the local
-    commit do not select the namespace.
-  - A `BRANCH` or a tag that the ref-name rule refuses, that holds `:`, or
-    that is 64 lowercase hex characters is refused with `error: Invalid
-    refspec NAME` after `REMOTE` resolves and before the ssh client starts or
-    the first HTTP request. So is a bound name that the ref-name rule
-    refuses or that holds `:`.
+  - `--collection=ID` adds `@ID:` to a plain `BRANCH` and to each plain
+    tag, as for a push of commits. It keeps an `@ID:` operand, refuses an
+    `@Y:` operand with `Y` other than `ID`, and does not change
+    `--bind-ref`. So `--onto a --tag b --bind-ref c --collection X` is
+    `--onto @X:a --tag @X:b --bind-ref c`. The bindings of the local commit
+    do not select the namespace.
+  - `BRANCH` and each tag are in one namespace, after the server maps the
+    refs of its collection id to the local refs. `--onto main --tag @OWN:t`
+    is accepted, where `OWN` is the collection id of the server. Refs of
+    two namespaces, for example `--onto main --tag @X:t` where `X` is not
+    the collection id of the server, are refused after the server reports
+    its refs, and before the push sends an object.
+  - `--disable-verify-bindings` does not change a push with `--onto`. The
+    server writes the bindings of the new commit, so no ref-binding check
+    applies.
+  - A `BRANCH` or a tag that is neither `NAME` nor `@ID:NAME` under the
+    ref-name rule, or a plain one that is 64 lowercase hex characters, is
+    refused with `error: Invalid refspec NAME` after `REMOTE` resolves and
+    before the ssh client starts or the first HTTP request. So is a bound
+    name that the ref-name rule refuses or that holds `:`.
   - A local commit that the repository marks partial, and a local commit
     with related objects, are refused with `error: invalid input: ...` at
     the same step.
@@ -5419,9 +5509,10 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
     tag, against the frame limit of the server, 1 MiB for an ostrya server.
     A longer frame is refused with `error: limit-exceeded: ...` before the
     push sends an object.
-  - The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
-    server whose receive hooks take no server commit refuses the push, and
-    the push fails with `error: ref-denied: ...`.
+  - The client group needs `c` on `BRANCH`, and `t` or `w` on each tag,
+    each in its namespace. A server whose receive hooks take no server
+    commit refuses the push, and the push fails with
+    `error: ref-denied: ...`.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
@@ -5493,8 +5584,9 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   at the start or the end of its value`.
 - On success the command writes one line for each ref to standard output,
   in the order of the refspecs and then of the tags, and exits 0. A line
-  holds the `DST` name, the old state, and the new state, separated by one
-  space. A commit is its full 64-character checksum:
+  holds the `DST` name as the push sent it, for example `@X:main`, the old
+  state, and the new state, separated by one space. A commit is its full
+  64-character checksum:
   - `main (new) C1` -- the server did not hold the ref;
   - `main C1 C2` -- the ref moved from `C1` to `C2`;
   - `main C2 (unchanged)` -- the ref was at `C2` already;
@@ -5729,11 +5821,18 @@ allow-cleartext-credentials`.
   and a summary of the bucket stays as it is until `remote summary -u`
   writes it. The bucket repository needs
   a `config`, else `error: invalid input: the bucket repository ADDRESS has
-  no config; init it first`. `--collection` selects the namespace with the
-  `config` of the bucket in the role of the server: the collection id of
-  the bucket, or no collection, gives `refs/heads/NAME`, and each other
-  collection gives `refs/mirrors/ID/NAME`. The push refuses `--tag`,
-  `--compress`, `--onto`, a delete refspec, `--push-token-file`,
+  no config; init it first`. Each `DST` names its namespace with the
+  `config` of the bucket in the role of the server: a plain `NAME`, and
+  `@ID:NAME` of the collection id of the bucket, give `refs/heads/NAME`, and
+  `@ID:NAME` of each other collection gives `refs/mirrors/ID/NAME`. One push
+  can write refs of more than one namespace. `--collection=ID` adds `@ID:`
+  to each plain `DST`, with the rules of a push over a session. The push
+  checks the bindings of each ref as a server does
+  (`../format-reference.md`, "The push to a bucket repository"). A bucket
+  has no client group, so `--disable-verify-bindings` alone skips the check
+  of `ostree.ref-binding`. The push refuses `--tag`,
+  `--compress`, `--onto`, a delete refspec, `:@ID:NAME` included,
+  `--push-token-file`,
   `--push-user`, the keys `push-token-file` and `push-user`, and the ssh
   options. It reads the environment and the shared AWS files before it
   refuses `--tag` and `--compress`, and sends no request for either
@@ -5817,8 +5916,8 @@ allow-cleartext-credentials`.
 ### `push-tree`
 
 ```text
-ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
-                 [--tag=NAME]... [--bind-ref=NAME]... [--orphan]
+ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
+                 [--tag=NAME|@ID:NAME]... [--bind-ref=NAME]... [--orphan]
                  [--collection=ID]
                  [-s SUBJECT] [-m BODY] [--body-file=FILE]
                  [--add-metadata-string=KEY=VALUE]... [--add-metadata=KEY=VALUE]...
@@ -5879,25 +5978,42 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   repository for a remote name alone, from `--repo`, then the current
   directory, then `OSTREE_REPO`. For an address the command opens no
   repository, and it ignores `--repo`.
-- The command refuses a `BRANCH` or a `--tag` that holds `:`, a name that
-  the ref-name rule refuses, which includes a name that holds `^`, a tag
-  equal to `BRANCH`, and a tag given twice. It refuses a name of 64
+- `BRANCH` and each `--tag` are `NAME` or `@ID:NAME`. The command refuses
+  each other form, for example a remote ref `REMOTE:NAME`, a name that the
+  ref-name rule refuses, which includes a name that holds `^`, a tag equal
+  to `BRANCH`, and a tag given twice. It refuses a name of 64
   lowercase hex characters with the wording of `commit`, before it reads
   the metadata options. The other names are refused after `--body-file` is
-  read, and before the walk. A name that holds `^` is refused with `branch
-  'NAME' is not a valid ref name` or `tag 'NAME' is not a valid ref name`.
+  read, and before the walk. A name that is neither `NAME` nor `@ID:NAME`
+  nor `REMOTE:NAME` under the ref-name rule, which includes a name that
+  holds `^`, is refused with `error: Invalid refspec NAME`. A remote ref is
+  refused with `error: invalid input: ...`.
 - `--bind-ref=NAME` binds `NAME` and creates no ref. It can repeat. `NAME`
-  passes the ref-name rule and holds no `:`.
+  is a plain name: it passes the ref-name rule and holds no `:`.
 - `--orphan` makes a commit with no parent. On a `BRANCH` that exists, the
   server refuses it with `error: non-fast-forward: ...` unless the client
   group has `c` and `d` on `BRANCH`.
-- `--collection=ID` names the namespace on the server. Without it, the push
-  writes the local refs of the server. An `ID` that fails the collection-id
-  rule or is longer than 255 bytes is refused before the walk.
+- A plain `BRANCH` and a plain tag are local refs of the server, and
+  `@ID:NAME` is a ref of the collection `ID`. `--collection=ID` adds `@ID:`
+  to a plain `BRANCH` and to each plain tag, and does not change
+  `--bind-ref`. It keeps an `@ID:` operand, and refuses an `@Y:` operand
+  with `Y` other than `ID` before the walk. An `ID` that fails the
+  collection-id rule or is longer than 255 bytes is refused before the
+  walk.
+- `BRANCH` and each tag are in one namespace, after the server maps the
+  refs of its collection id to the local refs. `--onto main --tag @OWN:t` is
+  accepted, where `OWN` is the collection id of the server. Refs of two
+  namespaces are refused after the server reports its refs, and before the
+  push sends an object. The command refuses refs of two collections
+  `@X:` and `@Y:` before the ssh client starts and before the first
+  request.
 - The metadata dict holds every `--add-metadata-string` entry, then every
   `--add-metadata` entry, then the binding keys that the server writes.
-  `ostree.ref-binding` holds `BRANCH`, each `--tag`, and each `--bind-ref`,
-  sorted. `ostree.collection-binding` holds the collection of the namespace.
+  `ostree.ref-binding` holds the name part of `BRANCH` and of each `--tag`,
+  without `@ID:`, and each `--bind-ref`, sorted. `ostree.collection-binding`
+  holds the id of the namespace of `BRANCH`: `ID` for `@ID:NAME`, and the
+  collection id of the server for a local ref. A server with no collection
+  id writes no `ostree.collection-binding` for a local ref.
   An empty key is refused. The keys `ostree.ref-binding` and
   `ostree.collection-binding` are refused, because the server writes them.
 - `--owner-uid`, `--owner-gid`, and `--canonical-permissions` have the
@@ -5912,9 +6028,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   `Commit` frame or a longest reply over the frame limit of the server gets
   `error: limit-exceeded: ...`. The reply names `BRANCH` and each tag. Each
   refusal comes before the push sends an object.
-- The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
-  server whose receive hooks take no server commit refuses the push, and the
-  push fails with `error: ref-denied: ...`.
+- The client group needs `c` on `BRANCH`, and `t` or `w` on each tag, each
+  in its namespace. A server whose receive hooks take no server commit
+  refuses the push, and the push fails with `error: ref-denied: ...`.
 - `--compress`, `--ssh-command`, `--receive-command`, and the HTTP options
   have the meaning they have in `push`.
 - On success the command writes the checksum of the new commit as one line
@@ -5928,10 +6044,12 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   - The parent is the commit of `BRANCH` in the bucket. `--orphan` makes a
     commit with no parent, and on a `BRANCH` that exists it replaces the
     commit of `BRANCH` with no check.
-  - `--collection=ID` selects the namespace as `push` does: the collection
-    id of the bucket, or no `ID`, writes `refs/heads/BRANCH`, and each other
-    `ID` writes `refs/mirrors/ID/BRANCH`. `ostree.collection-binding` holds
-    the collection id of the namespace.
+  - `BRANCH` names its namespace as a `DST` of `push` does: a plain
+    `NAME`, and `@ID:NAME` of the collection id of the bucket, write
+    `refs/heads/NAME`, and `@ID:NAME` of each other collection writes
+    `refs/mirrors/ID/NAME`. `--collection=ID` adds `@ID:` to a plain
+    `BRANCH`. `ostree.collection-binding` holds the collection id of the
+    namespace.
   - `--tag` is refused with `error: invalid input: a push to an s3://
     address creates no tag, and the push names tags`, before any request.
     `BRANCH` `ostree-metadata` in `refs/heads/` of a bucket with a
@@ -6042,7 +6160,7 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `../format-reference.md`, "Read access" and "Summaries of auth items",
   state the rules. The tool has no such rights. A `session` request
   takes the policy of the client group that carries the item, with the
-  items of the namespace of its `Hello`: the local refs, or one collection.
+  items of the namespace of each ref of its `Hello`.
   An item with no group gets 403 with `unauthorized` and the message `no
   client group carries the item of the request`. A group that opens no push
   session in any namespace gets 403 with `unauthorized` and the message
@@ -6167,15 +6285,15 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 ```text
 ostrya send [--repo=PATH] [--client=NAME]
 ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
-            SRC[:DST]...
+            [--disable-verify-bindings] SRC[:DST]...
 ```
 
 - The `send` feature of `ostrya-cli` builds the command. It is in the
   default set. `Repo::send` takes no feature of `ostrya`, so the command
   builds without `receive`, `push`, and `serve`. `--one-way` also needs the
   `push` feature, which is in the default set. A build without `push`
-  refuses `--one-way`, `--remote`, `--compress`, and a refspec as unknown
-  arguments.
+  refuses `--one-way`, `--remote`, `--compress`, `--disable-verify-bindings`,
+  and a refspec as unknown arguments.
 - The client name is `--client`, else the value of `LOGNAME`, as for
   `receive`. With no name, the command writes `error: send needs a client
   name: give --client, or set LOGNAME` and exits 1 before it opens the
@@ -6243,34 +6361,48 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
   `Repo::export_updates` and `Repo::export_stream`. The command serves no
   session and does not read standard input. It reads no client group and
   no `LOGNAME`, so it runs with neither `--client` nor `LOGNAME`.
-  `--one-way` conflicts with `--client`. `--remote`, `--compress`, and a
-  refspec each need `--one-way`. The option parser refuses each of these
-  cases at exit 1.
+  `--one-way` conflicts with `--client`. `--remote`, `--compress`,
+  `--disable-verify-bindings`, and a refspec each need `--one-way`. The
+  option parser refuses each of these cases at exit 1.
 - With `--one-way` and no refspec, the command writes the usage text and
   `error: REFSPEC must be specified`, and exits 1 before it opens the
   repository.
-- A refspec is `SRC[:DST]` with the rules of `push`: the split at the last
-  `:`, a `DST` that defaults to a `SRC` that is a ref, a checksum `SRC` or
-  a `SRC` with a `^` suffix that needs a `DST`, the ref-name rule on `DST`,
-  and a `DST` that two refspecs name. The command refuses a delete with
+- A refspec is `SRC[:DST]` with the rules of `push`: the refspec grammar,
+  so a `DST` can be `@ID:NAME`, a `DST` that defaults to a `SRC` that is a
+  ref, a checksum `SRC` or a `SRC` with a `^` suffix that needs a `DST`,
+  the ref-name rule on `DST`, and a `DST` that two refspecs name. The
+  command refuses a delete, `:@ID:NAME` included, with
   `error: invalid input: a one-way stream deletes no ref, and the refspec
   ':DST' is a delete` before it resolves a `SRC`. A `SRC` that resolves to
   no commit gets `error: ref not found: SRC`. A `DST` of 64 lowercase hex
   characters after a `SRC` gets `error: Invalid refspec DST`. Without
   `--remote`, the reason is that a revision reads such a name as a commit
   checksum. With `--remote`, the command refuses it by the refspec rule of
-  `push`. If the commit of a `SRC` has a non-empty `ostree.ref-binding`
-  list that does not hold `DST`, the command writes `error:
-  binding-mismatch: commit CHECKSUM is bound to the refs [...], which do
-  not hold 'DST'`. `ostrya commit -b BRANCH` binds the commit to `BRANCH`,
-  so `main^:old` gets this refusal for such a commit. Each refusal comes
-  before the command writes a byte, and the command exits 1.
+  `push`. If the commit of a `SRC` has an `ostree.ref-binding` list that
+  does not hold the name part of `DST`, an empty list included, the command
+  writes `error: binding-mismatch: commit CHECKSUM is bound to the refs
+  [...], which do not hold 'DST'`. `ostrya commit -b BRANCH` binds the
+  commit to `BRANCH`, so `main^:old` gets this refusal for such a commit.
+  `--disable-verify-bindings` skips this check. A receive without its own
+  `--disable-verify-bindings` refuses such a stream with
+  `binding-mismatch`.
+- For a `DST` `@X:NAME`, the command refuses a commit with no
+  `ostree.collection-binding` and a commit bound to `Y`, with `Y` other
+  than `X`, with `error: binding-mismatch: ...`, also with
+  `--disable-verify-bindings`. The command does not know the collection id
+  of the receiver, so it refuses a commit with no binding for each `@X:`
+  `DST`, also when `X` is the collection id of the receiver. It does not
+  check the collection binding of the commit of a plain `DST`, and the
+  receiver checks it.
+- Each refusal of the refspecs and of the bindings comes before the command
+  writes a byte, and the command exits 1.
 - `--remote=REMOTE` prefixes each `DST` with `REMOTE:`, so the receiver
-  writes the remote ref `REMOTE:DST`. The option parser checks `REMOTE`
-  with the remote-name rule of `remote add` before the repository opens. A
-  name that the rule refuses gets the usage error `error: invalid value
-  'REMOTE' for '--remote <REMOTE>'` with the rule, and exit 1. A name that
-  passes the remote-name rule and that the ref-name rule refuses as a
+  writes the remote ref `REMOTE:DST`. A remote ref has no collection, so
+  `--remote` refuses an `@ID:` `DST` at exit 1. The option parser checks
+  `REMOTE` with the remote-name rule of `remote add` before the repository
+  opens. A name that the rule refuses gets the usage error `error: invalid
+  value 'REMOTE' for '--remote <REMOTE>'` with the rule, and exit 1. A name
+  that passes the remote-name rule and that the ref-name rule refuses as a
   remote of a ref, such as a symbol that `char::is_alphanumeric` accepts,
   gets `error: Invalid refspec REMOTE:DST` and exit 1.
 - `--compress` sends content objects deflated at level 6, and

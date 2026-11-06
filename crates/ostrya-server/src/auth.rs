@@ -476,6 +476,7 @@ impl GroupAuth {
                     allow_unsigned,
                     signers,
                     allow_privileged,
+                    disable_verify_bindings,
                     summary_signers,
                     update_summary,
                     group,
@@ -486,6 +487,7 @@ impl GroupAuth {
                     allow_unsigned: *allow_unsigned,
                     signers: signers.clone(),
                     allow_privileged: *allow_privileged,
+                    disable_verify_bindings: *disable_verify_bindings,
                     summary_signers: summary_signers.clone(),
                     update_summary: *update_summary,
                     group: group.clone(),
@@ -557,7 +559,7 @@ impl ReceiveAuth for GroupAuth {
     ///
     /// [`ClientAccess::select`](ostrya::access::ClientAccess::select) states
     /// the selection. The group gives the rules of each namespace, and the
-    /// session reads the rules of the namespace of `hello`.
+    /// session reads the rules of the namespace of each ref of `hello`.
     ///
     /// When the group has `tls-accept-claim=true` and a certificate gave the
     /// item, the claims of the certificate for each namespace replace the
@@ -972,10 +974,10 @@ mod tests {
         }
     }
 
-    /// `open` gives the policy of the group that carries the item, in each
-    /// namespace of `Hello`. An item with no group, and a group that opens no
-    /// push session, get 403. A `tls:NAME` item with no group gets 403,
-    /// although a group of `tls:*` exists.
+    /// `open` gives the policy of the group that carries the item, whatever
+    /// the namespace of the refs of `Hello`. An item with no group, and a
+    /// group that opens no push session, get 403. A `tls:NAME` item with no
+    /// group gets 403, although a group of `tls:*` exists.
     #[test]
     fn open_selects_the_group_of_the_item() {
         let (auth, _tmp) = auth(
@@ -987,8 +989,7 @@ mod tests {
         let hello_in = |collection: Option<&str>| Hello {
             version: 1,
             agent: None,
-            refs: vec!["main".into()],
-            collection: collection.map(str::to_owned),
+            refs: vec![collection.map_or_else(|| "main".to_owned(), |id| format!("@{id}:main"))],
             one_way: false,
         };
         let hello = hello_in(None);
@@ -1260,7 +1261,6 @@ mod tests {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
-            collection: None,
             one_way: false,
         }
     }
@@ -1372,7 +1372,7 @@ mod tests {
         );
         let client = auth.identify(&HeaderMap::new(), &with_der(&der)).unwrap();
         let hello = Hello {
-            collection: Some("org.example.Os".into()),
+            refs: vec!["@org.example.Os:os/a".into()],
             ..hello()
         };
         let setup = ostrya_rt::block_on(auth.open(&client, &hello)).unwrap();

@@ -11,7 +11,7 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use ostrya_core::{Checksum, MAX_METADATA_SIZE, ObjectName, ObjectType};
+use ostrya_core::{Checksum, MAX_METADATA_SIZE, ObjectName, ObjectType, Ref};
 
 use super::invalid;
 use super::s3::{
@@ -27,7 +27,7 @@ use crate::remote::{
     Compression, Encoding, ObjectSource, PushOutcome, PushPhase, PushStats, RefOutcome,
     ScannedTree, TreePushOptions, scan_tree,
 };
-use crate::server_commit::{clock, commit_bytes};
+use crate::server_commit::{CommitFields, clock, commit_bytes};
 use crate::summary::OSTREE_METADATA_REF;
 
 /// The work of a tree push before the ref write, and its counts.
@@ -61,8 +61,8 @@ impl BucketRepo {
     /// 2. It takes the writer lock of the bucket repository for
     ///    [`LockOperation::Push`], with
     ///    [`break_lock`](BucketWriteOptions::break_lock).
-    /// 3. It reads the `config` and selects the namespace, as
-    ///    `Repo::push_to_bucket` does with
+    /// 3. It reads the `config`, and the branch selects the namespace, as a
+    ///    `DST` of `Repo::push_to_bucket` does. A plain branch takes
     ///    [`collection`](TreePushOptions::collection). Then at the same time
     ///    it reads the ref files of the ref directory of the namespace and
     ///    lists the objects. It reads no ref file of another namespace, and
@@ -75,9 +75,10 @@ impl BucketRepo {
     ///    that the listing holds.
     /// 5. It makes the commit. The parent is the tip of the branch in the
     ///    bucket, or none for an absent branch or with
-    ///    [`orphan`](TreePushOptions::orphan). The collection binding is the
-    ///    collection id of the bucket in `refs/heads/`, and the id of the
-    ///    namespace in `refs/mirrors/ID/`. With no
+    ///    [`orphan`](TreePushOptions::orphan). The ref binding holds the
+    ///    name part of the branch and each bound name. The collection binding
+    ///    is the collection id of the bucket in `refs/heads/`, and the id of
+    ///    the namespace in `refs/mirrors/ID/`. With no
     ///    [`timestamp`](TreePushOptions::timestamp), the push takes the clock
     ///    of the system. It reads no environment variable.
     /// 6. It uploads each object of the tree that the listing lacks, at most
@@ -198,7 +199,7 @@ impl BucketRepo {
             outcome: PushOutcome {
                 commit: Some(update.new),
                 refs: vec![RefOutcome {
-                    name: update.dst,
+                    name: update.dst.to_string(),
                     old: update.old,
                     new: Some(update.new),
                 }],
@@ -214,36 +215,38 @@ impl BucketRepo {
         let ScannedTree {
             model,
             commit: sc,
-            collection,
+            branch,
             compression,
             progress,
             ..
         } = scanned;
         let BucketState {
             level,
-            ns,
-            dir,
+            collection_id,
+            mut dirs,
             listing,
             ..
-        } = read_state(self, collection.as_deref()).await?;
+        } = read_state(self, &[branch]).await?;
+        let ns = Namespace::of(branch, collection_id.as_deref());
         let binding = match &ns {
-            Namespace::Local { binding } => binding.as_deref(),
+            Namespace::Local => collection_id.as_deref(),
             Namespace::Mirror { id } => Some(id.as_str()),
         };
+        let dir = dirs.remove(&ns).expect("the push read the namespace");
+        let name = branch.name();
 
         // The ref checks, in the directory of the namespace.
-        if matches!(ns, Namespace::Local { binding: Some(_) }) && sc.branch == OSTREE_METADATA_REF {
+        if ns == Namespace::Local && collection_id.is_some() && name == OSTREE_METADATA_REF {
             return Err(Error::Remote(crate::remote::Error::RefDenied(format!(
-                "ref '{}' holds the collection anchor commit of a repository with a collection \
-                 id, and a tree push writes no anchor commit",
-                sc.branch
+                "ref '{branch}' holds the collection anchor commit of a repository with a \
+                 collection id, and a tree push writes no anchor commit"
             ))));
         }
-        let tip = dir.get(&sc.branch).copied();
+        let tip = dir.get(name).copied();
         let parent = if sc.orphan { None } else { tip };
         let mut updated = dir.clone();
         // The new commit is not known yet. Any value serves the prefix check.
-        updated.insert(sc.branch.clone(), Checksum::from_bytes([0; 32]));
+        updated.insert(name.to_owned(), Checksum::from_bytes([0; 32]));
         check_prefixes(&updated)?;
         let holds = |commit: &Checksum| {
             listing
@@ -252,7 +255,7 @@ impl BucketRepo {
         };
         if let Some(absent) = dir
             .iter()
-            .filter(|(name, _)| **name != sc.branch)
+            .filter(|(other, _)| *other != name)
             .map(|(_, commit)| commit)
             .chain(parent.as_ref())
             .find(|commit| !holds(commit))
@@ -267,7 +270,19 @@ impl BucketRepo {
             Some(timestamp) => timestamp,
             None => clock()?,
         };
-        let bytes = commit_bytes(sc, tip, timestamp, binding)?;
+        let fields = CommitFields {
+            refs: std::iter::once(name)
+                .chain(scanned.tags.iter().map(Ref::name))
+                .chain(sc.bind_refs.iter().map(String::as_str))
+                .collect(),
+            root_dirtree: sc.root_dirtree,
+            root_dirmeta: sc.root_dirmeta,
+            subject: &sc.subject,
+            body: &sc.body,
+            metadata: &sc.metadata,
+            orphan: sc.orphan,
+        };
+        let bytes = commit_bytes(&fields, tip, timestamp, binding)?;
         if bytes.len() as u64 > MAX_METADATA_SIZE {
             return Err(Error::Remote(crate::remote::Error::LimitExceeded(format!(
                 "the commit object is {} bytes, over the limit of {MAX_METADATA_SIZE}",
@@ -330,8 +345,8 @@ impl BucketRepo {
         let bytes = counts.bytes.load(Ordering::Relaxed);
         Ok(Uploaded {
             update: Update {
-                key: ns.key(&sc.branch),
-                dst: sc.branch.clone(),
+                key: ns.key(name),
+                dst: branch.clone(),
                 old: tip,
                 new: commit,
             },

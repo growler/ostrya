@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Type, Value};
+use ostrya_core::{Checksum, Ref, Type, Value};
 
 use crate::error::{Error, Result};
 use crate::proto::ServerCommit;
@@ -28,34 +28,41 @@ const BINDING_KEYS: [&str; 2] = ["ostree.ref-binding", "ostree.collection-bindin
 ///
 /// [`push_tree`], [`push_tree_prepared`], and [`push_tree_over_stream`] take
 /// them. The struct carries no `#[non_exhaustive]`. A caller builds it with
-/// `..Default::default()`.
-#[derive(Default)]
+/// `..Default::default()`. The default branch is the local ref with an
+/// empty name, which the push refuses, so a caller sets
+/// [`onto`](TreePushOptions::onto).
 pub struct TreePushOptions {
-    /// The branch of the server that the server moves to the new commit.
+    /// The branch of the server that the server moves to the new commit: a
+    /// local ref `NAME`, or a ref `@ID:NAME` of the collection `ID`.
     ///
     /// The parent of the commit is the commit of the branch on the server
     /// when the server writes the commit. If the branch is absent, the commit
     /// has no parent.
-    pub onto: String,
+    pub onto: Ref,
     /// The tags that the server creates at the new commit, in order.
     ///
-    /// A tag that exists on the server refuses the push.
-    pub tags: Vec<String>,
+    /// A tag is a local ref `NAME` or a ref `@ID:NAME`. The branch and each
+    /// tag are in one namespace of the server. A tag that exists on the
+    /// server refuses the push.
+    pub tags: Vec<Ref>,
     /// The names that the commit binds and that get no ref, in order.
     ///
-    /// The `ostree.ref-binding` of the commit holds the branch, each tag, and
-    /// each of these names.
+    /// Each name is a plain ref name. The `ostree.ref-binding` of the commit
+    /// holds the name part of the branch and of each tag, and each of these
+    /// names.
     pub bind_refs: Vec<String>,
     /// The switch that makes a commit with no parent.
     ///
     /// On a branch that exists, the server allows it only for a client that
     /// can also delete the branch.
     pub orphan: bool,
-    /// The collection id of the namespace of the server that the push
-    /// writes.
+    /// The collection id that a plain branch and each plain tag take.
     ///
-    /// `None` writes the local refs of the server. The collection id of the
-    /// server also writes its local refs.
+    /// With `Some(ID)`, a plain branch or tag `NAME` is the ref `@ID:NAME`. A
+    /// branch or tag `@ID:NAME` stays, and a branch or tag `@Y:NAME`, with
+    /// `Y` other than `ID`, refuses the push before the scan. The collection
+    /// does not change [`bind_refs`](TreePushOptions::bind_refs). The server
+    /// writes the refs of its own collection id as its local refs.
     pub collection: Option<String>,
     /// The subject of the commit, empty if not set.
     pub subject: Option<String>,
@@ -85,6 +92,26 @@ pub struct TreePushOptions {
     /// The scan sets its phases in the handle, and the session counts its
     /// progress into it.
     pub progress: Option<PushProgress>,
+}
+
+impl Default for TreePushOptions {
+    fn default() -> TreePushOptions {
+        TreePushOptions {
+            onto: Ref::local(String::new()),
+            tags: Vec::new(),
+            bind_refs: Vec::new(),
+            orphan: false,
+            collection: None,
+            subject: None,
+            body: None,
+            metadata: Vec::new(),
+            timestamp: None,
+            compression: Compression::default(),
+            entry_filter: None,
+            hash_jobs: None,
+            progress: None,
+        }
+    }
 }
 
 /// Pushes the directory `root` to `endpoint` as one server commit.
@@ -187,15 +214,17 @@ pub async fn push_tree_prepared(
 ///
 /// Before the scan, the push refuses these values of `opts`:
 ///
-/// - a branch or a tag that holds `:`, that fails the ref-name rule of
-///   [`is_ref_name`](ostrya_core::is_ref_name), for example a name that holds
-///   `^`, or that is 64 lowercase hex characters, which a revision reads as
-///   a commit checksum
-/// - a tag that is the branch, and a tag named twice
-/// - a bound name that holds `:` or that fails the ref-name rule
 /// - a `collection` that fails
 ///   [`is_collection_id`](ostrya_core::is_collection_id) or is longer than
 ///   255 bytes
+/// - a branch or a tag that is a remote ref, that fails [`Ref::validate`],
+///   for example a name that holds `^`, or that is a local ref of 64
+///   lowercase hex characters, which a revision reads as a commit checksum
+/// - a branch or a tag `@Y:NAME` under a `collection` other than `Y`
+/// - after the collection applies, a tag that is the branch, a tag named
+///   twice, and a branch and tags of two collections, `@X:NAME` and
+///   `@Y:NAME`
+/// - a bound name that holds `:` or that fails the ref-name rule
 /// - a DEFLATE level outside 1 through 9
 /// - an empty key in `metadata`, the key `ostree.ref-binding` or
 ///   `ostree.collection-binding`, which the server writes, and a value that
@@ -207,14 +236,16 @@ pub async fn push_tree_prepared(
 ///
 /// # Server commit
 ///
-/// The session opens with the branch and then each tag. The push sends
-/// [`collection`](TreePushOptions::collection) in `Hello`. After `HelloReply`,
+/// The session opens with the text of the branch and then of each tag, after
+/// [`collection`](TreePushOptions::collection) applied. After `HelloReply`,
 /// the push refuses a tag that the server holds with
 /// [`Error::RefMismatch`]. Then it runs
-/// [`PushSession::check_server_commit`]: a commit must hold each metadata
-/// value, and the `Commit` frame of the server commit and the longest
-/// `CommitReply` must fit in the `max-frame` of the server. Each refusal
-/// comes before the push offers an object.
+/// [`PushSession::check_server_commit`]: the branch and each tag must be in
+/// one namespace after the server maps the refs of its collection id to its
+/// local refs, a commit must hold each metadata value, and the `Commit` frame
+/// of the server commit and the longest `CommitReply` must fit in the
+/// `max-frame` of the server. Each refusal comes before the push offers an
+/// object.
 ///
 /// The push offers each object of the tree in one round of `Have`, and sends
 /// the objects that the server lacks. It sends no commit object and no
@@ -245,6 +276,8 @@ pub async fn push_tree_prepared(
 /// - [`Error::Walk`] if the walk or the hash pass fails. [`TreeModel::scan`]
 ///   gives the `io::ErrorKind` of each case.
 /// - [`Error::RefMismatch`] if `HelloReply` reports a commit for a tag.
+/// - [`Error::InvalidInput`] if the branch and the tags are in two
+///   namespaces of the server.
 /// - [`Error::InvalidInput`] if a commit cannot hold a value of `metadata`.
 ///   In a commit, a value can hold two levels of containers fewer than a
 ///   variant.
@@ -304,11 +337,13 @@ pub struct ScannedTree {
     /// The root dirtree and the root dirmeta are those of
     /// [`model`](ScannedTree::model). The metadata entries are the bytes of
     /// each value as a `v` in normal form, in the order of the options. A
-    /// commit can hold each value.
+    /// commit can hold each value. The branch and the tags are the text of
+    /// [`branch`](ScannedTree::branch) and [`tags`](ScannedTree::tags).
     pub commit: ServerCommit,
-    /// The collection id of the namespace that the push writes, from
-    /// [`TreePushOptions::collection`].
-    pub collection: Option<String>,
+    /// The branch, after [`TreePushOptions::collection`] applied.
+    pub branch: Ref,
+    /// The tags, after [`TreePushOptions::collection`] applied.
+    pub tags: Vec<Ref>,
     /// The encoding of the content objects, from
     /// [`TreePushOptions::compression`].
     pub compression: Compression,
@@ -347,7 +382,8 @@ pub async fn scan_tree(root: &Path, opts: TreePushOptions) -> Result<ScannedTree
     let model = push.scan(root, scan).await?;
     let Prepared {
         mut commit,
-        collection,
+        branch,
+        tags,
         compression,
         progress,
         ..
@@ -357,7 +393,8 @@ pub async fn scan_tree(root: &Path, opts: TreePushOptions) -> Result<ScannedTree
     Ok(ScannedTree {
         model,
         commit,
-        collection,
+        branch,
+        tags,
         compression,
         progress,
     })
@@ -369,7 +406,10 @@ struct Prepared {
     refs: Vec<String>,
     /// The server commit, with no root checksums before the scan.
     commit: ServerCommit,
-    collection: Option<String>,
+    /// The branch, after the collection of the push applied.
+    branch: Ref,
+    /// The tags, after the collection of the push applied.
+    tags: Vec<Ref>,
     compression: Compression,
     progress: Option<PushProgress>,
 }
@@ -393,26 +433,26 @@ impl Prepared {
             hash_jobs,
             progress,
         } = opts;
-        check_names(&onto, &tags, &bind_refs)?;
         if let Some(id) = &collection {
             check_collection(id)?;
         }
+        let (branch, tags) = check_names(onto, tags, &bind_refs, collection.as_deref())?;
         deflate_level(compression)?;
         let metadata = metadata_entries(metadata)?;
         let scan = ScanOptions {
             entry_filter,
             hash_jobs,
         };
-        let refs = std::iter::once(onto.clone())
-            .chain(tags.iter().cloned())
+        let refs: Vec<String> = std::iter::once(&branch)
+            .chain(&tags)
+            .map(Ref::to_string)
             .collect();
         // The scan gives the root checksums.
         let unset = Checksum::from_bytes([0; 32]);
         let push = Prepared {
-            refs,
             commit: ServerCommit {
-                branch: onto,
-                tags,
+                branch: refs[0].clone(),
+                tags: refs[1..].to_vec(),
                 bind_refs,
                 root_dirtree: unset,
                 root_dirmeta: unset,
@@ -422,7 +462,9 @@ impl Prepared {
                 timestamp,
                 orphan,
             },
-            collection,
+            refs,
+            branch,
+            tags,
             compression,
             progress,
         };
@@ -451,7 +493,6 @@ impl Prepared {
 
     fn session_options(&self) -> SessionOptions {
         SessionOptions {
-            collection: self.collection.clone(),
             progress: self.progress.clone(),
             ..SessionOptions::default()
         }
@@ -508,39 +549,93 @@ fn check_tags_absent(server: &ServerInfo, tags: &[String]) -> Result<()> {
     }
 }
 
-/// Refuses a name of a ref that the server commit writes: a name that holds
-/// `:`, a name that fails the ref-name rule (which includes a name that holds
-/// `^`), and a name of 64 lowercase hex characters. `what` names the ref in
-/// the message.
-fn check_ref(name: &str, what: &str) -> Result<()> {
-    if name.contains(':') {
+/// Refuses a ref that the server commit writes: a remote ref, a ref that
+/// fails [`Ref::validate`] (which includes a name that holds `^`), and a
+/// local ref of 64 lowercase hex characters. `what` names the ref in the
+/// message.
+fn check_ref(r: &Ref, what: &str) -> Result<()> {
+    if let Ref::Remote { .. } = r {
         return Err(invalid(format!(
-            "{what} '{name}' holds ':'; a tree push writes refs below refs/heads"
+            "{what} '{r}' is a remote ref; a tree push writes no remote ref"
         )));
     }
-    if !ostrya_core::is_ref_name(name) {
-        return Err(invalid(format!("{what} '{name}' is not a valid ref name")));
+    if r.validate().is_err() {
+        return Err(invalid(format!("{what} '{r}' is not a valid ref name")));
     }
-    if ostrya_core::is_checksum_shaped(name) {
+    if let Ref::Local { name } = r
+        && ostrya_core::is_checksum_shaped(name)
+    {
         return Err(invalid(format!(
-            "{what} '{name}' is 64 hex characters, which a revision reads as a commit checksum"
+            "{what} '{r}' is 64 hex characters, which a revision reads as a commit checksum"
         )));
     }
     Ok(())
 }
 
-/// Refuses a bad branch, a bad tag, a tag that is the branch, a tag named
-/// twice, and a bound name that holds `:` or fails the ref-name rule.
-fn check_names(onto: &str, tags: &[String], bind_refs: &[String]) -> Result<()> {
-    check_ref(onto, "branch")?;
-    let mut seen = HashSet::new();
-    for tag in tags {
+/// Returns the ref `r` under the collection `collection` of the push: a
+/// local ref `NAME` becomes `@ID:NAME`, a ref `@ID:NAME` stays, and a ref of
+/// another collection is refused. `what` names the ref in the message.
+fn in_collection(r: Ref, collection: Option<&str>, what: &str) -> Result<Ref> {
+    let Some(id) = collection else {
+        return Ok(r);
+    };
+    match r {
+        Ref::Local { name } => Ok(Ref::collection(id, name)),
+        Ref::Collection { id: ref other, .. } if other != id => Err(invalid(format!(
+            "{what} '{r}' names the collection '{other}', and the push names the collection \
+             '{id}'"
+        ))),
+        r => Ok(r),
+    }
+}
+
+/// Checks the branch, the tags, and the bound names, and returns the branch
+/// and the tags after the collection `collection` applied.
+///
+/// The call refuses a bad branch, a bad tag, and a ref of another
+/// collection. After the collection applies, it refuses a tag that is the
+/// branch, a tag named twice, and a branch and tags of two collections. It
+/// also refuses a bound name that holds `:` or fails the ref-name rule.
+fn check_names(
+    onto: Ref,
+    tags: Vec<Ref>,
+    bind_refs: &[String],
+    collection: Option<&str>,
+) -> Result<(Ref, Vec<Ref>)> {
+    check_ref(&onto, "branch")?;
+    for tag in &tags {
         check_ref(tag, "tag")?;
-        if tag == onto {
+    }
+    let onto = in_collection(onto, collection, "branch")?;
+    let tags = tags
+        .into_iter()
+        .map(|tag| in_collection(tag, collection, "tag"))
+        .collect::<Result<Vec<_>>>()?;
+    let mut seen = HashSet::new();
+    for tag in &tags {
+        if *tag == onto {
             return Err(invalid(format!("the tag '{tag}' is also the branch")));
         }
-        if !seen.insert(tag.as_str()) {
+        if !seen.insert(tag) {
             return Err(invalid(format!("the tag '{tag}' is named twice")));
+        }
+    }
+    // The server maps the refs of its own collection id to its local refs,
+    // so the check of a local ref and a collection ref comes after
+    // `HelloReply`. Two collections are two namespaces on each server.
+    let mut first: Option<(&Ref, &str)> = None;
+    for r in std::iter::once(&onto).chain(&tags) {
+        let Ref::Collection { id, .. } = r else {
+            continue;
+        };
+        match first {
+            Some((other, other_id)) if other_id != id => {
+                return Err(invalid(format!(
+                    "the refs '{other}' and '{r}' of the server commit are in two namespaces"
+                )));
+            }
+            Some(_) => {}
+            None => first = Some((r, id)),
         }
     }
     for name in bind_refs {
@@ -550,7 +645,7 @@ fn check_names(onto: &str, tags: &[String], bind_refs: &[String]) -> Result<()> 
             )));
         }
     }
-    Ok(())
+    Ok((onto, tags))
 }
 
 /// Refuses a collection id that fails the collection-id rule or is longer
@@ -609,7 +704,7 @@ mod tests {
 
     fn onto(branch: &str) -> TreePushOptions {
         TreePushOptions {
-            onto: branch.into(),
+            onto: Ref::local(branch),
             timestamp: Some(1),
             ..Default::default()
         }
@@ -617,6 +712,11 @@ mod tests {
 
     fn strings(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Reads each text as a ref.
+    fn refs(items: &[&str]) -> Vec<Ref> {
+        items.iter().map(|s| s.parse().unwrap()).collect()
     }
 
     const BAD_NAMES: [&str; 16] = [
@@ -630,40 +730,126 @@ mod tests {
         for (what, make) in [
             (
                 "branch",
-                (|name: &str| onto(name)) as fn(&str) -> TreePushOptions,
+                (|r: Ref| TreePushOptions {
+                    onto: r,
+                    ..onto("main")
+                }) as fn(Ref) -> TreePushOptions,
             ),
-            ("tag", |name: &str| TreePushOptions {
-                tags: strings(&[name]),
+            ("tag", |r: Ref| TreePushOptions {
+                tags: vec![r],
                 ..onto("main")
             }),
         ] {
-            assert!(refused(make("origin:main")).contains("':'"), "{what}");
+            let m = refused(make(Ref::remote("origin", "main")));
+            assert!(m.contains("is a remote ref"), "{what}: {m}");
             for bad in BAD_NAMES {
-                let m = refused(make(bad));
+                let m = refused(make(Ref::local(bad)));
                 assert!(m.contains("not a valid ref name"), "{what} {bad:?}: {m}");
                 assert!(m.starts_with(what), "{what} {bad:?}: {m}");
             }
-            assert!(refused(make(&hex)).contains("commit checksum"), "{what}");
+            let m = refused(make(Ref::collection("no-dot", "a")));
+            assert!(m.contains("not a valid ref name"), "{what}: {m}");
+            assert!(
+                refused(make(Ref::local(hex.as_str()))).contains("commit checksum"),
+                "{what}"
+            );
         }
         let m = refused(TreePushOptions {
-            tags: strings(&["t", "main"]),
+            tags: refs(&["t", "main"]),
             ..onto("main")
         });
         assert!(m.contains("'main' is also the branch"), "{m}");
         let m = refused(TreePushOptions {
-            tags: strings(&["t", "u", "t"]),
+            tags: refs(&["t", "u", "t"]),
             ..onto("main")
         });
         assert!(m.contains("'t' is named twice"), "{m}");
+        let upper = hex.to_uppercase();
         let (_, push) = Prepared::new(TreePushOptions {
-            tags: strings(&["a/b", "x.y", &hex.to_uppercase(), &hex[1..]]),
+            tags: refs(&["a/b", "x.y", &upper, &hex[1..], "@org.example.X:t"]),
             ..onto("main")
         })
         .unwrap();
         assert_eq!(
             push.refs,
-            ["main", "a/b", "x.y", &hex.to_uppercase(), &hex[1..]]
+            ["main", "a/b", "x.y", &upper, &hex[1..], "@org.example.X:t"]
         );
+        // A collection ref of 64 lowercase hex characters is no checksum.
+        Prepared::new(TreePushOptions {
+            onto: Ref::collection("org.example.X", hex.as_str()),
+            ..onto("main")
+        })
+        .unwrap();
+    }
+
+    /// The collection applies to a plain branch and to each plain tag. A
+    /// ref of the collection stays, and a ref of another collection is
+    /// refused. Two refs of one text after that are refused, and so are
+    /// refs of two collections.
+    #[test]
+    fn the_collection_names_the_namespace_of_each_plain_ref() {
+        let x = || Some("org.example.X".to_owned());
+        let (_, push) = Prepared::new(TreePushOptions {
+            tags: refs(&["t", "@org.example.X:u"]),
+            bind_refs: strings(&["b"]),
+            collection: x(),
+            ..onto("a")
+        })
+        .unwrap();
+        assert_eq!(
+            push.refs,
+            ["@org.example.X:a", "@org.example.X:t", "@org.example.X:u"]
+        );
+        assert_eq!(push.commit.branch, "@org.example.X:a");
+        assert_eq!(push.commit.tags, ["@org.example.X:t", "@org.example.X:u"]);
+        assert_eq!(push.commit.bind_refs, ["b"]);
+        assert_eq!(push.branch, Ref::collection("org.example.X", "a"));
+        let (_, plain) = Prepared::new(TreePushOptions {
+            onto: Ref::collection("org.example.X", "a"),
+            ..onto("a")
+        })
+        .unwrap();
+        assert_eq!(plain.refs, push.refs[..1]);
+        let m = refused(TreePushOptions {
+            onto: Ref::collection("org.example.Y", "a"),
+            collection: x(),
+            ..onto("a")
+        });
+        assert!(
+            m.contains(
+                "names the collection 'org.example.Y', and the push names the collection \
+                        'org.example.X'"
+            ),
+            "{m}"
+        );
+        let m = refused(TreePushOptions {
+            tags: refs(&["@org.example.Y:t"]),
+            collection: x(),
+            ..onto("a")
+        });
+        assert!(m.starts_with("tag '@org.example.Y:t'"), "{m}");
+        let m = refused(TreePushOptions {
+            tags: refs(&["@org.example.X:a"]),
+            collection: x(),
+            ..onto("a")
+        });
+        assert!(m.contains("'@org.example.X:a' is also the branch"), "{m}");
+        let m = refused(TreePushOptions {
+            onto: Ref::collection("org.example.X", "a"),
+            tags: refs(&["t", "@org.example.Y:u"]),
+            ..onto("a")
+        });
+        assert!(
+            m.contains("'@org.example.X:a' and '@org.example.Y:u'"),
+            "{m}"
+        );
+        // A local ref and a collection ref are one namespace on a server
+        // whose collection id is the id, so the scan does not refuse them.
+        Prepared::new(TreePushOptions {
+            tags: refs(&["@org.example.X:t"]),
+            ..onto("main")
+        })
+        .unwrap();
     }
 
     #[test]
@@ -685,6 +871,14 @@ mod tests {
         .unwrap();
         assert_eq!(push.commit.bind_refs, ["x", "x", "main", hex.as_str()]);
         assert_eq!(push.refs, ["main"]);
+        // A bound name is plain: the collection does not change it.
+        let (_, push) = Prepared::new(TreePushOptions {
+            bind_refs: strings(&["x"]),
+            collection: Some("org.example.X".into()),
+            ..onto("main")
+        })
+        .unwrap();
+        assert_eq!(push.commit.bind_refs, ["x"]);
     }
 
     #[test]
@@ -703,7 +897,7 @@ mod tests {
             ..onto("main")
         })
         .unwrap();
-        assert_eq!(push.session_options().collection, Some(longest));
+        assert_eq!(push.branch, Ref::collection(longest, "main"));
     }
 
     #[test]
@@ -742,7 +936,7 @@ mod tests {
     fn the_server_commit_carries_the_options() {
         let string = |s: &str| Value::variant(ostrya_core::Type::Str, Value::Str(s.into()));
         let (_, push) = Prepared::new(TreePushOptions {
-            tags: strings(&["t"]),
+            tags: refs(&["t"]),
             bind_refs: strings(&["b"]),
             orphan: true,
             subject: Some("s".into()),
@@ -784,7 +978,6 @@ mod tests {
             version: 1,
             mode: "archive".into(),
             collection_id: None,
-            collection: None,
             max_frame: 1 << 20,
             max_have: 16_384,
             encodings: vec![Encoding::Raw],
@@ -845,9 +1038,10 @@ mod tests {
         let scanned = scanned.unwrap();
         assert_eq!(scanned.commit.root_dirtree, scanned.model.root_dirtree());
         assert_eq!(scanned.commit.root_dirmeta, scanned.model.root_dirmeta());
-        assert_eq!(scanned.commit.branch, "main");
+        assert_eq!(scanned.commit.branch, "@org.example.A:main");
         assert_eq!(scanned.commit.timestamp, Some(1));
-        assert_eq!(scanned.collection.as_deref(), Some("org.example.A"));
+        assert_eq!(scanned.branch, Ref::collection("org.example.A", "main"));
+        assert!(scanned.tags.is_empty());
         assert_eq!(scanned.compression, Compression::Deflate { level: 3 });
         // Two dirtrees, one dirmeta that the two directories share, and the
         // file.

@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use common::receive::{PIPE_CAP, collections_policy, new_repo, pipe, policy_allowing};
+use common::receive::{PIPE_CAP, collections_policy, new_repo, outcomes, pipe, policy_allowing};
 use common::{Counting, TmpDir, mark_partial};
 use futures_lite::future::zip;
 use ostrya::remote::{self, PushOutcome};
@@ -248,7 +248,7 @@ fn pushed(pair: &Pair, opts: PushOntoOptions) -> (Checksum, PushOutcome) {
     let (report, outcome) = push_under(pair, &policy(), opts);
     let report = report.unwrap();
     let outcome = outcome.unwrap();
-    assert_eq!(outcome.refs, report.refs);
+    assert_eq!(outcome.refs, outcomes(&report));
     let commit = outcome.commit.expect("the server names its commit");
     for r in &outcome.refs {
         assert_eq!(r.new, Some(commit), "{r:?}");
@@ -256,12 +256,29 @@ fn pushed(pair: &Pair, opts: PushOntoOptions) -> (Checksum, PushOutcome) {
     (commit, outcome)
 }
 
+/// Reads `text` as a ref. Text that is no ref is a local ref of that name,
+/// which the push refuses.
+fn r(text: &str) -> Ref {
+    text.parse().unwrap_or_else(|_| Ref::local(text))
+}
+
+fn refs(texts: &[&str]) -> Vec<Ref> {
+    texts.iter().map(|text| r(text)).collect()
+}
+
 fn onto(rev: &str, branch: &str) -> PushOntoOptions {
     PushOntoOptions {
         rev: rev.into(),
-        onto: branch.into(),
+        onto: r(branch),
         ..PushOntoOptions::default()
     }
+}
+
+/// Returns the commit of the ref file `relpath` of `repo`.
+fn ref_file(repo: &Repo, relpath: &str) -> Option<Checksum> {
+    std::fs::read_to_string(repo.path().join(relpath))
+        .ok()
+        .map(|text| text.trim_end().parse().unwrap())
 }
 
 /// The first server commit has no parent, and a second one has the tip of
@@ -318,7 +335,7 @@ fn the_options_of_a_server_commit_reach_the_commit() {
     let (s1, outcome) = pushed(
         &pair,
         PushOntoOptions {
-            tags: vec!["v2".into(), "v1".into()],
+            tags: refs(&["v2", "v1"]),
             bind_refs: vec!["bound".into(), "bound".into()],
             timestamp: Some(42),
             ..onto("main", "main")
@@ -576,7 +593,7 @@ fn a_bad_name_or_a_bad_local_commit_is_refused_before_a_byte() {
         (onto("main", &hex), hex.as_str()),
         (
             PushOntoOptions {
-                tags: vec!["t:x".into()],
+                tags: refs(&["t:x"]),
                 ..onto("main", "main")
             },
             "t:x",
@@ -599,14 +616,14 @@ fn a_bad_name_or_a_bad_local_commit_is_refused_before_a_byte() {
     for (opts, needle) in [
         (
             PushOntoOptions {
-                tags: vec!["main".into()],
+                tags: refs(&["main"]),
                 ..onto("main", "main")
             },
             "also the branch",
         ),
         (
             PushOntoOptions {
-                tags: vec!["t".into(), "t".into()],
+                tags: refs(&["t", "t"]),
                 ..onto("main", "main")
             },
             "named twice",
@@ -617,6 +634,36 @@ fn a_bad_name_or_a_bad_local_commit_is_refused_before_a_byte() {
                 ..onto("main", "main")
             },
             "invalid collection id",
+        ),
+        (
+            PushOntoOptions {
+                collection: Some("org.example.X".into()),
+                ..onto("main", "@org.example.Y:a")
+            },
+            "names the collection 'org.example.Y'",
+        ),
+        (
+            PushOntoOptions {
+                collection: Some("org.example.X".into()),
+                tags: refs(&["@org.example.Y:t"]),
+                ..onto("main", "a")
+            },
+            "names the collection 'org.example.Y'",
+        ),
+        (
+            PushOntoOptions {
+                collection: Some("org.example.X".into()),
+                tags: refs(&["@org.example.X:a"]),
+                ..onto("main", "a")
+            },
+            "also the branch",
+        ),
+        (
+            PushOntoOptions {
+                tags: refs(&["@org.example.Y:t"]),
+                ..onto("main", "@org.example.X:a")
+            },
+            "two namespaces",
         ),
     ] {
         let (e, written) = refused(&pair.client, opts);
@@ -663,7 +710,7 @@ fn an_existing_tag_and_a_client_with_no_c_are_refused() {
     let (first, _) = pushed(
         &pair,
         PushOntoOptions {
-            tags: vec!["v1".into()],
+            tags: refs(&["v1"]),
             ..onto("main", "main")
         },
     );
@@ -674,7 +721,7 @@ fn an_existing_tag_and_a_client_with_no_c_are_refused() {
         &pair,
         &policy(),
         PushOntoOptions {
-            tags: vec!["v1".into()],
+            tags: refs(&["v1"]),
             ..onto("main", "main")
         },
     );
@@ -699,6 +746,168 @@ fn an_existing_tag_and_a_client_with_no_c_are_refused() {
     );
     assert!(report.is_err());
     assert_eq!(tip(&pair.server, "main"), Some(first));
+}
+
+/// A branch and tags of a collection go to the mirror refs of the
+/// collection. The server binds the commit to the collection, and binds the
+/// name part of the branch and of each tag.
+#[test]
+fn a_server_commit_onto_a_collection_ref_writes_the_mirror_refs() {
+    let pair = Pair::new("collection", "", "collection-id=org.example.Server\n");
+    let c1 = commit(&pair.client, "main", "one", local_metadata());
+    let local = load(&pair.client, &c1);
+    let x = Some("org.example.X");
+    let policy = collections_policy(&["org.example.X"], &["c:**", "t:**"]);
+
+    let (report, client) = push_under(
+        &pair,
+        &policy,
+        PushOntoOptions {
+            tags: refs(&["@org.example.X:t"]),
+            ..onto("main", "@org.example.X:a")
+        },
+    );
+    report.unwrap();
+    let outcome = client.unwrap();
+    let s1 = outcome.commit.unwrap();
+    assert_eq!(s1, expected(&local, None, TIMESTAMP, &["a", "t"], x));
+    let names: Vec<&str> = outcome.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["@org.example.X:a", "@org.example.X:t"]);
+    for name in ["a", "t"] {
+        let relpath = format!("refs/mirrors/org.example.X/{name}");
+        assert_eq!(ref_file(&pair.server, &relpath), Some(s1), "{name}");
+        assert_eq!(tip(&pair.server, name), None, "{name}");
+    }
+
+    // The collection of the push adds `@ID:` to a plain branch, and keeps an
+    // `@ID:` branch of the same id.
+    for (opts, branch) in [
+        (onto("main", "b"), "b"),
+        (onto("main", "@org.example.X:c"), "c"),
+    ] {
+        let (report, client) = push_under(
+            &pair,
+            &policy,
+            PushOntoOptions {
+                collection: Some("org.example.X".into()),
+                ..opts
+            },
+        );
+        report.unwrap();
+        let commit = client.unwrap().commit.unwrap();
+        assert_eq!(commit, expected(&local, None, TIMESTAMP, &[branch], x));
+        let relpath = format!("refs/mirrors/org.example.X/{branch}");
+        assert_eq!(ref_file(&pair.server, &relpath), Some(commit), "{branch}");
+    }
+}
+
+/// A branch and a tag of the collection id of the server are local refs, so
+/// `@OWN:a` with the tag `t` writes `refs/heads/`.
+#[test]
+fn a_server_commit_onto_the_own_collection_writes_the_local_refs() {
+    let pair = Pair::new("own", "", "collection-id=org.example.Server\n");
+    let c1 = commit(&pair.client, "main", "one", local_metadata());
+    let local = load(&pair.client, &c1);
+    let (report, client) = push_under(
+        &pair,
+        &policy(),
+        PushOntoOptions {
+            tags: refs(&["t"]),
+            ..onto("main", "@org.example.Server:a")
+        },
+    );
+    // The report names the canonical refs, and the outcome repeats the text
+    // of the client.
+    let report = report.unwrap();
+    let canonical: Vec<String> = report.refs.iter().map(|r| r.name.to_string()).collect();
+    assert_eq!(canonical, ["a", "t"]);
+    let outcome = client.unwrap();
+    let s1 = outcome.commit.unwrap();
+    assert_eq!(
+        s1,
+        expected(
+            &local,
+            None,
+            TIMESTAMP,
+            &["a", "t"],
+            Some("org.example.Server")
+        )
+    );
+    let names: Vec<&str> = outcome.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["@org.example.Server:a", "t"]);
+    assert_eq!(ref_file(&pair.server, "refs/heads/a"), Some(s1));
+    assert_eq!(ref_file(&pair.server, "refs/heads/t"), Some(s1));
+    assert!(
+        !pair
+            .server
+            .path()
+            .join("refs/mirrors/org.example.Server")
+            .exists()
+    );
+}
+
+/// A branch and a tag in two namespaces of the server are refused after
+/// `HelloReply` and before any object. A tag needs `t` or `w` in its
+/// namespace.
+#[test]
+fn a_server_commit_in_two_namespaces_is_refused_before_any_object() {
+    let pair = Pair::new("two-namespaces", "", "collection-id=org.example.Server\n");
+    commit(&pair.client, "main", "one", local_metadata());
+    let mut policy = policy_allowing(&["c:**", "t:**"]);
+    policy.rules.collections = collections_policy(&["org.example.X"], &["c:**", "t:**"])
+        .rules
+        .collections;
+    let before = object_files(&pair.server);
+    let (report, client) = push_under(
+        &pair,
+        &policy,
+        PushOntoOptions {
+            tags: refs(&["@org.example.X:t"]),
+            ..onto("main", "main")
+        },
+    );
+    match &client {
+        Err(Error::Remote(remote::Error::InvalidInput(message))) => assert!(
+            message.contains("'main' and '@org.example.X:t'") && message.contains("two namespaces"),
+            "{message}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(report, Err(Error::Remote(remote::Error::Aborted))),
+        "{report:?}"
+    );
+    assert_eq!(object_files(&pair.server), before);
+    assert_eq!(tip(&pair.server, "main"), None);
+
+    // The tag `@OWN:t` is a local ref, so it is in the namespace of `main`.
+    let (report, client) = push_under(
+        &pair,
+        &policy,
+        PushOntoOptions {
+            tags: refs(&["@org.example.Server:t"]),
+            ..onto("main", "main")
+        },
+    );
+    report.unwrap();
+    let commit = client.unwrap().commit.unwrap();
+    assert_eq!(tip(&pair.server, "t"), Some(commit));
+
+    // A tag with no `t` and no `w` in its namespace is refused.
+    let (report, client) = push_under(
+        &pair,
+        &collections_policy(&["org.example.X"], &["c:a"]),
+        PushOntoOptions {
+            tags: refs(&["@org.example.X:u"]),
+            ..onto("main", "@org.example.X:a")
+        },
+    );
+    assert!(
+        matches!(client, Err(Error::Remote(remote::Error::RefDenied(_)))),
+        "{client:?}"
+    );
+    assert!(report.is_err());
+    assert_eq!(ref_file(&pair.server, "refs/mirrors/org.example.X/a"), None);
 }
 
 /// A server commit whose `Commit` frame is over the `max-frame` of the

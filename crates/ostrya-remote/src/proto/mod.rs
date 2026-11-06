@@ -343,7 +343,7 @@ impl Encoding {
 /// The state of a ref as the server reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefState {
-    /// The ref name: `NAME` or `REMOTE:NAME`.
+    /// The ref name, as the `Hello` holds it.
     pub name: String,
     /// The commit of the ref, or `None` if the ref is absent.
     pub commit: Option<Checksum>,
@@ -363,7 +363,8 @@ pub enum Expected {
 /// One ref update of a `Commit` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefUpdate {
-    /// The ref name: `NAME` or `REMOTE:NAME`.
+    /// The ref name, as the `Hello` holds it: `NAME` or `@ID:NAME`, and in a
+    /// one-way stream also `REMOTE:NAME`.
     pub name: String,
     /// The state that the ref must be in before the write.
     pub expected: Expected,
@@ -374,7 +375,7 @@ pub struct RefUpdate {
 /// The result of one ref update in a `CommitReply` message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefOutcome {
-    /// The ref name.
+    /// The ref name, as the client sent it.
     pub name: String,
     /// The commit before the write, or `None` if the ref was absent.
     pub old: Option<Checksum>,

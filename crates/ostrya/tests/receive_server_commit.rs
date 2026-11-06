@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use common::receive::{
     Obj, build_commit, collections_policy, commit_objects, connect, fixture_objects, new_repo,
-    policy_allowing, returned_code, session, staging_entries,
+    outcomes, policy_allowing, returned_code, session, staging_entries,
 };
 use common::{
     ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory, tool_fsck, writer_child_main,
@@ -119,34 +119,29 @@ type Pushed = (
     Result<Vec<RefOutcome>, ErrorMessage>,
 );
 
-/// One session: `Hello` with `names` in the namespace `collection`, one
-/// object stream with `objects` and the detached metadata `meta`, and the
-/// `Commit` `request`.
+/// One session: `Hello` with `names`, one object stream with `objects` and
+/// the detached metadata `meta`, and the `Commit` `request`.
 fn push_request(
     repo: &Repo,
     policy: &ReceivePolicy,
     names: &[&str],
-    collection: Option<&str>,
     objects: &[Obj],
     meta: &[(Checksum, Vec<u8>)],
     request: CommitRequest,
 ) -> Pushed {
     let names: Vec<String> = names.iter().map(|&n| n.into()).collect();
-    session(repo, policy, |c| {
-        script(c, names, collection, objects, meta, request)
-    })
+    session(repo, policy, |c| script(c, names, objects, meta, request))
 }
 
 async fn script(
     mut c: common::receive::Client,
     names: Vec<String>,
-    collection: Option<&str>,
     objects: &[Obj],
     meta: &[(Checksum, Vec<u8>)],
     request: CommitRequest,
 ) -> Result<Vec<RefOutcome>, ErrorMessage> {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    c.hello_reply_in(&names, collection).await;
+    c.hello_reply(&names).await;
     if !objects.is_empty() || !meta.is_empty() {
         for o in objects {
             c.object(o.ty, o.checksum, o.encoding, &o.bytes)
@@ -173,8 +168,8 @@ fn request(sc: ServerCommit) -> CommitRequest {
     }
 }
 
-/// One session that sends `objects` and the server commit `sc` in the local
-/// refs, with `names` in `Hello`.
+/// One session that sends `objects` and the server commit `sc`, with `names`
+/// in `Hello`.
 fn server_push(
     repo: &Repo,
     policy: &ReceivePolicy,
@@ -182,7 +177,7 @@ fn server_push(
     objects: &[Obj],
     sc: ServerCommit,
 ) -> Pushed {
-    push_request(repo, policy, names, None, objects, &[], request(sc))
+    push_request(repo, policy, names, objects, &[], request(sc))
 }
 
 /// [`server_push`] with the branch and the tags of `sc` in `Hello`.
@@ -200,14 +195,19 @@ fn hello_names(sc: &ServerCommit) -> Vec<String> {
 }
 
 /// Asserts that a push succeeded and returns its report.
+///
+/// The `CommitReply` holds the outcomes of the report, each with the name
+/// that the client sent. The report holds the canonical ref of each name.
 fn committed(pushed: Pushed) -> ReceiveReport {
     let (result, reply) = pushed;
     let report = result.unwrap_or_else(|e| panic!("the push failed: {e}"));
-    assert_eq!(
-        reply.as_ref(),
-        Ok(&report.refs),
-        "CommitReply is the report"
-    );
+    let reply = reply.unwrap_or_else(|e| panic!("the push failed: {e:?}"));
+    assert_eq!(reply.len(), report.refs.len(), "CommitReply is the report");
+    for (sent, held) in reply.iter().zip(&report.refs) {
+        let name: Ref = sent.name.parse().unwrap();
+        assert_eq!(name.name(), held.name.name(), "{sent:?} {held:?}");
+        assert_eq!((sent.old, sent.new), (held.old, held.new), "{sent:?}");
+    }
     report
 }
 
@@ -356,7 +356,7 @@ fn a_server_commit_on_an_absent_branch_has_no_parent() {
     let expected = expected_bytes(&sc, None, &["main"], None);
     let commit = sha(&expected);
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![RefOutcome {
             name: "main".into(),
             old: None,
@@ -651,7 +651,10 @@ fn tags_get_refs_and_bound_names_do_not() {
         old: None,
         new: Some(commit),
     };
-    assert_eq!(report.refs, vec![entry("main"), entry("v2"), entry("v1")]);
+    assert_eq!(
+        outcomes(&report),
+        vec![entry("main"), entry("v2"), entry("v1")]
+    );
     for name in ["main", "v1", "v2"] {
         assert_eq!(ref_at(&repo, &format!("refs/heads/{name}")), Some(commit));
     }
@@ -719,18 +722,20 @@ fn the_metadata_and_the_bindings() {
     for (core, hello, binding, relpath) in cases {
         let tmp = TmpDir::new("sc-metadata");
         let repo = new_repo(&tmp, RepoMode::Archive, core);
-        let policy = match hello {
-            Some(id) => collections_policy(&[id], &["c:**"]),
-            None => policy_allowing(&["c:**"]),
+        let (policy, branch) = match hello {
+            Some(id) => (collections_policy(&[id], &["c:**"]), format!("@{id}:main")),
+            None => (policy_allowing(&["c:**"]), "main".to_owned()),
         };
         let report = committed(push_request(
             &repo,
             &policy,
-            &["main"],
-            hello,
+            &[&branch],
             &tree_objects(),
             &[],
-            request(sc.clone()),
+            request(ServerCommit {
+                branch: branch.clone(),
+                ..sc.clone()
+            }),
         ));
         let commit = new_commit(&report);
         assert_eq!(
@@ -740,8 +745,113 @@ fn the_metadata_and_the_bindings() {
         );
         assert_eq!(load(&repo, &commit).1.collection_binding(), binding);
         assert_eq!(ref_at(&repo, relpath), Some(commit));
-        assert_eq!(report.collection.as_deref(), hello);
+        let canonical = match hello {
+            Some(id) => Ref::collection(id, "main"),
+            None => Ref::local("main"),
+        };
+        assert_eq!(report.refs[0].name, canonical);
     }
+}
+
+/// The branch and each tag of a server commit take `NAME` or `@ID:NAME`.
+/// `@X:a` with the tag `@X:t` writes `refs/mirrors/X/a` and
+/// `refs/mirrors/X/t`, and the commit has the collection binding `X` and the
+/// ref binding `[a, t, b]` with the bound name `b`. `@OWN:a` with the tag `t`
+/// writes the local refs, with the collection binding `OWN`.
+#[test]
+fn a_server_commit_writes_the_namespace_of_its_branch() {
+    let tmp = TmpDir::new("sc-namespace");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.Own\n");
+    let mut policy = collections_policy(&["org.example.X"], &["c:a", "t:t"]);
+    policy.rules.local = policy_allowing(&["c:a", "t:t"]).rules.local;
+    let sc = ServerCommit {
+        tags: vec!["@org.example.X:t".into()],
+        bind_refs: vec!["b".into()],
+        ..server_commit("@org.example.X:a")
+    };
+    let report = committed(push_sc(&repo, &policy, &tree_objects(), sc.clone()));
+    let commit = new_commit(&report);
+    let expected = ServerCommit {
+        branch: "a".into(),
+        tags: vec!["t".into()],
+        ..sc
+    };
+    assert_eq!(
+        load(&repo, &commit).0,
+        expected_bytes(&expected, None, &["a", "t", "b"], Some("org.example.X"))
+    );
+    assert_eq!(ref_at(&repo, "refs/mirrors/org.example.X/a"), Some(commit));
+    assert_eq!(ref_at(&repo, "refs/mirrors/org.example.X/t"), Some(commit));
+    assert_eq!(ref_at(&repo, "refs/heads/a"), None);
+    let names: Vec<Ref> = report.refs.iter().map(|r| r.name.clone()).collect();
+    assert_eq!(
+        names,
+        [
+            Ref::collection("org.example.X", "a"),
+            Ref::collection("org.example.X", "t"),
+        ]
+    );
+
+    let sc = ServerCommit {
+        tags: vec!["t".into()],
+        ..server_commit("@org.example.Own:a")
+    };
+    let report = committed(push_sc(&repo, &policy, &tree_objects(), sc));
+    let commit = new_commit(&report);
+    let (_, parsed) = load(&repo, &commit);
+    assert_eq!(parsed.collection_binding(), Some("org.example.Own"));
+    assert_eq!(parsed.ref_bindings(), ["a", "t"]);
+    assert_eq!(ref_at(&repo, "refs/heads/a"), Some(commit));
+    assert_eq!(ref_at(&repo, "refs/heads/t"), Some(commit));
+    assert_eq!(report.refs[0].name, Ref::local("a"));
+}
+
+/// The branch and the tags of a server commit are in one namespace, after
+/// the map of `@OWN:` to the local refs. `main` with the tag `@X:t`, and
+/// `@X:a` with the tag `@Y:t`, are `protocol`. `main` with the tag `@OWN:t`
+/// passes. The rights of each ref come from its own namespace: a tag with
+/// no `t` or `w` in its namespace is `ref-denied`.
+#[test]
+fn the_refs_of_a_server_commit_are_in_one_namespace() {
+    let tmp = TmpDir::new("sc-one-namespace");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.Own\n");
+    let mut policy = collections_policy(&["org.example.X", "org.example.Y"], &["c:**", "t:**"]);
+    policy.rules.local = policy_allowing(&["c:**", "t:**"]).rules.local;
+    let before = snapshot(&repo);
+    for (branch, tag) in [
+        ("main", "@org.example.X:t"),
+        ("@org.example.X:a", "@org.example.Y:t"),
+        ("@org.example.X:a", "t"),
+    ] {
+        let sc = ServerCommit {
+            tags: vec![tag.into()],
+            ..server_commit(branch)
+        };
+        let error = refused(
+            push_sc(&repo, &policy, &tree_objects(), sc),
+            ErrorCode::Protocol,
+        );
+        assert!(error.message.contains("namespace"), "{error:?}");
+        assert_unchanged(&repo, &before);
+    }
+
+    let mut tags_elsewhere = collections_policy(&["org.example.X"], &["t:**"]);
+    tags_elsewhere.rules.local = policy_allowing(&["c:**"]).rules.local;
+    let sc = ServerCommit {
+        tags: vec!["@org.example.Own:t".into()],
+        ..server_commit("main")
+    };
+    let error = refused(
+        push_sc(&repo, &tags_elsewhere, &tree_objects(), sc.clone()),
+        ErrorCode::RefDenied,
+    );
+    assert!(error.message.contains("no t or w on ref 't'"), "{error:?}");
+    assert_unchanged(&repo, &before);
+
+    let report = committed(push_sc(&repo, &policy, &tree_objects(), sc));
+    let commit = new_commit(&report);
+    assert_eq!(ref_at(&repo, "refs/heads/main"), Some(commit));
+    assert_eq!(ref_at(&repo, "refs/heads/t"), Some(commit));
 }
 
 /// The entries of the client under `ostree.composefs.digest.v0` and
@@ -903,7 +1013,6 @@ fn a_dependency_of_the_tip_gets_no_server_signature() {
         &repo,
         &policy_allowing(&["w:**"]),
         &["main"],
-        None,
         &objects,
         &[],
         CommitRequest {
@@ -1024,7 +1133,7 @@ fn a_commit_with_equal_inputs_keeps_its_stored_signature() {
     };
     let report = committed(push_sc(&repo, &both, &[], orphan));
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![RefOutcome {
             name: "main".into(),
             old: Some(commit),
@@ -1123,7 +1232,6 @@ fn detached_metadata_in_a_server_commit_session_is_protocol() {
             &repo,
             &policy_allowing(&["c:**"]),
             &["main"],
-            None,
             &tree_objects(),
             &[(commit, dict)],
             request(server_commit("main")),
@@ -1184,7 +1292,7 @@ fn the_form_of_a_server_commit_message() {
     ];
     for (names, request, needle) in cases {
         let error = refused(
-            push_request(&repo, &policy, names, None, &tree_objects(), &[], request),
+            push_request(&repo, &policy, names, &tree_objects(), &[], request),
             ErrorCode::Protocol,
         );
         assert!(error.message.contains(needle), "{needle}: {error:?}");
@@ -1348,11 +1456,11 @@ fn race(
     let ((r1, reply1), (r2, reply2)) = block_on(futures_lite::future::zip(
         futures_lite::future::zip(
             repo.receive(in1, out1, first.0),
-            script(c1, names1, None, &[], &[], request(first.1)),
+            script(c1, names1, &[], &[], request(first.1)),
         ),
         futures_lite::future::zip(
             repo.receive(in2, out2, second.0),
-            script(c2, names2, None, &[], &[], request(second.1)),
+            script(c2, names2, &[], &[], request(second.1)),
         ),
     ));
     ((r1, reply1), (r2, reply2))
@@ -1591,15 +1699,22 @@ mod tool {
     }
 
     /// Sends the tree of `commit` of the tool and the server commit `sc` to
-    /// `port` in the namespace `collection`, and returns the new commit.
+    /// `port`, and returns the new commit. With a `collection`, the branch and
+    /// each tag of `sc` are `@ID:NAME`.
     fn server(
         port: &Repo,
         policy: &ReceivePolicy,
         collection: Option<&str>,
         tool: &Path,
         commit: &Checksum,
-        sc: ServerCommit,
+        mut sc: ServerCommit,
     ) -> Checksum {
+        if let Some(id) = collection {
+            sc.branch = format!("@{id}:{}", sc.branch);
+            for tag in &mut sc.tags {
+                *tag = format!("@{id}:{tag}");
+            }
+        }
         let names = hello_names(&sc);
         let names: Vec<&str> = names.iter().map(String::as_str).collect();
         let objects = tree_of(tool, commit);
@@ -1607,7 +1722,6 @@ mod tool {
             port,
             policy,
             &names,
-            collection,
             &objects,
             &[],
             request(sc),

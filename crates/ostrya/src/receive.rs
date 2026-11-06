@@ -45,11 +45,14 @@ pub use crate::access::{
     NamespaceRules, ServerSettings,
 };
 pub use crate::verify::TrustedKeys;
-pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
+pub use hooks::{
+    HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceiveRefUpdate, ReceiveServerCommit,
+    UpdatePlan,
+};
 pub use pattern::ReceivePattern;
 pub use policy::{ReceivePolicies, ReceivePolicy, ReceiveVerify};
 pub use service::ReceiveService;
-pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
+pub use session::{ReceiveCommit, ReceiveRefOutcome, ReceiveReport, ReceiveStep, ReceiveWarning};
 pub use signer::ServerSigner;
 pub use stream_policy::{StreamPolicy, StreamRule};
 

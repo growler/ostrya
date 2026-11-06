@@ -1709,7 +1709,7 @@ fn the_options_of_another_transport_are_refused_before_a_request() {
         commit(&repo, "main", None, "one", None).await;
         for o in [
             RepoPushOptions {
-                tags: vec!["v1".into()],
+                tags: vec![Ref::local("v1")],
                 ..opts(&["main"])
             },
             RepoPushOptions {
@@ -1717,6 +1717,7 @@ fn the_options_of_another_transport_are_refused_before_a_request() {
                 ..opts(&["main"])
             },
             opts(&["main", ":old"]),
+            opts(&["main", ":@org.example.B:a"]),
         ] {
             refused(push(&repo, &server.endpoint(), o).await);
         }
@@ -1740,16 +1741,20 @@ fn a_ref_that_is_a_directory_prefix_of_another_is_refused() {
         assert!(message.contains("is a directory of the ref"), "{message}");
         refused(push(&repo, &server.endpoint(), opts(&["main:x", "main:x/y"])).await);
         // A mirror directory is a directory of its own.
-        push(&repo, &server.endpoint(), opts(&["bound:a/b"]))
-            .await
-            .unwrap();
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&[&format!("bound:@{B}:a/b")]),
+        )
+        .await
+        .unwrap();
         assert!(
             server
                 .state()
                 .objects
                 .contains_key(&format!("repo/refs/mirrors/{B}/a/b"))
         );
-        refused(push(&repo, &server.endpoint(), opts(&["bound:a"])).await);
+        refused(push(&repo, &server.endpoint(), opts(&[&format!("bound:@{B}:a")])).await);
     });
 }
 
@@ -1763,7 +1768,7 @@ fn push_onto_refuses_an_s3_endpoint() {
         let s3 = endpoint(&server.endpoint(), ADDRESS);
         let o = PushOntoOptions {
             rev: "main".into(),
-            onto: "main".into(),
+            onto: Ref::local("main"),
             ..PushOntoOptions::default()
         };
         let message = refused(repo.push_onto(Endpoint::S3(s3), o).await);
@@ -1875,9 +1880,13 @@ fn a_push_into_a_mirror_namespace_writes_refs_mirrors() {
             init(&server.endpoint(), bucket_id).await;
             let repo = archive(&scratch.path().join(format!("src-{bucket_id:?}"))).await;
             let tip = commit(&repo, "main", None, "one", bound(B)).await;
-            push(&repo, &server.endpoint(), opts(&["main"]))
-                .await
-                .unwrap();
+            push(
+                &repo,
+                &server.endpoint(),
+                opts(&[&format!("main:@{B}:main")]),
+            )
+            .await
+            .unwrap();
             assert_eq!(
                 ref_of(&server, &format!("repo/refs/mirrors/{B}/main")),
                 Some(tip)
@@ -1902,18 +1911,20 @@ fn a_mirror_ref_is_fast_forward_checked_in_its_own_namespace() {
         let repo = archive(&scratch.path().join("src")).await;
         let local = commit(&repo, "main", None, "local", None).await;
         let mirrored = commit(&repo, "mirrored", None, "mirrored", bound(B)).await;
+        let mirror = |src: &str| opts(&[&format!("{src}:@{B}:main")]);
+        // The binding of a commit selects no namespace.
         push(&repo, &server.endpoint(), opts(&["main", "mirrored:main"]))
             .await
             .unwrap_err();
         push(&repo, &server.endpoint(), opts(&["main"]))
             .await
             .unwrap();
-        push(&repo, &server.endpoint(), opts(&["mirrored:main"]))
+        push(&repo, &server.endpoint(), mirror("mirrored"))
             .await
             .unwrap();
         // Each namespace has its own tip of `main`.
         let next = commit(&repo, "mirrored", Some(mirrored), "next", bound(B)).await;
-        let outcome = push(&repo, &server.endpoint(), opts(&["mirrored:main"]))
+        let outcome = push(&repo, &server.endpoint(), mirror("mirrored"))
             .await
             .unwrap();
         assert_eq!(outcome.outcome.refs[0].old, Some(mirrored));
@@ -1923,7 +1934,7 @@ fn a_mirror_ref_is_fast_forward_checked_in_its_own_namespace() {
             Some(next)
         );
         let unrelated = commit(&repo, "unrelated", None, "unrelated", bound(B)).await;
-        match push(&repo, &server.endpoint(), opts(&["unrelated:main"])).await {
+        match push(&repo, &server.endpoint(), mirror("unrelated")).await {
             Err(Error::Remote(ostrya::remote::Error::NonFastForward(message))) => {
                 assert!(
                     message.contains(&format!("ref 'refs/mirrors/{B}/main'")),
@@ -1934,7 +1945,7 @@ fn a_mirror_ref_is_fast_forward_checked_in_its_own_namespace() {
         }
         let forced = RepoPushOptions {
             force: true,
-            ..opts(&["unrelated:main"])
+            ..mirror("unrelated")
         };
         push(&repo, &server.endpoint(), forced).await.unwrap();
         assert_eq!(
@@ -1981,16 +1992,174 @@ fn an_unbound_commit_into_a_mirror_namespace_is_refused() {
     });
 }
 
+/// One push writes the refs of more than one namespace: each `DST` names
+/// its own. A ref of the collection id of the bucket goes to `refs/heads/`.
+/// The push lists and reads the ref directory of each namespace of the push
+/// alone. The outcome repeats the text of each `DST`.
 #[test]
-fn two_sources_with_different_bindings_are_refused() {
-    let scratch = TmpDir::new("push-s3-two-bindings");
+fn one_push_writes_the_refs_of_more_than_one_namespace() {
+    let scratch = TmpDir::new("push-s3-namespaces");
     block_on(async {
         let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
         let repo = archive(&scratch.path().join("src")).await;
+        let main = commit(&repo, "main", None, "a", None).await;
+        let in_b = commit(&repo, "bound-b", None, "b", bound(B)).await;
+        let in_c = commit(&repo, "bound-c", None, "c", bound(C)).await;
+        server.state().requests.clear();
+        let specs = [
+            "main".to_owned(),
+            format!("main:@{A}:own"),
+            format!("bound-b:@{B}:main"),
+            format!("bound-c:@{C}:main"),
+        ];
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let outcome = push(&repo, &server.endpoint(), opts(&specs)).await.unwrap();
+        let names: Vec<&str> = outcome
+            .outcome
+            .refs
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "main".to_owned(),
+                format!("@{A}:own"),
+                format!("@{B}:main"),
+                format!("@{C}:main")
+            ]
+        );
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(main));
+        assert_eq!(ref_of(&server, "repo/refs/heads/own"), Some(main));
+        assert_eq!(
+            ref_of(&server, &format!("repo/refs/mirrors/{B}/main")),
+            Some(in_b)
+        );
+        assert_eq!(
+            ref_of(&server, &format!("repo/refs/mirrors/{C}/main")),
+            Some(in_c)
+        );
+        assert!(keys(&server, &format!("repo/refs/mirrors/{A}/")).is_empty());
+        let (_, lists) = ref_reads(&server);
+        assert_eq!(
+            lists,
+            BTreeSet::from([
+                "refs/heads/".to_owned(),
+                format!("refs/mirrors/{B}/"),
+                format!("refs/mirrors/{C}/"),
+            ])
+        );
+        assert_trees_whole(&server);
+    });
+}
+
+/// `NAME` and `@OWN:NAME` name one ref of a bucket whose collection id is
+/// `OWN`. A push that names both is refused before its first upload, and
+/// writes no ref.
+#[test]
+fn two_names_of_one_ref_are_refused_before_an_upload() {
+    let scratch = TmpDir::new("push-s3-one-ref-two-names");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        commit(&repo, "c1", None, "one", None).await;
+        commit(&repo, "c2", None, "two", None).await;
+        server.state().requests.clear();
+        let specs = ["c1:main".to_owned(), format!("c2:@{A}:main")];
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let message = refused(push(&repo, &server.endpoint(), opts(&specs)).await);
+        assert!(
+            message.contains(&format!("the refs 'main' and '@{A}:main' name one ref")),
+            "{message}"
+        );
+        let puts = puts(&server);
+        assert!(puts.iter().all(|key| key.starts_with(LOCK)), "{puts:?}");
+        assert!(keys(&server, "repo/objects/").is_empty());
+        assert!(keys(&server, "repo/refs/").is_empty());
+        assert!(!server.state().objects.contains_key(LOCK));
+    });
+}
+
+/// The binding of a commit selects no namespace: a commit bound to a
+/// collection other than the collection id of the bucket is refused on a
+/// plain `DST`, and a commit with no binding is refused on a ref of another
+/// collection, also under the switch of the ref-binding check. The same
+/// commit passes on `main` and on `@OWN:a`.
+#[test]
+fn each_ref_checks_the_binding_of_its_namespace() {
+    let scratch = TmpDir::new("push-s3-binding-per-ref");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let main = commit(&repo, "main", None, "a", None).await;
         commit(&repo, "bound-b", None, "b", bound(B)).await;
-        commit(&repo, "bound-c", None, "c", bound(C)).await;
-        mismatch(push(&repo, &server.endpoint(), opts(&["bound-b", "bound-c"])).await);
+        let message = mismatch(push(&repo, &server.endpoint(), opts(&["bound-b"])).await);
+        assert!(message.contains(B) && message.contains(A), "{message}");
+        for skip in [false, true] {
+            let o = RepoPushOptions {
+                disable_verify_bindings: skip,
+                ..opts(&[&format!("main:@{B}:a")])
+            };
+            let message = mismatch(push(&repo, &server.endpoint(), o).await);
+            assert!(message.contains("has no collection binding"), "{message}");
+        }
+        assert!(keys(&server, "repo/objects/").is_empty());
+        assert!(keys(&server, "repo/refs/").is_empty());
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&["main", &format!("main:@{A}:a")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(main));
+        assert_eq!(ref_of(&server, "repo/refs/heads/a"), Some(main));
+    });
+}
+
+/// A bucket has no server check, so the ref-binding check of the client
+/// alone guards it. The check reads the name part of a `DST`, and refuses an
+/// empty list before a request. The switch skips it.
+#[test]
+fn the_switch_skips_the_ref_binding_check_of_a_bucket() {
+    let scratch = TmpDir::new("push-s3-ref-binding");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let mut metadata = DictBuilder::new();
+        metadata.insert_strv("ostree.ref-binding", &["main".to_owned()]);
+        metadata.insert_str("ostree.collection-binding", B);
+        let tip = commit(&repo, "main", None, "a", Some(metadata.build())).await;
+        let mut empty = DictBuilder::new();
+        empty.insert_strv("ostree.ref-binding", &[]);
+        commit(&repo, "empty", None, "e", Some(empty.build())).await;
+        server.state().requests.clear();
+        for spec in [format!("main:@{B}:stable"), "empty".to_owned()] {
+            let message = mismatch(push(&repo, &server.endpoint(), opts(&[&spec])).await);
+            assert!(message.contains("which do not hold"), "{message}");
+        }
         assert!(server.state().requests.is_empty());
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&[&format!("main:@{B}:main")]),
+        )
+        .await
+        .unwrap();
+        let o = RepoPushOptions {
+            disable_verify_bindings: true,
+            ..opts(&[&format!("main:@{B}:stable"), "empty"])
+        };
+        push(&repo, &server.endpoint(), o).await.unwrap();
+        assert_eq!(
+            ref_of(&server, &format!("repo/refs/mirrors/{B}/stable")),
+            Some(tip)
+        );
+        assert!(ref_of(&server, "repo/refs/heads/empty").is_some());
     });
 }
 
@@ -2110,9 +2279,13 @@ fn a_push_reads_no_ref_file_of_another_namespace() {
         push(&repo, &server.endpoint(), opts(&["main"]))
             .await
             .unwrap();
-        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
-            .await
-            .unwrap();
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&[&format!("bound-b:@{B}:main")]),
+        )
+        .await
+        .unwrap();
         let next = commit(&repo, "main", Some(main), "two", None).await;
         let next_mirrored = commit(&repo, "bound-b", Some(mirrored), "b2", bound(B)).await;
 
@@ -2126,9 +2299,13 @@ fn a_push_reads_no_ref_file_of_another_namespace() {
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(next));
 
         server.state().requests.clear();
-        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
-            .await
-            .unwrap();
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&[&format!("bound-b:@{B}:main")]),
+        )
+        .await
+        .unwrap();
         let (gets, lists) = ref_reads(&server);
         assert_eq!(gets, [format!("refs/mirrors/{B}/main")]);
         assert_eq!(lists, BTreeSet::from([format!("refs/mirrors/{B}/")]));
@@ -2171,9 +2348,13 @@ fn a_push_ignores_the_mirror_refs_of_the_own_collection_id() {
         push(&repo, &server.endpoint(), opts(&["main"]))
             .await
             .unwrap();
-        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
-            .await
-            .unwrap();
+        push(
+            &repo,
+            &server.endpoint(),
+            opts(&[&format!("bound-b:@{B}:main")]),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(main));
         assert_eq!(

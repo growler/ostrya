@@ -845,9 +845,10 @@ target ref:
 `Hello` names the refs of a session and does not tell a write from a delete, so
 the server does not check the shape at `Hello`. The client passes a push delete
 (`:<name>`) of a ref of that shape. Check 1 of "Commit and CommitReply" states
-the server side. A remote ref `REMOTE:<name>`
-is not 64 characters, so a revision reads it as a refspec, and each push site
-takes it. Ref reads, local ref deletes, pull, and prune do not apply the guard.
+the server side. A remote ref `REMOTE:<name>` and a collection ref
+`@ID:<name>` are not 64 characters, so a revision reads each as a ref, and
+each push site takes it. Ref reads, local ref deletes, pull, and prune do
+not apply the guard.
 
 A ref of either hidden shape can arrive in these ways:
 
@@ -3599,7 +3600,9 @@ grammars share the part grammar. A pattern of a client group is one pattern of
 the part grammar, with no remote part and no negative form. An item of a
 client group names its collection with `@ID:` before the pattern, so the
 pattern itself has no collection part. An entry of a ref selector takes one
-leading `!`.
+leading `!`. A pattern of a rule of a one-way stream is one pattern of the
+part grammar with an optional prefix `REMOTE:`, `*:`, or `@ID:` ("The
+one-way stream").
 
 ### The part grammar
 
@@ -3780,23 +3783,32 @@ Each message kind has a number, a direction, a protocol, and a body type:
 A session refuses a kind of the other protocol with `protocol`.
 
 `Hello` holds the protocol version, a dict, and the ref names of the session.
-The dict holds these keys:
+Each ref name is the text of one ref ("Revision syntax"), with no `^`:
+
+- `NAME`: a local ref of the server;
+- `@ID:NAME`: a ref of the collection `ID`. When `ID` is the collection id of
+  the server, the name is the local ref `NAME`;
+- `REMOTE:NAME`: a remote ref. Only a one-way stream writes a remote ref.
+
+The other name fields of the push protocol hold the same forms: the name of
+each entry of `HelloReply`, of each update of `Commit`, and of each entry of
+`CommitReply`, and the branch and the tags of `server-commit`. The name of
+each ref carries its namespace, so one session can write local refs and the
+refs of more than one collection. The dict holds these keys:
 
 - `agent` (`s`, optional): the name and the version of the client.
-- `collection` (`s`, optional): the collection id of the namespace that the
-  session writes. Without the key, the session writes the local refs. A
-  writer puts the key in the dict only when it names a collection.
 - `one-way` (`b`, optional): true for a one-way stream. A writer puts the key
   in the dict only when its value is true.
 
 `HelloReply` holds the protocol version, a dict, and one `(name, commit)`
-entry for each ref of `Hello`, in the order of `Hello`. An absent commit is an
-absent ref. The dict holds these keys:
+entry for each ref of `Hello`, in the order of `Hello`. The name of each
+entry is the text of the name in `Hello`. An absent commit is an absent ref.
+The dict holds these keys:
 
 - `mode` (`s`, required): the mode of the repository.
-- `collection-id` (`s`, optional): the collection id of the repository.
-- `collection` (`s`, optional): the collection of the namespace that the
-  server selected for the session. The key is absent for the local refs.
+- `collection-id` (`s`, optional): the collection id of the repository. A
+  client reads it to find the namespace of each ref before it sends an
+  object.
 - `max-frame` (`u`, required): the frame limit ("Frame limits").
 - `max-have` (`u`, required): the most entries of one `Have`.
 - `encodings` (`as`, required): the encodings that the server accepts.
@@ -3806,12 +3818,6 @@ absent ref. The dict holds these keys:
 A `HelloReply` with no value for a required key is `protocol`. A `max-have` or
 a `parallel-uploads` of 0 is `protocol`. A client drops an encoding name that
 it does not know.
-
-A client refuses a `HelloReply` whose `collection` does not agree with its
-`Hello`, with `protocol`. A `Hello` with no `collection` needs a reply with
-no `collection`. A `Hello` with the collection `ID` needs a reply with the
-`collection` `ID`, or a reply with no `collection` and the `collection-id`
-`ID`.
 
 `Have` is a list of object names: the object type (1 to 4) and the checksum.
 Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
@@ -3863,9 +3869,10 @@ A `state` greater than 2, and an `expected` that does not agree with its
 
 The value of `server-commit` holds these members, in this order:
 
-1. `s`: the branch.
-2. `as`: the tags, in the order of the client.
-3. `as`: the bound names, in the order of the client.
+1. `s`: the branch, `NAME` or `@ID:NAME`.
+2. `as`: the tags, each `NAME` or `@ID:NAME`, in the order of the client.
+3. `as`: the bound names, in the order of the client. A bound name is a
+   plain name, because `ostree.ref-binding` holds names alone.
 4. `(ayay)`: the checksums of the root dirtree and of the root dirmeta.
 5. `s`: the subject.
 6. `s`: the body.
@@ -3881,7 +3888,8 @@ The value of `server-commit` holds these members, in this order:
      puts the key in the dict only when its value is true.
 
 `CommitReply` holds one `(name, old, new)` entry for each update, in the order
-of `Commit`. `old` is the commit of the ref before the write, and `new` is the
+of `Commit`. The name of each entry is the text that the client sent. `old`
+is the commit of the ref before the write, and `new` is the
 commit after it. An absent commit is an absent ref. For a server commit, the
 reply holds one entry for the branch, then one entry for each tag, in the
 order of `server-commit`. `new` of each entry is the new commit, and `old` of
@@ -3943,12 +3951,12 @@ give the condition of each refusal.
   code too.
 - `delete-denied` -- the client group has no `d` on a ref that an update
   deletes.
-- `invalid-ref` -- the server refuses a ref name, or the collection id of
-  `Hello`: an id longer than 255 bytes, or one that fails the collection-id
-  rule.
+- `invalid-ref` -- the server refuses a ref name, also the collection id of
+  a name `@ID:NAME`: an id longer than 255 bytes, or one that fails the
+  collection-id rule.
 - `ref-denied` -- no client group carries the item of the client, the
-  client group opens no push session, a ref of `Hello` has no `r` in the
-  namespace of `Hello`, an update writes
+  client group opens no push session, a ref of `Hello` has no `r` in its
+  namespace, an update writes
   a commit without `w` or `t`, or an update names a ref that a push does not
   write. A server commit gets this code without `c` on its branch, or without
   `t` or `w` on a tag. A hook of a host application can also refuse a commit
@@ -3957,7 +3965,8 @@ give the condition of each refusal.
   has no signature and the client group requires one.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
   ref, or its collection binding does not name the collection of the
-  namespace of the session.
+  namespace of the ref. A commit with no collection binding on a ref of a
+  collection other than the collection id of the server gets this code too.
 - `internal` -- a failure on the server side, for example an I/O error. A
   hook of a host application can also refuse a commit with ref updates or a
   server commit with this code.
@@ -3997,9 +4006,11 @@ counts 0 and 0.
 The server enforces these rules, or depends on them, so a client must keep
 them:
 
-- The refs of `Commit` are a subset of the refs of `Hello`. The subset is not
-  empty and names no ref two times. The refs of a server commit are its
-  branch and its tags.
+- `Hello` names no ref two times: no name two times, and not `NAME` with
+  `@OWN:NAME`, where `OWN` is the collection id of the server.
+- The refs of `Commit` are a subset of the refs of `Hello`, each with the
+  text of its name in `Hello`. The subset is not empty and names no ref two
+  times. The refs of a server commit are its branch and its tags.
 - `Have` and `missing` name objects of the types 1 to 4.
 - An object has the encoding `deflate` only if it is a file and `HelloReply`
   lists `deflate`.
@@ -4038,19 +4049,24 @@ The server runs these checks of `Hello` in this order. The checks do no I/O:
 3. A repository in the mode `bare-split-xattrs` is `mode-refused`.
 4. A repository with `[core] locking=false` is `locking-disabled`. A
    malformed `[core] locking` value is `internal`.
-5. A ref name that fails the refspec rule ("Ref name validation") is
-   `invalid-ref`.
-6. A `collection` that is longer than 255 bytes, or that fails the
-   collection-id rule, is `invalid-ref`. The id is one name under
-   `refs/mirrors/`, and a file system takes a name of 255 bytes at most.
+5. A ref name that is not `NAME`, `REMOTE:NAME`, or `@ID:NAME` is
+   `invalid-ref`. `NAME` and `REMOTE:NAME` follow the refspec rule ("Ref name
+   validation"). In `@ID:NAME`, `ID` follows the collection-id rule and is at
+   most 255 bytes, and `NAME` follows the ref-name rule. The id is one name
+   under `refs/mirrors/`, and a file system takes a name of 255 bytes at
+   most.
+6. Two names of one ref are `protocol`: one name two times, or `NAME` with
+   `@OWN:NAME`, where `OWN` is the collection id of the repository. The
+   server sends no `HelloReply`, so the client sends no object.
 7. A `HelloReply` with a commit for each ref that needs a frame over 1 MiB is
-   `limit-exceeded`. The reply holds the `collection` of the namespace.
+   `limit-exceeded`.
 
-`collection` names the namespace of the session. No `collection`, and the
-collection id of the repository, name the local refs, under `refs/heads/`.
-Each other id names the refs of that collection, under `refs/mirrors/ID/`.
-The session reads and writes the refs of its namespace alone, so a session
-of a collection does not touch `refs/heads/`.
+Each ref of `Hello` has its own namespace. A plain `NAME` names the local
+ref, under `refs/heads/NAME`. `@ID:NAME` names the ref `NAME` of the
+collection `ID`, under `refs/mirrors/ID/NAME`. When `ID` is the collection
+id of the repository, `@ID:NAME` names the local ref `refs/heads/NAME`, so
+`@OWN:NAME` and `NAME` name one ref. One session can read and write local
+refs and the refs of more than one collection.
 
 Then the server runs the checks of the client group of the session. They do
 no I/O, and each failure is `ref-denied`:
@@ -4062,7 +4078,7 @@ no I/O, and each failure is `ref-denied`:
 10. A remote ref `REMOTE:NAME` in `Hello` is refused, because a push writes
     no remote ref.
 11. A ref of `Hello` needs `r` in the effective rights of the group in the
-    namespace of `Hello` (`ostrya-config(1)`, "Access modes and patterns").
+    namespace of the ref (`ostrya-config(1)`, "Access modes and patterns").
     `d` does not add `r`.
     `HelloReply` gives the current commit of each ref of `Hello`, so this
     check keeps a client from reading a ref through a push session.
@@ -4070,15 +4086,14 @@ no I/O, and each failure is `ref-denied`:
 `ostrya receive` and `ostrya serve` give a session the client group that
 carries the auth item of the client ("Authentication of the receive
 endpoint"). The session takes the allow items and the deny items of the
-group for the namespace of `Hello`. With no such group, `ostrya receive`
+group for the namespace of each ref. With no such group, `ostrya receive`
 answers `Hello` with `ref-denied` at check 8, and `ostrya serve` answers the
 `session` request with 403.
 
-A `Hello` with no ref, and a `Hello` that names one ref two times, pass
-checks 1 to 7. A `Hello` with no ref also passes checks 10 and 11, so a
-client group that opens a push session accepts it. A session whose `Hello`
-names no ref cannot commit, because `Commit` names refs of `Hello` alone
-(check 1 of "Commit and CommitReply").
+A `Hello` with no ref passes checks 1 to 7, 10, and 11, so a client group
+that opens a push session accepts it. A session whose `Hello` names no ref
+cannot commit, because `Commit` names refs of `Hello` alone (check 1 of
+"Commit and CommitReply").
 
 Then the server opens the transaction of the session, and the transaction
 takes the repository lock shared ("Locks and on-disk state of a receive"). A
@@ -4095,28 +4110,37 @@ this order:
 3. In a `bare` repository, a new file in the staging directory must get the
    owner uid 0. Only root can store the owner of each file. Else the session
    is `mode-refused`.
-4. The server reads the ref of each name of `Hello` in the namespace of the
-   session. A failed read, and a ref file that does not parse, are
-   `internal`.
+4. The server reads the ref of each name of `Hello` in its namespace. A
+   failed read, and a ref file that does not parse, are `internal`.
 
 An ostrya server announces these values in `HelloReply`:
 
 - version 1;
 - `mode`: the mode of the repository, with `archive` sent as `archive-z2`;
 - `collection-id`: the collection id of the repository, when it has one;
-- `collection`: the collection of the namespace of the session. The key is
-  absent for the local refs, also when `Hello` names the collection id of the
-  repository;
 - `max-frame`: 1 MiB;
 - `max-have`: 16384;
 - `encodings`: `raw` and `deflate`, in every mode;
 - `parallel-uploads`: 1 on a stream, and the `parallel-uploads` setting of
   the endpoint over HTTP ("The receive endpoint");
-- the refs: the current commit of each ref of `Hello` in the namespace of the
-  session, in the order of `Hello`, with one entry for each name that `Hello`
-  repeats. A ref name that
-  names a directory, or a path through a file, reads as absent. An alias gets
-  the commit of its target.
+- the refs: the name of each ref of `Hello`, as `Hello` gives it, and the
+  current commit of the ref in its namespace, in the order of `Hello`. A ref
+  name that names a directory, or a path through a file, reads as absent. An
+  alias gets the commit of its target.
+
+A client of the port checks the collection binding of the new commit of
+each ref of a push of commits. A plain `NAME` and `@OWN:NAME`, where `OWN` is
+the `collection-id` of `HelloReply`, take the collection id of the server.
+`@ID:NAME` with another id takes `ID`. The client refuses a new commit whose
+`ostree.collection-binding` is not that id, and a new commit with no
+`ostree.collection-binding` on a ref of a collection other than the
+collection id of the server. It refuses a commit bound to `Y` on a ref
+`@X:NAME`, with `Y` other than `X`, before it sends `Hello`. It runs the
+other checks after `HelloReply`, and before it sends an object. After
+`HelloReply`, the client also refuses two names of one ref, `NAME` and
+`@OWN:NAME`, which check 6 refuses on an ostrya server. Check 7 of
+"Commit and CommitReply" states the same rules for the server. "Server
+commit" states the checks of a client of a server commit.
 
 ### Have and HaveReply
 
@@ -4192,21 +4216,22 @@ The server runs these checks of a `Commit` with no server commit in this
 order. "Server commit" states the checks of a `Commit` with a server commit.
 Each failed check ends the session, and the session writes nothing:
 
-1. Each ref name passes the refspec rule ("Ref name validation"). An update
+1. Each ref name has a form of check 5 of "Hello and HelloReply". An update
    that writes a commit to a name of 64 lowercase hex characters fails this
    check too. A delete of such a name passes. A failure is `invalid-ref`.
-   Then a request with no update, an update of a ref that `Hello` does not
-   name, and two updates of one ref are `protocol`.
+   Then a request with no update, an update whose name is not the text of a
+   name of `Hello`, and two updates of one ref are `protocol`.
 2. A `CommitReply` with a commit in each `old`, and the `new` of each
    update, that needs a frame over 1 MiB is `limit-exceeded`.
 3. A detached metadata dict for a commit that the session did not stage,
    that no update names as `new`, and that the repository does not hold is
    `protocol`.
 4. The server reads the effective rights of the ref of each update in the
-   client group. These updates are `ref-denied`:
+   client group, in the namespace of the ref. These updates are
+   `ref-denied`:
    - an update of `ostree-metadata` in the local refs of a repository with a
-     collection id. In a collection namespace, `ostree-metadata` is a ref
-     like the other refs;
+     collection id, also as `@OWN:ostree-metadata`. In the namespace of
+     another collection, `ostree-metadata` is a ref like the other refs;
    - an update of a remote ref `REMOTE:NAME`;
    - an update that writes a commit to a ref with neither `w` nor `t`.
 
@@ -4248,20 +4273,28 @@ Each failed check ends the session, and the session writes nothing:
    through the walk above, also with a partial-commit marker. The server
    does not check field 2 of a new commit that the repository holds with no
    partial-commit marker.
-7. The bindings of each new commit must agree with the session, else
-   `binding-mismatch`:
-   - A non-empty `ostree.ref-binding` must hold the name of each ref that the
-     commit is the new value of. For a remote ref of a one-way stream, the
-     name is the part after `REMOTE:`.
+7. The bindings of each new commit must agree with the ref of each update
+   that takes the commit as its new value, else `binding-mismatch`. The
+   server checks each ref in its own namespace:
+   - If the commit has `ostree.ref-binding`, the list must hold the name
+     part of the ref: `NAME` for `NAME`, for `@ID:NAME`, and for a remote ref
+     `REMOTE:NAME` of a one-way stream. An empty list holds no name, so a
+     commit with an empty list fails. A commit with no `ostree.ref-binding`
+     passes this check. A client group with `disable-verify-bindings=true`
+     (`ostrya-config(1)`, "Client keys"), and the rules of a one-way stream
+     with the same flag, skip this check alone.
    - If the commit has `ostree.collection-binding`, the value must be the id
-     of the namespace: the collection of a collection namespace, or the
-     collection id of the repository for the local refs. In the local refs of
-     a repository with no collection id, a commit with the key fails. A
-     one-way stream checks the key against the collection id of the
-     repository, and does not check it in a repository with no collection
-     id.
-   - The server does not check a binding key that the commit does not have,
-     so a commit with no binding passes in each namespace.
+     of the namespace of the ref: `ID` for `@ID:NAME`, and the collection id
+     of the repository for a local ref. A commit bound to `X` on a plain
+     `NAME` thus fails unless `X` is the collection id of the repository. In
+     the local refs of a repository with no collection id, a commit with the
+     key fails. A one-way stream checks the key of the commit of a remote
+     ref against the collection id of the repository, and does not check it
+     in a repository with no collection id.
+   - A commit with no `ostree.collection-binding` passes on a local ref and
+     on a remote ref. On a ref `@ID:NAME` whose `ID` is not the collection id
+     of the repository, it fails.
+   - No key and no flag skips the checks of the collection binding.
 8. A new commit that the client built must pass the signature verification
    of the client group, else `signature-required`. The verification reads the stored detached
    metadata of the commit and the incoming dict together, before the switch
@@ -4303,8 +4336,11 @@ Each failed check ends the session, and the session writes nothing:
    the ref, no walk runs: check 11 refuses the update if the ref is present.
    A host application is a program that embeds the receive path of the port.
    Its hook before the update can refuse with `ref-denied` or `internal`.
-10. The server takes the update lock and reads the refs again, in the
-    namespace of the session. These are `ref-denied`:
+   The hooks get the name of each ref in canonical form: a ref of the
+   collection id of the repository is a local ref, so `main` and
+   `@OWN:main` give a hook the same value.
+10. The server takes the update lock and reads the refs again, each ref in
+    its namespace. These are `ref-denied`:
     - a ref that is an alias;
     - a ref path that a ref write cannot replace;
     - two updates that write a commit, where one names a directory of the
@@ -4326,8 +4362,9 @@ Each failed check ends the session, and the session writes nothing:
     can give this error before the update lock, at step 9. Then the server
     commits the transaction.
 
-`CommitReply` has one entry for each update, in the order of `Commit`.
-"Locks and on-disk state of a receive" states when the server sends it.
+`CommitReply` has one entry for each update, in the order of `Commit`, with
+the name that the client sent. "Locks and on-disk state of a receive" states
+when the server sends it.
 
 #### Server commit
 
@@ -4336,12 +4373,16 @@ that the client sends in `server-commit` ("Messages"). Its parent is the tip
 of the branch on the server. The server runs these checks in this order. Each
 failed check ends the session, and the session writes nothing:
 
-1. The branch and each tag pass the refspec rule ("Ref name validation"), and
-   none is 64 lowercase hex characters. Each bound name passes the refspec
-   rule and holds no `:`. A failure is `invalid-ref`. Then a `Commit` with an
-   update, a `Commit` with `force`, a branch or a tag that `Hello` does not
-   name, and a ref that occurs two times among the branch and the tags are
-   `protocol`. A metadata value of the client that the commit cannot hold is
+1. The branch and each tag are `NAME` or `@ID:NAME` with the rules of check
+   5 of "Hello and HelloReply", and none is 64 lowercase hex characters.
+   Each bound name passes the refspec rule and holds no `:`. A failure is
+   `invalid-ref`. Then a `Commit` with an update, a `Commit` with `force`, a
+   branch or a tag that is not the text of a name of `Hello`, and a ref that
+   occurs two times among the branch and the tags are `protocol`. The
+   branch and the tags must be in one namespace, after the server maps the
+   refs of its collection id to the local refs, else `protocol`. So a branch
+   `main` with a tag `@OWN:t` passes, and a branch `main` with a tag `@X:t`
+   fails. A metadata value of the client that the commit cannot hold is
    also `protocol`. The port reads and writes the metadata dict of a commit
    with at most 128 levels of containers. In that dict, the `v` of each value
    is under two containers, the dict and its entry, so the `v` can hold two
@@ -4354,8 +4395,8 @@ failed check ends the session, and the session writes nothing:
    - a branch or a tag `ostree-metadata` in the local refs of a repository
      with a collection id;
    - a remote ref `REMOTE:NAME`;
-   - a branch without `c`;
-   - a tag with neither `t` nor `w`.
+   - a branch without `c` in its namespace;
+   - a tag with neither `t` nor `w` in its namespace.
 
    A bound name gets no ref and needs no right.
 5. Each object that the tree of the commit reaches must be staged or
@@ -4371,9 +4412,9 @@ Under `[ex-ostrya] generate-composefs`, the server then reads the key
 `ostree.composefs.digest.v0` of a server commit. A malformed key is
 `protocol`. The server then makes the staged objects durable. In a session
 with the hooks of a host application, the hook of the host gets the server
-commit next. The hook can refuse with `ref-denied` or `internal`, and no ref
-changes. A host whose hooks take no server commit refuses with `ref-denied`
-at this step.
+commit next, with the branch and the tags in canonical form. The hook can
+refuse with `ref-denied` or `internal`, and no ref changes. A host whose
+hooks take no server commit refuses with `ref-denied` at this step.
 
 If the server commit carries the key, the server then builds the composefs
 image of its tree, with these codes: `checksum-mismatch` for an image whose
@@ -4381,7 +4422,7 @@ digest is not the key, and `internal` for each other failure. So a request
 that the host refuses reads no tree.
 
 The server then takes the update lock. Under the lock it reads the branch and
-the tags in the namespace of the session, and check 10 applies, with a write
+the tags in their namespace, and check 10 applies, with a write
 to each of these refs. Then the server checks the branch, and then each tag,
 in order:
 
@@ -4404,12 +4445,13 @@ Then the server builds the commit under the update lock:
      drops each entry under `ostree.ref-binding` and
      `ostree.collection-binding`, and moves each entry under
      `ostree.composefs.digest.v0` and `ostree.sizes` to items 4 and 5;
-  2. `ostree.ref-binding` (`as`): the branch, each tag, and each bound name,
-     sorted byte-wise, with duplicates kept;
-  3. `ostree.collection-binding` (`s`): the collection of a collection
-     namespace, or the collection id of the repository for the local refs.
-     The key is absent for the local refs of a repository with no collection
-     id;
+  2. `ostree.ref-binding` (`as`): the name part of the branch and of each
+     tag, without `@ID:`, and each bound name, sorted byte-wise, with
+     duplicates kept;
+  3. `ostree.collection-binding` (`s`): the id of the namespace of the
+     branch and the tags: `ID` for the refs `@ID:NAME` of a collection, or
+     the collection id of the repository for the local refs. The key is
+     absent for the local refs of a repository with no collection id;
   4. each entry of the client under `ostree.composefs.digest.v0`, in order;
   5. each entry of the client under `ostree.sizes`, in order.
 
@@ -4457,8 +4499,15 @@ in these cases:
 The clients of a server commit are `ostrya push --onto` and `ostrya
 push-tree` ("The commit of `push-tree`"). Each client follows these rules:
 
-- `Hello` names the branch, then each tag. The namespace is the collection
-  of `--collection`, else the local refs of the server.
+- `Hello` names the branch, then each tag, each as `NAME` or `@ID:NAME`.
+  `--collection=ID` adds `@ID:` to a plain branch and to each plain tag. It
+  keeps an `@ID:` operand, and the client refuses an operand `@Y:NAME`,
+  with `Y` other than `ID`, before it sends `Hello`. `--collection` does not
+  change a bound name.
+- After `HelloReply`, the client maps each ref of the `collection-id` of the
+  reply to the local refs. A branch and tags of more than one namespace are
+  refused on the client before it sends an object, as check 1 refuses them
+  on the server.
 - After `HelloReply`, a tag that the server reports at a commit is
   `ref-mismatch` on the client. Then the client runs the checks of the
   server at `Commit` that need no state of the server:
@@ -4494,8 +4543,8 @@ commit holds these fields of the local commit:
 - each metadata entry, in order, with the bytes of its value, except each
   entry under `ostree.ref-binding` and `ostree.collection-binding`. The
   entries under `ostree.sizes` and `ostree.composefs.digest.v0` pass
-  unchanged. The bindings of the local commit do not select the namespace,
-  and the server writes the bindings of its own namespace;
+  unchanged. The server writes the bindings of the namespace of the branch,
+  so the client does not check the bindings of the local commit;
 - the timestamp of the local commit, or the value of `--timestamp`.
 
 The client sends no parent, no commit object, and no detached metadata. So
@@ -4623,10 +4672,20 @@ with no change.
 An ostrya sender also sends the dependencies of each new commit, with no
 ref update ("Dependencies in a one-way stream").
 
-The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
+An ostrya sender checks the bindings of each update before it writes the
+first byte. It refuses a commit with no `ostree.collection-binding`, and a
+commit bound to `Y`, on a ref `@X:NAME`, with `Y` other than `X`. It does not
+know the collection id of the receiver, so it refuses a commit with no
+binding on each ref `@X:NAME`, also when `X` is the collection id of the
+receiver, and it leaves the collection binding of a plain `NAME` to the
+receiver. It checks `ostree.ref-binding` as check 7 of "Commit and
+CommitReply" does, unless its caller skips that check.
+
+The server runs `Hello` checks 2, 3, 5, and 6 of a push session ("Hello and
 HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
-`protocol`, and so is a `Hello` with a `collection`: a one-way stream writes
-the local refs and the remote refs. Checks 8 to 11 do not apply. The server
+`protocol`. A name of a one-way `Hello` is `NAME`, `@ID:NAME`, or
+`REMOTE:NAME`, so a one-way stream writes local refs, collection refs, and
+remote refs. Checks 8 to 11 do not apply. The server
 then opens the transaction as in a push session, with the same config reads
 and the same `bare` owner check. It reads no ref of `Hello` and sends no
 `HelloReply`.
@@ -4643,12 +4702,20 @@ the summary. It calls no hook of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
 it. A host application gives the rules in code, or `ostrya receive --one-way`
-builds them from its options. Each rule has a pattern with an optional remote
-part, so a one-way stream can write a remote ref `REMOTE:NAME`. A rule
-states if it accepts an update, the trusted keys of
+builds them from its options. Each rule has a pattern of the part grammar
+("Ref patterns") with an optional prefix: `REMOTE:` or `*:` for remote refs,
+or `@ID:` with a literal collection id for the refs of that collection. A
+pattern `@OWN:PATTERN`, where `OWN` is the collection id of the repository,
+matches the local refs as `PATTERN` does, with the same rank when two
+patterns match one ref. A default rule covers each local ref that no
+pattern rule matches. A remote ref and a ref `@ID:NAME` of a collection
+other than the collection id of the repository take no default rule, so
+each needs a pattern rule that matches it. A rule states if it accepts an update, the trusted keys of
 check 8, if it allows a delete, and if it allows an update that is not a
 fast-forward under `force`. Check 4 refuses an update that no rule covers
-and an update whose rule does not accept it, with `ref-denied`. Check 8 with
+and an update whose rule does not accept it, with `ref-denied`. The rules
+can also skip the check of `ostree.ref-binding` of check 7. They never skip
+the checks of the collection binding. Check 8 with
 trusted keys refuses a commit with no signature. The trusted keys of the rule
 of an update apply to the new commit of that update alone. A dependency gets
 no verification, unless it is also a new commit. Then the rules of its own
@@ -5695,8 +5762,8 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 6. It gets the setup of the session from the authentication of the
    endpoint. A refusal gets 401 or 403 with `unauthorized`, and the place in
    the table becomes free. Under `ostrya serve`, an item that no client group
-   of the namespace of `Hello` carries, and a client group that opens no push
-   session, give a refusal with 403.
+   carries, and a client group that opens no push session, give a refusal
+   with 403.
 7. It runs checks 8 to 11 of "Hello and HelloReply" with the client group of
    the setup. Then it opens the session transaction, as "Hello and
    HelloReply" states. If the endpoint stopped during these steps, the
@@ -5974,8 +6041,8 @@ request. Else a client can send these headers through the proxy, and take
 another address, the scheme `https`, or another certificate.
 
 A `session` request then selects the client group that carries the item.
-The session takes the items of the group for the namespace of its `Hello`
-("Hello and HelloReply"). The server does not try another item: a
+The session takes the items of the group for the namespace of each ref of
+its `Hello` ("Hello and HelloReply"). The server does not try another item: a
 certificate that gets a `tls:NAME` item gets no group of `tls:*`. These
 requests get 403 with `unauthorized`:
 
@@ -6019,7 +6086,7 @@ a character boundary.
 its name: `--client NAME`, else the value of `LOGNAME`, which sshd sets from
 the password entry of the user. An empty `LOGNAME` counts as absent.
 `ostrya receive` gives the session the policy of the client group that
-carries `ssh:NAME`, with the items of the namespace of `Hello`. With no such
+carries `ssh:NAME`, with the items of the namespace of each ref. With no such
 group, `Hello` gets `ref-denied`. `ostrya send` serves the refs
 that the client group of `ssh:NAME` reads ("Read access"). When the
 repository has client groups and no group carries `ssh:NAME`, `ostrya send`
@@ -6061,11 +6128,11 @@ not percent-decode a URI, and it removes no white space.
 - A URI whose scheme is not `ostrya`, in any case, has no effect. So do the
   SANs of other types, for example a DNS name.
 
-The claims set the access alone. `verify`, `allow-unsigned`, `sign`, and
-`allow-privileged` still come from the group, and so does the group name of
-the report. The claims can give more rights than `allow` of the group, so
-the CA of `tls-client-ca` grants the rights of each certificate that it
-signs.
+The claims set the access alone. `verify`, `allow-unsigned`, `sign`,
+`allow-privileged`, and `disable-verify-bindings` still come from the group,
+and so does the group name of the report. The claims can give more rights
+than `allow` of the group, so the CA of `tls-client-ca` grants the rights of
+each certificate that it signs.
 
 The claims of a certificate do not parse in these cases:
 
@@ -6225,8 +6292,9 @@ The client does these steps:
 
 1. It walks and hashes the tree. It builds no commit object and no detached
    metadata.
-2. It opens the session with the branch of `--onto`, then each `--tag`, and
-   with `--collection` in `Hello`.
+2. It opens the session with the branch of `--onto`, then each `--tag`, each
+   as `NAME` or `@ID:NAME` in `Hello`. `--collection=ID` adds `@ID:` to a
+   plain branch and to each plain tag ("Server commit").
 3. It sends the objects of the tree that the server does not hold.
 4. It sends a `Commit` with the server commit: the branch, the tags, the
    names of `--bind-ref`, the root dirtree and the root dirmeta, the subject,
@@ -6241,10 +6309,14 @@ These rules are specific to `push-tree`:
 - The timestamp is the value of `--timestamp`, else the value of the
   `SOURCE_DATE_EPOCH` environment variable. When neither is set, the server
   commit holds no timestamp, and the server takes its system clock.
-- The server writes `ostree.ref-binding` with the branch, each tag, and each
-  bound name, sorted. It writes `ostree.collection-binding` with the
-  collection of the namespace of the session. The collection id of a local
-  repository has no effect.
+- The branch and each tag are in one namespace, after the server maps the
+  refs of its collection id to the local refs.
+- The server writes `ostree.ref-binding` with the name part of the branch
+  and of each tag, and each bound name, sorted. It writes
+  `ostree.collection-binding` with the id of the namespace of the branch: `ID`
+  for `@ID:NAME`, and the collection id of the server for a local ref. The
+  key is absent for a local ref of a server with no collection id. The
+  collection id of a local repository has no effect.
 - The parent is the tip of the branch on the server. With `--orphan`, the
   commit has no parent.
 - `--owner-uid`, `--owner-gid`, and `--canonical-permissions` apply to each
@@ -7049,20 +7121,24 @@ of the bucket ("The config of a bucket repository"). The steps of a push
 are:
 
 1. The local checks: the depth, the collection, the refspecs, the source
-   commits, and the bindings, as for a push over a session. A local refusal
-   changes nothing in the bucket. The push refuses tags, a compression, and
-   a refspec that deletes a ref.
+   commits, and the bindings that need no `config`, as for a push over a
+   session. A local refusal changes nothing in the bucket. The push refuses
+   tags, a compression, and a refspec that deletes a ref, `:@ID:NAME`
+   included.
 2. The take of the writer lock with `operation=push`.
-3. The read of `config` and the selection of the namespace. Then, at the
-   same time, the listing and the read of the ref files of the ref
-   directory of the namespace, `refs/heads/` or `refs/mirrors/ID/`, and the
-   listing of the objects of the 256 fan-out prefixes. The push reads no
-   ref file of another namespace, and does not check the keys under
-   `refs/` outside its ref directory. It does not list `refs/mirrors/` of
-   the collection id of the bucket. The push trusts the listing of the
-   objects alone. A bucket repository with
-   no `config` refuses the push.
-4. The check of the bindings, then the check of each ref update. Each tip of a ref in the bucket must be an
+3. The read of `config`, which gives the namespace of each `DST`. Then, at
+   the same time, the listing and the read of the ref files of the ref
+   directory of each namespace of the push, `refs/heads/` or
+   `refs/mirrors/ID/`, and the listing of the objects of the 256 fan-out
+   prefixes. The push reads no ref file of another namespace, and does not
+   check the keys under `refs/` outside its ref directories. It does not
+   list `refs/mirrors/` of the collection id of the bucket. The push trusts
+   the listing of the objects alone. A bucket repository with no `config`
+   refuses the push.
+4. The check that no two `DST` refs name one ref of the bucket, `NAME` and
+   `@OWN:NAME`, where `OWN` is the collection id of the bucket. Then the
+   check of the bindings of each ref in its namespace, then the check of
+   each ref update. Each tip of a ref in the bucket must be an
    ancestor of the new commit in the local repository, unless the push is
    forced. A tip that the local repository does not hold, or marks partial,
    is no ancestor. The fast-forward rule and the force apply to each ref in
@@ -7074,7 +7150,7 @@ are:
    `state/`. The walk reads no tree of another commit that the listing holds,
    because a commit object in the bucket has its whole tree in the bucket. The
    push lists `state/` only if the listing holds an offered commit. Each ref of
-   the new ref set of the ref directory of the namespace must name a commit that
+   the new ref set of each ref directory of the push must name a commit that
    the bucket holds or that the push uploads, else the push is refused.
 6. The upload of each tree object that the listing lacks, and of the
    `.commitmeta` of each commit that the bucket lacks and of each source
@@ -7101,23 +7177,32 @@ the refs that the push writes, as in a local `archive` repository with no
 `auto-update-summary`. A pull of a named ref reads the ref file
 `refs/heads/<name>` when the summary does not list the ref.
 
-The namespace of a push is the collection of the push, else the
-`ostree.collection-binding` of the source commits, else none. The `config`
-of the bucket takes the role of the server of a push over a session:
+Each `DST` of a push names its own namespace, as a ref of `Hello` does
+("Hello and HelloReply"). The collection `ID` of the push adds `@ID:` to
+each plain `DST`, keeps an `@ID:` `DST`, and refuses a `DST` of another
+collection. The `ostree.collection-binding` of a commit selects no
+namespace. The `config` of the bucket takes the role of the server of a
+push over a session:
 
-| Namespace | Collection id of the bucket | Ref keys | A bound commit names |
+| `DST` | Collection id of the bucket | Ref key | Collection binding of the commit |
 | --- | --- | --- | --- |
-| none | any | `refs/heads/DST` | the collection id of the bucket |
-| `ID` | `ID` | `refs/heads/DST` | `ID` |
-| `ID` | another id, or none | `refs/mirrors/ID/DST` | `ID` |
+| `NAME` | any | `refs/heads/NAME` | none, or the collection id of the bucket |
+| `@ID:NAME` | `ID` | `refs/heads/NAME` | none, or `ID` |
+| `@ID:NAME` | another id, or none | `refs/mirrors/ID/NAME` | `ID` |
 
-A commit with no binding goes to `refs/heads/` alone. Each other commit
-refuses the push.
+A commit whose collection binding is not in the last column of its row
+refuses the push with `binding-mismatch`. So a commit with no collection
+binding goes to `refs/heads/` alone. One push can write refs of more than
+one namespace. The ref-binding check of check 7 of "Commit and
+CommitReply" also applies: a commit with `ostree.ref-binding` must hold the
+name part of its `DST`. A bucket has no server and no client group, so
+`RepoPushOptions::disable_verify_bindings`, the flag of
+`ostrya push --disable-verify-bindings`, alone skips this check. No flag
+skips the check of the collection binding.
 
-A push refuses an update whose new ref set holds, in the ref directory of
-its namespace, a name that is a directory of another name, for example `a`
-and `a/b` in `refs/heads/`. Each `refs/mirrors/ID/` is a ref directory of
-its own.
+A push refuses an update whose new ref set holds, in one ref directory, a
+name that is a directory of another name, for example `a` and `a/b` in
+`refs/heads/`. Each `refs/mirrors/ID/` is a ref directory of its own.
 
 A commit object goes up only after each object of its tree. So a commit
 object in the bucket has its whole tree in the bucket at each point of a
@@ -7153,12 +7238,15 @@ commit is the server commit of "Server commit" and "The commit of
   which the push reads under the writer lock. With `orphan`, or when the
   branch is absent, the commit has no parent. With `orphan` on a branch
   that exists, the new commit replaces the tip with no check.
-- `ostree.ref-binding` holds the branch and each bound name, sorted.
+- The branch is `NAME` or `@ID:NAME`, and the collection of the push adds
+  `@ID:` to a plain branch. The branch names its namespace by the table of
+  "The push to a bucket repository".
+- `ostree.ref-binding` holds the name part of the branch, without `@ID:`,
+  and each bound name, sorted.
 - `ostree.collection-binding` holds the collection id of the bucket in
   `refs/heads/`, and the collection id of the namespace in
   `refs/mirrors/ID/`. The key is absent in `refs/heads/` of a bucket with no
-  collection id. The namespace follows the table of "The push to a bucket
-  repository", with the collection of the push as the namespace.
+  collection id.
 - The timestamp is the value of the push, else the system clock of the
   client.
 - The metadata entries, the subject, the body, and the root dirtree and
@@ -7173,10 +7261,10 @@ The steps of a tree push are:
    walk and the hash of the tree. A tree push to a bucket refuses tags. A
    local refusal and a failed walk send no request.
 2. The take of the writer lock with `operation=push`.
-3. The read of `config` and the selection of the namespace, then the read of
-   the ref files of the ref directory of the namespace, the listing of
-   `refs/mirrors/` of the collection id of the bucket, and the listing of the
-   objects, as for a push of commits.
+3. The read of `config`, which gives the namespace of the branch, then the
+   read of the ref files of the ref directory of the namespace and the
+   listing of the objects, as for a push of commits. The push does not list
+   `refs/mirrors/` of the collection id of the bucket.
 4. The checks of the refs. The branch `ostree-metadata` in `refs/heads/` of
    a bucket with a collection id is refused, as a server refuses it. The
    ref directory must hold no name that is a directory of another name

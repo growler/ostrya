@@ -16,8 +16,8 @@ use std::sync::Arc;
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, SECOND_SERVER_SECRET_B64, SECRET_B64, SERVER_SECRET_B64,
     build_commit, collections_policy, connect, ed25519_signature, ed25519_signatures,
-    fixture_objects, keyed_commit, new_repo, policy_allowing, returned_code, secret, server_signer,
-    session, sha, signed_dict, staging_entries, trust,
+    fixture_objects, keyed_commit, new_repo, outcomes, policy_allowing, returned_code, secret,
+    server_signer, session, sha, signed_dict, staging_entries, trust,
 };
 use common::{
     COMMIT, Field2Entry, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir,
@@ -134,36 +134,20 @@ fn push_named(
     force: bool,
 ) -> Pushed {
     session(repo, policy, |c| {
-        script(c, names, None, objects, meta, updates, force)
-    })
-}
-
-/// Runs one [`push`] whose `Hello` names the collection id `collection`.
-fn push_in(
-    repo: &Repo,
-    policy: &ReceivePolicy,
-    collection: &str,
-    objects: &[Obj],
-    updates: Vec<RefUpdate>,
-    force: bool,
-) -> Pushed {
-    let names: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
-    session(repo, policy, |c| {
-        script(c, &names, Some(collection), objects, &[], updates, force)
+        script(c, names, objects, meta, updates, force)
     })
 }
 
 async fn script(
     mut c: common::receive::Client,
     names: &[String],
-    collection: Option<&str>,
     objects: &[Obj],
     meta: &[(Checksum, Vec<u8>)],
     updates: Vec<RefUpdate>,
     force: bool,
 ) -> Result<Vec<RefOutcome>, ErrorMessage> {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    c.hello_reply_in(&names, collection).await;
+    c.hello_reply(&names).await;
     if !objects.is_empty() || !meta.is_empty() {
         for o in objects {
             c.object(o.ty, o.checksum, o.encoding, &o.bytes)
@@ -182,14 +166,19 @@ async fn script(
 }
 
 /// Asserts that a push succeeded and returns its report.
+///
+/// The `CommitReply` holds the outcomes of the report, each with the name
+/// that the client sent. The report holds the canonical ref of each name.
 fn committed(pushed: Pushed) -> ReceiveReport {
     let (result, reply) = pushed;
     let report = result.unwrap_or_else(|e| panic!("the push failed: {e}"));
-    assert_eq!(
-        reply.as_ref(),
-        Ok(&report.refs),
-        "CommitReply is the report"
-    );
+    let reply = reply.unwrap_or_else(|e| panic!("the push failed: {e:?}"));
+    assert_eq!(reply.len(), report.refs.len(), "CommitReply is the report");
+    for (sent, held) in reply.iter().zip(&report.refs) {
+        let name: Ref = sent.name.parse().unwrap();
+        assert_eq!(name.name(), held.name.name(), "{sent:?} {held:?}");
+        assert_eq!((sent.old, sent.new), (held.old, held.new), "{sent:?}");
+    }
     report
 }
 
@@ -316,7 +305,7 @@ fn the_fixture_commit_lands_in_each_mode() {
             false,
         ));
         assert_eq!(
-            report.refs,
+            outcomes(&report),
             vec![RefOutcome {
                 name: "test/main".into(),
                 old: None,
@@ -426,11 +415,11 @@ fn two_sessions_from_absent_give_one_success_and_one_ref_mismatch() {
     let ((r1, reply1), (r2, reply2)) = block_on(futures_lite::future::zip(
         futures_lite::future::zip(
             repo.receive(in1, out1, &policy),
-            script(c1, &names, None, &objects, &[], updates(), false),
+            script(c1, &names, &objects, &[], updates(), false),
         ),
         futures_lite::future::zip(
             repo.receive(in2, out2, &policy),
-            script(c2, &names, None, &objects, &[], updates(), false),
+            script(c2, &names, &objects, &[], updates(), false),
         ),
     ));
     let (ok, failed) = match (r1.is_ok(), r2.is_ok()) {
@@ -482,7 +471,7 @@ fn a_partial_commit_pushed_again_loses_its_marker() {
         false,
     ));
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![RefOutcome {
             name: "test/main".into(),
             old: Some(fixture_commit()),
@@ -1029,7 +1018,7 @@ fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
         false,
     ));
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![RefOutcome {
             name: hex.clone(),
             old: Some(fixture_commit()),
@@ -1413,15 +1402,41 @@ fn a_foreign_collection_binding_is_binding_mismatch() {
     ));
 }
 
+/// Returns a commit over the fixture tree with the collection binding
+/// `collection` and the ref binding `refs`, each key absent for `None`.
+fn bound_commit(subject: &str, collection: Option<&str>, refs: Option<&[&str]>) -> Obj {
+    bound_child(None, subject, collection, refs)
+}
+
+/// Returns a commit as [`bound_commit`] does, with the parent `parent`.
+fn bound_child(
+    parent: Option<Checksum>,
+    subject: &str,
+    collection: Option<&str>,
+    refs: Option<&[&str]>,
+) -> Obj {
+    let mut metadata = DictBuilder::new();
+    if let Some(refs) = refs {
+        let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
+        metadata.insert_strv("ostree.ref-binding", &refs);
+    }
+    if let Some(id) = collection {
+        metadata.insert_str("ostree.collection-binding", id);
+    }
+    build_commit(parent, subject, metadata.build(), &[])
+}
+
 /// In the local refs of a repository with no collection id, a commit with
 /// a collection binding is `binding-mismatch`. A commit with no binding
 /// passes.
+///
+/// A ref `@ID:NAME` takes a commit bound to `ID`. A commit bound to
+/// another collection, and a commit with no collection binding, are
+/// `binding-mismatch`.
 #[test]
 fn a_collection_binding_needs_a_namespace_of_that_id() {
-    let mut metadata = DictBuilder::new();
-    metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let bound = build_commit(None, "bound", metadata.build(), &[]);
-    let unbound = build_commit(None, "unbound", no_metadata(), &[]);
+    let bound = bound_commit("bound", Some("org.example.Os"), None);
+    let unbound = bound_commit("unbound", None, None);
     let mut objects = tree_objects();
     objects.extend([bound.clone(), unbound.clone()]);
 
@@ -1442,28 +1457,31 @@ fn a_collection_binding_needs_a_namespace_of_that_id() {
     assert!(error.message.contains("no collection id"), "{error:?}");
     assert_unchanged(&repo, &before);
 
-    // In the namespace of the collection, the bound commit and the unbound
-    // commit pass. Another collection refuses the bound commit.
     let all = collections_policy(&["org.example.Os", "org.example.Other"], &["w:**"]);
-    committed(push_in(
+    committed(push(
         &repo,
         &all,
-        "org.example.Os",
         &objects,
-        vec![
-            update("bound", Expected::Absent, Some(bound.checksum)),
-            update("unbound", Expected::Absent, Some(unbound.checksum)),
-        ],
+        &[],
+        vec![update(
+            "@org.example.Os:bound",
+            Expected::Absent,
+            Some(bound.checksum),
+        )],
         false,
     ));
     let before = snapshot(&repo);
     let error = refused(
-        push_in(
+        push(
             &repo,
             &all,
-            "org.example.Other",
             &[],
-            vec![update("main", Expected::Absent, Some(bound.checksum))],
+            &[],
+            vec![update(
+                "@org.example.Other:main",
+                Expected::Absent,
+                Some(bound.checksum),
+            )],
             false,
         ),
         ErrorCode::BindingMismatch,
@@ -1475,35 +1493,310 @@ fn a_collection_binding_needs_a_namespace_of_that_id() {
     assert_unchanged(&repo, &before);
 }
 
-/// A session of a collection namespace reads and writes the refs under
+/// A commit with no collection binding goes to the local refs alone. A ref
+/// `@ID:NAME` of a collection other than the collection id of the
+/// repository refuses it with `binding-mismatch`, also under a policy that
+/// skips the ref-binding check. The same commit passes on a plain `NAME` and
+/// on `@OWN:NAME`.
+#[test]
+fn an_unbound_commit_goes_to_the_local_refs_alone() {
+    let tmp = TmpDir::new("recv-unbound");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let unbound = bound_commit("unbound", None, None);
+    let mut objects = tree_objects();
+    objects.push(unbound.clone());
+    let mut all = collections_policy(&["org.example.Os"], &["w:**"]);
+    all.rules.local = policy().rules.local;
+    let before = snapshot(&repo);
+    for disable_verify_bindings in [false, true] {
+        let policy = ReceivePolicy {
+            disable_verify_bindings,
+            ..all.clone()
+        };
+        let error = refused(
+            push(
+                &repo,
+                &policy,
+                &objects,
+                &[],
+                vec![update(
+                    "@org.example.Os:a",
+                    Expected::Absent,
+                    Some(unbound.checksum),
+                )],
+                false,
+            ),
+            ErrorCode::BindingMismatch,
+        );
+        assert!(error.message.contains("no collection binding"), "{error:?}");
+        assert_unchanged(&repo, &before);
+    }
+    committed(push(
+        &repo,
+        &all,
+        &objects,
+        &[],
+        vec![
+            update("main", Expected::Absent, Some(unbound.checksum)),
+            update("@org.example.C:a", Expected::Absent, Some(unbound.checksum)),
+        ],
+        false,
+    ));
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{}\n", unbound.checksum))
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/a"),
+        Some(format!("{}\n", unbound.checksum))
+    );
+}
+
+/// The binding check runs for each ref: one commit bound to a collection
+/// passes on a ref of that collection and fails on a plain ref of a
+/// repository with another collection id. A refused ref writes no ref of
+/// the session.
+#[test]
+fn the_binding_check_runs_for_each_ref() {
+    let tmp = TmpDir::new("recv-binding-each");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let os = bound_commit("os", Some("org.example.Os"), None);
+    let own = bound_commit("own", Some("org.example.C"), None);
+    let mut objects = tree_objects();
+    objects.extend([os.clone(), own.clone()]);
+    let mut all = collections_policy(&["org.example.Os"], &["w:**"]);
+    all.rules.local = policy().rules.local;
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &all,
+            &objects,
+            &[],
+            vec![
+                update("@org.example.Os:a", Expected::Absent, Some(os.checksum)),
+                update("main", Expected::Absent, Some(os.checksum)),
+            ],
+            false,
+        ),
+        ErrorCode::BindingMismatch,
+    );
+    assert!(error.message.contains("ref 'main'"), "{error:?}");
+    assert_unchanged(&repo, &before);
+    committed(push(
+        &repo,
+        &all,
+        &objects,
+        &[],
+        vec![
+            update("@org.example.Os:a", Expected::Absent, Some(os.checksum)),
+            update("main", Expected::Absent, Some(own.checksum)),
+        ],
+        false,
+    ));
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.Os/a"),
+        Some(format!("{}\n", os.checksum))
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{}\n", own.checksum))
+    );
+}
+
+/// One session writes a local ref, a ref of a collection, and a ref of the
+/// own collection id. `@OWN:b` lands in `refs/heads/b`. `CommitReply` repeats
+/// the name of each update as the client sent it, and the report holds the
+/// canonical ref of each name.
+#[test]
+fn one_session_writes_refs_of_more_than_one_namespace() {
+    let tmp = TmpDir::new("recv-namespaces");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let os = bound_commit("os", Some("org.example.Os"), None);
+    let own = bound_commit("own", Some("org.example.C"), None);
+    let mut objects = tree_objects();
+    objects.extend([os.clone(), own.clone()]);
+    let mut all = collections_policy(&["org.example.Os"], &["w:**"]);
+    all.rules.local = policy().rules.local;
+    let updates = vec![
+        update("main", Expected::Absent, Some(own.checksum)),
+        update("@org.example.Os:a", Expected::Absent, Some(os.checksum)),
+        update("@org.example.C:b", Expected::Absent, Some(own.checksum)),
+    ];
+    let (result, reply) = push(&repo, &all, &objects, &[], updates, false);
+    let report = result.unwrap();
+    let names: Vec<String> = reply.unwrap().into_iter().map(|o| o.name).collect();
+    assert_eq!(names, ["main", "@org.example.Os:a", "@org.example.C:b"]);
+    let refs: Vec<Ref> = report.refs.iter().map(|o| o.name.clone()).collect();
+    assert_eq!(
+        refs,
+        [
+            Ref::local("main"),
+            Ref::collection("org.example.Os", "a"),
+            Ref::local("b"),
+        ]
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{}\n", own.checksum))
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.Os/a"),
+        Some(format!("{}\n", os.checksum))
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/b"),
+        Some(format!("{}\n", own.checksum))
+    );
+    assert_eq!(ref_file(&repo, "refs/mirrors/org.example.C/b"), None);
+}
+
+/// The ref-binding check compares the name of each ref without the `@ID:`
+/// part. With the list `[main]`, `@X:stable` is `binding-mismatch`, and
+/// `@X:main` passes. A commit with an empty list is `binding-mismatch`, and a
+/// commit with no list passes. A policy with `disable_verify_bindings`, and
+/// a client group with `disable-verify-bindings`, skip this check, and the
+/// collection-binding check stays on.
+#[test]
+fn the_ref_binding_check_reads_the_name_of_each_ref() {
+    let tmp = TmpDir::new("recv-ref-binding-name");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let x = Some("org.example.X");
+    let main = bound_commit("main", x, Some(&["main"]));
+    let empty = bound_commit("empty", x, Some(&[]));
+    let unlisted = bound_commit("unlisted", x, None);
+    let other = bound_commit("other", Some("org.example.Other"), Some(&["stable"]));
+    let mut objects = tree_objects();
+    objects.extend([main.clone(), empty.clone(), unlisted.clone(), other.clone()]);
+    let strict = collections_policy(&["org.example.X", "org.example.Other"], &["w:**"]);
+    let loose = ReceivePolicy {
+        disable_verify_bindings: true,
+        ..strict.clone()
+    };
+    std::fs::write(
+        repo.path().join("config"),
+        format!(
+            "{}[ex-ostrya client \"loose\"]\nauth=anonymous\nallow=w:@org.example.X:**;\
+             w:@org.example.Other:**\ndisable-verify-bindings=true\n",
+            std::fs::read_to_string(repo.path().join("config")).unwrap()
+        ),
+    )
+    .unwrap();
+    let repo = block_on(Repo::open(repo.path())).unwrap();
+    let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
+    let group = policies.get("loose").unwrap().as_ref().clone();
+    assert!(group.disable_verify_bindings);
+
+    let before = snapshot(&repo);
+    for (commit, name) in [
+        (&main, "@org.example.X:stable"),
+        (&empty, "@org.example.X:a"),
+    ] {
+        let error = refused(
+            push(
+                &repo,
+                &strict,
+                &objects,
+                &[],
+                vec![update(name, Expected::Absent, Some(commit.checksum))],
+                false,
+            ),
+            ErrorCode::BindingMismatch,
+        );
+        assert!(error.message.contains("bound to the refs"), "{error:?}");
+        assert_unchanged(&repo, &before);
+    }
+    let error = refused(
+        push(
+            &repo,
+            &loose,
+            &objects,
+            &[],
+            vec![update(
+                "@org.example.X:stable",
+                Expected::Absent,
+                Some(other.checksum),
+            )],
+            false,
+        ),
+        ErrorCode::BindingMismatch,
+    );
+    assert!(error.message.contains("org.example.Other"), "{error:?}");
+    assert_unchanged(&repo, &before);
+
+    committed(push(
+        &repo,
+        &strict,
+        &objects,
+        &[],
+        vec![
+            update("@org.example.X:main", Expected::Absent, Some(main.checksum)),
+            update(
+                "@org.example.X:free",
+                Expected::Absent,
+                Some(unlisted.checksum),
+            ),
+        ],
+        false,
+    ));
+    for (policy, prefix) in [(&loose, "a"), (&group, "b")] {
+        committed(push(
+            &repo,
+            policy,
+            &[],
+            &[],
+            vec![
+                update(
+                    &format!("@org.example.X:{prefix}/stable"),
+                    Expected::Absent,
+                    Some(main.checksum),
+                ),
+                update(
+                    &format!("@org.example.X:{prefix}/empty"),
+                    Expected::Absent,
+                    Some(empty.checksum),
+                ),
+            ],
+            false,
+        ));
+    }
+    for name in ["main", "free", "a/stable", "a/empty", "b/stable", "b/empty"] {
+        assert!(
+            ref_file(&repo, &format!("refs/mirrors/org.example.X/{name}")).is_some(),
+            "{name}"
+        );
+    }
+}
+
+/// A session reads and writes the refs `@ID:NAME` under
 /// `refs/mirrors/ID/`, and does not touch `refs/heads/`. The fast-forward
 /// check, the delete, and the rule of `t` apply to these refs.
 #[test]
-fn a_collection_namespace_writes_the_mirror_refs() {
+fn a_collection_ref_writes_the_mirror_ref() {
     let tmp = TmpDir::new("recv-mirror-refs");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
-    let mut metadata = DictBuilder::new();
-    metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let first = build_commit(None, "first", metadata.build(), &[]);
-    let mut metadata = DictBuilder::new();
-    metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let second = build_commit(Some(first.checksum), "second", metadata.build(), &[]);
+    let first = bound_commit("first", Some("org.example.Os"), None);
+    let second = bound_child(Some(first.checksum), "second", Some("org.example.Os"), None);
     let mut objects = tree_objects();
     objects.extend([first.clone(), second.clone()]);
     let local = sha(b"local");
     std::fs::write(repo.path().join("refs/heads/main"), format!("{local}\n")).unwrap();
     let mirror = "refs/mirrors/org.example.Os/main";
+    let name = "@org.example.Os:main";
     let all = collections_policy(&["org.example.Os"], &["w:**"]);
 
-    let report = committed(push_in(
+    let report = committed(push(
         &repo,
         &all,
-        "org.example.Os",
         &objects,
-        vec![update("main", Expected::Absent, Some(first.checksum))],
+        &[],
+        vec![update(name, Expected::Absent, Some(first.checksum))],
         false,
     ));
-    assert_eq!(report.collection.as_deref(), Some("org.example.Os"));
+    assert_eq!(
+        report.refs[0].name,
+        Ref::collection("org.example.Os", "main")
+    );
     assert_eq!(report.refs[0].old, None);
     assert_eq!(
         ref_file(&repo, mirror),
@@ -1515,13 +1808,13 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     );
 
     // The expected state is the state of the mirror ref.
-    let report = committed(push_in(
+    let report = committed(push(
         &repo,
         &all,
-        "org.example.Os",
+        &[],
         &[],
         vec![update(
-            "main",
+            name,
             Expected::Commit(first.checksum),
             Some(second.checksum),
         )],
@@ -1536,12 +1829,12 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     // A tag that exists is `ref-mismatch`, and a delete needs `d`.
     let before = snapshot(&repo);
     let error = refused(
-        push_in(
+        push(
             &repo,
             &collections_policy(&["org.example.Os"], &["t:**"]),
-            "org.example.Os",
             &[],
-            vec![update("main", Expected::Any, Some(second.checksum))],
+            &[],
+            vec![update(name, Expected::Any, Some(second.checksum))],
             false,
         ),
         ErrorCode::RefMismatch,
@@ -1550,23 +1843,23 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     assert_unchanged(&repo, &before);
     let current = Expected::Commit(second.checksum);
     refused(
-        push_in(
+        push(
             &repo,
             &all,
-            "org.example.Os",
             &[],
-            vec![update("main", current, None)],
+            &[],
+            vec![update(name, current, None)],
             false,
         ),
         ErrorCode::DeleteDenied,
     );
     assert_unchanged(&repo, &before);
-    committed(push_in(
+    committed(push(
         &repo,
         &collections_policy(&["org.example.Os"], &["rd:**"]),
-        "org.example.Os",
         &[],
-        vec![update("main", current, None)],
+        &[],
+        vec![update(name, current, None)],
         false,
     ));
     assert_eq!(ref_file(&repo, mirror), None);
@@ -1577,47 +1870,47 @@ fn a_collection_namespace_writes_the_mirror_refs() {
 }
 
 /// `ostree-metadata` is the anchor ref of the local refs of a repository
-/// with a collection id. In a collection namespace, the name is a normal ref.
+/// with a collection id, also as `@OWN:ostree-metadata`. In another
+/// collection, the name is a normal ref.
 #[test]
 fn ostree_metadata_is_a_normal_ref_in_a_collection() {
     let tmp = TmpDir::new("recv-mirror-anchor");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
-    let commit = build_commit(None, "unbound", no_metadata(), &[]);
+    let unbound = bound_commit("unbound", None, None);
+    let bound = bound_commit("bound", Some("org.example.Os"), None);
     let mut objects = tree_objects();
-    objects.push(commit.clone());
+    objects.extend([unbound.clone(), bound.clone()]);
     let before = snapshot(&repo);
-    let error = refused(
-        push_in(
-            &repo,
-            &policy(),
-            "org.example.C",
-            &objects,
-            vec![update(
-                "ostree-metadata",
-                Expected::Any,
-                Some(commit.checksum),
-            )],
-            false,
-        ),
-        ErrorCode::RefDenied,
-    );
-    assert!(error.message.contains("anchor"), "{error:?}");
-    assert_unchanged(&repo, &before);
-    committed(push_in(
+    for name in ["ostree-metadata", "@org.example.C:ostree-metadata"] {
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &objects,
+                &[],
+                vec![update(name, Expected::Any, Some(unbound.checksum))],
+                false,
+            ),
+            ErrorCode::RefDenied,
+        );
+        assert!(error.message.contains("anchor"), "{error:?}");
+        assert_unchanged(&repo, &before);
+    }
+    committed(push(
         &repo,
         &collections_policy(&["org.example.Os"], &["w:**"]),
-        "org.example.Os",
         &objects,
+        &[],
         vec![update(
-            "ostree-metadata",
+            "@org.example.Os:ostree-metadata",
             Expected::Absent,
-            Some(commit.checksum),
+            Some(bound.checksum),
         )],
         false,
     ));
     assert_eq!(
         ref_file(&repo, "refs/mirrors/org.example.Os/ostree-metadata"),
-        Some(format!("{}\n", commit.checksum))
+        Some(format!("{}\n", bound.checksum))
     );
     assert_eq!(ref_file(&repo, "refs/heads/ostree-metadata"), None);
 }
@@ -3047,7 +3340,7 @@ fn a_delete_the_rule_refuses_is_delete_denied() {
         false,
     ));
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![RefOutcome {
             name: "absent".into(),
             old: None,
@@ -3303,7 +3596,7 @@ fn a_session_and_concurrent_regenerations_chain_their_anchors() {
         futures_lite::future::zip(
             futures_lite::future::zip(
                 repo.receive(input, output, &policy),
-                script(c, &names, None, &objects, &[], updates, false),
+                script(c, &names, &objects, &[], updates, false),
             ),
             repo.regenerate_summary(&opts),
         ),

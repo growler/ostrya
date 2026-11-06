@@ -46,6 +46,11 @@
 //!   empty value is refused.
 //! - `allow-privileged` (boolean, default false) -- accept the privileged
 //!   file modes and extended attributes in a `bare` repository.
+//! - `disable-verify-bindings` (boolean, default false) -- skip the check of
+//!   `ostree.ref-binding` of each ref update and each tag of a push of the
+//!   group. The check of `ostree.collection-binding` stays on. A pull without
+//!   `--disable-verify-bindings` refuses a ref that a push writes with it,
+//!   and `fsck --verify-bindings` reports the ref.
 //! - `summary` (boolean, default false) -- give each auth item of the group a
 //!   summary (see [Summaries](#summaries)). A group with
 //!   `tls-accept-claim=true` cannot set `summary=true`.
@@ -225,16 +230,6 @@ impl Namespace {
             _ => Namespace::Local,
         }
     }
-
-    /// Returns the collection id of a collection namespace, or `None` for
-    /// the local refs.
-    #[cfg(feature = "receive")]
-    pub(crate) fn collection(&self) -> Option<&str> {
-        match self {
-            Namespace::Local => None,
-            Namespace::Collection(id) => Some(id),
-        }
-    }
 }
 
 /// One client group, `[ex-ostrya client "NAME"]`.
@@ -251,6 +246,7 @@ pub struct ClientGroup {
     allow_unsigned: bool,
     sign: Vec<String>,
     allow_privileged: bool,
+    disable_verify_bindings: bool,
     summary: bool,
     implicit: bool,
 }
@@ -302,6 +298,12 @@ impl ClientGroup {
     /// Returns the value of `allow-privileged`.
     pub fn allow_privileged(&self) -> bool {
         self.allow_privileged
+    }
+
+    /// Returns the value of `disable-verify-bindings`: `true` if a push of
+    /// the group skips the check of `ostree.ref-binding`.
+    pub fn disable_verify_bindings(&self) -> bool {
+        self.disable_verify_bindings
     }
 
     /// Returns the value of `summary`: `true` if the namespace of the group

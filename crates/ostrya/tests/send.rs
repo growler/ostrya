@@ -696,7 +696,6 @@ fn a_message_out_of_order_is_protocol() {
         version: 1,
         agent: None,
         refs: vec!["main".to_owned()],
-        collection: None,
         one_way: false,
     });
     let late = [

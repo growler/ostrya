@@ -1904,8 +1904,14 @@ lock, so a local refusal takes no lock and sends no request. The
 fast-forward check needs the refs of the bucket, so it comes after the
 lock.
 
-The collection of a push selects its namespace by the rule of the receive
-push, with the `config` of the bucket in the role of the server. A bucket
+Each `DST` of a push names its own namespace by the rule of the receive
+push ("The namespace of each pushed ref"), with the `config` of the bucket
+in the role of the server. One push can write refs of more than one
+namespace. The binding of a commit checks, and selects no namespace. A
+bucket has no server and no client group, so the flag
+`RepoPushOptions::disable_verify_bindings` alone skips the ref-binding
+check of a push to a bucket. No flag skips the check of the collection
+binding. A bucket
 repository can have a `[core] collection-id`, and it is then the primary
 server of that collection. It can also mirror other collections under
 `refs/mirrors/ID/`. A bucket repository with no collection id and with the
@@ -1928,19 +1934,20 @@ writes `refs/mirrors/ID/` of the own collection id. The push and the
 summary update skip the keys of that directory, the prune reads them as
 roots, and the fsck gives each of them a note.
 
-A push reads the ref files of the ref directory of its namespace alone:
-`refs/heads/` for a push into the own collection or with no collection, and
-`refs/mirrors/ID/` for a mirror push. The check that
+A push reads the ref files of the ref directories of its namespaces alone:
+`refs/heads/` for the local refs and the refs of the own collection, and
+`refs/mirrors/ID/` for each other collection of a `DST`. It reads each such
+directory one time. The check that
 each ref names a commit that the bucket holds or that the push uploads,
-and the check of the directory prefixes, cover the ref directory of the
-namespace alone. A key or a ref file of another namespace that breaks a
+and the check of the directory prefixes, cover these ref directories
+alone. A key or a ref file of another namespace that breaks a
 rule does not refuse the push, and the fsck of a bucket repository checks
 it. A read of all refs of the bucket at each push was rejected: the cost of
 the push then grows with the refs of each namespace, also of the namespaces
 that the push does not write, and only a summary write needs all refs.
 
-A push refuses an update whose new ref set holds, in the ref directory of
-its namespace, a name that is a directory of another name. A bucket has no
+A push refuses an update whose new ref set holds, in one ref directory, a
+name that is a directory of another name. A bucket has no
 directories, so the two keys can both exist, but a local repository cannot
 hold the two refs, and a pull into one fails.
 
@@ -2685,6 +2692,12 @@ Protocol version 1 changed in place for the client groups, the server
 commit, and the collection selectors of the ref listing. No deployment ran
 version 1 when these changes came, so the version number did not change.
 
+Version 1 also changed in place for the namespace of each ref of a push
+("The namespace of each pushed ref"). `Hello` and `HelloReply` have no
+`collection` key, and the name of each ref carries its namespace. Few
+nodes run the receive endpoint, and the operator updates them at one time,
+so the port keeps no second form of `Hello`.
+
 ## The one-way stream in the command
 
 `ostrya send --one-way` writes a one-way stream to standard output, and
@@ -2713,8 +2726,19 @@ The rules of the two commands:
 - The ref rules are the default rules of `StreamPolicy` and the options. A
   plain ref takes a fast-forward update. `--allow-remote=REMOTE`, which
   repeats, adds the rule `REMOTE:**`, and `--allow-remote='*'` adds `*:**`.
-  The command line has no pattern syntax. The stream cannot carry a delete,
-  so the receive has no `--allow-delete`.
+  `--allow-collection=ID`, which repeats, adds the rule `@ID:**`. `ID` is a
+  literal collection id, as in an item of a client group ("The access items
+  of each namespace"), so no value names each collection. A ref of a
+  collection other than the collection id of the repository takes no
+  default rule, as a remote ref takes none. The command line has no pattern
+  syntax. The stream cannot carry a delete, so the receive has no
+  `--allow-delete`.
+- `send --one-way --disable-verify-bindings` skips the ref-binding check of
+  the send, through `ExportStreamOptions`. `receive --one-way
+  --disable-verify-bindings` skips the ref-binding check of the receive,
+  through `StreamPolicy`. A stream from a send with the option is refused by
+  a receive without it. Neither option skips the check of the collection
+  binding.
 - The commands make no update that is not a fast-forward. The send has no
   `--force`, and the receive has no `--allow-non-fast-forward`.
 - Each update of the send expects any state of the ref. With an update that
@@ -2734,8 +2758,16 @@ The rules of the two commands:
 - Privileged content is refused by default, as in the library.
   `--allow-privileged` sets `StreamPolicy::allow_privileged`.
 - The send takes `SRC[:DST]` refspecs with the parse and the rules of
-  `ostrya push`, through `Repo::export_updates`. `--remote=REMOTE` writes
-  each DST as `REMOTE:DST`. The delete form `:DST` is refused.
+  `ostrya push`, through `Repo::export_updates` ("The ref syntax"). A `DST`
+  can be `@ID:NAME`. `--remote=REMOTE` writes each DST as `REMOTE:DST`, and
+  refuses an `@ID:` `DST`, because a remote ref has no collection. The
+  delete form `:DST` is refused, `:@ID:NAME` included.
+- The send cannot know the collection id of the receiver. Before the first
+  byte, it refuses a commit with no collection binding and a commit bound to
+  `Y` on a `DST` `@X:NAME`, with `Y` other than `X`. It refuses a commit with
+  no binding on each `@X:` `DST`, also when `X` is the collection id of the
+  receiver. The receiver checks the collection binding of a plain `DST`, and
+  of a remote ref against its own collection id.
 - `send --remote=REMOTE` and `receive --allow-remote=REMOTE` check REMOTE
   with `ostrya::valid_remote_name`, the rule of `remote add`.
   `--allow-remote` also takes `*`. The option parser checks each value
@@ -3378,13 +3410,45 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   ref-binding check reads the part after `@ID:`. Delta discovery reads the
   `from` commit at the ref that the name gives in the destination, with
   and without `no_ref_writes`. `PullOptions` has no collection id field.
-- The names of a one-way receive stream are refspecs. The library reads
-  such a name as a local or a remote ref, split at the first `:`, and it
-  does not read `@` there.
+- Each name field of the push protocol holds the text of a ref: `NAME` or
+  `@ID:NAME`, and in a one-way stream also `REMOTE:NAME`. The receive path
+  reads each name with the parser of `Ref` ("The namespace of each pushed
+  ref").
+- A push refspec is `SRC[:DST]`. `SRC` is a revision, and `DST` is the last
+  ref of the refspec. The parser splits the refspec at each `:` into fields.
+  If the field before the last field starts with `@`, the last ref is
+  `@ID:NAME`, which is two fields. Else the last ref is the last field. If
+  the last ref is the whole refspec, the refspec has a `SRC` alone, and the
+  `DST` is the text of `SRC`. Else `SRC` is the text before the `:` that
+  comes before the last ref, and an empty `SRC` is a delete. No part of a
+  ref other than a collection id starts with `@`, so the rule never guesses.
+  A refspec with no `@` gives the parts of a split at the last `:`.
+  Examples:
+  - `main`: `SRC` `main`, `DST` `main`;
+  - `origin:main`: `SRC` `origin`, `DST` `main`;
+  - `R:main:dst`: `SRC` `R:main`, `DST` `dst`;
+  - `@X:a`: `SRC` `@X:a`, `DST` `@X:a`;
+  - `main:@X:a`: `SRC` `main`, `DST` `@X:a`;
+  - `R:main:@X:a`: `SRC` `R:main`, `DST` `@X:a`;
+  - `@X:a:b`: `SRC` `@X:a`, `DST` `b`;
+  - `@X:a:@Y:b`: `SRC` `@X:a`, `DST` `@Y:b`;
+  - `@X:main^:b`: `SRC` `@X:main^`, `DST` `b`;
+  - `:@X:a`: a delete of `@X:a`;
+  - `a:@X`: `SRC` `a`, `DST` `@X`, which the ref-name rule refuses.
+- One parser splits each refspec: `Repo::push`, `Repo::export_updates`, and
+  the push to a bucket. The delete check of `export_updates` and of the push
+  to a bucket calls it, so each finds the delete `:@X:a`.
+  `export_updates` with a `remote` refuses an `@ID:` `DST`, because a remote
+  ref has no collection.
+- `RepoPushOptions::tags`, `TreePushOptions::onto` and `tags`, and
+  `PushOntoOptions::onto` and `tags` take `Ref` values. A push refuses a
+  `Remote` value. `bind_refs` of `TreePushOptions` and of `PushOntoOptions`
+  stays text, because `ostree.ref-binding` holds names alone.
 - `PruneOptions::only_branch` and `retain_branch_depth` take `Ref` values,
   and `PruneStats::deleted_refs` gives them ("The weak refs of a prune").
 - The CLI reads `@ID:NAME` in each ref operand of `commit`, `refs`,
-  `prune`, and `pull-local`. `commit -b` and `--tag` take `@ID:NAME`. The
+  `prune`, `pull-local`, `push`, `push-tree`, and `send --one-way`.
+  `commit -b` and `--tag` take `@ID:NAME`. The
   refs of one commit are in one namespace after the own-id mapping: the
   local refs, with a `REMOTE:NAME` branch, or the refs of one collection.
   The command refuses refs of two namespaces before the repository lock.
@@ -3415,6 +3479,9 @@ These alternatives were rejected:
   local or a remote ref. The API then has two names for one ref, for
   example a refspec setter for `main` and a collection ref setter for the
   local ref `main`.
+- Text for the tags of a push and the branch of a server commit, for one
+  form with `RepoPushOptions::refspecs`. A tag and a branch hold no
+  revision, and the typed value gives the same text on the wire.
 
 ## The own collection id
 
@@ -3491,12 +3558,12 @@ namespace (`ostrya-config(1)`, "Access modes and patterns"). The rules:
   form names more than one id. `@OWN:PATTERN` is the same as `PATTERN`.
 - The config has at most one group for each auth item. The server selects
   the group of the item, and the group gives the session policies:
-  `verify`, `allow-unsigned`, `sign`, and `allow-privileged`. A session
-  reads the items of the namespace of its `Hello`. The items of two
-  namespaces never combine.
+  `verify`, `allow-unsigned`, `sign`, `allow-privileged`, and
+  `disable-verify-bindings`. A session reads the items of the namespace of
+  each ref. The items of two namespaces never combine.
 - A group opens a push session when an allow item of any namespace has
   `w`, `c`, `t`, or `d`. The check of each ref of `Hello` refuses a ref
-  with no `r` in the namespace of `Hello`.
+  with no `r` in its namespace.
 - The claims of a namespace replace the items of the group for that
   namespace alone. A certificate with claims for `org.x` alone keeps the
   local rights of the group.
@@ -3526,6 +3593,112 @@ These alternatives were rejected:
   `ostrya:collection:ID:[MODES:]PATTERN`. Two spellings of one claim need
   two parsers and two sets of tests, and give a CA two ways to state one
   right.
+
+## The namespace of each pushed ref
+
+The push protocol carries the namespace of each ref in its name
+(`format-reference.md`, "Hello and HelloReply"). A user pushes local refs
+and the refs of more than one collection in one push. The rules:
+
+- Each name field holds the text of a ref ("The ref syntax"): `NAME` or
+  `@ID:NAME`, and in a one-way stream also `REMOTE:NAME`. The name fields
+  are `Hello.refs`, the names of `HelloReply`, `Commit`, and `CommitReply`,
+  and the branch and the tags of a server commit. The GVariant types are
+  the same for each form. `Hello` and `HelloReply` have no `collection`
+  key. `HelloReply` keeps `collection-id`, so the client checks the
+  bindings of each ref before it sends an object.
+- The server parses each name and maps `@OWN:NAME`, where `OWN` is its
+  collection id, to the local ref `NAME`. The names of `HelloReply` and of
+  `CommitReply` repeat the text that the client sent.
+- The server refuses two names of one ref in one `Hello` with `protocol`,
+  before it sends `HelloReply`: one name two times, or `NAME` with
+  `@OWN:NAME`. The server knows its own collection id at `Hello`, so the
+  client sends no object for a push that fails.
+- The binding of a commit checks the namespace, and never selects it. A
+  plain `DST` is a local ref of the server. A commit bound to `X` on a
+  plain `DST` is refused unless `X` is the collection id of the server. The
+  user writes `main:@X:main`, or `@X:main` when the source is the
+  collection ref `@X:main` of the local repository.
+- A commit with no `ostree.collection-binding` goes to the local refs
+  alone. An update of `@X:NAME`, where `X` is not the collection id of the
+  server, with such a commit is refused. No key and no flag turns this rule
+  off. A collection pull refuses a commit with no binding unless the caller
+  allows it, so such a ref fails the pull of its collection. A user binds a
+  commit with `ostrya commit -b @X:NAME`, or pushes it with
+  `push --onto @X:NAME`, where the server binds the commit.
+- The ref-binding check compares the name part of each `DST` and of each
+  tag with the `ostree.ref-binding` list of its commit: `stable` for
+  `@X:stable`. A commit with no key passes the check of a `DST`. An empty
+  list holds no name, so it is refused, as a pull refuses it. The client and
+  the server apply the check, also to a one-way stream and to a push to a
+  bucket. The client also refuses a tag whose commit has no key.
+- The client group key `disable-verify-bindings` (`ostrya-config(1)`,
+  "Client keys") makes the server skip the ref-binding check for the ref
+  updates and the tags of a session of the group. `ReceivePolicy` and
+  `StreamPolicy` carry the same flag. `ostrya push --disable-verify-bindings`
+  and `RepoPushOptions` skip the check of the client, and the server then
+  applies the key of the group. A bucket has no server check, so the flag
+  alone skips the check of a push to a bucket. `send --one-way` and
+  `receive --one-way` take the option for their side of the stream. The
+  check of the collection binding stays on under each key and each flag.
+  When a push under the key or a flag writes a ref whose commit does not
+  hold its name, a pull of the ref fails without
+  `--disable-verify-bindings`, also a pull by the `ostree` command.
+- The server checks the access of each ref in its namespace. The refusal of
+  `ostree-metadata` applies to each local ref, `@OWN:ostree-metadata`
+  included.
+- `push --collection=ID`, `push --onto`, and `push-tree` take one rule:
+  `--collection=ID` adds `@ID:` to each plain `DST` and to each plain tag
+  or branch. An `@ID:` operand stays, and an `@Y:` operand, with `Y` other
+  than `ID`, is refused before the session. A `DST` that defaults from an
+  `@Y:` `SRC` is an `@Y:` `DST`. `--bind-ref` takes a plain name, and
+  `--collection` does not change it.
+- The branch and the tags of a server commit are in one namespace, after
+  the mapping of the own collection id of the server. A commit made in a
+  namespace stays bound to it, and each tag of the commit is in that
+  namespace. The client checks this after `HelloReply`, before it sends an
+  object, and the server checks it again. The server needs `c` on the
+  branch, and `t` or `w` on each tag, each in its namespace. It writes
+  `ostree.collection-binding` with the id of the namespace, and no key for
+  the local refs of a server with no collection id. It writes
+  `ostree.ref-binding` with the name parts of the branch and the tags and
+  each bound name, and drops the binding keys of the client. `push --onto`
+  does not check the bindings of the local commit, and `push-tree` and
+  `push --onto` read no `disable-verify-bindings`.
+- A one-way stream takes `@ID:NAME` names and `@ID:` patterns. A ref of a
+  collection takes no default rule, so it needs a pattern rule that
+  matches it. A remote ref keeps the check of its collection binding
+  against the collection id of the receiver.
+- The push to a bucket takes the namespace of each `DST` with the `config`
+  of the bucket in the role of the server ("The S3 push").
+- The hooks and the receive report take types of `ostrya` with typed
+  names: `ReceiveRefUpdate` and `ReceiveRefOutcome` hold `name: Ref`, and
+  `ReceiveServerCommit` holds `branch: Ref` and `tags: Vec<Ref>`, with
+  `bind_refs` as text. Each name is canonical: a ref of the own collection
+  id of the server is `Local`, so `main` and `@OWN:main` give a hook the
+  same value. The server builds these values once, after the checks of the
+  `Commit`. `ReceiveReport` holds no namespace of the session. The protocol
+  types of `ostrya-remote` are the same for each form, and the client keeps
+  `PushOutcome` with the protocol `RefOutcome`, which holds the text that
+  the client sent.
+- `ReceiveService::commit` gives the host the `ReceiveReport` and the
+  protocol `RefOutcome` list. The host builds `CommitReply` from that list,
+  so the reply repeats the text of the client. The selector of
+  `receive_selected` takes no namespace, because a session has none.
+
+These alternatives were rejected:
+
+- A namespace for each session, named by a key of `Hello`. A push of the
+  refs of two collections then needs two sessions, and the binding of a
+  commit has to select the namespace when the user gives none.
+- A refusal of each `@ID:` operand under `--collection`, also of an operand
+  of the same id. The three push commands then take two rules for one
+  option.
+- The protocol `ServerCommit` for the hook, with the typed names as a second
+  argument. The host gets each name two times, and the two must agree.
+- The protocol types alone for the hooks and the report. Each host then
+  parses the names and reads the own collection id of the server to
+  compare `main` with `@OWN:main`.
 
 ## The pull scheduler
 

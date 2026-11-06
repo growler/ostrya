@@ -1,5 +1,6 @@
 //! The commit object of a server commit: the commit that a writer makes
-//! from a tree and the fields of a [`ServerCommit`].
+//! from a tree and the fields of a
+//! [`ServerCommit`](crate::remote::proto::ServerCommit).
 //!
 //! The receive side of a push and the tree push to a bucket repository make
 //! the commit with the same function, so the same inputs give the same
@@ -11,7 +12,6 @@ use ostrya_core::{
 };
 
 use crate::error::Error;
-use crate::remote::proto::ServerCommit;
 
 /// The metadata key of the ref binding.
 const REF_BINDING_KEY: &str = "ostree.ref-binding";
@@ -22,33 +22,49 @@ const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The metadata key of the size records of a commit.
 const SIZES_KEY: &str = "ostree.sizes";
 
-/// Returns the bytes of the commit object of `sc`.
+/// The fields of a server commit that its commit object holds.
+pub(crate) struct CommitFields<'a> {
+    /// The names of `ostree.ref-binding`, in any order: the name of the
+    /// branch and of each tag without the `@ID:` part, and each bound name.
+    pub(crate) refs: Vec<&'a str>,
+    /// The checksum of the root dirtree.
+    pub(crate) root_dirtree: Checksum,
+    /// The checksum of the root dirmeta.
+    pub(crate) root_dirmeta: Checksum,
+    /// The subject.
+    pub(crate) subject: &'a str,
+    /// The body.
+    pub(crate) body: &'a str,
+    /// The metadata entries of the client, each a key and the bytes of a `v`
+    /// in normal form.
+    pub(crate) metadata: &'a [(String, Vec<u8>)],
+    /// The flag that makes a commit with no parent.
+    pub(crate) orphan: bool,
+}
+
+/// Returns the bytes of the commit object of `fields`.
 ///
 /// The parent is `tip`, or none with `orphan`. The metadata comes from
-/// [`server_commit_metadata`], with the branch, each tag, and each bound name
-/// as the ref binding, and `collection_id` as the collection binding. The
-/// commit has no related objects. The caller checked that a commit can hold
-/// each metadata value of `sc`.
+/// [`server_commit_metadata`], with the names of `fields` as the ref
+/// binding, and `collection_id` as the collection binding. The commit has no
+/// related objects. The caller checked that a commit can hold each metadata
+/// value of `fields`.
 pub(crate) fn commit_bytes(
-    sc: &ServerCommit,
+    fields: &CommitFields<'_>,
     tip: Option<Checksum>,
     timestamp: u64,
     collection_id: Option<&str>,
 ) -> ostrya_core::Result<Vec<u8>> {
-    let bound: Vec<&str> = std::iter::once(sc.branch.as_str())
-        .chain(sc.tags.iter().map(String::as_str))
-        .chain(sc.bind_refs.iter().map(String::as_str))
-        .collect();
-    let metadata = server_commit_metadata(&sc.metadata, &bound, collection_id)?;
+    let metadata = server_commit_metadata(fields.metadata, &fields.refs, collection_id)?;
     Commit {
         metadata: Value::Array(Vec::new()),
-        parent: if sc.orphan { None } else { tip },
+        parent: if fields.orphan { None } else { tip },
         related: Vec::new(),
-        subject: sc.subject.clone(),
-        body: sc.body.clone(),
+        subject: fields.subject.to_owned(),
+        body: fields.body.to_owned(),
         timestamp,
-        root_dirtree: sc.root_dirtree,
-        root_dirmeta: sc.root_dirmeta,
+        root_dirtree: fields.root_dirtree,
+        root_dirmeta: fields.root_dirmeta,
     }
     .serialize_with_metadata(&metadata)
 }
@@ -223,32 +239,30 @@ mod tests {
     }
 
     /// The commit takes the tip as its parent, and none with `orphan`. The
-    /// bound names are the branch, each tag, and each bound name.
+    /// bound names are the names of the fields, sorted.
     #[test]
     fn the_commit_takes_the_tip_unless_orphan() {
         let tip = Checksum::from_bytes([7; 32]);
-        let mut sc = ServerCommit {
-            branch: "main".into(),
-            tags: vec!["v1".into()],
-            bind_refs: vec!["alias".into()],
+        let metadata = vec![entry("k", text("v"))];
+        let mut fields = CommitFields {
+            refs: vec!["main", "v1", "alias"],
             root_dirtree: Checksum::from_bytes([1; 32]),
             root_dirmeta: Checksum::from_bytes([2; 32]),
-            subject: "s".into(),
-            body: "b".into(),
-            metadata: vec![entry("k", text("v"))],
-            timestamp: None,
+            subject: "s",
+            body: "b",
+            metadata: &metadata,
             orphan: false,
         };
         let commit =
-            Commit::parse(&commit_bytes(&sc, Some(tip), 42, Some("org.a")).unwrap()).unwrap();
+            Commit::parse(&commit_bytes(&fields, Some(tip), 42, Some("org.a")).unwrap()).unwrap();
         assert_eq!(commit.parent, Some(tip));
         assert_eq!(commit.timestamp, 42);
         assert_eq!((commit.subject.as_str(), commit.body.as_str()), ("s", "b"));
         assert_eq!(commit.ref_bindings(), ["alias", "main", "v1"]);
         assert_eq!(commit.collection_binding(), Some("org.a"));
         assert_eq!(commit.metadata.dict_get("k"), Some(&text("v")));
-        sc.orphan = true;
-        let commit = Commit::parse(&commit_bytes(&sc, Some(tip), 42, None).unwrap()).unwrap();
+        fields.orphan = true;
+        let commit = Commit::parse(&commit_bytes(&fields, Some(tip), 42, None).unwrap()).unwrap();
         assert_eq!(commit.parent, None);
         assert_eq!(commit.collection_binding(), None);
     }

@@ -299,7 +299,7 @@ fn fixture_ca(url: &str) -> FetcherOptions {
 
 fn tree_options(branch: &str, timestamp: u64) -> TreePushOptions {
     TreePushOptions {
-        onto: branch.to_string(),
+        onto: ostrya::Ref::local(branch),
         timestamp: Some(timestamp),
         ..Default::default()
     }
@@ -1753,9 +1753,9 @@ mod cli {
         assert!(!server.join("refs/heads/main").exists());
     }
 
-    /// A commit bound to a collection opens the session in that collection,
-    /// and the items of the collection write `refs/mirrors/ID/NAME`. A
-    /// collection with no item of the group gets `ref-denied`.
+    /// `--collection` sends the plain DST as `@ID:NAME`, and the items of the
+    /// collection write `refs/mirrors/ID/NAME`. A ref of a collection with no
+    /// item of the group gets `ref-denied`.
     #[test]
     fn a_collection_push_over_http_takes_the_items_of_the_collection() {
         let setup = Setup::new("cli-collection");
@@ -1765,15 +1765,21 @@ mod cli {
         let text = std::fs::read_to_string(&config).unwrap();
         let text = text.replacen("[core]\n", "[core]\ncollection-id=org.example.Os\n", 1);
         std::fs::write(&config, text).unwrap();
-        let commit_to = |branch: &str, extra: &[&str]| {
+        let commit_to = |branch: &str| {
             let repo = format!("--repo={}", client.display());
-            let mut args = vec![repo.as_str(), "commit", "-b", branch, "-s", "subject"];
-            args.extend_from_slice(extra);
-            args.push(src.to_str().unwrap());
+            let args = [
+                repo.as_str(),
+                "commit",
+                "-b",
+                branch,
+                "-s",
+                "subject",
+                src.to_str().unwrap(),
+            ];
             ok("ostrya", &args).trim().to_owned()
         };
-        let commit = commit_to("main", &[]);
-        commit_to("plain", &["--no-bindings"]);
+        let commit = commit_to("main");
+        commit_to("@org.example.Other:other");
         let server = setup.init("server", "archive");
         add_config(
             &server,
@@ -1781,25 +1787,29 @@ mod cli {
         );
         let serving = Serving::start(&server, &[]);
 
-        let out = push_from(&client, &[&serving.url, "main"]);
+        let out = push_from(
+            &client,
+            &[&serving.url, "--collection=org.example.Os", "main"],
+        );
         assert!(out.status.success(), "{}", stderr(&out));
-        assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
+        assert_eq!(
+            stdout(&out),
+            format!("@org.example.Os:main (new) {commit}\n")
+        );
         assert_eq!(
             std::fs::read_to_string(server.join("refs/mirrors/org.example.Os/main")).unwrap(),
             format!("{commit}\n")
         );
         assert!(!server.join("refs/heads/main").exists());
 
-        let out = push_from(
-            &client,
-            &[&serving.url, "--collection=org.example.Other", "plain"],
-        );
+        let out = push_from(&client, &[&serving.url, "@org.example.Other:other"]);
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
         assert_eq!(stdout(&out), "");
         assert_eq!(
             stderr(&out),
-            "error: ref-denied: the policy gives no r on ref 'plain'\n"
+            "error: ref-denied: the policy gives no r on ref '@org.example.Other:other'\n"
         );
+        assert!(!server.join("refs/mirrors/org.example.Other").exists());
     }
 
     /// The push checks the remote and makes the transport ready before its

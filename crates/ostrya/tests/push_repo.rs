@@ -163,6 +163,12 @@ fn opts(specs: &[&str]) -> RepoPushOptions {
     }
 }
 
+/// Reads `text` as a ref. Text that is no ref is a local ref of that name,
+/// which the push refuses.
+fn r(text: &str) -> Ref {
+    text.parse().unwrap_or_else(|_| Ref::local(text))
+}
+
 // ---------------------------------------------------------------------------
 // The pushes.
 // ---------------------------------------------------------------------------
@@ -523,16 +529,51 @@ fn a_ref_binding_that_does_not_hold_the_destination_is_refused_before_any_byte()
     assert_eq!(written, 0);
 }
 
+/// A commit with an empty `ostree.ref-binding` list holds no name, so the
+/// client refuses it before it writes a byte. With the client switch, the
+/// server refuses it, unless the policy of the client also skips the check.
 #[test]
-fn an_empty_ref_binding_list_passes() {
+fn an_empty_ref_binding_list_is_refused() {
     let pair = Pair::new("empty-binding", RepoMode::Archive, RepoMode::Archive, "");
     let mut metadata = DictBuilder::new();
     metadata.insert_strv("ostree.ref-binding", &[]);
     let c1 = commit(&pair.client, "a", None, "unbound", Some(metadata.build()));
-    let (report, outcome) = push(&pair, opts(&["a:b"]));
+    let (error, written) = refused(&pair.client, opts(&["a:b"]));
+    assert_binding_mismatch::<()>(&Err(error), "which do not hold 'b'");
+    assert_eq!(written, 0);
+    let skip = || RepoPushOptions {
+        disable_verify_bindings: true,
+        ..opts(&["a:b"])
+    };
+    let (report, outcome) = push(&pair, skip());
+    assert_binding_mismatch(&report, "which do not hold 'b'");
+    assert_binding_mismatch(&outcome, "which do not hold 'b'");
+    assert_eq!(tip(&pair.server, "b"), None);
+    let (report, outcome) = push_under(&pair, skip(), &skipping_policy(&["w:**"]), |_| {});
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "b"), Some(c1));
+}
+
+/// Returns a policy whose rules hold the allow items `allow` for the local
+/// refs and for the collections `org.example.X` and `org.example.Y`, and
+/// that skips the check of `ostree.ref-binding`, as the client group key
+/// `disable-verify-bindings` does.
+fn skipping_policy(allow: &[&str]) -> ReceivePolicy {
+    ReceivePolicy {
+        disable_verify_bindings: true,
+        ..namespaces_policy(allow)
+    }
+}
+
+/// Returns a policy whose rules hold the allow items `allow` for the local
+/// refs and for the collections `org.example.X` and `org.example.Y`.
+fn namespaces_policy(allow: &[&str]) -> ReceivePolicy {
+    let mut policy = policy_allowing(allow);
+    policy.rules.collections = collections_policy(&["org.example.X", "org.example.Y"], allow)
+        .rules
+        .collections;
+    policy
 }
 
 /// Returns the metadata of a commit bound to the collection `id` and to the
@@ -562,11 +603,13 @@ fn assert_binding_mismatch<T: std::fmt::Debug>(result: &ostrya::Result<T>, needl
     }
 }
 
-/// A commit bound to a collection that is not the collection id of the
-/// server goes to `refs/mirrors/ID/` of the server. The server has no
-/// collection id here.
+/// The binding of a commit selects no namespace. A commit bound to a
+/// collection that is not the collection id of the server is refused on a
+/// plain `DST` after `HelloReply` and before any `Have`. The refspec
+/// `main:@ID:main` writes it to `refs/mirrors/ID/` of the server. The server
+/// has no collection id here.
 #[test]
-fn a_commit_bound_to_another_collection_goes_to_the_mirror_refs() {
+fn a_commit_bound_to_another_collection_needs_a_ref_of_the_collection() {
     let pair = Pair::new("mirror", RepoMode::Archive, RepoMode::Archive, "");
     let c1 = commit(
         &pair.client,
@@ -575,20 +618,159 @@ fn a_commit_bound_to_another_collection_goes_to_the_mirror_refs() {
         "c1",
         bound(Some("org.example.Os"), &[]),
     );
-    let (report, outcome) = push_under(
-        &pair,
-        opts(&["main"]),
-        &collections_policy(&["org.example.Os"], &["w:**"]),
-        |_| {},
-    );
+    let mut policy = collections_policy(&["org.example.Os"], &["w:**"]);
+    policy.rules.local = policy_allowing(&["w:**"]).rules.local;
+    let (kinds, hook) = frame_kinds();
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &policy, hook);
+    assert_aborted(&report);
+    assert_binding_mismatch(&outcome, "ref 'main' is a local ref");
+    let kinds = kinds.lock().unwrap().clone();
+    assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
+    assert!(!has_commit(&pair.server, &c1));
+
+    let (report, outcome) =
+        push_under(&pair, opts(&["main:@org.example.Os:main"]), &policy, |_| {});
     let report = report.unwrap();
-    assert_eq!(report.collection.as_deref(), Some("org.example.Os"));
-    outcome.unwrap();
+    assert_eq!(
+        report.refs[0].name,
+        ostrya::Ref::collection("org.example.Os", "main")
+    );
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.refs[0].name, "@org.example.Os:main");
     assert_eq!(
         ref_file(&pair.server, "refs/mirrors/org.example.Os/main"),
         Some(format!("{c1}\n"))
     );
     assert_eq!(tip(&pair.server, "main"), None);
+}
+
+/// One session writes a local ref and the refs of two collections. A ref of
+/// the collection id of the server, `@OWN:b`, lands in `refs/heads/b`. The
+/// outcome repeats the text of the client, and the report holds the
+/// canonical refs.
+#[test]
+fn one_push_writes_the_refs_of_more_than_one_namespace() {
+    let pair = Pair::new(
+        "namespaces",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "collection-id=org.example.Own\n",
+    );
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    let cx = commit(
+        &pair.client,
+        "x",
+        None,
+        "cx",
+        bound(Some("org.example.X"), &[]),
+    );
+    let cy = commit(
+        &pair.client,
+        "y",
+        None,
+        "cy",
+        bound(Some("org.example.Y"), &[]),
+    );
+    let specs = [
+        "main",
+        "x:@org.example.X:a",
+        "main:@org.example.Own:b",
+        "y:@org.example.Y:a",
+    ];
+    let (report, outcome) = push_under(&pair, opts(&specs), &namespaces_policy(&["w:**"]), |_| {});
+    let report = report.unwrap();
+    let canonical: Vec<String> = report.refs.iter().map(|r| r.name.to_string()).collect();
+    assert_eq!(
+        canonical,
+        ["main", "@org.example.X:a", "b", "@org.example.Y:a"]
+    );
+    let outcome = outcome.unwrap();
+    let names: Vec<&str> = outcome.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(
+        names,
+        [
+            "main",
+            "@org.example.X:a",
+            "@org.example.Own:b",
+            "@org.example.Y:a"
+        ]
+    );
+    assert_eq!(
+        ref_file(&pair.server, "refs/heads/main"),
+        Some(format!("{c1}\n"))
+    );
+    assert_eq!(
+        ref_file(&pair.server, "refs/heads/b"),
+        Some(format!("{c1}\n"))
+    );
+    assert_eq!(
+        ref_file(&pair.server, "refs/mirrors/org.example.X/a"),
+        Some(format!("{cx}\n"))
+    );
+    assert_eq!(
+        ref_file(&pair.server, "refs/mirrors/org.example.Y/a"),
+        Some(format!("{cy}\n"))
+    );
+    assert!(
+        !pair
+            .server
+            .path()
+            .join("refs/mirrors/org.example.Own")
+            .exists()
+    );
+}
+
+/// A ref that the server refuses at `Commit` writes no ref of the session,
+/// also no ref of another namespace.
+#[test]
+fn a_refused_ref_writes_no_ref_of_the_session() {
+    let pair = Pair::new("refused-ref", RepoMode::Archive, RepoMode::Archive, "");
+    commit(&pair.client, "main", None, "c1", None);
+    commit(
+        &pair.client,
+        "x",
+        None,
+        "cx",
+        bound(Some("org.example.X"), &[]),
+    );
+    commit(
+        &pair.client,
+        "y",
+        None,
+        "cy",
+        bound(Some("org.example.Y"), &[]),
+    );
+    // The client group reads the refs of `org.example.Y`, and writes none.
+    let mut policy = namespaces_policy(&["w:**"]);
+    policy.rules.collections = collections_policy(&["org.example.X"], &["w:**"])
+        .rules
+        .collections;
+    policy.rules.collections.extend(
+        collections_policy(&["org.example.Y"], &["r:**"])
+            .rules
+            .collections,
+    );
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["main", "x:@org.example.X:a", "y:@org.example.Y:a"]),
+        &policy,
+        |_| {},
+    );
+    assert!(
+        matches!(report, Err(Error::Remote(remote::Error::RefDenied(_)))),
+        "{report:?}"
+    );
+    assert!(
+        matches!(outcome, Err(Error::Remote(remote::Error::RefDenied(_)))),
+        "{outcome:?}"
+    );
+    assert_eq!(tip(&pair.server, "main"), None);
+    for id in ["org.example.X", "org.example.Y"] {
+        assert_eq!(
+            ref_file(&pair.server, &format!("refs/mirrors/{id}/a")),
+            None
+        );
+    }
 }
 
 /// A commit bound to the collection id of the server goes to the local refs.
@@ -610,7 +792,13 @@ fn a_commit_bound_to_the_server_collection_goes_to_the_local_refs() {
     );
     let c2 = commit(&pair.client, "other", None, "c2", None);
     let (report, outcome) = push(&pair, opts(&["main", "other"]));
-    assert_eq!(report.unwrap().collection, None);
+    let report = report.unwrap();
+    assert!(
+        report
+            .refs
+            .iter()
+            .all(|r| matches!(r.name, ostrya::Ref::Local { .. }))
+    );
     let outcome = outcome.unwrap();
     assert_eq!(outcome.refs.len(), 2);
     assert_eq!(tip(&pair.server, "main"), Some(c1));
@@ -647,33 +835,45 @@ fn a_push_into_the_server_collection_writes_the_local_ref_beside_a_mirror_ref() 
         bound(Some("org.example.Os"), &[]),
     );
     let (report, outcome) = push(&pair, opts(&["main"]));
-    assert_eq!(report.unwrap().collection, None);
+    let report = report.unwrap();
+    assert!(
+        report
+            .refs
+            .iter()
+            .all(|r| matches!(r.name, ostrya::Ref::Local { .. }))
+    );
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(c1));
     assert_eq!(std::fs::read_to_string(&mirror).unwrap(), held);
 }
 
-/// Two different bindings, a `collection` that differs from the binding, a
-/// `collection` that fails the collection-id rule or is longer than 255
-/// bytes, and a binding that fails the collection-id rule are refused before
-/// the push writes a byte.
+/// A commit bound to `Y` for a `DST` `@X:NAME`, a `collection` that fails the
+/// collection-id rule or is longer than 255 bytes, and a binding that fails
+/// the collection-id rule are refused before the push writes a byte. Two
+/// different bindings in one push are no refusal of their own.
 #[test]
-fn disagreeing_collections_are_refused_before_any_byte() {
+fn a_binding_that_no_ref_can_take_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-mixed-bindings");
     let repo = new_repo(&dir, RepoMode::Archive, "");
     commit(&repo, "os-a", None, "a", bound(Some("org.example.A"), &[]));
     commit(&repo, "os-b", None, "b", bound(Some("org.example.B"), &[]));
-    let (error, written) = refused(&repo, opts(&["os-a", "os-b"]));
-    assert_binding_mismatch::<()>(&Err(error), "'org.example.A'");
+    let (error, written) = refused(&repo, opts(&["os-a:@org.example.B:os-a"]));
+    assert_binding_mismatch::<()>(
+        &Err(error),
+        "bound to the collection 'org.example.A', not 'org.example.B'",
+    );
     assert_eq!(written, 0);
     let (error, written) = refused(
         &repo,
         RepoPushOptions {
             collection: Some("org.example.B".into()),
-            ..opts(&["os-a"])
+            ..opts(&["os-b", "os-a"])
         },
     );
-    assert_binding_mismatch::<()>(&Err(error), "not 'org.example.B'");
+    assert_binding_mismatch::<()>(
+        &Err(error),
+        "not 'org.example.B' of ref '@org.example.B:os-a'",
+    );
     assert_eq!(written, 0);
     let (error, written) = refused(
         &repo,
@@ -699,10 +899,202 @@ fn disagreeing_collections_are_refused_before_any_byte() {
     assert_eq!(written, 0);
 }
 
-/// A commit with no binding goes to the local refs alone. If `Hello` names a
-/// collection that is not the collection id of the server, the push sends
-/// `Abort` after `HelloReply` and sends no `Have`. This holds for a
-/// requested collection and for the binding of another source commit.
+/// Under `collection`, a `DST` and a tag of another collection are refused
+/// before the push writes a byte, also a `DST` that defaults from a `SRC`
+/// of another collection. A `DST` of the collection is accepted, and a plain
+/// `DST` takes the collection.
+#[test]
+fn a_collection_refuses_the_refs_of_another_collection() {
+    let pair = Pair::new("collection", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(Some("org.example.X"), &["main", "a", "t"]),
+    );
+    block_on(
+        pair.client
+            .set_ref_immediate(&Ref::collection("org.example.Y", "a"), Some(&c1)),
+    )
+    .unwrap();
+    let x = || Some("org.example.X".to_owned());
+    for (opts, needle) in [
+        (
+            RepoPushOptions {
+                collection: x(),
+                ..opts(&["main:@org.example.Y:a"])
+            },
+            "destination '@org.example.Y:a'",
+        ),
+        (
+            RepoPushOptions {
+                collection: x(),
+                ..opts(&["@org.example.Y:a"])
+            },
+            "destination '@org.example.Y:a'",
+        ),
+        (
+            RepoPushOptions {
+                collection: x(),
+                tags: vec![r("@org.example.Y:t")],
+                ..opts(&["main"])
+            },
+            "tag '@org.example.Y:t'",
+        ),
+    ] {
+        let (error, written) = refused(&pair.client, opts);
+        assert_invalid_input(&error, needle);
+        assert_invalid_input(
+            &error,
+            "names the collection 'org.example.Y', and the push names the collection \
+             'org.example.X'",
+        );
+        assert_eq!(written, 0);
+    }
+    let (report, outcome) = push_under(
+        &pair,
+        RepoPushOptions {
+            collection: x(),
+            tags: vec![r("t")],
+            ..opts(&["main", "main:@org.example.X:a"])
+        },
+        &namespaces_policy(&["w:**"]),
+        |_| {},
+    );
+    report.unwrap();
+    let names: Vec<String> = outcome.unwrap().refs.into_iter().map(|r| r.name).collect();
+    assert_eq!(
+        names,
+        [
+            "@org.example.X:main",
+            "@org.example.X:a",
+            "@org.example.X:t"
+        ]
+    );
+    for name in ["main", "a", "t"] {
+        assert_eq!(
+            ref_file(&pair.server, &format!("refs/mirrors/org.example.X/{name}")),
+            Some(format!("{c1}\n")),
+            "{name}"
+        );
+    }
+}
+
+/// The ref-binding check compares the name part of each `DST` and tag. With
+/// the list `[main]`, `main:@X:stable` and the tag `@X:v1` are refused by the
+/// client, and by the server when the client skips its check. `main:@X:main`
+/// passes. With the switch of the client and the key of the server,
+/// `main:@X:stable` passes, and a commit bound to another collection is
+/// still refused. A commit with no ref binding passes.
+#[test]
+fn the_ref_binding_check_reads_the_name_part_of_each_ref() {
+    let pair = Pair::new("ref-binding", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(Some("org.example.X"), &["main"]),
+    );
+    let tagged = |specs: &[&str], tags: &[&str], skip: bool| RepoPushOptions {
+        tags: tags.iter().map(|t| r(t)).collect(),
+        disable_verify_bindings: skip,
+        ..opts(specs)
+    };
+    for (specs, tags, needle) in [
+        (
+            &["main:@org.example.X:stable"][..],
+            &[][..],
+            "do not hold 'stable'",
+        ),
+        (
+            &["main:@org.example.X:main"],
+            &["@org.example.X:v1"],
+            "the tag 'v1'",
+        ),
+    ] {
+        let (error, written) = refused(&pair.client, tagged(specs, tags, false));
+        assert_binding_mismatch::<()>(&Err(error), needle);
+        assert_eq!(written, 0);
+        let (report, outcome) = push_under(
+            &pair,
+            tagged(specs, tags, true),
+            &namespaces_policy(&["w:**"]),
+            |_| {},
+        );
+        assert_binding_mismatch(&report, "which do not hold");
+        assert_binding_mismatch(&outcome, "which do not hold");
+    }
+    assert_eq!(
+        ref_file(&pair.server, "refs/mirrors/org.example.X/stable"),
+        None
+    );
+
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["main:@org.example.X:main"]),
+        &namespaces_policy(&["w:**"]),
+        |_| {},
+    );
+    report.unwrap();
+    outcome.unwrap();
+    let (report, outcome) = push_under(
+        &pair,
+        tagged(
+            &["main:@org.example.X:stable"],
+            &["@org.example.X:v1"],
+            true,
+        ),
+        &skipping_policy(&["w:**"]),
+        |_| {},
+    );
+    report.unwrap();
+    outcome.unwrap();
+    for name in ["main", "stable", "v1"] {
+        assert_eq!(
+            ref_file(&pair.server, &format!("refs/mirrors/org.example.X/{name}")),
+            Some(format!("{c1}\n")),
+            "{name}"
+        );
+    }
+    // The switch and the key skip no check of the collection binding.
+    let (report, outcome) = push_under(
+        &pair,
+        tagged(&["main:@org.example.Y:stable"], &[], true),
+        &skipping_policy(&["w:**"]),
+        |_| {},
+    );
+    assert!(report.is_err());
+    assert_binding_mismatch(&outcome, "'org.example.X', not 'org.example.Y'");
+    // A commit with no ref binding passes.
+    let c2 = commit(
+        &pair.client,
+        "other",
+        None,
+        "c2",
+        bound(Some("org.example.X"), &[]),
+    );
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["other:@org.example.X:any"]),
+        &namespaces_policy(&["w:**"]),
+        |_| {},
+    );
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(
+        ref_file(&pair.server, "refs/mirrors/org.example.X/any"),
+        Some(format!("{c2}\n"))
+    );
+}
+
+/// A commit with no collection binding goes to the local refs alone. A
+/// `DST` `@X:NAME` of a collection other than the collection id of the
+/// server refuses it after `HelloReply`: the push sends `Abort` and no
+/// `Have`. This holds for a `DST` that `collection` names, and under the
+/// switch of the client. The same commit passes on `main` and on
+/// `@OWN:a`.
 #[test]
 fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
     let pair = Pair::new(
@@ -712,19 +1104,16 @@ fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
         "collection-id=org.example.Server\n",
     );
     let c1 = commit(&pair.client, "main", None, "c1", None);
-    commit(
-        &pair.client,
-        "os",
-        None,
-        "os",
-        bound(Some("org.example.Os"), &[]),
-    );
     for opts in [
+        opts(&["main:@org.example.X:main"]),
         RepoPushOptions {
-            collection: Some("org.example.Os".into()),
+            collection: Some("org.example.X".into()),
             ..opts(&["main"])
         },
-        opts(&["main", "os"]),
+        RepoPushOptions {
+            disable_verify_bindings: true,
+            ..opts(&["main", "main:@org.example.X:a"])
+        },
     ] {
         let progress = PushProgress::new();
         let (kinds, hook) = frame_kinds();
@@ -734,7 +1123,7 @@ fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
                 progress: Some(progress.clone()),
                 ..opts
             },
-            &collections_policy(&["org.example.Os"], &["w:**"]),
+            &skipping_policy(&["w:**"]),
             hook,
         );
         assert_aborted(&report);
@@ -750,9 +1139,49 @@ fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
             .server
             .path()
             .join("refs/mirrors")
-            .join("org.example.Os")
+            .join("org.example.X")
             .exists()
     );
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["main", "main:@org.example.Server:a"]),
+        &namespaces_policy(&["w:**"]),
+        |_| {},
+    );
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(c1));
+    assert_eq!(tip(&pair.server, "a"), Some(c1));
+}
+
+/// `main` and `@OWN:main` name one ref of the server, which refuses the
+/// `Hello` before `HelloReply`, so the push sends no object.
+#[test]
+fn two_texts_of_one_ref_are_refused_before_any_object() {
+    let pair = Pair::new(
+        "two-texts",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "collection-id=org.example.Server\n",
+    );
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    let (kinds, hook) = frame_kinds();
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["main", "main:@org.example.Server:main"]),
+        &namespaces_policy(&["w:**"]),
+        hook,
+    );
+    assert!(
+        matches!(report, Err(Error::Remote(remote::Error::Protocol(_)))),
+        "{report:?}"
+    );
+    assert!(
+        matches!(outcome, Err(Error::Remote(remote::Error::Protocol(_)))),
+        "{outcome:?}"
+    );
+    assert!(!kinds.lock().unwrap().contains(&HAVE_FRAME));
+    assert!(!has_commit(&pair.server, &c1));
 }
 
 /// A tag is a ref update that expects no ref at the source commit. A tag
@@ -769,7 +1198,7 @@ fn a_tag_is_created_once_at_the_source_commit() {
         bound(None, &["main", "v1"]),
     );
     let tags = || RepoPushOptions {
-        tags: vec!["v1".into()],
+        tags: vec![Ref::local("v1")],
         ..opts(&["main"])
     };
     let policy = policy_allowing(&["w:main", "t:v1"]);
@@ -837,7 +1266,7 @@ fn a_tag_the_push_cannot_create_is_refused_before_any_byte() {
     commit(&repo, "other", None, "c2", bound(None, &["other", "v1"]));
     commit(&repo, "plain", None, "c3", None);
     let with = |specs: &[&str], tags: &[&str]| RepoPushOptions {
-        tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+        tags: tags.iter().map(|t| r(t)).collect(),
         ..opts(specs)
     };
 

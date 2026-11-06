@@ -349,8 +349,7 @@ pub struct PreparedSession {
 }
 
 impl PreparedSession {
-    /// Opens the session, sends `Hello` with `refs` and the collection of
-    /// `opts`, and reads `HelloReply`.
+    /// Opens the session, sends `Hello` with `refs`, and reads `HelloReply`.
     ///
     /// The call starts the ssh client, or sends the first HTTP request, as
     /// [`PushSession::connect`] does. An ssh session has the ssh time limits of
@@ -370,9 +369,8 @@ impl PreparedSession {
     /// - [`Error::Transport`] if the session fails with [`Error::Io`] and the
     ///   ssh client exits with a failure status. The message holds the status.
     /// - [`Error::Protocol`] if the reply is not `HelloReply`, if its version
-    ///   is not [`PROTOCOL_VERSION`](crate::proto::PROTOCOL_VERSION), if its
-    ///   refs are not the refs of `Hello` in order, or if its `collection`
-    ///   does not match [`SessionOptions::collection`].
+    ///   is not [`PROTOCOL_VERSION`](crate::proto::PROTOCOL_VERSION), or if
+    ///   its refs are not the refs of `Hello` in order.
     /// - [`Error::LimitExceeded`] if the `Hello` frame is more than
     ///   [`MIN_FRAME_LIMIT`](crate::proto::MIN_FRAME_LIMIT) bytes.
     /// - [`Error::Protocol`] or [`Error::LimitExceeded`] if the codec refuses

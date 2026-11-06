@@ -48,6 +48,7 @@ const CLIENT_KEYS: &[&str] = &[
     "allow-unsigned",
     "sign",
     "allow-privileged",
+    "disable-verify-bindings",
     "summary",
 ];
 /// The keys of the server group.
@@ -283,6 +284,9 @@ fn parse_client(
         allow_privileged: keyfile
             .get_bool(group, "allow-privileged")?
             .unwrap_or(false),
+        disable_verify_bindings: keyfile
+            .get_bool(group, "disable-verify-bindings")?
+            .unwrap_or(false),
         summary,
         implicit: false,
     })
@@ -383,6 +387,7 @@ pub(super) fn implicit_groups() -> Vec<ClientGroup> {
         allow_unsigned: true,
         sign: Vec::new(),
         allow_privileged: false,
+        disable_verify_bindings: false,
         summary: true,
         implicit: true,
     }]
@@ -1044,6 +1049,19 @@ mod tests {
         let message = refused(client("auth=anonymous\nsign=\n", keys));
         assert!(message.contains("sign is empty"), "{message}");
         let err = client("auth=anonymous\nallow-privileged=yes\n", "").unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "{err}");
+    }
+
+    /// `disable-verify-bindings` is a boolean that defaults to false.
+    #[test]
+    fn disable_verify_bindings_is_a_boolean() {
+        let group = client("auth=anonymous\n", "").unwrap();
+        assert!(!group.disable_verify_bindings());
+        let group = client("auth=anonymous\ndisable-verify-bindings=true\n", "").unwrap();
+        assert!(group.disable_verify_bindings());
+        let group = client("auth=anonymous\ndisable-verify-bindings=false\n", "").unwrap();
+        assert!(!group.disable_verify_bindings());
+        let err = client("auth=anonymous\ndisable-verify-bindings=yes\n", "").unwrap_err();
         assert!(matches!(err, Error::Core(_)), "{err}");
     }
 

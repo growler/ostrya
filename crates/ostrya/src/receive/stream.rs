@@ -60,9 +60,12 @@ impl Repo {
     /// differences:
     ///
     /// - The rule of each update is the rule that
-    ///   [`StreamPolicy::rule_for`](super::StreamPolicy::rule_for) selects. An
-    ///   update that no rule covers, and an update whose rule has `accept`
-    ///   false, are `ref-denied`. A delete of a ref that is present needs
+    ///   [`StreamPolicy::rule_for`](super::StreamPolicy::rule_for) selects for
+    ///   the canonical ref of the update. An update that no rule covers, and
+    ///   an update whose rule has `accept` false, are `ref-denied`. So a
+    ///   remote ref and a ref `@ID:NAME` of a collection other than the
+    ///   collection id of the repository need a pattern rule that matches
+    ///   them. A delete of a ref that is present needs
     ///   `allow_delete`. An update that is not a fast-forward needs `force`
     ///   and `allow_non_fast_forward`. With
     ///   [`ReceiveVerify::Keys`](super::ReceiveVerify::Keys), each new commit
@@ -90,10 +93,8 @@ impl Repo {
     /// leave the detached metadata and some refs written. The call returns a
     /// wire code inside [`Error::Remote`]. It returns each other error as it is.
     ///
-    /// - [`remote::Error::Protocol`] if the first message is not `Hello`, if
-    ///   `Hello` does not have `one-way` true, or if `Hello` names a
-    ///   collection. A one-way stream writes the local refs and the remote
-    ///   refs alone.
+    /// - [`remote::Error::Protocol`] if the first message is not `Hello`, or if
+    ///   `Hello` does not have `one-way` true.
     /// - [`remote::Error::Protocol`] if a message comes out of order. `Have` and
     ///   an `Abort` frame between two objects are out of order.
     /// - [`remote::Error::VersionUnsupported`] if `Hello` states another
@@ -102,6 +103,7 @@ impl Repo {
     ///   `bare-split-xattrs`, or if it is `bare` and the process does not run
     ///   as root.
     /// - [`remote::Error::InvalidRef`] if `Hello` names a ref that is not valid.
+    /// - [`remote::Error::Protocol`] if two names of `Hello` name one ref.
     /// - The errors of [`Repo::transaction`] if the session transaction cannot
     ///   open. These include [`Error::LockTimeout`] for the repository lock.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
@@ -247,7 +249,7 @@ where
     // that the buffer holds, with no check.
     drop(rest);
     drop(buf);
-    core.finish(request).await
+    Ok(core.finish(request).await?.report)
 }
 
 /// Checks that `request` holds no server commit, and that each update of

@@ -4,14 +4,17 @@
 use std::collections::{HashMap, HashSet};
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Commit, CommitLink, MAX_COLLECTION_ID_LEN, ObjectName, ObjectType};
+use ostrya_core::{
+    Checksum, Commit, CommitLink, MAX_COLLECTION_ID_LEN, ObjectName, ObjectType, Ref,
+};
 
 use super::invalid;
-use super::refspec::PushTarget;
+use super::refspec::{PushTarget, in_collection};
 use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
+use crate::refs::canonical_ref;
 use crate::related::{self, HeldDependency, RelatedField, RelatedRule};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
@@ -25,23 +28,31 @@ use crate::repo::Repo;
 /// `..Default::default()`.
 #[derive(Clone, Debug, Default)]
 pub struct RepoPushOptions {
-    /// The refspecs, each `SRC[:DST]`, split at the last `:`.
+    /// The refspecs, each `SRC[:DST]`.
     ///
     /// `SRC` is a revision of the local repository, as
     /// [`resolve_rev`](Repo::resolve_rev) reads it. `DST` is the ref of the
-    /// server that takes the commit of `SRC`. `:DST` deletes the ref `DST` of
-    /// the server. If `SRC` is a ref with no `^` suffix, `DST` defaults to
-    /// `SRC`.
+    /// server that takes the commit of `SRC`: a local ref `NAME`, or a ref
+    /// `@ID:NAME` of the collection `ID`. `:DST` deletes the ref `DST` of the
+    /// server. If `SRC` is a ref with no `^` suffix, `DST` defaults to the
+    /// text of `SRC`, so `@ID:NAME` sends `@ID:NAME`.
+    ///
+    /// `DST` is the last ref of the refspec. If the `:`-separated field
+    /// before the last field starts with `@`, `DST` is `@ID:NAME`, the last
+    /// two fields. Else `DST` is the last field. If `DST` is the whole
+    /// refspec, the refspec has a `SRC` alone. Else `SRC` is the text before
+    /// the `:` that comes before `DST`. So `R:main:dst` sends the remote ref
+    /// `R:main` to `dst`, `main:@X:a` sends `main` to `@X:a`, `@X:a:b` sends
+    /// `@X:a` to `b`, and `:@X:a` deletes `@X:a`. A refspec with no `@` splits
+    /// at its last `:`.
     ///
     /// A `SRC` with a `^` suffix needs a `DST`. A `SRC` that resolves as a
-    /// full or an abbreviated checksum also needs a `DST`. Because the split
-    /// is at the last `:`, `SRC` can name a remote ref, as in
-    /// `origin:main:DST`.
+    /// full or an abbreviated checksum also needs a `DST`.
     ///
-    /// `DST` holds no `:`, so a push names no remote ref of the server.
-    /// `DST` holds no `^`. A revision reads 64 lowercase hex characters as a
-    /// commit checksum, so a `DST` that takes a commit is not 64 lowercase hex
-    /// characters. A delete can name such a `DST`.
+    /// A push names no remote ref of the server. `DST` holds no `^`. A
+    /// revision reads 64 lowercase hex characters as a commit checksum, so a
+    /// local `DST` that takes a commit is not 64 lowercase hex characters. A
+    /// delete can name such a `DST`.
     pub refspecs: Vec<String>,
     /// The depth of the parent chain that the push reads for each source
     /// commit.
@@ -61,33 +72,46 @@ pub struct RepoPushOptions {
     /// commits included. [`Repo::push_over_stream`] states the rules in
     /// "Dependencies".
     pub depth: Option<i32>,
-    /// The collection id of the namespace of the server that the push
-    /// writes.
+    /// The collection id that each plain `DST` and each plain tag takes.
     ///
-    /// The push reads the `ostree.collection-binding` of each source commit
-    /// before it opens the session. The namespace is the collection of these
-    /// bindings: a commit with no binding goes to the local refs, and a
-    /// commit bound to `ID` goes to the namespace of `ID`. With `None`, the
-    /// bindings alone give the namespace. A value must agree with each
-    /// binding, and a commit with no binding cannot go to the refs of a
-    /// collection. The server writes the refs of the collection of its own
-    /// collection id as its local refs, under `refs/heads/`. It writes the
-    /// refs of each other collection under `refs/mirrors/ID/`.
+    /// With `Some(ID)`, a plain `DST` or tag `NAME` is the ref `@ID:NAME`. A
+    /// `DST` or tag `@ID:NAME` stays. A `DST` or tag `@Y:NAME`, with `Y`
+    /// other than `ID`, refuses the push before the session opens. A `DST`
+    /// that defaults to a `SRC` `@Y:NAME` is such a `DST`.
     ///
-    /// A push to a bucket repository takes the `config` of the bucket in the
-    /// role of the server: no collection, or the `[core] collection-id` of
-    /// the bucket, writes `refs/heads/DST`, and each other collection writes
-    /// `refs/mirrors/ID/DST`, also in a bucket with no collection id.
+    /// The bindings of the source commits select no namespace. Each `DST`
+    /// and each tag names its own namespace, and one push can write the
+    /// local refs and the refs of more than one collection. The server
+    /// writes the refs of its own collection id as its local refs, under
+    /// `refs/heads/`, and the refs of each other collection under
+    /// `refs/mirrors/ID/`. A push to a bucket repository takes the `config`
+    /// of the bucket in the role of the server.
     pub collection: Option<String>,
     /// The tags that the push creates at the source commit.
     ///
-    /// Each tag is one more ref update that expects an absent ref, also with
+    /// A tag is a local ref `NAME` or a ref `@ID:NAME`, and
+    /// [`collection`](RepoPushOptions::collection) applies to it. Each tag is
+    /// one more ref update that expects an absent ref, also with
     /// [`force`](RepoPushOptions::force). The refspecs that are not deletes
     /// must give one source commit, and its `ostree.ref-binding` must hold
-    /// each tag. A tag that exists on the server gets
+    /// the name part of each tag, unless
+    /// [`disable_verify_bindings`](RepoPushOptions::disable_verify_bindings)
+    /// is set. A tag that exists on the server gets
     /// [`RefMismatch`](crate::remote::Error::RefMismatch) after `HelloReply`,
     /// and the push sends no `Have` and no object.
-    pub tags: Vec<String>,
+    pub tags: Vec<Ref>,
+    /// The switch that skips the checks of `ostree.ref-binding` on the
+    /// client.
+    ///
+    /// If `true`, the push does not check that the `ostree.ref-binding` of
+    /// the commit of each `DST` and each tag holds the name part of the ref.
+    /// A server then applies its own rule: a client group without the key
+    /// `disable-verify-bindings` refuses such a commit. A bucket repository
+    /// has no server check, so the switch alone skips the check of a push to
+    /// a bucket. The switch skips no check of `ostree.collection-binding`.
+    /// A ref that a push writes with the switch fails a pull that checks the
+    /// bindings.
+    pub disable_verify_bindings: bool,
     /// The encoding of the content objects that the push sends.
     pub compression: Compression,
     /// The switch that updates each ref whatever its state on the server.
@@ -322,12 +346,12 @@ pub(super) struct Plan {
     pub(super) repo: Repo,
     /// The repository lock, held shared until the push returns.
     pub(super) _lock: LockGuard,
-    /// The `DST` of each target, in the order of the refspecs, then each
-    /// tag: the refs of `Hello`.
+    /// The text of the `DST` of each target, in the order of the refspecs,
+    /// then of each tag: the refs of `Hello`.
     pub(super) refs: Vec<String>,
     pub(super) targets: Vec<PushTarget>,
-    /// The collection id that `Hello` names.
-    pub(super) collection: Option<String>,
+    /// The tags, after [`RepoPushOptions::collection`] applied.
+    pub(super) tags: Vec<Ref>,
     /// The source commits, each once, in the order of the targets, with the
     /// `ostree.collection-binding` of each.
     pub(super) sources: Vec<(Checksum, Option<String>)>,
@@ -443,24 +467,39 @@ impl Repo {
     ///
     /// # Namespace
     ///
-    /// Before the session opens, the push reads the `ostree.collection-binding`
-    /// of each source commit. The `Hello` of the session names
-    /// [`collection`](RepoPushOptions::collection), else the binding of the
-    /// source commits, else no collection. Two different bindings, and a
-    /// binding that differs from `collection`, refuse the push before it
-    /// writes a byte.
+    /// Each `DST` and each tag names its own namespace of the server: a local
+    /// ref `NAME`, or a ref `@ID:NAME` of the collection `ID`. The server takes
+    /// the refs of its own collection id as its local refs, so `@OWN:NAME`
+    /// and `NAME` name one ref. The binding of a commit selects no namespace.
     ///
-    /// `HelloReply` reports the namespace that the server selected. The
-    /// server takes its own collection id as its local refs. A bound commit
-    /// needs a namespace of the same id: the collection, or the local refs of
-    /// a server with that collection id. A commit with no binding needs the
-    /// local refs. Else the push sends no object and ends the session with
-    /// `Abort`.
+    /// Before the session opens, the push reads the `ostree.collection-binding`
+    /// of each source commit. It refuses a binding that names no collection,
+    /// and a commit bound to `Y` for a `DST` or a tag `@X:NAME`, with `Y`
+    /// other than `X`, before it writes a byte.
+    ///
+    /// `HelloReply` reports the collection id of the server. Then each
+    /// update that writes a commit needs the binding of its namespace: a
+    /// bound commit on a local ref must name the collection id of the
+    /// server, and a commit on a ref `@X:NAME` of another collection must be
+    /// bound to `X`. A commit with no binding goes to the local refs alone.
+    /// Two `DST` refs or tags that name one ref of the server, `NAME` and
+    /// `@OWN:NAME`, also fail here. An ostrya server refuses such a `Hello`
+    /// before `HelloReply`. On a failure, the push sends no object and ends
+    /// the session with `Abort`.
+    ///
+    /// The `ostree.ref-binding` of the commit of each `DST` must hold the
+    /// name part of the `DST`: `stable` for `@X:stable`. A commit with no
+    /// `ostree.ref-binding` passes, and an empty list fails. The commit of the
+    /// tags must hold the name part of each tag, so a commit with no
+    /// `ostree.ref-binding` fails for a tag.
+    /// [`disable_verify_bindings`](RepoPushOptions::disable_verify_bindings)
+    /// skips these two checks of the client. The push runs them before it
+    /// writes a byte.
     ///
     /// # Negotiation
     ///
-    /// The session opens with the `DST` of each refspec, in order, then each
-    /// tag.
+    /// The session opens with the text of the `DST` of each refspec, in
+    /// order, then of each tag.
     ///
     /// If `depth` is `None`, the push cuts each chain at the server tip of
     /// its `DST`, the tip excluded. If the chain does not hold the tip, the
@@ -550,9 +589,11 @@ impl Repo {
     ///   `ostree.collection-binding` of a source commit fails
     ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
     ///   bytes.
-    /// - [`Error::InvalidRefspec`] with the tag if
-    ///   [`validate_refspec`](crate::validate_refspec) refuses a tag, or if a
-    ///   tag holds a `:` or is 64 lowercase hex characters.
+    /// - [`Error::InvalidRefspec`] with the text of the tag if a tag fails
+    ///   [`Ref::validate`], is a remote ref, or is a local ref of 64 lowercase
+    ///   hex characters.
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
+    ///   if a `DST` or a tag names a collection other than `collection`.
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if a tag is named twice or is the `DST` of a refspec, or if `tags`
     ///   is not empty and the refspecs that are not deletes do not give
@@ -565,30 +606,28 @@ impl Repo {
     ///   two refspecs name the same `DST`.
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if the local repository marks a source commit partial.
-    /// - [`Error::InvalidRefspec`] with the `DST` if
-    ///   [`validate_refspec`](crate::validate_refspec) refuses a `DST`, or if
-    ///   a `DST` holds a `^`. A `DST` of 64 lowercase hex characters that takes
-    ///   a commit also gives this error. A delete (`:DST`) of such a `DST`
-    ///   passes.
+    /// - [`Error::InvalidRefspec`] with the `DST` if a `DST` is not `NAME` or
+    ///   `@ID:NAME` under [`Ref::validate`], or if a `DST` holds a `^`. A
+    ///   local `DST` of 64 lowercase hex characters that takes a commit also
+    ///   gives this error. A delete (`:DST`) of such a `DST` passes.
     /// - [`Error::RefNotFound`], [`Error::AmbiguousRefspec`],
     ///   [`Error::NoParentCommit`], or another error of
     ///   [`resolve_rev`](Repo::resolve_rev) if a `SRC` does not resolve.
     /// - [`Error::Remote`] with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   `ostree.ref-binding` of a source commit is a list that does not hold
-    ///   its `DST`. A commit with no binding, or with an empty list, passes.
-    /// - [`Error::Remote`] with
-    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
+    ///   the name part of its `DST`, an empty list included, or if the
     ///   `ostree.ref-binding` of the source commit of a tag does not hold the
-    ///   tag. A commit with no ref binding fails too.
-    /// - [`Error::Remote`] with
-    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if two
-    ///   source commits have different `ostree.collection-binding` values, or
-    ///   if a binding differs from `collection`.
+    ///   name part of the tag, as "Namespace" states. A commit with no ref
+    ///   binding fails for a tag. `disable_verify_bindings` skips these
+    ///   checks.
     /// - [`Error::Remote`] with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
-    ///   namespace that the server reports does not agree with the binding of
-    ///   a source commit, as "Namespace" states.
+    ///   `ostree.collection-binding` of a source commit does not agree with
+    ///   the namespace of its `DST` or of a tag, as "Namespace" states.
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
+    ///   if two `DST` refs or tags name one ref of the server, after
+    ///   `HelloReply`.
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
     /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit of the
@@ -645,12 +684,13 @@ impl Repo {
         {
             return Err(invalid(format!("depth {depth} is below -1")));
         }
-        if let Some(reason) = opts.collection.as_deref().and_then(collection_id_refusal) {
+        let collection = opts.collection.as_deref();
+        if let Some(reason) = collection.and_then(collection_id_refusal) {
             return Err(invalid(reason));
         }
-        check_tag_names(&opts.tags)?;
+        let tags = check_tag_names(&opts.tags, collection)?;
         let lock = self.lock_repo(LockKind::Shared).await?;
-        let targets = self.push_targets(&opts.refspecs).await?;
+        let targets = self.push_targets(&opts.refspecs, collection).await?;
 
         let mut sources: Vec<(Checksum, Commit)> = Vec::new();
         let mut commits = Commits::default();
@@ -678,14 +718,22 @@ impl Repo {
                     sources.len() - 1
                 }
             };
-            check_ref_binding(&checksum, &sources[position].1, &target.dst)?;
+            if !opts.disable_verify_bindings {
+                check_ref_binding(&checksum, &sources[position].1, &target.dst)?;
+            }
         }
-        check_tags(&opts.tags, &targets, &sources)?;
+        check_tags(&tags, &targets, &sources, opts.disable_verify_bindings)?;
         let sources: Vec<(Checksum, Option<String>)> = sources
             .into_iter()
             .map(|(checksum, commit)| (checksum, commit.collection_binding().map(str::to_owned)))
             .collect();
-        let collection = hello_collection(opts.collection.as_deref(), &sources)?;
+        check_binding_ids(&sources)?;
+        // The checks that need the collection id of the server come after
+        // `HelloReply`. A commit bound to `Y` fails a ref `@X:NAME` on each
+        // server.
+        for (name, commit) in updates(&targets, &tags, &sources) {
+            check_named_collection(&commit, binding(&sources, &commit), name, false)?;
+        }
 
         // With no depth the chain runs to the root, and the cut at the
         // server tip comes after `HelloReply`.
@@ -747,11 +795,12 @@ impl Repo {
             _lock: lock,
             refs: targets
                 .iter()
-                .map(|t| t.dst.clone())
-                .chain(opts.tags.iter().cloned())
+                .map(|t| &t.dst)
+                .chain(&tags)
+                .map(Ref::to_string)
                 .collect(),
             targets,
-            collection,
+            tags,
             chains,
             sources,
             commits,
@@ -798,42 +847,54 @@ impl Repo {
     }
 }
 
-/// Refuses a tag name that a push cannot create.
+/// Refuses a tag that a push cannot create, and returns the tags after the
+/// collection `collection` of the push applied, in order.
 ///
-/// A tag passes [`validate_refspec`](crate::validate_refspec), holds no `:`,
-/// is not 64 lowercase hex characters, and is named once. Each refusal of the
-/// name is [`Error::InvalidRefspec`] with the name. A repeated name is
+/// A tag passes [`Ref::validate`], is not a remote ref, and is not a local
+/// ref of 64 lowercase hex characters. Each refusal of the form is
+/// [`Error::InvalidRefspec`] with the text of the tag. Then
+/// [`in_collection`] applies to each tag. A tag named twice after that is
 /// [`InvalidInput`](crate::remote::Error::InvalidInput).
-pub(super) fn check_tag_names(tags: &[String]) -> Result<()> {
-    let mut seen = HashSet::new();
+pub(super) fn check_tag_names(tags: &[Ref], collection: Option<&str>) -> Result<Vec<Ref>> {
+    let mut checked = Vec::with_capacity(tags.len());
     for tag in tags {
-        crate::validate_refspec(tag)?;
-        if tag.contains(':') || ostrya_core::is_checksum_shaped(tag) {
-            return Err(Error::InvalidRefspec(tag.clone()));
+        tag.validate()?;
+        match tag {
+            Ref::Remote { .. } => return Err(Error::InvalidRefspec(tag.to_string())),
+            Ref::Local { name } if ostrya_core::is_checksum_shaped(name) => {
+                return Err(Error::InvalidRefspec(tag.to_string()));
+            }
+            _ => {}
         }
-        if !seen.insert(tag.as_str()) {
+        checked.push(in_collection(tag.clone(), collection, "tag")?);
+    }
+    let mut seen = HashSet::new();
+    for tag in &checked {
+        if !seen.insert(tag) {
             return Err(invalid(format!("the tag '{tag}' is named twice")));
         }
     }
-    Ok(())
+    Ok(checked)
 }
 
 /// Refuses tags that the targets and the source commits of a push cannot
 /// carry.
 ///
 /// A tag is not the `DST` of a refspec. With one tag or more, the refspecs
-/// that are not deletes give exactly one source commit, and the
-/// `ostree.ref-binding` of that commit holds each tag.
+/// that are not deletes give exactly one source commit. Unless
+/// `skip_ref_binding` is set, the `ostree.ref-binding` of that commit holds
+/// the name part of each tag, so a commit with no ref binding fails.
 fn check_tags(
-    tags: &[String],
+    tags: &[Ref],
     targets: &[PushTarget],
     sources: &[(Checksum, Commit)],
+    skip_ref_binding: bool,
 ) -> Result<()> {
     if tags.is_empty() {
         return Ok(());
     }
-    let dsts: HashSet<&str> = targets.iter().map(|t| t.dst.as_str()).collect();
-    if let Some(tag) = tags.iter().find(|tag| dsts.contains(tag.as_str())) {
+    let dsts: HashSet<&Ref> = targets.iter().map(|t| &t.dst).collect();
+    if let Some(tag) = tags.iter().find(|tag| dsts.contains(tag)) {
         return Err(invalid(format!(
             "the tag '{tag}' is also the destination of a refspec"
         )));
@@ -848,15 +909,16 @@ fn check_tags(
             )));
         }
     };
+    if skip_ref_binding {
+        return Ok(());
+    }
     let bindings = commit.ref_bindings();
-    let bound: HashSet<&str> = bindings.iter().copied().collect();
     for tag in tags {
-        if !bound.contains(tag.as_str()) {
-            return Err(Error::Remote(crate::remote::Error::BindingMismatch(
-                format!(
-                    "commit {checksum} is bound to the refs {bindings:?}, which do not hold the \
-                     tag '{tag}'"
-                ),
+        if !bindings.contains(&tag.name()) {
+            return Err(binding_mismatch(format!(
+                "commit {checksum} is bound to the refs {bindings:?}, which do not hold the \
+                 tag '{}'",
+                tag.name()
             )));
         }
     }
@@ -882,105 +944,163 @@ pub(super) fn collection_id_refusal(id: &str) -> Option<String> {
     }
 }
 
-/// Returns the collection id that the `Hello` of a push names.
-///
-/// `requested` is [`RepoPushOptions::collection`]. `sources` holds each
-/// source commit with its `ostree.collection-binding`. The result is
-/// `requested`, else the binding of the source commits, else `None`. The
-/// server maps its own collection id to its local refs, so the result does
-/// not need to know that id.
-///
-/// Two source commits bound to different collections, and a binding that
-/// differs from `requested`, are
-/// [`BindingMismatch`](crate::remote::Error::BindingMismatch). A commit with
-/// no binding passes here, and the check after `HelloReply` decides it.
-/// A binding that [`collection_id_refusal`] refuses is
+/// Refuses a source commit whose `ostree.collection-binding` names no
+/// namespace: an id that [`collection_id_refusal`] refuses. The error is
 /// [`InvalidInput`](crate::remote::Error::InvalidInput).
-pub(super) fn hello_collection(
-    requested: Option<&str>,
-    sources: &[(Checksum, Option<String>)],
-) -> Result<Option<String>> {
-    let mut bound: Option<(&Checksum, &str)> = None;
+///
+/// No ref of a server takes such a commit, so the push refuses it before
+/// the session opens.
+fn check_binding_ids(sources: &[(Checksum, Option<String>)]) -> Result<()> {
     for (checksum, binding) in sources {
-        let Some(binding) = binding.as_deref() else {
-            continue;
-        };
-        match bound {
-            Some((first, id)) if id != binding => {
-                return Err(binding_mismatch(format!(
-                    "commit {checksum} is bound to the collection '{binding}', and commit \
-                     {first} to the collection '{id}'"
-                )));
-            }
-            Some(_) => {}
-            None => {
-                if let Some(reason) = collection_id_refusal(binding) {
-                    return Err(invalid(format!(
-                        "commit {checksum} has a collection binding that a push cannot name: \
-                         {reason}"
-                    )));
-                }
-                bound = Some((checksum, binding));
-            }
+        if let Some(reason) = binding.as_deref().and_then(collection_id_refusal) {
+            return Err(invalid(format!(
+                "commit {checksum} has a collection binding that a push cannot name: {reason}"
+            )));
         }
     }
-    match (requested, bound) {
-        (Some(requested), Some((checksum, id))) if requested != id => Err(binding_mismatch(
-            format!("commit {checksum} is bound to the collection '{id}', not '{requested}'"),
-        )),
-        (Some(requested), _) => Ok(Some(requested.to_owned())),
-        (None, bound) => Ok(bound.map(|(_, id)| id.to_owned())),
+    Ok(())
+}
+
+/// Returns the ref and the new commit of each update of a push that writes
+/// a commit: each target that is not a delete, in order, then each tag with
+/// the one source commit.
+fn updates<'a>(
+    targets: &'a [PushTarget],
+    tags: &'a [Ref],
+    sources: &'a [(Checksum, Option<String>)],
+) -> impl Iterator<Item = (&'a Ref, Checksum)> {
+    let written = targets
+        .iter()
+        .filter_map(|t| t.commit.map(|commit| (&t.dst, commit)));
+    let tagged = sources
+        .first()
+        .into_iter()
+        .flat_map(move |(commit, _)| tags.iter().map(move |tag| (tag, *commit)));
+    written.chain(tagged)
+}
+
+/// Returns the `ostree.collection-binding` of the source commit `commit`.
+pub(super) fn binding<'a>(
+    sources: &'a [(Checksum, Option<String>)],
+    commit: &Checksum,
+) -> Option<&'a str> {
+    sources
+        .iter()
+        .find(|(c, _)| c == commit)
+        .and_then(|(_, binding)| binding.as_deref())
+}
+
+/// Refuses the commit `checksum`, bound to the collection `bound`, for a
+/// ref `@X:NAME` whose `X` is not `bound`.
+///
+/// The check needs no collection id of the server: a commit bound to `Y`
+/// fails the ref `@X:NAME` on each server, with `Y` other than `X`. A commit
+/// with no binding fails too if `refuse_unbound` is set. Such a commit
+/// passes the ref `@X:NAME` of a server whose collection id is `X`, so a
+/// caller that does not know the collection id of the server and sends the
+/// commit with no other check sets it. A ref of another form passes. Each
+/// refusal is [`BindingMismatch`](crate::remote::Error::BindingMismatch).
+pub(super) fn check_named_collection(
+    checksum: &Checksum,
+    bound: Option<&str>,
+    name: &Ref,
+    refuse_unbound: bool,
+) -> Result<()> {
+    let Ref::Collection { id, .. } = name else {
+        return Ok(());
+    };
+    match bound {
+        Some(bound) if bound != id => Err(binding_mismatch(format!(
+            "commit {checksum} is bound to the collection '{bound}', not '{id}' of ref '{name}'"
+        ))),
+        None if refuse_unbound => Err(unbound_in_collection(checksum, name)),
+        _ => Ok(()),
     }
 }
 
-/// Checks the collection binding of each source commit against the namespace
-/// that `server` reports.
+/// Refuses the commit `checksum`, bound to the collection `bound`, for the
+/// ref `name` of a server or a bucket repository whose collection id is
+/// `own`.
 ///
-/// A bound commit needs the binding id of the namespace:
-/// [`ServerInfo::binding_collection`]. A commit with no binding needs the
-/// local refs of the server. Each other commit is
-/// [`BindingMismatch`](crate::remote::Error::BindingMismatch).
-fn check_namespace(server: &ServerInfo, sources: &[(Checksum, Option<String>)]) -> Result<()> {
-    check_bindings(
-        server.collection.as_deref(),
-        server.binding_collection(),
-        sources,
-    )
+/// A local ref `NAME`, and a ref `@OWN:NAME`, is a local ref of the server,
+/// and a bound commit must name `own`. So a bound commit fails each local
+/// ref of a server with no collection id. A ref `@X:NAME` of another
+/// collection takes a commit bound to `X` alone, so a commit with no
+/// binding fails it. A commit with no binding passes a local ref. Each
+/// refusal is [`BindingMismatch`](crate::remote::Error::BindingMismatch).
+pub(super) fn check_collection_binding(
+    checksum: &Checksum,
+    bound: Option<&str>,
+    name: &Ref,
+    own: Option<&str>,
+) -> Result<()> {
+    let collection = match name {
+        Ref::Collection { id, .. } if Some(id.as_str()) != own => Some(id.as_str()),
+        _ => None,
+    };
+    match (bound, collection.or(own)) {
+        (Some(bound), Some(id)) if bound == id => Ok(()),
+        (Some(bound), Some(id)) => Err(binding_mismatch(format!(
+            "commit {checksum} is bound to the collection '{bound}', not '{id}' of ref '{name}'"
+        ))),
+        (Some(bound), None) => Err(binding_mismatch(format!(
+            "commit {checksum} is bound to the collection '{bound}', and ref '{name}' is a \
+             local ref of a repository with no collection id"
+        ))),
+        (None, _) if collection.is_some() => Err(unbound_in_collection(checksum, name)),
+        (None, _) => Ok(()),
+    }
 }
 
-/// Checks the collection binding of each source commit against the
-/// namespace that a push writes.
+/// Returns the error for a commit with no collection binding on the ref
+/// `name` of a collection.
+fn unbound_in_collection(checksum: &Checksum, name: &Ref) -> Error {
+    binding_mismatch(format!(
+        "commit {checksum} has no collection binding, which a ref of the collection of ref \
+         '{name}' needs"
+    ))
+}
+
+/// Runs the checks of a push after `HelloReply`, against the collection id
+/// of `server`.
 ///
-/// `collection` is the id of a collection namespace, or `None` for the local
-/// refs. `binding` is the id that a bound commit must name: the collection
-/// of the namespace, or the collection id of the repository for its local
-/// refs. A commit with no binding needs the local refs. Each other commit is
-/// [`BindingMismatch`](crate::remote::Error::BindingMismatch).
-pub(super) fn check_bindings(
-    collection: Option<&str>,
-    binding: Option<&str>,
+/// Two refs of `targets` and `tags` that name one ref of the server, `NAME`
+/// and `@OWN:NAME`, are
+/// [`InvalidInput`](crate::remote::Error::InvalidInput). An ostrya server
+/// refuses such a `Hello` before `HelloReply`. Then
+/// [`check_collection_binding`] runs for each update that writes a commit.
+fn check_namespaces(
+    server: &ServerInfo,
+    targets: &[PushTarget],
+    tags: &[Ref],
     sources: &[(Checksum, Option<String>)],
 ) -> Result<()> {
-    let namespace = match collection {
-        Some(id) => format!("the collection '{id}'"),
-        None => "the local refs".to_owned(),
-    };
-    for (checksum, bound) in sources {
-        match (bound.as_deref(), binding) {
-            (Some(bound), Some(id)) if bound == id => {}
-            (Some(bound), _) => {
-                return Err(binding_mismatch(format!(
-                    "commit {checksum} is bound to the collection '{bound}', and the push \
-                     writes {namespace}"
-                )));
-            }
-            (None, _) if collection.is_some() => {
-                return Err(binding_mismatch(format!(
-                    "commit {checksum} has no collection binding, and the push writes \
-                     {namespace}"
-                )));
-            }
-            (None, _) => {}
+    let own = server.collection_id.as_deref();
+    check_distinct(own, targets.iter().map(|t| &t.dst).chain(tags))?;
+    for (name, commit) in updates(targets, tags, sources) {
+        check_collection_binding(&commit, binding(sources, &commit), name, own)?;
+    }
+    Ok(())
+}
+
+/// Refuses two refs of `names` that name one ref of a server whose
+/// collection id is `own`: `NAME` and `@OWN:NAME`.
+///
+/// # Errors
+///
+/// [`Error::Remote`] with
+/// [`InvalidInput`](crate::remote::Error::InvalidInput) for the first ref
+/// that names the ref of an earlier ref.
+pub(super) fn check_distinct<'a>(
+    own: Option<&str>,
+    names: impl IntoIterator<Item = &'a Ref>,
+) -> Result<()> {
+    let mut seen: HashMap<Ref, &Ref> = HashMap::new();
+    for name in names {
+        if let Some(first) = seen.insert(canonical_ref(own, name.clone()), name) {
+            return Err(invalid(format!(
+                "the refs '{first}' and '{name}' name one ref of the server"
+            )));
         }
     }
     Ok(())
@@ -990,19 +1110,24 @@ fn binding_mismatch(message: String) -> Error {
     Error::Remote(crate::remote::Error::BindingMismatch(message))
 }
 
-/// Refuses a commit whose `ostree.ref-binding` is a list that does not hold
-/// `dst`.
+/// Refuses a commit whose `ostree.ref-binding` does not hold the name part
+/// of `dst`.
 ///
-/// The check compares `dst` without the `REMOTE:` part of a remote ref. A
-/// commit with no binding, or with an empty list, passes, as on the server.
-pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &str) -> Result<()> {
-    let bindings = commit.ref_bindings();
-    let bare = dst.split_once(':').map_or(dst, |(_, bare)| bare);
-    if bindings.is_empty() || bindings.contains(&bare) {
+/// The check compares the name of `dst` without the `@ID:` part of a
+/// collection ref or the `REMOTE:` part of a remote ref: `stable` for
+/// `@X:stable`. A commit with no `ostree.ref-binding` passes. A commit with
+/// an empty list fails, because the list holds no name.
+pub(super) fn check_ref_binding(checksum: &Checksum, commit: &Commit, dst: &Ref) -> Result<()> {
+    if commit.metadata_value("ostree.ref-binding").is_none() {
         return Ok(());
     }
-    Err(Error::Remote(crate::remote::Error::BindingMismatch(
-        format!("commit {checksum} is bound to the refs {bindings:?}, which do not hold '{bare}'"),
+    let bindings = commit.ref_bindings();
+    let name = dst.name();
+    if bindings.contains(&name) {
+        return Ok(());
+    }
+    Err(binding_mismatch(format!(
+        "commit {checksum} is bound to the refs {bindings:?}, which do not hold '{name}'"
     )))
 }
 
@@ -1010,7 +1135,6 @@ impl Plan {
     /// Returns the options of the session of the push.
     fn session_options(&self, opts: &RepoPushOptions) -> SessionOptions {
         SessionOptions {
-            collection: self.collection.clone(),
             progress: opts.progress.clone(),
             ..SessionOptions::default()
         }
@@ -1040,17 +1164,16 @@ impl Plan {
         opts: &RepoPushOptions,
     ) -> Result<Vec<RefUpdate>> {
         let server = session.server();
-        check_namespace(server, &self.sources)?;
+        check_namespaces(server, &self.targets, &self.tags, &self.sources)?;
         // A tag expects an absent ref, so a tag that the server holds fails
         // before any `Have`. The server refuses it at `Commit` too.
-        if let Some((tag, current)) = opts
-            .tags
-            .iter()
-            .find_map(|tag| server.tip(tag).map(|tip| (tag, tip)))
-        {
+        if let Some((tag, current)) = self.tags.iter().find_map(|tag| {
+            let tag = tag.to_string();
+            server.tip(&tag).map(|tip| (tag, tip))
+        }) {
             return Err(Error::Remote(crate::remote::Error::RefMismatch {
                 message: format!("ref '{tag}' is at {current}"),
-                name: tag.clone(),
+                name: tag,
                 current: Some(current),
             }));
         }
@@ -1064,7 +1187,8 @@ impl Plan {
             let Some(source) = target.commit else {
                 continue;
             };
-            let history = offered_history(opts.depth, server.tip(&target.dst), chain);
+            let tip = server.tip(&target.dst.to_string());
+            let history = offered_history(opts.depth, tip, chain);
             for commit in std::iter::once(&source).chain(history) {
                 if offered.insert(*commit) {
                     names.push(ObjectName::new(*commit, ObjectType::Commit));
@@ -1155,22 +1279,26 @@ impl Plan {
 
         // A tag expects an absent ref, also under `force`, so the push never
         // moves a tag. Each tag takes the one source commit.
-        let tags = opts.tags.iter().map(|tag| RefUpdate {
-            name: tag.clone(),
+        let tags = self.tags.iter().map(|tag| RefUpdate {
+            name: tag.to_string(),
             expected: Expected::Absent,
             new: self.sources.first().map(|(c, _)| *c),
         });
         Ok(self
             .targets
             .iter()
-            .map(|target| RefUpdate {
-                name: target.dst.clone(),
-                expected: match (opts.force, server.tip(&target.dst)) {
+            .map(|target| {
+                let name = target.dst.to_string();
+                let expected = match (opts.force, server.tip(&name)) {
                     (true, _) => Expected::Any,
                     (false, Some(tip)) => Expected::Commit(tip),
                     (false, None) => Expected::Absent,
-                },
-                new: target.commit,
+                };
+                RefUpdate {
+                    name,
+                    expected,
+                    new: target.commit,
+                }
             })
             .chain(tags)
             .collect())
@@ -1221,12 +1349,11 @@ mod tests {
         }
     }
 
-    fn server(collection_id: Option<&str>, collection: Option<&str>) -> ServerInfo {
+    fn server(collection_id: Option<&str>) -> ServerInfo {
         ServerInfo {
             version: 1,
             mode: "archive".into(),
             collection_id: collection_id.map(str::to_owned),
-            collection: collection.map(str::to_owned),
             max_frame: 1 << 20,
             max_have: 16_384,
             encodings: Vec::new(),
@@ -1235,51 +1362,15 @@ mod tests {
         }
     }
 
-    /// `Hello` names the requested collection, else the one binding of the
-    /// source commits, else none.
-    #[test]
-    fn the_hello_collection_comes_from_the_request_or_the_bindings() {
-        let os = Some("org.example.Os");
-        assert_eq!(hello_collection(None, &sources(&[])).unwrap(), None);
-        assert_eq!(
-            hello_collection(None, &sources(&[None, None])).unwrap(),
-            None
-        );
-        for bindings in [&[os][..], &[os, os], &[None, os], &[os, None]] {
-            assert_eq!(
-                hello_collection(None, &sources(bindings))
-                    .unwrap()
-                    .as_deref(),
-                os,
-                "{bindings:?}"
-            );
-            assert_eq!(
-                hello_collection(os, &sources(bindings)).unwrap().as_deref(),
-                os,
-                "{bindings:?}"
-            );
+    fn invalid_input<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::Remote(crate::remote::Error::InvalidInput(message))) => message,
+            other => panic!("expected InvalidInput, got {other:?}"),
         }
-        assert_eq!(
-            hello_collection(os, &sources(&[None])).unwrap().as_deref(),
-            os
-        );
     }
 
-    /// Two different bindings, and a binding that differs from the request,
-    /// are `binding-mismatch`.
-    #[test]
-    fn disagreeing_bindings_are_refused() {
-        let message = mismatch(hello_collection(
-            None,
-            &sources(&[Some("org.example.A"), None, Some("org.example.B")]),
-        ));
-        assert!(message.contains("'org.example.B'"), "{message}");
-        assert!(message.contains("'org.example.A'"), "{message}");
-        let message = mismatch(hello_collection(
-            Some("org.example.B"),
-            &sources(&[Some("org.example.A")]),
-        ));
-        assert!(message.contains("not 'org.example.B'"), "{message}");
+    fn r(text: &str) -> Ref {
+        text.parse().unwrap()
     }
 
     /// A binding that fails the collection-id rule, or that is longer than
@@ -1289,22 +1380,11 @@ mod tests {
         let longest = format!("org.{}", "a".repeat(251));
         let over = format!("org.{}", "a".repeat(252));
         assert_eq!(collection_id_refusal(&longest), None);
-        assert_eq!(
-            hello_collection(None, &sources(&[Some(&longest)]))
-                .unwrap()
-                .as_deref(),
-            Some(longest.as_str())
-        );
+        check_binding_ids(&sources(&[None, Some(&longest)])).unwrap();
         for (binding, needle) in [("no-dot", "'no-dot'"), (over.as_str(), "256 bytes")] {
-            for requested in [None, Some(binding)] {
-                match hello_collection(requested, &sources(&[None, Some(binding)])) {
-                    Err(Error::Remote(crate::remote::Error::InvalidInput(message))) => {
-                        assert!(message.contains(needle), "{message}");
-                        assert!(message.contains(&csum(2).to_string()), "{message}");
-                    }
-                    other => panic!("{binding}: expected InvalidInput, got {other:?}"),
-                }
-            }
+            let message = invalid_input(check_binding_ids(&sources(&[None, Some(binding)])));
+            assert!(message.contains(needle), "{message}");
+            assert!(message.contains(&csum(2).to_string()), "{message}");
             assert!(
                 collection_id_refusal(binding).is_some_and(|reason| reason.contains(needle)),
                 "{binding}"
@@ -1312,53 +1392,137 @@ mod tests {
         }
     }
 
-    /// A bound commit needs the binding id of the namespace. An unbound
-    /// commit needs the local refs.
+    /// Before the session, a commit bound to `Y` fails a ref `@X:NAME`. A
+    /// commit with no binding fails it only on request. Other refs pass.
     #[test]
-    fn the_reported_namespace_must_agree_with_each_binding() {
-        let os = Some("org.example.Os");
-        let own = server(os, None);
-        let mirror = server(None, os);
-        let plain = server(None, None);
-        check_namespace(&own, &sources(&[os, None])).unwrap();
-        check_namespace(&mirror, &sources(&[os, os])).unwrap();
-        check_namespace(&plain, &sources(&[None])).unwrap();
-        let message = mismatch(check_namespace(&mirror, &sources(&[os, None])));
+    fn a_ref_of_a_collection_needs_a_commit_of_that_collection() {
+        let c = csum(1);
+        let x = r("@org.example.X:a");
+        check_named_collection(&c, Some("org.example.X"), &x, true).unwrap();
+        check_named_collection(&c, None, &x, false).unwrap();
+        let message = mismatch(check_named_collection(&c, None, &x, true));
         assert!(message.contains("no collection binding"), "{message}");
-        let message = mismatch(check_namespace(&plain, &sources(&[os])));
-        assert!(message.contains("the local refs"), "{message}");
-        mismatch(check_namespace(
-            &server(Some("org.example.B"), None),
-            &sources(&[os]),
-        ));
+        assert!(message.contains("'@org.example.X:a'"), "{message}");
+        let message = mismatch(check_named_collection(&c, Some("org.example.Y"), &x, false));
+        assert!(
+            message.contains("'org.example.Y', not 'org.example.X'"),
+            "{message}"
+        );
+        for name in [r("main"), r("o:main")] {
+            for bound in [None, Some("org.example.Y")] {
+                check_named_collection(&c, bound, &name, true).unwrap();
+            }
+        }
     }
 
-    /// The namespace of a push to a bucket repository: the local refs take
-    /// the collection id of the bucket as their binding, and a collection
-    /// namespace takes its own id.
+    /// The collection binding of each ref against the collection id of the
+    /// server: a local ref, and a ref of the own id, take the own id, and a
+    /// ref of another collection takes its id.
     #[test]
-    fn the_bindings_must_agree_with_the_namespace_of_the_push() {
-        let a = Some("org.example.A");
-        let b = Some("org.example.B");
-        // The local refs of a bucket with no collection id.
-        check_bindings(None, None, &sources(&[None])).unwrap();
-        let message = mismatch(check_bindings(None, None, &sources(&[a])));
-        assert!(
-            message.contains("and the push writes the local refs"),
-            "{message}"
-        );
-        // The local refs of a bucket with the collection id A.
-        check_bindings(None, a, &sources(&[a, None])).unwrap();
-        mismatch(check_bindings(None, a, &sources(&[b])));
-        // The namespace of the collection B.
-        check_bindings(b, b, &sources(&[b, b])).unwrap();
-        let message = mismatch(check_bindings(b, b, &sources(&[None])));
+    fn each_ref_takes_the_binding_of_its_namespace() {
+        let c = csum(1);
+        let x = Some("org.example.X");
+        let y = Some("org.example.Y");
+        let check = |bound, name: &str, own| check_collection_binding(&c, bound, &r(name), own);
+        // A local ref.
+        check(None, "main", None).unwrap();
+        check(None, "main", x).unwrap();
+        check(x, "main", x).unwrap();
+        let message = mismatch(check(x, "main", None));
+        assert!(message.contains("no collection id"), "{message}");
+        let message = mismatch(check(y, "main", x));
+        assert!(message.contains("not 'org.example.X'"), "{message}");
+        // A ref of the own id is a local ref.
+        check(None, "@org.example.X:a", x).unwrap();
+        check(x, "@org.example.X:a", x).unwrap();
+        mismatch(check(y, "@org.example.X:a", x));
+        // A ref of another collection.
+        check(x, "@org.example.X:a", None).unwrap();
+        check(x, "@org.example.X:a", y).unwrap();
+        let message = mismatch(check(None, "@org.example.X:a", y));
         assert!(message.contains("no collection binding"), "{message}");
+        mismatch(check(None, "@org.example.X:a", None));
+        mismatch(check(y, "@org.example.X:a", y));
+    }
+
+    /// After `HelloReply`, two texts of one ref are refused, and each update
+    /// gets the check of its namespace.
+    #[test]
+    fn the_checks_after_hello_reply_use_the_collection_id_of_the_server() {
+        let target = |dst: &str, commit| PushTarget {
+            dst: r(dst),
+            commit,
+        };
+        let x = Some("org.example.X");
+        let os = sources(&[x]);
+        let targets = [
+            target("main", Some(csum(1))),
+            target("@org.example.X:b", Some(csum(1))),
+        ];
+        check_namespaces(&server(x), &targets, &[r("t")], &os).unwrap();
+        let message = invalid_input(check_namespaces(
+            &server(x),
+            &targets,
+            &[r("@org.example.X:main")],
+            &os,
+        ));
         assert!(
-            message.contains("the collection 'org.example.B'"),
+            message.contains("'main' and '@org.example.X:main' name one ref"),
             "{message}"
         );
-        mismatch(check_bindings(b, b, &sources(&[a])));
+        // With no collection id on the server, both refs are distinct, and
+        // the bound commit fails the local ref.
+        let message = mismatch(check_namespaces(&server(None), &targets, &[], &os));
+        assert!(message.contains("ref 'main'"), "{message}");
+        // A delete gets no binding check.
+        check_namespaces(&server(None), &[target("main", None)], &[], &[]).unwrap();
+        // A tag takes the one source commit.
+        let unbound = sources(&[None]);
+        let message = mismatch(check_namespaces(
+            &server(x),
+            &[target("main", Some(csum(1)))],
+            &[r("@org.example.Y:t")],
+            &unbound,
+        ));
+        assert!(message.contains("'@org.example.Y:t'"), "{message}");
+    }
+
+    /// A tag is a local ref or a collection ref. The collection of the push
+    /// applies before the check of a repeated tag.
+    #[test]
+    fn a_tag_takes_the_collection_of_the_push() {
+        let hex = "ab".repeat(32);
+        let x = Some("org.example.X");
+        assert_eq!(
+            check_tag_names(&[r("a"), r("@org.example.X:b")], x).unwrap(),
+            [r("@org.example.X:a"), r("@org.example.X:b")]
+        );
+        assert_eq!(
+            check_tag_names(&[r("a"), r("@org.example.Y:b")], None).unwrap(),
+            [r("a"), r("@org.example.Y:b")]
+        );
+        for tag in [
+            Ref::remote("o", "a"),
+            Ref::local(hex.as_str()),
+            Ref::local("a b"),
+        ] {
+            match check_tag_names(std::slice::from_ref(&tag), None) {
+                Err(Error::InvalidRefspec(text)) => assert_eq!(text, tag.to_string()),
+                other => panic!("{tag}: {other:?}"),
+            }
+        }
+        let message = invalid_input(check_tag_names(&[r("@org.example.Y:b")], x));
+        assert!(
+            message.contains("names the collection 'org.example.Y'"),
+            "{message}"
+        );
+        let message = invalid_input(check_tag_names(&[r("a"), r("@org.example.X:a")], x));
+        assert!(
+            message.contains("'@org.example.X:a' is named twice"),
+            "{message}"
+        );
+        // A collection ref of 64 lowercase hex characters is no checksum.
+        check_tag_names(&[Ref::collection("org.example.X", hex.as_str())], None).unwrap();
     }
 
     /// With no depth, the history ends before the tip of the destination.

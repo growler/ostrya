@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use futures_io::AsyncWrite;
+use ostrya_core::Ref;
 use ostrya_remote::{
     Compression, Endpoint, Error, SshAddress, SshOptions, TreePushOptions, push_tree,
     push_tree_over_stream,
@@ -77,9 +78,15 @@ fn stand_in(address: &str, marker: &Path) -> Endpoint {
     }
 }
 
+/// Reads `text` as a ref. Text that is no ref is a local ref of that name,
+/// which the push refuses.
+fn r(text: &str) -> Ref {
+    text.parse().unwrap_or_else(|_| Ref::local(text))
+}
+
 fn options(branch: &str) -> TreePushOptions {
     TreePushOptions {
-        onto: branch.to_string(),
+        onto: r(branch),
         timestamp: Some(1_700_000_000),
         ..Default::default()
     }
@@ -249,7 +256,7 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         (
             "a tag twice",
             Box::new(|| TreePushOptions {
-                tags: vec!["a".into(), "a".into()],
+                tags: vec![r("a"), r("a")],
                 ..options("main")
             }),
             "twice",
@@ -257,7 +264,7 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
         (
             "a tag that is the branch",
             Box::new(|| TreePushOptions {
-                tags: vec!["main".into()],
+                tags: vec![r("main")],
                 ..options("main")
             }),
             "also the branch",
@@ -272,11 +279,31 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
             Box::new(|| options("a b")),
             "not a valid ref name",
         ),
-        ("a remote ref", Box::new(|| options("origin:main")), "':'"),
+        (
+            "a remote ref",
+            Box::new(|| options("origin:main")),
+            "is a remote ref",
+        ),
+        (
+            "a ref of another collection",
+            Box::new(|| TreePushOptions {
+                collection: Some("org.example.X".into()),
+                ..options("@org.example.Y:main")
+            }),
+            "names the collection 'org.example.Y'",
+        ),
+        (
+            "refs of two collections",
+            Box::new(|| TreePushOptions {
+                tags: vec![r("@org.example.Y:t")],
+                ..options("@org.example.X:main")
+            }),
+            "in two namespaces",
+        ),
         (
             "a parent revision",
             Box::new(|| TreePushOptions {
-                tags: vec!["main^".into()],
+                tags: vec![r("main^")],
                 ..options("main")
             }),
             "not a valid ref name",

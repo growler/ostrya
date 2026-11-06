@@ -38,7 +38,7 @@ use hyper::http::request::Parts;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use ostrya::remote::proto::{Hello, ServerCommit};
+use ostrya::remote::proto::Hello;
 use ostrya::remote::tree::{ScanOptions, TreeModel};
 use ostrya::remote::{
     self, BoxFuture, Compression, Encoding, Endpoint, Expected, ObjectData, ObjectSource,
@@ -46,7 +46,8 @@ use ostrya::remote::{
 };
 use ostrya::{
     Checksum, Commit, CreateOptions, HookFuture, HookRefusal, HostEntry, ObjectName, ObjectType,
-    ReceiveHooks, ReceivePolicy, ReceiveReport, Ref, Repo, RepoMode, Type, UpdatePlan, Value,
+    ReceiveHooks, ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport,
+    ReceiveServerCommit, Ref, Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_fetch::{
     BearerToken, FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer, TrustRoots,
@@ -57,20 +58,28 @@ use ostrya_server::{
 };
 
 /// A policy that writes a commit to each ref as a fast-forward, and makes a
-/// server commit on each ref.
+/// server commit on each ref, in the local refs and in the collection
+/// [`OTHER_COLLECTION`].
 fn pushing_policy() -> ReceivePolicy {
+    let rules = ostrya::access::AccessRules {
+        allow: ["w:**", "c:**"]
+            .into_iter()
+            .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
+            .collect(),
+        deny: Vec::new(),
+    };
+    let mut rules: ostrya::access::NamespaceRules = rules.into();
+    rules
+        .collections
+        .insert(OTHER_COLLECTION.to_owned(), rules.local.clone());
     ReceivePolicy {
-        rules: ostrya::access::AccessRules {
-            allow: ["w:**", "c:**"]
-                .into_iter()
-                .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
-                .collect(),
-            deny: Vec::new(),
-        }
-        .into(),
+        rules,
         ..ReceivePolicy::default()
     }
 }
+
+/// A collection that is not the collection id of a receiver of the tests.
+const OTHER_COLLECTION: &str = "org.example.X";
 
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
 const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
@@ -324,7 +333,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
     let seen = Arc::new(Seen::default());
 
     let push_options = || TreePushOptions {
-        onto: "main".into(),
+        onto: ostrya::Ref::local("main"),
         timestamp: Some(1_700_000_000),
         ..TreePushOptions::default()
     };
@@ -465,7 +474,10 @@ struct HostState {
     /// If `true`, `before_server_commit` refuses with `HookRefusal::denied`.
     deny_server_commit: AtomicBool,
     /// The refs of each report that `after_update` of [`ServerHooks`] got.
-    server_reports: Mutex<Vec<Vec<RefOutcome>>>,
+    server_reports: Mutex<Vec<Vec<ReceiveRefOutcome>>>,
+    /// The refs that each call of `before_update` or of
+    /// `before_server_commit` got, in order.
+    hook_refs: Mutex<Vec<Vec<Ref>>>,
 }
 
 /// The text of the error of `after_update`.
@@ -486,10 +498,15 @@ struct HostHooks {
 impl ReceiveHooks for HostHooks {
     fn before_update<'a>(
         &'a self,
-        updates: &'a [RefUpdate],
+        updates: &'a [ReceiveRefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
         Box::pin(async move {
             self.state.before_calls.fetch_add(1, Ordering::SeqCst);
+            self.state
+                .hook_refs
+                .lock()
+                .unwrap()
+                .push(updates.iter().map(|u| u.name.clone()).collect());
             let moved = self.state.move_ref.lock().unwrap().take();
             if let Some((name, commit)) = moved {
                 self.repo
@@ -497,7 +514,7 @@ impl ReceiveHooks for HostHooks {
                     .await
                     .map_err(|e| HookRefusal::internal(e.to_string()))?;
             }
-            let names = updates.iter().map(|u| u.name.clone()).collect();
+            let names = updates.iter().map(|u| u.name.to_string()).collect();
             let Some(guard) = self.locks.try_lock(names) else {
                 return Err(HookRefusal::internal("a ref of the push is locked"));
             };
@@ -553,27 +570,31 @@ struct ServerHooks {
 impl ReceiveHooks for ServerHooks {
     fn before_update<'a>(
         &'a self,
-        updates: &'a [RefUpdate],
+        updates: &'a [ReceiveRefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
         self.inner.before_update(updates)
     }
 
     fn before_server_commit<'a>(
         &'a self,
-        commit: &'a ServerCommit,
+        commit: &'a ReceiveServerCommit,
     ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
         Box::pin(async move {
             self.inner
                 .state
                 .server_commit_calls
                 .fetch_add(1, Ordering::SeqCst);
+            let refs = std::iter::once(&commit.branch).chain(&commit.tags);
+            self.inner
+                .state
+                .hook_refs
+                .lock()
+                .unwrap()
+                .push(refs.clone().cloned().collect());
             if self.inner.state.deny_server_commit.load(Ordering::SeqCst) {
                 return Err(HookRefusal::denied("the host refuses the release"));
             }
-            let names = std::iter::once(&commit.branch)
-                .chain(&commit.tags)
-                .cloned()
-                .collect();
+            let names = refs.map(Ref::to_string).collect();
             let Some(guard) = self.inner.locks.try_lock(names) else {
                 return Err(HookRefusal::internal("a ref of the push is locked"));
             };
@@ -827,7 +848,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 // Hooks that take no server commit refuse it with
                 // `ref-denied`, and neither of the other hooks runs.
                 let options = TreePushOptions {
-                    onto: "rel/s".into(),
+                    onto: ostrya::Ref::local("rel/s"),
                     ..TreePushOptions::default()
                 };
                 let denied = push_tree(connect(&url, "alice-token"), &small, options).await;
@@ -950,7 +971,7 @@ fn the_hooks_of_the_host_take_a_tree_push_through_a_mounted_endpoint() {
         Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, EndpointOptions::default()).unwrap());
     let seen = Arc::new(Seen::default());
     let push_options = || TreePushOptions {
-        onto: "rel/s".into(),
+        onto: ostrya::Ref::local("rel/s"),
         timestamp: Some(1_700_000_000),
         ..TreePushOptions::default()
     };
@@ -1026,9 +1047,20 @@ fn the_hooks_of_the_host_take_a_tree_push_through_a_mounted_endpoint() {
                         StatusCode::UNPROCESSABLE_ENTITY
                     ]
                 );
+                let canonical = |outcome: &PushOutcome| -> Vec<ReceiveRefOutcome> {
+                    outcome
+                        .refs
+                        .iter()
+                        .map(|r| ReceiveRefOutcome {
+                            name: Ref::local(&r.name),
+                            old: r.old,
+                            new: r.new,
+                        })
+                        .collect()
+                };
                 assert_eq!(
                     *state.server_reports.lock().unwrap(),
-                    [first.refs, second.refs]
+                    [canonical(&first), canonical(&second)]
                 );
                 assert_eq!(
                     *state.held_in_after.lock().unwrap(),
@@ -1037,6 +1069,85 @@ fn the_hooks_of_the_host_take_a_tree_push_through_a_mounted_endpoint() {
                 assert_eq!(state.server_commit_calls.load(Ordering::SeqCst), 3);
                 assert_eq!(state.before_calls.load(Ordering::SeqCst), 0);
                 assert_eq!(state.after_calls.load(Ordering::SeqCst), 2);
+            },
+        )
+        .await;
+    });
+}
+
+/// The hooks of the host get the canonical ref of the branch of a tree
+/// push. A branch of the collection id of the receiver is a local ref, and a
+/// branch of another collection is a collection ref. The report of each push
+/// holds the same refs.
+#[test]
+fn the_hooks_of_the_host_get_the_canonical_branch_of_a_tree_push() {
+    const OWN: &str = "org.example.Own";
+    let tmp = TmpDir::new("server-hooks-canonical");
+    let small = small_tree(tmp.path());
+    let receiver = block_on(Repo::create(
+        &tmp.path().join("receiver"),
+        CreateOptions::new(RepoMode::Archive).collection_id(OWN),
+    ))
+    .unwrap();
+    let state = Arc::new(HostState::default());
+    let auth = HookAuth {
+        repo: receiver.clone(),
+        locks: Arc::new(NameLocks::default()),
+        state: state.clone(),
+        server_commits: true,
+    };
+    let endpoint =
+        Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, EndpointOptions::default()).unwrap());
+    let seen = Arc::new(Seen::default());
+    let push_options = |collection: &str| TreePushOptions {
+        onto: ostrya::Ref::local("rel/s"),
+        collection: Some(collection.to_owned()),
+        timestamp: Some(1_700_000_000),
+        ..TreePushOptions::default()
+    };
+
+    block_on(async {
+        let config = ostrya_fetch::server_config(SERVER_CERT_PEM, SERVER_KEY_PEM, None, None)
+            .await
+            .unwrap();
+        let listener = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("https://127.0.0.1:{port}{MOUNT}");
+        let serving = host(listener, config, endpoint.clone(), seen.clone());
+        future::or(
+            async {
+                serving.await;
+                unreachable!("the host serves until the test ends");
+            },
+            async {
+                for collection in [OWN, OTHER_COLLECTION] {
+                    push_tree(
+                        connect(&url, "alice-token"),
+                        &small,
+                        push_options(collection),
+                    )
+                    .await
+                    .unwrap();
+                }
+                let local = Ref::local("rel/s");
+                let other = Ref::collection(OTHER_COLLECTION, "rel/s");
+                assert_eq!(
+                    *state.hook_refs.lock().unwrap(),
+                    [vec![local.clone()], vec![other.clone()]]
+                );
+                let reported: Vec<Ref> = state
+                    .server_reports
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .flatten()
+                    .map(|r| r.name.clone())
+                    .collect();
+                assert_eq!(reported, [local.clone(), other.clone()]);
+                assert!(receiver.resolve_ref_tip(&local).await.unwrap().is_some());
+                assert!(receiver.resolve_ref_tip(&other).await.unwrap().is_some());
             },
         )
         .await;

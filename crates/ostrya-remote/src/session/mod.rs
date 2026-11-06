@@ -37,7 +37,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType};
+use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType, Ref};
 use ostrya_gvariant::Value;
 
 pub use one_way::export_stream;
@@ -286,16 +286,9 @@ pub struct ServerInfo {
     /// The repository mode.
     pub mode: String,
     /// The collection id of the repository.
-    pub collection_id: Option<String>,
-    /// The collection of the namespace of the session, from the key
-    /// `collection` of `HelloReply`.
     ///
-    /// `None` is the local refs of the server. The session checks the value
-    /// against [`SessionOptions::collection`] when it opens. With no
-    /// requested collection, the value is `None`. With a requested id, the
-    /// value is that id, or `None` if the id is
-    /// [`collection_id`](ServerInfo::collection_id).
-    pub collection: Option<String>,
+    /// The refs of this collection are the local refs of the server.
+    pub collection_id: Option<String>,
     /// The frame and chunk limit that the session writes with.
     ///
     /// The value is in
@@ -312,14 +305,18 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
-    /// Returns the collection id that a commit of the session binds to.
+    /// Returns the canonical form of `r` on the server.
     ///
-    /// The value is [`collection`](ServerInfo::collection) for a collection
-    /// namespace, and [`collection_id`](ServerInfo::collection_id) for the
-    /// local refs. `None` is the local refs of a server with no collection
-    /// id.
-    pub fn binding_collection(&self) -> Option<&str> {
-        self.collection.as_deref().or(self.collection_id.as_deref())
+    /// A collection ref of the [`collection_id`](ServerInfo::collection_id)
+    /// of the server is the local ref of the same name. Each other ref is
+    /// unchanged. The call does not check the ref.
+    pub fn canonical(&self, r: &Ref) -> Ref {
+        match r {
+            Ref::Collection { id, name } if Some(id) == self.collection_id.as_ref() => {
+                Ref::local(name.clone())
+            }
+            r => r.clone(),
+        }
     }
 
     /// Returns the current commit of the ref `name` on the server.
@@ -340,13 +337,6 @@ pub struct SessionOptions {
     ///
     /// The default is `ostrya/<version>`.
     pub agent: Option<String>,
-    /// The collection id that the session sends in `Hello`, under the key
-    /// `collection`.
-    ///
-    /// `None` targets the local refs of the server. The collection id of the
-    /// server also targets its local refs. The session does not check the
-    /// id: the server refuses an id that fails the collection-id rule.
-    pub collection: Option<String>,
     /// A handle that the session also counts its progress into.
     pub progress: Option<PushProgress>,
 }
@@ -553,18 +543,13 @@ fn into_stream(slot: Mutex<Slot>) -> Result<Box<Stream>> {
     }
 }
 
-/// The facts of the server from `reply`, the reply to a `Hello` with `refs`
-/// and `collection`.
+/// The facts of the server from `reply`, the reply to a `Hello` with `refs`.
 ///
 /// These replies are [`Error::Protocol`]:
 ///
 /// - a version that is not the version of the session;
-/// - refs that are not `refs` in order;
-/// - a `collection` that does not match the request. A request with no
-///   collection needs a reply with none. A request of an id needs a reply of
-///   that id, or a reply with none from a server whose collection id is that
-///   id.
-fn server_info(reply: HelloReply, refs: &[String], collection: Option<&str>) -> Result<ServerInfo> {
+/// - refs that are not `refs` in order.
+fn server_info(reply: HelloReply, refs: &[String]) -> Result<ServerInfo> {
     if reply.version != PROTOCOL_VERSION {
         return Err(protocol(format!(
             "the server replied with protocol version {}, not {PROTOCOL_VERSION}",
@@ -574,25 +559,10 @@ fn server_info(reply: HelloReply, refs: &[String], collection: Option<&str>) -> 
     if reply.refs.len() != refs.len() || reply.refs.iter().zip(refs).any(|(s, n)| s.name != *n) {
         return Err(protocol("the refs of HelloReply are not the refs of Hello"));
     }
-    let matches = match (collection, reply.collection.as_deref()) {
-        (None, None) => true,
-        (Some(asked), Some(got)) => asked == got,
-        (Some(asked), None) => reply.collection_id.as_deref() == Some(asked),
-        (None, Some(_)) => false,
-    };
-    if !matches {
-        let text = |c: Option<&str>| c.map_or_else(|| "none".to_owned(), |id| format!("'{id}'"));
-        return Err(protocol(format!(
-            "the collection {} of HelloReply does not match the collection {} of Hello",
-            text(reply.collection.as_deref()),
-            text(collection)
-        )));
-    }
     Ok(ServerInfo {
         version: reply.version,
         mode: reply.mode,
         collection_id: reply.collection_id,
-        collection: reply.collection,
         max_frame: reply.max_frame,
         max_have: reply.max_have,
         encodings: reply.encodings,
@@ -623,9 +593,6 @@ impl PushSession {
     ///   code, for example [`Error::VersionUnsupported`].
     /// - [`Error::Protocol`] if the version of `HelloReply` is not the version
     ///   of the session, or if its refs are not the refs of `Hello` in order.
-    /// - [`Error::Protocol`] if the `collection` of `HelloReply` does not
-    ///   match [`SessionOptions::collection`]. [`ServerInfo::collection`]
-    ///   states the match.
     /// - [`Error::Protocol`] for a malformed frame, or for a reply that is not
     ///   `HelloReply`.
     /// - [`Error::LimitExceeded`] for a frame over the frame limit.
@@ -667,7 +634,6 @@ impl PushSession {
                 version: PROTOCOL_VERSION,
                 agent: Some(agent),
                 refs: refs.to_vec(),
-                collection: opts.collection.clone(),
                 one_way: false,
             }))
             .await?;
@@ -676,7 +642,7 @@ impl PushSession {
             Message::Error(e) => return Err(e.into()),
             other => return Err(unexpected(&other, "Hello")),
         };
-        let server = server_info(reply, refs, opts.collection.as_deref())?;
+        let server = server_info(reply, refs)?;
         stream.set_write_limit(server.max_frame);
         Ok(PushSession {
             inner: SessionInner {
@@ -703,7 +669,7 @@ impl PushSession {
         let agent = opts
             .agent
             .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
-        let (server, link) = http::open(endpoint, refs, agent, opts.collection, &counters).await?;
+        let (server, link) = http::open(endpoint, refs, agent, &counters).await?;
         Ok(PushSession {
             inner: SessionInner {
                 server,
@@ -978,8 +944,13 @@ impl PushSession {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if `Hello` did not name the branch or a tag
-    ///   of `sc`, or if `sc` names a ref twice among its branch and its
-    ///   tags.
+    ///   of `sc`, if a name is not a ref, or if `sc` names a ref twice among
+    ///   its branch and its tags. [`ServerInfo::canonical`] maps each name
+    ///   first, so `NAME` and `@OWN:NAME` name one ref, where `OWN` is the
+    ///   collection id of the server.
+    /// - [`Error::InvalidInput`] if the branch and the tags of `sc` are not
+    ///   in one namespace of the server after that map: the local refs, or
+    ///   the refs of one collection.
     /// - [`Error::Protocol`] if the bytes of a metadata entry of `sc` are not
     ///   a `v` in normal form.
     /// - [`Error::InvalidInput`] if a commit cannot hold a metadata value of
@@ -1188,22 +1159,43 @@ fn server_commit_refs(sc: &ServerCommit) -> impl Iterator<Item = &str> {
 }
 
 /// Runs the checks of a server commit `sc` against the facts of `server`,
-/// other than the length of the `Commit` frame: the names of the refs, the
-/// depth of each metadata value, and the length of the longest
-/// `CommitReply`.
+/// other than the length of the `Commit` frame: the names of the refs and
+/// their namespace, the depth of each metadata value, and the length of the
+/// longest `CommitReply`.
 fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<()> {
     let named: HashSet<&str> = server.refs.iter().map(|r| r.name.as_str()).collect();
     let mut seen = HashSet::new();
+    // The namespace of the first ref, and the ref: `None` for the local
+    // refs of the server.
+    let mut first: Option<(Option<String>, &str)> = None;
     for name in server_commit_refs(sc) {
         if !named.contains(name) {
             return Err(invalid(format!(
                 "ref '{name}' was not named when the session opened"
             )));
         }
-        if !seen.insert(name) {
+        let r: Ref = name
+            .parse()
+            .map_err(|_| invalid(format!("'{name}' is not a valid ref name")))?;
+        let r = server.canonical(&r);
+        let namespace = match &r {
+            Ref::Collection { id, .. } => Some(id.clone()),
+            _ => None,
+        };
+        if !seen.insert(r) {
             return Err(invalid(format!(
                 "ref '{name}' is named twice in the server commit"
             )));
+        }
+        match &first {
+            Some((ns, other)) if *ns != namespace => {
+                return Err(invalid(format!(
+                    "the refs '{other}' and '{name}' of the server commit are in two \
+                     namespaces of the server"
+                )));
+            }
+            Some(_) => {}
+            None => first = Some((namespace, name)),
         }
     }
     check_server_commit_metadata(sc)?;

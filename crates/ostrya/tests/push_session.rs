@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use common::receive::{PipeWriter, connect, fixture_objects, new_repo, policy_allowing};
+use common::receive::{PipeWriter, connect, fixture_objects, new_repo, outcomes, policy_allowing};
 use common::{COMMIT, TmpDir, fixture_repo};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
@@ -295,7 +295,7 @@ fn the_fixture_commit_lands_through_a_session() {
                 fixture_names(),
                 "{what}: the server needs every object"
             );
-            assert_eq!(outcome.refs, report.refs, "{what}");
+            assert_eq!(outcome.refs, outcomes(&report), "{what}");
             assert_eq!(outcome.refs[0].new, Some(fixture_commit()), "{what}");
             assert_eq!(outcome.stats.objects_sent, missing.len() as u64, "{what}");
             assert_eq!(ref_file(&repo), Some(format!("{COMMIT}\n")), "{what}");

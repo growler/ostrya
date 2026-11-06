@@ -10,19 +10,18 @@ use std::sync::{Arc, Mutex};
 
 use futures_io::AsyncRead;
 use ostrya_core::{
-    Checksum, MAX_COLLECTION_ID_LEN, ObjectName, ObjectType, Ref, RepoMode, choose_offset_size,
-    loose_path, offset_size_for,
+    Checksum, ObjectName, ObjectType, Ref, RepoMode, choose_offset_size, loose_path,
+    offset_size_for,
 };
 
 use super::hooks::ReceiveHooks;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
 use super::merge::check_incoming;
 use super::policy::SessionPolicy;
-use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
-use crate::access::Namespace;
-use crate::error::{Error, Result};
+use super::session::{Failure, ReceiveCommit, aborted, codec, next, out_of_order};
+use crate::error::Result;
 use crate::object::{MAX_METADATA_SIZE, object_exists};
-use crate::refs::{ref_relpath, refspec_to_relpath};
+use crate::refs::{canonical_ref, ref_relpath};
 use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
     ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
@@ -42,10 +41,10 @@ pub(super) struct SessionCore<P: Deref<Target: SessionPolicy + Sized>> {
     policy: P,
     txn: Transaction,
     rules: ModeRules,
-    /// The refs that `Hello` named.
+    /// The refs that `Hello` named, as the client sent them.
     named: Vec<String>,
-    /// The namespace of the session, or `None` for a one-way stream.
-    namespace: Option<Namespace>,
+    /// The canonical form of each ref of `named`, in the order of `named`.
+    refs: Vec<Ref>,
     /// The path under `refs/` of each ref of `named`, in the order of
     /// `named`.
     paths: Arc<[String]>,
@@ -80,9 +79,8 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// Answers the `Hello` of a two-way session and opens the session
     /// transaction.
     ///
-    /// The answer checks the version, the repository, the ref names, and
-    /// the collection id. `select` gives the policy of the namespace of
-    /// `Hello`, or `None`, which is a `ref-denied` failure.
+    /// The answer runs the checks of [`check_hello`]. `select` gives the
+    /// policy of the session, or `None`, which is a `ref-denied` failure.
     /// `parallel_uploads` is the value that the reply announces. `hooks` are
     /// the hooks that `Commit` calls.
     ///
@@ -90,7 +88,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// `one-way` set to `true` gives a `protocol` failure.
     pub(super) async fn open(
         repo: Repo,
-        select: impl FnOnce(&Namespace) -> Option<P>,
+        select: impl FnOnce() -> Option<P>,
         hooks: Option<Arc<dyn ReceiveHooks>>,
         parallel_uploads: u32,
         hello: Hello,
@@ -102,14 +100,13 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
                     .into(),
             )));
         }
-        check_hello(&repo, &hello)?;
-        let namespace = namespace(&repo, &hello);
-        let Some(policy) = select(&namespace) else {
+        let refs = check_hello(&repo, &hello)?;
+        let Some(policy) = select() else {
             return Err(Failure::Wire(remote::Error::RefDenied(
                 "no client group carries the item of the session".into(),
             )));
         };
-        let core = Self::start(repo, policy, hooks, hello, Some(namespace)).await?;
+        let core = Self::start(repo, policy, hooks, hello, refs).await?;
         let repo = &core.repo;
         let tips = repo
             .resolve_relpath_tips(Arc::clone(&core.paths))
@@ -122,7 +119,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             .zip(tips)
             .map(|(name, commit)| RefState { name, commit })
             .collect();
-        let reply = hello_reply(repo, parallel_uploads, core.namespace.as_ref(), refs);
+        let reply = hello_reply(repo, parallel_uploads, refs);
         Ok((core, reply))
     }
 
@@ -134,8 +131,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// stream gets no reply.
     ///
     /// The session checks `one-way` before the version. A `Hello` without
-    /// `one-way` set to `true`, and a `Hello` that names a collection, give a
-    /// `protocol` failure.
+    /// `one-way` set to `true` gives a `protocol` failure.
     pub(super) async fn open_one_way(
         repo: Repo,
         policy: P,
@@ -146,37 +142,33 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
                 "a one-way stream starts with a Hello with one-way true".into(),
             )));
         }
-        if hello.collection.is_some() {
-            return Err(Failure::Wire(remote::Error::Protocol(
-                "a one-way stream names no collection in Hello".into(),
-            )));
-        }
-        check_hello(&repo, &hello)?;
-        Self::start(repo, policy, None, hello, None).await
+        let refs = check_hello(&repo, &hello)?;
+        Self::start(repo, policy, None, hello, refs).await
     }
 
     /// Runs the checks of the policy on `hello`, and opens the session
-    /// transaction. The caller ran [`check_hello`].
+    /// transaction. The caller ran [`check_hello`], which gave `refs`.
     ///
     /// The checks of the policy of a client group refuse a policy that opens
-    /// no push session, and a ref of `hello` without `r` in the namespace,
-    /// with `ref-denied`. A one-way stream has no namespace and no such
-    /// check. If the repository mode is `bare` and the server does not run as
-    /// root, the result is a `mode-refused` failure.
+    /// no push session, and a ref of `hello` without `r` in its namespace,
+    /// with `ref-denied`. A one-way stream has no such check. If the
+    /// repository mode is `bare` and the server does not run as root, the
+    /// result is a `mode-refused` failure.
     async fn start(
         repo: Repo,
         policy: P,
         hooks: Option<Arc<dyn ReceiveHooks>>,
         hello: Hello,
-        namespace: Option<Namespace>,
+        refs: Vec<Ref>,
     ) -> std::result::Result<Self, Failure> {
-        policy.check_hello(namespace.as_ref().unwrap_or(&Namespace::Local), &hello.refs)?;
-        let paths = hello
-            .refs
+        policy.check_hello(&refs)?;
+        let own = repo.config().collection_id();
+        let paths = refs
             .iter()
-            .map(|name| ref_path(namespace.as_ref(), name))
+            .map(|r| ref_relpath(own, r))
             .collect::<Result<Arc<[String]>>>()
             .map_err(Failure::Internal)?;
+        let one_way = hello.one_way;
         let mode = repo.mode();
         let txn = repo.transaction().await.map_err(Failure::Internal)?;
         // Read the settings that the writes of the session use. A malformed
@@ -207,8 +199,8 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             txn,
             rules,
             named: hello.refs,
-            one_way: namespace.is_none(),
-            namespace,
+            refs,
+            one_way,
             paths,
             hooks,
             meta: Mutex::default(),
@@ -440,13 +432,13 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     pub(super) async fn finish(
         self,
         request: CommitRequest,
-    ) -> std::result::Result<ReceiveReport, Failure> {
+    ) -> std::result::Result<ReceiveCommit, Failure> {
         let SessionCore {
             repo,
             policy,
             txn,
             named,
-            namespace,
+            refs,
             paths,
             hooks,
             meta,
@@ -455,8 +447,8 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         let dicts = meta.into_inner().expect("detached metadata mutex").dicts;
         let hooks = hooks.as_deref();
         let session = super::finish::Named {
-            namespace: namespace.as_ref(),
             names: &named,
+            refs: &refs,
             paths: &paths,
         };
         // The future of the checks and of the commit is large, and it owns the
@@ -468,40 +460,25 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     }
 }
 
-/// Returns the namespace that `hello` names in `repo`.
-///
-/// No collection and the collection id of `repo` give the local refs.
-fn namespace(repo: &Repo, hello: &Hello) -> Namespace {
-    Namespace::of(hello.collection.as_deref(), repo.config().collection_id())
-}
-
-/// Returns the path under `refs/` of the ref `name` of `namespace`.
-///
-/// A one-way stream has no namespace, and its names are refspecs, so a
-/// remote ref `REMOTE:NAME` maps to `refs/remotes/`. In the local namespace,
-/// `name` maps to `refs/heads/NAME`. In a collection namespace, it maps to
-/// `refs/mirrors/ID/NAME`.
-fn ref_path(namespace: Option<&Namespace>, name: &str) -> Result<String> {
-    match namespace {
-        None | Some(Namespace::Local) => refspec_to_relpath(name),
-        Some(Namespace::Collection(id)) => ref_relpath(None, &Ref::collection(id.as_str(), name)),
-    }
-}
-
-/// Checks `hello` before a session opens.
+/// Checks `hello` before a session opens, and returns the canonical form of
+/// each ref of `hello`, in order.
 ///
 /// Each session runs these checks, in this order:
 ///
 /// 1. The protocol version.
 /// 2. The repository mode `bare-split-xattrs`.
 /// 3. `[core] locking=false`, for a two-way `Hello`.
-/// 4. Each ref name.
-/// 5. The collection id: an id longer than [`MAX_COLLECTION_ID_LEN`] bytes,
-///    or one that fails the collection-id rule, is `invalid-ref`.
+/// 4. Each ref name: `NAME`, `REMOTE:NAME`, or `@ID:NAME`, as
+///    [`Ref`](ostrya_core::Ref) reads it (`invalid-ref`).
+/// 5. No two names of `hello` name one ref (`protocol`). A name sent two
+///    times names one ref, and so do `NAME` and `@ID:NAME` with `ID` the
+///    collection id of the repository.
 /// 6. The size of the longest `HelloReply`, for a two-way `Hello`.
 ///
-/// No check does I/O.
-pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(), Failure> {
+/// The canonical form of `@ID:NAME` with `ID` the collection id of the
+/// repository is the local ref `NAME`. Each other ref is its own canonical
+/// form. No check does I/O.
+pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<Vec<Ref>, Failure> {
     if hello.version != PROTOCOL_VERSION {
         return Err(Failure::Wire(remote::Error::VersionUnsupported(format!(
             "the server speaks protocol version {PROTOCOL_VERSION}, not {}",
@@ -518,49 +495,43 @@ pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(),
             "the repository sets [core] locking=false".into(),
         )));
     }
+    let own = repo.config().collection_id();
+    let mut refs = Vec::with_capacity(hello.refs.len());
     for name in &hello.refs {
-        crate::validate_refspec(name).map_err(|e| match e {
-            Error::InvalidRefspec(_) => Failure::Wire(remote::Error::InvalidRef(format!(
+        let r: Ref = name.parse().map_err(|_| {
+            Failure::Wire(remote::Error::InvalidRef(format!(
                 "invalid ref name '{name}'"
-            ))),
-            other => Failure::Internal(other),
+            )))
         })?;
+        refs.push(canonical_ref(own, r));
     }
-    if let Some(id) = &hello.collection {
-        if id.len() > MAX_COLLECTION_ID_LEN {
-            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
-                "the collection id of {} bytes is longer than {MAX_COLLECTION_ID_LEN} bytes",
-                id.len()
-            ))));
-        }
-        if !ostrya_core::is_collection_id(id) {
-            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
-                "invalid collection id '{id}'"
-            ))));
+    let mut seen: HashMap<&Ref, &str> = HashMap::with_capacity(refs.len());
+    for (r, name) in refs.iter().zip(&hello.refs) {
+        if let Some(first) = seen.insert(r, name) {
+            return Err(Failure::Wire(remote::Error::Protocol(
+                if first == name.as_str() {
+                    format!("Hello names ref '{name}' two times")
+                } else {
+                    format!("Hello names ref '{r}' two times, as '{first}' and '{name}'")
+                },
+            )));
         }
     }
+    drop(seen);
     if !hello.one_way {
-        check_hello_reply_fits(repo, &namespace(repo, hello), &hello.refs)?;
+        check_hello_reply_fits(repo, &hello.refs)?;
     }
-    Ok(())
+    Ok(refs)
 }
 
 /// Returns the `HelloReply` of `repo` for the ref states `refs`.
 ///
-/// `parallel_uploads` is the value that the reply announces. The reply
-/// reports the collection of `namespace`, and no collection for the local
-/// refs.
-fn hello_reply(
-    repo: &Repo,
-    parallel_uploads: u32,
-    namespace: Option<&Namespace>,
-    refs: Vec<RefState>,
-) -> HelloReply {
+/// `parallel_uploads` is the value that the reply announces.
+fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> HelloReply {
     HelloReply {
         version: PROTOCOL_VERSION,
         mode: repo.mode().as_mode_str().into(),
         collection_id: repo.config().collection_id().map(Into::into),
-        collection: namespace.and_then(Namespace::collection).map(Into::into),
         max_frame: MAX_FRAME,
         max_have: MAX_HAVE,
         encodings: vec![Encoding::Raw, Encoding::Deflate],
@@ -569,22 +540,18 @@ fn hello_reply(
     }
 }
 
-/// Checks that the `HelloReply` for `names` in `namespace` fits in a frame
-/// of [`MAX_FRAME`].
+/// Checks that the `HelloReply` for `names` fits in a frame of
+/// [`MAX_FRAME`].
 ///
 /// The check uses a commit for each ref, which is the longest state that a
 /// ref can have. A reply over the limit gives a `limit-exceeded` failure.
 /// The size comes from the reply with no ref and from the length of each
 /// name. The check builds no reply with the refs.
-fn check_hello_reply_fits(
-    repo: &Repo,
-    namespace: &Namespace,
-    names: &[String],
-) -> std::result::Result<(), Failure> {
+fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<(), Failure> {
     // If the codec refuses the reply, the failure is a fault of the server,
     // whatever code the codec gives it. The value of `parallel_uploads` does
     // not change the size of the reply.
-    let empty = Message::HelloReply(hello_reply(repo, 1, Some(namespace), Vec::new()))
+    let empty = Message::HelloReply(hello_reply(repo, 1, Vec::new()))
         .encode_body()
         .map_err(|e| Failure::Wire(remote::Error::Internal(e.to_string())))?;
     let fits = reply_frame_len(empty.len(), names.iter().map(String::len))
@@ -697,17 +664,14 @@ mod tests {
 
     /// Returns a `HelloReply` like the one of a session.
     ///
-    /// The reply has a collection id of `ids.0` bytes and a collection of
-    /// the namespace of `ids.1` bytes, each absent for 0. It has `count`
-    /// refs with names of `name` bytes, each with a commit.
-    fn reply(ids: (usize, usize), name: usize, count: usize) -> HelloReply {
+    /// The reply has a collection id of `id` bytes, absent for 0. It has
+    /// `count` refs with names of `name` bytes, each with a commit.
+    fn reply(id: usize, name: usize, count: usize) -> HelloReply {
         let commit = Some(Checksum::from_bytes([7; 32]));
-        let id = |len: usize| (len > 0).then(|| "c".repeat(len));
         HelloReply {
             version: PROTOCOL_VERSION,
             mode: RepoMode::Archive.as_mode_str().into(),
-            collection_id: id(ids.0),
-            collection: id(ids.1),
+            collection_id: (id > 0).then(|| "c".repeat(id)),
             max_frame: MAX_FRAME,
             max_have: MAX_HAVE,
             encodings: vec![Encoding::Raw, Encoding::Deflate],
@@ -725,24 +689,24 @@ mod tests {
         Message::HelloReply(reply).encode_body().unwrap().len() as u64 + 1
     }
 
-    fn computed_frame_len(ids: (usize, usize), name: usize, count: usize) -> Option<u64> {
-        let empty = Message::HelloReply(reply(ids, 0, 0)).encode_body().unwrap();
+    fn computed_frame_len(id: usize, name: usize, count: usize) -> Option<u64> {
+        let empty = Message::HelloReply(reply(id, 0, 0)).encode_body().unwrap();
         reply_frame_len(empty.len(), std::iter::repeat_n(name, count))
     }
 
     /// The computed frame length is the length of the frame that the encoder
     /// writes. The test covers each size of the framing offsets of a ref
-    /// state, of the array, and of the reply. The collection of the namespace
-    /// is in the reply with no ref, so the bound holds it too.
+    /// state, of the array, and of the reply. The collection id is in the
+    /// reply with no ref, so the bound holds it too.
     #[test]
     fn the_reply_bound_is_the_encoded_size() {
-        for ids in [(0, 0), (300, 0), (0, 300), (300, 300)] {
+        for id in [0, 300, 600] {
             for name in [0, 1, 220, 221, 300] {
                 for count in [0, 1, 2, 7, 8, 9, 1000] {
                     assert_eq!(
-                        computed_frame_len(ids, name, count),
-                        Some(encoded_frame_len(reply(ids, name, count))),
-                        "ids {ids:?}, name {name}, count {count}"
+                        computed_frame_len(id, name, count),
+                        Some(encoded_frame_len(reply(id, name, count))),
+                        "id {id}, name {name}, count {count}"
                     );
                 }
             }
@@ -754,8 +718,8 @@ mod tests {
     #[test]
     fn the_largest_count_that_fits_is_the_limit_of_the_encoder() {
         let limit = u64::from(MAX_FRAME);
-        for (ids, name) in [((0, 0), 220), ((300, 0), 1), ((300, 300), 1)] {
-            let fits = |count| computed_frame_len(ids, name, count).is_some_and(|len| len <= limit);
+        for (id, name) in [(0, 220), (300, 1), (600, 1)] {
+            let fits = |count| computed_frame_len(id, name, count).is_some_and(|len| len <= limit);
             // The largest count that fits, by bisection: `low` fits, and
             // `high` does not.
             let (mut low, mut high) = (0, MAX_FRAME as usize);
@@ -768,8 +732,8 @@ mod tests {
                 }
             }
             let count = low;
-            assert!(encoded_frame_len(reply(ids, name, count)) <= limit);
-            assert!(encoded_frame_len(reply(ids, name, count + 1)) > limit);
+            assert!(encoded_frame_len(reply(id, name, count)) <= limit);
+            assert!(encoded_frame_len(reply(id, name, count + 1)) > limit);
         }
     }
 
@@ -777,9 +741,7 @@ mod tests {
     /// limit, and returns `None`.
     #[test]
     fn the_reply_bound_stops_past_the_frame_limit() {
-        let empty = Message::HelloReply(reply((0, 0), 0, 0))
-            .encode_body()
-            .unwrap();
+        let empty = Message::HelloReply(reply(0, 0, 0)).encode_body().unwrap();
         let mut taken = 0usize;
         let names = std::iter::repeat_n(1000, usize::MAX).inspect(|_| taken += 1);
         assert_eq!(reply_frame_len(empty.len(), names), None);

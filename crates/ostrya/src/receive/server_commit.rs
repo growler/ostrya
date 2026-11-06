@@ -2,26 +2,25 @@
 //! from a tree and the fields that the client sends.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
-use ostrya_core::{Checksum, ObjectType, Type, validate};
+use ostrya_core::{Checksum, ObjectType, Ref, Type, validate};
 
 use super::finish::{
-    Checked, Named, check_ref_paths, missing_objects, protocol, publish, queue_ref, ref_denied,
+    Checked, Named, check_anchor, check_ref_paths, commit_ref, missing_objects, protocol, publish,
     report, sign_server_commit,
 };
-use super::hooks::{self, HookRefusal, ReceiveHooks};
+use super::hooks::{self, HookRefusal, ReceiveHooks, ReceiveServerCommit};
 use super::policy::SessionPolicy;
-use super::session::{Failure, ReceiveReport};
+use super::session::{Failure, ReceiveCommit, ReceiveRefOutcome};
 use super::walk;
-use crate::access::Namespace;
 use crate::composefs::{StagedComposefsImage, digest_hex, entries_digest};
 use crate::error::Error;
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message, ServerCommit};
 use crate::remote::{self, RefOutcome};
 use crate::repo::Repo;
-use crate::server_commit::{clock, commit_bytes};
+use crate::server_commit::{CommitFields, clock, commit_bytes};
 use crate::summary::OSTREE_METADATA_REF;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
@@ -40,27 +39,28 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// Runs the checks of a `Commit` with a server commit, then writes the
 /// commit and its refs and commits `txn` under the update lock.
 ///
-/// `named` holds the refs of `Hello`, their paths, and their namespace.
-/// `commit_meta` holds the detached metadata dicts of the session.
+/// `named` holds the refs of `Hello`, their canonical forms, and their
+/// paths. `commit_meta` holds the detached metadata dicts of the session.
 ///
 /// # Checks
 ///
 /// The checks run in this order. The first failure ends the session, and the
 /// session publishes nothing.
 ///
-/// 1. The branch and each tag are valid ref names, and none is 64 lowercase
-///    hex characters. Each bound name is a valid ref name with no `:`
-///    (`invalid-ref`). The message holds no ref update and no `force`, the
-///    branch and each tag are refs of `Hello`, no ref occurs two times among
-///    them, and a commit can hold each metadata value within the depth
-///    limit of 128 levels of containers (`protocol`).
+/// 1. The branch and each tag are valid refs, and no local ref among them is
+///    64 lowercase hex characters. Each bound name is a valid ref name with
+///    no `:` (`invalid-ref`). The message holds no ref update and no
+///    `force`, the branch and each tag are refs of `Hello`, no ref occurs two
+///    times among them, the branch and each tag are in one namespace, and a
+///    commit can hold each metadata value within the depth limit of 128
+///    levels of containers (`protocol`).
 /// 2. The `CommitReply` fits in a frame of [`MAX_FRAME`], with an old commit
 ///    on the branch (`limit-exceeded`).
 /// 3. The session holds no detached metadata dict and staged no commit
 ///    object (`protocol`).
-/// 4. No ref is the collection anchor ref of the local refs of a repository
-///    with a collection id, and `policy` gives the rule of the server commit
-///    (`ref-denied`).
+/// 4. No ref is the local collection anchor ref of a repository with a
+///    collection id, and `policy` gives the rule of the server commit, with
+///    the rights of each ref in its namespace (`ref-denied`).
 /// 5. The tree of the commit is complete (`missing-objects`).
 ///
 /// The bindings and the signature verification of a commit that the client
@@ -72,7 +72,8 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// `true` and the metadata of the commit carries `ostree.composefs.digest.v0`,
 /// this function reads the key. A malformed key is `protocol`. Then the
 /// staged objects become durable. If `hooks` are given,
-/// [`ReceiveHooks::before_server_commit`] runs next with `sc`. If the hook
+/// [`ReceiveHooks::before_server_commit`] runs next with the server commit
+/// and the canonical name of its branch and of each tag. If the hook
 /// refuses, the session ends with the code of the refusal. The default method
 /// of the trait refuses with `ref-denied`, so a host without the method
 /// refuses each server commit at this step.
@@ -100,10 +101,14 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// Then this function builds the commit. Its parent is the commit of the
 /// branch, or none with `orphan` or for an absent branch. Its metadata comes
 /// from the commit builder that the tree push to a bucket repository also
-/// uses. Its timestamp is the value of the client,
-/// else the system clock. The server keys of the rule sign the commit. The
-/// branch moves to the commit, and each tag is created at the commit. A bound
-/// name gets no ref. A failure of the build is `internal`.
+/// uses. The `ostree.ref-binding` holds the name of the branch and of each
+/// tag without the `@ID:` part, and each bound name. The
+/// `ostree.collection-binding` is the id of the namespace of the branch: the
+/// collection id of the repository for a local ref, with no key in a
+/// repository with no collection id. Its timestamp is the value of the
+/// client, else the system clock. The server keys of the rule sign the
+/// commit. The branch moves to the commit, and each tag is created at the
+/// commit. A bound name gets no ref. A failure of the build is `internal`.
 ///
 /// If `[ex-ostrya] generate-composefs` of the repository is `true` and the
 /// metadata of the commit carries `ostree.composefs.digest.v0`, the image of
@@ -129,7 +134,7 @@ pub(super) async fn finish(
     named: Named<'_>,
     commit_meta: HashMap<Checksum, Vec<u8>>,
     request: CommitRequest,
-) -> Checked<ReceiveReport> {
+) -> Checked<ReceiveCommit> {
     let CommitRequest {
         updates,
         force,
@@ -138,20 +143,44 @@ pub(super) async fn finish(
     let Some(sc) = server_commit.map(|sc| *sc) else {
         unreachable!("the commit of a session passes a request with a server commit")
     };
-    let paths: Arc<[String]> = check_names(&named, &sc, updates.len(), force)?.into();
+    let own = repo.config().collection_id();
+    let indices = check_names(own, &named, &sc, updates.len(), force)?;
+    let paths: Arc<[String]> = indices.iter().map(|&i| named.paths[i].clone()).collect();
     check_metadata(&sc)?;
     check_reply_fits(&sc)?;
     check_session_objects(&txn, &commit_meta)?;
-    if named.is_local() && repo.config().collection_id().is_some() {
-        for name in refs(&sc) {
-            if name == OSTREE_METADATA_REF {
-                return Err(ref_denied(format!(
-                    "ref '{name}' holds the collection anchor commit, which the server writes"
-                )));
-            }
-        }
+    // The client text of each name goes into the reply. The server commit
+    // keeps the canonical names.
+    let ServerCommit {
+        branch: branch_text,
+        tags: tag_texts,
+        bind_refs,
+        root_dirtree,
+        root_dirmeta,
+        subject,
+        body,
+        metadata,
+        timestamp,
+        orphan,
+    } = sc;
+    let mut names = indices.iter().map(|&i| named.refs[i].clone());
+    let sc = ReceiveServerCommit {
+        branch: names.next().expect("a server commit names its branch"),
+        tags: names.collect(),
+        bind_refs,
+        root_dirtree,
+        root_dirmeta,
+        subject,
+        body,
+        metadata,
+        timestamp,
+        orphan,
+    };
+    drop(indices);
+    for name in std::iter::once(&sc.branch).chain(&sc.tags) {
+        check_anchor(own.is_some(), name)?;
     }
-    let rule = policy.server_commit_rule(named.rule_namespace(), &sc.branch, &sc.tags)?;
+    let rule = policy.server_commit_rule(&sc.branch, &sc.tags)?;
     let root = (sc.root_dirtree, sc.root_dirmeta);
     let missing = walk::completeness(&txn, [root]).await?;
     if missing.total > 0 {
@@ -187,7 +216,8 @@ pub(super) async fn finish(
         .read_ref_states(Arc::clone(&paths), anchor.then_some(OSTREE_METADATA_REF))
         .await
         .map_err(Failure::Internal)?;
-    let written: Vec<(&str, &str, bool)> = refs(&sc)
+    let written: Vec<(&str, &str, bool)> = std::iter::once(branch_text.as_str())
+        .chain(tag_texts.iter().map(String::as_str))
         .zip(paths.iter())
         .map(|(name, path)| (name, path.as_str(), true))
         .collect();
@@ -199,11 +229,11 @@ pub(super) async fn finish(
         && !rule.allow_orphan_over_branch
     {
         return Err(Failure::Wire(remote::Error::NonFastForward(format!(
-            "ref '{}' is at {tip}, and the policy does not allow a commit with no parent on it",
-            sc.branch
+            "ref '{branch_text}' is at {tip}, and the policy does not allow a commit with no \
+             parent on it"
         ))));
     }
-    for (tag, current) in sc.tags.iter().zip(&current[1..]) {
+    for (tag, current) in tag_texts.iter().zip(&current[1..]) {
         if let Some(commit) = current {
             return Err(Failure::Wire(remote::Error::RefMismatch {
                 message: format!(
@@ -215,21 +245,35 @@ pub(super) async fn finish(
         }
     }
 
-    let collection_id = match named.namespace {
-        Some(Namespace::Collection(id)) => Some(id.as_str()),
-        _ => repo.config().collection_id(),
+    let collection_id = match &sc.branch {
+        Ref::Collection { id, .. } => Some(id.as_str()),
+        _ => own,
     };
     let timestamp = match sc.timestamp {
         Some(timestamp) => timestamp,
         None => clock().map_err(Failure::Internal)?,
     };
+    let fields = CommitFields {
+        refs: std::iter::once(&sc.branch)
+            .chain(&sc.tags)
+            .map(Ref::name)
+            .chain(sc.bind_refs.iter().map(String::as_str))
+            .collect(),
+        root_dirtree: sc.root_dirtree,
+        root_dirmeta: sc.root_dirmeta,
+        subject: &sc.subject,
+        body: &sc.body,
+        metadata: &sc.metadata,
+        orphan: sc.orphan,
+    };
     let bytes = Arc::new(
-        commit_bytes(&sc, tip, timestamp, collection_id)
+        commit_bytes(&fields, tip, timestamp, collection_id)
             .map_err(|e| Failure::Internal(e.into()))?,
     );
+    drop(fields);
     // The commit bytes hold the other fields of the server commit. They are
     // freed here, so they are not held while the hook of the host runs.
-    let ServerCommit {
+    let ReceiveServerCommit {
         branch,
         tags,
         bind_refs,
@@ -255,10 +299,10 @@ pub(super) async fn finish(
 
     let moves = tip != Some(commit);
     if moves {
-        queue_ref(&txn, named.namespace, &branch, Some(&commit));
+        txn.set_ref(&branch, Some(&commit));
     }
     for tag in &tags {
-        queue_ref(&txn, named.namespace, tag, Some(&commit));
+        txn.set_ref(tag, Some(&commit));
     }
     let changed = moves || !tags.is_empty();
     // The future of the publication is large. The box keeps it out of the
@@ -277,15 +321,23 @@ pub(super) async fn finish(
     // hook of the host runs.
     drop((paths, states, current));
 
-    let refs = outcomes(branch, tags, tip, commit);
-    let report = report(policy, named.namespace, refs, stats, warnings);
+    let refs = std::iter::once((branch, tip))
+        .chain(tags.into_iter().map(|tag| (tag, None)))
+        .map(|(name, old)| ReceiveRefOutcome {
+            name,
+            old,
+            new: Some(commit),
+        })
+        .collect();
+    let reply = outcomes(branch_text, tag_texts, tip, commit);
+    let report = report(policy, refs, stats, warnings);
     if let (Some(hooks), Some(carried)) = (hooks, carried)
         && let Err(mut message) = hooks.after_update(&report, carried).await
     {
         hooks::cut(&mut message);
         return Err(Failure::Wire(remote::Error::Internal(message)));
     }
-    Ok(report)
+    Ok(ReceiveCommit { report, reply })
 }
 
 /// Returns the digest that `ostree.composefs.digest.v0` of `sc` records,
@@ -294,7 +346,7 @@ pub(super) async fn finish(
 /// Returns `None` with the key `false` or with no digest key. This step
 /// reads no tree, so it runs before the hook of the host. A malformed key is
 /// `protocol`. An error of the config read is `internal`.
-fn image_key(txn: &Transaction, sc: &ServerCommit) -> Checked<Option<[u8; 32]>> {
+fn image_key(txn: &Transaction, sc: &ReceiveServerCommit) -> Checked<Option<[u8; 32]>> {
     if !txn
         .repo()
         .config()
@@ -315,7 +367,7 @@ fn image_key(txn: &Transaction, sc: &ServerCommit) -> Checked<Option<[u8; 32]>> 
 /// `checksum-mismatch`. Each other error of the build is `internal`.
 async fn build_image<'t>(
     txn: &'t Transaction,
-    sc: &ServerCommit,
+    sc: &ReceiveServerCommit,
     key: [u8; 32],
 ) -> Checked<StagedComposefsImage<'t>> {
     let tree = RepoTree::from_parts(txn.repo().clone(), sc.root_dirtree, sc.root_dirmeta);
@@ -334,7 +386,8 @@ async fn build_image<'t>(
     Ok(image)
 }
 
-/// Returns the names of the refs of `sc`: the branch, then each tag.
+/// Returns the names of the refs of `sc`, as the client sent them: the
+/// branch, then each tag.
 fn refs(sc: &ServerCommit) -> impl Iterator<Item = &str> {
     std::iter::once(sc.branch.as_str()).chain(sc.tags.iter().map(String::as_str))
 }
@@ -371,33 +424,29 @@ fn name_failure(e: Error, what: &str, name: &str) -> Failure {
     }
 }
 
-/// Checks the names of `sc` and the form of the message, and returns the path
-/// under `refs/` of the branch, then of each tag.
+/// Checks the names of `sc` and the form of the message, and returns the
+/// index in `named` of the branch, then of each tag.
 ///
-/// `updates` is the number of ref updates of the message, and `force` is its
-/// `force` flag.
+/// `own` is the collection id of the repository. `updates` is the number of
+/// ref updates of the message, and `force` is its `force` flag.
 ///
-/// - The branch and each tag pass the refspec rule and are not 64 lowercase
-///   hex characters (`invalid-ref`).
+/// - The branch and each tag are refs, and no local ref among them is 64
+///   lowercase hex characters, after the map of `@ID:NAME` with `ID` `own`
+///   to the local ref `NAME` (`invalid-ref`).
 /// - Each bound name passes the refspec rule and has no `:` (`invalid-ref`).
 /// - The message holds no update and no `force` (`protocol`).
-/// - The branch and each tag are refs of `Hello`, and none occurs two times
-///   among them (`protocol`).
+/// - The branch and each tag are refs of `Hello`, with the text of `Hello`,
+///   and none occurs two times among them (`protocol`).
+/// - The branch and each tag are in one namespace (`protocol`).
 fn check_names(
+    own: Option<&str>,
     named: &Named<'_>,
     sc: &ServerCommit,
     updates: usize,
     force: bool,
-) -> Checked<Vec<String>> {
+) -> Checked<Vec<usize>> {
     for name in refs(sc) {
-        crate::validate_refspec(name).map_err(|e| name_failure(e, "ref name", name))?;
-        // A revision reads 64 lowercase hex characters as a checksum, so the
-        // server writes no commit to such a ref.
-        if ostrya_core::is_checksum_shaped(name) {
-            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
-                "invalid ref name '{name}'"
-            ))));
-        }
+        commit_ref(own, name, true)?;
     }
     for name in &sc.bind_refs {
         crate::validate_refspec(name).map_err(|e| name_failure(e, "bound name", name))?;
@@ -417,24 +466,29 @@ fn check_names(
             "the Commit message holds a server commit and force".into(),
         ));
     }
-    let paths: HashMap<&str, &String> = named
-        .names
-        .iter()
-        .map(String::as_str)
-        .zip(named.paths)
-        .collect();
-    let mut seen = HashSet::with_capacity(sc.tags.len() + 1);
-    let mut found = Vec::with_capacity(sc.tags.len() + 1);
-    for name in refs(sc) {
-        let Some(&path) = paths.get(name) else {
-            return Err(protocol(format!("ref '{name}' was not named in Hello")));
-        };
-        if !seen.insert(name) {
-            return Err(protocol(format!("ref '{name}' is written more than once")));
+    let found = named.indices(refs(sc), "written")?;
+    let branch = &named.refs[found[0]];
+    for &i in &found[1..] {
+        let tag = &named.refs[i];
+        if !same_namespace(tag, branch) {
+            return Err(protocol(format!(
+                "tag '{tag}' is not in the namespace of the branch '{branch}' of the server \
+                 commit"
+            )));
         }
-        found.push(path.clone());
     }
     Ok(found)
+}
+
+/// Returns `true` if the canonical refs `a` and `b` are in one namespace:
+/// both local, both of one collection, or both of one remote.
+fn same_namespace(a: &Ref, b: &Ref) -> bool {
+    match (a, b) {
+        (Ref::Local { .. }, Ref::Local { .. }) => true,
+        (Ref::Collection { id: x, .. }, Ref::Collection { id: y, .. }) => x == y,
+        (Ref::Remote { remote: x, .. }, Ref::Remote { remote: y, .. }) => x == y,
+        _ => false,
+    }
 }
 
 /// Checks that a commit can hold each metadata value of `sc` (`protocol`).

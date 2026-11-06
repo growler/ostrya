@@ -25,7 +25,9 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use common::receive::{PipeReader, collections_policy, connect, new_repo, policy_allowing};
+use common::receive::{
+    PipeReader, collections_policy, connect, new_repo, outcomes, policy_allowing,
+};
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir};
 use futures_io::AsyncRead;
 use futures_lite::future::zip;
@@ -372,7 +374,7 @@ fn a_push_of_the_tree_model_commits_and_sets_its_ref() {
             let (report, client) = push(&repo, &source, compression);
             let report = report.unwrap_or_else(|e| panic!("{what}: {e}"));
             let outcome = client.unwrap_or_else(|e| panic!("{what}: {e}"));
-            assert_eq!(outcome.refs, report.refs, "{what}");
+            assert_eq!(outcome.refs, outcomes(&report), "{what}");
             assert_eq!(outcome.refs[0].new, Some(commit), "{what}");
             assert_eq!(ref_file(&repo), Some(format!("{commit}\n")), "{what}");
 
@@ -505,11 +507,21 @@ fn strings(items: &[&str]) -> Vec<String> {
     items.iter().map(|s| s.to_string()).collect()
 }
 
+/// Reads `text` as a ref. Text that is no ref is a local ref of that name,
+/// which the push refuses.
+fn r(text: &str) -> Ref {
+    text.parse().unwrap_or_else(|_| Ref::local(text))
+}
+
+fn refs(items: &[&str]) -> Vec<Ref> {
+    items.iter().map(|s| r(s)).collect()
+}
+
 /// The options of a tree push onto `branch` with the canonical filter, the
 /// subject, the body, and the timestamp of these tests.
 fn tree_options(branch: &str) -> TreePushOptions {
     TreePushOptions {
-        onto: branch.into(),
+        onto: r(branch),
         subject: Some(SUBJECT.into()),
         body: Some(BODY.into()),
         timestamp: Some(TIMESTAMP),
@@ -596,7 +608,7 @@ fn pushed_under(
     let (report, client) = tree_push_under(repo, policy, src, opts, None);
     let report = report.unwrap_or_else(|e| panic!("{what}: {e}"));
     let outcome = client.unwrap_or_else(|e| panic!("{what}: {e}"));
-    assert_eq!(outcome.refs, report.refs, "{what}");
+    assert_eq!(outcome.refs, outcomes(&report), "{what}");
     let commit = outcome.commit.expect("the server names its commit");
     for r in &outcome.refs {
         assert_eq!(r.new, Some(commit), "{what}");
@@ -712,7 +724,7 @@ fn the_commit_of_a_tree_push_is_the_commit_that_write_commit_writes() {
         &plain,
         &src,
         TreePushOptions {
-            tags: strings(&["tree/t2", "tree/t1"]),
+            tags: refs(&["tree/t2", "tree/t1"]),
             bind_refs: strings(&["tree/bound", "tree/bound"]),
             ..tree_options("tree/other")
         },
@@ -837,7 +849,7 @@ fn a_tree_push_sends_the_tree_and_the_server_sets_its_refs() {
                 &src,
                 TreePushOptions {
                     compression,
-                    tags: strings(&["tree/tag"]),
+                    tags: refs(&["tree/tag"]),
                     ..tree_options("tree/one")
                 },
                 &what,
@@ -961,7 +973,7 @@ fn a_tag_of_64_lowercase_hex_characters_is_refused() {
         &repo,
         &src,
         TreePushOptions {
-            tags: strings(&[&hex]),
+            tags: refs(&[&hex]),
             ..tree_options("main")
         },
         None,
@@ -1069,7 +1081,7 @@ fn an_existing_tag_is_refused_before_any_upload() {
     // A new file gives the tree objects that the server does not hold.
     std::fs::write(src.join("new.txt"), b"new\n").unwrap();
     let opts = TreePushOptions {
-        tags: strings(&["tree/a"]),
+        tags: refs(&["tree/a"]),
         ..tree_options("tree/b")
     };
     match refused_before_any_upload(&repo, &src, opts, "tag") {
@@ -1147,7 +1159,9 @@ fn a_server_commit_whose_reply_is_over_the_frame_limit_is_refused_before_any_upl
     // A tag of 6 bytes costs 11 bytes in `Commit`, 45 in `HelloReply` with
     // a commit, and 46 in `CommitReply`. With 23,000 tags, `HelloReply` fits
     // in 1 MiB and `CommitReply` does not.
-    let tags: Vec<String> = (0..23_000).map(|i| format!("t{i:05}")).collect();
+    let tags: Vec<Ref> = (0..23_000)
+        .map(|i| Ref::local(format!("t{i:05}")))
+        .collect();
     let opts = TreePushOptions {
         tags,
         ..tree_options(REF)
@@ -1157,6 +1171,178 @@ fn a_server_commit_whose_reply_is_over_the_frame_limit_is_refused_before_any_upl
         other => panic!("{other:?}"),
     }
     assert_eq!(named_ref(&repo, REF), None);
+}
+
+/// Returns the commit of the ref file `relpath` of `repo`.
+fn ref_at(repo: &Repo, relpath: &str) -> Option<Checksum> {
+    std::fs::read_to_string(repo.path().join(relpath))
+        .ok()
+        .map(|text| text.trim_end().parse().unwrap())
+}
+
+/// A branch and a tag of a collection go to the mirror refs of the
+/// collection. The server binds the commit to the collection, and the ref
+/// binding holds the name part of the branch and of the tag. The collection
+/// of the push gives a plain branch the same namespace, and keeps a branch
+/// of its own id.
+#[test]
+fn a_tree_push_onto_a_collection_ref_writes_the_mirror_refs() {
+    let tmp = TmpDir::new("push-tree-collection");
+    let src = build_fixture_source(tmp.path());
+    let x = "org.example.X";
+    let policy = collections_policy(&[x], &["c:**", "t:**"]);
+    let mut commits = Vec::new();
+    for (tag, opts) in [
+        (
+            "named",
+            TreePushOptions {
+                tags: refs(&["@org.example.X:t"]),
+                ..tree_options("@org.example.X:a")
+            },
+        ),
+        (
+            "collection",
+            TreePushOptions {
+                tags: refs(&["t"]),
+                collection: Some(x.into()),
+                ..tree_options("a")
+            },
+        ),
+        (
+            "both",
+            TreePushOptions {
+                tags: refs(&["@org.example.X:t"]),
+                collection: Some(x.into()),
+                ..tree_options("@org.example.X:a")
+            },
+        ),
+    ] {
+        let dir = TmpDir::new(&format!("push-tree-collection-{tag}"));
+        let repo = new_repo(
+            &dir,
+            RepoMode::Archive,
+            "collection-id=org.example.Server\n",
+        );
+        let (report, client) = tree_push_under(&repo, &policy, &src, opts, None);
+        report.unwrap_or_else(|e| panic!("{tag}: {e}"));
+        let outcome = client.unwrap_or_else(|e| panic!("{tag}: {e}"));
+        let names: Vec<&str> = outcome.refs.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["@org.example.X:a", "@org.example.X:t"], "{tag}");
+        let commit = outcome.commit.unwrap();
+        for name in ["a", "t"] {
+            let relpath = format!("refs/mirrors/{x}/{name}");
+            assert_eq!(ref_at(&repo, &relpath), Some(commit), "{tag} {name}");
+            assert_eq!(named_ref(&repo, name), None, "{tag} {name}");
+        }
+        let (stored, _) = block_on(repo.load_commit(&commit)).unwrap();
+        assert_eq!(stored.collection_binding(), Some(x), "{tag}");
+        assert_eq!(stored.ref_bindings(), ["a", "t"], "{tag}");
+        commits.push(commit);
+    }
+    // The three forms make one commit.
+    assert!(commits.iter().all(|c| *c == commits[0]), "{commits:?}");
+}
+
+/// A branch of the collection id of the server is a local ref, so
+/// `@OWN:a` with the tag `t` writes `refs/heads/`.
+#[test]
+fn a_tree_push_onto_the_own_collection_writes_the_local_refs() {
+    let tmp = TmpDir::new("push-tree-own");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "collection-id=org.example.Server\n",
+    );
+    let (report, client) = tree_push(
+        &repo,
+        &src,
+        TreePushOptions {
+            tags: refs(&["t"]),
+            ..tree_options("@org.example.Server:a")
+        },
+        None,
+    );
+    let report = report.unwrap();
+    let canonical: Vec<String> = report.refs.iter().map(|r| r.name.to_string()).collect();
+    assert_eq!(canonical, ["a", "t"]);
+    let commit = client.unwrap().commit.unwrap();
+    assert_eq!(named_ref(&repo, "a"), Some(format!("{commit}\n")));
+    assert_eq!(named_ref(&repo, "t"), Some(format!("{commit}\n")));
+    let (stored, _) = block_on(repo.load_commit(&commit)).unwrap();
+    assert_eq!(stored.collection_binding(), Some("org.example.Server"));
+    assert_eq!(stored.ref_bindings(), ["a", "t"]);
+}
+
+/// A branch and a tag in two namespaces of the server are refused after
+/// `HelloReply` and before any upload. A branch of another collection than
+/// the collection of the push is refused before the scan. A tag needs `t`
+/// or `w` in its namespace.
+#[test]
+fn a_tree_push_in_two_namespaces_is_refused() {
+    let tmp = TmpDir::new("push-tree-two-namespaces");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "collection-id=org.example.Server\n",
+    );
+    let mut policy = server_commit_policy();
+    policy.rules.collections = collections_policy(&["org.example.X"], &["c:**", "t:**"])
+        .rules
+        .collections;
+    let before = object_files(&repo);
+    let progress = PushProgress::new();
+    let opts = TreePushOptions {
+        tags: refs(&["@org.example.X:t"]),
+        progress: Some(progress.clone()),
+        ..tree_options("main")
+    };
+    let (report, client) = tree_push_under(&repo, &policy, &src, opts, None);
+    match client {
+        Err(Error::InvalidInput(message)) => assert!(
+            message.contains("'main' and '@org.example.X:t'") && message.contains("two namespaces"),
+            "{message}"
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert!(
+        matches!(
+            report,
+            Err(ostrya::Error::Remote(ostrya::remote::Error::Aborted))
+        ),
+        "{report:?}"
+    );
+    assert_eq!(progress.snapshot().objects_total, 0);
+    assert_eq!(object_files(&repo), before);
+    let opts = TreePushOptions {
+        collection: Some("org.example.X".into()),
+        ..tree_options("@org.example.Y:a")
+    };
+    let error = block_on(push_tree_over_stream(
+        futures_lite::io::empty(),
+        futures_lite::io::sink(),
+        &src,
+        opts,
+    ))
+    .unwrap_err();
+    assert!(
+        matches!(&error, Error::InvalidInput(m) if m.contains("names the collection 'org.example.Y'")),
+        "{error:?}"
+    );
+    let (report, client) = tree_push_under(
+        &repo,
+        &collections_policy(&["org.example.X"], &["c:a"]),
+        &src,
+        TreePushOptions {
+            tags: refs(&["@org.example.X:t"]),
+            ..tree_options("@org.example.X:a")
+        },
+        None,
+    );
+    assert!(matches!(client, Err(Error::RefDenied(_))), "{client:?}");
+    assert!(report.is_err(), "{report:?}");
+    assert_eq!(ref_at(&repo, "refs/mirrors/org.example.X/a"), None);
 }
 
 /// A client group with no `c` on the branch gets `ref-denied`, and the

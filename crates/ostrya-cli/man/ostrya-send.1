@@ -24,11 +24,11 @@ With \%\-\-one\-way, the command serves no session. It writes the commits of the
 \fIREFSPECS...\fR
 The refspecs of \%\-\-one\-way, each \fB\%SRC[:DST]\fR\&. At least one refspec is required.
 .IP
-SRC is a revision of this repository, and DST is the ref that the receiver sets to its commit. The command splits each refspec at its last \fB\%:\fR\&. If SRC is a ref, DST defaults to SRC. A SRC that is a checksum, or that has a \fB\%^\fR suffix, needs a DST. A \%one\-way stream deletes no ref, so the command refuses \fB\%:DST\fR\&.
+SRC is a revision of this repository, and DST is the ref that the receiver sets to its commit: a local ref NAME, or \%@ID:NAME, the ref NAME of the collection ID. The command splits each refspec with the rule of \fB\%push\fR: DST is the last ref of the refspec, so \fB\%main:@X:a\fR sends \fB\%main\fR to \fB\%@X:a\fR\&. If SRC is a ref, DST defaults to the text of SRC. A SRC that is a checksum, or that has a \fB\%^\fR suffix, needs a DST. A \%one\-way stream deletes no ref, so the command refuses \fB\%:DST\fR\&.
 .IP
-The command refuses a DST that the \%ref\-name rule refuses, which includes a DST with \fB\%^\fR\&. It also refuses a DST of \%64 lowercase hex characters. Without \%\-\-remote, the reason is that a revision reads such a name as a commit checksum. With \%\-\-remote, the command refuses it by the refspec rule of \fB\%push\fR\&.
+The command refuses a DST that is not NAME or \%@ID:NAME under the \%ref\-name rule, which includes a DST with \fB\%^\fR\&. It also refuses a plain DST of \%64 lowercase hex characters. Without \%\-\-remote, the reason is that a revision reads such a name as a commit checksum. With \%\-\-remote, the command refuses it by the refspec rule of \fB\%push\fR, and it refuses a DST \%@ID:NAME, because a remote ref has no collection.
 .IP
-If the commit of a SRC has a ref binding, the binding must hold DST. Otherwise the command writes \fB\%error: binding\-mismatch: MESSAGE\fR before it writes a byte, and exits \%1. \fB\%ostrya commit \-b BRANCH\fR binds the commit to BRANCH. The refspecs need \%\-\-one\-way.
+If the commit of a SRC has a ref binding, the binding must hold the name part of DST, unless \%\-\-disable\-verify\-bindings is given. For a DST \%@ID:NAME, the commit must be bound to the collection ID, also with \%\-\-disable\-verify\-bindings. Otherwise the command writes \fB\%error: binding\-mismatch: MESSAGE\fR before it writes a byte, and exits \%1. \fB\%ostrya commit \-b BRANCH\fR binds the commit to BRANCH. The refspecs need \%\-\-one\-way.
 .SH OPTIONS
 .TP
 \fB\-\-client\fR \fINAME\fR
@@ -52,6 +52,11 @@ REMOTE is a remote name: one or more alphanumeric characters, \fB\%\-\fR, \fB\%_
 Send the content objects deflated at LEVEL, \%1 to \%9.
 .IP
 The value needs the \fB\%=\fR form, and \%\-\-compress alone gives level \%6. Without this option, the stream carries the content objects raw. With it, if this repository is an archive repository, the stream carries each stored content object as it is, whatever LEVEL is. The object keeps the zlib level that the repository wrote it with. The option needs \%\-\-one\-way.
+.TP
+\fB\-\-disable\-verify\-bindings\fR
+Do not check the \fB\%ostree.ref\-binding\fR list of the commit of each DST.
+.IP
+A receiver whose rules check the list refuses such a stream with \fB\%binding\-mismatch\fR, so the receiver also needs \%\-\-disable\-verify\-bindings. The switch skips no check of \fB\%ostree.collection\-binding\fR\&. The option needs \%\-\-one\-way.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

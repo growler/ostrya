@@ -20,15 +20,16 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 use common::receive::{
-    Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo, policy_allowing,
+    Obj, assert_staging_removed, body, collections_policy, fixture_objects, is_root, new_repo,
+    policy_allowing,
 };
 use common::{COMMIT, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, foreign_holder, lock_holder_main};
 use ostrya::remote::proto::{CommitRequest, Hello, ServerCommit};
-use ostrya::remote::{self, Encoding, Expected, RefOutcome, RefUpdate};
+use ostrya::remote::{self, Encoding, Expected, RefUpdate};
 use ostrya::{
     Checksum, Commit, Error, HookFuture, HookRefusal, HostEntry, LockKind, MAX_METADATA_SIZE,
-    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService, Ref, Repo, RepoMode,
-    Type, UpdatePlan, Value,
+    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport,
+    ReceiveServerCommit, ReceiveService, Ref, Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_rt::block_on;
 
@@ -45,7 +46,7 @@ fn lock_holder_subprocess() {
 /// The detached-metadata entries of a plan.
 type Metadata = Vec<(Checksum, Vec<HostEntry>)>;
 
-type PlanFn = dyn Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync;
+type PlanFn = dyn Fn(&[ReceiveRefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync;
 
 type AfterFn = dyn Fn(&ReceiveReport, Box<dyn Any + Send>) -> HookFuture<'static, Result<(), String>>
     + Send
@@ -65,7 +66,7 @@ struct Hook {
 impl ReceiveHooks for Hook {
     fn before_update<'a>(
         &'a self,
-        updates: &'a [RefUpdate],
+        updates: &'a [ReceiveRefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         let result = (self.plan)(updates);
@@ -86,7 +87,7 @@ impl ReceiveHooks for Hook {
 impl Hook {
     /// A hook whose `after_update` drops the carried value and succeeds.
     fn new(
-        plan: impl Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
+        plan: impl Fn(&[ReceiveRefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
     ) -> Arc<Hook> {
         Hook::with_after(plan, |_, carried| {
             drop(carried);
@@ -95,7 +96,7 @@ impl Hook {
     }
 
     fn with_after(
-        plan: impl Fn(&[RefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
+        plan: impl Fn(&[ReceiveRefUpdate]) -> Result<UpdatePlan, HookRefusal> + Send + Sync + 'static,
         after: impl Fn(&ReceiveReport, Box<dyn Any + Send>) -> HookFuture<'static, Result<(), String>>
         + Send
         + Sync
@@ -169,7 +170,8 @@ impl Drop for LockProbe {
     }
 }
 
-type ServerFn = dyn Fn(&ServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal> + Send + Sync;
+type ServerFn =
+    dyn Fn(&ReceiveServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal> + Send + Sync;
 
 /// A hook that gives the result of `server` for a server commit. It records
 /// the branch and the tags of each server commit that it gets.
@@ -177,20 +179,20 @@ type ServerFn = dyn Fn(&ServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal
 struct ServerHook {
     inner: Arc<Hook>,
     server: Box<ServerFn>,
-    seen: Mutex<Vec<(String, Vec<String>)>>,
+    seen: Mutex<Vec<(Ref, Vec<Ref>)>>,
 }
 
 impl ReceiveHooks for ServerHook {
     fn before_update<'a>(
         &'a self,
-        updates: &'a [RefUpdate],
+        updates: &'a [ReceiveRefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
         self.inner.before_update(updates)
     }
 
     fn before_server_commit<'a>(
         &'a self,
-        commit: &'a ServerCommit,
+        commit: &'a ReceiveServerCommit,
     ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
         self.seen
             .lock()
@@ -212,7 +214,7 @@ impl ReceiveHooks for ServerHook {
 impl ServerHook {
     fn new(
         inner: Arc<Hook>,
-        server: impl Fn(&ServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal>
+        server: impl Fn(&ReceiveServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal>
         + Send
         + Sync
         + 'static,
@@ -241,7 +243,7 @@ impl ServerHook {
 
     /// The branch and the tags of each server commit that the hook got, in
     /// order.
-    fn seen(&self) -> Vec<(String, Vec<String>)> {
+    fn seen(&self) -> Vec<(Ref, Vec<Ref>)> {
         self.seen.lock().unwrap().clone()
     }
 }
@@ -255,7 +257,6 @@ fn hello(refs: &[&str]) -> Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| r.to_string()).collect(),
-        collection: None,
         one_way: false,
     }
 }
@@ -307,7 +308,8 @@ fn run_with(
         updates,
         force: false,
         server_commit: None,
-    }));
+    }))
+    .map(|committed| committed.report);
     (service, result)
 }
 
@@ -552,7 +554,8 @@ fn run_server_with(
         updates: Vec::new(),
         force: false,
         server_commit: Some(Box::new(sc)),
-    }));
+    }))
+    .map(|committed| committed.report);
     (service, result)
 }
 
@@ -563,9 +566,9 @@ fn ref_of(repo: &Repo, name: &str) -> Option<Checksum> {
         .map(|text| Checksum::from_hex(text.trim()).unwrap())
 }
 
-fn outcome(name: &str, old: Option<Checksum>, new: Checksum) -> RefOutcome {
-    RefOutcome {
-        name: name.into(),
+fn outcome(name: &str, old: Option<Checksum>, new: Checksum) -> ReceiveRefOutcome {
+    ReceiveRefOutcome {
+        name: Ref::local(name),
         old,
         new: Some(new),
     }
@@ -707,8 +710,8 @@ fn a_host_hook_accepts_a_server_commit() {
     assert_eq!(
         hook.seen(),
         [
-            ("main".to_owned(), vec!["v1".to_owned()]),
-            ("main".to_owned(), vec!["v2".to_owned()]),
+            (Ref::local("main"), vec![Ref::local("v1")]),
+            (Ref::local("main"), vec![Ref::local("v2")]),
         ]
     );
     assert_eq!(hook.inner.calls(), 0);
@@ -719,6 +722,88 @@ fn a_host_hook_accepts_a_server_commit() {
     assert_eq!(ref_of(&repo, "main"), Some(c2));
     assert_eq!(ref_of(&repo, "v1"), Some(c1));
     assert_eq!(ref_of(&repo, "v2"), Some(c2));
+}
+
+/// The hooks and the report get the canonical ref of each name. A ref of
+/// the collection id of the repository is local, so the branch
+/// `@OWN:main` of a server commit gives the hook `Local("main")`, and the
+/// branch `@X:a` gives `Collection { id: "X", name: "a" }`. A `Hello` that
+/// holds `@OWN:b` gives `before_update` and the report the local ref `b`.
+#[test]
+fn the_hooks_get_the_canonical_name_of_each_ref() {
+    let tmp = TmpDir::new("hooks-canonical");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.Own\n");
+    let hook = ServerHook::giving(&Arc::default());
+    let mut policy = collections_policy(&["org.example.X"], &["c:**", "t:**"]);
+    policy.rules.local = policy_allowing(&["c:**", "t:**", "w:**"]).rules.local;
+    for (branch, tag) in [
+        ("@org.example.Own:main", "@org.example.Own:v1"),
+        ("@org.example.X:a", "@org.example.X:v1"),
+    ] {
+        let (_, result) = run_server_with(
+            &repo,
+            policy.clone(),
+            Some(hook.clone()),
+            &tree(),
+            server_commit(branch, &[tag]),
+        );
+        result.unwrap();
+    }
+    let local = Ref::local;
+    let x = |name: &str| Ref::collection("org.example.X", name);
+    assert_eq!(
+        hook.seen(),
+        [(local("main"), vec![local("v1")]), (x("a"), vec![x("v1")]),]
+    );
+    let reports = hook.inner.reports();
+    let names = |report: &ReceiveReport| -> Vec<Ref> {
+        report.refs.iter().map(|r| r.name.clone()).collect()
+    };
+    assert_eq!(names(&reports[0]), [local("main"), local("v1")]);
+    assert_eq!(names(&reports[1]), [x("a"), x("v1")]);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let record = seen.clone();
+    let hook = Hook::new(move |updates| {
+        record
+            .lock()
+            .unwrap()
+            .extend(updates.iter().map(|u| u.name.clone()));
+        Ok(UpdatePlan {
+            metadata: Vec::new(),
+            carried: Box::new(()),
+        })
+    });
+    let commit = fixture_commit();
+    let updates = vec![
+        RefUpdate {
+            name: "@org.example.Own:b".into(),
+            expected: Expected::Absent,
+            new: Some(commit),
+        },
+        RefUpdate {
+            name: "test/main".into(),
+            expected: Expected::Absent,
+            new: Some(commit),
+        },
+    ];
+    // The fixture commit binds `test/main` alone.
+    let policy = ReceivePolicy {
+        disable_verify_bindings: true,
+        ..policy_allowing(&["w:**"])
+    };
+    let (_, result) = run_with(
+        &repo,
+        policy,
+        Some(hook.clone()),
+        &fixture_objects(Encoding::Raw),
+        updates,
+    );
+    let report = result.unwrap();
+    assert_eq!(*seen.lock().unwrap(), [local("b"), local("test/main")]);
+    assert_eq!(names(&report), [local("b"), local("test/main")]);
+    assert_eq!(hook.reports(), [report]);
+    assert_eq!(ref_of(&repo, "b"), Some(commit));
 }
 
 /// The server-commit hook runs before the update lock. With

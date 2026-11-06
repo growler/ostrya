@@ -9,11 +9,10 @@ use std::any::Any;
 use std::future::Future;
 use std::pin::Pin;
 
-use ostrya_core::{Checksum, Value};
+use ostrya_core::{Checksum, Ref, Value};
 
 use super::session::{Failure, ReceiveReport};
-use crate::remote::proto::ServerCommit;
-use crate::remote::{self, RefUpdate};
+use crate::remote::{self, Expected};
 
 /// The future that a hook returns.
 ///
@@ -63,10 +62,12 @@ pub(super) fn cut(message: &mut String) {
 /// also run before the hook. If the commit fails one of these checks, it does
 /// not call the hook.
 ///
-/// The hook gets each ref update of the `Commit` message as the client sent
-/// it, deletes included. A delete has `new` set to `None`. The `expected`
-/// field is the state that the client expects. The hook gets no `force` flag,
-/// because the rights of the policy decide what `force` allows.
+/// The hook gets each ref update of the `Commit` message, in order, deletes
+/// included, as a [`ReceiveRefUpdate`]. The name of each update is canonical:
+/// `@ID:NAME` with `ID` the collection id of the repository is the local ref
+/// `NAME`. A delete has `new` set to `None`. The `expected` field is the
+/// state that the client expects. The hook gets no `force` flag, because the
+/// rights of the policy decide what `force` allows.
 ///
 /// The checks of the current value of each ref run after the hook, under the
 /// update lock, in this order:
@@ -84,12 +85,13 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// # A server commit
 ///
-/// For a `Commit` with a [`ServerCommit`],
+/// For a `Commit` with a [`ServerCommit`](crate::remote::proto::ServerCommit),
 /// [`before_server_commit`](Self::before_server_commit) runs once in place of
 /// `before_update`. Before the hook, the commit runs all its checks of these
 /// items:
 ///
-/// - the ref names and the form of the message
+/// - the ref names and the form of the message, with the one namespace of
+///   the branch and the tags
 /// - the depth of the metadata values
 /// - the size of the reply
 /// - the objects of the session
@@ -101,9 +103,11 @@ pub(super) fn cut(message: &mut String) {
 /// Then the staged objects become durable, and the hook runs. If the commit
 /// fails one of these checks, it does not call the hook.
 ///
-/// The hook gets the server commit as the client sent it. The new commit does
-/// not exist yet, because the server builds it under the update lock. The
-/// hook gives no detached-metadata entries.
+/// The hook gets the server commit as a [`ReceiveServerCommit`], with the
+/// canonical name of the branch and of each tag. The branch and the tags are
+/// in one namespace. The new commit does not exist yet, because the server
+/// builds it under the update lock. The hook gives no detached-metadata
+/// entries.
 ///
 /// After the hook and before the update lock, under
 /// `[ex-ostrya] generate-composefs`, the commit builds the composefs image of
@@ -291,7 +295,7 @@ pub trait ReceiveHooks: Send + Sync {
     /// of the refusal, and no ref changes.
     fn before_update<'a>(
         &'a self,
-        updates: &'a [RefUpdate],
+        updates: &'a [ReceiveRefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>>;
 
     /// Returns the carried value of a `Commit` with the server commit
@@ -309,7 +313,7 @@ pub trait ReceiveHooks: Send + Sync {
     /// of the refusal, and no ref changes.
     fn before_server_commit<'a>(
         &'a self,
-        _commit: &'a ServerCommit,
+        _commit: &'a ReceiveServerCommit,
     ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
         Box::pin(std::future::ready(Err(HookRefusal::denied(
             "the hooks of the host take no server commit",
@@ -336,6 +340,59 @@ pub trait ReceiveHooks: Send + Sync {
         report: &'a ReceiveReport,
         carried: Box<dyn Any + Send>,
     ) -> HookFuture<'a, Result<(), String>>;
+}
+
+/// One ref update of a `Commit` message, as
+/// [`ReceiveHooks::before_update`] gets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveRefUpdate {
+    /// The ref, in its canonical form.
+    ///
+    /// A ref of the collection id of the repository is [`Ref::Local`], so
+    /// the client text `main` and `@ID:main` give the same value. A two-way
+    /// session writes local refs and collection refs. A one-way stream also
+    /// writes remote refs.
+    pub name: Ref,
+    /// The state that the ref must be in before the write.
+    pub expected: Expected,
+    /// The new commit, or `None` to delete the ref.
+    pub new: Option<Checksum>,
+}
+
+/// A server commit, as [`ReceiveHooks::before_server_commit`] gets it.
+///
+/// The fields are those of the protocol
+/// [`ServerCommit`](crate::remote::proto::ServerCommit), with the branch and
+/// the tags in their canonical form. A ref of the collection id of the
+/// repository is [`Ref::Local`]. The session checked that the branch and each
+/// tag are in one namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveServerCommit {
+    /// The branch that the server moves to the new commit.
+    pub branch: Ref,
+    /// The tags that the server creates at the new commit, in order.
+    pub tags: Vec<Ref>,
+    /// The names that the commit binds and that get no ref, in order, each a
+    /// plain name.
+    pub bind_refs: Vec<String>,
+    /// The checksum of the root dirtree of the commit.
+    pub root_dirtree: Checksum,
+    /// The checksum of the root dirmeta of the commit.
+    pub root_dirmeta: Checksum,
+    /// The subject of the commit.
+    pub subject: String,
+    /// The body of the commit.
+    pub body: String,
+    /// The metadata entries of the client, in order.
+    ///
+    /// Each entry is a key and the bytes of a `v` in normal form, as the
+    /// protocol `ServerCommit` holds them.
+    pub metadata: Vec<(String, Vec<u8>)>,
+    /// The commit time in seconds since the Unix epoch, UTC, or `None` for the
+    /// clock of the server.
+    pub timestamp: Option<u64>,
+    /// The flag that makes a commit with no parent.
+    pub orphan: bool,
 }
 
 /// The plan that [`ReceiveHooks::before_update`] returns.

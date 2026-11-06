@@ -1,34 +1,41 @@
 //! The ref patterns of the rules of a one-way stream.
 
-use ostrya_core::RefPattern;
+use ostrya_core::{Ref, RefPattern};
 
 use crate::error::{Error, Result};
-use crate::refs::is_component;
+use crate::refs::{is_component, is_valid_collection_id};
 
 /// A pattern that names the refs of one rule of a one-way stream.
 ///
-/// A pattern has an optional remote part and a name part. The name part is a
-/// [`RefPattern`]: a path of parts, split at `/`. Each part is a literal, `*`,
-/// or `**`. `*` selects exactly one part of a name. `**` selects one or more
-/// parts. A pattern has one of these forms:
+/// A pattern has an optional remote part or collection part, and a name
+/// part. The name part is a [`RefPattern`]: a path of parts, split at `/`.
+/// Each part is a literal, `*`, or `**`. `*` selects exactly one part of a
+/// name. `**` selects one or more parts. A pattern has one of these forms:
 ///
 /// - `NAME` -- the plain refs that the name pattern `NAME` matches.
 /// - `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
 ///   matches.
 /// - `*:NAME` -- the remote refs of every remote that `NAME` matches.
+/// - `@ID:NAME` -- the refs of the collection `ID` that `NAME` matches. In a
+///   repository whose collection id is `ID`, these are the plain refs, so
+///   `@ID:NAME` matches the same refs as `NAME`.
 ///
 /// For example, `apps/*` selects `apps/web` and does not select `apps` or
 /// `apps/web/db`. `apps/**` selects `apps/web` and `apps/web/db`, and does not
 /// select `apps`. `central:**` selects every ref of the remote `central`.
+/// `@org.example.Os:**` selects every ref of the collection `org.example.Os`.
 ///
 /// `REMOTE` is one component of a ref path, under the wider rule of
-/// `is_ref_component`, and holds no `*`. [`ReceivePattern::parse`] refuses
-/// each other form:
+/// `is_ref_component`, and holds no `*`. `ID` is one literal collection id:
+/// it passes [`is_collection_id`](crate::is_collection_id) and is at most
+/// [`MAX_COLLECTION_ID_LEN`](ostrya_core::MAX_COLLECTION_ID_LEN) bytes.
+/// [`ReceivePattern::parse`] refuses each other form:
 ///
 /// - A `!` at the start of the pattern or in the name part. A receive pattern
 ///   has no negative form. A `!` in a remote part follows the component rule
 ///   of the remote part.
 /// - A `*` in a remote part other than the whole part `*`.
+/// - An `@` with no `:`, or a collection part that is not a collection id.
 /// - A `*` in a name part other than the whole part `*` or `**`.
 /// - An empty pattern, an empty part, or a `:` in the name part.
 /// - A control character.
@@ -42,21 +49,26 @@ use crate::refs::is_component;
 pub struct ReceivePattern {
     /// The pattern as written.
     text: String,
-    /// The remote part. It is `None` for a pattern of plain refs.
-    remote: Option<RemotePart>,
+    /// The refs that the pattern can match, from the part before the name
+    /// part.
+    scope: Scope,
     /// The name part.
     name: RefPattern,
     /// The kind of each part of the name part, in order.
     kinds: Vec<Kind>,
 }
 
-/// The remote part of a pattern.
+/// The part of a pattern before its name part.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum RemotePart {
+enum Scope {
+    /// No part: the plain refs.
+    Local,
     /// `*:`, every remote.
-    Any,
+    AnyRemote,
     /// `REMOTE:`, one remote.
-    Literal(String),
+    Remote(String),
+    /// `@ID:`, one collection.
+    Collection(String),
 }
 
 /// The kind of one part of a name part. A larger value is more specific.
@@ -75,7 +87,8 @@ enum Kind {
 /// The fields compare in order. A literal remote part wins over `*:`. Then the
 /// kinds of the parts of the name part compare from the left: a literal wins
 /// over `*`, and `*` wins over `**`. If one list of kinds is the start of the
-/// other, the longer one wins.
+/// other, the longer one wins. Two patterns that match one collection ref
+/// both have the literal collection part.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Specificity<'a> {
     literal_remote: bool,
@@ -102,20 +115,27 @@ impl ReceivePattern {
         if pattern.starts_with('!') {
             return Err(malformed("a receive pattern has no '!'"));
         }
-        let (remote, name) = match pattern.split_once(':') {
-            Some((remote, name)) => (Some(remote), name),
-            None => (None, pattern),
-        };
-        let remote = match remote {
-            None => None,
-            Some("*") => Some(RemotePart::Any),
-            Some(remote) if remote.contains('*') => {
-                return Err(malformed("a remote part is one remote or '*'"));
+        let (scope, name) = match pattern.strip_prefix('@') {
+            Some(rest) => {
+                let Some((id, name)) = rest.split_once(':') else {
+                    return Err(malformed("a collection part '@ID' has no ':'"));
+                };
+                if !is_valid_collection_id(id) {
+                    return Err(malformed("the collection part is not a collection id"));
+                }
+                (Scope::Collection(id.to_owned()), name)
             }
-            Some(remote) if !is_component(remote) => {
-                return Err(malformed("the remote part is not a remote name"));
-            }
-            Some(remote) => Some(RemotePart::Literal(remote.to_owned())),
+            None => match pattern.split_once(':') {
+                None => (Scope::Local, pattern),
+                Some(("*", name)) => (Scope::AnyRemote, name),
+                Some((remote, _)) if remote.contains('*') => {
+                    return Err(malformed("a remote part is one remote or '*'"));
+                }
+                Some((remote, _)) if !is_component(remote) => {
+                    return Err(malformed("the remote part is not a remote name"));
+                }
+                Some((remote, name)) => (Scope::Remote(remote.to_owned()), name),
+            },
         };
         let name_text = name;
         let name = RefPattern::parse(name_text).map_err(|err| match err {
@@ -136,7 +156,7 @@ impl ReceivePattern {
             .collect();
         Ok(ReceivePattern {
             text: pattern.to_owned(),
-            remote,
+            scope,
             name,
             kinds,
         })
@@ -147,17 +167,24 @@ impl ReceivePattern {
         &self.text
     }
 
-    /// Returns the strength of the match of this pattern on the ref `name` of
-    /// the remote `remote`.
+    /// Returns the strength of the match of this pattern on the ref `r`, in
+    /// a repository whose collection id is `own`.
     ///
-    /// `remote` is `None` for a plain ref. The result is `None` if the pattern
-    /// does not match. A pattern with a remote part matches only remote refs.
-    /// A pattern with no remote part matches only plain refs.
-    pub(crate) fn specificity(&self, remote: Option<&str>, name: &str) -> Option<Specificity<'_>> {
-        let literal_remote = match (&self.remote, remote) {
-            (None, None) => false,
-            (Some(RemotePart::Any), Some(_)) => false,
-            (Some(RemotePart::Literal(want)), Some(remote)) if want == remote => true,
+    /// `r` is in its canonical form: `@OWN:NAME` is the local ref `NAME`.
+    /// The result is `None` if the pattern does not match. A pattern with a
+    /// remote part matches only remote refs, and a pattern with a collection
+    /// part matches only the refs of its collection. A pattern with neither
+    /// part, or with the collection part of `own`, matches only plain refs,
+    /// with the strength of a pattern with neither part.
+    pub(crate) fn specificity(&self, r: &Ref, own: Option<&str>) -> Option<Specificity<'_>> {
+        let (literal_remote, name) = match (&self.scope, r) {
+            (Scope::Local, Ref::Local { name }) => (false, name),
+            (Scope::Collection(want), Ref::Local { name }) if Some(want.as_str()) == own => {
+                (false, name)
+            }
+            (Scope::AnyRemote, Ref::Remote { name, .. }) => (false, name),
+            (Scope::Remote(want), Ref::Remote { remote, name }) if want == remote => (true, name),
+            (Scope::Collection(want), Ref::Collection { id, name }) if want == id => (true, name),
             _ => return None,
         };
         if !self.name.matches(name) {
@@ -175,9 +202,17 @@ mod tests {
     use super::*;
 
     fn matches(pattern: &str, remote: Option<&str>, name: &str) -> bool {
+        let r = match remote {
+            Some(remote) => Ref::remote(remote, name),
+            None => Ref::local(name),
+        };
+        matches_ref(pattern, &r)
+    }
+
+    fn matches_ref(pattern: &str, r: &Ref) -> bool {
         ReceivePattern::parse(pattern)
             .unwrap()
-            .specificity(remote, name)
+            .specificity(r, None)
             .is_some()
     }
 
@@ -204,6 +239,9 @@ mod tests {
             "*:*",
             "*:**",
             "r!:a",
+            "@org.example.Os:main",
+            "@org.example.Os:**",
+            "@org.example.Os:apps/*",
         ] {
             let parsed = ReceivePattern::parse(pattern).unwrap();
             assert_eq!(parsed.as_str(), pattern);
@@ -249,6 +287,15 @@ mod tests {
             "a b",
             "-a",
             "a/.b/*",
+            "@org.example.Os",
+            "@:a",
+            "@*:a",
+            "@org.*:a",
+            "@nodot:a",
+            "@org.example.Os:",
+            "@org.example.Os:a:b",
+            "@org.example.Os:!a",
+            "!@org.example.Os:a",
         ] {
             let err = ReceivePattern::parse(pattern).unwrap_err();
             assert!(
@@ -291,5 +338,27 @@ mod tests {
         assert!(!matches("origin:**", Some("other"), "a/b"));
         assert!(!matches("origin:**", Some("origin2"), "a"));
         assert!(!matches("origin:*", Some("origin"), "a/b"));
+    }
+
+    /// A collection pattern matches only the refs of its collection, and no
+    /// other pattern matches a collection ref.
+    #[test]
+    fn a_collection_pattern_matches_its_collection_alone() {
+        let os = |name: &str| Ref::collection("org.example.Os", name);
+        assert!(matches_ref("@org.example.Os:**", &os("a/b")));
+        assert!(matches_ref("@org.example.Os:a", &os("a")));
+        assert!(!matches_ref("@org.example.Os:a", &os("b")));
+        assert!(!matches_ref(
+            "@org.example.Os:**",
+            &Ref::collection("org.example.Other", "a")
+        ));
+        assert!(!matches_ref("@org.example.Os:**", &Ref::local("a")));
+        assert!(!matches_ref(
+            "@org.example.Os:**",
+            &Ref::remote("origin", "a")
+        ));
+        for pattern in ["**", "*:**", "origin:**"] {
+            assert!(!matches_ref(pattern, &os("a")), "{pattern}");
+        }
     }
 }

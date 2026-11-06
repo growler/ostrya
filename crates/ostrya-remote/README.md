@@ -47,9 +47,10 @@ API documentation: <https://docs.rs/ostrya-remote>
 ## Examples
 
 ```rust
+use ostrya_core::Ref;
 use ostrya_remote::{TreePushOptions, push_tree, transport::Endpoint};
 let endpoint = Endpoint::parse("ssh://builder@repo.example.com/srv/repo")?;
-let opts = TreePushOptions { onto: "exampleos/stable".into(), ..Default::default() };
+let opts = TreePushOptions { onto: Ref::local("exampleos/stable"), ..Default::default() };
 let outcome = push_tree(endpoint, "rootfs".as_ref(), opts).await?;
 println!("{:?}", outcome.commit);
 ```

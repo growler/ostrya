@@ -505,13 +505,14 @@ enum Command {
     /// command writes an error line and exits 1 before it opens the
     /// repository. At start, the command reads and checks the client groups,
     /// the server group, the trust groups, and the key groups of the
-    /// repository config, and a bad group ends it with status 1. `Hello` names
-    /// the namespace of the session: the local refs, or one collection. The
-    /// session takes the policy of the client group that carries the item
-    /// `ssh:NAME`, with the allow items and the deny items of that namespace.
-    /// With no such group, `Hello` gets `ref-denied`. A session of a
-    /// collection writes the refs under `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
-    /// item. With `[core] auto-update-summary=true`, a session that changes a
+    /// repository config, and a bad group ends it with status 1. Each ref of
+    /// `Hello` names its own namespace: `NAME` is a local ref, and `@ID:NAME`
+    /// is a ref of the collection ID, under `refs/mirrors/ID/`. `@ID:NAME` of
+    /// the collection id of the repository is the local ref NAME. The session
+    /// takes the policy of the client group that carries the item `ssh:NAME`,
+    /// with the allow items and the deny items of the namespace of each ref.
+    /// With no such group, `Hello` gets `ref-denied`. The session uses no
+    /// `anonymous` and no `net:` item. With `[core] auto-update-summary=true`, a session that changes a
     /// ref writes each summary again, as `ostrya summary -u` does, signed
     /// with the key groups of `sign-summary`.
     /// Standard output carries the frames of the session alone. For each
@@ -534,8 +535,9 @@ enum Command {
     /// not write the summary again.
     ///
     /// A plain ref takes a fast-forward update. A remote ref needs
-    /// --allow-remote, and gets `ref-denied` without it. The stream deletes no
-    /// ref. A stream of the commit that a ref holds changes nothing. The
+    /// --allow-remote, and a ref of a collection other than the collection id
+    /// of the repository needs --allow-collection. Each gets `ref-denied`
+    /// without its option. The stream deletes no ref. A stream of the commit that a ref holds changes nothing. The
     /// stream carries no parent commit, so the history check of an update
     /// stops at the first commit that neither the stream nor the repository
     /// holds. For example, the repository holds commit A on a ref, and the
@@ -576,10 +578,12 @@ enum Command {
     /// push reads `[ex-ostrya] keep-detached-related` from the `config` of the
     /// bucket, and with `false` drops `ostrya.related`.
     ///
-    /// The collection bindings of the source commits, or --collection, give
-    /// the namespace of the push on the server: the local refs or one
-    /// collection. The server writes the refs of a collection other than its
-    /// own collection id under `refs/mirrors/ID/`.
+    /// Each DST and each tag names its namespace on the server: a plain NAME
+    /// is a local ref, and `@ID:NAME` is a ref of the collection ID. The
+    /// server writes the refs of its own collection id under `refs/heads/`,
+    /// and the refs of each other collection under `refs/mirrors/ID/`. One
+    /// push can write local refs and the refs of more than one collection.
+    /// The bindings of the source commits select no namespace.
     ///
     /// To an `s3://` address, the push writes a bucket repository in an S3
     /// bucket with signed requests, and needs no server program. The bucket
@@ -588,13 +592,13 @@ enum Command {
     /// that the bucket does not hold, in archive form, and then writes the ref
     /// files. A commit object goes up after each object of its tree. The
     /// bucket gets the `.filez` bytes at the `[archive] zlib-level` of this
-    /// repository. The `config` of the bucket takes the role of the server
-    /// for --collection: its collection id gives `refs/heads/`, and each
-    /// other collection gives `refs/mirrors/ID/`. The push writes no summary,
-    /// and a summary of the bucket stays as it is. A pull of a ref that the
-    /// summary lists takes the commit of the summary, so after the push moves
-    /// that ref, the pull takes the old commit until `ostrya remote summary
-    /// -u` writes the summary again. The push refuses --onto,
+    /// repository. The `config` of the bucket takes the role of the server:
+    /// a plain DST, and `@ID:NAME` of its collection id, give `refs/heads/`,
+    /// and each other collection gives `refs/mirrors/ID/`. The push writes no
+    /// summary, and a summary of the bucket stays as it is. A pull of a ref
+    /// that the summary lists takes the commit of the summary, so after the
+    /// push moves that ref, the pull takes the old commit until `ostrya
+    /// remote summary -u` writes the summary again. The push refuses --onto,
     /// --tag, --compress, a delete refspec, and the token and ssh options.
     ///
     /// With --onto, the push sends the tree of one local commit, and the
@@ -633,8 +637,9 @@ enum Command {
     /// extended attributes. The option names and the value forms are those
     /// of `commit`.
     ///
-    /// The client group needs `c` on the branch. A server whose receive hooks
-    /// take no server commit answers ref-denied. The push sends the server
+    /// The client group needs `c` on the branch, and `t` or `w` on each
+    /// --tag, each in its namespace. A server whose receive hooks take no
+    /// server commit answers ref-denied. The push sends the server
     /// commit in one frame, which an ostrya server limits to 1 MiB. The reply
     /// names the branch and each --tag, and must also fit in one frame. In a
     /// commit, an --add-metadata value can hold two levels of containers
@@ -668,9 +673,9 @@ enum Command {
     /// client address, or `anonymous`. A request that identifies no item gets
     /// 401 or 403 and no file. A push session takes the policy of the client
     /// group that carries the item, with the allow items and the deny items
-    /// of the namespace of its `Hello`: the local refs, or one collection.
-    /// With no such group, or with a group that opens no push session, the
-    /// session request gets 403.
+    /// of the namespace of each ref of its `Hello`. With no such group, or
+    /// with a group that opens no push session, the session request gets
+    /// 403.
     ///
     /// A ref under `refs/heads/` or `refs/mirrors/ID/` is served when the
     /// client group of the item has `r` on its name. An alias needs `r` on
@@ -4199,14 +4204,30 @@ struct ReceiveArgs {
         value_parser = parse_allow_remote
     )]
     allow_remote: Vec<ostrya::ReceivePattern>,
+    /// Accept the refs of the collection ID, each `@ID:NAME`. The option is
+    /// repeatable.
+    ///
+    /// ID is one literal collection id. A ref of the collection takes the
+    /// rules of a plain ref: a fast-forward update, and the keys of --trust.
+    /// The receiver writes it under `refs/mirrors/ID/`. Without a value that
+    /// names its collection, an update of a collection ref gets `ref-denied`.
+    /// @ID:NAME of the collection id of this repository is the local ref NAME,
+    /// and needs no value. The option needs --one-way.
+    #[arg(
+        long = "allow-collection",
+        value_name = "ID",
+        requires = "one_way",
+        value_parser = parse_allow_collection
+    )]
+    allow_collection: Vec<ostrya::ReceivePattern>,
     /// Verify each new commit with the keys of the trust group
     /// `[ex-ostrya trust "NAME"]` (see ostrya-config(1)).
     ///
-    /// The keys apply to each plain ref and to each remote ref of
-    /// --allow-remote. A commit that is the new value of a ref must pass the
-    /// verification, and a commit with no signature gets
-    /// `signature-required`. A dependency of a commit gets no verification of
-    /// its own. Field 2 of the signed commit holds the checksum of each
+    /// The keys apply to each plain ref, to each remote ref of
+    /// --allow-remote, and to each collection ref of --allow-collection. A
+    /// commit that is the new value of a ref must pass the verification, and
+    /// a commit with no signature gets `signature-required`. A dependency of
+    /// a commit gets no verification of its own. Field 2 of the signed commit holds the checksum of each
     /// dependency, so the signature of the commit covers each dependency. A
     /// NAME that the config has no group for, and a bad group, end the
     /// command with one `error:` line and exit 1 before it reads its input.
@@ -4222,6 +4243,18 @@ struct ReceiveArgs {
     /// option needs --one-way.
     #[arg(long, requires = "one_way")]
     allow_privileged: bool,
+    /// Do not check the `ostree.ref-binding` list of each new commit.
+    ///
+    /// Without this switch, the list of the new commit of each update must
+    /// hold the name part of its ref, or the stream gets `binding-mismatch`.
+    /// A commit with no `ostree.ref-binding` key passes. The switch skips no
+    /// check of `ostree.collection-binding`: a commit bound to a collection
+    /// other than the namespace of its ref, and a commit with no collection
+    /// binding on a ref of another collection, still get `binding-mismatch`.
+    /// The option needs --one-way. Without --one-way, the key
+    /// `disable-verify-bindings` of the client group applies.
+    #[arg(long, requires = "one_way")]
+    disable_verify_bindings: bool,
     /// Commit at the `Commit` frame of the stream.
     ///
     /// The command runs the commit checks when it has read the `Commit`
@@ -4258,6 +4291,21 @@ fn parse_allow_remote(text: &str) -> std::result::Result<ostrya::ReceivePattern,
         return Err(format!("{REMOTE_NAME_RULE}, or '*'"));
     }
     ostrya::ReceivePattern::parse(&format!("{text}:**")).map_err(|err| err.to_string())
+}
+
+/// Reads a value of `receive --allow-collection` into the pattern `@ID:**`.
+///
+/// The value is one collection id of at most 255 bytes.
+#[cfg(feature = "receive")]
+fn parse_allow_collection(text: &str) -> std::result::Result<ostrya::ReceivePattern, String> {
+    if text.len() > 255 || !ostrya::is_collection_id(text) {
+        return Err(
+            "a collection id is two or more elements split at '.', each of ASCII letters, \
+             digits, and '_', that does not start with a digit, and at most 255 bytes"
+                .to_owned(),
+        );
+    }
+    ostrya::ReceivePattern::parse(&format!("@{text}:**")).map_err(|err| err.to_string())
 }
 
 #[cfg(feature = "send")]
@@ -4321,25 +4369,40 @@ struct SendArgs {
         requires = "one_way"
     )]
     compress: Option<u8>,
+    /// Do not check the `ostree.ref-binding` list of the commit of each DST.
+    ///
+    /// A receiver whose rules check the list refuses such a stream with
+    /// `binding-mismatch`, so the receiver also needs
+    /// --disable-verify-bindings. The switch skips no check of
+    /// `ostree.collection-binding`. The option needs --one-way.
+    #[cfg(all(feature = "send", feature = "push"))]
+    #[arg(long, requires = "one_way")]
+    disable_verify_bindings: bool,
     /// The refspecs of --one-way, each `SRC[:DST]`. At least one refspec is
     /// required.
     ///
     /// SRC is a revision of this repository, and DST is the ref that the
-    /// receiver sets to its commit. The command splits each refspec at its
-    /// last `:`. If SRC is a ref, DST defaults to SRC. A SRC that is a
-    /// checksum, or that has a `^` suffix, needs a DST. A one-way stream
-    /// deletes no ref, so the command refuses `:DST`.
+    /// receiver sets to its commit: a local ref NAME, or @ID:NAME, the ref
+    /// NAME of the collection ID. The command splits each refspec with the
+    /// rule of `push`: DST is the last ref of the refspec, so `main:@X:a`
+    /// sends `main` to `@X:a`. If SRC is a ref, DST defaults to the text of
+    /// SRC. A SRC that is a checksum, or that has a `^` suffix, needs a DST.
+    /// A one-way stream deletes no ref, so the command refuses `:DST`.
     ///
-    /// The command refuses a DST that the ref-name rule refuses, which
-    /// includes a DST with `^`. It also refuses a DST of 64 lowercase hex
-    /// characters. Without --remote, the reason is that a revision reads
-    /// such a name as a commit checksum. With --remote, the command refuses
-    /// it by the refspec rule of `push`.
+    /// The command refuses a DST that is not NAME or @ID:NAME under the
+    /// ref-name rule, which includes a DST with `^`. It also refuses a plain
+    /// DST of 64 lowercase hex characters. Without --remote, the reason is
+    /// that a revision reads such a name as a commit checksum. With --remote,
+    /// the command refuses it by the refspec rule of `push`, and it refuses a
+    /// DST @ID:NAME, because a remote ref has no collection.
     ///
-    /// If the commit of a SRC has a ref binding, the binding must hold DST.
-    /// Otherwise the command writes `error: binding-mismatch: MESSAGE` before
-    /// it writes a byte, and exits 1. `ostrya commit -b BRANCH` binds the
-    /// commit to BRANCH. The refspecs need --one-way.
+    /// If the commit of a SRC has a ref binding, the binding must hold the
+    /// name part of DST, unless --disable-verify-bindings is given. For a DST
+    /// @ID:NAME, the commit must be bound to the collection ID, also with
+    /// --disable-verify-bindings. Otherwise the command writes `error:
+    /// binding-mismatch: MESSAGE` before it writes a byte, and exits 1.
+    /// `ostrya commit -b BRANCH` binds the commit to BRANCH. The refspecs
+    /// need --one-way.
     #[cfg(all(feature = "send", feature = "push"))]
     #[arg(requires = "one_way")]
     refspecs: Vec<String>,
@@ -4580,51 +4643,63 @@ struct PushArgs {
     /// client group of the push has `w` and `d` on the ref.
     #[arg(long)]
     force: bool,
-    /// Write the refs of the collection ID on the server.
+    /// Write each plain DST and each plain tag to the refs of the collection
+    /// ID on the server.
     ///
-    /// The push reads the `ostree.collection-binding` of each source commit.
-    /// Without this option, the bindings give the namespace on the server: a
-    /// commit with no binding goes to the local refs, and a commit bound to
-    /// ID goes to the refs of ID. The server writes the refs of its own
-    /// collection id under `refs/heads/`, and the refs of each other
-    /// collection under `refs/mirrors/ID/`. `commit` binds each commit of a
-    /// repository with a collection id to that id. So a push of such a
-    /// commit to a server with another collection id, or with none, writes
-    /// `refs/mirrors/ID/NAME` on the server.
+    /// A plain DST or tag NAME becomes @ID:NAME. A DST or tag @ID:NAME stays.
+    /// The command refuses a DST or tag @Y:NAME with Y other than ID, also a
+    /// DST that defaults to a SRC @Y:NAME. It refuses an ID that fails the
+    /// collection-id rule or is longer than 255 bytes. Each refusal comes
+    /// before the command starts the transport.
     ///
-    /// The command refuses two source commits with different bindings, a
-    /// binding that differs from ID, and a commit with no binding that goes
-    /// to the refs of a collection. It refuses an ID or a binding that fails
-    /// the collection-id rule or is longer than 255 bytes before it starts
-    /// the transport.
+    /// The server writes the refs of its own collection id under
+    /// `refs/heads/`, and the refs of each other collection under
+    /// `refs/mirrors/ID/`. The bindings of the source commits select no
+    /// namespace.
     ///
-    /// With --onto, ID alone names the namespace, and the bindings of the
-    /// local commit do not apply. Without ID, the server commit goes to the
-    /// local refs of the server.
+    /// With --onto, the option applies to BRANCH and to each --tag, and does
+    /// not change --bind-ref.
     ///
     /// To a bucket repository, the `config` of the bucket takes the role of
-    /// the server. No namespace, or the collection id of the bucket, writes
-    /// `refs/heads/NAME`. Each other collection writes
-    /// `refs/mirrors/ID/NAME`, also in a bucket with no collection id.
+    /// the server: @ID:NAME of the collection id of the bucket writes
+    /// `refs/heads/NAME`, and each other ID writes `refs/mirrors/ID/NAME`,
+    /// also in a bucket with no collection id.
     #[arg(long, value_name = "ID")]
     collection: Option<String>,
     /// Create the ref NAME on the server at the source commit.
     ///
-    /// The option can occur more than once. A tag is a ref update that
-    /// expects no ref, also with --force. So a tag that exists gets
-    /// ref-mismatch after the server reports its refs, and before the push
-    /// sends an object. The refspecs that are not deletes must give one
-    /// commit, and the `ostree.ref-binding` of that commit must hold NAME.
-    /// NAME passes the ref-name rule, has no `:`, is not 64 lowercase hex
-    /// characters, and is not a DST. The client group of the push needs `t`
-    /// or `w` on NAME.
+    /// NAME is a local ref NAME of the server, or @ID:NAME, the ref NAME of
+    /// the collection ID. The option can occur more than once. A tag is a ref
+    /// update that expects no ref, also with --force. So a tag that exists
+    /// gets ref-mismatch after the server reports its refs, and before the
+    /// push sends an object. The refspecs that are not deletes must give one
+    /// commit, and the `ostree.ref-binding` of that commit must hold the name
+    /// part of each tag: `v1` for @ID:v1. NAME passes the ref-name rule, is
+    /// not a remote ref, is not 64 lowercase hex characters if it is plain,
+    /// and is not a DST. The client group of the push needs `t` or `w` on the
+    /// tag in its namespace.
     ///
-    /// With --onto, the server creates NAME at the new commit, and the
-    /// `ostree.ref-binding` of that commit holds NAME. NAME is not BRANCH. A
-    /// tag that exists also gets ref-mismatch before the push sends an
-    /// object.
+    /// With --onto, the server creates the tag at the new commit, and the
+    /// `ostree.ref-binding` of that commit holds its name part. The tag is
+    /// not BRANCH. A tag that exists also gets ref-mismatch before the push
+    /// sends an object.
     #[arg(long = "tag", value_name = "NAME")]
     tags: Vec<String>,
+    /// Do not check the `ostree.ref-binding` list of the commit of each DST
+    /// and each tag.
+    ///
+    /// Without this switch, the list must hold the name part of each DST and
+    /// of each tag, or the push fails before it starts the transport. A
+    /// commit with no `ostree.ref-binding` key passes for a DST. A server
+    /// then applies the key `disable-verify-bindings` of the client group of
+    /// the push, and without the key it refuses such a commit. A bucket
+    /// repository has no server check, so the switch alone skips the check.
+    /// The switch skips no check of `ostree.collection-binding`. A ref that
+    /// the push writes with the switch fails a pull without
+    /// --disable-verify-bindings. The switch does not change a push with
+    /// --onto.
+    #[arg(long)]
+    disable_verify_bindings: bool,
     /// Ask the server to commit the tree of REF onto the branch BRANCH.
     ///
     /// The push sends the objects of the tree of the local commit that the
@@ -4634,25 +4709,30 @@ struct PushArgs {
     /// the server. The new commit takes the subject, the body, the metadata,
     /// and the timestamp of the local commit. The push leaves out the local
     /// `ostree.ref-binding` and `ostree.collection-binding`, and the server
-    /// writes the bindings of its namespace: BRANCH, each --tag, and each
-    /// --bind-ref.
+    /// writes the bindings of the namespace of BRANCH: the name parts of
+    /// BRANCH and of each --tag, and each --bind-ref. The push does not check
+    /// the bindings of the local commit.
     ///
     /// The push sends no parent, no commit object, and no detached metadata,
     /// so no signature of the local commit reaches the server. The server
     /// signs the new commit with the keys of its own client group.
     ///
-    /// The client group needs `c` on BRANCH. A server whose receive hooks
-    /// take no server commit answers ref-denied. The push sends the server
-    /// commit in one frame, which an ostrya server limits to 1 MiB. The reply
-    /// names BRANCH and each --tag, and must also fit in one frame. The push
-    /// checks the two frames against the limit of the server before it sends
-    /// an object.
+    /// The client group needs `c` on BRANCH, and `t` or `w` on each --tag,
+    /// each in its namespace. A server whose receive hooks take no server
+    /// commit answers ref-denied. The push sends the server commit in one
+    /// frame, which an ostrya server limits to 1 MiB. The reply names BRANCH
+    /// and each --tag, and must also fit in one frame. The push checks the
+    /// two frames against the limit of the server before it sends an object.
     ///
-    /// BRANCH passes the ref-name rule, has no `:`, and is not 64 lowercase
-    /// hex characters. With --onto, the command takes exactly one REF, a
-    /// revision of this repository, and does not split it at `:`. The local
-    /// commit must not be partial, and must have no related objects. --onto
-    /// conflicts with --depth and --force.
+    /// BRANCH is a local ref NAME of the server, or @ID:NAME, the ref NAME of
+    /// the collection ID. It passes the ref-name rule, is not a remote ref,
+    /// and is not 64 lowercase hex characters if it is plain. BRANCH and each
+    /// --tag are in one namespace, after the server maps the refs of its own
+    /// collection id to its local refs. The push refuses refs of two
+    /// namespaces before it sends an object. With --onto, the command takes
+    /// exactly one REF, a revision of this repository, and does not split it
+    /// at `:`. The local commit must not be partial, and must have no related
+    /// objects. --onto conflicts with --depth and --force.
     #[arg(long, value_name = "BRANCH", conflicts_with_all = ["depth", "force"])]
     onto: Option<String>,
     /// Bind the commit of --onto to NAME, and create no ref.
@@ -4729,15 +4809,21 @@ struct PushArgs {
     /// The refspecs, each `SRC[:DST]`. At least one refspec is required.
     ///
     /// SRC is a revision of this repository, and DST is the ref of the server
-    /// that takes its commit. The command splits each refspec at its last
-    /// `:`. If SRC is a ref, DST defaults to SRC. A SRC that is a checksum, or
-    /// that has a `^` suffix, needs a DST. `:DST` deletes the ref DST of the
-    /// server.
+    /// that takes its commit: a local ref NAME, or @ID:NAME, the ref NAME of
+    /// the collection ID. If SRC is a ref, DST defaults to the text of SRC.
+    /// A SRC that is a checksum, or that has a `^` suffix, needs a DST. `:DST`
+    /// deletes the ref DST of the server.
     ///
-    /// The command refuses a DST that the ref-name rule refuses, which
-    /// includes a DST with `^`. It also refuses a DST of 64 lowercase hex
-    /// characters after a SRC, because a revision reads such a name as a
-    /// commit checksum. A delete of such a DST passes.
+    /// DST is the last ref of the refspec. If the field before the last `:`
+    /// starts with `@`, DST is @ID:NAME, else DST is the text after the last
+    /// `:`. So `R:main:dst` sends the remote ref `R:main` to `dst`,
+    /// `main:@X:a` sends `main` to `@X:a`, `@X:a:b` sends `@X:a` to `b`, and
+    /// `:@X:a` deletes `@X:a`. A refspec with no `@` splits at its last `:`.
+    ///
+    /// The command refuses a DST that is not NAME or @ID:NAME under the
+    /// ref-name rule, which includes a DST with `^`. It also refuses a plain
+    /// DST of 64 lowercase hex characters after a SRC, because a revision
+    /// reads such a name as a commit checksum. A delete of such a DST passes.
     ///
     /// With --onto, the operand is one REF, a revision of this repository.
     refspecs: Vec<String>,
@@ -4833,10 +4919,11 @@ struct PushTreeArgs {
     /// BRANCH. A server whose receive hooks take no server commit answers
     /// ref-denied.
     ///
-    /// The command refuses a name that holds `:`, a name that the ref-name
-    /// rule refuses, which includes a name with `^`, and a name of 64
-    /// lowercase hex characters, because a revision reads such a name as a
-    /// commit checksum.
+    /// BRANCH is a local ref NAME of the server, or @ID:NAME, the ref NAME of
+    /// the collection ID. The command refuses a remote ref, a name that the
+    /// ref-name rule refuses, which includes a name with `^`, and a plain name
+    /// of 64 lowercase hex characters, because a revision reads such a name
+    /// as a commit checksum.
     ///
     /// To a bucket repository, the push makes the commit itself, as the
     /// server makes it. The parent is the commit of BRANCH in the bucket,
@@ -4848,18 +4935,24 @@ struct PushTreeArgs {
     onto: Option<String>,
     /// Create the ref NAME on the server at the new commit.
     ///
-    /// The option can occur more than once. The `ostree.ref-binding` of the
-    /// commit holds NAME. A tag that exists on the server gets ref-mismatch
-    /// before the push sends an object. NAME passes the rules of BRANCH, is
-    /// not BRANCH, and occurs once. The client group needs `t` or `w` on
-    /// NAME. A push to a bucket repository refuses this option.
+    /// NAME is a local ref NAME of the server, or @ID:NAME, the ref NAME of
+    /// the collection ID. The option can occur more than once. The
+    /// `ostree.ref-binding` of the commit holds the name part of NAME. A tag
+    /// that exists on the server gets ref-mismatch before the push sends an
+    /// object. NAME passes the rules of BRANCH, is not BRANCH, and occurs
+    /// once. BRANCH and each tag are in one namespace, after the server maps
+    /// the refs of its own collection id to its local refs. The push refuses
+    /// refs of two namespaces before it sends an object. The client group
+    /// needs `t` or `w` on the tag in its namespace. A push to a bucket
+    /// repository refuses this option.
     #[arg(long = "tag", value_name = "NAME")]
     tags: Vec<String>,
     /// Bind the commit to NAME, and create no ref.
     ///
     /// The option can occur more than once. The `ostree.ref-binding` of the
-    /// commit holds BRANCH, each --tag, and each NAME, sorted. NAME passes
-    /// the ref-name rule and has no `:`.
+    /// commit holds the name parts of BRANCH and of each --tag, and each
+    /// NAME, sorted. NAME is a plain name: it passes the ref-name rule and
+    /// has no `:`.
     #[arg(long = "bind-ref", value_name = "NAME")]
     bind_refs: Vec<String>,
     /// Make a commit with no parent.
@@ -4869,20 +4962,27 @@ struct PushTreeArgs {
     /// the new commit replaces the commit of BRANCH with no check.
     #[arg(long)]
     orphan: bool,
-    /// Write the refs of the collection ID on the server.
+    /// Write a plain BRANCH and each plain --tag to the refs of the
+    /// collection ID on the server.
+    ///
+    /// A plain BRANCH or tag NAME becomes @ID:NAME. An @ID:NAME operand
+    /// stays, and the command refuses an @Y:NAME operand with Y other than
+    /// ID. The option does not change --bind-ref. So `--onto a --tag b
+    /// --bind-ref c --collection X` is `--onto @X:a --tag @X:b --bind-ref c`.
     ///
     /// The server writes the refs of its own collection id under
     /// `refs/heads/`, and the refs of each other collection under
     /// `refs/mirrors/ID/`. `ostree.collection-binding` of the commit holds
-    /// ID. Without this option, the push writes the local refs of the server,
-    /// and the binding is the collection id of the server, if it has one.
-    /// The command refuses an ID that fails the collection-id rule or is
-    /// longer than 255 bytes before it starts the transport.
+    /// the id of the namespace of BRANCH: ID for @ID:NAME, and the collection
+    /// id of the server, if it has one, for a local ref. The command refuses
+    /// an ID that fails the collection-id rule or is longer than 255 bytes
+    /// before it starts the transport.
     ///
     /// To a bucket repository, the `config` of the bucket takes the role of
-    /// the server: the collection id of the bucket, or no ID, writes
-    /// `refs/heads/BRANCH`, and each other ID writes
-    /// `refs/mirrors/ID/BRANCH`, also in a bucket with no collection id.
+    /// the server: a plain BRANCH, or @ID:NAME of the collection id of the
+    /// bucket, writes `refs/heads/NAME`, and @ID:NAME of each other ID
+    /// writes `refs/mirrors/ID/NAME`, also in a bucket with no collection
+    /// id.
     #[arg(long, value_name = "ID")]
     collection: Option<String>,
     /// The commit subject.
@@ -5649,7 +5749,7 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 /// The command reads and checks the client groups, the server group, the
 /// trust groups, and the key groups of the repository config at start. The
 /// session runs under the policy of the client group that carries `client`,
-/// with the items of the namespace of `Hello`. With no such group, `Hello`
+/// with the items of the namespace of each ref. With no such group, `Hello`
 /// gets `ref-denied`. Standard output carries the frames of the session alone.
 /// Each warning of the report goes to standard error as one line. A failure
 /// goes there as the error line of [`main`].
@@ -5658,8 +5758,7 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 #[cfg(feature = "receive")]
 async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     let policies = ostrya::ReceivePolicies::from_config(&repo).await?;
-    let select =
-        |_: &ostrya::access::Namespace| policies.select(&client).map(|(_, policy)| policy.as_ref());
+    let select = || policies.select(&client).map(|(_, policy)| policy.as_ref());
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.
@@ -5705,10 +5804,12 @@ async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
         rules: args
             .allow_remote
             .into_iter()
+            .chain(args.allow_collection)
             .map(|pattern| (pattern, rule.clone()))
             .collect(),
         default_rule: rule,
         allow_privileged: args.allow_privileged,
+        disable_verify_bindings: args.disable_verify_bindings,
         ..ostrya::StreamPolicy::default()
     };
     let input = match &args.input {
@@ -5866,6 +5967,7 @@ async fn send_one_way(repo: Repo, args: SendArgs) -> Result<()> {
     let opts = ostrya::ExportStreamOptions {
         updates,
         compression: push_compression(args.compress),
+        disable_verify_bindings: args.disable_verify_bindings,
     };
     repo.export_stream(stdout_file()?, opts).await?;
     Ok(())
@@ -5922,11 +6024,13 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
+    let tags = parse_refs(&args.tags)?;
     let opts = ostrya::RepoPushOptions {
         refspecs: args.refspecs,
         depth: args.depth,
         collection: args.collection,
-        tags: args.tags,
+        tags,
+        disable_verify_bindings: args.disable_verify_bindings,
         compression: push_compression(args.compress),
         force: args.force,
         progress,
@@ -5972,6 +6076,21 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     Ok(())
 }
 
+/// Reads each branch or tag of a push as a ref: `NAME`, `REMOTE:NAME`, or
+/// `@ID:NAME`. The push refuses a remote ref itself.
+///
+/// # Errors
+///
+/// [`Error::InvalidRefspec`] with the text of the first value that is not a
+/// ref.
+#[cfg(feature = "push")]
+fn parse_refs(texts: &[String]) -> Result<Vec<Ref>> {
+    Ok(texts
+        .iter()
+        .map(|text| text.parse::<Ref>())
+        .collect::<std::result::Result<_, _>>()?)
+}
+
 /// Pushes the tree of the commit of one revision to a remote over ssh or
 /// HTTP, and asks the server to commit it onto the branch of `--onto`.
 ///
@@ -5998,12 +6117,14 @@ async fn push_onto(repo: Repo, verbose: bool, mut args: PushArgs) -> Result<()> 
     });
     let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
+    let onto = onto.parse::<Ref>()?;
+    let tags = parse_refs(&args.tags)?;
     let (progress, bar) = PushBar::start();
     let opts = ostrya::PushOntoOptions {
         rev: rev.clone(),
         onto,
         collection: args.collection,
-        tags: args.tags,
+        tags,
         bind_refs: args.bind_refs,
         orphan: args.orphan,
         timestamp,
@@ -6228,10 +6349,12 @@ async fn push_tree(
         Some(path) => Some(refuse!(read_body_file(path))),
         None => args.body,
     };
+    let onto = onto.parse::<Ref>()?;
+    let tags = parse_refs(&args.tags)?;
     let (progress, bar) = PushBar::start();
     let opts = ostrya::remote::TreePushOptions {
         onto,
-        tags: args.tags,
+        tags,
         bind_refs: args.bind_refs,
         orphan: args.orphan,
         collection: args.collection,

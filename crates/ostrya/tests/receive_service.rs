@@ -39,7 +39,6 @@ fn hello(refs: &[&str]) -> Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| r.to_string()).collect(),
-        collection: None,
         one_way: false,
     }
 }
@@ -267,7 +266,8 @@ fn hello_refusals_keep_their_codes() {
 /// 2. the mode
 /// 3. `[core] locking=false`, for a two-way `Hello` only
 /// 4. the ref names
-/// 5. the size of the reply, for a two-way `Hello` only
+/// 5. two names of one ref
+/// 6. the size of the reply, for a two-way `Hello` only
 ///
 /// It opens no transaction, and it leaves the refusal of a `bare` repository
 /// to `hello`. `hello` refuses a reply that is too large before it takes the
@@ -275,7 +275,8 @@ fn hello_refusals_keep_their_codes() {
 #[test]
 fn check_hello_runs_its_checks_in_order() {
     let check = |repo: &Repo, hello: &Hello| ReceiveService::check_hello(repo, hello);
-    let many = vec!["m"; 100_000];
+    let names: Vec<String> = (0..40_000).map(|i| i.to_string()).collect();
+    let many: Vec<&str> = names.iter().map(String::as_str).collect();
 
     let tmp = TmpDir::new("svc-check-locking");
     let repo = new_repo(&tmp, RepoMode::Archive, "locking=false\n");
@@ -307,6 +308,9 @@ fn check_hello_runs_its_checks_in_order() {
     let mut bad_name = hello(&many);
     bad_name.refs.push("bad//name".into());
     assert_eq!(code(&check(&repo, &bad_name)), Some(ErrorCode::InvalidRef));
+    let mut duplicate = hello(&many);
+    duplicate.refs.push("0".into());
+    assert_eq!(code(&check(&repo, &duplicate)), Some(ErrorCode::Protocol));
     assert_eq!(
         code(&check(&repo, &hello(&many))),
         Some(ErrorCode::LimitExceeded)
@@ -320,7 +324,7 @@ fn check_hello_runs_its_checks_in_order() {
     let opened = opened.map(|_| ());
     assert_eq!(code(&opened), Some(ErrorCode::LimitExceeded), "{opened:?}");
     let message = opened.unwrap_err().to_string();
-    assert!(message.contains("100000 refs"), "{message}");
+    assert!(message.contains("40000 refs"), "{message}");
     assert!(
         waited < Duration::from_secs(1),
         "the Hello returned after {waited:?}"
@@ -333,21 +337,32 @@ fn check_hello_runs_its_checks_in_order() {
 }
 
 /// A collection id is one name under `refs/mirrors/`, so `check_hello`
-/// takes an id of 255 bytes and refuses an id of 256 bytes with
-/// `invalid-ref`.
+/// takes a ref `@ID:NAME` with an id of 255 bytes and refuses an id of 256
+/// bytes with `invalid-ref`.
 #[test]
 fn a_collection_id_over_255_bytes_is_invalid_ref() {
     let tmp = TmpDir::new("svc-check-long-collection");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let with_id = |len: usize| Hello {
-        collection: Some(format!("org.{}", "a".repeat(len - 4))),
-        ..hello(&["main"])
-    };
+    let with_id = |len: usize| hello(&[&format!("@org.{}:main", "a".repeat(len - 4))]);
     ReceiveService::check_hello(&repo, &with_id(255)).unwrap();
     let refused = ReceiveService::check_hello(&repo, &with_id(256));
     assert_eq!(code(&refused), Some(ErrorCode::InvalidRef), "{refused:?}");
     let message = refused.unwrap_err().to_string();
-    assert!(message.contains("256 bytes"), "{message}");
+    assert!(message.contains("invalid ref name"), "{message}");
+}
+
+/// `check_hello` refuses two names of one ref with `protocol`: one name two
+/// times, and `NAME` with `@ID:NAME` where `ID` is the collection id of the
+/// repository.
+#[test]
+fn check_hello_refuses_two_names_of_one_ref() {
+    let tmp = TmpDir::new("svc-check-duplicate");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    for names in [&["a", "a"][..], &["a", "@org.example.C:a"]] {
+        let refused = ReceiveService::check_hello(&repo, &hello(names));
+        assert_eq!(code(&refused), Some(ErrorCode::Protocol), "{refused:?}");
+    }
+    ReceiveService::check_hello(&repo, &hello(&["a", "@org.example.Os:a"])).unwrap();
 }
 
 /// Two concurrent streams carry the objects of the fixture commit. The
@@ -374,9 +389,9 @@ fn a_push_through_the_steps_commits() {
 
     let have = block_on(service.have(names.clone())).unwrap();
     assert!((0..names.len()).all(|i| !have.is_missing(i)));
-    let report = block_on(service.commit(fixture_update())).unwrap();
+    let committed = block_on(service.commit(fixture_update())).unwrap();
     assert_eq!(
-        report.refs,
+        committed.reply,
         vec![RefOutcome {
             name: "test/main".into(),
             old: None,
@@ -474,7 +489,7 @@ fn the_same_objects_on_two_streams_both_succeed() {
         ra.objects as usize + rb.objects as usize > objects.len(),
         "{ra:?} {rb:?}"
     );
-    let report = block_on(service.commit(fixture_update())).unwrap();
+    let report = block_on(service.commit(fixture_update())).unwrap().report;
     assert_eq!(
         (report.stats.metadata_written + report.stats.content_written) as usize,
         objects.len(),

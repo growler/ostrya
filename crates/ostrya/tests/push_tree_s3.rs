@@ -140,7 +140,7 @@ fn caller_entries() -> Vec<(String, Value)> {
 /// subject, the body, the timestamp, and the metadata of these tests.
 fn tree_options(branch: &str) -> TreePushOptions {
     TreePushOptions {
-        onto: branch.into(),
+        onto: branch.parse().unwrap_or_else(|_| Ref::local(branch)),
         subject: Some(SUBJECT.into()),
         body: Some(BODY.into()),
         timestamp: Some(TIMESTAMP),
@@ -695,6 +695,51 @@ fn the_namespace_follows_the_collection_and_the_bucket_id() {
             server.state().objects["repo/refs/mirrors/org.example.A/ns"].bytes,
             b"junk"
         );
+
+        // The branch names its namespace. The collection of the push keeps
+        // a branch of its own id. The ref binding holds the name part of the
+        // branch.
+        for (opts, dir, binding) in [
+            (
+                tree_options("@org.example.B:named"),
+                "refs/mirrors/org.example.B",
+                B,
+            ),
+            (tree_options("@org.example.A:named"), "refs/heads", A),
+            (
+                TreePushOptions {
+                    collection: Some("org.example.C".into()),
+                    ..tree_options("@org.example.C:named")
+                },
+                "refs/mirrors/org.example.C",
+                "org.example.C",
+            ),
+        ] {
+            let commit = push_tree(&server.endpoint(), &src, opts, write(false))
+                .await
+                .unwrap()
+                .outcome
+                .commit
+                .unwrap();
+            assert_eq!(ref_of(&server, &format!("repo/{dir}/named")), Some(commit));
+            let stored = stored_commit(&server, &commit);
+            assert_eq!(stored.collection_binding(), Some(binding));
+            assert_eq!(stored.ref_bindings(), ["named"]);
+        }
+
+        // A branch of another collection than the collection of the push is
+        // refused before a request.
+        server.state().requests.clear();
+        let opts = TreePushOptions {
+            collection: Some("org.example.C".into()),
+            ..tree_options("@org.example.B:named")
+        };
+        let message = refused(push_tree(&server.endpoint(), &src, opts, write(false)).await);
+        assert!(
+            message.contains("names the collection 'org.example.B'"),
+            "{message}"
+        );
+        assert!(server.state().requests.is_empty());
     });
 }
 
@@ -724,6 +769,21 @@ fn the_anchor_ref_is_refused_in_the_local_refs_of_a_bucket_with_an_id() {
         assert!(keys(&server, "repo/objects/").is_empty());
         assert!(keys(&server, "repo/refs/").is_empty());
         assert!(!server.state().objects.contains_key(LOCK));
+        // `@OWN:ostree-metadata` is the local ref.
+        let result = push_tree(
+            &server.endpoint(),
+            &src,
+            tree_options("@org.example.A:ostree-metadata"),
+            write(false),
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Remote(ostrya::remote::Error::RefDenied(_)))
+            ),
+            "{result:?}"
+        );
         let opts = TreePushOptions {
             collection: Some(B.into()),
             ..tree_options("ostree-metadata")
@@ -826,7 +886,7 @@ fn a_refusal_of_the_options_or_the_walk_sends_no_request() {
                 &server.endpoint(),
                 &src,
                 TreePushOptions {
-                    tags: vec!["v1".into()],
+                    tags: vec![Ref::local("v1")],
                     ..tree_options(BRANCH)
                 },
                 write(false),

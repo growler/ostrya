@@ -1141,11 +1141,11 @@ mod cli {
         )
     }
 
-    /// A commit bound to a collection that the server does not own goes to
+    /// A DST `@ID:NAME` of a collection that the server does not own goes to
     /// `refs/mirrors/ID/` of the server, and `refs/heads/` stays empty. On a
-    /// server that owns the collection, the same commit goes to its local
-    /// refs. The `ostree` command lists both refs as `(ID, main)` and checks
-    /// both repositories.
+    /// server that owns the collection, a plain DST takes a commit bound to
+    /// it, and goes to its local refs. The `ostree` command lists both refs
+    /// as `(ID, main)` and checks both repositories.
     #[test]
     fn a_collection_push_writes_the_refs_of_the_collection() {
         let setup = Setup::new("cli-collection", "archive");
@@ -1153,9 +1153,9 @@ mod cli {
         let c = setup.commit("main", FILES, &[]);
         let dest = receiver(&setup.base, RepoMode::Archive);
         client_group(&dest, "w:@org.example.Os:**");
-        let out = setup.push_to(&dest, &["main"]);
+        let out = setup.push_to(&dest, &["main:@org.example.Os:main"]);
         assert!(out.status.success(), "{}", stderr(&out));
-        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        assert_eq!(stdout(&out), format!("@org.example.Os:main (new) {c}\n"));
         assert_eq!(
             std::fs::read_to_string(dest.join("refs/mirrors/org.example.Os/main")).unwrap(),
             format!("{c}\n")
@@ -1178,14 +1178,44 @@ mod cli {
         }
     }
 
-    /// Commits with different bindings, a `--collection` that differs from
-    /// the binding, and a `--collection` that fails the collection-id rule
-    /// or is longer than 255 bytes are refused before ssh starts.
+    /// One push writes a local ref and the refs of two collections. Each DST
+    /// names its namespace, and the binding of each commit names the same
+    /// collection.
+    #[test]
+    fn one_push_writes_a_local_ref_and_the_refs_of_two_collections() {
+        let setup = Setup::new("cli-collection-two", "archive");
+        let main = setup.commit("main", FILES, &[]);
+        let a = setup.commit("@org.example.A:a", FILES, &[]);
+        let b = setup.commit("@org.example.B:b", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:main;w:@org.example.A:**;w:@org.example.B:**");
+        let out = setup.push_to(&dest, &["main", "@org.example.A:a", "@org.example.B:b"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("main (new) {main}\n@org.example.A:a (new) {a}\n@org.example.B:b (new) {b}\n")
+        );
+        assert_eq!(server_tip(&dest, "main"), Some(main));
+        for (path, commit) in [
+            ("refs/mirrors/org.example.A/a", a),
+            ("refs/mirrors/org.example.B/b", b),
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(dest.join(path)).unwrap(),
+                format!("{commit}\n"),
+                "{path}"
+            );
+        }
+    }
+
+    /// A DST or a tag `@X:NAME` whose commit is bound to another collection,
+    /// and a `--collection` that fails the collection-id rule or is longer
+    /// than 255 bytes, are refused before ssh starts.
     #[test]
     fn disagreeing_collections_are_refused_before_ssh_starts() {
         let setup = Setup::new("cli-collection-mixed", "archive");
         set_collection_id(&setup.client, Some("org.example.A"));
-        setup.commit("os-a", FILES, &[]);
+        setup.commit("os-a", FILES, &["--bind-ref=t"]);
         set_collection_id(&setup.client, Some("org.example.B"));
         setup.commit("os-b", FILES, &[]);
         set_collection_id(&setup.client, None);
@@ -1194,9 +1224,16 @@ mod cli {
         let long_arg = format!("--collection={long}");
         let long_error = format!("error: Invalid collection ID {long}\n");
         for (args, prefix) in [
-            (&["os-a", "os-b"][..], "error: binding-mismatch: "),
+            (
+                &["os-a:@org.example.A:os-a", "os-b:@org.example.A:os-b"][..],
+                "error: binding-mismatch: ",
+            ),
             (
                 &["--collection=org.example.B", "os-a"],
+                "error: binding-mismatch: ",
+            ),
+            (
+                &["--tag=@org.example.B:t", "os-a:@org.example.A:os-a"],
                 "error: binding-mismatch: ",
             ),
             (
@@ -1212,6 +1249,94 @@ mod cli {
         assert!(!dest.join("refs/mirrors").join("org.example.A").exists());
     }
 
+    /// `--collection=ID` adds `@ID:` to each plain DST and to each plain tag,
+    /// and keeps an `@ID:` DST or tag. A DST `@Y:NAME`, a DST that defaults
+    /// from a SRC `@Y:NAME`, and a tag `@Y:NAME`, with Y other than ID, are
+    /// refused before ssh starts.
+    #[test]
+    fn the_collection_option_takes_its_own_collection_alone() {
+        let setup = Setup::new("cli-collection-option", "archive");
+        set_collection_id(&setup.client, Some("org.example.A"));
+        let c = setup.commit("main", FILES, &["--bind-ref=v1", "--bind-ref=v2"]);
+        setup.commit("@org.example.B:x", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        for args in [
+            &["--collection=org.example.A", "main:@org.example.B:main"][..],
+            &["--collection=org.example.A", "@org.example.B:x"],
+            &[
+                "--collection=org.example.A",
+                "--tag=@org.example.B:v1",
+                "main",
+            ],
+        ] {
+            let out = setup.push_to(&dest, args);
+            assert_failed(&out, "error: invalid input: ");
+            assert!(stderr(&out).contains("'org.example.B'"), "{}", stderr(&out));
+            assert!(!setup.ssh_started(), "{args:?}");
+        }
+
+        client_group(&dest, "w:@org.example.A:**");
+        let out = setup.push_to(
+            &dest,
+            &[
+                "--collection=org.example.A",
+                "--tag=v1",
+                "--tag=@org.example.A:v2",
+                "main:@org.example.A:main",
+            ],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!(
+                "@org.example.A:main (new) {c}\n@org.example.A:v1 (new) {c}\n\
+                 @org.example.A:v2 (new) {c}\n"
+            )
+        );
+        for name in ["main", "v1", "v2"] {
+            assert_eq!(
+                std::fs::read_to_string(dest.join("refs/mirrors/org.example.A").join(name))
+                    .unwrap(),
+                format!("{c}\n"),
+                "{name}"
+            );
+        }
+        assert!(!dest.join("refs/heads/main").exists());
+    }
+
+    /// The `ostree.ref-binding` list of the commit must hold the name part
+    /// of the DST, so `main:@X:stable` is refused before ssh starts.
+    /// `--disable-verify-bindings` skips the check of the client, and the
+    /// server then refuses the commit unless the client group has the key
+    /// `disable-verify-bindings`. With the key, the push writes the ref.
+    #[test]
+    fn disable_verify_bindings_skips_the_ref_binding_check_of_the_client() {
+        let setup = Setup::new("cli-disable-bindings", "archive");
+        set_collection_id(&setup.client, Some("org.example.A"));
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:@org.example.A:**");
+        let refspec = "main:@org.example.A:stable";
+        let out = setup.push_to(&dest, &[refspec]);
+        assert_failed(&out, "error: binding-mismatch: ");
+        assert!(!setup.ssh_started());
+
+        let out = setup.push_to(&dest, &["--disable-verify-bindings", refspec]);
+        assert_failed(&out, "error: binding-mismatch: ");
+        assert!(setup.ssh_started());
+        let stable = dest.join("refs/mirrors/org.example.A/stable");
+        assert!(!stable.exists());
+
+        let config = dest.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("disable-verify-bindings=true\n");
+        std::fs::write(&config, text).unwrap();
+        let out = setup.push_to(&dest, &["--disable-verify-bindings", refspec]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("@org.example.A:stable (new) {c}\n"));
+        assert_eq!(std::fs::read_to_string(stable).unwrap(), format!("{c}\n"));
+    }
+
     /// The items of the local refs, of another collection, and of the
     /// collection on another ref give no right on the ref, so the push gets
     /// `ref-denied` from `ostrya receive`. The items of the collection decide
@@ -1222,22 +1347,26 @@ mod cli {
         set_collection_id(&setup.client, Some("org.example.Os"));
         let c = setup.commit("main", FILES, &[]);
         let dest = receiver(&setup.base, RepoMode::Archive);
-        let out = setup.push_to(&dest, &["main"]);
+        let refspec = "main:@org.example.Os:main";
+        let out = setup.push_to(&dest, &[refspec]);
         assert_failed(&out, "error: ref-denied: ");
         let receive = std::fs::read_to_string(stderr_of(&setup.status)).unwrap();
         assert!(receive.starts_with("error: ref-denied: "), "{receive}");
-        assert!(receive.contains("no r on ref 'main'"), "{receive}");
+        assert!(
+            receive.contains("no r on ref '@org.example.Os:main'"),
+            "{receive}"
+        );
 
         client_group(
             &dest,
             "w:@org.example.Os:other;w:@org.example.Other:main;w:main",
         );
-        let out = setup.push_to(&dest, &["main"]);
+        let out = setup.push_to(&dest, &[refspec]);
         assert_failed(&out, "error: ref-denied: ");
         client_group(&dest, "w:@org.example.Os:**");
-        let out = setup.push_to(&dest, &["main"]);
+        let out = setup.push_to(&dest, &[refspec]);
         assert!(out.status.success(), "{}", stderr(&out));
-        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        assert_eq!(stdout(&out), format!("@org.example.Os:main (new) {c}\n"));
     }
 
     /// `--tag` creates the tag at the pushed commit, and its line follows
@@ -2030,8 +2159,8 @@ mod cli {
                 (vec!["--compress=0"], "--compress"),
                 (vec!["--tag", "main"], "is also the branch"),
                 (vec!["--tag", "t", "--tag", "t"], "is named twice"),
-                (vec!["--tag", "main^"], "is not a valid ref name"),
-                (vec!["--tag", "origin:main"], "holds ':'"),
+                (vec!["--tag", "main^"], "error: Invalid refspec main^"),
+                (vec!["--tag", "origin:main"], "is a remote ref"),
                 (vec!["--tag", hex.as_str()], "looks like a checksum"),
                 (vec!["--bind-ref", "o:b"], "bound name 'o:b'"),
                 (vec!["--collection=no-dot"], "invalid collection id"),
@@ -2172,6 +2301,43 @@ mod cli {
             assert_eq!(commit.collection_binding(), Some("org.example.Os"));
             assert_eq!(commit.ref_bindings(), ["main"]);
             assert_eq!(server_tip(&dest, "main"), None);
+
+            // `@ID:NAME` operands name the collection, as --collection does.
+            // The branch and each tag are in one namespace.
+            client_group(&dest, "w:**;c:@org.example.Os:**;t:@org.example.Os:**");
+            let out = push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &[
+                    "--onto",
+                    "@org.example.Os:next",
+                    "--tag",
+                    "@org.example.Os:t",
+                ],
+            );
+            let c = pushed(&out);
+            for name in ["next", "t"] {
+                let path = dest.join("refs/mirrors/org.example.Os").join(name);
+                assert_eq!(std::fs::read_to_string(path).unwrap(), format!("{c}\n"));
+            }
+            let commit = load(&dest, &c);
+            assert_eq!(commit.collection_binding(), Some("org.example.Os"));
+            assert_eq!(commit.ref_bindings(), ["next", "t"]);
+            for args in [
+                &["--onto", "main", "--tag", "@org.example.Os:u"][..],
+                &[
+                    "--onto",
+                    "@org.example.Other:a",
+                    "--collection=org.example.Os",
+                ],
+            ] {
+                let out = push_tree_to(&setup, &dest, &tree, args);
+                assert_failed(&out, "error: invalid input: ");
+            }
+            assert_eq!(server_tip(&dest, "main"), None);
+            assert!(!dest.join("refs/mirrors/org.example.Os/u").exists());
+            assert!(!dest.join("refs/mirrors/org.example.Other").exists());
         }
 
         /// With no `--timestamp` and no `SOURCE_DATE_EPOCH`, the push sends no
@@ -2373,6 +2539,27 @@ mod cli {
                 load(&dest, &mirrored).collection_binding(),
                 Some("org.example.Os")
             );
+
+            // `@ID:NAME` operands name the collection, and a tag of another
+            // namespace than the branch is refused.
+            client_group(&dest, "wcd:**;c:@org.example.Os:**;t:@org.example.Os:**");
+            let out = setup.push_to(
+                &dest,
+                &[
+                    "--onto=@org.example.Os:next",
+                    "--tag=@org.example.Os:t",
+                    "main",
+                ],
+            );
+            let next = pushed(&out);
+            for name in ["next", "t"] {
+                let path = dest.join("refs/mirrors/org.example.Os").join(name);
+                assert_eq!(std::fs::read_to_string(path).unwrap(), format!("{next}\n"));
+            }
+            assert_eq!(load(&dest, &next).ref_bindings(), ["next", "t"]);
+            let out = setup.push_to(&dest, &["--onto=main", "--tag=@org.example.Os:u", "main"]);
+            assert_failed(&out, "error: invalid input: ");
+            assert!(!dest.join("refs/mirrors/org.example.Os/u").exists());
         }
     }
 }

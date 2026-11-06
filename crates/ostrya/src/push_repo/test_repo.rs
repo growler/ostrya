@@ -41,8 +41,8 @@ impl Drop for Scratch {
     }
 }
 
-/// Commits a tree with the parent `parent`, points the ref `name` at the
-/// commit, and returns its checksum. The tree holds a regular file `file`
+/// Commits a tree with the parent `parent`, points the ref `name`, in the
+/// text form of [`Ref`](crate::Ref), at the commit, and returns its checksum. The tree holds a regular file `file`
 /// with `content` and a symlink `link` to `file`.
 pub(super) async fn commit_tree(
     repo: &Repo,
@@ -79,7 +79,7 @@ pub(super) async fn commit_tree(
         )
         .await
         .unwrap();
-    txn.set_ref(&crate::refs::refspec_ref(name), Some(&commit));
+    txn.set_ref(&name.parse::<crate::Ref>().unwrap(), Some(&commit));
     txn.commit().await.unwrap();
     commit
 }

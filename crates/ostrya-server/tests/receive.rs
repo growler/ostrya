@@ -276,7 +276,6 @@ fn hello() -> Message {
         version: 1,
         agent: None,
         refs: vec!["main".into()],
-        collection: None,
         one_way: false,
     })
 }
@@ -806,7 +805,6 @@ fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
             version: 1,
             agent: None,
             refs: vec!["a//b".into()],
-            collection: None,
             one_way: false,
         });
         let reply = client.post(SESSION, encode(&[bad]).await).await;
@@ -945,7 +943,6 @@ async fn open_named(client: &Client, refs: &[&str]) -> String {
         version: 1,
         agent: None,
         refs: refs.iter().map(|&r| r.into()).collect(),
-        collection: None,
         one_way: false,
     });
     let reply = client.post(SESSION, encode(&[hello]).await).await;
@@ -1710,11 +1707,11 @@ fn a_net_item_identifies_the_peer_address() {
     });
 }
 
-/// An item whose group has no item of the namespace of `Hello` opens no
-/// session: `Hello` gets 422 with `ref-denied`. Here the anonymous item of a
-/// group with items of a collection alone in the local refs, and the
-/// anonymous item of a group with items of the local refs alone in a
-/// collection.
+/// An item whose group has no item of the namespace of a ref of `Hello`
+/// opens no session: `Hello` gets 422 with `ref-denied`. Here the anonymous
+/// item of a group with items of a collection alone and a local ref, and the
+/// anonymous item of a group with items of the local refs alone and a ref of
+/// a collection.
 #[test]
 fn an_item_with_no_rights_in_the_namespace_gets_ref_denied() {
     let tmp = TmpDir::new("no-group");
@@ -1729,7 +1726,7 @@ fn an_item_with_no_rights_in_the_namespace_gets_ref_denied() {
         assert!(error.message.contains("no r on ref"), "{error:?}");
     });
     with_server(repo.clone(), options(&repo), |client, _| async move {
-        let hello = hello_in(&["main"], Some("org.example.Os"));
+        let hello = hello_in(&["@org.example.Os:main"]);
         let reply = client.post(SESSION, encode(&[hello]).await).await;
         let error = reply.error(422, ErrorCode::RefDenied);
         assert!(error.message.contains("no r on ref"), "{error:?}");
@@ -1737,24 +1734,24 @@ fn an_item_with_no_rights_in_the_namespace_gets_ref_denied() {
     assert_released(&repo);
 }
 
-/// `Hello` with the refs `refs` in the collection `collection`.
-fn hello_in(refs: &[&str], collection: Option<&str>) -> Message {
+/// `Hello` with the refs `refs`.
+fn hello_in(refs: &[&str]) -> Message {
     Message::Hello(Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| (*r).to_owned()).collect(),
-        collection: collection.map(str::to_owned),
         one_way: false,
     })
 }
 
-/// The collection of `Hello` selects the items of its namespace. The items
-/// of one collection give no right in another collection. The own
-/// collection id selects the items of the local refs. `HelloReply` reports
-/// the collection, and no collection for the local refs. A collection id
-/// that fails the rule is 422 with `invalid-ref`.
+/// Each ref of `Hello` takes the items of its own namespace, and one session
+/// can name refs of more than one namespace. The items of one collection
+/// give no right in another collection. A ref of the own collection id takes
+/// the items of the local refs. `HelloReply` gives each name as the client
+/// sent it. A name whose collection id fails the rule is 422 with
+/// `invalid-ref`, and two names of one ref are 422 with `protocol`.
 #[test]
-fn the_collection_of_hello_selects_the_items_of_its_namespace() {
+fn each_ref_of_hello_takes_the_items_of_its_namespace() {
     let tmp = TmpDir::new("namespace-groups");
     let repo = receiver(
         tmp.path(),
@@ -1767,54 +1764,53 @@ fn the_collection_of_hello_selects_the_items_of_its_namespace() {
          allow=w:local/**;w:@org.example.Os:os/**;w:@org.example.Other:main\n",
     );
     with_server(repo.clone(), opts, |client, _| async move {
-        for (refs, collection, reported) in [
-            (
-                &["os/x"][..],
-                Some("org.example.Os"),
-                Some("org.example.Os"),
-            ),
-            (
-                &["main"],
-                Some("org.example.Other"),
-                Some("org.example.Other"),
-            ),
-            (&["local/x"], Some("org.example.C"), None),
-            (&["local/x"], None, None),
+        for refs in [
+            &["@org.example.Os:os/x"][..],
+            &["@org.example.Other:main"],
+            &["@org.example.C:local/x"],
+            &["local/x"],
+            &[
+                "local/x",
+                "@org.example.Os:os/x",
+                "@org.example.Other:main",
+                "@org.example.C:local/y",
+            ],
         ] {
-            let reply = client
-                .post(SESSION, encode(&[hello_in(refs, collection)]).await)
-                .await;
+            let reply = client.post(SESSION, encode(&[hello_in(refs)]).await).await;
             let Message::HelloReply(hello_reply) = reply.ok() else {
                 panic!("no HelloReply");
             };
-            assert_eq!(
-                hello_reply.collection.as_deref(),
-                reported,
-                "{collection:?}"
-            );
+            let names: Vec<&str> = hello_reply.refs.iter().map(|r| r.name.as_str()).collect();
+            assert_eq!(names, refs);
+            assert_eq!(hello_reply.collection_id.as_deref(), Some("org.example.C"));
             let id = reply.headers["ostrya-session"].to_str().unwrap().to_owned();
             assert_eq!(client.delete(&id).await.status, 204);
         }
         // The items of `org.example.Other` give no right on `main` in another
         // namespace.
-        for (refs, collection) in [
-            (&["main"][..], Some("org.example.Os")),
-            (&["main"], None),
-            (&["main"], Some("org.example.Third")),
+        for refs in [
+            &["@org.example.Os:main"][..],
+            &["main"],
+            &["@org.example.C:main"],
+            &["@org.example.Third:main"],
+            &["local/x", "@org.example.Os:main"],
         ] {
-            let reply = client
-                .post(SESSION, encode(&[hello_in(refs, collection)]).await)
-                .await;
+            let reply = client.post(SESSION, encode(&[hello_in(refs)]).await).await;
             reply.error(422, ErrorCode::RefDenied);
         }
         let reply = client
-            .post(
-                SESSION,
-                encode(&[hello_in(&["main"], Some("no-dot"))]).await,
-            )
+            .post(SESSION, encode(&[hello_in(&["@no-dot:main"])]).await)
             .await;
         let error = reply.error(422, ErrorCode::InvalidRef);
-        assert!(error.message.contains("collection id"), "{error:?}");
+        assert!(error.message.contains("@no-dot:main"), "{error:?}");
+        for refs in [
+            &["local/x", "local/x"][..],
+            &["local/x", "@org.example.C:local/x"],
+        ] {
+            let reply = client.post(SESSION, encode(&[hello_in(refs)]).await).await;
+            let error = reply.error(422, ErrorCode::Protocol);
+            assert!(error.message.contains("two times"), "{error:?}");
+        }
     });
     assert_released(&repo);
 }

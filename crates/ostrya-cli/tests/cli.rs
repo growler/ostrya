@@ -46271,14 +46271,21 @@ fn send_one_way_refuses_a_destination_outside_the_ref_binding() {
     }
 }
 
-/// `--remote`, `--compress`, and a refspec each need `--one-way`.
+/// `--remote`, `--compress`, `--disable-verify-bindings`, and a refspec each
+/// need `--one-way`.
 #[cfg(all(feature = "send", feature = "push"))]
 #[test]
 fn send_one_way_options_need_one_way() {
     let tmp = TmpDir::new("send-one-way-requires");
     let missing = tmp.path().join("missing");
     let missing = missing.to_str().unwrap();
-    for option in ["--remote=os", "--compress", "--compress=3", BRANCH] {
+    for option in [
+        "--remote=os",
+        "--compress",
+        "--compress=3",
+        "--disable-verify-bindings",
+        BRANCH,
+    ] {
         let run = ostrya(
             &["send", "--repo", missing, option],
             None,
@@ -46572,8 +46579,9 @@ fn receive_one_way_refuses_an_input_that_does_not_open() {
     assert_no_staging(&guest, "missing");
 }
 
-/// `--allow-remote`, `--trust`, `--allow-privileged`, `--stop-at-commit`,
-/// and `--input` each need `--one-way`.
+/// `--allow-remote`, `--allow-collection`, `--trust`, `--allow-privileged`,
+/// `--disable-verify-bindings`, `--stop-at-commit`, and `--input` each need
+/// `--one-way`.
 #[cfg(all(feature = "send", feature = "push", feature = "receive"))]
 #[test]
 fn receive_one_way_options_need_one_way() {
@@ -46582,8 +46590,10 @@ fn receive_one_way_options_need_one_way() {
     let missing = missing.to_str().unwrap();
     for option in [
         "--allow-remote=os",
+        "--allow-collection=org.example.X",
         "--trust=t",
         "--allow-privileged",
+        "--disable-verify-bindings",
         "--stop-at-commit",
         "--input=x",
     ] {
@@ -46692,6 +46702,205 @@ fn receive_one_way_refuses_an_invalid_allow_remote() {
         );
     }
     assert!(!Path::new(missing).exists());
+}
+
+/// The option parser refuses a value of `--allow-collection` that is no
+/// collection id, or that is longer than 255 bytes, before the repository
+/// opens.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_refuses_an_invalid_allow_collection() {
+    let tmp = TmpDir::new("receive-one-way-allow-collection");
+    let missing = tmp.path().join("missing");
+    let missing = missing.to_str().unwrap();
+    let long = format!("org.{}", "a".repeat(252));
+    for id in [
+        "no-dot",
+        "",
+        "*",
+        "1a.b",
+        "@a.b",
+        "a.b:c",
+        "a.b.",
+        long.as_str(),
+    ] {
+        let option = format!("--allow-collection={id}");
+        let run = ostrya(
+            &["receive", "--repo", missing, "--one-way", &option],
+            None,
+            &[],
+        );
+        let stderr = refused(&run, id);
+        assert!(
+            stderr.starts_with(&format!(
+                "error: invalid value '{id}' for '--allow-collection "
+            )),
+            "{id:?}: {stderr}"
+        );
+    }
+    assert!(!Path::new(missing).exists());
+}
+
+/// `send --one-way --disable-verify-bindings` writes a ref `@X:stable`
+/// whose commit is bound to X and to the refs `[main]`. `send --one-way`
+/// without the switch refuses it. A collection ref needs
+/// `--allow-collection` with its collection, and gets `ref-denied` without
+/// it. `receive --one-way --allow-collection=X` refuses the stream with
+/// `binding-mismatch`, and accepts it with `--disable-verify-bindings`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_writes_a_collection_ref_with_allow_collection() {
+    let tmp = TmpDir::new("receive-one-way-collection");
+    let base = tmp.path();
+    let source = commit_fixture(&base.join("source"));
+    let commit = commit_tree(
+        &source,
+        "@org.example.X:main",
+        &one_file_tree(base, "x"),
+        None,
+    );
+    let spec = "@org.example.X:main:@org.example.X:stable";
+    let source_arg = format!("--repo={}", source.display());
+    let run = ostrya_to_file(base, &["send", &source_arg, "--one-way", spec]);
+    let stderr = refused(&run, "checked");
+    assert!(stderr.starts_with("error: binding-mismatch: "), "{stderr}");
+    assert!(stderr.contains("'stable'"), "{stderr}");
+    let stream = send_stream(
+        base,
+        "stable",
+        &source,
+        &["--disable-verify-bindings", spec],
+    );
+
+    let guest = guest(base, "guest", "archive");
+    let before = commit_store_state(&guest);
+    for (args, code) in [
+        (&[][..], "ref-denied"),
+        (&["--allow-collection=org.example.Y"][..], "ref-denied"),
+        (
+            &["--allow-collection=org.example.X"][..],
+            "binding-mismatch",
+        ),
+    ] {
+        let run = receive_from(&guest, Some(&stream), args);
+        refused_with(&run, code, &guest, &before, &format!("{args:?}"));
+    }
+    let run = receive_from(
+        &guest,
+        Some(&stream),
+        &[
+            "--allow-collection=org.example.X",
+            "--disable-verify-bindings",
+        ],
+    );
+    received(&run, "disabled");
+    assert_eq!(
+        std::fs::read_to_string(guest.join("refs/mirrors/org.example.X/stable")).unwrap(),
+        format!("{commit}\n")
+    );
+    assert_eq!(resolve(&guest, "stable"), None);
+}
+
+/// Returns the one-way stream `stream` with each ref name `from` of its
+/// `Hello` and of its `Commit` replaced by `to`. Each other frame and each
+/// object body keeps its bytes.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn renamed_stream(stream: &[u8], from: &str, to: &str) -> Vec<u8> {
+    use ostrya::remote::proto::{FrameReader, FrameWriter, Message, ObjectRead};
+
+    let rename = |name: &mut String| {
+        if name == from {
+            *name = to.to_owned();
+        }
+    };
+    let mut reader = FrameReader::new(stream);
+    reader.set_limit(u32::MAX);
+    let mut out = Vec::new();
+    block_on(async {
+        loop {
+            let start = stream.len() - reader.get_ref().len();
+            let message = match reader.read_message().await.unwrap() {
+                Some(Message::Hello(mut hello)) => {
+                    hello.refs.iter_mut().for_each(rename);
+                    Message::Hello(hello)
+                }
+                Some(Message::Commit(mut commit)) => {
+                    for update in &mut commit.updates {
+                        rename(&mut update.name);
+                    }
+                    Message::Commit(commit)
+                }
+                Some(other) => {
+                    if let Message::ObjectHeader(_) = other {
+                        let mut buf = vec![0; 64 * 1024];
+                        while let ObjectRead::Data(_) =
+                            reader.read_object_data(&mut buf).await.unwrap()
+                        {
+                        }
+                    }
+                    let end = stream.len() - reader.get_ref().len();
+                    out.extend_from_slice(&stream[start..end]);
+                    continue;
+                }
+                None => break,
+            };
+            let mut writer = FrameWriter::new(Vec::new());
+            writer.write_message(&message).await.unwrap();
+            out.extend(writer.into_inner());
+        }
+    });
+    out
+}
+
+/// A commit with no collection binding goes to the local refs alone.
+/// `send --one-way` refuses it for a ref `@X:NAME` before it writes a byte,
+/// also with `--disable-verify-bindings`. `receive --one-way
+/// --allow-collection=X` refuses a stream that carries it on `@X:NAME`, also
+/// with `--disable-verify-bindings`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn a_one_way_collection_ref_refuses_an_unbound_commit() {
+    let tmp = TmpDir::new("one-way-collection-unbound");
+    let base = tmp.path();
+    let source = commit_fixture(&base.join("source"));
+    let collection_ref = format!("@org.example.X:{BRANCH}");
+    let spec = format!("{BRANCH}:{collection_ref}");
+    let source_arg = format!("--repo={}", source.display());
+    for extra in [&[][..], &["--disable-verify-bindings"][..]] {
+        let mut args = vec!["send", source_arg.as_str(), "--one-way", spec.as_str()];
+        args.extend_from_slice(extra);
+        let run = ostrya_to_file(base, &args);
+        let stderr = refused(&run, &format!("{extra:?}"));
+        assert!(stderr.starts_with("error: binding-mismatch: "), "{stderr}");
+        assert!(stderr.contains("no collection binding"), "{stderr}");
+    }
+
+    let plain = send_stream(base, "plain", &source, &[BRANCH]);
+    let stream = base.join("unbound");
+    std::fs::write(
+        &stream,
+        renamed_stream(&std::fs::read(&plain).unwrap(), BRANCH, &collection_ref),
+    )
+    .unwrap();
+    let guest = guest(base, "guest", "archive");
+    let before = commit_store_state(&guest);
+    for extra in [&[][..], &["--disable-verify-bindings"][..]] {
+        let mut args = vec!["--allow-collection=org.example.X"];
+        args.extend_from_slice(extra);
+        let run = receive_from(&guest, Some(&stream), &args);
+        refused_with(
+            &run,
+            "binding-mismatch",
+            &guest,
+            &before,
+            &format!("{extra:?}"),
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(stderr.contains("no collection binding"), "{stderr}");
+    }
+    let run = receive_from(&guest, Some(&plain), &[]);
+    received(&run, "plain");
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
 }
 
 /// `--trust=NAME` verifies each new commit with the keys of the trust

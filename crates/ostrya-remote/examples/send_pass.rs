@@ -40,7 +40,6 @@ async fn scripted_replies() -> io::Result<Vec<u8>> {
             version: 1,
             mode: "archive".into(),
             collection_id: None,
-            collection: None,
             max_frame: MIN_FRAME_LIMIT,
             max_have: 16_384,
             encodings: vec![Encoding::Raw, Encoding::Deflate],

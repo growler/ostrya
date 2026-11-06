@@ -16,7 +16,7 @@ use hyper::header::{
 use hyper::{Method, Request, Response, StatusCode, Version};
 use ostrya::remote::proto::{ErrorMessage, MAX_FRAME, Message};
 use ostrya::remote::{self, ErrorCode};
-use ostrya::{ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
+use ostrya::{ReceiveCommit, ReceiveReport, ReceiveService, ReceiveStep, ReceiveWarning, Repo};
 use ostrya_rt as rt;
 
 use crate::body::ServeBody;
@@ -332,15 +332,18 @@ impl<A: ReceiveAuth> Receive<A> {
                 end.committed();
             }
             drop(end);
-            result.map(|report| Delivery {
-                report: Some(report),
-                on_report,
-                delivered: false,
+            result.map(|ReceiveCommit { report, reply }| {
+                let delivery = Delivery {
+                    report: Some(report),
+                    on_report,
+                    delivered: false,
+                };
+                (reply, delivery)
             })
         });
         match task.await {
-            Ok(delivery) => {
-                let reply = Message::CommitReply(delivery.report().refs.clone());
+            Ok((reply, delivery)) => {
+                let reply = Message::CommitReply(reply);
                 match encode(&reply) {
                     Ok(bytes) => reply_response(bytes, delivery),
                     // Before it writes a ref, the commit refuses updates whose
@@ -586,12 +589,6 @@ pub(crate) struct Delivery {
     delivered: bool,
 }
 
-impl Delivery {
-    fn report(&self) -> &ReceiveReport {
-        self.report.as_ref().expect("the report goes at the drop")
-    }
-}
-
 impl Drop for Delivery {
     fn drop(&mut self) {
         let Some(mut report) = self.report.take() else {
@@ -761,7 +758,6 @@ mod tests {
             stats: TransactionStats::default(),
             warnings: Vec::new(),
             group: None,
-            collection: None,
         }
     }
 
@@ -971,7 +967,6 @@ mod tests {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
-            collection: None,
             one_way: false,
         })
     }
@@ -1349,7 +1344,6 @@ mod tests {
                 version: 1,
                 agent: None,
                 refs: vec!["main".into(), "a//b".into()],
-                collection: None,
                 one_way: false,
             });
             for open_before in [false, true] {
@@ -1378,7 +1372,6 @@ mod tests {
                 version: 2,
                 agent: None,
                 refs: vec!["main".into()],
-                collection: None,
                 one_way: true,
             });
             let (status, reply) =

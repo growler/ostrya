@@ -108,6 +108,7 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
                 allow_unsigned: group.allow_unsigned(),
                 signers: named(group.sign()),
                 allow_privileged: group.allow_privileged(),
+                disable_verify_bindings: group.disable_verify_bindings(),
                 summary_signers: summary_signers.clone(),
                 update_summary,
                 group: Some(group.name().to_owned()),

@@ -17,9 +17,9 @@ use common::TmpDir;
 use common::receive::GnupgHome;
 #[cfg(feature = "sign-spki")]
 use common::wrap_pem;
-use ostrya::access::{AccessModes, AuthItem, Namespace};
+use ostrya::access::{AccessModes, AuthItem};
 use ostrya::{
-    CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Repo, RepoMode,
+    CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Ref, Repo, RepoMode,
     ServerSigner, TrustedKeys, base64,
 };
 use ostrya_rt::block_on;
@@ -133,11 +133,11 @@ fn select_gives_the_group_and_its_policy() {
     assert_eq!(group.name(), "u");
     assert!(Arc::ptr_eq(selected, policies.get("u").unwrap()));
     assert_eq!(selected.group.as_deref(), Some("u"));
-    let os = Namespace::Collection("org.example.Os".into());
-    assert_eq!(selected.rights(&Namespace::Local, "main").to_string(), "rw");
-    assert_eq!(selected.rights(&os, "main"), AccessModes::READ);
-    let other = Namespace::Collection("org.example.Other".into());
-    assert_eq!(selected.rights(&other, "main"), AccessModes::NONE);
+    assert_eq!(selected.rights(&Ref::local("main")).to_string(), "rw");
+    let os = Ref::collection("org.example.Os", "main");
+    assert_eq!(selected.rights(&os), AccessModes::READ);
+    let other = Ref::collection("org.example.Other", "main");
+    assert_eq!(selected.rights(&other), AccessModes::NONE);
     let (group, _) = policies.select(&AuthItem::parse("ssh:v").unwrap()).unwrap();
     assert_eq!(group.name(), "v");
     let other = AuthItem::parse("ssh:w").unwrap();
@@ -158,12 +158,15 @@ fn no_client_group_gives_the_implicit_policies() {
         .map(|g| g.name())
         .collect();
     assert_eq!(names, ["anonymous"]);
-    let os = Namespace::Collection("org.example.Os".into());
     for name in names {
         let policy = group(&policies, name);
-        for namespace in [&Namespace::Local, &os] {
-            assert_eq!(policy.rights(namespace, "main"), AccessModes::READ);
-            assert_eq!(policy.rights(namespace, "a/b/c"), AccessModes::READ);
+        for r in [
+            "main",
+            "a/b/c",
+            "@org.example.Os:main",
+            "@org.example.Os:a/b/c",
+        ] {
+            assert_eq!(policy.rights(&r.parse().unwrap()), AccessModes::READ, "{r}");
         }
         assert!(!policy.rules.opens_push_session(), "{name}");
         assert!(keys(policy).is_none());
@@ -196,12 +199,9 @@ fn each_group_key_reaches_its_own_field() {
     )
     .unwrap();
     let full = group(&policies, "full");
-    assert_eq!(full.rights(&Namespace::Local, "apps/a").to_string(), "rwd");
-    assert_eq!(full.rights(&Namespace::Local, "main").to_string(), "r");
-    assert_eq!(
-        full.rights(&Namespace::Local, "apps/secret"),
-        AccessModes::NONE
-    );
+    assert_eq!(full.rights(&Ref::local("apps/a")).to_string(), "rwd");
+    assert_eq!(full.rights(&Ref::local("main")).to_string(), "r");
+    assert_eq!(full.rights(&Ref::local("apps/secret")), AccessModes::NONE);
     assert!(keys(full).is_some());
     assert!(!full.allow_unsigned);
     assert_eq!(full.signers.len(), 1);
@@ -209,8 +209,8 @@ fn each_group_key_reaches_its_own_field() {
     assert_eq!(full.summary_signers.len(), 1);
 
     let plain = group(&policies, "plain");
-    assert_eq!(plain.rights(&Namespace::Local, "tags/v1").to_string(), "rt");
-    assert_eq!(plain.rights(&Namespace::Local, "main"), AccessModes::NONE);
+    assert_eq!(plain.rights(&Ref::local("tags/v1")).to_string(), "rt");
+    assert_eq!(plain.rights(&Ref::local("main")), AccessModes::NONE);
     assert!(keys(plain).is_none());
     assert!(plain.allow_unsigned);
     assert!(plain.signers.is_empty());
@@ -1098,8 +1098,8 @@ fn the_tool_keeps_a_client_group_verbatim() {
     let repo = block_on(Repo::open(&repo)).unwrap();
     let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
     let ci = group(&policies, "ci");
-    assert_eq!(ci.rights(&Namespace::Local, "apps/a/b").to_string(), "rw");
-    assert_eq!(ci.rights(&Namespace::Local, "main").to_string(), "r");
+    assert_eq!(ci.rights(&Ref::local("apps/a/b")).to_string(), "rw");
+    assert_eq!(ci.rights(&Ref::local("main")).to_string(), "r");
 }
 
 /// The policies move across tasks and threads.

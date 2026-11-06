@@ -9,7 +9,7 @@ use std::task::{Context, Poll};
 
 use futures_io::AsyncWrite;
 use futures_lite::io::BufWriter;
-use ostrya_core::{Checksum, ObjectName};
+use ostrya_core::{Checksum, ObjectName, Ref};
 
 use super::progress::Counters;
 use super::stream::WRITE_BUFFER;
@@ -115,11 +115,11 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// Before it writes the first byte, the call returns:
 ///
 /// - [`Error::InvalidInput`] if `updates` is empty, or names a ref twice.
-/// - [`Error::InvalidInput`] if a ref name fails the rule of
-///   [`ostrya_core::is_refspec`].
-/// - [`Error::InvalidInput`] if an update writes a ref name of 64 lowercase
-///   hex characters with no `REMOTE:` part. A revision reads such a name as a
-///   commit checksum.
+/// - [`Error::InvalidInput`] if a ref name is not `NAME`, `REMOTE:NAME`, or
+///   `@ID:NAME`, as [`Ref`](ostrya_core::Ref) reads them.
+/// - [`Error::InvalidInput`] if an update writes a local ref name of 64
+///   lowercase hex characters. A revision reads such a name as a commit
+///   checksum.
 /// - [`Error::InvalidInput`] if an update expects [`Expected::Commit`], or
 ///   has no new commit, because the sender cannot learn the current tips.
 /// - [`Error::InvalidInput`] if `compression` is [`Compression::Deflate`]
@@ -177,7 +177,6 @@ where
             version: PROTOCOL_VERSION,
             agent: Some(agent),
             refs: updates.iter().map(|u| u.name.clone()).collect(),
-            collection: None,
             one_way: true,
         }),
         "Hello",
@@ -243,8 +242,8 @@ where
     Ok(counters.stats())
 }
 
-/// Refuses empty `updates`, a ref named twice, a ref name that is not a
-/// refspec, a write to a ref name of 64 lowercase hex characters, an expected
+/// Refuses empty `updates`, a ref named twice, a ref name that is not a ref,
+/// a write to a local ref name of 64 lowercase hex characters, an expected
 /// commit, and a delete.
 fn check_updates(updates: &[RefUpdate]) -> Result<()> {
     if updates.is_empty() {
@@ -252,9 +251,12 @@ fn check_updates(updates: &[RefUpdate]) -> Result<()> {
     }
     let mut seen = HashSet::new();
     for u in updates {
-        if !ostrya_core::is_refspec(&u.name)
-            || (u.new.is_some() && ostrya_core::is_checksum_shaped(&u.name))
-        {
+        let valid = match u.name.parse::<Ref>() {
+            Ok(Ref::Local { name }) => u.new.is_none() || !ostrya_core::is_checksum_shaped(&name),
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        if !valid {
             return Err(invalid(format!("'{}' is not a valid ref name", u.name)));
         }
         if !seen.insert(u.name.as_str()) {
@@ -590,7 +592,6 @@ mod tests {
             version: PROTOCOL_VERSION,
             agent: Some("ostrya".into()),
             refs: long(20_000, 40).into_iter().map(|u| u.name).collect(),
-            collection: None,
             one_way: true,
         });
         frame(&hello, "Hello").unwrap();
@@ -703,7 +704,6 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 agent: Some("test".into()),
                 refs: updates().into_iter().map(|u| u.name).collect(),
-                collection: None,
                 one_way: true,
             }),
             "Hello",

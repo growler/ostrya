@@ -219,9 +219,10 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 #[doc(hidden)]
 pub use receive::{
-    HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePattern, ReceivePolicies,
-    ReceivePolicy, ReceiveReport, ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning,
-    ServerSigner, StreamPolicy, StreamRule, UpdatePlan,
+    HookFuture, HookRefusal, HostEntry, ReceiveCommit, ReceiveHooks, ReceivePattern,
+    ReceivePolicies, ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport,
+    ReceiveServerCommit, ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, ServerSigner,
+    StreamPolicy, StreamRule, UpdatePlan,
 };
 #[doc(hidden)]
 pub use refs::{CollectionRefEntry, RefAlias, validate_refspec};

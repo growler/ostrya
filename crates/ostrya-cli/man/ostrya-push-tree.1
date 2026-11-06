@@ -10,7 +10,7 @@ Push a directory as a new commit to a server or a bucket repository.
 .PP
 The command walks DIR and sends the objects of its tree that the server does not have. The server then makes one commit over the tree, moves the branch of \%\-\-onto to it, and creates each \%\-\-tag at it, in one transaction. The parent of the commit is the commit of the branch on the server. The server writes the bindings of its namespace and signs the commit with the keys of the client group. The tree holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
 .PP
-The client group needs \fB\%c\fR on the branch. A server whose receive hooks take no server commit answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
+The client group needs \fB\%c\fR on the branch, and \fB\%t\fR or \fB\%w\fR on each \%\-\-tag, each in its namespace. A server whose receive hooks take no server commit answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
 .PP
 The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. For an \fB\%s3://\fR push address, the command makes the commit itself and writes the bucket repository.
 .PP
@@ -33,19 +33,19 @@ The branch of the server that the server commit moves. Required.
 .IP
 The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server whose receive hooks take no server commit answers \%ref\-denied.
 .IP
-The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+BRANCH is a local ref NAME of the server, or \%@ID:NAME, the ref NAME of the collection ID. The command refuses a remote ref, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a plain name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
 .IP
 To a bucket repository, the push makes the commit itself, as the server makes it. The parent is the commit of BRANCH in the bucket, which the push reads under the writer lock, or none if BRANCH is absent. The push then writes the ref file of BRANCH. In a bucket repository with a collection id, the push refuses the BRANCH \fB\%ostree\-metadata\fR in \fB\%refs/heads/\fR\&. The push signs no commit.
 .TP
 \fB\-\-tag\fR \fINAME\fR
 Create the ref NAME on the server at the new commit.
 .IP
-The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds NAME. A tag that exists on the server gets \%ref\-mismatch before the push sends an object. NAME passes the rules of BRANCH, is not BRANCH, and occurs once. The client group needs \fB\%t\fR or \fB\%w\fR on NAME. A push to a bucket repository refuses this option.
+NAME is a local ref NAME of the server, or \%@ID:NAME, the ref NAME of the collection ID. The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds the name part of NAME. A tag that exists on the server gets \%ref\-mismatch before the push sends an object. NAME passes the rules of BRANCH, is not BRANCH, and occurs once. BRANCH and each tag are in one namespace, after the server maps the refs of its own collection id to its local refs. The push refuses refs of two namespaces before it sends an object. The client group needs \fB\%t\fR or \fB\%w\fR on the tag in its namespace. A push to a bucket repository refuses this option.
 .TP
 \fB\-\-bind\-ref\fR \fINAME\fR
 Bind the commit to NAME, and create no ref.
 .IP
-The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds BRANCH, each \%\-\-tag, and each NAME, sorted. NAME passes the \%ref\-name rule and has no \fB\%:\fR\&.
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds the name parts of BRANCH and of each \%\-\-tag, and each NAME, sorted. NAME is a plain name: it passes the \%ref\-name rule and has no \fB\%:\fR\&.
 .TP
 \fB\-\-orphan\fR
 Make a commit with no parent.
@@ -53,11 +53,13 @@ Make a commit with no parent.
 If BRANCH exists on the server, the client group needs \fB\%c\fR and \fB\%d\fR on it, else the server answers \%non\-fast\-forward. In a bucket repository, the new commit replaces the commit of BRANCH with no check.
 .TP
 \fB\-\-collection\fR \fIID\fR
-Write the refs of the collection ID on the server.
+Write a plain BRANCH and each plain \%\-\-tag to the refs of the collection ID on the server.
 .IP
-The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%ostree.collection\-binding\fR of the commit holds ID. Without this option, the push writes the local refs of the server, and the binding is the collection id of the server, if it has one. The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
+A plain BRANCH or tag NAME becomes \%@ID:NAME. An \%@ID:NAME operand stays, and the command refuses an \%@Y:NAME operand with Y other than ID. The option does not change \%\-\-bind\-ref. So \fB\%\-\-onto a \-\-tag b \-\-bind\-ref c \-\-collection X\fR is \fB\%\-\-onto @X:a \-\-tag @X:b \-\-bind\-ref c\fR\&.
 .IP
-To a bucket repository, the \fB\%config\fR of the bucket takes the role of the server: the collection id of the bucket, or no ID, writes \fB\%refs/heads/BRANCH\fR, and each other ID writes \fB\%refs/mirrors/ID/BRANCH\fR, also in a bucket with no collection id.
+The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%ostree.collection\-binding\fR of the commit holds the id of the namespace of BRANCH: ID for \%@ID:NAME, and the collection id of the server, if it has one, for a local ref. The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
+.IP
+To a bucket repository, the \fB\%config\fR of the bucket takes the role of the server: a plain BRANCH, or \%@ID:NAME of the collection id of the bucket, writes \fB\%refs/heads/NAME\fR, and \%@ID:NAME of each other ID writes \fB\%refs/mirrors/ID/NAME\fR, also in a bucket with no collection id.
 .TP
 \fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
 The commit subject.

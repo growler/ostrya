@@ -17,8 +17,8 @@ use ostrya::remote::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, CreateOptions, Ed25519Signer, Ed25519Verifier, Error, ObjectName, ObjectType,
-    ReceivePolicy, Repo, RepoMode, ServerSigner, Signer, TrustedKeys, Type, Value, Verifier,
-    Xattrs,
+    ReceivePolicy, ReceiveReport, Repo, RepoMode, ServerSigner, Signer, TrustedKeys, Type, Value,
+    Verifier, Xattrs,
 };
 use ostrya_core::DeflateSink;
 use ostrya_core::FileHeader;
@@ -53,21 +53,12 @@ impl Client {
         self.writer.flush().await
     }
 
+    /// Sends `Hello` with `refs`.
     pub async fn hello(&mut self, refs: &[&str]) -> remote::Result<()> {
-        self.hello_in(refs, None).await
-    }
-
-    /// Sends `Hello` with `refs` and the collection id `collection`.
-    pub async fn hello_in(
-        &mut self,
-        refs: &[&str],
-        collection: Option<&str>,
-    ) -> remote::Result<()> {
         self.send(&Message::Hello(Hello {
             version: 1,
             agent: None,
             refs: refs.iter().map(|r| r.to_string()).collect(),
-            collection: collection.map(str::to_owned),
             one_way: false,
         }))
         .await
@@ -80,13 +71,9 @@ impl Client {
             .expect("a well-formed frame")
     }
 
+    /// Sends `Hello` with `refs`, and reads `HelloReply`.
     pub async fn hello_reply(&mut self, refs: &[&str]) -> HelloReply {
-        self.hello_reply_in(refs, None).await
-    }
-
-    /// Sends `Hello` with `refs` and `collection`, and reads `HelloReply`.
-    pub async fn hello_reply_in(&mut self, refs: &[&str], collection: Option<&str>) -> HelloReply {
-        self.hello_in(refs, collection).await.unwrap();
+        self.hello(refs).await.unwrap();
         match self.recv().await {
             Some(Message::HelloReply(reply)) => reply,
             other => panic!("expected HelloReply, got {other:?}"),
@@ -203,6 +190,20 @@ pub fn collections_policy(ids: &[&str], allow: &[&str]) -> ReceivePolicy {
             .insert((*id).to_owned(), rules_allowing(allow));
     }
     policy
+}
+
+/// Returns the outcomes of `report` as protocol outcomes, each name as the
+/// text of its canonical ref.
+pub fn outcomes(report: &ReceiveReport) -> Vec<RefOutcome> {
+    report
+        .refs
+        .iter()
+        .map(|r| RefOutcome {
+            name: r.name.to_string(),
+            old: r.old,
+            new: r.new,
+        })
+        .collect()
 }
 
 /// Runs a session of `repo` under `policy` against the client `script`.

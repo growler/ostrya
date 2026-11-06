@@ -5,8 +5,8 @@
 //! mode gives the bytes of an `archive` repository. The view builds each
 //! `.filez` at the `[archive] zlib-level` of the bucket. The `config` of the
 //! bucket takes the role of the server of a session push: its collection id
-//! and the bindings of the source commits select the namespace of the refs,
-//! `refs/heads/` or `refs/mirrors/ID/`.
+//! and each `DST` select the namespace of each ref, `refs/heads/` or
+//! `refs/mirrors/ID/`.
 //!
 //! The writes go in this order: the tree objects and the detached metadata,
 //! then the commit objects and the ref files. The push writes no `summary`
@@ -28,11 +28,15 @@ use futures_io::AsyncRead;
 use futures_lite::AsyncReadExt;
 use futures_lite::future::zip;
 use futures_lite::io::Cursor;
-use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, is_ref_name};
+use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, Ref};
 use sha2::{Digest, Sha256};
 
 use super::invalid;
-use super::negotiate::{Commits, Local, Plan, RepoPushOptions, check_bindings, offered_history};
+use super::negotiate::{
+    Commits, Local, Plan, RepoPushOptions, binding, check_collection_binding, check_distinct,
+    offered_history,
+};
+use super::refspec::is_delete;
 use super::source::RepoSource;
 use crate::access::ReadAccess;
 use crate::archive::{ArchiveAnswer, ArchiveView};
@@ -53,22 +57,38 @@ use crate::remote::{
 use crate::repo::Repo;
 use crate::write::archive_level;
 
-/// The namespace of the refs that a push writes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The namespace of a ref that a push writes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Namespace {
-    /// `refs/heads/`. `binding` is the collection id of the bucket
-    /// repository, the id that a bound commit must name.
-    Local { binding: Option<String> },
+    /// `refs/heads/`.
+    Local,
     /// `refs/mirrors/ID/`.
     Mirror { id: String },
 }
 
 impl Namespace {
+    /// Returns the namespace of the ref `r` in a bucket repository with the
+    /// collection id `bucket_id`.
+    ///
+    /// A local ref, and a ref of the collection id of the bucket, give the
+    /// local refs. A ref of each other collection gives its mirror refs, also
+    /// in a bucket with no collection id. A push writes no remote ref, so a
+    /// remote ref is no case here.
+    pub(super) fn of(r: &Ref, bucket_id: Option<&str>) -> Namespace {
+        match r {
+            Ref::Collection { id, .. } if Some(id.as_str()) != bucket_id => {
+                Namespace::Mirror { id: id.clone() }
+            }
+            Ref::Remote { .. } => unreachable!("a push writes no remote ref"),
+            _ => Namespace::Local,
+        }
+    }
+
     /// Returns the ref directory of the namespace, `refs/heads/` or
     /// `refs/mirrors/ID/`.
     pub(super) fn dir(&self) -> String {
         match self {
-            Namespace::Local { .. } => "refs/heads/".to_owned(),
+            Namespace::Local => "refs/heads/".to_owned(),
             Namespace::Mirror { id } => format!("refs/mirrors/{id}/"),
         }
     }
@@ -76,21 +96,6 @@ impl Namespace {
     /// Returns the bucket key of the ref `name` of the namespace.
     pub(super) fn key(&self, name: &str) -> String {
         format!("{}{name}", self.dir())
-    }
-}
-
-/// Returns the namespace of a push whose source commits name the collection
-/// `collection`, to a bucket repository with the collection id `bucket_id`.
-///
-/// No collection, or the collection id of the bucket, gives the local refs.
-/// Each other collection gives its mirror refs, also in a bucket with no
-/// collection id.
-fn namespace(collection: Option<&str>, bucket_id: Option<&str>) -> Namespace {
-    match collection {
-        Some(id) if Some(id) != bucket_id => Namespace::Mirror { id: id.to_owned() },
-        _ => Namespace::Local {
-            binding: bucket_id.map(str::to_owned),
-        },
     }
 }
 
@@ -104,22 +109,22 @@ pub(super) struct BucketState {
     /// The `[ex-ostrya] keep-detached-related` of the `config`, `true` if it
     /// has none.
     pub(super) keep_related: bool,
-    /// The namespace of the push.
-    pub(super) ns: Namespace,
-    /// The refs of the ref directory of the namespace, by name.
-    pub(super) dir: BTreeMap<String, Checksum>,
+    /// The `[core] collection-id` of the `config`.
+    pub(super) collection_id: Option<String>,
+    /// The refs of the ref directory of each namespace of the push, by name.
+    pub(super) dirs: BTreeMap<Namespace, BTreeMap<String, Checksum>>,
     /// The objects of the bucket.
     pub(super) listing: ObjectListing,
 }
 
-/// Reads the state of `bucket` for a push whose commits name the collection
-/// `collection`.
+/// Reads the state of `bucket` for a push that writes the refs `refs`.
 ///
-/// The call reads the `config` and selects the namespace. Then at the same
-/// time it reads the ref files of the ref directory of the namespace and
-/// lists the objects. It reads no ref file of another namespace. The
-/// namespace of the collection id of the bucket is `refs/heads/`, so the
-/// call does not list or read `refs/mirrors/` of that id.
+/// The call reads the `config`, which gives the namespace of each ref. Then
+/// it lists the objects, and at the same time reads the ref files of the
+/// ref directory of each namespace, one directory after the other. It reads
+/// no ref file of another namespace. The namespace of the collection id of
+/// the bucket is `refs/heads/`, so the call does not list or read
+/// `refs/mirrors/` of that id.
 ///
 /// # Errors
 ///
@@ -128,10 +133,7 @@ pub(super) struct BucketState {
 ///   repository has no `config`.
 /// - The errors of [`BucketRepo::read_config`], of
 ///   [`BucketRepo::read_ref_dir`], and of [`BucketRepo::list_objects`].
-pub(super) async fn read_state(
-    bucket: &BucketRepo,
-    collection: Option<&str>,
-) -> Result<BucketState> {
+pub(super) async fn read_state(bucket: &BucketRepo, refs: &[&Ref]) -> Result<BucketState> {
     let Some(config) = bucket.read_config().await? else {
         return Err(invalid(format!(
             "the bucket repository {} has no config; init it first",
@@ -140,21 +142,32 @@ pub(super) async fn read_state(
     };
     let level = archive_level(config.zlib_level()?);
     let keep_related = config.keep_detached_related()?;
-    let bucket_id = config.collection_id();
-    let ns = namespace(collection, bucket_id);
-    // The push reads the ref directory of its namespace alone.
-    let (dir, listing) = zip(bucket.read_ref_dir(&ns.dir()), bucket.list_objects()).await;
+    let collection_id = config.collection_id().map(str::to_owned);
+    let namespaces: BTreeSet<Namespace> = refs
+        .iter()
+        .map(|r| Namespace::of(r, collection_id.as_deref()))
+        .collect();
+    // The push reads the ref directories of its namespaces alone.
+    let read_dirs = async {
+        let mut dirs = BTreeMap::new();
+        for ns in namespaces {
+            let dir = bucket.read_ref_dir(&ns.dir()).await?;
+            dirs.insert(ns, dir);
+        }
+        Ok::<_, Error>(dirs)
+    };
+    let (dirs, listing) = zip(read_dirs, bucket.list_objects()).await;
     Ok(BucketState {
         level,
         keep_related,
-        ns,
-        dir: dir?,
+        collection_id,
+        dirs: dirs?,
         listing: listing?,
     })
 }
 
 /// Refuses the options that a push to a bucket repository cannot carry:
-/// tags, a compression, and a delete refspec `:DST`.
+/// tags, a compression, and a delete refspec `:DST`, `:@ID:NAME` included.
 fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
     if !opts.tags.is_empty() {
         return Err(invalid(
@@ -167,10 +180,7 @@ fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
              names a compression",
         ));
     }
-    if let Some(spec) = opts.refspecs.iter().find(|spec| {
-        spec.rsplit_once(':')
-            .is_some_and(|(src, dst)| src.is_empty() && !dst.is_empty())
-    }) {
+    if let Some(spec) = opts.refspecs.iter().find(|spec| is_delete(spec)) {
         return Err(invalid(format!(
             "a push to an s3:// address deletes no ref, and the refspec '{spec}' is a delete"
         )));
@@ -181,7 +191,7 @@ fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
 /// One ref update of a push, after the checks against the bucket.
 pub(super) struct Update {
     /// The `DST` of the refspec, or the branch of a tree push.
-    pub(super) dst: String,
+    pub(super) dst: Ref,
     /// The bucket key of the ref.
     pub(super) key: String,
     /// The commit of the ref in the bucket before the push.
@@ -243,13 +253,14 @@ impl Repo {
     /// 2. It takes the writer lock of the bucket repository for
     ///    [`LockOperation::Push`], with
     ///    [`break_lock`](RepoPushOptions::break_lock).
-    /// 3. It reads the `config` and selects the namespace. Then at the same
-    ///    time it reads the ref files of the ref directory of the namespace
-    ///    and lists the objects. It reads no ref file of another namespace,
-    ///    and it skips `refs/mirrors/` of the collection id of the bucket,
-    ///    whose refs are in `refs/heads/`. It checks
-    ///    the bindings. For each ref, the tip of the ref in the bucket must
-    ///    be an ancestor of the new commit in the local repository, unless
+    /// 3. It reads the `config`, which gives the namespace of each `DST`.
+    ///    Then it lists the objects, and at the same time reads the ref files
+    ///    of the ref directory of each namespace of the push. It reads no ref
+    ///    file of another namespace, and it skips `refs/mirrors/` of the
+    ///    collection id of the bucket, whose refs are in `refs/heads/`. It
+    ///    checks the collection binding of each ref in its namespace. For
+    ///    each ref, the tip of the ref in the bucket must be an ancestor of
+    ///    the new commit in the local repository, unless
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
     ///    repository does not hold, or marks partial, is no ancestor.
     /// 4. It walks the commits to offer: each source commit, its history, and
@@ -281,15 +292,21 @@ impl Repo {
     ///
     /// # Namespace
     ///
-    /// The namespace is [`collection`](RepoPushOptions::collection), else
-    /// the `ostree.collection-binding` of the source commits, else none. No
-    /// namespace, or the `[core] collection-id` of the bucket, writes
-    /// `refs/heads/DST`. Each other collection writes
-    /// `refs/mirrors/ID/DST`, also in a bucket with no collection id. A bound
-    /// commit must name the id of the namespace, and for `refs/heads/` the
-    /// collection id of the bucket. A commit with no binding goes to
-    /// `refs/heads/` alone. The fast-forward rule and `force` apply to each
-    /// ref in its own namespace.
+    /// Each `DST` names its own namespace, as for
+    /// [`Repo::push_over_stream`], with the `config` of the bucket in the
+    /// role of the server. A plain `DST` `NAME`, and `@ID:NAME` where `ID` is
+    /// the `[core] collection-id` of the bucket, writes `refs/heads/NAME`.
+    /// Each other `@ID:NAME` writes `refs/mirrors/ID/NAME`, also in a bucket
+    /// with no collection id. One push can write the refs of more than one
+    /// namespace. The binding of a commit selects no namespace. A bound
+    /// commit must name the id of the namespace of its ref, and for
+    /// `refs/heads/` the collection id of the bucket. A commit with no
+    /// binding goes to `refs/heads/` alone. The fast-forward rule and `force`
+    /// apply to each ref in its own namespace.
+    ///
+    /// A bucket has no server check of `ostree.ref-binding`, so
+    /// [`disable_verify_bindings`](RepoPushOptions::disable_verify_bindings)
+    /// alone skips that check of the push.
     ///
     /// # Progress
     ///
@@ -298,8 +315,8 @@ impl Repo {
     /// gets one call with `Scanning`, also on a new handle. The phase stays
     /// for the lock, the reads, the checks, and the walk of steps 2 to 4. It
     /// also stays for the check after the walk: each ref of the new ref set
-    /// of the namespace must name a commit that the bucket holds or that the
-    /// push uploads. With a progress handle, a pass over the files to upload
+    /// of each namespace of the push must name a commit that the bucket holds
+    /// or that the push uploads. With a progress handle, a pass over the files to upload
     /// then gives the total of the content, also in `Scanning`. A failure of
     /// that pass gives no total, and the push goes on. The push sets
     /// `Uploading` before the uploads of steps 5 and 6, and `Committing`
@@ -343,8 +360,8 @@ impl Repo {
     ///
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if `opts` names
-    ///   tags, a compression, or a delete refspec, or a `DST` that is no ref
-    ///   name. The push then sends no request.
+    ///   tags, a compression, or a delete refspec, `:@ID:NAME` included. The
+    ///   push then sends no request.
     /// - The errors of the checks and of the commit walk of
     ///   [`Repo::push_over_stream`], before a request.
     /// - With no depth, [`Error::InvalidRelated`] or [`Error::ObjectNotFound`]
@@ -354,21 +371,25 @@ impl Repo {
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
-    ///   repository has no `config`, or if the ref directory of the namespace
-    ///   holds a name that is a directory of another name after the push.
+    ///   repository has no `config`, if two `DST` refs name one ref of the
+    ///   bucket, `NAME` and `@OWN:NAME` for the collection id `OWN` of the
+    ///   bucket, or if the ref directory of a namespace of the push holds a
+    ///   name that is a directory of another name after the push. The push
+    ///   then uploads nothing.
     /// - [`Error::InvalidFormat`] if the `config` of the bucket is malformed,
     ///   states a mode other than `archive-z2` and `archive`, holds a
     ///   `tombstone-commits`, `indexed-deltas`, or `keep-detached-related`
     ///   that is no boolean, or holds a `zlib-level` that is no integer, if a
-    ///   key under the ref directory of the namespace is no ref name, if a
-    ///   ref file of the namespace is malformed, or if a ref of the namespace
-    ///   names a commit that the bucket does not hold. The push then uploads
-    ///   nothing. The push does not check the keys and the ref files of the
-    ///   other namespaces, also `refs/mirrors/ID/` of the collection id of
-    ///   the bucket.
+    ///   key under the ref directory of a namespace of the push is no ref
+    ///   name, if a ref file of such a namespace is malformed, or if a ref of
+    ///   such a namespace names a commit that the bucket does not hold. The
+    ///   push then uploads nothing. The push does not check the keys and the
+    ///   ref files of the other namespaces, also `refs/mirrors/ID/` of the
+    ///   collection id of the bucket.
     /// - [`Error::Remote`] with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
-    ///   binding of a source commit does not agree with the namespace.
+    ///   binding of a source commit does not agree with the namespace of its
+    ///   `DST`.
     /// - [`Error::Remote`] with
     ///   [`NonFastForward`](crate::remote::Error::NonFastForward) if a ref
     ///   update is not a fast-forward and `force` is not set.
@@ -387,13 +408,6 @@ impl Repo {
         refuse_options(&opts)?;
         let bucket = BucketRepo::open(&endpoint).await?;
         let mut plan = self.plan_push(&opts).await?;
-        if let Some(target) = plan.targets.iter().find(|t| !is_ref_name(&t.dst)) {
-            return Err(invalid(format!(
-                "a push to an s3:// address writes the ref file of each destination, and '{}' \
-                 is no ref name",
-                target.dst
-            )));
-        }
         let progress = opts.progress.as_ref();
         if let Some(progress) = progress {
             progress.start_phase(PushPhase::Scanning);
@@ -420,7 +434,7 @@ impl Repo {
         let refs = updates
             .into_iter()
             .map(|update| RefOutcome {
-                name: update.dst,
+                name: update.dst.to_string(),
                 old: update.old,
                 new: Some(update.new),
             })
@@ -443,34 +457,45 @@ impl Repo {
         plan: &mut Plan,
         opts: &RepoPushOptions,
     ) -> Result<Uploaded> {
+        let dsts: Vec<&Ref> = plan.targets.iter().map(|t| &t.dst).collect();
         let BucketState {
             level,
             keep_related,
-            ns,
-            dir,
+            collection_id,
+            dirs,
             listing,
-        } = read_state(bucket, plan.collection.as_deref()).await?;
+        } = read_state(bucket, &dsts).await?;
+        drop(dsts);
+        let bucket_id = collection_id.as_deref();
+        // `NAME` and `@OWN:NAME` name one ref of the bucket, and the push
+        // writes each ref once.
+        check_distinct(bucket_id, plan.targets.iter().map(|t| &t.dst))?;
 
-        // The bindings.
-        match &ns {
-            Namespace::Local { binding } => {
-                check_bindings(None, binding.as_deref(), &plan.sources)?
-            }
-            Namespace::Mirror { id } => check_bindings(Some(id), Some(id), &plan.sources)?,
-        }
-
-        // The ref checks, in the directory of the namespace.
-        let mut updated = dir.clone();
+        // The bindings, each ref in its namespace.
         for target in &plan.targets {
             let commit = target.commit.expect("a push to a bucket refuses a delete");
-            updated.insert(target.dst.clone(), commit);
+            let bound = binding(&plan.sources, &commit);
+            check_collection_binding(&commit, bound, &target.dst, bucket_id)?;
         }
-        check_prefixes(&updated)?;
+
+        // The ref checks, in the directory of each namespace.
+        let mut updated = dirs.clone();
+        for target in &plan.targets {
+            let commit = target.commit.expect("a push to a bucket refuses a delete");
+            let ns = Namespace::of(&target.dst, bucket_id);
+            let dir = updated.get_mut(&ns).expect("the push read each namespace");
+            dir.insert(target.dst.name().to_owned(), commit);
+        }
+        for dir in updated.values() {
+            check_prefixes(dir)?;
+        }
         let mut updates = Vec::with_capacity(plan.targets.len());
         for target in &plan.targets {
             let new = target.commit.expect("a push to a bucket refuses a delete");
-            let old = dir.get(&target.dst).copied();
-            let key = ns.key(&target.dst);
+            let ns = Namespace::of(&target.dst, bucket_id);
+            let name = target.dst.name();
+            let old = dirs[&ns].get(name).copied();
+            let key = ns.key(name);
             if let Some(tip) = old
                 && tip != new
                 && !opts.force
@@ -490,17 +515,18 @@ impl Repo {
                 new,
             });
         }
+        drop(dirs);
 
         let walk = self
             .bucket_walk(bucket, plan, &updates, &listing, opts)
             .await?;
         // The walk is the last reader of the commits of the plan.
         drop(std::mem::take(&mut plan.commits));
-        // Each ref of the new ref set of the namespace names a commit that
-        // the bucket holds or that the push uploads, so a ref of the
-        // namespace that names an absent commit refuses the push before its
-        // first upload.
-        if let Some(absent) = updated.values().find(|commit| {
+        // Each ref of the new ref set of each namespace names a commit that
+        // the bucket holds or that the push uploads, so a ref of a namespace
+        // of the push that names an absent commit refuses the push before
+        // its first upload.
+        if let Some(absent) = updated.values().flat_map(BTreeMap::values).find(|commit| {
             !walk.missing.contains(commit)
                 && !listing
                     .objects
@@ -1252,52 +1278,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_namespace_comes_from_the_collection_and_the_bucket_id() {
+    fn the_namespace_comes_from_the_ref_and_the_bucket_id() {
         let a = Some("org.example.A");
-        let b = Some("org.example.B");
-        assert_eq!(namespace(None, None), Namespace::Local { binding: None });
+        let r = |text: &str| -> Ref { text.parse().unwrap() };
+        let mirror = || Namespace::Mirror {
+            id: "org.example.B".into(),
+        };
+        assert_eq!(Namespace::of(&r("main"), None), Namespace::Local);
+        assert_eq!(Namespace::of(&r("main"), a), Namespace::Local);
         assert_eq!(
-            namespace(None, a),
-            Namespace::Local {
-                binding: a.map(str::to_owned)
-            }
+            Namespace::of(&r("@org.example.A:main"), a),
+            Namespace::Local
         );
-        assert_eq!(
-            namespace(a, a),
-            Namespace::Local {
-                binding: a.map(str::to_owned)
-            }
-        );
-        assert_eq!(
-            namespace(b, a),
-            Namespace::Mirror {
-                id: "org.example.B".into()
-            }
-        );
-        assert_eq!(
-            namespace(b, None),
-            Namespace::Mirror {
-                id: "org.example.B".into()
-            }
-        );
-        assert_eq!(namespace(None, None).key("a/b"), "refs/heads/a/b");
-        assert_eq!(
-            namespace(b, a).key("main"),
-            "refs/mirrors/org.example.B/main"
-        );
+        assert_eq!(Namespace::of(&r("@org.example.B:main"), a), mirror());
+        assert_eq!(Namespace::of(&r("@org.example.B:main"), None), mirror());
+        assert_eq!(Namespace::Local.key("a/b"), "refs/heads/a/b");
+        assert_eq!(mirror().key("main"), "refs/mirrors/org.example.B/main");
     }
 
     #[test]
     fn the_options_of_a_session_push_are_refused() {
         refuse_options(&RepoPushOptions {
-            refspecs: vec!["main".into(), "origin:main:dst".into(), "a:b".into()],
+            refspecs: vec![
+                "main".into(),
+                "origin:main:dst".into(),
+                "a:b".into(),
+                "main:@org.example.X:a".into(),
+            ],
             ..RepoPushOptions::default()
         })
         .unwrap();
         for (opts, needle) in [
             (
                 RepoPushOptions {
-                    tags: vec!["v1".into()],
+                    tags: vec![Ref::local("v1")],
                     ..RepoPushOptions::default()
                 },
                 "tags",
@@ -1315,6 +1329,13 @@ mod tests {
                     ..RepoPushOptions::default()
                 },
                 "':old' is a delete",
+            ),
+            (
+                RepoPushOptions {
+                    refspecs: vec!["main".into(), ":@org.example.X:a".into()],
+                    ..RepoPushOptions::default()
+                },
+                "':@org.example.X:a' is a delete",
             ),
         ] {
             match refuse_options(&opts) {

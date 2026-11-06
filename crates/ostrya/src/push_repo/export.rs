@@ -3,15 +3,14 @@
 use std::collections::HashSet;
 
 use futures_io::AsyncWrite;
-use ostrya_core::{Checksum, Commit, ObjectName, ObjectType};
+use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Ref};
 
 use super::invalid;
-use super::negotiate::{Commits, Local, check_ref_binding, link_of};
+use super::negotiate::{Commits, Local, check_named_collection, check_ref_binding, link_of};
 use super::source::RepoSource;
 use crate::error::Result;
 use crate::lock::LockKind;
 use crate::read::CommitState;
-use crate::refs::validate_refspec;
 use crate::related::{self, RelatedRule};
 use crate::remote::{Compression, Expected, PushStats, RefUpdate, SessionOptions};
 use crate::repo::Repo;
@@ -25,13 +24,22 @@ pub struct ExportStreamOptions {
     /// The ref updates that the `Commit` frame of the stream carries.
     ///
     /// Each update expects [`Absent`](Expected::Absent) or
-    /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME` or
-    /// `REMOTE:NAME`. The new commits are the commits of the stream. The
-    /// stream also carries the dependencies of the new commits, with no ref.
-    /// [`Repo::export_updates`] returns these updates for a set of refspecs.
+    /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME`,
+    /// `@ID:NAME`, or `REMOTE:NAME`. The new commits are the commits of the
+    /// stream. The stream also carries the dependencies of the new commits,
+    /// with no ref. [`Repo::export_updates`] returns these updates for a set
+    /// of refspecs.
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
     pub compression: Compression,
+    /// The switch that skips the check of `ostree.ref-binding` of each new
+    /// commit.
+    ///
+    /// If `true`, the export does not check that the `ostree.ref-binding` of
+    /// the commit of each update holds the name part of its ref. A receiver
+    /// whose rules do not skip the check refuses such a stream. The switch
+    /// skips no check of `ostree.collection-binding`.
+    pub disable_verify_bindings: bool,
 }
 
 /// Methods that export commits as a one-way stream.
@@ -136,12 +144,13 @@ impl Repo {
     /// - [`Error::Remote`](crate::Error::Remote) with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if an update
     ///   expects [`Expected::Commit`], or has no new commit.
-    /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if
-    ///   [`validate_refspec`] refuses a ref name.
+    /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if a ref name
+    ///   is not `NAME`, `@ID:NAME`, or `REMOTE:NAME` under the ref-name rule
+    ///   of [`Ref`].
     /// - [`Error::InvalidRefspec`](crate::Error::InvalidRefspec) if an update
-    ///   writes a ref name of 64 lowercase hex characters with no `REMOTE:`
-    ///   part. A revision reads such a name as a commit checksum. A delete of
-    ///   such a name gives the error of an update with no new commit.
+    ///   writes a local ref name of 64 lowercase hex characters. A revision
+    ///   reads such a name as a commit checksum. A delete of such a name gives
+    ///   the error of an update with no new commit.
     /// - [`Error::LockTimeout`](crate::Error::LockTimeout) if the wait for the
     ///   lock passes `[core] lock-timeout-secs`.
     /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if
@@ -164,9 +173,21 @@ impl Repo {
     ///   marks a new commit partial.
     /// - [`Error::Remote`](crate::Error::Remote) with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
-    ///   `ostree.ref-binding` list of a commit does not hold the name of its
-    ///   ref. The check leaves out the `REMOTE:` part of a remote ref. A
-    ///   commit with no binding, or with an empty list, passes.
+    ///   `ostree.ref-binding` list of a commit does not hold the name part of
+    ///   its ref, unless
+    ///   [`disable_verify_bindings`](ExportStreamOptions::disable_verify_bindings)
+    ///   is set. The check leaves out the `@ID:` part of a collection ref and
+    ///   the `REMOTE:` part of a remote ref. A commit with no
+    ///   `ostree.ref-binding` passes, and a commit with an empty list fails.
+    /// - [`Error::Remote`](crate::Error::Remote) with
+    ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
+    ///   commit of a ref `@X:NAME` has no `ostree.collection-binding`, or is
+    ///   bound to a collection other than `X`. The export does not know the
+    ///   collection id of the receiver, so it refuses a commit with no binding
+    ///   on each ref `@X:NAME`, also when `X` is the collection id of the
+    ///   receiver. It leaves the collection binding of the commit of a local
+    ///   ref and of a remote ref to the receiver. The switch
+    ///   `disable_verify_bindings` does not skip this check.
     /// - [`Error::Remote`](crate::Error::Remote) with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if
     ///   `opts.compression` has a level outside 1 through 9.
@@ -205,11 +226,16 @@ impl Repo {
             return Err(invalid("a commit needs at least one ref update"));
         }
         let mut named = HashSet::new();
+        let mut refs = Vec::with_capacity(updates.len());
         for u in updates {
-            validate_refspec(&u.name)?;
-            if u.new.is_some() && ostrya_core::is_checksum_shaped(&u.name) {
+            let r: Ref = u.name.parse()?;
+            if u.new.is_some()
+                && let Ref::Local { name } = &r
+                && ostrya_core::is_checksum_shaped(name)
+            {
                 return Err(crate::Error::InvalidRefspec(u.name.clone()));
             }
+            refs.push(r);
             if !named.insert(u.name.as_str()) {
                 return Err(invalid(format!("ref '{}' is updated twice", u.name)));
             }
@@ -233,7 +259,7 @@ impl Repo {
         let mut targets: Vec<Checksum> = Vec::new();
         let mut loaded: Vec<Commit> = Vec::new();
         let mut commits = Commits::default();
-        for u in updates {
+        for (u, r) in updates.iter().zip(&refs) {
             let checksum = u.new.expect("a delete is refused");
             let position = match targets.iter().position(|c| *c == checksum) {
                 Some(position) => position,
@@ -256,9 +282,16 @@ impl Repo {
                     loaded.len() - 1
                 }
             };
-            check_ref_binding(&checksum, &loaded[position], &u.name)?;
+            let commit = &loaded[position];
+            if !opts.disable_verify_bindings {
+                check_ref_binding(&checksum, commit, r)?;
+            }
+            // The export does not know the collection id of the receiver, so
+            // a commit with no binding fails each ref of a collection.
+            check_named_collection(&checksum, commit.collection_binding(), r, true)?;
         }
         drop(loaded);
+        drop(refs);
 
         // The format of field 2 of each new commit, then its dependencies,
         // before the first byte.

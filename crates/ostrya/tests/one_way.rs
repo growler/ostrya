@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, PIPE_CAP, SECRET_B64, SERVER_SECRET_B64,
     assert_nothing_published, build_commit, ed25519_signature, ed25519_signatures, fixture_objects,
-    fixture_tree_digest, keyed_commit, new_repo, pipe, policy_allowing, returned_code,
+    fixture_tree_digest, keyed_commit, new_repo, outcomes, pipe, policy_allowing, returned_code,
     server_signer, session, signed_dict, staging_entries, trust,
 };
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
@@ -142,7 +142,6 @@ impl Stream {
             version: 1,
             agent: None,
             refs: refs.iter().map(|r| r.to_string()).collect(),
-            collection: None,
             one_way,
         }));
         stream
@@ -309,7 +308,7 @@ fn a_stream_commits_the_fixture_commit() {
             new: Some(fixture_commit()),
         };
         assert_eq!(
-            report.refs,
+            outcomes(&report),
             vec![outcome("test/main"), outcome("origin:test/main")]
         );
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
@@ -408,7 +407,7 @@ fn a_stream_to_commit_commits_on_an_open_pipe() {
         new: Some(fixture_commit()),
     };
     assert_eq!(
-        report.refs,
+        outcomes(&report),
         vec![outcome("test/main"), outcome("origin:test/main")]
     );
     let line = format!("{COMMIT}\n").into_bytes();
@@ -511,23 +510,8 @@ fn messages_out_of_place_are_protocol() {
             version: 2,
             agent: None,
             refs: vec!["test/main".into()],
-            collection: None,
             one_way: false,
         }));
-        s.bytes()
-    }));
-    cases.push(("a one-way Hello with a collection", {
-        let mut s = Stream {
-            writer: FrameWriter::new(Recorder::default()),
-        };
-        s.message(&Message::Hello(Hello {
-            version: 1,
-            agent: None,
-            refs: vec!["test/main".into(), "origin:test/main".into()],
-            collection: Some("org.example.Os".into()),
-            one_way: true,
-        }));
-        s.objects(&objects).commit(updates());
         s.bytes()
     }));
     cases.push(("a first frame that is not Hello", {
@@ -554,7 +538,6 @@ fn messages_out_of_place_are_protocol() {
             version: 1,
             agent: None,
             refs: vec![],
-            collection: None,
             one_way: true,
         }));
         s.commit(updates());
@@ -702,7 +685,7 @@ fn bytes_after_commit_are_ignored_by_a_stream_to_commit() {
         let report = receive_to_commit(&repo, &policy, &bytes)
             .unwrap_or_else(|e| panic!("{tail:?}: the stream failed: {e}"));
         assert_eq!(
-            report.refs,
+            outcomes(&report),
             vec![outcome("test/main"), outcome("origin:test/main")],
             "{tail:?}"
         );
@@ -976,12 +959,193 @@ fn the_switch_applies_to_a_one_way_stream() {
 fn a_one_way_hello_has_no_bound_of_the_reply() {
     let tmp = TmpDir::new("one-way-many-names");
     let (repo, before) = empty_repo(&tmp, "");
-    let many = vec!["m"; 100_000];
+    let names: Vec<String> = (0..40_000).map(|i| i.to_string()).collect();
+    let many: Vec<&str> = names.iter().map(String::as_str).collect();
+    let hello = Hello {
+        version: 1,
+        agent: None,
+        refs: names.clone(),
+        one_way: false,
+    };
+    assert!(matches!(
+        ReceiveService::check_hello(&repo, &hello),
+        Err(Error::Remote(remote::Error::LimitExceeded(_)))
+    ));
     match receive(&repo, &policy(), &Stream::hello(&many, true).bytes()) {
         Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
         other => panic!("{other:?}"),
     }
     assert_nothing_published(&repo, &before);
+}
+
+/// Returns a commit over the fixture tree with the collection binding
+/// `collection` and the ref binding `refs`, each key absent for `None`.
+fn bound_commit(subject: &str, collection: Option<&str>, refs: Option<&[&str]>) -> Obj {
+    let mut metadata = DictBuilder::new();
+    if let Some(refs) = refs {
+        let refs: Vec<String> = refs.iter().map(|&r| r.to_owned()).collect();
+        metadata.insert_strv("ostree.ref-binding", &refs);
+    }
+    if let Some(id) = collection {
+        metadata.insert_str("ostree.collection-binding", id);
+    }
+    build_commit(None, subject, metadata.build(), &[])
+}
+
+/// The stream of the fixture tree and `commit`, with one update of `name`
+/// to `commit`.
+fn stream_to(name: &str, commit: &Obj) -> Vec<u8> {
+    let mut objects: Vec<Obj> = fixture_objects(Encoding::Raw)
+        .into_iter()
+        .filter(|o| o.ty != ObjectType::Commit)
+        .collect();
+    objects.push(commit.clone());
+    let mut stream = Stream::hello(&[name], true);
+    stream.objects_with(&objects, &[]).commit(vec![update(
+        name,
+        Expected::Any,
+        Some(commit.checksum),
+    )]);
+    stream.bytes()
+}
+
+/// A one-way stream writes `@ID:NAME` under `refs/mirrors/ID/` only with a
+/// pattern rule of the collection `ID`: a collection ref takes no default
+/// rule. `@OWN:NAME`, with `OWN` the collection id of the receiver, is a
+/// local ref and takes the default rule.
+#[test]
+fn a_one_way_collection_ref_needs_a_pattern_rule() {
+    let tmp = TmpDir::new("one-way-collection");
+    let (repo, before) = empty_repo(&tmp, "collection-id=org.example.C\n");
+    let x = bound_commit("x", Some("org.example.X"), Some(&["a"]));
+    let bytes = stream_to("@org.example.X:a", &x);
+    match receive(&repo, &StreamPolicy::default(), &bytes) {
+        Err(Error::Remote(remote::Error::RefDenied(m))) => {
+            assert!(m.contains("'@org.example.X:a'"), "{m}")
+        }
+        other => panic!("{other:?}"),
+    }
+    let other = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("@org.example.Y:**").unwrap(),
+            StreamRule::default(),
+        )],
+        ..StreamPolicy::default()
+    };
+    match receive(&repo, &other, &bytes) {
+        Err(Error::Remote(remote::Error::RefDenied(_))) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+
+    let policy = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("@org.example.X:**").unwrap(),
+            StreamRule::default(),
+        )],
+        ..StreamPolicy::default()
+    };
+    let report = receive(&repo, &policy, &bytes).unwrap();
+    assert_eq!(report.refs[0].name, Ref::collection("org.example.X", "a"));
+    assert_eq!(
+        block_on(repo.resolve_ref_tip(&Ref::collection("org.example.X", "a"))).unwrap(),
+        Some(x.checksum)
+    );
+
+    let own = bound_commit("own", Some("org.example.C"), None);
+    let report = receive(
+        &repo,
+        &StreamPolicy::default(),
+        &stream_to("@org.example.C:b", &own),
+    )
+    .unwrap();
+    assert_eq!(report.refs[0].name, Ref::local("b"));
+    assert_eq!(
+        std::fs::read_to_string(repo.path().join("refs/heads/b")).unwrap(),
+        format!("{}\n", own.checksum)
+    );
+}
+
+/// In a receiver whose collection id is `OWN`, the pattern `@OWN:NAME`
+/// selects the local ref `NAME`, as the pattern `NAME` does. A deny rule
+/// `@OWN:secret` refuses a stream that writes `@OWN:secret` or `secret`,
+/// and the default rule still takes the other local refs.
+#[test]
+fn a_one_way_pattern_of_the_own_collection_selects_the_local_refs() {
+    let tmp = TmpDir::new("one-way-own-pattern");
+    let (repo, before) = empty_repo(&tmp, "collection-id=org.example.C\n");
+    let policy = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("@org.example.C:secret").unwrap(),
+            StreamRule {
+                accept: false,
+                ..StreamRule::default()
+            },
+        )],
+        ..StreamPolicy::default()
+    };
+    let own = bound_commit("own", Some("org.example.C"), None);
+    for name in ["@org.example.C:secret", "secret"] {
+        match receive(&repo, &policy, &stream_to(name, &own)) {
+            Err(Error::Remote(remote::Error::RefDenied(m))) => {
+                assert!(m.contains("refuses updates of ref 'secret'"), "{m}")
+            }
+            other => panic!("{name}: {other:?}"),
+        }
+    }
+    assert_nothing_published(&repo, &before);
+    assert!(!repo.path().join("refs/heads/secret").exists());
+    let report = receive(&repo, &policy, &stream_to("public", &own)).unwrap();
+    assert_eq!(report.refs[0].name, Ref::local("public"));
+}
+
+/// A one-way stream checks the bindings of each collection ref. A commit
+/// with no collection binding is refused on `@ID:NAME`, also under
+/// `disable_verify_bindings`. The ref binding holds the name without the
+/// `@ID:` part, and `disable_verify_bindings` skips that check alone.
+#[test]
+fn a_one_way_collection_ref_checks_its_bindings() {
+    let tmp = TmpDir::new("one-way-collection-bindings");
+    let (repo, before) = empty_repo(&tmp, "");
+    let strict = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("@org.example.X:**").unwrap(),
+            StreamRule::default(),
+        )],
+        ..StreamPolicy::default()
+    };
+    let loose = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("@org.example.X:**").unwrap(),
+            StreamRule::default(),
+        )],
+        disable_verify_bindings: true,
+        ..StreamPolicy::default()
+    };
+    let unbound = bound_commit("unbound", None, None);
+    for policy in [&strict, &loose] {
+        match receive(&repo, policy, &stream_to("@org.example.X:a", &unbound)) {
+            Err(Error::Remote(remote::Error::BindingMismatch(m))) => {
+                assert!(m.contains("no collection binding"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let main = bound_commit("main", Some("org.example.X"), Some(&["main"]));
+    let stable = stream_to("@org.example.X:stable", &main);
+    match receive(&repo, &strict, &stable) {
+        Err(Error::Remote(remote::Error::BindingMismatch(m))) => {
+            assert!(m.contains("'stable'"), "{m}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+    receive(&repo, &strict, &stream_to("@org.example.X:main", &main)).unwrap();
+    receive(&repo, &loose, &stable).unwrap();
+    assert_eq!(
+        block_on(repo.resolve_ref_tip(&Ref::collection("org.example.X", "stable"))).unwrap(),
+        Some(main.checksum)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -996,7 +1160,6 @@ fn the_two_way_receiver_refuses_a_one_way_hello() {
         version: 2,
         agent: None,
         refs: vec!["test/main".into()],
-        collection: None,
         one_way: true,
     };
     let tmp = TmpDir::new("one-way-two-way");
@@ -1542,6 +1705,7 @@ mod export {
                 update("origin:main", Expected::Any, Some(commit)),
             ],
             compression,
+            ..ExportStreamOptions::default()
         }
     }
 
@@ -1577,7 +1741,10 @@ mod export {
             old: None,
             new: Some(source.commit),
         };
-        assert_eq!(report.refs, vec![outcome("main"), outcome("origin:main")]);
+        assert_eq!(
+            outcomes(report),
+            vec![outcome("main"), outcome("origin:main")]
+        );
         let line = format!("{}\n", source.commit).into_bytes();
         assert_eq!(
             file_inventory(target.path(), "refs"),
@@ -1722,6 +1889,7 @@ mod export {
         let opts = ExportStreamOptions {
             updates,
             compression: Compression::None,
+            ..ExportStreamOptions::default()
         };
         let (received, exported) = export_piped(&source.repo, &target, &export_policy(), opts);
         let report = received.unwrap();
@@ -1732,7 +1900,7 @@ mod export {
             new: Some(source.commit),
         };
         assert_eq!(
-            report.refs,
+            outcomes(&report),
             vec![outcome("origin:main"), outcome("origin:copy")]
         );
         let line = format!("{}\n", source.commit).into_bytes();
@@ -1970,7 +2138,7 @@ mod export {
         let target_tmp = TmpDir::new("one-way-export-hex-target");
         let (target, _) = empty_repo(&target_tmp, "");
         let report = receive(&target, &export_policy(), &bytes).unwrap();
-        assert_eq!(report.refs[0].name, remote);
+        assert_eq!(report.refs[0].name.to_string(), remote);
         assert!(
             target
                 .path()
@@ -2001,6 +2169,115 @@ mod export {
             "{error:?}"
         );
         assert_eq!(calls, 0);
+    }
+
+    /// The metadata of a commit bound to the collection `id`, if set, and to
+    /// the refs `refs`, if set.
+    fn bound_in(id: Option<&str>, refs: Option<&[&str]>) -> Value {
+        let mut dict = DictBuilder::new();
+        if let Some(refs) = refs {
+            let refs: Vec<String> = refs.iter().map(|r| (*r).to_owned()).collect();
+            dict.insert_strv("ostree.ref-binding", &refs);
+        }
+        if let Some(id) = id {
+            dict.insert_str("ostree.collection-binding", id);
+        }
+        dict.build()
+    }
+
+    /// For a ref `@X:NAME`, the export refuses a commit with no collection
+    /// binding and a commit bound to another collection before the first
+    /// byte, also with the switch that skips the ref-binding check. The
+    /// ref-binding check reads the name part of the ref, refuses an empty
+    /// list, and passes a commit with no list. The switch skips it, and a
+    /// receiver whose rules do not skip it refuses the stream.
+    #[test]
+    fn an_export_checks_the_bindings_of_each_collection_ref() {
+        let tmp = TmpDir::new("one-way-export-collection");
+        let repo = &new_repo(&tmp, RepoMode::Archive, "");
+        let x = Some("org.example.X");
+        let (unbound, _) = commit_tree(repo, None, b"small\n");
+        let (other, _) = commit_tree(
+            repo,
+            Some(bound_in(Some("org.example.Y"), None)),
+            b"small\n",
+        );
+        let (stable, _) = commit_tree(repo, Some(bound_in(x, Some(&["stable"]))), b"small\n");
+        let (empty, _) = commit_tree(repo, Some(bound_in(x, Some(&[]))), b"small\n");
+        let (free, _) = commit_tree(repo, Some(bound_in(x, None)), b"small\n");
+        let with = |name: &str, commit, skip| ExportStreamOptions {
+            updates: vec![update(name, Expected::Any, Some(commit))],
+            disable_verify_bindings: skip,
+            ..ExportStreamOptions::default()
+        };
+        for (commit, needle) in [
+            (unbound, "has no collection binding"),
+            (other, "'org.example.Y', not 'org.example.X'"),
+        ] {
+            for skip in [false, true] {
+                let (error, calls) = refused(repo, with("@org.example.X:a", commit, skip));
+                match &error {
+                    Error::Remote(remote::Error::BindingMismatch(message)) => {
+                        assert!(message.contains(needle), "{message}")
+                    }
+                    other => panic!("{needle}: {other:?}"),
+                }
+                assert_eq!(calls, 0, "{needle}");
+            }
+        }
+        for commit in [stable, empty] {
+            let (error, calls) = refused(repo, with("@org.example.X:a", commit, false));
+            assert!(
+                matches!(&error, Error::Remote(remote::Error::BindingMismatch(m)) if m.contains("'a'")),
+                "{error:?}"
+            );
+            assert_eq!(calls, 0);
+        }
+        assert!(!capture(repo, with("@org.example.X:stable", stable, false)).is_empty());
+        assert!(!capture(repo, with("@org.example.X:a", free, false)).is_empty());
+        // The export leaves the collection binding of a plain ref to the
+        // receiver.
+        assert!(!capture(repo, with("main", other, false)).is_empty());
+
+        // A stream that the switch writes is refused by a receiver whose
+        // rules check the ref binding, and accepted by one whose rules skip
+        // it.
+        let bytes = capture(repo, with("@org.example.X:a", stable, true));
+        let policy = |skip| StreamPolicy {
+            rules: vec![(
+                ReceivePattern::parse("@org.example.X:**").unwrap(),
+                StreamRule::default(),
+            )],
+            allow_privileged: true,
+            disable_verify_bindings: skip,
+            ..StreamPolicy::default()
+        };
+        let target_tmp = TmpDir::new("one-way-export-collection-target");
+        let (target, _) = empty_repo(&target_tmp, "");
+        assert!(
+            matches!(
+                receive(&target, &policy(false), &bytes),
+                Err(Error::Remote(remote::Error::BindingMismatch(_)))
+            ),
+            "the receiver checks the ref binding"
+        );
+        let report = receive(&target, &policy(true), &bytes).unwrap();
+        assert_eq!(report.refs[0].name.to_string(), "@org.example.X:a");
+        let file = target.path().join("refs/mirrors/org.example.X/a");
+        assert_eq!(
+            std::fs::read_to_string(file).unwrap(),
+            format!("{stable}\n")
+        );
+
+        // The delete of a collection ref is a delete.
+        let refspecs = [":@org.example.X:a".to_owned()];
+        assert!(
+            matches!(
+                block_on(repo.export_updates(&refspecs, None)),
+                Err(Error::Remote(remote::Error::InvalidInput(m))) if m.contains("is a delete")
+            ),
+            "a delete"
+        );
     }
 
     /// If the source of an export lacks a file object, the export ends the
@@ -2124,7 +2401,7 @@ mod export {
         assert_eq!(stats.objects_sent, 10);
 
         assert_eq!(
-            report.refs,
+            outcomes(&report),
             vec![RefOutcome {
                 name: "main".into(),
                 old: None,
@@ -2420,7 +2697,7 @@ mod export {
             exported.unwrap();
             let report = received.unwrap_or_else(|e| panic!("{name}: {e}"));
             assert_eq!(
-                report.refs,
+                outcomes(&report),
                 vec![RefOutcome {
                     name: name.into(),
                     old: None,

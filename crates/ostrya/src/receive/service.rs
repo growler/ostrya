@@ -13,7 +13,7 @@ use futures_lite::io::{AsyncReadExt, BufReader};
 use ostrya_core::ObjectName;
 
 use super::core::SessionCore;
-use super::session::{Failure, ReceiveReport, STREAM_BUFFER, aborted, next, out_of_order};
+use super::session::{Failure, ReceiveCommit, STREAM_BUFFER, aborted, next, out_of_order};
 use super::{ReceiveHooks, ReceivePolicy};
 use crate::error::{Error, Result};
 use crate::remote;
@@ -147,8 +147,8 @@ fn into_error(failure: Failure) -> Error {
 impl ReceiveService {
     /// Opens a session: answers `Hello` and opens the session transaction.
     ///
-    /// `policy` is the policy of the namespace of `Hello`, which the host
-    /// selects. The session reads and writes the refs of that namespace, as
+    /// `policy` is the policy of the session, which the host selects. It
+    /// applies to each ref of `Hello` in the namespace of the ref, as
     /// [`Repo::receive`](crate::Repo::receive) states.
     ///
     /// The session transaction holds the repository lock shared until the
@@ -169,7 +169,7 @@ impl ReceiveService {
     /// - The errors of [`check_hello`](Self::check_hello).
     /// - [`remote::Error::RefDenied`] if `policy` opens no push session, if
     ///   `Hello` names a remote ref, or if `policy` gives no `r` on a ref of
-    ///   `Hello` in the namespace of `Hello`.
+    ///   `Hello` in the namespace of the ref.
     ///   These checks follow the checks of `check_hello` and do no I/O.
     /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
     ///   session transaction cannot open. These include
@@ -217,7 +217,7 @@ impl ReceiveService {
             ));
         }
         let (core, reply) =
-            SessionCore::open(repo, |_| Some(policy), hooks, parallel_uploads, hello)
+            SessionCore::open(repo, || Some(policy), hooks, parallel_uploads, hello)
                 .await
                 .map_err(into_error)?;
         let service = ReceiveService {
@@ -240,9 +240,11 @@ impl ReceiveService {
     /// 2. The mode `bare-split-xattrs` (`mode-refused`).
     /// 3. For a `Hello` with `one-way` false, `[core] locking=false`
     ///    (`locking-disabled`).
-    /// 4. Each ref name (`invalid-ref`).
-    /// 5. The collection id of `Hello`, which must be 255 bytes at most and
-    ///    pass [`is_collection_id`](crate::is_collection_id) (`invalid-ref`).
+    /// 4. Each ref name, which is `NAME`, `REMOTE:NAME`, or `@ID:NAME`, as
+    ///    [`Ref`](crate::Ref) reads it (`invalid-ref`).
+    /// 5. No two names of `Hello` name one ref (`protocol`). A name sent two
+    ///    times names one ref, and so do `NAME` and `@ID:NAME` with `ID` the
+    ///    collection id of the repository.
     /// 6. For a `Hello` with `one-way` false, the size of the `HelloReply`
     ///    with a commit for each ref, against [`MAX_FRAME`]
     ///    (`limit-exceeded`).
@@ -277,16 +279,17 @@ impl ReceiveService {
     ///   `bare-split-xattrs`.
     /// - [`remote::Error::LockingDisabled`] if `hello` has `one-way` false and
     ///   the repository sets `[core] locking=false`.
-    /// - [`remote::Error::InvalidRef`] if a ref name of `hello` is not valid,
-    ///   or if its collection id is longer than 255 bytes or fails the
-    ///   collection-id rule.
+    /// - [`remote::Error::InvalidRef`] if a ref name of `hello` is not valid.
+    /// - [`remote::Error::Protocol`] if two names of `hello` name one ref.
     /// - [`remote::Error::LimitExceeded`] if `hello` has `one-way` false and
     ///   its `HelloReply` can need a frame over [`MAX_FRAME`].
     /// - [`remote::Error::Internal`] if the encoder refuses the `HelloReply`
     ///   with no ref.
     /// - [`Error::Core`] if `[core] locking` is not a boolean.
     pub fn check_hello(repo: &Repo, hello: &Hello) -> Result<()> {
-        super::core::check_hello(repo, hello).map_err(into_error)
+        super::core::check_hello(repo, hello)
+            .map(drop)
+            .map_err(into_error)
     }
 
     /// Answers a `Have`: one bit for each object, set if the object is missing.
@@ -391,8 +394,11 @@ impl ReceiveService {
     ///
     /// # Reply
     ///
-    /// The host sends `CommitReply` from the refs of the report. If that send
-    /// fails, the host adds a warning of the step
+    /// The call returns the report and the outcomes of the reply, each in the
+    /// order of the updates. The host sends `CommitReply` with
+    /// [`ReceiveCommit::reply`], whose names are the text that the client
+    /// sent. The names of the report are canonical. If that send fails, the
+    /// host adds a warning of the step
     /// [`ReplyNotDelivered`](super::ReceiveStep::ReplyNotDelivered) to the
     /// report. The report that `after_update` gets never holds this warning.
     ///
@@ -446,22 +452,24 @@ impl ReceiveService {
     ///   the repository is `true`, and `ostree.composefs.digest.v0` of a new
     ///   commit of the session or of the server commit is not a variant of
     ///   type `ay` with 32 bytes.
+    /// - [`remote::Error::Protocol`] if the branch and the tags of a server
+    ///   commit are not in one namespace.
     /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an
-    ///   update writes a commit to a ref name of 64 lowercase hex characters.
-    ///   This applies to the branch and each tag of a server commit too. A
-    ///   bound name of a server commit that is not valid, or that holds `:`,
-    ///   also gives this error.
+    ///   update writes a commit to a local ref of 64 lowercase hex
+    ///   characters. This applies to the branch and each tag of a server
+    ///   commit too. A bound name of a server commit that is not valid, or
+    ///   that holds `:`, also gives this error.
     /// - [`remote::Error::LimitExceeded`] if the `CommitReply` can need a frame
     ///   over [`MAX_FRAME`], or if a merged detached metadata dict is larger
     ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`remote::Error::RefDenied`] if an update writes a commit to a ref
-    ///   on which the policy gives no `w` and no `t`, or if an update names
-    ///   the collection anchor ref in the local refs of a repository with a
-    ///   collection id.
+    ///   on which the policy gives no `w` and no `t` in the namespace of the
+    ///   ref, or if an update names the collection anchor ref in the local
+    ///   refs of a repository with a collection id.
     /// - [`remote::Error::RefDenied`] if the policy gives no `c` on the branch
-    ///   of a server commit, or neither `t` nor `w` on a tag, if the branch or
-    ///   a tag is the collection anchor ref in the local refs of a repository
-    ///   with a collection id.
+    ///   of a server commit, or neither `t` nor `w` on a tag, each in the
+    ///   namespace of the ref, or if the branch or a tag is the collection
+    ///   anchor ref in the local refs of a repository with a collection id.
     /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
@@ -478,11 +486,19 @@ impl ReceiveService {
     ///   A dependency that the repository holds and marks partial also gives
     ///   this error, with no object listed and the text of
     ///   [`Error::InvalidRelated`], unless it is a new commit of an update.
-    /// - [`remote::Error::BindingMismatch`] if the ref binding of a new commit
-    ///   does not name its ref, or if its collection binding does not name the
-    ///   collection of the namespace. For the local refs, that collection is
-    ///   the collection id of the repository, and in a repository with no
-    ///   collection id each collection binding fails.
+    /// - [`remote::Error::BindingMismatch`] if the `ostree.ref-binding` of a
+    ///   new commit does not hold the name of one of its refs, without the
+    ///   `@ID:` part. A commit with no such key passes, and a commit with an
+    ///   empty list fails.
+    ///   [`disable_verify_bindings`](super::ReceivePolicy::disable_verify_bindings)
+    ///   skips this check.
+    /// - [`remote::Error::BindingMismatch`] if the collection binding of a new
+    ///   commit does not name the collection of the namespace of one of its
+    ///   refs. For a local ref, that collection is the collection id of the
+    ///   repository, and in a repository with no collection id each collection
+    ///   binding fails. A commit with no collection binding fails for a ref
+    ///   `@ID:NAME` of a collection other than the collection id of the
+    ///   repository.
     /// - [`remote::Error::SignatureRequired`] if a new commit that the client
     ///   built fails the signature verification of the policy. A commit that
     ///   no update names gets no verification, a staged parent and a
@@ -524,7 +540,7 @@ impl ReceiveService {
     ///   `[core] lock-timeout-secs`.
     /// - An I/O error from the file system, if a read of the repository or a
     ///   write of the transaction commit fails.
-    pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveReport> {
+    pub async fn commit(&self, request: CommitRequest) -> Result<ReceiveCommit> {
         let core = {
             let mut state = self.lock();
             match &*state {

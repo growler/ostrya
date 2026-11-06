@@ -119,7 +119,6 @@ fn an_unknown_version_is_version_unsupported() {
             version: 2,
             agent: None,
             refs: vec![],
-            collection: None,
             one_way: false,
         }))
         .await
@@ -193,12 +192,12 @@ fn a_ref_path_through_a_directory_or_a_file_is_absent() {
 // Namespaces.
 // ---------------------------------------------------------------------------
 
-/// A `Hello` with a collection id reads the tips of the refs of that
-/// collection under `refs/mirrors/ID/`, and `HelloReply` reports the
-/// collection. The collection id of the repository names the local refs,
-/// and the reply then reports no collection.
+/// A ref `@ID:NAME` of `Hello` reads the tip of `refs/mirrors/ID/NAME`, and
+/// `@ID:NAME` with `ID` the collection id of the repository reads the local
+/// ref. `HelloReply` gives each name as the client sent it, and the
+/// collection id of the repository.
 #[test]
-fn hello_reply_reports_the_namespace_and_reads_its_refs() {
+fn hello_reply_reads_each_ref_in_its_namespace() {
     let tmp = TmpDir::new("recv-namespace");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
     let (local, mirror) = (sha(b"local"), sha(b"mirror"));
@@ -207,113 +206,152 @@ fn hello_reply_reports_the_namespace_and_reads_its_refs() {
     std::fs::create_dir_all(&mirrors).unwrap();
     std::fs::write(mirrors.join("main"), format!("{mirror}\n")).unwrap();
 
-    let tips = |reply: &ostrya::remote::proto::HelloReply| -> Vec<Option<Checksum>> {
-        reply.refs.iter().map(|r| r.commit).collect()
-    };
-    let os = collections_policy(&["org.example.Os"], &["w:**"]);
-    let (_, reply) = session(&repo, &os, |mut c| async move {
-        let reply = c
-            .hello_reply_in(&["main", "absent"], Some("org.example.Os"))
-            .await;
+    let mut both = collections_policy(&["org.example.Os"], &["w:**"]);
+    both.rules.local = policy().rules.local;
+    let names = [
+        "@org.example.Os:main",
+        "@org.example.Os:absent",
+        "main",
+        "@org.example.C:absent",
+    ];
+    let (_, reply) = session(&repo, &both, |mut c| async move {
+        let reply = c.hello_reply(&names).await;
         c.send(&Message::Abort).await.unwrap();
         reply
     });
-    assert_eq!(reply.collection.as_deref(), Some("org.example.Os"));
     assert_eq!(reply.collection_id.as_deref(), Some("org.example.C"));
-    assert_eq!(tips(&reply), vec![Some(mirror), None]);
-
-    for collection in [None, Some("org.example.C")] {
-        let (_, reply) = session(&repo, &policy(), |mut c| async move {
-            let reply = c.hello_reply_in(&["main"], collection).await;
-            c.send(&Message::Abort).await.unwrap();
-            reply
-        });
-        assert_eq!(reply.collection, None, "{collection:?}");
-        assert_eq!(tips(&reply), vec![Some(local)], "{collection:?}");
-    }
+    let states: Vec<(&str, Option<Checksum>)> = reply
+        .refs
+        .iter()
+        .map(|r| (r.name.as_str(), r.commit))
+        .collect();
+    assert_eq!(
+        states,
+        [
+            (names[0], Some(mirror)),
+            (names[1], None),
+            (names[2], Some(local)),
+            (names[3], None),
+        ]
+    );
+    let (_, reply) = session(&repo, &policy(), |mut c| async move {
+        let reply = c.hello_reply(&["@org.example.C:main"]).await;
+        c.send(&Message::Abort).await.unwrap();
+        reply
+    });
+    assert_eq!(reply.refs[0].commit, Some(local));
 }
 
-/// A collection id that fails the collection-id rule is `invalid-ref`, also
-/// under a policy with items of that id.
+/// A name whose collection id fails the collection-id rule is
+/// `invalid-ref`, also under a policy with items of that id.
 #[test]
 fn an_invalid_collection_id_is_invalid_ref() {
     let tmp = TmpDir::new("recv-bad-collection");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     for id in ["", "no-dot", "org.example/Os", "..", "1org.example"] {
         let policy = collections_policy(&[id], &["w:**"]);
+        let name = format!("@{id}:main");
         let (result, error) = session(&repo, &policy, |mut c| async move {
-            c.hello_in(&["main"], Some(id)).await.unwrap();
+            c.hello(&[&name]).await.unwrap();
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::InvalidRef, "{id:?}: {error:?}");
-        assert!(error.message.contains("collection id"), "{error:?}");
+        assert!(
+            error.message.contains(&format!("'@{id}:main'")),
+            "{error:?}"
+        );
         assert_eq!(returned_code(&result), Some(ErrorCode::InvalidRef));
     }
     assert!(staging_entries(repo.path()).is_empty());
 }
 
+/// Two names of one ref in one `Hello` are `protocol`, before `HelloReply`:
+/// the same name two times, and `NAME` with `@ID:NAME` where `ID` is the
+/// collection id of the repository. Two refs of one name in two namespaces
+/// are two refs.
+#[test]
+fn two_names_of_one_ref_are_protocol() {
+    let tmp = TmpDir::new("recv-duplicate");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let mut both = collections_policy(&["org.example.Os"], &["w:**"]);
+    both.rules.local = policy().rules.local;
+    for names in [
+        &["main", "main"][..],
+        &["main", "@org.example.C:main"],
+        &["@org.example.C:main", "main"],
+        &["@org.example.Os:a", "@org.example.Os:a"],
+    ] {
+        let (result, error) = session(&repo, &both, |mut c| async move {
+            c.hello(names).await.unwrap();
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::Protocol, "{names:?}: {error:?}");
+        assert!(error.message.contains("two times"), "{error:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+    }
+    let (_, reply) = session(&repo, &both, |mut c| async move {
+        let reply = c.hello_reply(&["main", "@org.example.Os:main"]).await;
+        c.send(&Message::Abort).await.unwrap();
+        reply
+    });
+    assert_eq!(reply.refs.len(), 2);
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
 /// The items of one namespace give no right in another namespace, so a ref
-/// of `Hello` with no `r` in the namespace of `Hello` is `ref-denied`. The
-/// items of the local refs give no right in a collection, and the items of
-/// a collection give no right in the local refs or in another collection.
+/// of `Hello` with no `r` in its own namespace is `ref-denied`. The items of
+/// the local refs give no right in a collection, and the items of a
+/// collection give no right in the local refs or in another collection.
 #[test]
 fn the_items_of_another_namespace_give_no_right() {
     let tmp = TmpDir::new("recv-uncovered");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
     let os = collections_policy(&["org.example.Os"], &["w:**"]);
-    for (policy, collection) in [
-        (policy(), Some("org.example.Os")),
-        (os.clone(), None),
-        (os.clone(), Some("org.example.C")),
-        (os, Some("org.example.Other")),
+    for (policy, name) in [
+        (policy(), "@org.example.Os:main"),
+        (os.clone(), "main"),
+        (os.clone(), "@org.example.C:main"),
+        (os, "@org.example.Other:main"),
     ] {
         let (result, error) = session(&repo, &policy, |mut c| async move {
-            c.hello_in(&["main"], collection).await.unwrap();
+            c.hello(&[name]).await.unwrap();
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::RefDenied, "{error:?}");
-        assert!(error.message.contains("no r on ref 'main'"), "{error:?}");
+        assert!(error.message.contains("no r on ref"), "{error:?}");
         assert_eq!(returned_code(&result), Some(ErrorCode::RefDenied));
     }
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// `receive_selected` asks for the policy of the namespace of `Hello`. A
-/// selection of no policy is `ref-denied`.
+/// `receive_selected` asks for the policy of the session once, after the
+/// checks of `Hello`. A selection of no policy is `ref-denied`.
 #[test]
-fn receive_selected_takes_the_policy_of_the_namespace() {
+fn receive_selected_takes_the_policy_of_the_session() {
     let tmp = TmpDir::new("recv-selected");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
     let policy = collections_policy(&["org.example.Os"], &["w:**"]);
-    for (collection, wanted, found) in [
-        (
-            Some("org.example.Os"),
-            ostrya::access::Namespace::Collection("org.example.Os".into()),
-            true,
-        ),
-        (
-            Some("org.example.C"),
-            ostrya::access::Namespace::Local,
-            false,
-        ),
-        (None, ostrya::access::Namespace::Local, false),
+    for (name, found) in [
+        ("@org.example.Os:main", true),
+        ("@org.example.C:main", false),
+        ("main", false),
     ] {
         let (mut client, server_in, server_out) = connect();
-        let seen = std::sync::Mutex::new(None);
-        let select = |namespace: &ostrya::access::Namespace| {
-            *seen.lock().unwrap() = Some(namespace.clone());
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let select = || {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             found.then_some(&policy)
         };
         let (result, reply) = block_on(futures_lite::future::zip(
             repo.receive_selected(server_in, server_out, select),
             async move {
-                client.hello_in(&["main"], collection).await.unwrap();
+                client.hello(&[name]).await.unwrap();
                 let reply = client.recv().await;
                 let _ = client.send(&Message::Abort).await;
                 reply
             },
         ));
-        assert_eq!(seen.into_inner().unwrap(), Some(wanted), "{collection:?}");
+        assert_eq!(calls.into_inner(), 1, "{name}");
         if found {
             assert!(matches!(reply, Some(Message::HelloReply(_))), "{reply:?}");
             assert!(
@@ -420,7 +458,8 @@ fn a_reply_over_the_frame_limit_is_limit_exceeded() {
         format!("{}\n", sha(b"tip")),
     )
     .unwrap();
-    let refs = vec!["m"; 100_000];
+    let names: Vec<String> = (0..40_000).map(|i| i.to_string()).collect();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let holder = foreign_holder(repo.path(), ".lock");
     let started = Instant::now();
     let (result, error) = session(&repo, &policy(), |mut c| async move {
@@ -430,7 +469,7 @@ fn a_reply_over_the_frame_limit_is_limit_exceeded() {
     let waited = started.elapsed();
     drop(holder);
     assert_eq!(error.code, ErrorCode::LimitExceeded, "{error:?}");
-    assert!(error.message.contains("100000 refs"), "{}", error.message);
+    assert!(error.message.contains("40000 refs"), "{}", error.message);
     assert_eq!(returned_code(&result), Some(ErrorCode::LimitExceeded));
     assert!(
         waited < Duration::from_secs(1),

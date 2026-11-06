@@ -604,14 +604,15 @@ Thus a key source that ostrya cannot read stops the command.
 \fB\%ostrya receive \-\-one\-way\fR and \fB\%ostrya send \-\-one\-way\fR read no client group, no server group, and no key group.
 A pull from a remote with the key \fB\%trust\fR, \fB\%ostrya pull\-local \-\-trust=NAME\fR, and \fB\%ostrya receive \-\-one\-way \-\-trust=NAME\fR check and build the one trust group that they name, and no other group.
 A bad group stops the command with status 1.
-A push session names its namespace in \fB\%Hello\fR: the local refs, or one collection.
-The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs.
+Each ref of a push session names its own namespace: \fB\%NAME\fR is a local ref, and \fB\%@ID:NAME\fR is a ref of the collection \fB\%ID\fR.
+The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id is the local ref \fB\%NAME\fR.
+One session can write local refs and the refs of more than one collection.
 \fB\%ostrya receive\fR gives a session the client group that holds the \fB\%ssh:NAME\fR item of the client name.
 With no such group, the session gets \fB\%ref\-denied\fR.
 \fB\%ostrya serve\fR gives a session the client group that holds the item that identified the request.
 With no such group, the request gets 403.
-The session takes the allow items and the deny items of the group for its namespace.
-A session of a collection reads and writes the refs below \fB\%refs/mirrors/ID/\fR alone.
+The session takes the allow items and the deny items of the group for the namespace of each ref.
+A ref of a collection other than the \fB\%collection\-id\fR of \fB\%[core]\fR is below \fB\%refs/mirrors/ID/\fR.
 \fB\%ostrya send\fR serves the refs that the group of the \fB\%ssh:NAME\fR item reads.
 With client groups and no group that holds that item, it writes an error line and exits 1 before it reads its input.
 \fB\%ostrya serve\fR takes its settings from the server group, and an option of the command has precedence over the key of its name.
@@ -753,6 +754,15 @@ In a \fB\%bare\fR repository, accept the setuid and setgid bits, and the extende
 The rule applies to each content object and each dirmeta object that a session receives, also to an object that the repository already holds.
 A session on a \fB\%bare\fR repository needs a server that runs as root.
 .TP
+\fB\%disable\-verify\-bindings\fR (boolean, default false)
+Skip the check of \fB\%ostree.ref\-binding\fR for each ref update of a push session of the group, each tag included.
+A new commit can then have an \fB\%ostree.ref\-binding\fR list that does not hold the name of its ref, or an empty list.
+The check of \fB\%ostree.collection\-binding\fR stays on, and a commit with no collection binding still goes to the local refs alone.
+A server commit gets no such check, because the server writes its bindings.
+A ref that a push writes under this key can point at a commit whose \fB\%ostree.ref\-binding\fR does not hold the name of the ref.
+A pull of such a ref fails without \fB\%\-\-disable\-verify\-bindings\fR, also a pull by the \fB\%ostree\fR command.
+\fB\%ostrya fsck \-\-verify\-bindings\fR reports such a ref.
+.TP
 \fB\%summary\fR (boolean, default false)
 Give each authentication item of the group a summary (see "Summaries").
 A group with \fB\%tls\-accept\-claim=true\fR refuses \fB\%summary=true\fR.
@@ -835,12 +845,13 @@ A push session follows these rules:
 .IP \(bu 2
 A group opens a push session only when an allow item of any namespace has \fB\%w\fR, \fB\%c\fR, \fB\%t\fR, or \fB\%d\fR.
 .IP \(bu 2
-Each ref of the session needs \fB\%r\fR in the namespace of the session.
+Each ref of the session needs \fB\%r\fR in its namespace.
 So a delete needs \fB\%r\fR and \fB\%d\fR, for example the item \fB\%rd:PATTERN\fR.
 .IP \(bu 2
 An update that writes a commit needs \fB\%w\fR or \fB\%t\fR.
 .IP \(bu 2
 A server commit needs \fB\%c\fR on its branch.
+The branch and the tags of a server commit are in one namespace.
 A server commit with no parent on a branch that exists needs \fB\%cd\fR, else it is \fB\%non\-fast\-forward\fR.
 Each tag of a server commit needs \fB\%t\fR or \fB\%w\fR, and a tag that exists gets \fB\%ref\-mismatch\fR, also with \fB\%w\fR.
 A bound name of a server commit gets no ref and needs no mode.
@@ -848,9 +859,14 @@ A bound name of a server commit gets no ref and needs no mode.
 .IP \(bu 2
 A push writes no remote ref, and no \fB\%ostree\-metadata\fR in the local refs of a repository with a collection id.
 .IP \(bu 2
-The \fB\%ostree.collection\-binding\fR of a new commit that the client built must name the collection of the namespace.
+The \fB\%ostree.collection\-binding\fR of a new commit that the client built must name the collection of the namespace of its ref.
 For the local refs, that is the \fB\%collection\-id\fR of \fB\%[core]\fR, and in a repository with no collection id, each collection binding is refused.
-A commit with no collection binding passes in each namespace.
+A commit with no collection binding passes on a local ref, and is refused on a ref of another collection.
+.IP \(bu 2
+A new commit that the client built with the key \fB\%ostree.ref\-binding\fR must hold the name of its ref in that list, without \fB\%@ID:\fR.
+An empty list holds no name, so it is refused.
+A commit with no such key passes.
+\fB\%disable\-verify\-bindings=true\fR skips this check.
 .IP \(bu 2
 The parent chain of a new branch can stop at any depth.
 On a branch that exists, the chain of the new commit must reach the current commit, else the update is \fB\%non\-fast\-forward\fR.
@@ -878,7 +894,7 @@ A claim with \fB\%@ID:\fR of the \fB\%collection\-id\fR of \fB\%[core]\fR is a c
 When the certificate holds one or more claims for a namespace, they replace the allow items and the deny items of the group for that namespace.
 In each other namespace, the items of the group apply.
 .IP \(bu 2
-\fB\%verify\fR, \fB\%allow\-unsigned\fR, \fB\%sign\fR, and \fB\%allow\-privileged\fR come from the group.
+\fB\%verify\fR, \fB\%allow\-unsigned\fR, \fB\%sign\fR, \fB\%allow\-privileged\fR, and \fB\%disable\-verify\-bindings\fR come from the group.
 .IP \(bu 2
 A URI whose scheme is not \fB\%ostrya\fR, in any case, has no effect.
 .IP \(bu 2

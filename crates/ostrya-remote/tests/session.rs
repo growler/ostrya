@@ -11,7 +11,7 @@ use std::task::{Context, Poll};
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncWriteExt, Cursor};
 use ostrya_core::filehdr::frame;
-use ostrya_core::{Checksum, DeflateSink, FileHeader, ObjectName, ObjectType, Xattrs};
+use ostrya_core::{Checksum, DeflateSink, FileHeader, ObjectName, ObjectType, Ref, Xattrs};
 use ostrya_gvariant::{DictBuilder, Type, Value};
 use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, HaveReply, HelloReply, MIN_FRAME_LIMIT, Message,
@@ -147,7 +147,6 @@ fn hello_reply(refs: &[&str], encodings: &[Encoding], max_have: u32) -> Message 
         version: 1,
         mode: "archive".into(),
         collection_id: None,
-        collection: None,
         max_frame: MIN_FRAME_LIMIT,
         max_have,
         encodings: encodings.to_vec(),
@@ -489,65 +488,31 @@ fn hello_reply_of_another_version_is_protocol() {
     assert!(matches!(r, Err(Error::Protocol(_))));
 }
 
-/// `Hello` carries the collection of the options. A reply whose collection
-/// does not match the request is `protocol`: a request of no collection
-/// needs a reply of none, and a request of an id needs a reply of that id,
-/// or a reply of none from a server whose collection id is that id.
+/// `Hello` carries each name as the caller gives it, `@ID:NAME` included,
+/// and no collection. The session reads the collection id of the server from
+/// `HelloReply`, and maps a ref of that id to the local ref of the same name.
 #[test]
-fn hello_reply_collection_must_match_the_request() {
-    let reply = |collection_id: Option<&str>, collection: Option<&str>| {
-        let mut reply = hello_reply(&["a"], BOTH, 16);
-        if let Message::HelloReply(r) = &mut reply {
-            r.collection_id = collection_id.map(str::to_owned);
-            r.collection = collection.map(str::to_owned);
-        }
-        encode(&[reply])
-    };
-    let os = Some("org.example.Os");
-    for (asked, collection_id, collection, binds) in [
-        (None, None, None, Ok(None)),
-        (None, os, None, Ok(os)),
-        (os, None, os, Ok(os)),
-        (os, Some("org.example.C"), os, Ok(os)),
-        (os, os, None, Ok(os)),
-        (None, None, os, Err("'org.example.Os' of HelloReply")),
-        (os, None, None, Err("none of HelloReply")),
-        (os, Some("org.example.C"), None, Err("none of HelloReply")),
-        (
-            os,
-            None,
-            Some("org.example.Other"),
-            Err("'org.example.Other' of HelloReply"),
-        ),
-    ] {
-        let opts = SessionOptions {
-            collection: asked.map(str::to_owned),
-            ..SessionOptions::default()
-        };
-        let (r, out) = open_with(reply(collection_id, collection), &["a"], opts);
-        match (r, binds) {
-            (Ok(session), Ok(binds)) => {
-                assert_eq!(session.server().collection.as_deref(), collection);
-                assert_eq!(session.server().binding_collection(), binds);
-            }
-            (Err(Error::Protocol(message)), Err(got)) => {
-                let asked = asked.map_or_else(|| "none".to_owned(), |id| format!("'{id}'"));
-                assert_eq!(
-                    message,
-                    format!("the collection {got} does not match the collection {asked} of Hello")
-                );
-            }
-            (other, _) => panic!(
-                "{asked:?} {collection_id:?} {collection:?}: {:?}",
-                other.map(|_| ())
-            ),
-        }
-        match &decode(&out.bytes())[..] {
-            [Event::Msg(Message::Hello(h)), ..] => {
-                assert_eq!(h.collection.as_deref(), asked);
-            }
-            other => panic!("{other:?}"),
-        }
+fn hello_names_a_collection_ref_as_text() {
+    let names = ["main", "@org.example.Os:a", "@org.example.C:b"];
+    let mut reply = hello_reply(&names, BOTH, 16);
+    if let Message::HelloReply(r) = &mut reply {
+        r.collection_id = Some("org.example.C".into());
+    }
+    let (r, out) = open_with(encode(&[reply]), &names, SessionOptions::default());
+    let session = r.unwrap();
+    let server = session.server();
+    assert_eq!(server.collection_id.as_deref(), Some("org.example.C"));
+    let canonical = |text: &str| server.canonical(&text.parse::<Ref>().unwrap());
+    assert_eq!(canonical("main"), Ref::local("main"));
+    assert_eq!(
+        canonical("@org.example.Os:a"),
+        Ref::collection("org.example.Os", "a")
+    );
+    assert_eq!(canonical("@org.example.C:b"), Ref::local("b"));
+    assert_eq!(canonical("origin:b"), Ref::remote("origin", "b"));
+    match &decode(&out.bytes())[..] {
+        [Event::Msg(Message::Hello(h)), ..] => assert_eq!(h.refs, names),
+        other => panic!("{other:?}"),
     }
 }
 
@@ -1583,7 +1548,6 @@ fn progress_counts_and_phases() {
     ];
     let opts = SessionOptions {
         agent: Some("test/1".into()),
-        collection: None,
         progress: Some(progress.clone()),
     };
     let (session, out) = open_with(encode(&msgs), &["a"], opts);

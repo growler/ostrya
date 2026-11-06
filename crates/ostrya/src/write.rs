@@ -2015,9 +2015,10 @@ fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
 /// Returns `true` if the file system of `tmp_fd` accepts an fs-verity seal.
 ///
 /// The function makes a temp file in `tmp_fd`, writes one byte, closes the
-/// writable descriptor, and enables fs-verity on a read-only descriptor. It
-/// tries again after an `ETXTBSY` error, as [`seal_regular`] does. Each other
-/// enable error gives `false`. The function removes the temp file.
+/// writable descriptor, and calls [`seal_regular`] with [`Tristate::Yes`] on
+/// a read-only descriptor. So the probe uses the same `ETXTBSY` retry. An
+/// enable error that remains after the retries gives `false`. The function
+/// removes the temp file.
 ///
 /// # Errors
 ///
@@ -2029,17 +2030,7 @@ pub(crate) fn probe_seal_blocking(tmp_fd: BorrowedFd<'_>) -> Result<bool> {
         .and_then(|_| reopen_ro(fd.as_fd()))
         .map(|ro| {
             drop(fd);
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                match ostrya_sys::enable_verity(&ro) {
-                    Ok(()) => break true,
-                    Err(rustix::io::Errno::TXTBSY) if attempts < SEAL_ATTEMPTS => {
-                        std::thread::sleep(SEAL_PAUSE);
-                    }
-                    Err(_) => break false,
-                }
-            }
+            seal_regular(ro.as_fd(), Tristate::Yes).is_ok()
         });
     cleanup_temp(tmp_fd, &temp);
     sealed

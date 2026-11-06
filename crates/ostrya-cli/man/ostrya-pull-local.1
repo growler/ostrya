@@ -12,6 +12,8 @@ The command opens \%SRC_REPO and imports each ref, the commits that \%\-\-depth 
 .PP
 The pull also imports the dependencies that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only.
 .PP
+With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only.
+.PP
 On success, the command prints one statistics line to standard output: \fB\%M metadata, C content objects imported; SIZE content written\fR\&. Under \%\-\-require\-static\-deltas, the line has the form of a pull from a remote. The command writes no progress line.
 .SH ARGUMENTS
 .TP

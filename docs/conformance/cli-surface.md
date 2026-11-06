@@ -6230,7 +6230,9 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   (`ostrya-config(1)`). If the repository does not seal its objects,
   `commit`, `pull`, `pull-local`, `receive`, and `static-delta
   apply-offline` write one `warning:` line to standard error, and the exit
-  status does not change. The tool ignores the group `[ex-ostrya]`.
+  status does not change. `pull` and `pull-local` write the line only after
+  a pull that succeeds, and not with `--commit-metadata-only` or, for
+  `pull`, `--subpath`. The tool ignores the group `[ex-ostrya]`.
 - The tool has no image store. `objects/` of a repository that holds images
   holds only the object types of the tool, so the tool reads the
   repository. `ostree fsck` and `ostree prune` neither check, count, nor

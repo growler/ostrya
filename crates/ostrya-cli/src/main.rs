@@ -441,6 +441,11 @@ enum Command {
     /// commit names, each with no parent and no ref, unless it takes
     /// --commit-metadata-only or --subpath.
     ///
+    /// With `[ex-ostrya] generate-composefs=true` in a repository that does
+    /// not seal its objects with fs-verity, a pull that succeeds writes one
+    /// warning line to standard error, unless it takes --commit-metadata-only
+    /// or --subpath.
+    ///
     /// On success, the command prints one statistics line to standard output.
     /// A pull with --collection can print two lines, as --collection states.
     /// If standard output is a terminal, a progress line shows while the pull
@@ -459,6 +464,10 @@ enum Command {
     /// The pull also imports the dependencies that field 2 of each pulled
     /// commit names, each with no parent and no ref, unless it takes
     /// --commit-metadata-only.
+    ///
+    /// With `[ex-ostrya] generate-composefs=true` in a repository that does
+    /// not seal its objects with fs-verity, a pull that succeeds writes one
+    /// warning line to standard error, unless it takes --commit-metadata-only.
     ///
     /// On success, the command prints one statistics line to standard output:
     /// `M metadata, C content objects imported; SIZE content written`. Under
@@ -5678,6 +5687,11 @@ async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
 /// does not change the exit status: an error of the key or of the probe
 /// gives no warning, and the writer of the command reports a bad setting
 /// itself.
+///
+/// `pull` and `pull-local` call it after a pull that succeeds and that
+/// records its commits as complete: a pull with no --commit-metadata-only
+/// and, for `pull`, no --subpath. The other callers call it before their
+/// work.
 async fn warn_unsealed(repo: &Repo) {
     if matches!(repo.config().generate_composefs(), Ok(true))
         && matches!(repo.seals_objects().await, Ok(false))
@@ -6880,6 +6894,7 @@ async fn pull(
     let line = progress
         .clone()
         .map(|progress| ProgressLine::start(progress, redraw));
+    let builds_image = !args.commit_metadata_only && args.subpath.is_empty();
     let opts = PullOptions {
         refs,
         flags,
@@ -6902,7 +6917,6 @@ async fn pull(
         progress,
         ..PullOptions::default()
     };
-    warn_unsealed(&repo).await;
     let pulled = match from {
         PullFrom::Remote(remote) => repo
             .pull(&remote, opts)
@@ -6939,6 +6953,9 @@ async fn pull(
         } else {
             println!("{text}");
         }
+    }
+    if builds_image {
+        warn_unsealed(&repo).await;
     }
     Ok(())
 }
@@ -7294,7 +7311,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         flags |= PullFlags::FORCE_COPY;
     }
 
-    warn_unsealed(&repo).await;
+    let builds_image = !args.commit_metadata_only;
     let stats = repo
         .pull_local(
             &src,
@@ -7331,6 +7348,9 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         PullSource::Local
     };
     println!("{}", statistics_line(&stats, source));
+    if builds_image {
+        warn_unsealed(&repo).await;
+    }
     Ok(())
 }
 

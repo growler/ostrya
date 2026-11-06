@@ -14,6 +14,8 @@ The pull stores the objects in one transaction, and then writes each ref under \
 .PP
 The pull also fetches the dependencies that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
 .PP
+With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
+.PP
 On success, the command prints one statistics line to standard output. A pull with \%\-\-collection can print two lines, as \%\-\-collection states. If standard output is a terminal, a progress line shows while the pull runs, and the first statistics line is drawn over it.
 .SH ARGUMENTS
 .TP

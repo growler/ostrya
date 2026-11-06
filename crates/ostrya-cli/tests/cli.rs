@@ -24243,6 +24243,73 @@ fn the_generate_composefs_key_stores_the_image_of_a_commit() {
     assert!(!image_path(&off, &same).exists());
 }
 
+/// With `[ex-ostrya] generate-composefs` true and `fsverity=no`, `pull` and
+/// `pull-local` write the warning only after a pull that succeeds and records
+/// its commits as complete. A pull with `--commit-metadata-only`, or a
+/// `pull` with `--subpath`, writes no warning. A pull that the request checks
+/// refuse writes only its error. The fixture commits have no composefs
+/// digest, so no pull builds an image.
+#[test]
+fn the_unsealed_warning_follows_a_pull_that_builds_an_image() {
+    let tmp = TmpDir::new("composefs-unsealed-pull");
+    let base = tmp.path();
+    let remote = build_subpath_remote(base, "remote", false);
+    let server = FileServer::start(&remote);
+    let config = "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n";
+
+    let dest = base.join("dest");
+    std::fs::create_dir_all(&dest).unwrap();
+    let dest = create_repo(&dest, RepoMode::BareUser);
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+    append_config(&dest, config);
+
+    for args in [
+        &["pull", "origin", BRANCH, "--commit-metadata-only"][..],
+        &["pull", "origin", BRANCH, "--subpath=/sub"],
+    ] {
+        let run = ostrya_repo(&dest, args);
+        assert_eq!(code_and_stderr(&run), (Some(0), String::new()), "{args:?}");
+    }
+    let run = ostrya_repo(&dest, &["pull", "origin", BRANCH, "--subpath=sub"]);
+    assert_eq!(
+        code_and_stderr(&run),
+        (
+            Some(1),
+            "error: pull: subpath 'sub' is not an absolute path\n".to_owned()
+        )
+    );
+    let run = ostrya_repo(&dest, &["pull", "origin", BRANCH]);
+    assert_eq!(
+        code_and_stderr(&run),
+        (Some(0), format!("{UNSEALED_WARNING}\n"))
+    );
+
+    let local = base.join("local");
+    std::fs::create_dir_all(&local).unwrap();
+    let local = create_repo(&local, RepoMode::BareUser);
+    append_config(&local, config);
+    // The commit binds the ref `test/main`. A pull of `origin:test/main`
+    // fails the binding check, so the source gets a local ref of that name.
+    let remote_ref = format!("origin:{BRANCH}");
+    let create = format!("--create={BRANCH}");
+    ostrya_repo(&dest, &["refs", &create, &remote_ref]).ok();
+    let run = ostrya_repo(
+        &local,
+        &[
+            "pull-local",
+            "--commit-metadata-only",
+            dest.to_str().unwrap(),
+            BRANCH,
+        ],
+    );
+    assert_eq!(code_and_stderr(&run), (Some(0), String::new()));
+    let run = ostrya_repo(&local, &["pull-local", dest.to_str().unwrap(), BRANCH]);
+    assert_eq!(
+        code_and_stderr(&run),
+        (Some(0), format!("{UNSEALED_WARNING}\n"))
+    );
+}
+
 /// With `[ex-ostrya] generate-composefs` true, fsck writes one line on
 /// standard output for a commit with the digest key and no image, and exits
 /// 0. A value of the key that is not a boolean fails `commit` and `fsck`, and

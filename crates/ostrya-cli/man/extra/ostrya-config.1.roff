@@ -500,6 +500,7 @@ With true, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\f
 .IP
 \fB\%warning: [ex\-ostrya] generate\-composefs is true, but the repository does not seal its objects with fs\-verity; the image build reads and hashes each object with no seal\fR
 .IP
+\fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR write the warning only after a pull that succeeds, and not with \fB\%\-\-commit\-metadata\-only\fR or, for \fB\%ostrya pull\fR, \fB\%\-\-subpath\fR.
 With \fB\%maybe\fR, the command makes a probe file in \fB\%tmp/\fR to find the result.
 The warning does not change the exit status.
 The fs\-verity setting applies to the objects that a write adds.

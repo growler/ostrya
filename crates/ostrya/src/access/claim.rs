@@ -6,7 +6,7 @@ use std::fmt;
 use ostrya_core::RefPattern;
 
 use super::Namespace;
-use super::rights::{AllowItem, parse_allow, parse_pattern};
+use super::rights::{AllowItem, parse_allow_item, parse_deny_item};
 
 /// The most claims that one certificate can hold.
 ///
@@ -19,9 +19,10 @@ const SCHEME: &str = "ostrya:";
 /// The rule of one claim: an allow item or a deny item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClaimRule {
-    /// An allow item, `[MODES:]PATTERN`.
+    /// An allow item: the modes and the pattern of
+    /// `[MODES:][@ID:]PATTERN`.
     Allow(AllowItem),
-    /// A deny item, `!PATTERN`.
+    /// A deny item: the pattern of `![@ID:]PATTERN`.
     Deny(RefPattern),
 }
 
@@ -31,17 +32,24 @@ pub enum ClaimRule {
 ///
 /// - `ostrya:ref:[MODES:]PATTERN` -- an allow item of the local refs.
 /// - `ostrya:ref:!PATTERN` -- a deny item of the local refs.
-/// - `ostrya:collection:ID:[MODES:]PATTERN` -- an allow item of the
-///   collection `ID`.
-/// - `ostrya:collection:ID:!PATTERN` -- a deny item of the collection `ID`.
+/// - `ostrya:ref:[MODES:]@ID:PATTERN` -- an allow item of the collection
+///   `ID`.
+/// - `ostrya:ref:!@ID:PATTERN` -- a deny item of the collection `ID`.
 ///
-/// `[MODES:]PATTERN` is the text that [`AllowItem::parse`] reads, so a claim
-/// with no `MODES` has the mode `r`. `PATTERN` is a [`RefPattern`]. `ID`
-/// passes [`is_collection_id`](crate::is_collection_id).
+/// The text after `ostrya:ref:` is an allow item of a client group, or `!`
+/// and a deny item of a client group, so a claim with no `MODES` has the
+/// mode `r`. `MODES` comes before `@ID:`, and `!` comes before `@ID:`.
+/// `PATTERN` is a [`RefPattern`]. `ID` passes
+/// [`is_collection_id`](crate::is_collection_id) and is at most
+/// [`MAX_COLLECTION_ID_LEN`](ostrya_core::MAX_COLLECTION_ID_LEN) bytes. A
+/// claim with `@ID:` of `[core] collection-id` names the local refs, as
+/// [`ClientAccess::claim_rules`](super::ClientAccess::claim_rules) states.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
-    /// The namespace that the claim names: [`Local`](Namespace::Local) for
-    /// `ostrya:ref:`, and the collection `ID` for `ostrya:collection:ID:`.
+    /// The namespace that the claim names: [`Local`](Namespace::Local) for a
+    /// claim with no `@ID:`, and the collection `ID` for a claim with
+    /// `@ID:`. The parse does not map `[core] collection-id` to
+    /// [`Local`](Namespace::Local).
     pub namespace: Namespace,
     /// The allow item or the deny item of the claim.
     pub rule: ClaimRule,
@@ -51,9 +59,9 @@ impl Claim {
     /// Parses the URI `uri` as a claim.
     ///
     /// The result is `None` if `uri` is not a claim: its scheme is not
-    /// `ostrya`, in any case. The scheme and the kind, `ref` or
-    /// `collection`, are lowercase in a claim. Each other spelling is a
-    /// malformed claim.
+    /// `ostrya`, in any case. The scheme and the kind `ref` are lowercase in
+    /// a claim. Each other spelling and each other kind is a malformed
+    /// claim.
     ///
     /// # Errors
     ///
@@ -79,23 +87,22 @@ fn is_claim(uri: &str) -> bool {
 /// Parses the claim `uri`, whose scheme is `ostrya` in any case. The error
 /// is the reason.
 fn parse_claim(uri: &str) -> Result<Claim, String> {
-    const FORMS: &str = "a claim starts with ostrya:ref: or ostrya:collection:ID:";
-    let rest = uri.strip_prefix(SCHEME).ok_or(FORMS)?;
-    let (namespace, rule) = if let Some(rule) = rest.strip_prefix("ref:") {
-        (Namespace::Local, rule)
-    } else if let Some(rest) = rest.strip_prefix("collection:") {
-        let (id, rule) = rest.split_once(':').ok_or(FORMS)?;
-        if !ostrya_core::is_collection_id(id) {
-            return Err("the collection id fails the collection-id rule".to_owned());
+    const FORMS: &str = "a claim starts with ostrya:ref:";
+    let body = uri
+        .strip_prefix(SCHEME)
+        .and_then(|rest| rest.strip_prefix("ref:"))
+        .ok_or(FORMS)?;
+    let (id, rule) = match body.strip_prefix('!') {
+        Some(item) => {
+            let (id, pattern) = parse_deny_item(item)?;
+            (id, ClaimRule::Deny(pattern))
         }
-        (Namespace::Collection(id.to_owned()), rule)
-    } else {
-        return Err(FORMS.to_owned());
+        None => {
+            let (id, item) = parse_allow_item(body)?;
+            (id, ClaimRule::Allow(item))
+        }
     };
-    let rule = match rule.strip_prefix('!') {
-        Some(pattern) => ClaimRule::Deny(parse_pattern(pattern)?),
-        None => ClaimRule::Allow(parse_allow(rule)?),
-    };
+    let namespace = id.map_or(Namespace::Local, Namespace::Collection);
     Ok(Claim { namespace, rule })
 }
 
@@ -129,7 +136,10 @@ impl std::error::Error for ClaimError {}
 /// The claims of a client certificate, in the order of its URI SANs.
 ///
 /// [`ClientAccess::claim_rules`](super::ClientAccess::claim_rules) gives the
-/// rules of the claims for one namespace.
+/// rules of the claims for one namespace, and
+/// [`ClientAccess::effective_rules`](super::ClientAccess::effective_rules)
+/// puts the rules of the claims of each namespace in place of the rules of a
+/// group.
 ///
 /// # Examples
 ///
@@ -139,12 +149,15 @@ impl std::error::Error for ClaimError {}
 /// let claims = Claims::parse([
 ///     "https://example.com/",
 ///     "ostrya:ref:wd:devel/**",
-///     "ostrya:collection:com.example.os:!os/secret",
+///     "ostrya:ref:!@com.example.os:os/secret",
 /// ])?;
 /// assert_eq!(claims.as_slice().len(), 2);
 /// assert_eq!(claims.as_slice()[0].namespace, Namespace::Local);
+/// let os = Namespace::Collection("com.example.os".into());
+/// assert_eq!(claims.as_slice()[1].namespace, os);
 /// assert!(matches!(claims.as_slice()[1].rule, ClaimRule::Deny(_)));
 /// assert!(Claims::parse(["ostrya:ref:x:a"]).is_err());
+/// assert!(Claims::parse(["ostrya:collection:com.example.os:r:a"]).is_err());
 /// # Ok::<(), ostrya::access::ClaimError>(())
 /// ```
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -219,7 +232,8 @@ mod tests {
         Namespace::Collection(id.to_owned())
     }
 
-    /// Each of the four forms parses, and a claim with no modes has `r`.
+    /// Each of the four forms parses, and a claim with no modes has `r`. The
+    /// own collection id stays a collection in the parse.
     #[test]
     fn each_form_parses() {
         assert_eq!(
@@ -239,16 +253,29 @@ mod tests {
             (Namespace::Local, "secret/**".to_owned())
         );
         assert_eq!(
-            allow("ostrya:collection:com.example.os:t:os/release/**"),
+            allow("ostrya:ref:t:@com.example.os:os/release/**"),
             (collection("com.example.os"), "t:os/release/**".to_owned())
         );
         assert_eq!(
-            allow("ostrya:collection:_a.b_1:os"),
+            allow("ostrya:ref:wd:@X.y:os/**"),
+            (collection("X.y"), "wd:os/**".to_owned())
+        );
+        assert_eq!(
+            allow("ostrya:ref:@_a.b_1:os"),
             (collection("_a.b_1"), "r:os".to_owned())
         );
         assert_eq!(
-            deny("ostrya:collection:a.b:!os/*"),
-            (collection("a.b"), "os/*".to_owned())
+            deny("ostrya:ref:!@a.b:os/secret"),
+            (collection("a.b"), "os/secret".to_owned())
+        );
+        assert_eq!(
+            allow("ostrya:ref:@own.id:a"),
+            (collection("own.id"), "r:a".to_owned())
+        );
+        let longest = format!("a.{}", "b".repeat(ostrya_core::MAX_COLLECTION_ID_LEN - 2));
+        assert_eq!(
+            allow(&format!("ostrya:ref:@{longest}:a")),
+            (collection(&longest), "r:a".to_owned())
         );
     }
 
@@ -299,13 +326,24 @@ mod tests {
             "Ostrya:ref:a",
             "ostrya:Collection:a.b:a",
             "ostrya:collection:",
-            "ostrya:collection:a.b",
-            "ostrya:collection:a.b:",
-            "ostrya:collection::r:a",
-            "ostrya:collection:fresh:r:a",
-            "ostrya:collection:1a.b:r:a",
-            "ostrya:collection:a..b:r:a",
-            "ostrya:collection:a.b:x:a",
+            "ostrya:collection:a.b:a",
+            "ostrya:collection:a.b:r:a",
+            "ostrya:collection:a.b:!a",
+            "ostrya:ref:@a.b:r:a",
+            "ostrya:ref:@a.b:",
+            "ostrya:ref:@a.b",
+            "ostrya:ref:@:a",
+            "ostrya:ref:r:@:a",
+            "ostrya:ref:@fresh:a",
+            "ostrya:ref:@1a.b:a",
+            "ostrya:ref:r:@a..b:a",
+            "ostrya:ref:r:@a.b",
+            "ostrya:ref:@a.b:@c.d:a",
+            "ostrya:ref:x:@a.b:a",
+            "ostrya:ref:@a.b:!a",
+            "ostrya:ref:!@a.b:!a",
+            "ostrya:ref:!r:@a.b:a",
+            "ostrya:ref:!@a.b",
         ] {
             let Some(Err(err)) = Claim::parse(uri) else {
                 panic!("{uri:?} was accepted");
@@ -329,17 +367,24 @@ mod tests {
             Some(Err(ClaimError::Malformed { reason, .. })) => reason,
             other => panic!("{uri:?}: {other:?}"),
         };
+        assert_eq!(reason("ostrya:tag:a"), "a claim starts with ostrya:ref:");
+        assert_eq!(reason("OSTRYA:ref:a"), "a claim starts with ostrya:ref:");
         assert_eq!(
-            reason("ostrya:tag:a"),
-            "a claim starts with ostrya:ref: or ostrya:collection:ID:"
+            reason("ostrya:collection:a.b:r:a"),
+            "a claim starts with ostrya:ref:"
         );
         assert_eq!(
-            reason("OSTRYA:ref:a"),
-            "a claim starts with ostrya:ref: or ostrya:collection:ID:"
-        );
-        assert_eq!(
-            reason("ostrya:collection:fresh:a"),
+            reason("ostrya:ref:@fresh:a"),
             "the collection id fails the collection-id rule"
+        );
+        assert_eq!(
+            reason("ostrya:ref:!@a..b:a"),
+            "the collection id fails the collection-id rule"
+        );
+        let long = format!("a.{}", "b".repeat(ostrya_core::MAX_COLLECTION_ID_LEN - 1));
+        assert_eq!(
+            reason(&format!("ostrya:ref:@{long}:a")),
+            "the collection id is longer than 255 bytes"
         );
         assert_eq!(
             reason("ostrya:ref:x:a"),
@@ -358,7 +403,7 @@ mod tests {
         let claims = Claims::parse([
             "ostrya:ref:a",
             "dns-like",
-            "ostrya:collection:a.b:w:b",
+            "ostrya:ref:w:@a.b:b",
             "ostrya:ref:a",
         ])
         .unwrap();

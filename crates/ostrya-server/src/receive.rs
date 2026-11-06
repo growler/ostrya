@@ -1169,7 +1169,8 @@ mod tests {
                             .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
                             .collect(),
                         deny: Vec::new(),
-                    },
+                    }
+                    .into(),
                     ..ReceivePolicy::default()
                 },
                 _ => pushing_policy(),

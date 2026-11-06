@@ -489,8 +489,8 @@ fn the_commit_is_the_commit_of_a_session_tree_push() {
         let tmp = TmpDir::new(&format!("push-tree-s3-session-{index}"));
         let receiver = new_repo(&tmp, RepoMode::Archive, core);
         let mirror = collection.is_some_and(|id| Some(id) != bucket_id);
-        let policy = if mirror {
-            collections_policy(&["cd:**"])
+        let policy = if let Some(id) = collection.filter(|_| mirror) {
+            collections_policy(&[id], &["cd:**"])
         } else {
             policy_allowing(&["cd:**"])
         };

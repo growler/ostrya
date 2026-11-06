@@ -1554,10 +1554,9 @@ fn the_client_groups_of_a_local_source_do_not_apply() {
         let tip = commit(&a, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
         let config = dir.path().join("a/config");
         let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str(
-            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:pub/**\n\
-             [ex-ostrya client \"d\"]\nauth=anonymous\ncollection=*\nallow=r:pub/**\n",
-        );
+        text.push_str(&format!(
+            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:pub/**;r:@{ID}:pub/**\n"
+        ));
         std::fs::write(&config, text).unwrap();
         // Over HTTP, the groups hide the ref from an anonymous client.
         let source = Repo::open(&dir.path().join("a")).await.unwrap();

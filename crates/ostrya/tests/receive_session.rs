@@ -210,7 +210,8 @@ fn hello_reply_reports_the_namespace_and_reads_its_refs() {
     let tips = |reply: &ostrya::remote::proto::HelloReply| -> Vec<Option<Checksum>> {
         reply.refs.iter().map(|r| r.commit).collect()
     };
-    let (_, reply) = session(&repo, &collections_policy(&["w:**"]), |mut c| async move {
+    let os = collections_policy(&["org.example.Os"], &["w:**"]);
+    let (_, reply) = session(&repo, &os, |mut c| async move {
         let reply = c
             .hello_reply_in(&["main", "absent"], Some("org.example.Os"))
             .await;
@@ -233,13 +234,14 @@ fn hello_reply_reports_the_namespace_and_reads_its_refs() {
 }
 
 /// A collection id that fails the collection-id rule is `invalid-ref`, also
-/// under a policy that covers each collection.
+/// under a policy with items of that id.
 #[test]
 fn an_invalid_collection_id_is_invalid_ref() {
     let tmp = TmpDir::new("recv-bad-collection");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     for id in ["", "no-dot", "org.example/Os", "..", "1org.example"] {
-        let (result, error) = session(&repo, &collections_policy(&["w:**"]), |mut c| async move {
+        let policy = collections_policy(&[id], &["w:**"]);
+        let (result, error) = session(&repo, &policy, |mut c| async move {
             c.hello_in(&["main"], Some(id)).await.unwrap();
             c.error().await
         });
@@ -250,32 +252,27 @@ fn an_invalid_collection_id_is_invalid_ref() {
     assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// A namespace that the scope of the policy does not cover is `ref-denied`.
-/// The policy of the local refs covers no collection, and a policy of
-/// collections does not cover the local refs.
+/// The items of one namespace give no right in another namespace, so a ref
+/// of `Hello` with no `r` in the namespace of `Hello` is `ref-denied`. The
+/// items of the local refs give no right in a collection, and the items of
+/// a collection give no right in the local refs or in another collection.
 #[test]
-fn a_namespace_the_policy_does_not_cover_is_ref_denied() {
+fn the_items_of_another_namespace_give_no_right() {
     let tmp = TmpDir::new("recv-uncovered");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
-    for (policy, collection, needle) in [
-        (
-            policy(),
-            Some("org.example.Os"),
-            "the collection 'org.example.Os'",
-        ),
-        (collections_policy(&["w:**"]), None, "the local refs"),
-        (
-            collections_policy(&["w:**"]),
-            Some("org.example.C"),
-            "the local refs",
-        ),
+    let os = collections_policy(&["org.example.Os"], &["w:**"]);
+    for (policy, collection) in [
+        (policy(), Some("org.example.Os")),
+        (os.clone(), None),
+        (os.clone(), Some("org.example.C")),
+        (os, Some("org.example.Other")),
     ] {
         let (result, error) = session(&repo, &policy, |mut c| async move {
             c.hello_in(&["main"], collection).await.unwrap();
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::RefDenied, "{error:?}");
-        assert!(error.message.contains(needle), "{error:?}");
+        assert!(error.message.contains("no r on ref 'main'"), "{error:?}");
         assert_eq!(returned_code(&result), Some(ErrorCode::RefDenied));
     }
     assert!(staging_entries(repo.path()).is_empty());
@@ -287,7 +284,7 @@ fn a_namespace_the_policy_does_not_cover_is_ref_denied() {
 fn receive_selected_takes_the_policy_of_the_namespace() {
     let tmp = TmpDir::new("recv-selected");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
-    let policy = collections_policy(&["w:**"]);
+    let policy = collections_policy(&["org.example.Os"], &["w:**"]);
     for (collection, wanted, found) in [
         (
             Some("org.example.Os"),

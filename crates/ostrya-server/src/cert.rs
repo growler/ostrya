@@ -740,7 +740,7 @@ mod tests {
             &[
                 "ostrya:ref:w:main",
                 "https://example.com/",
-                "ostrya:collection:a.b:!os/**",
+                "ostrya:ref:!@a.b:os/**",
             ],
         );
         let cert = ClientCert::from_der(&leaf);

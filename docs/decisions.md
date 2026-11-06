@@ -3481,6 +3481,52 @@ These alternatives were rejected:
 - An fsck error for such a ref. The ref breaks no object, the prune keeps
   its commit, and the `ostree` command exits 0 for the same state.
 
+## The access items of each namespace
+
+One client group holds the allow items and the deny items of each
+namespace (`ostrya-config(1)`, "Access modes and patterns"). The rules:
+
+- An allow item is `[MODES:]PATTERN` or `[MODES:]@ID:PATTERN`, and a deny
+  item is `PATTERN` or `@ID:PATTERN`. `ID` is a literal collection id. No
+  form names more than one id. `@OWN:PATTERN` is the same as `PATTERN`.
+- The config has at most one group for each auth item. The server selects
+  the group of the item, and the group gives the session policies:
+  `verify`, `allow-unsigned`, `sign`, and `allow-privileged`. A session
+  reads the items of the namespace of its `Hello`. The items of two
+  namespaces never combine.
+- A group opens a push session when an allow item of any namespace has
+  `w`, `c`, `t`, or `d`. The check of each ref of `Hello` refuses a ref
+  with no `r` in the namespace of `Hello`.
+- The claims of a namespace replace the items of the group for that
+  namespace alone. A certificate with claims for `org.x` alone keeps the
+  local rights of the group.
+- A claim has the one kind `ref`. The text after `ostrya:ref:` is an allow
+  item, or `!` and a deny item. `MODES` comes before `@ID:`, and `!` comes
+  before `@ID:`. One parser reads the items of a group and the body of a
+  claim, so the two grammars stay the same. A URI with the scheme `ostrya`
+  and another kind is no claim, so the server refuses each request of the
+  certificate with 403.
+- A group cannot set both `tls-accept-claim=true` and `summary=true`, and
+  each auth item has one group. Thus a TLS client whose group takes claims
+  gets no summary, also for the local refs. A remote with
+  `gpg-verify-summary` or `sign-verify-summary` reads the refs from the
+  summary alone, so that client pulls no ref through such a remote.
+- The implicit group `anonymous` of a config with no client group reads
+  each local ref and each ref of each collection. No item names each
+  collection, so the rights of each other collection are a part of the
+  implicit group alone. The access digest gives them the namespace line
+  `namespace=*`, so the digest of the implicit group keeps its text.
+
+These alternatives were rejected:
+
+- A claim form for each namespace kind: `ostrya:ref:` for the local refs
+  and `ostrya:collection:ID:` for a collection, with no `@` in a claim. The
+  claims then have a grammar that the items of a group do not have.
+- Both claim spellings, `ostrya:ref:[MODES:]@ID:PATTERN` and
+  `ostrya:collection:ID:[MODES:]PATTERN`. Two spellings of one claim need
+  two parsers and two sets of tests, and give a CA two ways to state one
+  right.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.

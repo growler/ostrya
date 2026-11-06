@@ -546,7 +546,7 @@ The \fB\%ostree\fR tool ignores the key.
 "Remotes directory" under REMOTE KEYS gives the rules of the read.
 .SH CLIENT AND SERVER GROUPS
 Client groups control the access to a repository through \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and \fB\%ostrya send\fR.
-A client group states how a client authenticates, which refs it can read and change in one namespace, how the server verifies its commits, and which keys sign them.
+A client group states how a client authenticates, which refs it can read and change in each namespace, how the server verifies its commits, and which keys sign them.
 These groups are extensions of ostrya, and the \fB\%ostree\fR tool ignores them:
 .TP
 \fB\%[ex\-ostrya server]\fR
@@ -563,6 +563,7 @@ A signing key of the server.
 .PP
 ostrya refuses an unknown key, a reference to a group that does not exist, and a group name that starts with \fB\%ex\-ostrya \fR and has no form of this list.
 It refuses \fB\%[ex\-ostrya receive]\fR and \fB\%[ex\-ostrya receive "PATTERN"]\fR, with a message that names \fB\%[ex\-ostrya client "NAME"]\fR.
+It refuses the key \fB\%collection\fR of a client group, with a message that names \fB\%@ID:PATTERN\fR.
 The quoted part of a group name is not empty and holds no \fB\%"\fR and no control character.
 A repeated key takes the last value, so each list key is one line in a group.
 .PP
@@ -575,13 +576,13 @@ A pull from a remote with the key \fB\%trust\fR, \fB\%ostrya pull\-local \-\-tru
 A bad group stops the command with status 1.
 A push session names its namespace in \fB\%Hello\fR: the local refs, or one collection.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs.
-\fB\%ostrya receive\fR gives a session the client group of that namespace that holds the \fB\%ssh:NAME\fR item of the client name.
+\fB\%ostrya receive\fR gives a session the client group that holds the \fB\%ssh:NAME\fR item of the client name.
 With no such group, the session gets \fB\%ref\-denied\fR.
-\fB\%ostrya serve\fR gives a session the client group of that namespace that holds the item that identified the request.
+\fB\%ostrya serve\fR gives a session the client group that holds the item that identified the request.
 With no such group, the request gets 403.
-For a collection, a group that names the collection wins over a group with \fB\%collection=*\fR.
+The session takes the allow items and the deny items of the group for its namespace.
 A session of a collection reads and writes the refs below \fB\%refs/mirrors/ID/\fR alone.
-\fB\%ostrya send\fR serves the refs that the groups of the \fB\%ssh:NAME\fR item read.
+\fB\%ostrya send\fR serves the refs that the group of the \fB\%ssh:NAME\fR item reads.
 With client groups and no group that holds that item, it writes an error line and exits 1 before it reads its input.
 \fB\%ostrya serve\fR takes its settings from the server group, and an option of the command has precedence over the key of its name.
 .SS "Server keys"
@@ -683,23 +684,16 @@ The authentication items of the group.
 The key is necessary.
 An item that occurs two times counts one time.
 .TP
-\fB\%collection\fR (list, or \fB\%*\fR)
-The namespace of the group.
-Without the key, the group applies to the local refs.
-A list names one or more collection ids.
-\fB\%*\fR, as the whole value, names each collection other than the own collection of the repository.
-Each id must pass the collection\-id rule, and the own collection id is refused, because its refs are the local refs.
-.TP
 \fB\%allow\fR (list)
-The allow items, each \fB\%[MODES:]PATTERN\fR.
+The allow items, each \fB\%[MODES:]PATTERN\fR for the local refs or \fB\%[MODES:]@ID:PATTERN\fR for the collection \fB\%ID\fR (see "Access modes and patterns").
 Without the key, the group has no right on a ref.
 .TP
 \fB\%deny\fR (list)
-The deny items, each a \fB\%PATTERN\fR.
+The deny items, each \fB\%PATTERN\fR for the local refs or \fB\%@ID:PATTERN\fR for the collection \fB\%ID\fR.
 .TP
 \fB\%tls\-accept\-claim\fR (boolean, default false)
 Read the claims of the client certificate (see "Claims").
-The claims of the namespace replace \fB\%allow\fR and \fB\%deny\fR of the group.
+The claims of a namespace replace the allow items and the deny items of the group for that namespace.
 A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with any value.
 .TP
 \fB\%verify\fR (string)
@@ -730,7 +724,7 @@ The rule applies to each content object and each dirmeta object that a session r
 A session on a \fB\%bare\fR repository needs a server that runs as root.
 .TP
 \fB\%summary\fR (boolean, default false)
-Add the namespace of the group to the summary of each authentication item of the group (see "Summaries").
+Give each authentication item of the group a summary (see "Summaries").
 A group with \fB\%tls\-accept\-claim=true\fR refuses \fB\%summary=true\fR.
 .SS "Authentication items"
 \fB\%auth\fR is a list.
@@ -768,7 +762,15 @@ A request whose client address is in \fB\%CIDR\fR.
 On a server with no \fB\%tls\-client\-ca\fR, the \fB\%tls:\fR and \fB\%tls\-sha256:\fR items match no request, and the other items of their groups still match.
 Two items are the same when their values are equal after the parse, so \fB\%net:2001:0db8::/56\fR and \fB\%net:2001:db8::/56\fR are the same item.
 .SS "Access modes and patterns"
-An allow item is \fB\%[MODES:]PATTERN\fR.
+An allow item is \fB\%[MODES:]PATTERN\fR for the local refs, or \fB\%[MODES:]@ID:PATTERN\fR for the refs of the collection \fB\%ID\fR.
+A deny item is \fB\%PATTERN\fR or \fB\%@ID:PATTERN\fR.
+\fB\%MODES\fR comes before \fB\%@ID:\fR.
+\fB\%ID\fR is a literal collection id: it passes the collection\-id rule and is at most 255 bytes.
+The item splits at the first \fB\%:\fR after the \fB\%@\fR.
+No item names more than one collection.
+\fB\%@ID:PATTERN\fR with the \fB\%collection\-id\fR of \fB\%[core]\fR is the same as \fB\%PATTERN\fR.
+The items of one namespace give no right in another namespace.
+.PP
 \fB\%MODES\fR is one or more of these letters, each at most one time, in any order, and an item with no \fB\%MODES\fR has the mode \fB\%r\fR:
 .TP
 \fB\%r\fR
@@ -795,15 +797,15 @@ Delete the ref.
 Each part is a literal, \fB\%*\fR for exactly one part, or \fB\%**\fR for one or more parts.
 For example, \fB\%apps/*\fR matches \fB\%apps/web\fR and does not match \fB\%apps/web/db\fR.
 \fB\%apps/**\fR matches both, and neither pattern matches \fB\%apps\fR.
-A pattern has no remote part and no collection part.
+A pattern has no remote part.
 .PP
-The effective rights of a ref are the union of the modes of each allow item that matches the ref.
-When a deny item matches the ref, the ref has no mode.
+The effective rights of a ref are the union of the modes of each allow item of its namespace that matches the ref.
+When a deny item of its namespace matches the ref, the ref has no mode.
 A push session follows these rules:
 .IP \(bu 2
-A group opens a push session only when an allow item has \fB\%w\fR, \fB\%c\fR, \fB\%t\fR, or \fB\%d\fR.
+A group opens a push session only when an allow item of any namespace has \fB\%w\fR, \fB\%c\fR, \fB\%t\fR, or \fB\%d\fR.
 .IP \(bu 2
-Each ref of the session needs \fB\%r\fR.
+Each ref of the session needs \fB\%r\fR in the namespace of the session.
 So a delete needs \fB\%r\fR and \fB\%d\fR, for example the item \fB\%rd:PATTERN\fR.
 .IP \(bu 2
 An update that writes a commit needs \fB\%w\fR or \fB\%t\fR.
@@ -833,27 +835,26 @@ An allow item of the local refs.
 \fB\%ostrya:ref:!PATTERN\fR
 A deny item of the local refs.
 .TP
-\fB\%ostrya:collection:ID:[MODES:]PATTERN\fR
+\fB\%ostrya:ref:[MODES:]@ID:PATTERN\fR
 An allow item of the collection \fB\%ID\fR.
 .TP
-\fB\%ostrya:collection:ID:!PATTERN\fR
+\fB\%ostrya:ref:!@ID:PATTERN\fR
 A deny item of the collection \fB\%ID\fR.
 .PP
-\fB\%MODES\fR and \fB\%PATTERN\fR have the grammar of "Access modes and patterns", and a claim with no \fB\%MODES\fR has the mode \fB\%r\fR.
-\fB\%ID\fR passes the collection\-id rule.
+The text after \fB\%ostrya:ref:\fR is an allow item of "Access modes and patterns", or \fB\%!\fR and a deny item, and a claim with no \fB\%MODES\fR has the mode \fB\%r\fR.
+\fB\%MODES\fR comes before \fB\%@ID:\fR, and \fB\%!\fR comes before \fB\%@ID:\fR.
+A claim with \fB\%@ID:\fR of the \fB\%collection\-id\fR of \fB\%[core]\fR is a claim of the local refs.
 .IP \(bu 2
-A group of the local refs reads the \fB\%ostrya:ref:\fR claims, and the \fB\%ostrya:collection:ID:\fR claims whose \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR.
-A group of a collection reads the \fB\%ostrya:collection:ID:\fR claims of the collection of the request.
-.IP \(bu 2
-When the certificate holds one or more claims for the namespace, they replace \fB\%allow\fR and \fB\%deny\fR of the group.
-When it holds none, \fB\%allow\fR and \fB\%deny\fR apply.
+When the certificate holds one or more claims for a namespace, they replace the allow items and the deny items of the group for that namespace.
+In each other namespace, the items of the group apply.
 .IP \(bu 2
 \fB\%verify\fR, \fB\%allow\-unsigned\fR, \fB\%sign\fR, and \fB\%allow\-privileged\fR come from the group.
 .IP \(bu 2
 A URI whose scheme is not \fB\%ostrya\fR, in any case, has no effect.
 .IP \(bu 2
 A URI whose scheme is \fB\%ostrya\fR, in any case, and that is no claim refuses the request with 403.
-The scheme and the kind are lowercase in a claim.
+A claim has the one kind \fB\%ref\fR, and the scheme and the kind are lowercase.
+So a URI that starts with \fB\%ostrya:collection:\fR refuses the request.
 More than 256 such URIs also refuse the request.
 So do a certificate that does not decode, a certificate with more than one subjectAltName extension, and a subjectAltName extension that does not decode.
 Each case has its own reason.
@@ -865,19 +866,19 @@ A credential, a \fB\%net:\fR item, and the \fB\%anonymous\fR item take no claims
 \fB\%ostrya serve\fR identifies the client of each read of a file and of the ref listing, as it identifies a push.
 A read that identifies no item gets 401 or 403 and no file.
 \fB\%ostrya send\fR identifies the client of a session by the \fB\%ssh:NAME\fR item of the client name.
-The groups of the item then give the read rights:
+The group of the item then gives the read rights:
 .IP \(bu 2
 \fB\%refs/heads/NAME\fR is in the local refs, and \fB\%refs/mirrors/ID/NAME\fR is in the collection \fB\%ID\fR.
-When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, the path is in the local refs, and the group of the local refs gives the rights of \fB\%NAME\fR.
+When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, the path is in the local refs, and the items of the local refs give the rights of \fB\%NAME\fR.
 .IP \(bu 2
-The server serves such a ref when the group of the item in its namespace has \fB\%r\fR on \fB\%NAME\fR.
+The server serves such a ref when the group of the item has \fB\%r\fR on \fB\%NAME\fR in its namespace.
 An alias needs \fB\%r\fR on its name and on its target.
 .IP \(bu 2
 The ref listing holds the local refs that the client reads.
-A request that names the collection refs gets them too: each collection takes the group of the item in its namespace, the group of the exact id, else the group of \fB\%collection=*\fR.
-The rights of two groups never combine.
+A request that names the collection refs gets them too: each collection takes the items of the group for that collection.
+The items of two namespaces never combine.
 .IP \(bu 2
-A directory under \fB\%refs/mirrors/\fR whose name is not a collection id selects no group.
+A directory under \fB\%refs/mirrors/\fR whose name is not a collection id gives no right.
 Its refs are not served, and the ref listing leaves out the directory.
 The server writes one warning that names the directory.
 .IP \(bu 2
@@ -890,15 +891,14 @@ Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR a
 A path that the client cannot read gets the answer of an absent path: 404 over HTTP, and no file over ssh.
 With \fB\%tls\-accept\-claim=true\fR, the claims of the certificate set the read rights too, and claims that do not parse refuse each read with 403.
 .SS "Summaries"
-An authentication item has a summary when one or more of its groups has \fB\%summary=true\fR.
+An authentication item has a summary when its group has \fB\%summary=true\fR.
 Each other item has no summary.
-The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR.
-A namespace whose selected group has \fB\%summary=false\fR adds no ref, and no other group takes its place.
+The summary of an item holds the refs that the item reads in each namespace.
 The claims of a client certificate do not apply.
 .PP
 \fB\%ostrya summary \-u\fR writes the summary of each item under \fB\%extensions/ostrya/summary/\fR, \fB\%anonymous\fR included (see \fBostrya\-repo\fR(5)).
 It also writes \fB\%summary\fR in the repository root, which holds each ref, whatever the client groups.
-The command also writes the access digest of each item: a digest of \fB\%collection\-id\fR of \fB\%[core]\fR and of the namespace, \fB\%allow\fR, \fB\%deny\fR, and \fB\%summary\fR of each group of the item, a group with \fB\%summary=false\fR too.
+The command also writes the access digest of each item: a digest of \fB\%collection\-id\fR of \fB\%[core]\fR, and of the allow items, the deny items, and \fB\%summary\fR of the group of the item in each namespace.
 So the digest changes when a change to the config can change the refs of the summary.
 The group names are not in the digest.
 \fB\%ostrya summary \-u \-c\fR writes the summary of each item alone, and leaves \fB\%summary\fR and \fB\%summary.sig\fR in the repository root as they are.
@@ -907,29 +907,20 @@ The group names are not in the digest.
 An item with no summary gets the answer of an absent path.
 When a change to the config changes the access digest of an item, the summary of the item gets the answer of an absent path until \fB\%ostrya summary \-u\fR, and the server writes one error that names the item.
 .SS "No client group"
-A repository with no client group has two groups:
-.PP
-.nf
-[ex\-ostrya client "anonymous"]
-auth=anonymous
-allow=r:**
-summary=true
-
-[ex\-ostrya client "anonymous\-collections"]
-auth=anonymous
-collection=*
-allow=r:**
-summary=true
-.fi
+A repository with no client group has one group, \fB\%anonymous\fR.
+It holds the item \fB\%anonymous\fR, has \fB\%summary=true\fR, and gives \fB\%r\fR on each local ref and on each ref of each collection.
+No value of \fB\%allow\fR names each collection, so a client group cannot state these rights.
 .PP
 So each client reads each local ref and each mirror ref, and gets the summary of \fB\%anonymous\fR, which holds each ref.
 No client opens a push session.
-An ssh session of \fB\%ostrya send\fR gets the \fB\%anonymous\fR item in such a repository, whatever its client name, so these groups apply to it.
+An ssh session of \fB\%ostrya send\fR gets the \fB\%anonymous\fR item in such a repository, whatever its client name, so this group applies to it.
 An ssh session of \fB\%ostrya receive\fR uses no \fB\%anonymous\fR item.
 .SS "Start checks"
 ostrya refuses the config in these cases:
 .IP \(bu 2
-Two groups carry the same item, and their namespaces overlap: both have no \fB\%collection\fR, both name one id, or both have \fB\%*\fR.
+Two groups carry the same item.
+.IP \(bu 2
+A group has the key \fB\%collection\fR.
 .IP \(bu 2
 A group has \fB\%tls\-accept\-claim\fR and no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item.
 .IP \(bu 2
@@ -937,7 +928,7 @@ A group has \fB\%tls\-accept\-claim=true\fR and \fB\%summary=true\fR.
 .IP \(bu 2
 A group has \fB\%allow\-unsigned=false\fR and no \fB\%verify\fR.
 .IP \(bu 2
-A \fB\%collection\fR value is the own collection id, or fails the collection\-id rule.
+The \fB\%ID\fR of an item \fB\%@ID:PATTERN\fR fails the collection\-id rule or is longer than 255 bytes.
 .IP \(bu 2
 A \fB\%verify\fR, \fB\%sign\fR, or \fB\%sign\-summary\fR value names a trust group or a key group that does not exist.
 .PP
@@ -1077,4 +1068,13 @@ verify=trust:release
 [ex\-ostrya trust "release"]
 sign\-verify=ed25519
 verification\-ed25519\-file=/etc/ostrya/release.ed25519
+.fi
+.PP
+A client group that reads each local ref, mirrors the refs below \fB\%os/\fR of the collection \fB\%com.example.Os\fR, and cannot read \fB\%os/secret\fR of that collection:
+.PP
+.nf
+[ex\-ostrya client "mirror"]
+auth=tls:mirror.example.com
+allow=r:**;w:@com.example.Os:os/**
+deny=@com.example.Os:os/secret
 .fi

@@ -654,7 +654,7 @@ fn a_ref_without_read_is_refused() {
 }
 
 /// An alias needs `r` on its name and on its target. A target in a
-/// collection takes the group of that collection. A target under
+/// collection takes the items of that collection. A target under
 /// `refs/remotes/` is never served.
 #[test]
 fn an_alias_needs_read_on_its_name_and_its_target() {
@@ -663,8 +663,7 @@ fn an_alias_needs_read_on_its_name_and_its_target() {
         let repo = repo_with_files(
             tmp.path(),
             None,
-            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:open/**\n\
-             [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=a.b\nallow=r:m/**\n",
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:open/**;r:@a.b:m/**\n",
             &[
                 "refs/heads/open/target",
                 "refs/heads/hidden/target",
@@ -705,7 +704,7 @@ fn an_alias_needs_read_on_its_name_and_its_target() {
 }
 
 /// `refs/remotes/` and a path under `refs/` outside `refs/heads/` and
-/// `refs/mirrors/` are never served, also under the implicit groups, which
+/// `refs/mirrors/` are never served, also under the implicit group, which
 /// serve each local ref and each collection ref.
 #[test]
 fn remote_and_other_ref_paths_are_never_served() {
@@ -735,8 +734,8 @@ fn remote_and_other_ref_paths_are_never_served() {
 }
 
 /// `refs/mirrors/ID/NAME` with the own collection id is in the local
-/// namespace: the group of the local refs decides, and a `collection=*`
-/// group does not. Another collection takes its own group.
+/// namespace: the items of the local refs decide, and the items of another
+/// collection do not. Another collection takes its own items.
 #[test]
 fn a_mirror_of_the_own_collection_takes_the_local_rights() {
     let tmp = TmpDir::new("view-own-mirror");
@@ -744,8 +743,7 @@ fn a_mirror_of_the_own_collection_takes_the_local_rights() {
         let repo = repo_with_files(
             tmp.path(),
             Some("own.id"),
-            "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=r:pub/**\n\
-             [ex-ostrya client \"others\"]\nauth=anonymous\ncollection=*\nallow=r:**\n",
+            "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=r:pub/**;r:@c.d:**\n",
             &[
                 "refs/mirrors/own.id/pub/a",
                 "refs/mirrors/own.id/secret",
@@ -954,15 +952,13 @@ fn a_summary_with_no_matching_access_file_is_stale() {
     });
 }
 
-/// An exact group with `summary=false` under a group of `*` with
-/// `summary=true` makes the summary stale. The exact group takes the refs of
-/// its collection from the summary, so the summary that the group of `*`
-/// gave holds refs that the item no more gets.
+/// A change to the items of a collection makes the summary stale. The
+/// summary that the old items gave holds refs that the item no more gets.
 #[test]
-fn an_exact_group_with_no_summary_makes_the_summary_stale() {
+fn a_change_to_the_items_of_a_collection_makes_the_summary_stale() {
     let tmp = TmpDir::new("view-summary-exact");
     block_on(async {
-        let any = "[ex-ostrya client \"any\"]\nauth=anonymous\ncollection=*\nallow=r:**\n\
+        let any = "[ex-ostrya client \"any\"]\nauth=anonymous\nallow=r:@a.b:**\n\
                    summary=true\n";
         let refs = ["refs/mirrors/a.b/public", "refs/mirrors/a.b/secret"];
         let (repo, _) = repo_with_refs(tmp.path(), any, &refs).await;
@@ -980,11 +976,8 @@ fn an_exact_group_with_no_summary_makes_the_summary_stale() {
         assert_eq!(map[0].1.len(), 2);
 
         let config = repo.path().join("config");
-        let mut text = fs::read_to_string(&config).unwrap();
-        text.push_str(
-            "[ex-ostrya client \"exact\"]\nauth=anonymous\ncollection=a.b\nallow=r:public\n",
-        );
-        fs::write(&config, text).unwrap();
+        let text = fs::read_to_string(&config).unwrap();
+        fs::write(&config, text.replace("r:@a.b:**", "r:@a.b:public")).unwrap();
         let reopened = Repo::open(repo.path()).await.unwrap();
         let anonymous = repo_access(&reopened, "anonymous");
         for path in ["summary", "summary.sig"] {
@@ -999,12 +992,12 @@ fn an_exact_group_with_no_summary_makes_the_summary_stale() {
             .await
             .unwrap();
         let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
-        let summary = ostrya::Summary::parse(&bytes).unwrap();
-        assert!(
-            summary
-                .metadata_value("ostree.summary.collection-map")
-                .is_none()
-        );
+        let map = ostrya::Summary::parse(&bytes)
+            .unwrap()
+            .collection_map()
+            .unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].1.len(), 1);
     });
 }
 

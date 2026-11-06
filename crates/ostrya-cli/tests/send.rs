@@ -411,7 +411,7 @@ fn summary_update(repo: &Path) {
 }
 
 /// In a repository with no client group, the session takes the item
-/// `anonymous` of the implicit groups: it serves each ref and the summary,
+/// `anonymous` of the implicit group: it serves each ref and the summary,
 /// whatever the client name.
 #[test]
 fn send_with_no_client_group_serves_each_ref() {

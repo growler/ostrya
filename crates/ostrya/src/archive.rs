@@ -1233,7 +1233,7 @@ mod tests {
         }
     }
 
-    /// The rights of an anonymous client under the implicit groups.
+    /// The rights of an anonymous client under the implicit group.
     fn anyone() -> ReadAccess {
         let config = config_of("[core]\nrepo_version=1\nmode=archive-z2\n");
         let access = crate::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();

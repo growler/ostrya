@@ -1,9 +1,11 @@
 //! The access modes, the allow items, and the effective rights of a ref.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
-use ostrya_core::RefPattern;
+use ostrya_core::{MAX_COLLECTION_ID_LEN, RefPattern, is_collection_id};
 
+use super::Namespace;
 use crate::error::{Error, Result};
 
 /// A set of access modes.
@@ -156,7 +158,7 @@ impl fmt::Display for AllowItem {
 }
 
 /// Parses an allow item. The error is the reason.
-pub(super) fn parse_allow(text: &str) -> std::result::Result<AllowItem, String> {
+fn parse_allow(text: &str) -> std::result::Result<AllowItem, String> {
     let (modes, pattern) = match text.split_once(':') {
         Some((modes, pattern)) => (parse_modes(modes).map_err(str::to_owned)?, pattern),
         None => (AccessModes::READ, text),
@@ -167,9 +169,59 @@ pub(super) fn parse_allow(text: &str) -> std::result::Result<AllowItem, String> 
     })
 }
 
+/// Parses an allow item of a client group or of a claim, `[MODES:]PATTERN`
+/// or `[MODES:]@ID:PATTERN`. The result holds the collection id of an item
+/// with `@ID:`. The error is the reason.
+///
+/// The text splits at the first `:` when the text before it does not start
+/// with `@`. Then `@ID:` splits at the first `:` after the `@`.
+pub(super) fn parse_allow_item(
+    text: &str,
+) -> std::result::Result<(Option<String>, AllowItem), String> {
+    let (modes, rest) = match text.split_once(':') {
+        Some((modes, rest)) if !modes.starts_with('@') => {
+            (parse_modes(modes).map_err(str::to_owned)?, rest)
+        }
+        _ => (AccessModes::READ, text),
+    };
+    let (id, pattern) = split_collection(rest)?;
+    let pattern = parse_pattern(pattern)?;
+    Ok((id, AllowItem { modes, pattern }))
+}
+
+/// Parses a deny item of a client group or of a claim, `PATTERN` or
+/// `@ID:PATTERN`. The result holds the collection id of an item with `@ID:`.
+/// The error is the reason.
+pub(super) fn parse_deny_item(
+    text: &str,
+) -> std::result::Result<(Option<String>, RefPattern), String> {
+    let (id, pattern) = split_collection(text)?;
+    Ok((id, parse_pattern(pattern)?))
+}
+
+/// Splits `@ID:REST` at the first `:` after the `@`, and checks `ID`. Text
+/// that does not start with `@` gives no id. The error is the reason.
+fn split_collection(text: &str) -> std::result::Result<(Option<String>, &str), String> {
+    let Some(rest) = text.strip_prefix('@') else {
+        return Ok((None, text));
+    };
+    let Some((id, rest)) = rest.split_once(':') else {
+        return Err("a collection id is @ID: before the pattern".to_owned());
+    };
+    if id.len() > MAX_COLLECTION_ID_LEN {
+        return Err(format!(
+            "the collection id is longer than {MAX_COLLECTION_ID_LEN} bytes"
+        ));
+    }
+    if !is_collection_id(id) {
+        return Err("the collection id fails the collection-id rule".to_owned());
+    }
+    Ok((Some(id.to_owned()), rest))
+}
+
 /// Parses a ref pattern of an allow item or a deny item. The error is the
 /// reason, without the pattern text.
-pub(super) fn parse_pattern(text: &str) -> std::result::Result<RefPattern, String> {
+fn parse_pattern(text: &str) -> std::result::Result<RefPattern, String> {
     RefPattern::parse(text).map_err(|err| match err {
         ostrya_core::Error::InvalidRefPattern(reason) => {
             let quoted = format!("{text:?}: ");
@@ -226,6 +278,111 @@ impl AccessRules {
     /// `t`. The deny items have no effect on the result.
     pub(crate) fn gives_read(&self) -> bool {
         self.allow.iter().any(AllowItem::gives_read)
+    }
+}
+
+/// The allow items and the deny items of a group, for each namespace.
+///
+/// [`get`](NamespaceRules::get) gives the rules of one namespace. The rules
+/// of two namespaces never combine. A collection with no entry in
+/// [`collections`](NamespaceRules::collections) has no rules, so a client has
+/// no right on its refs. The one exception is the implicit group of a config
+/// with no client group, whose rules apply to each collection.
+///
+/// `From<AccessRules>` gives the rules of the local refs alone.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::access::{AccessModes, AccessRules, AllowItem, Namespace, NamespaceRules};
+///
+/// let mut rules = NamespaceRules::from(AccessRules {
+///     allow: vec![AllowItem::parse("r:**")?],
+///     deny: Vec::new(),
+/// });
+/// rules.collections.insert(
+///     "com.example.os".into(),
+///     AccessRules {
+///         allow: vec![AllowItem::parse("w:os/**")?],
+///         deny: Vec::new(),
+///     },
+/// );
+/// let os = Namespace::Collection("com.example.os".into());
+/// assert_eq!(rules.rights(&os, "os/stable").to_string(), "rw");
+/// assert_eq!(rules.rights(&os, "main"), AccessModes::NONE);
+/// assert_eq!(rules.rights(&Namespace::Local, "main"), AccessModes::READ);
+/// let other = Namespace::Collection("org.example.other".into());
+/// assert!(rules.get(&other).is_none());
+/// assert!(rules.opens_push_session());
+/// # Ok::<(), ostrya::Error>(())
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NamespaceRules {
+    /// The rules of the local refs: the items with no `@ID:`, and the items
+    /// with `@ID:` of `[core] collection-id`.
+    pub local: AccessRules,
+    /// The rules of each collection, by collection id: the items with
+    /// `@ID:`.
+    pub collections: BTreeMap<String, AccessRules>,
+    /// The rules of each collection with no entry in `collections`. Only the
+    /// implicit group has them.
+    pub(crate) other: Option<AccessRules>,
+}
+
+impl NamespaceRules {
+    /// Returns the rules of `namespace`, or `None` if the rules name no ref
+    /// of it.
+    ///
+    /// [`Local`](Namespace::Local) gives
+    /// [`local`](NamespaceRules::local). A
+    /// [`Collection`](Namespace::Collection) gives its entry of
+    /// [`collections`](NamespaceRules::collections). An id that fails the
+    /// collection-id rule gives `None`.
+    pub fn get(&self, namespace: &Namespace) -> Option<&AccessRules> {
+        match namespace {
+            Namespace::Local => Some(&self.local),
+            Namespace::Collection(id) => self.collection(id),
+        }
+    }
+
+    /// Returns the rules of the collection `id`, as [`get`](Self::get) gives
+    /// them.
+    pub(crate) fn collection(&self, id: &str) -> Option<&AccessRules> {
+        self.collections
+            .get(id)
+            .or_else(|| self.other.as_ref().filter(|_| is_collection_id(id)))
+    }
+
+    /// Returns the effective rights of the ref `name` of `namespace`, as
+    /// [`AccessRules::rights`] gives them. A namespace with no rules gives no
+    /// right.
+    pub fn rights(&self, namespace: &Namespace, name: &str) -> AccessModes {
+        self.get(namespace)
+            .map_or(AccessModes::NONE, |rules| rules.rights(name))
+    }
+
+    /// Returns `true` if the rules of a namespace let a client open a push
+    /// session, as [`AccessRules::opens_push_session`] states.
+    pub fn opens_push_session(&self) -> bool {
+        self.namespaces().any(AccessRules::opens_push_session)
+    }
+
+    /// Returns the rules of each namespace.
+    fn namespaces(&self) -> impl Iterator<Item = &AccessRules> {
+        std::iter::once(&self.local)
+            .chain(self.collections.values())
+            .chain(self.other.as_ref())
+    }
+}
+
+impl From<AccessRules> for NamespaceRules {
+    /// Returns the rules of the local refs `local`, with no rules of a
+    /// collection.
+    fn from(local: AccessRules) -> NamespaceRules {
+        NamespaceRules {
+            local,
+            ..NamespaceRules::default()
+        }
     }
 }
 

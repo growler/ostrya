@@ -1338,8 +1338,7 @@ fn the_refs_follow_the_read_rights() {
     symlink("../../remotes/o/pub/a", heads.join("pub/to-remote")).unwrap();
     let (repo, policies) = with_groups(
         &path,
-        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n\
-         [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=a.b\nallow=r:x\n",
+        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**;r:@a.b:x\n",
     );
     with_server(repo, with_policies(policies), |addrs| async move {
         let addr = addrs[0];
@@ -1604,7 +1603,7 @@ fn the_ref_listing_holds_the_readable_refs() {
 }
 
 /// With no receive policies, the server identifies no client. Each read is
-/// the `anonymous` item under the two implicit groups, also when the
+/// the `anonymous` item under the implicit group, also when the
 /// repository config has client groups and the request has a credential:
 /// each local ref and each mirror ref, the summary, and no remote ref.
 #[test]
@@ -1819,10 +1818,9 @@ fn the_ref_listing_reads_collection_pairs() {
     });
 }
 
-/// Each collection of a listing takes the group of the token item in the
-/// namespace of the collection: the group of the exact id, else the group
-/// of `collection=*`. The body is the listing that `build_ref_listing`
-/// builds with the rights of the item.
+/// Each collection of a listing takes the items of the group of the token
+/// item for that collection. The body is the listing that
+/// `build_ref_listing` builds with the rights of the item.
 #[test]
 fn the_collection_refs_follow_the_group_of_the_item() {
     let tmp = TmpDir::new("listing-collection-rights");
@@ -1833,10 +1831,8 @@ fn the_collection_refs_follow_the_group_of_the_item() {
     let (repo, policies) = with_groups(
         &path,
         &format!(
-            "[ex-ostrya client \"a-local\"]\nauth=token-sha256:{a}\nallow=r:main\n\
-             [ex-ostrya client \"a-exact\"]\nauth=token-sha256:{a}\ncollection=org.a\n\
-             allow=r:y/**\n\
-             [ex-ostrya client \"a-any\"]\nauth=token-sha256:{a}\ncollection=*\nallow=r:**\n\
+            "[ex-ostrya client \"a\"]\nauth=token-sha256:{a}\n\
+             allow=r:main;r:@org.a:y/**;r:@org.b:**\n\
              [ex-ostrya client \"b-local\"]\nauth=token-sha256:{b}\nallow=r:**\n"
         ),
     );
@@ -1889,8 +1885,7 @@ fn an_invalid_collection_dir_gives_one_event_per_server() {
     std::fs::write(bad.join("x"), "no checksum\n").unwrap();
     let (repo, policies) = with_groups(
         &path,
-        "[ex-ostrya client \"all\"]\nauth=anonymous\nallow=r:**\n\
-         [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=*\nallow=r:**\n",
+        "[ex-ostrya client \"all\"]\nauth=anonymous\nallow=r:**;r:@org.a:**;r:@org.b:**\n",
     );
     for opts in [local(), with_policies(policies)] {
         let events = Arc::new(std::sync::Mutex::new(Vec::new()));

@@ -167,10 +167,9 @@ impl ReceiveService {
     /// - [`Error::InvalidInput`] if `parallel_uploads` is 0.
     /// - [`remote::Error::Protocol`] if `Hello` has `one-way` true.
     /// - The errors of [`check_hello`](Self::check_hello).
-    /// - [`remote::Error::RefDenied`] if the
-    ///   [scope](ReceivePolicy::scope) of `policy` does not cover the
-    ///   namespace of `Hello`, if `policy` opens no push session, if `Hello`
-    ///   names a remote ref, or if `policy` gives no `r` on a ref of `Hello`.
+    /// - [`remote::Error::RefDenied`] if `policy` opens no push session, if
+    ///   `Hello` names a remote ref, or if `policy` gives no `r` on a ref of
+    ///   `Hello` in the namespace of `Hello`.
     ///   These checks follow the checks of `check_hello` and do no I/O.
     /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
     ///   session transaction cannot open. These include

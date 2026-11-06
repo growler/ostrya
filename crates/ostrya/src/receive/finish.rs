@@ -79,6 +79,13 @@ impl Named<'_> {
     pub(super) fn is_local(&self) -> bool {
         !matches!(self.namespace, Some(Namespace::Collection(_)))
     }
+
+    /// Returns the namespace whose rights a rule of the policy reads: the
+    /// namespace of the session, or the local refs for a one-way stream,
+    /// whose policy reads no namespace.
+    pub(super) fn rule_namespace(&self) -> &Namespace {
+        self.namespace.unwrap_or(&Namespace::Local)
+    }
 }
 
 /// A commit that a ref update names as its new value.
@@ -336,7 +343,7 @@ pub(super) async fn finish(
         },
     ) = Box::pin(async {
         let outside = check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
-        let rules = select_rules(repo, policy, named.is_local(), &updates)?;
+        let rules = select_rules(repo, policy, &named, &updates)?;
         let loaded = load_commits(&txn, &updates).await?;
         drop_dependency_meta(outside, &loaded.fields, &mut commit_meta)?;
         Ok::<_, Failure>((rules, loaded))
@@ -754,15 +761,16 @@ fn drop_dependency_meta(
 /// Returns the rule of each update, in order.
 ///
 /// In the local refs of a repository with a collection id, an update of the
-/// anchor ref is `ref-denied`. `local` is `true` for the local refs. Then
-/// `policy` gives the rule of each update, or its `ref-denied` refusal.
+/// anchor ref is `ref-denied`. `named` gives the namespace of the updates.
+/// Then `policy` gives the rule of each update, or its `ref-denied` refusal.
 fn select_rules<'a>(
     repo: &Repo,
     policy: &'a dyn SessionPolicy,
-    local: bool,
+    named: &Named<'_>,
     updates: &[RefUpdate],
 ) -> Checked<Vec<UpdateRule<'a>>> {
-    let collection = local && repo.config().collection_id().is_some();
+    let collection = named.is_local() && repo.config().collection_id().is_some();
+    let namespace = named.rule_namespace();
     updates
         .iter()
         .map(|update| {
@@ -772,7 +780,7 @@ fn select_rules<'a>(
                     "ref '{name}' holds the collection anchor commit, which the server writes"
                 )));
             }
-            policy.rule(update)
+            policy.rule(namespace, update)
         })
         .collect()
 }

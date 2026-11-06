@@ -610,8 +610,9 @@ fn a_listing_takes_no_client_group() {
     let path = create(&tmp, Some(OWN));
     let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str("[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:pub/**\n");
-    text.push_str("[ex-ostrya client \"d\"]\nauth=anonymous\ncollection=*\nallow=r:pub/**\n");
+    text.push_str(&format!(
+        "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:pub/**;r:@{OTHER}:pub/**\n"
+    ));
     std::fs::write(&config, text).unwrap();
     let repo = open(&path);
     block_on(async {

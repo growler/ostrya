@@ -3,17 +3,18 @@
 //! The reader reads each group by the shape of its name, then checks the
 //! references between the groups. It reads no file.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use ostrya_core::{Checksum, KeyFile, RefPattern, is_collection_id};
+use ostrya_core::{Checksum, KeyFile, RefPattern};
 
 use super::item::{AuthItem, parse_item, parse_net};
-use super::rights::{AccessModes, AccessRules, AllowItem, parse_allow, parse_pattern};
+use super::rights::{
+    AccessModes, AccessRules, AllowItem, NamespaceRules, parse_allow_item, parse_deny_item,
+};
 use super::{
-    ClientAccess, ClientGroup, CollectionScope, ForwardedHeader, ServerSettings, SummaryFiles,
-    is_header_name,
+    ClientAccess, ClientGroup, ForwardedHeader, ServerSettings, SummaryFiles, is_header_name,
 };
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
@@ -40,7 +41,6 @@ const RESERVED_PREFIX: &str = "ex-ostrya ";
 /// The keys of a client group.
 const CLIENT_KEYS: &[&str] = &[
     "auth",
-    "collection",
     "allow",
     "deny",
     "tls-accept-claim",
@@ -210,6 +210,12 @@ fn parse_client(
     names: &Names<'_>,
     own_id: Option<&str>,
 ) -> Result<ClientGroup> {
+    if keyfile.get_value(group, "collection").is_some() {
+        return Err(Error::InvalidFormat(format!(
+            "[{group}] holds the removed key 'collection'; an allow item or a deny item \
+             names the refs of a collection as @ID:PATTERN"
+        )));
+    }
     check_keys(keyfile, group, CLIENT_KEYS)?;
 
     let mut auth: Vec<AuthItem> = Vec::new();
@@ -225,15 +231,16 @@ fn parse_client(
         )));
     }
 
-    let scope = parse_scope(keyfile, group, own_id)?;
-
-    let mut allow = Vec::new();
+    let mut rules = NamespaceRules::default();
     for text in keyfile.get_string_list(group, "allow")?.unwrap_or_default() {
-        allow.push(parse_allow(&text).map_err(|why| malformed_item(group, "allow", &text, &why))?);
+        let (id, item) =
+            parse_allow_item(&text).map_err(|why| malformed_item(group, "allow", &text, &why))?;
+        rules_of(&mut rules, id, own_id).allow.push(item);
     }
-    let mut deny: Vec<RefPattern> = Vec::new();
     for text in keyfile.get_string_list(group, "deny")?.unwrap_or_default() {
-        deny.push(parse_pattern(&text).map_err(|why| malformed_item(group, "deny", &text, &why))?);
+        let (id, pattern) =
+            parse_deny_item(&text).map_err(|why| malformed_item(group, "deny", &text, &why))?;
+        rules_of(&mut rules, id, own_id).deny.push(pattern);
     }
 
     if keyfile.get_value(group, "tls-accept-claim").is_some() && !auth.iter().any(AuthItem::is_tls)
@@ -268,8 +275,7 @@ fn parse_client(
     Ok(ClientGroup {
         name: name.to_owned(),
         auth,
-        scope,
-        rules: AccessRules { allow, deny },
+        rules,
         tls_accept_claim,
         verify_trust,
         allow_unsigned,
@@ -282,53 +288,18 @@ fn parse_client(
     })
 }
 
-/// Reads the `collection` key of `group`.
-fn parse_scope(keyfile: &KeyFile, group: &str, own_id: Option<&str>) -> Result<CollectionScope> {
-    let Some(raw) = keyfile.get_string(group, "collection")? else {
-        return Ok(CollectionScope::Local);
-    };
-    if raw == "*" {
-        return Ok(CollectionScope::AllOther);
+/// Returns the rules of `rules` that an item with the collection id `id`
+/// joins. An item with no id and an item of the own collection id `own_id`
+/// join the rules of the local refs.
+fn rules_of<'a>(
+    rules: &'a mut NamespaceRules,
+    id: Option<String>,
+    own_id: Option<&str>,
+) -> &'a mut AccessRules {
+    match id {
+        Some(id) if Some(id.as_str()) != own_id => rules.collections.entry(id).or_default(),
+        _ => &mut rules.local,
     }
-    let mut ids: Vec<String> = Vec::new();
-    for id in keyfile
-        .get_string_list(group, "collection")?
-        .unwrap_or_default()
-    {
-        if id == "*" {
-            return Err(malformed_item(
-                group,
-                "collection",
-                &id,
-                "'*' is valid only as the whole value",
-            ));
-        }
-        if !is_collection_id(&id) {
-            return Err(malformed_item(
-                group,
-                "collection",
-                &id,
-                "a collection id has two or more elements, separated by '.', and each \
-                 element is an ASCII letter or '_', then ASCII letters, digits, or '_'",
-            ));
-        }
-        if Some(id.as_str()) == own_id {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] collection names the own collection id '{id}' of the \
-                 repository, whose refs are the local refs; remove the key for the \
-                 local refs"
-            )));
-        }
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
-    }
-    if ids.is_empty() {
-        return Err(Error::InvalidFormat(format!(
-            "[{group}] collection is empty; remove the key for the local refs"
-        )));
-    }
-    Ok(CollectionScope::Ids(ids))
 }
 
 /// Reads the `verify` key of `group`: the name of a trust group, or `None`.
@@ -389,27 +360,23 @@ fn key_list(
     Ok(Some(kept))
 }
 
-/// Returns the two implicit groups of a config with no client group.
+/// Returns the implicit group of a config with no client group:
+/// `auth=anonymous`, `summary=true`, and `r` on each ref of each namespace.
 pub(super) fn implicit_groups() -> Vec<ClientGroup> {
-    vec![
-        implicit("anonymous", CollectionScope::Local),
-        implicit("anonymous-collections", CollectionScope::AllOther),
-    ]
-}
-
-/// Returns an implicit group: `auth=anonymous`, `allow=r:**`,
-/// `summary=true`, and `scope`.
-fn implicit(name: &str, scope: CollectionScope) -> ClientGroup {
-    ClientGroup {
-        name: name.to_owned(),
+    let read_all = AccessRules {
+        allow: vec![AllowItem {
+            modes: AccessModes::READ,
+            pattern: RefPattern::parse("**").expect("`**` is a valid pattern"),
+        }],
+        deny: Vec::new(),
+    };
+    vec![ClientGroup {
+        name: "anonymous".to_owned(),
         auth: vec![AuthItem::Anonymous],
-        scope,
-        rules: AccessRules {
-            allow: vec![AllowItem {
-                modes: AccessModes::READ,
-                pattern: RefPattern::parse("**").expect("`**` is a valid pattern"),
-            }],
-            deny: Vec::new(),
+        rules: NamespaceRules {
+            local: read_all.clone(),
+            collections: BTreeMap::new(),
+            other: Some(read_all),
         },
         tls_accept_claim: false,
         verify_trust: None,
@@ -418,7 +385,7 @@ fn implicit(name: &str, scope: CollectionScope) -> ClientGroup {
         allow_privileged: false,
         summary: true,
         implicit: true,
-    }
+    }]
 }
 
 /// Returns the indexes in `groups` of the groups that carry each item, in
@@ -437,8 +404,8 @@ pub(super) fn index(groups: &[ClientGroup]) -> HashMap<AuthItem, Vec<usize>> {
 /// item that a group with `summary=true` carries.
 ///
 /// `by_item` is the index of [`index`], and `own_id` is `[core]
-/// collection-id`. The digest is the SHA-256 digest of [`access_text`] over
-/// each group of the item.
+/// collection-id`. The digest is the SHA-256 digest of [`access_text`] of the
+/// group of the item.
 pub(super) fn summary_digests(
     groups: &[ClientGroup],
     by_item: &HashMap<AuthItem, Vec<usize>>,
@@ -447,11 +414,11 @@ pub(super) fn summary_digests(
     by_item
         .iter()
         .filter_map(|(item, carriers)| {
-            let carried: Vec<&ClientGroup> = carriers.iter().map(|&i| &groups[i]).collect();
-            if !carried.iter().any(|group| group.summary) {
+            let group = &groups[*carriers.first()?];
+            if !group.summary {
                 return None;
             }
-            let text = access_text(own_id, &carried);
+            let text = access_text(own_id, group);
             let files = SummaryFiles {
                 digest: Checksum::sha256(text.as_bytes()),
                 stem: summary_stem(item),
@@ -461,15 +428,17 @@ pub(super) fn summary_digests(
         .collect()
 }
 
-/// Returns the text of the access digest of an item whose groups are
-/// `groups`, in a repository whose own collection id is `own_id`.
+/// Returns the text of the access digest of an item whose group is `group`,
+/// in a repository whose own collection id is `own_id`.
 ///
 /// The text is the line `collection-id=ID`, with an empty `ID` when
-/// `own_id` is `None`. Then come four lines for each group, `summary=false`
-/// groups included, in the byte-wise order of their `namespace=` lines:
+/// `own_id` is `None`. Then come four lines for each namespace of the group,
+/// in the byte-wise order of their `namespace=` lines: the local refs, each
+/// collection with one or more items, and each other collection in the
+/// implicit group.
 ///
-/// - `namespace=NS`: empty for the local refs, `*` for `collection=*`, and
-///   else the collection ids, sorted byte-wise and joined by `;`.
+/// - `namespace=NS`: empty for the local refs, the collection id for a
+///   collection, and `*` for each other collection.
 /// - `allow=ITEMS`: the allow items in the form `MODES:PATTERN`, with the
 ///   modes in the order `rwctd`, each distinct item one time, sorted
 ///   byte-wise and joined by `;`.
@@ -477,49 +446,40 @@ pub(super) fn summary_digests(
 /// - `summary=true` or `summary=false`: the value of `summary`.
 ///
 /// Each line ends with a newline. The text holds no group name.
-pub(super) fn access_text(own_id: Option<&str>, groups: &[&ClientGroup]) -> String {
+pub(super) fn access_text(own_id: Option<&str>, group: &ClientGroup) -> String {
     fn joined(mut items: Vec<String>) -> String {
         items.sort();
         items.dedup();
         items.join(";")
     }
-    let mut blocks: Vec<(String, String)> = groups
-        .iter()
-        .map(|group| {
-            let namespace = match &group.scope {
-                CollectionScope::Local => String::new(),
-                CollectionScope::AllOther => "*".to_owned(),
-                CollectionScope::Ids(ids) => joined(ids.clone()),
-            };
-            let allow = joined(group.rules.allow.iter().map(ToString::to_string).collect());
-            let deny = joined(
-                group
-                    .rules
-                    .deny
-                    .iter()
-                    .map(|pattern| pattern.as_str().to_owned())
-                    .collect(),
-            );
-            let summary = group.summary;
-            let block =
-                format!("namespace={namespace}\nallow={allow}\ndeny={deny}\nsummary={summary}\n");
-            (namespace, block)
-        })
-        .collect();
-    blocks.sort();
+    let rules = &group.rules;
+    let mut namespaces: Vec<(&str, &AccessRules)> = vec![("", &rules.local)];
+    namespaces.extend(rules.collections.iter().map(|(id, r)| (id.as_str(), r)));
+    namespaces.extend(rules.other.iter().map(|r| ("*", r)));
+    namespaces.sort_by_key(|&(namespace, _)| namespace);
     let mut text = format!("collection-id={}\n", own_id.unwrap_or(""));
-    for (_, block) in blocks {
-        text.push_str(&block);
+    for (namespace, rules) in namespaces {
+        let allow = joined(rules.allow.iter().map(ToString::to_string).collect());
+        let deny = joined(
+            rules
+                .deny
+                .iter()
+                .map(|pattern| pattern.as_str().to_owned())
+                .collect(),
+        );
+        let summary = group.summary;
+        text.push_str(&format!(
+            "namespace={namespace}\nallow={allow}\ndeny={deny}\nsummary={summary}\n"
+        ));
     }
     text
 }
 
-/// Refuses two groups that carry one item and whose namespaces overlap.
+/// Refuses two groups that carry one item.
 ///
-/// `by_item` is the index of [`index`]. The function compares the scopes of
-/// two groups only when the groups carry one item. The error names the
-/// first such pair in the order of the config, and the first item of the
-/// first group that the second group carries.
+/// `by_item` is the index of [`index`]. The error names the first such pair
+/// in the order of the config, and the first item of the first group that
+/// the second group carries.
 fn check_overlap(groups: &[ClientGroup], by_item: &HashMap<AuthItem, Vec<usize>>) -> Result<()> {
     for (i, first) in groups.iter().enumerate() {
         let found = first
@@ -528,15 +488,12 @@ fn check_overlap(groups: &[ClientGroup], by_item: &HashMap<AuthItem, Vec<usize>>
             .filter_map(|item| {
                 let carriers = &by_item[item];
                 let later = &carriers[carriers.partition_point(|&j| j <= i)..];
-                later
-                    .iter()
-                    .find(|&&j| first.scope.overlaps(&groups[j].scope))
-                    .map(|&j| (j, item))
+                later.first().map(|&j| (j, item))
             })
             .min_by_key(|&(j, _)| j);
         if let Some((j, item)) = found {
             return Err(Error::InvalidFormat(format!(
-                "{} and {} both carry the item {item}, and their namespaces overlap",
+                "{} and {} both carry the item {item}; one client group carries each item",
                 first.header(),
                 groups[j].header()
             )));
@@ -670,7 +627,7 @@ mod tests {
     use std::net::IpAddr;
 
     use super::*;
-    use crate::access::IpNet;
+    use crate::access::{IpNet, Namespace};
 
     const CORE: &str = "[core]\nrepo_version=1\nmode=archive-z2\n";
     const HEX: &str = "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff";
@@ -879,48 +836,73 @@ mod tests {
         assert_eq!(group.auth(), [AuthItem::Ssh("user".into())]);
     }
 
-    /// The forms of `collection`.
+    /// The key `collection` is refused with any value, and the message names
+    /// the form `@ID:PATTERN`.
     #[test]
-    fn the_collection_forms() {
-        let scope = |keys: &str| client(&format!("auth=anonymous\n{keys}"), "");
-        assert_eq!(scope("").unwrap().scope(), &CollectionScope::Local);
-        assert_eq!(
-            scope("collection=*\n").unwrap().scope(),
-            &CollectionScope::AllOther
-        );
-        assert_eq!(
-            scope("collection=a.b;c.d;a.b\n").unwrap().scope(),
-            &CollectionScope::Ids(vec!["a.b".into(), "c.d".into()])
-        );
-        assert_eq!(
-            scope("collection=a.b;\n").unwrap().scope(),
-            &CollectionScope::Ids(vec!["a.b".into()])
-        );
-        for keys in [
-            "collection=\n",
-            "collection=*;a.b\n",
-            "collection=a.b;*\n",
-            "collection=*;\n",
-            "collection=**\n",
-            "collection=fresh\n",
-            "collection=a.b; c.d\n",
-            "collection=a-b.c\n",
-            "collection=a..b\n",
-        ] {
-            refused(scope(keys));
+    fn the_collection_key_is_refused() {
+        for value in ["*", "a.b", "a.b;c.d", "", "fresh"] {
+            let message = refused(client(&format!("auth=anonymous\ncollection={value}\n"), ""));
+            assert!(
+                message.starts_with("[ex-ostrya client \"c\"] holds the removed key 'collection'"),
+                "{message}"
+            );
+            assert!(message.contains("@ID:PATTERN"), "{message}");
         }
     }
 
-    /// The own collection id is refused in `collection`.
+    /// An allow item and a deny item with `@ID:` join the rules of the
+    /// collection `ID`. `MODES` comes before `@ID:`.
     #[test]
-    fn the_own_collection_id_is_refused() {
+    fn an_item_with_an_id_joins_its_collection() {
+        let group = client(
+            "auth=anonymous\nallow=@a.b:os/**;wd:@a.b:os/x;r:main;t:@c.d:**\n\
+             deny=@a.b:os/secret;secret\n",
+            "",
+        )
+        .unwrap();
+        let texts = |rules: &AccessRules| -> (Vec<String>, Vec<String>) {
+            (
+                rules.allow.iter().map(ToString::to_string).collect(),
+                rules.deny.iter().map(|p| p.as_str().to_owned()).collect(),
+            )
+        };
+        let rules = group.rules();
+        assert_eq!(
+            texts(&rules.local),
+            (vec!["r:main".into()], vec!["secret".into()])
+        );
+        assert_eq!(
+            texts(&rules.collections["a.b"]),
+            (
+                vec!["r:os/**".into(), "wd:os/x".into()],
+                vec!["os/secret".into()]
+            )
+        );
+        assert_eq!(
+            texts(&rules.collections["c.d"]),
+            (vec!["t:**".into()], vec![])
+        );
+        assert_eq!(rules.collections.len(), 2);
+        let longest = format!("a.{}", "b".repeat(ostrya_core::MAX_COLLECTION_ID_LEN - 2));
+        let group = client(&format!("auth=anonymous\nallow=@{longest}:a\n"), "").unwrap();
+        assert!(group.rules().collections.contains_key(&longest));
+    }
+
+    /// An item of the own collection id joins the rules of the local refs.
+    #[test]
+    fn an_item_of_the_own_collection_id_is_local() {
         let config = RepoConfig::parse(&format!(
             "{CORE}collection-id=own.id\n\
-             [ex-ostrya client \"c\"]\nauth=anonymous\ncollection=a.b;own.id\n"
+             [ex-ostrya client \"c\"]\nauth=anonymous\nallow=w:@own.id:a;r:b\n\
+             deny=@own.id:a/secret\n"
         ))
         .unwrap();
-        let message = refused(read(&config, Path::new("/r")));
-        assert!(message.contains("own collection id 'own.id'"), "{message}");
+        let access = read(&config, Path::new("/r")).unwrap();
+        let rules = access.groups()[0].rules();
+        assert!(rules.collections.is_empty());
+        let allow: Vec<String> = rules.local.allow.iter().map(ToString::to_string).collect();
+        assert_eq!(allow, ["w:a", "r:b"]);
+        assert_eq!(rules.local.deny[0].as_str(), "a/secret");
     }
 
     /// `allow` and `deny` read their items, and an absent or empty key gives
@@ -932,19 +914,15 @@ mod tests {
             "",
         )
         .unwrap();
-        let allow: Vec<String> = group
-            .rules()
-            .allow
-            .iter()
-            .map(ToString::to_string)
-            .collect();
+        let local = &group.rules().local;
+        let allow: Vec<String> = local.allow.iter().map(ToString::to_string).collect();
         assert_eq!(allow, ["r:os/**", "rw:os/stable", "rwctd:x"]);
-        let deny: Vec<&str> = group.rules().deny.iter().map(RefPattern::as_str).collect();
+        let deny: Vec<&str> = local.deny.iter().map(RefPattern::as_str).collect();
         assert_eq!(deny, ["os/secret/**", "y"]);
         for keys in ["auth=anonymous\n", "auth=anonymous\nallow=\ndeny=\n"] {
             let group = client(keys, "").unwrap();
-            assert_eq!(group.rules(), &AccessRules::default(), "{keys:?}");
-            assert!(group.rules().rights("a").is_empty());
+            assert_eq!(group.rules(), &NamespaceRules::default(), "{keys:?}");
+            assert!(group.rules().rights(&Namespace::Local, "a").is_empty());
         }
     }
 
@@ -961,6 +939,19 @@ mod tests {
             ("deny", "!a"),
             ("deny", "a//b"),
             ("deny", "r:a"),
+            ("allow", "@a.b:r:a"),
+            ("allow", "r:@a.b"),
+            ("allow", "@a.b:"),
+            ("allow", "@:a"),
+            ("allow", "@fresh:a"),
+            ("allow", "r:@a..b:a"),
+            ("allow", "@a.b:@c.d:a"),
+            ("allow", "r:@a.b:@c.d:a"),
+            ("deny", "@a.b"),
+            ("deny", "@a.b:"),
+            ("deny", "@1a.b:a"),
+            ("deny", "!@a.b:a"),
+            ("deny", "@a.b:!a"),
         ] {
             let message = refused(client(&format!("auth=anonymous\n{key}={item}\n"), ""));
             assert!(
@@ -1056,7 +1047,7 @@ mod tests {
         assert!(matches!(err, Error::Core(_)), "{err}");
     }
 
-    /// `summary` is a boolean that defaults to false. The implicit groups set
+    /// `summary` is a boolean that defaults to false. The implicit group sets
     /// it.
     #[test]
     fn summary_is_a_boolean_that_defaults_to_false() {
@@ -1104,17 +1095,19 @@ mod tests {
         access(text).summary_digest(&AuthItem::parse(item).unwrap())
     }
 
-    /// The text of the implicit groups holds two groups, the local refs first,
-    /// and the own collection id.
+    /// The text of the implicit group holds the local refs, then each other
+    /// collection, and the own collection id.
     #[test]
-    fn the_access_text_of_the_implicit_groups() {
+    fn the_access_text_of_the_implicit_group() {
         let groups = implicit_groups();
-        let refs: Vec<&ClientGroup> = groups.iter().collect();
         let text = "namespace=\nallow=r:**\ndeny=\nsummary=true\n\
                     namespace=*\nallow=r:**\ndeny=\nsummary=true\n";
-        assert_eq!(access_text(None, &refs), format!("collection-id=\n{text}"));
         assert_eq!(
-            access_text(Some("a.b"), &refs),
+            access_text(None, &groups[0]),
+            format!("collection-id=\n{text}")
+        );
+        assert_eq!(
+            access_text(Some("a.b"), &groups[0]),
             format!("collection-id=a.b\n{text}")
         );
         let want = Checksum::sha256(format!("collection-id=\n{text}").as_bytes());
@@ -1132,65 +1125,55 @@ mod tests {
         );
     }
 
-    /// The ids, the allow items, and the deny patterns are sorted byte-wise,
-    /// each one time. The groups come in the order of their namespaces.
+    /// The allow items and the deny patterns of each namespace are sorted
+    /// byte-wise, each one time. The namespaces come in byte-wise order, the
+    /// local refs first, also with no item.
     #[test]
     fn the_access_text_is_sorted_and_has_each_item_one_time() {
         let access = access(
-            "[ex-ostrya client \"b\"]\nauth=ssh:u\ncollection=c.d;a.b\n\
-             allow=r:b;rw:a;b;wr:a\ndeny=y;x;y\nsummary=true\n\
-             [ex-ostrya client \"a\"]\nauth=ssh:u\ncollection=*\nsummary=true\n\
-             [ex-ostrya client \"c\"]\nauth=ssh:u\nallow=d:z\n",
+            "[ex-ostrya client \"b\"]\nauth=ssh:u\n\
+             allow=r:@c.d:b;rw:@c.d:a;@c.d:b;wr:@c.d:a;d:@a.b:z\ndeny=@c.d:y;@c.d:x;@c.d:y\n\
+             summary=true\n",
         );
-        let groups: Vec<&ClientGroup> = access.groups().iter().collect();
         assert_eq!(
-            access_text(None, &groups),
+            access_text(None, &access.groups()[0]),
             "collection-id=\n\
-             namespace=\nallow=d:z\ndeny=\nsummary=false\n\
-             namespace=*\nallow=\ndeny=\nsummary=true\n\
-             namespace=a.b;c.d\nallow=r:b;rw:a\ndeny=x;y\nsummary=true\n"
+             namespace=\nallow=\ndeny=\nsummary=true\n\
+             namespace=a.b\nallow=d:z\ndeny=\nsummary=true\n\
+             namespace=c.d\nallow=r:b;rw:a\ndeny=x;y\nsummary=true\n"
         );
     }
 
     /// A new group name keeps the digest. A change to `allow`, to `deny`, to
-    /// the namespace, to `summary`, or to `[core] collection-id` changes it,
-    /// in a group with `summary=false` too. An item with no group with
-    /// `summary=true` has no summary.
+    /// the namespace of an item, to `summary`, or to `[core] collection-id`
+    /// changes it. An item whose group has `summary=false` has no summary.
     #[test]
     fn the_access_digest_follows_the_rules_of_the_summary() {
-        let config = |name: &str, rules: &str, other: &str| {
+        let config = |name: &str, rules: &str| {
             format!(
                 "[ex-ostrya client \"{name}\"]\nauth=ssh:u;anonymous\n{rules}summary=true\n\
-                 [ex-ostrya client \"other\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n{other}\
                  [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\n"
             )
         };
-        let rules = "allow=r:a/**\ndeny=a/secret\n";
-        let base = digest(&config("one", rules, ""), "ssh:u").unwrap();
-        assert_eq!(digest(&config("two", rules, ""), "ssh:u"), Some(base));
-        // `ssh:u` has the group `other` with `summary=false`, and `anonymous`
-        // does not.
-        let anonymous = digest(&config("one", rules, ""), "anonymous").unwrap();
-        assert_ne!(anonymous, base);
+        let rules = "allow=r:a/**;r:@c.d:**\ndeny=a/secret\n";
+        let base = digest(&config("one", rules), "ssh:u").unwrap();
+        assert_eq!(digest(&config("two", rules), "ssh:u"), Some(base));
+        assert_eq!(digest(&config("one", rules), "anonymous"), Some(base));
         for changed in [
-            config("one", "allow=r:a/**;r:b\ndeny=a/secret\n", ""),
-            config("one", "allow=rw:a/**\ndeny=a/secret\n", ""),
-            config("one", "allow=r:a/**\ndeny=a/secret;a/hidden\n", ""),
-            config("one", "allow=r:a/**\n", ""),
-            config("one", &format!("{rules}collection=a.b\n"), ""),
-            config("one", rules, "summary=true\n"),
-            config("one", rules, "deny=x\n"),
+            config("one", "allow=r:a/**;r:b;r:@c.d:**\ndeny=a/secret\n"),
+            config("one", "allow=rw:a/**;r:@c.d:**\ndeny=a/secret\n"),
+            config("one", "allow=r:a/**;r:@c.d:**\ndeny=a/secret;a/hidden\n"),
+            config("one", "allow=r:a/**;r:@c.d:**\n"),
+            config("one", "allow=r:a/**;r:@c.d:**\ndeny=@c.d:a/secret\n"),
+            config("one", "allow=r:a/**;r:@e.f:**\ndeny=a/secret\n"),
+            config("one", "allow=r:@a.b:a/**;r:@c.d:**\ndeny=a/secret\n"),
         ] {
             assert_ne!(digest(&changed, "ssh:u"), Some(base), "{changed}");
         }
-        assert_eq!(
-            digest(&config("one", rules, "deny=x\n"), "anonymous"),
-            Some(anonymous)
-        );
-        assert_eq!(digest(&config("one", rules, ""), "ssh:ci"), None);
+        assert_eq!(digest(&config("one", rules), "ssh:ci"), None);
         let with_id = RepoConfig::parse(&format!(
             "{CORE}collection-id=own.id\n{}",
-            config("one", rules, "")
+            config("one", rules)
         ))
         .unwrap();
         let own = read(&with_id, Path::new("/r")).unwrap();
@@ -1200,33 +1183,22 @@ mod tests {
         );
     }
 
-    /// A group with `summary=false` is in the text. An exact group under a
-    /// group of `*` with `summary=true` changes the digest, and so does a
-    /// move of the exact group to another collection.
+    /// An item of the own collection id gives the digest of the same item
+    /// with no `@ID:`.
     #[test]
-    fn a_group_with_no_summary_changes_the_digest() {
-        let any = "[ex-ostrya client \"any\"]\nauth=anonymous\ncollection=*\n\
-                   allow=r:**\nsummary=true\n";
-        let exact = |id: &str| {
-            format!(
-                "{any}[ex-ostrya client \"exact\"]\nauth=anonymous\ncollection={id}\n\
-                 allow=r:public\n"
-            )
+    fn an_item_of_the_own_collection_id_keeps_the_digest() {
+        let digest_of = |allow: &str| {
+            let config = RepoConfig::parse(&format!(
+                "{CORE}collection-id=own.id\n\
+                 [ex-ostrya client \"c\"]\nauth=anonymous\nallow={allow}\nsummary=true\n"
+            ))
+            .unwrap();
+            read(&config, Path::new("/r"))
+                .unwrap()
+                .summary_digest(&AuthItem::Anonymous)
         };
-        let base = digest(any, "anonymous").unwrap();
-        let added = digest(&exact("a.b"), "anonymous").unwrap();
-        let moved = digest(&exact("c.d"), "anonymous").unwrap();
-        assert_ne!(added, base);
-        assert_ne!(moved, base);
-        assert_ne!(moved, added);
-        let access = access(&exact("a.b"));
-        let groups: Vec<&ClientGroup> = access.groups().iter().collect();
-        assert_eq!(
-            access_text(None, &groups),
-            "collection-id=\n\
-             namespace=*\nallow=r:**\ndeny=\nsummary=true\n\
-             namespace=a.b\nallow=r:public\ndeny=\nsummary=false\n"
-        );
+        assert_eq!(digest_of("r:@own.id:a"), digest_of("r:a"));
+        assert_ne!(digest_of("r:@a.b:a"), digest_of("r:a"));
     }
 
     /// The server keys parse to their values, and a relative path is joined

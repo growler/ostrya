@@ -37626,7 +37626,7 @@ fn summary_reading_options_match_the_tool() {
 }
 
 /// `--auth-group=NAME` reads the summary of the item of the client group
-/// `NAME`. With no client group, the names of the implicit groups read a
+/// `NAME`. With no client group, the name of the implicit group reads a
 /// summary with the bytes of the root summary. The command refuses a group that does not exist, a group
 /// with `summary=false`, a group with more than one item, and the option
 /// with `-u`, with `--verify`, with a signing key, and with no read option.
@@ -37650,12 +37650,13 @@ fn summary_auth_group_reads_the_summary_of_one_item() {
     ostrya(&[&repo_arg, "summary", "-u"], None, &[]).ok();
     let root = ostrya(&[&repo_arg, "summary", "--raw"], None, &[]);
     root.ok();
-    for name in ["anonymous", "anonymous-collections"] {
-        let group = format!("--auth-group={name}");
-        let run = ostrya(&[&repo_arg, "summary", &group, "--raw"], None, &[]);
-        run.ok();
-        assert_eq!(run.stdout, root.stdout, "{name}");
-    }
+    let run = ostrya(
+        &[&repo_arg, "summary", "--auth-group=anonymous", "--raw"],
+        None,
+        &[],
+    );
+    run.ok();
+    assert_eq!(run.stdout, root.stdout);
 
     let config = repo.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();

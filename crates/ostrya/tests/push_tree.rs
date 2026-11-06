@@ -796,7 +796,7 @@ fn the_commit_of_a_tree_push_is_the_commit_that_write_commit_writes() {
     // server writes its refs under `refs/mirrors/`.
     let (mirrored, _) = pushed_under(
         &collection,
-        &collections_policy(&["c:**"]),
+        &collections_policy(&["org.example.Other"], &["c:**"]),
         &src,
         TreePushOptions {
             collection: Some("org.example.Other".into()),

@@ -410,7 +410,7 @@ async fn split_repo(base: &Path, bare_path: &Path, bare: &Repo, commit: &Checksu
         assert_eq!(id, name.checksum, "the hand-written split object");
     }
     // The summary of the `anonymous` item and its `.access` file. Both
-    // repositories have the implicit groups and no collection id, so the
+    // repositories have the implicit group and no collection id, so the
     // file of the `bare` repository holds the digest of this one.
     let stem = format!(
         "extensions/ostrya/summary/{}",

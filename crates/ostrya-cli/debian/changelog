@@ -26,6 +26,13 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     @ID:NAME. -A refuses a collection ref of another id.
   * prune --only-branch and --retain-branch-depth take @ID:NAME.
   * pull-local takes @ID:REF operands of more than one collection.
+  * A client group holds the items of each namespace: allow takes
+    [MODES:]@ID:PATTERN, and deny takes @ID:PATTERN. The config refuses
+    the key collection, and one item in two groups. With no client
+    group, the one implicit group is anonymous.
+  * A claim is ostrya:ref:[MODES:]@ID:PATTERN or ostrya:ref:!@ID:PATTERN
+    for the collection ID. serve refuses a certificate with an
+    ostrya:collection: URI with 403.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

@@ -122,9 +122,10 @@ pub trait ReceiveAuth: Send + Sync + 'static {
     /// Because of these checks, `hello` holds valid ref names alone. Its
     /// collection id, if present, is valid too.
     ///
-    /// The scope of the returned [`ReceivePolicy`](ostrya::ReceivePolicy)
-    /// must cover the namespace of `hello`. Otherwise the session refuses
-    /// the policy with 422 and `ref-denied`.
+    /// The session reads the rules of the returned
+    /// [`ReceivePolicy`](ostrya::ReceivePolicy) for the namespace of
+    /// `hello`. A policy that opens no push session, or that gives no `r` on
+    /// a ref of `hello` in that namespace, gets 422 and `ref-denied`.
     ///
     /// Each `open` call holds a slot, so the session limit also limits the
     /// count of `open` calls that run at one time.

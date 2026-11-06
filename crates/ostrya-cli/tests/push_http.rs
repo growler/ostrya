@@ -1754,11 +1754,10 @@ mod cli {
     }
 
     /// A commit bound to a collection opens the session in that collection,
-    /// and the group of the collection writes `refs/mirrors/ID/NAME`. A
-    /// collection that no group covers gets 403 with the namespace in the
-    /// message.
+    /// and the items of the collection write `refs/mirrors/ID/NAME`. A
+    /// collection with no item of the group gets `ref-denied`.
     #[test]
-    fn a_collection_push_over_http_takes_the_group_of_the_collection() {
+    fn a_collection_push_over_http_takes_the_items_of_the_collection() {
         let setup = Setup::new("cli-collection");
         let src = tree(setup.tmp.path(), "tree", 2, 100);
         let client = setup.init("client", "archive");
@@ -1778,7 +1777,7 @@ mod cli {
         let server = setup.init("server", "archive");
         add_config(
             &server,
-            "[ex-ostrya client \"os\"]\nauth=anonymous\ncollection=org.example.Os\nallow=w:**\n",
+            "[ex-ostrya client \"os\"]\nauth=anonymous\nallow=w:@org.example.Os:**\n",
         );
         let serving = Serving::start(&server, &[]);
 
@@ -1799,8 +1798,7 @@ mod cli {
         assert_eq!(stdout(&out), "");
         assert_eq!(
             stderr(&out),
-            "error: unauthorized: no client group of the request covers the collection \
-             'org.example.Other'\n"
+            "error: ref-denied: the policy gives no r on ref 'plain'\n"
         );
     }
 
@@ -1964,9 +1962,7 @@ mod cli {
         let server = setup.init("server", "archive");
         add_config(
             &server,
-            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:**;t:**\n\
-             [ex-ostrya client \"os\"]\nauth=anonymous\ncollection=org.example.Os\n\
-             allow=c:**\n",
+            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:**;t:**;c:@org.example.Os:**\n",
         );
         let serving = Serving::start(&server, &[]);
         let src_arg = src.to_str().unwrap();

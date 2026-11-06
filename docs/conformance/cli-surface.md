@@ -2815,8 +2815,8 @@ auth item of the client group `NAME` with `-v`, `--raw`,
 "Summaries of auth items"). The port refuses it at exit 1 for a group that does
 not exist, a group with `summary=false`, a group whose `auth` list holds more
 than one item, and with `-u`, `--verify`, a signing key, or no read option.
-With no client group, `NAME` is `anonymous` or `anonymous-collections`, the
-implicit groups. `-c/--client-groups` needs `-u`. With it, `-u` writes and
+With no client group, `NAME` is `anonymous`, the implicit group.
+`-c/--client-groups` needs `-u`. With it, `-u` writes and
 signs the summary of each auth item, removes the files of each item with no
 summary, and leaves `summary` and `summary.sig` as they are. In a repository
 with a collection id it writes no anchor commit. The port refuses `-c` with no
@@ -5198,10 +5198,9 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
   name with a line feed gives one line.
 - `Hello` names the namespace of the session: the local refs, or one
   collection. The collection id of the repository names the local refs. The
-  session takes the policy of the client group of that namespace that
-  carries `ssh:NAME`. For a collection, a group that names the collection
-  wins over a group with `collection=*`. With no such group, the `Hello`
-  gets `ref-denied`, and the command exits 1. A session of a collection
+  session takes the policy of the client group that carries `ssh:NAME`,
+  with the allow items and the deny items of that namespace. With no such
+  group, the `Hello` gets `ref-denied`, and the command exits 1. A session of a collection
   reads and writes the refs under `refs/mirrors/ID/`. The session uses no
   `anonymous` item and no `net:` item.
   `../format-reference.md`, "Authentication of the receive endpoint",
@@ -6042,12 +6041,11 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `summary` that the tool writes.
   `../format-reference.md`, "Read access" and "Summaries of auth items",
   state the rules. The tool has no such rights. A `session` request
-  takes the policy of the client group that carries the item in the
-  namespace of its `Hello`: the local refs, or one collection. An item with
-  no such group gets 403 with `unauthorized` and the message `no client
-  group of the request covers the local refs`, or `no client group of the
-  request covers the collection 'ID'`. A group
-  that opens no push session gets 403 with `unauthorized` and the message
+  takes the policy of the client group that carries the item, with the
+  items of the namespace of its `Hello`: the local refs, or one collection.
+  An item with no group gets 403 with `unauthorized` and the message `no
+  client group carries the item of the request`. A group that opens no push
+  session in any namespace gets 403 with `unauthorized` and the message
   `client group 'NAME' opens no push session`. With no client group in the
   config, the implicit group `anonymous` reads each ref and opens no push
   session, so each push gets 403. `../format-reference.md`, "Authentication

@@ -3596,8 +3596,10 @@ The port selects refs by name with two grammars. A pattern of a client group
 names the refs of an allow item or a deny item ("Access modes and patterns" of
 `ostrya-config(1)`). A ref selector selects the refs of a ref listing. The two
 grammars share the part grammar. A pattern of a client group is one pattern of
-the part grammar, with no remote part and no negative form. An entry of a ref
-selector takes one leading `!`.
+the part grammar, with no remote part and no negative form. An item of a
+client group names its collection with `@ID:` before the pattern, so the
+pattern itself has no collection part. An entry of a ref selector takes one
+leading `!`.
 
 ### The part grammar
 
@@ -3944,8 +3946,9 @@ give the condition of each refusal.
 - `invalid-ref` -- the server refuses a ref name, or the collection id of
   `Hello`: an id longer than 255 bytes, or one that fails the collection-id
   rule.
-- `ref-denied` -- no client group covers the namespace of `Hello`, the client
-  group opens no push session, a ref of `Hello` has no `r`, an update writes
+- `ref-denied` -- no client group carries the item of the client, the
+  client group opens no push session, a ref of `Hello` has no `r` in the
+  namespace of `Hello`, an update writes
   a commit without `w` or `t`, or an update names a ref that a push does not
   write. A server commit gets this code without `c` on its branch, or without
   `t` or `w` on a tag. A hook of a host application can also refuse a commit
@@ -4052,23 +4055,24 @@ of a collection does not touch `refs/heads/`.
 Then the server runs the checks of the client group of the session. They do
 no I/O, and each failure is `ref-denied`:
 
-8. The session needs a client group whose `collection` key covers the
-   namespace.
-9. A client group with no allow item that has `w`, `c`, `t`, or `d` opens no
-   push session.
+8. The session needs a client group that carries the auth item of the
+   client.
+9. A client group with no allow item that has `w`, `c`, `t`, or `d`, in any
+   namespace, opens no push session.
 10. A remote ref `REMOTE:NAME` in `Hello` is refused, because a push writes
     no remote ref.
-11. A ref of `Hello` needs `r` in the effective rights of the group
-    (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
+11. A ref of `Hello` needs `r` in the effective rights of the group in the
+    namespace of `Hello` (`ostrya-config(1)`, "Access modes and patterns").
+    `d` does not add `r`.
     `HelloReply` gives the current commit of each ref of `Hello`, so this
     check keeps a client from reading a ref through a push session.
 
 `ostrya receive` and `ostrya serve` give a session the client group that
-carries the auth item of the client in the namespace of `Hello`
-("Authentication of the receive endpoint"). For a collection, the group is
-the group that names the collection, else the group with `collection=*`.
-With no such group, `ostrya receive` answers `Hello` with `ref-denied` at
-check 8, and `ostrya serve` answers the `session` request with 403.
+carries the auth item of the client ("Authentication of the receive
+endpoint"). The session takes the allow items and the deny items of the
+group for the namespace of `Hello`. With no such group, `ostrya receive`
+answers `Hello` with `ref-denied` at check 8, and `ostrya serve` answers the
+`session` request with 403.
 
 A `Hello` with no ref, and a `Hello` that names one ref two times, pass
 checks 1 to 7. A `Hello` with no ref also passes checks 10 and 11, so a
@@ -4791,14 +4795,14 @@ These rules apply to each ref of the two parts:
 
 - The listing holds a selected ref when the client group of the item has `r`
   on its name in its namespace: the local namespace for field 0, and the
-  namespace of the collection for the map ("Read access"). The rules of two
-  groups never combine. The server checks the name before it reads the ref
-  file. So it reads no ref file that the client cannot read, and the content
-  of such a file fails no listing. The server reads no directory of a
-  collection whose group gives no `r`. When the entries of a part hold no
+  namespace of the collection for the map ("Read access"). The items of two
+  namespaces never combine. The server checks the name before it reads the
+  ref file. So it reads no ref file that the client cannot read, and the
+  content of such a file fails no listing. The server reads no directory of
+  a collection whose items give no `r`. When the entries of a part hold no
   positive entry, the server reads only the directories that the pattern of
-  an allow item of the group that gives `r` can match, and no directory that
-  a deny item of the group covers.
+  an allow item of the namespace that gives `r` can match, and no directory
+  that a deny item of the namespace covers.
 - An alias is in the listing under its own name, with the commit of its
   target, when the client reads its name and its target. The alias resolves
   by the rules of "The archive view": the body is relative and stays inside
@@ -4972,11 +4976,12 @@ Over ssh, `ostrya send` identifies the client by its `ssh:NAME` item. Claims
 never apply to `net:`, `anonymous`, or `ssh:NAME`.
 
 The listing holds the refs that the client reads ("Read access"). With
-`tls-accept-claim=true`, the claims of the namespace of a ref replace `allow`
-and `deny` of the group ("Claims of a client certificate"). The namespace of
-the own collection id of the remote is its local namespace. The probe then
-reads field 0, so the local group of the remote applies, with the
-`ostrya:ref:` claims and the `ostrya:collection:ID:` claims of that id. When
+`tls-accept-claim=true`, the claims of the namespace of a ref replace the
+items of the group for that namespace ("Claims of a client certificate").
+The namespace of the own collection id of the remote is its local
+namespace. The probe then reads field 0, so the items of the local refs of
+the remote apply, with the claims with no `@ID:` and the claims with `@ID:`
+of that id. When
 one candidate hides a ref, the pull takes the ref from another candidate that
 lists it. Else the pull fails, because no candidate lists the ref.
 
@@ -5186,11 +5191,11 @@ summary gives an empty result.
 ## Summaries of auth items
 
 The port writes the root summary ("Summary -- `(a(s(taya{sv}))a{sv})`") and
-one summary for each auth item that has a summary. An auth
-item has a summary when one or more of its client groups has
-`summary=true` (`ostrya-config(1)`, "Client keys"). Each other item has no
-summary. The two implicit groups of a repository with no client group set
-`summary=true`, so the `anonymous` item there has a summary.
+one summary for each auth item that has a summary. An auth item has a
+summary when its client group has `summary=true` (`ostrya-config(1)`,
+"Client keys"). Each other item has no summary. The implicit group of a
+repository with no client group sets `summary=true`, so the `anonymous` item
+there has a summary.
 
 ### The refs and the deltas of a summary
 
@@ -5198,9 +5203,8 @@ The summary of an item is a summary GVariant with the format of "Summary --
 `(a(s(taya{sv}))a{sv})`". It holds the refs of a ref listing whose two lists
 of entries are empty ("The ref listing"), with these changes:
 
-- In each namespace, the server first selects the group of the item, as
-  "Read access" states. When that group has `summary=false`, the summary
-  holds no ref of the namespace. No other group takes its place.
+- The group of the item gives the rights in each namespace, as "Read
+  access" states.
 - No group takes the claims of a client certificate. A group with
   `tls-accept-claim=true` cannot set `summary=true`.
 
@@ -5263,19 +5267,23 @@ summary=BOOL
 - The text starts with the line `collection-id=ID`. `ID` is
   `[core] collection-id`, and it is empty when the repository has no
   collection id.
-- Then each group of the item adds the four lines `namespace=`, `allow=`,
-  `deny=`, and `summary=`, a group with `summary=false` too. The groups come
-  in the byte-wise order of their `namespace=` lines.
-- `NS` is empty for the local refs, `*` for `collection=*`, and else the
-  collection ids, sorted byte-wise and joined by `;`.
-- `ITEMS` is the allow items in the form `MODES:PATTERN`, with the modes in
-  the order `r`, `w`, `c`, `t`, `d`. Each distinct item occurs one time. The
-  items are sorted byte-wise and joined by `;`.
-- `PATTERNS` is the deny patterns, in the same way.
+- Then each namespace of the group of the item adds the four lines
+  `namespace=`, `allow=`, `deny=`, and `summary=`: the local refs, each
+  collection with one or more items, and each other collection in the
+  implicit group. The namespaces come in the byte-wise order of their
+  `namespace=` lines.
+- `NS` is empty for the local refs, the collection id for a collection, and
+  `*` for each other collection of the implicit group. An item with `@ID:`
+  of `[core] collection-id` is an item of the local refs.
+- `ITEMS` is the allow items of the namespace in the form `MODES:PATTERN`,
+  with no `@ID:`, and with the modes in the order `r`, `w`, `c`, `t`, `d`.
+  Each distinct item occurs one time. The items are sorted byte-wise and
+  joined by `;`.
+- `PATTERNS` is the deny patterns of the namespace, in the same way.
 - `BOOL` is `true` or `false`, the value of `summary` of the group.
 - Each line ends with a newline.
 
-For example, the text of the `anonymous` item of the two implicit groups in
+For example, the text of the `anonymous` item of the implicit group in
 a repository with no collection id is:
 
 ```
@@ -5290,11 +5298,10 @@ deny=
 summary=true
 ```
 
-The text holds each group that the item can select in a namespace. A group
-with `summary=false` gives no ref, and it also keeps a group of `*` from the
-refs of its collection. So the access digest changes when a change to the
-config can change the refs of the summary. The group names are not in the
-text, so a new group name keeps the digest.
+The text holds each namespace in which the group has items. So the access
+digest changes when a change to the config can change the refs of the
+summary. The group name is not in the text, so a new group name keeps the
+digest.
 
 ### The write of the summaries
 
@@ -5555,17 +5562,17 @@ The client group of the item then gives the rights (`ostrya-config(1)`,
 
 - `refs/heads/NAME` is in the local namespace. `refs/mirrors/ID/NAME` is in
   the namespace of the collection `ID`. When `ID` is `[core] collection-id`,
-  the path is in the local namespace: the group of the local refs gives the
-  rights of `NAME`, and a group of `collection=*` does not apply.
-- The server serves such a ref when the group of the item in its namespace
-  has `r` on `NAME`. `w`, `c`, and `t` include `r`, and `d` alone does not.
+  the path is in the local namespace: the items of the local refs give the
+  rights of `NAME`.
+- The server serves such a ref when the group of the item has `r` on `NAME`
+  in its namespace. `w`, `c`, and `t` include `r`, and `d` alone does not.
   In a group with `tls-accept-claim=true`, the claims of the namespace
-  replace the rules of the group ("Claims of a client certificate").
+  replace the items of the group there ("Claims of a client certificate").
 - An alias needs `r` on its name and on its target. A target in another
-  namespace takes the group of the item in that namespace.
+  namespace takes the items of the group for that namespace.
 - `refs/remotes/`, each other path under `refs/`, and `extensions/ostrya/`
   are not served. An id under `refs/mirrors/` that fails the collection-id
-  rule selects no group, so its refs are not served, and the ref listing
+  rule gives no right, so its refs are not served, and the ref listing
   leaves out its directory ("The ref listing").
 - `summary` and `summary.sig` are the files of the summary of the item
   ("The serve of a summary"). An item with no summary gets the answer of an
@@ -5579,12 +5586,12 @@ over HTTP, and a `GetReply` with `found` false over a stream. The server
 checks the rights before it opens a file, so it reads no ref that the client
 cannot read.
 
-A repository with no client group has two implicit groups
+A repository with no client group has one implicit group
 (`ostrya-config(1)`, "No client group"). Each client then reads each local
 ref and each mirror ref, and gets the summary of the `anonymous` item. A
 server of `ostrya-server` with no
 receive policies identifies no client. Each read there gets the rights of
-the `anonymous` item under the two implicit groups. `ostrya serve` always
+the `anonymous` item under the implicit group. `ostrya serve` always
 reads the client groups.
 
 A collection pull from a `file://` candidate reads the source through the
@@ -5966,16 +5973,16 @@ proxy must set or remove the header of `trusted-proxy-header`,
 request. Else a client can send these headers through the proxy, and take
 another address, the scheme `https`, or another certificate.
 
-A `session` request then selects the client group that carries the item in
-the namespace of its `Hello` ("Hello and HelloReply"). For a collection, a
-group that names the collection wins over a group with `collection=*`. The
-server does not try another item: a certificate that gets a `tls:NAME` item
-gets no group of `tls:*`. These requests get 403 with `unauthorized`:
+A `session` request then selects the client group that carries the item.
+The session takes the items of the group for the namespace of its `Hello`
+("Hello and HelloReply"). The server does not try another item: a
+certificate that gets a `tls:NAME` item gets no group of `tls:*`. These
+requests get 403 with `unauthorized`:
 
-- a request whose item no group of the namespace carries. The message is
-  `no client group of the request covers the local refs`, or
-  `no client group of the request covers the collection 'ID'`.
-- a request whose group opens no push session. The message is
+- a request whose item no group carries. The message is
+  `no client group carries the item of the request`.
+- a request whose group opens no push session in any namespace. The message
+  is
   `client group 'NAME' opens no push session`. With no client group, the
   implicit group `anonymous` reads each ref and opens no push session.
 - a request whose group has `tls-accept-claim=true`, when the claims of the
@@ -6012,14 +6019,14 @@ a character boundary.
 its name: `--client NAME`, else the value of `LOGNAME`, which sshd sets from
 the password entry of the user. An empty `LOGNAME` counts as absent.
 `ostrya receive` gives the session the policy of the client group that
-carries `ssh:NAME` in the namespace of `Hello`. With no such group, `Hello`
-gets `ref-denied`. `ostrya send` serves the refs
-that the client groups of `ssh:NAME` read ("Read access"). When the
+carries `ssh:NAME`, with the items of the namespace of `Hello`. With no such
+group, `Hello` gets `ref-denied`. `ostrya send` serves the refs
+that the client group of `ssh:NAME` reads ("Read access"). When the
 repository has client groups and no group carries `ssh:NAME`, `ostrya send`
 writes one `error: MESSAGE` line and exits 1 before it reads its input. An
 ssh session uses no `anonymous` item and no `net:` item, with one exception:
 in a repository with no client group, an `ostrya send` session gets the
-`anonymous` item, so the implicit groups apply. `--client` is safe only
+`anonymous` item, so the implicit group applies. `--client` is safe only
 under a forced `command=` in `authorized_keys`, because a user with a shell
 can give any name.
 
@@ -6032,25 +6039,25 @@ forms:
 
 - `ostrya:ref:[MODES:]PATTERN` -- an allow item of the local refs.
 - `ostrya:ref:!PATTERN` -- a deny item of the local refs.
-- `ostrya:collection:ID:[MODES:]PATTERN` -- an allow item of the collection
-  `ID`.
-- `ostrya:collection:ID:!PATTERN` -- a deny item of the collection `ID`.
+- `ostrya:ref:[MODES:]@ID:PATTERN` -- an allow item of the collection `ID`.
+- `ostrya:ref:!@ID:PATTERN` -- a deny item of the collection `ID`.
 
-`[MODES:]PATTERN` has the grammar of an `allow` item, and `PATTERN` has the
-grammar of a `deny` item (`ostrya-config(1)`, "Access modes and patterns").
-A claim with no `MODES` has the mode `r`. `ID` passes the collection-id
-rule. The server reads the URI SANs alone. It does not percent-decode a
-URI, and it removes no white space.
+The text after `ostrya:ref:` is an `allow` item, or `!` and a `deny` item,
+in the grammar of the client group (`ostrya-config(1)`, "Access modes and
+patterns"). One parser reads both. A claim with no `MODES` has the mode
+`r`. `MODES` comes before `@ID:`, and `!` comes before `@ID:`, so
+`ostrya:ref:@ID:r:PATTERN` does not parse. `ID` passes the collection-id
+rule and is at most 255 bytes. The server reads the URI SANs alone. It does
+not percent-decode a URI, and it removes no white space.
 
-- A group of the local refs reads the `ostrya:ref:` claims, and the
-  `ostrya:collection:ID:` claims whose `ID` is `[core] collection-id`. A
-  group of a collection reads the `ostrya:collection:ID:` claims of the
-  collection of the request.
-- When the certificate holds one or more claims for the namespace, they
-  replace `allow` and `deny` of the group. Deny claims alone leave no allow
-  item, so they give no right.
-- When the certificate holds no claim for the namespace, `allow` and `deny`
-  of the group apply.
+- A claim with no `@ID:`, and a claim with `@ID:` of `[core]
+  collection-id`, name the local refs. A claim with another `@ID:` names the
+  collection `ID`.
+- When the certificate holds one or more claims for a namespace, they
+  replace the items of the group for that namespace. Deny claims alone
+  leave no allow item, so they give no right there.
+- In a namespace for which the certificate holds no claim, the items of the
+  group apply.
 - A URI whose scheme is not `ostrya`, in any case, has no effect. So do the
   SANs of other types, for example a DNS name.
 
@@ -6062,9 +6069,10 @@ signs.
 
 The claims of a certificate do not parse in these cases:
 
-- A URI whose scheme is `ostrya`, in any case, is no claim form. The scheme
-  and the kind, `ref` or `collection`, are lowercase in a claim, so
-  `OSTRYA:ref:a` and `ostrya:Ref:a` do not parse.
+- A URI whose scheme is `ostrya`, in any case, is no claim form. A claim
+  has the one kind `ref`, and the scheme and the kind are lowercase in a
+  claim, so `OSTRYA:ref:a`, `ostrya:Ref:a`, and
+  `ostrya:collection:ID:r:a` do not parse.
 - The certificate holds more than 256 URIs whose scheme is `ostrya`.
 - The certificate does not decode. The reason is
   `the certificate does not decode`.
@@ -6074,8 +6082,8 @@ The claims of a certificate do not parse in these cases:
   `the subjectAltName extension of the certificate does not decode`.
 
 The server refuses such a request with 403 and `unauthorized`, when the
-selected group has `tls-accept-claim=true`. A claim of another namespace
-that does not parse also refuses the request. A read gets 403 when a group
+selected group has `tls-accept-claim=true`. A claim of any namespace that
+does not parse refuses the request. A read gets 403 when a group
 with `tls-accept-claim=true` carries the item of the certificate ("Read
 access"). The message starts with
 `the claims of the client certificate do not parse: `. `ostrya serve` writes

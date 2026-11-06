@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::access::{
-    AccessModes, AccessRules, AuthItem, ClientAccess, ClientGroup, CollectionScope, Namespace,
-};
+use crate::access::{AccessModes, AuthItem, ClientAccess, ClientGroup, Namespace, NamespaceRules};
 use crate::error::Result;
 use crate::remote::{self, RefUpdate};
 use crate::repo::Repo;
@@ -29,14 +27,14 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 ///
 /// # Rights
 ///
-/// [`rights`](ReceivePolicy::rights) gives the effective rights of a ref. A
-/// session applies them in this way:
+/// [`rights`](ReceivePolicy::rights) gives the effective rights of a ref in
+/// a namespace. A session applies them in this way:
 ///
-/// - The [`scope`](ReceivePolicy::scope) must cover the namespace of
-///   `Hello`.
-/// - Each ref of `Hello` needs `r`. A remote ref `REMOTE:NAME` has no right,
-///   so a push session never reads or writes one.
-/// - A session opens only if an allow item has `w`, `c`, `t`, or `d`.
+/// - Each ref of `Hello` needs `r` in the namespace of `Hello`. A remote ref
+///   `REMOTE:NAME` has no right, so a push session never reads or writes
+///   one.
+/// - A session opens only if an allow item of a namespace has `w`, `c`, `t`,
+///   or `d`.
 /// - An update that writes a commit needs `w` or `t`. With `t` and no `w`,
 ///   the update can create the ref and cannot write to a ref that exists,
 ///   also when the commit is the current one.
@@ -50,14 +48,8 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 ///   server commit gets no ref and needs no right.
 #[derive(Debug, Clone, Default)]
 pub struct ReceivePolicy {
-    /// The namespace of the group.
-    ///
-    /// A session opens only in a namespace that the scope covers, as
-    /// [`CollectionScope::covers`] states. The rules name the refs of that
-    /// namespace. The default is [`CollectionScope::Local`].
-    pub scope: CollectionScope,
-    /// The allow items and the deny items of the group.
-    pub rules: AccessRules,
+    /// The allow items and the deny items of the group, for each namespace.
+    pub rules: NamespaceRules,
     /// The signatures that a new commit must carry.
     ///
     /// The verification applies to each new commit of a ref update that a
@@ -138,16 +130,17 @@ pub enum ReceiveVerify {
 }
 
 impl ReceivePolicy {
-    /// Returns the effective rights of the ref `refspec`.
+    /// Returns the effective rights of the ref `refspec` of `namespace`.
     ///
     /// For a plain ref `NAME`, the result is
-    /// [`AccessRules::rights`] of `NAME`. A remote ref `REMOTE:NAME` has no
-    /// right, because a push session does not write remote refs.
-    pub fn rights(&self, refspec: &str) -> AccessModes {
+    /// [`NamespaceRules::rights`] of `NAME` in `namespace`. A remote ref
+    /// `REMOTE:NAME` has no right, because a push session does not write
+    /// remote refs.
+    pub fn rights(&self, namespace: &Namespace, refspec: &str) -> AccessModes {
         if refspec.contains(':') {
             return AccessModes::NONE;
         }
-        self.rules.rights(refspec)
+        self.rules.rights(namespace, refspec)
     }
 }
 
@@ -166,8 +159,8 @@ impl ReceivePolicies {
     /// receive policy of each group.
     ///
     /// [`ClientAccess::from_config`] reads the client groups and
-    /// `[ex-ostrya server]`. A config with no client group has the two
-    /// implicit groups, and each one gets a policy. Then the call reads each
+    /// `[ex-ostrya server]`. A config with no client group has the implicit
+    /// group, and it gets a policy. Then the call reads each
     /// `[ex-ostrya trust "NAME"]` and each `[ex-ostrya key "NAME"]` group,
     /// and builds each one once, in file order, also a group that no client
     /// group names. So a key source that the policies cannot use fails the
@@ -175,7 +168,6 @@ impl ReceivePolicies {
     ///
     /// The policy of a group takes these values:
     ///
-    /// - [`scope`](ReceivePolicy::scope) from `collection`
     /// - [`rules`](ReceivePolicy::rules) from `allow` and `deny`
     /// - [`verify`](ReceivePolicy::verify) from `verify`, with the keys of the
     ///   trust group
@@ -265,17 +257,13 @@ impl ReceivePolicies {
             .map(|i| &self.policies[i])
     }
 
-    /// Returns the client group that carries `item` in `namespace`, with its
-    /// policy, or `None`.
+    /// Returns the client group that carries `item`, with its policy, or
+    /// `None`.
     ///
     /// [`ClientAccess::select`] states the selection.
-    pub fn select(
-        &self,
-        item: &AuthItem,
-        namespace: &Namespace,
-    ) -> Option<(&ClientGroup, &Arc<ReceivePolicy>)> {
+    pub fn select(&self, item: &AuthItem) -> Option<(&ClientGroup, &Arc<ReceivePolicy>)> {
         self.access
-            .select_index(item, namespace)
+            .select_index(item)
             .map(|i| (&self.access.groups()[i], &self.policies[i]))
     }
 }
@@ -322,14 +310,19 @@ pub(super) trait SessionPolicy: Send + Sync {
         refs: &[String],
     ) -> std::result::Result<(), Failure>;
 
-    /// Returns the rule of `update`, or the `ref-denied` refusal of the
-    /// update.
-    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure>;
+    /// Returns the rule of `update` of a ref of `namespace`, or the
+    /// `ref-denied` refusal of the update.
+    fn rule(
+        &self,
+        namespace: &Namespace,
+        update: &RefUpdate,
+    ) -> std::result::Result<UpdateRule<'_>, Failure>;
 
     /// Returns the rule of a server commit on `branch` that creates `tags`,
-    /// or the `ref-denied` refusal of the server commit.
+    /// refs of `namespace`, or the `ref-denied` refusal of the server commit.
     fn server_commit_rule(
         &self,
+        namespace: &Namespace,
         branch: &str,
         tags: &[String],
     ) -> std::result::Result<ServerCommitRule<'_>, Failure>;
@@ -349,33 +342,18 @@ fn ref_denied(message: String) -> Failure {
     Failure::Wire(remote::Error::RefDenied(message))
 }
 
-/// Returns `namespace` as the words of a message: `the local refs` or `the
-/// collection 'ID'`.
-pub(super) fn namespace_text(namespace: &Namespace) -> String {
-    match namespace {
-        Namespace::Local => "the local refs".into(),
-        Namespace::Collection(id) => format!("the collection '{id}'"),
-    }
-}
-
 impl SessionPolicy for ReceivePolicy {
     fn privileged_allowed(&self) -> bool {
         self.allow_privileged
     }
 
-    /// Refuses a namespace that the scope does not cover, a policy that
-    /// opens no push session, and a ref without `r`.
+    /// Refuses a policy that opens no push session, and a ref without `r`
+    /// in `namespace`.
     fn check_hello(
         &self,
         namespace: &Namespace,
         refs: &[String],
     ) -> std::result::Result<(), Failure> {
-        if !self.scope.covers(namespace) {
-            return Err(ref_denied(format!(
-                "the policy of the session does not cover {}",
-                namespace_text(namespace)
-            )));
-        }
         if !self.rules.opens_push_session() {
             return Err(ref_denied(
                 "the policy of the session opens no push session: no allow item has the \
@@ -389,7 +367,7 @@ impl SessionPolicy for ReceivePolicy {
                     "ref '{name}' is a remote ref, which a push session does not read or write"
                 )));
             }
-            if !self.rights(name).contains(AccessModes::READ) {
+            if !self.rights(namespace, name).contains(AccessModes::READ) {
                 return Err(ref_denied(format!("the policy gives no r on ref '{name}'")));
             }
         }
@@ -398,14 +376,18 @@ impl SessionPolicy for ReceivePolicy {
 
     /// Refuses a remote ref, and a write of a commit without `w` or `t`. The
     /// rule of a delete comes from `d`, under the update lock.
-    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure> {
+    fn rule(
+        &self,
+        namespace: &Namespace,
+        update: &RefUpdate,
+    ) -> std::result::Result<UpdateRule<'_>, Failure> {
         let name = &update.name;
         if name.contains(':') {
             return Err(ref_denied(format!(
                 "ref '{name}' is a remote ref, which a push session does not write"
             )));
         }
-        let rights = self.rights(name);
+        let rights = self.rights(namespace, name);
         let write = rights.contains(AccessModes::WRITE);
         let tag = rights.contains(AccessModes::TAG);
         if update.new.is_some() && !write && !tag {
@@ -429,6 +411,7 @@ impl SessionPolicy for ReceivePolicy {
     /// under the update lock.
     fn server_commit_rule(
         &self,
+        namespace: &Namespace,
         branch: &str,
         tags: &[String],
     ) -> std::result::Result<ServerCommitRule<'_>, Failure> {
@@ -439,14 +422,14 @@ impl SessionPolicy for ReceivePolicy {
                 )));
             }
         }
-        let rights = self.rights(branch);
+        let rights = self.rights(namespace, branch);
         if !rights.contains(AccessModes::COMMIT) {
             return Err(ref_denied(format!(
                 "the policy gives no c on ref '{branch}'"
             )));
         }
         for tag in tags {
-            let tag_rights = self.rights(tag);
+            let tag_rights = self.rights(namespace, tag);
             if !tag_rights.contains(AccessModes::TAG) && !tag_rights.contains(AccessModes::WRITE) {
                 return Err(ref_denied(format!(
                     "the policy gives no t or w on ref '{tag}'"
@@ -488,8 +471,13 @@ impl SessionPolicy for StreamPolicy {
     }
 
     /// Refuses an update that no rule covers and an update whose rule
-    /// refuses it. The rule takes no server key.
-    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure> {
+    /// refuses it. The rule takes no server key. A one-way stream has no
+    /// namespace.
+    fn rule(
+        &self,
+        _namespace: &Namespace,
+        update: &RefUpdate,
+    ) -> std::result::Result<UpdateRule<'_>, Failure> {
         let name = &update.name;
         match self.rule_for(name) {
             Some(rule) if rule.accept => Ok(UpdateRule {
@@ -512,6 +500,7 @@ impl SessionPolicy for StreamPolicy {
     /// A one-way stream carries no server commit.
     fn server_commit_rule(
         &self,
+        _namespace: &Namespace,
         _branch: &str,
         _tags: &[String],
     ) -> std::result::Result<ServerCommitRule<'_>, Failure> {
@@ -539,15 +528,21 @@ impl SessionPolicy for StreamPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::access::AllowItem;
+    use crate::access::{AccessRules, AllowItem};
     use crate::remote::Expected;
+
+    const LOCAL: &Namespace = &Namespace::Local;
+
+    fn rules(allow: &[&str]) -> AccessRules {
+        AccessRules {
+            allow: allow.iter().map(|t| AllowItem::parse(t).unwrap()).collect(),
+            deny: Vec::new(),
+        }
+    }
 
     fn policy(allow: &[&str]) -> ReceivePolicy {
         ReceivePolicy {
-            rules: AccessRules {
-                allow: allow.iter().map(|t| AllowItem::parse(t).unwrap()).collect(),
-                deny: Vec::new(),
-            },
+            rules: rules(allow).into(),
             ..ReceivePolicy::default()
         }
     }
@@ -580,12 +575,15 @@ mod tests {
     #[test]
     fn a_remote_ref_has_no_right() {
         let policy = policy(&["rwctd:**"]);
-        assert_eq!(policy.rights("main").to_string(), "rwctd");
-        assert_eq!(policy.rules.rights("origin:main").to_string(), "rwctd");
-        assert_eq!(policy.rights("origin:main"), AccessModes::NONE);
-        let message = denied(policy.check_hello(&Namespace::Local, &["origin:main".into()]));
+        assert_eq!(policy.rights(LOCAL, "main").to_string(), "rwctd");
+        assert_eq!(
+            policy.rules.rights(LOCAL, "origin:main").to_string(),
+            "rwctd"
+        );
+        assert_eq!(policy.rights(LOCAL, "origin:main"), AccessModes::NONE);
+        let message = denied(policy.check_hello(LOCAL, &["origin:main".into()]));
         assert!(message.contains("remote ref"), "{message}");
-        let message = denied(policy.rule(&update("origin:main", true)));
+        let message = denied(policy.rule(LOCAL, &update("origin:main", true)));
         assert!(message.contains("remote ref"), "{message}");
     }
 
@@ -593,7 +591,7 @@ mod tests {
     #[test]
     fn hello_needs_a_push_mode_and_read() {
         let names = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
-        let local = &Namespace::Local;
+        let local = LOCAL;
         denied(ReceivePolicy::default().check_hello(local, &[]));
         denied(policy(&["r:**"]).check_hello(local, &names(&["a"])));
         denied(policy(&["d:a"]).check_hello(local, &names(&["a"])));
@@ -603,50 +601,49 @@ mod tests {
         assert!(message.contains("'b'"), "{message}");
     }
 
-    /// `Hello` needs a scope that covers its namespace. The scope check comes
-    /// before the other checks.
+    /// A push mode in the rules of any namespace opens a session. Each ref
+    /// of `Hello` needs `r` in the namespace of `Hello`, and the rules of the
+    /// other namespaces give no right there.
     #[test]
-    fn hello_needs_a_scope_that_covers_the_namespace() {
+    fn hello_reads_the_rights_of_its_namespace() {
         let os = Namespace::Collection("org.example.Os".into());
         let other = Namespace::Collection("org.example.Other".into());
         let refs = ["main".to_owned()];
+        let mut both = policy(&["r:main"]);
+        both.rules
+            .collections
+            .insert("org.example.Os".into(), rules(&["w:os/**"]));
+        accepted(both.check_hello(LOCAL, &refs));
+        accepted(both.check_hello(&os, &["os/a".into()]));
+        let message = denied(both.check_hello(&os, &refs));
+        assert!(message.contains("no r on ref 'main'"), "{message}");
+        denied(both.check_hello(&other, &["os/a".into()]));
+        denied(both.check_hello(LOCAL, &["os/a".into()]));
+
         let local = policy(&["w:**"]);
-        let message = denied(local.check_hello(&os, &refs));
-        assert!(
-            message.contains("the collection 'org.example.Os'"),
-            "{message}"
-        );
-        let exact = ReceivePolicy {
-            scope: CollectionScope::Ids(vec!["org.example.Os".into()]),
-            ..policy(&["w:**"])
-        };
-        accepted(exact.check_hello(&os, &refs));
-        denied(exact.check_hello(&other, &refs));
-        let message = denied(exact.check_hello(&Namespace::Local, &refs));
-        assert!(message.contains("the local refs"), "{message}");
-        let all = ReceivePolicy {
-            scope: CollectionScope::AllOther,
-            ..ReceivePolicy::default()
-        };
-        let message = denied(all.check_hello(&Namespace::Local, &[]));
-        assert!(message.contains("does not cover"), "{message}");
+        denied(local.check_hello(&os, &refs));
+        accepted(local.check_hello(&os, &[]));
+        let rule = accepted(both.rule(&os, &update("os/a", true)));
+        assert!(!rule.create_only);
+        denied(both.rule(LOCAL, &update("os/a", true)));
+        denied(both.rule(&other, &update("os/a", true)));
     }
 
     /// A write needs `w` or `t`, and the modes give the rule of the update.
     #[test]
     fn the_modes_give_the_rule_of_an_update() {
-        denied(policy(&["rd:a"]).rule(&update("a", true)));
+        denied(policy(&["rd:a"]).rule(LOCAL, &update("a", true)));
         let delete = policy(&["rd:a"]);
-        let rule = accepted(delete.rule(&update("a", false)));
+        let rule = accepted(delete.rule(LOCAL, &update("a", false)));
         assert!(rule.allow_delete && !rule.allow_non_fast_forward);
         let tag = policy(&["t:a"]);
-        let rule = accepted(tag.rule(&update("a", true)));
+        let rule = accepted(tag.rule(LOCAL, &update("a", true)));
         assert!(rule.create_only && !rule.allow_delete);
         let write_tag = policy(&["wt:a"]);
-        let rule = accepted(write_tag.rule(&update("a", true)));
+        let rule = accepted(write_tag.rule(LOCAL, &update("a", true)));
         assert!(!rule.create_only && !rule.allow_non_fast_forward);
         let forced = policy(&["w:a", "d:a"]);
-        let rule = accepted(forced.rule(&update("a", true)));
+        let rule = accepted(forced.rule(LOCAL, &update("a", true)));
         assert!(rule.allow_non_fast_forward && rule.allow_delete);
     }
 
@@ -657,38 +654,39 @@ mod tests {
     fn the_modes_give_the_rule_of_a_server_commit() {
         let tags = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
         let commit = policy(&["c:main"]);
-        let rule = accepted(commit.server_commit_rule("main", &[]));
+        let rule = accepted(commit.server_commit_rule(LOCAL, "main", &[]));
         assert!(!rule.allow_orphan_over_branch);
         let orphan = policy(&["cd:main"]);
-        let rule = accepted(orphan.server_commit_rule("main", &[]));
+        let rule = accepted(orphan.server_commit_rule(LOCAL, "main", &[]));
         assert!(rule.allow_orphan_over_branch);
-        let message = denied(policy(&["wtd:main"]).server_commit_rule("main", &[]));
+        let message = denied(policy(&["wtd:main"]).server_commit_rule(LOCAL, "main", &[]));
         assert!(message.contains("no c on ref 'main'"), "{message}");
-        let message = denied(policy(&["r:**"]).server_commit_rule("main", &[]));
+        let message = denied(policy(&["r:**"]).server_commit_rule(LOCAL, "main", &[]));
         assert!(message.contains("no c"), "{message}");
 
         let both = policy(&["c:main", "t:v1", "w:v2"]);
-        accepted(both.server_commit_rule("main", &tags(&["v1", "v2"])));
-        let message = denied(both.server_commit_rule("main", &tags(&["v1", "v3"])));
+        accepted(both.server_commit_rule(LOCAL, "main", &tags(&["v1", "v2"])));
+        let message = denied(both.server_commit_rule(LOCAL, "main", &tags(&["v1", "v3"])));
         assert!(message.contains("no t or w on ref 'v3'"), "{message}");
         let message =
-            denied(policy(&["c:main", "cd:v1"]).server_commit_rule("main", &tags(&["v1"])));
+            denied(policy(&["c:main", "cd:v1"]).server_commit_rule(LOCAL, "main", &tags(&["v1"])));
         assert!(message.contains("'v1'"), "{message}");
 
         let denying = ReceivePolicy {
             rules: AccessRules {
                 allow: vec![AllowItem::parse("ctwd:**").unwrap()],
                 deny: vec![ostrya_core::RefPattern::parse("v1").unwrap()],
-            },
+            }
+            .into(),
             ..ReceivePolicy::default()
         };
-        accepted(denying.server_commit_rule("main", &tags(&["v2"])));
-        let message = denied(denying.server_commit_rule("main", &tags(&["v1"])));
+        accepted(denying.server_commit_rule(LOCAL, "main", &tags(&["v2"])));
+        let message = denied(denying.server_commit_rule(LOCAL, "main", &tags(&["v1"])));
         assert!(message.contains("'v1'"), "{message}");
-        let message = denied(denying.server_commit_rule("v1", &[]));
+        let message = denied(denying.server_commit_rule(LOCAL, "v1", &[]));
         assert!(message.contains("no c"), "{message}");
 
-        let message = denied(policy(&["c:**"]).server_commit_rule("origin:main", &[]));
+        let message = denied(policy(&["c:**"]).server_commit_rule(LOCAL, "origin:main", &[]));
         assert!(message.contains("remote ref"), "{message}");
     }
 }

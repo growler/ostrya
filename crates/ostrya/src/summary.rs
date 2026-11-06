@@ -664,10 +664,10 @@ impl Repo {
     /// serves it.
     ///
     /// The client groups of the config ([`ClientAccess::from_config`]) give
-    /// the auth items. An item has a summary when one or more of its groups
-    /// has `summary=true`. A config with no client group has the two
-    /// implicit groups, which set `summary=true`, so the `anonymous` item has
-    /// a summary that holds each ref.
+    /// the auth items. An item has a summary when its group has
+    /// `summary=true`. A config with no client group has the implicit group,
+    /// which sets `summary=true`, so the `anonymous` item has a summary that
+    /// holds each ref.
     ///
     /// If [`SummaryOptions::auth_items_only`] is `true`, the call writes the
     /// summaries of the auth items alone. It does not build, sign, or write
@@ -730,11 +730,10 @@ impl Repo {
     /// # Refs
     ///
     /// The root summary holds each local ref and each collection ref. The
-    /// summary of an item holds the refs that the item reads in each
-    /// namespace whose selected group has `summary=true`, by the rules of
+    /// summary of an item whose group has `summary=true` holds the refs that
+    /// the item reads in each namespace, by the rules of
     /// [`build_ref_listing`](Repo::build_ref_listing) with empty selectors
-    /// for the local refs and for the collection refs. A namespace whose
-    /// selected group has `summary=false` adds no ref. Field 0 holds the
+    /// for the local refs and for the collection refs. Field 0 holds the
     /// local refs, sorted byte-wise by name: the refs under `refs/heads`
     /// alone. In a repository with `[core] collection-id`, no summary holds a
     /// ref under `refs/mirrors/ID/` of that id. The refs of each other
@@ -1117,7 +1116,7 @@ impl Repo {
         opts: &SummaryOptions,
     ) -> Result<Vec<u8>> {
         // With no client group, the item is `anonymous` under the implicit
-        // groups, which have `summary=true`. Its rights are the rights of the
+        // group, which has `summary=true`. Its rights are the rights of the
         // full selection of the run, so the call takes that selection. Each
         // other item takes the refs of the full selection that it reads.
         let selected;
@@ -1284,15 +1283,14 @@ impl Repo {
     ///
     /// The listing holds a selected ref only when `access` reads it
     /// ([`ReadAccess::can_read`](crate::access::ReadAccess::can_read)). A
-    /// local ref takes the group of the item in the local namespace, and a
-    /// collection ref takes the group of the item in the namespace of its
-    /// collection: the group of the exact id, else the group of
-    /// `collection=*`. The rules of two groups never combine. In a group
-    /// with `tls-accept-claim=true`, the claims of the namespace replace the
-    /// rules of the group. The call checks the name before it reads the ref
-    /// file, so it never reads a ref file that `access` does not read. The
-    /// content of such a file does not fail the listing. The call reads no
-    /// directory of a collection whose group gives no `r`.
+    /// local ref takes the items of the group of the item for the local refs,
+    /// and a collection ref takes the items of that group for its
+    /// collection. The items of two namespaces never combine. In a group
+    /// with `tls-accept-claim=true`, the claims of a namespace replace the
+    /// rules of the group there. The call checks the name before it reads
+    /// the ref file, so it never reads a ref file that `access` does not
+    /// read. The content of such a file does not fail the listing. The call
+    /// reads no directory of a collection whose rules give no `r`.
     ///
     /// An alias is in the listing when `access` reads its name and its
     /// target, and the target is a regular file. The alias resolves by the
@@ -3096,7 +3094,7 @@ const _: fn() = || {
 mod tests {
     use super::*;
 
-    /// The rights of an anonymous client under the implicit groups.
+    /// The rights of an anonymous client under the implicit group.
     fn anyone() -> ReadAccess {
         let config = crate::RepoConfig::parse("[core]\nrepo_version=1\nmode=archive-z2\n").unwrap();
         let access =
@@ -4182,17 +4180,14 @@ mod tests {
             let mut text = std::fs::read_to_string(&config).unwrap();
             text.push_str(&format!("collection-id={own}\n"));
             text.push_str(
-                "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**;r:main\n\
-                 deny=pub/secret/**\nsummary=true\n\
-                 [ex-ostrya client \"public-c\"]\nauth=anonymous\ncollection=*\n\
-                 allow=r:**\ndeny=hidden/**\nsummary=true\n\
-                 [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\ndeny=priv/**\n\
+                "[ex-ostrya client \"public\"]\nauth=anonymous\n\
+                 allow=r:pub/**;r:main;r:@org.example.A:**;r:@org.example.B:**\n\
+                 deny=pub/secret/**;@org.example.A:hidden/**;@org.example.B:hidden/**\n\
                  summary=true\n\
-                 [ex-ostrya client \"ci-a\"]\nauth=ssh:ci\ncollection=org.example.A\n\
-                 allow=r:a/**\nsummary=true\n\
-                 [ex-ostrya client \"admin\"]\nauth=ssh:admin\nallow=r:**\nsummary=true\n\
-                 [ex-ostrya client \"admin-c\"]\nauth=ssh:admin\ncollection=*\n\
-                 allow=r:**\nsummary=true\n\
+                 [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**;r:@org.example.A:a/**\n\
+                 deny=priv/**\nsummary=true\n\
+                 [ex-ostrya client \"admin\"]\nauth=ssh:admin\n\
+                 allow=r:**;r:@org.example.A:**;r:@org.example.B:**\nsummary=true\n\
                  [ex-ostrya client \"none\"]\nauth=ssh:none\nallow=d:**\nsummary=true\n",
             );
             std::fs::write(&config, text).unwrap();

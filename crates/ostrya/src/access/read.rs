@@ -5,7 +5,10 @@ use std::sync::{Arc, OnceLock};
 
 use ostrya_core::Checksum;
 
-use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace, SummaryFiles};
+use super::{
+    AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace, NamespaceRules,
+    SummaryFiles,
+};
 
 /// The read rights of one identified client: the client groups, the auth
 /// item of the client, and the claims of its client certificate.
@@ -19,21 +22,21 @@ use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace,
 /// - `refs/heads/NAME` is in the local namespace. `refs/mirrors/ID/NAME` is
 ///   in the namespace of collection `ID`. When `ID` is `[core]
 ///   collection-id`, the path is in the local namespace.
-/// - The client reads `NAME` when the group that carries its item in the
-///   namespace ([`ClientAccess::select`]) has `r` on `NAME`. The rules of
-///   the group are the rules that [`ClientAccess::effective_rules`] gives
-///   with the claims. `w`, `c`, and `t` include `r`.
+/// - The client reads `NAME` when the group that carries its item
+///   ([`ClientAccess::select`]) has `r` on `NAME` in the namespace. The
+///   rules of the group are the rules that
+///   [`ClientAccess::effective_rules`] gives with the claims. `w`, `c`, and
+///   `t` include `r`.
 /// - Each other path under `refs/` is never read, `refs/remotes/` included.
 ///   A directory under `refs/mirrors/` whose name fails the collection-id
-///   rule selects no group, so the client reads no ref in it.
+///   rule has no rules, so the client reads no ref in it.
 ///
 /// `summary` and `summary.sig` are the files of the summary of the item.
 /// [`summary_digest`](ReadAccess::summary_digest) gives the access digest
 /// that these files must match.
 ///
-/// The value computes the rules of the local namespace one time, at their
-/// first use. It computes the rules of a collection namespace for each use.
-/// A ref listing computes them one time for each collection.
+/// The value finds the group and computes the rules with the claims one
+/// time, at their first use.
 ///
 /// # Examples
 ///
@@ -70,18 +73,19 @@ struct Reader {
     /// `true` for the rights of the summary of the item: a selected group
     /// with `summary=false` gives no right.
     summary_only: bool,
-    /// The rules of the local namespace, or `None` with no group of the
-    /// item there. The value finds them at their first use.
-    local: OnceLock<Option<Local>>,
+    /// The rules of the group of the item, or `None` with no group. The value
+    /// finds them at their first use.
+    rules: OnceLock<Option<Rules>>,
 }
 
-/// The rules of the local namespace of a [`Reader`].
+/// The rules of the group of the item of a [`Reader`].
 #[derive(Debug)]
-enum Local {
+enum Rules {
     /// The rules of the group at this index of the groups.
     Group(usize),
-    /// The rules of the claims, which replace the rules of the group.
-    Claimed(AccessRules),
+    /// The rules of the group with the rules of the claims in place of the
+    /// rules of the group for each namespace of the claims.
+    Claimed(NamespaceRules),
 }
 
 impl ReadAccess {
@@ -102,17 +106,16 @@ impl ReadAccess {
                 item: item.into(),
                 claims,
                 summary_only: false,
-                local: OnceLock::new(),
+                rules: OnceLock::new(),
             }),
         }
     }
 
     /// Returns the rights that give the refs of the summary of `item`.
     ///
-    /// The group of the item in a namespace is selected as for
-    /// [`new`](ReadAccess::new). When that group has `summary=false`, the
-    /// value reads no ref of the namespace, and no other group takes its
-    /// place. The value takes no claims.
+    /// The group of the item is selected as for [`new`](ReadAccess::new).
+    /// When that group has `summary=false`, the value reads no ref. The value
+    /// takes no claims.
     pub(crate) fn for_summary(access: Arc<ClientAccess>, item: AuthItem) -> ReadAccess {
         ReadAccess {
             inner: Arc::new(Reader {
@@ -120,7 +123,7 @@ impl ReadAccess {
                 item: Arc::new(item),
                 claims: None,
                 summary_only: true,
-                local: OnceLock::new(),
+                rules: OnceLock::new(),
             }),
         }
     }
@@ -141,15 +144,13 @@ impl ReadAccess {
     /// the local namespace. An id that fails the collection-id rule gives
     /// `false`.
     pub fn can_read(&self, namespace: &Namespace, name: &str) -> bool {
-        let local = match namespace {
-            Namespace::Local => true,
-            Namespace::Collection(id) => self.inner.access.is_own_collection(id),
+        let rules = match namespace {
+            Namespace::Collection(id) if !self.inner.access.is_own_collection(id) => {
+                self.collection_rules(id)
+            }
+            _ => self.local_rules(),
         };
-        if local {
-            return self.local_rules().is_some_and(|rules| reads(rules, name));
-        }
-        self.rules(namespace)
-            .is_some_and(|rules| reads(&rules, name))
+        rules.is_some_and(|rules| reads(rules, name))
     }
 
     /// Returns `true` if the client reads the file at `path` under `refs/`.
@@ -199,50 +200,42 @@ impl ReadAccess {
     /// collection `id`, with the claims, or `None`.
     ///
     /// The result is `None` for `[core] collection-id`, which is the local
-    /// namespace, for an id that fails the collection-id rule, and when no
-    /// group carries the item in the namespace. The group is the group that
-    /// [`ClientAccess::select`] gives: the group of the exact id, else the
-    /// group of `collection=*`. The rules of the two groups never combine.
-    pub(crate) fn collection_rules(&self, id: &str) -> Option<Cow<'_, AccessRules>> {
+    /// namespace, for an id that fails the collection-id rule, and when the
+    /// rules of the group name no ref of the collection.
+    pub(crate) fn collection_rules(&self, id: &str) -> Option<&AccessRules> {
         if self.inner.access.is_own_collection(id) {
             return None;
         }
-        self.rules(&Namespace::Collection(id.to_owned()))
+        self.group_rules()?.collection(id)
     }
 
     /// Returns the rules of the group of the item in the local namespace,
-    /// with the claims, or `None` with no such group. The value finds them
-    /// at the first call.
+    /// with the claims, or `None` with no group.
     pub(crate) fn local_rules(&self) -> Option<&AccessRules> {
+        self.group_rules().map(|rules| &rules.local)
+    }
+
+    /// Returns the rules of the group of the item, with the claims, or `None`
+    /// with no group. The value finds them at the first call.
+    fn group_rules(&self) -> Option<&NamespaceRules> {
         let access = &self.inner.access;
-        let local = self.inner.local.get_or_init(|| {
-            let index = access.select_index(&self.inner.item, &Namespace::Local)?;
+        let rules = self.inner.rules.get_or_init(|| {
+            let index = access.select_index(&self.inner.item)?;
             let group = &access.groups()[index];
             if self.inner.summary_only && !group.summary() {
                 return None;
             }
             let claims = self.inner.claims.as_deref();
-            let rules = match access.effective_rules(group, &Namespace::Local, claims) {
-                Cow::Owned(rules) => Local::Claimed(rules),
-                Cow::Borrowed(_) => Local::Group(index),
+            let rules = match access.effective_rules(group, claims) {
+                Cow::Owned(rules) => Rules::Claimed(rules),
+                Cow::Borrowed(_) => Rules::Group(index),
             };
             Some(rules)
         });
-        match local.as_ref()? {
-            Local::Group(index) => Some(access.groups()[*index].rules()),
-            Local::Claimed(rules) => Some(rules),
+        match rules.as_ref()? {
+            Rules::Group(index) => Some(access.groups()[*index].rules()),
+            Rules::Claimed(rules) => Some(rules),
         }
-    }
-
-    /// Returns the rules of the group of the item in `namespace`, with the
-    /// claims, or `None` with no such group.
-    fn rules(&self, namespace: &Namespace) -> Option<Cow<'_, AccessRules>> {
-        let access = &self.inner.access;
-        let group = access.select(&self.inner.item, namespace)?;
-        if self.inner.summary_only && !group.summary() {
-            return None;
-        }
-        Some(access.effective_rules(group, namespace, self.inner.claims.as_deref()))
     }
 }
 
@@ -276,22 +269,29 @@ mod tests {
         Namespace::Collection(id.to_owned())
     }
 
-    /// A group with `tls-accept-claim=true` takes the claims of the
-    /// namespace in place of its rules. With no claim of the namespace, the
-    /// rules of the group apply. A group with `tls-accept-claim=false`
+    /// A group with `tls-accept-claim=true` takes the claims of a namespace
+    /// in place of its rules there. With no claim of a namespace, the rules
+    /// of the group apply there. A group with `tls-accept-claim=false`
     /// ignores the claims.
     #[test]
     fn effective_rules_take_the_claims_of_a_claim_group() {
         let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
-                      allow=r:group/**\n\
+                      allow=r:group/**;r:@a.b:group/**\n\
                       [ex-ostrya client \"names\"]\nauth=tls:host\nallow=r:group/**\n";
-        let claims: &[&str] = &["ostrya:ref:claim/**", "ostrya:collection:a.b:other/**"];
+        let claims: &[&str] = &["ostrya:ref:claim/**", "ostrya:ref:@a.b:other/**"];
         let certs = reader(groups, "tls:*", Some(claims));
         assert!(certs.can_read(&Namespace::Local, "claim/x"));
         assert!(!certs.can_read(&Namespace::Local, "group/x"));
-        let no_local = reader(groups, "tls:*", Some(&["ostrya:collection:a.b:x"]));
+        assert!(certs.can_read(&collection("a.b"), "other/x"));
+        assert!(!certs.can_read(&collection("a.b"), "group/x"));
+        let no_local = reader(groups, "tls:*", Some(&["ostrya:ref:@a.b:x"]));
         assert!(no_local.can_read(&Namespace::Local, "group/x"));
         assert!(!no_local.can_read(&Namespace::Local, "claim/x"));
+        assert!(no_local.can_read_path("refs/mirrors/a.b/x"));
+        let own = reader(groups, "tls:*", Some(&["ostrya:ref:@own.id:claim/**"]));
+        assert!(own.can_read(&Namespace::Local, "claim/x"));
+        assert!(!own.can_read(&Namespace::Local, "group/x"));
+        assert!(own.can_read(&collection("a.b"), "group/x"));
         let names = reader(groups, "tls:host", Some(claims));
         assert!(names.can_read(&Namespace::Local, "group/x"));
         assert!(!names.can_read(&Namespace::Local, "claim/x"));
@@ -346,47 +346,45 @@ mod tests {
         }
     }
 
-    /// A mirror path takes the group of its collection: the exact id wins
-    /// over `*`. The own id takes the rules of the local refs. An id that
-    /// fails the collection-id rule reads nothing.
+    /// A mirror path takes the items of its collection. The own id takes the
+    /// rules of the local refs. An id that fails the collection-id rule
+    /// reads nothing.
     #[test]
-    fn a_mirror_path_uses_the_group_of_its_collection() {
+    fn a_mirror_path_uses_the_items_of_its_collection() {
         let read = reader(
-            "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:local/**\n\
-             [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b\nallow=r:exact/**\n\
-             [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:any/**\n",
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\n\
+             allow=r:local/**;r:@a.b:exact/**;r:@c.d:other/**\n",
             "ssh:u",
             None,
         );
         assert!(read.can_read_path("refs/mirrors/a.b/exact/x"));
-        assert!(!read.can_read_path("refs/mirrors/a.b/any/x"));
-        assert!(read.can_read_path("refs/mirrors/c.d/any/x"));
-        assert!(!read.can_read_path("refs/mirrors/c.d/exact/x"));
+        assert!(!read.can_read_path("refs/mirrors/a.b/other/x"));
+        assert!(!read.can_read_path("refs/mirrors/a.b/local/x"));
+        assert!(read.can_read_path("refs/mirrors/c.d/other/x"));
+        assert!(!read.can_read_path("refs/mirrors/e.f/other/x"));
         assert!(read.can_read_path("refs/mirrors/own.id/local/x"));
-        assert!(!read.can_read_path("refs/mirrors/own.id/any/x"));
+        assert!(!read.can_read_path("refs/mirrors/own.id/exact/x"));
         assert!(read.can_read(&collection("own.id"), "local/x"));
-        assert!(!read.can_read_path("refs/mirrors/bad/any/x"));
-        assert!(!read.can_read_path("refs/mirrors/a..b/any/x"));
+        assert!(!read.can_read_path("refs/heads/exact/x"));
+        let implicit = reader("", "anonymous", None);
+        assert!(implicit.can_read_path("refs/mirrors/e.f/x"));
+        assert!(!implicit.can_read_path("refs/mirrors/bad/x"));
+        assert!(!implicit.can_read_path("refs/mirrors/a..b/x"));
     }
 
-    /// The rules of a collection come from the group of its exact id, else
-    /// from the group of `collection=*`, and never from both. The own id, an
-    /// id that fails the collection-id rule, and an id with no group give
-    /// none. The claims of a namespace replace the rules of a claim group.
+    /// The rules of a collection come from the items of that collection
+    /// alone. The own id, an id that fails the collection-id rule, and an
+    /// id with no item give none. The claims of a namespace replace the
+    /// rules of a claim group there.
     #[test]
-    fn collection_rules_take_the_selected_group_alone() {
-        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:**\n\
-                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b\nallow=r:exact/**\n\
-                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:any/**\n\
-                      [ex-ostrya client \"deny\"]\nauth=ssh:v\ncollection=*\nallow=d:**\n";
+    fn collection_rules_take_the_items_of_the_collection() {
+        let groups = "[ex-ostrya client \"u\"]\nauth=ssh:u\nallow=r:**;r:@a.b:exact/**\n\
+                      [ex-ostrya client \"v\"]\nauth=ssh:v\nallow=d:@a.b:**\n";
         let read = reader(groups, "ssh:u", None);
         let exact = read.collection_rules("a.b").unwrap();
-        assert!(reads(&exact, "exact/x"));
-        assert!(!reads(&exact, "any/x"));
-        let any = read.collection_rules("c.d").unwrap();
-        assert!(reads(&any, "any/x"));
-        assert!(!reads(&any, "exact/x"));
-        for id in ["own.id", "bad", "a..b", "1a.b"] {
+        assert!(reads(exact, "exact/x"));
+        assert!(!reads(exact, "any/x"));
+        for id in ["c.d", "own.id", "bad", "a..b", "1a.b"] {
             assert!(read.collection_rules(id).is_none(), "{id}");
         }
         let delete = reader(groups, "ssh:v", None);
@@ -397,22 +395,22 @@ mod tests {
                 .is_none()
         );
 
-        let claims = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\n\
-                      tls-accept-claim=true\nallow=r:group/**\n";
-        let claimed = reader(claims, "tls:*", Some(&["ostrya:collection:a.b:claim/**"]));
+        let claims = "[ex-ostrya client \"certs\"]\nauth=tls:*\n\
+                      tls-accept-claim=true\nallow=r:@a.b:group/**;r:@c.d:group/**\n";
+        let claimed = reader(claims, "tls:*", Some(&["ostrya:ref:@a.b:claim/**"]));
         let rules = claimed.collection_rules("a.b").unwrap();
-        assert!(reads(&rules, "claim/x"));
-        assert!(!reads(&rules, "group/x"));
+        assert!(reads(rules, "claim/x"));
+        assert!(!reads(rules, "group/x"));
         let rules = claimed.collection_rules("c.d").unwrap();
-        assert!(reads(&rules, "group/x"));
-        assert!(!reads(&rules, "claim/x"));
+        assert!(reads(rules, "group/x"));
+        assert!(!reads(rules, "claim/x"));
     }
 
-    /// With no client group, the implicit groups read each local ref and
+    /// With no client group, the implicit group reads each local ref and
     /// each collection ref, and the item has a summary. A client group with
     /// no `summary` key gives no summary.
     #[test]
-    fn the_implicit_groups_read_each_local_and_collection_ref() {
+    fn the_implicit_group_reads_each_local_and_collection_ref() {
         let read = reader("", "anonymous", None);
         assert!(read.can_read(&Namespace::Local, "a/b"));
         assert!(read.can_read(&collection("a.b"), "x"));
@@ -424,33 +422,31 @@ mod tests {
             None,
         );
         assert!(groups.can_read(&Namespace::Local, "a/b"));
+        assert!(!groups.can_read(&collection("a.b"), "x"));
         assert!(groups.summary_digest().is_none());
         assert!(groups.access().has_client_groups());
     }
 
-    /// The rights of a summary select the group of each namespace first, and
-    /// keep it only with `summary=true`. A group of `*` does not take the
-    /// place of an exact group with `summary=false`.
+    /// The rights of a summary keep the group of the item only with
+    /// `summary=true`. Then they hold the rights of each namespace.
     #[test]
-    fn the_rights_of_a_summary_keep_the_groups_with_summary() {
-        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:**\n\
-                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b\nallow=r:**\n\
-                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n\
-                      summary=true\n";
+    fn the_rights_of_a_summary_keep_a_group_with_summary() {
+        let groups = "[ex-ostrya client \"with\"]\nauth=ssh:u\nallow=r:**;r:@a.b:**\n\
+                      summary=true\n\
+                      [ex-ostrya client \"without\"]\nauth=ssh:v\nallow=r:**;r:@a.b:**\n";
         let access = access(groups);
-        let item = AuthItem::parse("ssh:u").unwrap();
-        let full = ReadAccess::new(access.clone(), item.clone(), None);
-        let summary = ReadAccess::for_summary(access, item);
-        for read in [&full, &summary] {
-            assert!(read.can_read(&collection("c.d"), "x"));
+        for (item, kept) in [("ssh:u", true), ("ssh:v", false)] {
+            let item = AuthItem::parse(item).unwrap();
+            let full = ReadAccess::new(access.clone(), item.clone(), None);
+            let summary = ReadAccess::for_summary(access.clone(), item);
+            assert!(full.can_read(&Namespace::Local, "x"));
+            assert!(full.can_read(&collection("a.b"), "x"));
+            assert_eq!(summary.can_read(&Namespace::Local, "x"), kept);
+            assert_eq!(summary.reads_local_refs(), kept);
+            assert_eq!(summary.can_read(&collection("a.b"), "x"), kept);
+            assert_eq!(summary.collection_rules("a.b").is_some(), kept);
+            assert!(summary.collection_rules("c.d").is_none());
+            assert_eq!(summary.summary_digest().is_some(), kept);
         }
-        assert!(full.can_read(&Namespace::Local, "x"));
-        assert!(!summary.can_read(&Namespace::Local, "x"));
-        assert!(!summary.reads_local_refs());
-        assert!(full.can_read(&collection("a.b"), "x"));
-        assert!(!summary.can_read(&collection("a.b"), "x"));
-        assert!(summary.collection_rules("a.b").is_none());
-        assert!(summary.collection_rules("c.d").is_some());
-        assert!(summary.summary_digest().is_some());
     }
 }

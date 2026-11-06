@@ -491,13 +491,13 @@ impl Repo {
     /// each HTTP request carries the bearer token or the Basic credential of
     /// that header, which gives a `token-sha256` or a `basic-sha256` item.
     /// Over ssh, `ostrya send` identifies the client by its `ssh:NAME` item.
-    /// The listing holds a ref when the client group of the item in the
-    /// namespace of the ref has `r` on its name. With
-    /// `tls-accept-claim=true`, the claims of the certificate for that
-    /// namespace replace the rules of the group. The namespace of the own
-    /// collection id of the remote is its local namespace. So the local group
-    /// of the remote applies, with the `ostrya:ref:` claims and the
-    /// `ostrya:collection:ID:` claims of that id.
+    /// The listing holds a ref when the client group of the item has `r` on
+    /// its name in the namespace of the ref. With `tls-accept-claim=true`,
+    /// the claims of the certificate for that namespace replace the rules of
+    /// the group there. The namespace of the own collection id of the remote
+    /// is its local namespace. So the items of the local refs of the remote
+    /// apply, with the claims with no `@ID:` and the claims with `@ID:` of
+    /// that id.
     ///
     /// So the probe cannot tell a ref that the remote does not hold from a
     /// ref that the client cannot read. When one remote hides a ref, the pull
@@ -510,11 +510,10 @@ impl Repo {
     /// status. So the pull skips the remote.
     ///
     /// Under a summary policy, the probe reads the summary of the item alone.
-    /// That summary holds no ref of a namespace whose group has
-    /// `summary=false`, and claims never apply to a summary. A group with
-    /// `tls-accept-claim=true` cannot set `summary=true`. So from such a
-    /// remote, a client whose right comes from claims, or from a group with
-    /// `summary=false`, gets no ref of that namespace. The policy refuses ref
+    /// The item of a group with `summary=false` has no summary, and claims
+    /// never apply to a summary. A group with `tls-accept-claim=true` cannot
+    /// set `summary=true`. So from such a remote, a client whose right comes
+    /// from claims, or from a group with `summary=false`, gets no ref. The policy refuses ref
     /// data that no signature covers, so the probe does not read the listing
     /// in place of the summary.
     ///
@@ -1033,13 +1032,13 @@ impl Repo {
     /// the Basic credential of that header, which gives a `token-sha256` or a
     /// `basic-sha256` item. Over ssh, `ostrya send` identifies the client by
     /// its `ssh:NAME` item.
-    /// The result holds a ref when the client group of the item in the
-    /// namespace of the ref has `r` on its name. With
-    /// `tls-accept-claim=true`, the claims of the certificate for that
-    /// namespace replace the rules of the group. The namespace of the own
-    /// collection id of the remote is its local namespace. So the local group
-    /// of the remote applies, with the `ostrya:ref:` claims and the
-    /// `ostrya:collection:ID:` claims of that id. So a ref that the client
+    /// The result holds a ref when the client group of the item has `r` on
+    /// its name in the namespace of the ref. With `tls-accept-claim=true`,
+    /// the claims of the certificate for that namespace replace the rules of
+    /// the group there. The namespace of the own collection id of the remote
+    /// is its local namespace. So the items of the local refs of the remote
+    /// apply, with the claims with no `@ID:` and the claims with `@ID:` of
+    /// that id. So a ref that the client
     /// cannot read is absent from the result, as a ref that the remote does
     /// not hold is.
     ///
@@ -1048,10 +1047,9 @@ impl Repo {
     /// [`Error::HttpStatus`].
     ///
     /// Under a summary policy, the call reads the summary of the item alone.
-    /// That summary holds no ref of a namespace whose group has
-    /// `summary=false`, and claims never apply to a summary. So from such a
-    /// remote, a client whose right comes from claims, or from a group with
-    /// `summary=false`, gets no ref of that namespace.
+    /// The item of a group with `summary=false` has no summary, and claims
+    /// never apply to a summary. So from such a remote, a client whose right
+    /// comes from claims, or from a group with `summary=false`, gets no ref.
     ///
     /// A local repository applies no client group. The file permissions are
     /// the access.

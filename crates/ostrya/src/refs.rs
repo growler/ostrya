@@ -754,7 +754,7 @@ impl Repo {
                 mirrors.as_fd(),
                 &CollectionWalk::new(&collections),
                 &id,
-                &rules,
+                rules,
                 everyone,
                 &mut floor,
                 &mut selection,
@@ -1190,7 +1190,7 @@ impl RefSelection {
             let names: Vec<(String, Checksum)> = refs
                 .iter()
                 .filter(|(name, _)| {
-                    crate::access::reads(&rules, name)
+                    crate::access::reads(rules, name)
                         && aliases
                             .and_then(|aliases| aliases.get(name))
                             .is_none_or(|target| access.can_read_path(target))

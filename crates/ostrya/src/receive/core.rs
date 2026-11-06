@@ -17,7 +17,7 @@ use ostrya_core::{
 use super::hooks::ReceiveHooks;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
 use super::merge::check_incoming;
-use super::policy::{SessionPolicy, namespace_text};
+use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
 use crate::access::Namespace;
 use crate::error::{Error, Result};
@@ -105,10 +105,9 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         check_hello(&repo, &hello)?;
         let namespace = namespace(&repo, &hello);
         let Some(policy) = select(&namespace) else {
-            return Err(Failure::Wire(remote::Error::RefDenied(format!(
-                "no client group of the session covers {}",
-                namespace_text(&namespace)
-            ))));
+            return Err(Failure::Wire(remote::Error::RefDenied(
+                "no client group carries the item of the session".into(),
+            )));
         };
         let core = Self::start(repo, policy, hooks, hello, Some(namespace)).await?;
         let repo = &core.repo;
@@ -159,11 +158,11 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// Runs the checks of the policy on `hello`, and opens the session
     /// transaction. The caller ran [`check_hello`].
     ///
-    /// The checks of the policy of a client group refuse a namespace that
-    /// the policy does not cover, a policy that opens no push session, and a
-    /// ref of `hello` without `r`, with `ref-denied`. A one-way stream has no
-    /// namespace and no such check. If the repository mode is `bare` and the
-    /// server does not run as root, the result is a `mode-refused` failure.
+    /// The checks of the policy of a client group refuse a policy that opens
+    /// no push session, and a ref of `hello` without `r` in the namespace,
+    /// with `ref-denied`. A one-way stream has no namespace and no such
+    /// check. If the repository mode is `bare` and the server does not run as
+    /// root, the result is a `mode-refused` failure.
     async fn start(
         repo: Repo,
         policy: P,

@@ -529,7 +529,8 @@ fn the_branch_needs_c() {
         rules: ostrya::access::AccessRules {
             allow: vec![ostrya::access::AllowItem::parse("c:**").unwrap()],
             deny: vec![ostrya_core::RefPattern::parse("main").unwrap()],
-        },
+        }
+        .into(),
         ..ReceivePolicy::default()
     };
     let error = refused(
@@ -719,7 +720,7 @@ fn the_metadata_and_the_bindings() {
         let tmp = TmpDir::new("sc-metadata");
         let repo = new_repo(&tmp, RepoMode::Archive, core);
         let policy = match hello {
-            Some(_) => collections_policy(&["c:**"]),
+            Some(id) => collections_policy(&[id], &["c:**"]),
             None => policy_allowing(&["c:**"]),
         };
         let report = committed(push_request(
@@ -1695,7 +1696,7 @@ mod tool {
             let base = TmpDir::new("sc-tool-port");
             let port = new_repo(&base, RepoMode::Archive, &core);
             let policy = match hello {
-                Some(_) => collections_policy(&["c:main", "t:v1", "t:v2"]),
+                Some(id) => collections_policy(&[id], &["c:main", "t:v1", "t:v2"]),
                 None => policy_allowing(&["c:main", "t:v1", "t:v2"]),
             };
             let sc = fields(&tool, &first, "main", &["v1"], &[], false);

@@ -15,13 +15,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use common::receive::{
-    PIPE_CAP, PipeReader, PipeWriter, SECRET_B64, SERVER_SECRET_B64, ed25519_signature,
-    ed25519_signatures, is_root, new_repo, pipe, policy_allowing, secret, server_signer, trust,
+    PIPE_CAP, PipeReader, PipeWriter, SECRET_B64, SERVER_SECRET_B64, collections_policy,
+    ed25519_signature, ed25519_signatures, is_root, new_repo, pipe, policy_allowing, secret,
+    server_signer, trust,
 };
 use common::{Counting, TmpDir, dependency_error, mark_partial, store_with_field2};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
-use ostrya::access::CollectionScope;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DictBuilder, Ed25519Signer,
@@ -549,15 +549,6 @@ fn bound(id: Option<&str>, refs: &[&str]) -> Option<Value> {
     Some(metadata.build())
 }
 
-/// The policy of a client group with `collection=*` and the allow items
-/// `allow`.
-fn collections(allow: &[&str]) -> ReceivePolicy {
-    ReceivePolicy {
-        scope: CollectionScope::AllOther,
-        ..policy_allowing(allow)
-    }
-}
-
 fn ref_file(repo: &Repo, relpath: &str) -> Option<String> {
     std::fs::read_to_string(repo.path().join(relpath)).ok()
 }
@@ -584,7 +575,12 @@ fn a_commit_bound_to_another_collection_goes_to_the_mirror_refs() {
         "c1",
         bound(Some("org.example.Os"), &[]),
     );
-    let (report, outcome) = push_under(&pair, opts(&["main"]), &collections(&["w:**"]), |_| {});
+    let (report, outcome) = push_under(
+        &pair,
+        opts(&["main"]),
+        &collections_policy(&["org.example.Os"], &["w:**"]),
+        |_| {},
+    );
     let report = report.unwrap();
     assert_eq!(report.collection.as_deref(), Some("org.example.Os"));
     outcome.unwrap();
@@ -738,7 +734,7 @@ fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
                 progress: Some(progress.clone()),
                 ..opts
             },
-            &collections(&["w:**"]),
+            &collections_policy(&["org.example.Os"], &["w:**"]),
             hook,
         );
         assert_aborted(&report);

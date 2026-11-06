@@ -172,27 +172,37 @@ impl Client {
     }
 }
 
-/// Returns a policy whose rules hold the allow items `allow`, with the
-/// defaults of the other fields.
+/// Returns the rules of the allow items `allow`.
+fn rules_allowing(allow: &[&str]) -> ostrya::access::AccessRules {
+    ostrya::access::AccessRules {
+        allow: allow
+            .iter()
+            .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
+            .collect(),
+        deny: Vec::new(),
+    }
+}
+
+/// Returns a policy whose rules hold the allow items `allow` for the local
+/// refs, with the defaults of the other fields.
 pub fn policy_allowing(allow: &[&str]) -> ReceivePolicy {
     ReceivePolicy {
-        rules: ostrya::access::AccessRules {
-            allow: allow
-                .iter()
-                .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
-                .collect(),
-            deny: Vec::new(),
-        },
+        rules: rules_allowing(allow).into(),
         ..ReceivePolicy::default()
     }
 }
 
-/// Returns [`policy_allowing`] with the scope `collection=*`.
-pub fn collections_policy(allow: &[&str]) -> ReceivePolicy {
-    ReceivePolicy {
-        scope: ostrya::access::CollectionScope::AllOther,
-        ..policy_allowing(allow)
+/// Returns a policy whose rules hold the allow items `allow` for each
+/// collection of `ids`, and no item for the local refs.
+pub fn collections_policy(ids: &[&str], allow: &[&str]) -> ReceivePolicy {
+    let mut policy = ReceivePolicy::default();
+    for id in ids {
+        policy
+            .rules
+            .collections
+            .insert((*id).to_owned(), rules_allowing(allow));
     }
+    policy
 }
 
 /// Runs a session of `repo` under `policy` against the client `script`.

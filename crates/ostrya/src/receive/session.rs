@@ -146,15 +146,14 @@ impl Repo {
     /// that it states. Then it runs the checks of `policy`, which are
     /// `ref-denied`:
     ///
-    /// - The [scope](super::ReceivePolicy::scope) of the policy does not
-    ///   cover the namespace of `Hello`. `Hello` names the namespace with its
-    ///   collection id. No collection, and the collection id of the
-    ///   repository, name the local refs.
-    /// - The policy opens no push session: no allow item has `w`, `c`, `t`,
-    ///   or `d`.
+    /// - The policy opens no push session: no allow item of a namespace has
+    ///   `w`, `c`, `t`, or `d`.
     /// - A ref of `Hello` is a remote ref `REMOTE:NAME`.
     /// - A ref of `Hello` has no `r` in the
-    ///   [rights](super::ReceivePolicy::rights) of the policy.
+    ///   [rights](super::ReceivePolicy::rights) of the policy in the
+    ///   namespace of `Hello`. `Hello` names the namespace with its
+    ///   collection id. No collection, and the collection id of the
+    ///   repository, name the local refs.
     ///
     /// All these checks run before the transaction opens.
     ///

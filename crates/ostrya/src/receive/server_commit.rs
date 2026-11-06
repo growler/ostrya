@@ -151,7 +151,7 @@ pub(super) async fn finish(
             }
         }
     }
-    let rule = policy.server_commit_rule(&sc.branch, &sc.tags)?;
+    let rule = policy.server_commit_rule(named.rule_namespace(), &sc.branch, &sc.tags)?;
     let root = (sc.root_dirtree, sc.root_dirmeta);
     let missing = walk::completeness(&txn, [root]).await?;
     if missing.total > 0 {

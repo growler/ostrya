@@ -588,7 +588,8 @@ pub(crate) mod tests {
             rules: ostrya::access::AccessRules {
                 allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
                 deny: Vec::new(),
-            },
+            }
+            .into(),
             ..ReceivePolicy::default()
         }
     }

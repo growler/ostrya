@@ -14,7 +14,7 @@ request by the auth items of the groups. It serves each read with the
 read rights of the item (`ostrya::access::ReadAccess`), and runs the
 receive endpoint of a push, which gives each session the policy of one
 group. With no client groups, each read gets the rights of the
-`anonymous` item under the implicit groups. Behind a
+`anonymous` item under the implicit group. Behind a
 proxy, it reads the PROXY protocol header of a connection, and the client
 address, the scheme, and the client certificate that a trusted proxy
 forwards in the request headers. A host with

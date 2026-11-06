@@ -376,7 +376,7 @@ fn the_options_of_a_server_commit_reach_the_commit() {
     // do not apply.
     let (report, client) = push_under(
         &pair,
-        &collections_policy(&["c:**"]),
+        &collections_policy(&["org.example.Other"], &["c:**"]),
         PushOntoOptions {
             collection: Some("org.example.Other".into()),
             ..onto("main", "main")

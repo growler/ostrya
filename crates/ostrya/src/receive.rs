@@ -41,8 +41,8 @@ mod trust;
 mod walk;
 
 pub use crate::access::{
-    AccessModes, AccessRules, AllowItem, AuthItem, ClientAccess, ClientGroup, CollectionScope,
-    IpNet, Namespace, ServerSettings,
+    AccessModes, AccessRules, AllowItem, AuthItem, ClientAccess, ClientGroup, IpNet, Namespace,
+    NamespaceRules, ServerSettings,
 };
 pub use crate::verify::TrustedKeys;
 pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};

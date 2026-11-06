@@ -859,7 +859,7 @@ fn selector(entries: &[&str]) -> RefSelector {
 }
 
 /// Builds the ref listing of the selector that `entries` give, with the
-/// rights of an anonymous client under the implicit groups.
+/// rights of an anonymous client under the implicit group.
 async fn list(repo: &Repo, entries: &[&str]) -> Result<Vec<u8>, ostrya::Error> {
     repo.build_ref_listing(&selector(entries), None, &anyone())
         .await
@@ -1393,8 +1393,9 @@ fn a_ref_listing_holds_the_readable_refs_alone() {
     });
 }
 
-/// A client with no group of the local refs, and a client whose group of
-/// the local refs gives no `r`, read no entry of `refs/heads`. The listing
+/// A client with no group, a client whose group has items of a collection
+/// alone, and a client whose group gives no `r` on a local ref, read no
+/// entry of `refs/heads`. The listing
 /// of each one is empty also when `refs/heads` is a regular file, which
 /// fails the listing of a client that reads local refs.
 #[test]
@@ -1405,7 +1406,7 @@ fn a_client_that_reads_no_local_ref_reads_no_entry_of_refs_heads() {
         let heads = repo_dir.join("refs/heads");
         std::fs::remove_dir_all(&heads).unwrap();
         std::fs::write(&heads, "").unwrap();
-        let groups = "[ex-ostrya client \"mirrors\"]\nauth=ssh:m\ncollection=*\nallow=r:**\n\
+        let groups = "[ex-ostrya client \"mirrors\"]\nauth=ssh:m\nallow=r:@org.example.M:**\n\
                       [ex-ostrya client \"delete\"]\nauth=ssh:d\nallow=d:**\n\
                       [ex-ostrya client \"all\"]\nauth=ssh:a\nallow=r:**\n";
         for item in ["ssh:m", "ssh:d", "ssh:other"] {
@@ -1427,7 +1428,7 @@ fn a_client_that_reads_no_local_ref_reads_no_entry_of_refs_heads() {
 /// target, and the alias resolves by the rule of the archive view: a
 /// relative body inside `refs/`, one link, and a regular file at the
 /// target. An absolute body, an alias of an alias, and an alias to a ref
-/// under `refs/remotes/` are left out, also under the implicit groups.
+/// under `refs/remotes/` are left out, also under the implicit group.
 #[test]
 fn the_listing_applies_the_alias_rule() {
     let (_tmp, repo_dir) = writable_fixture("summary", "listing-alias-rule");
@@ -1602,10 +1603,9 @@ fn a_ref_listing_walks_the_directories_that_the_client_reads() {
         for name in ["c/a", "c/b/c", "c/no/b", "z/x"] {
             set_mirror(&repo, "org.example.M", name, &main).await;
         }
-        let groups = "[ex-ostrya client \"pub\"]\nauth=ssh:u\nallow=r:pub/**;w:main;d:priv/**\n\
-                      deny=pub/secret/**;pub/x\n\
-                      [ex-ostrya client \"pub-c\"]\nauth=ssh:u\ncollection=*\nallow=r:c/**\n\
-                      deny=c/no/**\n";
+        let groups = "[ex-ostrya client \"pub\"]\nauth=ssh:u\n\
+                      allow=r:pub/**;w:main;d:priv/**;r:@org.example.M:c/**\n\
+                      deny=pub/secret/**;pub/x;@org.example.M:c/no/**\n";
         let reader = read_access(groups, "ssh:u");
         let check = |listing: ostrya::RefListing, local: Names<'_>, map: Map<'_>| {
             assert_eq!(listed_names(&listing.bytes), local);
@@ -1995,15 +1995,14 @@ fn a_collection_entry_has_the_bytes_of_the_summary_entry() {
     });
 }
 
-/// Each collection takes the group of the item in its namespace: the group
-/// of its exact id, else the group of `collection=*`, and never the two.
-/// A deny item wins, `d` alone gives no read, a collection with no group of
-/// the item is left out, and an item with no collection group gets no map.
-/// In a group with `tls-accept-claim=true`, the claims of a namespace
-/// replace the rules of the group for that namespace alone. Field 0 keeps
-/// the rights of the local refs.
+/// Each collection takes the items of the group of the item for that
+/// collection. A deny item wins, `d` alone gives no read, a collection with
+/// no item is left out, and an item whose group has no collection item gets
+/// no map. In a group with `tls-accept-claim=true`, the claims of a
+/// namespace replace the rules of the group for that namespace alone. Field
+/// 0 keeps the rights of the local refs.
 #[test]
-fn the_collection_map_follows_the_group_of_each_namespace() {
+fn the_collection_map_follows_the_items_of_each_namespace() {
     let (_tmp, repo_dir) = writable_fixture("summary", "listing-collection-rights");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
@@ -2017,12 +2016,12 @@ fn the_collection_map_follows_the_group_of_each_namespace() {
         ] {
             set_mirror(&repo, id, name, &main).await;
         }
-        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:main\n\
-                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=org.a\nallow=r:x/**\n\
-                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:main;d:dev\n\
-                      [ex-ostrya client \"deny\"]\nauth=ssh:v\ncollection=*\nallow=r:**\ndeny=dev\n\
+        let groups = "[ex-ostrya client \"u\"]\nauth=ssh:u\n\
+                      allow=r:main;r:@org.a:x/**;r:@org.b:main;d:@org.b:dev;r:@org.c:main\n\
+                      [ex-ostrya client \"deny\"]\nauth=ssh:v\n\
+                      allow=r:@org.a:**;r:@org.b:**;r:@org.c:**\ndeny=@org.b:dev\n\
                       [ex-ostrya client \"only-local\"]\nauth=ssh:w\nallow=r:**\n\
-                      [ex-ostrya client \"one\"]\nauth=ssh:x\ncollection=org.b\nallow=w:**\n";
+                      [ex-ostrya client \"one\"]\nauth=ssh:x\nallow=w:@org.b:**\n";
         let cases: [(&str, Names, Map); 4] = [
             (
                 "ssh:u",
@@ -2054,19 +2053,19 @@ fn the_collection_map_follows_the_group_of_each_namespace() {
 
         let config = ostrya::RepoConfig::parse(
             "[core]\nrepo_version=1\nmode=archive-z2\n\
-             [ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\n\
-             tls-accept-claim=true\nallow=r:main\n",
+             [ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
+             allow=r:main;r:@org.a:main;r:@org.b:main;r:@org.c:main\n",
         )
         .unwrap();
         let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
-        let claims = ostrya::access::Claims::parse(["ostrya:collection:org.a:r:x/**"]).unwrap();
+        let claims = ostrya::access::Claims::parse(["ostrya:ref:r:@org.a:x/**"]).unwrap();
         let access = ostrya::access::ReadAccess::new(
             std::sync::Arc::new(access),
             ostrya::access::AuthItem::TlsAny,
             Some(std::sync::Arc::new(claims)),
         );
         let listing = list_with(&repo, &[], Some(&[]), &access).await;
-        assert!(listed_names(&listing.bytes).is_empty());
+        assert_eq!(listed_names(&listing.bytes), ["main"]);
         assert_eq!(
             collection_names(&listing.bytes),
             names_of(&[
@@ -2149,10 +2148,10 @@ fn a_listing_leaves_out_an_invalid_collection_directory() {
 }
 
 /// A collection ref that the client cannot read is not read: a ref file with
-/// no checksum in a collection with no group of the item, or under a name
+/// no checksum in a collection with no item of the group, or under a name
 /// that the group denies, fails no listing of that client, and fails the
 /// listing of a client that reads it. The directory of a collection whose
-/// group gives no `r` is not opened: a directory with mode 0 fails only the
+/// items give no `r` is not opened: a directory with mode 0 fails only the
 /// listing of a client that reads it. The second part returns at once for a
 /// user that ignores the mode.
 #[test]
@@ -2165,10 +2164,9 @@ fn a_collection_ref_that_the_client_cannot_read_is_not_read() {
         set_mirror(&repo, "org.a", "main", &main).await;
         write_mirror_file(&repo_dir, "org.a/secret", "no checksum\n");
         write_mirror_file(&repo_dir, "org.b/x", "no checksum\n");
-        let groups = "[ex-ostrya client \"a\"]\nauth=ssh:u\ncollection=org.a\n\
-                      allow=r:**\ndeny=secret\n\
-                      [ex-ostrya client \"delete\"]\nauth=ssh:u\ncollection=org.b\nallow=d:**\n\
-                      [ex-ostrya client \"all\"]\nauth=ssh:all\ncollection=*\nallow=r:**\n";
+        let groups = "[ex-ostrya client \"a\"]\nauth=ssh:u\nallow=r:@org.a:**;d:@org.b:**\n\
+                      deny=@org.a:secret\n\
+                      [ex-ostrya client \"all\"]\nauth=ssh:all\nallow=r:@org.a:**;r:@org.b:**\n";
         let reader = read_access(groups, "ssh:u");
         let listing = list_with(&repo, &[], Some(&[]), &reader).await;
         assert_eq!(
@@ -2316,9 +2314,9 @@ fn own_id_mirror_refs_are_in_no_listing() {
         let listing = list_with(&repo, &[], Some(&["org.ostrya.Test/**"]), &all).await;
         assert!(collection_names(&listing.bytes).is_empty());
 
-        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:main\n\
-                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n\
-                      [ex-ostrya client \"mirrors\"]\nauth=ssh:m\ncollection=*\nallow=r:**\n";
+        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\n\
+                      allow=r:main;r:@org.ostrya.Other:**\n\
+                      [ex-ostrya client \"mirrors\"]\nauth=ssh:m\nallow=r:@org.ostrya.Other:**\n";
         let listing = list_with(&repo, &[], Some(&[]), &collection_access(groups, "ssh:u")).await;
         assert_eq!(listed_names(&listing.bytes), ["main"]);
         let parsed = Summary::parse(&listing.bytes).unwrap();
@@ -2394,8 +2392,8 @@ fn fixed() -> SummaryOptions {
     }
 }
 
-/// Each item with a summary gets the refs that its groups with
-/// `summary=true` read: the local refs in field 0, and the collection refs
+/// Each item whose group has `summary=true` gets the refs that the group
+/// reads: the local refs in field 0, and the collection refs
 /// in the collection map. The root summary holds each ref, and each summary
 /// has the same `ostree.summary.last-modified`. An item with no summary gets
 /// no file, and each `.access` file holds the digest of its item.
@@ -2408,9 +2406,8 @@ fn each_item_gets_the_summary_of_its_groups() {
         set_mirror(&repo, "org.example.M", "m", &main).await;
         let repo = with_groups(
             &repo_dir,
-            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\nsummary=true\n\
-             [ex-ostrya client \"public-collections\"]\nauth=anonymous\ncollection=*\n\
-             allow=r:**\nsummary=true\n\
+            "[ex-ostrya client \"public\"]\nauth=anonymous\n\
+             allow=r:main;r:@org.example.M:**\nsummary=true\n\
              [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n\
              [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n",
         )
@@ -2524,9 +2521,8 @@ fn the_delta_map_follows_the_refs_of_the_summary() {
         set_mirror(&repo, "org.example.M", "m", &main).await;
         let repo = with_groups(
             &repo_dir,
-            "[ex-ostrya client \"all\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
-             [ex-ostrya client \"all-collections\"]\nauth=anonymous\ncollection=*\n\
-             allow=r:**\nsummary=true\n\
+            "[ex-ostrya client \"all\"]\nauth=anonymous\n\
+             allow=r:**;r:@org.example.M:**\nsummary=true\n\
              [ex-ostrya client \"local\"]\nauth=ssh:local\nallow=r:**\nsummary=true\n\
              [ex-ostrya client \"none\"]\nauth=ssh:none\nallow=r:nothing\nsummary=true\n",
         )

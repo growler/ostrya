@@ -389,10 +389,11 @@ fn a_push_over_ssh_writes_the_ref_and_the_tool_checks_the_repository() {
     }
 }
 
-/// A client name that no `ssh:` item of a group of the local refs names
-/// opens no push session. `Hello` gets `ref-denied`, the command exits 1
-/// with one error line, and the ref stays absent. A group of a collection
-/// does not count, and neither does an `anonymous` or a `net:` item.
+/// A client name that no `ssh:` item of a group names opens no push
+/// session, and an `anonymous` or a `net:` item does not count. A client
+/// name whose group has items of a collection alone gets no right on a
+/// local ref. In each case `Hello` gets `ref-denied`, the command exits 1
+/// with one error line, and the ref stays absent.
 #[test]
 fn receive_refuses_a_name_with_no_group_with_ref_denied() {
     let base = TmpDir::new("refused");
@@ -400,25 +401,27 @@ fn receive_refuses_a_name_with_no_group_with_ref_denied() {
     let config = dest.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(
-        "[ex-ostrya client \"mirror\"]\nauth=ssh:other\ncollection=*\nallow=w:**\n\
+        "[ex-ostrya client \"mirror\"]\nauth=ssh:mirror\nallow=w:@org.example.Os:**\n\
          [ex-ostrya client \"anyone\"]\nauth=anonymous;net:0.0.0.0/0;net:::/0\nallow=w:**\n",
     );
     std::fs::write(&config, text).unwrap();
     let status = base.0.join("status");
-    match push_as(&dest, &status, Compression::None, "other") {
-        Err(Error::RefDenied(message)) => {
-            assert!(
-                message.contains("no client group of the session covers the local refs"),
-                "{message}"
-            );
+    for (client, needle) in [
+        ("other", "no client group carries the item of the session"),
+        ("mirror", "the policy gives no r on ref"),
+    ] {
+        match push_as(&dest, &status, Compression::None, client) {
+            Err(Error::RefDenied(message)) => {
+                assert!(message.contains(needle), "{client}: {message}");
+            }
+            other => panic!("{client}: {other:?}"),
         }
-        other => panic!("{other:?}"),
+        assert_eq!(tip(&dest), None);
+        assert_eq!(exit_status(&status), "1");
+        let stderr = std::fs::read_to_string(stderr_of(&status)).unwrap();
+        assert!(stderr.starts_with("error: ref-denied: "), "{stderr}");
+        assert_eq!(stderr.lines().count(), 1, "{stderr}");
     }
-    assert_eq!(tip(&dest), None);
-    assert_eq!(exit_status(&status), "1");
-    let stderr = std::fs::read_to_string(stderr_of(&status)).unwrap();
-    assert!(stderr.starts_with("error: ref-denied: "), "{stderr}");
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
 }
 
 /// `ostrya receive` and `ostrya send` need a client name: `--client`, else
@@ -1113,18 +1116,6 @@ mod cli {
         std::fs::write(&config, text).unwrap();
     }
 
-    /// Appends the client group `name` of [`CLIENT`] in the collection scope
-    /// `collection`, with the allow list `allow`, to the config of `dest`.
-    fn collection_group(dest: &Path, name: &str, collection: &str, allow: &str) {
-        let config = dest.join("config");
-        let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str(&format!(
-            "[ex-ostrya client \"{name}\"]\nauth=ssh:{CLIENT}\ncollection={collection}\n\
-             allow={allow}\n"
-        ));
-        std::fs::write(&config, text).unwrap();
-    }
-
     /// The lines of `ostree refs -c` of `repo`, or `None` if the `ostree`
     /// command is not installed.
     fn tool_collection_refs(repo: &Path) -> Option<Vec<String>> {
@@ -1161,7 +1152,7 @@ mod cli {
         set_collection_id(&setup.client, Some("org.example.Os"));
         let c = setup.commit("main", FILES, &[]);
         let dest = receiver(&setup.base, RepoMode::Archive);
-        collection_group(&dest, "os", "org.example.Os", "w:**");
+        client_group(&dest, "w:@org.example.Os:**");
         let out = setup.push_to(&dest, &["main"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stdout(&out), format!("main (new) {c}\n"));
@@ -1221,11 +1212,12 @@ mod cli {
         assert!(!dest.join("refs/mirrors").join("org.example.A").exists());
     }
 
-    /// A collection that no group of the client covers gets `ref-denied`
-    /// from `ostrya receive`. A group that names the collection wins over a
-    /// group with `collection=*`.
+    /// The items of the local refs, of another collection, and of the
+    /// collection on another ref give no right on the ref, so the push gets
+    /// `ref-denied` from `ostrya receive`. The items of the collection decide
+    /// the push.
     #[test]
-    fn the_group_of_the_collection_decides_the_push() {
+    fn the_items_of_the_collection_decide_the_push() {
         let setup = Setup::new("cli-collection-groups", "archive");
         set_collection_id(&setup.client, Some("org.example.Os"));
         let c = setup.commit("main", FILES, &[]);
@@ -1234,16 +1226,15 @@ mod cli {
         assert_failed(&out, "error: ref-denied: ");
         let receive = std::fs::read_to_string(stderr_of(&setup.status)).unwrap();
         assert!(receive.starts_with("error: ref-denied: "), "{receive}");
-        assert!(
-            receive.contains("the collection 'org.example.Os'"),
-            "{receive}"
-        );
+        assert!(receive.contains("no r on ref 'main'"), "{receive}");
 
-        // The group of `*` gives no right on `main`.
-        collection_group(&dest, "all", "*", "w:other");
+        client_group(
+            &dest,
+            "w:@org.example.Os:other;w:@org.example.Other:main;w:main",
+        );
         let out = setup.push_to(&dest, &["main"]);
         assert_failed(&out, "error: ref-denied: ");
-        collection_group(&dest, "os", "org.example.Os", "w:**");
+        client_group(&dest, "w:@org.example.Os:**");
         let out = setup.push_to(&dest, &["main"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stdout(&out), format!("main (new) {c}\n"));
@@ -2167,7 +2158,7 @@ mod cli {
             assert_failed(&out, "error: ref-denied: ");
             assert_eq!(server_tip(&dest, "main"), None);
 
-            collection_group(&dest, "os", "org.example.Os", "c:**");
+            client_group(&dest, "w:**;c:@org.example.Os:**");
             let out = push_tree_to(
                 &setup,
                 &dest,
@@ -2367,7 +2358,7 @@ mod cli {
             assert_eq!(server_tip(&dest, "main"), Some(root));
             assert_eq!(load(&dest, &root).parent, None);
 
-            collection_group(&dest, "os", "org.example.Os", "c:**");
+            client_group(&dest, "wcd:**;c:@org.example.Os:**");
             let out = setup.push_to(
                 &dest,
                 &["--onto=main", "--collection=org.example.Os", "main"],

@@ -507,11 +507,10 @@ enum Command {
     /// the server group, the trust groups, and the key groups of the
     /// repository config, and a bad group ends it with status 1. `Hello` names
     /// the namespace of the session: the local refs, or one collection. The
-    /// session takes the policy of the client group of that namespace that
-    /// carries the item `ssh:NAME`. For a collection, a group that names the
-    /// collection wins over a group with `collection=*`. With no such group,
-    /// `Hello` gets `ref-denied`. A session of a collection writes the refs
-    /// under `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
+    /// session takes the policy of the client group that carries the item
+    /// `ssh:NAME`, with the allow items and the deny items of that namespace.
+    /// With no such group, `Hello` gets `ref-denied`. A session of a
+    /// collection writes the refs under `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
     /// item. With `[core] auto-update-summary=true`, a session that changes a
     /// ref writes each summary again, as `ostrya summary -u` does, signed
     /// with the key groups of `sign-summary`.
@@ -668,9 +667,10 @@ enum Command {
     /// groups: a bearer token, a Basic credential, a client certificate, the
     /// client address, or `anonymous`. A request that identifies no item gets
     /// 401 or 403 and no file. A push session takes the policy of the client
-    /// group that carries the item in the namespace of its `Hello`: the local
-    /// refs, or one collection. With no such group, or with a group that
-    /// opens no push session, the session request gets 403.
+    /// group that carries the item, with the allow items and the deny items
+    /// of the namespace of its `Hello`: the local refs, or one collection.
+    /// With no such group, or with a group that opens no push session, the
+    /// session request gets 403.
     ///
     /// A ref under `refs/heads/` or `refs/mirrors/ID/` is served when the
     /// client group of the item has `r` on its name. An alias needs `r` on
@@ -3155,12 +3155,10 @@ struct SummaryArgs {
     /// refs of the repository.
     ///
     /// The root summary `summary` holds each ref, whatever the client groups.
-    /// An auth item has a summary when one or more of its client groups has
-    /// `summary=true`. With no client group, the `anonymous` item has a
-    /// summary that holds each ref. The summary of an item holds the refs that
-    /// the item reads in each namespace whose selected group has
-    /// `summary=true`. A namespace whose selected group has `summary=false`
-    /// adds no ref. The summary of each item, `anonymous` included, is under
+    /// An auth item has a summary when its client group has `summary=true`.
+    /// With no client group, the `anonymous` item has a summary that holds
+    /// each ref. The summary of an item holds the refs that the item reads in
+    /// each namespace. The summary of each item, `anonymous` included, is under
     /// `extensions/ostrya/summary/`. The root summary states the mode of the
     /// repository. The summary of an item states `archive-z2`, the mode that
     /// `ostrya serve` serves. In a mode other than `archive`, the summary of
@@ -3342,7 +3340,7 @@ struct SummaryArgs {
     /// --list-metadata-keys, and --print-metadata-key. The command reads the
     /// file of the summary of the item, and does not compare its `.access`
     /// file with the client groups. In a repository with no client group,
-    /// NAME is `anonymous` or `anonymous-collections`, the implicit groups.
+    /// NAME is `anonymous`, the implicit group.
     /// The command refuses a group that does not exist, a group with
     /// `summary=false`, and a group whose `auth` list holds more than one
     /// item. It also refuses this option with -u, with --verify, with a
@@ -5650,9 +5648,9 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 ///
 /// The command reads and checks the client groups, the server group, the
 /// trust groups, and the key groups of the repository config at start. The
-/// session runs under the policy of the client group that carries `client`
-/// in the namespace of `Hello`. With no such group, `Hello` gets
-/// `ref-denied`. Standard output carries the frames of the session alone.
+/// session runs under the policy of the client group that carries `client`,
+/// with the items of the namespace of `Hello`. With no such group, `Hello`
+/// gets `ref-denied`. Standard output carries the frames of the session alone.
 /// Each warning of the report goes to standard error as one line. A failure
 /// goes there as the error line of [`main`].
 ///
@@ -5660,11 +5658,8 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 #[cfg(feature = "receive")]
 async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     let policies = ostrya::ReceivePolicies::from_config(&repo).await?;
-    let select = |namespace: &ostrya::access::Namespace| {
-        policies
-            .select(&client, namespace)
-            .map(|(_, policy)| policy.as_ref())
-    };
+    let select =
+        |_: &ostrya::access::Namespace| policies.select(&client).map(|(_, policy)| policy.as_ref());
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.
@@ -5815,7 +5810,7 @@ fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
 /// the repository config at start. It reads no key group, because a pull
 /// signs nothing. The session serves the refs that the client group of
 /// `client` reads. In a config with no client group, the session takes the
-/// item `anonymous` of the implicit groups. When no client group carries
+/// item `anonymous` of the implicit group. When no client group carries
 /// `client`, the process ends with an error line and exit 1 before the
 /// session reads its input.
 ///

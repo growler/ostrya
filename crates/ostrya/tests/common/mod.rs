@@ -22,8 +22,8 @@ pub mod receive;
 #[cfg(feature = "s3")]
 pub mod s3;
 
-/// Returns the read rights of an anonymous client under the two implicit
-/// groups of a config with no client group.
+/// Returns the read rights of an anonymous client under the implicit group
+/// of a config with no client group.
 pub fn anyone() -> ostrya::access::ReadAccess {
     read_access("", "anonymous")
 }

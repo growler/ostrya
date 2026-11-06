@@ -862,8 +862,9 @@ fn hello_needs_a_push_mode_and_read_on_each_ref() {
     let deny = ReceivePolicy {
         rules: ostrya::access::AccessRules {
             deny: vec![ostrya::RefPattern::parse("test/**").unwrap()],
-            ..policy().rules
-        },
+            ..policy().rules.local
+        }
+        .into(),
         ..policy()
     };
     let cases: Vec<(ReceivePolicy, Vec<&str>, &str)> = vec![
@@ -1443,7 +1444,7 @@ fn a_collection_binding_needs_a_namespace_of_that_id() {
 
     // In the namespace of the collection, the bound commit and the unbound
     // commit pass. Another collection refuses the bound commit.
-    let all = collections_policy(&["w:**"]);
+    let all = collections_policy(&["org.example.Os", "org.example.Other"], &["w:**"]);
     committed(push_in(
         &repo,
         &all,
@@ -1492,7 +1493,7 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     let local = sha(b"local");
     std::fs::write(repo.path().join("refs/heads/main"), format!("{local}\n")).unwrap();
     let mirror = "refs/mirrors/org.example.Os/main";
-    let all = collections_policy(&["w:**"]);
+    let all = collections_policy(&["org.example.Os"], &["w:**"]);
 
     let report = committed(push_in(
         &repo,
@@ -1537,7 +1538,7 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     let error = refused(
         push_in(
             &repo,
-            &collections_policy(&["t:**"]),
+            &collections_policy(&["org.example.Os"], &["t:**"]),
             "org.example.Os",
             &[],
             vec![update("main", Expected::Any, Some(second.checksum))],
@@ -1562,7 +1563,7 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     assert_unchanged(&repo, &before);
     committed(push_in(
         &repo,
-        &collections_policy(&["rd:**"]),
+        &collections_policy(&["org.example.Os"], &["rd:**"]),
         "org.example.Os",
         &[],
         vec![update("main", current, None)],
@@ -1604,7 +1605,7 @@ fn ostree_metadata_is_a_normal_ref_in_a_collection() {
     assert_unchanged(&repo, &before);
     committed(push_in(
         &repo,
-        &collections_policy(&["w:**"]),
+        &collections_policy(&["org.example.Os"], &["w:**"]),
         "org.example.Os",
         &objects,
         vec![update(

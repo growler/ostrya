@@ -119,32 +119,34 @@ fn keys(policy: &ReceivePolicy) -> Option<&Arc<TrustedKeys>> {
     }
 }
 
-/// `select` gives the group of an item in a namespace with the policy of that
-/// group. Each policy carries the name of its group.
+/// `select` gives the group of an item with the policy of that group. Each
+/// policy carries the name of its group, and the rules of each namespace.
 #[test]
 fn select_gives_the_group_and_its_policy() {
     let policies = policy(
-        "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=w:**\n\
-         [ex-ostrya client \"mirrors\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n",
+        "[ex-ostrya client \"u\"]\nauth=ssh:u\nallow=w:**;r:@org.example.Os:**\n\
+         [ex-ostrya client \"v\"]\nauth=ssh:v\nallow=r:**\n",
     )
     .unwrap();
     let item = AuthItem::parse("ssh:u").unwrap();
-    let (group, selected) = policies.select(&item, &Namespace::Local).unwrap();
-    assert_eq!(group.name(), "local");
-    assert!(Arc::ptr_eq(selected, policies.get("local").unwrap()));
-    assert_eq!(selected.group.as_deref(), Some("local"));
-    let namespace = Namespace::Collection("org.example.Os".into());
-    let (group, selected) = policies.select(&item, &namespace).unwrap();
-    assert_eq!(group.name(), "mirrors");
-    assert!(Arc::ptr_eq(selected, policies.get("mirrors").unwrap()));
-    assert_eq!(selected.group.as_deref(), Some("mirrors"));
-    let other = AuthItem::parse("ssh:v").unwrap();
-    assert!(policies.select(&other, &Namespace::Local).is_none());
+    let (group, selected) = policies.select(&item).unwrap();
+    assert_eq!(group.name(), "u");
+    assert!(Arc::ptr_eq(selected, policies.get("u").unwrap()));
+    assert_eq!(selected.group.as_deref(), Some("u"));
+    let os = Namespace::Collection("org.example.Os".into());
+    assert_eq!(selected.rights(&Namespace::Local, "main").to_string(), "rw");
+    assert_eq!(selected.rights(&os, "main"), AccessModes::READ);
+    let other = Namespace::Collection("org.example.Other".into());
+    assert_eq!(selected.rights(&other, "main"), AccessModes::NONE);
+    let (group, _) = policies.select(&AuthItem::parse("ssh:v").unwrap()).unwrap();
+    assert_eq!(group.name(), "v");
+    let other = AuthItem::parse("ssh:w").unwrap();
+    assert!(policies.select(&other).is_none());
     assert_eq!(ReceivePolicy::default().group, None);
 }
 
-/// A config with no client group gives the policies of the two implicit
-/// groups. Each one reads each ref, opens no push session, and has the
+/// A config with no client group gives the policy of the implicit group. It
+/// reads each ref of each namespace, opens no push session, and has the
 /// defaults of the other fields.
 #[test]
 fn no_client_group_gives_the_implicit_policies() {
@@ -155,11 +157,14 @@ fn no_client_group_gives_the_implicit_policies() {
         .iter()
         .map(|g| g.name())
         .collect();
-    assert_eq!(names, ["anonymous", "anonymous-collections"]);
+    assert_eq!(names, ["anonymous"]);
+    let os = Namespace::Collection("org.example.Os".into());
     for name in names {
         let policy = group(&policies, name);
-        assert_eq!(policy.rights("main"), AccessModes::READ, "{name}");
-        assert_eq!(policy.rights("a/b/c"), AccessModes::READ, "{name}");
+        for namespace in [&Namespace::Local, &os] {
+            assert_eq!(policy.rights(namespace, "main"), AccessModes::READ);
+            assert_eq!(policy.rights(namespace, "a/b/c"), AccessModes::READ);
+        }
         assert!(!policy.rules.opens_push_session(), "{name}");
         assert!(keys(policy).is_none());
         assert!(policy.allow_unsigned);
@@ -191,9 +196,12 @@ fn each_group_key_reaches_its_own_field() {
     )
     .unwrap();
     let full = group(&policies, "full");
-    assert_eq!(full.rights("apps/a").to_string(), "rwd");
-    assert_eq!(full.rights("main").to_string(), "r");
-    assert_eq!(full.rights("apps/secret"), AccessModes::NONE);
+    assert_eq!(full.rights(&Namespace::Local, "apps/a").to_string(), "rwd");
+    assert_eq!(full.rights(&Namespace::Local, "main").to_string(), "r");
+    assert_eq!(
+        full.rights(&Namespace::Local, "apps/secret"),
+        AccessModes::NONE
+    );
     assert!(keys(full).is_some());
     assert!(!full.allow_unsigned);
     assert_eq!(full.signers.len(), 1);
@@ -201,8 +209,8 @@ fn each_group_key_reaches_its_own_field() {
     assert_eq!(full.summary_signers.len(), 1);
 
     let plain = group(&policies, "plain");
-    assert_eq!(plain.rights("tags/v1").to_string(), "rt");
-    assert_eq!(plain.rights("main"), AccessModes::NONE);
+    assert_eq!(plain.rights(&Namespace::Local, "tags/v1").to_string(), "rt");
+    assert_eq!(plain.rights(&Namespace::Local, "main"), AccessModes::NONE);
     assert!(keys(plain).is_none());
     assert!(plain.allow_unsigned);
     assert!(plain.signers.is_empty());
@@ -249,7 +257,7 @@ fn a_refused_client_group_fails_the_read() {
              secret-key-file=/nonexistent/ostrya/secret\n\
              [ex-ostrya client \"d\"]\nauth=ssh:c\n"
         ),
-        "their namespaces overlap",
+        "both carry the item ssh:c",
     );
     assert_malformed("[ex-ostrya server]\nlisten=\n", "listen is empty");
 }
@@ -1031,8 +1039,8 @@ fn the_tool_tolerates_the_client_groups() {
         "\n[ex-ostrya server]\nlisten=127.0.0.1:8080\nsign-summary=central-ed\n\
          [ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\n\
          [ex-ostrya client \"mirror\"]\nauth=ssh:mirror;net:10.0.0.0/24\n\
-         collection=org.example.Os;org.example.Apps\n\
-         allow=wd:apps/**;t:releases/*\ndeny=apps/secret\n\
+         allow=wd:@org.example.Os:apps/**;t:@org.example.Apps:releases/*\n\
+         deny=@org.example.Os:apps/secret\n\
          verify=trust:release\nallow-unsigned=false\nsign=central-ed\n\
          [ex-ostrya trust \"release\"]\nsign-verify=ed25519\n\
          verification-ed25519-key={PUBLIC_B64}\n\
@@ -1090,8 +1098,8 @@ fn the_tool_keeps_a_client_group_verbatim() {
     let repo = block_on(Repo::open(&repo)).unwrap();
     let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
     let ci = group(&policies, "ci");
-    assert_eq!(ci.rights("apps/a/b").to_string(), "rw");
-    assert_eq!(ci.rights("main").to_string(), "r");
+    assert_eq!(ci.rights(&Namespace::Local, "apps/a/b").to_string(), "rw");
+    assert_eq!(ci.rights(&Namespace::Local, "main").to_string(), "r");
 }
 
 /// The policies move across tasks and threads.

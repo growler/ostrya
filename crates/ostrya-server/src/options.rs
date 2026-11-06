@@ -321,7 +321,7 @@ pub struct ServeOptions {
     ///
     /// With `None`, the server has no receive endpoint and identifies no
     /// client. Each read gets the rights of the `anonymous` item under the
-    /// two implicit groups of a config with no client group. The default is
+    /// implicit group of a config with no client group. The default is
     /// `None`.
     /// [`ReceivePolicies::from_config`](ostrya::ReceivePolicies::from_config)
     /// builds the value from the repository config.

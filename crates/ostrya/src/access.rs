@@ -1,18 +1,19 @@
 //! The client groups and the server settings of a repository config.
 //!
 //! A client group, `[ex-ostrya client "NAME"]`, states how a client
-//! authenticates, which refs it can read and change in one namespace, how
+//! authenticates, which refs it can read and change in each namespace, how
 //! its commits are verified, and which keys sign them. `[ex-ostrya server]`
 //! holds the settings of a server. [`ClientAccess::from_config`] reads both
 //! kinds of group.
 //!
 //! - [`ClientAccess`] holds the groups and the server settings, and selects
-//!   the group of an auth item in a namespace.
+//!   the group of an auth item.
 //! - [`ClientGroup`] is one client group.
 //! - [`AuthItem`] is one item of the `auth` list, and [`IpNet`] is the
 //!   network of a `net:` item or of a `trusted-proxy` entry.
-//! - [`AccessRules`] holds the allow items and the deny items of a group,
-//!   and gives the effective rights of a ref as [`AccessModes`].
+//! - [`AccessRules`] holds the allow items and the deny items of a group in
+//!   one namespace, and gives the effective rights of a ref as
+//!   [`AccessModes`]. [`NamespaceRules`] holds the rules of each namespace.
 //! - [`ServerSettings`] holds the keys of `[ex-ostrya server]`.
 //! - [`Claims`] holds the claims of a client certificate, and
 //!   [`ClientAccess::claim_rules`] gives their rules for one namespace.
@@ -25,14 +26,12 @@
 //!
 //! - `auth` (list, necessary) -- the [`AuthItem`]s of the group. An item
 //!   that occurs two times in one group counts one time.
-//! - `collection` (list, or `*`) -- the namespace of the group, as a
-//!   [`CollectionScope`]. Without the key, the group applies to the local
-//!   refs. `*` is valid only as the whole value. Each id passes
-//!   [`is_collection_id`](crate::is_collection_id) and differs from
-//!   `[core] collection-id`.
-//! - `allow` (list) -- the [`AllowItem`]s. Without the key, the group has no
-//!   right on a ref.
-//! - `deny` (list) -- the deny items, each a [`RefPattern`](crate::RefPattern).
+//! - `allow` (list) -- the [`AllowItem`]s, each `[MODES:]PATTERN` for the
+//!   local refs or `[MODES:]@ID:PATTERN` for the collection `ID`. Without the
+//!   key, the group has no right on a ref.
+//! - `deny` (list) -- the deny items, each `PATTERN` for the local refs or
+//!   `@ID:PATTERN` for the collection `ID`. `PATTERN` is a
+//!   [`RefPattern`](crate::RefPattern).
 //! - `tls-accept-claim` (boolean, default false) -- read the claims of the
 //!   client certificate (see [Claims](#claims)). A group with no `tls:*`,
 //!   `tls:NAME`, or `tls-sha256:HEX` item cannot hold this key, with any
@@ -47,10 +46,17 @@
 //!   empty value is refused.
 //! - `allow-privileged` (boolean, default false) -- accept the privileged
 //!   file modes and extended attributes in a `bare` repository.
-//! - `summary` (boolean, default false) -- add the namespace of the group to
-//!   the summary of each auth item of the group (see
-//!   [Summaries](#summaries)). A group with `tls-accept-claim=true` cannot
-//!   set `summary=true`.
+//! - `summary` (boolean, default false) -- give each auth item of the group a
+//!   summary (see [Summaries](#summaries)). A group with
+//!   `tls-accept-claim=true` cannot set `summary=true`.
+//!
+//! `ID` is a collection id. It passes
+//! [`is_collection_id`](crate::is_collection_id) and is at most
+//! [`MAX_COLLECTION_ID_LEN`](ostrya_core::MAX_COLLECTION_ID_LEN) bytes. The
+//! text splits at the first `:` after the `@`. An item with `@ID:` of
+//! `[core] collection-id` is an item of the local refs, so `@OWN:PATTERN` is
+//! the same as `PATTERN`. [`NamespaceRules`] holds the items of each
+//! namespace.
 //!
 //! [`ServerSettings`] lists the keys of `[ex-ostrya server]`.
 //!
@@ -60,12 +66,12 @@
 //! `ex-ostrya ` and has no shape of a known group, and a key that a client
 //! group or the server group does not take. It refuses `[ex-ostrya receive]`
 //! and `[ex-ostrya receive "PATTERN"]` with a message that names
-//! `[ex-ostrya client "NAME"]`. It also refuses the config in these cases:
+//! `[ex-ostrya client "NAME"]`. It refuses the key `collection` of a client
+//! group with a message that names `@ID:PATTERN`. It also refuses the config
+//! in these cases:
 //!
-//! - Two groups carry the same item, and their namespaces overlap: both
-//!   apply to the local refs, both name one id, or both have `*`.
-//! - A collection id fails the collection-id rule, or is the own collection
-//!   id of the repository.
+//! - Two groups carry the same item.
+//! - The collection id of an item fails the collection-id rule.
 //! - A network has host bits set.
 //! - A group sets `tls-accept-claim=true` and `summary=true`.
 //! - `verify`, `sign`, or `sign-summary` names a trust group or a key group
@@ -82,14 +88,14 @@
 //! server reads the claims of the certificate that gives the auth item of a
 //! request:
 //!
-//! - A group of the local refs reads the `ostrya:ref:` claims, and the
-//!   `ostrya:collection:ID:` claims whose `ID` is `[core] collection-id`. A
-//!   group of a collection reads the `ostrya:collection:ID:` claims of the
-//!   collection of the request.
-//! - When the certificate holds one or more claims for the namespace, they
-//!   replace `allow` and `deny` of the group.
-//! - When the certificate holds no claim for the namespace, `allow` and
-//!   `deny` apply.
+//! - A claim with no `@ID:` and a claim with `@ID:` of `[core] collection-id`
+//!   name the local refs. A claim with another `@ID:` names the collection
+//!   `ID`.
+//! - When the certificate holds one or more claims for a namespace, they
+//!   replace the allow items and the deny items of the group for that
+//!   namespace.
+//! - In a namespace for which the certificate holds no claim, the items of
+//!   the group apply.
 //!
 //! The claims can give more rights than the group, so the client CA grants
 //! the rights of each certificate that it signs. The other keys of the group
@@ -98,7 +104,7 @@
 //! # Read access
 //!
 //! A client reads `refs/heads/NAME` and `refs/mirrors/ID/NAME` when the
-//! group of its item in the namespace of the path has `r` on `NAME`. The own
+//! group of its item has `r` on `NAME` in the namespace of the path. The own
 //! collection id under `refs/mirrors/` names the local refs. An alias needs
 //! `r` on its name and on its target. No client reads another path under
 //! `refs/`. `summary` and `summary.sig` give the summary of the item of the
@@ -106,16 +112,14 @@
 //!
 //! # Summaries
 //!
-//! An auth item has a summary when one or more of its groups has
-//! `summary=true`. Each other item has no summary. The summary of an item
-//! holds the refs that the item reads in each namespace whose selected
-//! group has `summary=true`. A namespace whose selected group has
-//! `summary=false` adds no ref, and no other group takes its place.
+//! An auth item has a summary when its group has `summary=true`. Each other
+//! item has no summary. The summary of an item holds the refs that the item
+//! reads in each namespace.
 //!
 //! [`ClientAccess::summary_digest`] gives the access digest of an item: the
-//! SHA-256 digest of a text that holds `[core] collection-id` and the
-//! namespace, the allow items, the deny items, and the value of `summary`
-//! of each group of the item, `summary=false` groups included:
+//! SHA-256 digest of a text that holds `[core] collection-id`, and the
+//! allow items, the deny items, and the value of `summary` of the group of
+//! the item in each namespace:
 //!
 //! ```text
 //! collection-id=ID
@@ -126,39 +130,31 @@
 //! ```
 //!
 //! - `ID` is `[core] collection-id`, or empty with no collection id.
-//! - Each group adds the four lines `namespace=`, `allow=`, `deny=`, and
-//!   `summary=`. The groups come in the byte-wise order of their
-//!   `namespace=` lines.
-//! - `NS` is empty for the local refs, `*` for `collection=*`, and else the
-//!   collection ids, sorted byte-wise and joined by `;`.
-//! - `ITEMS` is the allow items in the form `MODES:PATTERN`, with the modes
-//!   in the order `rwctd`. Each distinct item occurs one time. The items
-//!   are sorted byte-wise and joined by `;`.
+//! - Each namespace adds the four lines `namespace=`, `allow=`, `deny=`, and
+//!   `summary=`: the local refs, each collection with one or more items, and
+//!   each other collection in the implicit group. The namespaces come in the
+//!   byte-wise order of their `namespace=` lines.
+//! - `NS` is empty for the local refs, the collection id for a collection,
+//!   and `*` for each other collection of the implicit group.
+//! - `ITEMS` is the allow items of the namespace in the form
+//!   `MODES:PATTERN`, with no `@ID:`, and with the modes in the order
+//!   `rwctd`. Each distinct item occurs one time. The items are sorted
+//!   byte-wise and joined by `;`.
 //! - `PATTERNS` is the deny patterns, in the same way.
 //! - `BOOL` is `true` or `false`, the value of `summary`.
 //! - Each line ends with a newline.
 //!
-//! The text holds each group that the item can select in a namespace, so
-//! the digest changes when a change to the config can change the refs of
-//! the summary. The group names are not in the text, so a new group name
-//! keeps the digest.
+//! The digest changes when a change to the config can change the refs of
+//! the summary. The group name is not in the text, so a new group name keeps
+//! the digest.
 //!
-//! # Implicit groups
+//! # Implicit group
 //!
-//! A config with no client group has two implicit groups:
-//!
-//! ```text
-//! [ex-ostrya client "anonymous"]
-//! auth=anonymous
-//! allow=r:**
-//! summary=true
-//!
-//! [ex-ostrya client "anonymous-collections"]
-//! auth=anonymous
-//! collection=*
-//! allow=r:**
-//! summary=true
-//! ```
+//! A config with no client group has one implicit group, `anonymous`. It
+//! carries the item `anonymous`, has `summary=true`, and gives `r` on each
+//! local ref and on each ref of each collection. No `allow` value names each
+//! collection, so a client group cannot state the rights of the implicit
+//! group.
 //!
 //! # Examples
 //!
@@ -172,9 +168,9 @@
 //! )?;
 //! let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
 //! let item = AuthItem::parse("ssh:user")?;
-//! let group = access.select(&item, &Namespace::Local).unwrap();
+//! let group = access.select(&item).unwrap();
 //! assert_eq!(group.name(), "developer");
-//! let rights = group.rules().rights("devel/user/main");
+//! let rights = group.rules().rights(&Namespace::Local, "devel/user/main");
 //! assert!(rights.contains(AccessModes::COMMIT));
 //! assert!(rights.contains(AccessModes::READ));
 //! # Ok::<(), ostrya::Error>(())
@@ -187,7 +183,7 @@ mod reader;
 mod rights;
 
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -198,7 +194,7 @@ pub use read::ReadAccess;
 pub(crate) use read::reads;
 #[cfg(feature = "receive")]
 pub(crate) use reader::{Group, classify};
-pub use rights::{AccessModes, AccessRules, AllowItem};
+pub use rights::{AccessModes, AccessRules, AllowItem, NamespaceRules};
 
 use ostrya_core::Checksum;
 
@@ -241,50 +237,6 @@ impl Namespace {
     }
 }
 
-/// The namespace of a client group, from its `collection` key.
-///
-/// The [`Default`] scope is [`Local`](CollectionScope::Local).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub enum CollectionScope {
-    /// No `collection` key: the local refs.
-    #[default]
-    Local,
-    /// A list of collection ids, in the order of the config, each one time.
-    Ids(Vec<String>),
-    /// `collection=*`: each collection other than the own collection of the
-    /// repository.
-    AllOther,
-}
-
-impl CollectionScope {
-    /// Returns `true` if the scope holds `namespace`.
-    ///
-    /// A `*` scope holds each [`Collection`](Namespace::Collection) whose id
-    /// passes the collection-id rule. [`ClientAccess::select`] also refuses
-    /// the own collection id, which [`ClientAccess::namespace`] maps to
-    /// [`Local`](Namespace::Local).
-    pub fn covers(&self, namespace: &Namespace) -> bool {
-        match (self, namespace) {
-            (CollectionScope::Local, Namespace::Local) => true,
-            (CollectionScope::Ids(ids), Namespace::Collection(id)) => ids.contains(id),
-            (CollectionScope::AllOther, Namespace::Collection(id)) => {
-                ostrya_core::is_collection_id(id)
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns `true` if one namespace is in both scopes.
-    fn overlaps(&self, other: &CollectionScope) -> bool {
-        match (self, other) {
-            (CollectionScope::Local, CollectionScope::Local)
-            | (CollectionScope::AllOther, CollectionScope::AllOther) => true,
-            (CollectionScope::Ids(a), CollectionScope::Ids(b)) => a.iter().any(|id| b.contains(id)),
-            _ => false,
-        }
-    }
-}
-
 /// One client group, `[ex-ostrya client "NAME"]`.
 ///
 /// [`ClientAccess::from_config`] builds each group. The module doc lists the
@@ -293,8 +245,7 @@ impl CollectionScope {
 pub struct ClientGroup {
     name: String,
     auth: Vec<AuthItem>,
-    scope: CollectionScope,
-    rules: AccessRules,
+    rules: NamespaceRules,
     tls_accept_claim: bool,
     verify_trust: Option<String>,
     allow_unsigned: bool,
@@ -316,13 +267,9 @@ impl ClientGroup {
         &self.auth
     }
 
-    /// Returns the namespace of the group.
-    pub fn scope(&self) -> &CollectionScope {
-        &self.scope
-    }
-
-    /// Returns the allow items and the deny items of the group.
-    pub fn rules(&self) -> &AccessRules {
+    /// Returns the allow items and the deny items of the group, for each
+    /// namespace.
+    pub fn rules(&self) -> &NamespaceRules {
         &self.rules
     }
 
@@ -365,18 +312,9 @@ impl ClientGroup {
         self.summary
     }
 
-    /// Returns `true` for one of the two groups that a config with no client
-    /// group has.
+    /// Returns `true` for the group that a config with no client group has.
     pub fn is_implicit(&self) -> bool {
         self.implicit
-    }
-
-    /// Returns `true` if the scope of the group holds `namespace`.
-    ///
-    /// The method reads the scope alone, as [`CollectionScope::covers`]
-    /// states.
-    pub fn covers(&self, namespace: &Namespace) -> bool {
-        self.scope.covers(namespace)
     }
 
     /// Returns the group name of the group, for the error messages.
@@ -656,9 +594,8 @@ impl ClientAccess {
         reader::read(config, repo_dir)
     }
 
-    /// Returns the two implicit groups of a config with no client group, with
-    /// the own collection id `collection_id` and the default server
-    /// settings.
+    /// Returns the implicit group of a config with no client group, with the
+    /// own collection id `collection_id` and the default server settings.
     ///
     /// The value is the value that
     /// [`from_config`](ClientAccess::from_config) gives for a config with no
@@ -674,7 +611,7 @@ impl ClientAccess {
     /// assert!(!access.has_client_groups());
     /// let own = access.namespace(Some("com.example.own"));
     /// assert_eq!(own, Namespace::Local);
-    /// let group = access.select(&AuthItem::Anonymous, &own).unwrap();
+    /// let group = access.select(&AuthItem::Anonymous).unwrap();
     /// assert_eq!(group.name(), "anonymous");
     /// ```
     pub fn implicit(collection_id: Option<&str>) -> ClientAccess {
@@ -695,8 +632,8 @@ impl ClientAccess {
         &self.server
     }
 
-    /// Returns the client groups, in the order of the config, or the two
-    /// implicit groups.
+    /// Returns the client groups, in the order of the config, or the implicit
+    /// group.
     pub fn groups(&self) -> &[ClientGroup] {
         &self.groups
     }
@@ -715,10 +652,10 @@ impl ClientAccess {
     /// Returns the access digest of `item`, or `None` if `item` has no
     /// summary.
     ///
-    /// An item has a summary when one or more of its groups has
-    /// `summary=true`. The digest covers `[core] collection-id` and the
-    /// namespace, the allow items, the deny items, and the value of
-    /// `summary` of each group of the item. The
+    /// An item has a summary when its group has `summary=true`. The digest
+    /// covers `[core] collection-id`, and the allow items, the deny items,
+    /// and the value of `summary` of the group of the item in each
+    /// namespace. The
     /// [module doc](crate::access#summaries) states the text.
     /// The value computes the digests one time, when it reads the config.
     ///
@@ -758,41 +695,19 @@ impl ClientAccess {
         Namespace::of(collection, self.collection_id.as_deref())
     }
 
-    /// Returns the group that carries `item` in `namespace`, or `None`.
+    /// Returns the group that carries `item`, or `None`.
     ///
-    /// For [`Local`](Namespace::Local), the result is the group of the local
-    /// refs that carries `item`. For a [`Collection`](Namespace::Collection),
-    /// the result is the first of these that exists:
-    ///
-    /// 1. the group that carries `item` and names the id in `collection`;
-    /// 2. the group that carries `item` and has `collection=*`.
-    ///
-    /// An id that fails the collection-id rule and the own collection id
-    /// give `None`. The selection compares `item` alone, so a `tls:NAME` item
-    /// never selects a group of `tls:*`.
-    pub fn select(&self, item: &AuthItem, namespace: &Namespace) -> Option<&ClientGroup> {
-        self.select_index(item, namespace).map(|i| &self.groups[i])
+    /// The config has at most one group for each item. The selection
+    /// compares `item` alone, so a `tls:NAME` item never selects a group of
+    /// `tls:*`.
+    pub fn select(&self, item: &AuthItem) -> Option<&ClientGroup> {
+        self.select_index(item).map(|i| &self.groups[i])
     }
 
     /// Returns the index in `groups` of the group that
     /// [`select`](ClientAccess::select) returns.
-    pub(crate) fn select_index(&self, item: &AuthItem, namespace: &Namespace) -> Option<usize> {
-        let mut carriers = self.carriers(item).iter().copied();
-        let scope = |i: usize| &self.groups[i].scope;
-        match namespace {
-            Namespace::Local => carriers.find(|&i| *scope(i) == CollectionScope::Local),
-            Namespace::Collection(id) => {
-                if !ostrya_core::is_collection_id(id)
-                    || Some(id.as_str()) == self.collection_id.as_deref()
-                {
-                    return None;
-                }
-                carriers
-                    .clone()
-                    .find(|&i| matches!(scope(i), CollectionScope::Ids(ids) if ids.contains(id)))
-                    .or_else(|| carriers.find(|&i| *scope(i) == CollectionScope::AllOther))
-            }
-        }
+    pub(crate) fn select_index(&self, item: &AuthItem) -> Option<usize> {
+        self.carriers(item).first().copied()
     }
 
     /// Returns the rules of the claims of `claims` for `namespace`, or `None`
@@ -819,8 +734,8 @@ impl ClientAccess {
     /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
     /// let claims = Claims::parse([
     ///     "ostrya:ref:w:main",
-    ///     "ostrya:collection:com.example.own:!secret",
-    ///     "ostrya:collection:com.example.os:r:os/**",
+    ///     "ostrya:ref:!@com.example.own:secret",
+    ///     "ostrya:ref:r:@com.example.os:os/**",
     /// ])
     /// .unwrap();
     /// let local = access.claim_rules(&claims, &Namespace::Local).unwrap();
@@ -862,13 +777,14 @@ impl ClientAccess {
         found.then_some(rules)
     }
 
-    /// Returns the rules of `group` in `namespace`, with the claims of
-    /// `claims`.
+    /// Returns the rules of `group`, with the claims of `claims`.
     ///
-    /// When the group has `tls-accept-claim=true` and
-    /// [`claim_rules`](ClientAccess::claim_rules) gives the rules of
-    /// `claims` for `namespace`, the result is these rules, owned. Else the
-    /// result is the rules of the group, borrowed. The [module
+    /// When the group has `tls-accept-claim=true` and `claims` holds one or
+    /// more claims, the result is owned. It holds the rules of the group, and
+    /// the rules of the claims of each namespace for which `claims` holds a
+    /// claim, as [`claim_rules`](ClientAccess::claim_rules) gives them, in
+    /// place of the rules of the group for that namespace. Else the result is
+    /// the rules of the group, borrowed. The [module
     /// doc](crate::access#claims) states the rule.
     ///
     /// # Examples
@@ -877,38 +793,63 @@ impl ClientAccess {
     /// use std::borrow::Cow;
     ///
     /// use ostrya::config::RepoConfig;
-    /// use ostrya::access::{AuthItem, Claims, ClientAccess, Namespace};
+    /// use ostrya::access::{AccessModes, AuthItem, Claims, ClientAccess, Namespace};
     ///
     /// let config = RepoConfig::parse(
     ///     "[core]\nrepo_version=1\nmode=archive-z2\n\
-    ///      [ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\nallow=r:**\n",
+    ///      [ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
+    ///      allow=r:**;r:@com.example.os:**\n",
     /// )?;
     /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
-    /// let group = access.select(&AuthItem::TlsAny, &Namespace::Local).unwrap();
+    /// let group = access.select(&AuthItem::TlsAny).unwrap();
     /// let claims = Claims::parse(["ostrya:ref:w:main"]).unwrap();
-    /// let rules = access.effective_rules(group, &Namespace::Local, Some(&claims));
+    /// let rules = access.effective_rules(group, Some(&claims));
     /// assert!(matches!(rules, Cow::Owned(_)));
-    /// let rules = access.effective_rules(group, &Namespace::Local, None);
+    /// assert!(rules.rights(&Namespace::Local, "main").contains(AccessModes::WRITE));
+    /// assert!(rules.rights(&Namespace::Local, "other").is_empty());
+    /// let os = Namespace::Collection("com.example.os".into());
+    /// assert_eq!(rules.rights(&os, "os/stable"), AccessModes::READ);
+    /// let rules = access.effective_rules(group, None);
     /// assert!(matches!(rules, Cow::Borrowed(_)));
     /// # Ok::<(), ostrya::Error>(())
     /// ```
     pub fn effective_rules<'g>(
         &self,
         group: &'g ClientGroup,
-        namespace: &Namespace,
         claims: Option<&Claims>,
-    ) -> Cow<'g, AccessRules> {
-        match claims {
-            Some(claims) if group.tls_accept_claim => match self.claim_rules(claims, namespace) {
-                Some(rules) => Cow::Owned(rules),
-                None => Cow::Borrowed(&group.rules),
-            },
-            _ => Cow::Borrowed(&group.rules),
+    ) -> Cow<'g, NamespaceRules> {
+        let claims = match claims {
+            Some(claims) if group.tls_accept_claim && !claims.is_empty() => claims,
+            _ => return Cow::Borrowed(&group.rules),
+        };
+        let mut local: Option<AccessRules> = None;
+        let mut collections: BTreeMap<String, AccessRules> = BTreeMap::new();
+        for claim in claims.as_slice() {
+            let claimed = match &claim.namespace {
+                Namespace::Collection(id) if !self.is_own_collection(id) => {
+                    collections.entry(id.clone()).or_default()
+                }
+                _ => local.get_or_insert_default(),
+            };
+            match &claim.rule {
+                ClaimRule::Allow(item) => claimed.allow.push(item.clone()),
+                ClaimRule::Deny(pattern) => claimed.deny.push(pattern.clone()),
+            }
         }
+        for (id, rules) in &group.rules.collections {
+            if !collections.contains_key(id) {
+                collections.insert(id.clone(), rules.clone());
+            }
+        }
+        Cow::Owned(NamespaceRules {
+            local: local.unwrap_or_else(|| group.rules.local.clone()),
+            collections,
+            other: group.rules.other.clone(),
+        })
     }
 
     /// Returns `true` if the config has one or more client groups, and
-    /// `false` if it has the two implicit groups.
+    /// `false` if it has the implicit group.
     pub fn has_client_groups(&self) -> bool {
         !self.groups.iter().all(ClientGroup::is_implicit)
     }
@@ -1004,7 +945,7 @@ const _: fn() = || {
     assert_send_sync::<ClientGroup>();
     assert_send_sync::<ServerSettings>();
     assert_send_sync::<Namespace>();
-    assert_send_sync::<CollectionScope>();
+    assert_send_sync::<NamespaceRules>();
     assert_send_sync::<AuthItem>();
     assert_send_sync::<IpNet>();
     assert_send_sync::<ForwardedHeader>();
@@ -1042,8 +983,13 @@ mod tests {
         Namespace::Collection(id.to_owned())
     }
 
-    fn selected<'a>(access: &'a ClientAccess, item_text: &str, ns: &Namespace) -> Option<&'a str> {
-        access.select(&item(item_text), ns).map(ClientGroup::name)
+    fn selected<'a>(access: &'a ClientAccess, item_text: &str) -> Option<&'a str> {
+        access.select(&item(item_text)).map(ClientGroup::name)
+    }
+
+    /// Returns the allow items of `rules` as text, in order.
+    fn allow_texts(rules: &AccessRules) -> Vec<String> {
+        rules.allow.iter().map(AllowItem::to_string).collect()
     }
 
     /// The example config of the client groups parses, and each request
@@ -1062,27 +1008,16 @@ trusted-proxy-header=x-forwarded-for
 
 [ex-ostrya client "public"]
 auth=anonymous
-allow=r:**
-
-[ex-ostrya client "public-collections"]
-auth=anonymous
-collection=*
-allow=r:**
+allow=r:**;r:@com.company.os:**
 
 [ex-ostrya client "developer"]
 auth=ssh:user
-allow=cd:devel/user/**
-
-[ex-ostrya client "developer-release"]
-auth=ssh:user
-collection=com.company.client
-allow=c:role/client/main/head;t:role/client/release/**
+allow=cd:devel/user/**;c:@com.company.client:role/client/main/head;t:@com.company.client:role/client/release/**
 sign=release-key
 
 [ex-ostrya client "mirror"]
 auth=tls:mirror.example.com
-collection=com.company.os
-allow=w:os/stable;w:os/beta;t:os/release/**
+allow=w:@com.company.os:os/stable;w:@com.company.os:os/beta;t:@com.company.os:os/release/**
 verify=trust:release
 
 [ex-ostrya client "farm"]
@@ -1104,49 +1039,49 @@ secret-key-file=/etc/ostrya/release.secret
 "#,
         );
         access.check_server(access.server()).unwrap();
-        assert_eq!(access.groups().len(), 7);
+        assert_eq!(access.groups().len(), 5);
         assert!(access.groups().iter().all(|g| !g.is_implicit()));
 
         let os = collection("com.company.os");
         let client = collection("com.company.client");
         let other = collection("org.example.other");
         let local = Namespace::Local;
-        assert_eq!(selected(&access, "anonymous", &local), Some("public"));
-        assert_eq!(
-            selected(&access, "anonymous", &os),
-            Some("public-collections")
-        );
-        assert_eq!(selected(&access, "ssh:user", &local), Some("developer"));
-        assert_eq!(
-            selected(&access, "ssh:user", &client),
-            Some("developer-release")
-        );
-        assert_eq!(selected(&access, "ssh:user", &other), None);
-        assert_eq!(
-            selected(&access, "tls:mirror.example.com", &os),
-            Some("mirror")
-        );
-        assert_eq!(selected(&access, "tls:mirror.example.com", &local), None);
-        assert_eq!(selected(&access, "tls:*", &local), Some("ci-cert"));
-        assert_eq!(selected(&access, "tls:*", &os), None);
-        assert_eq!(selected(&access, "net:10.0.1.0/24", &local), Some("farm"));
-        assert_eq!(
-            selected(&access, "net:2001:0db8::/56", &local),
-            Some("farm")
-        );
+        assert_eq!(selected(&access, "anonymous"), Some("public"));
+        assert_eq!(selected(&access, "ssh:user"), Some("developer"));
+        assert_eq!(selected(&access, "tls:mirror.example.com"), Some("mirror"));
+        assert_eq!(selected(&access, "tls:*"), Some("ci-cert"));
+        assert_eq!(selected(&access, "net:10.0.1.0/24"), Some("farm"));
+        assert_eq!(selected(&access, "net:2001:0db8::/56"), Some("farm"));
+        assert_eq!(selected(&access, "ssh:other"), None);
 
-        let mirror = access.select(&item("tls:mirror.example.com"), &os).unwrap();
+        let public = access.select(&item("anonymous")).unwrap();
+        assert_eq!(public.rules().rights(&local, "main"), AccessModes::READ);
+        assert_eq!(public.rules().rights(&os, "os/stable"), AccessModes::READ);
+        assert!(public.rules().get(&other).is_none());
+        let mirror = access.select(&item("tls:mirror.example.com")).unwrap();
         assert_eq!(mirror.verify_trust(), Some("release"));
         assert!(!mirror.allow_unsigned());
         assert!(mirror.rules().opens_push_session());
         assert_eq!(
-            mirror.rules().rights("os/stable"),
+            mirror.rules().rights(&os, "os/stable"),
             AccessModes::parse("rw").unwrap()
         );
-        let release = access.select(&item("ssh:user"), &client).unwrap();
-        assert_eq!(release.sign(), ["release-key"]);
-        assert!(release.allow_unsigned());
-        let ci = access.select(&item("tls:*"), &local).unwrap();
+        assert_eq!(
+            mirror.rules().rights(&local, "os/stable"),
+            AccessModes::NONE
+        );
+        let developer = access.select(&item("ssh:user")).unwrap();
+        assert_eq!(developer.sign(), ["release-key"]);
+        assert!(developer.allow_unsigned());
+        assert_eq!(
+            developer.rules().rights(&client, "role/client/release/1"),
+            AccessModes::parse("rt").unwrap()
+        );
+        assert_eq!(
+            developer.rules().rights(&local, "devel/user/a"),
+            AccessModes::parse("rcd").unwrap()
+        );
+        let ci = access.select(&item("tls:*")).unwrap();
         assert!(ci.tls_accept_claim());
         assert!(!ci.rules().opens_push_session());
         assert_eq!(
@@ -1159,10 +1094,11 @@ secret-key-file=/etc/ostrya/release.secret
         );
     }
 
-    /// A config with no client group has the two implicit groups, also when
-    /// it has a server group.
+    /// A config with no client group has the implicit group, also when it
+    /// has a server group. The group reads each local ref and each ref of
+    /// each collection.
     #[test]
-    fn a_config_with_no_client_group_has_the_implicit_groups() {
+    fn a_config_with_no_client_group_has_the_implicit_group() {
         for text in [
             "",
             "[ex-ostrya server]\nlisten=127.0.0.1:0\n",
@@ -1170,28 +1106,21 @@ secret-key-file=/etc/ostrya/release.secret
         ] {
             let access = access(text);
             let groups = access.groups();
-            assert_eq!(groups.len(), 2, "{text:?}");
-            assert_eq!(groups[0].name(), "anonymous");
-            assert_eq!(groups[0].scope(), &CollectionScope::Local);
-            assert_eq!(groups[1].name(), "anonymous-collections");
-            assert_eq!(groups[1].scope(), &CollectionScope::AllOther);
-            for group in groups {
-                assert!(group.is_implicit());
-                assert_eq!(group.auth(), [AuthItem::Anonymous]);
-                assert_eq!(group.rules().allow.len(), 1);
-                assert_eq!(group.rules().allow[0].to_string(), "r:**");
-                assert!(group.rules().deny.is_empty());
-                assert!(group.allow_unsigned());
-                assert!(!group.rules().opens_push_session());
+            assert_eq!(groups.len(), 1, "{text:?}");
+            let group = &groups[0];
+            assert_eq!(group.name(), "anonymous");
+            assert!(group.is_implicit());
+            assert_eq!(group.auth(), [AuthItem::Anonymous]);
+            assert_eq!(allow_texts(&group.rules().local), ["r:**"]);
+            assert!(group.rules().local.deny.is_empty());
+            assert!(group.rules().collections.is_empty());
+            for ns in [Namespace::Local, collection("a.b")] {
+                assert_eq!(group.rules().rights(&ns, "x/y"), AccessModes::READ);
             }
-            assert_eq!(
-                selected(&access, "anonymous", &Namespace::Local),
-                Some("anonymous")
-            );
-            assert_eq!(
-                selected(&access, "anonymous", &collection("a.b")),
-                Some("anonymous-collections")
-            );
+            assert!(group.rules().get(&collection("bad")).is_none());
+            assert!(group.allow_unsigned());
+            assert!(!group.rules().opens_push_session());
+            assert_eq!(selected(&access, "anonymous"), Some("anonymous"));
         }
     }
 
@@ -1220,79 +1149,103 @@ secret-key-file=/etc/ostrya/release.secret
         );
     }
 
-    /// One client group of any kind removes the implicit groups.
+    /// One client group of any kind removes the implicit group.
     #[test]
-    fn one_client_group_removes_the_implicit_groups() {
+    fn one_client_group_removes_the_implicit_group() {
         let access = access("[ex-ostrya client \"c\"]\nauth=ssh:c\n");
         assert_eq!(access.groups().len(), 1);
         assert!(!access.groups()[0].is_implicit());
-        assert_eq!(selected(&access, "anonymous", &Namespace::Local), None);
+        assert_eq!(selected(&access, "anonymous"), None);
     }
 
-    /// A group that names the collection wins over a group with `*`, and `*`
-    /// covers each other collection.
+    /// One group holds the items of each namespace. The items of one
+    /// collection never apply to another collection or to the local refs.
     #[test]
-    fn an_exact_collection_wins_over_the_wildcard() {
+    fn one_group_holds_the_items_of_each_namespace() {
         let access = access(
-            "[ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b;c.d\n\
-             [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\n\
-             [ex-ostrya client \"local\"]\nauth=ssh:u\n",
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\n\
+             allow=r:main;w:@a.b:os/**;@c.d:x;d:@a.b:os/old\ndeny=secret;@a.b:os/secret\n",
+        );
+        let rules = access.select(&item("ssh:u")).unwrap().rules();
+        assert_eq!(allow_texts(&rules.local), ["r:main"]);
+        let ab = rules.get(&collection("a.b")).unwrap();
+        assert_eq!(allow_texts(ab), ["w:os/**", "d:os/old"]);
+        assert_eq!(ab.deny.len(), 1);
+        assert_eq!(allow_texts(rules.get(&collection("c.d")).unwrap()), ["r:x"]);
+        assert!(rules.get(&collection("e.f")).is_none());
+        let local = Namespace::Local;
+        assert_eq!(rules.rights(&local, "main"), AccessModes::READ);
+        assert_eq!(rules.rights(&local, "os/a"), AccessModes::NONE);
+        assert_eq!(rules.rights(&local, "secret"), AccessModes::NONE);
+        assert_eq!(
+            rules.rights(&collection("a.b"), "os/old"),
+            AccessModes::parse("rwd").unwrap()
         );
         assert_eq!(
-            selected(&access, "ssh:u", &collection("a.b")),
-            Some("exact")
+            rules.rights(&collection("a.b"), "os/secret"),
+            AccessModes::NONE
         );
+        assert_eq!(rules.rights(&collection("a.b"), "main"), AccessModes::NONE);
+        assert_eq!(rules.rights(&collection("c.d"), "os/a"), AccessModes::NONE);
+        assert_eq!(rules.rights(&collection("e.f"), "x"), AccessModes::NONE);
+        assert!(rules.opens_push_session());
+    }
+
+    /// An item with `@ID:` of the own collection id is an item of the local
+    /// refs. With no own collection id, the item names the collection.
+    #[test]
+    fn an_item_of_the_own_collection_id_is_a_local_item() {
+        let groups = "[ex-ostrya client \"c\"]\nauth=ssh:u\n\
+                      allow=r:a;w:@own.id:b\ndeny=@own.id:a/secret\n";
+        let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n{groups}")).unwrap();
+        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let rules = access.select(&item("ssh:u")).unwrap().rules();
+        assert_eq!(allow_texts(&rules.local), ["r:a", "w:b"]);
+        assert_eq!(rules.local.deny.len(), 1);
+        assert!(rules.collections.is_empty());
+        let own = access.namespace(Some("own.id"));
+        assert_eq!(rules.rights(&own, "b"), AccessModes::parse("rw").unwrap());
+
+        let no_own_id = self::access(groups);
+        let rules = no_own_id.select(&item("ssh:u")).unwrap().rules();
+        assert_eq!(allow_texts(&rules.local), ["r:a"]);
         assert_eq!(
-            selected(&access, "ssh:u", &collection("c.d")),
-            Some("exact")
+            allow_texts(rules.get(&collection("own.id")).unwrap()),
+            ["w:b"]
         );
-        assert_eq!(selected(&access, "ssh:u", &collection("e.f")), Some("any"));
-        assert_eq!(selected(&access, "ssh:u", &Namespace::Local), Some("local"));
-        assert_eq!(selected(&access, "ssh:v", &Namespace::Local), None);
     }
 
     /// The selection never moves to another item.
     #[test]
     fn the_selection_never_falls_back_to_another_item() {
         let access = access(
-            "[ex-ostrya client \"name\"]\nauth=tls:n\ncollection=a.b\n\
-             [ex-ostrya client \"any\"]\nauth=tls:*\n\
-             [ex-ostrya client \"anon\"]\nauth=anonymous\ncollection=*\n",
+            "[ex-ostrya client \"name\"]\nauth=tls:n\n\
+             [ex-ostrya client \"any\"]\nauth=tls:*\n",
         );
-        assert_eq!(selected(&access, "tls:n", &Namespace::Local), None);
-        assert_eq!(selected(&access, "tls:n", &collection("c.d")), None);
-        assert_eq!(selected(&access, "tls:*", &collection("a.b")), None);
-        assert_eq!(selected(&access, "tls:n", &collection("a.b")), Some("name"));
+        assert_eq!(selected(&access, "tls:n"), Some("name"));
+        assert_eq!(selected(&access, "tls:*"), Some("any"));
+        assert_eq!(selected(&access, "anonymous"), None);
     }
 
-    /// An id that fails the collection-id rule and the own collection id
-    /// select no group, and the own id maps to the local namespace.
+    /// The own collection id maps to the local namespace, and an id that
+    /// fails the collection-id rule gives no rules.
     #[test]
-    fn the_own_id_and_an_invalid_id_select_no_collection_group() {
-        let config = RepoConfig::parse(
-            "[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=own.id\n\
-             [ex-ostrya client \"any\"]\nauth=anonymous\ncollection=*\n\
-             [ex-ostrya client \"local\"]\nauth=anonymous\n",
-        )
+    fn the_own_id_maps_to_the_local_namespace() {
+        let config = RepoConfig::parse(&format!(
+            "{CORE}collection-id=own.id\n\
+             [ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n"
+        ))
         .unwrap();
         let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
         assert_eq!(access.namespace(Some("own.id")), Namespace::Local);
         assert_eq!(access.namespace(None), Namespace::Local);
         assert_eq!(access.namespace(Some("a.b")), collection("a.b"));
         assert_eq!(access.namespace(Some("bad")), collection("bad"));
-        assert_eq!(selected(&access, "anonymous", &collection("own.id")), None);
-        assert_eq!(selected(&access, "anonymous", &collection("bad")), None);
-        assert_eq!(selected(&access, "anonymous", &collection("a..b")), None);
-        assert_eq!(
-            selected(&access, "anonymous", &collection("a.b")),
-            Some("any")
-        );
-        let ns = access.namespace(Some("own.id"));
-        assert_eq!(selected(&access, "anonymous", &ns), Some("local"));
-        let any = &access.groups()[0];
-        assert!(any.covers(&collection("a.b")));
-        assert!(!any.covers(&collection("bad")));
-        assert!(!any.covers(&Namespace::Local));
+        let implicit = ClientAccess::implicit(Some("own.id"));
+        let rules = implicit.select(&AuthItem::Anonymous).unwrap().rules();
+        for id in ["bad", "a..b", "1a.b"] {
+            assert!(rules.get(&collection(id)).is_none(), "{id}");
+        }
     }
 
     /// With no own collection id, each id maps to its collection, and no id
@@ -1314,23 +1267,21 @@ secret-key-file=/etc/ostrya/release.secret
         let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:main",
-            "ostrya:collection:a.b:t:os/**",
+            "ostrya:ref:t:@a.b:os/**",
             "ostrya:ref:!secret/**",
-            "ostrya:collection:own.id:d:devel/**",
-            "ostrya:collection:a.b:!os/secret",
+            "ostrya:ref:d:@own.id:devel/**",
+            "ostrya:ref:!@a.b:os/secret",
         ])
         .unwrap();
         let local = access.claim_rules(&claims, &Namespace::Local).unwrap();
-        let allow: Vec<String> = local.allow.iter().map(AllowItem::to_string).collect();
-        assert_eq!(allow, ["w:main", "d:devel/**"]);
+        assert_eq!(allow_texts(&local), ["w:main", "d:devel/**"]);
         assert_eq!(local.deny.len(), 1);
         assert_eq!(local.deny[0].as_str(), "secret/**");
         assert_eq!(local.rights("main"), AccessModes::parse("rw").unwrap());
         assert_eq!(local.rights("secret/a"), AccessModes::NONE);
 
         let ab = access.claim_rules(&claims, &collection("a.b")).unwrap();
-        let allow: Vec<String> = ab.allow.iter().map(AllowItem::to_string).collect();
-        assert_eq!(allow, ["t:os/**"]);
+        assert_eq!(allow_texts(&ab), ["t:os/**"]);
         assert_eq!(ab.rights("os/secret"), AccessModes::NONE);
         assert!(access.claim_rules(&claims, &collection("c.d")).is_none());
         assert!(
@@ -1339,7 +1290,7 @@ secret-key-file=/etc/ostrya/release.secret
                 .is_none()
         );
 
-        let collections_only = Claims::parse(["ostrya:collection:a.b:w:main"]).unwrap();
+        let collections_only = Claims::parse(["ostrya:ref:w:@a.b:main"]).unwrap();
         assert!(
             access
                 .claim_rules(&collections_only, &Namespace::Local)
@@ -1351,27 +1302,26 @@ secret-key-file=/etc/ostrya/release.secret
         assert_eq!(rules.rights("main"), AccessModes::NONE);
 
         let no_own_id = self::access("");
-        let own = Claims::parse(["ostrya:collection:own.id:w:main"]).unwrap();
+        let own = Claims::parse(["ostrya:ref:w:@own.id:main"]).unwrap();
         assert!(no_own_id.claim_rules(&own, &Namespace::Local).is_none());
         assert!(no_own_id.claim_rules(&own, &collection("own.id")).is_some());
     }
 
     /// The namespace of the own collection id gives the rules of the local
-    /// refs: the `ostrya:ref:` claims and the claims of the own id.
+    /// refs: the claims with no `@ID:` and the claims of the own id.
     #[test]
     fn the_own_collection_id_gives_the_claim_rules_of_the_local_refs() {
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
         let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:main",
-            "ostrya:collection:own.id:d:devel/**",
-            "ostrya:collection:a.b:t:os/**",
+            "ostrya:ref:d:@own.id:devel/**",
+            "ostrya:ref:t:@a.b:os/**",
             "ostrya:ref:!secret/**",
         ])
         .unwrap();
         let own = access.claim_rules(&claims, &collection("own.id")).unwrap();
-        let allow: Vec<String> = own.allow.iter().map(AllowItem::to_string).collect();
-        assert_eq!(allow, ["w:main", "d:devel/**"]);
+        assert_eq!(allow_texts(&own), ["w:main", "d:devel/**"]);
         assert_eq!(own.deny.len(), 1);
         assert_eq!(Some(own), access.claim_rules(&claims, &Namespace::Local));
         let refs_only = Claims::parse(["ostrya:ref:w:main"]).unwrap();
@@ -1382,28 +1332,75 @@ secret-key-file=/etc/ostrya/release.secret
         );
     }
 
-    /// `groups_of` gives each group of an item in config order.
+    /// The claims of one namespace replace the rules of the group in that
+    /// namespace alone. The other namespaces keep the rules of the group. A
+    /// claim of a collection with no item in the group gives rules there.
+    /// A group with `tls-accept-claim=false` ignores the claims.
     #[test]
-    fn groups_of_gives_each_group_of_an_item() {
+    fn the_claims_of_one_namespace_keep_the_rules_of_the_others() {
+        let groups = "[ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
+                      allow=r:group/**;r:@a.b:group/**;r:@c.d:group/**\n\
+                      [ex-ostrya client \"names\"]\nauth=tls:n\nallow=r:group/**\n";
+        let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n{groups}")).unwrap();
+        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let certs = access.select(&AuthItem::TlsAny).unwrap();
+        let claims = Claims::parse([
+            "ostrya:ref:w:@a.b:claim/**",
+            "ostrya:ref:@e.f:claim/**",
+            "ostrya:ref:!@own.id:group/secret",
+        ])
+        .unwrap();
+        let rules = access.effective_rules(certs, Some(&claims));
+        assert!(matches!(rules, Cow::Owned(_)));
+        let (ab, cd, ef) = (collection("a.b"), collection("c.d"), collection("e.f"));
+        let local = Namespace::Local;
+        assert_eq!(
+            rules.rights(&ab, "claim/x"),
+            AccessModes::parse("rw").unwrap()
+        );
+        assert_eq!(rules.rights(&ab, "group/x"), AccessModes::NONE);
+        assert_eq!(rules.rights(&cd, "group/x"), AccessModes::READ);
+        assert_eq!(rules.rights(&ef, "claim/x"), AccessModes::READ);
+        assert_eq!(rules.rights(&local, "group/x"), AccessModes::NONE);
+        assert_eq!(rules.rights(&local, "group/secret"), AccessModes::NONE);
+        assert!(rules.local.allow.is_empty());
+
+        let only_ab = Claims::parse(["ostrya:ref:@a.b:claim/**"]).unwrap();
+        let rules = access.effective_rules(certs, Some(&only_ab));
+        assert_eq!(rules.rights(&local, "group/x"), AccessModes::READ);
+        assert_eq!(rules.rights(&cd, "group/x"), AccessModes::READ);
+        assert_eq!(rules.rights(&ab, "group/x"), AccessModes::NONE);
+
+        let none = access.effective_rules(certs, Some(&Claims::default()));
+        assert!(matches!(none, Cow::Borrowed(_)));
+        let names = access.select(&item("tls:n")).unwrap();
+        assert!(matches!(
+            access.effective_rules(names, Some(&claims)),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    /// `groups_of` gives the group of an item.
+    #[test]
+    fn groups_of_gives_the_group_of_an_item() {
         let access = access(
             "[ex-ostrya client \"a\"]\nauth=ssh:u;anonymous\n\
-             [ex-ostrya client \"b\"]\nauth=ssh:v\n\
-             [ex-ostrya client \"c\"]\nauth=ssh:u\ncollection=*\n",
+             [ex-ostrya client \"b\"]\nauth=ssh:v\n",
         );
         let ssh = item("ssh:u");
         let names: Vec<&str> = access.groups_of(&ssh).map(ClientGroup::name).collect();
-        assert_eq!(names, ["a", "c"]);
+        assert_eq!(names, ["a"]);
         assert_eq!(access.groups_of(&item("ssh:w")).count(), 0);
     }
 
-    /// `items` gives each item one time, in the order of its first group.
-    /// Two texts of one network are one item.
+    /// `items` gives each item one time, in the order of its group. Two
+    /// texts of one network are one item.
     #[test]
     fn items_gives_each_item_one_time() {
         let access = access(
             "[ex-ostrya client \"a\"]\nauth=ssh:u;anonymous\n\
-             [ex-ostrya client \"b\"]\nauth=net:2001:0db8::/56;ssh:v\n\
-             [ex-ostrya client \"c\"]\nauth=ssh:u;net:2001:db8::/56;tls:*\ncollection=*\n",
+             [ex-ostrya client \"b\"]\nauth=net:2001:0db8::/56;ssh:v;net:2001:db8::/56\n\
+             [ex-ostrya client \"c\"]\nauth=tls:*\n",
         );
         let items: Vec<String> = access.items().map(AuthItem::to_string).collect();
         assert_eq!(
@@ -1415,13 +1412,13 @@ secret-key-file=/etc/ostrya/release.secret
         assert_eq!(items, [&AuthItem::Anonymous]);
     }
 
-    /// Two groups with one item are refused when their namespaces overlap.
+    /// Two groups with one item are refused, whatever their items name.
     #[test]
-    fn an_item_in_two_overlapping_groups_is_refused() {
+    fn an_item_in_two_groups_is_refused() {
         for (a, b) in [
             ("", ""),
-            ("collection=a.b\n", "collection=c.d;a.b\n"),
-            ("collection=*\n", "collection=*\n"),
+            ("allow=r:@a.b:x\n", "allow=r:@c.d:x\n"),
+            ("allow=r:x\n", "allow=r:@c.d:x\n"),
         ] {
             let text = format!(
                 "[ex-ostrya client \"one\"]\nauth=ssh:u\n{a}\
@@ -1437,23 +1434,6 @@ secret-key-file=/etc/ostrya/release.secret
         let text = "[ex-ostrya client \"one\"]\nauth=net:2001:db8::/56\n\
                     [ex-ostrya client \"two\"]\nauth=net:2001:0db8::/56\n";
         assert!(try_access(text).is_err());
-    }
-
-    /// Two groups with one item are accepted when their namespaces differ.
-    #[test]
-    fn an_item_in_two_disjoint_groups_is_accepted() {
-        for (a, b) in [
-            ("", "collection=*\n"),
-            ("", "collection=a.b\n"),
-            ("collection=a.b\n", "collection=c.d\n"),
-            ("collection=a.b\n", "collection=*\n"),
-        ] {
-            let text = format!(
-                "[ex-ostrya client \"one\"]\nauth=ssh:u\n{a}\
-                 [ex-ostrya client \"two\"]\nauth=ssh:u\n{b}"
-            );
-            try_access(&text).unwrap();
-        }
     }
 
     fn settings() -> ServerSettings {

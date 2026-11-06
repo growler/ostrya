@@ -4565,8 +4565,7 @@ fn a_local_pull_refuses_a_static_delta_list_it_cannot_take() {
             ),
             (
                 PullOptions {
-                    refs: vec!["a:b".to_owned()],
-                    collection_id: Some(COLLECTION.to_owned()),
+                    refs: vec![format!("@{COLLECTION}:a:b")],
                     no_ref_writes: true,
                     static_deltas: Some(vec![listed_delta(Some(1), 2, 3)]),
                     ..PullOptions::default()
@@ -5345,13 +5344,16 @@ fn a_pull_with_no_ref_writes_completes_every_parent_under_depth() {
 /// The collection id that the collection-ref tests read.
 const COLLECTION: &str = "org.example.Os";
 
-/// Returns the options of a pull that writes no ref. The pull reads `refs` as
-/// collection refs of [`COLLECTION`], under the remote name `origin`.
+/// Returns the options of a pull that writes no ref. The pull reads each name
+/// of `refs` as the operand `@COLLECTION:NAME`, under the remote name
+/// `origin`.
 fn collection_pull(refs: &[&str]) -> PullOptions {
     PullOptions {
-        refs: refs.iter().map(|name| (*name).to_owned()).collect(),
+        refs: refs
+            .iter()
+            .map(|name| format!("@{COLLECTION}:{name}"))
+            .collect(),
         remote: Some("origin".to_owned()),
-        collection_id: Some(COLLECTION.to_owned()),
         no_ref_writes: true,
         ..PullOptions::default()
     }
@@ -5650,8 +5652,10 @@ fn an_unreadable_local_ref_of_a_source_of_the_collection_fails_the_pull() {
     });
 }
 
-/// A collection pull that requires static deltas takes the delta from the
-/// commit of the ref under the remote name. The pull keeps that ref unchanged.
+/// A collection pull that requires static deltas and writes no ref takes the
+/// delta from the commit of the collection ref that the operand names in the
+/// destination, and not from the ref under the remote name. The pull keeps
+/// the collection ref unchanged.
 #[test]
 fn a_collection_pull_takes_a_required_delta() {
     let tmp = TmpDir::new("pull-collection-delta");
@@ -5667,18 +5671,17 @@ fn a_collection_pull_takes_a_required_delta() {
         thin.reindex_static_deltas().await.unwrap();
         summarize(&thin).await;
         let (_dst_dir, dst) = dst_holding(base, "dst", &src, &c1).await;
+        let cref = Ref::collection(COLLECTION, "main");
         let txn = dst.transaction().await.unwrap();
-        txn.set_ref(&Ref::remote("origin", "main"), Some(&c1));
+        txn.set_ref(&cref, Some(&c1));
         txn.commit().await.unwrap();
 
         let stats = dst
             .pull_local(
                 &thin,
                 PullOptions {
-                    remote: Some("origin".to_owned()),
-                    collection_id: Some(COLLECTION.to_owned()),
-                    no_ref_writes: true,
-                    ..required(PullFlags::empty())
+                    require_static_deltas: true,
+                    ..collection_pull(&["main"])
                 },
             )
             .await
@@ -5686,10 +5689,8 @@ fn a_collection_pull_takes_a_required_delta() {
 
         assert_eq!(stats.delta_parts, 1);
         assert_eq!(dst.commit_state(&c2).await.unwrap(), CommitState::Normal);
-        assert_eq!(
-            dst.resolve_rev("origin:main", false).await.unwrap(),
-            Some(c1)
-        );
+        assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(c1));
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), None);
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
     });
 }
@@ -5816,8 +5817,9 @@ async fn commit_collection_ref_full(
     commit
 }
 
-/// Returns the options of a pull that reads `refs` as collection refs of
-/// [`COLLECTION`] and writes them, under the remote name `origin`.
+/// Returns the options of a pull that reads each name of `refs` as the
+/// operand `@COLLECTION:NAME` and writes the refs, under the remote name
+/// `origin`.
 fn collection_write_pull(refs: &[&str]) -> PullOptions {
     PullOptions {
         no_ref_writes: false,
@@ -6039,6 +6041,86 @@ fn a_collection_pull_into_the_own_collection_writes_the_local_ref_beside_a_mirro
             vec![("app/a".to_owned(), commit)]
         );
         assert_complete(&src, &dst, &dst_dir, &commit).await;
+    });
+}
+
+/// One local pull takes a plain operand and `@ID:NAME` operands of two
+/// collections. It writes `refs/heads/main`, `refs/mirrors/X/a`, and
+/// `refs/mirrors/Y/b`. Into a destination whose `[core] collection-id` is X,
+/// the operand `@X:a` writes `refs/heads/a`, and no ref under
+/// `refs/mirrors/X/`.
+#[test]
+fn a_local_pull_reads_a_collection_ref_operand() {
+    let tmp = TmpDir::new("pull-collection-operands");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, main) = source_repo(base, RepoMode::BareUser).await;
+        let a = commit_collection_ref(
+            &src,
+            base,
+            "va",
+            "a",
+            None,
+            bound_to(COLLECTION),
+            Some(&["a"]),
+        )
+        .await;
+        let b = commit_collection_ref(
+            &src,
+            base,
+            "vb",
+            "b",
+            None,
+            bound_to("org.example.Other"),
+            Some(&["b"]),
+        )
+        .await;
+        set_ref(&src, "org.example.Other", "b", &b).await;
+        let operands = || PullOptions {
+            refs: vec![
+                "main".to_owned(),
+                format!("@{COLLECTION}:a"),
+                "@org.example.Other:b".to_owned(),
+            ],
+            ..PullOptions::default()
+        };
+
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
+        dst.pull_local(&src, operands()).await.unwrap();
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            vec![("main".to_owned(), main)]
+        );
+        let mut mirrors = dst.list_mirror_refs().await.unwrap();
+        mirrors.sort();
+        assert_eq!(
+            mirrors,
+            vec![
+                (COLLECTION.to_owned(), "a".to_owned(), a),
+                ("org.example.Other".to_owned(), "b".to_owned(), b),
+            ]
+        );
+        for commit in [&main, &a, &b] {
+            assert_complete(&src, &dst, &dst_dir, commit).await;
+        }
+
+        let own_dir = base.join("own");
+        let own = Repo::create(
+            &own_dir,
+            CreateOptions::new(RepoMode::BareUser).collection_id(COLLECTION),
+        )
+        .await
+        .unwrap();
+        own.pull_local(&src, operands()).await.unwrap();
+        assert_eq!(
+            own.list_refs(None).await.unwrap(),
+            vec![("a".to_owned(), a), ("main".to_owned(), main)]
+        );
+        assert_eq!(
+            own.list_mirror_refs().await.unwrap(),
+            vec![("org.example.Other".to_owned(), "b".to_owned(), b)]
+        );
+        assert!(file_inventory(&own_dir, &format!("refs/mirrors/{COLLECTION}")).is_empty());
     });
 }
 
@@ -6605,41 +6687,13 @@ fn disable_verify_bindings_skips_the_ref_binding_alone_in_a_collection_delta_pul
     });
 }
 
-/// A collection pull that names no ref fails before it reads the source, with
-/// and without ref writes. The pull does not change the destination. If the
-/// pull reads an empty list, it pulls the refs under `refs/heads`.
+/// A collection ref path to a directory, or through a file, fails the read of
+/// the ref with [`Error::Io`], as the path of a plain operand does. This is
+/// also true for the path under `refs/heads` of a source whose collection id
+/// is the id of the operand: there, `refs/heads/app` is a ref file, and the
+/// name `app/a` goes through it.
 #[test]
-fn a_collection_pull_is_refused_without_a_ref() {
-    let tmp = TmpDir::new("pull-collection-refused");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::BareUser).await;
-        let before = repo_inventory(&dst_dir);
-
-        for (case, opts) in [
-            ("no ref writes", collection_pull(&[])),
-            ("ref writes", collection_write_pull(&[])),
-        ] {
-            match dst.pull_local(&src, opts).await {
-                Err(Error::Unsupported(msg)) => assert_eq!(
-                    msg, "a local pull with a collection id needs at least one ref name",
-                    "{case}"
-                ),
-                other => panic!("{case}: {other:?}"),
-            }
-            assert_eq!(repo_inventory(&dst_dir), before, "{case}");
-        }
-    });
-}
-
-/// A collection ref path to a directory, or through a file, holds no ref. The
-/// pull fails with `@ID:NAME`, as for an absent ref. This is also true for the
-/// path under `refs/heads` of a source whose collection id is the id of the
-/// pull: there, `refs/heads/app` is a ref file, and the name `app/a` goes
-/// through it.
-#[test]
-fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
+fn a_collection_ref_path_through_a_directory_or_a_file_fails_the_read() {
     let tmp = TmpDir::new("pull-collection-not-a-ref");
     block_on(async {
         let base = tmp.path();
@@ -6647,13 +6701,16 @@ fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
         set_ref(&src, COLLECTION, "main/sub", &c2).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        for name in ["main", "main/sub/x"] {
+        for (name, kind) in [
+            ("main", std::io::ErrorKind::IsADirectory),
+            ("main/sub/x", std::io::ErrorKind::NotADirectory),
+        ] {
             let err = dst
                 .pull_local(&src, collection_pull(&[name]))
                 .await
                 .unwrap_err();
             match err {
-                Error::RefNotFound(pair) => assert_eq!(pair, format!("@{COLLECTION}:{name}")),
+                Error::Io(e) => assert_eq!(e.kind(), kind, "{name}"),
                 other => panic!("{name}: {other:?}"),
             }
             assert_nothing_left(&dst_dir, &dst, &c2).await;
@@ -6667,24 +6724,24 @@ fn a_collection_ref_path_through_a_directory_or_a_file_is_not_found() {
             .await
             .unwrap_err();
         match err {
-            Error::RefNotFound(pair) => assert_eq!(pair, format!("@{COLLECTION}:app/a")),
+            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory),
             other => panic!("app/a: {other:?}"),
         }
         assert_nothing_left(&dst_dir, &dst, &app).await;
     });
 }
 
-/// With a collection id, an abbreviated checksum is part of the ref name, and
-/// an ancestry suffix makes the name invalid. The source holds `main` under
-/// `refs/heads` and as a collection ref. If the pull reads the checksum as a
-/// revision, it finds a commit. If it reads `main^` as a revision, it pulls
-/// the parent of `main`.
+/// An `@ID:NAME` operand takes an ancestry suffix: `@ID:main^` pulls the
+/// parent of the collection ref `main`, and not of the local ref `main`. An
+/// abbreviated checksum after `@ID:` is part of the ref name. The source
+/// holds `main` under `refs/heads` at `c2`, and as a collection ref at `c2`.
+/// The ref-binding check reads the operand less `@ID:`, with the suffix.
 #[test]
-fn a_collection_ref_name_takes_no_revision_syntax() {
+fn a_local_pull_reads_a_collection_revision_operand() {
     let tmp = TmpDir::new("pull-collection-revision");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
         set_ref(&src, COLLECTION, "main", &c2).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         let hex = c2.to_hex();
@@ -6700,24 +6757,37 @@ fn a_collection_ref_name_takes_no_revision_syntax() {
         }
         assert_nothing_left(&dst_dir, &dst, &c2).await;
 
-        let name = "main^";
+        // The ref-binding check reads `main^`, which the binding of `c1`
+        // does not name, as for the plain operand `main^`.
         let err = dst
-            .pull_local(&src, collection_pull(&[name]))
+            .pull_local(&src, collection_pull(&["main^"]))
             .await
             .unwrap_err();
-        match err {
-            Error::InvalidRefspec(pair) => assert_eq!(pair, format!("@{COLLECTION}:{name}")),
-            other => panic!("{name}: {other:?}"),
-        }
-        assert_nothing_left(&dst_dir, &dst, &c2).await;
+        assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        assert!(err.to_string().contains("'main^'"), "{err}");
+        assert_nothing_left(&dst_dir, &dst, &c1).await;
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..collection_pull(&["main^"])
+            },
+        )
+        .await
+        .unwrap();
+        assert_complete(&src, &dst, &dst_dir, &c1).await;
+        assert!(!dst.has_object(ObjectType::Commit, &c2).await.unwrap());
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
     });
 }
 
-/// The pull refuses an invalid collection id, and a name that fails the
-/// ref-name rule, before it reads the source, with and without ref writes. The
-/// error holds the pair. The pull requires static deltas and the source holds
-/// no summary. If the check comes after the first read of the source, the
-/// error is that of the absent summary, as for the valid pair.
+/// The pull refuses an `@ID:NAME` operand with an invalid collection id, or
+/// with a name that fails the ref-name rule, before it reads the source, with
+/// and without ref writes. The error holds the operand. The pull requires
+/// static deltas and the source holds no summary. If the check comes after the
+/// first read of the source, the error is that of the absent summary, as for
+/// the valid operand.
 #[test]
 fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
     let tmp = TmpDir::new("pull-collection-invalid");
@@ -6728,8 +6798,7 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
         let before = repo_inventory(&dst_dir);
         for no_ref_writes in [true, false] {
             let opts = |id: &str, name: &str| PullOptions {
-                refs: vec![name.to_owned()],
-                collection_id: Some(id.to_owned()),
+                refs: vec![format!("@{id}:{name}")],
                 no_ref_writes,
                 require_static_deltas: true,
                 ..PullOptions::default()
@@ -6750,7 +6819,7 @@ fn an_invalid_collection_id_or_name_is_refused_before_the_source_is_read() {
                 (COLLECTION, "a:b"),
                 (COLLECTION, "x:"),
                 (COLLECTION, ":y"),
-                (COLLECTION, "main^"),
+                (COLLECTION, "^"),
                 (COLLECTION, "a b"),
                 (COLLECTION, "-a"),
             ] {

@@ -65,7 +65,7 @@ use super::{
     CheckedMeta, ModeChecks, Pinned, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
     READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, completes_marked, refuse_remote_collection, take_static_deltas,
+    check_tip_refs, completes_marked, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -544,10 +544,6 @@ impl Repo {
     ///
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
-    /// - [`Error::Unsupported`] if
-    ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
-    ///   no collection ref. [`pull_collection`](Repo::pull_collection) pulls
-    ///   collection refs.
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under [`MIRROR`](PullFlags::MIRROR).
@@ -705,7 +701,6 @@ impl Repo {
         // costs no request and opens no transaction.
         let subpaths = Subpaths::parse(&opts.subpaths)?;
         check_depth(opts.depth)?;
-        refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
         // The pull reads the rule one time, here. A value that is not a
@@ -814,9 +809,6 @@ impl Repo {
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
-    /// - [`Error::Unsupported`] if
-    ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
-    ///   no collection ref.
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under `MIRROR`.
@@ -2360,7 +2352,6 @@ pub(super) async fn s3_fetcher(
 async fn check_session_pull(opts: &mut PullOptions) -> Result<(Option<Subpaths>, Option<Edges>)> {
     let subpaths = Subpaths::parse(&opts.subpaths)?;
     check_depth(opts.depth)?;
-    refuse_remote_collection(opts)?;
     check_remote_option(opts)?;
     check_static_deltas(opts)?;
     if opts.refs.is_empty() {

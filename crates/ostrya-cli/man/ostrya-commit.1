@@ -27,7 +27,7 @@ Without this option, the parent is the branch name resolved as a revision, unles
 \fB\-b\fR, \fB\-\-branch\fR \fIBRANCH\fR
 Point this branch at the new commit and bind it into the commit.
 .IP
-The command needs \%\-\-branch or \%\-\-orphan. The branch name goes into the \fB\%ostree.ref\-binding\fR metadata key, unless \%\-\-no\-bindings is given. The command refuses a name that the \%ref\-name rule refuses, and a name of \%64 lowercase hexadecimal characters. It checks the name after it reads the tree. A refused name gives no new object and no ref.
+The command needs \%\-\-branch or \%\-\-orphan. BRANCH is NAME, \%REMOTE:NAME, or \%@ID:NAME. \%@ID:NAME is the ref NAME of the collection ID, under \fB\%refs/mirrors/ID\fR, or the local ref NAME if ID is the collection id of the repository. The branch name goes into the \fB\%ostree.ref\-binding\fR metadata key, unless \%\-\-no\-bindings is given. For \%@ID:NAME, the key holds NAME. The help of \%\-\-tag states the namespace rule and the \fB\%ostree.collection\-binding\fR key. The command refuses a name that the \%ref\-name rule refuses, and a local name of \%64 lowercase hexadecimal characters. It checks the name after it reads the tree. A refused name gives no new object and no ref.
 .TP
 \fB\-\-orphan\fR
 Take no implicit parent, and permit a commit that names no branch.
@@ -65,11 +65,13 @@ Bind this ref name into the commit beside the branch.
 The option can occur more than once. The \fB\%ostree.ref\-binding\fR key holds the \%\-\-branch name, each \%\-\-tag name, and each \%\-\-bind\-ref name, sorted byte by byte. The command moves no ref for a \%\-\-bind\-ref name.
 .TP
 \fB\-\-tag\fR \fINAME\fR
-Create the local ref NAME at the new commit, and bind NAME into it.
+Create the ref NAME at the new commit, and bind NAME into it.
 .IP
-The option can occur more than once. Each NAME goes into the \fB\%ostree.ref\-binding\fR key, as a \%\-\-bind\-ref name does. After the command publishes the objects, it writes the \%\-\-branch ref and then each ref NAME under \fB\%refs/heads\fR, one ref at a time. A name that is also a \%\-\-bind\-ref name occurs two times in the key.
+NAME is a local ref NAME, or \%@ID:NAME, the ref NAME of the collection ID. \%@ID:NAME is the local ref NAME if ID is the collection id of the repository. The option can occur more than once. Each name goes into the \fB\%ostree.ref\-binding\fR key, as a \%\-\-bind\-ref name does. For \%@ID:NAME, the key holds NAME. After the command publishes the objects, it writes the \%\-\-branch ref and then each ref NAME, under \fB\%refs/heads\fR or \fB\%refs/mirrors/ID\fR, one ref at a time. A name that is also a \%\-\-bind\-ref name occurs two times in the key.
 .IP
-NAME passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase hexadecimal characters. NAME is not the \%\-\-branch name, and each NAME occurs one time. No name of \%\-\-branch and \%\-\-tag is a path below another of these names. The command refuses a NAME that has an entry under \fB\%refs/heads\fR: a ref, an alias, or a directory of refs. It also refuses a NAME below a ref. A refused NAME gives no new object and no ref. The command reads the path of each NAME again before it publishes the objects. If another writer creates a ref at the path after this read, the command replaces that ref. The option conflicts with \%\-\-no\-bindings and \%\-\-skip\-if\-unchanged.
+The refs of \%\-\-branch and \%\-\-tag are in one namespace: the local refs, or the refs of one collection ID. A \%REMOTE:NAME branch is in the local namespace. The command refuses refs of two namespaces. The \fB\%ostree.collection\-binding\fR key holds the ID of the namespace, or the collection id of the repository for the local namespace.
+.IP
+NAME passes the \%ref\-name rule, is not \%REMOTE:NAME, and is not a local name of \%64 lowercase hexadecimal characters. NAME is not the \%\-\-branch ref, and each ref occurs one time. No ref of \%\-\-branch and \%\-\-tag is a path below another of these refs. The command refuses a NAME that has an entry at its path: a ref, an alias, or a directory of refs. It also refuses a NAME below a ref. A refused NAME gives no new object and no ref. The command reads the path of each NAME again before it publishes the objects. If another writer creates a ref at the path after this read, the command replaces that ref. The option conflicts with \%\-\-no\-bindings and \%\-\-skip\-if\-unchanged.
 .TP
 \fB\-\-related\fR \fINAME=CHECKSUM\fR
 Name a dependency of the commit in field \%2 of the commit object.

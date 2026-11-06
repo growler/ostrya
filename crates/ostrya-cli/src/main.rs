@@ -63,11 +63,12 @@ use ostrya::{
     Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult, FsckBindingError,
     FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, KeyFile,
     MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RemoteSource,
-    RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
-    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
-    Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RefSelector,
+    RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary,
+    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
+    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
+    from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -890,11 +891,16 @@ struct CommitArgs {
     parent: Option<String>,
     /// Point this branch at the new commit and bind it into the commit.
     ///
-    /// The command needs --branch or --orphan. The branch name goes into the
-    /// `ostree.ref-binding` metadata key, unless --no-bindings is given. The
-    /// command refuses a name that the ref-name rule refuses, and a name of
-    /// 64 lowercase hexadecimal characters. It checks the name after it reads
-    /// the tree. A refused name gives no new object and no ref.
+    /// The command needs --branch or --orphan. BRANCH is NAME, REMOTE:NAME,
+    /// or @ID:NAME. @ID:NAME is the ref NAME of the collection ID, under
+    /// `refs/mirrors/ID`, or the local ref NAME if ID is the collection id of
+    /// the repository. The branch name goes into the `ostree.ref-binding`
+    /// metadata key, unless --no-bindings is given. For @ID:NAME, the key
+    /// holds NAME. The help of --tag states the namespace rule and the
+    /// `ostree.collection-binding` key. The command refuses a name that the
+    /// ref-name rule refuses, and a local name of 64 lowercase hexadecimal
+    /// characters. It checks the name after it reads the tree. A refused name
+    /// gives no new object and no ref.
     #[arg(short, long)]
     branch: Option<String>,
     /// Take no implicit parent, and permit a commit that names no branch.
@@ -951,24 +957,33 @@ struct CommitArgs {
     /// byte by byte. The command moves no ref for a --bind-ref name.
     #[arg(long = "bind-ref", value_name = "BRANCH")]
     bind_ref: Vec<String>,
-    /// Create the local ref NAME at the new commit, and bind NAME into it.
+    /// Create the ref NAME at the new commit, and bind NAME into it.
     ///
-    /// The option can occur more than once. Each NAME goes into the
-    /// `ostree.ref-binding` key, as a --bind-ref name does. After the command
-    /// publishes the objects, it writes the --branch ref and then each ref
-    /// NAME under `refs/heads`, one ref at a time. A name that is also a
-    /// --bind-ref name occurs two times in the key.
+    /// NAME is a local ref NAME, or @ID:NAME, the ref NAME of the collection
+    /// ID. @ID:NAME is the local ref NAME if ID is the collection id of the
+    /// repository. The option can occur more than once. Each name goes into
+    /// the `ostree.ref-binding` key, as a --bind-ref name does. For @ID:NAME,
+    /// the key holds NAME. After the command publishes the objects, it writes
+    /// the --branch ref and then each ref NAME, under `refs/heads` or
+    /// `refs/mirrors/ID`, one ref at a time. A name that is also a --bind-ref
+    /// name occurs two times in the key.
     ///
-    /// NAME passes the ref-name rule, has no `:`, and is not 64 lowercase
-    /// hexadecimal characters. NAME is not the --branch name, and each NAME
-    /// occurs one time. No name of --branch and --tag is a path below another
-    /// of these names. The command refuses a NAME that has an entry under
-    /// `refs/heads`: a ref, an alias, or a directory of refs. It also refuses
-    /// a NAME below a ref. A refused NAME gives no new object and no ref. The
-    /// command reads the path of each NAME again before it publishes the
-    /// objects. If another writer creates a ref at the path after this read,
-    /// the command replaces that ref. The option conflicts with --no-bindings
-    /// and --skip-if-unchanged.
+    /// The refs of --branch and --tag are in one namespace: the local refs, or
+    /// the refs of one collection ID. A REMOTE:NAME branch is in the local
+    /// namespace. The command refuses refs of two namespaces. The
+    /// `ostree.collection-binding` key holds the ID of the namespace, or the
+    /// collection id of the repository for the local namespace.
+    ///
+    /// NAME passes the ref-name rule, is not REMOTE:NAME, and is not a local
+    /// name of 64 lowercase hexadecimal characters. NAME is not the --branch
+    /// ref, and each ref occurs one time. No ref of --branch and --tag is a
+    /// path below another of these refs. The command refuses a NAME that has
+    /// an entry at its path: a ref, an alias, or a directory of refs. It also
+    /// refuses a NAME below a ref. A refused NAME gives no new object and no
+    /// ref. The command reads the path of each NAME again before it publishes
+    /// the objects. If another writer creates a ref at the path after this
+    /// read, the command replaces that ref. The option conflicts with
+    /// --no-bindings and --skip-if-unchanged.
     #[arg(
         long = "tag",
         value_name = "NAME",
@@ -1528,6 +1543,8 @@ struct RefsArgs {
     ///
     /// Without this switch, the command prints the part of the name below the
     /// PREFIX. A ref whose name is equal to the PREFIX prints its whole name.
+    /// A ref of a collection prints as `@ID:NAME` with and without this
+    /// switch.
     #[arg(long)]
     list: bool,
     /// Print the commit checksum of each ref after a tab.
@@ -1540,14 +1557,20 @@ struct RefsArgs {
     /// If a PREFIX names a ref, the command prints that ref with its commit
     /// checksum as the target. Each other PREFIX selects the aliases below it.
     /// With --create, the new ref is an alias. Its target must be a ref, and
-    /// NEWREF must not name a remote ref. -c wins over this switch.
+    /// NEWREF must not name a remote ref. An alias is a local ref, so NEWREF
+    /// and the target must not name a collection ref, and the command refuses
+    /// an `@ID:` PREFIX. If ID is the collection id of the repository,
+    /// `@ID:NAME` is the local ref NAME. -c wins over this switch.
     #[arg(short = 'A', long)]
     alias: bool,
     /// Create the ref NEWREF, and point it at the commit that PREFIX names.
     ///
     /// The command line must give exactly one PREFIX argument, which is a
-    /// revision here. If NEWREF exists and --force is not given, the command
-    /// fails. With -A, NEWREF is an alias of the ref that PREFIX names. With
+    /// revision here. NEWREF is NAME, REMOTE:NAME, or @ID:NAME. @ID:NAME is
+    /// the collection ref `refs/mirrors/ID/NAME`, or the local ref NAME if ID
+    /// is the collection id of the repository. If NEWREF exists and --force
+    /// is not given, the command fails. With -A, NEWREF is an alias of the
+    /// ref that PREFIX names. With
     /// -c, NEWREF is `<collection-id>:<ref>`, and the command writes the
     /// collection ref `refs/mirrors/<collection-id>/<ref>`. If
     /// `<collection-id>` is the collection id of the repository, the command
@@ -1570,9 +1593,12 @@ struct RefsArgs {
     /// The ref-name prefixes to match, or the collection ids with -c.
     ///
     /// A PREFIX matches the ref with that name and each ref below it.
-    /// `<remote>:` matches each ref of the remote. With no PREFIX, the command
-    /// lists every ref. With --create, the one PREFIX is the revision that the
-    /// new ref points at.
+    /// `<remote>:` matches each ref of the remote. `@ID:` matches each ref of
+    /// the collection ID under `refs/mirrors/ID`, and `@ID:PREFIX` matches the
+    /// refs of ID by the rule of a PREFIX. If ID is the collection id of the
+    /// repository, `@ID:PREFIX` is PREFIX, and `@ID:` matches each local ref.
+    /// With no PREFIX, the command lists every local and remote ref. With
+    /// --create, the one PREFIX is the revision that the new ref points at.
     prefix: Vec<String>,
 }
 
@@ -2598,14 +2624,17 @@ struct PruneArgs {
     static_deltas_only: bool,
     /// Keep DEPTH parents of BRANCH, in place of --depth for that branch.
     ///
-    /// DEPTH is a decimal integer with an optional leading `-`. The option can
-    /// occur more than once, and the last value for a branch applies. The
-    /// value 0 keeps the branch at --depth. The walk starts from the refs
-    /// alone, as with --refs-only.
+    /// BRANCH is NAME, REMOTE:NAME, or @ID:NAME. @ID:NAME names the collection
+    /// ref NAME of the collection ID, and it names the local ref NAME if ID is
+    /// the collection id of the repository. DEPTH is a decimal integer with an
+    /// optional leading `-`. The option can occur more than once, and the last
+    /// value for a branch applies. The value 0 keeps the branch at --depth.
+    /// The walk starts from the refs alone, as with --refs-only.
     #[arg(long, value_name = "BRANCH=DEPTH")]
     retain_branch_depth: Vec<String>,
     /// Prune BRANCH alone. Every other branch keeps its whole ancestry.
     ///
+    /// BRANCH is NAME, REMOTE:NAME, or @ID:NAME, as for --retain-branch-depth.
     /// The option can occur more than once. A branch that
     /// --retain-branch-depth names is also pruned, to its own depth. The walk
     /// starts from the refs alone, as with --refs-only. The command reads each
@@ -5179,8 +5208,16 @@ struct PullLocalArgs {
     src_repo: Option<PathBuf>,
     /// The refs to pull.
     ///
-    /// With none, the pull takes every local ref of the source, under
-    /// `refs/heads`.
+    /// Each value is a revision of the source: a ref NAME, REMOTE:NAME, or
+    /// @ID:NAME, or a checksum, with an optional `^` suffix. @ID:NAME is the
+    /// ref NAME of the collection ID in the source, under
+    /// `refs/mirrors/ID`, or the local ref NAME if ID is the collection id of
+    /// the source. The pull writes @ID:NAME to `refs/mirrors/ID/NAME`, or to
+    /// the local ref NAME if ID is the collection id of this repository, also
+    /// with --remote. The commit of @ID:NAME must hold the
+    /// `ostree.collection-binding` ID, and --disable-verify-bindings does not
+    /// change this. With none, the pull takes every local ref of the source,
+    /// under `refs/heads`.
     refs: Vec<String>,
 }
 
@@ -8543,11 +8580,12 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // The names of `--tag` are checked before the repository lock. A tag
     // whose ref path has an entry is refused here, and again before the
     // transaction publishes.
-    if let Some(message) = tag_name_refusal(args.branch.as_deref(), &args.tags) {
+    let own = repo.config().collection_id();
+    if let Some(message) = tag_name_refusal(args.branch.as_deref(), &args.tags, own) {
         exit_error(&message);
     }
     for tag in &args.tags {
-        if let Some(message) = existing_tag_refusal(repo.path(), tag) {
+        if let Some(message) = existing_tag_refusal(repo.path(), tag, own) {
             exit_error(&message);
         }
     }
@@ -8609,7 +8647,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         // commit is written.
         None => match args.branch.as_deref() {
             Some(branch)
-                if shadowed_branch_name(branch).is_none() && validate_refspec(branch).is_ok() =>
+                if shadowed_branch_name(branch).is_none() && branch.parse::<Ref>().is_ok() =>
             {
                 match repo.resolve_rev(branch, true).await {
                     Ok(found) => found,
@@ -8905,11 +8943,12 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // of the tree can come first. `exit_error` runs no destructor, so the
     // abort reaps the staging directory before the exit.
     if let Some(branch) = args.branch.as_deref() {
-        if let Some(message) = shadowed_branch_name(branch) {
+        let branch_ref = commit_ref(branch, own);
+        if let Some(message) = branch_ref.as_ref().and_then(shadowed_ref_name) {
             txn.abort().await?;
             exit_error(&message);
         }
-        if validate_refspec(branch).is_err() {
+        if branch_ref.is_none() {
             txn.abort().await?;
             exit_error(&format!("Invalid refspec {branch}"));
         }
@@ -8931,7 +8970,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // `txn.commit` publishes the objects before it writes the refs, so a ref
     // that another writer creates in that step is replaced.
     for tag in &args.tags {
-        if let Some(message) = existing_tag_refusal(repo.path(), tag) {
+        if let Some(message) = existing_tag_refusal(repo.path(), tag, own) {
             txn.abort().await?;
             exit_error(&message);
         }
@@ -8955,48 +8994,72 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
 /// Returns the refusal of the `--tag` names of a commit, or `None` if each
 /// name is good.
 ///
-/// A tag is a local ref, so a name with `:` is refused. A name that the
-/// ref-name rule refuses, and a name of 64 lowercase hex characters, are
+/// `own` is the `[core] collection-id` of the repository. Each `--tag` and
+/// `--branch` value is read as a ref, and `@OWN:NAME` is the local ref NAME. A
+/// tag is a local ref or a collection ref, so a remote ref is refused. A name
+/// that is not a ref, and a local ref of 64 lowercase hex characters, are
 /// refused with the words of a refused branch. A tag that is the branch, and
-/// a tag named twice, are also refused.
+/// a tag named twice, are also refused. Two values name the same ref if they
+/// read as the same ref.
 ///
-/// After these checks, a name that is a path below another name is refused,
-/// because the ref file of the outer name blocks the directory of the inner
-/// name. The check covers each tag and the branch. It skips a branch with `:`,
-/// which is a ref under `refs/remotes`, and a branch that the ref write
-/// refuses with its own message.
-fn tag_name_refusal(branch: Option<&str>, tags: &[String]) -> Option<String> {
+/// After these checks, the refs of the branch and of the tags must be in one
+/// namespace ([`commit_namespace`]). Then a ref that is a path below another
+/// ref of the same directory is refused, because the ref file of the outer
+/// ref blocks the directory of the inner ref. The checks of the namespace and
+/// of the paths cover each tag and the branch. They skip a branch that the
+/// ref write refuses with its own message.
+fn tag_name_refusal(branch: Option<&str>, tags: &[String], own: Option<&str>) -> Option<String> {
+    let branch_ref = branch
+        .and_then(|branch| commit_ref(branch, own))
+        .filter(|r| shadowed_ref_name(r).is_none());
     let mut seen = HashSet::new();
+    let mut names: Vec<(&str, &str, Ref)> = Vec::new();
+    if let (Some(branch), Some(r)) = (branch, &branch_ref) {
+        names.push(("--branch", branch, r.clone()));
+    }
     for tag in tags {
-        if tag.contains(':') {
-            return Some(format!("--tag {tag} holds ':', and a tag is a local ref"));
-        }
-        if validate_refspec(tag).is_err() {
+        let Some(r) = commit_ref(tag, own) else {
             return Some(format!("Invalid refspec {tag}"));
+        };
+        if matches!(r, Ref::Remote { .. }) {
+            return Some(format!(
+                "--tag {tag} names a remote ref, and a tag is a local ref or a collection ref"
+            ));
         }
-        if let Some(message) = shadowed_branch_name(tag) {
+        if let Some(message) = shadowed_ref_name(&r) {
             return Some(message);
         }
-        if branch == Some(tag.as_str()) {
+        if branch_ref.as_ref() == Some(&r) {
             return Some(format!("--tag {tag} is also the --branch name"));
         }
-        if !seen.insert(tag.as_str()) {
+        if !seen.insert(r.clone()) {
             return Some(format!("--tag {tag} is given more than once"));
         }
+        names.push(("--tag", tag.as_str(), r));
     }
-    let local_branch = branch.filter(|branch| {
-        !branch.contains(':')
-            && shadowed_branch_name(branch).is_none()
-            && validate_refspec(branch).is_ok()
-    });
-    let names: Vec<(&str, &str)> = local_branch
-        .map(|branch| ("--branch", branch))
-        .into_iter()
-        .chain(tags.iter().map(|tag| ("--tag", tag.as_str())))
-        .collect();
-    for &(inner_option, inner) in &names {
-        for &(outer_option, outer) in &names {
-            if inner.starts_with(&format!("{outer}/")) {
+    if let Some((first_option, first, first_ref)) = names.first() {
+        for (option, text, r) in &names[1..] {
+            if collection_of(r) != collection_of(first_ref) {
+                return Some(format!(
+                    "{option} {text} and {first_option} {first} name refs of two \
+                     namespaces, and the refs of a commit are in one namespace"
+                ));
+            }
+        }
+    }
+    for (inner_option, inner, inner_ref) in &names {
+        for (outer_option, outer, outer_ref) in &names {
+            let same_dir = match (inner_ref, outer_ref) {
+                (Ref::Local { .. }, Ref::Local { .. }) => true,
+                (Ref::Remote { remote: a, .. }, Ref::Remote { remote: b, .. })
+                | (Ref::Collection { id: a, .. }, Ref::Collection { id: b, .. }) => a == b,
+                _ => false,
+            };
+            if same_dir
+                && inner_ref
+                    .name()
+                    .starts_with(&format!("{}/", outer_ref.name()))
+            {
                 return Some(format!(
                     "{inner_option} {inner} names a path below {outer_option} {outer}"
                 ));
@@ -9006,20 +9069,74 @@ fn tag_name_refusal(branch: Option<&str>, tags: &[String]) -> Option<String> {
     None
 }
 
+/// Reads a `--branch` or `--tag` value of a commit as a ref of a repository
+/// whose `[core] collection-id` is `own`. `@OWN:NAME` gives the local ref
+/// NAME. Returns `None` if the value is not the text of a ref.
+fn commit_ref(text: &str, own: Option<&str>) -> Option<Ref> {
+    match text.parse::<Ref>().ok()? {
+        Ref::Collection { id, name } if Some(id.as_str()) == own => Some(Ref::Local { name }),
+        r => Some(r),
+    }
+}
+
+/// Returns the refusal of a local ref whose name the revision syntax
+/// shadows, as [`shadowed_branch_name`] states. Each other ref gives `None`.
+fn shadowed_ref_name(r: &Ref) -> Option<String> {
+    match r {
+        Ref::Local { name } => shadowed_branch_name(name),
+        _ => None,
+    }
+}
+
+/// Returns the collection id of the namespace of a ref of a commit, as
+/// [`commit_ref`] reads it: the id of a collection ref, and `None` for the
+/// local namespace. A remote ref is in the local namespace.
+fn collection_of(r: &Ref) -> Option<&str> {
+    match r {
+        Ref::Collection { id, .. } => Some(id),
+        _ => None,
+    }
+}
+
+/// Returns the collection id of the namespace of the refs of a commit, or
+/// `None` for the local namespace.
+///
+/// The namespace is the collection X of each `@X:NAME` value of `--branch`
+/// and `--tag` whose X is not `own`, the `[core] collection-id` of the
+/// repository. A commit with no such value is in the local namespace.
+/// [`tag_name_refusal`] refuses the values of two namespaces.
+fn commit_namespace(branch: Option<&str>, tags: &[String], own: Option<&str>) -> Option<String> {
+    branch
+        .into_iter()
+        .chain(tags.iter().map(String::as_str))
+        .filter_map(|text| commit_ref(text, own))
+        .find_map(|r| match r {
+            Ref::Collection { id, .. } => Some(id),
+            _ => None,
+        })
+}
+
 /// Returns the refusal of a `--tag` name that has an entry at its ref path,
 /// or `None` if the path is absent.
 ///
-/// The path is `refs/heads/<tag>` in the repository at `repo_path`. The
-/// lookup reads each component with no symlink follow. Each component before
-/// the last must be a directory. The check refuses a regular file, a
-/// symlink (also a dangling one), and a directory at the last component. It
-/// also refuses a component before the last that is not a directory. Only a
-/// component that is absent gives `None`. A lookup error other than an
-/// absent entry is also a refusal.
-fn existing_tag_refusal(repo_path: &Path, tag: &str) -> Option<String> {
+/// The path is `refs/mirrors/X/<name>` in the repository at `repo_path` for a
+/// tag `@X:<name>` whose X is not `own`, the `[core] collection-id` of the
+/// repository, and `refs/heads/<name>` for each other tag. The lookup reads
+/// each component with no symlink follow. Each component before the last must
+/// be a directory. The check refuses a regular file, a symlink (also a
+/// dangling one), and a directory at the last component. It also refuses a
+/// component before the last that is not a directory. Only a component that
+/// is absent gives `None`. A lookup error other than an absent entry is also
+/// a refusal.
+fn existing_tag_refusal(repo_path: &Path, tag: &str, own: Option<&str>) -> Option<String> {
     let exists = || format!("--tag specified but ref {tag} already exists");
-    let mut path = repo_path.join("refs/heads");
-    let mut components = tag.split('/').peekable();
+    let (dir, name) = match commit_ref(tag, own) {
+        Some(Ref::Collection { id, name }) => (format!("refs/mirrors/{id}"), name),
+        Some(r) => ("refs/heads".to_owned(), r.name().to_owned()),
+        None => ("refs/heads".to_owned(), tag.to_owned()),
+    };
+    let mut path = repo_path.join(dir);
+    let mut components = name.split('/').peekable();
     while let Some(component) = components.next() {
         path.push(component);
         match std::fs::symlink_metadata(&path) {
@@ -11207,14 +11324,31 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
     // ostrya checks NEWREF as a ref name after the existence check and before
     // the positional resolves. This is the order of the `ostree` command. A
     // `^` fails the ref-name rule, so a name with an ancestry suffix is
-    // refused at this step.
-    if validate_refspec(newref).is_err() {
+    // refused at this step. With -c, NEWREF is `<collection-id>:<ref>`, which
+    // the refspec rule reads. Without -c, NEWREF is a ref: NAME, REMOTE:NAME,
+    // or @ID:NAME.
+    let valid = if args.collections {
+        validate_refspec(newref).is_ok()
+    } else {
+        newref.parse::<Ref>().is_ok()
+    };
+    if !valid {
         exit_error(&format!("Invalid refspec {newref}"));
     }
     if args.collections {
         return refs_create_collection(repo, newref, existing).await;
     }
     if args.alias {
+        // An alias is a local ref. `@OWN:NAME`, where OWN is the collection id
+        // of the repository, is the local ref NAME, as NEWREF and as the
+        // target. A collection ref of another id is refused as NEWREF and as
+        // the target, next to the refusal of a remote NEWREF.
+        let own = repo.config().collection_id();
+        let newref = own_local_name(newref, own);
+        let existing = own_local_name(existing, own);
+        if newref.starts_with('@') {
+            exit_error(&format!("Cannot create alias as collection ref: {newref}"));
+        }
         // An alias is under `refs/heads`, so a NEWREF that names a remote is
         // refused. The message names only the remote half, for a remote that
         // exists and for one that does not. This step comes after the three
@@ -11223,6 +11357,11 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
         // positional, and `--force` keeps the refusal.
         if let Some((remote, _)) = newref.split_once(':') {
             exit_error(&format!("Cannot create alias to remote ref: {remote}"));
+        }
+        if existing.starts_with('@') {
+            exit_error(&format!(
+                "Cannot create alias to collection ref: {existing}"
+            ));
         }
         // An alias records a name, so its target must be a ref. A checksum and
         // an ancestry suffix each name a commit and no ref file.
@@ -11272,6 +11411,21 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
     }
     repo.set_ref_immediate(&Ref::collection(collection_id, ref_name), Some(&commit))
         .await
+}
+
+/// Returns the local name NAME of `@OWN:NAME`, where OWN is the
+/// `[core] collection-id` `own` of the repository and NAME is a local ref
+/// name. Each other text is returned as given, so `@OWN:REMOTE:NAME` stays a
+/// collection ref.
+fn own_local_name<'a>(text: &'a str, own: Option<&str>) -> &'a str {
+    match collection_prefix(text) {
+        Some((id, name))
+            if Some(id) == own && matches!(name.parse::<Ref>(), Ok(Ref::Local { .. })) =>
+        {
+            name
+        }
+        _ => text,
+    }
 }
 
 /// Returns the commit of a ref name, or `None` if the name names no ref.
@@ -11352,6 +11506,17 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// `-A`. The prefix rules, the whole-remote refusal, and the alias guard apply
 /// to the set that the prefix selected.
 ///
+/// # Collection refs
+///
+/// Without `-c`, a prefix `@X:` selects each ref under `refs/mirrors/X/`, and
+/// `@X:PREFIX` selects the ref `@X:PREFIX` and each ref below it. The command
+/// checks each selected collection ref with [`Ref::validate`] before it
+/// removes the first ref of the prefix. A prefix `@OWN:PREFIX`, where OWN is
+/// the collection id of the repository and PREFIX is a local ref name, is the
+/// prefix PREFIX, and `@OWN:` selects each local ref. The alias guard applies
+/// to these local refs. The command refuses each other `@OWN:REST`.
+/// With `-A`, the command refuses an `@X:` prefix of another id.
+///
 /// # Collection ids (`-c`)
 ///
 /// With `-c`, the prefixes are collection ids. The id that is equal to the
@@ -11400,15 +11565,29 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     // All aliases, local and remote. A `-A` prefix filters this set, and a
     // `-A --delete` removes from it.
     let mut alias_names: Vec<String> = listed.into_iter().map(|alias| alias.refspec).collect();
-    let mut all = all_refs(repo).await?;
-    for prefix in prefixes(&args.prefix) {
+    let own = repo.config().collection_id();
+    let mut all = if !args.alias && needs_all_refs(&args.prefix, own) {
+        all_refs(repo).await?
+    } else {
+        Vec::new()
+    };
+    for given in prefixes(&args.prefix) {
+        let (prefix, local_only) = own_prefix(given, own);
+        if args.alias {
+            refuse_collection_alias_prefix(prefix);
+        }
         check_prefix(repo, prefix).await?;
         let selected: Vec<String> = if args.alias {
-            select_aliases(repo, &alias_names, prefix).await?
+            select_aliases(repo, &alias_names, prefix)
+                .await?
+                .into_iter()
+                .filter(|name| !local_only || !name.contains(':'))
+                .collect()
         } else {
-            all.iter()
-                .filter(|(name, _)| matches_prefix(name, prefix))
-                .map(|(name, _)| name.clone())
+            prefix_candidates(repo, &all, prefix, local_only)
+                .await?
+                .into_iter()
+                .map(|(name, _)| name)
                 .collect()
         };
         if let Some(given) = prefix
@@ -11431,12 +11610,29 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 exit_error(&format!("Ref '{refspec}' has an active alias: '{alias}'"));
             }
         }
-        for refspec in &selected {
-            // A listed name is a refspec. A name with `@` from outside the
-            // port fails here, and it is not read as a collection ref.
-            validate_refspec(refspec)?;
-            repo.set_ref_immediate(&refspec.parse::<Ref>()?, None)
-                .await?;
+        if prefix.and_then(collection_prefix).is_some() {
+            // Each selected name is `@X:NAME` of a ref under `refs/mirrors/X/`.
+            // Each ref passes the rule of the ref store before the first
+            // removal.
+            let removed: Vec<Ref> = selected
+                .iter()
+                .filter_map(|name| collection_prefix(name))
+                .map(|(id, name)| Ref::collection(id, name))
+                .collect();
+            for r in &removed {
+                r.validate()?;
+            }
+            for r in &removed {
+                repo.set_ref_immediate(r, None).await?;
+            }
+        } else {
+            for refspec in &selected {
+                // A listed name is a refspec. A name with `@` from outside the
+                // port fails here, and it is not read as a collection ref.
+                validate_refspec(refspec)?;
+                repo.set_ref_immediate(&refspec.parse::<Ref>()?, None)
+                    .await?;
+            }
         }
         all.retain(|(name, _)| !selected.contains(name));
         aliases.retain(|(alias, _)| !selected.contains(alias));
@@ -11505,11 +11701,23 @@ fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
 /// match a ref, the ref is printed once for each match. The prefix that
 /// selected a row strips the name of that row: `refs test test/main` prints
 /// `main` and then `test/main`.
+///
+/// A prefix `@X:` or `@X:PREFIX` lists the collection refs of X by the same
+/// rules, each as `@X:NAME`. A prefix `@OWN:PREFIX`, where OWN is the
+/// collection id of the repository and PREFIX is a local ref name, is the
+/// prefix PREFIX, and `@OWN:` lists each local ref. The command refuses each
+/// other `@OWN:REST`.
 async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
-    let all = all_refs(repo).await?;
-    for prefix in prefixes(&args.prefix) {
+    let own = repo.config().collection_id();
+    let all = if needs_all_refs(&args.prefix, own) {
+        all_refs(repo).await?
+    } else {
+        Vec::new()
+    };
+    for given in prefixes(&args.prefix) {
+        let (prefix, local_only) = own_prefix(given, own);
         check_prefix(repo, prefix).await?;
-        for (refspec, commit) in all.iter().filter(|(name, _)| matches_prefix(name, prefix)) {
+        for (refspec, commit) in &prefix_candidates(repo, &all, prefix, local_only).await? {
             let name = if args.list {
                 refspec.clone()
             } else {
@@ -11530,9 +11738,15 @@ async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
 /// If a `PREFIX` names a ref, the output is that one ref, with the commit
 /// checksum as the target. Each other prefix keeps the aliases under it. The
 /// name is never stripped, and `-r` adds nothing, as in the `ostree` command.
+/// An alias is a local ref, so the command refuses an `@X:` prefix of an id X
+/// that is not the collection id of the repository. `@OWN:` selects each
+/// local alias.
 async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
     let aliases = repo.list_ref_aliases().await?;
-    for prefix in prefixes(&args.prefix) {
+    let own = repo.config().collection_id();
+    for given in prefixes(&args.prefix) {
+        let (prefix, local_only) = own_prefix(given, own);
+        refuse_collection_alias_prefix(prefix);
         check_prefix(repo, prefix).await?;
         if let Some(prefix) = prefix
             && let Some(commit) = alias_prefix_commit(repo, prefix).await?
@@ -11541,7 +11755,9 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
             continue;
         }
         for alias in &aliases {
-            if nested_under_prefix(&alias.refspec, prefix) {
+            if (!local_only || !alias.refspec.contains(':'))
+                && nested_under_prefix(&alias.refspec, prefix)
+            {
                 println!(
                     "{} -> {}",
                     alias.refspec,
@@ -11617,6 +11833,80 @@ async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<Colle
     Ok(out)
 }
 
+/// Returns the collection id and the rest of a PREFIX `@ID:` or `@ID:REST`,
+/// or `None` for each other PREFIX. The rest of `@ID:` is empty.
+fn collection_prefix(prefix: &str) -> Option<(&str, &str)> {
+    prefix.strip_prefix('@')?.split_once(':')
+}
+
+/// Reads a PREFIX of `refs` in a repository whose `[core] collection-id` is
+/// `own`.
+///
+/// `@OWN:PREFIX`, where PREFIX is a local ref name, is the prefix PREFIX.
+/// `@OWN:` gives no prefix and `true`: it selects each local ref. Each other
+/// PREFIX is returned as given, with `false`. So [`check_prefix_name`]
+/// refuses `@OWN:REMOTE:NAME` and `@OWN:@X:` as given.
+fn own_prefix<'a>(prefix: Option<&'a str>, own: Option<&str>) -> (Option<&'a str>, bool) {
+    match prefix.and_then(collection_prefix) {
+        Some((id, "")) if Some(id) == own => (None, true),
+        Some((id, rest))
+            if Some(id) == own && matches!(rest.parse::<Ref>(), Ok(Ref::Local { .. })) =>
+        {
+            (Some(rest), false)
+        }
+        _ => (prefix, false),
+    }
+}
+
+/// Refuses an `@X:` PREFIX of `-A`. An alias is a local ref, so a collection
+/// ref of another id is no alias. [`own_prefix`] read the PREFIX before the
+/// call.
+fn refuse_collection_alias_prefix(prefix: Option<&str>) {
+    if let Some(prefix) = prefix.filter(|prefix| collection_prefix(prefix).is_some()) {
+        exit_error(&format!("-A takes no collection prefix: {prefix}"));
+    }
+}
+
+/// Returns the refs that a PREFIX selects, as `(name, commit)` pairs.
+///
+/// For a prefix `@X:` or `@X:REST`, the candidates are the refs under
+/// `refs/mirrors/X/`, each named `@X:NAME`. The call reads no other
+/// directory. For each other prefix, they are `all`, or its local refs alone
+/// if `local_only` is `true`. The prefix then selects from the candidates by
+/// [`matches_prefix`].
+async fn prefix_candidates(
+    repo: &Repo,
+    all: &[(String, Checksum)],
+    prefix: Option<&str>,
+    local_only: bool,
+) -> Result<Vec<(String, Checksum)>> {
+    if let Some((id, _)) = prefix.and_then(collection_prefix) {
+        return Ok(repo
+            .list_collection_refs_in(id, &RefSelector::parse([])?)
+            .await?
+            .into_iter()
+            .map(|(name, commit)| (format!("@{id}:{name}"), commit))
+            .filter(|(name, _)| matches_prefix(name, prefix))
+            .collect());
+    }
+    Ok(all
+        .iter()
+        .filter(|(name, _)| (!local_only || !name.contains(':')) && matches_prefix(name, prefix))
+        .cloned()
+        .collect())
+}
+
+/// Returns `true` if a prefix of `given` is no collection prefix after
+/// [`own_prefix`] reads it. Only such a prefix selects from [`all_refs`].
+fn needs_all_refs(given: &[String], own: Option<&str>) -> bool {
+    prefixes(given).into_iter().any(|prefix| {
+        own_prefix(prefix, own)
+            .0
+            .and_then(collection_prefix)
+            .is_none()
+    })
+}
+
 /// Returns the prefixes to iterate: each given prefix, or one `None` for all
 /// refs.
 fn prefixes(given: &[String]) -> Vec<Option<&str>> {
@@ -11663,7 +11953,21 @@ async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
 /// rule. It is not empty and does not start with `-` or `.`. It holds ASCII
 /// alphanumerics, `-`, `.`, `_`, and alphanumeric characters that are not
 /// ASCII.
+///
+/// A prefix `@ID:` or `@ID:REST` passes if ID is a collection id of at most
+/// 255 bytes and REST is empty or a valid ref name. This is the collection-id
+/// rule of the ref store.
 fn check_prefix_name(prefix: &str) -> Result<()> {
+    if let Some((id, rest)) = collection_prefix(prefix) {
+        let valid = id.len() <= 255
+            && ostrya::is_collection_id(id)
+            && (rest.is_empty() || matches!(rest.parse::<Ref>(), Ok(Ref::Local { .. })));
+        return if valid {
+            Ok(())
+        } else {
+            Err(Error::InvalidRefspec(prefix.to_owned()))
+        };
+    }
     let checked = whole_remote(prefix).unwrap_or(prefix);
     validate_refspec(checked).map_err(|_| Error::InvalidRefspec(prefix.to_owned()))
 }
@@ -11672,8 +11976,15 @@ fn check_prefix_name(prefix: &str) -> Result<()> {
 ///
 /// This is the ref file or directory that a listing enumerates. A whole-remote
 /// prefix names the directory of the remote, and its ref half stands for the
-/// root of the remote.
+/// root of the remote. A prefix `@ID:` names `mirrors/ID`, and `@ID:REST`
+/// names `mirrors/ID/REST`.
 fn prefix_path(prefix: &str) -> String {
+    if let Some((id, rest)) = collection_prefix(prefix) {
+        return match rest {
+            "" => format!("mirrors/{id}"),
+            rest => format!("mirrors/{id}/{rest}"),
+        };
+    }
     match whole_remote(prefix) {
         Some(remote) => format!("remotes/{remote}"),
         None => ref_path(prefix).join("/"),
@@ -11685,8 +11996,12 @@ fn prefix_path(prefix: &str) -> String {
 /// A whole-remote prefix is a `<remote>:` prefix with an empty ref half or the
 /// ref half `.`, and it names each ref of that remote. A remote name holds no
 /// `/`, so a prefix such as `or/igin:` is not a whole-remote prefix. The full
-/// prefix goes to the refspec rule.
+/// prefix goes to the refspec rule. A prefix that starts with `@` names
+/// collection refs, and it is not a whole-remote prefix.
 fn whole_remote(prefix: &str) -> Option<&str> {
+    if prefix.starts_with('@') {
+        return None;
+    }
     match prefix.split_once(':') {
         Some((remote, "" | ".")) if !remote.contains('/') => Some(remote),
         _ => None,
@@ -11706,11 +12021,15 @@ fn matches_prefix(refspec: &str, prefix: Option<&str>) -> bool {
 /// The prefix `None` matches each refspec. This is the `-A` filter. A prefix
 /// that is equal to the name of an alias resolves that name, so the filter
 /// reads a prefix only as a directory. A whole-remote prefix keeps each ref of
-/// its remote, because its ref half stands for the root of the remote.
+/// its remote, because its ref half stands for the root of the remote. A
+/// prefix `@ID:` keeps each `@ID:NAME` in the same way.
 fn nested_under_prefix(refspec: &str, prefix: Option<&str>) -> bool {
     let Some(prefix) = prefix else {
         return true;
     };
+    if let Some((_, "")) = collection_prefix(prefix) {
+        return refspec.len() > prefix.len() && refspec.starts_with(prefix);
+    }
     match whole_remote(prefix) {
         Some(remote) => refspec
             .strip_prefix(remote)
@@ -14245,6 +14564,16 @@ fn parse_retain_branch_depth(value: &str) -> std::result::Result<(String, i32), 
     }
 }
 
+/// Reads a value of `--only-branch` or a BRANCH of `--retain-branch-depth` as
+/// the ref that the prune selects.
+///
+/// A value that is not the text of a ref, such as `main^` or an empty BRANCH,
+/// gives the local ref of the text. No ref of a repository has that name, so
+/// the value selects nothing.
+fn branch_ref(text: &str) -> Ref {
+    text.parse().unwrap_or_else(|_| Ref::local(text))
+}
+
 /// The units for a byte count of 1000 or more in a prune totals line.
 const SIZE_UNITS: [&str; 6] = ["kB", "MB", "GB", "TB", "PB", "EB"];
 
@@ -14285,9 +14614,9 @@ fn format_size(bytes: u64) -> String {
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     // The refusals that follow come in the order of the `ostree` command. The
     // order is the option pair, the `--static-deltas-only` requirement, the
-    // date, each `--retain-branch-depth` value, and then the revisions.
-    // `Repo::prune` resolves the revisions last. No refusal writes, so a
-    // refusal leaves the repository as it was.
+    // date, each `--retain-branch-depth` value, and then the revisions:
+    // `--delete-commit` first, and then each `--only-branch` value. No refusal
+    // writes, so a refusal leaves the repository as it was.
     if args.no_prune && args.delete_commit.is_some() {
         exit_error("Cannot specify both --delete-commit and --no-prune");
     }
@@ -14312,13 +14641,25 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         Some(rev) => Some(resolve(&repo, rev).await?),
         None => None,
     };
+    // Each --only-branch value resolves as a revision, so a value that names
+    // nothing fails here. The run then selects a ref by the value read as a
+    // ref, and does not read the commit that the value resolves to.
+    let mut only_branch = Vec::with_capacity(args.only_branch.len());
+    for value in &args.only_branch {
+        resolve(&repo, value).await?;
+        only_branch.push(branch_ref(value));
+    }
+    let retain_branch_depth = retain_branch_depth
+        .into_iter()
+        .map(|(branch, depth)| (branch_ref(&branch), depth))
+        .collect();
     let opts = PruneOptions {
         refs_only: args.refs_only,
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
         keep_younger_than,
-        only_branch: args.only_branch.clone(),
+        only_branch,
         retain_branch_depth,
         commit_only: args.commit_only,
         static_deltas_only: args.static_deltas_only,
@@ -15819,6 +16160,12 @@ async fn kept_metadata(
 /// `--tag` value, and each `--bind-ref` value. A commit that names none of
 /// them has the empty `as` array. The `ostree` command writes this value under
 /// `--orphan` alone.
+///
+/// `ostree.ref-binding` holds the name part NAME of an `@ID:NAME` value of
+/// `-b` and `--tag`, each other value of `-b` and `--tag` as given, and each
+/// `--bind-ref` value as given. `ostree.collection-binding` holds the
+/// collection of the namespace of the commit ([`commit_namespace`]), or the
+/// `[core] collection-id` of the repository for the local namespace.
 fn commit_metadata_dict(
     repo: &Repo,
     args: &CommitArgs,
@@ -15828,19 +16175,27 @@ fn commit_metadata_dict(
 ) -> std::result::Result<Value, String> {
     let mut entries = user_metadata_entries(added_strings, added_variants)?;
     entries.extend(kept.iter().cloned());
+    let own = repo.config().collection_id();
+    fn name_part(text: &str) -> &str {
+        text.strip_prefix('@')
+            .and_then(|rest| rest.split_once(':'))
+            .map_or(text, |(_, name)| name)
+    }
     let refs: Vec<&str> = args
         .branch
         .as_deref()
         .into_iter()
         .chain(args.tags.iter().map(String::as_str))
+        .map(name_part)
         .chain(args.bind_ref.iter().map(String::as_str))
         .collect();
+    let namespace = commit_namespace(args.branch.as_deref(), &args.tags, own);
     // `--no-bindings` writes neither binding key, so the dict of a commit that
     // adds no entries of its own is empty.
     Ok(ostrya::commit::commit_metadata(
         entries,
         (!args.no_bindings).then_some(refs.as_slice()),
-        repo.config().collection_id(),
+        namespace.as_deref().or(own),
     ))
 }
 
@@ -16480,6 +16835,13 @@ mod tests {
         for prefix in ["test", "test/main", "origin:rr", "origin:", "origin:."] {
             check_prefix_name(prefix).expect("the prefix was refused");
         }
+        let longest = format!("a.{}", "b".repeat(253));
+        check_prefix_name(&format!("@{longest}:")).expect("the prefix was refused");
+        let too_long = format!("@{longest}b:");
+        assert!(matches!(
+            check_prefix_name(&too_long),
+            Err(Error::InvalidRefspec(name)) if name == too_long
+        ));
     }
 
     /// The path under `refs/` that a PREFIX names. It is the ref name under
@@ -17125,18 +17487,84 @@ mod tests {
         parse(&[&related, &related]).unwrap();
     }
 
-    /// `tag_name_refusal` refuses a name with `:`, a name that the ref-name
+    /// `tag_name_refusal` refuses a remote ref, a name that the ref-name
     /// rule refuses, a checksum-shaped name, the branch name, a repeated
-    /// name, and a name that is a path below another name.
+    /// name, refs of two namespaces, and a name that is a path below another
+    /// name.
     #[test]
     fn tag_names_follow_the_ref_rules() {
         let tags = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
         let hex = "0123456789abcdef".repeat(4);
+        let own = Some("org.example.Own");
         for (branch, names, message) in [
             (
                 Some("main"),
                 tags(&["a:b"]),
-                "--tag a:b holds ':', and a tag is a local ref".to_owned(),
+                "--tag a:b names a remote ref, and a tag is a local ref or a collection ref"
+                    .to_owned(),
+            ),
+            (
+                Some("main"),
+                tags(&["a:b:c"]),
+                "Invalid refspec a:b:c".to_owned(),
+            ),
+            (
+                Some("main"),
+                tags(&[&format!("@org.example.Own:{hex}")]),
+                format!("Rev name '{hex}' looks like a checksum"),
+            ),
+            (
+                Some("main"),
+                tags(&["@org.example.Own:main"]),
+                "--tag @org.example.Own:main is also the --branch name".to_owned(),
+            ),
+            (
+                Some("@org.example.X:main"),
+                tags(&["@org.example.X:main"]),
+                "--tag @org.example.X:main is also the --branch name".to_owned(),
+            ),
+            (
+                None,
+                tags(&["t", "@org.example.Own:t"]),
+                "--tag @org.example.Own:t is given more than once".to_owned(),
+            ),
+            (
+                Some("@org.example.X:a"),
+                tags(&["@org.example.Y:b"]),
+                "--tag @org.example.Y:b and --branch @org.example.X:a name refs of two \
+                 namespaces, and the refs of a commit are in one namespace"
+                    .to_owned(),
+            ),
+            (
+                Some("a"),
+                tags(&["@org.example.X:b"]),
+                "--tag @org.example.X:b and --branch a name refs of two namespaces, and \
+                 the refs of a commit are in one namespace"
+                    .to_owned(),
+            ),
+            (
+                Some("origin:a"),
+                tags(&["@org.example.X:b"]),
+                "--tag @org.example.X:b and --branch origin:a name refs of two \
+                 namespaces, and the refs of a commit are in one namespace"
+                    .to_owned(),
+            ),
+            (
+                None,
+                tags(&["@org.example.X:a", "b"]),
+                "--tag b and --tag @org.example.X:a name refs of two namespaces, and the \
+                 refs of a commit are in one namespace"
+                    .to_owned(),
+            ),
+            (
+                Some("@org.example.X:a"),
+                tags(&["@org.example.X:a/b"]),
+                "--tag @org.example.X:a/b names a path below --branch @org.example.X:a".to_owned(),
+            ),
+            (
+                Some("@org.example.Own:a"),
+                tags(&["a/b"]),
+                "--tag a/b names a path below --branch @org.example.Own:a".to_owned(),
             ),
             (
                 Some("main"),
@@ -17185,19 +17613,27 @@ mod tests {
                 "--tag a/b is given more than once".to_owned(),
             ),
         ] {
-            assert_eq!(tag_name_refusal(branch, &names), Some(message));
+            assert_eq!(tag_name_refusal(branch, &names, own), Some(message));
         }
-        assert_eq!(tag_name_refusal(Some("main"), &tags(&["a", "b/c"])), None);
+        let none = |branch, names: &[&str]| tag_name_refusal(branch, &tags(names), own);
+        assert_eq!(none(Some("main"), &["a", "b/c"]), None);
         // A name that only starts with the other name is not below it.
-        assert_eq!(tag_name_refusal(Some("ab"), &tags(&["a", "a-b/c"])), None);
+        assert_eq!(none(Some("ab"), &["a", "a-b/c"]), None);
         // A remote branch is a ref under `refs/remotes`, and the ref write
         // refuses a bad branch with its own message.
-        assert_eq!(tag_name_refusal(Some("origin:a"), &tags(&["a/b"])), None);
-        assert_eq!(
-            tag_name_refusal(Some(&hex), &tags(&[&format!("{hex}/x")])),
-            None
-        );
-        assert_eq!(tag_name_refusal(None, &[]), None);
+        assert_eq!(none(Some("origin:a"), &["a/b"]), None);
+        assert_eq!(none(Some(&hex), &[&format!("{hex}/x")]), None);
+        assert_eq!(none(None, &[]), None);
+        // A collection ref of the own id is a local ref, and two collection
+        // refs of one id are in one namespace. The same name in two
+        // directories names no path below another.
+        assert_eq!(none(Some("@org.example.Own:a"), &["b"]), None);
+        assert_eq!(none(Some("origin:a"), &["@org.example.Own:b"]), None);
+        assert_eq!(none(Some("@org.example.X:a"), &["@org.example.X:b"]), None);
+        assert_eq!(none(None, &["@org.example.X:a"]), None);
+        assert_eq!(none(Some("origin:a"), &["a"]), None);
+        // An unparsed branch takes no part in the namespace check.
+        assert_eq!(none(Some("bad name"), &["@org.example.X:a"]), None);
     }
 
     /// `--onto` conflicts with `--depth` and `--force`, and `--bind-ref`,

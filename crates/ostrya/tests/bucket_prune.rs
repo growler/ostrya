@@ -908,14 +908,14 @@ fn each_refused_option_fails_before_a_request() {
             (
                 "only_branch",
                 PruneOptions {
-                    only_branch: vec!["main".into()],
+                    only_branch: vec![Ref::local("main")],
                     ..PruneOptions::default()
                 },
             ),
             (
                 "retain_branch_depth",
                 PruneOptions {
-                    retain_branch_depth: vec![("main".into(), 1)],
+                    retain_branch_depth: vec![(Ref::local("main"), 1)],
                     ..PruneOptions::default()
                 },
             ),
@@ -1451,7 +1451,6 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
                 pruned_objects: objects.len() - kept.len(),
                 freed_bytes: freed as u64,
                 deleted_refs: Vec::new(),
-                deleted_collection_refs: Vec::new(),
                 warnings: Vec::new(),
             }
         );

@@ -21,8 +21,8 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Ref, RefLocation, Repo,
-    RepoMode, static_delta_relative_dir,
+    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Ref, Repo, RepoMode,
+    static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -235,7 +235,7 @@ fn only_branch_retains_the_branches_it_does_not_name() {
 
         prune(&repo, |o| {
             o.depth = 0;
-            o.only_branch = vec!["main".to_owned()];
+            o.only_branch = vec![Ref::local("main")];
         })
         .await;
         assert!(
@@ -262,7 +262,7 @@ fn only_branch_implies_refs_only() {
 
         prune(&repo, |o| {
             o.refs_only = false;
-            o.only_branch = vec!["main".to_owned()];
+            o.only_branch = vec![Ref::local("main")];
         })
         .await;
         assert!(
@@ -272,8 +272,11 @@ fn only_branch_implies_refs_only() {
     });
 }
 
+/// The run does not resolve a value of `only_branch`. A value that names no
+/// ref selects no branch, so the run keeps every branch in full. The hex of a
+/// commit names no ref either.
 #[test]
-fn only_branch_naming_no_ref_is_refused() {
+fn only_branch_naming_no_ref_selects_nothing() {
     let tmp = TmpDir::new("prune-only-branch-unknown");
     block_on(async {
         let repo = repo_at(tmp.path()).await;
@@ -282,22 +285,99 @@ fn only_branch_naming_no_ref_is_refused() {
         let mut opts = PruneOptions {
             refs_only: true,
             depth: 0,
-            only_branch: vec!["nosuch".to_owned()],
+            only_branch: vec![Ref::local("nosuch")],
             ..PruneOptions::default()
         };
-        let err = repo.prune(&opts).await.unwrap_err();
-        assert!(matches!(err, Error::RefNotFound(_)), "got {err:?}");
-        assert!(
-            holds(&repo, &main[0]).await,
-            "the refusal stands ahead of every removal"
-        );
-
-        // A value that resolves to a commit and names no ref gives the depth
-        // to no branch, so the run keeps every branch in full.
-        opts.only_branch = vec![main[2].to_hex()];
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(stats.pruned_objects, 0);
         assert!(holds(&repo, &main[0]).await);
+
+        opts.only_branch = vec![Ref::local(main[2].to_hex())];
+        let stats = repo.prune(&opts).await.unwrap();
+        assert_eq!(stats.pruned_objects, 0);
+        assert!(holds(&repo, &main[0]).await);
+    });
+}
+
+/// Moves the ref `name` of `repo` to the collection ref `name` of
+/// [`COLLECTION`], at the same commit.
+async fn move_to_collection(repo: &Repo, name: &str) {
+    let tip = repo.resolve_ref_tip(&Ref::local(name)).await.unwrap();
+    let txn = repo.transaction().await.unwrap();
+    txn.set_ref(&Ref::collection(COLLECTION, name), tip.as_ref());
+    txn.set_ref(&Ref::local(name), None);
+    txn.commit().await.unwrap();
+}
+
+/// The collection id of the collection-ref tests.
+const COLLECTION: &str = "org.example.Os";
+
+/// A value of `only_branch` selects a collection ref by the collection id and
+/// the name. The local ref of the same name selects nothing.
+#[test]
+fn only_branch_selects_a_collection_ref() {
+    let tmp = TmpDir::new("prune-only-branch-collection");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let main = chain(&repo, tmp.path(), "main").await;
+        let coll = chain(&repo, tmp.path(), "coll").await;
+        move_to_collection(&repo, "coll").await;
+
+        let stats = prune(&repo, |o| {
+            o.depth = 0;
+            o.only_branch = vec![Ref::local("coll")];
+        })
+        .await;
+        assert_eq!(stats.pruned_objects, 0, "the local name selects nothing");
+
+        prune(&repo, |o| {
+            o.depth = 0;
+            o.only_branch = vec![Ref::collection(COLLECTION, "coll")];
+        })
+        .await;
+        assert!(
+            holds(&repo, &coll[2]).await,
+            "the collection ref's head stays"
+        );
+        assert!(
+            !holds(&repo, &coll[1]).await,
+            "the selection prunes its history"
+        );
+        assert!(!holds(&repo, &coll[0]).await);
+        for commit in &main {
+            assert!(holds(&repo, commit).await, "main stays in full");
+        }
+    });
+}
+
+/// An entry of `retain_branch_depth` selects a collection ref by the
+/// collection id and the name.
+#[test]
+fn retain_branch_depth_selects_a_collection_ref() {
+    let tmp = TmpDir::new("prune-rbd-collection");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let main = chain(&repo, tmp.path(), "main").await;
+        let coll = chain(&repo, tmp.path(), "coll").await;
+        move_to_collection(&repo, "coll").await;
+
+        prune(&repo, |o| {
+            o.depth = 0;
+            o.retain_branch_depth = vec![(Ref::collection(COLLECTION, "coll"), -1)];
+        })
+        .await;
+        for commit in &coll {
+            assert!(
+                holds(&repo, commit).await,
+                "the entry keeps the whole chain"
+            );
+        }
+        assert!(holds(&repo, &main[2]).await, "main keeps its head");
+        assert!(
+            !holds(&repo, &main[1]).await,
+            "and the global depth prunes the rest"
+        );
+        assert!(!holds(&repo, &main[0]).await);
     });
 }
 
@@ -311,7 +391,7 @@ fn retain_branch_depth_replaces_the_global_depth() {
 
         prune(&repo, |o| {
             o.depth = 0;
-            o.retain_branch_depth = vec![("main".to_owned(), -1)];
+            o.retain_branch_depth = vec![(Ref::local("main"), -1)];
         })
         .await;
         assert!(holds(&repo, &main[0]).await, "the entry keeps main whole");
@@ -332,7 +412,7 @@ fn retain_branch_depth_zero_leaves_the_global_depth() {
 
         prune(&repo, |o| {
             o.depth = 1;
-            o.retain_branch_depth = vec![("main".to_owned(), 0)];
+            o.retain_branch_depth = vec![(Ref::local("main"), 0)];
         })
         .await;
         assert!(
@@ -353,8 +433,8 @@ fn retain_branch_depth_suppresses_only_branch_retention() {
 
         prune(&repo, |o| {
             o.depth = 0;
-            o.only_branch = vec!["main".to_owned()];
-            o.retain_branch_depth = vec![("other".to_owned(), 0)];
+            o.only_branch = vec![Ref::local("main")];
+            o.retain_branch_depth = vec![(Ref::local("other"), 0)];
         })
         .await;
         assert!(
@@ -375,7 +455,7 @@ fn retain_branch_depth_takes_the_last_entry_for_a_branch() {
 
         prune(&repo, |o| {
             o.depth = 0;
-            o.retain_branch_depth = vec![("main".to_owned(), 1), ("main".to_owned(), -1)];
+            o.retain_branch_depth = vec![(Ref::local("main"), 1), (Ref::local("main"), -1)];
         })
         .await;
         assert!(holds(&repo, &main[0]).await, "the last entry decides");
@@ -393,7 +473,7 @@ fn retain_branch_depth_roots_on_refs_alone() {
 
         prune(&repo, |o| {
             o.refs_only = false;
-            o.retain_branch_depth = vec![("main".to_owned(), -1)];
+            o.retain_branch_depth = vec![(Ref::local("main"), -1)];
         })
         .await;
         assert!(
@@ -416,7 +496,7 @@ fn a_ref_target_takes_its_own_bound_over_an_inherited_one() {
         // `mid`. The bound of `mid` applies at that commit. As a result, the
         // run keeps one parent of the target and removes the older history.
         prune(&repo, |o| {
-            o.retain_branch_depth = vec![("mid".to_owned(), 1)]
+            o.retain_branch_depth = vec![(Ref::local("mid"), 1)]
         })
         .await;
         assert!(holds(&repo, &c[4]).await);
@@ -443,7 +523,7 @@ fn a_ref_target_bound_replaces_and_does_not_narrow() {
         // depth 3. As a result, the run keeps the whole chain.
         prune(&repo, |o| {
             o.depth = 3;
-            o.retain_branch_depth = vec![("mid".to_owned(), 0)];
+            o.retain_branch_depth = vec![(Ref::local("mid"), 0)];
         })
         .await;
         for commit in &c {
@@ -467,7 +547,7 @@ fn only_branch_bounds_the_history_running_through_the_branch_it_names() {
         // applies where the walk from `main` reaches the target of `mid`.
         prune(&repo, |o| {
             o.depth = 0;
-            o.only_branch = vec!["mid".to_owned()];
+            o.only_branch = vec![Ref::local("mid")];
         })
         .await;
         assert!(holds(&repo, &c[4]).await);
@@ -489,7 +569,7 @@ fn a_time_bound_at_a_ref_target_replaces_an_inherited_depth() {
         // cut applies from the target of `mid` to the older commits.
         prune(&repo, |o| {
             o.keep_younger_than = Some(BASE_TS + DAY * 3);
-            o.retain_branch_depth = vec![("main".to_owned(), -1)];
+            o.retain_branch_depth = vec![(Ref::local("main"), -1)];
         })
         .await;
         assert!(holds(&repo, &c[2]).await, "mid's own target stays");
@@ -514,7 +594,7 @@ fn two_refs_at_one_commit_keep_what_either_bound_reaches() {
         // and keeps what either bound reaches.
         prune(&repo, |o| {
             o.depth = 0;
-            o.only_branch = vec!["alpha".to_owned()];
+            o.only_branch = vec![Ref::local("alpha")];
         })
         .await;
         for commit in &c {
@@ -1083,5 +1163,4 @@ fn prune_options_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PruneOptions>();
     assert_send_sync::<PruneStats>();
-    assert_send_sync::<RefLocation<'static>>();
 }

@@ -14,7 +14,7 @@ Without an option, the command prints the local refs and the remote refs, one on
 \fIPREFIX...\fR
 The \%ref\-name prefixes to match, or the collection ids with \%\-c.
 .IP
-A PREFIX matches the ref with that name and each ref below it. \fB\%<remote>:\fR matches each ref of the remote. With no PREFIX, the command lists every ref. With \%\-\-create, the one PREFIX is the revision that the new ref points at.
+A PREFIX matches the ref with that name and each ref below it. \fB\%<remote>:\fR matches each ref of the remote. \fB\%@ID:\fR matches each ref of the collection ID under \fB\%refs/mirrors/ID\fR, and \fB\%@ID:PREFIX\fR matches the refs of ID by the rule of a PREFIX. If ID is the collection id of the repository, \fB\%@ID:PREFIX\fR is PREFIX, and \fB\%@ID:\fR matches each local ref. With no PREFIX, the command lists every local and remote ref. With \%\-\-create, the one PREFIX is the revision that the new ref points at.
 .SH OPTIONS
 .TP
 \fB\-\-delete\fR
@@ -25,7 +25,7 @@ The command then lists no ref. At least one PREFIX is required. A PREFIX that ma
 \fB\-\-list\fR
 Print the whole name of each ref, with the matched PREFIX in it.
 .IP
-Without this switch, the command prints the part of the name below the PREFIX. A ref whose name is equal to the PREFIX prints its whole name.
+Without this switch, the command prints the part of the name below the PREFIX. A ref whose name is equal to the PREFIX prints its whole name. A ref of a collection prints as \fB\%@ID:NAME\fR with and without this switch.
 .TP
 \fB\-r\fR, \fB\-\-revision\fR
 Print the commit checksum of each ref after a tab.
@@ -35,12 +35,12 @@ With \%\-A, this switch adds nothing.
 \fB\-A\fR, \fB\-\-alias\fR
 List the aliases alone, each as \fB\%name \-> target\fR\&.
 .IP
-If a PREFIX names a ref, the command prints that ref with its commit checksum as the target. Each other PREFIX selects the aliases below it. With \%\-\-create, the new ref is an alias. Its target must be a ref, and NEWREF must not name a remote ref. \%\-c wins over this switch.
+If a PREFIX names a ref, the command prints that ref with its commit checksum as the target. Each other PREFIX selects the aliases below it. With \%\-\-create, the new ref is an alias. Its target must be a ref, and NEWREF must not name a remote ref. An alias is a local ref, so NEWREF and the target must not name a collection ref, and the command refuses an \fB\%@ID:\fR PREFIX. If ID is the collection id of the repository, \fB\%@ID:NAME\fR is the local ref NAME. \%\-c wins over this switch.
 .TP
 \fB\-\-create\fR \fINEWREF\fR
 Create the ref NEWREF, and point it at the commit that PREFIX names.
 .IP
-The command line must give exactly one PREFIX argument, which is a revision here. If NEWREF exists and \%\-\-force is not given, the command fails. With \%\-A, NEWREF is an alias of the ref that PREFIX names. With \%\-c, NEWREF is \fB\%<collection\-id>:<ref>\fR, and the command writes the collection ref \fB\%refs/mirrors/<collection\-id>/<ref>\fR\&. If \fB\%<collection\-id>\fR is the collection id of the repository, the command writes the local ref \fB\%refs/heads/<ref>\fR\&. This option wins over \%\-\-delete.
+The command line must give exactly one PREFIX argument, which is a revision here. NEWREF is NAME, \%REMOTE:NAME, or \%@ID:NAME. \%@ID:NAME is the collection ref \fB\%refs/mirrors/ID/NAME\fR, or the local ref NAME if ID is the collection id of the repository. If NEWREF exists and \%\-\-force is not given, the command fails. With \%\-A, NEWREF is an alias of the ref that PREFIX names. With \%\-c, NEWREF is \fB\%<collection\-id>:<ref>\fR, and the command writes the collection ref \fB\%refs/mirrors/<collection\-id>/<ref>\fR\&. If \fB\%<collection\-id>\fR is the collection id of the repository, the command writes the local ref \fB\%refs/heads/<ref>\fR\&. This option wins over \%\-\-delete.
 .TP
 \fB\-c\fR, \fB\-\-collections\fR
 List collection refs as \fB\%(collection\-id, ref)\fR pairs.

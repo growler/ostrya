@@ -2327,6 +2327,17 @@ pub(crate) fn ref_relpath(own: Option<&str>, r: &Ref) -> Result<String> {
     })
 }
 
+/// Returns the canonical form of a ref in a repository whose
+/// `[core] collection-id` is `own`: a collection ref of `own` is the local
+/// ref of the same name, and each other ref is unchanged. The call does not
+/// check the ref.
+pub(crate) fn canonical_ref(own: Option<&str>, r: Ref) -> Ref {
+    match r {
+        Ref::Collection { id, name } if Some(id.as_str()) == own => Ref::Local { name },
+        r => r,
+    }
+}
+
 /// Reads a refspec as a [`Ref`] with no check: `REMOTE:NAME`, split at the
 /// first `:`, is a remote ref, and other text is a local ref.
 ///

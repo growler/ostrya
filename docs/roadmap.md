@@ -53,8 +53,8 @@ for it.
 - The pull does not write the summary cache `tmp/cache/summaries/`.
 - The pull does not read the remote keys `contenturl` and `metalink`, and
   refuses a `metalink=` or `mirrorlist=` URL.
-- `Repo::pull` over HTTP refuses `collection_id`. `Repo::pull_collection`
-  pulls collection refs.
+- `Repo::pull` from a named remote reads no `@ID:NAME` ref.
+  `Repo::pull_collection` pulls collection refs.
 - `Repo::pull_local` refuses a subpath.
 - `ostrya pull REMOTE`, `remote refs`, and `remote summary` refuse a
   `file://` address, which the `ostree` command reads. `ostrya pull
@@ -124,7 +124,7 @@ for it.
   small objects. The `Slots` driver of the pull has the necessary shape.
 - A config key that marks weak refs by a pattern, for local refs, remote
   refs, and collection refs. `Repo::prune` takes the classification as a
-  function of the `RefLocation` of each ref.
+  function of the `Ref` of each ref.
 - The detached metadata in an offline apply.
   `Repo::apply_static_delta_offline` and `Repo::apply_static_delta` write no
   `.commitmeta`. The `ostree` command writes the `.commitmeta` of the target

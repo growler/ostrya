@@ -64,7 +64,7 @@ use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
     LocalWanted, Pinned, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth,
-    read_checked_local_summary, refuse_remote_collection,
+    read_checked_local_summary,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -655,8 +655,6 @@ impl Repo {
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
-    /// - [`Error::Unsupported`] if
-    ///   [`collection_id`](PullOptions::collection_id) is set.
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) is set,
     ///   if [`flags`](PullOptions::flags) holds
     ///   [`MIRROR`](PullFlags::MIRROR) or
@@ -1334,7 +1332,6 @@ fn check_collection_pull(
     }
     let subpaths = Subpaths::parse(&opts.subpaths)?;
     check_depth(opts.depth)?;
-    refuse_remote_collection(opts)?;
     if opts.remote.is_some() {
         return Err(Error::InvalidInput(
             "a collection pull writes the refs of the collection, and takes no remote option"

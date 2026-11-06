@@ -156,7 +156,10 @@ These metadata keys are well known:
 
 The commit write of the port adds neither binding key. The caller supplies
 them as normal metadata entries. For example, `commit -b` writes
-`ostree.ref-binding`.
+`ostree.ref-binding`. `commit -b @ID:NAME` writes `NAME` in
+`ostree.ref-binding` and `ID` in `ostree.collection-binding`. A commit whose
+refs are local refs writes the `[core] collection-id` of the repository in
+`ostree.collection-binding`, if the config sets one.
 
 `ostree.linux` and `ostree.bootable` mark a commit that holds a kernel.
 `ostree.linux` holds the name of the directory under `/usr/lib/modules` that
@@ -5109,29 +5112,40 @@ refs/mirrors/ID/NAME`, and the line is not an error. Phase 2 of the fsck
 checks the commit of such a ref. `ostrya prune` holds such a ref as a
 strong ref with no name: the ref roots the walk, no `--only-branch` or
 `--retain-branch-depth` value selects it, and the run never deletes it.
-The port has no repair for such a ref. Remove it by hand.
+`--only-branch=@ID:REF` of the own collection id selects `refs/heads/REF`
+alone. The port has no repair for such a ref. Remove it by hand.
 
-The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
-collection refs from a local repository. It reads each ref of the source with
-the rule of `Repo::resolve_ref_tip`: `refs/mirrors/ID/REF`, or
-`refs/heads/REF` when `ID` is the `[core] collection-id` of the source. The
-probe of a local candidate reads
-the ref files with the same rule. A ref that the source does not hold fails
-the pull with `Error::RefNotFound`, which holds `@ID:REF`. Each written ref
-names the commit that the pull read from the source. Unless the caller sets
-`no_ref_writes`, the pull writes the refs at the place above, and delta
-discovery reads the `from` commit of a delta at the same place. The pull
-refuses a tip commit whose `ostree.collection-binding` is absent, is not a
-string, or is not `ID`. It checks the `ostree.ref-binding` as each pull does,
-and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone.
+The library call `Repo::pull_local` and the command `ostrya pull-local` pull
+collection refs from a local repository with operands `@ID:REF`. One call
+can take plain operands and `@ID:REF` operands of more than one collection.
+Each operand is a revision of the source, so `@ID:REF^` names the parent of
+the commit of `@ID:REF`. The pull reads each `@ID:REF` of the source with the
+rule of `Repo::resolve_ref_tip`: `refs/mirrors/ID/REF`, or `refs/heads/REF`
+when `ID` is the `[core] collection-id` of the source. The probe of a local
+candidate reads the ref files with the same rule. A ref that the source does
+not hold fails the pull with `Error::RefNotFound`, which holds `@ID:REF`. The
+pull refuses an operand that starts with `@` and, less each `^` at its end,
+is not an `@ID:REF` ref, with `Error::InvalidRefspec`, before it reads the
+source.
+
+Each written ref names the commit that the pull read from the source. Unless
+the caller sets `no_ref_writes`, the pull writes `@ID:REF` to
+`refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the
+`[core] collection-id` of the destination. The remote name of the call does
+not change this place: it selects the `[remote "NAME"]` section whose
+verification keys apply, and the place of each plain operand. Delta discovery
+reads the `from` commit of a delta at the place of the operand in the
+destination, with and without `no_ref_writes`.
+
+Unless the caller sets `no_ref_writes`, the pull refuses the tip commit of an
+`@ID:REF` operand whose `ostree.collection-binding` is absent, is not a
+string, or is not `ID`. This is also true when `ID` is the
+`[core] collection-id` of the destination. The pull checks the
+`ostree.ref-binding` as each pull does, against the part of the operand after
+`@ID:`, and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone. With
+`no_ref_writes`, the pull reads no `ostree.collection-binding`.
 `Repo::pull_local` makes no timestamp check. The pull makes each check before
-it writes an object, a `.commitpartial` marker, or a ref. With ref writes, the
-remote name of the call selects only the `[remote "NAME"]` section whose
-verification keys apply, and the pull writes no ref under `refs/remotes/`.
-With `no_ref_writes`, the pull writes no ref and reads no
-`ostree.collection-binding`. The remote name then also selects the place
-where delta discovery reads the `from` commit of a delta:
-`refs/remotes/REMOTE/REF`, or `refs/heads/REF` with no remote name.
+it writes an object, a `.commitpartial` marker, or a ref.
 
 The library call `Repo::remote_list_collection_refs` lists the refs of `ID`
 on one remote, and pulls nothing. `Repo::remote_list_collection_refs_with`

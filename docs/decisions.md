@@ -2378,13 +2378,12 @@ and `traverse_parent` reads the metadata of each commit. These stay for a
 later version.
 
 The result is `BucketPruneReport`: the `PruneStats` of the local prune,
-whose `deleted_refs` and `deleted_collection_refs` are always empty and
-whose `warnings` hold the defective field 2 entries, and the deleted
-deltas, the deleted markers, the aborted uploads, and the holder of a
-broken lock. With `no_prune`, the lists name what a run deletes. A
-`PruneStats` alone was rejected, because the command prints the deltas, the
-markers, and the uploads, and the holder of a broken lock needs a place on
-success.
+whose `deleted_refs` is always empty and whose `warnings` hold the
+defective field 2 entries, and the deleted deltas, the deleted markers, the
+aborted uploads, and the holder of a broken lock. With `no_prune`, the
+lists name what a run deletes. A `PruneStats` alone was rejected, because
+the command prints the deltas, the markers, and the uploads, and the holder
+of a broken lock needs a place on success.
 
 When the roots are not on the refs alone, each commit of the listing is a
 root, so each root, the ref targets and the commits of the summary
@@ -3068,20 +3067,21 @@ the rules.
 ## The weak refs of a prune
 
 `PruneOptions::weak_ref_filter` holds one callback for the refs of each
-space. The callback gets a `RefLocation` and the commit of the ref, and
-returns `true` for a strong ref:
+space. The callback gets a `Ref` and the commit of the ref, and returns
+`true` for a strong ref:
 
-- `RefLocation::Local` for a ref under `refs/heads`, with its name.
-- `RefLocation::Remote` for a ref under `refs/remotes`, with the remote and
-  the name.
-- `RefLocation::Collection` for a ref under `refs/mirrors`, with the
-  collection id and the name. The id is never the `[core] collection-id` of
-  the repository.
+- `Ref::Local` for a ref under `refs/heads`, with its name.
+- `Ref::Remote` for a ref under `refs/remotes`, with the remote and the
+  name.
+- `Ref::Collection` for a ref under `refs/mirrors`, with the collection id
+  and the name. The id is never the `[core] collection-id` of the
+  repository, so each `Ref` that the callback gets is canonical ("The ref
+  syntax").
 
 The rules of the classification:
 
-- A local ref or a remote ref gets a location when its listed name maps back
-  to the file that the listing read. A mirror ref gets a location when the
+- A local ref or a remote ref gets a `Ref` when its listed name maps back
+  to the file that the listing read. A mirror ref gets a `Ref` when the
   part of its path before the first `/` passes `is_collection_id` and is at
   most 255 bytes, and the rest passes the ref-name rule. Each other ref is
   strong and never reaches the callback. The classification reads no file:
@@ -3089,21 +3089,27 @@ The rules of the classification:
 - A ref under `refs/mirrors/ID/` of the `[core] collection-id` of the
   repository is a strong ref with no name. The classification reads the
   own id from the config that the handle read at the open. The ref roots
-  the walk, never reaches the callback, and takes the bound of a name that
+  the walk, never reaches the callback, and takes the bound of a ref that
   no list names: the global bound, or no bound under a non-empty
   `only_branch`. No value of `only_branch` or `retain_branch_depth`
   selects it, and the run never deletes it. "The own collection id" states
   the rule.
+- `only_branch` and `retain_branch_depth` hold `Ref` values. The run maps
+  a value `@OWN:NAME` of the own id to the local ref `NAME`, and selects a
+  ref by a value equal to its `Ref`. A ref that gets no `Ref` takes the
+  bound of a ref that no list names. The run does not resolve a value, so a
+  value that names no ref selects nothing. The `ostrya` command resolves
+  each `--only-branch` value as a revision first, so a value that names
+  nothing fails the command.
 - A weak collection ref follows the rule of each weak ref. It survives when
   the walk reaches its commit over a `parent` edge, a dependency in field 2,
   or a build source in `ostrya.related`. A strong ref on the same commit
-  keeps it too. The bound of a mirror ref comes from its listed name,
-  `ID/NAME`.
-- `PruneStats::deleted_collection_refs` names each deleted collection ref
-  as a `Ref::Collection`. It is sorted with `sort`, by collection id and
-  then by ref name, in byte order. `deleted_refs` names the deleted local
-  and remote refs alone. Under `no_prune`, both lists name
-  what a run deletes, and the run deletes nothing.
+  keeps it too.
+- `PruneStats::deleted_refs` names each deleted weak ref as a `Ref`. It is
+  sorted with `sort`, by the derived order of `Ref`: the local refs first,
+  the remote refs next, and the collection refs last, each by its parts in
+  byte order. Under `no_prune`, the list names what a run deletes, and the
+  run deletes nothing.
 - One helper deletes the weak refs of each space.
   `delete_matching_refs_blocking` takes a key and a closure that gives the
   path of each key. One blocking hop and one set of `fsync` calls cover the
@@ -3111,9 +3117,8 @@ The rules of the classification:
   compare-and-delete guard.
 - An emptied `refs/mirrors/ID/` directory stays, as an emptied directory
   under `refs/heads` does.
-- `RefLocation` has `#[non_exhaustive]`, so a later ref space adds a
-  variant. `PruneOptions` and `PruneStats` have no `#[non_exhaustive]`. With
-  the attribute, no other crate can use `..PruneOptions::default()`, and the
+- `PruneOptions` and `PruneStats` have no `#[non_exhaustive]`. With the
+  attribute, no other crate can use `..PruneOptions::default()`, and the
   `ostrya` command uses it. A new field in either struct takes a minor
   version before 1.0.
 
@@ -3124,21 +3129,27 @@ These alternatives were rejected:
   the name. A substring test still matches refs of more than one space. A
   remote ref `REMOTE:NAME` in such a string carries two `:` separators.
 - A second filter field for the collection refs. A caller that applies one
-  rule to each space then writes the rule two times. The enum gives the same
-  split in one callback, and the wildcard arm of a `match` states the verdict
-  for each other space.
-- A mirror ref of the own collection id as a `Local` ref. `Local(NAME)`
+  rule to each space then writes the rule two times. The `Ref` gives the
+  same split in one callback.
+- A location type of the prune alone. The API then has two types for one
+  ref, and a caller converts between them. Each public API that names one
+  ref takes a `Ref` ("The ref syntax").
+- A mirror ref of the own collection id as a `Local` ref. `Ref::Local`
   names `refs/heads/NAME`, and the mirror ref is a different file. Both
-  files can exist and name two commits, so the callback gets one location
-  for two refs.
+  files can exist and name two commits, so the callback gets one `Ref` for
+  two refs.
 - A mirror ref of the own collection id as a weak `Collection` ref. The
   readers of the port ignore such a ref, so a caller has no use for it, and
   a filter that marks each ref weak then deletes a ref that the port did
   not write. A strong ref keeps the commit, and the operator removes the
   ref by hand.
-- The collection refs in `deleted_refs`. The list holds refspecs, and no
-  refspec maps below `refs/mirrors`. The form `ID:NAME` reads as the refspec
-  of a remote named `ID`.
+- A list of refspecs for the local and the remote refs, and a second list
+  for the collection refs. No refspec maps below `refs/mirrors`, and the
+  form `ID:NAME` reads as the refspec of a remote named `ID`. One list of
+  `Ref` values names the refs of each space.
+- A selection by the listed name of a ref, with the path `ID/NAME` for a
+  mirror ref. The name `ID/NAME` is also a valid local ref name, so one
+  value selects two refs.
 
 ## The unbound collection pull
 
@@ -3355,9 +3366,44 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
 - An operand that can hold a revision stays text: `Repo::resolve_rev`,
   `PullOptions::refs`, and the refspecs of a push. `resolve_rev` reads
   `@ID:NAME[^...]`.
-- The names of a local pull and of a one-way receive stream are refspecs.
-  The library reads such a name as a local or a remote ref, split at the
-  first `:`, and it does not read `@` there.
+- `Repo::pull_local` reads each name of `PullOptions::refs` as a revision
+  of the source, `@ID:NAME[^...]` included. It refuses a name that starts
+  with `@` and, less each `^` at its end, is not an `@ID:NAME` ref, before
+  it reads the source. It writes the ref of an `@ID:NAME` name as the
+  collection ref of `ID` by the rule of the own id, and the ref of each
+  other name at the place that `PullOptions::remote` names. Without
+  `no_ref_writes`, the tip commit of each `@ID:NAME` name must hold the
+  `ostree.collection-binding` `ID`, also when `ID` is the own id of the
+  destination, and `DISABLE_VERIFY_BINDINGS` does not skip the check. The
+  ref-binding check reads the part after `@ID:`. Delta discovery reads the
+  `from` commit at the ref that the name gives in the destination, with
+  and without `no_ref_writes`. `PullOptions` has no collection id field.
+- The names of a one-way receive stream are refspecs. The library reads
+  such a name as a local or a remote ref, split at the first `:`, and it
+  does not read `@` there.
+- `PruneOptions::only_branch` and `retain_branch_depth` take `Ref` values,
+  and `PruneStats::deleted_refs` gives them ("The weak refs of a prune").
+- The CLI reads `@ID:NAME` in each ref operand of `commit`, `refs`,
+  `prune`, and `pull-local`. `commit -b` and `--tag` take `@ID:NAME`. The
+  refs of one commit are in one namespace after the own-id mapping: the
+  local refs, with a `REMOTE:NAME` branch, or the refs of one collection.
+  The command refuses refs of two namespaces before the repository lock.
+  `ostree.collection-binding` holds the id of the namespace, or the own id
+  for the local namespace, and `ostree.ref-binding` holds the name part of
+  each `@ID:NAME` value. A `--tag` that is a remote ref is refused.
+- `refs --create` and `refs --delete` take `@ID:NAME` without `-c`. A
+  `PREFIX` `@X:` matches each ref of X, as `REMOTE:` matches each ref of a
+  remote, and `@X:PREFIX` matches by the rule of a plain `PREFIX`. A
+  listing prints each such ref as `@X:NAME`. `@OWN:PREFIX` is `PREFIX` if
+  `PREFIX` is a local ref name, and `@OWN:` matches each local ref. The
+  command refuses each other `@OWN:REST`, for example `@OWN:origin:main`,
+  as the refspec rule refuses `@X:origin:main`. `-A` refuses a collection
+  ref of another id as `NEWREF`, as the target of an alias, and as a
+  `PREFIX`.
+- `prune --only-branch` and `--retain-branch-depth` take `@ID:NAME`. The
+  command resolves each `--only-branch` value as a revision, and passes the
+  value as a `Ref`. A value that is not a ref, for example `main^`, becomes
+  the local ref of the text, which selects nothing.
 
 These alternatives were rejected:
 
@@ -3377,8 +3423,9 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
 
 - Each writer of the collection ref `@ID:NAME` of the own id writes
   `refs/heads/NAME`: `Transaction::set_ref`, `Repo::set_ref_immediate`,
-  `UpdateGuard::set_ref`, `refs -c --create`, `Repo::pull_collection`, `Repo::pull_local` with
-  `PullOptions::collection_id`, the receive path, and the S3 push. The same
+  `UpdateGuard::set_ref`, `refs -c --create`, `refs --create`, `commit`,
+  `Repo::pull_collection`, `Repo::pull_local` with an `@ID:NAME` name, the
+  receive path, and the S3 push. The same
   writers remove `refs/heads/NAME` for a removal. No writer creates
   `refs/mirrors/ID/` of the own id. `ostree refs --collections
   --create=ID:NAME` writes `refs/heads/NAME` for the own id too (observed).
@@ -3389,11 +3436,11 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
   dependency, and `TimestampCheck::CurrentRef` read `refs/heads/NAME`.
   `Repo::list_mirror_refs` lists the directory, and the fsck and the
   prune read it.
-- `Repo::pull_local` with `PullOptions::collection_id` reads each name of
-  the source with the rule of `Repo::resolve_ref_tip`:
-  `refs/heads/NAME` when the source has the collection id, and
-  `refs/mirrors/ID/NAME` otherwise. The probe of a local candidate reads
-  the source with `Repo::list_collection_refs_in`, which has the same rule.
+- `Repo::pull_local` reads each `@ID:NAME` name of the source with the
+  rule of `Repo::resolve_ref_tip`: `refs/heads/NAME` when the source has
+  the collection id `ID`, and `refs/mirrors/ID/NAME` otherwise. The probe
+  of a local candidate reads the source with
+  `Repo::list_collection_refs_in`, which has the same rule.
 - Such a directory comes from outside the port: a hand edit, the `ostree`
   command, or a repository that took the own id after a pull of that
   collection. The summary of the `ostree` command reads the directory, and
@@ -3461,9 +3508,6 @@ when the port owns its set of members and expects the set to grow.
 - `ostrya::Error` has the attribute. Its variants are the error vocabulary of
   the port, and a new failure mode adds a variant.
 - `TrustRoots` has the attribute. The port owns the set of trust settings.
-- `ostrya::RefLocation` has the attribute. The port owns the set of ref
-  spaces that the weak-ref filter of a prune classifies ("The weak refs of a
-  prune").
 - `ostrya_fetch::UploadMethod` and `ostrya_fetch::SignPayload` have the
   attribute. The fetcher owns the set of upload methods and the set of body
   forms that a signer gets.

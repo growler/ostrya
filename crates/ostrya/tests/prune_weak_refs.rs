@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex};
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
-    MutableTree, ObjectType, PruneOptions, Ref, RefLocation, Repo, RepoMode, WeakRefFilter,
+    MutableTree, ObjectType, PruneOptions, Ref, Repo, RepoMode, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -120,35 +120,29 @@ fn weak_options(filter: WeakRefFilter) -> PruneOptions {
     }
 }
 
-/// Returns the label of a ref location:
+/// Returns the label of a ref:
 ///
 /// - the name of a local ref;
 /// - the `<remote>:<name>` refspec of a remote ref;
 /// - `<collection id>::<name>` for a collection ref.
-fn label(location: RefLocation<'_>) -> String {
-    match location {
-        RefLocation::Local(name) => name.to_owned(),
-        RefLocation::Remote { remote, name } => format!("{remote}:{name}"),
-        RefLocation::Collection {
-            collection_id,
-            name,
-        } => format!("{collection_id}::{name}"),
-        other => format!("{other:?}"),
+fn label(r: &Ref) -> String {
+    match r {
+        Ref::Local { name } => name.to_owned(),
+        Ref::Remote { remote, name } => format!("{remote}:{name}"),
+        Ref::Collection { id, name } => format!("{id}::{name}"),
     }
 }
 
 /// Returns a classifier that answers weak for each ref whose label starts with
 /// `pool/`. Only a local ref has such a label.
 fn pool_is_weak() -> WeakRefFilter {
-    WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
-        !label(location).starts_with("pool/")
-    })
+    WeakRefFilter::new(|r: &Ref, _: &Checksum| !label(r).starts_with("pool/"))
 }
 
 /// Returns a classifier that answers weak for each label that contains `pool`.
 /// The rule applies to local, remote, and collection refs.
 fn any_pool_is_weak() -> WeakRefFilter {
-    WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| !label(location).contains("pool"))
+    WeakRefFilter::new(|r: &Ref, _: &Checksum| !label(r).contains("pool"))
 }
 
 /// Returns a classifier that records the label of each ref location it gets,
@@ -162,8 +156,8 @@ where
 {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
-    let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
-        let name = label(location);
+    let filter = WeakRefFilter::new(move |r: &Ref, _: &Checksum| {
+        let name = label(r);
         let verdict = strong(&name);
         record.lock().unwrap().push(name);
         verdict
@@ -204,7 +198,7 @@ fn an_unreached_weak_ref_is_deleted_and_its_objects_swept() {
 
         assert_eq!(
             stats.deleted_refs,
-            vec!["pool/a".to_owned()],
+            vec![Ref::local("pool/a")],
             "the run names the weak ref it deleted"
         );
         assert_eq!(tip(&repo, "pool/a").await, None, "the weak ref is gone");
@@ -256,7 +250,7 @@ fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
 
         let opts = PruneOptions {
             depth: 1,
-            retain_branch_depth: vec![("pool/a".to_owned(), -1)],
+            retain_branch_depth: vec![(Ref::local("pool/a"), -1)],
             ..weak_options(pool_is_weak())
         };
         let stats = repo.prune(&opts).await.unwrap();
@@ -312,14 +306,14 @@ fn the_ancestry_rule_b_reaches_roots_a_second_weak_ref() {
 
         let opts = PruneOptions {
             depth: 1,
-            retain_branch_depth: vec![("pool/a".to_owned(), -1)],
+            retain_branch_depth: vec![(Ref::local("pool/a"), -1)],
             ..weak_options(pool_is_weak())
         };
         let stats = repo.prune(&opts).await.unwrap();
 
         assert_eq!(
             stats.deleted_refs,
-            vec!["pool/c".to_owned()],
+            vec![Ref::local("pool/c")],
             "the one weak ref nothing reaches is the one the run deleted"
         );
         assert_eq!(
@@ -361,7 +355,7 @@ fn a_dry_run_deletes_no_ref_and_still_reports_the_list() {
 
         assert_eq!(
             stats.deleted_refs,
-            vec!["pool/a".to_owned()],
+            vec![Ref::local("pool/a")],
             "the dry run names the ref the run would delete"
         );
         assert_eq!(
@@ -389,12 +383,10 @@ fn a_classifier_without_refs_only_is_refused() {
         let counter = Arc::clone(&calls);
         let opts = PruneOptions {
             refs_only: false,
-            ..weak_options(WeakRefFilter::new(
-                move |_: RefLocation<'_>, _: &Checksum| {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                    false
-                },
-            ))
+            ..weak_options(WeakRefFilter::new(move |_: &Ref, _: &Checksum| {
+                counter.fetch_add(1, Ordering::SeqCst);
+                false
+            }))
         };
         let err = repo
             .prune(&opts)
@@ -480,25 +472,24 @@ fn the_deleted_ref_list_is_sorted() {
             commit(&repo, tmp.path(), tree, None, Some(branch)).await;
         }
 
-        let filter = WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
-            location == RefLocation::Local("main")
-        });
+        let filter = WeakRefFilter::new(|r: &Ref, _: &Checksum| *r == Ref::local("main"));
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
-        let mut expected: Vec<String> = weak.iter().map(|n| (*n).to_owned()).collect();
+        let mut expected: Vec<Ref> = weak.iter().map(|n| Ref::local(*n)).collect();
         expected.sort();
         assert_eq!(
             expected,
-            vec![
-                "alpha/one".to_owned(),
-                "alpha/two".to_owned(),
-                "mid/aaa".to_owned(),
-                "mid/zzz".to_owned(),
-                "pool/0".to_owned(),
-                "pool/9".to_owned(),
-                "zeta/one".to_owned(),
-                "zeta/two".to_owned(),
-            ],
+            [
+                "alpha/one",
+                "alpha/two",
+                "mid/aaa",
+                "mid/zzz",
+                "pool/0",
+                "pool/9",
+                "zeta/one",
+                "zeta/two",
+            ]
+            .map(Ref::local),
             "the expected list is the eight weak names in byte order"
         );
         assert_eq!(stats.deleted_refs, expected, "the run reports them sorted");
@@ -528,8 +519,8 @@ fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
         // that it captured. A `Repo` method in the closure re-enters the
         // runtime. The new target is a commit that the run keeps, so the
         // repository stays consistent after the test.
-        let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
-            if location == RefLocation::Local("pool/a") {
+        let filter = WeakRefFilter::new(move |r: &Ref, _: &Checksum| {
+            if *r == Ref::local("pool/a") {
                 counter.fetch_add(1, Ordering::SeqCst);
                 std::fs::write(
                     repo_path.join("refs/heads/pool/a"),
@@ -589,7 +580,10 @@ fn a_local_ref_name_holding_a_colon_is_never_classified() {
             "it did see the ordinary name: {names:?}"
         );
         assert!(
-            !stats.deleted_refs.iter().any(|n| n == "foo:bar"),
+            !stats
+                .deleted_refs
+                .iter()
+                .any(|r| r.to_string() == "foo:bar"),
             "the run did not report it deleted: {:?}",
             stats.deleted_refs
         );
@@ -630,10 +624,10 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
         assert_eq!(
             stats.deleted_refs,
             vec![
-                "pool/a".to_owned(),
-                "pool/b".to_owned(),
-                "pool/x".to_owned(),
-                "pool/y".to_owned(),
+                Ref::local("pool/a"),
+                Ref::local("pool/b"),
+                Ref::local("pool/x"),
+                Ref::local("pool/y"),
             ],
             "the run names every weak ref it removed, the aliases among them"
         );
@@ -672,7 +666,7 @@ fn a_reached_weak_ref_narrows_the_arrival_bound() {
         // of the negative values that keep only the named commit.
         let opts = PruneOptions {
             depth: -1,
-            retain_branch_depth: vec![("pool/a".to_owned(), -2)],
+            retain_branch_depth: vec![(Ref::local("pool/a"), -2)],
             ..weak_options(pool_is_weak())
         };
         let stats = repo.prune(&opts).await.unwrap();
@@ -725,7 +719,7 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
         );
         assert_eq!(
             stats.deleted_refs,
-            vec!["origin:pool/drop".to_owned()],
+            vec![Ref::remote("origin", "pool/drop")],
             "the run names the remote ref it deleted by its refspec"
         );
         assert_eq!(
@@ -760,12 +754,9 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
 /// Returns a classifier that answers weak for each collection ref of
 /// `collection_id`. Each other ref is strong.
 fn collection_is_weak(collection_id: &'static str) -> WeakRefFilter {
-    WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
-        !matches!(
-            location,
-            RefLocation::Collection { collection_id: id, .. } if id == collection_id
-        )
-    })
+    WeakRefFilter::new(
+        move |r: &Ref, _: &Checksum| !matches!(r, Ref::Collection { id, .. } if id == collection_id),
+    )
 }
 
 /// Sets the collection ref `collection_id`, `name` to `commit` and returns it.
@@ -782,8 +773,8 @@ async fn collection_tip(repo: &Repo, cref: &Ref) -> Option<Checksum> {
 }
 
 /// A weak collection ref whose commit no strong root reaches is deleted, and
-/// its commit is swept. The run names the ref in `deleted_collection_refs`
-/// alone. The emptied directory of the collection id stays.
+/// its commit is swept. The run names the ref in `deleted_refs`. The emptied
+/// directory of the collection id stays.
 #[test]
 fn an_unreached_weak_collection_ref_is_deleted_and_its_objects_swept() {
     let tmp = TmpDir::new("weak-refs-collection-unreached");
@@ -800,14 +791,9 @@ fn an_unreached_weak_collection_ref_is_deleted_and_its_objects_swept() {
             .unwrap();
 
         assert_eq!(
-            stats.deleted_collection_refs,
+            stats.deleted_refs,
             vec![cref.clone()],
             "the run names the collection ref it deleted"
-        );
-        assert!(
-            stats.deleted_refs.is_empty(),
-            "and names no ref in deleted_refs: {:?}",
-            stats.deleted_refs
         );
         assert_eq!(collection_tip(&repo, &cref).await, None, "the ref is gone");
         let dir = tmp.path().join("repo/refs/mirrors/org.example.Cache");
@@ -849,7 +835,7 @@ fn a_weak_collection_ref_reached_through_a_parent_survives() {
             "the classifier saw the kept ref: {names:?}"
         );
         assert_eq!(
-            stats.deleted_collection_refs,
+            stats.deleted_refs,
             vec![unreached.clone()],
             "the run deleted the unreached weak ref alone"
         );
@@ -885,11 +871,6 @@ fn with_no_filter_each_collection_ref_is_strong() {
         let stats = repo.prune(&opts).await.unwrap();
 
         assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
-        assert!(
-            stats.deleted_collection_refs.is_empty(),
-            "{:?}",
-            stats.deleted_collection_refs
-        );
         assert!(
             !holds(&repo, &loose).await,
             "the run swept the loose commit"
@@ -934,7 +915,7 @@ fn a_filter_on_one_collection_leaves_another_collection_strong() {
                 "the classifier saw {name}: {names:?}"
             );
         }
-        assert_eq!(stats.deleted_collection_refs, vec![weak.clone()]);
+        assert_eq!(stats.deleted_refs, vec![weak.clone()]);
         assert_eq!(collection_tip(&repo, &weak).await, None);
         assert!(
             !holds(&repo, &cached).await,
@@ -992,8 +973,7 @@ fn a_mirror_ref_outside_the_name_rule_is_never_classified() {
             vec!["main".to_owned(), "org.example.Cache::pool/ok".to_owned()],
             "only the valid refs reached the classifier"
         );
-        assert_eq!(stats.deleted_collection_refs, vec![cref.clone()]);
-        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert_eq!(stats.deleted_refs, vec![cref.clone()]);
         assert_eq!(collection_tip(&repo, &cref).await, None);
         assert!(
             !holds(&repo, &valid).await,
@@ -1036,11 +1016,10 @@ fn a_dry_run_lists_weak_collection_refs_and_deletes_nothing() {
         let stats = repo.prune(&opts).await.unwrap();
 
         assert_eq!(
-            stats.deleted_collection_refs,
+            stats.deleted_refs,
             vec![cref.clone()],
             "the dry run names the ref the run would delete"
         );
-        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
         assert_eq!(
             collection_tip(&repo, &cref).await,
             Some(cached),
@@ -1075,9 +1054,8 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
             set_ref(&repo, collection_id, name, &target).await;
         }
 
-        let filter = WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
-            !matches!(location, RefLocation::Collection { .. })
-        });
+        let filter =
+            WeakRefFilter::new(|r: &Ref, _: &Checksum| !matches!(r, Ref::Collection { .. }));
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
         let expected: Vec<Ref> = [
@@ -1091,7 +1069,7 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
         .iter()
         .map(|(collection_id, name)| Ref::collection(*collection_id, *name))
         .collect();
-        assert_eq!(stats.deleted_collection_refs, expected);
+        assert_eq!(stats.deleted_refs, expected);
     });
 }
 
@@ -1138,8 +1116,7 @@ fn an_own_id_mirror_ref_is_a_strong_ref_with_no_name() {
             vec!["app".to_owned()],
             "the classifier saw the local ref alone"
         );
-        assert_eq!(stats.deleted_refs, vec!["app".to_owned()]);
-        assert!(stats.deleted_collection_refs.is_empty());
+        assert_eq!(stats.deleted_refs, vec![Ref::local("app")]);
         assert_eq!(tip(&repo, "app").await, None, "the local ref is gone");
         assert!(mirror.is_file(), "the mirror ref file stays");
         assert!(holds(&repo, &mirrored).await, "the mirror commit stays");
@@ -1174,7 +1151,7 @@ fn an_own_id_mirror_ref_takes_the_bound_of_an_unnamed_ref() {
 
         let only_other = PruneOptions {
             depth: 0,
-            only_branch: vec!["other".to_owned()],
+            only_branch: vec![Ref::local("other")],
             ..PruneOptions::new()
         };
         repo.prune(&only_other).await.unwrap();
@@ -1185,7 +1162,7 @@ fn an_own_id_mirror_ref_takes_the_bound_of_an_unnamed_ref() {
 
         let retain_other = PruneOptions {
             depth: 0,
-            retain_branch_depth: vec![("other".to_owned(), 0)],
+            retain_branch_depth: vec![(Ref::local("other"), 0)],
             ..PruneOptions::new()
         };
         repo.prune(&retain_other).await.unwrap();
@@ -1193,6 +1170,105 @@ fn an_own_id_mirror_ref_takes_the_bound_of_an_unnamed_ref() {
         assert!(!holds(&repo, &c2).await, "the global depth sweeps c2");
         assert!(!holds(&repo, &c1).await, "the global depth sweeps c1");
         assert!(mirror.is_file(), "the mirror ref file stays");
+    });
+}
+
+/// The value `@OWN:main` of `only_branch` and `retain_branch_depth`, where
+/// `OWN` is the `[core] collection-id` of the repository, selects
+/// `refs/heads/main` alone. A hand-made `refs/mirrors/OWN/main` names another
+/// chain, and takes the bound of a ref that no list names: a non-empty
+/// `only_branch` keeps that chain in full, and the global depth bounds it
+/// beside a `retain_branch_depth` entry.
+#[test]
+fn only_branch_of_the_own_id_selects_the_local_ref_alone() {
+    let tmp = TmpDir::new("weak-refs-own-id-only-branch");
+    block_on(async {
+        for name in ["l1", "l2", "m1", "m2"] {
+            write_tree(tmp.path(), name);
+        }
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive).collection_id("org.example.Own"),
+        )
+        .await
+        .unwrap();
+        let l1 = commit(&repo, tmp.path(), "l1", None, None).await;
+        let l2 = commit(&repo, tmp.path(), "l2", Some(l1), Some("main")).await;
+        let m1 = commit(&repo, tmp.path(), "m1", None, None).await;
+        let m2 = commit(&repo, tmp.path(), "m2", Some(m1), None).await;
+        let mirror = tmp.path().join("repo/refs/mirrors/org.example.Own/main");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, format!("{}\n", m2.to_hex())).unwrap();
+
+        let only_own = PruneOptions {
+            depth: 0,
+            only_branch: vec![Ref::collection("org.example.Own", "main")],
+            ..PruneOptions::new()
+        };
+        repo.prune(&only_own).await.unwrap();
+        assert!(holds(&repo, &l2).await, "the local tip stays");
+        assert!(
+            !holds(&repo, &l1).await,
+            "the selection prunes refs/heads/main"
+        );
+        assert!(holds(&repo, &m2).await, "the mirror tip stays");
+        assert!(
+            holds(&repo, &m1).await,
+            "the selection keeps the mirror chain"
+        );
+        assert!(mirror.is_file(), "the mirror ref file stays");
+
+        let l3 = commit(&repo, tmp.path(), "l1", Some(l2), Some("main")).await;
+        let retain_own = PruneOptions {
+            depth: 0,
+            retain_branch_depth: vec![(Ref::collection("org.example.Own", "main"), 1)],
+            ..PruneOptions::new()
+        };
+        repo.prune(&retain_own).await.unwrap();
+        assert!(holds(&repo, &l3).await, "the local tip stays");
+        assert!(holds(&repo, &l2).await, "the entry keeps one parent");
+        assert!(holds(&repo, &m2).await, "the mirror tip stays");
+        assert!(
+            !holds(&repo, &m1).await,
+            "the global depth prunes the mirror chain"
+        );
+        assert!(mirror.is_file(), "the mirror ref file stays");
+    });
+}
+
+/// `deleted_refs` names each deleted weak ref as a `Ref`: a local ref, a
+/// remote ref, and a collection ref, in the order of `Ref`.
+#[test]
+fn deleted_refs_names_a_local_a_remote_and_a_collection_ref() {
+    let tmp = TmpDir::new("weak-refs-deleted-kinds");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "l", "r", "c"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        commit(
+            &repo,
+            tmp.path(),
+            "c",
+            None,
+            Some("@org.example.Cache:pool/c"),
+        )
+        .await;
+        commit(&repo, tmp.path(), "r", None, Some("origin:pool/r")).await;
+        commit(&repo, tmp.path(), "l", None, Some("pool/l")).await;
+
+        let stats = repo.prune(&weak_options(any_pool_is_weak())).await.unwrap();
+
+        assert_eq!(
+            stats.deleted_refs,
+            vec![
+                Ref::local("pool/l"),
+                Ref::remote("origin", "pool/r"),
+                Ref::collection("org.example.Cache", "pool/c"),
+            ]
+        );
+        for r in &stats.deleted_refs {
+            assert_eq!(repo.resolve_ref_tip(r).await.unwrap(), None, "{r} is gone");
+        }
+        assert!(tip(&repo, "main").await.is_some(), "the strong ref stays");
     });
 }
 
@@ -1307,7 +1383,7 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
         );
         assert_eq!(
             stats.deleted_refs,
-            vec!["pool/a".to_owned()],
+            vec![Ref::local("pool/a")],
             "the run deleted the weak ref alone"
         );
         assert!(!holds(&repo, &orphan).await, "and swept its commit");
@@ -1392,7 +1468,7 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
         );
         assert_eq!(
             stats.deleted_refs,
-            vec!["a:pool/x".to_owned()],
+            vec![Ref::remote("a", "pool/x")],
             "the run deleted the addressed ref alone"
         );
         assert!(!addressed_path.exists(), "the addressed file is gone");
@@ -1425,7 +1501,10 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
             "and so does the local ref of that name"
         );
         assert!(
-            !stats.deleted_refs.iter().any(|n| n == "poolstray"),
+            !stats
+                .deleted_refs
+                .iter()
+                .any(|r| r.to_string() == "poolstray"),
             "the run deleted neither: {:?}",
             stats.deleted_refs
         );
@@ -1454,8 +1533,8 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
         // unlink then finds no file, and the directory that held the file is
         // also gone.
         let dir = tmp.path().join("repo/refs/heads/pool");
-        let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
-            let name = label(location);
+        let filter = WeakRefFilter::new(move |r: &Ref, _: &Checksum| {
+            let name = label(r);
             if name == "pool/doomed" {
                 std::fs::remove_file(dir.join("doomed")).unwrap();
                 std::fs::remove_dir(&dir).unwrap();
@@ -1470,7 +1549,7 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
 
         assert_eq!(
             stats.deleted_refs,
-            vec!["pool/doomed".to_owned()],
+            vec![Ref::local("pool/doomed")],
             "the run names the ref it removed"
         );
         assert!(
@@ -1518,7 +1597,7 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
 
         let opts = PruneOptions {
             depth: 0,
-            retain_branch_depth: vec![("origin:pool/chain".to_owned(), -1)],
+            retain_branch_depth: vec![(Ref::remote("origin", "pool/chain"), -1)],
             ..weak_options(any_pool_is_weak())
         };
         let stats = repo.prune(&opts).await.unwrap();
@@ -1594,8 +1673,8 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
         assert_eq!(
             stats.deleted_refs,
             vec![
-                "origin:pool/target".to_owned(),
-                "pool/into-remote".to_owned()
+                Ref::local("pool/into-remote"),
+                Ref::remote("origin", "pool/target")
             ],
             "the run removed the alias into the remote space and the ref it named"
         );
@@ -1656,8 +1735,8 @@ fn a_weak_remote_alias_over_a_weak_remote_ref_leaves_no_ref_file() {
         assert_eq!(
             stats.deleted_refs,
             vec![
-                "origin:pool/alias".to_owned(),
-                "origin:pool/target".to_owned(),
+                Ref::remote("origin", "pool/alias"),
+                Ref::remote("origin", "pool/target"),
             ],
             "the run names the remote alias and the remote ref it named"
         );

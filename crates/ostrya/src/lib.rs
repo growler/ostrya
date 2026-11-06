@@ -206,7 +206,7 @@ pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,
 };
 #[doc(hidden)]
-pub use prune::{PruneOptions, PruneStats, RefLocation, WeakRefFilter, WeakRefFilterFn};
+pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]
 pub use pull::{
     CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats, PullFlags,

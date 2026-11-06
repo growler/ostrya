@@ -1272,52 +1272,6 @@ fn the_stream_source_with_no_ref_writes_writes_no_ref() {
     });
 }
 
-/// A pull over ssh refuses a collection id. The pull over a pair of streams
-/// refuses it before its first `Get`. The pull from an ssh address refuses it
-/// before the ssh client starts. Neither pull publishes anything.
-#[test]
-fn the_ssh_pull_refuses_a_collection_id() {
-    block_on(async {
-        let dir = TmpDir::new("pull-ssh-collection");
-        let (remote, _commit) = build_remote(dir.path()).await;
-        let dest_path = dir.path().join("dest");
-        let (dest, record) = dest_with_standin_ssh(dir.path(), "").await;
-        let before = snapshot(&dest_path);
-        let collection = || PullOptions {
-            collection_id: Some("org.example.Os".to_owned()),
-            no_ref_writes: true,
-            ..main_ref(0)
-        };
-        let expected = "only a local pull takes a collection id";
-
-        let (pulled, served, messages) = pull_session_ssh(
-            &dest,
-            &remote,
-            PullTrust::unverified(),
-            StreamSessionOptions::default(),
-            collection(),
-        )
-        .await;
-        match pulled {
-            Err(Error::Unsupported(msg)) => assert_eq!(msg, expected),
-            other => panic!("{other:?}"),
-        }
-        assert!(
-            matches!(messages.as_slice(), [Message::PullHello(_)]),
-            "{messages:?}"
-        );
-        served.unwrap();
-
-        let err = dest.pull("origin", collection()).await.unwrap_err();
-        match err {
-            Error::Unsupported(msg) => assert_eq!(msg, expected),
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(recorded(&record), None);
-        assert_eq!(snapshot(&dest_path), before);
-    });
-}
-
 /// The read half of the pipe into the server. It keeps a copy of each byte
 /// that the server reads.
 struct Tap {

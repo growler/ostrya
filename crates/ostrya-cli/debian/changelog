@@ -18,6 +18,14 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     gives each such key a note, and remote prune keeps its commit.
   * A revision takes @ID:NAME, the ref NAME of the collection ID. An
     error names a collection ref as @ID:NAME.
+  * commit -b and --tag take @ID:NAME. The refs of one commit are in one
+    namespace, and ostree.collection-binding holds its id. --tag refuses
+    a remote ref.
+  * refs --create and refs --delete take @ID:NAME without -c. A PREFIX
+    @ID: matches each ref of the collection ID, and a listing prints
+    @ID:NAME. -A refuses a collection ref of another id.
+  * prune --only-branch and --retain-branch-depth take @ID:NAME.
+  * pull-local takes @ID:REF operands of more than one collection.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

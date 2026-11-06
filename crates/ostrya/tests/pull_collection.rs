@@ -2317,15 +2317,6 @@ fn refused_options_send_no_request() {
             ("long id", &long, vec!["a"], base()),
             ("no remote", ID, vec![], base()),
             (
-                "collection_id",
-                ID,
-                vec!["a"],
-                PullOptions {
-                    collection_id: Some(ID.to_owned()),
-                    ..base()
-                },
-            ),
-            (
                 "remote",
                 ID,
                 vec!["a"],
@@ -2398,7 +2389,6 @@ fn refused_options_send_no_request() {
             opts.pull = pull;
             let err = dest.pull_collection(id, &remotes, opts).await.unwrap_err();
             let expected = match tag {
-                "collection_id" => matches!(err, Error::Unsupported(_)),
                 "ref name" => matches!(err, Error::InvalidRefspec(_)),
                 "unknown remote" => true,
                 _ => matches!(err, Error::InvalidInput(_)),

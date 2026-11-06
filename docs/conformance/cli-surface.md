@@ -355,6 +355,41 @@ Each revision operand of the port also reads `@ID:NAME`, the ref `NAME` of
 the collection `ID`. This form is a port extension. `../format-reference.md`,
 "Revision syntax", states its rule.
 
+`refs` of the port takes `@ID:NAME` without `-c` as a port extension
+(`../decisions.md`, "The ref syntax"). The `-c` forms keep the meaning of the
+tool. The port extension has these rules:
+
+- `refs --create=@ID:NAME REV` writes `refs/mirrors/ID/NAME`, or
+  `refs/heads/NAME` when `ID` is the `[core] collection-id` of the
+  repository. `--force` applies as to a local ref. A NEWREF `@ID:NAME` that
+  fails the collection-id rule or the ref-name rule gives `error: Invalid
+  refspec <NEWREF>`.
+- A `PREFIX` `@ID:` matches each ref under `refs/mirrors/ID/`, as `REMOTE:`
+  matches each ref of a remote. A `PREFIX` `@ID:PREFIX` matches the ref
+  `@ID:PREFIX` and each ref below it. A listing prints each such ref as
+  `@ID:NAME`. Without `--list`, a prefix `@ID:PREFIX` prints the part below
+  it as `@ID:NAME`, by the rule of a remote prefix. A listing with no
+  `PREFIX` prints no collection ref.
+- `refs --delete @ID:` removes each ref under `refs/mirrors/ID/`. The
+  refusal of a whole-remote prefix does not apply to it, and the command
+  exits 0. `refs --delete @ID:PREFIX` removes the refs that the prefix
+  matches, and no local ref.
+- A `PREFIX` `@OWN:PREFIX`, where `OWN` is the `[core] collection-id` of the
+  repository and `PREFIX` is a local ref name, is the `PREFIX` `PREFIX`.
+  `@OWN:` matches each local ref, and `refs --delete @OWN:` removes each
+  local ref under the alias guard. A `PREFIX` `@OWN:REST`, where `REST` is
+  not a local ref name, gives `error: Invalid refspec @OWN:REST` and exits 1.
+  Examples are `@OWN:origin:main` and `@OWN:@ID:`. The target
+  `@OWN:REMOTE:NAME` of `-A --create` is a collection ref of the refusal
+  below.
+- `-A` refuses a collection ref of another id: `-A --create=@ID:NAME` with
+  `error: Cannot create alias as collection ref: @ID:NAME`, the target
+  `@ID:NAME` with `error: Cannot create alias to collection ref: @ID:NAME`,
+  and a `PREFIX` `@ID:` or `@ID:PREFIX`, in a listing and with `--delete`,
+  with `error: -A takes no collection prefix: <PREFIX>`. Each refusal exits
+  1 and writes nothing. `-A --create=@OWN:NAME` writes the local alias
+  `NAME`.
+
 Abbreviated checksum resolution is shared: a run of one to 63 lowercase hex
 characters names the one commit object whose checksum starts with it, wherever a
 revision is taken, and a prefix more than one commit carries reports `error:
@@ -675,25 +710,44 @@ checksum that the tool gives for `--bind-ref=NAME`. After the port publishes
 the objects, it writes the `-b` ref and then each tag ref, one ref at a time.
 A name that is also a `--bind-ref` name occurs two times in
 `ostree.ref-binding`. The tool refuses the option with
-`error: Unknown option --tag=NAME` at exit 1. The port refuses these values at
-exit 1, before it takes the repository lock:
+`error: Unknown option --tag=NAME` at exit 1.
 
-- a name with `:`;
-- a name that the ref-name rule refuses, with `error: Invalid refspec <name>`;
-- a name of 64 lowercase hex characters, with `error: Rev name '<name>' looks
-  like a checksum`;
-- the `-b` name, and a name given two times;
-- a name that is a path below another name of `-b` and `--tag`, with
-  `error: --tag <name> names a path below --branch <branch>`, `error: --tag
-  <name> names a path below --tag <tag>`, or `error: --branch <branch> names
-  a path below --tag <tag>`. A `-b` name with `:` is a ref under
-  `refs/remotes`, and this check does not include it;
-- a name that has an entry under `refs/heads`: a ref, an alias (also a
-  dangling one), or a directory of refs. A name below a ref is refused too.
-  The message is `error: --tag specified but ref <name> already exists`. The
-  port reads the path again before it publishes the objects, and refuses an
-  entry that came after the first read. If another writer creates a ref at
-  the path after the second read, the port replaces that ref.
+The `-b` and `--tag` values of the port also take the port extension
+`@ID:NAME` ("The ref syntax" of `../decisions.md`). `@ID:NAME` is the ref
+`refs/mirrors/ID/NAME`, or the local ref `NAME` when `ID` is the
+`[core] collection-id` of the repository. `ostree.ref-binding` holds the
+part `NAME`. The refs of `-b` and `--tag` are in one namespace: the local
+refs, or the refs of one collection. A `-b REMOTE:NAME` is in the local
+namespace, and a commit with no `-b` and no `--tag` is in the local
+namespace. `ostree.collection-binding` holds the id of the namespace, or the
+`[core] collection-id` of the repository for the local namespace. The
+implicit parent of `-b @ID:NAME` is the commit of that ref.
+
+The port refuses these `--tag` values at exit 1, before it takes the
+repository lock:
+
+- a remote ref `REMOTE:NAME`, with `error: --tag <name> names a remote ref,
+  and a tag is a local ref or a collection ref`;
+- a value that is not a ref, with `error: Invalid refspec <name>`;
+- a local name of 64 lowercase hex characters, also as `@OWN:NAME`, with
+  `error: Rev name '<name>' looks like a checksum`;
+- the `-b` ref, and a ref given two times. `NAME` and `@OWN:NAME` are one
+  ref;
+- refs of two namespaces in `-b` and `--tag`, with `error: <option> <value>
+  and <option> <value> name refs of two namespaces, and the refs of a commit
+  are in one namespace`;
+- a ref that is a path below another ref of `-b` and `--tag` in the same
+  directory, with `error: --tag <name> names a path below --branch
+  <branch>`, `error: --tag <name> names a path below --tag <tag>`, or
+  `error: --branch <branch> names a path below --tag <tag>`. A
+  `-b REMOTE:NAME` is a ref under `refs/remotes`, so it is below no tag;
+- a value that has an entry at its path under `refs/heads` or
+  `refs/mirrors/ID`: a ref, an alias (also a dangling one), or a directory of
+  refs. A path below a ref is refused too. The message is `error: --tag
+  specified but ref <name> already exists`. The port reads the path again
+  before it publishes the objects, and refuses an entry that came after the
+  first read. If another writer creates a ref at the path after the second
+  read, the port replaces that ref.
 
 A refusal writes no object and no ref. Without `-b`, the option needs
 `--orphan`, as each commit does. `--orphan --tag=NAME` creates `NAME` and
@@ -2367,6 +2421,16 @@ removed), and the port refuses the same pair in the same words. The totals text
 the command writes is in `cli-behavior.md`, "CLI output formats",
 `prune`.
 
+The BRANCH of `--only-branch` and of `--retain-branch-depth` of the port also
+takes `@ID:NAME`, the collection ref `refs/mirrors/ID/NAME`, as a port
+extension (`../decisions.md`, "The weak refs of a prune"). `@OWN:NAME`, where
+`OWN` is the `[core] collection-id` of the repository, selects
+`refs/heads/NAME` alone, and no BRANCH selects a ref under
+`refs/mirrors/OWN/`. The port resolves each `--only-branch` value as a
+revision, so a value that names nothing gives `error: Refspec '<value>' not
+found` at exit 1. A BRANCH selects the ref that it names as a ref, so a value
+that is not a ref, for example `main^`, selects no branch.
+
 A symlink under `refs/` that names a directory ends `prune --refs-only` of the
 tool with exit 1. It ends each `prune` of the port with exit 1, in different
 words ("P1", `refs`). The default `prune` of the tool exits 0.
@@ -3995,6 +4059,18 @@ ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
 refuses the value at exit 1. The port opens the source repository and each
 `--localcache-repo` first, and refuses the value before it reads a ref or an
 object of the source. Neither writes an object or a ref.
+
+The ref operands of `pull-local` of the port also take `@ID:REF[^...]` as a
+port extension (`../format-reference.md`, "The pull of collection refs"). One
+run takes plain operands and `@ID:REF` operands of more than one collection.
+The port reads `@ID:REF` in the source at `refs/mirrors/ID/REF`, or at
+`refs/heads/REF` when `ID` is the collection id of the source. It writes the
+ref to `refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the
+collection id of the destination, also with `--remote`. The tip commit of
+`@ID:REF` must hold the `ostree.collection-binding` `ID`, and
+`--disable-verify-bindings` does not skip this check. An operand that starts
+with `@` and is not an `@ID:REF` ref gives `error: Invalid refspec
+<operand>` at exit 1, before the port reads the source.
 
 The two GPG switches check what the tool checks and refuse where it refuses
 (`cli-behavior.md`, "Signature verification during a pull"), with the

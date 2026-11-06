@@ -8032,53 +8032,6 @@ fn a_mirror_pull_with_no_ref_writes_copies_no_summary() {
     });
 }
 
-// --- collection refs -------------------------------------------------------
-
-/// An HTTP pull refuses a collection id before its first request and publishes
-/// nothing. A pull from a remote with no section in the configuration gets the
-/// same refusal.
-#[test]
-fn an_http_pull_refuses_a_collection_id() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-collection");
-        build_remote(dir.path()).await;
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
-        let dest_dir = dir.path().join("dest");
-        let snapshot = || {
-            let mut out = file_inventory(&dest_dir, "objects");
-            out.extend(file_inventory(&dest_dir, "refs"));
-            out.extend(file_inventory(&dest_dir, "state"));
-            out
-        };
-        let before = snapshot();
-
-        for remote in ["origin", "absent"] {
-            let err = dest
-                .pull(
-                    remote,
-                    PullOptions {
-                        refs: vec!["test/main".to_owned()],
-                        collection_id: Some("org.example.Os".to_owned()),
-                        no_ref_writes: true,
-                        ..PullOptions::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            match err {
-                Error::Unsupported(msg) => {
-                    assert_eq!(msg, "only a local pull takes a collection id", "{remote}")
-                }
-                other => panic!("{remote}: {other:?}"),
-            }
-        }
-
-        assert!(server.seen().is_empty(), "{:?}", server.seen());
-        assert_eq!(snapshot(), before);
-    });
-}
-
 // --- the proxy key of a remote ---------------------------------------------
 
 /// The variables that the fetcher reads to find a proxy, in both spellings. A
@@ -8934,13 +8887,6 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                     ..main()
                 },
             ),
-            (
-                "collection_id",
-                PullOptions {
-                    collection_id: Some("org.example.Os".to_owned()),
-                    ..main()
-                },
-            ),
         ];
         for (tag, opts) in cases {
             let progress = ostrya::PullProgress::new();
@@ -8953,9 +8899,6 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                 .await
                 .unwrap_err();
             match (tag, &err) {
-                ("collection_id", Error::Unsupported(m)) => {
-                    assert_eq!(m, "only a local pull takes a collection id")
-                }
                 ("overrides", Error::InvalidInput(m)) => assert_eq!(
                     m,
                     "a pull with a session takes its server from the session, and takes \
@@ -8967,7 +8910,7 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                      takes no trust group"
                 ),
                 ("subpath", Error::Pull(_)) => {}
-                ("collection_id" | "subpath" | "overrides" | "trust_group", _) => {
+                ("subpath" | "overrides" | "trust_group", _) => {
                     panic!("{tag}: {err:?}")
                 }
                 (_, Error::InvalidInput(_)) => {}

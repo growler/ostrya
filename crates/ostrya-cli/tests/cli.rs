@@ -21140,8 +21140,8 @@ fn commit_tag_refuses_a_ref_created_during_the_commit() {
     assert_eq!(resolve(&repo, "late"), resolve(&repo, "held"));
 }
 
-/// `commit --tag` refuses a bad name before it reads the tree: a name with
-/// `:`, a name that the ref-name rule refuses, a checksum-shaped name, the
+/// `commit --tag` refuses a bad name before it reads the tree: a remote
+/// ref, a name that the ref-name rule refuses, a checksum-shaped name, the
 /// branch name, a name given twice, and a tag with no branch and no
 /// `--orphan`. The refusal writes no object and no ref.
 #[test]
@@ -21156,7 +21156,7 @@ fn commit_tag_refuses_bad_names_and_writes_nothing() {
     let cases: [(&[&str], String); 6] = [
         (
             &["-b", "new", "--tag=a:b"],
-            "--tag a:b holds ':', and a tag is a local ref".to_owned(),
+            "--tag a:b names a remote ref, and a tag is a local ref or a collection ref".to_owned(),
         ),
         (
             &["-b", "new", "--tag=-bad"],
@@ -46982,4 +46982,541 @@ fn receive_one_way_allow_privileged_as_root() {
         .filter(|(name, _)| name.ends_with(".file"))
         .any(|(name, _)| std::fs::metadata(guest.join(name)).unwrap().mode() & 0o4000 != 0);
     assert!(setuid, "no object carries the setuid bit");
+}
+
+// --- the @ID:NAME operands of commit, refs, prune, and pull-local ---------
+
+/// The `[core] collection-id` of a repository of the tests of the `@ID:NAME`
+/// operands.
+const OWN_ID: &str = "org.example.Own";
+
+/// Creates an archive repository at `path`, with the collection id `id` if it
+/// is `Some`, and returns the path.
+fn init_archive(path: &Path, id: Option<&str>) -> PathBuf {
+    let repo_arg = format!("--repo={}", path.display());
+    let id_arg = id.map(|id| format!("--collection-id={id}"));
+    let mut argv = vec!["init", &repo_arg, "--mode=archive"];
+    argv.extend(id_arg.as_deref());
+    ostrya(&argv, None, &[]).ok();
+    path.to_owned()
+}
+
+/// Returns the commit object of `checksum` in the repository at `repo`.
+fn load_commit_at(repo: &Path, checksum: &str) -> ostrya::Commit {
+    block_on(async {
+        let repo = Repo::open(repo).await.unwrap();
+        let checksum = Checksum::from_hex(checksum).unwrap();
+        repo.load_commit(&checksum).await.unwrap().0
+    })
+}
+
+/// Returns `true` if the repository at `repo` holds the commit `checksum`.
+fn holds_commit(repo: &Path, checksum: &str) -> bool {
+    block_on(async {
+        let repo = Repo::open(repo).await.unwrap();
+        let checksum = Checksum::from_hex(checksum).unwrap();
+        repo.has_object(ObjectType::Commit, &checksum)
+            .await
+            .unwrap()
+    })
+}
+
+/// Returns the checksum in the ref file at `relpath` of the repository at
+/// `repo`, or `None` if the file is absent.
+fn ref_file(repo: &Path, relpath: &str) -> Option<String> {
+    std::fs::read_to_string(repo.join(relpath))
+        .ok()
+        .map(|text| text.trim().to_owned())
+}
+
+/// Runs `ostrya` with `args`, `--repo` of `repo` first, and returns the run.
+fn ostrya_at(repo: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let mut argv = vec![args[0], &repo_arg];
+    argv.extend_from_slice(&args[1..]);
+    ostrya(&argv, None, &[])
+}
+
+/// Checks that `run` exits 1 with `error: <message>` alone on standard
+/// error.
+fn refused_with_message(run: &Run, message: &str) {
+    assert_eq!(run.status.code(), Some(1), "not refused: {message}");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr).trim(),
+        format!("error: {message}")
+    );
+}
+
+/// `commit -b @X:a --tag=@X:t` writes `refs/mirrors/X/a` and
+/// `refs/mirrors/X/t`, and no local ref. A second commit to `@X:a` takes the
+/// tip of `@X:a` as its parent. In a repository whose collection id is OWN,
+/// `-b @OWN:b --tag=t` writes the local refs `b` and `t`.
+#[test]
+fn commit_branch_and_tag_take_a_collection_ref() {
+    let tmp = TmpDir::new("commit-collection-ref");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+
+    let first = commit_no_parent(
+        &repo,
+        &["-b", "@org.example.X:a", "--tag=@org.example.X:t"],
+        &src,
+    )
+    .ok()
+    .stdout_trimmed();
+    for relpath in [
+        "refs/mirrors/org.example.X/a",
+        "refs/mirrors/org.example.X/t",
+    ] {
+        assert_eq!(ref_file(&repo, relpath).as_ref(), Some(&first), "{relpath}");
+    }
+    for name in ["a", "t"] {
+        assert_eq!(ref_file(&repo, &format!("refs/heads/{name}")), None);
+    }
+
+    let second = ostrya_at(
+        &repo,
+        &[
+            "commit",
+            FIXED_TIMESTAMP,
+            "-b",
+            "@org.example.X:a",
+            "--add-metadata-string=k=v",
+            src.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert_eq!(
+        load_commit_at(&repo, &second).parent.map(|c| c.to_hex()),
+        Some(first.clone()),
+        "the tip of @X:a is the implicit parent"
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.X/a"),
+        Some(second)
+    );
+
+    let own = commit_no_parent(&repo, &[&format!("-b=@{OWN_ID}:b"), "--tag=t"], &src)
+        .ok()
+        .stdout_trimmed();
+    for name in ["b", "t"] {
+        assert_eq!(
+            ref_file(&repo, &format!("refs/heads/{name}")).as_ref(),
+            Some(&own)
+        );
+    }
+    assert!(!repo.join(format!("refs/mirrors/{OWN_ID}")).exists());
+}
+
+/// `commit -b @X:a --tag=@X:t` writes the collection binding X and the ref
+/// binding `[a, t]`. `-b @OWN:a --tag=t` writes the collection binding OWN and
+/// the ref binding `[a, t]`.
+#[test]
+fn commit_collection_branch_writes_the_collection_binding() {
+    let tmp = TmpDir::new("commit-collection-binding");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+
+    for (args, collection) in [
+        (
+            vec!["-b", "@org.example.X:a", "--tag=@org.example.X:t"],
+            "org.example.X",
+        ),
+        (vec!["-b", "@org.example.Own:a", "--tag=t"], OWN_ID),
+    ] {
+        let checksum = commit_no_parent(&repo, &args, &src).ok().stdout_trimmed();
+        let commit = load_commit_at(&repo, &checksum);
+        assert_eq!(commit.collection_binding(), Some(collection), "{args:?}");
+        assert_eq!(commit.ref_bindings(), ["a", "t"], "{args:?}");
+    }
+}
+
+/// `commit` refuses the refs of two namespaces before it takes the lock:
+/// `-b @X:a --tag=@Y:b`, and `-b a --tag=@X:b` where X is not the collection
+/// id of the repository. The refusal writes no object and no ref.
+#[test]
+fn commit_refuses_refs_of_two_namespaces_and_writes_nothing() {
+    let tmp = TmpDir::new("commit-two-namespaces");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let refs = describe_tree_with_content(&repo.join("refs"));
+
+    for (args, message) in [
+        (
+            ["-b", "@org.example.X:a", "--tag=@org.example.Y:b"],
+            "--tag @org.example.Y:b and --branch @org.example.X:a name refs of two \
+             namespaces, and the refs of a commit are in one namespace",
+        ),
+        (
+            ["-b", "a", "--tag=@org.example.X:b"],
+            "--tag @org.example.X:b and --branch a name refs of two namespaces, and \
+             the refs of a commit are in one namespace",
+        ),
+    ] {
+        refused_with_message(&commit_no_parent(&repo, &args, &src), message);
+        assert!(loose_objects(&repo).is_empty(), "{args:?} wrote an object");
+        assert_eq!(
+            describe_tree_with_content(&repo.join("refs")),
+            refs,
+            "{args:?} wrote a ref"
+        );
+    }
+}
+
+/// `pull-local` takes a plain operand and `@ID:NAME` operands of two
+/// collections in one call. Into a destination whose collection id is X,
+/// `@X:a` writes the local ref `a`, and `@Y:b` writes `refs/mirrors/Y/b`.
+#[test]
+fn pull_local_takes_a_collection_ref_operand() {
+    let tmp = TmpDir::new("pull-local-collection-operand");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let tree = base.join("src");
+    let src = init_archive(&base.join("source"), None);
+    let mut tips = Vec::new();
+    for branch in ["main", "@org.example.X:a", "@org.example.Y:b"] {
+        let run = commit_no_parent(&src, &["-b", branch, &format!("-s={branch}")], &tree);
+        tips.push(run.ok().stdout_trimmed());
+    }
+    let dst = init_archive(&base.join("dst"), Some("org.example.X"));
+
+    ostrya_at(
+        &dst,
+        &[
+            "pull-local",
+            src.to_str().unwrap(),
+            "main",
+            "@org.example.X:a",
+            "@org.example.Y:b",
+        ],
+    )
+    .ok();
+
+    assert_eq!(ref_file(&dst, "refs/heads/main").as_ref(), Some(&tips[0]));
+    assert_eq!(ref_file(&dst, "refs/heads/a").as_ref(), Some(&tips[1]));
+    assert_eq!(
+        ref_file(&dst, "refs/mirrors/org.example.Y/b").as_ref(),
+        Some(&tips[2])
+    );
+    assert!(!dst.join("refs/mirrors/org.example.X").exists());
+    ostrya_at(&dst, &["fsck"]).ok();
+}
+
+/// `prune --only-branch=@X:a` prunes the collection ref `@X:a` to `--depth`,
+/// and keeps the local ref `a` in full. A value that names no ref fails in the
+/// words of a revision.
+#[test]
+fn prune_only_branch_selects_a_collection_ref() {
+    let tmp = TmpDir::new("prune-only-branch-collection");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), None);
+    let mut chains = Vec::new();
+    for branch in ["a", "@org.example.X:a"] {
+        let first = commit_no_parent(&repo, &["-b", branch], &src)
+            .ok()
+            .stdout_trimmed();
+        let second = ostrya_at(
+            &repo,
+            &[
+                "commit",
+                FIXED_TIMESTAMP,
+                "-b",
+                branch,
+                "-s=second",
+                src.to_str().unwrap(),
+            ],
+        )
+        .ok()
+        .stdout_trimmed();
+        chains.push((first, second));
+    }
+
+    refused_with_message(
+        &ostrya_at(&repo, &["prune", "--only-branch=@org.example.X:nosuch"]),
+        "Refspec '@org.example.X:nosuch' not found",
+    );
+    ostrya_at(
+        &repo,
+        &["prune", "--depth=0", "--only-branch=@org.example.X:a"],
+    )
+    .ok();
+
+    let (local, collection) = (&chains[0], &chains[1]);
+    assert!(holds_commit(&repo, &collection.1), "the tip of @X:a stays");
+    assert!(
+        !holds_commit(&repo, &collection.0),
+        "the selection prunes @X:a"
+    );
+    assert!(holds_commit(&repo, &local.1));
+    assert!(
+        holds_commit(&repo, &local.0),
+        "the local ref a stays in full"
+    );
+}
+
+/// In a repository whose collection id is OWN, with a hand-made
+/// `refs/mirrors/OWN/main` and a different `refs/heads/main`,
+/// `prune --only-branch=@OWN:main` prunes `refs/heads/main` alone. The mirror
+/// ref keeps its history in full.
+#[test]
+fn prune_only_branch_of_the_own_id_selects_the_local_ref() {
+    let tmp = TmpDir::new("prune-only-branch-own-id");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let mut chains = Vec::new();
+    for branch in ["main", "other"] {
+        let first = commit_no_parent(&repo, &["-b", branch, &format!("-s={branch}")], &src)
+            .ok()
+            .stdout_trimmed();
+        let second = ostrya_at(
+            &repo,
+            &[
+                "commit",
+                FIXED_TIMESTAMP,
+                "-b",
+                branch,
+                "-s=second",
+                src.to_str().unwrap(),
+            ],
+        )
+        .ok()
+        .stdout_trimmed();
+        chains.push((first, second));
+    }
+    let mirror = repo.join(format!("refs/mirrors/{OWN_ID}/main"));
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::rename(repo.join("refs/heads/other"), &mirror).unwrap();
+
+    ostrya_at(
+        &repo,
+        &[
+            "prune",
+            "--depth=0",
+            &format!("--only-branch=@{OWN_ID}:main"),
+        ],
+    )
+    .ok();
+
+    let (local, mirrored) = (&chains[0], &chains[1]);
+    assert!(holds_commit(&repo, &local.1));
+    assert!(!holds_commit(&repo, &local.0), "refs/heads/main is pruned");
+    assert!(holds_commit(&repo, &mirrored.1));
+    assert!(
+        holds_commit(&repo, &mirrored.0),
+        "the mirror ref stays in full"
+    );
+    assert_eq!(
+        ref_file(&repo, &format!("refs/mirrors/{OWN_ID}/main")).as_ref(),
+        Some(&mirrored.1)
+    );
+}
+
+/// Creates a repository at `base/repo` whose collection id is [`OWN_ID`],
+/// with one commit at the local ref `main`. Returns the path and the commit.
+fn own_repo_with_main(base: &Path) -> (PathBuf, String) {
+    build_fixture_source(base);
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let main = commit_no_parent(&repo, &["-b", "main"], &base.join("src"))
+        .ok()
+        .stdout_trimmed();
+    (repo, main)
+}
+
+/// `refs --create=@X:a` writes `refs/mirrors/X/a`, and `--create=@OWN:a`
+/// writes `refs/heads/a`. An existing `@X:a` is refused without `--force`, and
+/// an `@ID:NAME` that fails the rule is refused.
+#[test]
+fn refs_create_takes_a_collection_ref() {
+    let tmp = TmpDir::new("refs-create-collection");
+    let (repo, main) = own_repo_with_main(tmp.path());
+
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+    ostrya_at(&repo, &["refs", &format!("--create=@{OWN_ID}:a"), "main"]).ok();
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.X/a").as_ref(),
+        Some(&main)
+    );
+    assert_eq!(ref_file(&repo, "refs/heads/a").as_ref(), Some(&main));
+    assert!(!repo.join(format!("refs/mirrors/{OWN_ID}")).exists());
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]),
+        "--create specified but ref @org.example.X:a already exists",
+    );
+    ostrya_at(
+        &repo,
+        &["refs", "--create=@org.example.X:a", "--force", "main"],
+    )
+    .ok();
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--create=@bad:a", "main"]),
+        "Invalid refspec @bad:a",
+    );
+}
+
+/// `refs --delete @X:a` deletes `@X:a/b` and `@X:a/c`, and keeps `@X:ab` and
+/// the local ref `a/b`. `refs --delete @OWN:a` deletes the local ref `a/b`.
+/// `refs --delete @X:` deletes each ref of X, and keeps the refs of Y.
+/// `refs --delete @OWN:` deletes each local ref, and keeps the remote refs and
+/// the refs under `refs/mirrors/OWN/`.
+#[test]
+fn refs_delete_takes_a_collection_prefix() {
+    let tmp = TmpDir::new("refs-delete-collection");
+    let (repo, _main) = own_repo_with_main(tmp.path());
+    for newref in [
+        "@org.example.X:a/b",
+        "@org.example.X:a/c",
+        "@org.example.X:ab",
+        "@org.example.Y:a/b",
+        "a/b",
+        "origin:main",
+    ] {
+        ostrya_at(&repo, &["refs", &format!("--create={newref}"), "main"]).ok();
+    }
+    let own_mirror = repo.join(format!("refs/mirrors/{OWN_ID}/m"));
+    std::fs::create_dir_all(own_mirror.parent().unwrap()).unwrap();
+    std::fs::copy(repo.join("refs/heads/main"), &own_mirror).unwrap();
+    let present = |relpath: &str| repo.join(relpath).is_file();
+
+    ostrya_at(&repo, &["refs", "--delete", "@org.example.X:a"]).ok();
+    assert!(!present("refs/mirrors/org.example.X/a/b"));
+    assert!(!present("refs/mirrors/org.example.X/a/c"));
+    assert!(present("refs/mirrors/org.example.X/ab"));
+    assert!(present("refs/heads/a/b"), "no local ref is deleted");
+
+    ostrya_at(&repo, &["refs", "--delete", &format!("@{OWN_ID}:a")]).ok();
+    assert!(!present("refs/heads/a/b"));
+    assert!(present("refs/heads/main"));
+
+    ostrya_at(&repo, &["refs", "--delete", "@org.example.X:"]).ok();
+    assert!(!present("refs/mirrors/org.example.X/ab"));
+    assert!(present("refs/mirrors/org.example.Y/a/b"));
+    assert!(present("refs/heads/main"));
+
+    ostrya_at(&repo, &["refs", "--delete", &format!("@{OWN_ID}:")]).ok();
+    assert!(!present("refs/heads/main"));
+    assert!(present("refs/remotes/origin/main"));
+    assert!(present("refs/mirrors/org.example.Y/a/b"));
+    assert!(own_mirror.is_file());
+}
+
+/// `@OWN:REST` is the local ref REST only if REST is a local ref name. `refs`
+/// refuses `@OWN:REMOTE:NAME` and `@OWN:@X:` as given and deletes no ref.
+/// `refs -A` refuses the target `@OWN:REMOTE:NAME` as a collection ref.
+#[test]
+fn refs_refuses_an_own_prefix_that_names_no_local_ref() {
+    let tmp = TmpDir::new("refs-own-not-local");
+    let (repo, _main) = own_repo_with_main(tmp.path());
+    for newref in ["origin:main", "@org.example.X:a"] {
+        ostrya_at(&repo, &["refs", &format!("--create={newref}"), "main"]).ok();
+    }
+    let remote = format!("@{OWN_ID}:origin:main");
+    let mirror = format!("@{OWN_ID}:@org.example.X:");
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", &remote]),
+        &format!("Invalid refspec {remote}"),
+    );
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", &mirror]),
+        &format!("Invalid refspec {mirror}"),
+    );
+    let whole_remote = format!("@{OWN_ID}:origin:");
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", &whole_remote]),
+        &format!("Invalid refspec {whole_remote}"),
+    );
+    assert!(repo.join("refs/remotes/origin/main").is_file());
+    assert!(repo.join("refs/mirrors/org.example.X/a").is_file());
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "--create=x", &remote]),
+        &format!("Cannot create alias to collection ref: {remote}"),
+    );
+    assert!(!repo.join("refs/heads/x").exists());
+}
+
+/// `refs @X:` lists the refs of X, and `refs --list @X:` prints each as
+/// `@X:NAME`. `refs @X:a` strips the prefix as for a remote prefix. A listing
+/// with no prefix holds no collection ref, and `refs @OWN:` lists the local
+/// refs.
+#[test]
+fn refs_lists_a_collection_prefix() {
+    let tmp = TmpDir::new("refs-list-collection");
+    let (repo, main) = own_repo_with_main(tmp.path());
+    for newref in ["@org.example.X:a/b", "@org.example.X:c", "@org.example.Y:d"] {
+        ostrya_at(&repo, &["refs", &format!("--create={newref}"), "main"]).ok();
+    }
+    let lines = |args: &[&str]| -> Vec<String> {
+        ostrya_at(&repo, args)
+            .ok()
+            .stdout_trimmed()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    };
+
+    let whole = ["@org.example.X:a/b", "@org.example.X:c"];
+    assert_eq!(lines(&["refs", "@org.example.X:"]), whole);
+    assert_eq!(lines(&["refs", "--list", "@org.example.X:"]), whole);
+    assert_eq!(lines(&["refs", "@org.example.X:a"]), ["@org.example.X:b"]);
+    assert_eq!(
+        lines(&["refs", "--list", "@org.example.X:a"]),
+        ["@org.example.X:a/b"]
+    );
+    assert_eq!(
+        lines(&["refs", "-r", "@org.example.X:c"]),
+        [format!("@org.example.X:c\t{main}")]
+    );
+    assert_eq!(lines(&["refs"]), ["main"]);
+    assert_eq!(lines(&["refs", &format!("@{OWN_ID}:")]), ["main"]);
+}
+
+/// `refs -A` refuses `--create=@X:a`, the target `@X:a`, and the PREFIX
+/// `@X:`. `-A --create=@OWN:al main` writes the local alias `al`.
+#[test]
+fn refs_alias_refuses_a_collection_ref() {
+    let tmp = TmpDir::new("refs-alias-collection");
+    let (repo, _main) = own_repo_with_main(tmp.path());
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "--create=@org.example.X:al", "main"]),
+        "Cannot create alias as collection ref: @org.example.X:al",
+    );
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "--create=al", "@org.example.X:a"]),
+        "Cannot create alias to collection ref: @org.example.X:a",
+    );
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "@org.example.X:"]),
+        "-A takes no collection prefix: @org.example.X:",
+    );
+    assert!(!repo.join("refs/heads/al").exists());
+
+    ostrya_at(
+        &repo,
+        &["refs", "-A", &format!("--create=@{OWN_ID}:al"), "main"],
+    )
+    .ok();
+    let alias = repo.join("refs/heads/al");
+    assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("main"));
+    assert_eq!(
+        ostrya_at(&repo, &["refs", "-A", &format!("@{OWN_ID}:")])
+            .ok()
+            .stdout_trimmed(),
+        "al -> main"
+    );
 }

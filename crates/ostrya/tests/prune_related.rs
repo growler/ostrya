@@ -15,8 +15,8 @@ use std::path::Path;
 use common::{TmpDir, dependency_warning, store_with_field2};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
-    Error, MutableTree, ObjectType, PruneOptions, Ref, RefLocation, RelatedField, RelatedWarning,
-    Repo, RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
+    Error, MutableTree, ObjectType, PruneOptions, Ref, RelatedField, RelatedWarning, Repo,
+    RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -284,16 +284,13 @@ fn a_weak_ref_named_by_a_build_source_of_a_strong_commit_survives() {
             .unwrap();
 
         let opts = PruneOptions {
-            weak_ref_filter: WeakRefFilter::new(|location, _| {
-                !matches!(
-                    location,
-                    RefLocation::Local(name) if name.starts_with("cache/")
-                )
-            }),
+            weak_ref_filter: WeakRefFilter::new(
+                |r, _| !matches!(r, Ref::Local { name } if name.starts_with("cache/")),
+            ),
             ..refs_only()
         };
         let stats = repo.prune(&opts).await.unwrap();
-        assert_eq!(stats.deleted_refs, ["cache/other"]);
+        assert_eq!(stats.deleted_refs, [Ref::local("cache/other")]);
         assert!(holds(&repo, &src).await, "the build source survives");
         assert_eq!(
             repo.resolve_rev("cache/src", true).await.unwrap(),
@@ -311,9 +308,7 @@ fn a_weak_ref_named_by_a_build_source_of_a_strong_commit_survives() {
 /// weak and each other ref strong.
 fn collection_refs_are_weak() -> PruneOptions {
     PruneOptions {
-        weak_ref_filter: WeakRefFilter::new(|location, _| {
-            !matches!(location, RefLocation::Collection { .. })
-        }),
+        weak_ref_filter: WeakRefFilter::new(|r, _| !matches!(r, Ref::Collection { .. })),
         ..refs_only()
     }
 }
@@ -346,8 +341,7 @@ fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
         let dropped = set_cache_ref(&repo, "other", &other).await;
 
         let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
-        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
-        assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
+        assert_eq!(stats.deleted_refs, vec![dropped.clone()]);
         assert!(holds(&repo, &dep).await, "the dependency survives");
         assert_eq!(
             repo.resolve_ref_tip(&kept).await.unwrap(),
@@ -377,8 +371,7 @@ fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
         let dropped = set_cache_ref(&repo, "other", &other).await;
 
         let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
-        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
-        assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
+        assert_eq!(stats.deleted_refs, vec![dropped.clone()]);
         assert!(holds(&repo, &src).await, "the build source survives");
         assert_eq!(
             repo.resolve_ref_tip(&kept).await.unwrap(),

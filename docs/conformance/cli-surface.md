@@ -85,7 +85,7 @@ Done, Phase 17b:
 - `cat` -- `COMMIT` and one or more `PATH`.
 
 Their output formats are recorded in `cli-behavior.md`, "CLI output
-formats", `refs`, `rev-parse`, and `cat`. Seventeen tool behaviors around them
+formats", `refs`, `rev-parse`, and `cat`. Nineteen tool behaviors around them
 are observed and deliberately not reproduced:
 
 - the tool names an `-A` alias that lives under `refs/remotes/<remote>/` by its
@@ -188,8 +188,9 @@ are observed and deliberately not reproduced:
   nothing and exits 0. The port validates a collection id where `-c --create`
   writes one and where `-c --delete` removes one. `-c --delete` checks each
   ref that its positionals select and that it removes, before it removes a
-  ref. The mirror refs of the own `collection-id` stay, and the check skips
-  them. If the ref store refuses one selected ref by its id or its name, the
+  ref. The `-c` listing of the port leaves out the mirror refs of the own
+  `collection-id`, so they stay, and the check does not read them. If the ref
+  store refuses one selected ref by its id or its name, the
   command removes no ref and exits 1. A mirror ref whose id fails the
   collection-id rule or is longer than 255 bytes, or whose name fails the
   ref-name rule, gives `error: Invalid refspec <id>:<name>`. A ref under
@@ -203,6 +204,15 @@ are observed and deliberately not reproduced:
   of the port prints `(<own id>, origin:main)`. `refs -c --delete <own id>` of
   the port reports `error: Invalid refspec origin:main`, exits 1, and removes
   no ref. In both, `refs/remotes/origin/main` stays;
+- a ref under `refs/mirrors/<own id>/`, where `<own id>` is the
+  `collection-id` of the repository. Such a ref comes from an out-of-band
+  change alone, because no writer of the port writes it. The `-c` listing of
+  the tool prints a `(<own id>, <name>)` row for it, and prints one row for a
+  name that `refs/heads` also holds. The port ignores that directory, and
+  its `-c` listing prints the rows of `refs/heads` alone for the own id. The
+  other rows agree. `refs -c --create=<own id>:<ref>` writes
+  `refs/heads/<ref>` in both, and `refs -c --delete <own id>` keeps the
+  directory in both;
 - `refs -c --create=<id>`, whose NEWREF holds no `:` and therefore no ref name,
   makes the tool print a GLib assertion line (`g_regex_match_full: assertion
   'string != NULL' failed`) ahead of its own `error: Invalid ref name (null)`;
@@ -2580,7 +2590,7 @@ one alike. `--delete` takes no such gate of its own: the objects it unlinks and
 the commits it marks are the same set with `-a` and without it in both
 implementations.
 
-Nine divergences stand at `fsck`:
+Ten divergences stand at `fsck`:
 
 - the progress line. The tool writes `fsck objects (n/total) pct%` to standard
   output: the first update, the last one, and about one more a second between
@@ -2654,7 +2664,17 @@ Nine divergences stand at `fsck`:
   `--no-mark-dependencies` is given, and exits 1 with
   `error: Repository corruption encountered`. A defective entry gets no marker.
   `../format-reference.md`, "Dependencies in the fsck", states the rules. Over a
-  repository whose dependencies are complete, the two agree.
+  repository whose dependencies are complete, the two agree;
+- a ref under `refs/mirrors/<own id>/`, where `<own id>` is the
+  `collection-id` of the repository. Such a ref comes from an out-of-band
+  change alone, because no writer of the port writes it. The tool prints no
+  line for it and exits 0. The port prints `Ref under the own collection id,
+  not read: refs/mirrors/<own id>/<name>` on standard output for each such
+  ref, also with `-q`, and exits 0. The line is a divergence of the terminal
+  output alone: the ref resolve, the ref listings, and the summary of the
+  port ignore such a ref, and the line names it. Both check the commit of the ref, so a missing commit ends both
+  runs at exit 1. `../format-reference.md`, "The pull of collection refs",
+  states the rule.
 
 `fsck --add-tombstones` deletes a commit object and leaves a branch ref
 standing over it, so repeated runs walk a broken branch backwards one commit
@@ -2765,7 +2785,7 @@ keeps `-v/--verbose`. `-m`, `--sign`, and `--gpg-sign` are read with `-u`
 alone, and both implementations check every one of them before the
 regeneration, so a refusal leaves `summary` and `summary.sig` as they stood
 (`cli-behavior.md`, "CLI output formats", `summary`, "The `-u` checks").
-Sixteen differences stand.
+Seventeen differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2891,6 +2911,15 @@ Sixteen differences stand.
   For each directory under `refs/mirrors/` whose name is not a collection
   id, the port writes one `warning:` line to standard error and leaves the
   directory out of each summary;
+- field 0 in a repository whose `refs/mirrors/<own id>/` holds a ref, where
+  `<own id>` is the `collection-id` of the repository. Such a ref comes from
+  an out-of-band change alone, because no writer of the port writes it. The
+  tool puts each ref of that directory into field 0 under its plain name,
+  and the mirror ref takes the place of the ref of `refs/heads` of the same
+  name. The port ignores that directory, and field 0 holds the refs of
+  `refs/heads` alone. The collection map agrees, and neither holds the own
+  id. `../format-reference.md`, "Summary -- `(a(s(taya{sv}))a{sv})`", states
+  the rule;
 - a `summary` file whose bytes are not a document of the summary type. Such a
   file reaches a repository only through a write that is neither
   implementation's. The tool reads it as an empty document, so `--raw` writes
@@ -4404,15 +4433,12 @@ No matrix cell needs these. The shell suite invokes them.
   - The port has no `--mirror` for a collection pull, and no command that
     finds the remotes and pulls nothing.
   - In a repository whose `[core] collection-id` is ID, the port writes
-    `refs/mirrors/ID/REF` when that file holds a ref, as
-    `Repo::resolve_collection_ref` reads it, and `refs/heads/REF` otherwise.
-    The tool writes `refs/heads/REF` in each state under
-    `find-remotes --pull --mirror`, and `refs/remotes/REMOTE/REF` under
-    `find-remotes --pull` (`cli-behavior.md`, "The pulled ref under the own
-    collection id"). The reason: the readers of the port and `refs -c -r` of
-    the tool read `refs/mirrors/ID/REF` first. So while that file holds a
-    ref, the write of the tool leaves the pulled commit hidden from these
-    readers. Neither the port nor the tool removes a ref.
+    `refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. The tool
+    writes `refs/heads/REF` under `find-remotes --pull --mirror`, and
+    `refs/remotes/REMOTE/REF` under `find-remotes --pull`
+    (`cli-behavior.md`, "The pulled ref under the own collection id"). The
+    port takes the own id as its local namespace, so each reader of the port
+    gives the pulled commit. Neither the port nor the tool removes a ref.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
   `--commit=COMMIT`.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG
@@ -5511,7 +5537,9 @@ allow-cleartext-credentials`.
   (`../format-reference.md`, "Dependencies in the fsck"). A report with an
   error ends with `error: Bucket repository corruption encountered` and exit
   status 1. Else the command writes `fsck of the bucket repository ADDRESS: no
-  errors found` and exits 0. Notes alone give exit status 0. A failed write to
+  errors found` and exits 0. Notes alone give exit status 0. A ref key under
+  `refs/mirrors/ID/` of the collection id of the bucket gives a `ref` note,
+  and the command reads no such ref file. A failed write to
   standard output, for example on a full device, gives `error: i/o error: ...`
   and exit status 1. With a remote name, the command verifies the signature of
   the summary with the summary keys of the remote, `gpg-verify-summary` and
@@ -5545,7 +5573,9 @@ allow-cleartext-credentials`.
   `--keep-younger-than`, and `--no-prune` have the meaning and the values
   of `prune`, and the command refuses a `--keep-younger-than` value that
   `prune` refuses, with the same message, before any request. The option
-  parser refuses the other options of `prune`. The commits that the summary
+  parser refuses the other options of `prune`. The commit of each ref is a
+  root, also of a ref under `refs/mirrors/ID/` of the collection id of the
+  bucket, and the command deletes no ref. The commits that the summary
   names are roots with no parent. The dependencies in field 2 of each
   reached commit, also of a commit of the summary, are roots, as in
   `prune`, and the command reads no build source. For each defective
@@ -5569,7 +5599,9 @@ allow-cleartext-credentials`.
   takes the address of its operand as `remote init` does, with no
   repository for an address. The summary holds the refs of `refs/heads/`
   in field 0 and the refs of each `refs/mirrors/ID/` in the collection map,
-  and names each static delta with a superblock. With the same
+  and names each static delta with a superblock. The command skips each key
+  under `refs/mirrors/ID/` of the collection id of the bucket, and reads no
+  such ref file. With the same
   `--last-modified`, its `summary` holds the bytes that `ostrya summary -u`
   writes in a copy of the bucket repository with no collection id. With the
   same ed25519 keys, `summary.sig` holds the same bytes too. The command
@@ -6047,9 +6079,10 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   401 for the summary, and its pull exits 1. Both pulls are in
   `crates/ostrya-cli/tests/serve.rs`.
 - In a repository with a collection id, `ostrya summary -u` and `ostree
-  summary -u` give the same refs in field 0 and the same collection map,
-  other than the anchor commit, with the mirror refs of the own id in
-  field 0, in `crates/ostrya-cli/tests/serve.rs`.
+  summary -u` give the same collection map. Field 0 of the tool also holds
+  the mirror refs of the own id, and field 0 of the port holds the refs of
+  `refs/heads` alone, as "P2", `summary`, records. Both are in
+  `crates/ostrya-cli/tests/serve.rs`.
 
 ### `send`
 

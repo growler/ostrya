@@ -45,6 +45,14 @@ async fn put(repo: &Repo, id: &str, name: &str, checksum: &Checksum) {
         .unwrap();
 }
 
+/// Writes `checksum` to `refs/mirrors/OWN/name` of the repository at `path`
+/// by hand, as a source outside the port does.
+fn put_own_mirror(path: &Path, name: &str, checksum: &Checksum) {
+    let file = path.join("refs/mirrors").join(OWN).join(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, format!("{}\n", checksum.to_hex())).unwrap();
+}
+
 /// Writes `checksum` to the local ref `name`.
 async fn put_local(repo: &Repo, name: &str, checksum: &Checksum) {
     repo.set_ref_immediate(name, Some(checksum)).await.unwrap();
@@ -112,15 +120,23 @@ fn the_own_collection_reads_a_local_ref() {
 }
 
 #[test]
-fn the_mirror_ref_of_the_own_collection_wins() {
-    let tmp = TmpDir::new("resolve-cref-own-wins");
-    let repo = open(&create(&tmp, Some(OWN)));
+fn the_own_collection_ignores_its_mirror_refs() {
+    let tmp = TmpDir::new("resolve-cref-own-mirror");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    put_own_mirror(&path, "main", &checksum(1));
+    put_own_mirror(&path, "only", &checksum(1));
     block_on(async {
-        put(&repo, OWN, "main", &checksum(1)).await;
         put_local(&repo, "main", &checksum(2)).await;
         assert_eq!(
             resolve(&repo, &CollectionRef::new(OWN, "main")).await,
-            Some(checksum(1))
+            Some(checksum(2))
+        );
+        let only = CollectionRef::new(OWN, "only");
+        assert_eq!(resolve(&repo, &only).await, None);
+        assert_not_found(
+            repo.resolve_collection_ref(&only, false).await,
+            &format!("{OWN}:only"),
         );
     });
 }
@@ -128,10 +144,11 @@ fn the_mirror_ref_of_the_own_collection_wins() {
 #[test]
 fn a_local_ref_reads_refs_heads_alone() {
     let tmp = TmpDir::new("resolve-cref-local");
-    let repo = open(&create(&tmp, Some(OWN)));
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    put_own_mirror(&path, "main", &checksum(1));
+    put_own_mirror(&path, "only-mirror", &checksum(1));
     block_on(async {
-        put(&repo, OWN, "main", &checksum(1)).await;
-        put(&repo, OWN, "only-mirror", &checksum(1)).await;
         put_local(&repo, "main", &checksum(2)).await;
         assert_eq!(
             resolve(&repo, &CollectionRef::local("main")).await,
@@ -239,12 +256,13 @@ fn an_absent_ref_follows_allow_noent() {
 }
 
 #[test]
-fn the_own_collection_reads_a_local_ref_past_a_directory_or_a_file() {
+fn the_own_collection_reads_a_local_ref_beside_a_mirror_directory_or_file() {
     let tmp = TmpDir::new("resolve-cref-own-not-a-ref");
-    let repo = open(&create(&tmp, Some(OWN)));
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
     block_on(async {
         // `refs/mirrors/OWN/a` is a directory.
-        put(&repo, OWN, "a/b", &checksum(2)).await;
+        put_own_mirror(&path, "a/b", &checksum(2));
         put_local(&repo, "a", &checksum(1)).await;
         let cref = CollectionRef::new(OWN, "a");
         assert_eq!(
@@ -254,7 +272,7 @@ fn the_own_collection_reads_a_local_ref_past_a_directory_or_a_file() {
 
         // `refs/mirrors/OWN/f` is a file, so `refs/mirrors/OWN/f/g` goes
         // through a file.
-        put(&repo, OWN, "f", &checksum(2)).await;
+        put_own_mirror(&path, "f", &checksum(2));
         put_local(&repo, "f/g", &checksum(1)).await;
         let cref = CollectionRef::new(OWN, "f/g");
         assert_eq!(
@@ -265,7 +283,7 @@ fn the_own_collection_reads_a_local_ref_past_a_directory_or_a_file() {
 }
 
 #[test]
-fn the_own_collection_reads_a_local_ref_past_a_mirror_path_that_is_too_long() {
+fn the_own_collection_reads_a_local_ref_whose_mirror_path_is_too_long() {
     let tmp = TmpDir::new("resolve-cref-own-too-long");
     let repo = open(&create(&tmp, Some(OWN)));
     // A name of 4079 bytes, in components of at most 200 bytes. The path
@@ -294,7 +312,7 @@ fn the_own_collection_reads_a_local_ref_past_a_mirror_path_that_is_too_long() {
 }
 
 #[test]
-fn the_own_collection_does_not_read_a_local_ref_past_a_mirror_ref_that_fails() {
+fn the_own_collection_reads_a_local_ref_beside_a_mirror_ref_that_fails() {
     let tmp = TmpDir::new("resolve-cref-own-fails");
     let path = create(&tmp, Some(OWN));
     let repo = open(&path);
@@ -307,26 +325,12 @@ fn the_own_collection_does_not_read_a_local_ref_past_a_mirror_ref_that_fails() {
     block_on(async {
         for name in ["l", "g", "u"] {
             put_local(&repo, name, &checksum(1)).await;
-        }
-        for allow_noent in [true, false] {
-            let l = CollectionRef::new(OWN, "l");
-            // `ErrorKind::FilesystemLoop` is not stable, so the test reads the
-            // OS error.
-            let eloop = rustix::io::Errno::LOOP.raw_os_error();
-            match repo.resolve_collection_ref(&l, allow_noent).await {
-                Err(Error::Io(e)) if e.raw_os_error() == Some(eloop) => {}
-                other => panic!("l: {other:?}"),
-            }
-            let g = CollectionRef::new(OWN, "g");
-            match repo.resolve_collection_ref(&g, allow_noent).await {
-                Err(Error::Core(_)) => {}
-                other => panic!("g: {other:?}"),
-            }
-            let u = CollectionRef::new(OWN, "u");
-            match repo.resolve_collection_ref(&u, allow_noent).await {
-                Err(Error::InvalidFormat(_)) => {}
-                other => panic!("u: {other:?}"),
-            }
+            let cref = CollectionRef::new(OWN, name);
+            assert_eq!(
+                repo.resolve_collection_ref(&cref, false).await.unwrap(),
+                Some(checksum(1)),
+                "{name}"
+            );
         }
     });
 }

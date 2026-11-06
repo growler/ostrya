@@ -147,10 +147,13 @@ A collection ref.
 The summary lists these refs in its collection map.
 A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
-A push to that own collection id writes \fB\%refs/heads/<ref>\fR.
-A pull with \fB\%\-\-collection\fR writes the collection ref.
-For the own collection id, it writes the collection ref if that file holds a ref, and \fB\%refs/heads/<ref>\fR otherwise.
-The pull removes no ref.
+A pull with \fB\%\-\-collection\fR and \fB\%refs \-c \-\-create\fR write it by the same rule.
+The refs of the own collection id are the local refs: each writer writes \fB\%refs/heads/<ref>\fR for that id.
+A directory \fB\%refs/mirrors/\fR of the own collection id comes from outside ostrya, for example from a hand edit or from the \fB\%ostree\fR command.
+The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the summary, and the ref listing.
+\fB\%ostrya fsck\fR prints a line for each ref in it, and the line is not an error.
+\fB\%ostrya prune\fR keeps the commit of each ref in it, and never deletes such a ref.
+Remove such a ref by hand.
 .TP
 \fB\%<repo>/state/<checksum>.commitpartial\fR
 A marker of a commit that the repository does not hold in full.
@@ -406,7 +409,9 @@ The refs of the repository, and of its own collection.
 \fB\%refs/mirrors/<id>/<name>\fR
 The refs of the collection \fB\%<id>\fR, which the repository mirrors.
 \fB\%<id>\fR passes the collection\-id rule and is at most 255 bytes.
-Each writer refuses the refs of \fB\%refs/mirrors/\fR of the own collection id.
+No writer writes \fB\%refs/mirrors/\fR of the own collection id.
+A push and \fB\%ostrya remote summary \-u\fR skip each key of that directory.
+\fB\%ostrya remote prune\fR keeps the commit of each ref of that directory, and \fB\%ostrya remote fsck\fR gives each such key a note.
 A push reads the ref files of the ref directory that it writes alone, and refuses a key in that directory that is not a ref name.
 It does not check the keys under \fB\%refs/\fR outside that directory.
 .TP

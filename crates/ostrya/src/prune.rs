@@ -53,8 +53,8 @@ pub enum RefLocation<'a> {
     },
     /// A collection ref, at `refs/mirrors/ID/NAME`.
     ///
-    /// The collection id can be the `[core] collection-id` of the
-    /// repository. A ref of that id is a `Collection` ref too.
+    /// The collection id is never the `[core] collection-id` of the
+    /// repository. A ref under `refs/mirrors/` of that id gets no location.
     Collection {
         /// The collection id.
         collection_id: &'a str,
@@ -261,7 +261,9 @@ pub struct PruneOptions {
     /// The run resolves each value as a revision, so a value that names nothing
     /// fails the prune before the run removes an object. A value that resolves
     /// and matches no ref name selects no branch. If no value selects a branch,
-    /// the run keeps every branch in full.
+    /// the run keeps every branch in full. No value selects a ref under
+    /// `refs/mirrors/ID/` of the `[core] collection-id` of the repository,
+    /// so the run keeps such a ref in full under a non-empty list.
     ///
     /// A ref that [`weak_ref_filter`](PruneOptions::weak_ref_filter) marks weak
     /// gets no retention from this list, because it roots the walk under no
@@ -277,7 +279,8 @@ pub struct PruneOptions {
     /// [`depth`](PruneOptions::depth) and still counts as a name.
     ///
     /// [`only_branch`](PruneOptions::only_branch) never keeps in full a branch
-    /// that this list names.
+    /// that this list names. No entry names a ref under `refs/mirrors/ID/` of
+    /// the `[core] collection-id` of the repository.
     pub retain_branch_depth: Vec<(String, i32)>,
     /// The switch that deletes commit objects alone.
     ///
@@ -327,17 +330,27 @@ pub struct PruneOptions {
     ///   of the path before its first `/` is the collection id, and the rest
     ///   is the name. The id must pass
     ///   [`is_collection_id`](crate::is_collection_id) and be at most 255
-    ///   bytes, and the name must pass the ref-name rule. A ref of the
-    ///   `[core] collection-id` of the repository is a `Collection` ref too.
+    ///   bytes, and the name must pass the ref-name rule. The id must not be
+    ///   the `[core] collection-id` of the repository.
     ///
     /// Each other ref is strong, and the filter never sees it. Examples are a
     /// ref whose name fails the ref-name rule, a file directly under
-    /// `refs/mirrors`, and a remote ref whose refspec maps to a different
-    /// file. The run reads no config key to classify a ref.
+    /// `refs/mirrors`, a ref under `refs/mirrors/ID/` of the
+    /// `[core] collection-id` of the repository, and a remote ref whose
+    /// refspec maps to a different file. The run reads `[core] collection-id`
+    /// from the config that the handle read at the open.
     ///
     /// A repository can hold a directory of `refs/mirrors/` whose name fails
     /// the collection id rule above. A ref under that directory is strong,
     /// so a prune never deletes it. Remove such a ref by hand.
+    ///
+    /// A ref under `refs/mirrors/ID/` of the `[core] collection-id` of the
+    /// repository is a strong ref with no name. The ref resolve, the
+    /// collection ref listings, and the summary ignore it. No value of
+    /// [`only_branch`](PruneOptions::only_branch) or
+    /// [`retain_branch_depth`](PruneOptions::retain_branch_depth) selects
+    /// it, so it takes the bound of a ref that no list names. The run never
+    /// deletes it. Remove such a ref by hand.
     ///
     /// A strong ref roots the walk under the bound that
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth),
@@ -358,12 +371,6 @@ pub struct PruneOptions {
     /// deleted collection ref in [`PruneStats::deleted_collection_refs`]. The
     /// run leaves an emptied directory under `refs/` in place, for example
     /// `refs/mirrors/ID/`.
-    ///
-    /// A collection ref of the `[core] collection-id` of the repository can
-    /// have a local ref of the same name under `refs/heads`. After the run
-    /// deletes the collection ref, a read of that collection ref, for example
-    /// with [`Repo::resolve_collection_ref`](crate::Repo::resolve_collection_ref),
-    /// gives the commit of the local ref.
     ///
     /// The branch selection has nothing to select for a weak ref, because a
     /// weak ref roots nothing. The filter also classifies a weak ref outside an
@@ -445,12 +452,23 @@ impl PruneOptions {
             Some(depth) if depth != 0 => ParentBound::depth(depth),
             entry => {
                 let named = entry.is_some() || self.only_branch.iter().any(|value| value == name);
-                if self.only_branch.is_empty() || named {
+                if named {
                     self.global_bound()
                 } else {
-                    ParentBound::Depth(-1)
+                    self.unnamed_bound()
                 }
             }
+        }
+    }
+
+    /// Returns the bound of the history of a ref that no list names: the
+    /// global bound if `only_branch` is empty, and else no bound, so the run
+    /// keeps the ref in full.
+    fn unnamed_bound(&self) -> ParentBound {
+        if self.only_branch.is_empty() {
+            self.global_bound()
+        } else {
+            ParentBound::Depth(-1)
         }
     }
 }
@@ -663,11 +681,17 @@ impl Repo {
     ///    [`delete_commit`](PruneOptions::delete_commit) set writes tombstones
     ///    and does not read `[core] tombstone-commits`.
     ///
-    /// The options decide all other behavior.
+    /// The run also reads `[core] collection-id` from the config that the
+    /// handle read at the open, to find the refs of `refs/mirrors/ID/` of
+    /// that id. The options decide all other behavior.
     ///
     /// # Roots
     ///
-    /// The commits that the refs name are always roots.
+    /// The commits that the refs name are always roots. These include the
+    /// refs under `refs/mirrors/ID/` of the `[core] collection-id` of the
+    /// repository, which the ref resolve, the collection ref listings, and
+    /// the summary ignore. Such a ref is a strong ref with no name, as
+    /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) states.
     /// [`refs_only`](PruneOptions::refs_only) states when each other commit in
     /// the store is also a root. Each of these options roots the walk on the
     /// refs alone, as `refs_only` does:
@@ -970,6 +994,10 @@ impl Repo {
         //
         // Every other ref is strong and never reaches the classifier.
         //
+        // A ref of `refs/mirrors/ID/` of the own collection id is a strong
+        // ref with no name. No list selects it, so it takes the bound of a
+        // name that no list names, and the run never deletes it.
+        //
         // A weak target stays out of `ref_targets`: the walk needs a seed for
         // every checksum that set names, and a weak ref supplies none. The weak
         // targets go in `GcRoots::weak_roots`, and the walk seeds one on the
@@ -982,6 +1010,7 @@ impl Repo {
         // An unset classifier makes every ref strong, so the unset case tests
         // one boolean for each ref.
         let filtering = opts.weak_ref_filter.is_set();
+        let own = self.config().collection_id();
         let mut roots: Vec<(Checksum, ParentBound)> = Vec::new();
         let mut ref_targets: HashSet<Checksum> = HashSet::new();
         let mut weak_refs: Vec<(WeakRef, Checksum)> = Vec::new();
@@ -993,6 +1022,13 @@ impl Repo {
             checksum,
         } in named_refs
         {
+            let own_mirror = space == RefSpace::Mirrors
+                && name.split_once('/').is_some_and(|(id, _)| Some(id) == own);
+            if own_mirror {
+                roots.push((checksum, opts.unnamed_bound()));
+                ref_targets.insert(checksum);
+                continue;
+            }
             let bound = opts.ref_bound(&name);
             let weak = filtering
                 && ref_location(space, &name, addressable)

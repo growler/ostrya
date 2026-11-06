@@ -735,11 +735,10 @@ impl Repo {
     /// [`build_ref_listing`](Repo::build_ref_listing) with empty selectors
     /// for the local refs and for the collection refs. A namespace whose
     /// selected group has `summary=false` adds no ref. Field 0 holds the
-    /// local refs, sorted byte-wise by name: the refs under `refs/heads` and,
-    /// in a repository with `[core] collection-id`, the refs under
-    /// `refs/mirrors/ID/` of that id, under their plain names. When the two
-    /// directories hold one name, field 0 holds the commit of the mirror ref.
-    /// The refs of each other collection go into
+    /// local refs, sorted byte-wise by name: the refs under `refs/heads`
+    /// alone. In a repository with `[core] collection-id`, no summary holds a
+    /// ref under `refs/mirrors/ID/` of that id. The refs of each other
+    /// collection go into
     /// `ostree.summary.collection-map`. A directory under `refs/mirrors/`
     /// whose name fails the collection-id rule is in no summary, and its
     /// name is in [`SummaryReport::invalid_collection_dirs`].
@@ -1072,7 +1071,7 @@ impl Repo {
             let commits: HashSet<Checksum> = if access.has_client_groups() {
                 items
                     .iter()
-                    .filter_map(|item| {
+                    .map(|item| {
                         let read = ReadAccess::for_summary(access.clone(), (*item).clone());
                         every.readable(&read)
                     })
@@ -1120,19 +1119,11 @@ impl Repo {
         // With no client group, the item is `anonymous` under the implicit
         // groups, which have `summary=true`. Its rights are the rights of the
         // full selection of the run, so the call takes that selection. Each
-        // other item takes the refs of the full selection that it reads. When
-        // the full selection did not read a ref that the item reads, the
-        // call walks the refs with the rights of the item.
+        // other item takes the refs of the full selection that it reads.
         let selected;
         let selection = if run.access.has_client_groups() {
             let read = ReadAccess::for_summary(run.access.clone(), item.clone());
-            selected = match run.every.readable(&read) {
-                Some(selected) => selected,
-                None => {
-                    let all = RefSelector::parse([])?;
-                    self.select_refs(&all, Some(&all), &read, None).await?
-                }
-            };
+            selected = run.every.readable(&read);
             &selected
         } else {
             &run.every
@@ -1258,12 +1249,9 @@ impl Repo {
     ///
     /// Field 0 holds the local refs that `refs` selects, each one time,
     /// sorted byte-wise by name. The local refs are the refs under
-    /// `refs/heads` and, in a repository with `[core] collection-id`, the
-    /// refs under `refs/mirrors/ID/` of that id, under their plain names.
-    /// When the two directories hold one name, field 0 holds one entry with
-    /// the commit of the mirror ref. `collections` has no effect on field 0.
-    /// In a repository with no `refs/mirrors/ID/` of its own id, field 0
-    /// holds the refs of `refs/heads` alone.
+    /// `refs/heads`. In a repository with `[core] collection-id`, the call
+    /// does not read `refs/mirrors/ID/` of that id. `collections` has no
+    /// effect on field 0.
     ///
     /// `collections` selects the refs under `refs/mirrors/` of each other
     /// collection by `ID/NAME`, for example `org.example.Os/stable` or
@@ -1290,7 +1278,7 @@ impl Repo {
     /// [`RefListing::invalid_collection_dirs`], so a server can write a
     /// warning. A name that is not UTF-8, and an entry at the top level that
     /// is no directory, are left out with no report. With `None`, the call
-    /// reads only `refs/mirrors/ID/` of the own id.
+    /// does not read `refs/mirrors/`.
     ///
     /// # Access
     ///
@@ -1320,9 +1308,8 @@ impl Repo {
     /// directories at its level. It skips a directory that a negative
     /// pattern covers, and it applies the negative patterns to a name before
     /// it reads the ref file, so it reads no ref that the selector does not
-    /// select. With the negative pattern `**` in `refs`, the call opens
-    /// neither `refs/heads/` nor the directory of `[core] collection-id`
-    /// under `refs/mirrors/`. It reads each commit one time, also when more
+    /// select. With the negative pattern `**` in `refs`, the call does not
+    /// open `refs/heads/`. It reads each commit one time, also when more
     /// than one ref names it. An empty selector, and a selector of negative
     /// patterns alone, read only the directories that an allow item that
     /// gives `r` in the group of the namespace can match, and no directory
@@ -4124,11 +4111,11 @@ mod tests {
     }
 
     /// The summary of each item holds the refs that a walk of the repository
-    /// with the rights of the summary of the item selects: the local refs
-    /// with the mirror refs of the own id, the collection refs, the aliases
-    /// whose names and targets the item reads, and no ref that a deny item
-    /// covers. A mirror alias of the own id that the item does not read
-    /// gives its place to the ref of `refs/heads` of the same name.
+    /// with the rights of the summary of the item selects: the local refs,
+    /// the collection refs, the aliases whose names and targets the item
+    /// reads, and no ref that a deny item covers. No summary holds a ref of
+    /// `refs/mirrors/` of the own id, and such a ref does not hide the ref of
+    /// `refs/heads` of the same name.
     #[test]
     fn each_item_summary_holds_the_refs_of_a_walk_with_its_rights() {
         let dir = std::env::temp_dir().join(format!(
@@ -4166,8 +4153,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            // A mirror alias of the own id hides `refs/heads/shadow`, and
-            // aliases under the directory of a collection.
+            // A mirror ref and a mirror alias of the own id, which the
+            // summaries ignore, and aliases under the directory of a
+            // collection.
             let mirrors = dir.join("refs/mirrors");
             for (link, body) in [
                 (format!("{own}/shadow"), "../../heads/priv/p"),
@@ -4203,7 +4191,6 @@ mod tests {
             let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
             let run = repo.summary_run(access.clone(), &opts).await.unwrap();
             let all = all_refs();
-            let mut fallbacks = 0;
             for text in ["anonymous", "ssh:ci", "ssh:admin", "ssh:none"] {
                 let item = AuthItem::parse(text).unwrap();
                 let bytes = repo.item_summary(&run, &item, &opts).await.unwrap();
@@ -4221,12 +4208,11 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(bytes, built, "{text}");
-                if run.every.readable(&read).is_none() {
+                assert!(!local.iter().any(|(name, _)| name == "pub/m"), "{text}");
+                if text == "ssh:ci" {
                     assert!(local.contains(&("shadow".to_owned(), first)), "{text}");
-                    fallbacks += 1;
                 }
             }
-            assert_eq!(fallbacks, 1, "the ci item walks the refs");
             let anonymous = Summary::parse(
                 &repo
                     .item_summary(&run, &AuthItem::Anonymous, &opts)
@@ -4236,7 +4222,7 @@ mod tests {
             .unwrap();
             let (local, collections) = summary_refs(&anonymous);
             let names: Vec<&str> = local.iter().map(|(name, _)| name.as_str()).collect();
-            assert_eq!(names, ["main", "pub/a", "pub/b/c", "pub/m", "pub/open"]);
+            assert_eq!(names, ["main", "pub/a", "pub/b/c", "pub/open"]);
             let ids: Vec<&str> = collections.keys().map(String::as_str).collect();
             assert_eq!(ids, ["org.example.A", "org.example.B"]);
             let a: Vec<&str> = collections["org.example.A"]

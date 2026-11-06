@@ -712,6 +712,21 @@ note: a `^` in either half of the pair is refused, and the port leaves `refs/`
 
 family: M10
 subcommand: refs
+cell: refs/create-collection-own-id
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::refs_create_collection_own_id_matches_the_tool
+spec: cli-behavior.md#refs
+note: `-c --create=<own id>:<ref>`, with the repository's own `collection-id`,
+ writes the local ref `refs/heads/<ref>` in both implementations, and no file
+ under `refs/mirrors/`. The tool's `rev-parse` and `-c` listing read the ref the
+ port wrote. The existence check reads NEWREF as a refspec, so both pass a NEWREF
+ whose `refs/heads/<ref>` exists and replace it with no `--force`. The setup
+ binds no collection id, so the cited test builds the repository.
+
+family: M10
+subcommand: refs
 cell: refs/create-collection-forms
 setup: repo-with-commit
 outcome: full
@@ -1095,11 +1110,13 @@ note: `-c --delete` of the id equal to the repository's own `collection-id`
  refs carrying that id, where a foreign id removes the mirror refs it names. The
  cited test compares the own id, the foreign id, both together, the own id twice,
  and an id no ref carries, over a repository holding both sources of a collection
- ref under its own id; it also compares the `-c` listing that reads them, which
- prints the same rows on both sides, and the three narrower repositories -- the
- own id with no local ref, a local ref carrying a mirror ref's name, and no
- `collection-id` at all. The setup binds no collection id and writes no mirror
- ref, so the cited test builds the repositories.
+ ref under its own id, and the three narrower repositories -- the own id with no
+ local ref, a local ref carrying a mirror ref's name, and no `collection-id` at
+ all. It also compares the `-c` listing: the tool prints a row for each mirror
+ ref of the own id, and the port ignores that directory and prints the other
+ rows alone, the divergence `cli-surface.md`, "P1", records. Each removal
+ agrees. The setup binds no collection id and writes no mirror ref, so the cited
+ test builds the repositories.
 
 family: M10
 subcommand: refs

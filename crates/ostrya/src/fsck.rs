@@ -510,6 +510,13 @@ pub struct FsckReport {
     ///
     /// [`Repo::fsck`] states the check under "Dependencies".
     pub dependency_errors: Vec<FsckDependencyError>,
+    /// The refs under `refs/mirrors/ID/` of the `[core] collection-id` of the
+    /// repository, by their names below that directory, sorted.
+    ///
+    /// The ref resolve, the collection ref listings, and the summary ignore
+    /// these refs. Such a ref is not an error. [`Repo::fsck`] states the rule under "Refs of the own
+    /// collection id".
+    pub own_mirror_refs: Vec<String>,
 }
 
 impl FsckReport {
@@ -517,8 +524,9 @@ impl FsckReport {
     ///
     /// A pass has no faulty object, no faulty composefs image, no faulty
     /// dependency, no condition that ended the run, and no commit that the
-    /// run skipped as already partial. A composefs image with no commit does
-    /// not stop a pass.
+    /// run skipped as already partial. A composefs image with no commit and
+    /// a ref of [`own_mirror_refs`](FsckReport::own_mirror_refs) do not stop
+    /// a pass.
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
             && self.image_errors.is_empty()
@@ -563,6 +571,9 @@ struct Ctx {
     incomplete: HashSet<Checksum>,
     /// The findings of the dependency check, in the order of the run.
     dependency_errors: Vec<FsckDependencyError>,
+    /// The names of the refs under `refs/mirrors/ID/` of the own collection
+    /// id, sorted.
+    own_mirror_refs: Vec<String>,
 }
 
 impl Ctx {
@@ -614,6 +625,7 @@ impl Ctx {
             orphan_images: self.orphan_images,
             missing_images: self.missing_images,
             dependency_errors: self.dependency_errors,
+            own_mirror_refs: self.own_mirror_refs,
         }
     }
 
@@ -655,13 +667,16 @@ impl Repo {
     ///    ([`FsckPhase::ValidateCollectionRefs`]). The run loads the commit of
     ///    each mirror ref and verifies its checksum. If `verify_bindings` is
     ///    set, the `ostree.collection-binding` of the commit of each
-    ///    collection-qualified ref must be the collection id of the ref.
+    ///    collection-qualified ref must be the collection id of the ref. The
+    ///    mirror refs include the refs under `refs/mirrors/ID/` of the
+    ///    `[core] collection-id` of the repository.
     /// 3. Enumerate commits ([`FsckPhase::EnumerateCommits`]). The run lists
     ///    each commit object in the object store. It skips each commit that
     ///    has a `state/<commit>.commitpartial` marker at the start of the run.
     ///    If [`verify_back_refs`](FsckOptions::verify_back_refs) is set, each
     ///    name in the `ostree.ref-binding` of a commit must name a ref that
-    ///    resolves to that commit.
+    ///    resolves to that commit. A ref under `refs/mirrors/ID/` of the
+    ///    `[core] collection-id` of the repository resolves no name.
     /// 4. Verify objects ([`FsckPhase::VerifyObjects`]). The run reads each
     ///    object that the verified commits reference, once:
     ///
@@ -678,6 +693,22 @@ impl Repo {
     /// [`mark_partial`](FsckOptions::mark_partial),
     /// [`mark_dependencies`](FsckOptions::mark_dependencies), and
     /// [`delete`](FsckOptions::delete) state the actions on a finding.
+    ///
+    /// # Refs of the own collection id
+    ///
+    /// The refs of the `[core] collection-id` of the repository are the
+    /// local refs, under `refs/heads`. The port writes no ref under
+    /// `refs/mirrors/ID/` of that id, and the ref resolve, the collection ref
+    /// listings, and the summary ignore that directory. Such a ref comes from outside the port, for
+    /// example from a hand edit or from the `ostree` command.
+    /// [`FsckReport::own_mirror_refs`] holds the name of each such ref. The
+    /// list is not an error, and the run repairs nothing for it. Remove such
+    /// a ref by hand.
+    ///
+    /// A prune keeps the commit of such a ref, so phase 2 checks it: a
+    /// commit object that the store does not hold ends the run with
+    /// [`FsckFailure::RefTarget`], and a binding mismatch under
+    /// `verify_bindings` ends the run with [`FsckFailure::Binding`].
     ///
     /// # Dependencies
     ///
@@ -819,6 +850,12 @@ impl Repo {
         let mut ctx = Ctx::default();
         // Every phase that reads a ref reads this one listing.
         let (ref_targets, collection_refs) = self.fsck_read_refs().await?;
+        let own = self.config().collection_id();
+        ctx.own_mirror_refs = collection_refs
+            .iter()
+            .filter(|entry| is_own_mirror(entry, own))
+            .map(|entry| entry.name.clone())
+            .collect();
 
         // Phase 1: the refs.
         if let Some(failure) = self
@@ -918,7 +955,7 @@ impl Repo {
     /// tail only.
     async fn fsck_read_refs(&self) -> Result<(Vec<(String, Checksum)>, Vec<CollectionRefEntry>)> {
         let heads = self.list_refs(None).await?;
-        let collection_refs = self.collection_refs_over(&heads).await?;
+        let collection_refs = self.collection_refs_over(&heads, None).await?;
         let mut targets = heads;
         for (refspec, commit) in self.list_remote_refs().await? {
             let name = match refspec.split_once(':') {
@@ -1072,12 +1109,20 @@ impl Repo {
                 .iter()
                 .map(|(name, commit)| (name.as_str(), *commit)),
         );
-        let by_pair = index_first(collection_refs.iter().map(|entry| {
-            (
-                (entry.collection.as_str(), entry.name.as_str()),
-                entry.commit,
-            )
-        }));
+        // The refs of the own collection id are the local refs. A ref under
+        // `refs/mirrors/` of that id gives no pair.
+        let own = self.config().collection_id();
+        let by_pair = index_first(
+            collection_refs
+                .iter()
+                .filter(|entry| !is_own_mirror(entry, own))
+                .map(|entry| {
+                    (
+                        (entry.collection.as_str(), entry.name.as_str()),
+                        entry.commit,
+                    )
+                }),
+        );
         for commit in commits {
             let Ok(bytes) = self.load_object_bytes(ObjectType::Commit, commit).await else {
                 continue;
@@ -1656,6 +1701,12 @@ fn check_back_refs(
         }
     }
     None
+}
+
+/// Returns `true` if `entry` is a ref under `refs/mirrors/ID/` of `own`, the
+/// `[core] collection-id` of the repository.
+fn is_own_mirror(entry: &CollectionRefEntry, own: Option<&str>) -> bool {
+    !entry.local && Some(entry.collection.as_str()) == own
 }
 
 /// Indexes `entries` by key and keeps the first value of each key. A linear

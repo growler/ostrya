@@ -40,12 +40,12 @@ If a PREFIX names a ref, the command prints that ref with its commit checksum as
 \fB\-\-create\fR \fINEWREF\fR
 Create the ref NEWREF, and point it at the commit that PREFIX names.
 .IP
-The command line must give exactly one PREFIX argument, which is a revision here. If NEWREF exists and \%\-\-force is not given, the command fails. With \%\-A, NEWREF is an alias of the ref that PREFIX names. With \%\-c, NEWREF is \fB\%<collection\-id>:<ref>\fR, and the command writes a collection ref. This option wins over \%\-\-delete.
+The command line must give exactly one PREFIX argument, which is a revision here. If NEWREF exists and \%\-\-force is not given, the command fails. With \%\-A, NEWREF is an alias of the ref that PREFIX names. With \%\-c, NEWREF is \fB\%<collection\-id>:<ref>\fR, and the command writes the collection ref \fB\%refs/mirrors/<collection\-id>/<ref>\fR\&. If \fB\%<collection\-id>\fR is the collection id of the repository, the command writes the local ref \fB\%refs/heads/<ref>\fR\&. This option wins over \%\-\-delete.
 .TP
 \fB\-c\fR, \fB\-\-collections\fR
 List collection refs as \fB\%(collection\-id, ref)\fR pairs.
 .IP
-Each PREFIX is then a collection id. The local refs carry the collection id of the repository. With \%\-\-delete and the collection id of the repository, the command deletes only the local refs. The mirror refs with that id stay. This switch wins over \%\-A.
+Each PREFIX is then a collection id. The local refs carry the collection id of the repository. The listing leaves out the refs of \fB\%refs/mirrors/<collection\-id>/\fR of that id. With \%\-\-delete and the collection id of the repository, the command deletes only the local refs, and the refs of that directory stay. This switch wins over \%\-A.
 .TP
 \fB\-\-force\fR
 With \%\-\-create, replace an existing ref.

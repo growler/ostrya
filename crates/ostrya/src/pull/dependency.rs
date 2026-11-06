@@ -24,7 +24,6 @@ use std::collections::{HashMap, HashSet};
 use ostrya_core::{Checksum, ObjectType};
 
 use crate::error::{Error, Result};
-use crate::refs::RefPath;
 use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 
@@ -273,20 +272,20 @@ pub(super) async fn lookups(
     if named.is_empty() {
         return Ok((Vec::new(), HashMap::new()));
     }
-    let mut paths: Vec<Option<RefPath>> = vec![None; targets.len()];
+    let mut relpaths: Vec<Option<String>> = vec![None; targets.len()];
     for (target, _) in named.iter().flat_map(|named| &named.pairs) {
         let (name, tip) = &targets[*target];
-        if paths[*target].is_none() && *name != tip.to_hex() {
-            paths[*target] = place.ref_path(name).ok();
+        if relpaths[*target].is_none() && *name != tip.to_hex() {
+            relpaths[*target] = place.ref_path(name).ok();
         }
     }
     let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
     let repo = repo.clone();
     ostrya_rt::unblock(move || {
         let mut entries: Vec<Option<HashMap<String, Checksum>>> = Vec::with_capacity(names.len());
-        for path in &paths {
-            entries.push(match path {
-                Some(path) => held_entries(&repo, path)?,
+        for relpath in &relpaths {
+            entries.push(match relpath {
+                Some(relpath) => held_entries(&repo, relpath)?,
                 None => None,
             });
         }
@@ -328,13 +327,12 @@ pub(super) async fn lookups(
     .await
 }
 
-/// Returns the entries of field 2 of the commit that the ref at `path` names
-/// in `repo`, by name, on the calling thread. The read of the ref follows the
-/// rule of [`Repo::resolve_ref_path_blocking`]. Returns `None` for an absent
-/// ref, an absent commit, and a field 2 that does not decode or has a
+/// Returns the entries of field 2 of the commit that the ref at `relpath`
+/// names in `repo`, by name, on the calling thread. Returns `None` for an
+/// absent ref, an absent commit, and a field 2 that does not decode or has a
 /// defective entry.
-fn held_entries(repo: &Repo, path: &RefPath) -> Result<Option<HashMap<String, Checksum>>> {
-    let Some(tip) = repo.resolve_ref_path_blocking(path)? else {
+fn held_entries(repo: &Repo, relpath: &str) -> Result<Option<HashMap<String, Checksum>>> {
+    let Some(tip) = repo.resolve_relpath_tip_blocking(relpath)? else {
         return Ok(None);
     };
     let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &tip) {

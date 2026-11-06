@@ -116,9 +116,10 @@ pub(super) struct BucketState {
 /// `collection`.
 ///
 /// The call reads the `config` and selects the namespace. Then at the same
-/// time it reads the ref files of the ref directory of the namespace, lists
-/// `refs/mirrors/` of the collection id of the bucket, and lists the
-/// objects. It reads no ref file of another namespace.
+/// time it reads the ref files of the ref directory of the namespace and
+/// lists the objects. It reads no ref file of another namespace. The
+/// namespace of the collection id of the bucket is `refs/heads/`, so the
+/// call does not list or read `refs/mirrors/` of that id.
 ///
 /// # Errors
 ///
@@ -126,8 +127,7 @@ pub(super) struct BucketState {
 ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
 ///   repository has no `config`.
 /// - The errors of [`BucketRepo::read_config`], of
-///   [`BucketRepo::read_ref_dir`], of [`BucketRepo::refuse_own_mirror_refs`],
-///   and of [`BucketRepo::list_objects`].
+///   [`BucketRepo::read_ref_dir`], and of [`BucketRepo::list_objects`].
 pub(super) async fn read_state(
     bucket: &BucketRepo,
     collection: Option<&str>,
@@ -142,20 +142,8 @@ pub(super) async fn read_state(
     let keep_related = config.keep_detached_related()?;
     let bucket_id = config.collection_id();
     let ns = namespace(collection, bucket_id);
-    // The push reads the ref directory of its namespace alone, and lists
-    // `refs/mirrors/` of the collection id of the bucket.
-    let own_mirrors = async {
-        match bucket_id {
-            Some(own) => bucket.refuse_own_mirror_refs(own).await,
-            None => Ok(()),
-        }
-    };
-    let ((dir, own_mirrors), listing) = zip(
-        zip(bucket.read_ref_dir(&ns.dir()), own_mirrors),
-        bucket.list_objects(),
-    )
-    .await;
-    own_mirrors?;
+    // The push reads the ref directory of its namespace alone.
+    let (dir, listing) = zip(bucket.read_ref_dir(&ns.dir()), bucket.list_objects()).await;
     Ok(BucketState {
         level,
         keep_related,
@@ -256,9 +244,10 @@ impl Repo {
     ///    [`LockOperation::Push`], with
     ///    [`break_lock`](RepoPushOptions::break_lock).
     /// 3. It reads the `config` and selects the namespace. Then at the same
-    ///    time it reads the ref files of the ref directory of the namespace,
-    ///    lists `refs/mirrors/` of the collection id of the bucket, and lists
-    ///    the objects. It reads no ref file of another namespace. It checks
+    ///    time it reads the ref files of the ref directory of the namespace
+    ///    and lists the objects. It reads no ref file of another namespace,
+    ///    and it skips `refs/mirrors/` of the collection id of the bucket,
+    ///    whose refs are in `refs/heads/`. It checks
     ///    the bindings. For each ref, the tip of the ref in the bucket must
     ///    be an ancestor of the new commit in the local repository, unless
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
@@ -371,12 +360,12 @@ impl Repo {
     ///   states a mode other than `archive-z2` and `archive`, holds a
     ///   `tombstone-commits`, `indexed-deltas`, or `keep-detached-related`
     ///   that is no boolean, or holds a `zlib-level` that is no integer, if a
-    ///   key under the ref directory of the namespace is no ref name, if the
-    ///   bucket holds `refs/mirrors/ID/` of its own collection id, if a ref
-    ///   file of the namespace is malformed, or if a ref of the namespace
+    ///   key under the ref directory of the namespace is no ref name, if a
+    ///   ref file of the namespace is malformed, or if a ref of the namespace
     ///   names a commit that the bucket does not hold. The push then uploads
     ///   nothing. The push does not check the keys and the ref files of the
-    ///   other namespaces.
+    ///   other namespaces, also `refs/mirrors/ID/` of the collection id of
+    ///   the bucket.
     /// - [`Error::Remote`] with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   binding of a source commit does not agree with the namespace.

@@ -2087,9 +2087,9 @@ fn ref_reads(server: &StandIn) -> (Vec<String>, BTreeSet<String>) {
     (gets, lists)
 }
 
-/// A push lists and reads the ref directory of its namespace alone, and
-/// lists `refs/mirrors/` of the collection id of the bucket. A key or a ref
-/// file of another namespace that breaks a rule does not refuse the push.
+/// A push lists and reads the ref directory of its namespace alone. A key or
+/// a ref file of another namespace that breaks a rule does not refuse the
+/// push.
 #[test]
 fn a_push_reads_no_ref_file_of_another_namespace() {
     let scratch = TmpDir::new("push-s3-own-namespace");
@@ -2122,10 +2122,7 @@ fn a_push_reads_no_ref_file_of_another_namespace() {
             .unwrap();
         let (gets, lists) = ref_reads(&server);
         assert_eq!(gets, ["refs/heads/main"]);
-        assert_eq!(
-            lists,
-            BTreeSet::from(["refs/heads/".to_owned(), format!("refs/mirrors/{A}/")])
-        );
+        assert_eq!(lists, BTreeSet::from(["refs/heads/".to_owned()]));
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(next));
 
         server.state().requests.clear();
@@ -2134,10 +2131,7 @@ fn a_push_reads_no_ref_file_of_another_namespace() {
             .unwrap();
         let (gets, lists) = ref_reads(&server);
         assert_eq!(gets, [format!("refs/mirrors/{B}/main")]);
-        assert_eq!(
-            lists,
-            BTreeSet::from([format!("refs/mirrors/{A}/"), format!("refs/mirrors/{B}/")])
-        );
+        assert_eq!(lists, BTreeSet::from([format!("refs/mirrors/{B}/")]));
         assert_eq!(
             ref_of(&server, &format!("repo/refs/mirrors/{B}/main")),
             Some(next_mirrored)
@@ -2154,35 +2148,44 @@ fn a_push_reads_no_ref_file_of_another_namespace() {
     });
 }
 
-/// A ref key under `refs/mirrors/` of the collection id of the bucket
-/// refuses a push into each namespace.
+/// A push into each namespace ignores the ref keys under `refs/mirrors/` of
+/// the collection id of the bucket: it neither lists nor reads them, and the
+/// keys stay. A push of a commit bound to that id writes `refs/heads/`.
 #[test]
-fn the_mirror_refs_of_the_own_collection_id_refuse_the_push() {
-    let ref_body = format!("{}\n", "ab".repeat(32));
-    let (server, result) = push_onto_seed(
-        "push-s3-own-mirror",
-        &format!("{PLAIN}collection-id={A}\n"),
-        &[(&format!("repo/refs/mirrors/{A}/x"), ref_body.as_bytes())],
-    );
-    let message = malformed(result);
-    assert!(message.contains("its own collection id"), "{message}");
-    assert!(
-        message.contains(&format!("refs/mirrors/{A}/x")),
-        "{message}"
-    );
-    assert_unchanged(&server);
-    let (gets, _) = ref_reads(&server);
-    assert!(gets.is_empty(), "{gets:?}");
-
-    let scratch = TmpDir::new("push-s3-own-mirror-into-mirror");
-    let result = block_on(async {
+fn a_push_ignores_the_mirror_refs_of_the_own_collection_id() {
+    let scratch = TmpDir::new("push-s3-own-mirror");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let own = format!("repo/refs/mirrors/{A}/main");
+        let body = format!("{}\n", "ab".repeat(32));
+        server.state().store(&own, body.as_bytes());
+        server
+            .state()
+            .store(&format!("repo/refs/mirrors/{A}/bad"), b"bad");
         let repo = archive(&scratch.path().join("src")).await;
-        commit(&repo, "bound-b", None, "b", bound(B)).await;
-        push(&repo, &server.endpoint(), opts(&["bound-b:main"])).await
+        let main = commit(&repo, "main", None, "one", bound(A)).await;
+        let mirrored = commit(&repo, "bound-b", None, "b", bound(B)).await;
+        server.state().requests.clear();
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
+            .await
+            .unwrap();
+
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(main));
+        assert_eq!(
+            ref_of(&server, &format!("repo/refs/mirrors/{B}/main")),
+            Some(mirrored)
+        );
+        assert_eq!(server.state().objects[&own].bytes, body.as_bytes());
+        let prefix = format!("refs/mirrors/{A}/");
+        let (gets, lists) = ref_reads(&server);
+        assert!(!gets.iter().any(|key| key.starts_with(&prefix)), "{gets:?}");
+        assert!(!lists.contains(&prefix), "{lists:?}");
     });
-    let message = malformed(result);
-    assert!(message.contains("its own collection id"), "{message}");
-    assert_unchanged(&server);
 }
 
 #[test]

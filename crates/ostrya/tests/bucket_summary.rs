@@ -543,6 +543,40 @@ fn a_bucket_with_a_collection_id_states_it_and_maps_the_mirror_refs() {
     });
 }
 
+/// The update skips each key under `refs/mirrors/` of the own collection id,
+/// with no check of the key and no read: a ref of another commit than
+/// `refs/heads/main`, a ref to a commit that the bucket does not hold, and a
+/// key that is no ref key.
+#[test]
+fn the_update_skips_the_mirror_refs_of_the_own_collection_id() {
+    block_on(async {
+        let f = Fixture::new(Some(ID)).await;
+        f.put_ref(&format!("refs/mirrors/{ID}/main"), &f.c1);
+        f.put_ref(
+            &format!("refs/mirrors/{ID}/gone"),
+            &Checksum::sha256(b"absent"),
+        );
+        f.put_ref(&format!("refs/mirrors/{ID}/bad@name"), &f.c1);
+        f.server.state().requests.clear();
+        let report = f.update().await.unwrap();
+        assert_eq!(report.refs, 2);
+        let summary = f.summary();
+        assert_eq!(
+            heads(&summary),
+            [("main".to_owned(), f.c2), ("side".to_owned(), f.s1)]
+        );
+        assert!(summary.collection_map().unwrap().is_empty());
+        let prefix = format!("refs/mirrors/{ID}/");
+        let reads: Vec<(String, String)> = f
+            .requests()
+            .into_iter()
+            .filter(|(method, key)| method == "GET" && key.starts_with(&prefix))
+            .collect();
+        assert_eq!(reads, []);
+        assert_no_summary_finding(&f.bucket).await;
+    });
+}
+
 #[test]
 fn the_config_values_and_an_empty_ref_set_are_written() {
     block_on(async {
@@ -788,12 +822,6 @@ fn a_bad_ref_or_commit_refuses_the_update_and_changes_nothing() {
             None,
             |f| f.put_ref("refs/heads/gone", &Checksum::sha256(b"absent")),
             "which the bucket does not hold",
-        ),
-        (
-            "a mirror ref of the own collection id",
-            Some(ID),
-            |f| f.put_ref(&format!("refs/mirrors/{ID}/main"), &f.c2),
-            "of its own collection id",
         ),
         (
             "a commit object with other bytes",

@@ -34,7 +34,8 @@
 //! marker before it writes the ref files. The refs of the
 //! collection id of the bucket, or of a push with no collection, are under
 //! `refs/heads/`. The refs of each other collection are under
-//! `refs/mirrors/ID/`. A push builds each `.filez` that it uploads at the
+//! `refs/mirrors/ID/`. The push, the summary update, and the prune write no
+//! key under `refs/mirrors/ID/` of the collection id of the bucket. A push builds each `.filez` that it uploads at the
 //! `[archive] zlib-level` of the `config` of the bucket, 6 if the `config`
 //! has none, clamped to 1 to 9.
 //!
@@ -112,9 +113,9 @@
 //!
 //! - The `config`, as a writer reads it.
 //! - The ref files under `refs/`: each key is a ref of `refs/heads/` or of
-//!   `refs/mirrors/ID/`, with an `ID` other than the collection id of the
-//!   bucket, each file holds a checksum, and each commit of a ref is in the
-//!   bucket.
+//!   `refs/mirrors/ID/`, each file holds a checksum, and each commit of a
+//!   ref is in the bucket. A ref of `refs/mirrors/ID/` of the collection id
+//!   of the bucket gets a note, and the run reads no such ref file.
 //! - The summary: it parses, and with
 //!   [`summary_keys`](BucketFsckOptions::summary_keys), its signature
 //!   verifies. A summary ref whose commit is absent, and a summary delta
@@ -174,8 +175,9 @@
 //! the writer lock with the operation `prune`, also with `no_prune`, and
 //! refuses `break_lock` with `no_prune`.
 //!
-//! - The roots are the commits of the refs, the commits that the `summary`
-//!   names, the dependencies in field 2 of each commit that the walk
+//! - The roots are the commits of the refs, the refs of `refs/mirrors/ID/`
+//!   of the collection id of the bucket included, the commits that the
+//!   `summary` names, the dependencies in field 2 of each commit that the walk
 //!   reaches, and, unless the roots are on the refs alone, each commit of
 //!   the listing. The objects that the run keeps are the objects that a
 //!   local prune keeps with the same options, refs, and objects, and the
@@ -224,7 +226,8 @@
 //!
 //! - Field 0 holds the refs of `refs/heads/`, and
 //!   `ostree.summary.collection-map` holds the refs of each
-//!   `refs/mirrors/ID/`.
+//!   `refs/mirrors/ID/`. The run skips the keys of `refs/mirrors/ID/` of
+//!   the collection id of the bucket.
 //! - `ostree.static-deltas` holds each delta with a superblock, with the
 //!   SHA-256 of its superblock. Each read of a superblock takes the strict
 //!   rule of an absent key, so only a superblock gone with an answer 404

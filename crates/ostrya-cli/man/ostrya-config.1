@@ -77,6 +77,10 @@ ostrya refuses to open a repository without this key, or with another value.
 \fB\%collection\-id\fR (string)
 The collection ID of the repository.
 The summary records it, and the collection refs below \fB\%refs/mirrors/\fR use it.
+The refs of this id are the local refs below \fB\%refs/heads/\fR.
+ostrya writes no ref below \fB\%refs/mirrors/\fR of this id.
+The resolve, the listing of \fB\%refs \-c\fR, the ref listing, and the summary ignore that directory.
+\fB\%ostrya fsck\fR reports each ref in it, and \fB\%ostrya prune\fR keeps the commit of each ref in it.
 \fB\%ostrya init \-\-collection\-id\fR writes it.
 In the \fB\%config\fR of a bucket repository, \fB\%ostrya remote init \-\-collection\-id\fR writes it, and it never changes.
 \fB\%ostrya\-repo\fR(5) describes the \fB\%config\fR of a bucket repository.

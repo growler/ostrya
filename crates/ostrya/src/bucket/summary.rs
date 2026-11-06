@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 use super::lock::{LockHolder, LockOperation, WriterLock};
 use super::prune::UNBLOCK_SIZE;
-use super::state::{BucketRefs, check_prefixes, summary_refs};
+use super::state::{BucketRefs, OwnMirrors, check_prefixes, summary_refs};
 use super::{BucketRepo, invalid, object_key, release_on_error};
 use crate::config::RepoConfig;
 use crate::delta::{MAX_SUPERBLOCK, parse_delta_dir};
@@ -140,7 +140,10 @@ impl BucketRepo {
     ///
     /// The summary is the root summary of the repository. It holds the refs
     /// of `refs/heads/` in field 0, and the refs of each `refs/mirrors/ID/`
-    /// in `ostree.summary.collection-map` under `ID`. It names each static
+    /// in `ostree.summary.collection-map` under `ID`. The update skips each
+    /// key under `refs/mirrors/ID/` of the `[core] collection-id` of the
+    /// `config`, with no check and no read, so no such ref is in the
+    /// summary. It names each static
     /// delta with a superblock. Its bytes are the bytes of the root summary
     /// that [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries)
     /// writes for a local repository with the same refs, commits, deltas,
@@ -154,7 +157,8 @@ impl BucketRepo {
     /// 1. The read of the `config`, by the strict rule of an absent key.
     /// 2. The take of the writer lock for [`LockOperation::Summary`] with
     ///    [`break_lock`](BucketSummaryOptions::break_lock).
-    /// 3. The refs: one list of `refs/` and a read of each ref file. With no
+    /// 3. The refs: one list of `refs/` and a read of each ref file that the
+    ///    update does not skip. With no
     ///    signer in `opts`, the probe of `summary.sig` runs at the same time.
     ///    The probe is a `GET` with `Range: bytes=0-0`. Only an answer 404
     ///    `NoSuchKey` is an absent key. With a signer, the update sends no
@@ -211,7 +215,8 @@ impl BucketRepo {
     ///   `a/b`.
     /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if the
     ///   `config` breaks a rule of a bucket repository, if a key under
-    ///   `refs/` is no ref key, if a ref file is malformed or is gone at its
+    ///   `refs/` that the update does not skip is no ref key, if a ref file
+    ///   is malformed or is gone at its
     ///   read, if a ref names a commit that the bucket does not hold, if a
     ///   commit object is larger than its cap or does not have the checksum
     ///   of its name, if a superblock key names no delta, if a superblock is
@@ -308,11 +313,15 @@ impl BucketRepo {
         lock: &WriterLock<'_>,
     ) -> Result<BucketSummaryReport> {
         let (refs, signed) = if opts.summary_signers.is_empty() {
-            let (refs, signed) =
-                zip(self.read_refs(config.collection_id()), self.is_signed()).await;
+            let (refs, signed) = zip(
+                self.read_refs(config.collection_id(), OwnMirrors::Skip),
+                self.is_signed(),
+            )
+            .await;
             (refs?, signed?)
         } else {
-            (self.read_refs(config.collection_id()).await?, false)
+            let refs = self.read_refs(config.collection_id(), OwnMirrors::Skip);
+            (refs.await?, false)
         };
         check_prefixes(&refs.heads)?;
         for dir in refs.mirrors.values() {

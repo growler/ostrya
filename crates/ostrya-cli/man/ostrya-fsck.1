@@ -17,6 +17,8 @@ After the walk, the command checks the dependencies in field \%2 of each commit 
 After the walk, the command checks each composefs image in \fB\%extensions/ostrya/composefs/\fR against the key \fB\%ostree.composefs.digest.v0\fR of its commit. A faulty image is an error, and \%\-\-delete removes it: an image whose digest is not the key, an image that does not read, and an image whose commit has no key or a malformed key. If the commit of an image does not load, the command reports an error and keeps the image. An image whose commit is absent gets one line on standard output and is not an error. Each commit that \%\-\-delete or \%\-\-add\-tombstones deletes loses its image first.
 .PP
 If \fB\%[ex\-ostrya] generate\-composefs\fR is true, the command also writes the line \fB\%Commit with no composefs image: <commit>\fR on standard output for each complete commit that carries \fB\%ostree.composefs.digest.v0\fR and has no image. Such a commit is not an error, and the command repairs nothing for it. \fB\%composefs\-image \-\-add\fR stores the image. A commit with a malformed key gets no line. A value of the key that is not a boolean fails the command before the first phase.
+.PP
+The refs of the \fB\%collection\-id\fR of the repository are the local refs. For each ref under \fB\%refs/mirrors/<collection\-id>/\fR of that id, the command writes the line \fB\%Ref under the own collection id, not read: refs/mirrors/ID/NAME\fR on standard output, also with \%\-\-quiet. The ref resolve, the listing of \fB\%refs \-c\fR, the ref listing, and the summary ignore such a ref, and a prune keeps its commit. The line is not an error. The command checks the commit of such a ref as the commit of each other collection ref.
 .SH OPTIONS
 .TP
 \fB\-\-no\-mark\-partial\fR

@@ -21,8 +21,8 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
-    CollectionRef, collection_ref_to_relpath, put_alias_blocking, put_ref_blocking,
-    refspec_to_relpath, relative_link, sync_dirs_all,
+    CollectionRef, collection_ref_path, put_alias_blocking, put_ref_blocking, refspec_to_relpath,
+    relative_link, sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config_blocking};
@@ -347,12 +347,9 @@ impl UpdateGuard {
     /// Returns the commit that a collection ref names in the ref store.
     ///
     /// The call reads the ref as [`read_ref`](UpdateGuard::read_ref) reads a
-    /// refspec. It reads the path of the collection ref alone. For the
-    /// collection id of the repository, it does not read `refs/heads/NAME`
-    /// when the mirror ref is absent. [`Repo::resolve_collection_ref`] reads
-    /// a collection ref with no lock, and for the collection id of the
-    /// repository it reads `refs/heads/NAME` when the mirror path holds no
-    /// ref file.
+    /// refspec, at the path that [`Repo::resolve_collection_ref`] reads. For
+    /// the `[core] collection-id` of the repository, the call reads
+    /// `refs/heads/NAME`, and it does not read `refs/mirrors/ID/`.
     ///
     /// # Errors
     ///
@@ -364,8 +361,9 @@ impl UpdateGuard {
     /// - [`Error::Io`] if the read fails, for example if the ref path names a
     ///   directory.
     pub async fn read_collection_ref(&self, cref: &CollectionRef) -> Result<Option<Checksum>> {
+        let own = self.repo().config().collection_id();
         self.repo()
-            .resolve_relpath_tip(collection_ref_to_relpath(cref)?)
+            .resolve_relpath_tip(collection_ref_path(own, cref)?)
             .await
     }
 
@@ -387,7 +385,10 @@ impl UpdateGuard {
     /// Writes one collection ref atomically, as
     /// [`set_ref`](UpdateGuard::set_ref) writes a refspec.
     ///
-    /// If `checksum` is `None`, the call removes the ref file.
+    /// The call writes the path that
+    /// [`Repo::set_collection_ref_immediate`] writes: `refs/heads/NAME` for
+    /// the `[core] collection-id` of the repository. If `checksum` is `None`,
+    /// the call removes the ref file.
     ///
     /// # Errors
     ///
@@ -404,7 +405,7 @@ impl UpdateGuard {
         cref: &CollectionRef,
         checksum: Option<&Checksum>,
     ) -> Result<()> {
-        let relpath = collection_ref_to_relpath(cref)?;
+        let relpath = collection_ref_path(self.repo().config().collection_id(), cref)?;
         self.set_relpath(relpath, checksum).await
     }
 

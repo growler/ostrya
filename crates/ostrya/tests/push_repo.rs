@@ -625,6 +625,35 @@ fn a_commit_bound_to_the_server_collection_goes_to_the_local_refs() {
     );
 }
 
+/// A push into the collection id of the server writes the local ref, also
+/// when the server holds `refs/mirrors/ID/main` of that id. The mirror ref
+/// keeps its content.
+#[test]
+fn a_push_into_the_server_collection_writes_the_local_ref_beside_a_mirror_ref() {
+    let pair = Pair::new(
+        "own-mirror",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "collection-id=org.example.Os\n",
+    );
+    let mirror = pair.server.path().join("refs/mirrors/org.example.Os/main");
+    let held = format!("{}\n", "ab".repeat(32));
+    std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+    std::fs::write(&mirror, &held).unwrap();
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(Some("org.example.Os"), &[]),
+    );
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    assert_eq!(report.unwrap().collection, None);
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(c1));
+    assert_eq!(std::fs::read_to_string(&mirror).unwrap(), held);
+}
+
 /// Two different bindings, a `collection` that differs from the binding, a
 /// `collection` that fails the collection-id rule or is longer than 255
 /// bytes, and a binding that fails the collection-id rule are refused before

@@ -50,6 +50,14 @@ async fn put(repo: &Repo, id: &str, name: &str, checksum: &Checksum) {
         .unwrap();
 }
 
+/// Writes `checksum` to `refs/mirrors/OWN/name` of the repository at `path`
+/// by hand, as a source outside the port does.
+fn put_own_mirror(path: &Path, name: &str, checksum: &Checksum) {
+    let file = path.join("refs/mirrors").join(OWN).join(name);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, format!("{}\n", checksum.to_hex())).unwrap();
+}
+
 /// Writes `checksum` to the local ref `name`.
 async fn put_local(repo: &Repo, name: &str, checksum: &Checksum) {
     repo.set_ref_immediate(name, Some(checksum)).await.unwrap();
@@ -150,21 +158,21 @@ fn a_listing_of_another_collection_reads_only_the_selected_directories() {
 }
 
 /// Under the collection id of the repository, the listing walks
-/// `refs/mirrors/ID/` and `refs/heads/` by the same rules. The test returns
-/// at once for a user that ignores the mode.
+/// `refs/heads/` by the same rules, and it never opens `refs/mirrors/ID/`.
+/// The test returns at once for a user that ignores the mode.
 #[test]
 fn a_listing_of_the_own_collection_reads_only_the_selected_directories() {
     let tmp = TmpDir::new("list-cref-in-own-dirs");
     let path = create(&tmp, Some(OWN));
     let repo = open(&path);
+    put_own_mirror(&path, "pool/m", &checksum(6));
     block_on(async {
         put(&repo, OWN, "pool/a", &checksum(1)).await;
-        put(&repo, OWN, "builds/locked/y", &checksum(4)).await;
         put_local(&repo, "pool/b/c", &checksum(2)).await;
         put_local(&repo, "builds/x", &checksum(3)).await;
         put_local(&repo, "builds/locked/z", &checksum(5)).await;
         let locked = [
-            path.join("refs/mirrors").join(OWN).join("builds/locked"),
+            path.join("refs/mirrors").join(OWN),
             path.join("refs/heads/builds/locked"),
         ];
         if !lock(&locked) {
@@ -201,7 +209,7 @@ fn a_listing_of_another_collection_reads_no_other_collection_and_no_local_ref() 
         put(&repo, OTHER, "main", &checksum(1)).await;
         put(&repo, OTHER, "x/y", &checksum(2)).await;
         put(&repo, THIRD, "main", &checksum(3)).await;
-        put(&repo, OWN, "main", &checksum(4)).await;
+        put_own_mirror(&path, "main", &checksum(4));
         put_local(&repo, "main", &checksum(5)).await;
         let mirrors = path.join("refs/mirrors");
         let locked = [
@@ -341,31 +349,28 @@ fn a_pattern_keeps_its_meaning_in_the_collection() {
 }
 
 /// Under the collection id of the repository, the listing holds the refs of
-/// `refs/mirrors/ID/` and of `refs/heads/`. The mirror ref wins a clash, and
-/// the listing does not read the ref file of `refs/heads/` that it hides. The
-/// last part of the test returns at once for a user that ignores the mode.
+/// `refs/heads/` alone, and it does not open `refs/mirrors/ID/`. The last
+/// part of the test returns at once for a user that ignores the mode.
 #[test]
-fn the_mirror_ref_of_the_own_collection_wins() {
-    let tmp = TmpDir::new("list-cref-in-own-wins");
+fn the_own_collection_ignores_its_mirror_refs() {
+    let tmp = TmpDir::new("list-cref-in-own-mirror");
     let path = create(&tmp, Some(OWN));
     let repo = open(&path);
+    put_own_mirror(&path, "main", &checksum(2));
+    put_own_mirror(&path, "only-mirror", &checksum(4));
     block_on(async {
         put_local(&repo, "main", &checksum(1)).await;
         put_local(&repo, "only-local", &checksum(3)).await;
-        put(&repo, OWN, "main", &checksum(2)).await;
-        put(&repo, OWN, "only-mirror", &checksum(4)).await;
-        let want = pairs(&[("main", 2), ("only-local", 3), ("only-mirror", 4)]);
+        let want = pairs(&[("main", 1), ("only-local", 3)]);
         assert_eq!(list(&repo, OWN, &[]).await, want);
 
-        let hidden = path.join("refs/heads/main");
-        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read(&hidden).is_ok() {
-            std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let locked = [path.join("refs/mirrors").join(OWN)];
+        if !lock(&locked) {
             return;
         }
         assert_eq!(list(&repo, OWN, &[]).await, want);
-        assert_eq!(list(&repo, OWN, &["main"]).await, pairs(&[("main", 2)]));
-        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(list(&repo, OWN, &["main"]).await, pairs(&[("main", 1)]));
+        unlock(&locked);
     });
 }
 
@@ -442,9 +447,10 @@ fn an_absent_collection_gives_an_empty_listing() {
     });
 }
 
-/// A `refs/mirrors` that is a regular file fails a listing that opens it, for
-/// the own collection and for another collection. A selector with the
-/// negative pattern `**` opens no directory and gives an empty listing.
+/// A `refs/mirrors` that is a regular file fails a listing of another
+/// collection, which opens it. A listing of the own collection does not open
+/// it. A selector with the negative pattern `**` opens no directory and
+/// gives an empty listing.
 #[test]
 fn a_mirror_directory_that_is_a_file_fails_the_listing() {
     let tmp = TmpDir::new("list-cref-in-mirrors-file");
@@ -455,11 +461,12 @@ fn a_mirror_directory_that_is_a_file_fails_the_listing() {
         let mirrors = path.join("refs/mirrors");
         std::fs::remove_dir(&mirrors).unwrap();
         std::fs::write(&mirrors, "").unwrap();
+        match repo.list_collection_refs_in(OTHER, &selector(&[])).await {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::NotADirectory, "{e}"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(list(&repo, OWN, &[]).await, pairs(&[("main", 1)]));
         for id in [OWN, OTHER] {
-            match repo.list_collection_refs_in(id, &selector(&[])).await {
-                Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::NotADirectory, "{id}: {e}"),
-                other => panic!("{id}: {other:?}"),
-            }
             assert!(list(&repo, id, &["!**"]).await.is_empty(), "{id}");
         }
     });

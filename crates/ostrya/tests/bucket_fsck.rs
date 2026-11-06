@@ -830,8 +830,8 @@ fn the_ref_findings_name_each_bad_ref_key() {
                 ),
                 (
                     format!("refs/mirrors/{ID}/main"),
-                    "is a ref under refs/mirrors/ of the own collection id; a bucket repository \
-                     holds the refs of its own collection under refs/heads/"
+                    "is a ref under refs/mirrors/ of the own collection id; the summary and the \
+                     push ignore it, and a prune keeps its commit"
                         .to_owned()
                 ),
                 (
@@ -841,6 +841,35 @@ fn the_ref_findings_name_each_bad_ref_key() {
             ]
         );
         assert!(report.has_errors());
+    });
+}
+
+/// A ref under `refs/mirrors/` of the own collection id gets one `ref` note.
+/// The run reads no such ref file, so a ref to a commit that the bucket does
+/// not hold gives no error.
+#[test]
+fn a_ref_of_the_own_collection_id_is_a_note() {
+    block_on(async {
+        let f = Fixture::new(Some(ID)).await;
+        let key = format!("refs/mirrors/{ID}/main");
+        f.put_ref(&key, &Checksum::sha256(b"absent"));
+        let report = f.fsck().await;
+        let refs: Vec<(String, bool)> = report
+            .findings
+            .iter()
+            .filter(|found| found.kind == Ref)
+            .map(|found| (found.key.clone(), found.error))
+            .collect();
+        assert_eq!(refs, [(key.clone(), false)]);
+        assert!(!report.has_errors(), "{:#?}", report.findings);
+        let gets = f
+            .server
+            .state()
+            .requests
+            .iter()
+            .filter(|(method, target)| method == "GET" && target == &format!("/bkt/repo/{key}"))
+            .count();
+        assert_eq!(gets, 0);
     });
 }
 

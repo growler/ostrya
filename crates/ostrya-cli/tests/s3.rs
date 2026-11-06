@@ -1535,6 +1535,35 @@ fn remote_fsck_reports_a_stale_summary_as_a_note() {
     );
 }
 
+/// A ref under `refs/mirrors/ID/` of the collection id of the bucket refuses
+/// no push and no summary update. The fsck gives it a `ref` note and exits 0.
+#[cfg(feature = "push")]
+#[test]
+fn remote_fsck_reports_a_ref_of_the_own_collection_id_as_a_note() {
+    let scratch = Scratch::new("fsck-own-mirror");
+    let server = StandIn::start();
+    init(&scratch, &server, Some(ID));
+    let own = format!("repo/refs/mirrors/{ID}/main");
+    let body = format!("{}\n", "ab".repeat(32));
+    server.state().store(&own, body.as_bytes());
+    let repo = scratch.repo("local");
+    let tip = scratch.commit(&repo, "main", "one");
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&[&repo, "push", ADDRESS, "main", &endpoint, CLEARTEXT]);
+    assert_eq!(ref_of(&server, "repo/refs/heads/main").unwrap(), tip);
+    scratch.ok(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]);
+    let out = scratch.run(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "note: ref refs/mirrors/{ID}/main: is a ref under refs/mirrors/ of the own \
+             collection id; the summary and the push ignore it, and a prune keeps its commit\n"
+        )
+    );
+    assert_eq!(object(&server, &own).unwrap(), body.as_bytes());
+}
+
 #[test]
 fn remote_fsck_with_delete_marks_the_commit_and_deletes_the_bad_object() {
     let scratch = Scratch::new("fsck-delete");

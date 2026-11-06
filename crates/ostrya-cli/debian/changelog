@@ -8,6 +8,14 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     keyring through a symlink, and take a symlink to no file as no
     keyring. They refuse a repository keyring over 4 MiB before they read
     it.
+  * The collection-id of a repository is its local namespace. refs -c
+    --create and pull --collection write refs/heads/REF for that id.
+  * refs -c, summary -u, and the ref listing of serve ignore
+    refs/mirrors/ID/ of the own collection id. fsck prints a line for
+    each ref there, and prune keeps its commit.
+  * push to a bucket and remote summary -u skip the keys of
+    refs/mirrors/ID/ of the collection id of the bucket. remote fsck
+    gives each such key a note, and remote prune keeps its commit.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
 

@@ -1029,9 +1029,11 @@ fn a_bad_ref_key_fails_the_run_before_a_delete_and_releases_the_lock() {
     block_on(async {
         for id in [None, Some(ID)] {
             let f = Fixture::new(id).await;
+            // A key under `refs/mirrors/` of the own collection id takes the
+            // rules of each other ref key.
             let bad = match id {
                 None => "refs/remotes/origin/main".to_owned(),
-                Some(id) => format!("refs/mirrors/{id}/main"),
+                Some(id) => format!("refs/mirrors/{id}/bad@name"),
             };
             f.put_ref(&bad, &f.c3);
             let before = f.snapshot();
@@ -1393,6 +1395,24 @@ fn the_mirror_refs_of_another_collection_are_roots() {
         f.put_ref("refs/mirrors/org.example.Other/side", &f.s1);
         f.prune(&refs_only(0)).await.unwrap();
         assert_eq!(f.keys("objects"), f.reachable(&[f.c3, f.s1], 0).await);
+    });
+}
+
+/// A ref under `refs/mirrors/` of the own collection id roots the walk, and
+/// the run keeps the ref.
+#[test]
+fn the_mirror_refs_of_the_own_collection_id_are_roots() {
+    block_on(async {
+        let f = Fixture::new(Some(ID)).await;
+        f.remove("refs/heads/side");
+        let mirror = format!("refs/mirrors/{ID}/main");
+        f.put_ref(&mirror, &f.s1);
+        f.prune(&refs_only(0)).await.unwrap();
+        assert_eq!(f.keys("objects"), f.reachable(&[f.c3, f.s1], 0).await);
+        assert_eq!(
+            f.get(&mirror),
+            Some(format!("{}\n", f.s1.to_hex()).into_bytes())
+        );
     });
 }
 

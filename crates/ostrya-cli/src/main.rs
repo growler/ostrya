@@ -371,6 +371,15 @@ enum Command {
     /// nothing for it. `composefs-image --add` stores the image. A commit with
     /// a malformed key gets no line. A value of the key that is not a boolean
     /// fails the command before the first phase.
+    ///
+    /// The refs of the `collection-id` of the repository are the local refs.
+    /// For each ref under `refs/mirrors/<collection-id>/` of that id, the
+    /// command writes the line
+    /// `Ref under the own collection id, not read: refs/mirrors/ID/NAME` on
+    /// standard output, also with --quiet. The ref resolve, the listing of
+    /// `refs -c`, the ref listing, and the summary ignore such a ref, and a
+    /// prune keeps its commit. The line is not an error. The command checks
+    /// the commit of such a ref as the commit of each other collection ref.
     Fsck(FsckArgs),
     /// Report the paths that changed between two revisions or directories.
     ///
@@ -1540,16 +1549,20 @@ struct RefsArgs {
     /// The command line must give exactly one PREFIX argument, which is a
     /// revision here. If NEWREF exists and --force is not given, the command
     /// fails. With -A, NEWREF is an alias of the ref that PREFIX names. With
-    /// -c, NEWREF is `<collection-id>:<ref>`, and the command writes a
-    /// collection ref. This option wins over --delete.
+    /// -c, NEWREF is `<collection-id>:<ref>`, and the command writes the
+    /// collection ref `refs/mirrors/<collection-id>/<ref>`. If
+    /// `<collection-id>` is the collection id of the repository, the command
+    /// writes the local ref `refs/heads/<ref>`. This option wins over
+    /// --delete.
     #[arg(long, value_name = "NEWREF")]
     create: Option<String>,
     /// List collection refs as `(collection-id, ref)` pairs.
     ///
     /// Each PREFIX is then a collection id. The local refs carry the
-    /// collection id of the repository. With --delete and the collection id
-    /// of the repository, the command deletes only the local refs. The mirror
-    /// refs with that id stay. This switch wins over -A.
+    /// collection id of the repository. The listing leaves out the refs of
+    /// `refs/mirrors/<collection-id>/` of that id. With --delete and the
+    /// collection id of the repository, the command deletes only the local
+    /// refs, and the refs of that directory stay. This switch wins over -A.
     #[arg(short = 'c', long)]
     collections: bool,
     /// With --create, replace an existing ref.
@@ -1845,8 +1858,11 @@ enum RemoteCommand {
     /// error, and the command exits 1. Else the command prints `fsck of the
     /// bucket repository ADDRESS: no errors found`, and exits 0. A stale
     /// summary, an absent summary, a marker of a commit whose tree is whole, an
-    /// incomplete multipart upload, and a writer lock are notes. A failed write
-    /// to standard output gives an error line and exit 1.
+    /// incomplete multipart upload, and a writer lock are notes. A ref under
+    /// `refs/mirrors/ID/` of the collection id of the bucket is a `ref` note:
+    /// the summary and a push ignore it, and a prune keeps its commit. The
+    /// command does not read such a ref file. A failed write to standard
+    /// output gives an error line and exit 1.
     ///
     /// With a remote name, the command verifies the signature of the summary
     /// with the summary keys of the remote, as a pull with
@@ -1898,7 +1914,9 @@ enum RemoteCommand {
     /// The command prunes the bucket repository at the `s3://` address of
     /// NAME, or at the address `s3://BUCKET[/PREFIX]`, as `ostrya prune`
     /// prunes a local repository with the same options. The commit of each
-    /// ref is a root. Without --refs-only and --keep-younger-than, each
+    /// ref is a root, also the commit of a ref under `refs/mirrors/ID/` of the
+    /// collection id of the bucket, which the summary and a push ignore.
+    /// Without --refs-only and --keep-younger-than, each
     /// commit of the bucket is a root too. The commits that the summary names
     /// are roots, and the command keeps them with no parent. A kept commit
     /// keeps its detached metadata.
@@ -2022,10 +2040,12 @@ enum RemoteCommand {
     /// are the bytes of the root summary that `ostrya summary -u` writes for a
     /// local repository with the same refs, commits, deltas, and config, when
     /// that command writes no `ostree-metadata` anchor commit. The command
-    /// reads the commit of each ref from the bucket, and checks its checksum.
-    /// It refuses a ref whose commit the bucket does not hold, a key under
-    /// `refs/` outside `refs/heads/` and `refs/mirrors/ID/`, and a ref name
-    /// that is a directory of another ref name, as `a` is of `a/b`.
+    /// skips each key under `refs/mirrors/ID/` of the collection id of the
+    /// bucket, and reads no such ref file. It reads the commit of each other
+    /// ref from the bucket, and checks its checksum. It refuses a ref whose
+    /// commit the bucket does not hold, a key under `refs/` outside
+    /// `refs/heads/` and `refs/mirrors/ID/`, and a ref name that is a
+    /// directory of another ref name, as `a` is of `a/b`.
     ///
     /// Each --gpg-sign key, each --sign key, and each --keys-file key signs
     /// the summary, in this order. The command writes `summary`, and then
@@ -3864,8 +3884,7 @@ struct PullArgs {
     /// Each commit must be bound to ID. If a commit has a ref binding, the
     /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`. If
     /// the `collection-id` of this repository is ID, the pull writes
-    /// `refs/mirrors/ID/REF` if that file holds a ref, and `refs/heads/REF`
-    /// otherwise. It removes no ref. The timestamp check reads the same ref.
+    /// `refs/heads/REF`. The timestamp check reads the same ref.
     /// If the pull fetched nothing and imported objects, the statistics line
     /// has the form of `pull-local`. If the pull fetched objects, and the
     /// local candidates imported objects and fetched nothing, the command
@@ -11221,8 +11240,9 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
 
 /// Writes a collection ref for `-c` from a `<collection-id>:<ref>` NEWREF.
 ///
-/// The pair names `refs/mirrors/<collection-id>/<ref>`. The steps run in the
-/// order of the `ostree` command:
+/// The pair names `refs/mirrors/<collection-id>/<ref>`, or `refs/heads/<ref>`
+/// if `<collection-id>` is the `collection-id` of the repository. The steps
+/// run in the order of the `ostree` command:
 ///
 /// 1. the shape of the pair
 /// 2. the revision
@@ -11339,7 +11359,8 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 ///
 /// With `-c`, the prefixes are collection ids. The id that is equal to the
 /// `collection-id` of the repository removes only the refs under
-/// `refs/heads`. The mirror refs with that id stay. The command checks each
+/// `refs/heads`. The `-c` listing ignores the mirror refs with that id, so
+/// they stay. The command checks each
 /// selected ref that it removes with [`CollectionRef::validate`] before it
 /// removes the first ref. A ref under `refs/heads` is a `CollectionRef` with
 /// no id and takes the ref-name rule, so a name with `:` fails. A mirror ref
@@ -11352,21 +11373,17 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     }
     if args.collections {
         // An id that is equal to the `collection-id` of the repository removes
-        // only the refs under `refs/heads`, and the mirror refs with the same
-        // id stay. A foreign id removes the mirror refs that it names.
-        let own = repo.config().collection_id().map(str::to_owned);
+        // only the refs under `refs/heads`: the listing holds no mirror ref of
+        // that id. A foreign id removes the mirror refs that it names.
         let selected = select_collection_refs(repo, &args.prefix).await?;
-        // The refs to remove. The mirror refs of the own id stay, so they are
-        // not in the list. A ref under `refs/heads` has no id.
+        // The refs to remove. A ref under `refs/heads` has no id.
         let removed: Vec<CollectionRef> = selected
             .into_iter()
-            .filter_map(|entry| {
+            .map(|entry| {
                 if entry.local {
-                    Some(CollectionRef::local(entry.name))
-                } else if own.as_deref() == Some(entry.collection.as_str()) {
-                    None
+                    CollectionRef::local(entry.name)
                 } else {
-                    Some(CollectionRef::new(entry.collection, entry.name))
+                    CollectionRef::new(entry.collection, entry.name)
                 }
             })
             .collect();
@@ -14406,6 +14423,14 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
                 "Verifying content integrity of {} commit objects...",
                 report.commits_checked
             );
+        }
+    }
+    // The ref resolve, the listings, and the summary ignore a ref under
+    // `refs/mirrors/` of the own collection id, so each such ref gets a line
+    // that is no error.
+    if let Some(own) = repo.config().collection_id() {
+        for name in &report.own_mirror_refs {
+            println!("Ref under the own collection id, not read: refs/mirrors/{own}/{name}");
         }
     }
     // The walk runs to its end, so each finding is written plain, and the run

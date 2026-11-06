@@ -7,7 +7,8 @@
 //! If the walk reaches the commit of a weak ref over another edge, the weak ref
 //! survives. If not, the run unlinks the weak ref. A ref under `refs/mirrors`
 //! reaches the classifier as a collection ref if its path splits into a valid
-//! collection id and a valid ref name. Each other mirror ref is strong.
+//! collection id and a valid ref name, and the id is not the
+//! `[core] collection-id` of the repository. Each other mirror ref is strong.
 //!
 //! Rule B: if the walk reaches the commit of a weak ref, the walk restarts at
 //! that commit under the own bound of the weak ref.
@@ -1099,12 +1100,13 @@ fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
     });
 }
 
-/// A mirror ref of the `[core] collection-id` of the repository reaches the
-/// classifier as a collection ref. After the run deletes it, the local ref of
-/// the same name stays, and a read of the collection ref gives the commit of
-/// the local ref.
+/// A ref under `refs/mirrors/` of the `[core] collection-id` of the
+/// repository is a strong ref with no name. A run with refs alone keeps its
+/// commit. A classifier that marks each ref weak never gets the ref: the run
+/// deletes the local ref of the same name, and keeps the mirror ref and its
+/// commit.
 #[test]
-fn an_own_id_mirror_ref_is_classified_as_a_collection_ref() {
+fn an_own_id_mirror_ref_is_a_strong_ref_with_no_name() {
     let tmp = TmpDir::new("weak-refs-collection-own-id");
     block_on(async {
         for name in ["local", "mirror"] {
@@ -1118,38 +1120,84 @@ fn an_own_id_mirror_ref_is_classified_as_a_collection_ref() {
         .unwrap();
         let local = commit(&repo, tmp.path(), "local", None, Some("app")).await;
         let mirrored = commit(&repo, tmp.path(), "mirror", None, None).await;
-        let cref = set_collection_ref(&repo, "org.example.Own", "app", &mirrored).await;
-        assert_eq!(
-            collection_tip(&repo, &cref).await,
-            Some(mirrored),
-            "the mirror ref wins before the run"
-        );
+        let mirror = tmp.path().join("repo/refs/mirrors/org.example.Own/app");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, format!("{}\n", mirrored.to_hex())).unwrap();
 
-        let (filter, seen) = recording_filter(|name: &str| !name.contains("::"));
+        let refs_only = PruneOptions {
+            refs_only: true,
+            ..PruneOptions::new()
+        };
+        repo.prune(&refs_only).await.unwrap();
+        assert!(
+            holds(&repo, &mirrored).await,
+            "refs alone keep the mirror commit"
+        );
+        assert!(holds(&repo, &local).await);
+
+        let (filter, seen) = recording_filter(|_: &str| false);
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
-        let mut names = recorded(&seen);
-        names.sort();
         assert_eq!(
-            names,
-            vec!["app".to_owned(), "org.example.Own::app".to_owned()],
-            "the classifier saw the local ref and the collection ref"
+            recorded(&seen),
+            vec!["app".to_owned()],
+            "the classifier saw the local ref alone"
         );
-        assert_eq!(stats.deleted_collection_refs, vec![cref.clone()]);
-        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
-        assert!(
-            !tmp.path()
-                .join("repo/refs/mirrors/org.example.Own/app")
-                .exists(),
-            "the mirror ref file is gone"
-        );
-        assert_eq!(tip(&repo, "app").await, Some(local), "the local ref stays");
-        assert_eq!(
-            collection_tip(&repo, &cref).await,
-            Some(local),
-            "a read of the collection ref gives the local ref"
-        );
-        assert!(!holds(&repo, &mirrored).await, "the mirror commit is swept");
+        assert_eq!(stats.deleted_refs, vec!["app".to_owned()]);
+        assert!(stats.deleted_collection_refs.is_empty());
+        assert_eq!(tip(&repo, "app").await, None, "the local ref is gone");
+        assert!(mirror.is_file(), "the mirror ref file stays");
+        assert!(holds(&repo, &mirrored).await, "the mirror commit stays");
+        assert!(!holds(&repo, &local).await, "the local commit is swept");
+    });
+}
+
+/// A ref under `refs/mirrors/` of the `[core] collection-id` of the
+/// repository takes the bound of a ref that no list names. A non-empty
+/// `only_branch` keeps its history in full. With `retain_branch_depth` alone,
+/// it takes the global depth.
+#[test]
+fn an_own_id_mirror_ref_takes_the_bound_of_an_unnamed_ref() {
+    let tmp = TmpDir::new("weak-refs-own-id-unnamed-bound");
+    block_on(async {
+        for name in ["c1", "c2", "c3", "other"] {
+            write_tree(tmp.path(), name);
+        }
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive).collection_id("org.example.Own"),
+        )
+        .await
+        .unwrap();
+        let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
+        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None).await;
+        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None).await;
+        commit(&repo, tmp.path(), "other", None, Some("other")).await;
+        let mirror = tmp.path().join("repo/refs/mirrors/org.example.Own/app");
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, format!("{}\n", c3.to_hex())).unwrap();
+
+        let only_other = PruneOptions {
+            depth: 0,
+            only_branch: vec!["other".to_owned()],
+            ..PruneOptions::new()
+        };
+        repo.prune(&only_other).await.unwrap();
+        for (commit, label) in [(c1, "c1"), (c2, "c2"), (c3, "c3")] {
+            assert!(holds(&repo, &commit).await, "only_branch keeps {label}");
+        }
+        assert!(mirror.is_file(), "the mirror ref file stays");
+
+        let retain_other = PruneOptions {
+            depth: 0,
+            retain_branch_depth: vec![("other".to_owned(), 0)],
+            ..PruneOptions::new()
+        };
+        repo.prune(&retain_other).await.unwrap();
+        assert!(holds(&repo, &c3).await, "the global depth keeps the tip");
+        assert!(!holds(&repo, &c2).await, "the global depth sweeps c2");
+        assert!(!holds(&repo, &c1).await, "the global depth sweeps c1");
+        assert!(mirror.is_file(), "the mirror ref file stays");
     });
 }
 

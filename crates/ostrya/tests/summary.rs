@@ -1502,12 +1502,12 @@ fn a_ref_listing_skips_a_directory_that_a_negative_entry_covers() {
     });
 }
 
-/// A selector of the local refs with the negative entry `**` reads neither
-/// `refs/heads` nor the mirror directory of the collection id of the
-/// repository. A listing with it and an unreadable directory of each
-/// succeeds, with or without collection refs. A listing that reads these
-/// directories fails. The test returns at once for a user that ignores the
-/// mode.
+/// A selector of the local refs with the negative entry `**` does not read
+/// `refs/heads`, and no listing reads the mirror directory of the
+/// collection id of the repository. A listing with that selector succeeds
+/// with both directories unreadable, with or without collection refs. A
+/// listing that reads `refs/heads` fails. The test returns at once for a
+/// user that ignores the mode.
 #[test]
 fn a_listing_with_no_local_ref_reads_no_local_directory() {
     use std::os::unix::fs::PermissionsExt;
@@ -1515,7 +1515,11 @@ fn a_listing_with_no_local_ref_reads_no_local_directory() {
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let main = repo.list_refs(None).await.unwrap()[0].1;
-        set_mirror(&repo, COLLECTION_ID, "own", &main).await;
+        write_mirror_file(
+            &repo_dir,
+            &format!("{COLLECTION_ID}/own"),
+            &format!("{main}\n"),
+        );
         set_mirror(&repo, "org.a", "main", &main).await;
         let access = collection_access("", "anonymous");
         let locked = [
@@ -2259,14 +2263,14 @@ fn a_listing_with_collections_advertises_the_deltas_of_collection_commits() {
     });
 }
 
-/// In a repository with a collection id, the refs under
-/// `refs/mirrors/ID/` of that id go into field 0 under their plain names,
-/// as the `ostree` command writes them into a summary. The mirror ref wins
-/// over the ref of `refs/heads` of the same name. The local rights apply to
-/// them, the group of `collection=*` does not, and the id is no key of the
-/// collection map.
+/// In a repository with a collection id, field 0 holds the refs of
+/// `refs/heads` alone. The refs under `refs/mirrors/ID/` of that id are in
+/// no listing, and such a ref does not hide the ref of `refs/heads` of the
+/// same name. The `ostree` command puts these refs into field 0 of a
+/// summary, so this is a divergence. The id is no key of the collection
+/// map.
 #[test]
-fn own_id_mirror_refs_go_into_field_0() {
+fn own_id_mirror_refs_are_in_no_listing() {
     let (_tmp, repo_dir) = collection_fixture_with_no_wait("listing-own-mirrors");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
@@ -2278,20 +2282,24 @@ fn own_id_mirror_refs_go_into_field_0() {
             .unwrap()
             .unwrap();
         assert_ne!(anchor, main);
-        set_mirror(&repo, COLLECTION_ID, "main", &anchor).await;
-        set_mirror(&repo, COLLECTION_ID, "extra/x", &main).await;
+        write_mirror_file(
+            &repo_dir,
+            &format!("{COLLECTION_ID}/main"),
+            &format!("{anchor}\n"),
+        );
+        write_mirror_file(
+            &repo_dir,
+            &format!("{COLLECTION_ID}/extra/x"),
+            &format!("{main}\n"),
+        );
         set_mirror(&repo, "org.ostrya.Other", "m", &main).await;
 
         let all = collection_access("", "anonymous");
         for collections in [None, Some(&[][..])] {
             let listing = list_with(&repo, &[], collections, &all).await;
             let parsed = Summary::parse(&listing.bytes).unwrap();
-            assert_eq!(
-                listed_names(&listing.bytes),
-                ["extra/x", "main", "ostree-metadata"]
-            );
-            assert_eq!(parsed.lookup("main"), Some(anchor));
-            assert_eq!(parsed.lookup("extra/x"), Some(main));
+            assert_eq!(listed_names(&listing.bytes), ["main", "ostree-metadata"]);
+            assert_eq!(parsed.lookup("main"), Some(main));
             let want: &[(&str, &[&str])] = match collections {
                 Some(_) => &[("org.ostrya.Other", &["m"])],
                 None => &[],
@@ -2307,7 +2315,7 @@ fn own_id_mirror_refs_go_into_field_0() {
         let listing = list_with(&repo, &[], Some(&[]), &collection_access(groups, "ssh:u")).await;
         assert_eq!(listed_names(&listing.bytes), ["main"]);
         let parsed = Summary::parse(&listing.bytes).unwrap();
-        assert_eq!(parsed.lookup("main"), Some(anchor));
+        assert_eq!(parsed.lookup("main"), Some(main));
         let listing = list_with(&repo, &[], Some(&[]), &collection_access(groups, "ssh:m")).await;
         assert!(listed_names(&listing.bytes).is_empty());
         assert_eq!(
@@ -2967,11 +2975,11 @@ fn the_summaries_of_the_auth_items_alone_write_no_anchor_commit() {
     });
 }
 
-/// The mirror refs of the own collection id go into field 0 of a summary
-/// under their plain names, and the mirror ref wins over the ref of
-/// `refs/heads` of the same name. The own id is no key of the map.
+/// The mirror refs of the own collection id are in no summary, and such a
+/// ref does not hide the ref of `refs/heads` of the same name. The own id is
+/// no key of the map.
 #[test]
-fn a_summary_merges_the_mirror_refs_of_the_own_id() {
+fn a_summary_leaves_out_the_mirror_refs_of_the_own_id() {
     let (_tmp, repo_dir) = collection_fixture_with_no_wait("items-own-mirrors");
     block_on(async {
         let repo = Repo::open(&repo_dir).await.unwrap();
@@ -2982,12 +2990,20 @@ fn a_summary_merges_the_mirror_refs_of_the_own_id() {
             .await
             .unwrap()
             .unwrap();
-        set_mirror(&repo, COLLECTION_ID, "main", &anchor).await;
-        set_mirror(&repo, COLLECTION_ID, "extra/x", &main).await;
+        write_mirror_file(
+            &repo_dir,
+            &format!("{COLLECTION_ID}/main"),
+            &format!("{anchor}\n"),
+        );
+        write_mirror_file(
+            &repo_dir,
+            &format!("{COLLECTION_ID}/extra/x"),
+            &format!("{main}\n"),
+        );
         set_mirror(&repo, "org.ostrya.Other", "m", &main).await;
         let summary = regenerate_with(&repo, Vec::new()).await;
-        assert_eq!(ref_names(&summary), ["extra/x", "main", "ostree-metadata"]);
-        assert_eq!(summary.lookup("main"), Some(anchor));
+        assert_eq!(ref_names(&summary), ["main", "ostree-metadata"]);
+        assert_eq!(summary.lookup("main"), Some(main));
         let map = summary.collection_map().unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].0, "org.ostrya.Other");

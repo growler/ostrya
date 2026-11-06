@@ -643,8 +643,8 @@ fn orphan_replaces_the_tip_of_an_existing_branch() {
 // ---------------------------------------------------------------------------
 
 /// The collection id of the bucket writes `refs/heads/`, another id writes
-/// `refs/mirrors/ID/`, and a key under `refs/mirrors/` of the own id refuses
-/// the push.
+/// `refs/mirrors/ID/`, and the push ignores a key under `refs/mirrors/` of
+/// the own id.
 #[test]
 fn the_namespace_follows_the_collection_and_the_bucket_id() {
     let scratch = TmpDir::new("push-tree-s3-namespace");
@@ -679,10 +679,22 @@ fn the_namespace_follows_the_collection_and_the_bucket_id() {
         }
         server
             .state()
-            .store("repo/refs/mirrors/org.example.A/x", b"junk");
-        let message =
-            malformed(push_tree(&server.endpoint(), &src, tree_options("ns"), write(false)).await);
-        assert!(message.contains("own collection id"), "{message}");
+            .store("repo/refs/mirrors/org.example.A/ns", b"junk");
+        let opts = TreePushOptions {
+            timestamp: Some(TIMESTAMP + 1),
+            ..tree_options("ns")
+        };
+        let commit = push_tree(&server.endpoint(), &src, opts, write(false))
+            .await
+            .unwrap()
+            .outcome
+            .commit
+            .unwrap();
+        assert_eq!(ref_of(&server, "repo/refs/heads/ns"), Some(commit));
+        assert_eq!(
+            server.state().objects["repo/refs/mirrors/org.example.A/ns"].bytes,
+            b"junk"
+        );
     });
 }
 

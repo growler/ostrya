@@ -64,9 +64,10 @@ impl BucketRepo {
     /// 3. It reads the `config` and selects the namespace, as
     ///    `Repo::push_to_bucket` does with
     ///    [`collection`](TreePushOptions::collection). Then at the same time
-    ///    it reads the ref files of the ref directory of the namespace, lists
-    ///    `refs/mirrors/` of the collection id of the bucket, and lists the
-    ///    objects. It reads no ref file of another namespace.
+    ///    it reads the ref files of the ref directory of the namespace and
+    ///    lists the objects. It reads no ref file of another namespace, and
+    ///    it skips `refs/mirrors/` of the collection id of the bucket, whose
+    ///    refs are in `refs/heads/`.
     /// 4. It checks the refs: the branch `ostree-metadata` in `refs/heads/`
     ///    of a bucket with a collection id is refused, the ref directory must
     ///    hold no name that is a directory of another name after the push,

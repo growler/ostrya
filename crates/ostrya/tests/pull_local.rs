@@ -5503,8 +5503,8 @@ fn an_absent_collection_ref_is_not_found() {
 
 /// Creates an archive source under `base/src` whose collection id is
 /// [`COLLECTION`], with one commit bound to the collection and to `name`.
-/// The local ref `name` points at the commit, and the source holds no
-/// collection ref. Returns the path, the handle, and the commit.
+/// The write of the collection ref writes the local ref `name`, and the
+/// source holds no mirror ref. Returns the path, the handle, and the commit.
 async fn own_collection_source(base: &Path, name: &str) -> (PathBuf, Repo, Checksum) {
     let path = base.join("src");
     let src = Repo::create(
@@ -5523,10 +5523,6 @@ async fn own_collection_source(base: &Path, name: &str) -> (PathBuf, Repo, Check
         Some(&[name]),
     )
     .await;
-    let txn = src.transaction().await.unwrap();
-    txn.set_collection_ref(&CollectionRef::new(COLLECTION, name), None);
-    txn.set_ref(name, Some(&commit));
-    txn.commit().await.unwrap();
     assert!(
         !path
             .join(format!("refs/mirrors/{COLLECTION}/{name}"))
@@ -5561,26 +5557,32 @@ fn a_collection_pull_reads_the_local_ref_of_a_source_of_the_collection() {
     });
 }
 
-/// In a source whose collection id is the id of the pull, the collection ref
-/// wins over the local ref of the same name. A name with neither ref fails
-/// with `ID:NAME`, and the pull writes nothing.
+/// In a source whose collection id is the id of the pull, the pull reads the
+/// local ref, and ignores `refs/mirrors/ID/` of that id. A name with no local
+/// ref fails with `ID:NAME`, also when the mirror directory holds it, and the
+/// pull writes nothing.
 #[test]
-fn the_collection_ref_of_a_source_of_the_collection_wins_over_its_local_ref() {
+fn a_source_of_the_collection_gives_its_local_ref_beside_a_mirror_ref() {
     let tmp = TmpDir::new("pull-collection-own-source-mirror");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, local) = own_collection_source(base, "app/a").await;
+        let (src_dir, src, local) = own_collection_source(base, "app/a").await;
         let mirrored = commit_collection_ref(
             &src,
             base,
             "vb",
-            "app/a",
+            "app/b",
             None,
             bound_to(COLLECTION),
-            Some(&["app/a"]),
+            Some(&["app/a", "app/none"]),
         )
         .await;
         assert_ne!(mirrored, local);
+        for name in ["app/a", "app/none"] {
+            let mirror = src_dir.join(format!("refs/mirrors/{COLLECTION}/{name}"));
+            std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+            std::fs::write(&mirror, format!("{}\n", mirrored.to_hex())).unwrap();
+        }
         assert_eq!(src.resolve_rev("app/a", false).await.unwrap(), Some(local));
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
@@ -5602,10 +5604,10 @@ fn the_collection_ref_of_a_source_of_the_collection_wins_over_its_local_ref() {
         let cref = CollectionRef::new(COLLECTION, "app/a");
         assert_eq!(
             dst.resolve_collection_ref(&cref, false).await.unwrap(),
-            Some(mirrored)
+            Some(local)
         );
-        assert_complete(&src, &dst, &dst_dir, &mirrored).await;
-        assert!(!dst.has_object(ObjectType::Commit, &local).await.unwrap());
+        assert_complete(&src, &dst, &dst_dir, &local).await;
+        assert!(!dst.has_object(ObjectType::Commit, &mirrored).await.unwrap());
     });
 }
 
@@ -5973,11 +5975,11 @@ fn a_collection_pull_into_the_own_collection_writes_refs_heads() {
 }
 
 /// If the collection id is the own id of the destination, and the destination
-/// holds the collection ref of the name, the pull writes that collection ref.
-/// The resolve and the listing of the collection ref read it. The local ref
-/// of the name keeps its commit.
+/// holds `refs/mirrors/ID/NAME`, written by hand, the pull writes the local
+/// ref of the name. The mirror ref keeps its commit, and the resolve and the
+/// listing of the collection ref read the local ref.
 #[test]
-fn a_collection_pull_into_the_own_collection_writes_an_existing_mirror_ref() {
+fn a_collection_pull_into_the_own_collection_writes_the_local_ref_beside_a_mirror_ref() {
     let tmp = TmpDir::new("pull-collection-own-mirror");
     block_on(async {
         let base = tmp.path();
@@ -6009,10 +6011,10 @@ fn a_collection_pull_into_the_own_collection_writes_an_existing_mirror_ref() {
         for c in [held, local] {
             hold_commit(&dst, &src, &c).await;
         }
-        let txn = dst.transaction().await.unwrap();
-        txn.set_collection_ref(&CollectionRef::new(COLLECTION, "app/a"), Some(&held));
-        txn.set_ref("app/a", Some(&local));
-        txn.commit().await.unwrap();
+        let mirror = dst_dir.join(format!("refs/mirrors/{COLLECTION}/app/a"));
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, format!("{}\n", held.to_hex())).unwrap();
+        dst.set_ref_immediate("app/a", Some(&local)).await.unwrap();
 
         dst.pull_local(&src, collection_write_pull(&["app/a"]))
             .await
@@ -6020,11 +6022,11 @@ fn a_collection_pull_into_the_own_collection_writes_an_existing_mirror_ref() {
 
         assert_eq!(
             dst.list_refs(None).await.unwrap(),
-            vec![("app/a".to_owned(), local)]
+            vec![("app/a".to_owned(), commit)]
         );
         assert_eq!(
             dst.list_mirror_refs().await.unwrap(),
-            vec![(COLLECTION.to_owned(), "app/a".to_owned(), commit)]
+            vec![(COLLECTION.to_owned(), "app/a".to_owned(), held)]
         );
         let cref = CollectionRef::new(COLLECTION, "app/a");
         assert_eq!(
@@ -6318,12 +6320,13 @@ enum HeldAt {
     /// The local ref `main`, in a destination whose `[core] collection-id` is
     /// [`COLLECTION`].
     Own,
-    /// The collection ref `main` of [`COLLECTION`] and no local ref `main`, in
-    /// a destination whose `[core] collection-id` is [`COLLECTION`].
-    OwnMirror,
-    /// The collection ref `main` of [`COLLECTION`], and the local ref `main`
-    /// at [`unheld_commit`], in a destination whose `[core] collection-id` is
+    /// `refs/mirrors/COLLECTION/main`, written by hand, and no local ref
+    /// `main`, in a destination whose `[core] collection-id` is
     /// [`COLLECTION`].
+    OwnMirror,
+    /// The local ref `main`, and `refs/mirrors/COLLECTION/main` at
+    /// [`unheld_commit`], written by hand, in a destination whose
+    /// `[core] collection-id` is [`COLLECTION`].
     OwnBoth,
     /// The ref `main` under the remote name `origin` and the local ref `main`,
     /// in a destination with no collection id.
@@ -6354,14 +6357,20 @@ async fn dst_with_main(
     for commit in held {
         hold_commit(&dst, src, commit).await;
     }
+    let mirror = path.join(format!("refs/mirrors/{COLLECTION}/main"));
+    let write_mirror = |commit: &Checksum| {
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        std::fs::write(&mirror, format!("{}\n", commit.to_hex())).unwrap();
+    };
     let txn = dst.transaction().await.unwrap();
     match at {
-        HeldAt::Mirror | HeldAt::OwnMirror => {
+        HeldAt::Mirror => {
             txn.set_collection_ref(&CollectionRef::new(COLLECTION, "main"), Some(tip));
         }
+        HeldAt::OwnMirror => write_mirror(tip),
         HeldAt::OwnBoth => {
-            txn.set_collection_ref(&CollectionRef::new(COLLECTION, "main"), Some(tip));
-            txn.set_ref("main", Some(&unheld_commit()));
+            write_mirror(&unheld_commit());
+            txn.set_ref("main", Some(tip));
         }
         HeldAt::Own => txn.set_ref("main", Some(tip)),
         HeldAt::Elsewhere => {
@@ -6373,30 +6382,29 @@ async fn dst_with_main(
     (path, dst)
 }
 
-/// Checks that the pull kept `refs/heads/main` of `dst` at [`unheld_commit`],
-/// and then removes that ref, so that fsck finds no ref to an absent commit.
-async fn clear_unheld_main(dst: &Repo, name: &str) {
-    assert_eq!(
-        dst.list_refs(None).await.unwrap(),
-        vec![("main".to_owned(), unheld_commit())],
-        "{name}"
-    );
-    dst.set_ref_immediate("main", None).await.unwrap();
+/// Checks that the pull kept `refs/mirrors/COLLECTION/main` of the
+/// destination at `dst_dir` at [`unheld_commit`], and then removes that
+/// file, so that fsck finds no ref to an absent commit.
+fn clear_unheld_mirror(dst_dir: &Path, name: &str) {
+    let mirror = dst_dir.join(format!("refs/mirrors/{COLLECTION}/main"));
+    let text = std::fs::read_to_string(&mirror).unwrap();
+    assert_eq!(text.trim(), unheld_commit().to_hex(), "{name}");
+    std::fs::remove_file(&mirror).unwrap();
 }
 
 /// Delta discovery reads the current commit of the ref at the place where the
 /// pull writes the ref: the collection ref, or, if the id is the
-/// `[core] collection-id` of the destination, the collection ref when the
-/// destination holds it and the local ref otherwise. The source holds the
-/// delta from scratch to `c2` alone, and each destination holds `c1`
-/// complete. If the ref at that place names `c1`, the pull does not take the
-/// delta from scratch, and it imports `c2` loose. If `c1` is under the remote
-/// name and under `refs/heads` alone, the ref at the place names no commit,
-/// and the pull takes the delta from scratch. If the collection ref names
-/// `c1` and `refs/heads/main` names a commit that the destination does not
-/// hold, the pull reads the collection ref: a read of `refs/heads/main` takes
-/// the delta from scratch. Each case runs with the deltas of the summary and
-/// with a list.
+/// `[core] collection-id` of the destination, the local ref. The source
+/// holds the delta from scratch to `c2` alone, and each destination holds
+/// `c1` complete. If the ref at that place names `c1`, the pull does not take
+/// the delta from scratch, and it imports `c2` loose. If `c1` is under the
+/// remote name and under `refs/heads` alone, or under
+/// `refs/mirrors/COLLECTION/` of the own id alone, the ref at the place names
+/// no commit, and the pull takes the delta from scratch. If
+/// `refs/heads/main` names `c1` and `refs/mirrors/COLLECTION/main` names a
+/// commit that the destination does not hold, the pull reads the local ref:
+/// a read of the mirror ref takes the delta from scratch. Each case runs with
+/// the deltas of the summary and with a list.
 #[test]
 fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
     let tmp = TmpDir::new("pull-collection-delta-place");
@@ -6409,7 +6417,7 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
             for (at, parts) in [
                 (HeldAt::Mirror, 0),
                 (HeldAt::Own, 0),
-                (HeldAt::OwnMirror, 0),
+                (HeldAt::OwnMirror, 1),
                 (HeldAt::OwnBoth, 0),
                 (HeldAt::Elsewhere, 1),
             ] {
@@ -6435,7 +6443,7 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
                     }
                 }
                 if let HeldAt::OwnBoth = at {
-                    clear_unheld_main(&dst, &name).await;
+                    clear_unheld_mirror(&dst_dir, &name);
                 }
                 assert_complete(&src, &dst, &dst_dir, &c2).await;
                 assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
@@ -6447,15 +6455,15 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
 /// The search for the delta of a dependency reads the paired entry from the
 /// commit that the ref names at the place where the pull writes the ref. In a
 /// destination whose `[core] collection-id` is the id, that place is the
-/// collection ref when the destination holds it, also when `refs/heads/main`
-/// names another commit. T1 names D1 as `boot/uki`, and its child T2 names
-/// D2. Each destination holds
-/// T1 and D1 complete. The source holds the delta `<T1>-<T2>` and the delta
-/// from scratch to D2. If the ref at that place names T1, the paired entry D1
-/// is held complete, and the pull imports D2 loose. If T1 is under the remote
-/// name and under `refs/heads` alone, the pull finds no paired entry, and it
-/// takes the delta from scratch to D2. Each case runs with the deltas of the
-/// summary and with a list.
+/// local ref, also when `refs/mirrors/COLLECTION/main` names another commit.
+/// T1 names D1 as `boot/uki`, and its child T2 names D2. Each destination
+/// holds T1 and D1 complete. The source holds the delta `<T1>-<T2>` and the
+/// delta from scratch to D2. If the ref at that place names T1, the paired
+/// entry D1 is held complete, and the pull imports D2 loose. If T1 is under
+/// the remote name and under `refs/heads` alone, or under
+/// `refs/mirrors/COLLECTION/` of the own id alone, the pull finds no paired
+/// entry, and it takes the delta from scratch to D2. Each case runs with the
+/// deltas of the summary and with a list.
 #[test]
 fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref() {
     let tmp = TmpDir::new("pull-collection-dependency-place");
@@ -6495,7 +6503,7 @@ fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref()
             for (at, parts) in [
                 (HeldAt::Mirror, 1),
                 (HeldAt::Own, 1),
-                (HeldAt::OwnMirror, 1),
+                (HeldAt::OwnMirror, 2),
                 (HeldAt::OwnBoth, 1),
                 (HeldAt::Elsewhere, 2),
             ] {
@@ -6506,7 +6514,7 @@ fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref()
 
                 assert_eq!(stats.delta_parts, parts, "{name}");
                 if let HeldAt::OwnBoth = at {
-                    clear_unheld_main(&dst, &name).await;
+                    clear_unheld_mirror(&dst_dir, &name);
                 }
                 for commit in [t2, d2] {
                     assert_complete(&src, &dst, &dst_dir, &commit).await;

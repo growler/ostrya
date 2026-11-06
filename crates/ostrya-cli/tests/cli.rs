@@ -12169,8 +12169,9 @@ fn build_own_collection_repo(base: &Path) -> PathBuf {
 /// If the id of `refs -c --delete` is the `collection-id` of the repository,
 /// the command removes the refs under `refs/heads` and the aliases among them.
 /// It keeps the mirror refs with that id. A foreign id removes the mirror refs
-/// that it names. The `-c` listing prints both sets for each id, so the two ids
-/// share one selection and differ in the removal.
+/// that it names. The `-c` listing of the tool prints the mirror refs of the
+/// own id, and the listing of the port leaves them out. The other rows of the
+/// listing and each removal agree.
 #[test]
 fn refs_delete_collection_own_id_matches_the_tool() {
     if !ostree_available() {
@@ -12180,16 +12181,32 @@ fn refs_delete_collection_own_id_matches_the_tool() {
     let base = tmp.path();
     let repo = build_own_collection_repo(base);
 
-    // The listing reads the mirror refs of the own id, so the next steps
-    // compare removals over one selection.
+    // The rows of the mirror refs of the own id are a divergence of the
+    // listing. Each other row, the standard error, and the exit status agree.
+    let own_rows = ["(org.example.Coll, deep/x)", "(org.example.Coll, mm)"];
     for args in [
         vec!["refs", "-c"],
         vec!["refs", "-c", "-r"],
         vec!["refs", "-c", "org.example.Coll"],
-        vec!["refs", "-c", "org.example.Other"],
     ] {
-        assert_agrees(&repo, &repo, &args);
+        let label = args.join(" ");
+        let (port, tool) = run_both(&repo, &repo, &args);
+        assert_eq!(port.status.code(), tool.status.code(), "{label}");
+        assert_eq!(port.stderr, tool.stderr, "{label}");
+        let port_out = String::from_utf8(port.stdout).unwrap();
+        let tool_out = String::from_utf8(tool.stdout).unwrap();
+        let own_row = |line: &&str| own_rows.iter().any(|row| line.starts_with(row));
+        for row in own_rows {
+            assert!(
+                tool_out.contains(row),
+                "the tool left out {row} in `{label}`"
+            );
+        }
+        let tool_rows: Vec<&str> = tool_out.lines().filter(|line| !own_row(line)).collect();
+        let port_rows: Vec<&str> = port_out.lines().collect();
+        assert_eq!(port_rows, tool_rows, "{label}");
     }
+    assert_agrees(&repo, &repo, &["refs", "-c", "org.example.Other"]);
 
     for (name, args, gone, kept) in [
         (
@@ -12684,6 +12701,74 @@ fn refs_collections_match_the_tool() {
         describe_refs(&tool),
         "deleting the local collection left different refs trees",
     );
+}
+
+/// With the `collection-id` of the repository, `refs -c --create=ID:REF`
+/// writes the local ref `refs/heads/REF` in both commands, and no file under
+/// `refs/mirrors/`. Each command reads the ref that the port wrote. The
+/// existence check reads NEWREF as a refspec, so in both commands a NEWREF
+/// whose `refs/heads/REF` exists passes the check, and the write replaces the
+/// ref with no --force.
+#[test]
+fn refs_create_collection_own_id_matches_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("refs-coll-create-own");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = base.join("own-create");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Coll",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let src = base.join("src");
+    let plain = commit_tree(&repo, "plain", &src, None);
+    let other = commit_tree(&repo, "other", &src, Some("plain"));
+    let port = clone_repo(base, &repo, "own-create-port");
+    let tool = clone_repo(base, &repo, "own-create-tool");
+
+    for args in [
+        vec!["refs", "-c", "--create=org.example.Coll:x", "plain"],
+        vec!["refs", "-c", "--create=org.example.Coll:a/b", "plain"],
+    ] {
+        assert_agrees(&port, &tool, &args);
+    }
+    assert_agrees(&port, &tool, &["refs", "-c"]);
+    assert_eq!(
+        describe_refs(&port),
+        describe_refs(&tool),
+        "the writes of the own id left different refs trees",
+    );
+    assert_eq!(resolve(&port, "x"), Some(plain.clone()));
+    assert_eq!(resolve(&port, "a/b"), Some(plain.clone()));
+    assert!(!port.join("refs/mirrors").join("org.example.Coll").exists());
+
+    // The tool reads the refs that the port wrote.
+    for args in [
+        vec!["rev-parse", "x"],
+        vec!["rev-parse", "a/b"],
+        vec!["refs", "-c"],
+    ] {
+        assert_agrees(&port, &port, &args);
+    }
+
+    // `refs/heads/x` exists, and the write with no --force replaces it.
+    assert_agrees(
+        &port,
+        &tool,
+        &["refs", "-c", "--create=org.example.Coll:x", "other"],
+    );
+    assert_eq!(describe_refs(&port), describe_refs(&tool));
+    assert_eq!(resolve(&port, "x"), Some(other));
 }
 
 #[test]
@@ -24307,6 +24392,52 @@ fn the_unsealed_warning_follows_a_pull_that_builds_an_image() {
     assert_eq!(
         code_and_stderr(&run),
         (Some(0), format!("{UNSEALED_WARNING}\n"))
+    );
+}
+
+/// fsck writes one line on standard output for each ref under
+/// `refs/mirrors/ID/` of the `collection-id` of the repository, also with
+/// --quiet, and exits 0. The command checks the commit of such a ref: with
+/// that commit object removed, it exits 1.
+#[test]
+fn fsck_notes_a_ref_under_the_own_collection_id() {
+    let tmp = TmpDir::new("fsck-own-mirror");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = base.join("repo");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Coll",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    commit_tree(&repo, "main", &src, None);
+    let held = commit_tree(&repo, "held", &src, Some("main"));
+    write_ref_file(&repo, "mirrors/org.example.Coll/main", &held);
+    std::fs::remove_file(repo.join("refs/heads/held")).unwrap();
+
+    let line = "Ref under the own collection id, not read: refs/mirrors/org.example.Coll/main";
+    for args in [&["fsck"][..], &["fsck", "-q"][..]] {
+        let fsck = ostrya_repo(&repo, args);
+        let stdout = fsck.ok().stdout_trimmed();
+        assert!(stdout.lines().any(|l| l == line), "{args:?}: {stdout}");
+    }
+
+    let object = repo.join(format!("objects/{}/{}.commit", &held[..2], &held[2..]));
+    std::fs::remove_file(object).unwrap();
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    assert!(!fsck.status.success(), "{}", fsck.stdout_trimmed());
+    assert!(
+        fsck.stdout_trimmed().lines().any(|l| l == line),
+        "{}",
+        fsck.stdout_trimmed()
     );
 }
 

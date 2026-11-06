@@ -26,8 +26,23 @@ pub(super) const PARTIAL_STATE_BYTE: u8 = 0x66;
 pub(crate) struct BucketRefs {
     /// The refs `refs/heads/NAME`, by name.
     pub(crate) heads: BTreeMap<String, Checksum>,
-    /// The refs `refs/mirrors/ID/NAME`, by collection id, then by name.
+    /// The refs `refs/mirrors/ID/NAME`, by collection id, then by name. The
+    /// own collection id is not in the map.
     pub(crate) mirrors: BTreeMap<String, BTreeMap<String, Checksum>>,
+    /// The refs `refs/mirrors/ID/NAME` of the own collection id, by name.
+    /// A read with [`OwnMirrors::Read`] alone fills the map.
+    pub(crate) own_mirrors: BTreeMap<String, Checksum>,
+}
+
+/// The rule of [`BucketRepo::read_refs`] for a key under `refs/mirrors/ID/`
+/// of the own collection id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnMirrors {
+    /// Skip each such key. The read checks no name and reads no ref file.
+    Skip,
+    /// Check and read each such key as each other key, into
+    /// [`BucketRefs::own_mirrors`].
+    Read,
 }
 
 /// The result of the read of one ref file.
@@ -138,29 +153,43 @@ impl BucketRepo {
     /// Reads the refs of the repository: one list of `refs/`, then a read of
     /// each ref file.
     ///
-    /// Each key under `refs/` is `refs/heads/NAME`, or `refs/mirrors/ID/NAME`
-    /// with an `ID` other than `own`, the collection id of the repository.
+    /// Each key under `refs/` is `refs/heads/NAME` or `refs/mirrors/ID/NAME`.
     /// `NAME` passes the ref name rule, and `ID` passes the collection id
     /// rule and is at most 255 bytes. A ref file holds 64 lowercase hex
     /// digits and a newline. At most `max_outstanding` reads run at a time.
     ///
+    /// The refs of the own collection id `own`, the collection id of the
+    /// repository, are under `refs/heads/`. `own_mirrors` gives the rule of
+    /// a key under `refs/mirrors/ID/` of `own`: [`OwnMirrors::Skip`] skips
+    /// the key with no check, and [`OwnMirrors::Read`] checks and reads it
+    /// as each other key.
+    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a key under `refs/` breaks a rule above,
-    ///   if a ref file is malformed, or if a listed ref file is gone at its
-    ///   read. The refs of `refs/mirrors/` of the own collection id are a
-    ///   malformed state: the repository holds the refs of its own
-    ///   collection under `refs/heads/`.
+    /// - [`Error::InvalidFormat`] if a key under `refs/` that the call does
+    ///   not skip breaks a rule above, if a ref file is malformed, or if a
+    ///   listed ref file is gone at its read.
     /// - [`Error::Remote`] for an error of the bucket client.
-    pub(crate) async fn read_refs(&self, own: Option<&str>) -> Result<BucketRefs> {
+    pub(crate) async fn read_refs(
+        &self,
+        own: Option<&str>,
+        own_mirrors: OwnMirrors,
+    ) -> Result<BucketRefs> {
+        let skipped = match own_mirrors {
+            OwnMirrors::Skip => own.map(|id| format!("refs/mirrors/{id}/")),
+            OwnMirrors::Read => None,
+        };
         let listing = self.bucket.list("refs/").await?;
         let mut keys = Vec::with_capacity(listing.objects.len());
         for listed in &listing.objects {
             let key = listed.key.as_str();
+            if skipped
+                .as_deref()
+                .is_some_and(|prefix| key.starts_with(prefix))
+            {
+                continue;
+            }
             match ref_key(key) {
-                Some(RefKey::Mirror(id, _)) if Some(id) == own => {
-                    return Err(self.own_mirror_ref(key));
-                }
                 Some(_) => keys.push(key),
                 None => {
                     return Err(self.malformed(format!(
@@ -176,6 +205,9 @@ impl BucketRepo {
             match ref_key(key) {
                 Some(RefKey::Head(name)) => {
                     refs.heads.insert(name.to_owned(), commit);
+                }
+                Some(RefKey::Mirror(id, name)) if Some(id) == own => {
+                    refs.own_mirrors.insert(name.to_owned(), commit);
                 }
                 Some(RefKey::Mirror(id, name)) => {
                     refs.mirrors
@@ -224,34 +256,6 @@ impl BucketRepo {
             .into_iter()
             .map(|(key, commit)| (key[dir.len()..].to_owned(), commit))
             .collect())
-    }
-
-    /// Refuses a repository that holds a key under `refs/mirrors/` of its
-    /// own collection id `own`. The call lists that directory alone.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidFormat`] if the repository holds such a key: the
-    ///   repository holds the refs of its own collection under
-    ///   `refs/heads/`.
-    /// - [`Error::Remote`] for an error of the bucket client.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
-    pub(crate) async fn refuse_own_mirror_refs(&self, own: &str) -> Result<()> {
-        let listing = self.bucket.list(&format!("refs/mirrors/{own}/")).await?;
-        match listing.objects.first() {
-            Some(listed) => Err(self.own_mirror_ref(&listed.key)),
-            None => Ok(()),
-        }
-    }
-
-    /// Returns the error of the ref key `key` under `refs/mirrors/` of the
-    /// own collection id.
-    fn own_mirror_ref(&self, key: &str) -> Error {
-        self.malformed(format!(
-            "it holds the ref key '{}' under refs/mirrors/ of its own collection id; a bucket \
-             repository holds the refs of its own collection under refs/heads/",
-            key.escape_debug()
-        ))
     }
 
     /// Reads the ref file of each key of `keys`, at most `max_outstanding`

@@ -6,7 +6,7 @@ use futures_lite::future::zip;
 use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode};
 
 use super::lock::{LockHolder, LockOperation, WriterLock};
-use super::state::{BucketRefs, marker_key};
+use super::state::{BucketRefs, OwnMirrors, marker_key};
 use super::{BucketRepo, ObjectListing, each_slot, invalid, object_key, release_on_error};
 use crate::delta::parse_delta_dir;
 use crate::deltagen::delta_name;
@@ -207,8 +207,10 @@ impl BucketRepo {
     ///
     /// # Roots
     ///
-    /// The commit of each ref is a root under the bound of the run. The
-    /// commit of each ref of the summary, field 0 and
+    /// The commit of each ref is a root under the bound of the run. The refs
+    /// include each key under `refs/mirrors/ID/` of the `[core] collection-id`
+    /// of the `config`, which the summary and the push skip. The commit of
+    /// each ref of the summary, field 0 and
     /// `ostree.summary.collection-map`, is a root that keeps no parent.
     /// Unless the roots are on the refs alone, each commit of the listing is
     /// a root too. In that case, each root keeps no parent, so the walk reads
@@ -296,7 +298,8 @@ impl BucketRepo {
     ///   repository has no `config`, or if its `config` sets
     ///   `[core] tombstone-commits` to `true`. The run then takes no lock.
     /// - [`Error::InvalidFormat`] if the `config` breaks a rule of a bucket
-    ///   repository, if a key under `refs/` is no ref key, if a ref file is
+    ///   repository, if a key under `refs/` is no ref key, also a key under
+    ///   `refs/mirrors/ID/` of the own collection id, if a ref file is
     ///   malformed or is gone at its read, if the summary does not parse or
     ///   is larger than its cap, or if a commit or a dirtree that the walk
     ///   reads is larger than its cap or than its size in the listing, is
@@ -395,7 +398,7 @@ impl BucketRepo {
         own: Option<&str>,
     ) -> Result<(Plan, Vec<Upload>)> {
         let (refs, (listing, (deltas, (partial, (uploads, summary))))) = zip(
-            self.read_refs(own),
+            self.read_refs(own, OwnMirrors::Read),
             zip(
                 self.list_objects(),
                 zip(
@@ -439,6 +442,7 @@ impl BucketRepo {
             .heads
             .values()
             .chain(refs.mirrors.values().flat_map(BTreeMap::values))
+            .chain(refs.own_mirrors.values())
             .copied()
             .collect();
         let global = opts.global_bound();

@@ -322,9 +322,8 @@ The file `summary` at the repository root. The outer tuple is
 `(refs, global_metadata)`.
 
 Field 0, `a(s(taya{sv}))`, is the ref array. It holds the local refs
-(`refs/heads`), sorted by ref name with byte-wise comparison. In a repository
-with `[core] collection-id=ID`, it also holds the refs of
-`refs/mirrors/ID/`, as the paragraph below states. It holds no remote ref.
+(`refs/heads`), sorted by ref name with byte-wise comparison. It holds no
+ref of `refs/mirrors/` and no remote ref.
 Each entry is `(s, (t, ay, a{sv}))`:
 
 - `s` ref name.
@@ -340,18 +339,20 @@ Observed behavior: in a repository with `[core] collection-id=ID`,
 into field 0 under its plain name. When `refs/heads/NAME` and
 `refs/mirrors/ID/NAME` both exist, field 0 holds one entry `NAME`, with the
 checksum of the mirror ref. `ID` is not a key of
-`ostree.summary.collection-map`. The summary writer of the port does the
-same.
+`ostree.summary.collection-map`.
 
-`Repo::resolve_collection_ref` reads one ref of the collection `ID` by the
-same rule for the ref files and the aliases that the port writes. It reads
-`refs/mirrors/ID/NAME`. It reads `refs/heads/NAME` only when the mirror path
-is absent, is a directory, has a parent that is a file, or is longer than
-the system accepts. For each other collection id, it reads
-`refs/mirrors/ID/NAME` alone. The read takes no lock.
-`Repo::list_collection_refs_in` lists the refs of the collection `ID` by the
-same rule: the mirror ref wins, and the listing does not read the
-`refs/heads/NAME` that it hides.
+The port takes the collection id `ID` of the repository as its local
+namespace: the refs of `ID` are the refs of `refs/heads/`. No writer of the
+port writes `refs/mirrors/ID/`, and the summary writer of the port does not
+read that directory. Its field 0 holds the refs of `refs/heads/` alone, so
+it differs from the field 0 of the tool when `refs/mirrors/ID/` holds a
+ref. `docs/conformance/cli-surface.md` records the divergence.
+
+`Repo::resolve_collection_ref` reads one ref of the collection `ID` at
+`refs/heads/NAME`, and does not read `refs/mirrors/ID/`. For each other
+collection id, it reads `refs/mirrors/ID/NAME`. The read takes no lock.
+`Repo::list_collection_refs_in` lists the refs of the collection `ID` by
+the same rule.
 
 A symlink that the port does not write can make the resolve and the ref
 listing give different results. Examples are a symlink to a directory in
@@ -4759,15 +4760,10 @@ A request has two lists of entries:
 
 Field 0 holds the local refs:
 
-- The local refs are the refs under `refs/heads` and, in a repository with
-  `[core] collection-id=ID`, the refs under `refs/mirrors/ID/`, under their
-  plain names. When `refs/heads/NAME` and `refs/mirrors/ID/NAME` both exist,
-  field 0 holds one entry `NAME` with the checksum of the mirror ref, and the
-  server does not read `refs/heads/NAME`. This is
-  the field 0 that the tool writes into a summary ("Summary --
-  `(a(s(taya{sv}))a{sv})`"). So a request with no list of the collection
-  refs gets the bytes of a listing of `refs/heads` alone in each repository
-  with no `refs/mirrors/ID/` of its own id.
+- The local refs are the refs under `refs/heads`. In a repository with
+  `[core] collection-id=ID`, the server does not read `refs/mirrors/ID/`.
+  This is the field 0 that the summary writer of the port writes ("Summary
+  -- `(a(s(taya{sv}))a{sv})`").
 - Field 0 is sorted byte-wise by name and holds each ref one time. It holds
   no remote ref.
 
@@ -4813,7 +4809,7 @@ whose name fails the collection-id rule is left out of the listing, and the
 server reads no file in it. The server writes a warning for each such
 directory. A name that is not UTF-8, and a file or a symlink at the top level,
 are left out with no warning. With no list of the collection refs, the server
-reads `refs/mirrors/ID/` of the collection id of the repository alone.
+does not read `refs/mirrors/`.
 
 The global metadata dict holds these entries, in this order:
 
@@ -4930,8 +4926,8 @@ repository under the size cap of a summary, verifies the summary, and reads
 the refs from it, as item 1 states. Otherwise the probe reads the ref files
 of `ID` by the rule of `Repo::list_collection_refs_in`: in a source whose
 `[core] collection-id` is `ID`, the refs of `ID` are the refs of
-`refs/mirrors/ID/` and of `refs/heads/`, and the ref of `refs/mirrors/ID/`
-wins when a name is in the two directories. The probe reads only the
+`refs/heads/`, and the probe does not read `refs/mirrors/ID/`. The probe
+reads only the
 directories that the requested names can reach. The timestamp of each ref is
 the timestamp of its commit in the source.
 
@@ -5085,41 +5081,31 @@ by the caller after the pull are the protection.
 The pull writes `refs/mirrors/ID/REF`. It writes no ref under
 `refs/remotes/`.
 
-In a repository with `[core] collection-id=ID`, the pull writes the ref that
-`Repo::resolve_collection_ref` reads. The pull makes one `stat` of
-`refs/mirrors/ID/REF` that follows each symlink, and selects the path by the
-result:
+In a repository with `[core] collection-id=ID`, the pull writes
+`refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. Delta discovery
+and the timestamp check read the current commit of `refs/heads/REF`. A
+write of a collection ref through `Transaction::set_collection_ref`,
+`Repo::set_collection_ref_immediate`, `UpdateGuard::set_collection_ref`, or
+`ostrya refs -c --create` follows the same rule. `ostree refs --collections
+--create=ID:REF` writes `refs/heads/REF` for the own collection id too
+(observed).
 
-- A regular file, an alias to a file, or another file that is not a
-  directory: the pull writes `refs/mirrors/ID/REF`.
-- A directory, an absent path, an alias whose target is absent, a parent
-  component that is a file (`ENOTDIR`), or a path longer than the system
-  accepts (`ENAMETOOLONG`): the pull writes `refs/heads/REF`.
-- Each other error, for example `ELOOP` or `EACCES`: the pull fails, and
-  writes no ref. The published objects stay.
-
-The pull makes the selection when it writes the refs, under the update lock,
-and makes each `stat` before the first ref write. It removes no ref, so the
-path that it does not write keeps its commit. Delta discovery and the
-timestamp check read the current commit of the ref by the same rule. A write
-of a collection ref through `Transaction::set_collection_ref` or
-`Repo::set_collection_ref_immediate` always writes `refs/mirrors/ID/REF`.
-
-In each state of the ref store that the port and the `ostree` tool write,
-`Repo::resolve_collection_ref`, `Repo::list_collection_refs_in`, and the
-summary read the ref that the pull writes. Two states that neither writes
-are exceptions. If `refs/mirrors/ID/REF` is a directory with no read
-permission, the pull writes `refs/heads/REF`, and the resolve fails with
-`EACCES`. If a component of the mirror tree is a symlink to a directory, for
-example `refs/mirrors/ID` to `../alt`, the pull and the resolve follow it, and
-the listing and the summary open the mirror tree with no symlink followed and
-do not give the written ref.
+A ref under `refs/mirrors/ID/` of the own collection id comes from outside
+the port, for example from a hand edit or from the tool. Each reader of the
+port ignores it: the resolve, the collection ref listing, the summary, and
+the ref listing. `ostrya fsck` writes one line on standard output for each
+such ref, `Ref under the own collection id, not read:
+refs/mirrors/ID/NAME`, and the line is not an error. Phase 2 of the fsck
+checks the commit of such a ref. `ostrya prune` holds such a ref as a
+strong ref with no name: the ref roots the walk, no `--only-branch` or
+`--retain-branch-depth` value selects it, and the run never deletes it.
+The port has no repair for such a ref. Remove it by hand.
 
 The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
 collection refs from a local repository. It reads each ref of the source with
-the rule of `Repo::resolve_collection_ref`: `refs/mirrors/ID/REF`, and
-`refs/heads/REF` when `ID` is the `[core] collection-id` of the source and
-`refs/mirrors/ID/REF` holds no ref file. The probe of a local candidate reads
+the rule of `Repo::resolve_collection_ref`: `refs/mirrors/ID/REF`, or
+`refs/heads/REF` when `ID` is the `[core] collection-id` of the source. The
+probe of a local candidate reads
 the ref files with the same rule. A ref that the source does not hold fails
 the pull with `Error::RefNotFound`, which holds `ID:REF`. Each written ref
 names the commit that the pull read from the source. Unless the caller sets
@@ -6735,7 +6721,11 @@ are:
 - `refs/heads/<name>`, with a ref name of "Ref name validation"
 - `refs/mirrors/<id>/<name>`, with a collection id of at most 255 bytes that
   the collection id rule of "Ref name validation" accepts, and a ref name of
-  "Ref name validation"
+  "Ref name validation". The refs of the collection id of the bucket are
+  under `refs/heads/`, and no writer of the port writes
+  `refs/mirrors/<id>/` of that id. A key there comes from outside the port:
+  the push and the summary update skip it, the prune reads it as a root,
+  and the fsck gives it a `ref` note.
 - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, the layout
   of "Static delta directories", with the checksums in modified base64 and
   the target `superblock` or a part number with no leading zero
@@ -7033,13 +7023,12 @@ are:
 2. The take of the writer lock with `operation=push`.
 3. The read of `config` and the selection of the namespace. Then, at the
    same time, the listing and the read of the ref files of the ref
-   directory of the namespace, `refs/heads/` or `refs/mirrors/ID/`, the
-   listing of `refs/mirrors/` of the collection id of the bucket, and the
+   directory of the namespace, `refs/heads/` or `refs/mirrors/ID/`, and the
    listing of the objects of the 256 fan-out prefixes. The push reads no
    ref file of another namespace, and does not check the keys under
-   `refs/` outside its ref directory. A key under
-   `refs/mirrors/` of the collection id of the bucket refuses the push. The
-   push trusts the listing of the objects alone. A bucket repository with
+   `refs/` outside its ref directory. It does not list `refs/mirrors/` of
+   the collection id of the bucket. The push trusts the listing of the
+   objects alone. A bucket repository with
    no `config` refuses the push.
 4. The check of the bindings, then the check of each ref update. Each tip of a ref in the bucket must be an
    ancestor of the new commit in the local repository, unless the push is
@@ -7207,8 +7196,9 @@ no summary serves no collection ref.
 - Field 0 holds the refs of `refs/heads/`, sorted byte-wise by name. A
   bucket repository with no ref gets a summary with an empty field 0.
 - `ostree.summary.collection-map` holds the refs of each `refs/mirrors/ID/`
-  with a ref, by collection id. A bucket repository with a collection id
-  holds no `refs/mirrors/ID/` of that id: each writer refuses it.
+  with a ref, by collection id. The update skips each key under
+  `refs/mirrors/ID/` of the collection id of the bucket, with no check of
+  the key and no read of the ref file.
 - `ostree.summary.mode`, `ostree.summary.tombstone-commits`,
   `ostree.summary.indexed-deltas`, and `ostree.summary.collection-id` come
   from `mode`, `tombstone-commits`, `indexed-deltas`, and `collection-id` of
@@ -7386,8 +7376,11 @@ Each finding has one kind, and is an error or a note:
 
 - `config`, an error: `config` is absent, or breaks a rule.
 - `ref`, an error: a key under `refs/` that is no ref key, a ref file that
-  does not parse or is gone at its read, a ref under `refs/mirrors/` of the
-  own collection id, or a ref whose commit the bucket does not hold.
+  does not parse or is gone at its read, or a ref whose commit the bucket
+  does not hold.
+- `ref`, a note: a ref key under `refs/mirrors/` of the own collection id.
+  The run reads no such ref file. The summary update and the push skip the
+  key, and the prune keeps the commit of the ref.
 - `summary`, an error: the summary does not parse, fails the check of its
   signature, names a ref at a commit that the bucket does not hold, or
   names a delta whose superblock is absent or has another SHA-256. With the
@@ -7500,8 +7493,10 @@ differences apply:
 The roots are:
 
 - the commit of each ref of `refs/heads/` and `refs/mirrors/<id>/`, under
-  the bound of `--depth` or `--keep-younger-than`. A ref whose commit the
-  bucket does not hold is no error, and it keeps nothing.
+  the bound of `--depth` or `--keep-younger-than`. The refs of
+  `refs/mirrors/<id>/` of the collection id of the bucket are roots too,
+  as in a local prune, and the prune deletes none of them. A ref whose
+  commit the bucket does not hold is no error, and it keeps nothing.
 - the commit of each ref of the summary, in field 0 and in
   `ostree.summary.collection-map`, with no parent. A summary that does not
   parse, or that is larger than 64 MiB, fails the run before its first
@@ -7568,9 +7563,9 @@ The steps of the prune are:
    listing of the objects of the 256 fan-out prefixes, the list of
    `deltas/`, the list of `state/`, the list of the incomplete multipart
    uploads, and the read of `summary`. A key under `refs/` other than
-   `refs/heads/<name>`, and `refs/mirrors/<id>/<name>` with an id other
-   than the collection id of the bucket, fails the run. So does a ref file
-   that does not hold 64 lowercase hex digits and a newline.
+   `refs/heads/<name>` and `refs/mirrors/<id>/<name>` fails the run, also
+   under `refs/mirrors/` of the collection id of the bucket. So does a ref
+   file that does not hold 64 lowercase hex digits and a newline.
 4. The walk. A run with `--no-prune` then releases the lock, and reports
    the counts and the deletes that a run without it does.
 5. The commits. One `DELETE` of each commit object to delete, then of its

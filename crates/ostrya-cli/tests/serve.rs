@@ -747,14 +747,15 @@ fn client_without_cert(path: &Path, url: &str, pki: &Pki) -> String {
     client(path, "archive", url, Some(pki))
 }
 
-/// In a repository with a collection id, `ostrya summary -u` and `ostree
-/// summary -u` put the refs of `refs/mirrors/ID/` of the own id into field 0,
-/// with the mirror ref in place of the ref of `refs/heads` of the same name.
-/// Both keep the other collections in the collection map, and neither has
-/// the own id there. The anchor commit differs in each run, so the test
-/// compares each other ref.
+/// In a repository with a collection id, `ostree summary -u` puts the refs of
+/// `refs/mirrors/ID/` of the own id into field 0, with the mirror ref in
+/// place of the ref of `refs/heads` of the same name. `ostrya summary -u`
+/// ignores that directory, and its field 0 holds the refs of `refs/heads`
+/// alone. This is a divergence. Both keep the other collections in the
+/// collection map, and neither has the own id there. The anchor commit
+/// differs in each run, so the test compares each other ref.
 #[test]
-fn the_summary_merges_the_own_mirrors_as_the_tool_does() {
+fn the_summary_leaves_out_the_own_mirrors_that_the_tool_merges() {
     if !ostree_available() {
         return;
     }
@@ -828,11 +829,25 @@ fn the_summary_merges_the_own_mirrors_as_the_tool_does() {
     };
     let (port_refs, port_map) = parse(&path);
     let (tool_refs, tool_map) = parse(&tool);
-    assert_eq!(port_refs, tool_refs);
     assert_eq!(port_map, tool_map);
-    let names: Vec<&str> = port_refs.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(names, ["extra/x", "main", "other"]);
-    assert_eq!(port_refs[1].1.to_hex(), other);
+    let pairs = |refs: &Refs| -> Vec<(String, String)> {
+        refs.iter()
+            .map(|(name, commit)| (name.clone(), commit.to_hex()))
+            .collect()
+    };
+    let pair = |name: &str, commit: &str| (name.to_owned(), commit.to_owned());
+    assert_eq!(
+        pairs(&tool_refs),
+        [
+            pair("extra/x", &main),
+            pair("main", &other),
+            pair("other", &other)
+        ]
+    );
+    assert_eq!(
+        pairs(&port_refs),
+        [pair("main", &main), pair("other", &other)]
+    );
     let ids: Vec<&str> = port_map.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(ids, ["org.example.Other"]);
 }

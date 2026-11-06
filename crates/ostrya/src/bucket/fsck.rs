@@ -153,8 +153,9 @@ pub struct BucketFinding {
     /// not hold the object and a read after the listing finds it. A
     /// `Dependency` finding of a run without `delete` is a note if the
     /// listing does not hold the commit of the dependency and a read after
-    /// the listing finds it. A `Marker`, an `Upload`, and a `Lock` finding
-    /// are notes. Each other finding is an error.
+    /// the listing finds it. A `Ref` finding of a ref under `refs/mirrors/`
+    /// of the own collection id is a note. A `Marker`, an `Upload`, and a
+    /// `Lock` finding are notes. Each other finding is an error.
     pub error: bool,
     /// The key of the finding, relative to the prefix of the repository:
     /// `config`, a ref key, `summary`, `summary.sig`, a stray key, the key of
@@ -206,9 +207,9 @@ pub enum BucketFindingKind {
     /// The `config` is absent, or breaks a rule of a bucket repository.
     Config,
     /// A key under `refs/` that is no ref key, a ref file that does not
-    /// parse or is gone at its read, a ref under `refs/mirrors/` of the own
-    /// collection id, or a ref that names a commit that the bucket does not
-    /// hold.
+    /// parse or is gone at its read, or a ref that names a commit that the
+    /// bucket does not hold. Also, as a note, a ref under `refs/mirrors/` of
+    /// the own collection id. The run reads no such ref file.
     Ref,
     /// The summary does not parse, fails the check of its signature, or
     /// differs from the ref files or the deltas of the bucket. Also a delta
@@ -803,10 +804,10 @@ impl BucketRepo {
             match ref_key(key) {
                 Some(RefKey::Mirror(id, _)) if Some(id) == own => run.add(
                     Ref,
-                    true,
+                    false,
                     key,
-                    "is a ref under refs/mirrors/ of the own collection id; a bucket repository \
-                     holds the refs of its own collection under refs/heads/"
+                    "is a ref under refs/mirrors/ of the own collection id; the summary and the \
+                     push ignore it, and a prune keeps its commit"
                         .to_owned(),
                 ),
                 Some(_) => keys.push(key),

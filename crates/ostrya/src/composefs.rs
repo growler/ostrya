@@ -1004,7 +1004,8 @@ impl Repo {
     /// the digest from it, and stages it as the image of the new commit with
     /// [`attach_composefs_image`](Transaction::attach_composefs_image). So
     /// the call reads the tree one time, and the commit of `txn` stores the
-    /// image.
+    /// image. A new commit that the repository holds already, complete or
+    /// partial, is not staged and gets no image.
     ///
     /// # Errors
     ///
@@ -1085,8 +1086,14 @@ impl Repo {
         append_dict_entry(&mut commit_obj.metadata, COMPOSEFS_DIGEST_KEY, value)?;
         let bytes = commit_obj.serialize()?;
         let new = txn.write_metadata(ObjectType::Commit, None, &bytes).await?;
-        if let Some(image) = image {
-            txn.attach_composefs_image(&new, image).await?;
+        // A new commit that the repository holds already is not staged, and
+        // gets no image. The discard of the image removes its file.
+        match image {
+            Some(image) if txn.is_staged(&new, ObjectType::Commit) => {
+                txn.attach_composefs_image(&new, image).await?;
+            }
+            Some(image) => image.discard().await,
+            None => {}
         }
         Ok(new)
     }

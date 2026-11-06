@@ -433,16 +433,18 @@ commits of its markers under the condition that removes the markers after
 the commit, and one helper holds that condition.
 `Transaction::write_metadata` records no commit, because a pull writes
 partial commits through it. `Repo::commit_add_composefs_metadata` and the
-server commit of a receive build the image themselves and stage it, as
+server commit of a receive build the image themselves, as
 `commit --generate-composefs` does, so each of them reads the tree one time.
+They stage the image only if the transaction stages the commit.
 
 The build skips a commit that the transaction did not stage and that has no
 marker. So a commit that the repository holds complete before the
 transaction gets no image from it, also when a writer writes it again. The
 commit writes and `Repo::apply_static_delta` record a commit only if the
 transaction stages it. A commit that the repository holds partial is not
-staged again, so it gets no image from them. There is no backfill:
-`composefs-image --add` builds the image of a held commit.
+staged again, so it gets no image from them. There is no backfill under
+the key: `composefs-image --add` and `commit --generate-composefs` build the
+image of a held commit.
 
 The build runs in the commit of the transaction, after the transaction
 stages its objects and before the publication. `publish()` renames the
@@ -478,7 +480,10 @@ and the fsck does not check the seals.
 
 `commit --generate-composefs` stores the image also with the key `false`.
 With the key `true`, `commit --generate-composefs-metadata` takes the same
-path, so the command reads the tree one time.
+path, so the command reads the tree one time. The key alone stores no
+image of a commit that the repository holds already.
+`commit --generate-composefs` stores the image of such a commit, as
+`composefs-image --add` does.
 
 Rejected alternative: the transaction removes the markers of a pull, so that
 one call decides the marker and the image. It changes the error handling of

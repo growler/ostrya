@@ -6329,7 +6329,9 @@ The generation:
   `ostrya static-delta apply-offline` record a commit only if the transaction
   stages it, so a commit that the repository holds partial also gets no image
   from them. The build also skips a commit with no key and a commit whose
-  image is staged. There is no backfill.
+  image is staged. There is no backfill under the key. `ostrya commit
+  --generate-composefs` stores the image of a commit that the repository
+  holds, as `ostrya composefs-image --add` does.
 - A malformed key, or an image whose digest is not the key, fails the
   transaction. It publishes no object and writes no ref. For a pull, the rule
   covers each recorded commit, so one such commit fails the whole pull. A

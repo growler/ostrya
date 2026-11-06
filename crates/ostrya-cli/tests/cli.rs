@@ -24310,6 +24310,79 @@ fn fsck_notes_a_commit_with_no_composefs_image() {
     assert_eq!(fsck.status.code(), Some(1));
 }
 
+/// With `[ex-ostrya] generate-composefs` true, `commit
+/// --generate-composefs-metadata` stores no image of a commit that the
+/// repository holds already, and fsck notes the commit. `commit
+/// --generate-composefs` stores the image of that commit.
+#[test]
+fn the_generate_composefs_key_gives_no_image_to_a_held_commit() {
+    let tmp = TmpDir::new("composefs-generate-held");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let repo = create_repo(base, RepoMode::BareUser);
+    append_config(&repo, "[ex-integrity]\nfsverity=no\n");
+    let checksum = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src,
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert!(!image_path(&repo, &checksum).exists());
+
+    append_config(&repo, "[ex-ostrya]\ngenerate-composefs=true\n");
+    let again = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            "--parent=none",
+            FIXED_TIMESTAMP,
+            "--generate-composefs-metadata",
+            src,
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert_eq!(again, checksum);
+    assert!(!image_path(&repo, &checksum).exists());
+    let fsck = ostrya_repo(&repo, &["fsck"]);
+    fsck.ok();
+    let line = format!("Commit with no composefs image: {checksum}");
+    assert!(
+        fsck.stdout_trimmed().lines().any(|l| l == line),
+        "{}",
+        fsck.stdout_trimmed()
+    );
+
+    let explicit = ostrya_repo(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "m",
+            "--parent=none",
+            FIXED_TIMESTAMP,
+            "--generate-composefs",
+            src,
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    assert_eq!(explicit, checksum);
+    assert!(image_path(&repo, &checksum).exists());
+    ostrya_repo(&repo, &["composefs-image", "--check", "m"]).ok();
+}
+
 /// `composefs-image --check` and `--get-path` fail for a commit that carries
 /// the key and has no image. `--check` writes the reason in one line.
 #[test]

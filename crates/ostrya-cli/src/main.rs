@@ -1156,6 +1156,8 @@ struct CommitArgs {
     ///
     /// If `[ex-ostrya] generate-composefs` of the repository is true, the
     /// command also stores the composefs image, as --generate-composefs does.
+    /// It stores the image only for a commit that the repository does not
+    /// hold already.
     #[arg(long)]
     generate_composefs_metadata: bool,
     /// Store the composefs image of the tree with the commit.
@@ -1166,7 +1168,8 @@ struct CommitArgs {
     /// digest is the value of `ostree.composefs.digest.v0`. The
     /// command reads the tree one time for the digest and the image. The
     /// option stores the image whatever the value of
-    /// `[ex-ostrya] generate-composefs`. This option is an extension of
+    /// `[ex-ostrya] generate-composefs`. It also stores the image of a commit
+    /// that the repository holds already. This option is an extension of
     /// ostrya.
     #[arg(long)]
     generate_composefs: bool,
@@ -8812,7 +8815,9 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // `[ex-ostrya] generate-composefs` true, the commit of the transaction
     // stores the image of a commit with the digest, so
     // `--generate-composefs-metadata` takes the same path, and the tree is
-    // read one time.
+    // read one time. Under the key alone, a commit that the repository holds
+    // already is not staged, and gets no image. The drop of the image removes
+    // its file.
     let store_image = args.generate_composefs
         || (args.generate_composefs_metadata && repo.config().generate_composefs()?);
     let checksum = {
@@ -8842,7 +8847,9 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
             related: Vec::new(),
         };
         let checksum = txn.write_commit_checked(opts, checked, &root).await?;
-        if let Some(image) = image {
+        if let Some(image) =
+            image.filter(|_| args.generate_composefs || txn.is_commit_staged(&checksum))
+        {
             txn.attach_composefs_image(&checksum, image).await?;
         }
         checksum

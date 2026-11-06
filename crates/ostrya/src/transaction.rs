@@ -591,6 +591,23 @@ impl Transaction {
             .contains_key(&(*checksum, ty))
     }
 
+    /// Returns `true` if the commit object `commit` is staged in this
+    /// transaction.
+    ///
+    /// [`write_commit`](Transaction::write_commit) stages a new commit. A
+    /// commit that the repository holds before the write, complete or
+    /// partial, is not staged. A caller that attaches the image of a new
+    /// commit alone with
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image) checks
+    /// the commit with this call. The call reads the staged set of this
+    /// transaction, so another writer under the shared lock does not change
+    /// its result. A [`Repo::has_object`] check after the write reads the
+    /// object store, and another transaction can publish the same commit
+    /// before that check.
+    pub fn is_commit_staged(&self, commit: &Checksum) -> bool {
+        self.is_staged(commit, ObjectType::Commit)
+    }
+
     /// Returns `true` if a composefs image of `commit` is staged in this
     /// transaction.
     pub(crate) fn is_image_staged(&self, commit: &Checksum) -> bool {
@@ -1510,8 +1527,9 @@ impl Transaction {
     /// dependencies, and each held partial commit. A partial commit is not
     /// recorded. [`write_metadata`](Transaction::write_metadata) records no
     /// commit. [`Repo::commit_add_composefs_metadata`] and the server commit
-    /// of a receive build and stage the image of their commit themselves, so
-    /// step 2 does not build it again.
+    /// of a receive build the image of their commit themselves, and stage it
+    /// if the transaction stages the commit. So step 2 does not build it
+    /// again.
     ///
     /// The build reads each recorded commit, staged first. It skips a commit
     /// that the transaction did not stage and that has no `.commitpartial`

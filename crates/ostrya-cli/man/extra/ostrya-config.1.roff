@@ -480,6 +480,8 @@ A commit that the repository holds complete before the write gets no image.
 \fB\%ostrya composefs\-image \-\-add\fR stores the image of such a commit.
 \fB\%ostrya commit\fR and \fB\%ostrya static\-delta apply\-offline\fR also give no image to a commit that the repository holds partial.
 With true, \fB\%ostrya commit \-\-generate\-composefs\-metadata\fR also stores the image, as \fB\%\-\-generate\-composefs\fR does.
+It stores no image of a commit that the repository holds already.
+\fB\%ostrya commit \-\-generate\-composefs\fR stores the image of such a commit, as \fB\%ostrya composefs\-image \-\-add\fR does.
 .IP
 A malformed key or an image whose fs\-verity digest is not the key fails the write, and the write adds no object and no ref.
 For a pull, one such commit fails the whole pull, also when the image of each target is correct.

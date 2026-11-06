@@ -6215,14 +6215,15 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   `error:` line and exits 1 if the image is absent, if the commit does not
   carry the key, or if the digests are different. The line for different
   digests names both digests.
-- `commit --generate-composefs` stores the image with a new commit. The
+- `commit --generate-composefs` stores the image with the commit. The
   option turns on `--generate-composefs-metadata`, so the commit is the
   commit that the tool writes with `--generate-composefs-metadata`. The tool
   refuses `--generate-composefs` as an unknown option. The option stores
-  the image also with `[ex-ostrya] generate-composefs` false. With the key
-  true, `commit --generate-composefs-metadata` also stores the image and
-  reads the tree one time. Each of the two options writes the commit of the
-  tool.
+  the image also with `[ex-ostrya] generate-composefs` false, and also for
+  a commit that the repository holds already. With the key true, `commit
+  --generate-composefs-metadata` also stores the image and reads the tree
+  one time. It stores no image of a commit that the repository holds
+  already. Each of the two options writes the commit of the tool.
 - With `[ex-ostrya] generate-composefs` true, `commit`, `pull`,
   `pull-local`, `receive`, `serve`, and `static-delta apply-offline` store
   the image of each complete commit that they add and that carries the key

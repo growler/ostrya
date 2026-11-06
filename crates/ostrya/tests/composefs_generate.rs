@@ -17,6 +17,10 @@
 //!   target that the repository holds partial gets no image.
 //! - A commit that the repository holds complete before the transaction gets
 //!   no image when a transaction writes it again.
+//! - `is_commit_staged` is `true` for a new commit, and `false` for a commit
+//!   that the repository holds before the transaction.
+//! - `commit_add_composefs_metadata` stores no image of a new commit that the
+//!   repository holds before the transaction.
 //! - A value of the key that is not a boolean, and the value `true` in an
 //!   `archive` repository, fail the open of a transaction and the fsck.
 //! - With the key `true`, the fsck notes each complete commit with the key
@@ -329,6 +333,68 @@ fn a_commit_held_complete_gets_no_image() {
         let (again, _) = commit_tree(&repo, &base, 1, false, None).await;
         assert_eq!(again, commit);
         assert!(!repo.has_composefs_image(&commit).await.unwrap());
+    });
+}
+
+/// `is_commit_staged` is `true` for a new commit that `write_commit` writes,
+/// and `false` when a second transaction writes the same commit again.
+#[test]
+fn a_held_commit_is_not_staged_again() {
+    let scratch = TmpDir::new("cfs-gen-staged");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let base = &base;
+    block_on(async {
+        let repo = new_repo(
+            &scratch.path().join("repo"),
+            RepoMode::BareUser,
+            "[ex-integrity]\nfsverity=no\n",
+        )
+        .await;
+        let write = |txn: Transaction| async move {
+            let root = stage_tree(&txn, base).await;
+            let opts = CommitOptions {
+                timestamp: Some(1),
+                ..CommitOptions::default()
+            };
+            let commit = txn.write_commit(opts, &root).await.unwrap();
+            let staged = txn.is_commit_staged(&commit);
+            txn.commit().await.unwrap();
+            (commit, staged)
+        };
+        let (commit, staged) = write(repo.transaction().await.unwrap()).await;
+        assert!(staged);
+        let (again, staged) = write(repo.transaction().await.unwrap()).await;
+        assert_eq!(again, commit);
+        assert!(!staged);
+    });
+}
+
+/// With the key `true`, `commit_add_composefs_metadata` stores no image when
+/// the repository holds the new commit before the transaction.
+#[test]
+fn a_held_commit_with_added_metadata_gets_no_image() {
+    let scratch = TmpDir::new("cfs-gen-add-held");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let root = scratch.path().join("repo");
+    block_on(async {
+        let add = |repo: Repo, plain: Checksum| async move {
+            let txn = repo.transaction().await.unwrap();
+            let keyed = repo
+                .commit_add_composefs_metadata(&txn, &plain)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            keyed
+        };
+        let repo = new_repo(&root, RepoMode::BareUser, "[ex-integrity]\nfsverity=no\n").await;
+        let plain = commit_owned(&repo, &base).await;
+        let keyed = add(repo, plain).await;
+        let repo = set_generate(&root, "true").await;
+        let again = add(repo.clone(), plain).await;
+        assert_eq!(again, keyed);
+        assert!(!repo.has_composefs_image(&keyed).await.unwrap());
     });
 }
 

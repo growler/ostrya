@@ -309,14 +309,10 @@ impl ServerInfo {
     ///
     /// A collection ref of the [`collection_id`](ServerInfo::collection_id)
     /// of the server is the local ref of the same name. Each other ref is
-    /// unchanged. The call does not check the ref.
+    /// unchanged. The call does not check the ref. [`Ref::canonical`] gives
+    /// the same form in a repository.
     pub fn canonical(&self, r: &Ref) -> Ref {
-        match r {
-            Ref::Collection { id, name } if Some(id) == self.collection_id.as_ref() => {
-                Ref::local(name.clone())
-            }
-            r => r.clone(),
-        }
+        r.clone().canonical(self.collection_id.as_deref())
     }
 
     /// Returns the current commit of the ref `name` on the server.
@@ -1177,7 +1173,7 @@ fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<
         let r: Ref = name
             .parse()
             .map_err(|_| invalid(format!("'{name}' is not a valid ref name")))?;
-        let r = server.canonical(&r);
+        let r = r.canonical(server.collection_id.as_deref());
         let namespace = match &r {
             Ref::Collection { id, .. } => Some(id.clone()),
             _ => None,

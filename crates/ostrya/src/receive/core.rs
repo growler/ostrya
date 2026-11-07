@@ -21,7 +21,7 @@ use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveCommit, aborted, codec, next, out_of_order};
 use crate::error::Result;
 use crate::object::{MAX_METADATA_SIZE, object_exists};
-use crate::refs::{canonical_ref, ref_relpath};
+use crate::refs::ref_relpath;
 use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
     ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
@@ -505,7 +505,7 @@ pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<Vec
                 "invalid ref name '{name}'"
             )))
         })?;
-        refs.push(canonical_ref(own, r));
+        refs.push(r.canonical(own));
     }
     let mut seen: HashMap<&Ref, &str> = HashMap::with_capacity(refs.len());
     for (r, name) in refs.iter().zip(&hello.refs) {

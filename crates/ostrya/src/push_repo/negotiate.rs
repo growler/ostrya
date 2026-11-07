@@ -14,7 +14,6 @@ use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
-use crate::refs::canonical_ref;
 use crate::related::{self, HeldDependency, RelatedField, RelatedRule};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
@@ -1102,7 +1101,7 @@ pub(super) fn check_distinct<'a>(
 ) -> Result<()> {
     let mut seen: HashMap<Ref, &Ref> = HashMap::new();
     for name in names {
-        if let Some(first) = seen.insert(canonical_ref(own, name.clone()), name) {
+        if let Some(first) = seen.insert(name.clone().canonical(own), name) {
             return Err(invalid(format!(
                 "the refs '{first}' and '{name}' name one ref of the server"
             )));

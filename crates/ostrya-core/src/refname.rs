@@ -325,7 +325,7 @@ pub const MAX_COLLECTION_ID_LEN: usize = 255;
 /// - `@ID:NAME` is the collection ref [`Ref::Collection`], at
 ///   `refs/mirrors/ID/NAME`. A repository whose `[core] collection-id` is
 ///   `ID` keeps the ref at `refs/heads/NAME`, so `@ID:NAME` and `NAME` name
-///   the same ref there.
+///   the same ref there. [`canonical`](Ref::canonical) gives the local form.
 ///
 /// No valid ref name holds `@` or `:`, so the three forms do not overlap.
 ///
@@ -398,6 +398,20 @@ impl Ref {
     pub fn name(&self) -> &str {
         match self {
             Ref::Local { name } | Ref::Remote { name, .. } | Ref::Collection { name, .. } => name,
+        }
+    }
+
+    /// Returns the canonical form of the ref in a repository whose
+    /// `[core] collection-id` is `own`.
+    ///
+    /// A collection ref of `own` is the local ref of the same name, because
+    /// the repository keeps it at `refs/heads/<name>`. Each other ref is
+    /// returned unchanged, and so is each ref if `own` is `None`. The call
+    /// does not check the ref or `own`.
+    pub fn canonical(self, own: Option<&str>) -> Ref {
+        match self {
+            Ref::Collection { id, name } if Some(id.as_str()) == own => Ref::Local { name },
+            r => r,
         }
     }
 
@@ -499,6 +513,24 @@ impl std::error::Error for ParseRefError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_collection_ref_of_the_own_id_is_the_local_ref() {
+        let own = Some("org.example.Os");
+        assert_eq!(
+            Ref::collection("org.example.Os", "a/b").canonical(own),
+            Ref::local("a/b")
+        );
+        for r in [
+            Ref::collection("org.example.B", "a"),
+            Ref::local("a"),
+            Ref::remote("origin", "a"),
+        ] {
+            assert_eq!(r.clone().canonical(own), r);
+        }
+        let r = Ref::collection("org.example.Os", "a");
+        assert_eq!(r.clone().canonical(None), r);
+    }
 
     #[test]
     fn a_ref_name_holds_components_of_the_rule() {

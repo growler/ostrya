@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
 use crate::read::CommitState;
-use crate::refs::{RefFileState, canonical_ref};
+use crate::refs::RefFileState;
 use crate::related::{self, HeldDependency, RelatedRule};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
@@ -121,7 +121,7 @@ pub(super) fn commit_ref(own: Option<&str>, name: &str, writes: bool) -> Checked
             "invalid ref name '{name}'"
         )))
     };
-    let r = canonical_ref(own, name.parse().map_err(|_| invalid())?);
+    let r = name.parse::<Ref>().map_err(|_| invalid())?.canonical(own);
     match &r {
         Ref::Local { name } if writes && ostrya_core::is_checksum_shaped(name) => Err(invalid()),
         _ => Ok(r),

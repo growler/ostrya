@@ -413,12 +413,12 @@ impl PruneOptions {
             only_branch: self
                 .only_branch
                 .iter()
-                .map(|r| crate::refs::canonical_ref(own, r.clone()))
+                .map(|r| r.clone().canonical(own))
                 .collect(),
             retain_branch_depth: self
                 .retain_branch_depth
                 .iter()
-                .map(|(r, depth)| (crate::refs::canonical_ref(own, r.clone()), *depth))
+                .map(|(r, depth)| (r.clone().canonical(own), *depth))
                 .collect(),
             ..self.clone()
         }

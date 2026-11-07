@@ -9250,10 +9250,7 @@ fn tag_name_refusal(branch: Option<&str>, tags: &[String], own: Option<&str>) ->
 /// whose `[core] collection-id` is `own`. `@OWN:NAME` gives the local ref
 /// NAME. Returns `None` if the value is not the text of a ref.
 fn commit_ref(text: &str, own: Option<&str>) -> Option<Ref> {
-    match text.parse::<Ref>().ok()? {
-        Ref::Collection { id, name } if Some(id.as_str()) == own => Some(Ref::Local { name }),
-        r => Some(r),
-    }
+    text.parse::<Ref>().ok().map(|r| r.canonical(own))
 }
 
 /// Returns the refusal of a local ref whose name the revision syntax

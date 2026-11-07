@@ -5,7 +5,6 @@ use std::sync::Arc;
 use ostrya_core::Ref;
 
 use super::{ReceivePattern, ReceiveVerify, ServerSigner};
-use crate::refs::canonical_ref;
 
 /// The rules that decide what a one-way stream accepts.
 ///
@@ -136,7 +135,7 @@ impl StreamPolicy {
     /// [`default_rule`](StreamPolicy::default_rule). A remote ref or a
     /// collection ref that no pattern matches gets `None`.
     pub fn rule_for(&self, r: &Ref, own: Option<&str>) -> Option<&StreamRule> {
-        let r = &canonical_ref(own, r.clone());
+        let r = &r.clone().canonical(own);
         let mut best = None;
         for (pattern, rule) in &self.rules {
             if let Some(found) = pattern.specificity(r, own)

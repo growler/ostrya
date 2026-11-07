@@ -217,7 +217,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
-use crate::refs::{canonical_ref, ref_relpath, refspec_ref};
+use crate::refs::{ref_relpath, refspec_ref};
 use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
@@ -2679,7 +2679,7 @@ impl<'a> RefPlace<'a> {
             RefPlace::Heads => refspec_ref(name),
             RefPlace::Collection(id) => Ref::collection(id, name),
             RefPlace::Operands { remote, own } => match operand_collection(name) {
-                Some((id, name)) => canonical_ref(own, Ref::collection(id, name)),
+                Some((id, name)) => Ref::collection(id, name).canonical(own),
                 None => match remote {
                     Some(remote) => Ref::remote(remote, name),
                     None => refspec_ref(name),

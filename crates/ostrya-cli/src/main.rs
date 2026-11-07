@@ -4212,9 +4212,12 @@ struct PullArgs {
     /// The pull looks up @ID:REF in the summary: in the ref list if the
     /// summary states the collection id ID, else in its collection map. If
     /// the summary does not list the ref, the pull reads `refs/heads/REF` of
-    /// the remote if the `collection-id` of the remote config is ID, else
-    /// `refs/mirrors/ID/REF`. The pull writes `refs/mirrors/ID/REF`, or
-    /// `refs/heads/REF` if the `collection-id` of this repository is ID. The
+    /// the remote if the `[core] collection-id` of the `config` file that the
+    /// remote serves is ID, else `refs/mirrors/ID/REF`. If the remote serves
+    /// no `config` file, or the file has no `collection-id`, the pull uses
+    /// the collection id of the summary in its place. The pull writes
+    /// `refs/mirrors/ID/REF`, or `refs/heads/REF` if the `collection-id` of
+    /// this repository is ID. The
     /// commit must be bound to ID, also with --disable-verify-bindings. The
     /// ref-binding check reads REF. A ref named two times counts one time.
     /// The command refuses two other refs that write one ref, after it reads

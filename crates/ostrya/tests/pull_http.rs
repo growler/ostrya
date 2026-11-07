@@ -11081,6 +11081,105 @@ fn a_collection_ref_of_the_remote_id_reads_its_local_ref() {
     });
 }
 
+/// Builds the remote of [`build_collection_remote`] under `dir`, adds the
+/// local ref `d`, bound to [`REMOTE_ID`], after the summary, and starts a
+/// server of it. The server serves the text that `config` gives for the
+/// remote config, or no config if `config` is `None`.
+async fn remote_with_unlisted_ref(
+    dir: &Path,
+    config: Option<fn(&str) -> String>,
+) -> (RepoServer, Checksum) {
+    let (remote, _) = build_collection_remote(dir).await;
+    let d = commit_bound(&remote, dir, "src", &Ref::local("d"), Some(REMOTE_ID)).await;
+    let server = RepoServer::start(&dir.join("remote"), false).await;
+    match config {
+        Some(config) => {
+            let text = std::fs::read_to_string(dir.join("remote/config")).unwrap();
+            server.tamper("config", config(&text).into_bytes());
+        }
+        None => server.hide("config"),
+    }
+    (server, d)
+}
+
+/// If the remote config states no collection id, a collection ref of the
+/// collection id of the summary is a local ref of the remote. The pull reads
+/// a ref that the summary does not list from `refs/heads/NAME`, and never
+/// from `refs/mirrors/`.
+#[test]
+fn a_collection_ref_of_the_summary_id_reads_its_local_ref() {
+    block_on(async {
+        fn no_id(text: &str) -> String {
+            let kept: Vec<&str> = text
+                .lines()
+                .filter(|line| !line.starts_with("collection-id="))
+                .collect();
+            assert_ne!(kept.len(), text.lines().count(), "{text}");
+            kept.join("\n") + "\n"
+        }
+        let cases = [
+            ("pull-http-collection-summary-id-no-config", None),
+            (
+                "pull-http-collection-summary-id-no-key",
+                Some(no_id as fn(&str) -> String),
+            ),
+        ];
+        for (name, config) in cases {
+            let dir = TmpDir::new(name);
+            let (server, d) = remote_with_unlisted_ref(dir.path(), config).await;
+            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+            dest.pull("origin", refs_of(&[&at(REMOTE_ID, "d")]))
+                .await
+                .unwrap();
+            assert_eq!(
+                dest.list_mirror_refs().await.unwrap(),
+                [(REMOTE_ID.to_owned(), "d".to_owned(), d)],
+                "{name}"
+            );
+            let seen = server.seen();
+            assert_eq!(server.requests_for("refs/heads/d"), 1, "{name}: {seen:?}");
+            assert!(
+                !seen.iter().any(|path| path.starts_with("refs/mirrors/")),
+                "{name}: {seen:?}"
+            );
+        }
+    });
+}
+
+/// The collection id of the remote config wins over the collection id of
+/// the summary. If the config states another id, the pull reads a ref of
+/// the summary id that the summary does not list from
+/// `refs/mirrors/ID/NAME`.
+#[test]
+fn the_config_id_wins_over_the_summary_id() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-collection-config-id-wins");
+        let other = |text: &str| {
+            let old = format!("collection-id={REMOTE_ID}");
+            assert!(text.contains(&old), "{text}");
+            text.replace(&old, "collection-id=org.example.Other")
+        };
+        let (server, _) = remote_with_unlisted_ref(dir.path(), Some(other)).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let r_d = at(REMOTE_ID, "d");
+        let err = dest.pull("origin", refs_of(&[&r_d])).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::RefNotFound(got) if *got == r_d),
+            "{err}"
+        );
+        let seen = server.seen_set();
+        assert_eq!(
+            server.requests_for(&format!("refs/mirrors/{REMOTE_ID}/d")),
+            1,
+            "{seen:?}"
+        );
+        assert!(!seen.contains("refs/heads/d"), "{seen:?}");
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
 /// A collection ref of the collection id of this repository is a local ref
 /// here: the pull writes `refs/heads/NAME`, and no `refs/mirrors/` entry of
 /// that id.

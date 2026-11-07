@@ -5317,10 +5317,12 @@ The pull resolves `@ID:NAME` in this order:
    `ostree.summary.collection-id` of the summary is `ID`. Otherwise it reads
    the entry of `ID` in `ostree.summary.collection-map`.
 2. If the summary does not list the ref, or the remote serves no summary,
-   the pull reads one ref file: `refs/heads/NAME` when the
-   `[core] collection-id` of the `config` of the remote is `ID`, and else
-   `refs/mirrors/ID/NAME`. The HTTP source percent-encodes `NAME` in the
-   request path, as for `refs/heads/NAME`.
+   the pull reads one ref file: `refs/heads/NAME` when the collection id of
+   the remote is `ID`, and else `refs/mirrors/ID/NAME`. The collection id of
+   the remote is the `[core] collection-id` of the `config` of the remote.
+   When the remote serves no config, or the config has no `collection-id`,
+   it is the `ostree.summary.collection-id` of the summary. The HTTP source
+   percent-encodes `NAME` in the request path, as for `refs/heads/NAME`.
 
 The pull sends no ref listing request. A ref that neither source names fails
 the pull with `Error::RefNotFound`, which holds `@ID:NAME`. `ostrya serve`

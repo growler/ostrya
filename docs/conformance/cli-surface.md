@@ -3679,12 +3679,14 @@ One run takes plain operands and `@ID:REF` operands of more than one
 collection. The port reads `@ID:REF` from the summary of the remote: from
 field 0 when the summary states the collection id ID, and else from its
 collection map. If the summary does not list the ref, the port reads
-`refs/heads/REF` of the remote when the `collection-id` of the remote config
-is ID, and else `refs/mirrors/ID/REF`. It writes the ref to
-`refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the collection id
-of the repository. The tip commit of `@ID:REF` must hold the
-`ostree.collection-binding` `ID`, and `--disable-verify-bindings` does not
-skip this check. An operand
+`refs/heads/REF` of the remote when the `[core] collection-id` of the
+`config` file that the remote serves is ID, and else `refs/mirrors/ID/REF`.
+When the remote serves no `config` file, or the file has no
+`collection-id`, the port uses the collection id of the summary in its
+place. It writes the ref to `refs/mirrors/ID/REF`, or to `refs/heads/REF`
+when `ID` is the collection id of the repository. The tip commit of
+`@ID:REF` must hold the `ostree.collection-binding` `ID`, and
+`--disable-verify-bindings` does not skip this check. An operand
 `REMOTE:REF`, an operand with a `^` suffix, and an operand that starts with
 `@` and is not an `@ID:REF` ref give `error: Invalid refspec <operand>` at
 exit 1. The port refuses each of these operands before the first request.

@@ -155,8 +155,11 @@ impl Repo {
     ///   entry of `ID` of `ostree.summary.collection-map`.
     /// - If the summary does not list the ref, or the remote serves no
     ///   summary, the pull reads `refs/heads/<NAME>` of the remote if the
-    ///   `[core] collection-id` of the `config` of the remote is `ID`, and
-    ///   else `refs/mirrors/<ID>/<NAME>`.
+    ///   collection id of the remote is `ID`, and else
+    ///   `refs/mirrors/<ID>/<NAME>`. The collection id of the remote is the
+    ///   `[core] collection-id` of the `config` of the remote. If the remote
+    ///   serves no config, or the config has no collection id, it is the
+    ///   `ostree.summary.collection-id` of the summary.
     /// - The pull writes the collection ref `refs/mirrors/<ID>/<NAME>`, or
     ///   the local ref `refs/heads/<NAME>` if `ID` is the
     ///   `[core] collection-id` of this repository, whatever
@@ -3399,9 +3402,10 @@ fn mirror_targets(
 /// `summary` states is in field 0 of the summary. The ref of each other
 /// collection is in the entry of `id` of `ostree.summary.collection-map`. If
 /// the summary does not list the ref, or the remote serves no summary, the
-/// call reads the ref file of the remote: `refs/heads/<name>` if `remote_id`,
-/// the `[core] collection-id` of the remote, is `id`, else
-/// `refs/mirrors/<id>/<name>`.
+/// call reads the ref file of the remote: `refs/heads/<name>` if the
+/// collection id of the remote is `id`, else `refs/mirrors/<id>/<name>`. The
+/// collection id of the remote is `remote_id`, the `[core] collection-id` of
+/// the remote, or `summary_id` if `remote_id` is `None`.
 ///
 /// `summary_id` is the `ostree.summary.collection-id` of `summary`, or `None`
 /// if the summary states none.
@@ -3445,7 +3449,7 @@ async fn remote_collection_ref(
             return Ok(commit);
         }
     }
-    if remote_id == Some(id) {
+    if remote_id.or(summary_id) == Some(id) {
         fetch_remote_ref(source, HEADS_DIR, name).await
     } else {
         fetch_remote_ref(source, &format!("{MIRRORS_DIR}/{id}"), name).await

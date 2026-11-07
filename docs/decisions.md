@@ -3597,10 +3597,16 @@ rules:
 - The pull resolves `@ID:NAME` from the summary first: field 0 when the
   summary states the collection id `ID`, and else the entry of `ID` in the
   collection map. Then it reads one ref file: `refs/heads/NAME` when the
-  `[core] collection-id` of the `config` of the remote is `ID`, and else
-  `refs/mirrors/ID/NAME`. The server keeps the refs of its own id under
-  `refs/heads/` ("The own collection id"), and its summary lists them in
-  field 0.
+  collection id of the remote is `ID`, and else `refs/mirrors/ID/NAME`. The
+  collection id of the remote is the `[core] collection-id` of the `config`
+  of the remote. When the remote serves no config, or the config has no
+  `collection-id`, it is the `ostree.summary.collection-id` of the summary.
+  The server keeps the refs of its own id under `refs/heads/` ("The own
+  collection id"), and its summary lists them in field 0. The config id
+  wins because `ostrya serve` and `ostrya send` take it as the own id of
+  the repository: they serve no file under `refs/mirrors/OWN/`, and the
+  summary that they make states it. The config thus states which refs are
+  under `refs/heads/`.
 - The pull writes `@ID:NAME` by the own-id rule of the client: to
   `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the own id.
   The remote name gives the place of a plain name alone.
@@ -3620,6 +3626,9 @@ These alternatives were rejected:
 - A read of `refs/mirrors/ID/NAME` for each id. A server keeps the refs of
   its own id under `refs/heads/`, so the pull would not find them when the
   remote serves no summary.
+- A read of `refs/heads/NAME` when the config id or the summary id is `ID`.
+  When the config states another id `X`, `refs/heads/NAME` holds a ref of
+  `X`, and the binding check refuses its tip.
 
 ## The collection of a mirror pull
 

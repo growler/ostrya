@@ -11947,9 +11947,9 @@ async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
 /// If a `PREFIX` names a ref, the output is that one ref, with the commit
 /// checksum as the target. Each other prefix keeps the aliases under it. The
 /// name is never stripped, and `-r` adds nothing, as in the `ostree` command.
-/// An alias is a local ref, so the command refuses an `@X:` prefix of an id X
-/// that is not the collection id of the repository. `@OWN:` selects each
-/// local alias.
+/// An alias is a local ref, so the command refuses a prefix `@X:` or
+/// `@X:PREFIX` of an id X that is not the collection id of the repository.
+/// `@OWN:` selects each local alias.
 async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
     let aliases = repo.list_ref_aliases().await?;
     let own = repo.config().collection_id();
@@ -12067,9 +12067,9 @@ fn own_prefix<'a>(prefix: Option<&'a str>, own: Option<&str>) -> (Option<&'a str
     }
 }
 
-/// Refuses an `@X:` PREFIX of `-A`. An alias is a local ref, so a collection
-/// ref of another id is no alias. [`own_prefix`] read the PREFIX before the
-/// call.
+/// Refuses a PREFIX `@X:` or `@X:PREFIX` of `-A`. An alias is a local ref, so
+/// a collection ref of another id is no alias. [`own_prefix`] read the PREFIX
+/// before the call.
 fn refuse_collection_alias_prefix(prefix: Option<&str>) {
     if let Some(prefix) = prefix.filter(|prefix| collection_prefix(prefix).is_some()) {
         exit_error(&format!("-A takes no collection prefix: {prefix}"));

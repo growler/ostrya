@@ -47930,8 +47930,9 @@ fn refs_lists_a_collection_prefix() {
     assert_eq!(lines(&["refs", &format!("@{OWN_ID}:")]), ["main"]);
 }
 
-/// `refs -A` refuses `--create=@X:a`, the target `@X:a`, and the PREFIX
-/// `@X:`. `-A --create=@OWN:al main` writes the local alias `al`.
+/// `refs -A` refuses `--create=@X:a`, the target `@X:a`, and a PREFIX `@X:`
+/// or `@X:a`. `refs -A --delete @X:a` refuses the PREFIX and keeps the ref.
+/// `-A --create=@OWN:al main` writes the local alias `al`.
 #[test]
 fn refs_alias_refuses_a_collection_ref() {
     let tmp = TmpDir::new("refs-alias-collection");
@@ -47950,6 +47951,15 @@ fn refs_alias_refuses_a_collection_ref() {
         &ostrya_at(&repo, &["refs", "-A", "@org.example.X:"]),
         "-A takes no collection prefix: @org.example.X:",
     );
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "@org.example.X:a"]),
+        "-A takes no collection prefix: @org.example.X:a",
+    );
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-A", "--delete", "@org.example.X:a"]),
+        "-A takes no collection prefix: @org.example.X:a",
+    );
+    assert!(repo.join("refs/mirrors/org.example.X/a").is_file());
     assert!(!repo.join("refs/heads/al").exists());
 
     ostrya_at(

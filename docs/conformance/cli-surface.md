@@ -397,8 +397,10 @@ tool. The port extension has these rules:
   `@ID:NAME` with `error: Cannot create alias to collection ref: @ID:NAME`,
   and a `PREFIX` `@ID:` or `@ID:PREFIX`, in a listing and with `--delete`,
   with `error: -A takes no collection prefix: <PREFIX>`. Each refusal exits
-  1 and writes nothing. `-A --create=@OWN:NAME` writes the local alias
-  `NAME`.
+  1. A refusal of a `--create` form writes nothing. The prefixes before a
+  refused `PREFIX` keep their effect: a listing prints their rows, and
+  `--delete` removes the refs that they selected. `-A --create=@OWN:NAME`
+  writes the local alias `NAME`.
 
 Abbreviated checksum resolution is shared: a run of one to 63 lowercase hex
 characters names the one commit object whose checksum starts with it, wherever a

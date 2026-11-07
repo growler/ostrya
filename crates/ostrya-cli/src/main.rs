@@ -62,8 +62,8 @@ use ostrya::{
     DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer,
     Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult, FsckBindingError,
     FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, KeyFile,
-    MutableTree, Namespace, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags,
-    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias,
+    MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RefNamespace,
     RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer,
     Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
     TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
@@ -9273,7 +9273,7 @@ fn shadowed_ref_name(r: &Ref) -> Option<String> {
 /// local namespace. A remote ref is in the local namespace.
 fn collection_of(r: &Ref) -> Option<&str> {
     match r.namespace() {
-        Namespace::Collection(id) => Some(id),
+        RefNamespace::Collection(id) => Some(id),
         _ => None,
     }
 }

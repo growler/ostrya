@@ -452,11 +452,11 @@ impl Ref {
     /// The call does not canonicalize the ref. A collection ref of the own
     /// id of a repository is in the namespace of its local refs only after
     /// [`canonical`](Ref::canonical).
-    pub fn namespace(&self) -> Namespace<'_> {
+    pub fn namespace(&self) -> RefNamespace<'_> {
         match self {
-            Ref::Local { .. } => Namespace::Local,
-            Ref::Remote { remote, .. } => Namespace::Remote(remote),
-            Ref::Collection { id, .. } => Namespace::Collection(id),
+            Ref::Local { .. } => RefNamespace::Local,
+            Ref::Remote { remote, .. } => RefNamespace::Remote(remote),
+            Ref::Collection { id, .. } => RefNamespace::Collection(id),
         }
     }
 
@@ -574,7 +574,7 @@ impl ParseRefError {
 
 /// The namespace of a [`Ref`], as [`Ref::namespace`] returns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Namespace<'a> {
+pub enum RefNamespace<'a> {
     /// The local refs.
     Local,
     /// The refs of the remote with this name.
@@ -629,11 +629,11 @@ mod tests {
 
     #[test]
     fn a_ref_gives_its_namespace() {
-        assert_eq!(Ref::local("a").namespace(), Namespace::Local);
-        assert_eq!(Ref::remote("o", "a").namespace(), Namespace::Remote("o"));
+        assert_eq!(Ref::local("a").namespace(), RefNamespace::Local);
+        assert_eq!(Ref::remote("o", "a").namespace(), RefNamespace::Remote("o"));
         assert_eq!(
             Ref::collection("org.example.A", "a").namespace(),
-            Namespace::Collection("org.example.A")
+            RefNamespace::Collection("org.example.A")
         );
     }
 

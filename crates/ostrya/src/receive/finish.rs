@@ -78,6 +78,15 @@ pub(super) struct Named<'a> {
 }
 
 impl Named<'_> {
+    /// Returns a map from each name of `names` to its index.
+    fn by_name(&self) -> HashMap<&str, usize> {
+        self.names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.as_str(), i))
+            .collect()
+    }
+
     /// Returns the index in `names` of each name of `wanted`, in order.
     ///
     /// A name that `Hello` did not name is `protocol`, and so is a name that
@@ -88,12 +97,7 @@ impl Named<'_> {
         wanted: impl Iterator<Item = &'n str>,
         what: &str,
     ) -> Checked<Vec<usize>> {
-        let index: HashMap<&str, usize> = self
-            .names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.as_str(), i))
-            .collect();
+        let index = self.by_name();
         let mut seen = HashSet::new();
         let mut found = Vec::new();
         for name in wanted {
@@ -116,16 +120,32 @@ impl Named<'_> {
 /// 64 lowercase hex characters if `writes` is `true`: a revision reads such
 /// text as a checksum, so a push writes no commit to such a ref.
 pub(super) fn commit_ref(own: Option<&str>, name: &str, writes: bool) -> Checked<Ref> {
-    let invalid = || {
-        Failure::Wire(remote::Error::InvalidRef(format!(
-            "invalid ref name '{name}'"
-        )))
-    };
-    let r = name.parse::<Ref>().map_err(|_| invalid())?.canonical(own);
-    match &r {
-        Ref::Local { name } if writes && ostrya_core::is_checksum_shaped(name) => Err(invalid()),
-        _ => Ok(r),
+    let r = name
+        .parse::<Ref>()
+        .map_err(|_| invalid_ref(name))?
+        .canonical(own);
+    check_shape(&r, name, writes)?;
+    Ok(r)
+}
+
+/// Checks the canonical ref `r` of the ref name `name` of a `Commit`
+/// message.
+///
+/// A local ref of 64 lowercase hex characters is `invalid-ref` if `writes`
+/// is `true`.
+fn check_shape(r: &Ref, name: &str, writes: bool) -> Checked<()> {
+    match r {
+        Ref::Local { name: local } if writes && ostrya_core::is_checksum_shaped(local) => {
+            Err(invalid_ref(name))
+        }
+        _ => Ok(()),
     }
+}
+
+fn invalid_ref(name: &str) -> Failure {
+    Failure::Wire(remote::Error::InvalidRef(format!(
+        "invalid ref name '{name}'"
+    )))
 }
 
 /// A commit that a ref update names as its new value.
@@ -636,8 +656,18 @@ pub(super) fn report(
 /// - The message holds one update at least.
 /// - Each update names a ref of `Hello`, with the text of `Hello`, once.
 fn check_names(own: Option<&str>, named: &Named<'_>, updates: &[RefUpdate]) -> Checked<Vec<usize>> {
+    // `Hello` holds the canonical ref of each of its names. Read the other
+    // names here, so that an invalid name is `invalid-ref` before the
+    // protocol check.
+    let index = named.by_name();
     for update in updates {
-        commit_ref(own, &update.name, update.new.is_some())?;
+        let writes = update.new.is_some();
+        match index.get(update.name.as_str()) {
+            Some(&i) => check_shape(&named.refs[i], &update.name, writes)?,
+            None => {
+                commit_ref(own, &update.name, writes)?;
+            }
+        }
     }
     if updates.is_empty() {
         return Err(protocol("the Commit message holds no ref update".into()));

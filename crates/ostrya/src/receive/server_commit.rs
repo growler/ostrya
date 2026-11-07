@@ -466,7 +466,7 @@ fn check_names(
             "the Commit message holds a server commit and force".into(),
         ));
     }
-    let found = named.indices(refs(sc), "written")?;
+    let found = Named::indices(&named.by_name(), refs(sc), "written")?;
     let branch = &named.refs[found[0]];
     for &i in &found[1..] {
         let tag = &named.refs[i];

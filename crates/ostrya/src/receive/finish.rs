@@ -79,7 +79,7 @@ pub(super) struct Named<'a> {
 
 impl Named<'_> {
     /// Returns a map from each name of `names` to its index.
-    fn by_name(&self) -> HashMap<&str, usize> {
+    pub(super) fn by_name(&self) -> HashMap<&str, usize> {
         self.names
             .iter()
             .enumerate()
@@ -87,17 +87,17 @@ impl Named<'_> {
             .collect()
     }
 
-    /// Returns the index in `names` of each name of `wanted`, in order.
+    /// Returns the index in `names` of each name of `wanted`, in order, as
+    /// `index` maps it. `index` is the map that [`Named::by_name`] returns.
     ///
     /// A name that `Hello` did not name is `protocol`, and so is a name that
     /// `wanted` holds two times. `what` is the verb of the message of the
     /// second case.
     pub(super) fn indices<'n>(
-        &self,
+        index: &HashMap<&str, usize>,
         wanted: impl Iterator<Item = &'n str>,
         what: &str,
     ) -> Checked<Vec<usize>> {
-        let index = self.by_name();
         let mut seen = HashSet::new();
         let mut found = Vec::new();
         for name in wanted {
@@ -672,7 +672,7 @@ fn check_names(own: Option<&str>, named: &Named<'_>, updates: &[RefUpdate]) -> C
     if updates.is_empty() {
         return Err(protocol("the Commit message holds no ref update".into()));
     }
-    named.indices(updates.iter().map(|u| u.name.as_str()), "updated")
+    Named::indices(&index, updates.iter().map(|u| u.name.as_str()), "updated")
 }
 
 /// Checks that the `CommitReply` of `updates` fits in a frame of

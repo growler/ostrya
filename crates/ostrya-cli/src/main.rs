@@ -14817,8 +14817,10 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     // The refusals that follow come in the order of the `ostree` command. The
     // order is the option pair, the `--static-deltas-only` requirement, the
     // date, each `--retain-branch-depth` value, and then the revisions:
-    // `--delete-commit` first, and then each `--only-branch` value. No refusal
-    // writes, so a refusal leaves the repository as it was.
+    // `--delete-commit` first, and then each `--only-branch` value. This
+    // function resolves `--delete-commit`. `Repo::prune` resolves each
+    // `--only-branch` value before it takes the lock. No refusal writes, so a
+    // refusal leaves the repository as it was.
     if args.no_prune && args.delete_commit.is_some() {
         exit_error("Cannot specify both --delete-commit and --no-prune");
     }
@@ -14843,12 +14845,8 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         Some(rev) => Some(resolve(&repo, rev).await?),
         None => None,
     };
-    // Each --only-branch value resolves as a revision, so a value that names
-    // nothing fails here. The run then selects a ref by the value read as a
-    // ref, and does not read the commit that the value resolves to.
     let mut only_branch = Vec::with_capacity(args.only_branch.len());
     for value in &args.only_branch {
-        resolve(&repo, value).await?;
         only_branch.push(branch_ref(value));
     }
     let retain_branch_depth = retain_branch_depth

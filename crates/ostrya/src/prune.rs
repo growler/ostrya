@@ -222,11 +222,16 @@ pub struct PruneOptions {
     /// each branch that neither this list nor
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth) names.
     ///
-    /// A value selects the ref that the run reads as an equal [`Ref`].
+    /// Each run resolves the text form of each value as a revision, as
+    /// [`resolve_rev`](Repo::resolve_rev) does. A
+    /// [`static_deltas_only`](PruneOptions::static_deltas_only) run does this
+    /// too. The resolve comes before the run takes the lock, so a value that
+    /// names nothing fails the prune, and the run removes nothing. A value
+    /// selects the ref that the run reads as an equal [`Ref`].
     /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) states which refs
-    /// the run reads as a [`Ref`]. The run does not resolve a value, so a
-    /// value that names no ref selects no branch and gives no error. If no
-    /// value selects a branch, the run keeps every branch in full. No value
+    /// the run reads as a [`Ref`]. A value that resolves and equals no ref
+    /// that the run reads selects no branch. If no value selects a branch, the
+    /// run keeps every branch in full. No value
     /// selects a ref under `refs/mirrors/ID/` of the `[core] collection-id`
     /// of the repository, so the run keeps such a ref in full under a
     /// non-empty list.
@@ -525,7 +530,7 @@ pub struct PruneStats {
     /// because the run left that ref in place.
     ///
     /// A [`static_deltas_only`](PruneOptions::static_deltas_only) run returns
-    /// before it reads the refs, so it classifies no ref. The list is then
+    /// before it lists the refs, so it classifies no ref. The list is then
     /// empty, whatever [`weak_ref_filter`](PruneOptions::weak_ref_filter)
     /// holds.
     ///
@@ -826,6 +831,12 @@ impl Repo {
     ///   run with [`commit_only`](PruneOptions::commit_only) reads no dirtree.
     /// - [`Error::LockTimeout`] if the wait for the lock passes `[core]
     ///   lock-timeout-secs`.
+    /// - An error of [`resolve_rev`](Repo::resolve_rev), for example
+    ///   [`Error::RefNotFound`], if a value of
+    ///   [`only_branch`](PruneOptions::only_branch) does not resolve. Each
+    ///   run, a [`static_deltas_only`](PruneOptions::static_deltas_only) run
+    ///   too, resolves the values before it takes the lock and removes
+    ///   anything.
     /// - [`Error::Io`] if a read, a write, or a removal on the file system
     ///   fails.
     /// - [`Error::Io`] if a metadata object is larger than
@@ -868,6 +879,14 @@ impl Repo {
             ));
         }
 
+        // The run resolves each branch selection as a revision before the
+        // lock, as it refuses the pairs above, so a value that names nothing
+        // fails each run, the delta-only run too. The run does not read the
+        // commit that the value resolves to.
+        for r in &opts.only_branch {
+            self.resolve_rev(&r.to_string(), false).await?;
+        }
+
         let _lock = self.lock_repo(LockKind::Exclusive).await?;
 
         let Some(delta_target) = opts.delete_commit else {
@@ -892,7 +911,7 @@ impl Repo {
                 total_objects,
                 pruned_objects: 0,
                 freed_bytes: 0,
-                // A delta-only run reads no ref, so it deletes none.
+                // A delta-only run lists no ref, so it deletes none.
                 deleted_refs: Vec::new(),
                 // A delta-only run walks nothing, so it reads no related value.
                 warnings: Vec::new(),
@@ -921,7 +940,7 @@ impl Repo {
         let named_refs = self.list_all_refs().await?;
         // The run reads each listed ref as a canonical `Ref`, so a value of a
         // branch list selects a ref by an equal value only in its canonical
-        // form. A value that names no ref selects nothing.
+        // form. A value that resolves and equals no listed ref selects nothing.
         let own = self.config().collection_id();
         let opts = &opts.with_canonical_branches(own);
         // Classify the ref space in one pass, so the strong roots and the weak

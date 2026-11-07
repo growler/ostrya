@@ -272,26 +272,39 @@ fn only_branch_implies_refs_only() {
     });
 }
 
-/// The run does not resolve a value of `only_branch`. A value that names no
-/// ref selects no branch, so the run keeps every branch in full. The hex of a
-/// commit names no ref either.
+/// The run resolves each value of `only_branch` as a revision. A value that
+/// names nothing fails the prune before the run removes an object. A value
+/// that resolves and names no ref selects no branch, so the run keeps every
+/// branch in full.
 #[test]
-fn only_branch_naming_no_ref_selects_nothing() {
+fn only_branch_naming_no_ref_is_refused() {
     let tmp = TmpDir::new("prune-only-branch-unknown");
     block_on(async {
         let repo = repo_at(tmp.path()).await;
         let main = chain(&repo, tmp.path(), "main").await;
 
+        // The value `main` selects a branch, so a run that did not refuse
+        // `nosuch` would prune the history of `main`.
         let mut opts = PruneOptions {
             refs_only: true,
             depth: 0,
-            only_branch: vec![Ref::local("nosuch")],
+            only_branch: vec![Ref::local("main"), Ref::local("nosuch")],
             ..PruneOptions::default()
         };
-        let stats = repo.prune(&opts).await.unwrap();
-        assert_eq!(stats.pruned_objects, 0);
+        let err = repo.prune(&opts).await.unwrap_err();
+        assert!(matches!(err, Error::RefNotFound(_)), "got {err:?}");
+        assert!(
+            holds(&repo, &main[0]).await,
+            "the refusal stands ahead of every removal"
+        );
+
+        opts.only_branch = vec![Ref::local("main"), Ref::collection(COLLECTION, "nosuch")];
+        let err = repo.prune(&opts).await.unwrap_err();
+        assert!(matches!(err, Error::RefNotFound(_)), "got {err:?}");
         assert!(holds(&repo, &main[0]).await);
 
+        // A value that resolves to a commit and names no ref gives the depth
+        // to no branch, so the run keeps every branch in full.
         opts.only_branch = vec![Ref::local(main[2].to_hex())];
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(stats.pruned_objects, 0);
@@ -313,7 +326,7 @@ async fn move_to_collection(repo: &Repo, name: &str) {
 const COLLECTION: &str = "org.example.Os";
 
 /// A value of `only_branch` selects a collection ref by the collection id and
-/// the name. The local ref of the same name selects nothing.
+/// the name. The local ref of the same name names nothing, so the prune fails.
 #[test]
 fn only_branch_selects_a_collection_ref() {
     let tmp = TmpDir::new("prune-only-branch-collection");
@@ -323,12 +336,24 @@ fn only_branch_selects_a_collection_ref() {
         let coll = chain(&repo, tmp.path(), "coll").await;
         move_to_collection(&repo, "coll").await;
 
-        let stats = prune(&repo, |o| {
-            o.depth = 0;
-            o.only_branch = vec![Ref::local("coll")];
-        })
-        .await;
-        assert_eq!(stats.pruned_objects, 0, "the local name selects nothing");
+        // The value `main` selects a branch, so a run that did not refuse
+        // the local name `coll` would prune the history of `main`.
+        let opts = PruneOptions {
+            refs_only: true,
+            depth: 0,
+            only_branch: vec![Ref::local("main"), Ref::local("coll")],
+            ..PruneOptions::default()
+        };
+        let err = repo.prune(&opts).await.unwrap_err();
+        assert!(
+            matches!(err, Error::RefNotFound(_)),
+            "the local name names nothing: {err:?}"
+        );
+        assert!(
+            holds(&repo, &main[0]).await,
+            "the refusal stands ahead of every removal"
+        );
+        assert!(holds(&repo, &coll[0]).await);
 
         prune(&repo, |o| {
             o.depth = 0;
@@ -875,6 +900,41 @@ fn static_deltas_only_deletes_the_delta_and_nothing_else() {
             repo.list_static_deltas().await.unwrap(),
             vec![format!("{}-{}", main[0].to_hex(), main[1].to_hex())],
             "the delta the named commit targets goes and the other stays"
+        );
+    });
+}
+
+/// A `static_deltas_only` run resolves each value of `only_branch` too, so a
+/// value that names nothing fails the run before it removes a delta.
+#[test]
+fn static_deltas_only_refuses_an_only_branch_value_that_names_nothing() {
+    let tmp = TmpDir::new("prune-deltas-only-unknown-branch");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let main = chain(&repo, tmp.path(), "main").await;
+        repo.generate_static_delta(Some(&main[1]), &main[2], &DeltaOptions::default())
+            .await
+            .unwrap();
+
+        let err = repo
+            .prune(&PruneOptions {
+                delete_commit: Some(main[2]),
+                static_deltas_only: true,
+                only_branch: vec![Ref::local("nosuch")],
+                ..PruneOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::RefNotFound(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_static_deltas().await.unwrap(),
+            vec![format!("{}-{}", main[1].to_hex(), main[2].to_hex())],
+            "the refusal removes no delta"
         );
     });
 }

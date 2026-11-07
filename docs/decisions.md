@@ -3130,10 +3130,11 @@ The rules of the classification:
 - `only_branch` and `retain_branch_depth` hold `Ref` values. The run maps
   a value `@OWN:NAME` of the own id to the local ref `NAME`, and selects a
   ref by a value equal to its `Ref`. A ref that gets no `Ref` takes the
-  bound of a ref that no list names. The run does not resolve a value, so a
-  value that names no ref selects nothing. The `ostrya` command resolves
-  each `--only-branch` value as a revision first, so a value that names
-  nothing fails the command.
+  bound of a ref that no list names. Each run, the `static_deltas_only`
+  run too, resolves the text form of each `only_branch` value as a
+  revision before it takes the lock. A value that names nothing fails the
+  prune with `Error::RefNotFound`, and the run removes nothing. A value
+  that resolves and equals no `Ref` of a listed ref selects nothing.
 - A weak collection ref follows the rule of each weak ref. It survives when
   the walk reaches its commit over a `parent` edge, a dependency in field 2,
   or a build source in `ostrya.related`. A strong ref on the same commit
@@ -3470,9 +3471,11 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   `PREFIX`. `refs --delete` refuses `@X:` and `@OWN:` with an empty rest
   if the prefix matches a ref, as it refuses a whole-remote `PREFIX`.
 - `prune --only-branch` and `--retain-branch-depth` take `@ID:NAME`. The
-  command resolves each `--only-branch` value as a revision, and passes the
-  value as a `Ref`. A value that is not a ref, for example `main^`, becomes
-  the local ref of the text, which selects nothing.
+  command passes each value as a `Ref`, and `Repo::prune` resolves each
+  `only_branch` value as a revision before it takes the lock. A value that
+  names nothing fails the command, the `--static-deltas-only` run too. A
+  value that is not a ref, for example `main^`, becomes the local ref of
+  the text, which selects nothing.
 
 These alternatives were rejected:
 

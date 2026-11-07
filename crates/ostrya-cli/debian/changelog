@@ -1,5 +1,16 @@
-ostrya (0.10.0) UNRELEASED; urgency=medium
+ostrya (0.10.0) unstable; urgency=medium
 
+  * Add the global option --remotes-config-dir. The command reads the
+    remotes in the NAME.conf files of the remotes directory. It selects
+    the directory in this order: the option, the key [ex-ostrya]
+    remotes-config-dir, /etc/ostree/remotes.d for the system repository,
+    and no directory. init --remotes-config-dir writes the key.
+  * remote add writes the remote into the new file NAME.conf of the
+    remotes directory, unless [core] add-remotes-config-dir is false.
+    remote add --force and remote delete change the file that holds the
+    remote. remote delete removes a .conf file that then holds no remote.
+  * The GPG keys of a remote are in NAME.trustedkeys.gpg of the
+    repository, or, when that file is absent, of the remotes directory.
   * remote gpg-import reads each -k file as a binary or an ASCII-armored
     keyring by itself. A mix of binary and armored files imports.
   * remote gpg-import and remote add --gpg-import refuse key input over
@@ -8,11 +19,25 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     keyring through a symlink, and take a symlink to no file as no
     keyring. They refuse a repository keyring over 4 MiB before they read
     it.
+  * The composefs image of a commit is the file
+    extensions/ostrya/composefs/AA/REST.cfs. No pull, push, send,
+    receive, static delta, or bucket operation carries it. A static delta
+    or a push stream with a .cfs object is refused.
+  * fsck checks each composefs image against the key
+    ostree.composefs.digest.v0 of its commit, and --delete removes a
+    faulty image.
+  * With [ex-ostrya] generate-composefs true, commit, pull, pull-local,
+    receive, the receive endpoint of serve, and static-delta
+    apply-offline build and check the composefs image of each complete
+    commit that carries ostree.composefs.digest.v0. pull and pull-local
+    write a warning when the repository does not seal its objects with
+    fs-verity. fsck writes a line for a commit with the key and no image.
   * The collection-id of a repository is its local namespace. refs -c
     --create and pull --collection write refs/heads/REF for that id.
   * refs -c, summary -u, and the ref listing of serve ignore
-    refs/mirrors/ID/ of the own collection id. fsck prints a line for
-    each ref there, and prune keeps its commit.
+    refs/mirrors/ID/ of the own collection id. serve serves no file
+    under that directory. fsck prints a line for each ref there, and
+    prune keeps its commit.
   * push to a bucket and remote summary -u skip the keys of
     refs/mirrors/ID/ of the collection id of the bucket. remote fsck
     gives each such key a note, and remote prune keeps its commit.
@@ -33,6 +58,25 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
   * prune --only-branch reads a ref name. It refuses a checksum and
     main^.
   * pull-local takes @ID:REF operands of more than one collection.
+  * push, push --onto, push-tree, and send take @ID:NAME for each ref
+    that they write. The push protocol carries the namespace of each
+    ref, and the server writes @ID:NAME of its own collection id to
+    refs/heads/NAME. Each push refuses a ref that is a local name of 64
+    lowercase hexadecimal characters on the destination.
+  * Add --disable-verify-bindings to push, send, and receive, and the
+    client group key disable-verify-bindings. They skip the check of
+    ostree.ref-binding.
+  * receive --one-way takes --allow-collection=ID.
+  * pull from a named remote takes REF and @ID:REF operands of more than
+    one collection. @ID:REF writes refs/mirrors/ID/REF, or
+    refs/heads/REF for the own collection id.
+  * pull --mirror writes a plain REF as @S:REF, where S is the collection
+    id of the summary. With no ref, it pulls each ref of the ref list and
+    of the collection map of the summary.
+  * pull and pull-local refuse two operands that write one ref.
+  * pull --collection=ID takes REF and @ID:REF. A remote is a candidate
+    when its collection-id is ID or its mirrored-collection-ids key holds
+    ID. remote add takes --mirrored-collection-id.
   * A client group holds the items of each namespace: allow takes
     [MODES:]@ID:PATTERN, and deny takes @ID:PATTERN. The config refuses
     the key collection, and one item in two groups. With no client
@@ -41,7 +85,7 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     for the collection ID. serve refuses a certificate with an
     ostrya:collection: URI with 403.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 04 Nov 2026 15:15:21 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 07 Nov 2026 22:26:49 +0100
 
 ostrya (0.9.0) unstable; urgency=medium
 

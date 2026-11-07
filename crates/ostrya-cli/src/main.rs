@@ -1548,11 +1548,11 @@ struct RefsArgs {
     /// The command then lists no ref. At least one PREFIX is required. A
     /// PREFIX that matches nothing is not an error. With -A, each PREFIX
     /// selects the aliases that a -A listing prints for it. With -c, each
-    /// PREFIX is a collection id. If an alias names a local ref that a PREFIX
-    /// matches, the command fails, and that PREFIX deletes nothing. Without
-    /// -c, if a PREFIX `<remote>:` or `@ID:` matches a ref, the command fails,
-    /// and that PREFIX deletes nothing. This applies to each ID, also to the
-    /// collection id of the repository.
+    /// PREFIX is a collection id. Without -c, if an alias under `refs/heads`
+    /// names a local ref that a PREFIX matches, the command fails, and that
+    /// PREFIX deletes nothing. Without -c, if a PREFIX `<remote>:` or `@ID:`
+    /// matches a ref, the command fails, and that PREFIX deletes nothing. This
+    /// applies to each ID, also to the collection id of the repository.
     #[arg(long)]
     delete: bool,
     /// Print the whole name of each ref, with the matched PREFIX in it.
@@ -11675,7 +11675,9 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// refused with exit 1, and the prefix that matched it removes nothing. The
 /// guard runs for each prefix, after the whole-remote refusal.
 /// `refs --delete deep test` removes the matches of `deep` and then reports
-/// the refusal for `test`. `-c` has no alias guard.
+/// the refusal for `test`. `-c` has no alias guard. The guard reads the
+/// aliases under `refs/heads` alone. An alias under `refs/remotes` or
+/// `refs/mirrors` guards no ref.
 ///
 /// # Prefix order
 ///
@@ -11700,7 +11702,8 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// the collection id of the repository and PREFIX is a local ref name, is the
 /// prefix PREFIX, and `@OWN:` selects each local ref. The alias guard applies
 /// to these local refs. The command refuses each other `@OWN:REST`.
-/// With `-A`, the command refuses an `@X:` prefix of another id.
+/// A prefix `@X:` or `@X:PREFIX` of another id runs no alias guard.
+/// With `-A`, the command refuses a prefix `@X:` or `@X:PREFIX` of another id.
 ///
 /// Each selected name of a plain, a remote, or a `-A` prefix must parse as a
 /// local or a remote ref before the command removes the first ref of the
@@ -11887,8 +11890,9 @@ async fn select_aliases(
 /// the ref `other`. The link itself resolves to `refs/heads/test/other`.
 ///
 /// An alias under `refs/remotes` names no ref here. A body that reaches
-/// outside `refs/heads` matches no local refspec, which is a local ref name
-/// with no `:`.
+/// outside `refs/heads` also names the ref of the body with its leading `../`
+/// components removed: the body `../remotes/origin/x` names the local ref
+/// `remotes/origin/x`.
 fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
     listed
         .iter()

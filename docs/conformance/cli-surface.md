@@ -124,7 +124,8 @@ are observed and deliberately not reproduced:
   `-r` agree verbatim, both refuse the delete and remove nothing, and a
   whole-remote prefix matching no ref exits 0 in both, including where a prefix
   ahead of it in the same `--delete` removed the remote's last ref;
-- `refs --delete` refuses a ref under `refs/heads` that an alias names, with
+- `refs --delete` refuses a ref under `refs/heads` that an alias under
+  `refs/heads` names, with
   `error: Ref '<refspec>' has an active alias: '<alias>'`, in both
   implementations. Where one prefix matches more than one guarded ref, or more
   than one alias names one matched ref, each names the pair its own enumeration
@@ -381,7 +382,9 @@ tool. The port extension has these rules:
   `refs --delete REMOTE:` does. The rule applies to each `ID`, also to
   `OWN`, and to `refs --delete -A @OWN:`. The prefix removes no ref. If it
   matches no ref, the command exits 0. `refs --delete @ID:PREFIX` removes
-  the refs that the prefix matches, and no local ref.
+  the refs that the prefix matches, and no local ref. The refusal of a ref
+  that an alias names does not apply to a prefix `@ID:` or `@ID:PREFIX` of
+  another id. The port and the tool write no alias under `refs/mirrors/`.
 - A `PREFIX` `@OWN:PREFIX`, where `OWN` is the `[core] collection-id` of the
   repository and `PREFIX` is a local ref name, is the `PREFIX` `PREFIX`.
   `@OWN:` matches each local ref. A `PREFIX` `@OWN:REST`, where `REST` is

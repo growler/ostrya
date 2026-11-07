@@ -62,10 +62,10 @@ use ostrya::{
     DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer,
     Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult, FsckBindingError,
     FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, KeyFile,
-    MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RefSelector,
-    RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary,
-    SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
+    MutableTree, Namespace, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags,
+    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias,
+    RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer,
+    Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
     TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
     from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
     validate_refspec,
@@ -9226,13 +9226,7 @@ fn tag_name_refusal(branch: Option<&str>, tags: &[String], own: Option<&str>) ->
     }
     for (inner_option, inner, inner_ref) in &names {
         for (outer_option, outer, outer_ref) in &names {
-            let same_dir = match (inner_ref, outer_ref) {
-                (Ref::Local { .. }, Ref::Local { .. }) => true,
-                (Ref::Remote { remote: a, .. }, Ref::Remote { remote: b, .. })
-                | (Ref::Collection { id: a, .. }, Ref::Collection { id: b, .. }) => a == b,
-                _ => false,
-            };
-            if same_dir
+            if inner_ref.same_namespace(outer_ref)
                 && inner_ref
                     .name()
                     .starts_with(&format!("{}/", outer_ref.name()))
@@ -9266,8 +9260,8 @@ fn shadowed_ref_name(r: &Ref) -> Option<String> {
 /// [`commit_ref`] reads it: the id of a collection ref, and `None` for the
 /// local namespace. A remote ref is in the local namespace.
 fn collection_of(r: &Ref) -> Option<&str> {
-    match r {
-        Ref::Collection { id, .. } => Some(id),
+    match r.namespace() {
+        Namespace::Collection(id) => Some(id),
         _ => None,
     }
 }

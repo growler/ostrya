@@ -470,7 +470,7 @@ fn check_names(
     let branch = &named.refs[found[0]];
     for &i in &found[1..] {
         let tag = &named.refs[i];
-        if !same_namespace(tag, branch) {
+        if !tag.same_namespace(branch) {
             return Err(protocol(format!(
                 "tag '{tag}' is not in the namespace of the branch '{branch}' of the server \
                  commit"
@@ -478,17 +478,6 @@ fn check_names(
         }
     }
     Ok(found)
-}
-
-/// Returns `true` if the canonical refs `a` and `b` are in one namespace:
-/// both local, both of one collection, or both of one remote.
-fn same_namespace(a: &Ref, b: &Ref) -> bool {
-    match (a, b) {
-        (Ref::Local { .. }, Ref::Local { .. }) => true,
-        (Ref::Collection { id: x, .. }, Ref::Collection { id: y, .. }) => x == y,
-        (Ref::Remote { remote: x, .. }, Ref::Remote { remote: y, .. }) => x == y,
-        _ => false,
-    }
 }
 
 /// Checks that a commit can hold each metadata value of `sc` (`protocol`).

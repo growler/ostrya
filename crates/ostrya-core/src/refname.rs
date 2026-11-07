@@ -415,6 +415,48 @@ impl Ref {
         }
     }
 
+    /// Returns the namespace of the ref: the local refs, the refs of one
+    /// remote, or the refs of one collection id.
+    ///
+    /// The call does not canonicalize the ref. A collection ref of the own
+    /// id of a repository is in the namespace of its local refs only after
+    /// [`canonical`](Ref::canonical).
+    pub fn namespace(&self) -> Namespace<'_> {
+        match self {
+            Ref::Local { .. } => Namespace::Local,
+            Ref::Remote { remote, .. } => Namespace::Remote(remote),
+            Ref::Collection { id, .. } => Namespace::Collection(id),
+        }
+    }
+
+    /// Returns `true` if the refs `self` and `other` are in one namespace:
+    /// both local, both of one remote, or both of one collection id.
+    pub fn same_namespace(&self, other: &Ref) -> bool {
+        self.namespace() == other.namespace()
+    }
+
+    /// Returns the first ref of `refs` that is in another collection than
+    /// an earlier ref of `refs`, with that earlier ref.
+    ///
+    /// The refs that are not collection refs are ignored. The call returns
+    /// `None` if the collection refs of `refs` hold one collection id.
+    pub fn collection_conflict<'a>(
+        refs: impl IntoIterator<Item = &'a Ref>,
+    ) -> Option<(&'a Ref, &'a Ref)> {
+        let mut first: Option<(&Ref, &str)> = None;
+        for r in refs {
+            let Ref::Collection { id, .. } = r else {
+                continue;
+            };
+            match first {
+                Some((other, other_id)) if other_id != id => return Some((other, r)),
+                Some(_) => {}
+                None => first = Some((r, id)),
+            }
+        }
+        None
+    }
+
     /// Checks the ref against the ref-name rule.
     ///
     /// The ref name must pass [`is_ref_name`] in each case. The remote of
@@ -502,6 +544,17 @@ impl ParseRefError {
     }
 }
 
+/// The namespace of a [`Ref`], as [`Ref::namespace`] returns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Namespace<'a> {
+    /// The local refs.
+    Local,
+    /// The refs of the remote with this name.
+    Remote(&'a str),
+    /// The refs of the collection with this id.
+    Collection(&'a str),
+}
+
 impl fmt::Display for ParseRefError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "invalid ref: {}", self.text)
@@ -530,6 +583,51 @@ mod tests {
         }
         let r = Ref::collection("org.example.Os", "a");
         assert_eq!(r.clone().canonical(None), r);
+    }
+
+    #[test]
+    fn a_ref_gives_its_namespace() {
+        assert_eq!(Ref::local("a").namespace(), Namespace::Local);
+        assert_eq!(Ref::remote("o", "a").namespace(), Namespace::Remote("o"));
+        assert_eq!(
+            Ref::collection("org.example.A", "a").namespace(),
+            Namespace::Collection("org.example.A")
+        );
+    }
+
+    #[test]
+    fn same_namespace_compares_the_kind_and_the_owner() {
+        let local = Ref::local("a");
+        let remote = Ref::remote("o", "a");
+        let a = Ref::collection("org.example.A", "a");
+        let b = Ref::collection("org.example.B", "a");
+        assert!(local.same_namespace(&Ref::local("b")));
+        assert!(!remote.same_namespace(&local));
+        assert!(remote.same_namespace(&Ref::remote("o", "b")));
+        assert!(!remote.same_namespace(&Ref::remote("p", "a")));
+        assert!(a.same_namespace(&Ref::collection("org.example.A", "b")));
+        assert!(!a.same_namespace(&b));
+        assert!(!a.same_namespace(&local));
+        let own = Some("org.example.A");
+        assert!(a.clone().canonical(own).same_namespace(&local));
+        assert!(!b.canonical(own).same_namespace(&local));
+    }
+
+    #[test]
+    fn collection_conflict_returns_the_first_pair_of_two_ids() {
+        let a = Ref::collection("org.example.A", "a");
+        let a2 = Ref::collection("org.example.A", "b");
+        let b = Ref::collection("org.example.B", "a");
+        let c = Ref::collection("org.example.C", "a");
+        let local = Ref::local("x");
+        assert_eq!(Ref::collection_conflict([]), None);
+        assert_eq!(Ref::collection_conflict([&a]), None);
+        assert_eq!(Ref::collection_conflict([&local, &a, &local, &a2]), None);
+        assert_eq!(
+            Ref::collection_conflict([&a, &local, &b, &c]),
+            Some((&a, &b))
+        );
+        assert_eq!(Ref::collection_conflict([&a, &a2, &c, &b]), Some((&a, &c)));
     }
 
     #[test]

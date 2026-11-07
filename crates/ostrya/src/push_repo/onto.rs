@@ -329,20 +329,10 @@ impl Repo {
 /// [`PushSession::check_server_commit`] checks them after `HelloReply`. The
 /// error is [`InvalidInput`](crate::remote::Error::InvalidInput).
 fn check_one_collection(branch: &Ref, tags: &[Ref]) -> Result<()> {
-    let mut first: Option<(&Ref, &str)> = None;
-    for r in std::iter::once(branch).chain(tags) {
-        let Ref::Collection { id, .. } = r else {
-            continue;
-        };
-        match first {
-            Some((other, other_id)) if other_id != id => {
-                return Err(invalid(format!(
-                    "the refs '{other}' and '{r}' of the server commit are in two namespaces"
-                )));
-            }
-            Some(_) => {}
-            None => first = Some((r, id)),
-        }
+    if let Some((other, r)) = Ref::collection_conflict(std::iter::once(branch).chain(tags)) {
+        return Err(invalid(format!(
+            "the refs '{other}' and '{r}' of the server commit are in two namespaces"
+        )));
     }
     Ok(())
 }

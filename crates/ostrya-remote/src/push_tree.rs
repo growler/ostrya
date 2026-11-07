@@ -623,20 +623,10 @@ fn check_names(
     // The server maps the refs of its own collection id to its local refs,
     // so the check of a local ref and a collection ref comes after
     // `HelloReply`. Two collections are two namespaces on each server.
-    let mut first: Option<(&Ref, &str)> = None;
-    for r in std::iter::once(&onto).chain(&tags) {
-        let Ref::Collection { id, .. } = r else {
-            continue;
-        };
-        match first {
-            Some((other, other_id)) if other_id != id => {
-                return Err(invalid(format!(
-                    "the refs '{other}' and '{r}' of the server commit are in two namespaces"
-                )));
-            }
-            Some(_) => {}
-            None => first = Some((r, id)),
-        }
+    if let Some((other, r)) = Ref::collection_conflict(std::iter::once(&onto).chain(&tags)) {
+        return Err(invalid(format!(
+            "the refs '{other}' and '{r}' of the server commit are in two namespaces"
+        )));
     }
     for name in bind_refs {
         if name.contains(':') || !ostrya_core::is_ref_name(name) {

@@ -11617,16 +11617,18 @@ fn own_local_name<'a>(text: &'a str, own: Option<&str>) -> &'a str {
 ///
 /// The lookup reads only the ref store ([`Repo::resolve_ref_tip`]), so no
 /// revision syntax applies here. An alias target is a refspec, so a name that
-/// [`validate_refspec`] refuses names no ref.
+/// does not parse as a local or a remote ref names no ref.
 async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
     // A 64-character name is a checksum only in lowercase hex, as the split
     // resolution reads it. An uppercase one is looked up as a ref name, and an
     // alias to it is written.
-    if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() || validate_refspec(rev).is_err()
-    {
+    if rev.ends_with('^') || Checksum::from_hex_lower(rev).is_ok() {
         return Ok(None);
     }
-    repo.resolve_ref_tip(&rev.parse::<Ref>()?).await
+    match rev.parse::<Ref>() {
+        Ok(r) if !matches!(r, Ref::Collection { .. }) => repo.resolve_ref_tip(&r).await,
+        _ => Ok(None),
+    }
 }
 
 /// Returns `true` if `rev` names a ref file, by the rules of
@@ -11806,9 +11808,11 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
             for refspec in &selected {
                 // A listed name is a refspec. A name with `@` from outside the
                 // port fails here, and it is not read as a collection ref.
-                validate_refspec(refspec)?;
-                repo.set_ref_immediate(&refspec.parse::<Ref>()?, None)
-                    .await?;
+                let r = refspec.parse::<Ref>()?;
+                if matches!(r, Ref::Collection { .. }) {
+                    return Err(Error::InvalidRefspec(refspec.clone()));
+                }
+                repo.set_ref_immediate(&r, None).await?;
             }
         }
         all.retain(|(name, _)| !selected.contains(name));

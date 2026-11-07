@@ -1539,10 +1539,10 @@ impl Repo {
         let mirror = opts.flags.contains(PullFlags::MIRROR);
         // Under `MIRROR`, a plain name and each ref of field 0 of the summary
         // are refs of the collection that the summary states.
-        let summary_id = summary
-            .filter(|_| mirror)
+        let summary_collection_id = summary
             .and_then(|summary| summary.metadata_value(COLLECTION_ID_KEY))
             .and_then(Value::as_str);
+        let summary_id = summary_collection_id.filter(|_| mirror);
         let names = if !opts.refs.is_empty() {
             opts.refs.clone()
         } else if mirror {
@@ -1580,7 +1580,10 @@ impl Repo {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let target = match operand_collection(&name).filter(|_| operands) {
+            let operand = operand_collection(&name)
+                .filter(|_| operands)
+                .map(|(id, ref_name)| (id.to_owned(), ref_name.to_owned()));
+            let target = match operand {
                 Some(_) => name.clone(),
                 None => {
                     // The name goes on the wire as a request path, so the pull
@@ -1594,22 +1597,30 @@ impl Repo {
                     }
                 }
             };
-            wanted_refs.push((name, target));
+            wanted_refs.push((name, target, operand));
         }
         check_one_place(
             place,
             wanted_refs
                 .iter()
-                .map(|(name, target)| (name.as_str(), target.as_str())),
+                .map(|(name, target, _)| (name.as_str(), target.as_str())),
         )?;
 
         let mut listed = HashMap::new();
         let mut out = Vec::with_capacity(wanted_refs.len());
-        for (name, target) in wanted_refs {
-            let checksum = match operand_collection(&name).filter(|_| operands) {
+        for (name, target, operand) in wanted_refs {
+            let checksum = match operand {
                 Some((id, ref_name)) => {
-                    remote_collection_ref(summary, &mut listed, remote_id, id, ref_name, source)
-                        .await?
+                    remote_collection_ref(
+                        summary,
+                        summary_collection_id,
+                        &mut listed,
+                        remote_id,
+                        &id,
+                        &ref_name,
+                        source,
+                    )
+                    .await?
                 }
                 None => match summary.and_then(|summary| summary.lookup(&name)) {
                     Some(checksum) => Some(checksum),
@@ -3418,6 +3429,9 @@ fn check_one_place<'a>(
 /// the `[core] collection-id` of the remote, is `id`, else
 /// `refs/mirrors/<id>/<name>`.
 ///
+/// `summary_id` is the `ostree.summary.collection-id` of `summary`, or `None`
+/// if the summary states none.
+///
 /// `listed` holds the refs of each collection whose entry of the collection
 /// map an earlier call parsed, by collection id and then by name. The call
 /// parses the entry of `id` only if `listed` does not hold `id`, and then
@@ -3430,6 +3444,7 @@ fn check_one_place<'a>(
 /// - The errors of [`fetch_remote_ref`].
 async fn remote_collection_ref(
     summary: Option<&Summary>,
+    summary_id: Option<&str>,
     listed: &mut HashMap<String, HashMap<String, Checksum>>,
     remote_id: Option<&str>,
     id: &str,
@@ -3437,9 +3452,6 @@ async fn remote_collection_ref(
     source: &RemoteSource,
 ) -> Result<Option<Checksum>> {
     if let Some(summary) = summary {
-        let summary_id = summary
-            .metadata_value(COLLECTION_ID_KEY)
-            .and_then(Value::as_str);
         let commit = if summary_id == Some(id) {
             summary.lookup(name)
         } else {

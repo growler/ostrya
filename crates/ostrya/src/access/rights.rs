@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use ostrya_core::{MAX_COLLECTION_ID_LEN, RefPattern, is_collection_id};
+use ostrya_core::{MAX_COLLECTION_ID_LEN, RefPattern, is_valid_collection_id};
 
 use super::Namespace;
 use crate::error::{Error, Result};
@@ -213,7 +213,7 @@ fn split_collection(text: &str) -> std::result::Result<(Option<String>, &str), S
             "the collection id is longer than {MAX_COLLECTION_ID_LEN} bytes"
         ));
     }
-    if !is_collection_id(id) {
+    if !is_valid_collection_id(id) {
         return Err("the collection id fails the collection-id rule".to_owned());
     }
     Ok((Some(id.to_owned()), rest))
@@ -337,7 +337,8 @@ impl NamespaceRules {
     /// [`local`](NamespaceRules::local). A
     /// [`Collection`](Namespace::Collection) gives its entry of
     /// [`collections`](NamespaceRules::collections). An id that fails the
-    /// collection-id rule gives `None`.
+    /// collection-id rule or is longer than [`MAX_COLLECTION_ID_LEN`] bytes
+    /// gives `None`.
     pub fn get(&self, namespace: &Namespace) -> Option<&AccessRules> {
         match namespace {
             Namespace::Local => Some(&self.local),
@@ -350,7 +351,7 @@ impl NamespaceRules {
     pub(crate) fn collection(&self, id: &str) -> Option<&AccessRules> {
         self.collections
             .get(id)
-            .or_else(|| self.other.as_ref().filter(|_| is_collection_id(id)))
+            .or_else(|| self.other.as_ref().filter(|_| is_valid_collection_id(id)))
     }
 
     /// Returns the effective rights of the ref `name` of `namespace`, as
@@ -428,6 +429,27 @@ mod tests {
             Err("the collection id fails the collection-id rule".to_owned())
         );
         assert_eq!(split_collection("x"), Ok((None, "x")));
+    }
+
+    /// The rules of each other collection apply only to an id that passes
+    /// the collection-id rule and is at most `MAX_COLLECTION_ID_LEN` bytes.
+    #[test]
+    fn the_other_rules_refuse_a_collection_id_over_the_limit() {
+        let ns = NamespaceRules {
+            other: Some(rules(&["r:**"], &[])),
+            ..NamespaceRules::default()
+        };
+        let longest = format!("a.{}", "b".repeat(MAX_COLLECTION_ID_LEN - 2));
+        let over = format!("{longest}b");
+        assert_eq!(over.len(), MAX_COLLECTION_ID_LEN + 1);
+        assert!(ns.collection(&longest).is_some());
+        assert!(ns.collection(&over).is_none());
+        assert!(ns.get(&Namespace::Collection(over.clone())).is_none());
+        assert_eq!(
+            ns.rights(&Namespace::Collection(over), "x"),
+            AccessModes::NONE
+        );
+        assert!(ns.collection("nodot").is_none());
     }
 
     /// The modes parse in any order, and `Display` writes them in the order

@@ -141,8 +141,10 @@ impl ReadAccess {
     /// Returns `true` if the client reads the ref `name` of `namespace`.
     ///
     /// A [`Collection`](Namespace::Collection) of `[core] collection-id` is
-    /// the local namespace. An id that fails the collection-id rule gives
-    /// `false`.
+    /// the local namespace. An id that fails the collection-id rule or is
+    /// longer than
+    /// [`MAX_COLLECTION_ID_LEN`](ostrya_core::MAX_COLLECTION_ID_LEN) bytes
+    /// gives `false`.
     pub fn can_read(&self, namespace: &Namespace, name: &str) -> bool {
         let rules = match namespace {
             Namespace::Collection(id) if !self.inner.access.is_own_collection(id) => {
@@ -200,8 +202,9 @@ impl ReadAccess {
     /// collection `id`, with the claims, or `None`.
     ///
     /// The result is `None` for `[core] collection-id`, which is the local
-    /// namespace, for an id that fails the collection-id rule, and when the
-    /// rules of the group name no ref of the collection.
+    /// namespace, for an id that fails the collection-id rule or is longer
+    /// than [`MAX_COLLECTION_ID_LEN`](ostrya_core::MAX_COLLECTION_ID_LEN)
+    /// bytes, and when the rules of the group name no ref of the collection.
     pub(crate) fn collection_rules(&self, id: &str) -> Option<&AccessRules> {
         if self.inner.access.is_own_collection(id) {
             return None;

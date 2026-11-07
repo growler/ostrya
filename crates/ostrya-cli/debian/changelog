@@ -23,7 +23,8 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     a remote ref.
   * refs --create and refs --delete take @ID:NAME without -c. A PREFIX
     @ID: matches each ref of the collection ID, and a listing prints
-    @ID:NAME. -A refuses a collection ref of another id.
+    @ID:NAME. refs --delete refuses a PREFIX @ID: with an empty rest, as
+    it refuses REMOTE:. -A refuses a collection ref of another id.
   * prune --only-branch and --retain-branch-depth take @ID:NAME.
   * pull-local takes @ID:REF operands of more than one collection.
   * A client group holds the items of each namespace: allow takes

@@ -1541,7 +1541,10 @@ struct RefsArgs {
     /// PREFIX that matches nothing is not an error. With -A, each PREFIX
     /// selects the aliases that a -A listing prints for it. With -c, each
     /// PREFIX is a collection id. If an alias names a local ref that a PREFIX
-    /// matches, the command fails, and that PREFIX deletes nothing.
+    /// matches, the command fails, and that PREFIX deletes nothing. Without
+    /// -c, if a PREFIX `<remote>:` or `@ID:` matches a ref, the command fails,
+    /// and that PREFIX deletes nothing. This applies to each ID, also to the
+    /// collection id of the repository.
     #[arg(long)]
     delete: bool,
     /// Print the whole name of each ref, with the matched PREFIX in it.
@@ -11646,7 +11649,8 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// exit 1, and the prefix removes none of its matches. This is the outcome of
 /// `ostree`. `ostree` names each ref that it deletes as the ref half of the
 /// prefix joined with the name under it. The `.` in that join gives a refspec
-/// that the rule of `ostree` refuses.
+/// that the rule of `ostree` refuses. A prefix `@ID:` with an empty rest takes
+/// the same refusal, for each ID. See "Collection refs".
 ///
 /// The prefixes before it keep their effect. A whole-remote prefix that
 /// matches no ref exits 0. The two commands use different words for the
@@ -11684,6 +11688,12 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// prefix PREFIX, and `@OWN:` selects each local ref. The alias guard applies
 /// to these local refs. The command refuses each other `@OWN:REST`.
 /// With `-A`, the command refuses an `@X:` prefix of another id.
+///
+/// If a prefix `@X:` or `@OWN:` with an empty rest selects one or more refs
+/// or aliases, the command fails with [`Error::InvalidRefspec`], and the
+/// prefix removes none of them. This is the rule of a whole-remote prefix.
+/// The command reads the prefix as given for this check. A prefix `@X:` that
+/// selects nothing exits 0.
 ///
 /// # Collection ids (`-c`)
 ///
@@ -11758,8 +11768,10 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 .map(|(name, _)| name)
                 .collect()
         };
-        if let Some(given) = prefix
-            && whole_remote(given).is_some()
+        // The refusal reads the prefix as given, so `@OWN:` is refused as
+        // `@X:` is.
+        if let Some(given) = given
+            && (whole_remote(given).is_some() || whole_collection(given))
             && !selected.is_empty()
         {
             return Err(Error::InvalidRefspec(given.to_owned()));
@@ -12174,6 +12186,13 @@ fn whole_remote(prefix: &str) -> Option<&str> {
         Some((remote, "" | ".")) if !remote.contains('/') => Some(remote),
         _ => None,
     }
+}
+
+/// Returns `true` if a prefix is `@ID:`, a collection prefix with an empty
+/// rest. It names each ref of the id, and `refs --delete` refuses it as it
+/// refuses a whole-remote prefix.
+fn whole_collection(prefix: &str) -> bool {
+    matches!(collection_prefix(prefix), Some((_, "")))
 }
 
 /// Returns `true` if a refspec is the prefix or is nested under it.

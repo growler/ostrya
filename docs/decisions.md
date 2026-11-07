@@ -3467,7 +3467,8 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   command refuses each other `@OWN:REST`, for example `@OWN:origin:main`,
   as the refspec rule refuses `@X:origin:main`. `-A` refuses a collection
   ref of another id as `NEWREF`, as the target of an alias, and as a
-  `PREFIX`.
+  `PREFIX`. `refs --delete` refuses `@X:` and `@OWN:` with an empty rest
+  if the prefix matches a ref, as it refuses a whole-remote `PREFIX`.
 - `prune --only-branch` and `--retain-branch-depth` take `@ID:NAME`. The
   command resolves each `--only-branch` value as a revision, and passes the
   value as a `Ref`. A value that is not a ref, for example `main^`, becomes

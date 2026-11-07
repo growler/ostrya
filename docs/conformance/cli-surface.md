@@ -370,14 +370,15 @@ tool. The port extension has these rules:
   `@ID:NAME`. Without `--list`, a prefix `@ID:PREFIX` prints the part below
   it as `@ID:NAME`, by the rule of a remote prefix. A listing with no
   `PREFIX` prints no collection ref.
-- `refs --delete @ID:` removes each ref under `refs/mirrors/ID/`. The
-  refusal of a whole-remote prefix does not apply to it, and the command
-  exits 0. `refs --delete @ID:PREFIX` removes the refs that the prefix
-  matches, and no local ref.
+- `refs --delete @ID:`, with an empty rest, gives
+  `error: Invalid refspec @ID:` and exits 1 if it matches a ref, as
+  `refs --delete REMOTE:` does. The rule applies to each `ID`, also to
+  `OWN`, and to `refs --delete -A @OWN:`. The prefix removes no ref. If it
+  matches no ref, the command exits 0. `refs --delete @ID:PREFIX` removes
+  the refs that the prefix matches, and no local ref.
 - A `PREFIX` `@OWN:PREFIX`, where `OWN` is the `[core] collection-id` of the
   repository and `PREFIX` is a local ref name, is the `PREFIX` `PREFIX`.
-  `@OWN:` matches each local ref, and `refs --delete @OWN:` removes each
-  local ref under the alias guard. A `PREFIX` `@OWN:REST`, where `REST` is
+  `@OWN:` matches each local ref. A `PREFIX` `@OWN:REST`, where `REST` is
   not a local ref name, gives `error: Invalid refspec @OWN:REST` and exits 1.
   Examples are `@OWN:origin:main` and `@OWN:@ID:`. The target
   `@OWN:REMOTE:NAME` of `-A --create` is a collection ref of the refusal

@@ -47697,9 +47697,9 @@ fn refs_create_takes_a_collection_ref() {
 
 /// `refs --delete @X:a` deletes `@X:a/b` and `@X:a/c`, and keeps `@X:ab` and
 /// the local ref `a/b`. `refs --delete @OWN:a` deletes the local ref `a/b`.
-/// `refs --delete @X:` deletes each ref of X, and keeps the refs of Y.
-/// `refs --delete @OWN:` deletes each local ref, and keeps the remote refs and
-/// the refs under `refs/mirrors/OWN/`.
+/// `refs --delete @X:ab` deletes the ref `ab` of X, and keeps the refs of Y.
+/// `refs --delete @OWN:main` deletes the local ref `main`, and keeps the remote
+/// refs and the refs under `refs/mirrors/OWN/`.
 #[test]
 fn refs_delete_takes_a_collection_prefix() {
     let tmp = TmpDir::new("refs-delete-collection");
@@ -47729,16 +47729,48 @@ fn refs_delete_takes_a_collection_prefix() {
     assert!(!present("refs/heads/a/b"));
     assert!(present("refs/heads/main"));
 
-    ostrya_at(&repo, &["refs", "--delete", "@org.example.X:"]).ok();
+    ostrya_at(&repo, &["refs", "--delete", "@org.example.X:ab"]).ok();
     assert!(!present("refs/mirrors/org.example.X/ab"));
     assert!(present("refs/mirrors/org.example.Y/a/b"));
     assert!(present("refs/heads/main"));
 
-    ostrya_at(&repo, &["refs", "--delete", &format!("@{OWN_ID}:")]).ok();
+    ostrya_at(&repo, &["refs", "--delete", &format!("@{OWN_ID}:main")]).ok();
     assert!(!present("refs/heads/main"));
     assert!(present("refs/remotes/origin/main"));
     assert!(present("refs/mirrors/org.example.Y/a/b"));
     assert!(own_mirror.is_file());
+}
+
+/// `refs --delete @ID:` with an empty rest is refused for each id, as a
+/// whole-remote prefix is, if it matches a ref. `@OWN:`, `@X:`, and
+/// `-A @OWN:` with an alias delete no ref. `@Z:`, which matches no ref,
+/// exits 0.
+#[test]
+fn refs_delete_refuses_a_whole_collection_prefix() {
+    let tmp = TmpDir::new("refs-delete-whole-collection");
+    let (repo, _main) = own_repo_with_main(tmp.path());
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+    ostrya_at(&repo, &["refs", "-A", "--create=al", "main"]).ok();
+    let before = describe_refs(&repo);
+
+    let own = format!("@{OWN_ID}:");
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", "@org.example.X:"]),
+        "Invalid refspec @org.example.X:",
+    );
+    assert_eq!(describe_refs(&repo), before);
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", &own]),
+        &format!("Invalid refspec {own}"),
+    );
+    assert_eq!(describe_refs(&repo), before);
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", "-A", &own]),
+        &format!("Invalid refspec {own}"),
+    );
+    assert_eq!(describe_refs(&repo), before);
+    ostrya_at(&repo, &["refs", "--delete", "@org.example.Z:"]).ok();
+    assert_eq!(describe_refs(&repo), before);
 }
 
 /// `@OWN:REST` is the local ref REST only if REST is a local ref name. `refs`

@@ -189,7 +189,7 @@ impl BucketRepo {
                 continue;
             }
             match ref_key(key) {
-                Some(_) => keys.push(key),
+                Some(_) => keys.push(((), key)),
                 None => {
                     return Err(self.malformed(format!(
                         "it holds the key '{}' under refs/, which is no ref of refs/heads/ or of \
@@ -200,7 +200,7 @@ impl BucketRepo {
             }
         }
         let mut refs = BucketRefs::default();
-        for (key, commit) in self.read_ref_files(keys).await? {
+        for ((), key, commit) in self.read_ref_files(keys).await? {
             match ref_key(key) {
                 Some(RefKey::Head(name)) => {
                     refs.heads.insert(name.to_owned(), commit);
@@ -220,68 +220,94 @@ impl BucketRepo {
         Ok(refs)
     }
 
-    /// Reads the refs of the ref directory `dir`, `refs/heads/` or
-    /// `refs/mirrors/ID/`: one list of `dir`, then a read of each ref file.
-    /// The call reads no key outside `dir`.
+    /// Reads the refs of each ref directory of `dirs`, `refs/heads/` or
+    /// `refs/mirrors/ID/`, and returns one map for each directory, in the
+    /// order of `dirs`. The call reads no key outside `dirs`.
     ///
-    /// The part of each key after `dir` passes the ref name rule. A ref file
-    /// holds 64 lowercase hex digits and a newline. At most
-    /// `max_outstanding` ref file reads of this call run at a time. Calls
-    /// for more than one directory at the same time each have that bound,
-    /// so the total is the bound times the number of directories.
+    /// The call sends one list of each directory, at most `max_outstanding`
+    /// lists at a time. Then it reads the ref files of all the directories,
+    /// at most `max_outstanding` reads at a time in total.
+    ///
+    /// The part of each key after its directory passes the ref name rule. A
+    /// ref file holds 64 lowercase hex digits and a newline.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a key under `dir` is no ref name, if a
-    ///   ref file is malformed, or if a listed ref file is gone at its read.
+    /// - [`Error::InvalidFormat`] if a key under a directory is no ref name,
+    ///   if a ref file is malformed, or if a listed ref file is gone at its
+    ///   read.
     /// - [`Error::Remote`] for an error of the bucket client.
     #[cfg_attr(not(feature = "push"), allow(dead_code))]
-    pub(crate) async fn read_ref_dir(&self, dir: &str) -> Result<BTreeMap<String, Checksum>> {
-        let listing = self.bucket.list(dir).await?;
-        let mut keys = Vec::with_capacity(listing.objects.len());
-        for listed in &listing.objects {
-            let key = listed.key.as_str();
-            match key.strip_prefix(dir) {
-                Some(name) if is_ref_name(name) => keys.push(key),
-                _ => {
-                    return Err(self.malformed(format!(
-                        "it holds the key '{}' under {dir}, which is no ref of {dir}",
-                        key.escape_debug()
-                    )));
+    pub(crate) async fn read_ref_dirs(
+        &self,
+        dirs: &[String],
+    ) -> Result<Vec<BTreeMap<String, Checksum>>> {
+        let mut listings = Vec::with_capacity(dirs.len());
+        let mut lists = Slots::new(self.max_outstanding);
+        let mut pending = dirs.iter().enumerate();
+        loop {
+            while lists.has_room()
+                && let Some((index, dir)) = pending.next()
+            {
+                let bucket = &self.bucket;
+                lists.push(async move { (index, bucket.list(dir).await) });
+            }
+            let Some((index, list)) = lists.next_ready().await else {
+                break;
+            };
+            listings.push((index, list?));
+        }
+        listings.sort_by_key(|(index, _)| *index);
+        let mut keys = Vec::new();
+        for (index, listing) in &listings {
+            let dir = dirs[*index].as_str();
+            for listed in &listing.objects {
+                let key = listed.key.as_str();
+                match key.strip_prefix(dir) {
+                    Some(name) if is_ref_name(name) => keys.push((*index, key)),
+                    _ => {
+                        return Err(self.malformed(format!(
+                            "it holds the key '{}' under {dir}, which is no ref of {dir}",
+                            key.escape_debug()
+                        )));
+                    }
                 }
             }
         }
-        Ok(self
-            .read_ref_files(keys)
-            .await?
-            .into_iter()
-            .map(|(key, commit)| (key[dir.len()..].to_owned(), commit))
-            .collect())
+        let mut refs = vec![BTreeMap::new(); dirs.len()];
+        for (index, key, commit) in self.read_ref_files(keys).await? {
+            refs[index].insert(key[dirs[index].len()..].to_owned(), commit);
+        }
+        Ok(refs)
     }
 
     /// Reads the ref file of each key of `keys`, at most `max_outstanding`
-    /// reads at a time, and returns each key with its commit.
+    /// reads at a time. Each item of `keys` is a tag and a key. The call
+    /// returns the tag and the key of each item with its commit.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if a ref file is malformed, or if a ref
     ///   file is gone at its read.
     /// - [`Error::Remote`] for an error of the bucket client.
-    async fn read_ref_files<'k>(&self, keys: Vec<&'k str>) -> Result<Vec<(&'k str, Checksum)>> {
+    async fn read_ref_files<'k, T: Send + 'k>(
+        &self,
+        keys: Vec<(T, &'k str)>,
+    ) -> Result<Vec<(T, &'k str, Checksum)>> {
         let mut out = Vec::with_capacity(keys.len());
         let mut reads = Slots::new(self.max_outstanding);
         let mut pending = keys.into_iter();
         loop {
             while reads.has_room()
-                && let Some(key) = pending.next()
+                && let Some((tag, key)) = pending.next()
             {
-                reads.push(async move { (key, self.read_ref_file(key).await) });
+                reads.push(async move { (tag, key, self.read_ref_file(key).await) });
             }
-            let Some((key, read)) = reads.next_ready().await else {
+            let Some((tag, key, read)) = reads.next_ready().await else {
                 break;
             };
             match read? {
-                RefRead::Commit(commit) => out.push((key, commit)),
+                RefRead::Commit(commit) => out.push((tag, key, commit)),
                 RefRead::Gone => {
                     return Err(self.malformed(format!(
                         "the ref file '{}' was in the listing and is gone",

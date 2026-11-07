@@ -48,7 +48,7 @@ use crate::error::{Error, Result};
 use crate::hashing::VerifyingReader;
 use crate::pull::drive::Slots;
 use crate::related::RelatedRule;
-use crate::remote::s3::{S3Endpoint, part_size};
+use crate::remote::s3::{Bucket, S3Endpoint, part_size};
 use crate::remote::tree::TreeModel;
 use crate::remote::{
     Compression, Encoding, ObjectData, ObjectSource, PushOutcome, PushPhase, PushProgress,
@@ -122,9 +122,11 @@ pub(super) struct BucketState {
 /// The call reads the `config`, which gives the namespace of each ref. Then
 /// it lists the objects and reads the ref files of the ref directory of
 /// each namespace. The listing and the reads of all the directories run at
-/// the same time. The call reads no ref file of another namespace. The
-/// namespace of the collection id of the bucket is `refs/heads/`, so the
-/// call does not list or read `refs/mirrors/` of that id.
+/// the same time. The ref file reads of all the directories share one bound
+/// of `max_outstanding`, and the listing of the objects has its own bound.
+/// The call reads no ref file of another namespace. The namespace of the
+/// collection id of the bucket is `refs/heads/`, so the call does not list
+/// or read `refs/mirrors/` of that id.
 ///
 /// If more than one read fails, the call returns the error of one of them.
 ///
@@ -134,7 +136,7 @@ pub(super) struct BucketState {
 ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
 ///   repository has no `config`.
 /// - The errors of [`BucketRepo::read_config`], of
-///   [`BucketRepo::read_ref_dir`], and of [`BucketRepo::list_objects`].
+///   [`BucketRepo::read_ref_dirs`], and of [`BucketRepo::list_objects`].
 pub(super) async fn read_state(bucket: &BucketRepo, refs: &[&Ref]) -> Result<BucketState> {
     let Some(config) = bucket.read_config().await? else {
         return Err(invalid(format!(
@@ -150,26 +152,13 @@ pub(super) async fn read_state(bucket: &BucketRepo, refs: &[&Ref]) -> Result<Buc
         .map(|r| Namespace::of(r, collection_id.as_deref()))
         .collect();
     // The push reads the ref directories of its namespaces alone.
-    let read_dirs = async {
-        let mut slots = Slots::new(namespaces.len());
-        for ns in namespaces {
-            slots.push(async move {
-                let dir = bucket.read_ref_dir(&ns.dir()).await;
-                (ns, dir)
-            });
-        }
-        let mut dirs = BTreeMap::new();
-        while let Some((ns, dir)) = slots.next_ready().await {
-            dirs.insert(ns, dir?);
-        }
-        Ok::<_, Error>(dirs)
-    };
-    let (dirs, listing) = zip(read_dirs, bucket.list_objects()).await;
+    let dirs: Vec<String> = namespaces.iter().map(Namespace::dir).collect();
+    let (refs, listing) = zip(bucket.read_ref_dirs(&dirs), bucket.list_objects()).await;
     Ok(BucketState {
         level,
         keep_related,
         collection_id,
-        dirs: dirs?,
+        dirs: namespaces.into_iter().zip(refs?).collect(),
         listing: listing?,
     })
 }
@@ -420,7 +409,10 @@ impl Repo {
         opts: RepoPushOptions,
     ) -> Result<BucketPushOutcome> {
         refuse_options(&opts)?;
-        let bucket = BucketRepo::open(&endpoint).await?;
+        let bucket = match opts.bucket_max_outstanding {
+            Some(n) => BucketRepo::new(Bucket::new(&endpoint).await?, n),
+            None => BucketRepo::open(&endpoint).await?,
+        };
         let mut plan = self.plan_push(&opts).await?;
         let progress = opts.progress.as_ref();
         if let Some(progress) = progress {

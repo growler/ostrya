@@ -2086,6 +2086,48 @@ fn the_ref_directories_of_the_namespaces_are_read_at_the_same_time() {
     });
 }
 
+/// The reads of the ref files of all the namespaces of a push share one
+/// bound of the requests in flight. The bound of the HTTP client is higher,
+/// so it does not hold the reads back.
+#[test]
+fn the_ref_file_reads_of_all_namespaces_share_one_bound() {
+    let scratch = TmpDir::new("push-s3-dirs-bound");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let main = commit(&repo, "main", None, "a", None).await;
+        let in_b = commit(&repo, "bound-b", None, "b", bound(B)).await;
+        let in_c = commit(&repo, "bound-c", None, "c", bound(C)).await;
+        let specs = [
+            "main".to_owned(),
+            "main:second".to_owned(),
+            format!("bound-b:@{B}:main"),
+            format!("bound-b:@{B}:second"),
+            format!("bound-c:@{C}:main"),
+            format!("bound-c:@{C}:second"),
+        ];
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        push(&repo, &server.endpoint(), opts(&specs)).await.unwrap();
+        commit(&repo, "main", Some(main), "a2", None).await;
+        commit(&repo, "bound-b", Some(in_b), "b2", bound(B)).await;
+        commit(&repo, "bound-c", Some(in_c), "c2", bound(C)).await;
+        {
+            let mut state = server.state();
+            state.delay = Some(("GET", "repo/refs/".to_owned(), Duration::from_millis(50)));
+            state.max_delayed = 0;
+        }
+        let bounded = RepoPushOptions {
+            bucket_max_outstanding: Some(2),
+            ..opts(&specs)
+        };
+        push_bounded(&repo, &server.endpoint(), bounded, 16)
+            .await
+            .unwrap();
+        assert_eq!(server.state().max_delayed, 2);
+    });
+}
+
 /// `NAME` and `@OWN:NAME` name one ref of a bucket whose collection id is
 /// `OWN`. A push that names both is refused before its first upload, and
 /// writes no ref.

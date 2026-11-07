@@ -134,6 +134,14 @@ pub struct RepoPushOptions {
     /// or HTTP refuses a value.
     #[doc(hidden)]
     pub part_size: Option<u64>,
+    /// The bound of the requests in flight of one call on a bucket
+    /// repository, for tests. `None` takes the
+    /// [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of
+    /// the HTTP options of the endpoint.
+    ///
+    /// A push over ssh or HTTP refuses a value.
+    #[doc(hidden)]
+    pub bucket_max_outstanding: Option<usize>,
 }
 
 /// Refuses the fields of `opts` that apply to a push to a bucket repository
@@ -142,6 +150,10 @@ fn refuse_bucket_fields(opts: &RepoPushOptions) -> Result<()> {
     let set = [
         ("break_lock", opts.break_lock),
         ("part_size", opts.part_size.is_some()),
+        (
+            "bucket_max_outstanding",
+            opts.bucket_max_outstanding.is_some(),
+        ),
     ];
     match set.iter().find(|(_, set)| *set) {
         Some((name, _)) => Err(invalid(format!(
@@ -1637,6 +1649,13 @@ mod tests {
                     ..RepoPushOptions::default()
                 },
                 "part_size",
+            ),
+            (
+                RepoPushOptions {
+                    bucket_max_outstanding: Some(2),
+                    ..RepoPushOptions::default()
+                },
+                "bucket_max_outstanding",
             ),
         ] {
             match refuse_bucket_fields(&opts) {

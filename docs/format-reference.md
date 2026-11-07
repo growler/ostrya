@@ -5223,6 +5223,15 @@ verification keys apply, and the place of each plain operand. Delta discovery
 reads the `from` commit of a delta at the place of the operand in the
 destination, with and without `no_ref_writes`.
 
+Unless the caller sets `no_ref_writes`, the pull refuses two different
+operands that write one ref, with `Error::Pull`, before it reads the source.
+An example is `main` and `@ID:main` with no remote name, into a destination
+whose `[core] collection-id` is `ID`: both write `refs/heads/main`. The text
+of the error is `the refs A and B write one ref PATH`. An operand given two
+times counts one time. The pull refuses an operand that gives no valid ref to
+write, for example an operand with a `^` suffix, with
+`Error::InvalidRefspec`, at the same step.
+
 Unless the caller sets `no_ref_writes`, the pull refuses the tip commit of an
 `@ID:REF` operand whose `ostree.collection-binding` is absent, is not a
 string, or is not `ID`. This is also true when `ID` is the

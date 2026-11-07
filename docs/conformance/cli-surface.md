@@ -4121,8 +4121,8 @@ refuses the value at exit 1. The port opens the source repository and each
 `--localcache-repo` first, and refuses the value before it reads a ref or an
 object of the source. Neither writes an object or a ref.
 
-The ref operands of `pull-local` of the port also take `@ID:REF[^...]` as a
-port extension (`../format-reference.md`, "The pull of collection refs"). One
+The ref operands of `pull-local` of the port also take `@ID:REF` as a port
+extension (`../format-reference.md`, "The pull of collection refs"). One
 run takes plain operands and `@ID:REF` operands of more than one collection.
 The port reads `@ID:REF` in the source at `refs/mirrors/ID/REF`, or at
 `refs/heads/REF` when `ID` is the collection id of the source. It writes the
@@ -4131,7 +4131,17 @@ collection id of the destination, also with `--remote`. The tip commit of
 `@ID:REF` must hold the `ostree.collection-binding` `ID`, and
 `--disable-verify-bindings` does not skip this check. An operand that starts
 with `@` and is not an `@ID:REF` ref gives `error: Invalid refspec
-<operand>` at exit 1, before the port reads the source.
+<operand>` at exit 1, before the port reads the source. An operand that
+gives no valid ref to write gives `error: Invalid refspec <ref>` at exit 1,
+before the port reads the source, and `<ref>` names the ref that the port
+writes: `--remote=origin SRC 'a b'` gives `error: Invalid refspec origin:a b`.
+The port refuses each operand with a `^` suffix in this way: `@ID:main^` into
+a destination whose collection id is ID gives `error: Invalid refspec main^`.
+Two different operands that write one ref give `error: pull: the refs A and B
+write one ref <path>` at exit 1, before the port reads the source. An example
+is `REF` and `@ID:REF` with no `--remote`, into a destination whose collection
+id is ID. The port writes no object and no ref. An operand given two times
+counts one time.
 
 The two GPG switches check what the tool checks and refuse where it refuses
 (`cli-behavior.md`, "Signature verification during a pull"), with the

@@ -23,7 +23,7 @@ The repository to pull from. Required.
 \fIREFS...\fR
 The refs to pull.
 .IP
-Each value is a revision of the source: a ref NAME, \%REMOTE:NAME, or \%@ID:NAME, or a checksum, with an optional \fB\%^\fR suffix. \%@ID:NAME is the ref NAME of the collection ID in the source, under \fB\%refs/mirrors/ID\fR, or the local ref NAME if ID is the collection id of the source. The pull writes \%@ID:NAME to \fB\%refs/mirrors/ID/NAME\fR, or to the local ref NAME if ID is the collection id of this repository, also with \%\-\-remote. The commit of \%@ID:NAME must hold the \fB\%ostree.collection\-binding\fR ID, and \%\-\-disable\-verify\-bindings does not change this. With none, the pull takes every local ref of the source, under \fB\%refs/heads\fR\&.
+Each value is a revision of the source: a ref NAME, \%REMOTE:NAME, or \%@ID:NAME, or a checksum. The command refuses a value with a \fB\%^\fR suffix, before it reads the source. \%@ID:NAME is the ref NAME of the collection ID in the source, under \fB\%refs/mirrors/ID\fR, or the local ref NAME if ID is the collection id of the source. The pull writes \%@ID:NAME to \fB\%refs/mirrors/ID/NAME\fR, or to the local ref NAME if ID is the collection id of this repository, also with \%\-\-remote. The commit of \%@ID:NAME must hold the \fB\%ostree.collection\-binding\fR ID, and \%\-\-disable\-verify\-bindings does not change this. A ref named two times counts one time. The command refuses two different refs that write one ref, before it reads the source. With none, the pull takes every local ref of the source, under \fB\%refs/heads\fR\&.
 .SH OPTIONS
 .TP
 \fB\-\-remote\fR \fIREMOTE\fR

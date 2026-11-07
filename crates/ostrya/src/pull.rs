@@ -1259,6 +1259,12 @@ impl Repo {
     ///   set, and else the ref of the name as a refspec: `refs/heads/<name>`,
     ///   or `refs/remotes/<REMOTE>/<NAME>` for `REMOTE:NAME`.
     ///
+    /// A name given two times counts one time. Two different names that write
+    /// one ref, such as `main` and `@ID:main` with no `remote` into a
+    /// repository whose `[core] collection-id` is `ID`, stop the pull before
+    /// it reads `src`. Under [`no_ref_writes`](PullOptions::no_ref_writes) the
+    /// pull makes no such check.
+    ///
     /// Delta discovery reads the `from` commit of a delta at that ref, with
     /// and without [`no_ref_writes`](PullOptions::no_ref_writes).
     ///
@@ -1654,6 +1660,14 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if a name starts with `@` and is not an
     ///   `@ID:NAME` ref that [`Ref`] reads, less each `^` at its end, before
     ///   the pull reads `src`. The error holds the name.
+    /// - [`Error::InvalidRefspec`] if, without
+    ///   [`no_ref_writes`](PullOptions::no_ref_writes), a name gives no valid
+    ///   ref to write, for example a name with a `^` suffix, before the pull
+    ///   reads `src`.
+    /// - [`Error::Pull`] if, without
+    ///   [`no_ref_writes`](PullOptions::no_ref_writes), two different names
+    ///   write one ref, before the pull reads `src`. The error names both
+    ///   names and the path of the ref.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote). With
     ///   [`trust_group`](PullOptions::trust_group), only a summary check needs
@@ -1753,6 +1767,7 @@ impl Repo {
         check_static_deltas(&opts)?;
         let related = RelatedRule::of(self.config())?;
         check_local_operands(&opts)?;
+        check_local_places(self, &opts)?;
         let edges = take_static_deltas(&mut opts).await?;
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
@@ -3529,6 +3544,63 @@ fn check_local_operands(opts: &PullOptions) -> Result<()> {
         if name.trim_end_matches('^').parse::<Ref>().is_err() {
             return Err(Error::InvalidRefspec(name.clone()));
         }
+    }
+    Ok(())
+}
+
+/// Refuses two different names of a local pull that write one ref.
+///
+/// Each name of [`refs`](PullOptions::refs) writes its ref at
+/// [`RefPlace::Operands`] of [`remote`](PullOptions::remote) and of the
+/// `[core] collection-id` of `repo`. A name given two times counts one time.
+/// Under [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
+/// and the function checks nothing. The check reads nothing.
+///
+/// # Errors
+///
+/// The errors of [`check_one_place`].
+fn check_local_places(repo: &Repo, opts: &PullOptions) -> Result<()> {
+    if opts.no_ref_writes {
+        return Ok(());
+    }
+    let place = RefPlace::Operands {
+        remote: opts.remote.as_deref(),
+        own: repo.config().collection_id(),
+    };
+    let mut seen = HashSet::new();
+    check_one_place(
+        place,
+        opts.refs
+            .iter()
+            .map(String::as_str)
+            .filter(|name| seen.insert(*name))
+            .map(|name| (name, name)),
+    )
+}
+
+/// Refuses two refs of a pull that write one ref at `place`.
+///
+/// Each item is a name of the pull and its target. No two items have the
+/// same name.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if a target gives no valid ref path.
+/// - [`Error::Pull`] if two targets write one ref. The error names both
+///   names and the ref path.
+fn check_one_place<'a>(
+    place: RefPlace<'_>,
+    refs: impl Iterator<Item = (&'a str, &'a str)>,
+) -> Result<()> {
+    let mut paths: HashMap<String, &str> = HashMap::new();
+    for (name, target) in refs {
+        let path = place.ref_path(target)?;
+        if let Some(first) = paths.get(path.as_str()) {
+            return Err(Error::Pull(format!(
+                "the refs {first} and {name} write one ref {path}"
+            )));
+        }
+        paths.insert(path, name);
     }
     Ok(())
 }

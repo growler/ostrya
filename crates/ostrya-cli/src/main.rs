@@ -5358,15 +5358,17 @@ struct PullLocalArgs {
     /// The refs to pull.
     ///
     /// Each value is a revision of the source: a ref NAME, REMOTE:NAME, or
-    /// @ID:NAME, or a checksum, with an optional `^` suffix. @ID:NAME is the
-    /// ref NAME of the collection ID in the source, under
-    /// `refs/mirrors/ID`, or the local ref NAME if ID is the collection id of
-    /// the source. The pull writes @ID:NAME to `refs/mirrors/ID/NAME`, or to
-    /// the local ref NAME if ID is the collection id of this repository, also
-    /// with --remote. The commit of @ID:NAME must hold the
-    /// `ostree.collection-binding` ID, and --disable-verify-bindings does not
-    /// change this. With none, the pull takes every local ref of the source,
-    /// under `refs/heads`.
+    /// @ID:NAME, or a checksum. The command refuses a value with a `^` suffix,
+    /// before it reads the source. @ID:NAME is the ref NAME of the collection
+    /// ID in the source, under `refs/mirrors/ID`, or the local ref NAME if ID
+    /// is the collection id of the source. The pull writes @ID:NAME to
+    /// `refs/mirrors/ID/NAME`, or to the local ref NAME if ID is the
+    /// collection id of this repository, also with --remote. The commit of
+    /// @ID:NAME must hold the `ostree.collection-binding` ID, and
+    /// --disable-verify-bindings does not change this. A ref named two times
+    /// counts one time. The command refuses two different refs that write one
+    /// ref, before it reads the source. With none, the pull takes every local
+    /// ref of the source, under `refs/heads`.
     refs: Vec<String>,
 }
 

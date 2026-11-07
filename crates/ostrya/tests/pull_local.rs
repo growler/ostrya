@@ -6124,6 +6124,126 @@ fn a_local_pull_reads_a_collection_ref_operand() {
     });
 }
 
+/// Into a destination whose `[core] collection-id` is X, with no remote, the
+/// names `main` and `@X:main` both write `refs/heads/main`. The pull refuses
+/// the pair before it reads the source, and writes no object and no ref. The
+/// pull requires static deltas and the source holds no summary: if the check
+/// comes after the first read of the source, the error is that of the absent
+/// summary. The pull refuses the name `main^`, which gives no valid ref to
+/// write, at the same step with [`Error::InvalidRefspec`]. A name given two
+/// times, the pair under a remote, and the pair with no ref writes are no
+/// error.
+#[test]
+fn a_local_pull_refuses_two_names_that_write_one_ref() {
+    let tmp = TmpDir::new("pull-collection-one-place");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, main) = source_repo(base, RepoMode::Archive).await;
+        let mirror = commit_collection_ref(
+            &src,
+            base,
+            "vc",
+            "main",
+            None,
+            bound_to(COLLECTION),
+            Some(&["main"]),
+        )
+        .await;
+        let dst_dir = base.join("dst");
+        let dst = Repo::create(
+            &dst_dir,
+            CreateOptions::new(RepoMode::BareUser).collection_id(COLLECTION),
+        )
+        .await
+        .unwrap();
+        let before = repo_inventory(&dst_dir);
+        let operand = format!("@{COLLECTION}:main");
+        let opts = |refs: &[&str]| PullOptions {
+            refs: refs.iter().map(|name| (*name).to_owned()).collect(),
+            ..PullOptions::default()
+        };
+
+        for (refs, deltas) in [
+            (["main", operand.as_str()], false),
+            ([operand.as_str(), "main"], false),
+            (["main", operand.as_str()], true),
+        ] {
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        require_static_deltas: deltas,
+                        ..opts(&refs)
+                    },
+                )
+                .await
+                .unwrap_err();
+            match err {
+                Error::Pull(msg) => assert_eq!(
+                    msg,
+                    format!(
+                        "the refs {} and {} write one ref refs/heads/main",
+                        refs[0], refs[1]
+                    )
+                ),
+                other => panic!("{refs:?} {deltas}: {other:?}"),
+            }
+            assert_eq!(repo_inventory(&dst_dir), before, "{refs:?} {deltas}");
+        }
+
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    require_static_deltas: true,
+                    ..opts(&["main^"])
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if name == "main^"),
+            "{err:?}"
+        );
+        assert_eq!(repo_inventory(&dst_dir), before);
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                no_ref_writes: true,
+                ..opts(&["main", &operand])
+            },
+        )
+        .await
+        .unwrap();
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+
+        dst.pull_local(&src, opts(&["main", "main"])).await.unwrap();
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            vec![("main".to_owned(), main)]
+        );
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                remote: Some("origin".to_owned()),
+                ..opts(&["main", &operand])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dst.list_remote_refs().await.unwrap(),
+            vec![("origin:main".to_owned(), main)]
+        );
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            vec![("main".to_owned(), mirror)]
+        );
+    });
+}
+
 /// A collection pull that writes refs refuses a tip with no collection
 /// binding. It writes no object, no ref, and no marker. The pull makes the
 /// check before its first write: under [`ReadOnlyStore`], a later check gives

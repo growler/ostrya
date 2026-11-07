@@ -68,8 +68,9 @@ use super::verify::Verification;
 use super::{
     CheckedMeta, ModeChecks, Pinned, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
     READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
-    check_commit_signatures_filtered, check_depth, check_remote_operands, check_remote_option,
-    check_static_deltas, check_tip_refs, completes_marked, operand_collection, take_static_deltas,
+    check_commit_signatures_filtered, check_depth, check_one_place, check_remote_operands,
+    check_remote_option, check_static_deltas, check_tip_refs, completes_marked, operand_collection,
+    take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -3389,33 +3390,6 @@ fn mirror_targets(
         out.iter().map(|(text, _)| (text.as_str(), text.as_str())),
     )?;
     Ok(out)
-}
-
-/// Refuses two refs of a pull that write one ref at `place`.
-///
-/// Each item is a name of the pull and its target. No two items have the
-/// same name.
-///
-/// # Errors
-///
-/// - [`Error::InvalidRefspec`] if a target gives no valid ref path.
-/// - [`Error::Pull`] if two targets write one ref. The error names both
-///   names and the ref path.
-fn check_one_place<'a>(
-    place: RefPlace<'_>,
-    refs: impl Iterator<Item = (&'a str, &'a str)>,
-) -> Result<()> {
-    let mut paths: HashMap<String, &str> = HashMap::new();
-    for (name, target) in refs {
-        let path = place.ref_path(target)?;
-        if let Some(first) = paths.get(path.as_str()) {
-            return Err(Error::Pull(format!(
-                "the refs {first} and {name} write one ref {path}"
-            )));
-        }
-        paths.insert(path, name);
-    }
-    Ok(())
 }
 
 /// Returns the commit of the ref `name` of the collection `id` on the remote,

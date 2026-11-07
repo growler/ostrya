@@ -430,6 +430,22 @@ impl Ref {
         }
     }
 
+    /// Puts a local ref in the collection `id`.
+    ///
+    /// A local ref `NAME` becomes `@ID:NAME`. A collection ref of `id` stays,
+    /// and so does a remote ref. The call does not check the ref or `id`.
+    ///
+    /// # Errors
+    ///
+    /// Gives back the ref unchanged if it is a collection ref of another id.
+    pub fn in_collection(self, id: &str) -> Result<Ref, Ref> {
+        match self {
+            Ref::Local { name } => Ok(Ref::collection(id, name)),
+            Ref::Collection { id: ref other, .. } if other != id => Err(self),
+            r => Ok(r),
+        }
+    }
+
     /// Returns the namespace of the ref: the local refs, the refs of one
     /// remote, or the refs of one collection id.
     ///
@@ -595,6 +611,20 @@ mod tests {
         }
         let r = Ref::collection("org.example.Os", "a");
         assert_eq!(r.clone().canonical(None), r);
+    }
+
+    #[test]
+    fn a_ref_in_a_collection_takes_its_id() {
+        let id = "org.example.Os";
+        assert_eq!(
+            Ref::local("a/b").in_collection(id),
+            Ok(Ref::collection(id, "a/b"))
+        );
+        for r in [Ref::collection(id, "a"), Ref::remote("origin", "a")] {
+            assert_eq!(r.clone().in_collection(id), Ok(r));
+        }
+        let other = Ref::collection("org.example.B", "a");
+        assert_eq!(other.clone().in_collection(id), Err(other));
     }
 
     #[test]

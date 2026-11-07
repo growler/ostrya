@@ -580,14 +580,15 @@ fn in_collection(r: Ref, collection: Option<&str>, what: &str) -> Result<Ref> {
     let Some(id) = collection else {
         return Ok(r);
     };
-    match r {
-        Ref::Local { name } => Ok(Ref::collection(id, name)),
-        Ref::Collection { id: ref other, .. } if other != id => Err(invalid(format!(
+    r.in_collection(id).map_err(|r| {
+        let Ref::Collection { id: other, .. } = &r else {
+            unreachable!("a refused ref is a collection ref");
+        };
+        invalid(format!(
             "{what} '{r}' names the collection '{other}', and the push names the collection \
              '{id}'"
-        ))),
-        r => Ok(r),
-    }
+        ))
+    })
 }
 
 /// Checks the branch, the tags, and the bound names, and returns the branch

@@ -25,6 +25,10 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     @ID: matches each ref of the collection ID, and a listing prints
     @ID:NAME. refs --delete refuses a PREFIX @ID: with an empty rest, as
     it refuses REMOTE:. -A refuses a collection ref of another id.
+  * refs --delete checks each name that a PREFIX selects before it
+    deletes a ref of that PREFIX. A name that is not a valid local or
+    remote ref, such as test/x:y, makes the command fail, and the PREFIX
+    deletes no ref.
   * prune --only-branch and --retain-branch-depth take @ID:NAME.
   * prune --only-branch reads a ref name. It refuses a checksum and
     main^.

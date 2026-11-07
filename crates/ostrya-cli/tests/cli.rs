@@ -12539,6 +12539,28 @@ fn refs_delete_collection_refuses_a_local_name_with_a_colon() {
     }
 }
 
+/// `refs --delete` with a plain prefix checks each selected name before it
+/// removes a ref. A file `refs/heads/test/x:y` has a name that is not a local
+/// or a remote ref, so the command stops, and no ref of the prefix is removed.
+#[test]
+fn refs_delete_prefix_refuses_an_invalid_name_before_it_removes_a_ref() {
+    let tmp = TmpDir::new("refs-delete-prefix-invalid-name");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let head = commit_tree(&repo, "keep", &base.join("src"), None);
+    write_ref_file(&repo, "heads/test/a", &head);
+    write_ref_file(&repo, "heads/test/x:y", &head);
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(&["refs", &repo_arg, "--delete", "test"], None, &[]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "the port exited 0: {stderr}");
+    assert!(stderr.contains("test/x:y"), "the port gave: {stderr}");
+    for path in ["refs/heads/test/a", "refs/heads/test/x:y"] {
+        assert!(repo.join(path).exists(), "the port removed {path}");
+    }
+}
+
 #[test]
 fn refs_create_ancestry_suffix_matches_the_tool() {
     if !ostree_available() {

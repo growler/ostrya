@@ -203,7 +203,13 @@ are observed and deliberately not reproduced:
   other refs under `refs/heads`, keeps the file, and exits 0. The `-c` listing
   of the port prints `(<own id>, origin:main)`. `refs -c --delete <own id>` of
   the port reports `error: Invalid refspec origin:main`, exits 1, and removes
-  no ref. In both, `refs/remotes/origin/main` stays;
+  no ref. In both, `refs/remotes/origin/main` stays. `refs --delete` of the
+  port with a plain, a remote, or a `-A` prefix checks each name that the
+  prefix selects before it removes the first ref of the prefix. A name that is
+  not a valid local or remote ref, such as `test/x:y`, gives `error: Invalid
+  refspec test/x:y`, exits 1, and the prefix removes no ref. The port reads a
+  file under `refs/heads` whose name parses as a remote ref, such as
+  `origin:main`, as that remote ref;
 - a ref under `refs/mirrors/<own id>/`, where `<own id>` is the
   `collection-id` of the repository. Such a ref comes from an out-of-band
   change alone, because no writer of the port writes it. The `-c` listing of

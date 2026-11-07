@@ -11700,6 +11700,11 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// to these local refs. The command refuses each other `@OWN:REST`.
 /// With `-A`, the command refuses an `@X:` prefix of another id.
 ///
+/// Each selected name of a plain, a remote, or a `-A` prefix must parse as a
+/// local or a remote ref before the command removes the first ref of the
+/// prefix. If one name fails, the command fails with
+/// [`Error::InvalidRefspec`], and the prefix removes no ref.
+///
 /// If a prefix `@X:` or `@OWN:` with an empty rest selects one or more refs
 /// or aliases, the command fails with [`Error::InvalidRefspec`], and the
 /// prefix removes none of them. This is the rule of a whole-remote prefix.
@@ -11817,6 +11822,8 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 repo.set_ref_immediate(r, None).await?;
             }
         } else {
+            // Each selected name parses before the first removal.
+            let mut removed: Vec<Ref> = Vec::new();
             for refspec in &selected {
                 // A listed name is a refspec. A name with `@` from outside the
                 // port fails here, and it is not read as a collection ref.
@@ -11824,7 +11831,10 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 if matches!(r, Ref::Collection { .. }) {
                     return Err(Error::InvalidRefspec(refspec.clone()));
                 }
-                repo.set_ref_immediate(&r, None).await?;
+                removed.push(r);
+            }
+            for r in &removed {
+                repo.set_ref_immediate(r, None).await?;
             }
         }
         all.retain(|(name, _)| !selected.contains(name));

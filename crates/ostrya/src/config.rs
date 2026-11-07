@@ -768,7 +768,9 @@ impl Repo {
     /// check.
     ///
     /// This handle keeps the configuration that it was opened with. To read
-    /// the new values, open the repository again.
+    /// the new values, open the repository again. This also applies to
+    /// `[core] collection-id`, as
+    /// [`UpdateGuard::set_ref`](crate::UpdateGuard::set_ref) states.
     ///
     /// # Locks
     ///

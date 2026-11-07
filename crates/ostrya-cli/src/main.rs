@@ -711,7 +711,13 @@ enum Command {
     /// relative to the current directory. `sign-summary` has no option. At
     /// start, the command reads and checks the client groups, the server
     /// group, the trust groups, and the key groups. A bad group, or a key group whose key the command cannot
-    /// read, ends the command with status 1.
+    /// read, ends the command with status 1. Until it restarts, the command
+    /// maps the collection refs, applies the client groups and the
+    /// `anonymous` item, and computes the access digests with the `[core]
+    /// collection-id` that it read at start. The served `config` file shows a
+    /// new value of the key at once. After a change of the key, run `ostrya
+    /// summary -u` and restart the command: until the restart, a summary
+    /// request gets 404, because the access digests differ.
     ///
     /// When all listeners are bound, the command writes the URL of each
     /// listener to standard output, one line each, and writes nothing else

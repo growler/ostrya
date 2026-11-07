@@ -383,3 +383,47 @@ fn the_fsck_lists_the_mirror_refs_of_the_own_collection_id() {
         assert!(!report.is_ok());
     });
 }
+
+/// A handle keeps the collection id that its open read. After a guard writes
+/// a new `[core] collection-id`, `set_ref` of a ref of the new id on the same
+/// guard writes `refs/mirrors/ID/NAME`. A guard of a new open writes
+/// `refs/heads/NAME`.
+#[test]
+fn a_new_collection_id_applies_to_a_handle_of_a_new_open() {
+    let tmp = TmpDir::new("own-id-new-open");
+    block_on(async {
+        let path = tmp.path().join("repo");
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let cref = Ref::collection(OWN, "main");
+        let commit = checksum(1);
+
+        let guard = repo.begin_update().await.unwrap();
+        let mut keyfile = repo.config().keyfile().clone();
+        keyfile.set_value("core", "collection-id", OWN).unwrap();
+        guard.write_config(&keyfile).await.unwrap();
+        guard.set_ref(&cref, Some(&commit)).await.unwrap();
+        guard.finish().await.unwrap();
+        let mirror = [(
+            format!("refs/mirrors/{OWN}/main"),
+            format!("{}\n", commit.to_hex()).into_bytes(),
+        )];
+        assert!(heads(&path).is_empty());
+        assert_eq!(file_inventory(&path, "refs/mirrors"), mirror);
+
+        let repo = Repo::open(&path).await.unwrap();
+        let guard = repo.begin_update().await.unwrap();
+        guard.set_ref(&cref, Some(&commit)).await.unwrap();
+        guard.finish().await.unwrap();
+        assert_eq!(
+            heads(&path),
+            [(
+                "refs/heads/main".to_owned(),
+                format!("{}\n", commit.to_hex())
+            )]
+        );
+        // The write of the new open leaves the file of the first handle.
+        assert_eq!(file_inventory(&path, "refs/mirrors"), mirror);
+    });
+}

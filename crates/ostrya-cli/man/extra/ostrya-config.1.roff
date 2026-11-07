@@ -52,6 +52,9 @@ ostrya writes no ref below \fB\%refs/mirrors/\fR of this id.
 The resolve, the listing of \fB\%refs \-c\fR, the ref listing, and the summary ignore that directory.
 \fB\%ostrya fsck\fR reports each ref in it, and \fB\%ostrya prune\fR keeps the commit of each ref in it.
 \fB\%ostrya init \-\-collection\-id\fR writes it.
+A change of the key applies at the next open of the repository and at the restart of a running \fB\%ostrya serve\fR.
+Until then, ostrya maps each collection ref with the old id, so it writes a ref \fB\%@NEW:NAME\fR of the new id \fB\%NEW\fR to \fB\%refs/mirrors/NEW/NAME\fR.
+\fB\%ostrya serve\fR also applies its client groups and the \fB\%anonymous\fR item and computes its access digests with the old id, and the \fB\%config\fR file that it serves shows the new value.
 In the \fB\%config\fR of a bucket repository, \fB\%ostrya remote init \-\-collection\-id\fR writes it, and it never changes.
 \fB\%ostrya\-repo\fR(5) describes the \fB\%config\fR of a bucket repository.
 .TP

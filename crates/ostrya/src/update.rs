@@ -355,6 +355,12 @@ impl UpdateGuard {
     /// file. The ref is visible when the call returns. The sync of each
     /// directory that changed waits for [`finish`](UpdateGuard::finish).
     ///
+    /// The id is the `[core] collection-id` that the open of the handle read.
+    /// After [`write_config`](UpdateGuard::write_config) sets a new id `NEW`,
+    /// the call writes `@NEW:NAME` to `refs/mirrors/NEW/NAME` until a new
+    /// open. The ref resolve, the collection ref listings, and the summary of
+    /// a new open ignore that file.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
@@ -437,8 +443,9 @@ impl UpdateGuard {
     ///
     /// The call writes the document as given. The repository handle and the
     /// guard keep the values that they read before. A new open of the
-    /// repository reads the new values. The write does not interleave with a
-    /// remote call of the same guard.
+    /// repository reads the new values. This also applies to `[core]
+    /// collection-id`, as [`set_ref`](UpdateGuard::set_ref) states. The write
+    /// does not interleave with a remote call of the same guard.
     ///
     /// The call refuses a document with a `[remote "NAME"]` group when a
     /// `.conf` file of the remotes directory defines `NAME`, as

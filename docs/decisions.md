@@ -182,6 +182,17 @@ open gives the same remotes when the key names the same directory. A `Fd`
 value writes no key, and a create over an existing `config` writes no key, so
 a later open can select another directory.
 
+The own collection id of a handle, `[core] collection-id`, is in the same
+snapshot. A handle and each `UpdateGuard` of it map a collection ref with the
+id that the open read, so a change of the key applies to a handle of a new
+open alone. Until it restarts, `ostrya serve` maps the collection refs,
+applies its client groups and the `anonymous` item, and computes its access
+digests with the old id, and the `config` file that it serves shows the new
+value. Each open reads `config` one time, and the path of a ref name stays the
+same over the life of a handle. A live update of the handle on `write_config` was rejected: it makes
+`Repo::config` take a shared lock and changes its return type for each
+caller, and the server must build its client groups again.
+
 `RepoConfig` keeps the name and the parsed key file of each `.conf` file.
 `RepoConfig::keyfile` gives `config` alone, so no write of `config` copies a
 remote of the directory into `config`. `Remote::source` gives the file that

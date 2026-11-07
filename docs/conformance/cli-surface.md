@@ -2427,10 +2427,14 @@ takes `@ID:NAME`, the collection ref `refs/mirrors/ID/NAME`, as a port
 extension (`../decisions.md`, "The weak refs of a prune"). `@OWN:NAME`, where
 `OWN` is the `[core] collection-id` of the repository, selects
 `refs/heads/NAME` alone, and no BRANCH selects a ref under
-`refs/mirrors/OWN/`. The port resolves each `--only-branch` value as a
-revision, so a value that names nothing gives `error: Refspec '<value>' not
-found` at exit 1. A BRANCH selects the ref that it names as a ref, so a value
-that is not a ref, for example `main^`, selects no branch.
+`refs/mirrors/OWN/`. The port reads each `--only-branch` value as a ref
+name from the ref store, so a value that no ref has as its name gives
+`error: Refspec '<value>' not found` at exit 1, and the run removes nothing.
+A full or an abbreviated checksum is such a value. A value that fails the
+ref-name rule, for example `main^`, gives `error: Invalid refspec <value>`
+at exit 1. A BRANCH of `--retain-branch-depth` selects the ref that it names
+as a ref, so a value that is not a ref, for example `main^`, selects no
+branch.
 
 A symlink under `refs/` that names a directory ends `prune --refs-only` of the
 tool with exit 1. It ends each `prune` of the port with exit 1, in different
@@ -2493,7 +2497,7 @@ makes one attempt in both. Every port command that takes `.lock` or
 own wording, `error: timed out acquiring repository lock after <N>s`, which is
 the diagnostic carve-out of "Scope of CLI compatibility" above.
 
-Eight divergences stand at `prune`:
+Nine divergences stand at `prune`:
 
 - the `--keep-younger-than` value dialect. The port takes `@SECONDS` and an
   absolute date and time carrying a UTC offset, and refuses the tool's
@@ -2541,6 +2545,17 @@ Eight divergences stand at `prune`:
   superset the port carries at every site that takes a revision, and `prune` is
   the one site where the superset removes objects: a value the tool refuses
   deletes here;
+- the values `--only-branch` takes. The tool takes `main^`, a full
+  checksum, and an abbreviated checksum, exits 0, and selects no branch, so
+  each branch keeps its whole ancestry. The port reads each value as a ref
+  name. It refuses `main^` with `error: Invalid refspec main^`, and a full
+  or an abbreviated checksum that no ref has as its name with
+  `error: Refspec '<value>' not found`. Each refusal exits 1 and removes
+  nothing. A hex branch name, for example `cafe`, must select its ref also
+  where two commits start with `cafe`, and there the abbreviated-checksum
+  lookup fails. A value that resolves only as a revision selects no
+  branch, so the run would do nothing for it
+  (`ostrya_cli::cli::prune_only_branch_refuses_a_revision`);
 - the line the port writes where the repository config sets `[core] locking`
   false. With that key set the tool takes no lock, prunes beside a held foreign
   lock, exits 0, and writes nothing to standard error. The port does the same

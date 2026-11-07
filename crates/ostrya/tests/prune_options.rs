@@ -272,10 +272,9 @@ fn only_branch_implies_refs_only() {
     });
 }
 
-/// The run resolves each value of `only_branch` as a revision. A value that
-/// names nothing fails the prune before the run removes an object. A value
-/// that resolves and names no ref selects no branch, so the run keeps every
-/// branch in full.
+/// The run reads each value of `only_branch` as a ref. A value that names no
+/// ref fails the prune before the run removes an object. A full checksum of a
+/// commit names no ref, so it fails the prune too.
 #[test]
 fn only_branch_naming_no_ref_is_refused() {
     let tmp = TmpDir::new("prune-only-branch-unknown");
@@ -303,12 +302,136 @@ fn only_branch_naming_no_ref_is_refused() {
         assert!(matches!(err, Error::RefNotFound(_)), "got {err:?}");
         assert!(holds(&repo, &main[0]).await);
 
-        // A value that resolves to a commit and names no ref gives the depth
-        // to no branch, so the run keeps every branch in full.
-        opts.only_branch = vec![Ref::local(main[2].to_hex())];
-        let stats = repo.prune(&opts).await.unwrap();
-        assert_eq!(stats.pruned_objects, 0);
+        // The checksum of a commit names no ref.
+        let hex = main[2].to_hex();
+        opts.only_branch = vec![Ref::local(hex.clone())];
+        let err = repo.prune(&opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::RefNotFound(name) if *name == hex),
+            "got {err:?}"
+        );
         assert!(holds(&repo, &main[0]).await);
+    });
+}
+
+/// The run reads an abbreviated checksum as a ref name. A prefix of a commit
+/// that no ref has as its name fails the prune before the run removes an
+/// object.
+#[test]
+fn only_branch_abbreviated_checksum_is_refused() {
+    let tmp = TmpDir::new("prune-only-branch-abbrev");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let main = chain(&repo, tmp.path(), "main").await;
+        let prefix = main[2].to_hex()[..8].to_owned();
+
+        let err = repo
+            .prune(&PruneOptions {
+                refs_only: true,
+                depth: 0,
+                only_branch: vec![Ref::local("main"), Ref::local(prefix.clone())],
+                ..PruneOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::RefNotFound(name) if *name == prefix),
+            "got {err:?}"
+        );
+        assert!(
+            holds(&repo, &main[0]).await,
+            "the refusal stands ahead of every removal"
+        );
+    });
+}
+
+/// The run reads a value with a `^` suffix as a ref name, and the name fails
+/// the ref-name rule. The run refuses the value before it removes an object.
+#[test]
+fn only_branch_parent_suffix_is_refused() {
+    let tmp = TmpDir::new("prune-only-branch-caret");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let main = chain(&repo, tmp.path(), "main").await;
+
+        let err = repo
+            .prune(&PruneOptions {
+                refs_only: true,
+                depth: 0,
+                only_branch: vec![Ref::local("main"), Ref::local("main^")],
+                ..PruneOptions::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRefspec(name) if name == "main^"),
+            "got {err:?}"
+        );
+        assert!(
+            holds(&repo, &main[0]).await,
+            "the refusal stands ahead of every removal"
+        );
+    });
+}
+
+/// A hex ref name selects its ref when it is also an abbreviated checksum
+/// that more than one commit starts with. The run reads the value from the
+/// ref store alone.
+#[test]
+fn only_branch_hex_name_selects_its_ref_over_an_ambiguous_prefix() {
+    let tmp = TmpDir::new("prune-only-branch-hex-name");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+
+        // Of 17 commits, two start with the same hex character.
+        let mut seen: Vec<Checksum> = Vec::new();
+        let mut found = None;
+        for n in 0..17u64 {
+            let c = commit(
+                &repo,
+                tmp.path(),
+                &format!("probe{n}"),
+                BASE_TS + n,
+                None,
+                None,
+            )
+            .await;
+            let head = c.to_hex()[..1].to_owned();
+            if let Some(first) = seen.iter().find(|s| s.to_hex().starts_with(&head)) {
+                found = Some((head, *first));
+                break;
+            }
+            seen.push(c);
+        }
+        let (prefix, parent) = found.expect("two of 17 commits share a first character");
+
+        // The ref takes the name of the prefix and names a child of one of
+        // the two commits.
+        let tip = commit(&repo, tmp.path(), "tip", BASE_TS + DAY, Some(parent), None).await;
+        let txn = repo.transaction().await.unwrap();
+        txn.set_ref(&Ref::local(prefix.clone()), Some(&tip));
+        txn.commit().await.unwrap();
+        assert!(
+            matches!(
+                repo.resolve_rev(&prefix, false).await,
+                Err(Error::AmbiguousRefspec(_))
+            ),
+            "the name is an ambiguous abbreviated checksum"
+        );
+
+        let opts = PruneOptions {
+            refs_only: true,
+            depth: 0,
+            only_branch: vec![Ref::local(prefix.clone())],
+            ..PruneOptions::default()
+        };
+        let stats = repo.prune(&opts).await.unwrap();
+        assert!(stats.pruned_objects > 0);
+        assert!(holds(&repo, &tip).await);
+        assert!(
+            !holds(&repo, &parent).await,
+            "the selected branch takes the depth"
+        );
     });
 }
 
@@ -904,8 +1027,8 @@ fn static_deltas_only_deletes_the_delta_and_nothing_else() {
     });
 }
 
-/// A `static_deltas_only` run resolves each value of `only_branch` too, so a
-/// value that names nothing fails the run before it removes a delta.
+/// A `static_deltas_only` run reads each value of `only_branch` as a ref too,
+/// so a value that names no ref fails the run before it removes a delta.
 #[test]
 fn static_deltas_only_refuses_an_only_branch_value_that_names_nothing() {
     let tmp = TmpDir::new("prune-deltas-only-unknown-branch");

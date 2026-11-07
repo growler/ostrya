@@ -3142,10 +3142,15 @@ The rules of the classification:
   a value `@OWN:NAME` of the own id to the local ref `NAME`, and selects a
   ref by a value equal to its `Ref`. A ref that gets no `Ref` takes the
   bound of a ref that no list names. Each run, the `static_deltas_only`
-  run too, resolves the text form of each `only_branch` value as a
-  revision before it takes the lock. A value that names nothing fails the
-  prune with `Error::RefNotFound`, and the run removes nothing. A value
-  that resolves and equals no `Ref` of a listed ref selects nothing.
+  run too, reads each `only_branch` value from the ref store with
+  `Repo::resolve_ref_tip` before it takes the lock. The run does not read a
+  value as a full checksum, as an abbreviated checksum, or with a `^`
+  suffix. A value that no ref has as its name, for example a checksum,
+  fails the prune with `Error::RefNotFound`. A value that fails the
+  ref-name rule, for example `main^`, fails the prune with
+  `Error::InvalidRefspec`. After a refusal the run removes nothing. A ref
+  that the ref listing does not give, for example through a symlink that
+  the port does not write, selects nothing.
 - A weak collection ref follows the rule of each weak ref. It survives when
   the walk reaches its commit over a `parent` edge, a dependency in field 2,
   or a build source in `ostrya.related`. A strong ref on the same commit
@@ -3195,6 +3200,13 @@ These alternatives were rejected:
 - A selection by the listed name of a ref, with the path `ID/NAME` for a
   mirror ref. The name `ID/NAME` is also a valid local ref name, so one
   value selects two refs.
+- A resolve of each `only_branch` value as a revision, as
+  `Repo::resolve_rev` does. A hex branch name, for example `cafe`, then
+  goes to the abbreviated-checksum lookup first. If two commits start with
+  `cafe`, the prune fails with `Error::AmbiguousRefspec`, and the ref
+  `cafe` is never read. A value that resolves only as a revision, for
+  example `main^` or a checksum, selects no branch, so the run accepts a
+  value that has no effect.
 
 ## The unbound collection pull
 
@@ -3482,11 +3494,13 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   `PREFIX`. `refs --delete` refuses `@X:` and `@OWN:` with an empty rest
   if the prefix matches a ref, as it refuses a whole-remote `PREFIX`.
 - `prune --only-branch` and `--retain-branch-depth` take `@ID:NAME`. The
-  command passes each value as a `Ref`, and `Repo::prune` resolves each
-  `only_branch` value as a revision before it takes the lock. A value that
-  names nothing fails the command, the `--static-deltas-only` run too. A
-  value that is not a ref, for example `main^`, becomes the local ref of
-  the text, which selects nothing.
+  command passes each value as a `Ref`, and `Repo::prune` reads each
+  `only_branch` value from the ref store before it takes the lock. A value
+  that no ref has as its name, for example a checksum, fails the command,
+  the `--static-deltas-only` run too. A value that is not a ref, for
+  example `main^`, becomes the local ref of the text. `--only-branch`
+  refuses such a value with `Error::InvalidRefspec`. For
+  `--retain-branch-depth`, such a value selects nothing.
 
 These alternatives were rejected:
 

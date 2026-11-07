@@ -222,16 +222,18 @@ pub struct PruneOptions {
     /// each branch that neither this list nor
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth) names.
     ///
-    /// Each run resolves the text form of each value as a revision, as
-    /// [`resolve_rev`](Repo::resolve_rev) does. A
-    /// [`static_deltas_only`](PruneOptions::static_deltas_only) run does this
-    /// too. The resolve comes before the run takes the lock, so a value that
-    /// names nothing fails the prune, and the run removes nothing. A value
-    /// selects the ref that the run reads as an equal [`Ref`].
+    /// Each run reads each value as a ref from the ref store, as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) does. The run does not read
+    /// a value as a full checksum, as an abbreviated checksum, or with a `^`
+    /// suffix. A [`static_deltas_only`](PruneOptions::static_deltas_only) run
+    /// reads the values too. The read comes before the run takes the lock, so
+    /// a value that names no ref fails the prune, and the run removes nothing.
+    /// A value selects the ref that the run reads as an equal [`Ref`].
     /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) states which refs
-    /// the run reads as a [`Ref`]. A value that resolves and equals no ref
-    /// that the run reads selects no branch. If no value selects a branch, the
-    /// run keeps every branch in full. No value
+    /// the run reads as a [`Ref`]. A ref that the ref listing does not give,
+    /// for example through a symlink that the port does not write, selects no
+    /// branch. If no value selects a branch, the run keeps every branch in
+    /// full. No value
     /// selects a ref under `refs/mirrors/ID/` of the `[core] collection-id`
     /// of the repository, so the run keeps such a ref in full under a
     /// non-empty list.
@@ -831,12 +833,15 @@ impl Repo {
     ///   run with [`commit_only`](PruneOptions::commit_only) reads no dirtree.
     /// - [`Error::LockTimeout`] if the wait for the lock passes `[core]
     ///   lock-timeout-secs`.
-    /// - An error of [`resolve_rev`](Repo::resolve_rev), for example
-    ///   [`Error::RefNotFound`], if a value of
-    ///   [`only_branch`](PruneOptions::only_branch) does not resolve. Each
+    /// - [`Error::RefNotFound`] if no ref has the name of a value of
+    ///   [`only_branch`](PruneOptions::only_branch), for example a checksum.
+    /// - [`Error::InvalidRefspec`] if a value of
+    ///   [`only_branch`](PruneOptions::only_branch) fails [`Ref::validate`],
+    ///   for example `main^`.
+    /// - An error of [`resolve_ref_tip`](Repo::resolve_ref_tip) if the read
+    ///   of a value of [`only_branch`](PruneOptions::only_branch) fails. Each
     ///   run, a [`static_deltas_only`](PruneOptions::static_deltas_only) run
-    ///   too, resolves the values before it takes the lock and removes
-    ///   anything.
+    ///   too, reads the values before it takes the lock and removes anything.
     /// - [`Error::Io`] if a read, a write, or a removal on the file system
     ///   fails.
     /// - [`Error::Io`] if a metadata object is larger than
@@ -879,12 +884,14 @@ impl Repo {
             ));
         }
 
-        // The run resolves each branch selection as a revision before the
-        // lock, as it refuses the pairs above, so a value that names nothing
-        // fails each run, the delta-only run too. The run does not read the
-        // commit that the value resolves to.
+        // The run reads each branch selection from the ref store before the
+        // lock, as it refuses the pairs above, so a value that names no ref
+        // fails each run, the delta-only run too. A checksum or a `^` suffix
+        // names no ref. The run does not read the commit of the ref.
         for r in &opts.only_branch {
-            self.resolve_rev(&r.to_string(), false).await?;
+            if self.resolve_ref_tip(r).await?.is_none() {
+                return Err(Error::RefNotFound(r.to_string()));
+            }
         }
 
         let _lock = self.lock_repo(LockKind::Exclusive).await?;
@@ -940,7 +947,8 @@ impl Repo {
         let named_refs = self.list_all_refs().await?;
         // The run reads each listed ref as a canonical `Ref`, so a value of a
         // branch list selects a ref by an equal value only in its canonical
-        // form. A value that resolves and equals no listed ref selects nothing.
+        // form. A ref that the listing does not give, for example through a
+        // symlink that the port does not write, selects nothing.
         let own = self.config().collection_id();
         let opts = &opts.with_canonical_branches(own);
         // Classify the ref space in one pass, so the strong roots and the weak

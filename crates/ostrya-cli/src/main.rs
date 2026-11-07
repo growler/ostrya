@@ -2663,8 +2663,9 @@ struct PruneArgs {
     /// BRANCH is NAME, REMOTE:NAME, or @ID:NAME, as for --retain-branch-depth.
     /// The option can occur more than once. A branch that
     /// --retain-branch-depth names is also pruned, to its own depth. The walk
-    /// starts from the refs alone, as with --refs-only. The command reads each
-    /// BRANCH as a revision, and it fails if a BRANCH names nothing.
+    /// starts from the refs alone, as with --refs-only. Each BRANCH is a ref
+    /// name. The command fails if no ref has the name, for example for a
+    /// checksum or `main^`.
     #[arg(long, value_name = "BRANCH")]
     only_branch: Vec<String>,
     /// Delete commit objects alone.
@@ -14781,8 +14782,10 @@ fn parse_retain_branch_depth(value: &str) -> std::result::Result<(String, i32), 
 /// the ref that the prune selects.
 ///
 /// A value that is not the text of a ref, such as `main^` or an empty BRANCH,
-/// gives the local ref of the text. No ref of a repository has that name, so
-/// the value selects nothing.
+/// gives the local ref of the text. The prune refuses such a value of
+/// `--only-branch`, because the ref fails the ref-name rule. No ref of a
+/// repository has that name, so such a BRANCH of `--retain-branch-depth`
+/// selects nothing.
 fn branch_ref(text: &str) -> Ref {
     text.parse().unwrap_or_else(|_| Ref::local(text))
 }
@@ -14827,11 +14830,11 @@ fn format_size(bytes: u64) -> String {
 async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     // The refusals that follow come in the order of the `ostree` command. The
     // order is the option pair, the `--static-deltas-only` requirement, the
-    // date, each `--retain-branch-depth` value, and then the revisions:
-    // `--delete-commit` first, and then each `--only-branch` value. This
-    // function resolves `--delete-commit`. `Repo::prune` resolves each
-    // `--only-branch` value before it takes the lock. No refusal writes, so a
-    // refusal leaves the repository as it was.
+    // date, each `--retain-branch-depth` value, `--delete-commit`, and then
+    // each `--only-branch` value. This function resolves `--delete-commit` as
+    // a revision. `Repo::prune` reads each `--only-branch` value as a ref
+    // before it takes the lock. No refusal writes, so a refusal leaves the
+    // repository as it was.
     if args.no_prune && args.delete_commit.is_some() {
         exit_error("Cannot specify both --delete-commit and --no-prune");
     }

@@ -29034,11 +29034,10 @@ fn prune_keep_younger_than_dialect_parts_from_the_tool() {
 }
 
 /// `--only-branch` prunes the branch that it names and keeps each other branch
-/// in full. It uses only the refs as roots of the walk, and resolves its value
-/// as a revision. The test carries `prune/only-branch-names-the-branch`,
+/// in full. It uses only the refs as roots of the walk. The test carries
+/// `prune/only-branch-names-the-branch`,
 /// `prune/only-branch-retains-the-others`, `prune/only-branch-repeated`,
-/// `prune/only-branch-implies-refs-only`,
-/// `prune/only-branch-abbreviated-checksum`, and `prune/only-branch-unknown`.
+/// `prune/only-branch-implies-refs-only`, and `prune/only-branch-unknown`.
 #[test]
 fn prune_only_branch_matches_the_tool() {
     if !ostree_available() {
@@ -29047,8 +29046,6 @@ fn prune_only_branch_matches_the_tool() {
     let tmp = TmpDir::new("prune-only-branch");
     let base = tmp.path();
     let repo = build_prune_repo(base, RepoMode::BareUser);
-    let head = resolve(&repo, "main").unwrap();
-    let abbreviated = &head[..10];
 
     for (tag, args) in [
         ("ob-plain", vec!["--only-branch=main"]),
@@ -29065,14 +29062,80 @@ fn prune_only_branch_matches_the_tool() {
         ("ob-depth1", vec!["--only-branch=main", "--depth=1"]),
         ("ob-infinite", vec!["--only-branch=main", "--depth=-1"]),
         ("ob-unknown", vec!["--only-branch=nosuch", "--depth=0"]),
-        ("ob-parent", vec!["--only-branch=main^", "--depth=0"]),
     ] {
         assert_prune_agrees(base, &repo, tag, &args);
     }
-    // A value that resolves and names no ref assigns the depth to no branch.
-    let value = format!("--only-branch={abbreviated}");
-    let text = assert_prune_agrees(base, &repo, "ob-abbrev", &[&value, "--depth=0"]);
-    assert!(text.ends_with("No unreachable objects\n"), "{text:?}");
+}
+
+/// `--only-branch` reads each value as a ref name. The port refuses a value
+/// that the tool resolves as a revision: a `^` suffix, an abbreviated
+/// checksum, and a full checksum. The port exits 1 and removes nothing. The
+/// tool takes each value, exits 0, and selects no branch. This is a recorded
+/// divergence. The test carries `prune/only-branch-abbreviated-checksum`.
+#[test]
+fn prune_only_branch_refuses_a_revision() {
+    let tmp = TmpDir::new("prune-only-branch-revision");
+    let base = tmp.path();
+    let repo = build_prune_repo(base, RepoMode::BareUser);
+    let head = resolve(&repo, "main").unwrap();
+    let before = prune_inventory(&repo);
+    let cases = [
+        ("main^".to_owned(), "Invalid refspec main^".to_owned()),
+        (
+            head[..10].to_owned(),
+            format!("Refspec '{}' not found", &head[..10]),
+        ),
+        (head.clone(), format!("Refspec '{head}' not found")),
+    ];
+
+    for (value, message) in &cases {
+        let option = format!("--only-branch={value}");
+        let port = ostrya(
+            &[
+                "prune",
+                &format!("--repo={}", repo.display()),
+                &option,
+                "--depth=0",
+            ],
+            None,
+            &PRUNE_ENV,
+        );
+        assert_eq!(port.status.code(), Some(1), "the port took `{value}`");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains(message.as_str()),
+            "the port worded `{value}` as {:?}",
+            String::from_utf8_lossy(&port.stderr),
+        );
+        assert_eq!(
+            prune_inventory(&repo),
+            before,
+            "the port removed objects for `{value}`"
+        );
+    }
+
+    if !ostree_available() {
+        return;
+    }
+    for (value, _) in &cases {
+        let tool_repo = clone_repo(base, &repo, "ob-revision-tool");
+        let option = format!("--only-branch={value}");
+        let tool = ostree_env(
+            &[
+                "prune",
+                &format!("--repo={}", tool_repo.display()),
+                &option,
+                "--depth=0",
+            ],
+            &PRUNE_ENV,
+        );
+        assert_eq!(tool.status.code(), Some(0), "the tool refused `{value}`");
+        assert!(
+            String::from_utf8_lossy(&tool.stdout).ends_with("No unreachable objects\n"),
+            "the tool selected a branch for `{value}`: {:?}",
+            String::from_utf8_lossy(&tool.stdout),
+        );
+        std::fs::remove_dir_all(&tool_repo).unwrap();
+    }
 }
 
 /// `--retain-branch-depth` replaces the global depth for the branch that it

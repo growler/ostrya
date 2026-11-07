@@ -9791,28 +9791,32 @@ oracle: exit-status stderr-text inventory
 outcome: full
 severity: interop
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the value is resolved as a revision, so one naming nothing fails the run
- before an object is removed. Both write the one resolution message and leave
- the store as it stood.
+note: the port reads the value as a ref name, and the tool resolves it as a
+ revision. A value that names nothing fails both runs before an object is
+ removed. Both write the one resolution message and leave the store as it
+ stood.
 
 family: M10
 subcommand: prune
 cell: prune/only-branch-abbreviated-checksum
 setup: repo-with-commit
 run: prune --repo=$REPO --only-branch=$REV --depth=0
-expect-exit: 0
-expect-stderr: empty
+expect-exit: 1
+expect-stderr: contains "not found"
 ref-expect-exit: 0
 ref-expect-stderr: empty
-oracle: exit-status stdout-text inventory
-outcome: full
+outcome: lossy
 severity: interop
+loss: a value that names a commit and no ref. The tool resolves a full
+ checksum, an abbreviated checksum, and `<branch>^` as a revision, selects no
+ branch, and exits 0. The port reads each value as a ref name and refuses it at
+ exit 1, so a hex branch name selects its ref also where two commits start with
+ its text. The refusal removes nothing (`cli-surface.md`, "P2").
+evidence: ostrya_cli::cli::prune_only_branch_refuses_a_revision
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: a value that resolves and matches no ref name assigns the depth to no
- branch, so every branch is retained in full and the run deletes nothing. A full
- checksum, an abbreviated one, and `<branch>^` each read this way; the cited
- test of `prune/only-branch-retains-the-others` states the abbreviated form over
- a repository where the depth would otherwise bite.
+note: the two reach different exit statuses, so no oracle reads the pair. The
+ run gives a full checksum. The cited test also gives an abbreviated checksum
+ and `<branch>^`.
 
 family: M10
 subcommand: prune
@@ -9915,9 +9919,8 @@ outcome: full
 severity: interop
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: an entry naming a branch the repository does not hold is accepted by both
- and does nothing. The value is matched against the ref names, not resolved as a
- revision, so an unknown name is no refusal here where `--only-branch=nosuch` is
- one.
+ and does nothing. Both match the value against the ref names, so an unknown
+ name is no refusal here where `--only-branch=nosuch` is one.
 
 family: M10
 subcommand: prune

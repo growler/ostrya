@@ -26,6 +26,8 @@ ostrya (0.10.0) UNRELEASED; urgency=medium
     @ID:NAME. refs --delete refuses a PREFIX @ID: with an empty rest, as
     it refuses REMOTE:. -A refuses a collection ref of another id.
   * prune --only-branch and --retain-branch-depth take @ID:NAME.
+  * prune --only-branch reads a ref name. It refuses a checksum and
+    main^.
   * pull-local takes @ID:REF operands of more than one collection.
   * A client group holds the items of each namespace: allow takes
     [MODES:]@ID:PATTERN, and deny takes @ID:PATTERN. The config refuses

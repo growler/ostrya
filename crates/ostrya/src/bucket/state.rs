@@ -3,13 +3,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use ostrya_core::{Checksum, RepoMode, is_ref_name};
+use ostrya_core::{Checksum, RepoMode, is_ref_name, is_valid_collection_id};
 
 use super::BucketRepo;
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
-use crate::refs::is_valid_collection_id;
 use crate::remote::s3::Object;
 use crate::repo::MAX_CONFIG_SIZE;
 

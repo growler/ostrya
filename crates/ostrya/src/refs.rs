@@ -21,7 +21,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 #[cfg(feature = "receive")]
 use std::sync::Arc;
 
-use ostrya_core::{Checksum, MAX_COLLECTION_ID_LEN, Ref, RefPattern, RefSelector, RepoMode};
+use ostrya_core::{Checksum, Ref, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
@@ -706,7 +706,7 @@ impl Repo {
         collection_id: &str,
         refs: &RefSelector,
     ) -> Result<Vec<(String, Checksum)>> {
-        if !is_valid_collection_id(collection_id) {
+        if !ostrya_core::is_valid_collection_id(collection_id) {
             return Err(Error::InvalidRefspec(collection_id.to_owned()));
         }
         if selects_no_name(refs) {
@@ -1315,7 +1315,7 @@ fn collect_collections_selected(
         if Some(name.as_str()) == own {
             continue;
         }
-        if !is_valid_collection_id(&name) {
+        if !ostrya_core::is_valid_collection_id(&name) {
             if ref_entry_type(mirrors, &name)? == Some(FileType::Directory) {
                 selection.invalid_dirs.push(name);
             }
@@ -2292,19 +2292,11 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 // `.`, `_`, and alphanumeric characters that are not ASCII. `is_component` is
 // the wider one-component rule that the remote part of a receive pattern uses
 // (`receive/pattern.rs`): not empty, not `.` or `..`, no slash, no NUL.
-// `ostrya-core` holds the rules. A collection id takes
-// `is_valid_collection_id`, which adds a length limit to the rule of
-// `ostrya-core`.
+// `ostrya-core` holds the rules, and a collection id takes
+// `ostrya_core::is_valid_collection_id`.
 #[cfg(feature = "receive")]
 pub(crate) use ostrya_core::is_ref_component as is_component;
 pub(crate) use ostrya_core::is_ref_name as is_ref_path;
-
-/// Returns `true` if `id` is a collection id that the ref store takes: it
-/// passes [`is_collection_id`](ostrya_core::is_collection_id) and is at most
-/// [`MAX_COLLECTION_ID_LEN`] bytes.
-pub(crate) fn is_valid_collection_id(id: &str) -> bool {
-    id.len() <= MAX_COLLECTION_ID_LEN && ostrya_core::is_collection_id(id)
-}
 
 /// Maps a ref to the path under the repository that the ref store reads and
 /// writes, in a repository whose `[core] collection-id` is `own`.
@@ -2899,7 +2891,7 @@ mod tests {
             );
         }
         let longest = format!("org.{}", "a".repeat(251));
-        assert_eq!(longest.len(), MAX_COLLECTION_ID_LEN);
+        assert_eq!(longest.len(), ostrya_core::MAX_COLLECTION_ID_LEN);
         assert!(ref_relpath(None, &Ref::collection(longest.as_str(), "main")).is_ok());
         let too_long = format!("org.{}", "a".repeat(252));
         let err = ref_relpath(None, &Ref::collection(too_long.as_str(), "main")).unwrap_err();
@@ -2917,15 +2909,6 @@ mod tests {
         let at = refspec_ref("@org.example.A:x");
         assert_eq!(at, Ref::remote("@org.example.A", "x"));
         assert!(at.validate().is_err());
-    }
-
-    #[test]
-    fn a_valid_collection_id_passes_the_collection_id_rule_and_the_length() {
-        assert!(is_valid_collection_id("org.example.Os"));
-        assert!(is_valid_collection_id(&format!("org.{}", "a".repeat(251))));
-        assert!(!is_valid_collection_id(&format!("org.{}", "a".repeat(252))));
-        assert!(!is_valid_collection_id("nodot"));
-        assert!(!is_valid_collection_id(""));
     }
 
     #[test]

@@ -1370,7 +1370,7 @@ pub fn check_mirrored_collection_ids(own: Option<&str>, ids: Vec<String>) -> Res
     }
     let mut out: Vec<String> = Vec::with_capacity(ids.len());
     for id in ids {
-        if !crate::refs::is_valid_collection_id(&id) {
+        if !ostrya_core::is_valid_collection_id(&id) {
             return Err(Error::InvalidFormat(format!(
                 "{MIRRORED_COLLECTION_IDS}: invalid collection id: '{id}'"
             )));

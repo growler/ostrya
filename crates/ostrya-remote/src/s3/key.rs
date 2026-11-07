@@ -1,13 +1,9 @@
 //! The keys of a bucket repository, and their encoding in a request.
 
-use ostrya_core::{Checksum, is_collection_id, is_ref_name};
+use ostrya_core::{Checksum, is_ref_name, is_valid_collection_id};
 
 use super::sigv4::uri_encode;
 use crate::{Error, Result};
-
-/// The longest collection id of a key under `refs/mirrors/`: 255 bytes. The
-/// id is the name of one directory.
-const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// The keys of a bucket repository that hold one file each.
 const SINGLE_KEYS: [&str; 5] = [
@@ -42,8 +38,8 @@ const OBJECT_EXTENSIONS: [&str; 6] = [
 ///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`, or
 ///   `tombstone-commit`
 /// - `refs/heads/<name>`, with a name that [`is_ref_name`] accepts
-/// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that
-///   [`is_collection_id`] accepts, and a name that [`is_ref_name`] accepts
+/// - `refs/mirrors/<id>/<name>`, with an id that
+///   [`is_valid_collection_id`] accepts, and a name that [`is_ref_name`] accepts
 /// - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, with
 ///   checksums in modified base64, and the target `superblock` or a part
 ///   number with no leading zero
@@ -61,9 +57,9 @@ pub fn is_repository_key(key: &str) -> bool {
         return is_ref_name(name);
     }
     if let Some(rest) = key.strip_prefix("refs/mirrors/") {
-        return rest.split_once('/').is_some_and(|(id, name)| {
-            id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id) && is_ref_name(name)
-        });
+        return rest
+            .split_once('/')
+            .is_some_and(|(id, name)| is_valid_collection_id(id) && is_ref_name(name));
     }
     if let Some(rest) = key.strip_prefix("deltas/") {
         return is_delta_key(rest);

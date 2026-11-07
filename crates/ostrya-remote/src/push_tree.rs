@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, Ref, Type, Value};
+use ostrya_core::{Checksum, MAX_COLLECTION_ID_LEN, Ref, Type, Value};
 
 use crate::error::{Error, Result};
 use crate::proto::ServerCommit;
@@ -16,10 +16,6 @@ use crate::session::{
 };
 use crate::transport::{Endpoint, PreparedSession};
 use crate::tree::{EntryFilter, ScanOptions, TreeModel};
-
-/// The longest collection id, in bytes. The server writes the refs of a
-/// collection under one directory of that name.
-const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// The metadata keys of the bindings, which the server writes.
 const BINDING_KEYS: [&str; 2] = ["ostree.ref-binding", "ostree.collection-binding"];

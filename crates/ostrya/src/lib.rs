@@ -199,8 +199,8 @@ pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DictBuilder, DirMeta, DirTree, KeyFile, Namespace, ObjectName, ObjectType,
     ParseRefError, Ref, RefPattern, RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs,
-    from_bytes, from_text, is_checksum_shaped, is_collection_id, loose_path, source_date_epoch,
-    to_text, to_text_unannotated,
+    from_bytes, from_text, is_checksum_shaped, is_collection_id, is_valid_collection_id,
+    loose_path, source_date_epoch, split_collection, to_text, to_text_unannotated,
 };
 pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,

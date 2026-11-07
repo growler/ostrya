@@ -559,7 +559,7 @@ pub struct PruneStats {
 ///   listed name is its `<remote>:<name>` refspec.
 /// - A ref in `refs/mirrors` is [`Ref::Collection`] if the part of its path
 ///   before the first `/` is a collection id that the ref store takes
-///   ([`is_valid_collection_id`](crate::refs::is_valid_collection_id)) and
+///   ([`is_valid_collection_id`](ostrya_core::is_valid_collection_id)) and
 ///   the rest is a valid ref name. The listing gives a mirror ref no
 ///   addressability, so the call does not read it.
 ///
@@ -576,7 +576,7 @@ fn listed_ref(space: RefSpace, mut name: String, addressable: bool) -> Option<Re
         }
         RefSpace::Mirrors => {
             let (id, ref_name) = name.split_once('/')?;
-            if !crate::refs::is_valid_collection_id(id) || !ostrya_core::is_ref_name(ref_name) {
+            if !ostrya_core::is_valid_collection_id(id) || !ostrya_core::is_ref_name(ref_name) {
                 return None;
             }
             let slash = id.len();

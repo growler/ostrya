@@ -315,6 +315,21 @@ pub fn is_collection_id(id: &str) -> bool {
 /// system takes a name of 255 bytes at most (`NAME_MAX`).
 pub const MAX_COLLECTION_ID_LEN: usize = 255;
 
+/// Returns `true` if `id` is a valid collection id for a ref: it passes
+/// [`is_collection_id`] and is at most [`MAX_COLLECTION_ID_LEN`] bytes.
+pub fn is_valid_collection_id(id: &str) -> bool {
+    id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id)
+}
+
+/// Splits `@ID:REST` at the first `:` after the `@`.
+///
+/// Returns the id and the rest, or `None` if `text` does not start with `@`
+/// or has no `:` after it. The call does not check the id or the rest. Use
+/// [`is_valid_collection_id`] for the id.
+pub fn split_collection(text: &str) -> Option<(&str, &str)> {
+    text.strip_prefix('@')?.split_once(':')
+}
+
 /// One ref of a repository.
 ///
 /// A ref has three cases, and each case has a text form:
@@ -473,9 +488,7 @@ impl Ref {
         let valid = match self {
             Ref::Local { name } => is_ref_name(name),
             Ref::Remote { remote, name } => is_ref_name_component(remote) && is_ref_name(name),
-            Ref::Collection { id, name } => {
-                id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id) && is_ref_name(name)
-            }
+            Ref::Collection { id, name } => is_valid_collection_id(id) && is_ref_name(name),
         };
         if valid {
             Ok(())
@@ -502,14 +515,13 @@ impl FromStr for Ref {
     /// [`ParseRefError`] if the text has no form or a part fails its rule.
     /// The error holds the text as given.
     fn from_str(text: &str) -> Result<Ref, ParseRefError> {
-        let parsed = match text.strip_prefix('@') {
-            Some(rest) => rest
-                .split_once(':')
-                .map(|(id, name)| Ref::collection(id, name)),
-            None => Some(match text.split_once(':') {
+        let parsed = if text.starts_with('@') {
+            split_collection(text).map(|(id, name)| Ref::collection(id, name))
+        } else {
+            Some(match text.split_once(':') {
                 Some((remote, name)) => Ref::remote(remote, name),
                 None => Ref::local(text),
-            }),
+            })
         };
         match parsed {
             Some(r) if r.validate().is_ok() => Ok(r),
@@ -813,6 +825,26 @@ mod tests {
         ] {
             assert!(!is_collection_id(id), "{id:?}");
         }
+    }
+
+    #[test]
+    fn split_collection_splits_at_the_first_colon_without_checking() {
+        assert_eq!(split_collection("@a.b:c:d"), Some(("a.b", "c:d")));
+        assert_eq!(split_collection("@a.b:"), Some(("a.b", "")));
+        assert_eq!(split_collection("@nodot:x"), Some(("nodot", "x")));
+        for text in ["a.b:c", "@a.b", "@", ""] {
+            assert_eq!(split_collection(text), None, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn a_valid_collection_id_is_a_collection_id_of_at_most_the_limit() {
+        let longest = format!("a.{}", "b".repeat(MAX_COLLECTION_ID_LEN - 2));
+        assert!(is_valid_collection_id(&longest));
+        assert!(!is_valid_collection_id(&format!("{longest}b")));
+        assert!(is_valid_collection_id("org.example.Os"));
+        assert!(!is_valid_collection_id("nodot"));
+        assert!(!is_valid_collection_id(""));
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use ostrya_core::{Ref, RefPattern};
 
 use crate::error::{Error, Result};
-use crate::refs::{is_component, is_valid_collection_id};
+use crate::refs::is_component;
 
 /// A pattern that names the refs of one rule of a one-way stream.
 ///
@@ -115,17 +115,16 @@ impl ReceivePattern {
         if pattern.starts_with('!') {
             return Err(malformed("a receive pattern has no '!'"));
         }
-        let (scope, name) = match pattern.strip_prefix('@') {
-            Some(rest) => {
-                let Some((id, name)) = rest.split_once(':') else {
-                    return Err(malformed("a collection part '@ID' has no ':'"));
-                };
-                if !is_valid_collection_id(id) {
-                    return Err(malformed("the collection part is not a collection id"));
-                }
-                (Scope::Collection(id.to_owned()), name)
+        let (scope, name) = if pattern.starts_with('@') {
+            let Some((id, name)) = ostrya_core::split_collection(pattern) else {
+                return Err(malformed("a collection part '@ID' has no ':'"));
+            };
+            if !ostrya_core::is_valid_collection_id(id) {
+                return Err(malformed("the collection part is not a collection id"));
             }
-            None => match pattern.split_once(':') {
+            (Scope::Collection(id.to_owned()), name)
+        } else {
+            match pattern.split_once(':') {
                 None => (Scope::Local, pattern),
                 Some(("*", name)) => (Scope::AnyRemote, name),
                 Some((remote, _)) if remote.contains('*') => {
@@ -135,7 +134,7 @@ impl ReceivePattern {
                     return Err(malformed("the remote part is not a remote name"));
                 }
                 Some((remote, name)) => (Scope::Remote(remote.to_owned()), name),
-            },
+            }
         };
         let name_text = name;
         let name = RefPattern::parse(name_text).map_err(|err| match err {
@@ -245,6 +244,20 @@ mod tests {
         ] {
             let parsed = ReceivePattern::parse(pattern).unwrap();
             assert_eq!(parsed.as_str(), pattern);
+        }
+    }
+
+    #[test]
+    fn a_collection_part_must_be_a_collection_id_within_the_limit() {
+        let longest = format!("a.{}", "b".repeat(ostrya_core::MAX_COLLECTION_ID_LEN - 2));
+        assert!(ReceivePattern::parse(&format!("@{longest}:**")).is_ok());
+        for id in [format!("{longest}b"), "nodot".to_owned()] {
+            let err = ReceivePattern::parse(&format!("@{id}:**")).unwrap_err();
+            assert!(
+                err.to_string()
+                    .ends_with("the collection part is not a collection id"),
+                "{err}"
+            );
         }
     }
 

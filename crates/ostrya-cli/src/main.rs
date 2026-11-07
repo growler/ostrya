@@ -4349,7 +4349,7 @@ fn parse_allow_remote(text: &str) -> std::result::Result<ostrya::ReceivePattern,
 /// The value is one collection id of at most 255 bytes.
 #[cfg(feature = "receive")]
 fn parse_allow_collection(text: &str) -> std::result::Result<ostrya::ReceivePattern, String> {
-    if text.len() > 255 || !ostrya::is_collection_id(text) {
+    if !ostrya::is_valid_collection_id(text) {
         return Err(
             "a collection id is two or more elements split at '.', each of ASCII letters, \
              digits, and '_', that does not start with a digit, and at most 255 bytes"
@@ -6051,7 +6051,7 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     // The id is one name under `refs/mirrors/` on the server, and a file
     // system takes a name of 255 bytes at most.
     if let Some(id) = &args.collection
-        && (id.len() > 255 || !ostrya::is_collection_id(id))
+        && !ostrya::is_valid_collection_id(id)
     {
         exit_error(&format!("Invalid collection ID {id}"));
     }
@@ -11569,12 +11569,12 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
     };
     let commit = resolve(repo, existing).await?;
     let Some((collection_id, ref_name)) = pair else {
-        if !ostrya::is_collection_id(newref) {
+        if !ostrya::is_valid_collection_id(newref) {
             exit_error(&format!("Invalid collection ID {newref}"));
         }
         exit_error("Invalid ref name (null)");
     };
-    if !ostrya::is_collection_id(collection_id) {
+    if !ostrya::is_valid_collection_id(collection_id) {
         exit_error(&format!("Invalid collection ID {collection_id}"));
     }
     repo.set_ref_immediate(&Ref::collection(collection_id, ref_name), Some(&commit))
@@ -12013,7 +12013,7 @@ async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<Colle
 /// Returns the collection id and the rest of a PREFIX `@ID:` or `@ID:REST`,
 /// or `None` for each other PREFIX. The rest of `@ID:` is empty.
 fn collection_prefix(prefix: &str) -> Option<(&str, &str)> {
-    prefix.strip_prefix('@')?.split_once(':')
+    ostrya::split_collection(prefix)
 }
 
 /// Reads a PREFIX of `refs` in a repository whose `[core] collection-id` is
@@ -12136,8 +12136,7 @@ async fn check_prefix(repo: &Repo, prefix: Option<&str>) -> Result<()> {
 /// rule of the ref store.
 fn check_prefix_name(prefix: &str) -> Result<()> {
     if let Some((id, rest)) = collection_prefix(prefix) {
-        let valid = id.len() <= 255
-            && ostrya::is_collection_id(id)
+        let valid = ostrya::is_valid_collection_id(id)
             && (rest.is_empty() || matches!(rest.parse::<Ref>(), Ok(Ref::Local { .. })));
         return if valid {
             Ok(())
@@ -16374,9 +16373,7 @@ fn commit_metadata_dict(
     entries.extend(kept.iter().cloned());
     let own = repo.config().collection_id();
     fn name_part(text: &str) -> &str {
-        text.strip_prefix('@')
-            .and_then(|rest| rest.split_once(':'))
-            .map_or(text, |(_, name)| name)
+        ostrya::split_collection(text).map_or(text, |(_, name)| name)
     }
     let refs: Vec<&str> = args
         .branch

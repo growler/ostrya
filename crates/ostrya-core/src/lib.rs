@@ -84,7 +84,8 @@ pub use objname::ObjectName;
 pub use objtype::ObjectType;
 pub use refname::{
     MAX_COLLECTION_ID_LEN, Namespace, ParseRefError, Ref, is_checksum_shaped, is_collection_id,
-    is_ref_component, is_ref_name, is_ref_name_component, is_refspec,
+    is_ref_component, is_ref_name, is_ref_name_component, is_refspec, is_valid_collection_id,
+    split_collection,
 };
 pub use refpattern::{RefPattern, RefSelector};
 pub use xattr::{Xattrs, XattrsRef};

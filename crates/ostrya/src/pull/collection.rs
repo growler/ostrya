@@ -36,12 +36,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ostrya_core::{Checksum, Commit, ObjectType, Ref, RefSelector, Value};
+use ostrya_core::{Checksum, Commit, ObjectType, Ref, RefSelector, Value, is_valid_collection_id};
 
 use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
-use crate::refs::{check_ref_path, is_ref_path, is_valid_collection_id};
+use crate::refs::{check_ref_path, is_ref_path};
 use crate::related::RelatedRule;
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
 #[cfg(feature = "s3")]
@@ -1414,7 +1414,8 @@ fn collection_names(collection_id: &str, names: &[String]) -> Result<Vec<String>
 /// # Errors
 ///
 /// - [`Error::InvalidInput`] if `collection_id` fails
-///   [`is_valid_collection_id`]: the collection-id rule or the length limit.
+///   [`is_valid_collection_id`](ostrya_core::is_valid_collection_id): the
+///   collection-id rule or the length limit.
 fn check_collection_id(collection_id: &str) -> Result<()> {
     if !is_valid_collection_id(collection_id) {
         return Err(Error::InvalidInput(format!(

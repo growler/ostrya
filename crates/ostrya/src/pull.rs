@@ -2715,7 +2715,7 @@ async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, 
 /// [`check_remote_operands`] checked each name that starts with `@`, and a
 /// mirror pull makes each other such name from a [`Ref`], so it holds a `:`.
 fn operand_collection(name: &str) -> Option<(&str, &str)> {
-    name.strip_prefix('@')?.split_once(':')
+    ostrya_core::split_collection(name)
 }
 
 /// Follows the parents of a commit in the source, and appends each commit

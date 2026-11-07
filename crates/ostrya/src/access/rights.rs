@@ -202,10 +202,10 @@ pub(super) fn parse_deny_item(
 /// Splits `@ID:REST` at the first `:` after the `@`, and checks `ID`. Text
 /// that does not start with `@` gives no id. The error is the reason.
 fn split_collection(text: &str) -> std::result::Result<(Option<String>, &str), String> {
-    let Some(rest) = text.strip_prefix('@') else {
+    if !text.starts_with('@') {
         return Ok((None, text));
-    };
-    let Some((id, rest)) = rest.split_once(':') else {
+    }
+    let Some((id, rest)) = ostrya_core::split_collection(text) else {
         return Err("a collection id is @ID: before the pattern".to_owned());
     };
     if id.len() > MAX_COLLECTION_ID_LEN {
@@ -406,6 +406,28 @@ mod tests {
             allow: allow.iter().map(|t| AllowItem::parse(t).unwrap()).collect(),
             deny: deny.iter().map(|t| RefPattern::parse(t).unwrap()).collect(),
         }
+    }
+
+    /// An id over the limit and an id that is no collection id each give
+    /// their own reason.
+    #[test]
+    fn the_collection_id_of_an_item_is_checked() {
+        let longest = format!("a.{}", "b".repeat(MAX_COLLECTION_ID_LEN - 2));
+        assert_eq!(
+            split_collection(&format!("@{longest}:x")),
+            Ok((Some(longest.clone()), "x"))
+        );
+        assert_eq!(
+            split_collection(&format!("@{longest}b:x")),
+            Err(format!(
+                "the collection id is longer than {MAX_COLLECTION_ID_LEN} bytes"
+            ))
+        );
+        assert_eq!(
+            split_collection("@nodot:x"),
+            Err("the collection id fails the collection-id rule".to_owned())
+        );
+        assert_eq!(split_collection("x"), Ok((None, "x")));
     }
 
     /// The modes parse in any order, and `Display` writes them in the order

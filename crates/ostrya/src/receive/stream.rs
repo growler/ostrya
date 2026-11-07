@@ -56,7 +56,7 @@ impl Repo {
     ///
     /// # Commit
     ///
-    /// `Commit` runs the checks and the steps of [`Repo::receive`], with four
+    /// `Commit` runs the checks and the steps of [`Repo::receive`], with five
     /// differences:
     ///
     /// - The rule of each update is the rule that
@@ -72,6 +72,9 @@ impl Repo {
     ///   must pass the verification of the rule of each of its updates, and a
     ///   commit with no signature fails. A commit that no update names gets
     ///   no verification, a dependency included.
+    /// - In a repository with no collection id, the check of
+    ///   `ostree.collection-binding` does not run for a local ref and a remote
+    ///   ref. A ref `@ID:NAME` keeps the check.
     /// - The call ignores the `signers` of each rule, `summary_signers`, and
     ///   `update_summary` of `policy`. As a result, the commit adds no server
     ///   signature, writes no anchor commit, and does not regenerate the

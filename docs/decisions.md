@@ -2767,7 +2767,8 @@ The rules of the two commands:
   `Y` on a `DST` `@X:NAME`, with `Y` other than `X`. It refuses a commit with
   no binding on each `@X:` `DST`, also when `X` is the collection id of the
   receiver. The receiver checks the collection binding of a plain `DST`, and
-  of a remote ref against its own collection id.
+  of a remote ref against its own collection id. A receiver with no
+  collection id does not check the collection binding of these refs.
 - `send --remote=REMOTE` and `receive --allow-remote=REMOTE` check REMOTE
   with `ostrya::valid_remote_name`, the rule of `remote add`.
   `--allow-remote` also takes `*`. The option parser checks each value

@@ -52,7 +52,7 @@ Privileged content is a setuid or setgid mode bit, or the \fB\%security.capabili
 \fB\-\-disable\-verify\-bindings\fR
 Do not check the \fB\%ostree.ref\-binding\fR list of each new commit.
 .IP
-Without this switch, the list of the new commit of each update must hold the name part of its ref, or the stream gets \fB\%binding\-mismatch\fR\&. A commit with no \fB\%ostree.ref\-binding\fR key passes. The switch skips no check of \fB\%ostree.collection\-binding\fR: a commit bound to a collection other than the namespace of its ref, and a commit with no collection binding on a ref of another collection, still get \fB\%binding\-mismatch\fR\&. The option needs \%\-\-one\-way. Without \%\-\-one\-way, the key \fB\%disable\-verify\-bindings\fR of the client group applies.
+Without this switch, the list of the new commit of each update must hold the name part of its ref, or the stream gets \fB\%binding\-mismatch\fR\&. A commit with no \fB\%ostree.ref\-binding\fR key passes. The switch skips no check of \fB\%ostree.collection\-binding\fR: a commit bound to a collection other than the namespace of its ref, and a commit with no collection binding on a ref of another collection, still get \fB\%binding\-mismatch\fR\&. In a repository with no collection id, the receive does not check the collection binding of a plain ref and of a remote ref. The option needs \%\-\-one\-way. Without \%\-\-one\-way, the key \fB\%disable\-verify\-bindings\fR of the client group applies.
 .TP
 \fB\-\-stop\-at\-commit\fR
 Commit at the \fB\%Commit\fR frame of the stream.

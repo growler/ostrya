@@ -440,6 +440,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             named,
             refs,
             paths,
+            one_way,
             hooks,
             meta,
             ..
@@ -450,6 +451,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             names: &named,
             refs: &refs,
             paths: &paths,
+            one_way,
         };
         // The future of the checks and of the commit is large, and it owns the
         // transaction. The box keeps it out of the future of each caller.

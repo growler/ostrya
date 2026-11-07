@@ -4291,7 +4291,9 @@ struct ReceiveArgs {
     /// check of `ostree.collection-binding`: a commit bound to a collection
     /// other than the namespace of its ref, and a commit with no collection
     /// binding on a ref of another collection, still get `binding-mismatch`.
-    /// The option needs --one-way. Without --one-way, the key
+    /// In a repository with no collection id, the receive does not check the
+    /// collection binding of a plain ref and of a remote ref. The option
+    /// needs --one-way. Without --one-way, the key
     /// `disable-verify-bindings` of the client group applies.
     #[arg(long, requires = "one_way")]
     disable_verify_bindings: bool,

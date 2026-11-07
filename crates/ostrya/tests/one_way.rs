@@ -1148,6 +1148,37 @@ fn a_one_way_collection_ref_checks_its_bindings() {
     );
 }
 
+/// A one-way stream into a repository with no collection id writes a local
+/// ref to a commit with a collection binding: the collection check does not
+/// run. A repository with a collection id refuses a commit bound to another
+/// collection on a local ref.
+#[test]
+fn a_one_way_local_ref_skips_the_collection_check_with_no_own_id() {
+    let tmp = TmpDir::new("one-way-local-binding");
+    let (repo, _) = empty_repo(&tmp, "");
+    let main = bound_commit("main", Some("org.example.A"), Some(&["main"]));
+    let bytes = stream_to("main", &main);
+    let report = receive(&repo, &StreamPolicy::default(), &bytes).unwrap();
+    assert_eq!(report.refs[0].name, Ref::local("main"));
+    assert_eq!(
+        block_on(repo.resolve_ref_tip(&Ref::local("main"))).unwrap(),
+        Some(main.checksum)
+    );
+
+    let tmp = TmpDir::new("one-way-local-binding-own");
+    let (repo, before) = empty_repo(&tmp, "collection-id=org.example.B\n");
+    match receive(&repo, &StreamPolicy::default(), &bytes) {
+        Err(Error::Remote(remote::Error::BindingMismatch(m))) => {
+            assert!(
+                m.contains("'org.example.A'") && m.contains("'org.example.B'"),
+                "{m}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+}
+
 // ---------------------------------------------------------------------------
 // The two-way receiver.
 // ---------------------------------------------------------------------------

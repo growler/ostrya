@@ -4285,12 +4285,14 @@ Each failed check ends the session, and the session writes nothing:
      with the same flag, skip this check alone.
    - If the commit has `ostree.collection-binding`, the value must be the id
      of the namespace of the ref: `ID` for `@ID:NAME`, and the collection id
-     of the repository for a local ref. A commit bound to `X` on a plain
-     `NAME` thus fails unless `X` is the collection id of the repository. In
-     the local refs of a repository with no collection id, a commit with the
-     key fails. A one-way stream checks the key of the commit of a remote
-     ref against the collection id of the repository, and does not check it
-     in a repository with no collection id.
+     of the repository for a local ref. In a repository with a collection
+     id, a commit bound to `X` on a plain `NAME` thus fails unless `X` is
+     that id. A one-way stream checks the key of the commit of a remote ref
+     against the collection id of the repository. In a repository with no
+     collection id, a two-way session refuses a commit with the key on a
+     local ref. A one-way stream into such a repository does not check the
+     key on a local ref and on a remote ref, and checks it on a ref
+     `@ID:NAME`.
    - A commit with no `ostree.collection-binding` passes on a local ref and
      on a remote ref. On a ref `@ID:NAME` whose `ID` is not the collection id
      of the repository, it fails.

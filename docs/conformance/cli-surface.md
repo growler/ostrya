@@ -5328,7 +5328,9 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]...
   check of `ostree.ref-binding`. A commit whose collection binding does not
   name the namespace of its ref still gets `binding-mismatch`, and so does
   a commit with no collection binding on a ref of a collection other than
-  the collection id of the repository. Without `--one-way`, the key
+  the collection id of the repository. In a repository with no collection
+  id, the receive does not check the collection binding of a plain ref and
+  of a remote ref. Without `--one-way`, the key
   `disable-verify-bindings` of the client group applies.
 - `--trust=NAME` puts the keys of `[ex-ostrya trust "NAME"]`, from
   `TrustedKeys::from_trust_group`, on the default rule and on each rule of

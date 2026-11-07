@@ -73,6 +73,8 @@ pub(super) struct Named<'a> {
     pub(super) refs: &'a [Ref],
     /// The path under `refs/` of each ref of `names`, in the same order.
     pub(super) paths: &'a [String],
+    /// `true` if the session reads a one-way stream.
+    pub(super) one_way: bool,
 }
 
 impl Named<'_> {
@@ -399,7 +401,13 @@ pub(super) async fn finish(
         return Err(missing_objects(missing, "the trees of the commits reach"));
     }
     check_dependencies(&txn, &targets, &staged, &fields).await?;
-    check_bindings(repo, policy.verifies_ref_bindings(), &names, &targets)?;
+    check_bindings(
+        repo,
+        policy.verifies_ref_bindings(),
+        named.one_way,
+        &names,
+        &targets,
+    )?;
     drop((staged, fields));
     let commit_meta: HashMap<Checksum, Bytes> = commit_meta
         .into_iter()
@@ -1190,8 +1198,8 @@ async fn check_dependencies(
 /// namespace of each of its refs:
 ///
 /// - A local ref takes the collection id of the repository. In a repository
-///   with no collection id, a commit with the key fails. A commit without
-///   the key passes.
+///   with no collection id, a commit with the key fails and a commit without
+///   the key passes, but the check of a one-way stream does not read the key.
 /// - A collection ref `@ID:NAME` takes `ID`. A commit without the key fails,
 ///   because a commit with no collection binding goes to the local refs
 ///   alone.
@@ -1201,6 +1209,7 @@ async fn check_dependencies(
 fn check_bindings(
     repo: &Repo,
     ref_bindings: bool,
+    one_way: bool,
     names: &[&Ref],
     targets: &[Target],
 ) -> Checked<()> {
@@ -1221,6 +1230,9 @@ fn check_bindings(
             }
             let wanted = match name {
                 Ref::Collection { id, .. } => Some(id.as_str()),
+                // A one-way stream writes a local ref of a repository with
+                // no collection id with no collection check.
+                Ref::Local { .. } if one_way && own.is_none() => continue,
                 Ref::Local { .. } => own,
                 Ref::Remote { .. } if own.is_some() => own,
                 Ref::Remote { .. } => continue,

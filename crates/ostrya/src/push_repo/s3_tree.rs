@@ -68,11 +68,13 @@ impl BucketRepo {
     ///    lists the objects. It reads no ref file of another namespace, and
     ///    it skips `refs/mirrors/` of the collection id of the bucket, whose
     ///    refs are in `refs/heads/`.
-    /// 4. It checks the refs: the branch `ostree-metadata` in `refs/heads/`
-    ///    of a bucket with a collection id is refused, the ref directory must
-    ///    hold no name that is a directory of another name after the push,
-    ///    and each ref of the namespace and the parent must name a commit
-    ///    that the listing holds.
+    /// 4. It checks the refs. It refuses a branch `@OWN:NAME`, where `OWN`
+    ///    is the collection id of the bucket, if `NAME` is 64 lowercase hex
+    ///    characters, as step 1 refuses a plain branch of that form. It
+    ///    refuses the branch `ostree-metadata` in `refs/heads/` of a bucket
+    ///    with a collection id. The ref directory must hold no name that is a
+    ///    directory of another name after the push, and each ref of the
+    ///    namespace and the parent must name a commit that the listing holds.
     /// 5. It makes the commit. The parent is the tip of the branch in the
     ///    bucket, or none for an absent branch or with
     ///    [`orphan`](TreePushOptions::orphan). The ref binding holds the
@@ -144,8 +146,10 @@ impl BucketRepo {
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
-    ///   repository has no `config`, or if the ref directory of the namespace
-    ///   holds a name that is a directory of another name after the push.
+    ///   repository has no `config`, if the branch is `@OWN:NAME` for the
+    ///   collection id `OWN` of the bucket and `NAME` is 64 lowercase hex
+    ///   characters, or if the ref directory of the namespace holds a name
+    ///   that is a directory of another name after the push.
     /// - [`Error::Remote`] with
     ///   [`RefDenied`](crate::remote::Error::RefDenied) if the branch is
     ///   `ostree-metadata` in `refs/heads/` of a bucket with a collection id.
@@ -235,7 +239,15 @@ impl BucketRepo {
         let dir = dirs.remove(&ns).expect("the push read the namespace");
         let name = branch.name();
 
-        // The ref checks, in the directory of the namespace.
+        // The ref checks, in the directory of the namespace. The scan refuses
+        // a plain branch of the checksum shape, and `@OWN:NAME` is
+        // `refs/heads/NAME` too.
+        if ns == Namespace::Local && ostrya_core::is_checksum_shaped(name) {
+            return Err(invalid(format!(
+                "branch '{branch}' is 64 hex characters, which a revision reads as a commit \
+                 checksum"
+            )));
+        }
         if ns == Namespace::Local && collection_id.is_some() && name == OSTREE_METADATA_REF {
             return Err(Error::Remote(crate::remote::Error::RefDenied(format!(
                 "ref '{branch}' holds the collection anchor commit of a repository with a \

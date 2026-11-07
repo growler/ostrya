@@ -50,8 +50,10 @@ pub struct RepoPushOptions {
     ///
     /// A push names no remote ref of the server. `DST` holds no `^`. A
     /// revision reads 64 lowercase hex characters as a commit checksum, so a
-    /// local `DST` that takes a commit is not 64 lowercase hex characters. A
-    /// delete can name such a `DST`.
+    /// local `DST` that takes a commit is not 64 lowercase hex characters.
+    /// This rule also applies to the name part of a `DST` `@OWN:NAME`, where
+    /// `OWN` is the collection id of the server, because the server keeps
+    /// that ref at `refs/heads/NAME`. A delete can name such a `DST`.
     pub refspecs: Vec<String>,
     /// The depth of the parent chain that the push reads for each source
     /// commit.
@@ -483,8 +485,10 @@ impl Repo {
     /// bound to `X`. A commit with no binding goes to the local refs alone.
     /// Two `DST` refs or tags that name one ref of the server, `NAME` and
     /// `@OWN:NAME`, also fail here. An ostrya server refuses such a `Hello`
-    /// before `HelloReply`. On a failure, the push sends no object and ends
-    /// the session with `Abort`.
+    /// before `HelloReply`. A `DST` or a tag `@OWN:NAME` that takes a commit
+    /// fails here if `NAME` is 64 lowercase hex characters, as a local `DST`
+    /// of that form fails before the session opens. On a failure, the push
+    /// sends no object and ends the session with `Abort`.
     ///
     /// The `ostree.ref-binding` of the commit of each `DST` must hold the
     /// name part of the `DST`: `stable` for `@X:stable`. A commit with no
@@ -609,6 +613,10 @@ impl Repo {
     ///   `@ID:NAME` under [`Ref::validate`], or if a `DST` holds a `^`. A
     ///   local `DST` of 64 lowercase hex characters that takes a commit also
     ///   gives this error. A delete (`:DST`) of such a `DST` passes.
+    /// - [`Error::InvalidRefspec`] with the text of the ref if a `DST` or a
+    ///   tag `@OWN:NAME` takes a commit and `NAME` is 64 lowercase hex
+    ///   characters, where `OWN` is the collection id of the server, after
+    ///   `HelloReply`.
     /// - [`Error::RefNotFound`], [`Error::AmbiguousRefspec`],
     ///   [`Error::NoParentCommit`], or another error of
     ///   [`resolve_rev`](Repo::resolve_rev) if a `SRC` does not resolve.
@@ -1072,6 +1080,7 @@ fn unbound_in_collection(checksum: &Checksum, name: &Ref) -> Error {
 /// and `@OWN:NAME`, are
 /// [`InvalidInput`](crate::remote::Error::InvalidInput). An ostrya server
 /// refuses such a `Hello` before `HelloReply`. Then
+/// [`check_written_shape`] runs for the refs that take a commit, and
 /// [`check_collection_binding`] runs for each update that writes a commit.
 fn check_namespaces(
     server: &ServerInfo,
@@ -1081,6 +1090,7 @@ fn check_namespaces(
 ) -> Result<()> {
     let own = server.collection_id.as_deref();
     check_distinct(own, targets.iter().map(|t| &t.dst).chain(tags))?;
+    check_written_shape(own, updates(targets, tags, sources).map(|(name, _)| name))?;
     for (name, commit) in updates(targets, tags, sources) {
         check_collection_binding(&commit, binding(sources, &commit), name, own)?;
     }
@@ -1105,6 +1115,34 @@ pub(super) fn check_distinct<'a>(
             return Err(invalid(format!(
                 "the refs '{first}' and '{name}' name one ref of the server"
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a ref of `written` that is a local ref of 64 lowercase hex
+/// characters on a server or a bucket repository whose collection id is
+/// `own`: a local ref `NAME`, or a ref `@OWN:NAME`.
+///
+/// A revision reads such a name as a commit checksum, so a push writes no
+/// commit to it. The caller gives the refs that take a commit alone, so a
+/// delete passes.
+///
+/// # Errors
+///
+/// [`Error::InvalidRefspec`] with the text of the first such ref.
+pub(super) fn check_written_shape<'a>(
+    own: Option<&str>,
+    written: impl IntoIterator<Item = &'a Ref>,
+) -> Result<()> {
+    for r in written {
+        let name = match r {
+            Ref::Local { name } => name,
+            Ref::Collection { id, name } if Some(id.as_str()) == own => name,
+            _ => continue,
+        };
+        if ostrya_core::is_checksum_shaped(name) {
+            return Err(Error::InvalidRefspec(r.to_string()));
         }
     }
     Ok(())
@@ -1497,6 +1535,35 @@ mod tests {
         assert!(message.contains("'@org.example.Y:t'"), "{message}");
     }
 
+    /// After `HelloReply`, a ref `@OWN:NAME` that takes a commit is the
+    /// local ref `NAME` of the server, so a `NAME` of 64 lowercase hex
+    /// characters is refused, as a `DST` and as a tag. A delete passes, and
+    /// so does such a ref of another collection.
+    #[test]
+    fn a_written_ref_of_the_own_id_and_64_hex_is_refused() {
+        let own = format!("@org.example.X:{}", "ab".repeat(32));
+        let target = |dst: &str, commit| PushTarget {
+            dst: r(dst),
+            commit,
+        };
+        let x = Some("org.example.X");
+        let os = sources(&[x]);
+        let refused = |result: Result<()>| match result {
+            Err(Error::InvalidRefspec(text)) => assert_eq!(text, own),
+            other => panic!("expected InvalidRefspec, got {other:?}"),
+        };
+        let written = [target(&own, Some(csum(1)))];
+        refused(check_namespaces(&server(x), &written, &[], &os));
+        let main = [target("main", Some(csum(1)))];
+        refused(check_namespaces(&server(x), &main, &[r(&own)], &os));
+        // A delete writes no commit.
+        check_namespaces(&server(x), &[target(&own, None)], &[], &[]).unwrap();
+        // With another collection id on the server, or with none, the ref is
+        // no local ref of the server.
+        check_namespaces(&server(None), &written, &[], &os).unwrap();
+        check_namespaces(&server(Some("org.example.Y")), &written, &[], &os).unwrap();
+    }
+
     /// A tag is a local ref or a collection ref. The collection of the push
     /// applies before the check of a repeated tag.
     #[test]
@@ -1531,7 +1598,9 @@ mod tests {
             message.contains("'@org.example.X:a' is named twice"),
             "{message}"
         );
-        // A collection ref of 64 lowercase hex characters is no checksum.
+        // A collection ref of 64 lowercase hex characters passes before
+        // `HelloReply`, because its id can name another collection than the
+        // collection id of the server.
         check_tag_names(&[Ref::collection("org.example.X", hex.as_str())], None).unwrap();
     }
 

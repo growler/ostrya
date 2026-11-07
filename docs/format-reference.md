@@ -837,6 +837,17 @@ target ref:
   looks like a checksum` before it takes the repository lock.
 - In the library, `Repo::push`, `Repo::push_onto`, `Repo::export_stream`, and
   `push_tree` refuse the name before they send a byte.
+- Each push to a server or to a bucket repository maps each ref that it
+  writes to the collection id of the destination, then refuses a local name
+  of that shape. So it also refuses `@OWN:<name>`, where `OWN` is the
+  collection id of the destination, because the destination keeps that ref
+  at `refs/heads/<name>`. A push over a session reads `OWN` from
+  `HelloReply` and refuses the ref before it offers an object. `push` gives
+  `error: Invalid refspec @OWN:<name>`. `push --onto` and `push-tree` give
+  `error: invalid input: branch '@OWN:<name>' is 64 hex characters, which a
+  revision reads as a commit checksum`, or `tag` for a tag. A push to a
+  bucket repository reads `OWN` from the `config` of the bucket and refuses
+  the ref before its first upload, with the same errors.
 - The server of a push session or of a one-way stream refuses an update that
   writes a commit to such a ref at `Commit` ("Commit and CommitReply"). It
   refuses a server commit whose branch or tag has that shape with
@@ -846,8 +857,12 @@ target ref:
 the server does not check the shape at `Hello`. The client passes a push delete
 (`:<name>`) of a ref of that shape. Check 1 of "Commit and CommitReply" states
 the server side. A remote ref `REMOTE:<name>` and a collection ref
-`@ID:<name>` are not 64 characters, so a revision reads each as a ref, and
-each push site takes it. Ref reads, local ref deletes, pull, and prune do
+`@ID:<name>` are not 64 characters, so a revision reads each as a ref. The
+guard of a push site does not apply to a remote ref, or to a collection ref of
+an id other than the collection id of the destination. A `send --one-way`
+stream and `Repo::export_stream` do not know the collection id of the
+receiver, so they take each collection ref. The receiver refuses
+`@OWN:<name>` at `Commit`. Ref reads, local ref deletes, pull, and prune do
 not apply the guard.
 
 A ref of either hidden shape can arrive in these ways:
@@ -4138,7 +4153,9 @@ collection id of the server. It refuses a commit bound to `Y` on a ref
 `@X:NAME`, with `Y` other than `X`, before it sends `Hello`. It runs the
 other checks after `HelloReply`, and before it sends an object. After
 `HelloReply`, the client also refuses two names of one ref, `NAME` and
-`@OWN:NAME`, which check 6 refuses on an ostrya server. Check 7 of
+`@OWN:NAME`, which check 6 refuses on an ostrya server. It also refuses a
+ref `@OWN:NAME` that takes a commit if `NAME` is 64 lowercase hex
+characters, which check 1 of "Commit and CommitReply" refuses. Check 7 of
 "Commit and CommitReply" states the same rules for the server. "Server
 commit" states the checks of a client of a server commit.
 
@@ -4217,8 +4234,9 @@ order. "Server commit" states the checks of a `Commit` with a server commit.
 Each failed check ends the session, and the session writes nothing:
 
 1. Each ref name has a form of check 5 of "Hello and HelloReply". An update
-   that writes a commit to a name of 64 lowercase hex characters fails this
-   check too. A delete of such a name passes. A failure is `invalid-ref`.
+   that writes a commit to a local name of 64 lowercase hex characters, also
+   as `@OWN:NAME` for the collection id `OWN` of the server, fails this check
+   too. A delete of such a name passes. A failure is `invalid-ref`.
    Then a request with no update, an update whose name is not the text of a
    name of `Hello`, and two updates of one ref are `protocol`.
 2. A `CommitReply` with a commit in each `old`, and the `new` of each
@@ -4376,7 +4394,9 @@ of the branch on the server. The server runs these checks in this order. Each
 failed check ends the session, and the session writes nothing:
 
 1. The branch and each tag are `NAME` or `@ID:NAME` with the rules of check
-   5 of "Hello and HelloReply", and none is 64 lowercase hex characters.
+   5 of "Hello and HelloReply", and none is a local name of 64 lowercase hex
+   characters, also as `@OWN:NAME` for the collection id `OWN` of the
+   server.
    Each bound name passes the refspec rule and holds no `:`. A failure is
    `invalid-ref`. Then a `Commit` with an update, a `Commit` with `force`, a
    branch or a tag that is not the text of a name of `Hello`, and a ref that
@@ -4509,7 +4529,8 @@ push-tree` ("The commit of `push-tree`"). Each client follows these rules:
 - After `HelloReply`, the client maps each ref of the `collection-id` of the
   reply to the local refs. A branch and tags of more than one namespace are
   refused on the client before it sends an object, as check 1 refuses them
-  on the server.
+  on the server. So is a branch or a tag `@OWN:NAME` whose `NAME` is 64
+  lowercase hex characters, with `invalid input`.
 - After `HelloReply`, a tag that the server reports at a commit is
   `ref-mismatch` on the client. Then the client runs the checks of the
   server at `Commit` that need no state of the server:
@@ -7224,6 +7245,8 @@ are:
    refuses the push.
 4. The check that no two `DST` refs name one ref of the bucket, `NAME` and
    `@OWN:NAME`, where `OWN` is the collection id of the bucket. Then the
+   refusal of a `DST` `@OWN:NAME` whose `NAME` is 64 lowercase hex
+   characters, as step 1 refuses a plain `DST` of that form. Then the
    check of the bindings of each ref in its namespace, then the check of
    each ref update. Each tip of a ref in the bucket must be an
    ancestor of the new commit in the local repository, unless the push is
@@ -7352,8 +7375,11 @@ The steps of a tree push are:
    read of the ref files of the ref directory of the namespace and the
    listing of the objects, as for a push of commits. The push does not list
    `refs/mirrors/` of the collection id of the bucket.
-4. The checks of the refs. The branch `ostree-metadata` in `refs/heads/` of
-   a bucket with a collection id is refused, as a server refuses it. The
+4. The checks of the refs. A branch `@OWN:NAME`, where `OWN` is the
+   collection id of the bucket, is refused if `NAME` is 64 lowercase hex
+   characters, as step 1 refuses a plain branch of that form. The branch
+   `ostree-metadata` in `refs/heads/` of a bucket with a collection id is
+   refused, as a server refuses it. The
    ref directory must hold no name that is a directory of another name
    after the push. Each ref of the namespace other than the branch, and the
    parent, must name a commit that the listing holds. A failed check

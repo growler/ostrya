@@ -1397,6 +1397,44 @@ fn server_commit_prechecks_send_nothing() {
     }
 }
 
+/// A branch or a tag `@OWN:NAME`, where `OWN` is the collection id of the
+/// server, is the local ref `NAME` of the server. A `NAME` of 64 lowercase
+/// hex characters fails the check, and `server_commit` then sends nothing.
+/// The same name of another collection passes.
+#[test]
+fn a_server_commit_to_the_own_id_and_64_hex_sends_nothing() {
+    let hex = "ab".repeat(32);
+    let own = format!("@org.example.C:{hex}");
+    let other = format!("@org.example.Os:{hex}");
+    let open_c = |names: &[&str]| {
+        let mut reply = hello_reply(names, BOTH, 16_384);
+        if let Message::HelloReply(r) = &mut reply {
+            r.collection_id = Some("org.example.C".into());
+        }
+        let (session, out) = open_with(encode(&[reply]), names, SessionOptions::default());
+        (session.unwrap(), out)
+    };
+    let cases = [
+        (server_commit(&own, &[]), vec![own.as_str()], "branch"),
+        (
+            server_commit("main", &[&own]),
+            vec!["main", own.as_str()],
+            "tag",
+        ),
+    ];
+    for (sc, names, what) in cases {
+        let text = format!("{what} '{own}' is 64 hex characters");
+        let (session, out) = open_c(&names);
+        assert_invalid(session.check_server_commit(&sc), &text);
+        assert_invalid(block_on(session.server_commit(sc)), &text);
+        assert!(after_hello(&out).is_empty(), "{text}");
+    }
+    let (session, _) = open_c(&[&other]);
+    session
+        .check_server_commit(&server_commit(&other, &[]))
+        .unwrap();
+}
+
 /// The frame of a server commit that the server limit does not hold fails
 /// the check, and `server_commit` then sends nothing.
 #[test]

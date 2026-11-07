@@ -34,7 +34,7 @@ use sha2::{Digest, Sha256};
 use super::invalid;
 use super::negotiate::{
     Commits, Local, Plan, RepoPushOptions, binding, check_collection_binding, check_distinct,
-    offered_history,
+    check_written_shape, offered_history,
 };
 use super::refspec::is_delete;
 use super::source::RepoSource;
@@ -266,7 +266,10 @@ impl Repo {
     ///    of the ref directory of each namespace of the push. It reads no ref
     ///    file of another namespace, and it skips `refs/mirrors/` of the
     ///    collection id of the bucket, whose refs are in `refs/heads/`. It
-    ///    checks the collection binding of each ref in its namespace. For
+    ///    refuses a `DST` `@OWN:NAME`, where `OWN` is the collection id of
+    ///    the bucket, if `NAME` is 64 lowercase hex characters, as step 1
+    ///    refuses a local `DST` of that form. It checks the collection
+    ///    binding of each ref in its namespace. For
     ///    each ref, the tip of the ref in the bucket must be an ancestor of
     ///    the new commit in the local repository, unless
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
@@ -384,6 +387,9 @@ impl Repo {
     ///   bucket, or if the ref directory of a namespace of the push holds a
     ///   name that is a directory of another name after the push. The push
     ///   then uploads nothing.
+    /// - [`Error::InvalidRefspec`] with the text of the `DST` if a `DST` is
+    ///   `@OWN:NAME` for the collection id `OWN` of the bucket, and `NAME` is
+    ///   64 lowercase hex characters. The push then uploads nothing.
     /// - [`Error::InvalidFormat`] if the `config` of the bucket is malformed,
     ///   states a mode other than `archive-z2` and `archive`, holds a
     ///   `tombstone-commits`, `indexed-deltas`, or `keep-detached-related`
@@ -478,6 +484,9 @@ impl Repo {
         // `NAME` and `@OWN:NAME` name one ref of the bucket, and the push
         // writes each ref once.
         check_distinct(bucket_id, plan.targets.iter().map(|t| &t.dst))?;
+        // `@OWN:NAME` is `refs/heads/NAME`, so the local checksum-shape rule
+        // applies to its `NAME`.
+        check_written_shape(bucket_id, plan.targets.iter().map(|t| &t.dst))?;
 
         // The bindings, each ref in its namespace.
         for target in &plan.targets {

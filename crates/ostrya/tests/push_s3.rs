@@ -2114,6 +2114,32 @@ fn two_names_of_one_ref_are_refused_before_an_upload() {
     });
 }
 
+/// A `DST` `@OWN:NAME`, where `OWN` is the collection id of the bucket, is
+/// `refs/heads/NAME`. A `NAME` of 64 lowercase hex characters is refused
+/// before the first upload, as a plain `DST` of that form is refused.
+#[test]
+fn a_dst_of_the_bucket_id_and_64_hex_is_refused() {
+    let scratch = TmpDir::new("push-s3-own-id-hex");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        commit(&repo, "main", None, "one", None).await;
+        server.state().requests.clear();
+        let hex = "ab".repeat(32);
+        let spec = format!("main:@{A}:{hex}");
+        match push(&repo, &server.endpoint(), opts(&[&spec])).await {
+            Err(Error::InvalidRefspec(text)) => assert_eq!(text, format!("@{A}:{hex}")),
+            other => panic!("expected InvalidRefspec, got {other:?}"),
+        }
+        let puts = puts(&server);
+        assert!(puts.iter().all(|key| key.starts_with(LOCK)), "{puts:?}");
+        assert!(keys(&server, "repo/objects/").is_empty());
+        assert!(keys(&server, "repo/refs/").is_empty());
+        assert!(!server.state().objects.contains_key(LOCK));
+    });
+}
+
 /// The binding of a commit selects no namespace: a commit bound to a
 /// collection other than the collection id of the bucket is refused on a
 /// plain `DST`, and a commit with no binding is refused on a ref of another

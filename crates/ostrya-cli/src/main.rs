@@ -4727,7 +4727,9 @@ struct PushArgs {
     /// commit, and the `ostree.ref-binding` of that commit must hold the name
     /// part of each tag: `v1` for @ID:v1. NAME passes the ref-name rule, is
     /// not a remote ref, is not 64 lowercase hex characters if it is plain,
-    /// and is not a DST. The client group of the push needs `t` or `w` on the
+    /// and is not a DST. The name part of a tag @OWN:NAME is not 64
+    /// lowercase hex characters either, where OWN is the collection id of
+    /// the server. The client group of the push needs `t` or `w` on the
     /// tag in its namespace.
     ///
     /// With --onto, the server creates the tag at the new commit, and the
@@ -4777,7 +4779,9 @@ struct PushArgs {
     ///
     /// BRANCH is a local ref NAME of the server, or @ID:NAME, the ref NAME of
     /// the collection ID. It passes the ref-name rule, is not a remote ref,
-    /// and is not 64 lowercase hex characters if it is plain. BRANCH and each
+    /// and is not 64 lowercase hex characters if it is plain. The NAME of a
+    /// BRANCH @OWN:NAME is not 64 lowercase hex characters either, where OWN
+    /// is the collection id of the server. BRANCH and each
     /// --tag are in one namespace, after the server maps the refs of its own
     /// collection id to its local refs. The push refuses refs of two
     /// namespaces before it sends an object. With --onto, the command takes
@@ -4874,7 +4878,10 @@ struct PushArgs {
     /// The command refuses a DST that is not NAME or @ID:NAME under the
     /// ref-name rule, which includes a DST with `^`. It also refuses a plain
     /// DST of 64 lowercase hex characters after a SRC, because a revision
-    /// reads such a name as a commit checksum. A delete of such a DST passes.
+    /// reads such a name as a commit checksum. It refuses a DST @OWN:NAME
+    /// of that form after a SRC too, where OWN is the collection id of the
+    /// server or of the bucket, before it sends an object. A delete of such
+    /// a DST passes.
     ///
     /// With --onto, the operand is one REF, a revision of this repository.
     refspecs: Vec<String>,
@@ -4974,7 +4981,9 @@ struct PushTreeArgs {
     /// the collection ID. The command refuses a remote ref, a name that the
     /// ref-name rule refuses, which includes a name with `^`, and a plain name
     /// of 64 lowercase hex characters, because a revision reads such a name
-    /// as a commit checksum.
+    /// as a commit checksum. It refuses a name @OWN:NAME of that form too,
+    /// where OWN is the collection id of the server or of the bucket, before
+    /// it sends an object.
     ///
     /// To a bucket repository, the push makes the commit itself, as the
     /// server makes it. The parent is the commit of BRANCH in the bucket,

@@ -805,6 +805,51 @@ fn the_anchor_ref_is_refused_in_the_local_refs_of_a_bucket_with_an_id() {
     });
 }
 
+/// A branch `@OWN:NAME`, where `OWN` is the collection id of the bucket, is
+/// `refs/heads/NAME`. A `NAME` of 64 lowercase hex characters is refused
+/// before an upload. The same name in a mirror namespace is taken.
+#[test]
+fn a_branch_of_the_bucket_id_and_64_hex_is_refused() {
+    let scratch = TmpDir::new("push-tree-s3-own-id-hex");
+    let src = build_src(scratch.path());
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A), None).await;
+        server.state().requests.clear();
+        let hex = "ab".repeat(32);
+        let branch = format!("@{A}:{hex}");
+        let message = refused(
+            push_tree(
+                &server.endpoint(),
+                &src,
+                tree_options(&branch),
+                write(false),
+            )
+            .await,
+        );
+        assert!(message.contains(&format!("'{branch}'")), "{message}");
+        assert!(message.contains("commit checksum"), "{message}");
+        let puts = puts(&server);
+        assert!(
+            puts.iter().all(|key| key == PROBE || key == LOCK),
+            "{puts:?}"
+        );
+        assert!(keys(&server, "repo/objects/").is_empty());
+        assert!(keys(&server, "repo/refs/").is_empty());
+        assert!(!server.state().objects.contains_key(LOCK));
+        let mirror = format!("@{B}:{hex}");
+        push_tree(
+            &server.endpoint(),
+            &src,
+            tree_options(&mirror),
+            write(false),
+        )
+        .await
+        .unwrap();
+        assert!(ref_of(&server, &format!("repo/refs/mirrors/{B}/{hex}")).is_some());
+    });
+}
+
 #[test]
 fn a_tree_push_to_a_bucket_with_no_config_is_refused() {
     let scratch = TmpDir::new("push-tree-s3-no-config");

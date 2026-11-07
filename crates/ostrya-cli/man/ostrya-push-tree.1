@@ -33,7 +33,7 @@ The branch of the server that the server commit moves. Required.
 .IP
 The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server whose receive hooks take no server commit answers \%ref\-denied.
 .IP
-BRANCH is a local ref NAME of the server, or \%@ID:NAME, the ref NAME of the collection ID. The command refuses a remote ref, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a plain name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+BRANCH is a local ref NAME of the server, or \%@ID:NAME, the ref NAME of the collection ID. The command refuses a remote ref, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a plain name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum. It refuses a name \%@OWN:NAME of that form too, where OWN is the collection id of the server or of the bucket, before it sends an object.
 .IP
 To a bucket repository, the push makes the commit itself, as the server makes it. The parent is the commit of BRANCH in the bucket, which the push reads under the writer lock, or none if BRANCH is absent. The push then writes the ref file of BRANCH. In a bucket repository with a collection id, the push refuses the BRANCH \fB\%ostree\-metadata\fR in \fB\%refs/heads/\fR\&. The push signs no commit.
 .TP

@@ -944,6 +944,10 @@ impl PushSession {
     ///   its branch and its tags. [`ServerInfo::canonical`] maps each name
     ///   first, so `NAME` and `@OWN:NAME` name one ref, where `OWN` is the
     ///   collection id of the server.
+    /// - [`Error::InvalidInput`] if the branch or a tag of `sc` is a local
+    ///   ref of the server whose name is 64 lowercase hex characters after
+    ///   that map: `NAME` or `@OWN:NAME`. A revision reads such a name as a
+    ///   commit checksum.
     /// - [`Error::InvalidInput`] if the branch and the tags of `sc` are not
     ///   in one namespace of the server after that map: the local refs, or
     ///   the refs of one collection.
@@ -1155,16 +1159,17 @@ fn server_commit_refs(sc: &ServerCommit) -> impl Iterator<Item = &str> {
 }
 
 /// Runs the checks of a server commit `sc` against the facts of `server`,
-/// other than the length of the `Commit` frame: the names of the refs and
-/// their namespace, the depth of each metadata value, and the length of the
-/// longest `CommitReply`.
+/// other than the length of the `Commit` frame: the names of the refs, the
+/// checksum shape of each local ref of the server, and their namespace, the
+/// depth of each metadata value, and the length of the longest
+/// `CommitReply`.
 fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<()> {
     let named: HashSet<&str> = server.refs.iter().map(|r| r.name.as_str()).collect();
     let mut seen = HashSet::new();
     // The namespace of the first ref, and the ref: `None` for the local
     // refs of the server.
     let mut first: Option<(Option<String>, &str)> = None;
-    for name in server_commit_refs(sc) {
+    for (i, name) in server_commit_refs(sc).enumerate() {
         if !named.contains(name) {
             return Err(invalid(format!(
                 "ref '{name}' was not named when the session opened"
@@ -1176,6 +1181,13 @@ fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<
         let r = r.canonical(server.collection_id.as_deref());
         let namespace = match &r {
             Ref::Collection { id, .. } => Some(id.clone()),
+            Ref::Local { name: local } if ostrya_core::is_checksum_shaped(local) => {
+                let what = if i == 0 { "branch" } else { "tag" };
+                return Err(invalid(format!(
+                    "{what} '{name}' is 64 hex characters, which a revision reads as a commit \
+                     checksum"
+                )));
+            }
             _ => None,
         };
         if !seen.insert(r) {

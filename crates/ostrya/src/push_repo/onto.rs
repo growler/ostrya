@@ -187,9 +187,11 @@ impl Repo {
     /// After `HelloReply`, the push refuses a tag that the server holds. Then
     /// it runs [`PushSession::check_server_commit`]: the branch and each tag
     /// must be in one namespace after the server maps the refs of its
-    /// collection id to its local refs, and the `Commit` frame of the server
-    /// commit and the longest `CommitReply` must fit in the `max-frame` of
-    /// the server. Each refusal comes before the push offers an object.
+    /// collection id to its local refs, the `NAME` of a ref `@OWN:NAME` of
+    /// the collection id `OWN` of the server must not be 64 lowercase hex
+    /// characters, and the `Commit` frame of the server commit and the
+    /// longest `CommitReply` must fit in the `max-frame` of the server. Each
+    /// refusal comes before the push offers an object.
     ///
     /// The push does not check the bindings of the local commit. The server
     /// writes the bindings of the namespace of the branch.
@@ -235,7 +237,9 @@ impl Repo {
     ///   reports a commit for a tag.
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the branch
-    ///   and the tags are in two namespaces of the server.
+    ///   and the tags are in two namespaces of the server, or if the branch
+    ///   or a tag is `@OWN:NAME` for the collection id `OWN` of the server
+    ///   and `NAME` is 64 lowercase hex characters.
     /// - [`Error::Remote`] with
     ///   [`LimitExceeded`](crate::remote::Error::LimitExceeded) if the
     ///   `Commit` frame of the server commit, or the longest `CommitReply`

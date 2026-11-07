@@ -5455,6 +5455,13 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   starts or the first HTTP request. A delete `:DST` of a `DST` of 64
   lowercase hex characters passes, and the server removes the ref where the
   client group has `r` and `d` on it.
+- A `DST` `@OWN:NAME` after a `SRC`, where `OWN` is the collection id of the
+  server or of the bucket and `NAME` is 64 lowercase hex characters, is
+  refused with `error: Invalid refspec @OWN:NAME` at exit 1. The
+  destination keeps the ref at `refs/heads/NAME`. The push refuses it after
+  the server reports its collection id, or after it reads the `config` of
+  the bucket, and before it sends an object. A `--tag=@OWN:NAME` of that
+  form gets the same refusal at the same step.
 - The command checks its operands after the repository opens. With no
   `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
   With no refspec it writes the usage text and `error: REFSPEC must be
@@ -5579,6 +5586,11 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   - A local commit that the repository marks partial, and a local commit
     with related objects, are refused with `error: invalid input: ...` at
     the same step.
+  - A `BRANCH` or a tag `@OWN:NAME`, where `OWN` is the collection id of the
+    server and `NAME` is 64 lowercase hex characters, is refused with
+    `error: invalid input: branch '@OWN:NAME' is 64 hex characters, which a
+    revision reads as a commit checksum`, or `tag` for a tag, after the
+    server reports its refs and before the push sends an object.
   - After the server reports its refs, the push checks the `Commit` frame of
     the server commit and the longest reply, which names `BRANCH` and each
     tag, against the frame limit of the server, 1 MiB for an ostrya server.
@@ -6062,7 +6074,12 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
   read, and before the walk. A name that is neither `NAME` nor `@ID:NAME`
   nor `REMOTE:NAME` under the ref-name rule, which includes a name that
   holds `^`, is refused with `error: Invalid refspec NAME`. A remote ref is
-  refused with `error: invalid input: ...`.
+  refused with `error: invalid input: ...`. A `BRANCH` or a tag
+  `@OWN:NAME`, where `OWN` is the collection id of the server and `NAME` is
+  64 lowercase hex characters, is refused with `error: invalid input:
+  branch '@OWN:NAME' is 64 hex characters, which a revision reads as a
+  commit checksum`, or `tag` for a tag, after the server reports its refs
+  and before the push sends an object.
 - `--bind-ref=NAME` binds `NAME` and creates no ref. It can repeat. `NAME`
   is a plain name: it passes the ref-name rule and holds no `:`.
 - `--orphan` makes a commit with no parent. On a `BRANCH` that exists, the
@@ -6128,7 +6145,11 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
   - `--tag` is refused with `error: invalid input: a push to an s3://
     address creates no tag, and the push names tags`, before any request.
     `BRANCH` `ostree-metadata` in `refs/heads/` of a bucket with a
-    collection id is refused with `error: ref-denied: ...`.
+    collection id is refused with `error: ref-denied: ...`. A `BRANCH`
+    `@OWN:NAME`, where `OWN` is the collection id of the bucket and `NAME`
+    is 64 lowercase hex characters, is refused with `error: invalid input:
+    branch '@OWN:NAME' is 64 hex characters, which a revision reads as a
+    commit checksum` before an upload.
   - The push uploads each `.filez` at `--compress=LEVEL`, else at the
     `[archive] zlib-level` of the bucket, else at level 6.
   - `--break-lock` removes the writer lock of another writer, and writes

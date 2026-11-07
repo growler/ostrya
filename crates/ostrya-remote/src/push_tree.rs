@@ -238,10 +238,11 @@ pub async fn push_tree_prepared(
 /// [`Error::RefMismatch`]. Then it runs
 /// [`PushSession::check_server_commit`]: the branch and each tag must be in
 /// one namespace after the server maps the refs of its collection id to its
-/// local refs, a commit must hold each metadata value, and the `Commit` frame
-/// of the server commit and the longest `CommitReply` must fit in the
-/// `max-frame` of the server. Each refusal comes before the push offers an
-/// object.
+/// local refs, the `NAME` of a ref `@OWN:NAME` of the collection id `OWN`
+/// of the server must not be 64 lowercase hex characters, a commit must hold
+/// each metadata value, and the `Commit` frame of the server commit and the
+/// longest `CommitReply` must fit in the `max-frame` of the server. Each
+/// refusal comes before the push offers an object.
 ///
 /// The push offers each object of the tree in one round of `Have`, and sends
 /// the objects that the server lacks. It sends no commit object and no
@@ -273,7 +274,9 @@ pub async fn push_tree_prepared(
 ///   gives the `io::ErrorKind` of each case.
 /// - [`Error::RefMismatch`] if `HelloReply` reports a commit for a tag.
 /// - [`Error::InvalidInput`] if the branch and the tags are in two
-///   namespaces of the server.
+///   namespaces of the server, or if the branch or a tag is `@OWN:NAME` for
+///   the collection id `OWN` of the server and `NAME` is 64 lowercase hex
+///   characters.
 /// - [`Error::InvalidInput`] if a commit cannot hold a value of `metadata`.
 ///   In a commit, a value can hold two levels of containers fewer than a
 ///   variant.
@@ -548,7 +551,9 @@ fn check_tags_absent(server: &ServerInfo, tags: &[String]) -> Result<()> {
 /// Refuses a ref that the server commit writes: a remote ref, a ref that
 /// fails [`Ref::validate`] (which includes a name that holds `^`), and a
 /// local ref of 64 lowercase hex characters. `what` names the ref in the
-/// message.
+/// message. [`PushSession::check_server_commit`] refuses a ref `@OWN:NAME`
+/// of that form after `HelloReply`, when the collection id `OWN` of the
+/// server is known.
 fn check_ref(r: &Ref, what: &str) -> Result<()> {
     if let Ref::Remote { .. } = r {
         return Err(invalid(format!(
@@ -760,7 +765,9 @@ mod tests {
             push.refs,
             ["main", "a/b", "x.y", &upper, &hex[1..], "@org.example.X:t"]
         );
-        // A collection ref of 64 lowercase hex characters is no checksum.
+        // A collection ref of 64 lowercase hex characters passes here. The
+        // check of the ref after the server maps it to its collection id
+        // comes after `HelloReply`.
         Prepared::new(TreePushOptions {
             onto: Ref::collection("org.example.X", hex.as_str()),
             ..onto("main")

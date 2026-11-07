@@ -359,6 +359,15 @@ fn assert_aborted(report: &ostrya::Result<ReceiveReport>) {
     }
 }
 
+fn assert_protocol<T: std::fmt::Debug>(result: &ostrya::Result<T>, needle: &str) {
+    match result {
+        Err(Error::Remote(remote::Error::Protocol(msg))) => {
+            assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
+        }
+        other => panic!("expected Protocol, got {other:?}"),
+    }
+}
+
 fn assert_invalid_input(error: &Error, needle: &str) {
     match error {
         Error::Remote(remote::Error::InvalidInput(msg)) => {
@@ -1172,14 +1181,38 @@ fn two_texts_of_one_ref_are_refused_before_any_object() {
         &namespaces_policy(&["w:**"]),
         hook,
     );
-    assert!(
-        matches!(report, Err(Error::Remote(remote::Error::Protocol(_)))),
-        "{report:?}"
+    let needle = "Hello names ref 'main' two times, as 'main' and '@org.example.Server:main'";
+    assert_protocol(&report, needle);
+    assert_protocol(&outcome, needle);
+    assert!(!kinds.lock().unwrap().contains(&HAVE_FRAME));
+    assert!(!has_commit(&pair.server, &c1));
+}
+
+/// `push remote main --tag @OWN:main` names the ref `main` of the server
+/// two times. The server refuses the `Hello` before `HelloReply`, so the
+/// push sends no object.
+#[test]
+fn a_tag_in_the_own_collection_of_the_dst_is_refused_by_the_server() {
+    let pair = Pair::new(
+        "tag-own",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "collection-id=org.example.Server\n",
     );
-    assert!(
-        matches!(outcome, Err(Error::Remote(remote::Error::Protocol(_)))),
-        "{outcome:?}"
+    let c1 = commit(&pair.client, "main", None, "c1", bound(None, &["main"]));
+    let (kinds, hook) = frame_kinds();
+    let (report, outcome) = push_under(
+        &pair,
+        RepoPushOptions {
+            tags: vec![r("@org.example.Server:main")],
+            ..opts(&["main"])
+        },
+        &namespaces_policy(&["w:**", "t:**"]),
+        hook,
     );
+    let needle = "Hello names ref 'main' two times, as 'main' and '@org.example.Server:main'";
+    assert_protocol(&report, needle);
+    assert_protocol(&outcome, needle);
     assert!(!kinds.lock().unwrap().contains(&HAVE_FRAME));
     assert!(!has_commit(&pair.server, &c1));
 }

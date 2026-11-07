@@ -483,7 +483,9 @@ impl Repo {
     /// Each `DST` and each tag names its own namespace of the server: a local
     /// ref `NAME`, or a ref `@ID:NAME` of the collection `ID`. The server takes
     /// the refs of its own collection id as its local refs, so `@OWN:NAME`
-    /// and `NAME` name one ref. The binding of a commit selects no namespace.
+    /// and `NAME` name one ref. The server refuses two `DST` refs or tags
+    /// that name one ref before `HelloReply`. The binding of a commit selects
+    /// no namespace.
     ///
     /// Before the session opens, the push reads the `ostree.collection-binding`
     /// of each source commit. It refuses a binding that names no collection,
@@ -495,12 +497,10 @@ impl Repo {
     /// bound commit on a local ref must name the collection id of the
     /// server, and a commit on a ref `@X:NAME` of another collection must be
     /// bound to `X`. A commit with no binding goes to the local refs alone.
-    /// Two `DST` refs or tags that name one ref of the server, `NAME` and
-    /// `@OWN:NAME`, also fail here. An ostrya server refuses such a `Hello`
-    /// before `HelloReply`. A `DST` or a tag `@OWN:NAME` that takes a commit
-    /// fails here if `NAME` is 64 lowercase hex characters, as a local `DST`
-    /// of that form fails before the session opens. On a failure, the push
-    /// sends no object and ends the session with `Abort`.
+    /// A `DST` or a tag `@OWN:NAME` that takes a commit fails here if `NAME`
+    /// is 64 lowercase hex characters, as a local `DST` of that form fails
+    /// before the session opens. On a failure, the push sends no object and
+    /// ends the session with `Abort`.
     ///
     /// The `ostree.ref-binding` of the commit of each `DST` must hold the
     /// name part of the `DST`: `stable` for `@X:stable`. A commit with no
@@ -644,9 +644,9 @@ impl Repo {
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   `ostree.collection-binding` of a source commit does not agree with
     ///   the namespace of its `DST` or of a tag, as "Namespace" states.
-    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
-    ///   if two `DST` refs or tags name one ref of the server, after
-    ///   `HelloReply`.
+    /// - [`Error::Remote`] with [`Protocol`](crate::remote::Error::Protocol)
+    ///   if two `DST` refs or tags name one ref of the server, `NAME` and
+    ///   `@OWN:NAME`. The server refuses such a `Hello` before `HelloReply`.
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
     /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit of the
@@ -1088,12 +1088,10 @@ fn unbound_in_collection(checksum: &Checksum, name: &Ref) -> Error {
 /// Runs the checks of a push after `HelloReply`, against the collection id
 /// of `server`.
 ///
-/// Two refs of `targets` and `tags` that name one ref of the server, `NAME`
-/// and `@OWN:NAME`, are
-/// [`InvalidInput`](crate::remote::Error::InvalidInput). An ostrya server
-/// refuses such a `Hello` before `HelloReply`. Then
 /// [`check_written_shape`] runs for the refs that take a commit, and
 /// [`check_collection_binding`] runs for each update that writes a commit.
+/// An ostrya server refuses two names of one ref, `NAME` and `@OWN:NAME`,
+/// before `HelloReply`.
 fn check_namespaces(
     server: &ServerInfo,
     targets: &[PushTarget],
@@ -1101,33 +1099,9 @@ fn check_namespaces(
     sources: &[(Checksum, Option<String>)],
 ) -> Result<()> {
     let own = server.collection_id.as_deref();
-    check_distinct(own, targets.iter().map(|t| &t.dst).chain(tags))?;
     check_written_shape(own, updates(targets, tags, sources).map(|(name, _)| name))?;
     for (name, commit) in updates(targets, tags, sources) {
         check_collection_binding(&commit, binding(sources, &commit), name, own)?;
-    }
-    Ok(())
-}
-
-/// Refuses two refs of `names` that name one ref of a server whose
-/// collection id is `own`: `NAME` and `@OWN:NAME`.
-///
-/// # Errors
-///
-/// [`Error::Remote`] with
-/// [`InvalidInput`](crate::remote::Error::InvalidInput) for the first ref
-/// that names the ref of an earlier ref.
-pub(super) fn check_distinct<'a>(
-    own: Option<&str>,
-    names: impl IntoIterator<Item = &'a Ref>,
-) -> Result<()> {
-    let mut seen: HashMap<Ref, &Ref> = HashMap::new();
-    for name in names {
-        if let Some(first) = seen.insert(name.clone().canonical(own), name) {
-            return Err(invalid(format!(
-                "the refs '{first}' and '{name}' name one ref of the server"
-            )));
-        }
     }
     Ok(())
 }
@@ -1505,8 +1479,7 @@ mod tests {
         assert!(message.contains("not 'org.example.X'"), "{message}");
     }
 
-    /// After `HelloReply`, two texts of one ref are refused, and each update
-    /// gets the check of its namespace.
+    /// After `HelloReply`, each update gets the check of its namespace.
     #[test]
     fn the_checks_after_hello_reply_use_the_collection_id_of_the_server() {
         let target = |dst: &str, commit| PushTarget {
@@ -1520,18 +1493,8 @@ mod tests {
             target("@org.example.X:b", Some(csum(1))),
         ];
         check_namespaces(&server(x), &targets, &[r("t")], &os).unwrap();
-        let message = invalid_input(check_namespaces(
-            &server(x),
-            &targets,
-            &[r("@org.example.X:main")],
-            &os,
-        ));
-        assert!(
-            message.contains("'main' and '@org.example.X:main' name one ref"),
-            "{message}"
-        );
-        // With no collection id on the server, both refs are distinct, and
-        // the bound commit fails the local ref.
+        // With no collection id on the server, the bound commit fails the
+        // local ref.
         let message = mismatch(check_namespaces(&server(None), &targets, &[], &os));
         assert!(message.contains("ref 'main'"), "{message}");
         // A delete gets no binding check.

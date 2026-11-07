@@ -33,8 +33,8 @@ use sha2::{Digest, Sha256};
 
 use super::invalid;
 use super::negotiate::{
-    Commits, Local, Plan, RepoPushOptions, binding, check_collection_binding, check_distinct,
-    check_written_shape, offered_history,
+    Commits, Local, Plan, RepoPushOptions, binding, check_collection_binding, check_written_shape,
+    offered_history,
 };
 use super::refspec::is_delete;
 use super::source::RepoSource;
@@ -181,6 +181,26 @@ fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
         return Err(invalid(format!(
             "a push to an s3:// address deletes no ref, and the refspec '{spec}' is a delete"
         )));
+    }
+    Ok(())
+}
+
+/// Refuses two refs of `names` that name one ref of a bucket repository
+/// whose collection id is `own`: `NAME` and `@OWN:NAME`.
+///
+/// # Errors
+///
+/// [`Error::Remote`] with
+/// [`InvalidInput`](crate::remote::Error::InvalidInput) for the first ref
+/// that names the ref of an earlier ref.
+fn check_distinct<'a>(own: Option<&str>, names: impl IntoIterator<Item = &'a Ref>) -> Result<()> {
+    let mut seen: HashMap<Ref, &Ref> = HashMap::new();
+    for name in names {
+        if let Some(first) = seen.insert(name.clone().canonical(own), name) {
+            return Err(invalid(format!(
+                "the refs '{first}' and '{name}' name one ref of the server"
+            )));
+        }
     }
     Ok(())
 }

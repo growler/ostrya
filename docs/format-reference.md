@@ -4151,10 +4151,8 @@ the `collection-id` of `HelloReply`, take the collection id of the server.
 `ostree.collection-binding` on a ref of a collection other than the
 collection id of the server. It refuses a commit bound to `Y` on a ref
 `@X:NAME`, with `Y` other than `X`, before it sends `Hello`. It runs the
-other checks after `HelloReply`, and before it sends an object. After
-`HelloReply`, the client also refuses two names of one ref, `NAME` and
-`@OWN:NAME`, which check 6 refuses on an ostrya server. It also refuses a
-ref `@OWN:NAME` that takes a commit if `NAME` is 64 lowercase hex
+other checks after `HelloReply`, and before it sends an object. It also
+refuses a ref `@OWN:NAME` that takes a commit if `NAME` is 64 lowercase hex
 characters, which check 1 of "Commit and CommitReply" refuses. Check 7 of
 "Commit and CommitReply" states the same rules for the server. "Server
 commit" states the checks of a client of a server commit.

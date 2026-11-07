@@ -95,8 +95,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// - With no receive policies, the server identifies no client. Each read
 ///   gets the rights of the `anonymous` item under the implicit group of
 ///   a config with no client group, with the collection id of the
-///   repository. Each local ref and each mirror ref are served, and
-///   `refs/remotes/` is not. `summary` and `summary.sig` give the files of
+///   repository. Each local ref and each mirror ref of another collection
+///   are served, and `refs/remotes/` is not. `summary` and `summary.sig` give the files of
 ///   the summary of the `anonymous` item of this implicit group.
 /// - The HTTP layer removes a `#` fragment before the routing, so the server
 ///   does not see a fragment.
@@ -318,8 +318,8 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
 /// Returns the read rights of each request of a server with no receive
 /// policies: the rights of the `anonymous` item under the implicit
 /// group of a config with no client group. The config has the collection id
-/// of `repo`, so `refs/mirrors/ID/NAME` of that id is in the local
-/// namespace.
+/// of `repo`, so a collection ref of that id is a local ref, and no path
+/// under `refs/mirrors/` of that id is served.
 fn anonymous_reads(repo: &Repo) -> ReadAccess {
     let access = ClientAccess::implicit(repo.config().collection_id());
     ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)

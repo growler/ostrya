@@ -654,10 +654,10 @@ impl Repo {
     ///
     /// An alias resolves by the rule of the ref listing: its body is a
     /// relative path, and it names a regular file under `refs/heads/` or
-    /// under `refs/mirrors/ID/` of a valid collection id with one link. The
-    /// result holds the alias by its own name, with the commit of the target.
-    /// An alias whose target is absent, is outside these directories, or is
-    /// an alias is not in the result.
+    /// under `refs/mirrors/ID/` of a valid collection id other than `[core]
+    /// collection-id` with one link. The result holds the alias by its own
+    /// name, with the commit of the target. An alias whose target is absent,
+    /// is outside these directories, or is an alias is not in the result.
     ///
     /// The call does not check a name that it finds against the ref-name
     /// rule. A wildcard of `refs` selects a name that the rule refuses.
@@ -3141,8 +3141,8 @@ mod tests {
     }
 
     /// The implicit read access of a handle takes the collection id of the
-    /// repository as the local namespace, and reads the mirror path of a ref
-    /// of that id.
+    /// repository as the local namespace. It reads the local path of a ref
+    /// of that id, and no mirror path of that id.
     #[test]
     fn the_implicit_read_access_takes_the_collection_id_of_the_repository() {
         let root = Root::new("implicit-reads");
@@ -3150,7 +3150,8 @@ mod tests {
             let repo = own_repo(&root.dir.join("repo")).await;
             let reads = repo.implicit_reads();
             assert_eq!(reads.access().namespace(Some(OWN)), Namespace::Local);
-            assert!(reads.can_read_path(&format!("refs/mirrors/{OWN}/{NAME}")));
+            assert!(reads.can_read_path(&format!("refs/heads/{NAME}")));
+            assert!(!reads.can_read_path(&format!("refs/mirrors/{OWN}/{NAME}")));
         });
     }
 

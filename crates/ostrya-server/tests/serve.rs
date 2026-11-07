@@ -1631,28 +1631,33 @@ fn a_server_with_no_receive_policies_serves_as_the_implicit_groups() {
     });
 }
 
-/// With no receive policies, the collection id of the repository maps its
-/// mirror refs to the local refs as the config holds it. The id `a\b` is
-/// written with an escape in the config and fails the collection-id rule,
-/// so only that mapping serves `refs/mirrors/a\b/x`. Another id that fails
-/// the rule is not served.
+/// With no receive policies, the server takes the collection id of the
+/// repository: it serves no file under `refs/mirrors/` of that id, and it
+/// serves the mirror refs of each other collection and the local refs.
 #[test]
 fn a_server_with_no_receive_policies_takes_the_own_collection_id_as_read() {
     let tmp = TmpDir::new("read-own-id");
     let (path, _, _, _) = block_on(repo(tmp.path()));
     let config = path.join("config");
     let text = std::fs::read_to_string(&config).unwrap();
-    let text = text.replacen("[core]\n", "[core]\ncollection-id=a\\\\b\n", 1);
+    let text = text.replacen("[core]\n", "[core]\ncollection-id=a.b\n", 1);
     std::fs::write(&config, text).unwrap();
-    copy_main(&path, &["refs/mirrors/a\\b/x", "refs/mirrors/c\\d/x"]);
+    copy_main(&path, &["refs/mirrors/a.b/x", "refs/mirrors/c.d/x"]);
     let repo = block_on(Repo::open(&path)).unwrap();
-    assert_eq!(repo.config().collection_id(), Some("a\\b"));
+    assert_eq!(repo.config().collection_id(), Some("a.b"));
     with_server(repo, local(), |addrs| async move {
         let addr = addrs[0];
-        let response = raw(addr, &ask("GET", "/refs/mirrors/a%5Cb/x")).await;
-        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
-        let response = raw(addr, &ask("GET", "/refs/mirrors/c%5Cd/x")).await;
-        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+        for (target, status) in [
+            ("/refs/heads/main", "200"),
+            ("/refs/mirrors/c.d/x", "200"),
+            ("/refs/mirrors/a.b/x", "404"),
+        ] {
+            let response = raw(addr, &ask("GET", target)).await;
+            assert!(
+                response.starts_with(&format!("HTTP/1.1 {status} ")),
+                "{target}: {response}"
+            );
+        }
     });
 }
 

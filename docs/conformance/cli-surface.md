@@ -2761,8 +2761,8 @@ Ten divergences stand at `fsck`:
   line for it and exits 0. The port prints `Ref under the own collection id,
   not read: refs/mirrors/<own id>/<name>` on standard output for each such
   ref, also with `-q`, and exits 0. The line is a divergence of the terminal
-  output alone: the ref resolve, the ref listings, and the summary of the
-  port ignore such a ref, and the line names it. Both check the commit of the ref, so a missing commit ends both
+  output alone: the ref resolve, the ref listings, the summary, and the
+  archive view of the port ignore such a ref, and the line names it. Both check the commit of the ref, so a missing commit ends both
   runs at exit 1. `../format-reference.md`, "The pull of collection refs",
   states the rule.
 
@@ -6265,7 +6265,8 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   archive view and of the ref listing too. A read that identifies no item
   gets 401 or 403 with an empty body. A ref under `refs/heads/` or
   `refs/mirrors/ID/` is served when the group of the item has `r` on its
-  name, and the ref listing holds these refs alone. `refs/remotes/` and
+  name, and the ref listing holds these refs alone. No file under
+  `refs/mirrors/<own id>/` is served. `refs/remotes/` and
   `extensions/ostrya/` get 404. `summary` and `summary.sig` are the files of
   the summary of the identified item, which `summary -u` writes. An item
   with no summary gets 404. A summary whose `.access` file does not hold the

@@ -49,7 +49,7 @@ The collection ID of the repository.
 The summary records it, and the collection refs below \fB\%refs/mirrors/\fR use it.
 The refs of this id are the local refs below \fB\%refs/heads/\fR.
 ostrya writes no ref below \fB\%refs/mirrors/\fR of this id.
-The resolve, the listing of \fB\%refs \-c\fR, the ref listing, and the summary ignore that directory.
+The resolve, the listing of \fB\%refs \-c\fR, the ref listing, the summary, and the served files ignore that directory.
 \fB\%ostrya fsck\fR reports each ref in it, and \fB\%ostrya prune\fR keeps the commit of each ref in it.
 \fB\%ostrya init \-\-collection\-id\fR writes it.
 A change of the key applies at the next open of the repository and at the restart of a running \fB\%ostrya serve\fR.
@@ -900,7 +900,7 @@ A read that identifies no item gets 401 or 403 and no file.
 The group of the item then gives the read rights:
 .IP \(bu 2
 \fB\%refs/heads/NAME\fR is in the local refs, and \fB\%refs/mirrors/ID/NAME\fR is in the collection \fB\%ID\fR.
-When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, the path is in the local refs, and the items of the local refs give the rights of \fB\%NAME\fR.
+When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, no path under that directory is served, also to a client that reads the local ref \fB\%NAME\fR.
 .IP \(bu 2
 The server serves such a ref when the group of the item has \fB\%r\fR on \fB\%NAME\fR in its namespace.
 An alias needs \fB\%r\fR on its name and on its target.

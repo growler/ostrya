@@ -18,7 +18,7 @@ After the walk, the command checks each composefs image in \fB\%extensions/ostry
 .PP
 If \fB\%[ex\-ostrya] generate\-composefs\fR is true, the command also writes the line \fB\%Commit with no composefs image: <commit>\fR on standard output for each complete commit that carries \fB\%ostree.composefs.digest.v0\fR and has no image. Such a commit is not an error, and the command repairs nothing for it. \fB\%composefs\-image \-\-add\fR stores the image. A commit with a malformed key gets no line. A value of the key that is not a boolean fails the command before the first phase.
 .PP
-The refs of the \fB\%collection\-id\fR of the repository are the local refs. For each ref under \fB\%refs/mirrors/<collection\-id>/\fR of that id, the command writes the line \fB\%Ref under the own collection id, not read: refs/mirrors/ID/NAME\fR on standard output, also with \%\-\-quiet. The ref resolve, the listing of \fB\%refs \-c\fR, the ref listing, and the summary ignore such a ref, and a prune keeps its commit. The line is not an error. The command checks the commit of such a ref as the commit of each other collection ref.
+The refs of the \fB\%collection\-id\fR of the repository are the local refs. For each ref under \fB\%refs/mirrors/<collection\-id>/\fR of that id, the command writes the line \fB\%Ref under the own collection id, not read: refs/mirrors/ID/NAME\fR on standard output, also with \%\-\-quiet. The ref resolve, the listing of \fB\%refs \-c\fR, the ref listing, the summary, and the archive view of \fB\%serve\fR and \fB\%send\fR ignore such a ref, and a prune keeps its commit. The line is not an error. The command checks the commit of such a ref as the commit of each other collection ref.
 .SH OPTIONS
 .TP
 \fB\-\-no\-mark\-partial\fR

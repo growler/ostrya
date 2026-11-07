@@ -86,8 +86,9 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// read:
 ///
 /// - A path under `refs/` needs [`ReadAccess::can_read_path`]. So
-///   `refs/heads/NAME` and `refs/mirrors/ID/NAME` need `r` on `NAME`, and
-///   each other path under `refs/` is refused, `refs/remotes/` included.
+///   `refs/heads/NAME` and `refs/mirrors/ID/NAME` need `r` on `NAME`. A
+///   path under `refs/mirrors/` of the own collection id is refused. Each
+///   other path under `refs/` is refused, `refs/remotes/` included.
 /// - An alias also needs [`ReadAccess::can_read_path`] on its target.
 /// - `config`, the objects, and the files under `extensions/`, `deltas/`,
 ///   and `delta-indexes/` need no right.

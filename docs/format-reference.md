@@ -5212,8 +5212,9 @@ write of a collection ref through `Transaction::set_ref`,
 
 A ref under `refs/mirrors/ID/` of the own collection id comes from outside
 the port, for example from a hand edit or from the tool. Each reader of the
-port ignores it: the resolve, the collection ref listing, the summary, and
-the ref listing. `ostrya fsck` writes one line on standard output for each
+port ignores it: the resolve, the collection ref listing, the summary, the
+ref listing, and the archive view, which serves no file under that
+directory. `ostrya fsck` writes one line on standard output for each
 such ref, `Ref under the own collection id, not read:
 refs/mirrors/ID/NAME`, and the line is not an error. Phase 2 of the fsck
 checks the commit of such a ref. `ostrya prune` holds such a ref as a
@@ -5737,8 +5738,8 @@ The client group of the item then gives the rights (`ostrya-config(1)`,
 
 - `refs/heads/NAME` is in the local namespace. `refs/mirrors/ID/NAME` is in
   the namespace of the collection `ID`. When `ID` is `[core] collection-id`,
-  the path is in the local namespace: the items of the local refs give the
-  rights of `NAME`.
+  no path under that directory is served, also to a client that reads the
+  local ref `NAME`.
 - The server serves such a ref when the group of the item has `r` on `NAME`
   in its namespace. `w`, `c`, and `t` include `r`, and `d` alone does not.
   In a group with `tls-accept-claim=true`, the claims of the namespace

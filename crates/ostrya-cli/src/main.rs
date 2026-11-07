@@ -377,9 +377,10 @@ enum Command {
     /// command writes the line
     /// `Ref under the own collection id, not read: refs/mirrors/ID/NAME` on
     /// standard output, also with --quiet. The ref resolve, the listing of
-    /// `refs -c`, the ref listing, and the summary ignore such a ref, and a
-    /// prune keeps its commit. The line is not an error. The command checks
-    /// the commit of such a ref as the commit of each other collection ref.
+    /// `refs -c`, the ref listing, the summary, and the archive view of
+    /// `serve` and `send` ignore such a ref, and a prune keeps its commit.
+    /// The line is not an error. The command checks the commit of such a ref
+    /// as the commit of each other collection ref.
     Fsck(FsckArgs),
     /// Report the paths that changed between two revisions or directories.
     ///
@@ -683,12 +684,13 @@ enum Command {
     /// the client reads, and with a `collection` pair in its query the
     /// collection refs that the client reads. A directory under
     /// `refs/mirrors/` whose name is not a collection id is not served and
-    /// not listed. `refs/remotes/`, each other path
+    /// not listed. No file under `refs/mirrors/` of the own collection id is
+    /// served. `refs/remotes/`, each other path
     /// under `refs/`, and `extensions/ostrya/` get 404. Objects, deltas,
     /// `config`, and the other files under `extensions/` are served to each
     /// identified client. A denied path gets the 404 of an absent path. With
     /// no client group, each client reads each local ref and each mirror
-    /// ref.
+    /// ref of another collection.
     ///
     /// `summary` and `summary.sig` give the summary of the auth item of the
     /// client, which `ostrya summary -u` writes. The summary of an item and

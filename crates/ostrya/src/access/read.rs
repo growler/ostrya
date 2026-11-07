@@ -21,7 +21,8 @@ use super::{
 ///
 /// - `refs/heads/NAME` is in the local namespace. `refs/mirrors/ID/NAME` is
 ///   in the namespace of collection `ID`. When `ID` is `[core]
-///   collection-id`, the path is in the local namespace.
+///   collection-id`, the client reads no path under `refs/mirrors/ID/`. The
+///   readers of the repository ignore that directory.
 /// - The client reads `NAME` when the group that carries its item
 ///   ([`ClientAccess::select`]) has `r` on `NAME` in the namespace. The
 ///   rules of the group are the rules that
@@ -53,7 +54,7 @@ use super::{
 /// let access = Arc::new(ClientAccess::from_config(&config, "/srv/repo".as_ref())?);
 /// let read = ReadAccess::new(access, AuthItem::Anonymous, None);
 /// assert!(read.can_read_path("refs/heads/pub/main"));
-/// assert!(read.can_read_path("refs/mirrors/com.example.own/pub/main"));
+/// assert!(!read.can_read_path("refs/mirrors/com.example.own/pub/main"));
 /// assert!(!read.can_read_path("refs/heads/secret"));
 /// assert!(!read.can_read_path("refs/remotes/origin/pub/main"));
 /// assert!(read.summary_digest().is_none());
@@ -159,8 +160,9 @@ impl ReadAccess {
     ///
     /// `path` is relative to the repository root. `refs/heads/NAME` and
     /// `refs/mirrors/ID/NAME` give the answer of
-    /// [`can_read`](ReadAccess::can_read) for `NAME`. Each other path gives
-    /// `false`. The call reads no file.
+    /// [`can_read`](ReadAccess::can_read) for `NAME`. When `ID` is `[core]
+    /// collection-id`, `refs/mirrors/ID/NAME` gives `false`. Each other path
+    /// gives `false`. The call reads no file.
     pub fn can_read_path(&self, path: &str) -> bool {
         let Some(rest) = path.strip_prefix("refs/") else {
             return false;
@@ -173,7 +175,11 @@ impl ReadAccess {
             && !id.is_empty()
             && !name.is_empty()
         {
-            return self.can_read(&Namespace::Collection(id.to_owned()), name);
+            // The own id reads no path: the readers of the repository ignore
+            // that directory.
+            return self
+                .collection_rules(id)
+                .is_some_and(|rules| reads(rules, name));
         }
         false
     }
@@ -349,9 +355,9 @@ mod tests {
         }
     }
 
-    /// A mirror path takes the items of its collection. The own id takes the
-    /// rules of the local refs. An id that fails the collection-id rule
-    /// reads nothing.
+    /// A mirror path takes the items of its collection. A mirror path of the
+    /// own id is never read, and the local ref of the same name is read. An
+    /// id that fails the collection-id rule reads nothing.
     #[test]
     fn a_mirror_path_uses_the_items_of_its_collection() {
         let read = reader(
@@ -365,7 +371,7 @@ mod tests {
         assert!(!read.can_read_path("refs/mirrors/a.b/local/x"));
         assert!(read.can_read_path("refs/mirrors/c.d/other/x"));
         assert!(!read.can_read_path("refs/mirrors/e.f/other/x"));
-        assert!(read.can_read_path("refs/mirrors/own.id/local/x"));
+        assert!(!read.can_read_path("refs/mirrors/own.id/local/x"));
         assert!(!read.can_read_path("refs/mirrors/own.id/exact/x"));
         assert!(read.can_read(&collection("own.id"), "local/x"));
         assert!(!read.can_read_path("refs/heads/exact/x"));
@@ -373,6 +379,31 @@ mod tests {
         assert!(implicit.can_read_path("refs/mirrors/e.f/x"));
         assert!(!implicit.can_read_path("refs/mirrors/bad/x"));
         assert!(!implicit.can_read_path("refs/mirrors/a..b/x"));
+    }
+
+    /// No path under the mirror directory of the own id is read: not under
+    /// the implicit group, not under a group that reads each local ref, and
+    /// not with a claim of the own id. The local ref of the same name is
+    /// read.
+    #[test]
+    fn no_path_under_the_mirror_directory_of_the_own_id_is_read() {
+        let claims = "[ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
+                      allow=r:@a.b:**\n";
+        for read in [
+            reader("", "anonymous", None),
+            reader(
+                "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**;r:@a.b:**\n",
+                "anonymous",
+                None,
+            ),
+            reader(claims, "tls:*", Some(&["ostrya:ref:@own.id:**"])),
+        ] {
+            assert!(read.can_read_path("refs/heads/main"));
+            assert!(read.can_read(&collection("own.id"), "main"));
+            assert!(!read.can_read_path("refs/mirrors/own.id/main"));
+            assert!(!read.can_read_path("refs/mirrors/own.id/a/b"));
+            assert!(read.can_read_path("refs/mirrors/a.b/main"));
+        }
     }
 
     /// The rules of a collection come from the items of that collection

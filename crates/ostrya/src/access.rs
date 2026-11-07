@@ -109,11 +109,12 @@
 //! # Read access
 //!
 //! A client reads `refs/heads/NAME` and `refs/mirrors/ID/NAME` when the
-//! group of its item has `r` on `NAME` in the namespace of the path. The own
-//! collection id under `refs/mirrors/` names the local refs. An alias needs
-//! `r` on its name and on its target. No client reads another path under
-//! `refs/`. `summary` and `summary.sig` give the summary of the item of the
-//! client (see [Summaries](#summaries)). [`ReadAccess`] states the rules.
+//! group of its item has `r` on `NAME` in the namespace of the path. No
+//! client reads a path under `refs/mirrors/` of the own collection id. An
+//! alias needs `r` on its name and on its target. No client reads another
+//! path under `refs/`. `summary` and `summary.sig` give the summary of the
+//! item of the client (see [Summaries](#summaries)). [`ReadAccess`] states
+//! the rules.
 //!
 //! # Summaries
 //!

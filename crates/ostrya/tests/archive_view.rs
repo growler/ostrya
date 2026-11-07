@@ -733,31 +733,38 @@ fn remote_and_other_ref_paths_are_never_served() {
     });
 }
 
-/// `refs/mirrors/ID/NAME` with the own collection id is in the local
-/// namespace: the items of the local refs decide, and the items of another
-/// collection do not. Another collection takes its own items.
+/// No file under `refs/mirrors/` of the own collection id is served, also to
+/// a client that reads the local ref of the same name, and also through an
+/// alias. A file under `refs/mirrors/` of another collection takes the items
+/// of that collection.
 #[test]
-fn a_mirror_of_the_own_collection_takes_the_local_rights() {
+fn no_file_under_the_mirror_directory_of_the_own_id_is_served() {
     let tmp = TmpDir::new("view-own-mirror");
     block_on(async {
-        let repo = repo_with_files(
-            tmp.path(),
-            Some("own.id"),
-            "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=r:pub/**;r:@c.d:**\n",
-            &[
-                "refs/mirrors/own.id/pub/a",
-                "refs/mirrors/own.id/secret",
-                "refs/mirrors/c.d/secret",
-            ],
+        let files = [
+            "refs/heads/pub/a",
+            "refs/mirrors/own.id/pub/a",
+            "refs/mirrors/own.id/secret",
+            "refs/mirrors/c.d/secret",
+        ];
+        let groups = "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=r:pub/**;r:@c.d:**\n";
+        let repo = repo_with_files(tmp.path(), Some("own.id"), groups, &files).await;
+        symlink(
+            "../../mirrors/own.id/pub/a",
+            tmp.path().join("refs/heads/pub/to-own-mirror"),
         )
-        .await;
+        .unwrap();
         let view = ArchiveView::new(repo.clone());
         let access = repo_access(&repo, "anonymous");
-        assert!(serves(&view, "refs/mirrors/own.id/pub/a", &access).await);
-        assert!(!serves(&view, "refs/mirrors/own.id/secret", &access).await);
+        assert!(serves(&view, "refs/heads/pub/a", &access).await);
         assert!(serves(&view, "refs/mirrors/c.d/secret", &access).await);
-        let stranger = repo_access(&repo, "ssh:u");
-        assert!(!serves(&view, "refs/mirrors/own.id/pub/a", &stranger).await);
+        for path in [
+            "refs/mirrors/own.id/pub/a",
+            "refs/mirrors/own.id/secret",
+            "refs/heads/pub/to-own-mirror",
+        ] {
+            assert!(!serves(&view, path, &access).await, "{path}");
+        }
     });
 }
 

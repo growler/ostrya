@@ -3532,8 +3532,10 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
 - The readers ignore `refs/mirrors/ID/` of the own id:
   `Repo::resolve_ref_tip`, `Repo::resolve_rev`, `UpdateGuard::read_ref`,
   `Repo::list_collection_refs`, `Repo::list_collection_refs_in`, the ref
-  listing, and the summary. Delta discovery, the search for the delta of a
-  dependency, and `TimestampCheck::CurrentRef` read `refs/heads/NAME`.
+  listing, the summary, and the archive view: `ReadAccess::can_read_path`
+  refuses each path under that directory. Delta discovery, the search for
+  the delta of a dependency, and `TimestampCheck::CurrentRef` read
+  `refs/heads/NAME`.
   `Repo::list_mirror_refs` lists the directory, and the fsck and the
   prune read it.
 - `Repo::pull_local` reads each `@ID:NAME` name of the source with the

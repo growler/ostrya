@@ -151,7 +151,7 @@ A pull with \fB\%\-\-collection\fR and \fB\%refs \-c \-\-create\fR write it by t
 A pull with \fB\%\-\-mirror\fR writes it by the same rule for each ref of the collection \fB\%<collection\-id>\fR that the summary of the remote states, and for each ref of the collection map of that summary.
 The refs of the own collection id are the local refs: each writer writes \fB\%refs/heads/<ref>\fR for that id.
 A directory \fB\%refs/mirrors/\fR of the own collection id comes from outside ostrya, for example from a hand edit or from the \fB\%ostree\fR command.
-The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the summary, and the ref listing.
+The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the summary, the ref listing, and the archive view of \fB\%ostrya serve\fR and \fB\%ostrya send\fR, which serves no file in it.
 \fB\%ostrya fsck\fR prints a line for each ref in it, and the line is not an error.
 \fB\%ostrya prune\fR keeps the commit of each ref in it, and never deletes such a ref.
 Remove such a ref by hand.
@@ -324,6 +324,7 @@ The view refuses \fB\%tmp/\fR, \fB\%state/\fR, each name that starts with \fB\%.
 .PP
 The client groups of the config give the read rights of each client, as \fB\%ostrya\-config\fR(1) states in "Read access".
 A ref under \fB\%refs/heads/\fR or \fB\%refs/mirrors/ID/\fR is served when the group of the client has \fB\%r\fR on its name.
+The view serves no file under \fB\%refs/mirrors/\fR of the own collection id, also to a client that reads the local ref of the same name.
 \fB\%refs/remotes/\fR and each other path under \fB\%refs/\fR are not served.
 \fB\%summary\fR and \fB\%summary.sig\fR give the files of the item of the client under \fB\%extensions/ostrya/summary/\fR, \fB\%anonymous\fR included.
 The view never serves \fB\%summary\fR and \fB\%summary.sig\fR of the repository root.

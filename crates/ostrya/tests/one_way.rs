@@ -1149,34 +1149,44 @@ fn a_one_way_collection_ref_checks_its_bindings() {
 }
 
 /// A one-way stream into a repository with no collection id writes a local
-/// ref to a commit with a collection binding: the collection check does not
-/// run. A repository with a collection id refuses a commit bound to another
-/// collection on a local ref.
+/// ref or a remote ref to a commit with a collection binding: the collection
+/// check does not run. A repository with a collection id refuses a commit
+/// bound to another collection on a local ref and on a remote ref.
 #[test]
-fn a_one_way_local_ref_skips_the_collection_check_with_no_own_id() {
-    let tmp = TmpDir::new("one-way-local-binding");
-    let (repo, _) = empty_repo(&tmp, "");
+fn a_one_way_local_or_remote_ref_skips_the_collection_check_with_no_own_id() {
+    let policy = StreamPolicy {
+        rules: vec![(
+            ReceivePattern::parse("*:**").unwrap(),
+            StreamRule::default(),
+        )],
+        ..StreamPolicy::default()
+    };
     let main = bound_commit("main", Some("org.example.A"), Some(&["main"]));
-    let bytes = stream_to("main", &main);
-    let report = receive(&repo, &StreamPolicy::default(), &bytes).unwrap();
-    assert_eq!(report.refs[0].name, Ref::local("main"));
-    assert_eq!(
-        block_on(repo.resolve_ref_tip(&Ref::local("main"))).unwrap(),
-        Some(main.checksum)
-    );
-
-    let tmp = TmpDir::new("one-way-local-binding-own");
-    let (repo, before) = empty_repo(&tmp, "collection-id=org.example.B\n");
-    match receive(&repo, &StreamPolicy::default(), &bytes) {
-        Err(Error::Remote(remote::Error::BindingMismatch(m))) => {
-            assert!(
-                m.contains("'org.example.A'") && m.contains("'org.example.B'"),
-                "{m}"
-            )
+    let tmp = TmpDir::new("one-way-binding-no-id");
+    let (repo, _) = empty_repo(&tmp, "");
+    let tmp_own = TmpDir::new("one-way-binding-own");
+    let (repo_own, before) = empty_repo(&tmp_own, "collection-id=org.example.B\n");
+    for name in ["main", "origin:main"] {
+        let r: Ref = name.parse().unwrap();
+        let bytes = stream_to(name, &main);
+        let report = receive(&repo, &policy, &bytes).unwrap();
+        assert_eq!(report.refs[0].name, r);
+        assert_eq!(
+            block_on(repo.resolve_ref_tip(&r)).unwrap(),
+            Some(main.checksum),
+            "{name}"
+        );
+        match receive(&repo_own, &policy, &bytes) {
+            Err(Error::Remote(remote::Error::BindingMismatch(m))) => {
+                assert!(
+                    m.contains("'org.example.A'") && m.contains("'org.example.B'"),
+                    "{name}: {m}"
+                )
+            }
+            other => panic!("{name}: {other:?}"),
         }
-        other => panic!("{other:?}"),
     }
-    assert_nothing_published(&repo, &before);
+    assert_nothing_published(&repo_own, &before);
 }
 
 // ---------------------------------------------------------------------------

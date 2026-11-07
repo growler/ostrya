@@ -1026,14 +1026,19 @@ pub(super) fn check_named_collection(
 /// and a bound commit must name `own`. So a bound commit fails each local
 /// ref of a server with no collection id. A ref `@X:NAME` of another
 /// collection takes a commit bound to `X` alone, so a commit with no
-/// binding fails it. A commit with no binding passes a local ref. Each
-/// refusal is [`BindingMismatch`](crate::remote::Error::BindingMismatch).
+/// binding fails it. A commit with no binding passes a local ref. A remote
+/// ref `REMOTE:NAME` takes `own` as a local ref does, and passes with no
+/// check if `own` is `None`. Each refusal is
+/// [`BindingMismatch`](crate::remote::Error::BindingMismatch).
 pub(super) fn check_collection_binding(
     checksum: &Checksum,
     bound: Option<&str>,
     name: &Ref,
     own: Option<&str>,
 ) -> Result<()> {
+    if matches!(name, Ref::Remote { .. }) && own.is_none() {
+        return Ok(());
+    }
     let collection = match name {
         Ref::Collection { id, .. } if Some(id.as_str()) != own => Some(id.as_str()),
         _ => None,
@@ -1416,8 +1421,9 @@ mod tests {
     }
 
     /// The collection binding of each ref against the collection id of the
-    /// server: a local ref, and a ref of the own id, take the own id, and a
-    /// ref of another collection takes its id.
+    /// server: a local ref, and a ref of the own id, take the own id, a ref
+    /// of another collection takes its id, and a remote ref takes the own
+    /// id, with no check if the server has no collection id.
     #[test]
     fn each_ref_takes_the_binding_of_its_namespace() {
         let c = csum(1);
@@ -1443,6 +1449,11 @@ mod tests {
         assert!(message.contains("no collection binding"), "{message}");
         mismatch(check(None, "@org.example.X:a", None));
         mismatch(check(y, "@org.example.X:a", y));
+        // A remote ref takes the own id, and has no check with no own id.
+        check(x, "o:main", None).unwrap();
+        check(x, "o:main", x).unwrap();
+        let message = mismatch(check(y, "o:main", x));
+        assert!(message.contains("not 'org.example.X'"), "{message}");
     }
 
     /// After `HelloReply`, two texts of one ref are refused, and each update

@@ -2054,6 +2054,38 @@ fn one_push_writes_the_refs_of_more_than_one_namespace() {
     });
 }
 
+/// A push that names refs in three namespaces reads the three ref
+/// directories at the same time.
+#[test]
+fn the_ref_directories_of_the_namespaces_are_read_at_the_same_time() {
+    let scratch = TmpDir::new("push-s3-dirs-overlap");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let main = commit(&repo, "main", None, "a", None).await;
+        let in_b = commit(&repo, "bound-b", None, "b", bound(B)).await;
+        let in_c = commit(&repo, "bound-c", None, "c", bound(C)).await;
+        let specs = [
+            "main".to_owned(),
+            format!("bound-b:@{B}:main"),
+            format!("bound-c:@{C}:main"),
+        ];
+        let specs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        push(&repo, &server.endpoint(), opts(&specs)).await.unwrap();
+        commit(&repo, "main", Some(main), "a2", None).await;
+        commit(&repo, "bound-b", Some(in_b), "b2", bound(B)).await;
+        commit(&repo, "bound-c", Some(in_c), "c2", bound(C)).await;
+        {
+            let mut state = server.state();
+            state.delay = Some(("GET", "repo/refs/".to_owned(), Duration::from_millis(50)));
+            state.max_delayed = 0;
+        }
+        push(&repo, &server.endpoint(), opts(&specs)).await.unwrap();
+        assert!(server.state().max_delayed >= 2);
+    });
+}
+
 /// `NAME` and `@OWN:NAME` name one ref of a bucket whose collection id is
 /// `OWN`. A push that names both is refused before its first upload, and
 /// writes no ref.

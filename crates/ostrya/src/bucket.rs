@@ -368,10 +368,12 @@ impl BucketRepo {
     /// Returns the bucket repository of the client `bucket`. The call sends
     /// no request.
     ///
-    /// `max_outstanding` bounds the requests in flight of a call on the
-    /// repository: the lists of [`list_objects`](BucketRepo::list_objects),
-    /// the reads of the ref files and of the objects, the uploads and the
-    /// other writes, and the deletes and the aborts. A value of zero is one.
+    /// `max_outstanding` bounds the requests in flight of one call on the
+    /// repository. Calls that run at the same time, such as the reads of
+    /// more than one ref directory, each have the bound. The requests are the lists of
+    /// [`list_objects`](BucketRepo::list_objects), the reads of the ref files
+    /// and of the objects, the uploads and the other writes, and the deletes
+    /// and the aborts. A value of zero is one.
     /// The admission limit of the fetcher of `bucket` is the value to give.
     pub fn new(bucket: Bucket, max_outstanding: usize) -> BucketRepo {
         BucketRepo {

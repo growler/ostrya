@@ -226,7 +226,9 @@ impl BucketRepo {
     ///
     /// The part of each key after `dir` passes the ref name rule. A ref file
     /// holds 64 lowercase hex digits and a newline. At most
-    /// `max_outstanding` reads run at a time.
+    /// `max_outstanding` ref file reads of this call run at a time. Calls
+    /// for more than one directory at the same time each have that bound,
+    /// so the total is the bound times the number of directories.
     ///
     /// # Errors
     ///

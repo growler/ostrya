@@ -120,11 +120,13 @@ pub(super) struct BucketState {
 /// Reads the state of `bucket` for a push that writes the refs `refs`.
 ///
 /// The call reads the `config`, which gives the namespace of each ref. Then
-/// it lists the objects, and at the same time reads the ref files of the
-/// ref directory of each namespace, one directory after the other. It reads
-/// no ref file of another namespace. The namespace of the collection id of
-/// the bucket is `refs/heads/`, so the call does not list or read
-/// `refs/mirrors/` of that id.
+/// it lists the objects and reads the ref files of the ref directory of
+/// each namespace. The listing and the reads of all the directories run at
+/// the same time. The call reads no ref file of another namespace. The
+/// namespace of the collection id of the bucket is `refs/heads/`, so the
+/// call does not list or read `refs/mirrors/` of that id.
+///
+/// If more than one read fails, the call returns the error of one of them.
 ///
 /// # Errors
 ///
@@ -149,10 +151,16 @@ pub(super) async fn read_state(bucket: &BucketRepo, refs: &[&Ref]) -> Result<Buc
         .collect();
     // The push reads the ref directories of its namespaces alone.
     let read_dirs = async {
-        let mut dirs = BTreeMap::new();
+        let mut slots = Slots::new(namespaces.len());
         for ns in namespaces {
-            let dir = bucket.read_ref_dir(&ns.dir()).await?;
-            dirs.insert(ns, dir);
+            slots.push(async move {
+                let dir = bucket.read_ref_dir(&ns.dir()).await;
+                (ns, dir)
+            });
+        }
+        let mut dirs = BTreeMap::new();
+        while let Some((ns, dir)) = slots.next_ready().await {
+            dirs.insert(ns, dir?);
         }
         Ok::<_, Error>(dirs)
     };

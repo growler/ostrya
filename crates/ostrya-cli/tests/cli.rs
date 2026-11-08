@@ -12694,8 +12694,8 @@ fn refs_collections_match_the_tool() {
         vec!["refs", "-c", "org.example.Local", "org.example.Mirror"],
         // `-c` wins over `-A`: the two options together list collection refs.
         vec!["refs", "-c", "-A"],
-        // A collection-qualified listing excludes the remote refs that the
-        // plain listing includes.
+        // A collection-qualified listing excludes the refs of a remote with
+        // no config group, which the plain listing includes.
         vec!["refs"],
     ] {
         assert_agrees(&repo, &repo, &args);
@@ -12722,6 +12722,117 @@ fn refs_collections_match_the_tool() {
         describe_refs(&port),
         describe_refs(&tool),
         "deleting the local collection left different refs trees",
+    );
+}
+
+/// `refs -c` lists the refs of a remote under the `collection-id` of the
+/// remote. A remote with no `collection-id`, with an invalid one, or with no
+/// config group gives no row. `-c --delete ID` removes no remote ref.
+#[test]
+fn refs_collections_of_a_remote_match_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("refs-coll-remote");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = base.join("repo");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Local",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let src = base.join("src");
+    let c1 = commit_tree(&repo, "test/main", &src, None);
+    let c2 = commit_tree(&repo, "other", &src, Some(&c1));
+    let c3 = commit_tree(&repo, "spare", &src, Some(&c2));
+    append_config(
+        &repo,
+        "[remote \"origin\"]\nurl=file:///nonexistent\ncollection-id=org.example.Os\n\
+         [remote \"plain\"]\nurl=file:///nonexistent\n\
+         [remote \"bad\"]\nurl=file:///nonexistent\ncollection-id=fresh\n",
+    );
+    for (relpath, commit) in [
+        ("remotes/origin/os/main", &c2),
+        ("remotes/origin/os/only", &c3),
+        ("remotes/plain/x", &c1),
+        ("remotes/bad/y", &c1),
+        ("remotes/nosuch/z", &c1),
+        ("mirrors/org.example.Mirror/mm/z", &c1),
+    ] {
+        write_ref_file(&repo, relpath, commit);
+    }
+
+    for args in [
+        vec!["refs", "-c"],
+        vec!["refs", "-c", "-r"],
+        vec!["refs", "-c", "org.example.Os"],
+        vec!["refs", "-c", "org.example.Os", "org.example.Local"],
+    ] {
+        assert_agrees(&repo, &repo, &args);
+    }
+
+    let port = clone_repo(base, &repo, "coll-remote-port");
+    let tool = clone_repo(base, &repo, "coll-remote-tool");
+    assert_agrees(&port, &tool, &["refs", "-c", "--delete", "org.example.Os"]);
+    assert_eq!(
+        describe_refs(&port),
+        describe_refs(&tool),
+        "deleting the collection of a remote left different refs trees",
+    );
+    assert!(port.join("refs/remotes/origin/os/main").exists());
+
+    // With a mirror ref of the id of a remote, `-c --delete` removes the
+    // mirror ref and keeps the remote refs in both.
+    write_ref_file(&repo, "mirrors/org.example.Os/os/main", &c1);
+    let port = clone_repo(base, &repo, "coll-mirror-port");
+    let tool = clone_repo(base, &repo, "coll-mirror-tool");
+    assert_agrees(&port, &tool, &["refs", "-c", "--delete", "org.example.Os"]);
+    assert_eq!(
+        describe_refs(&port),
+        describe_refs(&tool),
+        "deleting the collection of a mirror and a remote left different refs trees",
+    );
+    assert!(!port.join("refs/mirrors/org.example.Os/os/main").exists());
+    assert!(port.join("refs/remotes/origin/os/main").exists());
+
+    // Two divergences, which the port output alone shows. A remote whose
+    // `collection-id` is the own id gives no row, so the row of the own id
+    // shows the commit of `refs/heads`. For one pair, the mirror ref wins
+    // over a remote ref, and among remotes the first by name wins.
+    append_config(
+        &repo,
+        "[remote \"self\"]\nurl=file:///nonexistent\ncollection-id=org.example.Local\n\
+         [remote \"origin2\"]\nurl=file:///nonexistent\ncollection-id=org.example.Os\n",
+    );
+    for (relpath, commit) in [
+        ("remotes/self/test/main", &c2),
+        ("remotes/self/only", &c3),
+        ("remotes/origin2/os/main", &c3),
+        ("remotes/origin2/os/only", &c1),
+    ] {
+        write_ref_file(&repo, relpath, commit);
+    }
+    let listed = ostrya_repo(&repo, &["refs", "-c", "-r"])
+        .ok()
+        .stdout_trimmed();
+    assert_eq!(
+        listed,
+        format!(
+            "(org.example.Local, other)\t{c2}\n\
+             (org.example.Local, spare)\t{c3}\n\
+             (org.example.Local, test/main)\t{c1}\n\
+             (org.example.Mirror, mm/z)\t{c1}\n\
+             (org.example.Os, os/main)\t{c1}\n\
+             (org.example.Os, os/only)\t{c3}"
+        ),
     );
 }
 

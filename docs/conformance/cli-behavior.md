@@ -1164,9 +1164,12 @@ refs in each state:
 
 The tool does not examine which ref files exist. It does not change or
 remove `refs/mirrors/ID/REF`. When that file holds a commit before the pull,
-`refs -c -r` after the pull shows `(ID, REF)` with that old commit, and not
-the pulled commit. No pull is refused, and each pull exits 0. No pull removes
-a ref file.
+`refs -c -r` after a pull that writes `refs/heads/REF` shows `(ID, REF)`
+with that old commit, and not the pulled commit. After a pull that writes
+`refs/remotes/origin/REF`, `refs -c -r` shows `(ID, REF)` with the pulled
+commit, because the ref of the remote `origin` wins (`refs`, "Collection
+refs"). No pull is refused, and each pull exits 0. No pull removes a ref
+file.
 
 With a destination of another collection id, or of no collection id,
 `find-remotes --finders=config --pull --mirror ID REF` and
@@ -3270,10 +3273,48 @@ It sorts them by collection id and then by ref name. The set holds these refs:
   `[core] collection-id`
 - each ref under `refs/mirrors`, qualified by the collection component of its
   path
+- each ref under `refs/remotes/<remote>/`, qualified by the `collection-id` of
+  the remote
 
-The set excludes `refs/remotes`. A repository with no `collection-id` lists its
-mirror refs alone. `-c` has precedence over `-A`, so the two together list
-collection refs.
+A repository with no `collection-id` and no remote with a `collection-id`
+lists its mirror refs alone. `-c` has precedence over `-A`, so the two together
+list collection refs. A PREFIX of `-c` is a collection id, and it selects the
+rows of that id. The rows of a remote follow this rule too.
+
+These records of the refs of a remote come from libostree 2026.1 on a NixOS
+host, observed on 2026-11-08. The repository has the `collection-id`
+`org.example.Local` and these remotes:
+
+- `origin` and `origin2`, each with the `collection-id` `org.example.Os`
+- `plain`, with no `collection-id`
+- `self`, with the `collection-id` `org.example.Local`
+- `bad`, with the `collection-id` `fresh`. `remote add` writes this value with
+  no check.
+
+The ref files are `remotes/origin/os/main` (commit C1), `remotes/origin2/os/main`
+and `remotes/origin2/os/only2` (C2), `mirrors/org.example.Os/os/main` (C3),
+`remotes/plain/x`, `remotes/self/test/main` (C2, with `heads/test/main` at C1),
+`remotes/self/only` (C3), `remotes/bad/y`, and `remotes/nosuch/z`. The config
+has no group for `nosuch`.
+
+- `refs -c` prints `(org.example.Os, os/main)` and `(org.example.Os, os/only2)`
+  for the remotes `origin` and `origin2`. It prints `(org.example.Local, only)`
+  and `(org.example.Local, test/main)` for the remote `self`, in one sorted
+  list with the local refs.
+- `refs -c` prints no row for `plain/x`, `bad/y`, and `nosuch/z`. A remote
+  with no `collection-id`, with a value that is not a valid collection id, or
+  with no config group gives no row.
+- The listing holds each pair of a collection id and a ref name one time. A
+  ref of a remote wins over a local ref and over a mirror ref of the same
+  pair. `refs -c -r` prints C2 for `(org.example.Local, test/main)`, which is
+  the commit of `remotes/self/test/main`, and C2 for
+  `(org.example.Os, os/main)`, which is the commit of `origin2`.
+- Among remotes with the same pair, `origin2` wins over `origin` in both orders
+  of the remote groups in the config. The winner does not follow the config
+  order.
+- `refs -c org.example.Os` prints the rows of `org.example.Os` alone.
+
+`cli-surface.md`, "P1", `refs`, records the port side.
 
 A directory under `refs/mirrors` can have a name that is not a valid collection
 id. Such a directory makes the tool abort on a GLib assertion, and a signal ends
@@ -3460,6 +3501,14 @@ that id. So `refs -c --delete org.example.Coll` over a repository whose
 in place. A foreign id removes the mirror refs of that id. A repository with no
 `collection-id` owns no id, so the command removes each mirror ref that a prefix
 names.
+
+The command removes no file under `refs/remotes`. The `-c` listing holds the
+refs of a remote under the `collection-id` of the remote (`refs`, "Collection
+refs"), and the removal of the id leaves them. In the repository of that
+section, `refs -c --delete org.example.Os` removes
+`refs/mirrors/org.example.Os/os/main` alone, and
+`refs -c --delete org.example.Local` removes the refs under `refs/heads` alone.
+Observed with libostree 2026.1 on 2026-11-08.
 
 The `-c` listing prints both sets for either id. So the two ids share one
 selection and differ in the removal. The own id removes nothing and exits 0

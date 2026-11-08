@@ -505,6 +505,27 @@ note: `-c` listing `(collection-id, ref)` pairs over a repository carrying a
  whole collection. The setup binds no `collection-id`, so the cited test builds
  the repository.
 
+family: M10
+subcommand: refs
+cell: refs/collections-remote
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: two rules of the rows of a remote (`cli-surface.md`, "P1"). The tool lists
+ the refs of a remote whose `collection-id` is the own id under that id, and its
+ row wins over the local ref of the same name, where the port lists no ref of
+ such a remote. For one pair that a mirror ref and the refs of remotes hold, the
+ tool takes a remote ref, where the port takes the mirror ref, and then the
+ first remote by name. The cited test pins the port side of both.
+evidence: ostrya_cli::cli::refs_collections_of_a_remote_match_the_tool
+spec: cli-behavior.md#refs
+note: `-c` listing the refs of a remote under the `collection-id` of the remote,
+ `-c -r` and a positional collection id over these rows, no row for a remote
+ with no `collection-id`, with an invalid one, or with no config group, and
+ `-c --delete` of the id of a remote removing no file under `refs/remotes`. The
+ setup binds no `collection-id` and no remote, so the cited test builds the
+ repository.
+
 # ---------------------------------------------------------------------------
 # refs -- creating and deleting.
 # ---------------------------------------------------------------------------

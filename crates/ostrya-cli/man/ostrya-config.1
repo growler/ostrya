@@ -285,6 +285,8 @@ A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs 
 A candidate whose pull address is a \fB\%file://\fR address is a local repository, which the pull reads through the file system.
 The client groups of that repository do not apply, and the file permissions are the access.
 \fB\%ostrya remote summary \-u\fR writes the summary of a bucket repository.
+\fB\%ostrya refs \-c\fR lists the refs of the remote under this id, if the id is valid and is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
+\fB\%ostrya refs \-c\fR also reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
 .SS "Verification"
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
 The checks of the commits apply to each target, each parent that the depth takes, and each commit of a chain of static deltas.

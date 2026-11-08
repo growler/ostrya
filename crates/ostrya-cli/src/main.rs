@@ -1598,9 +1598,11 @@ struct RefsArgs {
     ///
     /// Each PREFIX is then a collection id. The local refs carry the
     /// collection id of the repository. The listing leaves out the refs of
-    /// `refs/mirrors/<collection-id>/` of that id. With --delete and the
-    /// collection id of the repository, the command deletes only the local
-    /// refs, and the refs of that directory stay. This switch wins over -A.
+    /// `refs/mirrors/<collection-id>/` of that id. The refs of a remote carry
+    /// the `collection-id` of the remote, if it is not the collection id of
+    /// the repository. With --delete and the collection id of the
+    /// repository, the command deletes only the local refs, and the refs of
+    /// that directory stay. This switch wins over -A.
     #[arg(short = 'c', long)]
     collections: bool,
     /// With --create, replace an existing ref.
@@ -11727,9 +11729,10 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// they stay. The command checks each
 /// selected ref that it removes with [`Ref::validate`] before it removes the
 /// first ref. A ref under `refs/heads` is a [`Ref::Local`] and takes the
-/// ref-name rule, so a name with `:` fails. A mirror ref takes the
-/// collection-id rule and the ref-name rule. If one selected ref fails, the
-/// command fails with [`Error::InvalidRefspec`] and removes no ref.
+/// ref-name rule, so a name with `:` fails. A mirror ref and a ref of a
+/// remote take the collection-id rule and the ref-name rule. If one selected
+/// ref fails, the command fails with [`Error::InvalidRefspec`] and removes no
+/// ref. The command removes no file under `refs/remotes`.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -11737,7 +11740,10 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.collections {
         // An id that is equal to the `collection-id` of the repository removes
         // only the refs under `refs/heads`: the listing holds no mirror ref of
-        // that id. A foreign id removes the mirror refs that it names.
+        // that id. A foreign id removes the mirror refs that it names. A ref
+        // of a remote is in the listing only if no mirror ref has its name, so
+        // its mirror path holds no ref file, and no file under `refs/remotes`
+        // is removed.
         let selected = select_collection_refs(repo, &args.prefix).await?;
         // The refs to remove. A ref under `refs/heads` has no id.
         let removed: Vec<Ref> = selected
@@ -12031,7 +12037,8 @@ async fn all_refs(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
 ///
 /// The ids group the refs as a listing groups ref-name prefixes. The
 /// `collection-id` of the repository qualifies its local refs. The mirror
-/// refs carry their id in the path.
+/// refs carry their id in the path. The `collection-id` of a remote
+/// qualifies the refs of the remote.
 async fn select_collection_refs(repo: &Repo, ids: &[String]) -> Result<Vec<CollectionRefEntry>> {
     let all = repo.list_collection_refs().await?;
     let mut out = Vec::new();

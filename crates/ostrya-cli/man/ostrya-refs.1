@@ -45,7 +45,7 @@ The command line must give exactly one PREFIX argument, which is a revision here
 \fB\-c\fR, \fB\-\-collections\fR
 List collection refs as \fB\%(collection\-id, ref)\fR pairs.
 .IP
-Each PREFIX is then a collection id. The local refs carry the collection id of the repository. The listing leaves out the refs of \fB\%refs/mirrors/<collection\-id>/\fR of that id. With \%\-\-delete and the collection id of the repository, the command deletes only the local refs, and the refs of that directory stay. This switch wins over \%\-A.
+Each PREFIX is then a collection id. The local refs carry the collection id of the repository. The listing leaves out the refs of \fB\%refs/mirrors/<collection\-id>/\fR of that id. The refs of a remote carry the \fB\%collection\-id\fR of the remote, if it is not the collection id of the repository. With \%\-\-delete and the collection id of the repository, the command deletes only the local refs, and the refs of that directory stay. This switch wins over \%\-A.
 .TP
 \fB\-\-force\fR
 With \%\-\-create, replace an existing ref.

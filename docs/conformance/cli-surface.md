@@ -85,8 +85,8 @@ Done, Phase 17b:
 - `cat` -- `COMMIT` and one or more `PATH`.
 
 Their output formats are recorded in `cli-behavior.md`, "CLI output
-formats", `refs`, `rev-parse`, and `cat`. Nineteen tool behaviors around them
-are observed and deliberately not reproduced:
+formats", `refs`, `rev-parse`, and `cat`. Twenty-two tool behaviors around
+them are observed and deliberately not reproduced:
 
 - the tool names an `-A` alias that lives under `refs/remotes/<remote>/` by its
   path below the remote, dropping the remote and printing a name that resolves
@@ -192,11 +192,16 @@ are observed and deliberately not reproduced:
   ref. The `-c` listing of the port leaves out the mirror refs of the own
   `collection-id`, so they stay, and the check does not read them. If the ref
   store refuses one selected ref by its id or its name, the
-  command removes no ref and exits 1. A mirror ref whose id fails the
-  collection-id rule or is longer than 255 bytes, or whose name fails the
-  ref-name rule, gives `error: Invalid refspec @<id>:<name>`. A ref under
-  `refs/heads` whose name fails the ref-name rule gives `error: Invalid refspec
-  <name>`. The ref-name rule refuses a name with `:`;
+  command removes no ref and exits 1. A mirror ref or a ref of a remote whose
+  id fails the collection-id rule or is longer than 255 bytes, or whose name
+  fails the ref-name rule, gives `error: Invalid refspec @<id>:<name>`. A ref
+  under `refs/heads` whose name fails the ref-name rule gives `error: Invalid
+  refspec <name>`. The ref-name rule refuses a name with `:`. The `-c` listing
+  of the tool prints no row for a ref of a remote whose name fails the
+  ref-name rule, such as `a:b`, `-bad`, or `.hid/x`. The `-c` listing of the
+  port prints the row. Then `refs -c --delete <id>` of the port gives `error:
+  Invalid refspec @<id>:a:b`, exits 1, and removes no ref. The tool removes
+  the mirror refs of `<id>` and exits 0;
 - a file under `refs/heads` whose name holds `:`, for example
   `refs/heads/origin:main` in a repository with `[core] collection-id`. Such a
   file comes from an out-of-band change alone. The `-c` listing of the tool
@@ -220,6 +225,34 @@ are observed and deliberately not reproduced:
   other rows agree. `refs -c --create=<own id>:<ref>` writes
   `refs/heads/<ref>` in both, and `refs -c --delete <own id>` keeps the
   directory in both;
+- a ref under `refs/remotes/<remote>/` of a remote whose `collection-id` is
+  the `collection-id` of the repository. The `-c` listing of the tool prints a
+  `(<own id>, <name>)` row for it. For a name that `refs/heads` also holds,
+  the row of the tool shows the commit of the remote ref. The `-c` listing of
+  the port prints no row for such a remote, so the rows of the own id are the
+  rows of `refs/heads` alone. Thus `refs -c --delete <own id>` of the port
+  does not map a ref of a remote to a local ref. The other rows agree;
+- one pair `(<id>, <name>)` that a mirror ref and the refs of remotes with the
+  `collection-id` `<id>` hold. The `-c` listing prints one row for the pair in
+  both. In the tool, a ref of a remote wins over the mirror ref. Among
+  remotes, the winner of the tool does not follow the config order: `origin2`
+  wins over `origin` in both orders of the remote groups. In the port, the
+  mirror ref wins, and among remotes the first remote in the byte order of the
+  names wins. So `refs -c -r` can print a different commit for the pair. The
+  rows of the other pairs agree, and `refs -c --delete <id>` removes the
+  mirror refs of `<id>` alone in both;
+- three states of a remote in the `-c` listing:
+  - A `collection-id` value with a malformed escape sequence, such as
+    `org.example.O\qs`. The tool prints the other rows and exits 0. The port
+    fails `refs -c` at exit 1 with `error: keyfile: invalid escape '\q'`, also
+    when no other remote has a `collection-id`.
+  - A remote group whose name is not a valid remote name, such as
+    `[remote "-x"]`, with a valid foreign `collection-id`. The tool lists the
+    refs of the remote. The port lists no ref of the remote.
+  - A ref file of a remote with a valid foreign `collection-id` that holds no
+    checksum, such as `garbage`. The tool prints the row and exits 0. The port
+    fails `refs -c` at exit 1 with `error: invalid checksum: hex checksum is
+    not 64 characters`;
 - `refs -c --create=<id>`, whose NEWREF holds no `:` and therefore no ref name,
   makes the tool print a GLib assertion line (`g_regex_match_full: assertion
   'string != NULL' failed`) ahead of its own `error: Invalid ref name (null)`;
@@ -376,7 +409,8 @@ tool. The port extension has these rules:
   `@ID:PREFIX` and each ref below it. A listing prints each such ref as
   `@ID:NAME`. Without `--list`, a prefix `@ID:PREFIX` prints the part below
   it as `@ID:NAME`, by the rule of a remote prefix. A listing with no
-  `PREFIX` prints no collection ref.
+  `PREFIX` prints no collection ref. `@ID:NAME` and a `PREFIX` `@ID:` do not
+  find a ref of a remote that `refs -c` lists under `ID`.
 - `refs --delete @ID:`, with an empty rest, gives
   `error: Invalid refspec @ID:` and exits 1 if it matches a ref, as
   `refs --delete REMOTE:` does. The rule applies to each `ID`, also to

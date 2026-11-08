@@ -3538,6 +3538,13 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
   `refs/heads/NAME`.
   `Repo::list_mirror_refs` lists the directory, and the fsck and the
   prune read it.
+- The collection ref listing, `Repo::list_collection_refs` and `refs -c`,
+  lists no ref of a remote whose `collection-id` is the own id. The rows of
+  the own id come from `refs/heads/` alone. So `refs -c --delete OWN` does
+  not map a ref of a remote to a local ref of the same name. The `-c`
+  listing of the `ostree` command lists the refs of such a remote under the
+  own id (observed). This is a divergence, recorded in
+  `docs/conformance/cli-surface.md`.
 - `Repo::pull_local` reads each `@ID:NAME` name of the source with the
   rule of `Repo::resolve_ref_tip`: `refs/heads/NAME` when the source has
   the collection id `ID`, and `refs/mirrors/ID/NAME` otherwise. The probe

@@ -275,6 +275,77 @@ fn the_collection_ref_listing_does_not_read_the_mirror_refs_of_the_own_id() {
     });
 }
 
+/// The collection ref listing lists the refs of a remote under the
+/// `collection-id` of the remote. A remote of the own collection id, a remote
+/// with no `collection-id`, a remote with an invalid one, and a directory
+/// with no remote group give no entry. The listing does not read their
+/// refs, so a malformed file there does not fail it. For one collection id
+/// and name, a mirror ref wins over a remote ref, and among remotes the
+/// first by name wins.
+#[test]
+fn the_collection_ref_listing_lists_the_refs_of_a_remote_with_a_collection_id() {
+    let tmp = TmpDir::new("own-id-listing-remotes");
+    block_on(async {
+        let (path, repo) = create(&tmp).await;
+        let guard = repo.begin_update().await.unwrap();
+        for (name, id) in [
+            ("origin2", Some(OTHER)),
+            ("origin", Some(OTHER)),
+            ("self", Some(OWN)),
+            ("plain", None),
+            ("bad", Some("fresh")),
+        ] {
+            let mut keys = vec![("url", "https://example.invalid/")];
+            keys.extend(id.map(|id| ("collection-id", id)));
+            guard.add_remote(name, &keys).await.unwrap();
+        }
+        guard.finish().await.unwrap();
+        // The handle keeps the config that it read at the open.
+        let repo = Repo::open(&path).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&checksum(1)))
+            .await
+            .unwrap();
+        repo.set_ref_immediate(&Ref::collection(OTHER, "x"), Some(&checksum(2)))
+            .await
+            .unwrap();
+        for (remote, name, byte) in [
+            ("origin", "x", 3),
+            ("origin", "y", 4),
+            ("origin2", "y", 5),
+            ("origin2", "z", 6),
+            ("self", "main", 7),
+            ("self", "only", 7),
+            ("plain", "p", 8),
+            ("bad", "b", 8),
+        ] {
+            repo.set_ref_immediate(&Ref::remote(remote, name), Some(&checksum(byte)))
+                .await
+                .unwrap();
+        }
+        for remote in ["self", "plain", "bad", "nosuch"] {
+            let dir = path.join("refs/remotes").join(remote);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("text"), "no checksum\n").unwrap();
+        }
+
+        let entry = |collection: &str, name: &str, byte: u8, local: bool| CollectionRefEntry {
+            collection: collection.to_owned(),
+            name: name.to_owned(),
+            commit: checksum(byte),
+            local,
+        };
+        assert_eq!(
+            repo.list_collection_refs().await.unwrap(),
+            [
+                entry(OTHER, "x", 2, false),
+                entry(OTHER, "y", 4, false),
+                entry(OTHER, "z", 6, false),
+                entry(OWN, "main", 1, true),
+            ]
+        );
+    });
+}
+
 /// The back-ref check of the fsck finds the collection ref of the own
 /// collection id under `refs/heads` alone. A ref under `refs/mirrors/ID/` of
 /// that id gives no collection ref.

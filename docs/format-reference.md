@@ -592,6 +592,13 @@ The refspec `remote:ref` maps to `refs/remotes/remote/ref`, and a bare `ref`
 maps to `refs/heads/ref`. A NULL rev deletes the ref. An alias is a relative
 symlink.
 
+A remote ref `refs/remotes/R/REF` belongs to the collection that the
+`collection-id` of the remote `R` names. The port lists it under that id in
+the collection ref listing and in `refs -c` alone, and never under the
+`[core] collection-id` of the repository. The `@ID:REF` resolve,
+`Repo::list_collection_refs_in`, the summary, and the pulls do not take a
+ref under `refs/remotes` as a ref of a collection.
+
 Both implementations write the 64 lowercase hex characters, and the port reads a
 ref file in either case. Only an out-of-band write puts other content in a ref
 file. `conformance/cli-surface.md`, "P1", records how the tool reads it, and

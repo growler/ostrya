@@ -27,6 +27,7 @@ use rustix::io::Errno;
 
 use crate::access::{AccessRules, Namespace, ReadAccess};
 use crate::archive::{Walked, resolve_alias, walk};
+use crate::config::valid_remote_name;
 use crate::error::{Error, Result};
 use crate::perm;
 use crate::repo::Repo;
@@ -39,7 +40,8 @@ use crate::traverse::read_dir_names;
 ///
 /// [`Repo::list_collection_refs`] returns these entries. The refs of the
 /// `[core] collection-id` of the repository are the local refs, under
-/// `refs/heads`.
+/// `refs/heads`. The refs of another collection id are under `refs/mirrors`
+/// or under `refs/remotes`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRefEntry {
     /// The collection id that qualifies the ref.
@@ -51,7 +53,7 @@ pub struct CollectionRefEntry {
     /// The commit that the ref names.
     pub commit: Checksum,
     /// `true` for a ref under `refs/heads`, `false` for a ref under
-    /// `refs/mirrors`.
+    /// `refs/mirrors` or `refs/remotes`.
     ///
     /// The collection id of the repository qualifies a ref under `refs/heads`.
     pub local: bool,
@@ -612,22 +614,77 @@ impl Repo {
     ///   path, except the refs of `refs/mirrors/ID/` of the
     ///   `[core] collection-id` of the repository. The call does not read
     ///   that directory.
+    /// - Each ref under `refs/remotes/R/` of a remote R whose config sets a
+    ///   `collection-id`, qualified by that id. The call skips a remote
+    ///   whose `collection-id` fails
+    ///   [`is_valid_collection_id`](crate::is_valid_collection_id) or is the
+    ///   `[core] collection-id` of the repository, and a remote name that
+    ///   [`valid_remote_name`] refuses. A directory under `refs/remotes` with
+    ///   no remote group in the config gives no ref. If no remote qualifies,
+    ///   the call does not read `refs/remotes`.
+    ///
+    /// The result holds each pair of a collection id and a ref name one
+    /// time. A ref under `refs/mirrors` wins over a ref of a remote with the
+    /// same pair. Among remotes with the same pair, the first remote in the
+    /// byte order of the names wins.
     ///
     /// [`list_collection_refs_in`](Repo::list_collection_refs_in) lists the
-    /// refs of one collection that a selector selects.
+    /// refs of one collection that a selector selects. It does not read
+    /// `refs/remotes`.
     ///
     /// # Errors
     ///
+    /// - [`Error::Core`] if the `collection-id` of a remote holds a malformed
+    ///   escape sequence.
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_collection_refs(&self) -> Result<Vec<CollectionRefEntry>> {
-        let own = self.config().collection_id();
+        let config = self.config();
+        let own = config.collection_id();
+        // The remotes whose refs the listing holds, each with its collection
+        // id, sorted by name.
+        let mut remotes = BTreeMap::new();
+        for name in config.remotes() {
+            if !valid_remote_name(name) {
+                continue;
+            }
+            let Some(remote) = config.remote(name) else {
+                continue;
+            };
+            if let Some(id) = remote.collection_id()?
+                && ostrya_core::is_valid_collection_id(&id)
+                && Some(id.as_str()) != own
+            {
+                remotes.insert(name.to_owned(), id);
+            }
+        }
         let heads = match own {
             Some(_) => self.list_refs(None).await?,
             None => Vec::new(),
         };
-        self.collection_refs_over(&heads, own).await
+        let mut all = self.collection_refs_over(&heads, own).await?;
+        if remotes.is_empty() {
+            return Ok(all);
+        }
+        let repo = self.clone();
+        let refs = ostrya_rt::unblock(move || collect_remote_collections(&repo, &remotes)).await?;
+        // The refs of the remotes come after the mirror refs, in the byte
+        // order of the remote names. The sort is stable, and `dedup_by` keeps
+        // the first entry of each pair, so a mirror ref wins over a ref of a
+        // remote, and the first remote by name wins over the others.
+        all.extend(
+            refs.into_iter()
+                .map(|(collection, name, commit)| CollectionRefEntry {
+                    collection,
+                    name,
+                    commit,
+                    local: false,
+                }),
+        );
+        all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
+        all.dedup_by(|a, b| a.collection == b.collection && a.name == b.name);
+        Ok(all)
     }
 
     /// Returns the refs of the collection `collection_id` that `refs`
@@ -1710,6 +1767,34 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
         }
         Ok(())
     })?;
+    Ok(out)
+}
+
+/// Collects each ref under `refs/remotes/R/` of each remote R of `remotes`,
+/// as `(collection_id, ref_name, commit)` triples. `remotes` maps a remote
+/// name to its collection id. The refs come in the order of the remotes in
+/// the map. A directory `R` that is absent, a regular file, or a symlink
+/// gives no ref.
+fn collect_remote_collections(
+    repo: &Repo,
+    remotes: &BTreeMap<String, String>,
+) -> Result<Vec<(String, String, Checksum)>> {
+    let Some(dir) = open_refs_dir(repo, "refs/remotes")? else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for (remote, collection) in remotes {
+        let Some(sub) = open_ref_subdir(dir.as_fd(), remote)? else {
+            continue;
+        };
+        walk_ref_dir(sub.as_fd(), "", &mut |entry| {
+            if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
+                let checksum = parse_ref_content(&bytes)?;
+                out.push((collection.clone(), entry.path.to_owned(), checksum));
+            }
+            Ok(())
+        })?;
+    }
     Ok(out)
 }
 

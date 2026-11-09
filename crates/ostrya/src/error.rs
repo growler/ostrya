@@ -583,6 +583,28 @@ pub enum Error {
         /// The commit of the image.
         commit: Checksum,
     },
+    /// No media repository on the mounted volumes, or in the directory that
+    /// the caller gave in place of the mount table.
+    ///
+    /// [`Repo::import_media`](crate::Repo::import_media) gives this error.
+    #[error("no media repository found")]
+    MediaNotFound {
+        /// Each candidate that exists and that the media finder skipped, with
+        /// the reason, in probe order.
+        skipped: Vec<(std::path::PathBuf, crate::media::MediaSkip)>,
+    },
+    /// More than one media repository on the mounted volumes.
+    ///
+    /// [`Repo::import_media`](crate::Repo::import_media) gives this error.
+    #[error(
+        "more than one media repository: {}",
+        .paths.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ")
+    )]
+    AmbiguousMedia {
+        /// The path of each media repository, in the order of the mount
+        /// table.
+        paths: Vec<std::path::PathBuf>,
+    },
     /// The writer lock of a bucket repository that another writer holds.
     ///
     /// The take of the lock found a lock. A take with no break of the lock
@@ -790,6 +812,7 @@ impl From<Error> for std::io::Error {
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
             | Error::ComposefsImageNotFound { .. }
+            | Error::MediaNotFound { .. }
             | Error::RefNotFound(_)
             | Error::RemoteNotFound(_)
             | Error::StaticDeltaNotFound { .. }
@@ -848,6 +871,12 @@ mod tests {
             (
                 Error::ComposefsImageNotFound {
                     commit: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
+                },
+                ErrorKind::NotFound,
+            ),
+            (
+                Error::MediaNotFound {
+                    skipped: Vec::new(),
                 },
                 ErrorKind::NotFound,
             ),

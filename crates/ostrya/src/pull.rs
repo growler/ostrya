@@ -3548,19 +3548,23 @@ enum LocalWanted<'a> {
 
 impl Repo {
     /// Pulls the refs `targets` of the collection `collection` from the local
-    /// repository `src`, each at its commit, with no signature check.
+    /// repository `src`, each at its commit, under the trust `trust` and the
+    /// timestamp check `timestamp_check`.
     ///
     /// The pull is the pull of a local candidate of [`Repo::pull_collection`]
-    /// at depth 0, with no static delta and no timestamp check. It takes the
-    /// `.commitmeta` and the dependencies of field 2 of each commit. It writes
-    /// each ref at [`RefPlace::of_collection`]. The
-    /// `ostree.collection-binding` of each tip must state `collection`, and
-    /// the ref-binding check applies.
+    /// at depth 0, with no static delta. It takes the `.commitmeta` and the
+    /// dependencies of field 2 of each commit. It writes each ref at
+    /// [`RefPlace::of_collection`]. The `ostree.collection-binding` of each
+    /// tip must state `collection`, and the ref-binding check applies. If
+    /// `trust` checks signatures, the pull adds
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED) to its flags.
     pub(crate) async fn pull_local_pinned(
         &self,
         src: &Repo,
         collection: &str,
         targets: Vec<(String, Checksum)>,
+        trust: crate::verify::PullTrust,
+        timestamp_check: TimestampCheck,
     ) -> Result<PullStats> {
         let pinned = Pinned {
             targets,
@@ -3570,13 +3574,20 @@ impl Repo {
             place: RefPlace::of_collection(self, collection),
             summary: Mutex::new(None),
         };
+        let flags = if trust.checks_signatures() {
+            PullFlags::UNTRUSTED
+        } else {
+            PullFlags::default()
+        };
         let opts = PullOptions {
             disable_static_deltas: true,
+            flags,
+            timestamp_check,
             ..PullOptions::default()
         };
         self.pull_local_from(
             src,
-            crate::verify::PullTrust::unverified(),
+            trust,
             RelatedRule::of(self.config())?,
             opts,
             LocalWanted::Pinned(&pinned),

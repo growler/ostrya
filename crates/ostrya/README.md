@@ -38,6 +38,8 @@ API documentation: <https://docs.rs/ostrya>
   serve it.
 - `Repo::export_media` copies the commits of collection refs onto removable
   media.
+- `Repo::import_media` pulls collection refs from removable media, under the
+  trust of their remotes.
 - `Error` is the error of each fallible operation of the crate.
 
 ## Modules
@@ -49,7 +51,7 @@ API documentation: <https://docs.rs/ostrya>
   `remote`, which holds the session of a pull over HTTP, over ssh, or over a pair
   of byte streams.
 - Removable media: `media`, the export of collection refs onto a mounted
-  volume.
+  volume, and the import from it.
 - Push and receive: `remote`, the wire protocol of `ostrya-remote`, and `receive`.
 - Client access: `access`, the client groups and the server settings of the
   config, the claims of a client certificate, and the read rights of a

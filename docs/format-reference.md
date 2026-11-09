@@ -5375,9 +5375,10 @@ or an object.
 ## Removable media
 
 `Repo::export_media` copies the commits of collection refs onto a mounted
-volume. A host with no network finds the media repository on the volume and
-pulls from it. The media layout is the layout that `ostree create-usb`
-writes, so `ostree find-remotes --pull` reads the media of the port.
+volume. On a host with no network, `Repo::import_media` finds the media
+repository on the volume and pulls collection refs from it. The media
+layout is the layout that `ostree create-usb` writes, so
+`ostree find-remotes --pull` reads the media of the port.
 
 The media repository is `MOUNT/.ostree/repo`. The export does not check
 that `MOUNT` is a mount point. A symlink to a directory is a valid `MOUNT`.
@@ -5535,8 +5536,9 @@ reads no summary of it. When the finder finds one media repository, it
 keeps the open repository and the summary bytes that it read.
 
 The finder accepts exactly one media repository. When it finds none, it
-gives each candidate that it skipped, with the reason. When it finds more
-than one, it gives the path of each, in the order of the mount table.
+gives `Error::MediaNotFound` with each candidate that it skipped, and the
+reason. When it finds more than one, it gives `Error::AmbiguousMedia` with
+the path of each, in the order of the mount table.
 
 The caller can give a directory in place of the mount table. Then the
 finder probes that directory alone, with the same candidates and checks,
@@ -5545,6 +5547,96 @@ path of each candidate must not cross a mount point, and the file-system
 check compares each candidate with the file system of the directory. The
 finder still skips the client repository. A directory that
 the finder cannot open is an error.
+
+### The import from the media
+
+`Repo::import_media` finds the one media repository with the media finder,
+and pulls collection refs from it into the client repository.
+
+A ref `(ID, NAME)` is on the media when the ref files of the media
+repository and its `summary` both list it. `Repo::list_collection_refs_in`
+of the media repository reads the ref files. For a collection that only
+operands `NAME` and `@ID:NAME` select, it reads the ref files of these names
+alone. The summary lists the refs of `ID` in field 0 when it states the
+collection id `ID` (`ostree.summary.collection-id`), and else in the first
+entry of `ID` in `ostree.summary.collection-map`. The import ignores an
+entry of the collection map for the collection id that the summary states.
+The first entry of a name counts. The import ignores a name that fails the
+ref-name rule, and a collection id that is not valid. The commit of a ref is
+the commit that the summary lists, so a stale summary pins an old commit.
+The import parses the summary bytes that the finder read. It reads no
+`summary.sig`: the media summary is unsigned.
+
+The operands of the import:
+
+- `NAME` is the ref `(OWN, NAME)`, where `OWN` is the `[core] collection-id`
+  of the client. A client with no collection id refuses the operand.
+- `@ID:NAME` is the ref `(ID, NAME)`.
+- The prefix `@ID:` is each ref of `ID` on the media, in the byte order of
+  the names.
+- `REMOTE:NAME` is refused.
+
+The import takes the refs of the operands `NAME` and `@ID:NAME` first, in
+order, and then the refs of each prefix. An operand that occurs two times,
+and a ref that a prefix and an operand both name, are imported one time.
+`NAME` and `@OWN:NAME` in one run name one ref, and the import refuses
+them. With no operand, the import takes each ref on the media whose
+collection has a matched remote, in the byte order of the collection ids
+and then of the names. It ignores each other collection.
+
+The matched remote of a collection `ID` is the first remote, in the byte
+order of the names, whose `collection-id` is `ID`. If no remote has that
+`collection-id`, it is the first remote whose `mirrored-collection-ids`
+holds `ID`. The import ignores a remote whose name or `collection-id` is
+not valid. A remote with no `collection-id` does not match by the
+collection id of its summary: the import reads no summary of a remote.
+
+The import makes these checks before its first pull, so a refusal writes
+no ref:
+
+- Each operand is valid.
+- Each collection of an operand has a matched remote. The import makes
+  this check before it reads the media.
+- The finder finds exactly one media repository.
+- The media summary parses.
+- Each operand `NAME` and `@ID:NAME` names a ref on the media, and each
+  prefix `@ID:` names at least one ref on the media. The error of a missing
+  ref is `Error::RefNotFound` with the text `@ID:NAME` or `@ID:`.
+- The trust of the matched remote of each selected ref resolves.
+
+The import checks the commits of a collection with the trust of its matched
+remote: `gpg-verify`, `sign-verify`, the keyrings, and the trust group of
+`trust=NAME`. It checks no summary, whatever the keys
+`gpg-verify-summary` and `sign-verify-summary` hold. When the trust checks
+no commit signature, the import checks the GPG signature of each commit
+with the keys of a pull from the remote with `gpg-verify=true`: the keyring
+of the remote, or the keyrings of the global trusted-keyring directory when
+the remote has no keyring of its own, and the keyrings that `gpgkeypath`
+names. The `ostree` command checks the GPG signature with the keyring of
+the remote alone, so a key of `gpgkeypath` also verifies a commit in the
+port. The `ostree` command ignores `sign-verify`, and the port checks it.
+A build without the feature `verify-gpg` refuses each ref that the import
+pulls from a remote that checks no commit signature, with a text that names
+the feature.
+
+A ref of the client that holds the commit of the media is unchanged, and
+the import does not pull it. For each other ref, the import makes one local
+pull from the media repository, with its own transaction. The pull is at
+depth 0, and reads no static delta. It copies the `.commitmeta` of the
+commit, and the dependencies of field 2 of the commit as loose objects. The
+`ostree.collection-binding` of the commit must state `ID`, and the
+ref-binding check applies. The pull refuses a commit whose timestamp is
+older than the timestamp of the commit of the ref in the client. The
+`ostree` command moves the ref back. The pull writes the ref to
+`refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the
+`[core] collection-id` of the client. Under
+`[ex-ostrya] generate-composefs`, the transaction builds the composefs
+image of the commit, as each pull does.
+
+A pull that fails refuses its ref, and the import continues with the next
+ref. The result of the import holds the written refs, the unchanged refs,
+and each refused ref with its error. The import also reads a media
+repository on a read-only mount.
 
 ### The file systems of the media
 

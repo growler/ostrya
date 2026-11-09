@@ -26,6 +26,7 @@
 //! - [`Repo::pull_with_session`] copies commits from a remote through a session of the caller.
 //! - [`Repo::pull_collection`] copies the refs of a collection from the remotes that serve it.
 //! - [`Repo::export_media`] copies the commits of collection refs onto removable media.
+//! - [`Repo::import_media`] pulls collection refs from removable media, under the trust of their remotes.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
@@ -33,7 +34,7 @@
 //! - Write: [`transaction`], [`mtree`], [`staging_tree`], [`commit`], [`modifier`], [`bootable`].
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
 //! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`], which holds the session of a pull over HTTP, over ssh, or over a pair of byte streams.
-//! - Removable media: [`media`], the export of collection refs onto a mounted volume.
+//! - Removable media: [`media`], the export of collection refs onto a mounted volume, and the import from it.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Client access: [`access`], the client groups and the server settings of the config, the claims of a client certificate, and the read rights of a client.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
@@ -190,7 +191,9 @@ pub use gpg::{FromOstreeKeyrings, GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
 #[doc(hidden)]
-pub use media::{MediaExportOptions, MediaExportReport};
+pub use media::{
+    MediaExportOptions, MediaExportReport, MediaImportOptions, MediaImportReport, MediaSkip,
+};
 #[doc(hidden)]
 pub use modifier::{
     CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, ModeFn,

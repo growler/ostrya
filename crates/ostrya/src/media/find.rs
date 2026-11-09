@@ -11,8 +11,9 @@ use ostrya_core::Value;
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
+use super::MediaSkip;
 use super::mountinfo::{self, Mount};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::repo::Repo;
 use crate::summary::{
     COLLECTION_ID_KEY, SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list,
@@ -83,27 +84,11 @@ pub(super) struct FoundMedia {
     pub(super) summary: Vec<u8>,
 }
 
-/// The reason why the finder skipped a candidate that exists.
-#[derive(Debug)]
-pub(super) enum Skip {
-    /// The candidate is on another file system than the mount, or its path
-    /// crosses a mount point.
-    OtherFileSystem,
-    /// The candidate is the client repository.
-    Client,
-    /// The finder cannot open the candidate, read its summary, or open its
-    /// repository.
-    Unreadable(Error),
-    /// The summary of the candidate lists no collection ref, or the
-    /// candidate has no summary.
-    NoCollectionRef,
-}
-
 /// The result of a scan.
 pub(super) enum MediaChoice {
     /// No media repository. The list holds each candidate that exists and
     /// that the finder skipped, with the reason, in probe order.
-    None(Vec<(PathBuf, Skip)>),
+    None(Vec<(PathBuf, MediaSkip)>),
     /// One media repository.
     One(FoundMedia),
     /// More than one media repository: the path of each, in the order of
@@ -124,8 +109,8 @@ pub(super) enum MediaChoice {
 ///
 /// # Errors
 ///
-/// - [`Error::Io`] if the call cannot read the device and the inode of the
-///   client repository.
+/// - [`Error::Io`](crate::Error::Io) if the call cannot read the device
+///   and the inode of the client repository.
 pub(super) async fn find_media(client: &Repo, table: Vec<u8>) -> Result<MediaChoice> {
     let mut scan = Scan::new(client).await?;
     let points = ostrya_rt::unblock(move || probe_points(&table)).await;
@@ -143,8 +128,8 @@ pub(super) async fn find_media(client: &Repo, table: Vec<u8>) -> Result<MediaCho
 ///
 /// # Errors
 ///
-/// - [`Error::Io`] if the call cannot open `dir`, or cannot read the device
-///   and the inode of the client repository.
+/// - [`Error::Io`](crate::Error::Io) if the call cannot open `dir`, or
+///   cannot read the device and the inode of the client repository.
 pub(super) async fn find_media_in(client: &Repo, dir: &Path) -> Result<MediaChoice> {
     let mut scan = Scan::new(client).await?;
     scan.probe(dir).await?;
@@ -177,7 +162,7 @@ struct Scan {
     /// The client repository.
     client: Identity,
     /// Each candidate that exists and that the scan skipped, with the reason.
-    skipped: Vec<(PathBuf, Skip)>,
+    skipped: Vec<(PathBuf, MediaSkip)>,
     /// The device, the inode, and the path of each media repository, in the
     /// order of the mounts.
     found: Vec<(Identity, PathBuf)>,
@@ -194,7 +179,7 @@ struct MountDir {
     dev: u64,
     /// The names of the entries of `.ostree/repos.d`, in byte order, or the
     /// reason why the scan skips that directory.
-    repos_d: std::result::Result<Vec<Vec<u8>>, Skip>,
+    repos_d: std::result::Result<Vec<Vec<u8>>, MediaSkip>,
 }
 
 /// The result of the probe of one candidate.
@@ -202,7 +187,7 @@ enum Probe {
     /// The candidate does not exist.
     Missing,
     /// The candidate exists, and the finder skipped it.
-    Skipped(Skip),
+    Skipped(MediaSkip),
     /// The candidate is a media repository that the scan found before.
     Found,
     /// The candidate is a media repository.
@@ -233,7 +218,8 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the call cannot open `dir` or read its device.
+    /// - [`Error::Io`](crate::Error::Io) if the call cannot open `dir` or
+    ///   read its device.
     async fn probe(&mut self, dir: &Path) -> Result<()> {
         let path = dir.to_owned();
         let mount = ostrya_rt::unblock(move || open_mount(&path)).await?;
@@ -303,11 +289,11 @@ fn open_mount(path: &Path) -> Result<MountDir> {
 /// Returns the names of the entries of `.ostree/repos.d` under the
 /// directory `dir`, in byte order, or no name if the directory does not
 /// exist. Blocks the calling thread.
-fn repos_d_names(dir: BorrowedFd<'_>) -> std::result::Result<Vec<Vec<u8>>, Skip> {
+fn repos_d_names(dir: BorrowedFd<'_>) -> std::result::Result<Vec<Vec<u8>>, MediaSkip> {
     let Some(fd) = open_in_mount(dir, Path::new(REPOS_D))? else {
         return Ok(Vec::new());
     };
-    let unreadable = |e: Errno| Skip::Unreadable(e.into());
+    let unreadable = |e: Errno| MediaSkip::Unreadable(e.into());
     let mut names = Vec::new();
     for entry in Dir::new(fd).map_err(unreadable)? {
         let name = entry.map_err(unreadable)?.file_name().to_bytes().to_vec();
@@ -333,27 +319,27 @@ fn probe_candidate(
     client: Identity,
     found: &[Identity],
     path: PathBuf,
-) -> std::result::Result<Probe, Skip> {
+) -> std::result::Result<Probe, MediaSkip> {
     let Some(candidate) = open_in_mount(dir, relative)? else {
         return Ok(Probe::Missing);
     };
-    let id = identity(candidate.as_fd()).map_err(|e| Skip::Unreadable(e.into()))?;
+    let id = identity(candidate.as_fd()).map_err(|e| MediaSkip::Unreadable(e.into()))?;
     if id.0 != dev {
-        return Err(Skip::OtherFileSystem);
+        return Err(MediaSkip::OtherFileSystem);
     }
     if id == client {
-        return Err(Skip::Client);
+        return Err(MediaSkip::Client);
     }
     if found.contains(&id) {
         return Ok(Probe::Found);
     }
     let summary = read_root_file_with(candidate.as_fd(), SUMMARY_FILE, true)
-        .map_err(Skip::Unreadable)?
-        .ok_or(Skip::NoCollectionRef)?;
-    if !lists_collection_ref(&summary).map_err(Skip::Unreadable)? {
-        return Err(Skip::NoCollectionRef);
+        .map_err(MediaSkip::Unreadable)?
+        .ok_or(MediaSkip::NoCollectionRef)?;
+    if !lists_collection_ref(&summary).map_err(MediaSkip::Unreadable)? {
+        return Err(MediaSkip::NoCollectionRef);
     }
-    let repo = Repo::open_strict_blocking(candidate, path).map_err(Skip::Unreadable)?;
+    let repo = Repo::open_strict_blocking(candidate, path).map_err(MediaSkip::Unreadable)?;
     Ok(Probe::Media(id, repo, summary))
 }
 
@@ -367,7 +353,7 @@ fn probe_candidate(
 fn open_in_mount(
     dir: BorrowedFd<'_>,
     relative: &Path,
-) -> std::result::Result<Option<OwnedFd>, Skip> {
+) -> std::result::Result<Option<OwnedFd>, MediaSkip> {
     match rustix::fs::openat2(
         dir,
         relative,
@@ -380,8 +366,8 @@ fn open_in_mount(
         Err(Errno::NOTDIR) if rustix::fs::statat(dir, relative, AtFlags::empty()).is_err() => {
             Ok(None)
         }
-        Err(Errno::XDEV) => Err(Skip::OtherFileSystem),
-        Err(e) => Err(Skip::Unreadable(e.into())),
+        Err(Errno::XDEV) => Err(MediaSkip::OtherFileSystem),
+        Err(e) => Err(MediaSkip::Unreadable(e.into())),
     }
 }
 
@@ -416,7 +402,7 @@ mod tests {
     use ostrya_core::{Type, to_bytes};
 
     use super::*;
-    use crate::{CreateOptions, RepoMode};
+    use crate::{CreateOptions, Error, RepoMode};
 
     /// The collection of the test media.
     const ID: &str = "org.example.Os";
@@ -546,7 +532,7 @@ mod tests {
                 .into_iter()
                 .map(|(path, skip)| {
                     let reason = match skip {
-                        Skip::Unreadable(Error::Io(_)) => "unreadable".to_owned(),
+                        MediaSkip::Unreadable(Error::Io(_)) => "unreadable".to_owned(),
                         other => format!("{other:?}"),
                     };
                     (path, reason)

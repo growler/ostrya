@@ -123,8 +123,7 @@ pub(super) async fn find_media(client: &Repo, table: Vec<u8>) -> Result<MediaCho
 
 /// Scans the directory `dir` alone for media, as the client repository
 /// `client` reads them. The call reads no mount table, and `dir` need not
-/// be a mount point. The file system of each candidate must be the file
-/// system of `dir`.
+/// be a mount point. The path of each candidate must cross no mount point.
 ///
 /// # Errors
 ///
@@ -175,8 +174,6 @@ struct Scan {
 struct MountDir {
     /// The directory, open with `O_PATH`.
     fd: OwnedFd,
-    /// The device of the directory.
-    dev: u64,
     /// The names of the entries of `.ostree/repos.d`, in byte order, or the
     /// reason why the scan skips that directory.
     repos_d: std::result::Result<Vec<Vec<u8>>, MediaSkip>,
@@ -218,8 +215,7 @@ impl Scan {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`](crate::Error::Io) if the call cannot open `dir` or
-    ///   read its device.
+    /// - [`Error::Io`](crate::Error::Io) if the call cannot open `dir`.
     async fn probe(&mut self, dir: &Path) -> Result<()> {
         let path = dir.to_owned();
         let mount = ostrya_rt::unblock(move || open_mount(&path)).await?;
@@ -235,12 +231,11 @@ impl Scan {
         for relative in candidates {
             let path = dir.join(&relative);
             let fd = Arc::clone(&fd);
-            let dev = mount.dev;
             let client = self.client;
             let found: Vec<Identity> = self.found.iter().map(|(id, _)| *id).collect();
             let repo_path = path.clone();
             let probe = ostrya_rt::unblock(move || {
-                probe_candidate(fd.as_fd(), dev, &relative, client, &found, repo_path)
+                probe_candidate(fd.as_fd(), &relative, client, &found, repo_path)
                     .unwrap_or_else(Probe::Skipped)
             })
             .await;
@@ -273,17 +268,16 @@ impl Scan {
     }
 }
 
-/// Opens the directory `path` with `O_PATH`, and reads its device and the
-/// names of the entries of its `.ostree/repos.d`. Blocks the calling thread.
+/// Opens the directory `path` with `O_PATH`, and reads the names of the
+/// entries of its `.ostree/repos.d`. Blocks the calling thread.
 fn open_mount(path: &Path) -> Result<MountDir> {
     let fd = rustix::fs::open(
         path,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
-    let dev = identity(fd.as_fd())?.0;
     let repos_d = repos_d_names(fd.as_fd());
-    Ok(MountDir { fd, dev, repos_d })
+    Ok(MountDir { fd, repos_d })
 }
 
 /// Returns the names of the entries of `.ostree/repos.d` under the
@@ -305,16 +299,15 @@ fn repos_d_names(dir: BorrowedFd<'_>) -> std::result::Result<Vec<Vec<u8>>, Media
     Ok(names)
 }
 
-/// Probes the candidate `relative` under the directory `dir` on the device
-/// `dev`, for the client repository `client` and the media repositories
-/// `found` of the scan. The repository of a media candidate stores `path`.
-/// Blocks the calling thread.
+/// Probes the candidate `relative` under the directory `dir`, for the
+/// client repository `client` and the media repositories `found` of the
+/// scan. The repository of a media candidate stores `path`. Blocks the
+/// calling thread.
 ///
 /// The call reads the summary before it opens the repository, so it reads
 /// the `config` of a media candidate alone.
 fn probe_candidate(
     dir: BorrowedFd<'_>,
-    dev: u64,
     relative: &Path,
     client: Identity,
     found: &[Identity],
@@ -324,9 +317,6 @@ fn probe_candidate(
         return Ok(Probe::Missing);
     };
     let id = identity(candidate.as_fd()).map_err(|e| MediaSkip::Unreadable(e.into()))?;
-    if id.0 != dev {
-        return Err(MediaSkip::OtherFileSystem);
-    }
     if id == client {
         return Err(MediaSkip::Client);
     }
@@ -773,6 +763,51 @@ mod tests {
 
             let choice = find_media_in(&client, &dir).await;
             assert_eq!(one(choice.unwrap()).path, dir.join("ostree/repo"));
+        });
+    }
+
+    /// Creates a btrfs subvolume at `path`, or returns `false` if the host
+    /// cannot create it.
+    fn btrfs_subvolume(path: &Path) -> bool {
+        Command::new("btrfs")
+            .args(["subvolume", "create"])
+            .arg(path)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// A repository in a btrfs subvolume of the mount is media, although
+    /// the device of the subvolume is not the device of the mount. The
+    /// subvolume is `.ostree` or `.ostree/repo`.
+    #[test]
+    fn a_repository_in_a_btrfs_subvolume_is_media() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new(&std::env::temp_dir());
+            let client = repo_at(&scratch.root.join("client"), None).await;
+            let cases = [("a", ".ostree"), ("b", ".ostree/repo")].map(|(name, subvolume)| {
+                let mount = scratch.dir(name);
+                let subvolume = mount.join(subvolume);
+                std::fs::create_dir_all(subvolume.parent().unwrap()).unwrap();
+                (btrfs_subvolume(&subvolume), mount, subvolume)
+            });
+            if !cases.iter().all(|(created, ..)| *created) {
+                eprintln!("skipping: the host cannot create a btrfs subvolume");
+                return;
+            }
+            let dev = |path: &Path| {
+                std::os::unix::fs::MetadataExt::dev(&std::fs::metadata(path).unwrap())
+            };
+            for (_, mount, subvolume) in cases {
+                assert_ne!(dev(&subvolume), dev(&mount));
+                repo_at(&mount.join(".ostree/repo"), Some(&media_summary())).await;
+
+                let choice = find_media(&client, table(&[(&mount, "btrfs")])).await;
+                assert_eq!(one(choice.unwrap()).path, mount.join(".ostree/repo"));
+                let choice = find_media_in(&client, &mount).await;
+                assert_eq!(one(choice.unwrap()).path, mount.join(".ostree/repo"));
+            }
         });
     }
 

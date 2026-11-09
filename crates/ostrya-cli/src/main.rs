@@ -5338,8 +5338,8 @@ struct MediaImportArgs {
     /// Probe the directory PATH in place of the mount table.
     ///
     /// PATH need not be a mount point. The command probes the same paths
-    /// under PATH, and compares the file system of each repository with the
-    /// file system of PATH.
+    /// under PATH, and the path of each repository must cross no mount point
+    /// under PATH.
     #[arg(long, value_name = "PATH")]
     mount: Option<PathBuf>,
     /// Put each plain REF in the collection ID.

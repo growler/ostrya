@@ -5507,10 +5507,10 @@ symlink in the volume resolves. The finder ignores a candidate that does
 not exist, and a candidate with a component before the last one that is
 not a directory. It skips a candidate for these reasons:
 
-- The path of the candidate crosses a mount point, or the `st_dev` of the
-  candidate is not the `st_dev` of the mount directory. So the candidate
-  must be on the device of the mount, and a repository in a nested btrfs
-  subvolume is on another file system.
+- The path of the candidate crosses a mount point, a bind mount included.
+  A btrfs subvolume is no mount point. So the finder takes a repository in
+  a btrfs subvolume of the mount, although its `st_dev` is not the
+  `st_dev` of the mount directory.
 - The candidate has the device and the inode of the client repository.
 - The finder cannot read the candidate: the open of the directory, the read
   or the parse of its `summary`, or the open of the repository fails. The

@@ -469,7 +469,8 @@ FAT32 refuses a file of 4 GiB or more.
 vfat and exFAT compare names with no case.
 .PP
 The media finder of the client reads these paths on each mounted volume, in this order: each entry of \fB\%MOUNT/.ostree/repos.d/\fR in the byte order of the names, \fB\%MOUNT/.ostree/repo\fR, \fB\%MOUNT/ostree/repo\fR, and \fB\%MOUNT/var/lib/flatpak/repo\fR.
-The path of a candidate must not cross a mount point, and the candidate must be on the device of the volume.
+The path of a candidate must not cross a mount point.
+A btrfs subvolume of the volume is no mount point.
 The finder reads the \fB\%summary\fR of each candidate, and the \fB\%config\fR of a candidate whose summary lists a collection ref.
 The media repository of a volume is the first candidate whose summary lists a collection ref.
 The finder skips the client repository.

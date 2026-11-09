@@ -120,8 +120,9 @@ pub struct MediaImportReport {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum MediaSkip {
-    /// The candidate is on another file system than the mount, or its path
-    /// crosses a mount point.
+    /// The resolution of the path of the candidate crosses a mount point, a
+    /// bind mount included. A btrfs subvolume of the mount is no mount
+    /// point.
     OtherFileSystem,
     /// The candidate is the client repository.
     Client,

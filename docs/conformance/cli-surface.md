@@ -4673,6 +4673,9 @@ No matrix cell needs these. The shell suite invokes them.
   - The port also reads media whose `[core] collection-id` is the id of a
     ref, where field 0 of the summary lists the ref. The tool was not
     observed on such media.
+  - The port takes a candidate in a btrfs subvolume of the mount, although
+    the `st_dev` of the subvolume is not the `st_dev` of the mount. A btrfs
+    subvolume is no mount point. The tool was not observed on such media.
   - When no remote has the `collection-id` ID, the matched remote of the
     port is the first remote whose `mirrored-collection-ids` holds ID. The
     tool needs a remote with the `collection-id` ID.

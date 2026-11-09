@@ -5565,10 +5565,11 @@ collection id `ID` (`ostree.summary.collection-id`), and else in the first
 entry of `ID` in `ostree.summary.collection-map`. The import ignores an
 entry of the collection map for the collection id that the summary states.
 The first entry of a name counts. The import ignores a name that fails the
-ref-name rule, and a collection id that is not valid. The commit of a ref is
-the commit that the summary lists, so a stale summary pins an old commit.
-The import parses the summary bytes that the finder read. It reads no
-`summary.sig`: the media summary is unsigned.
+ref-name rule. The commit of a ref is the commit that the summary lists, so
+a stale summary pins an old commit. The timestamp of a ref is the
+`ostree.commit.timestamp` that the summary lists. The import parses the
+summary bytes that the finder read. It reads no `summary.sig`: the media
+summary is unsigned.
 
 The operands of the import:
 
@@ -5601,7 +5602,9 @@ no ref:
 - Each collection of an operand has a matched remote. The import makes
   this check before it reads the media.
 - The finder finds exactly one media repository.
-- The media summary parses.
+- The media summary parses, and each ref with a valid name of a
+  collection that the import reads has an `ostree.commit.timestamp` of type
+  `t` in the summary. The error is `Error::InvalidFormat`.
 - Each operand `NAME` and `@ID:NAME` names a ref on the media, and each
   prefix `@ID:` names at least one ref on the media. The error of a missing
   ref is `Error::RefNotFound` with the text `@ID:NAME` or `@ID:`.
@@ -5640,9 +5643,10 @@ the `.commitmeta` of the commit, and the dependencies of field 2 of the
 commit as loose objects. The `ostree.collection-binding` of the commit must
 state `ID`, and the ref-binding check applies. The pull refuses a commit
 whose timestamp is older than the timestamp of the commit of the current
-ref. The `ostree` command moves the ref back. Under
-`[ex-ostrya] generate-composefs`, the transaction builds the composefs
-image of the commit, as each pull does.
+ref. The `ostree` command moves the ref back. The pull also refuses a
+commit whose timestamp is not the timestamp that the summary lists for the
+ref. Under `[ex-ostrya] generate-composefs`, the transaction builds the
+composefs image of the commit, as each pull does.
 
 A read of the current ref that fails refuses its ref, and so does a pull
 that fails. The import then continues with the next ref. The result of the

@@ -50,8 +50,8 @@ use crate::remote::{Endpoint, PullSession, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::send::write_escaped;
 use crate::summary::{
-    COLLECTION_ID_KEY, COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, Summary, SummaryRef,
-    collection_map_refs, parse_ref_list,
+    COMMIT_TIMESTAMP_KEY, SUMMARY_FILE, Summary, SummaryRef, collection_map_refs, parse_ref_list,
+    summary_collection_id,
 };
 use crate::verify::PullTrust;
 use crate::verify::trust::FieldGroup;
@@ -336,10 +336,10 @@ enum Session {
 
 /// One ref that a remote lists for the collection.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Listed {
-    name: String,
-    commit: Checksum,
-    timestamp: u64,
+pub(crate) struct Listed {
+    pub(crate) name: String,
+    pub(crate) commit: Checksum,
+    pub(crate) timestamp: u64,
 }
 
 /// What the probe of one remote gives if the remote answers. [`find_refs`]
@@ -364,9 +364,9 @@ struct Probed {
 /// The refs of the collection that a listing, a summary, or the ref files
 /// of a local repository give.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct ListedRefs {
+pub(crate) struct ListedRefs {
     /// Each ref whose name passes the ref-name rule.
-    listed: Vec<Listed>,
+    pub(crate) listed: Vec<Listed>,
     /// Each name that fails the ref-name rule, in the listed order. The
     /// find step skips these refs, and reads no commit and no timestamp of
     /// them.
@@ -1826,17 +1826,13 @@ async fn parse_refs(bytes: Arc<Vec<u8>>, id: &str, names: &[&str]) -> Result<(bo
 ///   or if the collection map is malformed.
 /// - [`Error::InvalidFormat`] if a ref with a valid name has no
 ///   `ostree.commit.timestamp` of type `t`.
-fn collection_refs(
+pub(crate) fn collection_refs(
     bytes: &[u8],
     id: &str,
     wanted: Option<&HashSet<String>>,
 ) -> Result<(bool, ListedRefs)> {
     let metadata = Summary::parse_metadata(bytes)?;
-    let own = metadata
-        .dict_get(COLLECTION_ID_KEY)
-        .and_then(Value::as_variant)
-        .and_then(|(_, value)| value.as_str())
-        == Some(id);
+    let own = summary_collection_id(&metadata) == Some(id);
     let entries = if own {
         drop(metadata);
         parse_ref_list(bytes)?
@@ -2017,6 +2013,7 @@ mod tests {
 
     use super::*;
     use crate::fetch::FetcherOptions;
+    use crate::summary::COLLECTION_ID_KEY;
 
     /// The transport of an S3 endpoint builds its fetcher and connects to no
     /// server. Each session that it opens holds a bucket client.

@@ -7,7 +7,6 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ostrya_core::Value;
 use rustix::fs::{AtFlags, Dir, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
@@ -16,8 +15,8 @@ use super::mountinfo::{self, Mount};
 use crate::error::Result;
 use crate::repo::Repo;
 use crate::summary::{
-    COLLECTION_ID_KEY, SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list,
-    read_root_file_with,
+    SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list, read_root_file_with,
+    summary_collection_id,
 };
 
 /// The directory of the repository entries of the tool on a volume.
@@ -376,11 +375,7 @@ fn lists_collection_ref(bytes: &[u8]) -> Result<bool> {
     if collection_map_has_ref(&metadata)? {
         return Ok(true);
     }
-    let own = metadata
-        .dict_get(COLLECTION_ID_KEY)
-        .and_then(Value::as_variant)
-        .and_then(|(_, value)| value.as_str())
-        .is_some();
+    let own = summary_collection_id(&metadata).is_some();
     Ok(own && !parse_ref_list(bytes)?.is_empty())
 }
 
@@ -389,9 +384,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
-    use ostrya_core::{Type, to_bytes};
+    use ostrya_core::{Type, Value, to_bytes};
 
     use super::*;
+    use crate::summary::COLLECTION_ID_KEY;
     use crate::{CreateOptions, Error, RepoMode};
 
     /// The collection of the test media.

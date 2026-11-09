@@ -879,6 +879,59 @@ fn media_with_the_collection_id_of_the_ref_are_read() {
     });
 }
 
+/// A commit whose timestamp is not the timestamp that the media summary
+/// lists for its ref is refused, and the other refs are imported. The
+/// summary lists the ref in the collection map, or in field 0 when the
+/// media have the collection id of the ref.
+#[test]
+fn a_listed_timestamp_that_is_not_the_commit_timestamp_refuses_the_ref() {
+    for own in [None, Some(X)] {
+        let tmp = TmpDir::new("media-import-listed-timestamp");
+        let dir = tmp.path();
+        block_on(async {
+            let src = source(dir).await;
+            signed(&src, dir, X, "a", 1_111_111_111).await;
+            let b = signed(&src, dir, X, "b", 1_222_222_222).await;
+            let mount = mount_dir(dir, "mnt");
+            if own.is_some() {
+                std::fs::create_dir(mount.join(".ostree")).unwrap();
+                drop(create(&mount.join(".ostree/repo"), own).await);
+            }
+            export(
+                &src,
+                &mount,
+                &[Ref::collection(X, "a"), Ref::collection(X, "b")],
+            )
+            .await;
+            // The summary lists one second more than the commit of `a`
+            // holds.
+            let path = mount.join(".ostree/repo/summary");
+            let mut bytes = std::fs::read(&path).unwrap();
+            let real = 1_111_111_111u64.to_be_bytes();
+            let at: Vec<usize> = bytes
+                .windows(8)
+                .enumerate()
+                .filter(|(_, w)| *w == real)
+                .map(|(at, _)| at)
+                .collect();
+            assert_eq!(at.len(), 1, "{own:?}");
+            bytes[at[0]..at[0] + 8].copy_from_slice(&1_111_111_112u64.to_be_bytes());
+            std::fs::write(&path, bytes).unwrap();
+
+            let c = client(dir, "client", None, &origin()).await;
+            let report = import(&c, &mount, &[], &[]).await.unwrap();
+            assert_eq!(report.written, [(Ref::collection(X, "b"), b)], "{own:?}");
+            assert_eq!(names(&report.refused), [format!("@{X}:a")], "{own:?}");
+            assert!(
+                matches!(&report.refused[0].1, Error::Pull(m) if m.contains("timestamp")),
+                "{own:?}: {:?}",
+                report.refused[0].1
+            );
+            assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), None, "{own:?}");
+        });
+    }
+}
+
 /// A commit on the media that is bound to another collection, or that has
 /// no collection binding, is refused, and the other refs are imported.
 #[test]

@@ -438,6 +438,16 @@ pub(crate) fn collection_map_refs(metadata: &Value, id: &str) -> Result<Vec<Summ
     Ok(Vec::new())
 }
 
+/// Returns the collection id that the global metadata dict `metadata` of a
+/// summary states in `ostree.summary.collection-id`, or `None` if the dict
+/// has no such key, or if its value is not a string.
+pub(crate) fn summary_collection_id(metadata: &Value) -> Option<&str> {
+    metadata
+        .dict_get(COLLECTION_ID_KEY)
+        .and_then(Value::as_variant)
+        .and_then(|(_, value)| value.as_str())
+}
+
 /// Returns `true` if an entry of the `ostree.summary.collection-map` of the
 /// global metadata dict `metadata` holds a ref. The call parses no ref, and
 /// it stops at the first entry with a ref.

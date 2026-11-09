@@ -237,6 +237,7 @@ mod source;
 mod subpath;
 mod verify;
 
+pub(crate) use collection::collection_refs;
 pub use collection::{
     CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats,
 };
@@ -3556,19 +3557,21 @@ impl Repo {
     /// dependencies of field 2 of each commit. It writes each ref at
     /// [`RefPlace::of_collection`]. The `ostree.collection-binding` of each
     /// tip must state `collection`, and the ref-binding check applies. If
-    /// `trust` checks signatures, the pull adds
+    /// `listed` holds a timestamp for a ref, the timestamp of its tip must
+    /// equal it. If `trust` checks signatures, the pull adds
     /// [`UNTRUSTED`](PullFlags::UNTRUSTED) to its flags.
     pub(crate) async fn pull_local_pinned(
         &self,
         src: &Repo,
         collection: &str,
         targets: Vec<(String, Checksum)>,
+        listed: HashMap<String, u64>,
         trust: crate::verify::PullTrust,
         timestamp_check: TimestampCheck,
     ) -> Result<PullStats> {
         let pinned = Pinned {
             targets,
-            listed: HashMap::new(),
+            listed,
             collection,
             allow_unbound: false,
             place: RefPlace::of_collection(self, collection),

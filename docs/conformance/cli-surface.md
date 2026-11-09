@@ -4690,6 +4690,9 @@ No matrix cell needs these. The shell suite invokes them.
     `refs/remotes/REMOTE/REF` of the matched remote whose `collection-id`
     is ID. Under the `[core] collection-id`, the port reads no ref under
     `refs/remotes/`. The tool moves the ref to the older commit at exit 0.
+  - The port refuses a commit whose timestamp is not the timestamp that the
+    media summary lists for its ref, and imports the other refs. The tool
+    was not observed with such media.
   - The port writes `refs/mirrors/ID/REF`, or `refs/heads/REF` when ID is
     the `[core] collection-id` of the client, as `pull --collection` writes
     the ref. The tool writes `refs/remotes/REMOTE/REF` under `--pull`, and
@@ -6857,7 +6860,8 @@ ostrya media import [--repo=PATH] [--mount=PATH] [-c|--collection ID] [REF...]
   refuses the ref.
 - The command pulls each ref at depth 0, with its own transaction, and reads
   no static delta. It refuses a commit that is older than the commit of the
-  current ref.
+  current ref, and a commit whose timestamp is not the timestamp that the
+  media summary lists for the ref.
 - Before the first pull, the command checks each REF, finds the media
   repository, finds each REF on the media, and finds the matched remote of
   each collection. A failure writes one `error:` line to standard error and

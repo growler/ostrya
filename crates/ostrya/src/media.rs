@@ -20,19 +20,18 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ostrya_core::{Checksum, Ref, RefSelector, RepoMode, Value, is_valid_collection_id};
+use ostrya_core::{Checksum, Ref, RefSelector, RepoMode, is_valid_collection_id};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::config::{RepoConfig, valid_remote_name};
 use crate::error::{Error, Result};
-use crate::pull::{PullVerify, TimestampCheck, check_collection_binding, check_ref_binding};
-use crate::refs::is_ref_path;
+use crate::pull::{
+    PullVerify, TimestampCheck, check_collection_binding, check_ref_binding, collection_refs,
+};
 use crate::related::RelatedRule;
 use crate::repo::{CreateOptions, Repo};
-use crate::summary::{
-    COLLECTION_ID_KEY, Summary, SummaryOptions, SummaryRef, collection_map_refs, parse_ref_list,
-};
+use crate::summary::SummaryOptions;
 use crate::verify::PullTrust;
 
 mod find;
@@ -291,6 +290,7 @@ impl Repo {
                     self,
                     id,
                     targets,
+                    HashMap::new(),
                     PullTrust::unverified(),
                     TimestampCheck::Off,
                 )
@@ -345,8 +345,9 @@ impl Repo {
     /// repository and its `summary` both list it. The summary lists the refs
     /// of `ID` in field 0 when it states the collection id `ID`, and else in
     /// the first entry of `ID` in `ostree.summary.collection-map`. The commit
-    /// of the ref is the commit that the summary lists. The import reads no
-    /// `summary.sig`.
+    /// of the ref is the commit that the summary lists, and its timestamp is
+    /// the `ostree.commit.timestamp` that the summary lists. The import reads
+    /// no `summary.sig`.
     ///
     /// The import takes these refs, in this order:
     ///
@@ -399,7 +400,9 @@ impl Repo {
     /// no static delta. It takes the `.commitmeta` and the dependencies of
     /// field 2 of the commit. The `ostree.collection-binding` of the commit
     /// must state `ID`, and the ref-binding check applies. The pull refuses
-    /// a commit that is older than the commit of the current ref.
+    /// a commit that is older than the commit of the current ref. It also
+    /// refuses a commit whose timestamp is not the timestamp that the
+    /// summary lists for the ref.
     ///
     /// A read of the current ref that fails refuses its ref, and so does a
     /// pull that fails. The import then continues with the next ref.
@@ -436,6 +439,9 @@ impl Repo {
     ///   repository.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if the summary of the
     ///   media repository does not parse.
+    /// - [`Error::InvalidFormat`] if the summary lists a ref with a valid name
+    ///   of a collection that the import reads, and the ref has no
+    ///   `ostree.commit.timestamp` of type `t`.
     /// - [`Error::RefNotFound`] if a ref of the options is not on the media,
     ///   with the text `@ID:NAME`, or if a collection of the options has no
     ///   ref on the media, with the text `@ID:`.
@@ -523,7 +529,7 @@ impl Repo {
         // names alone. A valid ref name holds no wildcard, so each name is a
         // literal pattern.
         let all = RefSelector::parse([])?;
-        let mut on_media: HashMap<&str, BTreeMap<String, Checksum>> = HashMap::new();
+        let mut on_media: HashMap<&str, ListedTips> = HashMap::new();
         for &(id, _) in &collections {
             let only_named = !no_operand && !prefixes.contains(&id);
             let selector = if only_named {
@@ -548,29 +554,29 @@ impl Repo {
         }
         drop(listed);
 
-        let mut selected: Vec<(&str, String, Checksum)> = Vec::new();
+        let mut selected: Vec<(&str, String, (Checksum, u64))> = Vec::new();
         let seen: HashSet<(&str, &str)> = named.iter().copied().collect();
         for &(id, name) in &named {
-            let Some(&commit) = on_media[id].get(name) else {
+            let Some(&tip) = on_media[id].get(name) else {
                 return Err(Error::RefNotFound(Ref::collection(id, name).to_string()));
             };
-            selected.push((id, name.to_owned(), commit));
+            selected.push((id, name.to_owned(), tip));
         }
         for &id in &prefixes {
             let refs = on_media.remove(id).unwrap_or_default();
             if refs.is_empty() {
                 return Err(Error::RefNotFound(format!("@{id}:")));
             }
-            for (name, commit) in refs {
+            for (name, tip) in refs {
                 if !seen.contains(&(id, name.as_str())) {
-                    selected.push((id, name, commit));
+                    selected.push((id, name, tip));
                 }
             }
         }
         if no_operand {
             for &(id, _) in &collections {
-                for (name, commit) in on_media.remove(id).unwrap_or_default() {
-                    selected.push((id, name, commit));
+                for (name, tip) in on_media.remove(id).unwrap_or_default() {
+                    selected.push((id, name, tip));
                 }
             }
         }
@@ -611,7 +617,7 @@ impl Repo {
         // the first pull.
         let remote_of: HashMap<&str, &str> = collections.iter().copied().collect();
         let mut trusts: HashMap<&str, Option<PullTrust>> = HashMap::new();
-        for ((id, _, commit), (tip, _)) in selected.iter().zip(&tips) {
+        for ((id, _, (commit, _)), (tip, _)) in selected.iter().zip(&tips) {
             let remote = remote_of[id];
             if matches!(tip, Ok(tip) if *tip != Some(*commit)) && !trusts.contains_key(remote) {
                 trusts.insert(remote, self.media_trust(remote).await?);
@@ -624,7 +630,7 @@ impl Repo {
             unchanged: Vec::new(),
             refused: Vec::new(),
         };
-        for ((id, name, commit), (tip, check)) in selected.into_iter().zip(tips) {
+        for ((id, name, (commit, timestamp)), (tip, check)) in selected.into_iter().zip(tips) {
             let target = Ref::collection(id, name.as_str());
             match tip {
                 Ok(Some(tip)) if tip == commit => {
@@ -642,9 +648,10 @@ impl Repo {
                 report.refused.push((target, no_gpg_engine(remote)));
                 continue;
             };
+            let listed = HashMap::from([(name.clone(), timestamp)]);
             let targets = vec![(name, commit)];
             match self
-                .pull_local_pinned(&media, id, targets, trust.clone(), check)
+                .pull_local_pinned(&media, id, targets, listed, trust.clone(), check)
                 .await
             {
                 Ok(_) => report.written.push((target, commit)),
@@ -824,60 +831,33 @@ fn take_media(choice: MediaChoice) -> Result<FoundMedia> {
     }
 }
 
+/// The refs of one collection that the media summary lists: each name, in
+/// byte order, with its commit and its timestamp.
+type ListedTips = BTreeMap<String, (Checksum, u64)>;
+
 /// Returns the refs that the media summary `bytes` lists for each
-/// collection of `ids`, with their commits.
-///
-/// If the summary states the collection id `S`, field 0 holds the refs of
-/// `S`, and the call ignores an entry of `S` in the collection map. The
-/// refs of each other collection come from the collection map. If the map
-/// holds a collection id two times, the first entry counts. The first entry
-/// of a name counts. The call leaves out a name that fails the ref-name
-/// rule, and a collection id that is not valid. It parses the refs of the
-/// collections of `ids` alone.
+/// collection of `ids`, with their commits and their timestamps, as
+/// [`collection_refs`] reads them. The call leaves out a name that fails the
+/// ref-name rule. It parses the refs of the collections of `ids` alone.
 ///
 /// # Errors
 ///
 /// - [`Error::Core`] or [`Error::InvalidFormat`] if the bytes do not parse,
 ///   or if the collection map is malformed.
-fn summary_collections(
-    bytes: &[u8],
-    ids: &[String],
-) -> Result<BTreeMap<String, BTreeMap<String, Checksum>>> {
-    let metadata = Summary::parse_metadata(bytes)?;
-    let own = metadata
-        .dict_get(COLLECTION_ID_KEY)
-        .and_then(Value::as_variant)
-        .and_then(|(_, value)| value.as_str())
-        .map(str::to_owned);
+/// - [`Error::InvalidFormat`] if a ref with a valid name of a collection of
+///   `ids` has no `ostree.commit.timestamp` of type `t`.
+fn summary_collections(bytes: &[u8], ids: &[String]) -> Result<BTreeMap<String, ListedTips>> {
     let mut listed = BTreeMap::new();
     for id in ids {
-        if Some(id) != own.as_ref() {
-            add_listed(&mut listed, id, collection_map_refs(&metadata, id)?);
-        }
-    }
-    drop(metadata);
-    if let Some(id) = own.filter(|id| ids.contains(id)) {
-        add_listed(&mut listed, &id, parse_ref_list(bytes)?);
+        let (_, refs) = collection_refs(bytes, id, None)?;
+        let names = refs
+            .listed
+            .into_iter()
+            .map(|entry| (entry.name, (entry.commit, entry.timestamp)))
+            .collect();
+        listed.insert(id.clone(), names);
     }
     Ok(listed)
-}
-
-/// Adds the refs `refs` of the collection `id` to `listed`, as
-/// [`summary_collections`] states.
-fn add_listed(
-    listed: &mut BTreeMap<String, BTreeMap<String, Checksum>>,
-    id: &str,
-    refs: Vec<SummaryRef>,
-) {
-    if !is_valid_collection_id(id) {
-        return;
-    }
-    let names = listed.entry(id.to_owned()).or_default();
-    for entry in refs {
-        if is_ref_path(&entry.name) {
-            names.entry(entry.name).or_insert(entry.commit);
-        }
-    }
 }
 
 /// Returns the refusal of a ref whose matched remote `remote` checks no
@@ -935,39 +915,65 @@ mod tests {
         assert!(err.to_string().contains("/mnt/b/ostree/repo"), "{err}");
     }
 
-    /// The summary parse reads the first collection-map entry of an id, and
-    /// parses no collection that the caller does not ask for.
+    /// The summary parse reads the first collection-map entry of an id, with
+    /// the commit and the timestamp of each ref, and parses no collection
+    /// that the caller does not ask for. A ref with no timestamp in a
+    /// collection that the caller asks for fails the parse.
     #[test]
     fn the_summary_parse_reads_the_first_map_entry_of_an_id() {
-        use ostrya_core::{Type, to_bytes};
-        let entry = |name: &str, byte: u8| {
+        use ostrya_core::{Type, Value, to_bytes};
+
+        use crate::summary::COMMIT_TIMESTAMP_KEY;
+
+        let entry = |name: &str, byte: u8, timestamp: Option<u64>| {
+            let metadata = timestamp.map(|ts| {
+                Value::Tuple(vec![
+                    Value::Str(COMMIT_TIMESTAMP_KEY.to_owned()),
+                    Value::variant(Type::parse("t").unwrap(), Value::U64(ts.swap_bytes())),
+                ])
+            });
             Value::Tuple(vec![
                 Value::Str(name.to_owned()),
                 Value::Tuple(vec![
                     Value::U64(0),
                     Value::Bytes(vec![byte; 32]),
-                    Value::Array(Vec::new()),
+                    Value::Array(metadata.into_iter().collect()),
                 ]),
             ])
         };
         let collection = |id: &str, refs: Vec<Value>| {
             Value::Tuple(vec![Value::Str(id.to_owned()), Value::Array(refs)])
         };
-        let map = Value::Array(vec![
-            collection("org.x", vec![entry("a", 1)]),
-            collection("org.x", vec![entry("b", 2)]),
-            collection("org.y", vec![entry("c", 3)]),
-        ]);
-        let metadata = Value::Array(vec![Value::Tuple(vec![
-            Value::Str("ostree.summary.collection-map".to_owned()),
-            Value::variant(Type::parse("a{sa(s(taya{sv}))}").unwrap(), map),
-        ])]);
-        let summary = Value::Tuple(vec![Value::Array(Vec::new()), metadata]);
-        let bytes = to_bytes(&Type::parse("(a(s(taya{sv}))a{sv})").unwrap(), &summary).unwrap();
+        let summary = |map: Vec<Value>| {
+            let metadata = Value::Array(vec![Value::Tuple(vec![
+                Value::Str("ostree.summary.collection-map".to_owned()),
+                Value::variant(
+                    Type::parse("a{sa(s(taya{sv}))}").unwrap(),
+                    Value::Array(map),
+                ),
+            ])]);
+            let summary = Value::Tuple(vec![Value::Array(Vec::new()), metadata]);
+            to_bytes(&Type::parse("(a(s(taya{sv}))a{sv})").unwrap(), &summary).unwrap()
+        };
 
+        let bytes = summary(vec![
+            collection("org.x", vec![entry("a", 1, Some(1000))]),
+            collection("org.x", vec![entry("b", 2, Some(2000))]),
+            collection("org.y", vec![entry("c", 3, None)]),
+        ]);
         let listed = summary_collections(&bytes, &["org.x".to_owned()]).unwrap();
-        let x: Vec<&str> = listed["org.x"].keys().map(String::as_str).collect();
-        assert_eq!(x, ["a"]);
+        let x: Vec<(&str, &(Checksum, u64))> = listed["org.x"]
+            .iter()
+            .map(|(name, tip)| (name.as_str(), tip))
+            .collect();
+        assert_eq!(x, [("a", &(Checksum::from_bytes([1; 32]), 1000))]);
         assert!(!listed.contains_key("org.y"), "{listed:?}");
+
+        let bytes = summary(vec![collection(
+            "org.x",
+            vec![entry("a", 1, Some(1000)), entry("b", 2, None)],
+        )]);
+        let err = summary_collections(&bytes, &["org.x".to_owned()]).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
     }
 }

@@ -5455,6 +5455,97 @@ collection id. It writes no summary of an auth item
 another collection than the `[core] collection-id` of the media repository
 is in `ostree.summary.collection-map`.
 
+### The media finder
+
+The media finder of the client finds the media repository on the mounted
+volumes. On Linux, it reads the mount table of the process,
+`/proc/self/mountinfo`, and refuses a table larger than 16 MiB. From each
+line, it takes the mount point, field 5, and the file system type, the
+first field after the `-` separator. Zero or more optional fields come
+before the separator. The finder decodes the octal escapes of the kernel in
+both fields: `\040` (space), `\011` (tab), `\012` (line feed), and `\134`
+(backslash). It skips a line of another form. On a platform other than
+Linux, the finder finds no mount.
+
+A mount hides each earlier mount at the same mount point. So for each
+mount point, the finder uses the last line of the table with that mount
+point alone. It applies the exclusions below and the probe to that line.
+The order of the mounts is the table order of these last lines.
+
+The finder skips these mounts before it makes a system call on their path:
+
+- the root mount, `/`;
+- the pseudo file systems `proc`, `sysfs`, `devtmpfs`, `devpts`, `cgroup`,
+  `cgroup2`, `securityfs`, `debugfs`, `tracefs`, `bpf`, `pstore`, `mqueue`,
+  `hugetlbfs`, `configfs`, `fusectl`, `autofs`, `binfmt_misc`, and
+  `efivarfs`;
+- the network file systems `nfs`, `nfs4`, `cifs`, `smb3`, `smbfs`, `ceph`,
+  `9p`, `virtiofs`, `davfs`, `afs`, `glusterfs`, `fuse.glusterfs`,
+  `fuse.sshfs`, `fuse.rclone`, `fuse.s3fs`, and `fuse.gvfsd-fuse`, so that
+  a dead server cannot stop the scan.
+
+The finder also finds media on a `tmpfs`, on a bind mount, and outside
+`/run/media/`. It opens the mount directory with `O_PATH`, so the client
+needs the search permission alone on that directory. It skips a mount whose directory it cannot open.
+
+On each other mount, the finder probes these candidates in this order:
+
+1. each entry of `MOUNT/.ostree/repos.d/`, in the byte order of the names;
+2. `MOUNT/.ostree/repo`;
+3. `MOUNT/ostree/repo`;
+4. `MOUNT/var/lib/flatpak/repo`.
+
+The finder opens `MOUNT/.ostree/repos.d/` and each candidate relative to
+the mount directory, with `openat2` and `RESOLVE_NO_XDEV`. The open follows
+a symlink, but the path of the candidate must not leave the mount: a
+resolution that crosses a mount point fails with `EXDEV`. A relative
+symlink in the volume resolves. The finder ignores a candidate that does
+not exist, and a candidate with a component before the last one that is
+not a directory. It skips a candidate for these reasons:
+
+- The path of the candidate crosses a mount point, or the `st_dev` of the
+  candidate is not the `st_dev` of the mount directory. So the candidate
+  must be on the device of the mount, and a repository in a nested btrfs
+  subvolume is on another file system.
+- The candidate has the device and the inode of the client repository.
+- The finder cannot read the candidate: the open of the directory, the read
+  or the parse of its `summary`, or the open of the repository fails. The
+  finder reads `summary` in the strict open mode: the open follows no
+  symlink and does not block, and the finder refuses a file that is not a
+  regular file. It opens the repository only for a candidate whose summary
+  lists a collection ref. It opens it in the strict open mode
+  (`Repo::open_at_strict`), so the open reads no remotes directory.
+- The summary lists no collection ref, or the candidate has no `summary`.
+
+A summary lists a collection ref when field 0 holds a ref and the summary
+states a collection id (`ostree.summary.collection-id`), or when an entry of
+`ostree.summary.collection-map` holds a ref. The first case is the media of
+the tool in a destination with a collection id, and a repository with a
+collection id and local refs, for example a system repository at
+`MOUNT/ostree/repo`.
+
+The media repository of a mount is the first candidate that the finder does
+not skip. The finder probes no later candidate of that mount. A mount with
+no such candidate holds no media. Candidates with the same device and inode
+are one media repository, at the path of the first one in the order of the
+mount table. So a volume that is mounted at two paths gives one media
+repository. A candidate with the device and the inode of a media repository
+that the finder found before ends the probe of its mount, and the finder
+reads no summary of it. When the finder finds one media repository, it
+keeps the open repository and the summary bytes that it read.
+
+The finder accepts exactly one media repository. When it finds none, it
+gives each candidate that it skipped, with the reason. When it finds more
+than one, it gives the path of each, in the order of the mount table.
+
+The caller can give a directory in place of the mount table. Then the
+finder probes that directory alone, with the same candidates and checks,
+and reads no mount table. The directory need not be a mount point. The
+path of each candidate must not cross a mount point, and the file-system
+check compares each candidate with the file system of the directory. The
+finder still skips the client repository. A directory that
+the finder cannot open is an error.
+
 ### The file systems of the media
 
 A removable volume often has a vfat or an exFAT file system. These file

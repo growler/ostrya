@@ -438,6 +438,24 @@ pub(crate) fn collection_map_refs(metadata: &Value, id: &str) -> Result<Vec<Summ
     Ok(Vec::new())
 }
 
+/// Returns `true` if an entry of the `ostree.summary.collection-map` of the
+/// global metadata dict `metadata` holds a ref. The call parses no ref, and
+/// it stops at the first entry with a ref.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the variant that holds the map has a type
+///   other than `a{sa(s(taya{sv}))}`, or if an entry up to the first entry
+///   with a ref is not a pair of an id and an array.
+pub(crate) fn collection_map_has_ref(metadata: &Value) -> Result<bool> {
+    for entry in collection_map_entries(metadata)? {
+        if !collection_map_entry(entry)?.1.is_empty() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Returns the entries of the `ostree.summary.collection-map` of the global
 /// metadata dict `metadata`, or no entry if the dict has no map.
 ///
@@ -1518,13 +1536,16 @@ impl Repo {
     /// Returns the bytes of `summary`, or `None` if the file does not exist.
     ///
     /// The call refuses a file larger than 64 MiB, the cap of a summary
-    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Size").
+    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Size"). On a
+    /// handle of [`open_at_strict`](Repo::open_at_strict), the open of
+    /// `summary` does not block, and the call refuses a file that is not a
+    /// regular file.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB.
     /// - [`Error::Io`] if the read fails, for example if `summary` is a
-    ///   symlink.
+    ///   symlink, or if `summary` of a strict handle is not a regular file.
     pub async fn read_summary(&self) -> Result<Option<Vec<u8>>> {
         self.read_root_file(SUMMARY_FILE).await
     }
@@ -1907,10 +1928,13 @@ impl Repo {
 
     /// Reads a whole file at the repository root, or returns `None` if it does
     /// not exist. The call refuses a file larger than [`SUMMARY_READ_CAP`].
+    /// On a strict handle, the open is the strict open of
+    /// [`read_root_file_with`].
     pub(crate) async fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
-        ostrya_rt::unblock(move || read_root_file_blocking(repo_fd.as_fd(), &name)).await
+        let strict = self.is_strict();
+        ostrya_rt::unblock(move || read_root_file_with(repo_fd.as_fd(), &name, strict)).await
     }
 }
 
@@ -2657,16 +2681,35 @@ pub(crate) fn read_root_file_blocking(
     repo_fd: BorrowedFd<'_>,
     name: &str,
 ) -> Result<Option<Vec<u8>>> {
+    read_root_file_with(repo_fd, name, false)
+}
+
+/// Reads a whole file relative to `repo_fd`, as [`read_root_file_blocking`]
+/// does, in the strict open mode of
+/// [`open_regular_file`](crate::object::open_regular_file) if `strict` is
+/// set. In that mode, the open does not block, and the call refuses a file
+/// that is not a regular file.
+pub(crate) fn read_root_file_with(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+    strict: bool,
+) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
 
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
+    let opened = if strict {
+        crate::object::open_regular_file(repo_fd, name, true)
+    } else {
+        rustix::fs::openat(
+            repo_fd,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+    };
+    let fd = match opened {
         Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
     let file = std::fs::File::from(fd);
@@ -4334,6 +4377,44 @@ mod tests {
                 matches!(&outcome, Err(Error::InvalidFormat(m)) if m.contains("cap")),
                 "{:?}",
                 outcome.map(|bytes| bytes.map(|bytes| bytes.len()))
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read of `summary` on a strict handle refuses a FIFO at once, and
+    /// does not wait for a writer. The read on a strict handle gives the
+    /// bytes of a regular file and `None` for a missing file.
+    #[test]
+    fn a_strict_summary_read_refuses_a_fifo() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-summary-strict-fifo-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            repo_with_refs(&dir, &["main"]).await;
+            let root = std::fs::File::open(&dir).unwrap();
+            let repo = Repo::open_at_strict(root.as_fd(), std::path::Path::new("."))
+                .await
+                .unwrap();
+            assert_eq!(repo.read_summary().await.unwrap(), None);
+            std::fs::write(dir.join(SUMMARY_FILE), b"bytes").unwrap();
+            assert_eq!(repo.read_summary().await.unwrap().unwrap(), b"bytes");
+            std::fs::remove_file(dir.join(SUMMARY_FILE)).unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                dir.join(SUMMARY_FILE),
+                FileType::Fifo,
+                Mode::from_raw_mode(0o644),
+                0,
+            )
+            .unwrap();
+            let outcome = repo.read_summary().await;
+            assert!(
+                matches!(&outcome, Err(Error::Io(e)) if e.to_string().contains("regular file")),
+                "{outcome:?}"
             );
         });
         let _ = std::fs::remove_dir_all(&dir);

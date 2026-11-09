@@ -641,11 +641,13 @@ impl Repo {
     /// - The open reads no `[ex-ostrya] remotes-config-dir` key and no remotes
     ///   directory, so the handle has no remotes directory.
     /// - The open of `objects` follows no symlink.
-    /// - The reads of `config`, of each metadata object, and of the stored
-    ///   composefs image open the file with `openat2`, `RESOLVE_BENEATH`,
-    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is
-    ///   not a regular file. A symlink at any component of the path, a FIFO,
-    ///   or a device fails the read and does not block it.
+    /// - The reads of `config`, of each metadata object, of the stored
+    ///   composefs image, and of `summary` by
+    ///   [`read_summary`](Repo::read_summary) open the file with `openat2`,
+    ///   `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and
+    ///   refuse a file that is not a regular file. A symlink at any
+    ///   component of the path, a FIFO, or a device fails the read and does
+    ///   not block it.
     /// - The load of a file object opens its fan-out directory
     ///   `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
     ///   `RESOLVE_NO_SYMLINKS`, and loads the object relative to it. A symlink
@@ -673,6 +675,13 @@ impl Repo {
             ostrya_rt::unblock(move || open_materials(&dir, &path, true, &OpenOptions::default()))
                 .await?;
         Ok(Repo::assemble(materials, stored))
+    }
+
+    /// Opens the repository whose root is the open directory `repo_fd` in the
+    /// strict open mode of [`open_at_strict`](Repo::open_at_strict). The
+    /// handle stores `path`. Blocks the calling thread.
+    pub(crate) fn open_strict_blocking(repo_fd: OwnedFd, path: PathBuf) -> Result<Repo> {
+        Ok(Repo::assemble(materials_from_repo(repo_fd, true)?, path))
     }
 
     /// Creates and opens a repository at `path`, relative to the working directory.

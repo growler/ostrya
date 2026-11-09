@@ -21,6 +21,11 @@ use crate::pull::{check_collection_binding, check_ref_binding};
 use crate::repo::{CreateOptions, Repo};
 use crate::summary::SummaryOptions;
 
+#[cfg_attr(not(test), expect(dead_code, reason = "the finder has no caller yet"))]
+mod find;
+#[cfg_attr(not(test), expect(dead_code, reason = "the finder has no caller yet"))]
+mod mountinfo;
+
 /// The path of the media repository under the mount directory.
 const MEDIA_REPO: &str = ".ostree/repo";
 

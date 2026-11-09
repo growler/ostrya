@@ -5276,9 +5276,14 @@ enum MediaCommand {
     /// The command pulls each ref at depth 0, with its own transaction, and
     /// reads no static delta. It writes the ref @ID:NAME to
     /// `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when ID is the
-    /// `collection-id` of this repository. It does not pull a ref that holds
-    /// the commit of the media. It refuses a commit that is older than the
-    /// commit of the ref in this repository.
+    /// `collection-id` of this repository. The current ref is the ref at that
+    /// place. If this repository has no ref at that place, and the
+    /// `collection-id` of the matched remote R is ID, the current ref is
+    /// `refs/remotes/R/NAME`. Under the `collection-id` of this repository,
+    /// the command reads no ref under `refs/remotes/`. The command does not
+    /// pull a ref whose current ref holds the commit of the media. It refuses
+    /// a commit that is older than the commit of the current ref, and a ref
+    /// whose current ref it cannot read.
     ///
     /// Before the first pull, the command checks each REF, finds the media
     /// repository, and finds each REF and the matched remote of each
@@ -5288,10 +5293,11 @@ enum MediaCommand {
     /// repository that it skipped.
     ///
     /// Standard output has one line `@ID:NAME CHECKSUM` for each written ref,
-    /// in the order of the import. A ref that holds the commit of the media
-    /// prints no line. A refused ref does not stop the import. After the last
-    /// pull, the command writes one line `error: @ID:NAME: TEXT` to standard
-    /// error for each refused ref, then exits 1.
+    /// in the order of the import. A ref whose current ref holds the commit of
+    /// the media prints no line. A refused ref does not stop the import.
+    /// After the last pull, the command writes one line
+    /// `error: @ID:NAME: TEXT` to standard error for each refused ref, then
+    /// exits 1.
     Import(MediaImportArgs),
 }
 

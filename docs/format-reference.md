@@ -5619,24 +5619,31 @@ A build without the feature `verify-gpg` refuses each ref that the import
 pulls from a remote that checks no commit signature, with a text that names
 the feature.
 
-A ref of the client that holds the commit of the media is unchanged, and
-the import does not pull it. For each other ref, the import makes one local
-pull from the media repository, with its own transaction. The pull is at
-depth 0, and reads no static delta. It copies the `.commitmeta` of the
-commit, and the dependencies of field 2 of the commit as loose objects. The
-`ostree.collection-binding` of the commit must state `ID`, and the
-ref-binding check applies. The pull refuses a commit whose timestamp is
-older than the timestamp of the commit of the ref in the client. The
-`ostree` command moves the ref back. The pull writes the ref to
-`refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the
-`[core] collection-id` of the client. Under
+The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
+`refs/heads/NAME` when `ID` is the `[core] collection-id` of the client.
+The current ref of `@ID:NAME` is the ref of the client at that place. If
+the client has no ref at that place, and the `collection-id` of the matched
+remote `R` is `ID`, the current ref is `refs/remotes/R/NAME`. A remote that
+matches through `mirrored-collection-ids` alone gives no current ref. Under
+the `[core] collection-id`, the import reads no ref under `refs/remotes/`.
+
+A ref whose current ref holds the commit of the media is unchanged. The
+import does not pull it, and writes no ref for it. For each other ref, the
+import makes one local pull from the media repository, with its own
+transaction. The pull is at depth 0, and reads no static delta. It copies
+the `.commitmeta` of the commit, and the dependencies of field 2 of the
+commit as loose objects. The `ostree.collection-binding` of the commit must
+state `ID`, and the ref-binding check applies. The pull refuses a commit
+whose timestamp is older than the timestamp of the commit of the current
+ref. The `ostree` command moves the ref back. Under
 `[ex-ostrya] generate-composefs`, the transaction builds the composefs
 image of the commit, as each pull does.
 
-A pull that fails refuses its ref, and the import continues with the next
-ref. The result of the import holds the written refs, the unchanged refs,
-and each refused ref with its error. The import also reads a media
-repository on a read-only mount.
+A read of the current ref that fails refuses its ref, and so does a pull
+that fails. The import then continues with the next ref. The result of the
+import holds the written refs, the unchanged refs, and each refused ref
+with its error. The import also reads a media repository on a read-only
+mount.
 
 ### The file systems of the media
 

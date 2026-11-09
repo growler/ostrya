@@ -104,8 +104,9 @@ pub struct MediaImportReport {
     pub repo: PathBuf,
     /// Each ref that the import wrote, with its new commit.
     pub written: Vec<(Ref, Checksum)>,
-    /// Each ref that held the commit of the media before the import, with
-    /// that commit. The import did not pull it.
+    /// Each ref whose current ref held the commit of the media before the
+    /// import, with that commit. The import did not pull it, and did not
+    /// write a ref for it. [`Repo::import_media`] states the current ref.
     pub unchanged: Vec<(Ref, Checksum)>,
     /// Each ref that the import refused, with the reason. The import did
     /// not change the ref.
@@ -370,25 +371,31 @@ impl Repo {
     /// the remote with `gpg-verify=true`: the keyring of the remote, or the
     /// global trusted keyrings when the remote has no keyring of its own,
     /// and each keyring that `gpgkeypath` names. A build without the
-    /// `verify-gpg` feature refuses each ref of such a remote that does not
-    /// hold the commit of the media.
+    /// `verify-gpg` feature refuses each ref of such a remote whose current
+    /// ref does not hold the commit of the media.
     ///
     /// # Pull
     ///
-    /// The import does not pull a ref that holds the commit of the media.
-    /// It makes one local pull from the media repository for each other ref,
-    /// with its own transaction, as the pull of a local candidate of
-    /// [`Repo::pull_collection`] does. The pull is at depth 0, and reads no
-    /// static delta. It takes the `.commitmeta` and the dependencies of
+    /// The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
+    /// `refs/heads/NAME` when `ID` is the `[core] collection-id` of this
+    /// repository. The current ref of `@ID:NAME` is the ref at that place.
+    /// If this repository has no ref at that place, and the `collection-id`
+    /// of the matched remote `R` is `ID`, the current ref is
+    /// `refs/remotes/R/NAME`. Under the `[core] collection-id`, the import
+    /// reads no ref under `refs/remotes/`.
+    ///
+    /// The import does not pull a ref whose current ref holds the commit of
+    /// the media. It makes one local pull from the media repository for each
+    /// other ref, with its own transaction, as the pull of a local candidate
+    /// of [`Repo::pull_collection`] does. The pull is at depth 0, and reads
+    /// no static delta. It takes the `.commitmeta` and the dependencies of
     /// field 2 of the commit. The `ostree.collection-binding` of the commit
     /// must state `ID`, and the ref-binding check applies. The pull refuses
-    /// a commit that is older than the commit of the ref in this repository,
-    /// as [`TimestampCheck::CurrentRef`] states. It writes the ref to
-    /// `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the
-    /// `[core] collection-id` of this repository.
+    /// a commit that is older than the commit of the current ref.
     ///
-    /// A pull that fails refuses its ref, and the import continues with the
-    /// next ref. [`MediaImportReport::refused`] holds the error.
+    /// A read of the current ref that fails refuses its ref, and so does a
+    /// pull that fails. The import then continues with the next ref.
+    /// [`MediaImportReport::refused`] holds the error.
     ///
     /// # Errors
     ///
@@ -570,6 +577,21 @@ impl Repo {
             }
         }
 
+        // The matched remote whose remote refs count for each collection: a
+        // remote whose `collection-id` is the collection, when the collection
+        // is not the `[core] collection-id` of this repository.
+        let own = self.config().collection_id();
+        let tracked: HashMap<&str, &str> = collections
+            .iter()
+            .copied()
+            .filter(|&(id, remote)| {
+                Some(id) != own
+                    && remotes
+                        .iter()
+                        .any(|r| r.name == remote && r.collection_id.as_deref() == Some(id))
+            })
+            .collect();
+
         let mut report = MediaImportReport {
             repo: path,
             written: Vec::new(),
@@ -578,9 +600,28 @@ impl Repo {
         };
         for (id, name, commit) in selected {
             let target = Ref::collection(id, name.as_str());
-            if matches!(self.resolve_ref_tip(&target).await, Ok(Some(tip)) if tip == commit) {
-                report.unchanged.push((target, commit));
-                continue;
+            // The current ref is the ref that the pull writes. If that ref is
+            // absent, it is the remote ref of the remote in `tracked`.
+            let mut check = TimestampCheck::CurrentRef;
+            let mut tip = self.resolve_ref_tip(&target).await;
+            if let (Ok(None), Some(&remote)) = (&tip, tracked.get(id)) {
+                tip = self
+                    .resolve_ref_tip(&Ref::remote(remote, name.as_str()))
+                    .await;
+                if let Ok(Some(remote_tip)) = tip {
+                    check = TimestampCheck::Rev(remote_tip);
+                }
+            }
+            match tip {
+                Ok(Some(tip)) if tip == commit => {
+                    report.unchanged.push((target, commit));
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    report.refused.push((target, e));
+                    continue;
+                }
             }
             let remote = remote_of[id];
             let Some(trust) = &trusts[remote] else {
@@ -589,13 +630,7 @@ impl Repo {
             };
             let targets = vec![(name, commit)];
             match self
-                .pull_local_pinned(
-                    &media,
-                    id,
-                    targets,
-                    trust.clone(),
-                    TimestampCheck::CurrentRef,
-                )
+                .pull_local_pinned(&media, id, targets, trust.clone(), check)
                 .await
             {
                 Ok(_) => report.written.push((target, commit)),

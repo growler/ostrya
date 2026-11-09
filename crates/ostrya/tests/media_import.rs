@@ -409,6 +409,162 @@ fn a_downgrade_is_refused_and_the_other_refs_are_imported() {
     });
 }
 
+/// With no mirror ref, the import refuses a commit that is older than the
+/// remote ref of the matched remote.
+#[test]
+fn a_commit_older_than_the_remote_ref_is_refused() {
+    let tmp = TmpDir::new("media-import-remote-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let tracked = Ref::remote("origin", "a");
+        let new = commit(&c, dir, "new", &tracked, Some(X), 2000, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert_eq!(names(&report.refused), [format!("@{X}:a")]);
+        assert!(
+            matches!(&report.refused[0].1, Error::Pull(m) if m.contains("chronologically older")),
+            "{:?}",
+            report.refused[0].1
+        );
+        assert_eq!(ref_files(&c), ["refs/remotes/origin/a"]);
+        assert_eq!(ref_file(&c, "remotes/origin/a"), Some(new));
+        assert_fsck_clean(&c).await;
+    });
+}
+
+/// With no mirror ref, a remote ref of the matched remote that holds the
+/// commit of the media is unchanged, and the import writes no mirror ref.
+#[test]
+fn a_remote_ref_at_the_commit_of_the_media_is_unchanged() {
+    let tmp = TmpDir::new("media-import-remote-ref-same");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let old = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let tracked = Ref::remote("origin", "a");
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), old)]);
+        c.set_ref_immediate(&tracked, Some(&old)).await.unwrap();
+        c.set_ref_immediate(&Ref::collection(X, "a"), None)
+            .await
+            .unwrap();
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert_eq!(report.unchanged, [(Ref::collection(X, "a"), old)]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(ref_files(&c), ["refs/remotes/origin/a"]);
+    });
+}
+
+/// The remote ref of a remote that matches the collection through
+/// `mirrored-collection-ids` alone is not the current ref.
+#[test]
+fn the_remote_ref_of_a_mirroring_remote_is_ignored() {
+    let tmp = TmpDir::new("media-import-mirroring-remote-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let old = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let mirror = remote(
+            "mirror",
+            &format!("mirrored-collection-ids={X}"),
+            SECRET_B64,
+        );
+        let c = client(dir, "client", None, &mirror).await;
+        let tracked = Ref::remote("mirror", "a");
+        let new = commit(&c, dir, "new", &tracked, Some(X), 2000, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), old)]);
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(old));
+        assert_eq!(ref_file(&c, "remotes/mirror/a"), Some(new));
+    });
+}
+
+/// Under the own collection id of the client, the remote ref of the matched
+/// remote is not the current ref.
+#[test]
+fn the_remote_ref_under_the_own_collection_is_ignored() {
+    let tmp = TmpDir::new("media-import-own-remote-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let old = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", Some(X), &origin()).await;
+        let tracked = Ref::remote("origin", "a");
+        let new = commit(&c, dir, "new", &tracked, Some(X), 2000, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), old)]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(ref_file(&c, "heads/a"), Some(old));
+        assert_eq!(ref_file(&c, "remotes/origin/a"), Some(new));
+    });
+}
+
+/// A mirror ref is the current ref when a remote ref of the matched remote
+/// is also present.
+#[test]
+fn the_mirror_ref_comes_before_the_remote_ref() {
+    let tmp = TmpDir::new("media-import-mirror-before-remote");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let old = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), old)]);
+        let tracked = Ref::remote("origin", "a");
+        let new = commit(&c, dir, "new", &tracked, Some(X), 2000, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert_eq!(report.unchanged, [(Ref::collection(X, "a"), old)]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(old));
+        assert_eq!(ref_file(&c, "remotes/origin/a"), Some(new));
+    });
+}
+
+/// A remote ref that the import cannot read refuses the ref.
+#[test]
+fn a_remote_ref_that_cannot_be_read_refuses_the_ref() {
+    let tmp = TmpDir::new("media-import-bad-remote-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let bad = c.path().join("refs/remotes/origin");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("a"), "not a checksum\n").unwrap();
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert_eq!(names(&report.refused), [format!("@{X}:a")]);
+        assert_eq!(ref_files(&c), ["refs/remotes/origin/a"]);
+    });
+}
+
 /// The trust of the matched remote checks each commit. A remote that checks
 /// no commit signature makes the import check the GPG signature, and a
 /// build with no GPG engine refuses the ref with its own text. A commit

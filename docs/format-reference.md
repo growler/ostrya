@@ -5605,7 +5605,9 @@ no ref:
 - Each operand `NAME` and `@ID:NAME` names a ref on the media, and each
   prefix `@ID:` names at least one ref on the media. The error of a missing
   ref is `Error::RefNotFound` with the text `@ID:NAME` or `@ID:`.
-- The trust of the matched remote of each selected ref resolves.
+- The trust of the matched remote of each ref that the import pulls
+  resolves. The import reads no trust for a ref whose current ref holds
+  the commit of the media, or whose current ref it cannot read.
 
 The import checks the commits of a collection with the trust of its matched
 remote: `gpg-verify`, `sign-verify`, the keyrings, and the trust group of

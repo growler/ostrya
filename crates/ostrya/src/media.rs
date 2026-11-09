@@ -441,7 +441,9 @@ impl Repo {
     /// - The errors of
     ///   [`list_collection_refs_in`](Repo::list_collection_refs_in) on the
     ///   media repository.
-    /// - The errors of [`PullTrust::from_remote`] for a matched remote.
+    /// - The errors of [`PullTrust::from_remote`] for the matched remote of a
+    ///   ref that the import pulls. The import reads no trust for an
+    ///   unchanged ref, or for a ref whose current ref it cannot read.
     pub async fn import_media(&self, options: MediaImportOptions) -> Result<MediaImportReport> {
         let named = self.media_refs(&options.refs)?;
         let mut prefixes: Vec<&str> = Vec::new();
@@ -574,16 +576,6 @@ impl Repo {
         // Only the selected refs stay in memory during the pulls.
         drop(on_media);
 
-        // The trust of each matched remote, one time, before the first pull.
-        let remote_of: HashMap<&str, &str> = collections.iter().copied().collect();
-        let mut trusts: HashMap<&str, Option<PullTrust>> = HashMap::new();
-        for &(id, ..) in &selected {
-            let remote = remote_of[id];
-            if !trusts.contains_key(remote) {
-                trusts.insert(remote, self.media_trust(remote).await?);
-            }
-        }
-
         // The matched remote whose remote refs count for each collection: a
         // remote whose `collection-id` is the collection, when the collection
         // is not the `[core] collection-id` of this repository.
@@ -599,26 +591,40 @@ impl Repo {
             })
             .collect();
 
+        // The current ref is the ref that the pull writes. If that ref is
+        // absent, it is the remote ref of the remote in `tracked`.
+        let mut tips = Vec::with_capacity(selected.len());
+        for &(id, ref name, _) in &selected {
+            let mut check = TimestampCheck::CurrentRef;
+            let mut tip = self.resolve_ref_tip(&Ref::collection(id, name)).await;
+            if let (Ok(None), Some(&remote)) = (&tip, tracked.get(id)) {
+                tip = self.resolve_ref_tip(&Ref::remote(remote, name)).await;
+                if let Ok(Some(remote_tip)) = tip {
+                    check = TimestampCheck::Rev(remote_tip);
+                }
+            }
+            tips.push((tip, check));
+        }
+
+        // The trust of each matched remote of a ref to pull, one time, before
+        // the first pull.
+        let remote_of: HashMap<&str, &str> = collections.iter().copied().collect();
+        let mut trusts: HashMap<&str, Option<PullTrust>> = HashMap::new();
+        for ((id, _, commit), (tip, _)) in selected.iter().zip(&tips) {
+            let remote = remote_of[id];
+            if matches!(tip, Ok(tip) if *tip != Some(*commit)) && !trusts.contains_key(remote) {
+                trusts.insert(remote, self.media_trust(remote).await?);
+            }
+        }
+
         let mut report = MediaImportReport {
             repo: path,
             written: Vec::new(),
             unchanged: Vec::new(),
             refused: Vec::new(),
         };
-        for (id, name, commit) in selected {
+        for ((id, name, commit), (tip, check)) in selected.into_iter().zip(tips) {
             let target = Ref::collection(id, name.as_str());
-            // The current ref is the ref that the pull writes. If that ref is
-            // absent, it is the remote ref of the remote in `tracked`.
-            let mut check = TimestampCheck::CurrentRef;
-            let mut tip = self.resolve_ref_tip(&target).await;
-            if let (Ok(None), Some(&remote)) = (&tip, tracked.get(id)) {
-                tip = self
-                    .resolve_ref_tip(&Ref::remote(remote, name.as_str()))
-                    .await;
-                if let Ok(Some(remote_tip)) = tip {
-                    check = TimestampCheck::Rev(remote_tip);
-                }
-            }
             match tip {
                 Ok(Some(tip)) if tip == commit => {
                     report.unchanged.push((target, commit));

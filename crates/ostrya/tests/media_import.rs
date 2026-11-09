@@ -636,6 +636,111 @@ fn the_trust_of_the_matched_remote_checks_each_commit() {
     });
 }
 
+/// A trust of the matched remote that cannot be read does not stop an
+/// import whose refs all hold the commit of the media. An import with a
+/// ref to pull fails and writes no ref.
+#[test]
+fn a_trust_error_does_not_stop_an_import_with_nothing_to_pull() {
+    let tmp = TmpDir::new("media-import-trust-error-unchanged");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), a)]);
+        signed(&src, dir, X, "b", 1000).await;
+        export(&src, &mount, &[Ref::collection(X, "b")]).await;
+
+        let config = c.path().join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        let absent = dir.join("absent.key");
+        text.push_str(&format!("verification-ed25519-file={}\n", absent.display()));
+        std::fs::write(&config, text).unwrap();
+        let c = Repo::open(c.path()).await.unwrap();
+
+        let report = import(&c, &mount, &[Ref::collection(X, "a")], &[])
+            .await
+            .unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert_eq!(report.unchanged, [(Ref::collection(X, "a"), a)]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+
+        let err = import(&c, &mount, &[], &[]).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert_eq!(ref_files(&c), [format!("refs/mirrors/{X}/a")]);
+    });
+}
+
+/// A trust that cannot be read fails the import before the first pull, also
+/// when the ref of that trust comes after a ref with a good trust.
+#[test]
+fn a_trust_error_comes_before_the_first_pull() {
+    let tmp = TmpDir::new("media-import-trust-error-order");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        signed(&src, dir, X, "a", 1000).await;
+        signed(&src, dir, Y, "b", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(
+            &src,
+            &mount,
+            &[Ref::collection(X, "a"), Ref::collection(Y, "b")],
+        )
+        .await;
+
+        // The section of `other` is the last one, so the key line lands in
+        // it.
+        let absent = dir.join("absent.key");
+        let remotes = origin()
+            + &remote("other", &format!("collection-id={Y}"), SECRET_B64)
+            + &format!("verification-ed25519-file={}\n", absent.display());
+        let c = client(dir, "client", None, &remotes).await;
+
+        let err = import(&c, &mount, &[], &[]).await.unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert!(ref_files(&c).is_empty());
+    });
+}
+
+/// A `gpgkeypath` that cannot be read does not stop an import whose refs
+/// all hold the commit of the media.
+#[cfg(feature = "verify-gpg")]
+#[test]
+fn an_unreadable_gpgkeypath_does_not_stop_an_import_with_nothing_to_pull() {
+    let tmp = TmpDir::new("media-import-gpgkeypath-unchanged");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), a)]);
+
+        let config = c.path().join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains(&origin()), "{text}");
+        let absent = dir.join("absent.gpg");
+        let section = format!(
+            "\n[remote \"origin\"]\nurl=file:///dev/null\ncollection-id={X}\n\
+             gpg-verify=false\ngpgkeypath={}\n",
+            absent.display()
+        );
+        std::fs::write(&config, text.replace(&origin(), &section)).unwrap();
+        let c = Repo::open(c.path()).await.unwrap();
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert_eq!(report.unchanged, [(Ref::collection(X, "a"), a)]);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+    });
+}
+
 /// A stale media summary pins its commit: the media repository does not
 /// hold that commit, so that ref is refused, and another ref is imported.
 #[test]

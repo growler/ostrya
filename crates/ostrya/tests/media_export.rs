@@ -2,7 +2,8 @@
 //!
 //! Each test exports from a source repository into a mount directory of a
 //! scratch directory, and reads the media repository `MOUNT/.ostree/repo`.
-//! Each refusal leaves no `MOUNT/.ostree`. One test mounts a vfat and an
+//! Each refusal leaves no `MOUNT/.ostree`, or changes no file of a source
+//! repository that is the media repository. One test mounts a vfat and an
 //! exFAT volume, and needs root.
 
 mod common;
@@ -550,6 +551,36 @@ fn a_missing_or_non_directory_mount_is_refused() {
             "{err:?}"
         );
         assert_eq!(std::fs::read(&file).unwrap(), b"");
+    });
+}
+
+/// A media repository that is the source repository is refused, also
+/// through a symlink, and the export changes no file of the source.
+/// `MOUNT/.ostree` exists here, so the test compares the files of the
+/// source.
+#[test]
+fn the_source_repository_is_refused_as_the_media() {
+    let tmp = TmpDir::new("media-source-is-media");
+    block_on(async {
+        let mount = mount_dir(tmp.path());
+        std::fs::create_dir(mount.join(".ostree")).unwrap();
+        let src = create(&media(&mount), RepoMode::Archive, Some(ID)).await;
+        commit(&src, tmp.path(), "a", Some(&Ref::local(REF)), BOUND, &[]).await;
+        src.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        std::fs::write(media(&mount).join("summary.sig"), b"sig").unwrap();
+        let before = file_inventory(&media(&mount), "");
+        let err = export(&src, &mount, &[Ref::local(REF)]).await.unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(file_inventory(&media(&mount), ""), before);
+
+        let link = tmp.path().join("link");
+        std::fs::create_dir_all(link.join(".ostree")).unwrap();
+        std::os::unix::fs::symlink(media(&mount), link.join(".ostree/repo")).unwrap();
+        let err = export(&src, &link, &[Ref::local(REF)]).await.unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(file_inventory(&media(&mount), ""), before);
     });
 }
 

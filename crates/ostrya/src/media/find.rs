@@ -372,7 +372,7 @@ fn open_in_mount(
 }
 
 /// Returns the device and the inode of the open file `fd`.
-fn identity(fd: impl AsFd) -> std::result::Result<Identity, Errno> {
+pub(super) fn identity(fd: impl AsFd) -> std::result::Result<Identity, Errno> {
     let stat = rustix::fs::fstat(fd)?;
     Ok((stat.st_dev, stat.st_ino))
 }

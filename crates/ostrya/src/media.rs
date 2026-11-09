@@ -164,9 +164,11 @@ impl Repo {
     /// # Media repository
     ///
     /// The call resolves each ref and checks each tip before it creates or
-    /// changes a file. Then it creates `mount/.ostree` and the media
-    /// repository in `archive` mode, if they do not exist. An existing
-    /// repository keeps its mode and its `[core] collection-id`.
+    /// changes a file. It refuses a `mount/.ostree/repo` that is this
+    /// repository: the same device and inode, also through a symlink. Then
+    /// it creates `mount/.ostree` and the media repository in `archive`
+    /// mode, if they do not exist. An existing repository keeps its mode and
+    /// its `[core] collection-id`.
     ///
     /// The call makes one pull for each collection, in the order of the
     /// first operand of each collection. Each pull is a local pull at depth
@@ -206,8 +208,12 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the source does not hold a tip commit,
     ///   for example the commit of [`commit`](MediaExportOptions::commit).
     /// - [`Error::Pull`] if a binding check of a tip fails.
-    /// - [`Error::Io`] if `mount` does not exist or is not a directory. The
-    ///   errors above and this error come before the call creates a file.
+    /// - [`Error::Io`] if the call cannot read the device and the inode of
+    ///   this repository.
+    /// - [`Error::Io`] if `mount` does not exist or is not a directory.
+    /// - [`Error::InvalidInput`] if `mount/.ostree/repo` is this repository.
+    ///   The errors above and this error come before the call creates a
+    ///   file.
     /// - The errors of [`CreateOptions::create`], of
     ///   [`pull_local`](Repo::pull_local), of
     ///   [`write_config`](Repo::write_config), and of
@@ -260,8 +266,9 @@ impl Repo {
             tips.push(tip);
         }
 
+        let source = self.clone();
         let dir = mount.to_owned();
-        ostrya_rt::unblock(move || make_media_dir_blocking(&dir)).await?;
+        ostrya_rt::unblock(move || make_media_dir_blocking(&source, &dir)).await?;
         let path = mount.join(MEDIA_REPO);
         let mut media = CreateOptions::new(RepoMode::Archive).create(&path).await?;
 
@@ -709,14 +716,30 @@ impl Repo {
     }
 }
 
-/// Opens the directory `mount`, and creates the directory `.ostree` in it if
+/// Opens the directory `mount`, refuses a `mount/.ostree/repo` that is the
+/// repository `source`, and creates the directory `.ostree` in `mount` if
 /// it does not exist, with the mode `0777` less the file-creation mask.
-fn make_media_dir_blocking(mount: &Path) -> Result<()> {
+fn make_media_dir_blocking(source: &Repo, mount: &Path) -> Result<()> {
+    let own = find::identity(source.repo_fd())?;
     let fd = rustix::fs::open(
         mount,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    // A media repository that does not open is no source repository. The
+    // create reports its error.
+    if let Ok(media) = rustix::fs::openat(
+        &fd,
+        MEDIA_REPO,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) && find::identity(&media)? == own
+    {
+        return Err(Error::InvalidInput(format!(
+            "the media repository {} is the source repository",
+            mount.join(MEDIA_REPO).display()
+        )));
+    }
     match rustix::fs::mkdirat(&fd, MEDIA_DIR, Mode::from_raw_mode(0o777)) {
         Ok(()) | Err(Errno::EXIST) => Ok(()),
         Err(e) => Err(e.into()),

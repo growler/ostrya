@@ -6796,8 +6796,10 @@ ostrya media export [--repo=PATH] [--commit=CHECKSUM] MOUNT [-c|--collection ID]
   parser.
 - Before the command creates a file, it checks and resolves each REF, reads
   each tip commit, and checks the collection binding and the ref binding of
-  each tip commit. A usage error and a failure of these checks write no
-  `MOUNT/.ostree`. A failure after these checks can leave a repository with
+  each tip commit. It also refuses a MOUNT whose `.ostree/repo` is the
+  repository, also through a symlink. This is a rule of the port. A usage
+  error and a failure of these checks create no `MOUNT/.ostree` and change
+  no file. A failure after these checks can leave a repository with
   objects on the media. Examples are a tip commit whose tree is not complete
   in the source, and a full volume.
 - `crates/ostrya/tests/media_export.rs` and

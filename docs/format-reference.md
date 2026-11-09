@@ -5382,6 +5382,8 @@ layout is the layout that `ostree create-usb` writes, so
 
 The media repository is `MOUNT/.ostree/repo`. The export does not check
 that `MOUNT` is a mount point. A symlink to a directory is a valid `MOUNT`.
+The export refuses a `MOUNT/.ostree/repo` that is the source repository: the
+same device and inode, also through a symlink. This is a rule of the port.
 The export creates `MOUNT/.ostree` with the mode `0777` less the
 file-creation mask, if it does not exist. It writes no `.ostree/repos.d/`
 entry.
@@ -5421,8 +5423,9 @@ commit checksum. The source must hold that commit, and the ref need not exist.
 
 The tip commit of each ref must have an `ostree.collection-binding` that
 states `ID`. When the commit has the key `ostree.ref-binding`, the list must
-hold `NAME`. The export resolves each ref and checks each tip before it
-creates or changes a file, so a refusal leaves no `MOUNT/.ostree`. A failure
+hold `NAME`. The export resolves each ref, checks each tip, and checks that
+the media repository is not the source before it creates or changes a file.
+A refusal creates no `MOUNT/.ostree` and changes no file. A failure
 after these checks, for example a full volume, can leave objects on the
 media. Each pull writes its refs when it completes, so a failure in the pull
 of a collection keeps the refs of the collections that the export pulled

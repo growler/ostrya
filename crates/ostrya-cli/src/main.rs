@@ -5237,6 +5237,7 @@ enum MediaCommand {
     /// Before the command creates a file on the volume, it checks and
     /// resolves each REF, and it reads the tip commit of each REF. It also
     /// checks the collection binding and the ref binding of each tip commit.
+    /// It refuses a MOUNT whose `.ostree/repo` is this repository.
     /// If one of these checks fails, the command writes nothing on the
     /// volume. A failure after these checks can leave a repository with
     /// objects on the volume. Examples are a tip commit whose tree is not

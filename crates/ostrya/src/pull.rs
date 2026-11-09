@@ -368,7 +368,7 @@ pub enum TimestampCheck {
     ///
     /// The check reads the ref that the pull writes. Under the
     /// `[core] collection-id` of this repository, a collection pull reads
-    /// `refs/heads/<name>`, as [`Repo::resolve_ref_tip`] does.
+    /// `refs/heads/<name>`, the path that [`Repo::resolve_ref_tip`] reads.
     ///
     /// A ref that this repository does not hold passes.
     CurrentRef,
@@ -1246,7 +1246,7 @@ impl Repo {
     /// of `src`, as [`Repo::resolve_rev`] reads it. So a name can be a
     /// checksum, an abbreviated checksum, or a ref with a `^` suffix, and a
     /// ref is `NAME`, `REMOTE:NAME`, or `@ID:NAME`. The pull reads `@ID:NAME`
-    /// in `src` with the rule of [`Repo::resolve_ref_tip`]:
+    /// in `src` at the path that [`Repo::resolve_ref_tip`] reads:
     /// `refs/mirrors/<ID>/<NAME>`, or `refs/heads/<NAME>` if the
     /// `[core] collection-id` of `src` is `ID`. One pull can take names of
     /// more than one collection, and plain names beside them.

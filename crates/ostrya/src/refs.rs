@@ -192,10 +192,12 @@ impl Repo {
     /// 2. An abbreviated checksum: 1 to 63 lowercase hex characters. It
     ///    resolves to the one commit object whose checksum starts with it.
     /// 3. A ref in a text form of [`Ref`]: `NAME`, `REMOTE:NAME`, or
-    ///    `@ID:NAME`. It resolves to the commit that the ref names, as
-    ///    [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. `@ID:NAME`
-    ///    reads `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when `ID` is the
-    ///    `[core] collection-id` of the repository.
+    ///    `@ID:NAME`. It resolves to the commit that the ref names, read at
+    ///    the path that [`resolve_ref_tip`](Repo::resolve_ref_tip) reads.
+    ///    `@ID:NAME` reads `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when
+    ///    `ID` is the `[core] collection-id` of the repository. A ref path
+    ///    that names a directory, or that passes through a file, fails with
+    ///    [`Error::Io`].
     ///
     /// A checksum is in lowercase hex only. A 64-character name with an
     /// uppercase character is a refspec.
@@ -226,7 +228,8 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum, or a commit object
     ///   does not parse.
-    /// - [`Error::Io`] if a read from the file system fails.
+    /// - [`Error::Io`] if a read from the file system fails, or if the ref
+    ///   path of the base names a directory or passes through a file.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
         Ok(self
             .resolve_rev_kind(rev, allow_noent)
@@ -291,7 +294,8 @@ impl Repo {
         }
 
         let r: Ref = rev.parse()?;
-        match self.resolve_ref_tip(&r).await? {
+        let relpath = ref_relpath(self.config().collection_id(), &r)?;
+        match self.resolve_relpath_tip(relpath).await? {
             Some(checksum) => Ok(Some((checksum, RevKind::Ref))),
             None if allow_noent => Ok(None),
             None => Err(Error::RefNotFound(rev.to_owned())),
@@ -310,14 +314,15 @@ impl Repo {
     /// The call does not read the name as a checksum, as an abbreviated
     /// checksum, or with a `^` suffix. If the ref is an alias, the call
     /// follows the link. An alias whose target is absent reads as an absent
-    /// ref. The result is `None` if the store holds no such ref. A caller
-    /// that needs an error for an absent ref gives
+    /// ref. A ref path that names a directory, or that passes through a
+    /// file, holds no ref. The result is `None` if the store holds no such
+    /// ref. A caller that needs an error for an absent ref gives
     /// [`Error::RefNotFound`] with the text of the ref.
     ///
     /// Callers that hold a ref name and not a revision use this call. These
-    /// are a pull for its local tip, a summary for the metadata ref that it
-    /// chains, and the CLI for its alias-target check. An alias records a
-    /// name, so the CLI uses this call.
+    /// are a media export and a media import for their refs, a summary for
+    /// the metadata ref that it chains, and the CLI for its alias-target
+    /// check. An alias records a name, so the CLI uses this call.
     ///
     /// A symlink that the port does not write can make the call and the ref
     /// listing give different results. Examples are a symlink to a directory
@@ -336,16 +341,22 @@ impl Repo {
     ///   error holds the text of the ref, and the call reads no file.
     /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
     /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example if the ref path names a
-    ///   directory.
+    /// - [`Error::Io`] if the read fails, for example on an alias loop or on
+    ///   a ref file that the process cannot read.
     pub async fn resolve_ref_tip(&self, r: &Ref) -> Result<Option<Checksum>> {
-        self.resolve_relpath_tip(ref_relpath(self.config().collection_id(), r)?)
+        match self
+            .resolve_relpath_tip(ref_relpath(self.config().collection_id(), r)?)
             .await
+        {
+            Err(Error::Io(e)) if is_not_a_ref_path(&e) => Ok(None),
+            other => other,
+        }
     }
 
-    /// Returns the commit that the ref file at `relpath` names, read as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a ref. The call
-    /// follows an alias. The result is `None` if no file is at the path.
+    /// Returns the commit that the ref file at `relpath` names. The call
+    /// follows an alias. The result is `None` if no file is at the path. A
+    /// path that names a directory, or that passes through a file, fails
+    /// with [`Error::Io`].
     ///
     /// The read and the parse run in one call on the blocking pool.
     pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
@@ -377,14 +388,7 @@ impl Repo {
             relpaths
                 .iter()
                 .map(|p| match read_ref_file(repo.repo_fd(), p) {
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
-                        ) =>
-                    {
-                        Ok(None)
-                    }
+                    Err(e) if is_not_a_ref_path(&e) => Ok(None),
                     other => other,
                 })
                 .collect::<std::io::Result<Vec<_>>>()
@@ -404,10 +408,11 @@ impl Repo {
     /// regular file with `O_NOFOLLOW` and parses it. A ref that does not parse
     /// fails the call.
     ///
-    /// If `tip` is given, the call reads it as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) does. The result holds the
-    /// failure of `tip` separately, so the caller decides if it needs the
-    /// value.
+    /// If `tip` is given, the call reads it at the path where
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. A path that names
+    /// a directory, or that passes through a file, fails `tip` with
+    /// [`Error::Io`]. The result holds the failure of `tip` separately, so
+    /// the caller decides if it needs the value.
     #[cfg(feature = "receive")]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn read_ref_states(
@@ -2226,6 +2231,15 @@ fn read_ref_file(
         .take(REF_READ_CAP)
         .read_to_end(&mut buf)?;
     Ok(Some(buf))
+}
+
+/// Returns `true` if `e` is the error of a read of a ref path that names a
+/// directory, or that passes through a file. Such a path holds no ref.
+fn is_not_a_ref_path(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
+    )
 }
 
 /// Returns the state of the ref path `relpath`, read with `lstat` and then an

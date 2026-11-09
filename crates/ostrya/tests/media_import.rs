@@ -565,6 +565,38 @@ fn a_remote_ref_that_cannot_be_read_refuses_the_ref() {
     });
 }
 
+/// A remote ref path of the matched remote that names a directory, or that
+/// passes through a remote ref file, holds no remote ref. The import writes
+/// the mirror ref.
+#[test]
+fn a_remote_ref_path_with_no_ref_file_gives_no_current_ref() {
+    let tmp = TmpDir::new("media-import-no-remote-ref-file");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let bc_ref = Ref::collection(X, "b/c");
+        let bc = commit(&src, dir, "bc", &bc_ref, Some(X), 1000, Some(SECRET_B64)).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a"), bc_ref.clone()]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let ax = Ref::remote("origin", "a/x");
+        let ax_tip = commit(&c, dir, "ax", &ax, Some(X), 2000, Some(SECRET_B64)).await;
+        let b = Ref::remote("origin", "b");
+        let b_tip = commit(&c, dir, "b", &b, Some(X), 2000, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(Ref::collection(X, "a"), a), (bc_ref, bc)]);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(a));
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/b/c")), Some(bc));
+        assert_eq!(ref_file(&c, "remotes/origin/a/x"), Some(ax_tip));
+        assert_eq!(ref_file(&c, "remotes/origin/b"), Some(b_tip));
+        assert_fsck_clean(&c).await;
+    });
+}
+
 /// The trust of the matched remote checks each commit. A remote that checks
 /// no commit signature makes the import check the GPG signature, and a
 /// build with no GPG engine refuses the ref with its own text. A commit

@@ -11938,9 +11938,8 @@ fn own_local_name<'a>(text: &'a str, own: Option<&str>) -> &'a str {
 /// prefix with no ref in the ref store names no ref. An ambiguous prefix and
 /// a unique prefix are the same here, because neither names a ref.
 ///
-/// If an I/O error occurs on the ref file, the function returns it. The
-/// caller decides if a name that is a directory, or a path through a ref
-/// file, is a refusal or a miss.
+/// A name that is a directory, or a path through a ref file, names no ref.
+/// If another I/O error occurs on the ref file, the function returns it.
 ///
 /// The lookup reads only the ref store ([`Repo::resolve_ref_tip`]), so no
 /// revision syntax applies here. An alias target is a refspec, so a name that
@@ -12184,7 +12183,7 @@ async fn select_aliases(
     prefix: Option<&str>,
 ) -> Result<Vec<String>> {
     if let Some(prefix) = prefix
-        && alias_prefix_commit(repo, prefix).await?.is_some()
+        && resolve_ref_name(repo, prefix).await?.is_some()
     {
         return Ok(vec![prefix.to_owned()]);
     }
@@ -12275,7 +12274,7 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
         refuse_collection_alias_prefix(prefix);
         check_prefix(repo, prefix).await?;
         if let Some(prefix) = prefix
-            && let Some(commit) = alias_prefix_commit(repo, prefix).await?
+            && let Some(commit) = resolve_ref_name(repo, prefix).await?
         {
             println!("{prefix} -> {}", commit.to_hex());
             continue;
@@ -12293,27 +12292,6 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Returns the commit of the ref that a `-A` PREFIX names, alias or not.
-///
-/// Some prefixes reach no ref file: a directory that holds refs, a path
-/// through a ref file, and an alias with a missing target ref. Such a prefix
-/// names no ref, so it filters the alias listing. These paths give `EISDIR`
-/// and `ENOTDIR`. Each other read failure is returned, so a permission fault
-/// reaches the caller and does not show as an empty listing.
-async fn alias_prefix_commit(repo: &Repo, prefix: &str) -> Result<Option<Checksum>> {
-    match resolve_ref_name(repo, prefix).await {
-        Err(Error::Io(err))
-            if matches!(
-                err.kind(),
-                std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
-            ) =>
-        {
-            Ok(None)
-        }
-        other => other,
-    }
 }
 
 /// Prints the collection refs as `(collection-id, ref)`.

@@ -177,7 +177,10 @@ them are observed and deliberately not reproduced:
     an enumeration reaches it. The port reports `error: i/o error: Is a
     directory (os error 21)` and exits 1 from each listing form other than
     `-A`. It does the same from `--delete`, whatever the prefix matches, and
-    from `fsck`, `prune`, and `summary -u`;
+    from `fsck` and `prune`. `summary -u` leaves the link out of the summary
+    and exits 0. Where `summary -u` writes the anchor commit and the link is
+    `refs/heads/ostree-metadata`, the port replaces the link with the anchor
+    ref;
 - an invalid collection id aborts the tool when it names a directory under
   `refs/mirrors`. The tool prints `ostree_collection_ref_new: assertion
   'collection_id == NULL || ostree_validate_collection_id (collection_id,
@@ -323,10 +326,10 @@ them are observed and deliberately not reproduced:
   existence check ahead of it, so `refs -A --create=origin:rr plain` reports
   `error: Cannot create alias to remote ref: origin` and `error: i/o error: Is a
   directory (os error 21)`, both exiting 1 and writing nothing. A directory named
-  as an `-A --create` target draws a fourth message from the tool, its own
-  existence check's `error: Cannot create alias to non-existent ref: <target>`,
-  so `refs -A --create=al deep` and `refs -A --create=al deep/nest` report that
-  line where the port reports its `Is a directory` one;
+  as an `-A --create` target names no ref in both implementations, so `refs -A
+  --create=al deep` and `refs -A --create=al deep/nest` report the line of the
+  existence check, `error: Cannot create alias to non-existent ref: <target>`,
+  in both;
 - a ref name whose path under `refs/` runs through a ref file -- `plain/x` over
   the ref `plain`, `origin:rr/x/y` over the remote ref `origin:rr/x`, `al/x`
   through an alias symlink -- is the `ENOTDIR` sibling of that case, refused by
@@ -339,12 +342,12 @@ them are observed and deliberately not reproduced:
   openat(refs/remotes/origin/rr/x/y): Not a directory`; under
   `-c --create=<id>:<ref>` the write reaches the
   mirror path and it reports `error: open(O_TMPFILE): Not a directory`, naming
-  no path; and as an `-A --create` target it reports the target as a name no ref
-  holds, `error: Cannot create alias to non-existent ref: plain/x`, the existence
-  check standing ahead of the name at that one site. The port reports `error: i/o
-  error: Not a directory (os error 20)`
-  for every one of them, the one message it gives that condition, which is also
-  the message the `PREFIX` form above draws. Both exit 1 and leave `refs/`
+  no path. As an `-A --create` target, both implementations report the target
+  as a name no ref holds, `error: Cannot create alias to non-existent ref:
+  plain/x`, the existence check standing ahead of the name at that one site.
+  The port reports `error: i/o error: Not a directory (os error 20)` for every
+  other site, the one message it gives that condition, which is also the
+  message the `PREFIX` form above draws. Both exit 1 and leave `refs/`
   unchanged;
 - a revision resolving to a commit the store does not hold is refused in
   different words: the tool names the loose object file it looked for, `error: No
@@ -2883,8 +2886,11 @@ verifies a summary signature through a remote alone. A signing `--keys-file`
 of the spki engine holds PEM `PRIVATE KEY` blocks, the form of a `sign
 --keys-file`, and each block adds one signature
 (`../format-reference.md`, "Signing details"). A symlink under `refs/`
-that names a directory ends `summary -u` with exit 1 in both implementations,
-in different words ("P1", `refs`). The port's `summary
+that names a directory ends `summary -u` of the tool with exit 1. The port
+leaves the link out of the summary and exits 0. In a repository with a
+collection id, a link at `refs/heads/ostree-metadata` makes the tool report
+`Couldn't open ref 'ostree-metadata': Is a directory`, and the port replaces
+the link with the anchor ref ("P1", `refs`). The port's `summary
 --verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
 output formats", `sign`, "The key sources of `sign`"), with one verifier for
 each engine, and refuses `--sign` and `--gpg-sign`. With `--remote`, it reads

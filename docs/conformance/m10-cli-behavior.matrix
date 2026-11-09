@@ -623,22 +623,20 @@ setup: repo-with-commit
 run: refs --repo=$REPO -A --create=al $BRANCH/x
 expect-exit: 1
 expect-stdout: empty
-expect-stderr: contains "error: i/o error: Not a directory (os error 20)"
+expect-stderr: contains "error: Cannot create alias to non-existent ref: $BRANCH/x"
 ref-expect-exit: 1
 ref-expect-stdout: empty
 ref-expect-stderr: contains "error: Cannot create alias to non-existent ref: $BRANCH/x"
-oracle: exit-status stdout-text refs-bytes
+oracle: exit-status stdout-text stderr-text refs-bytes
 outcome: refused-both
 severity: interop
 spec: cli-behavior.md#refs
-note: a target whose path under `refs/` runs through a ref file is refused by
- both and in different words: the tool's existence check reports the target as a
- name no ref holds, where every other site names the path and the syscall, and
- the port reports the one message it gives that condition, so `stderr-text` is
- not an oracle here (`cli-surface.md`, "P1"). A target naming a directory takes
- the same split and needs a ref directory the setup does not bind, so it sits in
- `refs/invalid-refspec-forms` below. `refs-bytes` states that neither wrote a
- link.
+note: a target whose path under `refs/` runs through a ref file names no ref, so
+ the existence check of both reports the target as a name no ref holds, where
+ every other site refuses the path (`cli-surface.md`, "P1"). A target naming a
+ directory takes the same answer and needs a ref directory the setup does not
+ bind, so it sits in `refs/invalid-refspec-forms` below. `refs-bytes` states
+ that neither wrote a link.
 
 family: M10
 subcommand: refs
@@ -991,18 +989,17 @@ spec: format-reference.md#ref-name-validation
 note: the refused-name cases the single-branch setup does not bind: every shape
  an alias target takes, which both report as `Cannot create alias to non-existent
  ref: <target>` -- the existence check standing ahead of the name rule there --
- with the tool answering a target naming a directory the same way where the port
- reports its `Is a directory` line, and the same line for each target the
- ref-name rule refuses, such as `tes~t` and `a:b:c`; a remote half holding a
- `/`, which is one component in both; and `commit -b` of a name the rule
- refuses, which both refuse with exit 1 and no ref written. The cited test
- also pins the two divergences
- `cli-surface.md`, "P1" records -- the empty refspec as the zero-length case of
- the tool's abbreviated-checksum scan, which the repository's four commits
- make not unique, and what a ref name that names a directory draws: the
- tool's three refusals, and its `--create` scan for a ref below the name, which
- runs under `refs/heads` alone and leaves the write to replace an empty directory
- and any directory under `refs/remotes`, where the port refuses both -- against a
+ for a target naming a directory or running through a ref file, and the same
+ line for each target the ref-name rule refuses, such as `tes~t` and `a:b:c`; a
+ remote half holding a `/`, which is one component in both; and `commit -b` of
+ a name the rule refuses, which both refuse with exit 1 and no ref written.
+ The cited test also pins the two divergences `cli-surface.md`, "P1"
+ records -- the empty refspec as the zero-length case of the tool's
+ abbreviated-checksum scan, which the repository's four commits make not
+ unique, and what a ref name that names a directory draws: the tool's three
+ refusals, and its `--create` scan for a ref below the name, which runs under
+ `refs/heads` alone and leaves the write to replace an empty directory and any
+ directory under `refs/remotes`, where the port refuses both -- against a
  repository holding four branches, a nested ref directory, and two remote refs.
 
 family: M10

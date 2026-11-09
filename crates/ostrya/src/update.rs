@@ -332,8 +332,9 @@ impl UpdateGuard {
     /// collection ref of the `[core] collection-id` of the repository, the
     /// call reads `refs/heads/NAME`, and it does not read
     /// `refs/mirrors/ID/`. If the store holds the ref as an alias, the call
-    /// follows the alias to the ref that it names. The result is `None` if
-    /// the store holds no such ref.
+    /// follows the alias to the ref that it names. A ref path that names a
+    /// directory, or that passes through a file, holds no ref. The result is
+    /// `None` if the store holds no such ref.
     ///
     /// # Errors
     ///
@@ -341,8 +342,8 @@ impl UpdateGuard {
     ///   call reads no file.
     /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
     /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example if the ref path names a
-    ///   directory.
+    /// - [`Error::Io`] if the read fails, for example on an alias loop or on
+    ///   a ref file that the process cannot read.
     pub async fn read_ref(&self, r: &Ref) -> Result<Option<Checksum>> {
         self.repo().resolve_ref_tip(r).await
     }

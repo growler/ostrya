@@ -13217,6 +13217,9 @@ fn invalid_refspec_matches_the_tool() {
     // - a second `:` and a `/` in the remote half
     // - a `~` in a component
     // - an ancestry suffix, which names a commit
+    //
+    // A name whose path under `refs/` runs through a ref file, or that names
+    // a directory, also names no ref in both commands.
     for target in [
         "a/../b",
         "a//b",
@@ -13228,38 +13231,15 @@ fn invalid_refspec_matches_the_tool() {
         "a/b:x",
         "tes~t",
         "test/main^",
+        "plain/x",
+        "deep",
+        "deep/nest",
     ] {
         assert_agrees_on_error(
             &port,
             &tool,
             &["refs", "-A", "--create=al", target],
             &format!("error: Cannot create alias to non-existent ref: {target}"),
-        );
-    }
-    // The check of the `ostree` command answers the two i/o conditions with
-    // that same line. ostrya reports the message that it gives for each
-    // condition. This is a recorded divergence.
-    for (target, message) in [
-        ("plain/x", "error: i/o error: Not a directory (os error 20)"),
-        ("deep", "error: i/o error: Is a directory (os error 21)"),
-        (
-            "deep/nest",
-            "error: i/o error: Is a directory (os error 21)",
-        ),
-    ] {
-        let (refused, missing) = run_both(&port, &tool, &["refs", "-A", "--create=al", target]);
-        assert_eq!(refused.status.code(), Some(1));
-        assert_eq!(
-            String::from_utf8_lossy(&refused.stderr),
-            format!("{message}\n"),
-        );
-        assert_eq!(missing.status.code(), Some(1));
-        let stderr = String::from_utf8_lossy(&missing.stderr);
-        assert!(
-            stderr.contains(&format!(
-                "error: Cannot create alias to non-existent ref: {target}"
-            )),
-            "the tool's refusal for the target `{target}` lacks the line:\n{stderr}",
         );
     }
     assert_eq!(

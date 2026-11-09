@@ -241,23 +241,10 @@ impl Repo {
             let tip = match options.commit {
                 Some(commit) => commit,
                 None => {
-                    // A name that reaches a directory of the ref tree, or a
-                    // path under a ref file, is no ref of the source.
                     let target = Ref::collection(id, name);
-                    match self.resolve_ref_tip(&target).await {
-                        Ok(Some(tip)) => tip,
-                        Ok(None) => return Err(Error::RefNotFound(target.to_string())),
-                        Err(Error::Io(e))
-                            if matches!(
-                                e.kind(),
-                                std::io::ErrorKind::IsADirectory
-                                    | std::io::ErrorKind::NotADirectory
-                            ) =>
-                        {
-                            return Err(Error::RefNotFound(target.to_string()));
-                        }
-                        Err(e) => return Err(e),
-                    }
+                    self.resolve_ref_tip(&target)
+                        .await?
+                        .ok_or_else(|| Error::RefNotFound(target.to_string()))?
                 }
             };
             let (commit, _) = self.load_commit(&tip).await?;

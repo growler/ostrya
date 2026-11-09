@@ -569,8 +569,8 @@ impl Repo {
     ///
     /// Delta discovery and
     /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) read
-    /// the current commit of a ref at the same place, as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it.
+    /// the current commit of a ref at the path that
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads.
     ///
     /// # Local repository
     ///

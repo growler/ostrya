@@ -3415,8 +3415,10 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   `Transaction::set_ref`, `Repo::set_ref_immediate`,
   `UpdateGuard::read_ref`, `UpdateGuard::set_ref`, and
   `Repo::resolve_ref_tip`. `resolve_ref_tip` gives `None` for an absent
-  ref. A caller that needs an error gives `Error::RefNotFound` with the
-  text of the ref.
+  ref. A ref path that names a directory, or that passes through a file,
+  holds no ref, so it also gives `None`. A caller that needs an error gives
+  `Error::RefNotFound` with the text of the ref. `Repo::resolve_rev` reads
+  a revision, and it fails with `Error::Io` for such a path.
 - A value from a caller can be `@OWN:NAME`, and the ref store maps it to
   the local ref. A value that the library gives is canonical: a ref of the
   own id is `Local`.

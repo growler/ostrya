@@ -333,29 +333,29 @@ fn the_own_collection_reads_a_local_ref_beside_a_mirror_ref_that_fails() {
 }
 
 #[test]
-fn another_collection_fails_on_a_directory_or_a_file() {
+fn a_directory_or_a_path_through_a_file_reads_as_no_ref() {
     let tmp = TmpDir::new("ref-store-other-not-a-ref");
     let repo = open(&create(&tmp, Some(OWN)));
     block_on(async {
         put(&repo, OTHER, "a/b", &checksum(2)).await;
         put_local(&repo, "a", &checksum(1)).await;
-        assert_io(
-            repo.resolve_ref_tip(&Ref::collection(OTHER, "a")).await,
-            ErrorKind::IsADirectory,
-        );
+        assert_eq!(resolve(&repo, &Ref::collection(OTHER, "a")).await, None);
 
         put(&repo, OTHER, "f", &checksum(2)).await;
         put_local(&repo, "f/g", &checksum(1)).await;
-        assert_io(
-            repo.resolve_ref_tip(&Ref::collection(OTHER, "f/g")).await,
-            ErrorKind::NotADirectory,
-        );
+        assert_eq!(resolve(&repo, &Ref::collection(OTHER, "f/g")).await, None);
 
-        // A local ref keeps the error of `resolve_rev`.
         put_local(&repo, "d/e", &checksum(1)).await;
+        assert_eq!(resolve(&repo, &Ref::local("d")).await, None);
+
+        // A revision keeps the error of the read.
         assert_io(
-            repo.resolve_ref_tip(&Ref::local("d")).await,
+            repo.resolve_rev(&format!("@{OTHER}:a"), false).await,
             ErrorKind::IsADirectory,
+        );
+        assert_io(
+            repo.resolve_rev(&format!("@{OTHER}:f/g"), false).await,
+            ErrorKind::NotADirectory,
         );
     });
 }

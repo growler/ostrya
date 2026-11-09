@@ -3371,8 +3371,9 @@ rule. So the check answers for a bare checksum (`../format-reference.md`,
 answers for each name that the ref rule refuses, and reports the target as
 given. These names each get it: `a/../b`, `a//b`, `.`, `..`, the empty
 argument, `origin:`, `a:b:c`, `a/b:x`, `te st`, `.test`, `origin::rr`, and
-`tes~t`. The tool also reports this line for a target whose path runs through a
-ref file or names a directory (`cli-surface.md`, "P1", `refs`).
+`tes~t`. Both implementations also report this line for a target whose path
+runs through a ref file or names a directory (`cli-surface.md`, "P1",
+`refs`).
 
 The command refuses a NEWREF or a positional revision whose path under `refs/`
 runs through a ref file, before it writes anything. The tool also refuses a

@@ -284,16 +284,20 @@ impl Repo {
                 .await?;
         }
 
-        // The handle keeps the config that it read at the open, so the
-        // summary reads the new key through a new handle.
+        // The summary reads `[core] indexed-deltas` from the config of the
+        // handle, and an absent key reads as `true`. Only a key with another
+        // value needs a new handle that reads the written config.
         if !matches!(
             media.config().keyfile().get_bool("core", "indexed-deltas"),
             Ok(Some(true))
         ) {
+            let stale = !matches!(media.config().indexed_deltas(), Ok(true));
             let mut keyfile = media.config().keyfile().clone();
             keyfile.set_value("core", "indexed-deltas", "true")?;
             media.write_config(&keyfile).await?;
-            media = Repo::open(&path).await?;
+            if stale {
+                media = Repo::open(&path).await?;
+            }
         }
         media
             .regenerate_summary(&SummaryOptions {

@@ -459,6 +459,10 @@ fn a_new_destination_is_an_archive_repository() {
                 .metadata_value("ostree.summary.collection-id")
                 .is_none()
         );
+        assert_eq!(
+            summary.metadata_value("ostree.summary.indexed-deltas"),
+            Some(&Value::Bool(true))
+        );
         assert_fsck_clean(&repo).await;
     });
 }
@@ -497,6 +501,36 @@ fn an_existing_destination_gets_indexed_deltas() {
         std::fs::write(
             &config,
             "[core]\nrepo_version=1\nmode=archive-z2\nindexed-deltas=false\n",
+        )
+        .unwrap();
+        export(&src, &mount, &[Ref::local(REF)]).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "[core]\nrepo_version=1\nmode=archive-z2\nindexed-deltas=true\n"
+        );
+        assert_eq!(
+            media_summary(&mount).metadata_value("ostree.summary.indexed-deltas"),
+            Some(&Value::Bool(true))
+        );
+    });
+}
+
+/// An existing media repository with an `indexed-deltas` value that is not
+/// a boolean gets `indexed-deltas=true`, and its summary states the new
+/// value.
+#[test]
+fn an_existing_destination_with_a_bad_indexed_deltas_gets_true() {
+    let tmp = TmpDir::new("media-bad-indexed-deltas");
+    block_on(async {
+        let src = source(tmp.path(), Some(ID)).await;
+        commit(&src, tmp.path(), "a", Some(&Ref::local(REF)), BOUND, &[]).await;
+        let mount = mount_dir(tmp.path());
+        std::fs::create_dir(mount.join(".ostree")).unwrap();
+        create(&media(&mount), RepoMode::Archive, None).await;
+        let config = media(&mount).join("config");
+        std::fs::write(
+            &config,
+            "[core]\nrepo_version=1\nmode=archive-z2\nindexed-deltas=maybe\n",
         )
         .unwrap();
         export(&src, &mount, &[Ref::local(REF)]).await.unwrap();

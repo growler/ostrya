@@ -3304,8 +3304,9 @@ has no group for `nosuch`.
   and `(org.example.Local, test/main)` for the remote `self`, in one sorted
   list with the local refs.
 - `refs -c` prints no row for `plain/x`, `bad/y`, and `nosuch/z`. A remote
-  with no `collection-id`, with a value that is not a valid collection id, or
-  with no config group gives no row.
+  with no `collection-id`, with a value that is not a valid collection id, with
+  a value that holds a malformed escape sequence such as `org.\q`, or with no
+  config group gives no row.
 - The listing holds each pair of a collection id and a ref name one time. A
   ref of a remote wins over a local ref and over a mirror ref of the same
   pair. `refs -c -r` prints C2 for `(org.example.Local, test/main)`, which is

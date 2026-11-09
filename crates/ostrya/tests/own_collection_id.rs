@@ -346,6 +346,55 @@ fn the_collection_ref_listing_lists_the_refs_of_a_remote_with_a_collection_id() 
     });
 }
 
+/// The collection ref listing skips a remote whose `collection-id` holds a
+/// malformed escape sequence, and lists the other rows.
+#[test]
+fn the_collection_ref_listing_skips_a_remote_whose_collection_id_has_a_malformed_escape() {
+    let tmp = TmpDir::new("own-id-listing-bad-escape");
+    block_on(async {
+        let (path, repo) = create(&tmp).await;
+        let guard = repo.begin_update().await.unwrap();
+        guard
+            .add_remote(
+                "origin",
+                &[
+                    ("url", "https://example.invalid/"),
+                    ("collection-id", OTHER),
+                ],
+            )
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+        // The key file writer escapes a backslash, so the test writes the
+        // malformed value by hand.
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[remote \"x\"]\nurl=https://example.invalid/\ncollection-id=org.\\q\n");
+        std::fs::write(&config, text).unwrap();
+        let repo = Repo::open(&path).await.unwrap();
+        repo.set_ref_immediate(&Ref::local("main"), Some(&checksum(1)))
+            .await
+            .unwrap();
+        repo.set_ref_immediate(&Ref::remote("origin", "o"), Some(&checksum(2)))
+            .await
+            .unwrap();
+        repo.set_ref_immediate(&Ref::remote("x", "b"), Some(&checksum(3)))
+            .await
+            .unwrap();
+
+        let entry = |collection: &str, name: &str, byte: u8, local: bool| CollectionRefEntry {
+            collection: collection.to_owned(),
+            name: name.to_owned(),
+            commit: checksum(byte),
+            local,
+        };
+        assert_eq!(
+            repo.list_collection_refs().await.unwrap(),
+            [entry(OTHER, "o", 2, false), entry(OWN, "main", 1, true)]
+        );
+    });
+}
+
 /// The back-ref check of the fsck finds the collection ref of the own
 /// collection id under `refs/heads` alone. A ref under `refs/mirrors/ID/` of
 /// that id gives no collection ref.

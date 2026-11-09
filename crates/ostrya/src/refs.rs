@@ -616,8 +616,8 @@ impl Repo {
     ///   that directory.
     /// - Each ref under `refs/remotes/R/` of a remote R whose config sets a
     ///   `collection-id`, qualified by that id. The call skips a remote
-    ///   whose `collection-id` fails
-    ///   [`is_valid_collection_id`](crate::is_valid_collection_id) or is the
+    ///   whose `collection-id` holds a malformed escape sequence, fails
+    ///   [`is_valid_collection_id`](crate::is_valid_collection_id), or is the
     ///   `[core] collection-id` of the repository, and a remote name that
     ///   [`valid_remote_name`] refuses. A directory under `refs/remotes` with
     ///   no remote group in the config gives no ref. If no remote qualifies,
@@ -634,8 +634,6 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Core`] if the `collection-id` of a remote holds a malformed
-    ///   escape sequence.
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails.
@@ -652,7 +650,8 @@ impl Repo {
             let Some(remote) = config.remote(name) else {
                 continue;
             };
-            if let Some(id) = remote.collection_id()?
+            // A value with a malformed escape sequence gives no row.
+            if let Ok(Some(id)) = remote.collection_id()
                 && ostrya_core::is_valid_collection_id(&id)
                 && Some(id.as_str()) != own
             {

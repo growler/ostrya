@@ -241,11 +241,7 @@ them are observed and deliberately not reproduced:
   names wins. So `refs -c -r` can print a different commit for the pair. The
   rows of the other pairs agree, and `refs -c --delete <id>` removes the
   mirror refs of `<id>` alone in both;
-- three states of a remote in the `-c` listing:
-  - A `collection-id` value with a malformed escape sequence, such as
-    `org.example.O\qs`. The tool prints the other rows and exits 0. The port
-    fails `refs -c` at exit 1 with `error: keyfile: invalid escape '\q'`, also
-    when no other remote has a `collection-id`.
+- two states of a remote in the `-c` listing:
   - A remote group whose name is not a valid remote name, such as
     `[remote "-x"]`, with a valid foreign `collection-id`. The tool lists the
     refs of the remote. The port lists no ref of the remote.

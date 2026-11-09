@@ -12836,6 +12836,62 @@ fn refs_collections_of_a_remote_match_the_tool() {
     );
 }
 
+/// `refs -c` gives no row for a remote whose `collection-id` holds a
+/// malformed escape sequence, and lists the other rows. `-c --delete ID`
+/// keeps the refs of that remote.
+#[test]
+fn refs_collections_skip_a_remote_with_a_malformed_collection_id_like_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("refs-coll-bad-escape");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = base.join("repo");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Local",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let src = base.join("src");
+    let c1 = commit_tree(&repo, "test/main", &src, None);
+    let c2 = commit_tree(&repo, "other", &src, Some(&c1));
+    append_config(
+        &repo,
+        "[remote \"origin\"]\nurl=file:///nonexistent\ncollection-id=org.example.Os\n\
+         [remote \"x\"]\nurl=file:///nonexistent\ncollection-id=org.\\q\n",
+    );
+    for (relpath, commit) in [
+        ("remotes/origin/os/main", &c2),
+        ("remotes/x/b", &c1),
+        ("mirrors/org.y/m", &c1),
+    ] {
+        write_ref_file(&repo, relpath, commit);
+    }
+
+    for args in [vec!["refs", "-c"], vec!["refs", "-c", "-r"]] {
+        assert_agrees(&repo, &repo, &args);
+    }
+
+    let port = clone_repo(base, &repo, "coll-bad-escape-port");
+    let tool = clone_repo(base, &repo, "coll-bad-escape-tool");
+    assert_agrees(&port, &tool, &["refs", "-c", "--delete", "org.y"]);
+    assert_eq!(
+        describe_refs(&port),
+        describe_refs(&tool),
+        "deleting a collection next to a remote with a malformed id left \
+         different refs trees",
+    );
+    assert!(port.join("refs/remotes/x/b").exists());
+}
+
 /// With the `collection-id` of the repository, `refs -c --create=ID:REF`
 /// writes the local ref `refs/heads/REF` in both commands, and no file under
 /// `refs/mirrors/`. Each command reads the ref that the port wrote. The

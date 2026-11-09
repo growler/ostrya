@@ -25,6 +25,7 @@
 //! - [`Repo::pull`] copies commits from a remote, and [`Repo::pull_local`] from a local repository.
 //! - [`Repo::pull_with_session`] copies commits from a remote through a session of the caller.
 //! - [`Repo::pull_collection`] copies the refs of a collection from the remotes that serve it.
+//! - [`Repo::export_media`] copies the commits of collection refs onto removable media.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
@@ -32,6 +33,7 @@
 //! - Write: [`transaction`], [`mtree`], [`staging_tree`], [`commit`], [`modifier`], [`bootable`].
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
 //! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`], which holds the session of a pull over HTTP, over ssh, or over a pair of byte streams.
+//! - Removable media: [`media`], the export of collection refs onto a mounted volume.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Client access: [`access`], the client groups and the server settings of the config, the claims of a client certificate, and the read rights of a client.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
@@ -91,6 +93,7 @@ mod inflate;
 mod ingest;
 mod jobs;
 mod lock;
+pub mod media;
 pub mod modifier;
 pub mod mtree;
 mod object;
@@ -186,6 +189,8 @@ pub use gpg::GpgSigner;
 pub use gpg::{FromOstreeKeyrings, GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
+#[doc(hidden)]
+pub use media::{MediaExportOptions, MediaExportReport};
 #[doc(hidden)]
 pub use modifier::{
     CommitModifier, CommitModifierFlags, DevInoCache, FilterFn, FilterResult, LabelFn, ModeFn,

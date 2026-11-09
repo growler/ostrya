@@ -1442,6 +1442,12 @@ impl Repo {
     ///   applies the inode policy of this repository again from the logical
     ///   header of the object. It reads the header from the metadata of the
     ///   object, and does not read the payload for it.
+    /// - Copy of a `.filez`: if the pull cannot link a regular file between
+    ///   two `archive` repositories, it writes the stored `.filez` bytes of
+    ///   the source unchanged. So the object keeps the DEFLATE level of the
+    ///   source, and not the `[archive] zlib-level` of this repository. The
+    ///   pull inflates the payload to hash it, and compares the result with
+    ///   the name of the object.
     /// - Re-ingest: the pull reads the remaining content objects into their
     ///   logical form (uid, gid, mode, xattrs, and payload). It writes them
     ///   through the ordinary ingest path, in the form that the destination
@@ -1450,9 +1456,9 @@ impl Repo {
     ///   forms. `archive` stores a framed, deflated form that no other mode
     ///   shares.
     ///
-    /// If the pull cannot link a content object, it uses the clone or the
-    /// re-ingest path. These paths give the object the inode metadata that a
-    /// commit into this repository writes.
+    /// If the pull cannot link a content object, it uses the clone, the
+    /// `.filez` copy, or the re-ingest path. These paths give the object the
+    /// inode metadata that a commit into this repository writes.
     ///
     /// # Hardlink rules
     ///
@@ -1539,11 +1545,11 @@ impl Repo {
     /// [`UNTRUSTED`](PullFlags::UNTRUSTED) fails the pull if an imported
     /// object does not hash to its name.
     ///
-    /// The re-ingest path hashes each object as it streams, and compares the
-    /// result with the name, whatever the flags say. So that path refuses a
-    /// corrupt source with or without the flag. The other paths move bytes
-    /// without a hash, and the flag adds one read of each object. An untrusted
-    /// pull thus hashes each object once.
+    /// The `.filez` copy and the re-ingest path hash each object as they
+    /// stream, and compare the result with the name, whatever the flags say.
+    /// So these paths refuse a corrupt source with or without the flag. The
+    /// other paths move bytes without a hash, and the flag adds one read of
+    /// each object. An untrusted pull thus hashes each object once.
     ///
     /// A signature covers the commit or the summary alone. A signature check
     /// of this pull does not set the flag. A caller that checks the
@@ -1731,9 +1737,9 @@ impl Repo {
     ///   a dirtree that this repository holds is a symlink that points to no
     ///   file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
-    ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the re-ingest
-    ///   path. Also if a delta superblock does not match its advertised digest
-    ///   or its digest in the list.
+    ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the `.filez`
+    ///   copy and the re-ingest path. Also if a delta superblock does not
+    ///   match its advertised digest or its digest in the list.
     /// - [`Error::InsufficientFreeSpace`] if an imported object needs more
     ///   space than the free-space budget of the transaction holds.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
@@ -1748,7 +1754,9 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
     ///   `src` is malformed, or if `src` does not hold a superblock of a chain
-    ///   or of a dependency when the pull applies its delta.
+    ///   or of a dependency when the pull applies its delta. Also if a
+    ///   `.filez` that the pull copies has bytes after its payload, or a
+    ///   payload that does not inflate to the size that its header declares.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
@@ -2387,9 +2395,10 @@ impl Repo {
         // The mode checks read the logical form of the object, before each
         // import path. An untrusted verification reads the same form, and it
         // waits for the import path. The link and the clone move bytes without
-        // a hash, so the pull verifies them here. A re-ingest hashes the object
-        // as it writes it and compares the result with its name. A verification
-        // before the re-ingest reads the payload twice, so the pull makes none.
+        // a hash, so the pull verifies them here. A `.filez` copy and a
+        // re-ingest hash the object as they write it and compare the result
+        // with its name. A verification before them reads the payload twice,
+        // so the pull makes none.
         let loaded = if checks.any() || untrusted {
             let file = src.load_file(&name.checksum).await?;
             if checks.any() {
@@ -2410,7 +2419,8 @@ impl Repo {
         }
 
         // The logical form of the object. The clone applies the inode policy
-        // of the destination from its header, and a re-ingest streams its
+        // of the destination from its header, a `.filez` copy reads the
+        // stored file of the source again, and a re-ingest streams its
         // payload. A refused link also gets here, at the cost of one
         // metadata read.
         let file = match loaded {
@@ -2448,6 +2458,9 @@ impl Repo {
                     )
                     .await?;
                     return Ok(());
+                }
+                if src.mode().is_archive() && self.mode().is_archive() {
+                    return import_filez(txn, src, name, &meta, verify_buf).await;
                 }
                 let reader = file.reader().await?;
                 txn.write_content(Some(&name.checksum), &meta, reader)
@@ -3533,6 +3546,47 @@ enum LocalWanted<'a> {
     Pinned(&'a Pinned<'a>),
 }
 
+impl Repo {
+    /// Pulls the refs `targets` of the collection `collection` from the local
+    /// repository `src`, each at its commit, with no signature check.
+    ///
+    /// The pull is the pull of a local candidate of [`Repo::pull_collection`]
+    /// at depth 0, with no static delta and no timestamp check. It takes the
+    /// `.commitmeta` and the dependencies of field 2 of each commit. It writes
+    /// each ref at [`RefPlace::of_collection`]. The
+    /// `ostree.collection-binding` of each tip must state `collection`, and
+    /// the ref-binding check applies.
+    pub(crate) async fn pull_local_pinned(
+        &self,
+        src: &Repo,
+        collection: &str,
+        targets: Vec<(String, Checksum)>,
+    ) -> Result<PullStats> {
+        let pinned = Pinned {
+            targets,
+            listed: HashMap::new(),
+            collection,
+            allow_unbound: false,
+            place: RefPlace::of_collection(self, collection),
+            summary: Mutex::new(None),
+        };
+        let opts = PullOptions {
+            disable_static_deltas: true,
+            ..PullOptions::default()
+        };
+        self.pull_local_from(
+            src,
+            crate::verify::PullTrust::unverified(),
+            RelatedRule::of(self.config())?,
+            opts,
+            LocalWanted::Pinned(&pinned),
+            None,
+            Instant::now(),
+        )
+        .await
+    }
+}
+
 /// Checks each name of a local pull that starts with `@`.
 ///
 /// Less each `^` at its end, the name must be an `@ID:NAME` ref that
@@ -3759,7 +3813,11 @@ async fn read_checked_local_summary(
 ///
 /// A commit with no binding key is older than the convention and passes. A
 /// commit with a binding list that does not name the ref fails.
-fn check_ref_binding(checksum: &Checksum, commit: &Commit, ref_name: &str) -> Result<()> {
+pub(crate) fn check_ref_binding(
+    checksum: &Checksum,
+    commit: &Commit,
+    ref_name: &str,
+) -> Result<()> {
     if commit.metadata_value("ostree.ref-binding").is_none() {
         return Ok(());
     }
@@ -3931,7 +3989,7 @@ async fn check_tip_refs(
 ///
 /// A commit with no binding key fails, unless `allow_unbound` is `true`. A
 /// commit whose binding is not a string fails with either value.
-fn check_collection_binding(
+pub(crate) fn check_collection_binding(
     checksum: &Checksum,
     commit: &Commit,
     id: &str,
@@ -4037,6 +4095,60 @@ async fn link_import(
         name.ty,
         src.mode(),
         flags.contains(PullFlags::FORCE_COPY),
+    )
+    .await
+}
+
+/// Stores the regular-file content object `name` of the `archive` repository
+/// `src` in the `archive` repository of `txn`, from the stored `.filez` file
+/// of the source.
+///
+/// The staged file holds the bytes of the source unchanged, so the object
+/// keeps the DEFLATE level of the source. The write inflates the payload in
+/// bounded chunks to feed the digest. It refuses an object that does not hash
+/// to its name, and a payload that does not inflate to the size that its
+/// header declares. `meta` is the logical metadata of the object.
+async fn import_filez(
+    txn: &Transaction,
+    src: &Repo,
+    name: ObjectName,
+    meta: &FileMeta,
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    let path = name.loose_path(src.mode());
+    let repo = src.clone();
+    let (file, len) = ostrya_rt::unblock(move || -> Result<_> {
+        let fd = match rustix::fs::openat(
+            repo.objects_fd(),
+            path.as_str(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        ) {
+            Ok(fd) => fd,
+            Err(rustix::io::Errno::NOENT) => {
+                return Err(Error::ObjectNotFound {
+                    checksum: name.checksum,
+                    ty: ObjectType::File,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let file = std::fs::File::from(fd);
+        let len = file.metadata()?.len();
+        Ok((file, len))
+    })
+    .await?;
+    let (header, declared, framed, body) =
+        http::read_archive_header(ostrya_rt::FileReader::with_len_hint(file, len)).await?;
+    http::store_filez_payload(
+        txn,
+        &name.checksum,
+        &header,
+        meta,
+        declared,
+        &framed,
+        body,
+        buf,
     )
     .await
 }

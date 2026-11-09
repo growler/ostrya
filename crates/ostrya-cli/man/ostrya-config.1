@@ -155,6 +155,7 @@ The keys of the group \fB\%[archive]\fR.
 \fB\%zlib\-level\fR (integer, default 6)
 The DEFLATE level of the \fB\%.filez\fR objects that ostrya writes into an archive repository, and that \fB\%ostrya serve\fR makes from another mode.
 A value less than 1 gives 1, and a value more than 9 gives 9.
+A pull stores each \fB\%.filez\fR that it copies or fetches from an archive repository as the source stores it.
 In the \fB\%config\fR of a bucket repository, \fB\%ostrya remote init \-\-zlib\-level\fR writes it.
 \fB\%ostrya push\fR and \fB\%ostrya push\-tree\fR to an \fB\%s3://\fR address make each \fB\%.filez\fR at the level of the bucket, and not at the level of the local repository.
 \fB\%ostrya push\-tree \-\-compress=LEVEL\fR has precedence over the level of the bucket.

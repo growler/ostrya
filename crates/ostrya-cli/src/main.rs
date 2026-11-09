@@ -15599,6 +15599,7 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         metadata_commit_timestamp: args.metadata_commit_timestamp,
         additional_metadata,
         auth_items_only: args.client_groups,
+        root_summary_only: false,
     };
     let report = repo
         .regenerate_summaries(&opts, &signer_refs(&signers))

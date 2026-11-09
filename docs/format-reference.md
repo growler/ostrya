@@ -455,7 +455,8 @@ The timestamp resolves as for any commit: the explicit value, then
 anchor with the previous anchor as its parent, so the checksum changes on each
 run. The first generation on a new repository has no parent and is
 reproducible. The anchor ref is in field 0 by name, as any other local ref.
-`ostrya summary -u -c` writes no anchor commit.
+`ostrya summary -u -c` writes no anchor commit. The summary of removable
+media has no anchor commit ("Removable media").
 
 The port adds no caller key to the anchor. In a repository with a collection
 id it refuses any caller key before the anchor advances and before any write
@@ -5371,10 +5372,117 @@ summary in a mirror pull with no ref. It makes this check after it reads
 the summary and the `config` of the remote, and before it reads a ref file
 or an object.
 
+## Removable media
+
+`Repo::export_media` copies the commits of collection refs onto a mounted
+volume. A host with no network finds the media repository on the volume and
+pulls from it. The media layout is the layout that `ostree create-usb`
+writes, so `ostree find-remotes --pull` reads the media of the port.
+
+The media repository is `MOUNT/.ostree/repo`. The export does not check
+that `MOUNT` is a mount point. A symlink to a directory is a valid `MOUNT`.
+The export creates `MOUNT/.ostree` with the mode `0777` less the
+file-creation mask, if it does not exist. It writes no `.ostree/repos.d/`
+entry.
+
+A new media repository is an `archive` repository, also from a source in
+another mode. Its `config` is:
+
+```
+[core]
+repo_version=1
+mode=archive-z2
+indexed-deltas=true
+```
+
+An existing media repository keeps its mode, its `[core] collection-id`,
+and its other keys. The export adds `indexed-deltas=true` to `[core]` when
+the key does not hold `true`. It copies no key and no remote config of the
+source.
+
+### The refs of the media
+
+Each operand of the export names one collection ref of the source:
+
+- `NAME` is the local ref `refs/heads/NAME`, and goes onto the media as the
+  ref `(OWN, NAME)`, where `OWN` is the `[core] collection-id` of the source.
+  A source with no collection id refuses the operand.
+- `@ID:NAME` is the ref `(ID, NAME)` of the source: `refs/heads/NAME` when
+  `ID` is the own id of the source, and else `refs/mirrors/ID/NAME`.
+- `REMOTE:NAME` is refused.
+
+The export reads the ref files alone. It does not read the `summary` of the
+source, and it does not read `refs/remotes/`. An operand that occurs two
+times counts one time. `NAME` and `@OWN:NAME` in one run name one ref, and
+the export refuses them. One run takes the refs of more than one collection.
+In place of the tip of the one ref of a run, the caller can give a full
+commit checksum. The source must hold that commit, and the ref need not exist.
+
+The tip commit of each ref must have an `ostree.collection-binding` that
+states `ID`. When the commit has the key `ostree.ref-binding`, the list must
+hold `NAME`. The export resolves each ref and checks each tip before it
+creates or changes a file, so a refusal leaves no `MOUNT/.ostree`. A failure
+after these checks, for example a full volume, can leave objects on the
+media. Each pull writes its refs when it completes, so a failure in the pull
+of a collection keeps the refs of the collections that the export pulled
+before it. The export then does not set `indexed-deltas` and writes no
+summary: the media repository keeps its old summary, or has none.
+
+The export writes each ref to `refs/mirrors/ID/NAME` of the media
+repository, or to `refs/heads/NAME` when `ID` is the `[core] collection-id`
+of the media repository. It does not check for a downgrade: a run can move
+a ref of the media to an older commit.
+
+### The objects of the media
+
+The export makes one local pull for each collection, in the order of the
+first operand of each collection. Each pull is at depth 0, with no signature
+check and no timestamp check. It copies the `.commitmeta` of each commit, and
+the dependencies of field 2 of each commit as loose objects, with no ref
+("Static deltas of dependencies"). It copies no static delta, no
+`delta-indexes/` entry, and no `summary.sig` of the source. On the file system
+of the source, the pull can share an object by hardlink or reflink. Where the
+file system refuses the link, it copies the object.
+
+### The summary of the media
+
+After the pulls, the export writes the root summary of the media repository
+("Summary -- `(a(s(taya{sv}))a{sv})`"). It removes an existing `summary.sig`
+and writes no new one, so the media summary is unsigned. It writes no
+`ostree-metadata` anchor commit, also in a media repository with a
+collection id. It writes no summary of an auth item
+(`extensions/ostrya/summary/`). Field 0 holds the local refs. Each ref of
+another collection than the `[core] collection-id` of the media repository
+is in `ostree.summary.collection-map`.
+
+### The file systems of the media
+
+A removable volume often has a vfat or an exFAT file system. These file
+systems keep no POSIX modes, no owner, no hardlink, no symlink, and no xattr.
+The export writes an `archive` repository, which needs none of these. The
+observed calls on such a volume:
+
+- `O_TMPFILE` fails with `EOPNOTSUPP`, and the write path uses a named
+  temporary file.
+- `linkat` fails with `EPERM`, and the pull copies the object.
+- `fchmod` returns `0`. The mode of each file and each directory comes from
+  the mount options `fmask` and `dmask`, and not from the call. With a mask
+  that removes the bits of the group and of the other users, for example
+  `fmask=0177,dmask=0077`, the owner of the mount alone can read the media
+  repository.
+- The record locks of `fcntl`, `fsync`, `syncfs`, and `rename` over a file
+  operate.
+
+FAT32 refuses a file of 4 GiB or more, so an object of that size cannot go
+onto a FAT32 volume. vfat and exFAT compare names with no case. The names of
+the objects are lowercase hex, and the names of two refs that differ in case
+alone name one file.
+
 ## Summaries of auth items
 
 The port writes the root summary ("Summary -- `(a(s(taya{sv}))a{sv})`") and
-one summary for each auth item that has a summary. An auth item has a
+one summary for each auth item that has a summary. Removable media get the
+root summary alone ("Removable media"). An auth item has a
 summary when its client group has `summary=true` (`ostrya-config(1)`,
 "Client keys"). Each other item has no summary. The implicit group of a
 repository with no client group sets `summary=true`, so the `anonymous` item

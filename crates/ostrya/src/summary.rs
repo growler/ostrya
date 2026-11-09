@@ -9,7 +9,9 @@
 //!   with the options in [`SummaryOptions`]. It signs each one, and returns
 //!   a [`SummaryReport`]. [`Repo::regenerate_summary`] writes them
 //!   unsigned. With [`SummaryOptions::auth_items_only`], the two calls write
-//!   the summaries of the auth items alone.
+//!   the summaries of the auth items alone. With
+//!   [`SummaryOptions::root_summary_only`], they write the root summary
+//!   alone.
 //! - [`Repo::sign_summary`] and [`Repo::sign_summary_all`] add signatures to
 //!   each summary. [`Repo::verify_summary`] verifies the signatures in
 //!   `summary.sig`.
@@ -614,7 +616,8 @@ pub struct SummaryOptions {
     /// If `None`, the timestamp resolves as for each commit: `SOURCE_DATE_EPOCH`
     /// if it is set, else the current time. A repository with no collection id
     /// ignores this field. A call with [`SummaryOptions::auth_items_only`]
-    /// set to `true` writes no anchor commit, so it also ignores this field.
+    /// or [`SummaryOptions::root_summary_only`] set to `true` writes no
+    /// anchor commit, so it also ignores this field.
     pub metadata_commit_timestamp: Option<u64>,
     /// The keys that the caller adds to the global metadata dict.
     ///
@@ -637,6 +640,15 @@ pub struct SummaryOptions {
     /// repository root as they are, and no signer signs them. In a repository
     /// with a collection id, the call writes no anchor commit.
     pub auth_items_only: bool,
+    /// The switch that writes the root summary alone.
+    ///
+    /// If it is `true`, the call writes `summary` and `summary.sig` at the
+    /// repository root, and writes no anchor commit in a repository with a
+    /// collection id. It writes no summary of an auth item, and leaves the
+    /// files under `extensions/ostrya/summary/` as they are. The default is
+    /// `false`. A call that sets this field and
+    /// [`SummaryOptions::auth_items_only`] fails.
+    pub root_summary_only: bool,
 }
 
 /// Methods that write, read, sign, and verify the summary.
@@ -671,7 +683,10 @@ impl Repo {
     ///
     /// If [`SummaryOptions::auth_items_only`] is `true`, the call writes the
     /// summaries of the auth items alone. It does not build, sign, or write
-    /// the root summary, and it writes no anchor commit.
+    /// the root summary, and it writes no anchor commit. If
+    /// [`SummaryOptions::root_summary_only`] is `true`, the call writes the
+    /// root summary alone. It writes no anchor commit, writes no summary of
+    /// an auth item, and removes no file of an auth item.
     ///
     /// The checks of [`SummaryOptions::additional_metadata`] and of the
     /// client groups come before each write and before each lock. A refusal
@@ -801,9 +816,10 @@ impl Repo {
     ///
     /// # Collection id
     ///
-    /// If the repository sets `[core] collection-id` and
-    /// [`SummaryOptions::auth_items_only`] is `false`, the call first writes
-    /// a new anchor commit to `refs/heads/ostree-metadata`. The anchor
+    /// If the repository sets `[core] collection-id`, and
+    /// [`SummaryOptions::auth_items_only`] and
+    /// [`SummaryOptions::root_summary_only`] are `false`, the call first
+    /// writes a new anchor commit to `refs/heads/ostree-metadata`. The anchor
     /// commit:
     ///
     /// - has an empty root tree, with uid 0, gid 0, and the mode `0o40755`,
@@ -870,6 +886,9 @@ impl Repo {
     ///   before the Unix epoch, if a summary is larger than 64 MiB, or if
     ///   `extensions`, `extensions/ostrya`, or `extensions/ostrya/summary` is
     ///   not a directory.
+    /// - [`Error::InvalidInput`] if [`SummaryOptions::auth_items_only`] and
+    ///   [`SummaryOptions::root_summary_only`] are both `true`. The call then
+    ///   writes nothing.
     /// - [`Error::Unsupported`] if the repository has a collection id and
     ///   [`SummaryOptions::additional_metadata`] is not empty.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, `[core]
@@ -893,6 +912,12 @@ impl Repo {
         opts: &SummaryOptions,
         signers: &[&dyn Signer],
     ) -> Result<SummaryReport> {
+        if opts.auth_items_only && opts.root_summary_only {
+            return Err(Error::InvalidInput(
+                "a summary update cannot write the auth items alone and the root summary alone"
+                    .into(),
+            ));
+        }
         // A caller value the dict cannot hold is refused before the anchor
         // commit advances, so a refusal leaves the repository as it stood.
         if let Some((key, _)) = opts
@@ -922,11 +947,13 @@ impl Repo {
         // The repository lock comes before the update lock. The anchor
         // transaction takes the repository lock shared too, before the update
         // lock, so its staging directory is made outside the update lock. A
-        // run that writes the summaries of the auth items alone writes no
-        // anchor.
+        // run that writes the summaries of the auth items alone, or the root
+        // summary alone, writes no anchor.
         let repo_lock = self.lock_repo(LockKind::Shared).await?;
         let txn = match &collection_id {
-            Some(_) if !opts.auth_items_only => Some(self.transaction().await?),
+            Some(_) if !opts.auth_items_only && !opts.root_summary_only => {
+                Some(self.transaction().await?)
+            }
             _ => None,
         };
         let held = self.lock_update().await?;
@@ -951,7 +978,9 @@ impl Repo {
     /// Writes the root summary, unless [`SummaryOptions::auth_items_only`] is
     /// set, and the summary of each item of `access`, as
     /// [`regenerate_summaries`](Repo::regenerate_summaries) states. Then it
-    /// removes the files of each other item.
+    /// removes the files of each other item. With
+    /// [`SummaryOptions::root_summary_only`], it writes the root summary
+    /// alone.
     ///
     /// The caller holds the update lock, and the anchor commit of the run, if
     /// the run writes one, is in place.
@@ -975,14 +1004,17 @@ impl Repo {
         };
         let fsync = self.config().fsync().map_err(write)?;
         let run = self.summary_run(access, opts).await.map_err(build)?;
-        let items: Vec<(AuthItem, SummaryFiles)> = run
-            .access
-            .items()
-            .filter_map(|item| {
-                let files = run.access.summary_files(item)?;
-                Some((item.clone(), files.clone()))
-            })
-            .collect();
+        let items: Vec<(AuthItem, SummaryFiles)> = if opts.root_summary_only {
+            Vec::new()
+        } else {
+            run.access
+                .items()
+                .filter_map(|item| {
+                    let files = run.access.summary_files(item)?;
+                    Some((item.clone(), files.clone()))
+                })
+                .collect()
+        };
         // The signature file of each distinct summary of the run, by the
         // SHA-256 digest of its bytes. Two summaries with the same bytes
         // share one signature file, so each signer signs each distinct
@@ -1031,11 +1063,13 @@ impl Repo {
             .await
             .map_err(write)?;
         }
-        let kept: HashSet<String> = items.iter().map(|(_, files)| files.stem.clone()).collect();
-        let repo = self.clone();
-        ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, fsync))
-            .await
-            .map_err(write)?;
+        if !opts.root_summary_only {
+            let kept: HashSet<String> = items.iter().map(|(_, files)| files.stem.clone()).collect();
+            let repo = self.clone();
+            ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, fsync))
+                .await
+                .map_err(write)?;
+        }
         Ok(SummaryReport {
             invalid_collection_dirs: run.every.invalid_dirs,
         })

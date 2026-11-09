@@ -81,6 +81,7 @@ fn plain_summary_is_byte_identical_to_the_tool() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -104,6 +105,7 @@ fn regenerate_removes_a_stale_signature() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -119,6 +121,7 @@ fn regenerate_removes_a_stale_signature() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -141,6 +144,7 @@ fn collection_summary_and_anchor_match_the_tool() {
             metadata_commit_timestamp: Some(FIXED_EPOCH),
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -178,6 +182,7 @@ fn sign_and_verify_round_trip() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -210,6 +215,7 @@ fn verify_summary_runs_the_verifiers_on_the_blocking_pool() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -246,6 +252,7 @@ fn tool_verifies_a_port_signed_summary() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -298,6 +305,7 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -324,6 +332,7 @@ fn the_summary_advertises_the_deltas_the_repository_holds() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -426,6 +435,7 @@ fn the_tool_reads_the_port_written_delta_map() {
             metadata_commit_timestamp: None,
             additional_metadata: Vec::new(),
             auth_items_only: false,
+            root_summary_only: false,
         })
         .await
         .unwrap();
@@ -477,6 +487,7 @@ async fn regenerate_with(repo: &Repo, added: Vec<(String, Value)>) -> Summary {
         metadata_commit_timestamp: Some(FIXED_EPOCH),
         additional_metadata: added,
         auth_items_only: false,
+        root_summary_only: false,
     })
     .await
     .unwrap();
@@ -590,6 +601,7 @@ fn caller_metadata_that_is_no_variant_is_refused_first() {
                 metadata_commit_timestamp: Some(FIXED_EPOCH + 1),
                 additional_metadata: vec![("bare".to_owned(), Value::U32(1))],
                 auth_items_only: false,
+                root_summary_only: false,
             })
             .await
             .unwrap_err();
@@ -647,6 +659,7 @@ fn caller_metadata_in_a_collection_repository_is_refused() {
                 metadata_commit_timestamp: Some(FIXED_EPOCH + 1),
                 additional_metadata: vec![string_entry("k", "v")],
                 auth_items_only: false,
+                root_summary_only: false,
             })
             .await
             .unwrap_err();
@@ -2984,6 +2997,94 @@ fn the_summaries_of_the_auth_items_alone_write_no_anchor_commit() {
             .find(|entry| entry.name == "ostree-metadata")
             .expect("the summary lists the anchor");
         assert_eq!(entry.commit, tip);
+    });
+}
+
+/// In a repository with a collection id, a write of the root summary alone
+/// writes `summary`, removes `summary.sig`, writes no anchor commit, and
+/// writes no file of an auth item. The summary lists no anchor ref.
+#[test]
+fn the_root_summary_alone_writes_no_anchor_commit_and_no_item_summary() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("root-alone");
+    block_on(async {
+        std::fs::write(repo_dir.join("summary.sig"), b"stale").unwrap();
+        let refs = common::file_inventory(&repo_dir, "refs");
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            root_summary_only: true,
+            ..fixed()
+        })
+        .await
+        .unwrap();
+        assert_eq!(common::file_inventory(&repo_dir, "refs"), refs);
+        assert_eq!(
+            repo.resolve_ref_tip(&Ref::local("ostree-metadata"))
+                .await
+                .unwrap(),
+            None
+        );
+        let summary = Summary::parse(&std::fs::read(repo_dir.join("summary")).unwrap()).unwrap();
+        assert!(!ref_names(&summary).is_empty());
+        assert!(
+            !ref_names(&summary)
+                .iter()
+                .any(|name| name == "ostree-metadata")
+        );
+        assert!(!repo_dir.join("summary.sig").exists());
+        assert!(!item_file(&repo_dir, "anonymous", "").exists());
+        assert!(!item_file(&repo_dir, "anonymous", ".access").exists());
+    });
+}
+
+/// A write of the root summary alone leaves the files of each auth item as
+/// they are.
+#[test]
+fn the_root_summary_alone_keeps_the_item_files() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "root-alone-items");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let files = common::file_inventory(&repo_dir, "extensions");
+        assert!(!files.is_empty());
+        let summary = std::fs::read(repo_dir.join("summary")).unwrap();
+        let config = repo_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            format!("{text}[ex-ostrya client \"none\"]\nauth=anonymous\nsummary=false\n"),
+        )
+        .unwrap();
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH + 1),
+            root_summary_only: true,
+            ..SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(common::file_inventory(&repo_dir, "extensions"), files);
+        assert_ne!(std::fs::read(repo_dir.join("summary")).unwrap(), summary);
+    });
+}
+
+/// A write that asks for the auth items alone and for the root summary alone
+/// is refused, and writes nothing.
+#[test]
+fn the_root_summary_alone_with_the_auth_items_alone_is_refused() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("root-alone-refused");
+    block_on(async {
+        let before = common::file_inventory(&repo_dir, "");
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let err = repo
+            .regenerate_summary(&SummaryOptions {
+                auth_items_only: true,
+                root_summary_only: true,
+                ..fixed()
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ostrya::Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(common::file_inventory(&repo_dir, ""), before);
     });
 }
 

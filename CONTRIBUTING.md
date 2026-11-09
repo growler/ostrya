@@ -47,6 +47,19 @@ need the `server` feature:
 cargo test -p ostrya-mount --features server
 ```
 
+The test `exports_onto_vfat_and_exfat` in
+`crates/ostrya/tests/media_export.rs` makes a vfat and an exFAT volume in an
+image file, mounts each one on a loop device, and exports onto it. It needs
+root, loop devices, `mkfs.vfat` of dosfstools, and `mkfs.exfat` of
+exfatprogs. Without them it skips. If `OSTRYA_REQUIRE_MEDIA_FS` is set, a
+missing requirement or a volume that does not mount fails it:
+
+```sh
+cargo test -p ostrya --test media_export --no-run
+sudo env OSTRYA_REQUIRE_MEDIA_FS=1 target/debug/deps/media_export-<hash> \
+    exports_onto_vfat_and_exfat
+```
+
 The tests of the bucket client in `ostrya-remote` need the `s3` feature. The
 tests in `crates/ostrya-remote/tests/s3_bucket.rs` run `rclone serve s3` on a
 scratch directory, with a key pair and a port that the server picks. They
@@ -536,6 +549,9 @@ test:
   ownership gate.
 - `OSTRYA_REQUIRE_MOUNT` -- `CAP_SYS_ADMIN` and fs-verity, for the mount
   tests (see "Tests").
+- `OSTRYA_REQUIRE_MEDIA_FS` -- root, loop devices, `mkfs.vfat`, and
+  `mkfs.exfat`, for the export onto a vfat and an exFAT volume (see
+  "Tests").
 - `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client, of
   the pull from an `s3://` address, of the pull of collection refs, and of
   a bucket repository against `rclone serve s3`: the writer lock, the

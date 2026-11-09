@@ -1006,6 +1006,104 @@ fn a_refused_link_imports_a_content_object_through_its_header() {
     });
 }
 
+/// Between two archive repositories, a refused link stores the `.filez` of the
+/// source unchanged, also when the destination has another `zlib-level`.
+#[test]
+fn a_refused_archive_link_stores_the_filez_of_the_source() {
+    let tmp = TmpDir::new("pull-archive-copy");
+    block_on(async {
+        let base = tmp.path();
+        build_tree(&base.join("v1"), b"hello one\n");
+        // DEFLATE level 1 and level 6 store this payload as different bytes.
+        let text: String = (0..8192)
+            .map(|i| format!("line {} of {}\n", i % 97, i % 13))
+            .collect();
+        std::fs::write(base.join("v1/big.txt"), text).unwrap();
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let c1 = commit_tree(&src, base, "v1", "main", None).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        drop(dst);
+        let config = dst_dir.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[archive]\nzlib-level=1\n");
+        std::fs::write(&config, text).unwrap();
+        let dst = Repo::open(&dst_dir).await.unwrap();
+
+        pull_main(&dst, &src, PullFlags::FORCE_COPY).await;
+
+        for name in src.traverse_commit(&c1, 0).await.unwrap() {
+            if name.ty != ObjectType::File {
+                continue;
+            }
+            let src_path = object_path(&src_dir, &name, RepoMode::Archive);
+            let dst_path = object_path(&dst_dir, &name, RepoMode::Archive);
+            let object = name.loose_path(RepoMode::Archive).replace('/', "");
+            assert_ne!(
+                object_ino(&src_dir, &object),
+                object_ino(&dst_dir, &object),
+                "{name} should be a fresh inode"
+            );
+            assert_eq!(
+                std::fs::read(&src_path).unwrap(),
+                std::fs::read(&dst_path).unwrap(),
+                "{name}"
+            );
+        }
+        let report = dst.fsck(&FsckOptions::new()).await.unwrap();
+        assert!(report.is_ok(), "fsck reported {:?}", report.errors);
+    });
+}
+
+/// Between two archive repositories, a refused link hashes the `.filez` of
+/// the source, with or without `UNTRUSTED`, and refuses an object that does
+/// not hash to its name.
+#[test]
+fn a_refused_archive_link_rejects_a_filez_of_another_object() {
+    let tmp = TmpDir::new("pull-archive-copy-corrupt");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let content = first_regular_content(&src, &c2).await;
+        let mut other = None;
+        for name in src.traverse_commit(&c2, 0).await.unwrap() {
+            if name.ty == ObjectType::File
+                && name.checksum != content.checksum
+                && !src.load_file(&name.checksum).await.unwrap().is_symlink()
+            {
+                other = Some(name);
+                break;
+            }
+        }
+        let other = other.expect("the commit holds a second regular content object");
+        std::fs::copy(
+            object_path(&src_dir, &other, RepoMode::Archive),
+            object_path(&src_dir, &content, RepoMode::Archive),
+        )
+        .unwrap();
+
+        for flags in [PullFlags::NONE, PullFlags::UNTRUSTED] {
+            let (dst_dir, dst) =
+                make_repo(base, &format!("dst-{}", flags.bits()), RepoMode::Archive).await;
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned()],
+                        flags: flags | PullFlags::FORCE_COPY,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::ChecksumMismatch { expected, .. } if expected == content.checksum),
+                "flags {flags:?}: unexpected error: {err}"
+            );
+            assert!(object_names(&dst_dir).is_empty());
+        }
+    });
+}
+
 #[test]
 fn a_cloned_metadata_object_takes_the_destination_policy() {
     let tmp = TmpDir::new("pull-clone-metadata");

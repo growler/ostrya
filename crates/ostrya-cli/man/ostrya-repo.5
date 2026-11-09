@@ -452,6 +452,24 @@ A server that writes the second request ignores the header, so the lock gives no
 A take of the lock writes the key if it is absent, and no writer deletes it.
 Do not delete the key, and do not set an expiry rule on it: a delete between the two requests of a probe stops the writer.
 The \fB\%ostree\fR tool does not read this key.
+.SH REMOVABLE MEDIA
+Removable media carry the commits of collection refs to a host with no network.
+The media repository is \fB\%MOUNT/.ostree/repo\fR on a mounted volume, in the layout that \fB\%ostree create\-usb\fR writes, so \fB\%ostree find\-remotes \-\-pull\fR reads it.
+The ostrya library writes it with \fB\%Repo::export_media\fR.
+.PP
+A new media repository is an archive repository, with \fB\%indexed\-deltas=true\fR in \fB\%[core]\fR.
+An existing media repository keeps its mode and its \fB\%collection\-id\fR, and gets \fB\%indexed\-deltas=true\fR.
+Each ref of the collection \fB\%<id>\fR is \fB\%refs/mirrors/<id>/<name>\fR, or \fB\%refs/heads/<name>\fR when \fB\%<id>\fR is the \fB\%collection\-id\fR of the media repository.
+The media repository holds each commit at depth 0, with its \fB\%.commitmeta\fR and the dependencies of its related objects as loose objects.
+It holds no static delta of the export.
+The summary of the media repository is unsigned: an export removes \fB\%summary.sig\fR.
+The summary holds no \fB\%ostree\-metadata\fR anchor commit, and the export writes no file under \fB\%extensions/ostrya/summary/\fR.
+.PP
+A vfat or an exFAT volume keeps no modes, no owner, no hardlink, no symlink, and no xattr.
+The modes of the files and the directories come from the mount options \fB\%fmask\fR and \fB\%dmask\fR.
+With \fB\%fmask=0177,dmask=0077\fR, the owner of the mount alone can read the media repository.
+FAT32 refuses a file of 4 GiB or more.
+vfat and exFAT compare names with no case.
 .SH EXTENSIONS
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2

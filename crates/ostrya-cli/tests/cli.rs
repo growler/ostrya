@@ -46829,10 +46829,6 @@ fn one_file_tree(base: &Path, name: &str) -> PathBuf {
 
 /// Returns `true` if the test process runs with the effective user id 0. The
 /// value is the second field of the `Uid:` line of `/proc/self/status`.
-#[cfg(any(
-    all(feature = "send", feature = "push", feature = "receive"),
-    feature = "gpg"
-))]
 fn is_root() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status
@@ -48429,7 +48425,8 @@ fn program_outside_run(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// The `ostree` tool finds and pulls the media of the port.
+/// The `ostree` tool finds and pulls the media of the port, and the port
+/// imports the media of the tool.
 ///
 /// The commit has a GPG signature. In a new mount namespace, a tmpfs covers
 /// `/run`, and a ramfs at `/run/media/root/usb` gets a copy of the media tree
@@ -48438,9 +48435,15 @@ fn program_outside_run(name: &str) -> Option<PathBuf> {
 /// port refuses a file system that reports no blocks. So `media export`
 /// writes into a directory, and `cp -a` copies the tree onto the ramfs. Then
 /// `ostree find-remotes --finders=mount --pull` pulls the ref into a
-/// `bare-user` client with a remote of the collection id and the GPG key,
-/// and verifies the signature. The ref lands, and `ostree fsck` of the
-/// client passes. The tool reads its GnuPG home from a scratch directory.
+/// `bare-user` client, and `--pull --mirror` pulls it into a second one. Each
+/// client has a remote of the collection id and the GPG key, and the tool
+/// verifies the signature.
+///
+/// `ostree create-usb` writes the same ref into a directory, and
+/// `media import --mount` pulls it into a `bare-user` client of the port with
+/// the same remote and key. The three refs hold the commit, the three clients
+/// hold the same objects, and `ostree fsck` of each client passes. The tool
+/// reads its GnuPG home from a scratch directory.
 #[cfg(feature = "gpg")]
 #[test]
 fn ostree_find_remotes_pulls_the_media_of_the_port() {
@@ -48493,25 +48496,64 @@ fn ostree_find_remotes_pulls_the_media_of_the_port() {
     )
     .ok();
 
-    let client = base.join("client");
-    let client_arg = format!("--repo={}", client.display());
-    let run = ostree(&["init", &client_arg, "--mode=bare-user"]);
-    assert!(run.status.success());
-    configure_remote(
-        &client,
-        "file:///nonexistent",
-        "collection-id=org.example.Os\n",
-    );
-    home.export_to(&client.join("origin.trustedkeys.gpg"));
+    let clients = ["client", "client2", "port-client"].map(|name| base.join(name));
+    for client in &clients {
+        let client_arg = format!("--repo={}", client.display());
+        let run = if client.ends_with("port-client") {
+            ostrya(&["init", &client_arg, "--mode=bare-user"], None, &[])
+        } else {
+            ostree(&["init", &client_arg, "--mode=bare-user"])
+        };
+        assert!(run.status.success());
+        configure_remote(
+            client,
+            "file:///nonexistent",
+            "collection-id=org.example.Os\n",
+        );
+        home.export_to(&client.join("origin.trustedkeys.gpg"));
+    }
+    let [client, client2, port_client] = &clients;
     let gnupghome = base.join("tool-gnupghome");
     std::fs::create_dir(&gnupghome).unwrap();
     std::fs::set_permissions(&gnupghome, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    // The port imports the media of the tool.
+    let tool_media = base.join("tool-media");
+    std::fs::create_dir(&tool_media).unwrap();
+    let run = ostree_env(
+        &[
+            &format!("--repo={}", repo.display()),
+            "create-usb",
+            tool_media.to_str().unwrap(),
+            "org.example.Os",
+            "os/stable",
+        ],
+        &[("GNUPGHOME", gnupghome.to_str().unwrap())],
+    );
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let run = ostrya_at(
+        port_client,
+        &[
+            "media",
+            "import",
+            &format!("--mount={}", tool_media.display()),
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        format!("@org.example.Os:os/stable {commit}\n")
+    );
 
     let script = r#"set -e
 "$1" -t tmpfs tmpfs /run
 "$1" --mkdir -t ramfs ramfs /run/media/root/usb
 "$2" -a "$4/media/.ostree" /run/media/root/usb/
 "$3" "--repo=$4/client" find-remotes --finders=mount --pull org.example.Os os/stable
+"$3" "--repo=$4/client2" find-remotes --finders=mount --pull --mirror org.example.Os os/stable
 "#;
     let namespace: &[&str] = if is_root() {
         &["-m", "--propagation", "private"]
@@ -48552,15 +48594,328 @@ fn ostree_find_remotes_pulls_the_media_of_the_port() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
-    assert!(stdout.contains("Pulled 1/1 refs successfully."), "{stdout}");
     assert_eq!(
-        ref_file(&client, "refs/remotes/origin/os/stable"),
-        Some(commit)
+        stdout.matches("Pulled 1/1 refs successfully.").count(),
+        2,
+        "{stdout}"
     );
-    let run = ostree(&["fsck", &client_arg]);
+    let mirror = "refs/mirrors/org.example.Os/os/stable";
+    for (client, relpath) in [
+        (client, "refs/remotes/origin/os/stable"),
+        (client2, mirror),
+        (port_client, mirror),
+    ] {
+        assert_eq!(
+            ref_file(client, relpath).as_ref(),
+            Some(&commit),
+            "{}",
+            client.display()
+        );
+        let run = ostree(&["fsck", &format!("--repo={}", client.display())]);
+        assert!(
+            run.status.success(),
+            "{}: {}",
+            client.display(),
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+    let inventory = prune_inventory(client);
+    assert_eq!(prune_inventory(client2), inventory);
+    assert_eq!(prune_inventory(port_client), inventory);
+}
+
+// --- media import ------------------------------------------------------------
+
+/// The variable that names the scratch directory of the child of
+/// [`media_import_needs_one_volume_and_mount_selects_one`].
+const MEDIA_IMPORT_CHILD: &str = "OSTRYA_CLI_MEDIA_IMPORT_CHILD";
+
+/// Creates an archive source repository at `base/src-repo` with the
+/// collection id [`OWN_ID`], and commits the fixture tree of `base/src` with
+/// an ed25519 signature onto each ref of `refs`. Returns the repository and
+/// the commit of each ref.
+fn media_source(base: &Path, refs: &[&str]) -> (PathBuf, Vec<String>) {
+    let repo = init_archive(&base.join("src-repo"), Some(OWN_ID));
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let commits = refs
+        .iter()
+        .map(|r| {
+            commit_no_parent(
+                &repo,
+                &["-b", r, "--sign-type=ed25519", &sign],
+                &base.join("src"),
+            )
+            .ok()
+            .stdout_trimmed()
+        })
+        .collect();
+    (repo, commits)
+}
+
+/// Creates an archive client repository at `path` with the collection id
+/// `id`, and one remote for each collection of `collections`. Each remote
+/// turns the GPG check off and trusts the ed25519 key of the commits.
+fn media_client(path: &Path, id: Option<&str>, collections: &[&str]) -> PathBuf {
+    let client = init_archive(path, id);
+    let config = client.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    for (index, collection) in collections.iter().enumerate() {
+        text.push_str(&format!(
+            "\n[remote \"r{index}\"]\nurl=file:///dev/null\ncollection-id={collection}\n\
+             gpg-verify=false\nsign-verify=ed25519\n\
+             verification-ed25519-key={ED25519_PUBLIC_B64}\n"
+        ));
+    }
+    std::fs::write(&config, text).unwrap();
+    client
+}
+
+/// `media import` takes `@ID:NAME`, the prefix `@ID:`, `-c ID NAME`, and a
+/// plain NAME, which names the ref of the own collection id. Each written ref
+/// prints one `@ID:NAME CHECKSUM` line. A plain NAME in a client with no
+/// collection id, NAME with `@OWN:NAME`, and a collection with no remote are
+/// refused at exit 1, with one `error:` line and no ref.
+#[test]
+fn media_import_takes_each_operand_form() {
+    let tmp = TmpDir::new("media-import-operands");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let (x, y) = ("org.example.X", "org.example.Y");
+    let (src, commits) = media_source(
+        base,
+        &[
+            "a",
+            "@org.example.X:a",
+            "@org.example.X:b",
+            "@org.example.Y:b",
+        ],
+    );
+    let [own_a, xa, xb, yb] = commits.as_slice() else {
+        unreachable!()
+    };
+    let mount = base.join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let mount_arg = format!("--mount={}", mount.display());
+    ostrya_at(
+        &src,
+        &[
+            "media",
+            "export",
+            mount.to_str().unwrap(),
+            "a",
+            "@org.example.X:a",
+            "@org.example.X:b",
+            "@org.example.Y:b",
+        ],
+    )
+    .ok();
+
+    let remotes = [OWN_ID, x, y];
+    // Imports `args` into a new client, and checks the standard output and the
+    // ref files against `refs`: each written ref, its ref file, and its commit.
+    let imports = |name: &str, args: &[&str], refs: &[(&str, &str, &String)]| {
+        let client = media_client(&base.join(name), Some(OWN_ID), &remotes);
+        let mut argv = vec!["media", "import", &mount_arg];
+        argv.extend_from_slice(args);
+        let run = ostrya_at(&client, &argv);
+        let stdout: String = refs.iter().map(|(r, _, c)| format!("{r} {c}\n")).collect();
+        assert_eq!(
+            String::from_utf8(run.ok().stdout.clone()).unwrap(),
+            stdout,
+            "{args:?}"
+        );
+        let mut want: Vec<String> = refs.iter().map(|(_, p, c)| format!("{p} = {c}")).collect();
+        want.sort();
+        let got: Vec<String> = describe_refs(&client)
+            .into_iter()
+            .filter(|line| !line.ends_with('/'))
+            .map(|line| format!("refs/{line}"))
+            .collect();
+        assert_eq!(got, want, "{args:?}");
+    };
+    let xa_ref = ("@org.example.X:a", "refs/mirrors/org.example.X/a", xa);
+    imports(
+        "client-two",
+        &["@org.example.X:a", "@org.example.Y:b"],
+        &[
+            xa_ref,
+            ("@org.example.Y:b", "refs/mirrors/org.example.Y/b", yb),
+        ],
+    );
+    imports(
+        "client-prefix",
+        &["@org.example.X:"],
+        &[
+            xa_ref,
+            ("@org.example.X:b", "refs/mirrors/org.example.X/b", xb),
+        ],
+    );
+    imports("client-c", &["-c", "org.example.X", "a"], &[xa_ref]);
+    imports(
+        "client-own",
+        &["a"],
+        &[("@org.example.Own:a", "refs/heads/a", own_a)],
+    );
+
+    let own_a_arg = format!("@{OWN_ID}:a");
+    let refused: [(Option<&str>, &[&str]); 3] = [
+        (None, &["a"]),
+        (Some(OWN_ID), &["a", &own_a_arg]),
+        (Some(OWN_ID), &["@org.example.Z:a"]),
+    ];
+    for (index, (id, args)) in refused.into_iter().enumerate() {
+        let client = media_client(&base.join(format!("refused-{index}")), id, &remotes);
+        let mut argv = vec!["media", "import", &mount_arg];
+        argv.extend_from_slice(args);
+        let run = ostrya_at(&client, &argv);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            stderr.lines().filter(|l| l.starts_with("error:")).count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert!(
+            describe_refs(&client)
+                .iter()
+                .all(|line| line.ends_with('/')),
+            "{args:?}"
+        );
+    }
+}
+
+/// Two media volumes give exit 1 with the path of each media repository,
+/// and write no ref. `--mount` selects one volume. The test mounts two tmpfs
+/// volumes in a new mount namespace, in a user namespace when it does not
+/// run as root.
+#[test]
+fn media_import_needs_one_volume_and_mount_selects_one() {
+    let tmp = TmpDir::new("media-import-volumes");
+    let unshare = |args: &[&str]| {
+        Command::new("unshare")
+            .args(args)
+            .arg("true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+    };
+    if unshare(&[]).is_err() {
+        eprintln!("skipping: unshare is not available");
+        return;
+    }
+    let root = is_root();
+    if !root && !unshare(&["--map-root-user"]).is_ok_and(|s| s.success()) {
+        eprintln!("skipping: the host grants no user namespace");
+        return;
+    }
+    let namespace: &[&str] = if root {
+        &["-m", "--propagation", "private"]
+    } else {
+        &["--map-root-user", "-m", "--propagation", "private"]
+    };
+    if !unshare(namespace).is_ok_and(|s| s.success()) {
+        eprintln!("skipping: the host grants no mount namespace");
+        return;
+    }
+    let out = Command::new("unshare")
+        .args(namespace)
+        .arg(std::env::current_exe().unwrap())
+        .args([
+            "media_import_volumes_subprocess",
+            "--exact",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(MEDIA_IMPORT_CHILD, tmp.path())
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if let Some(line) = stdout.lines().find(|l| l.starts_with("mount refused")) {
+        eprintln!("skipping: {line}");
+        return;
+    }
     assert!(
-        run.status.success(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
+        out.status.success() && stdout.contains("1 passed"),
+        "the child reported {}:\n{stdout}{}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
+/// The half of [`media_import_needs_one_volume_and_mount_selects_one`] that
+/// mounts two tmpfs volumes, exports onto each, and imports. It runs only if
+/// this test binary runs again with the environment set.
+#[test]
+#[ignore = "helper process for media_import_needs_one_volume_and_mount_selects_one"]
+fn media_import_volumes_subprocess() {
+    let Some(base) = std::env::var_os(MEDIA_IMPORT_CHILD).map(PathBuf::from) else {
+        return;
+    };
+    let base = base.canonicalize().unwrap();
+    build_fixture_source(&base);
+    let (src, commits) = media_source(&base, &["@org.example.X:a"]);
+    let volumes = ["a", "b"].map(|name| base.join(name));
+    for volume in &volumes {
+        std::fs::create_dir(volume).unwrap();
+        let out = Command::new("mount")
+            .args(["-t", "tmpfs", "tmpfs"])
+            .arg(volume)
+            .output();
+        match out {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                println!("mount refused: {}", stderr.trim());
+                return;
+            }
+            Err(e) => {
+                println!("mount refused: mount: {e}");
+                return;
+            }
+        }
+        ostrya_at(
+            &src,
+            &[
+                "media",
+                "export",
+                volume.to_str().unwrap(),
+                "@org.example.X:a",
+            ],
+        )
+        .ok();
+    }
+    let client = media_client(&base.join("client"), None, &["org.example.X"]);
+
+    let run = ostrya_at(&client, &["media", "import"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert!(run.stdout.is_empty());
+    for volume in &volumes {
+        let media = volume.join(".ostree/repo");
+        assert!(stderr.contains(media.to_str().unwrap()), "{stderr}");
+    }
+    assert!(
+        describe_refs(&client)
+            .iter()
+            .all(|line| line.ends_with('/'))
+    );
+
+    let run = ostrya_at(
+        &client,
+        &[
+            "media",
+            "import",
+            &format!("--mount={}", volumes[1].display()),
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        format!("@org.example.X:a {}\n", commits[0])
+    );
+    assert_eq!(
+        ref_file(&client, "refs/mirrors/org.example.X/a").as_ref(),
+        Some(&commits[0])
     );
 }

@@ -17,9 +17,9 @@
 //! - Read: `checkout`, `export`, `rev-parse`, `cat`, `show`, `log`, `ls`,
 //!   `diff`.
 //! - Pull: `pull`, `pull-local`.
-//! - ostrya extensions: `composefs-image`, `media export`, `push`,
-//!   `push-tree`, `receive`, `send`, `serve`, `remote init`, `remote fsck`,
-//!   `remote prune`.
+//! - ostrya extensions: `composefs-image`, `media export`, `media import`,
+//!   `push`, `push-tree`, `receive`, `send`, `serve`, `remote init`,
+//!   `remote fsck`, `remote prune`.
 //!
 //! # Features
 //!
@@ -499,12 +499,13 @@ enum Command {
     /// standard error and exits 1. This command is an extension of ostrya.
     #[command(name = "composefs-image")]
     ComposefsImage(ComposefsImageArgs),
-    /// Copy collection refs onto removable media.
+    /// Copy collection refs onto removable media, or pull them from it.
     ///
     /// The media carry the commits of collection refs to a host with no
     /// network. The media repository is `MOUNT/.ostree/repo` on a mounted
     /// volume, in the layout that `ostree create-usb` writes, so
-    /// `ostree find-remotes --pull` reads it. A nested subcommand is
+    /// `ostree find-remotes --pull` reads it. `media import` also reads the
+    /// media that `ostree create-usb` writes. A nested subcommand is
     /// necessary. This command is an extension of ostrya.
     Media(MediaArgs),
     /// Receive one push session, or one one-way stream with --one-way.
@@ -5247,6 +5248,51 @@ enum MediaCommand {
     /// writes one `error:` line to standard error and nothing to standard
     /// output, and exits 1.
     Export(MediaExportArgs),
+    /// Pull collection refs from the media repository on a mounted volume.
+    ///
+    /// Without --mount, the command reads the mount table of the process and
+    /// probes each mount. On each mount, it probes each entry of
+    /// `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
+    /// `var/lib/flatpak/repo`. The media repository of a mount is the first
+    /// of these repositories whose summary lists a collection ref. The
+    /// command skips a repository on another file system than the mount, a
+    /// repository that it cannot read, and this repository. The command
+    /// needs exactly one media repository.
+    ///
+    /// A ref @ID:NAME is on the media when the ref files of the media
+    /// repository and its summary both list it. The commit of the ref is the
+    /// commit that the summary lists. The command reads no `summary.sig`.
+    /// With no REF and no -c, the command imports each ref on the media whose
+    /// collection has a matched remote, and ignores each other collection.
+    ///
+    /// The matched remote of the collection ID is the first remote, in the
+    /// byte order of the names, whose `collection-id` is ID. If no remote has
+    /// that `collection-id`, it is the first remote whose
+    /// `mirrored-collection-ids` holds ID. The trust of the matched remote
+    /// checks the commits of ID: `gpg-verify`, `sign-verify`, and their keys.
+    /// If that trust checks no commit signature, the command checks the GPG
+    /// signature of each commit with the keyring of the remote.
+    ///
+    /// The command pulls each ref at depth 0, with its own transaction, and
+    /// reads no static delta. It writes the ref @ID:NAME to
+    /// `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when ID is the
+    /// `collection-id` of this repository. It does not pull a ref that holds
+    /// the commit of the media. It refuses a commit that is older than the
+    /// commit of the ref in this repository.
+    ///
+    /// Before the first pull, the command checks each REF, finds the media
+    /// repository, and finds each REF and the matched remote of each
+    /// collection. If one of these checks fails, the command changes no ref,
+    /// writes one `error:` line to standard error, and exits 1. When it finds
+    /// no media repository, one line `PATH: REASON` follows for each
+    /// repository that it skipped.
+    ///
+    /// Standard output has one line `@ID:NAME CHECKSUM` for each written ref,
+    /// in the order of the import. A ref that holds the commit of the media
+    /// prints no line. A refused ref does not stop the import. After the last
+    /// pull, the command writes one line `error: @ID:NAME: TEXT` to standard
+    /// error for each refused ref, then exits 1.
+    Import(MediaImportArgs),
 }
 
 #[derive(Args)]
@@ -5277,6 +5323,34 @@ struct MediaExportArgs {
     /// The command refuses REMOTE:NAME, and NAME with @OWN:NAME in one run.
     /// Without --commit, a REF that occurs two times is exported one time.
     #[arg(value_name = "REF", required = true)]
+    refs: Vec<String>,
+}
+
+#[derive(Args)]
+struct MediaImportArgs {
+    /// Probe the directory PATH in place of the mount table.
+    ///
+    /// PATH need not be a mount point. The command probes the same paths
+    /// under PATH, and compares the file system of each repository with the
+    /// file system of PATH.
+    #[arg(long, value_name = "PATH")]
+    mount: Option<PathBuf>,
+    /// Put each plain REF in the collection ID.
+    ///
+    /// A plain NAME becomes @ID:NAME, and @ID:NAME and @ID: stay. The command
+    /// refuses @C:NAME and @C: with C other than ID. With no REF, the command
+    /// imports each ref of ID on the media.
+    #[arg(short = 'c', long, value_name = "ID")]
+    collection: Option<String>,
+    /// The refs to import.
+    ///
+    /// NAME is the ref @OWN:NAME, where OWN is the `collection-id` of this
+    /// repository, and a repository with no `collection-id` refuses it.
+    /// @ID:NAME is the ref NAME of the collection ID. @ID: is each ref of the
+    /// collection ID on the media. The command refuses REMOTE:NAME, and NAME
+    /// with @OWN:NAME in one run. A REF that occurs two times is imported one
+    /// time.
+    #[arg(value_name = "REF")]
     refs: Vec<String>,
 }
 
@@ -5729,6 +5803,7 @@ async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> 
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             match args.command {
                 MediaCommand::Export(args) => media_export(repo, args).await,
+                MediaCommand::Import(args) => media_import(repo, args).await,
             }
         }
         #[cfg(feature = "receive")]
@@ -7644,8 +7719,8 @@ async fn media_export(repo: Repo, args: MediaExportArgs) -> Result<()> {
     Ok(())
 }
 
-/// Reads each REF operand of `media export` as a ref, and puts each local
-/// ref in the collection `collection`.
+/// Reads each REF operand of `media export` or `media import` as a ref, and
+/// puts each local ref in the collection `collection`.
 ///
 /// # Errors
 ///
@@ -7665,6 +7740,95 @@ fn media_refs(texts: &[String], collection: Option<&str>) -> Result<Vec<Ref>> {
             })
         })
         .collect()
+}
+
+/// Pulls the refs of `args` from the media repository, and prints each
+/// written ref and the error of each refused ref.
+async fn media_import(repo: Repo, args: MediaImportArgs) -> Result<()> {
+    let (refs, collections) = media_import_operands(&args.refs, args.collection.as_deref())?;
+    let options = ostrya::MediaImportOptions {
+        mount: args.mount,
+        refs,
+        collections,
+    };
+    let report = match repo.import_media(options).await {
+        Ok(report) => report,
+        Err(err) => {
+            let Error::MediaNotFound { skipped } = &err else {
+                return Err(err);
+            };
+            eprintln!("error: {}", error_line(&err));
+            for (path, skip) in skipped {
+                eprintln!("{}: {}", path.display(), media_skip_text(skip));
+            }
+            exit_process(1);
+        }
+    };
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let written = report
+        .written
+        .iter()
+        .try_for_each(|(r, commit)| writeln!(out, "{r} {commit}"))
+        .and_then(|()| out.flush());
+    for (r, err) in &report.refused {
+        eprintln!("error: {r}: {}", error_line(err));
+    }
+    written.map_err(Error::Io)?;
+    if !report.refused.is_empty() {
+        exit_process(1);
+    }
+    Ok(())
+}
+
+/// Returns the reason why the media finder skipped a repository, as
+/// `media import` prints it.
+fn media_skip_text(skip: &ostrya::MediaSkip) -> String {
+    match skip {
+        ostrya::MediaSkip::OtherFileSystem => "on another file system than the mount".to_owned(),
+        ostrya::MediaSkip::Client => "this repository".to_owned(),
+        ostrya::MediaSkip::Unreadable(err) => format!("cannot read: {}", error_line(err)),
+        ostrya::MediaSkip::NoCollectionRef => "the summary lists no collection ref".to_owned(),
+        _ => "skipped".to_owned(),
+    }
+}
+
+/// Reads the REF operands of `media import` as refs and collections.
+///
+/// An operand `@ID:` names the collection `ID`. Each other operand is a ref,
+/// which [`media_refs`] reads with `collection`. With no operand,
+/// `collection` names the one collection.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if an operand is not a ref.
+/// - [`Error::InvalidInput`] if an operand names a collection other than
+///   `collection`.
+fn media_import_operands(
+    texts: &[String],
+    collection: Option<&str>,
+) -> Result<(Vec<Ref>, Vec<String>)> {
+    let mut collections = Vec::new();
+    let mut rest = Vec::new();
+    for text in texts {
+        match collection_prefix(text) {
+            Some((id, "")) => {
+                if let Some(c) = collection
+                    && c != id
+                {
+                    return Err(Error::InvalidInput(format!(
+                        "the ref {text} names a collection other than {c}"
+                    )));
+                }
+                collections.push(id.to_owned());
+            }
+            _ => rest.push(text.clone()),
+        }
+    }
+    if texts.is_empty() {
+        collections.extend(collection.map(str::to_owned));
+    }
+    Ok((media_refs(&rest, collection)?, collections))
 }
 
 /// Imports refs and their objects from another local repository.
@@ -16941,6 +17105,46 @@ mod tests {
         assert!(matches!(
             media_refs(&texts(&["a b"]), None),
             Err(Error::InvalidRefspec(_))
+        ));
+    }
+
+    /// A media import operand `@ID:` names the collection ID, and -c ID with
+    /// no operand names ID. -c ID refuses `@C:` and `@C:NAME` with C other
+    /// than ID. The command parses with no REF.
+    #[test]
+    fn a_media_import_prefix_selects_a_collection() {
+        let texts = |refs: &[&str]| refs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        let (x, y) = ("org.example.X", "org.example.Y");
+        assert_eq!(
+            media_import_operands(&texts(&["@org.example.X:", "a", "@org.example.Y:b"]), None)
+                .unwrap(),
+            (
+                vec![Ref::local("a"), Ref::collection(y, "b")],
+                vec![x.to_owned()]
+            )
+        );
+        assert_eq!(
+            media_import_operands(&texts(&["a", "@org.example.X:"]), Some(x)).unwrap(),
+            (vec![Ref::collection(x, "a")], vec![x.to_owned()])
+        );
+        assert_eq!(
+            media_import_operands(&[], Some(x)).unwrap(),
+            (vec![], vec![x.to_owned()])
+        );
+        for refused in ["@org.example.Y:", "@org.example.Y:b"] {
+            let err = media_import_operands(&texts(&[refused]), Some(x)).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInput(text)
+                    if *text == format!("the ref {refused} names a collection other than {x}")),
+                "{err:?}"
+            );
+        }
+        let cli = parse_cli(["ostrya", "media", "import"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Media(MediaArgs {
+                command: MediaCommand::Import(MediaImportArgs { ref refs, .. }),
+            })) if refs.is_empty()
         ));
     }
 

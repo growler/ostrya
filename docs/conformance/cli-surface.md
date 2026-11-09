@@ -4626,12 +4626,15 @@ No matrix cell needs these. The shell suite invokes them.
   note at the end of this section.
 - `checksum` -- `--ignore-xattrs`.
 - `find-remotes` -- `--cache-dir`, `--disable-fsync`, `--finders=FINDERS`,
-  `--pull`, `--mirror`. The port's counterpart of `find-remotes --pull` is
-  `pull --collection=ID [REF]...` ("P2", `pull`). It differs from the tool in
-  these points:
+  `--pull`, `--mirror`. The port does not carry the command. The port has
+  two counterparts of `find-remotes --pull`: `pull --collection=ID [REF]...`
+  ("P2", `pull`) does the work of the config finder, and `media import` does
+  the work of the mount finder ("Port extensions", `media import`;
+  `cli-behavior.md`, "`find-remotes`"). The port has no `--finders`, no LAN
+  (Avahi) finder, and no command that finds the remotes and pulls nothing.
+  `pull --collection` differs from the tool in these points:
   - The port reads the candidates from the config alone: the keys
-    `collection-id` and `mirrored-collection-ids` of each remote. It has no
-    `--finders`, no mount finder, and no LAN (Avahi) finder.
+    `collection-id` and `mirrored-collection-ids` of each remote.
   - The operands are refs of one collection. The tool takes
     `COLLECTION-ID REF` pairs. The port pulls the refs of more than one
     collection from one named remote with `pull REMOTE @ID:REF...`.
@@ -4645,8 +4648,7 @@ No matrix cell needs these. The shell suite invokes them.
     It prints one warning line for each skipped ref:
     `warning: remote REMOTE skipped the ref NAME: the name fails the ref-name
     rule`. The `-c` listing of the tool skips such a ref with no warning.
-  - The port has no `--mirror` for a collection pull, and no command that
-    finds the remotes and pulls nothing.
+  - The port has no `--mirror` for a collection pull.
   - In a repository whose `[core] collection-id` is ID, the port writes
     `refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. The tool
     writes `refs/heads/REF` under `find-remotes --pull --mirror`, and
@@ -4654,6 +4656,54 @@ No matrix cell needs these. The shell suite invokes them.
     (`cli-behavior.md`, "The pulled ref under the own collection id"). The
     port takes the own id as its local namespace, so each reader of the port
     gives the pulled commit. Neither the port nor the tool removes a ref.
+
+  `media import` differs from the tool in these points:
+  - The operands are `NAME`, `@ID:NAME`, and the prefix `@ID:`, and `-c ID`
+    puts each plain `NAME` in the collection `ID`. With no operand, the port
+    imports each ref on the media whose collection has a matched remote. The
+    tool takes `COLLECTION-ID REF` pairs.
+  - The port reads the mount table of the process. It takes each mount
+    except the root mount, the pseudo file systems, and the network file
+    systems. So the port also finds media on a tmpfs, on a bind mount, and
+    outside `/run/media/`. The tool lists the mounts through GIO, and finds
+    a ramfs under `/run/media/`. `--mount=PATH` of the port probes the
+    directory PATH alone. The tool has no such option.
+  - The port reads exactly one media repository. More than one gives exit 1
+    with the path of each, and `--mount` selects one. On one mount, the
+    media repository is the first candidate whose summary lists a collection
+    ref. The tool reads each mount. For each ref, it takes the first
+    candidate of a mount that holds the ref, and the result with the newest
+    commit.
+  - The port also reads media whose `[core] collection-id` is the id of a
+    ref, where field 0 of the summary lists the ref. The tool was not
+    observed on such media.
+  - When no remote has the `collection-id` ID, the matched remote of the
+    port is the first remote whose `mirrored-collection-ids` holds ID. The
+    tool needs a remote with the `collection-id` ID.
+  - The port checks each commit with the trust of the matched remote:
+    `gpg-verify`, `sign-verify`, and their keys. When that trust checks no
+    commit signature, the port checks the GPG signature with the keyring of
+    the remote, as the tool does. The tool ignores `sign-verify` and
+    `gpgkeypath`, and the port reads both.
+  - The port refuses a commit that is older than the commit of the ref that
+    it writes, and imports the other refs. The tool moves the ref to the
+    older commit at exit 0.
+  - The port writes `refs/mirrors/ID/REF`, or `refs/heads/REF` when ID is
+    the `[core] collection-id` of the client, as `pull --collection` writes
+    the ref. The tool writes `refs/remotes/REMOTE/REF` under `--pull`, and
+    `refs/mirrors/ID/REF` under `--pull --mirror`.
+  - Before the first pull, the port refuses an operand that matches no ref
+    on the media, and an operand whose collection has no matched remote, at
+    exit 1. The tool prints `(not found)` for a ref that it does not find,
+    and pulls the other refs at exit 0.
+  - The port pulls each ref with its own transaction. A refused ref does
+    not stop the import. After the last pull, the port writes one line
+    `error: @ID:NAME: TEXT` to standard error for each refused ref, then
+    exits 1. Standard output carries one
+    `@ID:NAME CHECKSUM` line for each written ref. The tool prints the
+    report of the finders and `Pulled N/N refs successfully.`, and
+    `error: Failed to pull some refs from the remotes: (ID, REF)` at exit 1.
+  - The port has no `--cache-dir` and no `--disable-fsync`.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
   `--commit=COMMIT`. The port does not carry the command. `ostrya media
   export` does its work, and writes the media layout of the tool ("Port
@@ -5336,8 +5386,9 @@ The tool has no push, no pull over ssh, no server, no composefs image
 store, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
 `send`, `composefs-image`, `remote init`, `remote fsck`, and `remote prune`
 are commands of the port alone, so no matrix cell compares them with the
-tool. `media export` does the work of `create-usb` with operands and output
-of its own ("P3", `create-usb`). `pull`, `remote
+tool. `media export` does the work of `create-usb`, and `media import` does
+the work of `find-remotes --pull` with the mount finder, each with operands
+and output of its own ("P3", `create-usb` and `find-remotes`). `pull`, `remote
 refs`, and `remote summary` also read a remote over ssh, for an ssh address
 in the `pull-url` key or in `--url` of `pull` (`pull`), and a bucket
 repository in an S3 bucket, for an `s3://` address in the same places
@@ -6747,6 +6798,69 @@ ostrya media export [--repo=PATH] [--commit=CHECKSUM] MOUNT [-c|--collection ID]
   objects on the media. Examples are a tip commit whose tree is not complete
   in the source, and a full volume.
 - `crates/ostrya/tests/media_export.rs` and
+  `crates/ostrya-cli/tests/cli.rs` hold the tests.
+
+### `media import`
+
+```text
+ostrya media import [--repo=PATH] [--mount=PATH] [-c|--collection ID] [REF...]
+```
+
+- The command takes no feature. It pulls collection refs from a media
+  repository in the layout of `ostree create-usb` (`../format-reference.md`,
+  "Removable media"). It reads the media of `media export` and the media of
+  `ostree create-usb`. "P3", `find-remotes`, records the differences from
+  the tool.
+- Without `--mount`, the command reads the mount table of the process.
+  `--mount=PATH` probes the directory PATH alone, and PATH need not be a
+  mount point. On each mount, the command probes each entry of
+  `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
+  `var/lib/flatpak/repo`. The media repository of a mount is the first
+  candidate whose summary lists a collection ref. The command skips a
+  candidate on another file system than the mount, a candidate that it
+  cannot read, and the client repository. It needs exactly one media
+  repository.
+- The operand forms:
+  - `NAME` is the ref `@OWN:NAME` on the media, where `OWN` is the
+    `[core] collection-id` of the repository. A repository with no
+    collection id refuses it.
+  - `@ID:NAME` is the ref `NAME` of the collection `ID` on the media.
+  - `@ID:` is a `PREFIX`, as the `PREFIX` `@ID:` of `refs` ("P1", `refs`).
+    It names each ref of `ID` on the media.
+  - `-c ID` makes each plain `NAME` the operand `@ID:NAME`. The command
+    refuses an operand `@C:NAME` or `@C:` with `C` other than `ID`, and
+    accepts `@ID:NAME` and `@ID:`. With no REF, `-c ID` names each ref of
+    `ID` on the media.
+  - With no REF and no `-c`, the command imports each ref on the media
+    whose collection has a matched remote.
+  - The command refuses `REMOTE:NAME`, and `NAME` with `@OWN:NAME` in one
+    run. An operand that occurs two times is imported one time. One run
+    takes the refs of more than one collection.
+- The matched remote of the collection `ID` is the first remote, in the
+  byte order of the names, whose `collection-id` is `ID`. If no remote has
+  that `collection-id`, it is the first remote whose
+  `mirrored-collection-ids` holds `ID`. The trust of the matched remote
+  checks each commit of `ID`. If that trust checks no commit signature, the
+  command checks the GPG signature of each commit with the keyring of the
+  remote. A build without the feature `gpg` refuses each such ref that does
+  not hold the commit of the media.
+- The command pulls each ref at depth 0, with its own transaction, and reads
+  no static delta. It writes `refs/mirrors/ID/NAME`, or `refs/heads/NAME`
+  when `ID` is the `[core] collection-id` of the repository. It refuses a
+  commit that is older than the commit of the ref.
+- Before the first pull, the command checks each REF, finds the media
+  repository, finds each REF on the media, and finds the matched remote of
+  each collection. A failure writes one `error:` line to standard error and
+  changes no ref, and the command exits 1. When the command finds no media
+  repository, one line `PATH: REASON` follows the `error:` line for each
+  candidate that it skipped.
+- Standard output carries one line `@ID:NAME CHECKSUM` for each written ref,
+  in the order of the import. A ref that holds the commit of the media is
+  not written and prints no line. A refused ref does not stop the import.
+  After the last pull, the command writes one line `error: @ID:NAME: TEXT`
+  to standard error for each refused ref, then exits 1 with no other line.
+  A run that writes no ref and refuses no ref exits 0 with no output.
+- `crates/ostrya/tests/media_import.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### ssh access with `authorized_keys`

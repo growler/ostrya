@@ -15,7 +15,8 @@ The document records:
 - the `--fsync` vocabulary and the sync calls that it controls
 - the output format, the error text, and the exit status of the commands
   that "CLI output formats" lists
-- the media repository that `create-usb` writes onto a mounted volume
+- the media repository that `create-usb` writes onto a mounted volume, and
+  the pull of `find-remotes` from it
 
 The tool is `ostree` 2026.1. A statement about the tool with no label is
 observed behavior: a run of the tool records the fact. The facts about the
@@ -7123,3 +7124,127 @@ The errors exit 1. Unless a line states otherwise, the run writes nothing:
 On success, standard output carries `Copied N/N refs successfully from
 ‘SRC’ to ‘DEST’ repository in ‘MOUNT-PATH’.`. A duplicate pair counts two
 times.
+
+### `find-remotes`
+
+`find-remotes` finds the repositories that hold collection refs, and with
+`--pull` it pulls the refs from them. The port does not carry the command.
+`ostrya pull --collection` does the work of the config finder, and `ostrya
+media import` does the work of the mount finder.
+
+Usage: `ostree find-remotes COLLECTION-ID REF [COLLECTION-ID REF...]`. The
+options are `--cache-dir=DIR`, `--disable-fsync`, `--finders=FINDERS`,
+`--pull`, and `--mirror`.
+
+The finders:
+
+- The default is `config,mount`. With `-v`, the tool writes
+  `[OstreeRepoFinderConfig, OstreeRepoFinderMount]`. `[core]
+  default-repo-finders` sets the default, and `--finders` wins over it. The
+  finders run in a fixed order: config, then mount.
+- `--finders=lan` gives `error: LAN repo finder requested but ostree was
+  compiled without Avahi support`. An unknown or a duplicate name gives
+  `error: Unknown or duplicate finder type given in --finders option:
+  ‘<x>’`. An empty list gives `error: List of finders in --finders option
+  must not be empty`. Each of these exits 1 with the usage text.
+- `default-repo-finders=lan` alone leaves no finder. The tool then writes a
+  GLib critical message and does not stop.
+
+The mount finder:
+
+- The tool lists the mounts through GIO. It finds a `ramfs` under
+  `/run/media/`. It does not find a `tmpfs`, a bind mount of a
+  subdirectory, a mount at `/run/other/`, the root file system, `/boot`, or
+  a plain directory. In a user namespace, the tool finds a ramfs at
+  `/run/media/root/usb` under a tmpfs at `/run`:
+
+  ```sh
+  unshare --map-auto --map-root-user -m --propagation private bash -c '
+    mount -t tmpfs tmpfs /run
+    mkdir -p /run/media/root/usb
+    mount -t ramfs ramfs /run/media/root/usb
+    ostree --repo=SRC create-usb /run/media/root/usb org.example.Os os/stable
+    ostree --repo=CLIENT find-remotes org.example.Os os/stable'
+  ```
+
+- On each mount, the tool probes each entry of `.ostree/repos.d/` in name
+  order, then `.ostree/repo`, `ostree/repo`, and `var/lib/flatpak/repo`.
+- The tool skips a repository on another file system than the mount root,
+  with the text `as it’s on a different file system from the mount`. The
+  check compares the file systems. It does not compare the paths.
+- The tool checks no owner and no mode. It skips a repository that it
+  cannot read.
+- The tool uses a repository for a ref only when its refs list the
+  collection ref (`refs/mirrors/ID/REF`), and its `summary` lists the ref
+  in the collection map. The commit and its timestamp come from the
+  summary. A missing summary, an empty summary, and a summary that does not
+  parse give no result.
+- On one mount, the tool uses the first repository in probe order that
+  holds the ref, also when a later repository holds a newer commit.
+
+The results:
+
+- A result needs a configured remote with the same `collection-id`, for
+  its keyring. With no such remote, the tool logs `No keyring found
+  configured locally`. Of two or more such remotes, the first by name wins.
+- Only the result with the newest commit of a ref lists the ref. When two
+  media hold the same commit, both results list the ref, and the result
+  with the older summary `last-modified` comes first.
+- The tool writes the report to standard output, and exits 0:
+
+  ```text
+  Result 0: file:///run/media/root/usb/.ostree/repo
+   - Finder: OstreeRepoFinderMount
+   - Keyring: origin.trustedkeys.gpg
+   - Priority: 50
+   - Summary last modified: 2026-11-02T08:02:19Z
+   - Refs:
+      - (org.example.Os, os/stable) = <checksum>
+
+  1/1 refs were found.
+  ```
+
+  A ref that a result does not carry prints `= (not found)`. When no result
+  carries a ref, the line `Refs not found in any remote:` and one line
+  ` - (ID, REF)` for each such ref follow. With no result, the tool prints
+  `No results.` and exits 0. The config finder prints
+  `OstreeRepoFinderConfig`, the priority 100, and the URL of the remote.
+- A duplicate pair gives `(not found)` and `0/2`.
+
+`--pull` and `--mirror`:
+
+- `--mirror` without `--pull` gives `error: When --mirror is specified,
+  --pull must also be` at exit 1.
+- `--pull` verifies the GPG signature of each commit, also under
+  `gpg-verify=false`. An unsigned commit fails. The keyring is
+  `<remote>.trustedkeys.gpg` of the matched remote, then the global trusted
+  directory. The tool ignores `gpgkeypath`. It ignores `sign-verify`, so a
+  wrong ed25519 key does not stop the pull. It ignores `summary.sig` and
+  `gpg-verify-summary`.
+- `--pull` writes `refs/remotes/<remote>/REF`, and `--pull --mirror` writes
+  `refs/mirrors/ID/REF`. Neither copies the summary. The pull is depth 0.
+- The pull moves a ref to an older commit at exit 0. It does not touch a
+  local `refs/heads/` ref.
+- The pull reads no static delta from the media, also when the media
+  summary lists one.
+- A stale media summary whose commit is absent fails the pull with `No such
+  metadata object`.
+- When the tool finds one ref and does not find another, it prints `Pulled
+  2/2 refs successfully.` and exits 0. A failed pull gives `error: Failed to
+  pull some refs from the remotes: (ID, REF)` at exit 1.
+- With `--disable-fsync`, the tool makes no `fsync`, `fdatasync`, or
+  `syncfs` call.
+- `--cache-dir` takes a value. The directory must exist. The mount finder
+  writes nothing into it.
+
+Not observed:
+
+- The LAN finder. The build has no Avahi.
+- A real block device. Loop devices need root on the host.
+- `--cache-dir` with the config finder over HTTP.
+- `find-remotes` on media whose `[core] collection-id` is the id of the
+  ref, so that the ref is in `refs/heads/` and in field 0 of the summary.
+  The port reads such media with `ostrya media import`.
+
+`cli-surface.md`, "P3", `find-remotes`, records the differences of the
+port.

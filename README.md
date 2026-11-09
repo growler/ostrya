@@ -107,7 +107,10 @@ Ostrya adds these functions, which the `ostree` command does not have:
 - Removable media. `ostrya media export` copies the commits of collection
   refs onto a mounted volume, for a host with no network. The media
   repository has the layout that `ostree create-usb` writes, and
-  `ostree find-remotes --pull` reads it.
+  `ostree find-remotes --pull` reads it. `ostrya media import` finds the
+  media repository on the mounted volumes, and pulls the refs from it under
+  the trust of the remote of each collection. It also reads the media of
+  `ostree create-usb`.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -135,7 +138,8 @@ These `ostree` commands have no counterpart in `ostrya`:
 - `create-usb`: `ostrya media export` does the same work, with its own
   operands and output, and writes the media layout of `create-usb`;
 - `find-remotes`: `ostrya pull --collection=ID` does the work of
-  `find-remotes --pull`, with the configured remotes as the only candidates.
+  `find-remotes --pull` with the configured remotes, and
+  `ostrya media import` does it with the media on the mounted volumes.
   `ostrya` has no command that finds remotes and pulls nothing;
 - `gpg-sign`: `ostrya sign --sign-type=gpg` does the same signing work, with
   different option names. `gpg-sign --delete` has no counterpart: no `ostrya`
@@ -163,9 +167,9 @@ The `ostrya` command has these subcommands:
 - `sign` and `summary`: sign and verify commits, and generate the summary.
 - `static-delta`: list, generate, apply, and index static deltas.
 - `prune` and `fsck`: delete unreachable objects and verify the repository.
-- `composefs-image`, `media export`, `push`, `push-tree`, `receive`,
-  `send`, `serve`, `remote init`, `remote fsck`, `remote prune`, and
-  `remote summary -u`: the port extensions.
+- `composefs-image`, `media export`, `media import`, `push`, `push-tree`,
+  `receive`, `send`, `serve`, `remote init`, `remote fsck`, `remote prune`,
+  and `remote summary -u`: the port extensions.
 
 Each subcommand has a man page, for example `ostrya-commit(1)`. The page
 `ostrya-repo(5)` describes the layout of a repository, and the page

@@ -15,16 +15,6 @@ The `ostrya` command does not carry these commands of the `ostree` command.
 
 - `reset`.
 - `checksum`, with `--ignore-xattrs`.
-- `find-remotes`. `ostrya pull --collection` over `Repo::pull_collection`
-  does the work of `find-remotes --pull`, with the config finder alone.
-  `Repo::remote_list_collection_refs` lists the refs of a collection on one
-  named remote, and pulls nothing. The library has no entry point that
-  finds the remotes of a collection.
-- The dependencies of field 2 in the import from removable media.
-  `Repo::export_media` puts each dependency of a commit onto the media as
-  loose objects, and `Repo::import_media` pulls them from the media
-  (`format-reference.md`, "Removable media"). The `ostrya` command has no
-  `media import` command, and does not carry the pull of `find-remotes`.
 - `gpg-sign`, the alias of `sign --sign-type=gpg` with its own option names.
   `ostree gpg-sign --delete` removes a GPG signature, and no command of the
   port removes a signature, so the alias needs a delete mode of its own.

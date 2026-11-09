@@ -4119,6 +4119,9 @@ async fn link_import(
 /// bounded chunks to feed the digest. It refuses an object that does not hash
 /// to its name, and a payload that does not inflate to the size that its
 /// header declares. `meta` is the logical metadata of the object.
+///
+/// If `src` is a handle in the strict open mode, the open of the `.filez`
+/// file is the strict open of [`Repo::open_at_strict`].
 async fn import_filez(
     txn: &Transaction,
     src: &Repo,
@@ -4129,14 +4132,20 @@ async fn import_filez(
     let path = name.loose_path(src.mode());
     let repo = src.clone();
     let (file, len) = ostrya_rt::unblock(move || -> Result<_> {
-        let fd = match rustix::fs::openat(
-            repo.objects_fd(),
-            path.as_str(),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        ) {
+        let opened = if repo.is_strict() {
+            crate::object::open_regular_file(repo.objects_fd(), &path, true)
+        } else {
+            rustix::fs::openat(
+                repo.objects_fd(),
+                path.as_str(),
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .map_err(Into::into)
+        };
+        let fd = match opened {
             Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(Error::ObjectNotFound {
                     checksum: name.checksum,
                     ty: ObjectType::File,
@@ -4512,5 +4521,123 @@ mod tests {
         assert!(flags.contains(PullFlags::COMMIT_ONLY));
         assert!(!flags.contains(PullFlags::FORCE_COPY));
         assert!(PullFlags::empty().contains(PullFlags::NONE));
+    }
+
+    /// Creates the `archive` repositories `src` and `dst` in a new directory,
+    /// stores a regular file object in `src`, and loads the object through a
+    /// handle of `src` in the strict open mode. Returns the directory, the
+    /// strict handle, the name of the object, its metadata, and `dst`.
+    fn strict_filez_fixture(tag: &str) -> (std::path::PathBuf, Repo, ObjectName, FileMeta, Repo) {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pull-{tag}-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        ostrya_rt::block_on(async {
+            let opts = || crate::CreateOptions::new(RepoMode::Archive);
+            let src = Repo::create(&dir.join("src"), opts()).await.unwrap();
+            let txn = src.transaction().await.unwrap();
+            let checksum = txn
+                .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o644), b"inside\n")
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            let parent = std::fs::File::open(&dir).unwrap();
+            let strict = Repo::open_at_strict(
+                std::os::fd::AsFd::as_fd(&parent),
+                std::path::Path::new("src"),
+            )
+            .await
+            .unwrap();
+            let meta = strict.load_file(&checksum).await.unwrap().meta();
+            let dst = Repo::create(&dir.join("dst"), opts()).await.unwrap();
+            let name = ObjectName {
+                checksum,
+                ty: ObjectType::File,
+            };
+            (dir, strict, name, meta, dst)
+        })
+    }
+
+    /// The `.filez` copy from a handle in the strict open mode opens the
+    /// fan-out directory `objects/<xx>` again, and follows no symlink there.
+    /// A symlink that replaces `objects/<xx>` after the load fails the copy
+    /// with `ELOOP`.
+    #[test]
+    fn a_strict_filez_copy_refuses_a_fanout_symlinked_after_the_load() {
+        let (dir, strict, name, meta, dst) = strict_filez_fixture("filez-fanout");
+        let hex = name.checksum.to_hex();
+        let fanout = dir.join("src/objects").join(&hex[..2]);
+        let moved = dir.join("moved");
+        std::fs::rename(&fanout, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &fanout).unwrap();
+
+        let result = ostrya_rt::block_on(async {
+            let txn = dst.transaction().await.unwrap();
+            import_filez(&txn, &strict, name, &meta, &mut Vec::new()).await
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Err(Error::Io(e)) => {
+                assert_eq!(
+                    e.raw_os_error(),
+                    Some(rustix::io::Errno::LOOP.raw_os_error()),
+                    "{e}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The `.filez` copy from a handle in the strict open mode refuses a
+    /// FIFO that replaces the `.filez` file after the load, and does not wait
+    /// for a writer.
+    #[test]
+    fn a_strict_filez_copy_refuses_a_fifo_swapped_in_after_the_load() {
+        let (dir, strict, name, meta, dst) = strict_filez_fixture("filez-fifo");
+        let filez = dir
+            .join("src/objects")
+            .join(name.loose_path(RepoMode::Archive));
+        std::fs::remove_file(&filez).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &filez,
+            rustix::fs::FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = ostrya_rt::block_on(async {
+                let txn = dst.transaction().await.unwrap();
+                import_filez(&txn, &strict, name, &meta, &mut Vec::new()).await
+            });
+            let _ = tx.send(result);
+        });
+        let result = match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(result) => result,
+            Err(_) => {
+                // A writer releases the blocked open, so the thread ends.
+                let _ = rustix::fs::open(
+                    &filez,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                let _ = rx.recv_timeout(Duration::from_secs(10));
+                let _ = std::fs::remove_dir_all(&dir);
+                panic!("the copy waits on the FIFO");
+            }
+        };
+        let _ = std::fs::remove_dir_all(&dir);
+        match result {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+                assert!(e.to_string().contains("not a regular file"), "{e}");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

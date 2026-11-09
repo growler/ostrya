@@ -654,6 +654,12 @@ impl Repo {
     ///   at `objects/<xx>` fails the load. Each open of the payload by the
     ///   [`FileObject`](crate::FileObject) of the load opens `objects/<xx>`
     ///   again in the same way.
+    /// - A local pull from the handle into an `archive` repository can copy
+    ///   the bytes of a `.filez` file when it does not make a hardlink. That
+    ///   copy opens the `.filez` file with `openat2`, `RESOLVE_BENEATH`,
+    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuses a file that is
+    ///   not a regular file. A symlink at `objects/<xx>`, a FIFO, or a device
+    ///   fails the copy and does not block it.
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.

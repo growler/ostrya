@@ -46829,7 +46829,10 @@ fn one_file_tree(base: &Path, name: &str) -> PathBuf {
 
 /// Returns `true` if the test process runs with the effective user id 0. The
 /// value is the second field of the `Uid:` line of `/proc/self/status`.
-#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[cfg(any(
+    all(feature = "send", feature = "push", feature = "receive"),
+    feature = "gpg"
+))]
 fn is_root() -> bool {
     let status = std::fs::read_to_string("/proc/self/status").unwrap();
     status
@@ -48086,5 +48089,478 @@ fn refs_alias_refuses_a_collection_ref() {
             .ok()
             .stdout_trimmed(),
         "al -> main"
+    );
+}
+
+// --- media export ------------------------------------------------------------
+
+/// Returns the lines that `media export` prints on standard output: the media
+/// repository under `mount`, then `@ID:NAME CHECKSUM` for each pair of `refs`.
+fn media_lines(mount: &Path, refs: &[(&str, &str)]) -> String {
+    let mut text = format!("{}\n", mount.join(".ostree/repo").display());
+    for (r, commit) in refs {
+        text.push_str(&format!("{r} {commit}\n"));
+    }
+    text
+}
+
+/// `media export` writes each ref to `refs/mirrors/ID/NAME` of the media
+/// repository, also a plain NAME, which goes under the collection id of the
+/// source. Standard output carries the absolute path of the media repository
+/// and one `@ID:NAME CHECKSUM` line for each ref, in the order of the
+/// operands. `-c X a` is `@X:a`, and an operand that names one ref two times
+/// gives one line.
+#[test]
+fn media_export_writes_the_refs_of_each_collection() {
+    let tmp = TmpDir::new("media-export");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let commit = |branch: &str| {
+        commit_no_parent(&repo, &["-b", branch], &src)
+            .ok()
+            .stdout_trimmed()
+    };
+    let main = commit("main");
+    let a = commit("@org.example.X:a");
+    let b = commit("@org.example.Y:b");
+
+    let mount = base.join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let run = ostrya_at(
+        &repo,
+        &[
+            "media",
+            "export",
+            mount.to_str().unwrap(),
+            "main",
+            "@org.example.X:a",
+            "@org.example.Y:b",
+        ],
+    );
+    let own_main = format!("@{OWN_ID}:main");
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        media_lines(
+            &mount,
+            &[
+                (&own_main, &main),
+                ("@org.example.X:a", &a),
+                ("@org.example.Y:b", &b),
+            ]
+        )
+    );
+    let media = mount.join(".ostree/repo");
+    for (relpath, commit) in [
+        (format!("refs/mirrors/{OWN_ID}/main"), &main),
+        ("refs/mirrors/org.example.X/a".to_owned(), &a),
+        ("refs/mirrors/org.example.Y/b".to_owned(), &b),
+    ] {
+        assert_eq!(
+            ref_file(&media, &relpath).as_ref(),
+            Some(commit),
+            "{relpath}"
+        );
+    }
+    assert_eq!(ref_file(&media, "refs/heads/main"), None);
+
+    // A relative MOUNT prints as an absolute path.
+    std::fs::create_dir(base.join("mnt2")).unwrap();
+    let run = ostrya_in(
+        Some(base),
+        &[
+            "media",
+            "--repo=repo",
+            "export",
+            "mnt2",
+            "-c",
+            "org.example.X",
+            "a",
+            "@org.example.X:a",
+            "a",
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        media_lines(
+            &base.canonicalize().unwrap().join("mnt2"),
+            &[("@org.example.X:a", &a)]
+        )
+    );
+}
+
+/// Each refusal of `media export` exits 1 with one `error:` line, writes
+/// nothing to standard output, and leaves no `MOUNT/.ostree`: a remote ref,
+/// a ref of another collection than `-c`, `NAME` with `@OWN:NAME`, a plain
+/// NAME in a source with no collection id, a ref that is not found, a commit
+/// bound to another collection, a commit with no binding, a `--commit` value
+/// that is not a full lowercase checksum, and `--commit` with two refs.
+#[test]
+fn media_export_refusals_write_nothing() {
+    let tmp = TmpDir::new("media-export-refused");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let main = commit_no_parent(&repo, &["-b", "main"], &src)
+        .ok()
+        .stdout_trimmed();
+    let a = commit_no_parent(&repo, &["-b", "@org.example.X:a"], &src)
+        .ok()
+        .stdout_trimmed();
+    commit_no_parent(&repo, &["-b", "loose", "--no-bindings"], &src).ok();
+    let plain = init_archive(&base.join("plain"), None);
+    commit_no_parent(&plain, &["-b", "main"], &src).ok();
+
+    let own_main = format!("@{OWN_ID}:main");
+    let other = format!("--commit={a}");
+    let short = format!("--commit={}", &main[..12]);
+    let upper = format!("--commit={}", main.to_uppercase());
+    let full = format!("--commit={main}");
+    let cases: [(&Path, &[&str]); 11] = [
+        (&repo, &["origin:main"]),
+        (&repo, &["-c", "org.example.X", "@org.example.Y:a"]),
+        (&repo, &["main", &own_main]),
+        (&plain, &["main"]),
+        (&repo, &["nope"]),
+        (&repo, &[&other, "@org.example.Y:a"]),
+        (&repo, &["loose"]),
+        (&repo, &[&short, "main"]),
+        (&repo, &[&upper, "main"]),
+        (&repo, &["--commit=main", "main"]),
+        (&repo, &[&full, "main", "@org.example.X:a"]),
+    ];
+    for (index, (source, args)) in cases.into_iter().enumerate() {
+        let mount = base.join(format!("mnt-{index}"));
+        std::fs::create_dir(&mount).unwrap();
+        let mut argv = vec!["media", "export", mount.to_str().unwrap()];
+        argv.extend_from_slice(args);
+        let run = ostrya_at(source, &argv);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            stderr.lines().filter(|l| l.starts_with("error:")).count(),
+            1,
+            "{args:?}: {stderr}"
+        );
+        assert!(!mount.join(".ostree").exists(), "{args:?}");
+    }
+}
+
+/// `--commit` sets the ref on the media to the commit, also to a commit older
+/// than the commit of the ref on the media.
+#[test]
+fn media_export_commit_pins_an_older_commit() {
+    let tmp = TmpDir::new("media-export-commit");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), Some(OWN_ID));
+    let old = commit_no_parent(&repo, &["-b", "main", "-s", "old"], &src)
+        .ok()
+        .stdout_trimmed();
+    let new = commit_no_parent(&repo, &["-b", "main", "-s", "new"], &src)
+        .ok()
+        .stdout_trimmed();
+    assert_ne!(old, new);
+    let mount = base.join("mnt");
+    std::fs::create_dir(&mount).unwrap();
+    let mount_arg = mount.to_str().unwrap();
+    let media = mount.join(".ostree/repo");
+    let relpath = format!("refs/mirrors/{OWN_ID}/main");
+
+    ostrya_at(&repo, &["media", "export", mount_arg, "main"]).ok();
+    assert_eq!(ref_file(&media, &relpath), Some(new));
+    let run = ostrya_at(
+        &repo,
+        &[
+            "media",
+            "export",
+            &format!("--commit={old}"),
+            mount_arg,
+            "main",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        media_lines(&mount, &[(&format!("@{OWN_ID}:main"), &old)])
+    );
+    assert_eq!(ref_file(&media, &relpath), Some(old));
+}
+
+/// Returns each entry under `mount` in name order, with its type, its
+/// permission bits, and the bytes of a regular file. The list leaves out
+/// `tmp/` and the port lock file `.update.lock` of the media repository, and
+/// the bytes of its summary.
+fn media_tree(mount: &Path) -> Vec<(String, char, u32, Vec<u8>)> {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, char, u32, Vec<u8>)>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap())
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let rel = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if [".ostree/repo/tmp", ".ostree/repo/.update.lock"].contains(&rel.as_str()) {
+                continue;
+            }
+            let meta = entry.path().symlink_metadata().unwrap();
+            let mode = meta.permissions().mode() & 0o7777;
+            if meta.is_dir() {
+                out.push((rel.clone(), 'd', mode, Vec::new()));
+                walk(&entry.path(), &format!("{rel}/"), out);
+            } else {
+                let bytes = if rel == ".ostree/repo/summary" {
+                    Vec::new()
+                } else {
+                    std::fs::read(entry.path()).unwrap()
+                };
+                out.push((rel, 'f', mode, bytes));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(mount, "", &mut out);
+    out
+}
+
+/// Returns the bytes of the summary of the media repository under `mount`,
+/// with zero bytes in place of the value of `ostree.summary.last-modified`.
+fn masked_media_summary(mount: &Path) -> Vec<u8> {
+    let mut bytes = std::fs::read(mount.join(".ostree/repo/summary")).unwrap();
+    let summary = ostrya::Summary::parse(&bytes).unwrap();
+    let Some(Value::U64(raw)) = summary.metadata_value("ostree.summary.last-modified") else {
+        panic!("the summary has no last-modified value");
+    };
+    let value = raw.to_le_bytes();
+    let at: Vec<usize> = bytes
+        .windows(value.len())
+        .enumerate()
+        .filter(|(_, window)| *window == value)
+        .map(|(at, _)| at)
+        .collect();
+    assert_eq!(at.len(), 1, "the last-modified value is not unique");
+    bytes[at[0]..at[0] + value.len()].fill(0);
+    bytes
+}
+
+/// `media export` writes the media tree that `ostree create-usb` writes for
+/// the same refs of two collections, under the umasks 022 and 077: the paths,
+/// the types, the modes, the refs, the objects, and the config, and the
+/// summary with `last-modified` masked. The source is a `bare-user`
+/// repository, so neither command links an object of the source into the
+/// archive media repository. The source has no collection id, because the
+/// tool refuses a ref of another collection from a source that has one.
+#[test]
+fn media_export_writes_the_tree_of_create_usb() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("media-export-create-usb");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = base.join("repo");
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(&["init", &repo_arg, "--mode=bare-user"], None, &[]).ok();
+    commit_no_parent(&repo, &["-b", "@org.example.X:a"], &src).ok();
+    commit_no_parent(&repo, &["-b", "@org.example.Y:b"], &src).ok();
+
+    for mask in ["022", "077"] {
+        let port = base.join(format!("port-{mask}"));
+        let tool = base.join(format!("tool-{mask}"));
+        std::fs::create_dir(&port).unwrap();
+        std::fs::create_dir(&tool).unwrap();
+        ostrya_with_umask(
+            mask,
+            &[
+                "media",
+                &repo_arg,
+                "export",
+                port.to_str().unwrap(),
+                "@org.example.X:a",
+                "@org.example.Y:b",
+            ],
+        )
+        .ok();
+        let run = program_with_umask(
+            "ostree",
+            mask,
+            &[
+                &repo_arg,
+                "create-usb",
+                tool.to_str().unwrap(),
+                "org.example.X",
+                "a",
+                "org.example.Y",
+                "b",
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(media_tree(&port), media_tree(&tool), "umask {mask}");
+        assert_eq!(
+            masked_media_summary(&port),
+            masked_media_summary(&tool),
+            "umask {mask}"
+        );
+    }
+}
+
+/// Returns the path of the program `name` in a directory of `PATH` whose
+/// canonical path is not under `/run`, or `None`. The canonical path of the
+/// program must not be under `/run` either. The path keeps the name `name`,
+/// so a multi-call binary selects the program by its name.
+#[cfg(feature = "gpg")]
+fn program_outside_run(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|dir| {
+        let dir = dir.canonicalize().ok()?;
+        let program = dir.join(name);
+        let target = program.canonicalize().ok()?;
+        (!dir.starts_with("/run") && !target.starts_with("/run")).then_some(program)
+    })
+}
+
+/// The `ostree` tool finds and pulls the media of the port.
+///
+/// The commit has a GPG signature. In a new mount namespace, a tmpfs covers
+/// `/run`, and a ramfs at `/run/media/root/usb` gets a copy of the media tree
+/// of `media export`. The mount finder of the tool lists a ramfs under
+/// `/run/media/`. A ramfs reports no blocks, and the free-space check of the
+/// port refuses a file system that reports no blocks. So `media export`
+/// writes into a directory, and `cp -a` copies the tree onto the ramfs. Then
+/// `ostree find-remotes --finders=mount --pull` pulls the ref into a
+/// `bare-user` client with a remote of the collection id and the GPG key,
+/// and verifies the signature. The ref lands, and `ostree fsck` of the
+/// client passes. The tool reads its GnuPG home from a scratch directory.
+#[cfg(feature = "gpg")]
+#[test]
+fn ostree_find_remotes_pulls_the_media_of_the_port() {
+    if !ostree_available() {
+        return;
+    }
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("media-find-remotes");
+    let base = tmp.path();
+    // The tmpfs over `/run` hides each path under `/run` in the namespace.
+    let programs = ["bash", "mount", "cp", "ostree"].map(program_outside_run);
+    let [Some(bash), Some(mount), Some(cp), Some(tool)] = &programs else {
+        eprintln!("skipping: bash, mount, cp, or ostree has no path outside /run");
+        return;
+    };
+    if base.starts_with("/run") {
+        eprintln!("skipping: the scratch directory is under /run");
+        return;
+    }
+    build_fixture_source(base);
+    let src = base.join("src");
+    let home = GpgHome::create(base, "Media Export <media@ostrya.example>");
+    let repo = init_archive(&base.join("repo"), Some("org.example.Os"));
+    let commit = ostrya_at(
+        &repo,
+        &[
+            "commit",
+            FIXED_TIMESTAMP,
+            "-b",
+            "os/stable",
+            &format!("--gpg-sign={}", home.fingerprint()),
+            &format!("--gpg-homedir={}", home.dir.display()),
+            src.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    let media = base.join("media");
+    std::fs::create_dir(&media).unwrap();
+    ostrya_at(
+        &repo,
+        &["media", "export", media.to_str().unwrap(), "os/stable"],
+    )
+    .ok();
+
+    let client = base.join("client");
+    let client_arg = format!("--repo={}", client.display());
+    let run = ostree(&["init", &client_arg, "--mode=bare-user"]);
+    assert!(run.status.success());
+    configure_remote(
+        &client,
+        "file:///nonexistent",
+        "collection-id=org.example.Os\n",
+    );
+    home.export_to(&client.join("origin.trustedkeys.gpg"));
+    let gnupghome = base.join("tool-gnupghome");
+    std::fs::create_dir(&gnupghome).unwrap();
+    std::fs::set_permissions(&gnupghome, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+    let script = r#"set -e
+"$1" -t tmpfs tmpfs /run
+"$1" --mkdir -t ramfs ramfs /run/media/root/usb
+"$2" -a "$4/media/.ostree" /run/media/root/usb/
+"$3" "--repo=$4/client" find-remotes --finders=mount --pull org.example.Os os/stable
+"#;
+    let namespace: &[&str] = if is_root() {
+        &["-m", "--propagation", "private"]
+    } else {
+        &[
+            "--map-auto",
+            "--map-root-user",
+            "-m",
+            "--propagation",
+            "private",
+        ]
+    };
+    let out = Command::new("unshare")
+        .args(namespace)
+        .arg(bash)
+        .args(["-c", script, "bash"])
+        .args([mount, cp, tool])
+        .arg(base)
+        .env("GNUPGHOME", &gnupghome)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    remove_gnupg_sockets(&gnupghome);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        // Only a host that grants no namespace makes the failure a skip.
+        let probe = Command::new("unshare")
+            .args(namespace)
+            .arg("true")
+            .stderr(Stdio::null())
+            .status();
+        if !probe.is_ok_and(|status| status.success()) {
+            eprintln!("skipping: the host grants no user namespace with a mount namespace");
+            return;
+        }
+        panic!(
+            "find-remotes failed: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    assert!(stdout.contains("Pulled 1/1 refs successfully."), "{stdout}");
+    assert_eq!(
+        ref_file(&client, "refs/remotes/origin/os/stable"),
+        Some(commit)
+    );
+    let run = ostree(&["fsck", &client_arg]);
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
     );
 }

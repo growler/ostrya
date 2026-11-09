@@ -452,7 +452,7 @@ The \fB\%ostree\fR tool does not read this key.
 .SH REMOVABLE MEDIA
 Removable media carry the commits of collection refs to a host with no network.
 The media repository is \fB\%MOUNT/.ostree/repo\fR on a mounted volume, in the layout that \fB\%ostree create\-usb\fR writes, so \fB\%ostree find\-remotes \-\-pull\fR reads it.
-The ostrya library writes it with \fB\%Repo::export_media\fR.
+\fB\%ostrya media export\fR writes it, and the ostrya library writes it with \fB\%Repo::export_media\fR.
 .PP
 A new media repository is an archive repository, with \fB\%indexed\-deltas=true\fR in \fB\%[core]\fR.
 An existing media repository keeps its mode and its \fB\%collection\-id\fR, and gets \fB\%indexed\-deltas=true\fR.

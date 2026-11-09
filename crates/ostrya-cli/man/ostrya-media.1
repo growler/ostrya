@@ -1,0 +1,53 @@
+.TH "OSTRYA\-MEDIA" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-media \- Copy collection refs onto removable media
+.SH SYNOPSIS
+.nf
+ostrya media [OPTIONS] <COMMAND>
+.fi
+.SH DESCRIPTION
+Copy collection refs onto removable media.
+.PP
+The media carry the commits of collection refs to a host with no network. The media repository is \fB\%MOUNT/.ostree/repo\fR on a mounted volume, in the layout that \fB\%ostree create\-usb\fR writes, so \fB\%ostree find\-remotes \-\-pull\fR reads it. A nested subcommand is necessary. This command is an extension of ostrya.
+.SH OPTIONS
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH COMMANDS
+.SS "export"
+Copy the commits of collection refs onto a mounted volume.
+.PP
+The command writes the media repository \fB\%MOUNT/.ostree/repo\fR\&. It does not check that MOUNT is a mount point. A new media repository is an archive repository. An existing media repository keeps its mode and its \fB\%collection\-id\fR\&. The command reads the ref files of this repository alone. It reads no \fB\%summary\fR and no ref under \fB\%refs/remotes/\fR\&. The tip commit of each ref must have an \fB\%ostree.collection\-binding\fR that states the collection id of the ref. If the commit has an \fB\%ostree.ref\-binding\fR, the binding must hold the name of the ref.
+.PP
+The command copies each commit at depth \%0, with its \fB\%\&.commitmeta\fR and the dependencies in field \%2, and copies no static delta. It writes the ref NAME of the collection ID to \fB\%refs/mirrors/ID/NAME\fR, or to \fB\%refs/heads/NAME\fR when ID is the \fB\%collection\-id\fR of the media repository. It moves a ref to an older commit with no error. Then it sets \fB\%[core] indexed\-deltas=true\fR, writes the summary of the media repository with no \fB\%ostree\-metadata\fR commit, and removes \fB\%summary.sig\fR\&.
+.PP
+Before the command creates a file on the volume, it checks and resolves each REF, and it reads the tip commit of each REF. It also checks the collection binding and the ref binding of each tip commit. If one of these checks fails, the command writes nothing on the volume. A failure after these checks can leave a repository with objects on the volume. Examples are a tip commit whose tree is not complete in this repository, and a full volume.
+.PP
+On success, the first line of standard output is the absolute path of the media repository. One line \fB\%@ID:NAME CHECKSUM\fR follows for each exported ref, in the order of the operands. On failure, the command writes one \fB\%error:\fR line to standard error and nothing to standard output, and exits \%1.
+.PP
+.nf
+ostrya media export [OPTIONS] <MOUNT> <REF>...
+.fi
+.PP
+Arguments:
+.TP
+\fIMOUNT\fR
+The directory where the volume is mounted.
+.TP
+\fIREF...\fR
+The refs to export.
+.IP
+NAME is the local ref \fB\%refs/heads/NAME\fR\&. It goes onto the media as \%@OWN:NAME, where OWN is the \fB\%collection\-id\fR of this repository, and a repository with no \fB\%collection\-id\fR refuses it. \%@ID:NAME is the ref NAME of the collection ID: \fB\%refs/heads/NAME\fR when ID is the \fB\%collection\-id\fR of this repository, and else \fB\%refs/mirrors/ID/NAME\fR\&. The command refuses \%REMOTE:NAME, and NAME with \%@OWN:NAME in one run. Without \%\-\-commit, a REF that occurs two times is exported one time.
+.PP
+Options:
+.TP
+\fB\-\-commit\fR \fICHECKSUM\fR
+Export this commit as the one REF.
+.IP
+CHECKSUM is a full commit checksum in lower case. The repository must hold the commit, and the ref need not exist. The commit can be older than the commit of the ref on the media. The command refuses an abbreviated checksum, a ref name, and more than one REF.
+.TP
+\fB\-c\fR, \fB\-\-collection\fR \fIID\fR
+Put each plain REF in the collection ID.
+.IP
+A plain NAME becomes \%@ID:NAME, and \%@ID:NAME stays. The command refuses \%@C:NAME with C other than ID.
+.SH SEE ALSO
+\fBostrya\fR(1)

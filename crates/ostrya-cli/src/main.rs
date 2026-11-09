@@ -17,8 +17,9 @@
 //! - Read: `checkout`, `export`, `rev-parse`, `cat`, `show`, `log`, `ls`,
 //!   `diff`.
 //! - Pull: `pull`, `pull-local`.
-//! - ostrya extensions: `composefs-image`, `push`, `push-tree`, `receive`,
-//!   `send`, `serve`, `remote init`, `remote fsck`, `remote prune`.
+//! - ostrya extensions: `composefs-image`, `media export`, `push`,
+//!   `push-tree`, `receive`, `send`, `serve`, `remote init`, `remote fsck`,
+//!   `remote prune`.
 //!
 //! # Features
 //!
@@ -498,6 +499,14 @@ enum Command {
     /// standard error and exits 1. This command is an extension of ostrya.
     #[command(name = "composefs-image")]
     ComposefsImage(ComposefsImageArgs),
+    /// Copy collection refs onto removable media.
+    ///
+    /// The media carry the commits of collection refs to a host with no
+    /// network. The media repository is `MOUNT/.ostree/repo` on a mounted
+    /// volume, in the layout that `ostree create-usb` writes, so
+    /// `ostree find-remotes --pull` reads it. A nested subcommand is
+    /// necessary. This command is an extension of ostrya.
+    Media(MediaArgs),
     /// Receive one push session, or one one-way stream with --one-way.
     ///
     /// Without --one-way, `ostrya push` runs this command on the server over
@@ -817,6 +826,7 @@ impl Command {
         "pull",
         "pull-local",
         "composefs-image",
+        "media",
         #[cfg(feature = "receive")]
         "receive",
         #[cfg(feature = "push")]
@@ -854,6 +864,7 @@ impl Command {
             Command::Pull(_) => "pull",
             Command::PullLocal(_) => "pull-local",
             Command::ComposefsImage(_) => "composefs-image",
+            Command::Media(_) => "media",
             #[cfg(feature = "receive")]
             Command::Receive(_) => "receive",
             #[cfg(feature = "push")]
@@ -5194,6 +5205,82 @@ struct ComposefsImageArgs {
 }
 
 #[derive(Args)]
+struct MediaArgs {
+    #[command(subcommand)]
+    command: MediaCommand,
+}
+
+#[derive(Subcommand)]
+enum MediaCommand {
+    /// Copy the commits of collection refs onto a mounted volume.
+    ///
+    /// The command writes the media repository `MOUNT/.ostree/repo`. It does
+    /// not check that MOUNT is a mount point. A new media repository is an
+    /// archive repository. An existing media repository keeps its mode and
+    /// its `collection-id`. The command reads the ref files of this
+    /// repository alone. It reads no `summary` and no ref under
+    /// `refs/remotes/`. The tip commit of each ref must have an
+    /// `ostree.collection-binding` that states the collection id of the ref.
+    /// If the commit has an `ostree.ref-binding`, the binding must hold the
+    /// name of the ref.
+    ///
+    /// The command copies each commit at depth 0, with its `.commitmeta` and
+    /// the dependencies in field 2, and copies no static delta. It writes the
+    /// ref NAME of the collection ID to `refs/mirrors/ID/NAME`, or to
+    /// `refs/heads/NAME` when ID is the `collection-id` of the media
+    /// repository. It moves a ref to an older commit with no error. Then it
+    /// sets `[core] indexed-deltas=true`, writes the summary of the media
+    /// repository with no `ostree-metadata` commit, and removes
+    /// `summary.sig`.
+    ///
+    /// Before the command creates a file on the volume, it checks and
+    /// resolves each REF, and it reads the tip commit of each REF. It also
+    /// checks the collection binding and the ref binding of each tip commit.
+    /// If one of these checks fails, the command writes nothing on the
+    /// volume. A failure after these checks can leave a repository with
+    /// objects on the volume. Examples are a tip commit whose tree is not
+    /// complete in this repository, and a full volume.
+    ///
+    /// On success, the first line of standard output is the absolute path of
+    /// the media repository. One line `@ID:NAME CHECKSUM` follows for each
+    /// exported ref, in the order of the operands. On failure, the command
+    /// writes one `error:` line to standard error and nothing to standard
+    /// output, and exits 1.
+    Export(MediaExportArgs),
+}
+
+#[derive(Args)]
+struct MediaExportArgs {
+    /// Export this commit as the one REF.
+    ///
+    /// CHECKSUM is a full commit checksum in lower case. The repository must
+    /// hold the commit, and the ref need not exist. The commit can be older
+    /// than the commit of the ref on the media. The command refuses an
+    /// abbreviated checksum, a ref name, and more than one REF.
+    #[arg(long, value_name = "CHECKSUM", value_parser = Checksum::from_hex_lower)]
+    commit: Option<Checksum>,
+    /// The directory where the volume is mounted.
+    mount: PathBuf,
+    /// Put each plain REF in the collection ID.
+    ///
+    /// A plain NAME becomes @ID:NAME, and @ID:NAME stays. The command refuses
+    /// @C:NAME with C other than ID.
+    #[arg(short = 'c', long, value_name = "ID")]
+    collection: Option<String>,
+    /// The refs to export.
+    ///
+    /// NAME is the local ref `refs/heads/NAME`. It goes onto the media as
+    /// @OWN:NAME, where OWN is the `collection-id` of this repository, and
+    /// a repository with no `collection-id` refuses it. @ID:NAME is the ref
+    /// NAME of the collection ID: `refs/heads/NAME` when ID is the
+    /// `collection-id` of this repository, and else `refs/mirrors/ID/NAME`.
+    /// The command refuses REMOTE:NAME, and NAME with @OWN:NAME in one run.
+    /// Without --commit, a REF that occurs two times is exported one time.
+    #[arg(value_name = "REF", required = true)]
+    refs: Vec<String>,
+}
+
+#[derive(Args)]
 #[command(group(
     clap::ArgGroup::new("key_source")
         .args(["remote", "trust"])
@@ -5637,6 +5724,12 @@ async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> 
         Command::ComposefsImage(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             composefs_image(repo, args).await
+        }
+        Command::Media(args) => {
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            match args.command {
+                MediaCommand::Export(args) => media_export(repo, args).await,
+            }
         }
         #[cfg(feature = "receive")]
         Command::Receive(args) => {
@@ -7529,6 +7622,49 @@ async fn composefs_image(repo: Repo, args: ComposefsImageArgs) -> Result<()> {
             actual,
         }),
     }
+}
+
+/// Copies the commits of the refs of `args` onto the volume at the mount
+/// directory, and prints the path of the media repository and each exported
+/// ref.
+async fn media_export(repo: Repo, args: MediaExportArgs) -> Result<()> {
+    let refs = media_refs(&args.refs, args.collection.as_deref())?;
+    let options = ostrya::MediaExportOptions {
+        commit: args.commit,
+    };
+    let report = repo.export_media(&args.mount, &refs, options).await?;
+    let path = std::path::absolute(&report.repo)?;
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{}", path.display()).map_err(Error::Io)?;
+    for (r, commit) in &report.refs {
+        writeln!(out, "{r} {commit}").map_err(Error::Io)?;
+    }
+    out.flush().map_err(Error::Io)?;
+    Ok(())
+}
+
+/// Reads each REF operand of `media export` as a ref, and puts each local
+/// ref in the collection `collection`.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if an operand is not a ref.
+/// - [`Error::InvalidInput`] if an operand names a collection other than
+///   `collection`.
+fn media_refs(texts: &[String], collection: Option<&str>) -> Result<Vec<Ref>> {
+    texts
+        .iter()
+        .map(|text| {
+            let r = text.parse::<Ref>()?;
+            let Some(id) = collection else {
+                return Ok(r);
+            };
+            r.in_collection(id).map_err(|r| {
+                Error::InvalidInput(format!("the ref {r} names a collection other than {id}"))
+            })
+        })
+        .collect()
 }
 
 /// Imports refs and their objects from another local repository.
@@ -16776,6 +16912,58 @@ fn stdout_file() -> Result<ostrya_rt::File> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// With --collection, a local ref takes the collection, a ref of the
+    /// collection and a remote ref stay, and a ref of another collection is
+    /// refused. Without it, each ref stays.
+    #[test]
+    fn a_media_collection_applies_to_each_plain_ref() {
+        let texts = |refs: &[&str]| refs.iter().map(|r| (*r).to_owned()).collect::<Vec<_>>();
+        let x = Some("org.example.X");
+        assert_eq!(
+            media_refs(&texts(&["a", "@org.example.X:b", "r:c"]), x).unwrap(),
+            [
+                Ref::collection("org.example.X", "a"),
+                Ref::collection("org.example.X", "b"),
+                Ref::remote("r", "c"),
+            ]
+        );
+        assert_eq!(
+            media_refs(&texts(&["a", "@org.example.Y:b"]), None).unwrap(),
+            [Ref::local("a"), Ref::collection("org.example.Y", "b")]
+        );
+        let err = media_refs(&texts(&["a", "@org.example.Y:b"]), x).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput(text)
+                if text == "the ref @org.example.Y:b names a collection other than org.example.X"),
+            "{err:?}"
+        );
+        assert!(matches!(
+            media_refs(&texts(&["a b"]), None),
+            Err(Error::InvalidRefspec(_))
+        ));
+    }
+
+    /// --commit takes a full lowercase checksum alone.
+    #[test]
+    fn a_media_export_commit_is_a_full_lowercase_checksum() {
+        let hex = "ab".repeat(32);
+        let parse = |value: &str| {
+            parse_cli(["ostrya", "media", "export", "--commit", value, "mnt", "a"]).map(|cli| {
+                let Some(Command::Media(MediaArgs {
+                    command: MediaCommand::Export(args),
+                })) = cli.command
+                else {
+                    panic!("no media export");
+                };
+                args.commit
+            })
+        };
+        assert_eq!(parse(&hex).unwrap(), Some(hex.parse().unwrap()));
+        for refused in [&hex[..12], &hex.to_uppercase(), "main"] {
+            assert!(parse(refused).is_err(), "{refused}");
+        }
+    }
 
     /// The `apply-offline` PATH is reduced lexically, as the `ostree` command
     /// reduces it. `.`, empty components, and a trailing `/` go. Each `..`

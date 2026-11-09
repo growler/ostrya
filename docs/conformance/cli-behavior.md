@@ -15,6 +15,7 @@ The document records:
 - the `--fsync` vocabulary and the sync calls that it controls
 - the output format, the error text, and the exit status of the commands
   that "CLI output formats" lists
+- the media repository that `create-usb` writes onto a mounted volume
 
 The tool is `ostree` 2026.1. A statement about the tool with no label is
 observed behavior: a run of the tool records the fact. The facts about the
@@ -7009,3 +7010,116 @@ line with no statistics line after it.
 
 The progress line is outside the byte-exact scope. `cli-surface.md`, "P2",
 `pull`, records the port side.
+
+## Removable media
+
+### `create-usb`
+
+`create-usb` copies collection refs onto a mounted volume, into a
+repository that a host with no network reads. The port does not carry the
+command, and `ostrya media export` does its work (`cli-surface.md`, "P3",
+`create-usb`).
+
+Usage: `ostree create-usb [OPTION…] MOUNT-PATH COLLECTION-ID REF
+[COLLECTION-ID REF...]`. The options are `--disable-fsync`,
+`--destination-repo=DEST`, and `--commit=COMMIT`.
+
+The destination:
+
+- The destination is `MOUNT-PATH/.ostree/repo`. The tool does not check for
+  a mount point. A plain directory, a mount point, a subdirectory of a mount,
+  and a symlink to a directory give the same result.
+- A new destination gets `mode=archive-z2`, also from a `bare-user` source.
+  The tool creates it before it resolves the refs, so a failed run leaves a
+  repository with `[core] repo_version=1` and `mode=archive-z2`, and no ref.
+  A run that succeeds adds `indexed-deltas=true`.
+- An existing destination keeps its mode and its `collection-id`.
+- `--destination-repo=D` puts the repository at `MOUNT-PATH/D`, and writes
+  the symlink `MOUNT-PATH/.ostree/repos.d/NN-generated` with the text
+  `../../D`. `NN` starts at `00`. A second run with the same `D` adds
+  `01-generated`. The tool writes no symlink when `D` is `.ostree/repo`,
+  `ostree/repo`, or a direct child of `.ostree/repos.d/`. An absolute `D`
+  and a `D` with `..` write outside the mount.
+- On a ramfs, which states no free space, `create-usb` and `pull-local`
+  into a repository on the ramfs exit 0. `commit` into such a repository
+  fails with `error: Writing content object: min-free-space-percent '3%'
+  would be exceeded, at least 4.1 kB requested`.
+
+The refs and the objects:
+
+- Each ref goes to `refs/mirrors/COLLECTION-ID/REF`. `refs/heads/` and
+  `refs/remotes/` stay empty.
+- When the destination has `[core] collection-id` COLLECTION-ID, the ref
+  goes to `refs/heads/REF`, and `refs/mirrors/` stays empty. The summary
+  lists the ref in field 0, states the collection id, and has no collection
+  map. With a destination of another collection id, the ref goes to
+  `refs/mirrors/COLLECTION-ID/REF`, and the summary lists it in the
+  collection map.
+- The copy is depth 0. It carries the `.commitmeta`. It carries no static
+  delta, no `delta-indexes/`, and no `summary.sig` of the source. It copies
+  no key and no remote config.
+- On the same file system, the objects are hardlinks of the source objects.
+- Files are 0644 under umask 022 and 077. Directories are 0777 less the
+  umask, and `.lock` is 0660 less the umask.
+
+The ref resolution in the source:
+
+- The sources of a ref are the local heads under the own `collection-id` of
+  the source, `refs/mirrors/ID/REF`, and `refs/remotes/R/REF` of a remote
+  `R` whose `collection-id` is `ID`. A source with no `collection-id` and no
+  such ref gives `error: Collection–ref (ID, REF) not found` (U+2013).
+- When the source has a `summary`, the tool reads the commit of each ref from
+  that summary. A ref that the summary does not list gives `error: No such
+  branch (ID, REF) in repository summary`. A stale summary pins the old
+  commit.
+- When the source has `[core] collection-id` OWN, the tool refuses a commit
+  whose `ostree.collection-binding` is not OWN: `error: Commit <checksum>:
+  Commit has collection ID ‘ID’ in collection binding metadata, while the
+  remote it came from has collection ID ‘OWN’`, at exit 1. The run writes no
+  ref and no summary, and leaves `state/<checksum>.commitpartial` in the
+  destination. So from such a source, a ref of another collection whose
+  commit is bound to that collection does not copy. From a source with no
+  `collection-id`, the refs of two collections copy in one run.
+- The tool does not check the collection binding of the commit against the
+  COLLECTION-ID of the pair: from a source with `collection-id`
+  `org.example.Os`, the pair `(org.other.Os, os/b)` copies a commit bound to
+  `org.example.Os`.
+- The tool does not check for a downgrade: a run moves a media ref to an
+  older commit.
+
+The summary:
+
+- The tool writes the summary again on each run. Field 0 is empty, and each
+  ref is in `ostree.summary.collection-map`, except on a destination whose
+  collection id is the id of the ref, as stated above. The metadata holds
+  `mode`, `last-modified`, `tombstone-commits=false`,
+  `indexed-deltas=true`, and `collection-id` when the destination has one.
+  It holds no `ostree-metadata` anchor commit.
+- The summary is byte-identical to the summary of `summary -u` on the media
+  in the same second.
+- The tool deletes an existing `summary.sig`. With `-v` it writes `Deleting
+  existing unmatched summary.sig file`.
+
+`--commit=C`:
+
+- `C` sets the ref to the commit, also to an older commit.
+- An abbreviated checksum or a ref name ends the tool on an assertion at
+  exit 134.
+- An unknown commit gives `error: Importing <C>.commit: linkat: No such file
+  or directory`.
+- A commit bound to another ref fails the ref binding check.
+- More than one pair gives `error: The --commit option can only be used when
+  a single COLLECTION-ID REF pair is specified`.
+
+The errors exit 1. Unless a line states otherwise, the run writes nothing:
+
+- `error: A MOUNT-PATH must be specified`.
+- `error: At least one COLLECTION-ID REF pair must be specified`.
+- `error: Only complete COLLECTION-ID REF pairs may be specified`.
+- `error: Invalid collection ID <id>` and `error: Invalid ref name <ref>`.
+- `error: opendir(<path>): No such file or directory` and `Not a
+  directory`.
+
+On success, standard output carries `Copied N/N refs successfully from
+‘SRC’ to ‘DEST’ repository in ‘MOUNT-PATH’.`. A duplicate pair counts two
+times.

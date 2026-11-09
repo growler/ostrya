@@ -20,8 +20,6 @@ The `ostrya` command does not carry these commands of the `ostree` command.
   `Repo::remote_list_collection_refs` lists the refs of a collection on one
   named remote, and pulls nothing. The library has no entry point that
   finds the remotes of a collection.
-- `create-usb`. It puts a `pull-local` or a mirror pull onto a destination
-  repository, and needs no new library primitive.
 - The dependencies of field 2 in the import from removable media.
   `Repo::export_media` puts each dependency of a commit onto the media as
   loose objects (`format-reference.md`, "Removable media"). The port has no

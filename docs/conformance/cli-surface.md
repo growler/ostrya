@@ -4655,7 +4655,45 @@ No matrix cell needs these. The shell suite invokes them.
     port takes the own id as its local namespace, so each reader of the port
     gives the pulled commit. Neither the port nor the tool removes a ref.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
-  `--commit=COMMIT`.
+  `--commit=COMMIT`. The port does not carry the command. `ostrya media
+  export` does its work, and writes the media layout of the tool ("Port
+  extensions", `media export`; `cli-behavior.md`, "`create-usb`"). It
+  differs from the tool in these points:
+  - The operands are `NAME` and `@ID:NAME`, and `-c ID` puts each plain
+    `NAME` in the collection `ID`. The tool takes `COLLECTION-ID REF` pairs.
+  - The port reads the ref files alone. It does not read the summary of the
+    source, so a ref goes onto the media at its tip, also when the summary
+    of the source lists an older commit. It does not read `refs/remotes/`,
+    so an `@ID:NAME` that only `refs/remotes/R/NAME` holds is not found.
+    `ostrya pull R @ID:NAME` first writes `refs/mirrors/ID/NAME`.
+  - The port refuses a commit whose `ostree.collection-binding` names a
+    collection other than the collection of the ref, and a commit with no
+    `ostree.collection-binding`, at exit 1. From a source with no
+    collection id, the tool copies the first. From a source with a
+    collection id, the tool copies a commit bound to that id, and refuses a
+    commit bound to another collection. The port does not, so from a source
+    with a collection id, one run exports the local refs and the refs of
+    other collections.
+  - Before the port creates a file, it checks and resolves each ref, reads
+    each tip commit, and checks the collection binding and the ref binding
+    of each tip commit. A run that fails one of these checks leaves no
+    `MOUNT/.ostree`. A failure after these checks can leave a repository
+    with objects on the media. Examples are a tip commit whose tree is not
+    complete in the source, and a full volume. The tool creates the
+    destination first, and a failed run leaves a repository with no ref.
+  - The port has no `--destination-repo` and no `--disable-fsync`. It
+    always writes `MOUNT/.ostree/repo`, also when the volume holds
+    `.ostree/repos.d/`.
+  - `--commit` takes a full lowercase checksum alone. The port refuses an
+    abbreviated checksum, an uppercase checksum, and a ref name at exit 1.
+    The tool ends on an assertion at exit 134 for an abbreviated checksum
+    and for a ref name.
+  - On success, standard output carries the absolute path of the media
+    repository, then one `@ID:NAME CHECKSUM` line for each exported ref. The
+    tool writes one `Copied N/N refs` line. Each refusal and each failure of
+    the port writes one `error:` line with the text of the port.
+  - Without `--commit`, an operand that occurs two times is exported one
+    time and gives one line. The tool counts a duplicate pair two times.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG
   signing into `sign --sign-type=gpg`, so this is an alias with its own option
   names. `ostree gpg-sign --delete` in 2026.1 removes a GPG signature. No
@@ -5292,13 +5330,14 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    reads the global trusted directory, and the port refuses an armored file
    there by its path too. The tool has no gpg engine in `sign`.
 
-## Port extensions with no counterpart in the tool
+## Port extensions
 
 The tool has no push, no pull over ssh, no server, no composefs image
 store, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
 `send`, `composefs-image`, `remote init`, `remote fsck`, and `remote prune`
 are commands of the port alone, so no matrix cell compares them with the
-tool. `pull`, `remote
+tool. `media export` does the work of `create-usb` with operands and output
+of its own ("P3", `create-usb`). `pull`, `remote
 refs`, and `remote summary` also read a remote over ssh, for an ssh address
 in the `pull-url` key or in `--url` of `pull` (`pull`), and a bucket
 repository in an S3 bucket, for an `s3://` address in the same places
@@ -6662,6 +6701,52 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   for each complete commit that carries the key and has no image, after the
   lines of the images whose commit is absent. This line is not an error.
 - `crates/ostrya/tests/composefs_image.rs` and
+  `crates/ostrya-cli/tests/cli.rs` hold the tests.
+
+### `media export`
+
+```text
+ostrya media export [--repo=PATH] [--commit=CHECKSUM] MOUNT [-c|--collection ID] REF...
+```
+
+- The command takes no feature. It writes the media repository
+  `MOUNT/.ostree/repo` in the layout of `ostree create-usb`
+  (`../format-reference.md`, "Removable media"), and `ostree find-remotes
+  --pull` reads it. "P3", `create-usb`, records the differences from the
+  tool.
+- The operand forms:
+  - `NAME` is the local ref `refs/heads/NAME`. It goes onto the media as
+    `@OWN:NAME`, where `OWN` is the `[core] collection-id` of the
+    repository. A repository with no collection id refuses it.
+  - `@ID:NAME` is the collection ref `(ID, NAME)`: `refs/heads/NAME` when
+    `ID` is the collection id of the repository, and else
+    `refs/mirrors/ID/NAME`.
+  - `-c ID` makes each plain `NAME` the operand `@ID:NAME`. The command
+    refuses an operand `@C:NAME` with `C` other than `ID`, and accepts
+    `@ID:NAME`.
+  - The command refuses `REMOTE:NAME`, and `NAME` with `@OWN:NAME` in one
+    run.
+  - Without `--commit`, an operand that occurs two times is exported one
+    time. One run takes the refs of more than one collection.
+- `--commit=CHECKSUM` sets the one REF to the commit, also to a commit
+  older than the commit of the ref on the media. The repository must hold
+  the commit, and the ref need not exist. The command refuses the option
+  with more than one REF.
+- On success, the first line of standard output is the absolute path of the
+  media repository, also for a relative MOUNT. One line `@ID:NAME CHECKSUM`
+  follows for each exported ref, in the order of the operands.
+- The command exits 0 on success. Each refusal and each failure writes one
+  `error:` line to standard error and nothing to standard output, and the
+  command exits 1. For a missing operand and a `--commit` value that is
+  not a full lowercase checksum, the line is the usage error of the option
+  parser.
+- Before the command creates a file, it checks and resolves each REF, reads
+  each tip commit, and checks the collection binding and the ref binding of
+  each tip commit. A usage error and a failure of these checks write no
+  `MOUNT/.ostree`. A failure after these checks can leave a repository with
+  objects on the media. Examples are a tip commit whose tree is not complete
+  in the source, and a full volume.
+- `crates/ostrya/tests/media_export.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### ssh access with `authorized_keys`

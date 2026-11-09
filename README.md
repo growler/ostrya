@@ -104,6 +104,10 @@ Ostrya adds these functions, which the `ostree` command does not have:
   memory. The mount reads the objects of the repository in place. Root in the
   initial user namespace mounts directly. A process in its own user namespace
   asks the mount daemon `ostrya-mountd`, which runs as root.
+- Removable media. `ostrya media export` copies the commits of collection
+  refs onto a mounted volume, for a host with no network. The media
+  repository has the layout that `ostree create-usb` writes, and
+  `ostree find-remotes --pull` reads it.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -127,7 +131,9 @@ exits with a non-zero status.
 These `ostree` commands have no counterpart in `ostrya`:
 
 - `admin`, the sysroot and deployment functions;
-- `reset`, `checksum`, and `create-usb`;
+- `reset` and `checksum`;
+- `create-usb`: `ostrya media export` does the same work, with its own
+  operands and output, and writes the media layout of `create-usb`;
 - `find-remotes`: `ostrya pull --collection=ID` does the work of
   `find-remotes --pull`, with the configured remotes as the only candidates.
   `ostrya` has no command that finds remotes and pulls nothing;
@@ -157,9 +163,9 @@ The `ostrya` command has these subcommands:
 - `sign` and `summary`: sign and verify commits, and generate the summary.
 - `static-delta`: list, generate, apply, and index static deltas.
 - `prune` and `fsck`: delete unreachable objects and verify the repository.
-- `composefs-image`, `push`, `push-tree`, `receive`, `send`, `serve`,
-  `remote init`, `remote fsck`, `remote prune`, and `remote summary -u`: the
-  port extensions.
+- `composefs-image`, `media export`, `push`, `push-tree`, `receive`,
+  `send`, `serve`, `remote init`, `remote fsck`, `remote prune`, and
+  `remote summary -u`: the port extensions.
 
 Each subcommand has a man page, for example `ostrya-commit(1)`. The page
 `ostrya-repo(5)` describes the layout of a repository, and the page

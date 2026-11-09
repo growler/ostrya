@@ -31,7 +31,7 @@ use crate::pull::{
 };
 use crate::related::RelatedRule;
 use crate::repo::{CreateOptions, Repo};
-use crate::summary::SummaryOptions;
+use crate::summary::{OSTREE_METADATA_REF, SummaryOptions};
 use crate::verify::PullTrust;
 
 mod find;
@@ -335,10 +335,12 @@ impl Repo {
     /// A ref `@ID:NAME` is on the media when the ref files of the media
     /// repository and its `summary` both list it. The summary lists the refs
     /// of `ID` in field 0 when it states the collection id `ID`, and else in
-    /// the first entry of `ID` in `ostree.summary.collection-map`. The commit
-    /// of the ref is the commit that the summary lists, and its timestamp is
-    /// the `ostree.commit.timestamp` that the summary lists. The import reads
-    /// no `summary.sig`.
+    /// the first entry of `ID` in `ostree.summary.collection-map`. For the
+    /// collection id that the summary states, the import does not count the
+    /// ref `ostree-metadata` as listed, because it is the anchor ref of the
+    /// media repository. The commit of the ref is the commit that the summary
+    /// lists, and its timestamp is the `ostree.commit.timestamp` that the
+    /// summary lists. The import reads no `summary.sig`.
     ///
     /// The import takes these refs, in this order:
     ///
@@ -829,7 +831,9 @@ type ListedTips = BTreeMap<String, (Checksum, u64)>;
 /// Returns the refs that the media summary `bytes` lists for each
 /// collection of `ids`, with their commits and their timestamps, as
 /// [`collection_refs`] reads them. The call leaves out a name that fails the
-/// ref-name rule. It parses the refs of the collections of `ids` alone.
+/// ref-name rule, and the anchor ref `ostree-metadata` of the media
+/// repository in field 0. It parses the refs of the collections of `ids`
+/// alone.
 ///
 /// # Errors
 ///
@@ -840,10 +844,12 @@ type ListedTips = BTreeMap<String, (Checksum, u64)>;
 fn summary_collections(bytes: &[u8], ids: &[String]) -> Result<BTreeMap<String, ListedTips>> {
     let mut listed = BTreeMap::new();
     for id in ids {
-        let (_, refs) = collection_refs(bytes, id, None)?;
+        let (own, refs) = collection_refs(bytes, id, None)?;
+        // Field 0 also lists the anchor ref of the media repository.
         let names = refs
             .listed
             .into_iter()
+            .filter(|entry| !own || entry.name != OSTREE_METADATA_REF)
             .map(|entry| (entry.name, (entry.commit, entry.timestamp)))
             .collect();
         listed.insert(id.clone(), names);

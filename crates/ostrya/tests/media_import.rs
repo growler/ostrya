@@ -911,6 +911,57 @@ fn media_with_the_collection_id_of_the_ref_are_read() {
     });
 }
 
+/// Media whose collection id is X list the anchor ref `ostree-metadata` of
+/// the media repository in field 0. The import ignores it.
+#[test]
+fn the_anchor_ref_of_the_media_is_not_imported() {
+    let tmp = TmpDir::new("media-import-anchor");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        std::fs::create_dir(mount.join(".ostree")).unwrap();
+        let media = create(&mount.join(".ostree/repo"), Some(X)).await;
+        media
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        drop(media);
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let summary = std::fs::read(mount.join(".ostree/repo/summary")).unwrap();
+        let summary = ostrya::Summary::parse(&summary).unwrap();
+        assert_eq!(summary.lookup("a"), Some(a));
+        assert!(summary.lookup("ostree-metadata").is_some());
+
+        for (name, own) in [("client-own", Some(X)), ("client", None)] {
+            let c = client(dir, name, own, &origin()).await;
+            if own.is_some() {
+                c.regenerate_summary(&SummaryOptions::default())
+                    .await
+                    .unwrap();
+            }
+            let anchor = ref_file(&c, "heads/ostree-metadata");
+            assert_eq!(anchor.is_some(), own.is_some(), "{own:?}");
+            let report = import(&c, &mount, &[], &[]).await.unwrap();
+            assert_eq!(names(&report.written), [format!("@{X}:a")], "{own:?}");
+            assert!(report.refused.is_empty(), "{own:?}: {report:?}");
+            let report = import(&c, &mount, &[], &[X]).await.unwrap();
+            assert_eq!(names(&report.unchanged), [format!("@{X}:a")], "{own:?}");
+            assert!(report.refused.is_empty(), "{own:?}: {report:?}");
+            assert_eq!(ref_file(&c, "heads/ostree-metadata"), anchor, "{own:?}");
+            assert_eq!(ref_file(&c, &format!("mirrors/{X}/ostree-metadata")), None);
+            let err = import(&c, &mount, &[Ref::collection(X, "ostree-metadata")], &[])
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::RefNotFound(m) if *m == format!("@{X}:ostree-metadata")),
+                "{err:?}"
+            );
+        }
+    });
+}
+
 /// A commit whose timestamp is not the timestamp that the media summary
 /// lists for its ref is refused, and the other refs are imported. The
 /// summary lists the ref in the collection map, or in field 0 when the

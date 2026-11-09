@@ -5261,8 +5261,11 @@ enum MediaCommand {
     /// needs exactly one media repository.
     ///
     /// A ref @ID:NAME is on the media when the ref files of the media
-    /// repository and its summary both list it. The commit of the ref is the
-    /// commit that the summary lists. The command reads no `summary.sig`.
+    /// repository and its summary both list it. For the collection id that
+    /// the summary states, the command does not count the ref
+    /// `ostree-metadata` as listed, because it is the anchor ref of the media
+    /// repository. The commit of the ref is the commit that the summary
+    /// lists. The command reads no `summary.sig`.
     /// With no REF and no -c, the command imports each ref on the media whose
     /// collection has a matched remote, and ignores each other collection.
     ///

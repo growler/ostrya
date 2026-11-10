@@ -1,8 +1,29 @@
-ostrya (0.11.0) UNRELEASED; urgency=medium
+ostrya (0.11.0) unstable; urgency=medium
 
-  * New upstream release.
+  * Add the command media, an extension of ostrya. media export MOUNT
+    REF... copies the commits of collection refs into the media
+    repository MOUNT/.ostree/repo, in the layout that ostree create-usb
+    writes. media import finds the media repository on the mounted
+    volumes, or under --mount PATH, and pulls collection refs from it.
+    The trust of the matched remote of each collection checks its
+    commits.
+  * refs -c lists each ref of a remote under the collection-id of the
+    remote. A remote with no valid collection-id, or with the
+    collection-id of the repository, gives no row. A malformed escape
+    sequence in a collection-id does not make the command fail.
+  * refs -c --delete deletes no ref of a remote, and does not check the
+    names of the refs of a remote.
+  * refs -A --create reports a ref path that names a directory, or that
+    passes through a ref file, as a ref that does not exist.
+  * A ref entry that is a FIFO or a socket is no ref. The ref listing of
+    refs, summary -u, and serve does not wait on a FIFO.
+  * pull-local --untrusted hashes each commit that it reads for the
+    checks and for the walk of the chain, and each dirtree that the walk
+    of the tree reads, before it uses the bytes. It stages the bytes
+    that it hashed. pull --collection does the same for a file://
+    candidate whose keys check signatures.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 07 Nov 2026 22:56:28 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 10 Nov 2026 21:48:57 +0100
 
 ostrya (0.10.0) unstable; urgency=medium
 

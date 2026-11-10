@@ -1,8 +1,11 @@
-ostrya-mountd (0.11.0) UNRELEASED; urgency=medium
+ostrya-mountd (0.11.0) unstable; urgency=medium
 
-  * New upstream release.
+  * A read of the payload of a file object opens the object file with
+    openat2, RESOLVE_BENEATH, and RESOLVE_NO_SYMLINKS, as the read of a
+    metadata object does. A symlink or a FIFO at the place of the object
+    file stops the read.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 07 Nov 2026 22:56:28 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 10 Nov 2026 21:48:57 +0100
 
 ostrya-mountd (0.10.0) unstable; urgency=medium
 

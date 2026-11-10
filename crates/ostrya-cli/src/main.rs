@@ -5252,8 +5252,9 @@ enum MediaCommand {
     /// Pull collection refs from the media repository on a mounted volume.
     ///
     /// Without --mount, the command reads the mount table of the process and
-    /// probes each mount. On each mount, it probes each entry of
-    /// `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
+    /// probes each mount. It skips a mount whose directory any user can
+    /// write, such as /tmp or /dev/shm. On each mount, it probes each entry
+    /// of `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
     /// `var/lib/flatpak/repo`. The media repository of a mount is the first
     /// of these repositories whose summary lists a collection ref. The
     /// command skips a repository on another file system than the mount, a
@@ -5341,9 +5342,9 @@ struct MediaExportArgs {
 struct MediaImportArgs {
     /// Probe the directory PATH in place of the mount table.
     ///
-    /// PATH need not be a mount point. The command probes the same paths
-    /// under PATH, and the path of each repository must cross no mount point
-    /// under PATH.
+    /// PATH need not be a mount point. The command probes PATH also if any
+    /// user can write it. The command probes the same paths under PATH, and
+    /// the path of each repository must cross no mount point under PATH.
     #[arg(long, value_name = "PATH")]
     mount: Option<PathBuf>,
     /// Put each plain REF in the collection ID.

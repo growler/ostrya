@@ -5490,9 +5490,18 @@ The finder skips these mounts before it makes a system call on their path:
   `fuse.sshfs`, `fuse.rclone`, `fuse.s3fs`, and `fuse.gvfsd-fuse`, so that
   a dead server cannot stop the scan.
 
-The finder also finds media on a `tmpfs`, on a bind mount, and outside
-`/run/media/`. It opens the mount directory with `O_PATH`, so the client
-needs the search permission alone on that directory. It skips a mount whose directory it cannot open.
+The finder also finds media on a `tmpfs` whose directory has no bit `o+w`,
+on a bind mount, and outside `/run/media/`. It opens the mount directory
+with `O_PATH`, so the client needs the search permission alone on that
+directory. It skips a mount whose directory it cannot open.
+
+The finder also skips a mount whose directory any user can write: the mode
+of the directory has the bit `o+w`, with or without the sticky bit. It
+reads the mode with `fstat` on the `O_PATH` descriptor, before it reads
+`.ostree` on the mount. A local user with no privileges can write a
+repository on such a mount, for example on `/tmp` or `/dev/shm`. A `tmpfs`
+gets the mode `1777` when its mount options set no `mode`, so the finder
+skips it. The finder records no skipped candidate for such a mount.
 
 On each other mount, the finder probes these candidates in this order:
 
@@ -5548,6 +5557,7 @@ the path of each, in the order of the mount table.
 The caller can give a directory in place of the mount table. Then the
 finder probes that directory alone, with the same candidates and checks,
 and reads no mount table. The directory need not be a mount point. The
+finder probes the directory also if any user can write it. The
 path of each candidate must not cross a mount point, and the file-system
 check compares each candidate with the file system of the directory. The
 finder still skips the client repository. A directory that

@@ -48896,7 +48896,7 @@ fn media_import_volumes_subprocess() {
     for volume in &volumes {
         std::fs::create_dir(volume).unwrap();
         let out = Command::new("mount")
-            .args(["-t", "tmpfs", "tmpfs"])
+            .args(["-t", "tmpfs", "-o", "mode=0755", "tmpfs"])
             .arg(volume)
             .output();
         match out {

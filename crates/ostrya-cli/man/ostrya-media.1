@@ -52,7 +52,7 @@ A plain NAME becomes \%@ID:NAME, and \%@ID:NAME stays. The command refuses \%@C:
 .SS "import"
 Pull collection refs from the media repository on a mounted volume.
 .PP
-Without \%\-\-mount, the command reads the mount table of the process and probes each mount. On each mount, it probes each entry of \fB\%\&.ostree/repos.d/\fR, then \fB\%\&.ostree/repo\fR, \fB\%ostree/repo\fR, and \fB\%var/lib/flatpak/repo\fR\&. The media repository of a mount is the first of these repositories whose summary lists a collection ref. The command skips a repository on another file system than the mount, a repository that it cannot read, and this repository. The command needs exactly one media repository.
+Without \%\-\-mount, the command reads the mount table of the process and probes each mount. It skips a mount whose directory any user can write, such as \%/tmp or \%/dev/shm. On each mount, it probes each entry of \fB\%\&.ostree/repos.d/\fR, then \fB\%\&.ostree/repo\fR, \fB\%ostree/repo\fR, and \fB\%var/lib/flatpak/repo\fR\&. The media repository of a mount is the first of these repositories whose summary lists a collection ref. The command skips a repository on another file system than the mount, a repository that it cannot read, and this repository. The command needs exactly one media repository.
 .PP
 A ref \%@ID:NAME is on the media when the ref files of the media repository and its summary both list it. For the collection id that the summary states, the command does not count the ref \fB\%ostree\-metadata\fR as listed, because it is the anchor ref of the media repository. The commit of the ref is the commit that the summary lists. The command reads no \fB\%summary.sig\fR\&. With no REF and no \%\-c, the command imports each ref on the media whose collection has a matched remote, and ignores each other collection.
 .PP
@@ -80,7 +80,7 @@ Options:
 \fB\-\-mount\fR \fIPATH\fR
 Probe the directory PATH in place of the mount table.
 .IP
-PATH need not be a mount point. The command probes the same paths under PATH, and the path of each repository must cross no mount point under PATH.
+PATH need not be a mount point. The command probes PATH also if any user can write it. The command probes the same paths under PATH, and the path of each repository must cross no mount point under PATH.
 .TP
 \fB\-c\fR, \fB\-\-collection\fR \fIID\fR
 Put each plain REF in the collection ID.

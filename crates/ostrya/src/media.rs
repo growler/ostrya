@@ -322,10 +322,12 @@ impl Repo {
     /// # Media repository
     ///
     /// The media finder reads the mount table of the process, or probes the
-    /// directory [`mount`](MediaImportOptions::mount) alone. On each mount,
-    /// it probes each entry of `.ostree/repos.d/`, then `.ostree/repo`,
-    /// `ostree/repo`, and `var/lib/flatpak/repo`. The media repository of a
-    /// mount is the first candidate whose summary lists a collection ref.
+    /// directory [`mount`](MediaImportOptions::mount) alone. In the mount
+    /// table, it skips a mount whose directory any user can write, such as
+    /// `/tmp` or `/dev/shm`. On each mount, it probes each entry of
+    /// `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
+    /// `var/lib/flatpak/repo`. The media repository of a mount is the first
+    /// candidate whose summary lists a collection ref.
     /// The finder skips a candidate on another file system than the mount,
     /// the client repository, and a candidate that it cannot read. The
     /// import needs exactly one media repository.

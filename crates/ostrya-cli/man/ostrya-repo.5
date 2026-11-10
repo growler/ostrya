@@ -561,6 +561,7 @@ The mount table of the process.
 The media finder reads the mount point and the file system type of each mount, and refuses a table larger than 16 MiB.
 For each mount point, it uses the last line of the table alone.
 It skips the root mount, the pseudo file systems, and the network file systems.
+It also skips a mount whose directory any user can write, with or without the sticky bit, such as \fB\%/tmp\fR, \fB\%/dev/shm\fR, or a tmpfs with the mode 1777.
 .TP
 \fB\%~/.aws/credentials\fR, \fB\%~/.aws/config\fR
 The shared AWS credentials file and config file of a command that reads or writes a bucket repository at an \fB\%s3://\fR address.

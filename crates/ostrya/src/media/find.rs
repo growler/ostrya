@@ -101,10 +101,12 @@ pub(super) enum MediaChoice {
 /// For each mount point, the call takes the last line of the table alone
 /// (see [`mountinfo::parse`]). It skips the root mount, the pseudo file
 /// systems, and the network file systems before a system call on their
-/// path. It also skips a mount whose directory it cannot open. On each other
-/// mount, it takes the first candidate whose summary lists a collection ref
-/// (see `probe`). Candidates with the same device and inode are one media
-/// repository, at the path of the first one in table order.
+/// path. It also skips a mount whose directory it cannot open, and a mount
+/// whose directory any user can write (mode bit `o+w`, with or without the
+/// sticky bit), such as `/tmp` or `/dev/shm`. On each other mount, it takes
+/// the first candidate whose summary lists a collection ref (see `probe`).
+/// Candidates with the same device and inode are one media repository, at
+/// the path of the first one in table order.
 ///
 /// # Errors
 ///
@@ -115,14 +117,15 @@ pub(super) async fn find_media(client: &Repo, table: Vec<u8>) -> Result<MediaCho
     let points = ostrya_rt::unblock(move || probe_points(&table)).await;
     for point in points {
         // A mount whose directory the scan cannot open holds no media.
-        let _ = scan.probe(&point).await;
+        let _ = scan.probe(&point, true).await;
     }
     Ok(scan.choice())
 }
 
 /// Scans the directory `dir` alone for media, as the client repository
 /// `client` reads them. The call reads no mount table, and `dir` need not
-/// be a mount point. The path of each candidate must cross no mount point.
+/// be a mount point. The call probes `dir` also if any user can write it.
+/// The path of each candidate must cross no mount point.
 ///
 /// # Errors
 ///
@@ -130,7 +133,7 @@ pub(super) async fn find_media(client: &Repo, table: Vec<u8>) -> Result<MediaCho
 ///   cannot read the device and the inode of the client repository.
 pub(super) async fn find_media_in(client: &Repo, dir: &Path) -> Result<MediaChoice> {
     let mut scan = Scan::new(client).await?;
-    scan.probe(dir).await?;
+    scan.probe(dir, false).await?;
     Ok(scan.choice())
 }
 
@@ -211,13 +214,18 @@ impl Scan {
     /// candidate whose summary lists a collection ref, and the probe stops
     /// there. The probe also stops at a candidate with the device and the
     /// inode of an earlier media repository, and does not record it again.
+    /// If `skip_writable` is `true`, the call does not probe a `dir` that
+    /// any user can write.
     ///
     /// # Errors
     ///
     /// - [`Error::Io`](crate::Error::Io) if the call cannot open `dir`.
-    async fn probe(&mut self, dir: &Path) -> Result<()> {
+    async fn probe(&mut self, dir: &Path, skip_writable: bool) -> Result<()> {
         let path = dir.to_owned();
-        let mount = ostrya_rt::unblock(move || open_mount(&path)).await?;
+        let Some(mount) = ostrya_rt::unblock(move || open_mount(&path, skip_writable)).await?
+        else {
+            return Ok(());
+        };
         let names = mount.repos_d.unwrap_or_else(|skip| {
             self.skipped.push((dir.join(REPOS_D), skip));
             Vec::new()
@@ -268,15 +276,20 @@ impl Scan {
 }
 
 /// Opens the directory `path` with `O_PATH`, and reads the names of the
-/// entries of its `.ostree/repos.d`. Blocks the calling thread.
-fn open_mount(path: &Path) -> Result<MountDir> {
+/// entries of its `.ostree/repos.d`. If `skip_writable` is `true`, the call
+/// returns `None` for a directory that any user can write (mode bit `o+w`),
+/// before it reads `.ostree`. Blocks the calling thread.
+fn open_mount(path: &Path, skip_writable: bool) -> Result<Option<MountDir>> {
     let fd = rustix::fs::open(
         path,
         OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?;
+    if skip_writable && Mode::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode).contains(Mode::WOTH) {
+        return Ok(None);
+    }
     let repos_d = repos_d_names(fd.as_fd());
-    Ok(MountDir { fd, repos_d })
+    Ok(Some(MountDir { fd, repos_d }))
 }
 
 /// Returns the names of the entries of `.ostree/repos.d` under the
@@ -724,6 +737,27 @@ mod tests {
         assert_eq!(probe_points(&table(&mounts)), [Path::new("/mnt/media")]);
     }
 
+    /// The scan of the mount table skips a mount whose directory any user
+    /// can write, with or without the sticky bit, and records no skipped
+    /// candidate. A directory given in place of the mount table is probed.
+    #[test]
+    fn the_scan_skips_a_mount_that_any_user_can_write() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new(&std::env::temp_dir());
+            let client = repo_at(&scratch.root.join("client"), None).await;
+            for mode in [0o1777, 0o777] {
+                let mount = scratch.dir(&format!("{mode:o}"));
+                repo_at(&mount.join(".ostree/repo"), Some(&media_summary())).await;
+                std::fs::set_permissions(&mount, std::fs::Permissions::from_mode(mode)).unwrap();
+
+                let choice = find_media(&client, table(&[(&mount, "tmpfs")])).await;
+                assert!(skipped(choice.unwrap()).is_empty(), "mode {mode:o}");
+                let choice = find_media_in(&client, &mount).await;
+                assert_eq!(one(choice.unwrap()).path, mount.join(".ostree/repo"));
+            }
+        });
+    }
+
     /// A mount of an excluded type over a mount with media hides the media.
     /// A mount of another type over an excluded mount is probed.
     #[test]
@@ -881,7 +915,7 @@ mod tests {
         let mount = dir.join("mnt");
         std::fs::create_dir(&mount).unwrap();
         match Command::new("mount")
-            .args(["-t", "tmpfs", "tmpfs"])
+            .args(["-t", "tmpfs", "-o", "mode=0755", "tmpfs"])
             .arg(&mount)
             .output()
         {

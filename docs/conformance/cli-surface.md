@@ -4665,11 +4665,15 @@ No matrix cell needs these. The shell suite invokes them.
     imports each ref on the media whose collection has a matched remote. The
     tool takes `COLLECTION-ID REF` pairs.
   - The port reads the mount table of the process. It takes each mount
-    except the root mount, the pseudo file systems, and the network file
-    systems. So the port also finds media on a tmpfs, on a bind mount, and
-    outside `/run/media/`. The tool lists the mounts through GIO, and finds
-    a ramfs under `/run/media/`. `--mount=PATH` of the port probes the
-    directory PATH alone. The tool has no such option.
+    except the root mount, the pseudo file systems, the network file
+    systems, and a mount whose directory any user can write (mode bit
+    `o+w`, with or without the sticky bit). So the port also finds media on
+    a tmpfs whose directory has no bit `o+w`, on a bind mount, and outside
+    `/run/media/`. It does not find media on `/tmp`, on `/dev/shm`, or on a
+    tmpfs with the mode `1777`. The tool lists the mounts through GIO, and
+    finds a ramfs under `/run/media/`. `--mount=PATH` of the port probes the
+    directory PATH alone, also if any user can write it. The tool has no
+    such option.
   - The port reads exactly one media repository. More than one gives exit 1
     with the path of each, and `--mount` selects one. On one mount, the
     media repository is the first candidate whose summary lists a collection

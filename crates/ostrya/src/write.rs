@@ -1701,17 +1701,7 @@ pub(crate) fn stage_clone_content_blocking(
         ));
     }
     let src_path = loose_path(checksum, ObjectType::File, src_mode);
-    let opened = if strict {
-        crate::object::open_regular_file(src_objects_fd, &src_path, true)
-    } else {
-        rustix::fs::openat(
-            src_objects_fd,
-            src_path.as_str(),
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(Into::into)
-    };
+    let opened = crate::object::open_regular_file_nofollow(src_objects_fd, &src_path, strict);
     let src = match opened {
         Ok(src) => src,
         // If the source object disappeared between the plan and the import,
@@ -1798,16 +1788,7 @@ fn clone_metadata(
     staging_name: &str,
     strict: bool,
 ) -> Result<(u64, Blocks)> {
-    let src = if strict {
-        crate::object::open_regular_file(src_dir, src_path, true)?
-    } else {
-        rustix::fs::openat(
-            src_dir,
-            src_path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?
-    };
+    let src = crate::object::open_regular_file_nofollow(src_dir, src_path, strict)?;
     let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
     let apply = || -> Result<(u64, Blocks)> {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;

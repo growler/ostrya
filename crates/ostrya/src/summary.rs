@@ -2706,17 +2706,7 @@ pub(crate) fn read_root_file_with(
 ) -> Result<Option<Vec<u8>>> {
     use std::io::Read;
 
-    let opened = if strict {
-        crate::object::open_regular_file(repo_fd, name, true)
-    } else {
-        rustix::fs::openat(
-            repo_fd,
-            name,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(std::io::Error::from)
-    };
+    let opened = crate::object::open_regular_file_nofollow(repo_fd, name, strict);
     let fd = match opened {
         Ok(fd) => fd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -4445,6 +4435,29 @@ mod tests {
         assert!(remove_root_file_blocking(fd.as_fd(), "file").unwrap());
         assert!(!dir.join("file").exists());
         assert!(!remove_root_file_blocking(fd.as_fd(), "file").unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The plain read of a root file follows no symlink at the file. A
+    /// symlink to a regular file fails the read with `ELOOP`.
+    #[test]
+    fn a_plain_summary_read_refuses_a_symlinked_summary() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-summary-plain-symlink-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("target"), b"bytes").unwrap();
+        std::os::unix::fs::symlink("target", dir.join(SUMMARY_FILE)).unwrap();
+        let fd = std::fs::File::open(&dir).unwrap();
+        let outcome = read_root_file_blocking(fd.as_fd(), SUMMARY_FILE);
+        assert!(
+            matches!(&outcome, Err(Error::Io(e))
+                if e.raw_os_error() == Some(Errno::LOOP.raw_os_error())),
+            "{outcome:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

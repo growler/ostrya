@@ -4151,17 +4151,8 @@ async fn import_filez(
     let path = name.loose_path(src.mode());
     let repo = src.clone();
     let (file, len) = ostrya_rt::unblock(move || -> Result<_> {
-        let opened = if repo.is_strict() {
-            crate::object::open_regular_file(repo.objects_fd(), &path, true)
-        } else {
-            rustix::fs::openat(
-                repo.objects_fd(),
-                path.as_str(),
-                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )
-            .map_err(Into::into)
-        };
+        let opened =
+            crate::object::open_regular_file_nofollow(repo.objects_fd(), &path, repo.is_strict());
         let fd = match opened {
             Ok(fd) => fd,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

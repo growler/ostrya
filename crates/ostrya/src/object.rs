@@ -73,6 +73,30 @@ pub(crate) fn open_regular_file(
     Ok(fd)
 }
 
+/// Opens the file at `path` under `dir` for reading, and follows no symlink
+/// at the last component of `path`.
+///
+/// If `strict` is set, the open is the strict open of [`open_regular_file`].
+/// If `strict` is not set, the open is an `openat` with `O_NOFOLLOW`. A
+/// symlink at the last component fails the open with `ELOOP`. This open
+/// follows a symlink at a directory component of `path`. It does not check
+/// the file type, and it can wait on a FIFO.
+pub(crate) fn open_regular_file_nofollow(
+    dir: rustix::fd::BorrowedFd<'_>,
+    path: &str,
+    strict: bool,
+) -> std::io::Result<OwnedFd> {
+    if strict {
+        return open_regular_file(dir, path, true);
+    }
+    Ok(rustix::fs::openat(
+        dir,
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )?)
+}
+
 /// Opens the fan-out directory `fanout` under `objects_fd` as a path
 /// descriptor with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`.
 ///

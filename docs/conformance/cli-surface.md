@@ -4701,8 +4701,10 @@ No matrix cell needs these. The shell suite invokes them.
     ref, and imports the other refs. The current ref is the ref that the
     port writes. When the port has no ref at that place, it is
     `refs/remotes/REMOTE/REF` of the matched remote whose `collection-id`
-    is ID. Under the `[core] collection-id`, the port reads no ref under
-    `refs/remotes/`. The tool moves the ref to the older commit at exit 0.
+    is ID. A remote ref whose commit the client does not store is no
+    current ref. Under the `[core] collection-id`, the port reads no ref
+    under `refs/remotes/`. The tool moves the ref to the older commit at
+    exit 0.
   - The port refuses a commit whose timestamp is not the timestamp that the
     media summary lists for its ref, and imports the other refs. The tool
     was not observed with such media.
@@ -6868,13 +6870,16 @@ ostrya media import [--repo=PATH] [--mount=PATH] [-c|--collection ID] [REF...]
   is the `[core] collection-id` of the repository. The current ref is the
   ref at that place. If the repository has no ref at that place, and the
   `collection-id` of the matched remote `R` is `ID`, the current ref is
-  `refs/remotes/R/NAME`. Under the `[core] collection-id`, the command reads
-  no ref under `refs/remotes/`. A read of the current ref that fails
+  `refs/remotes/R/NAME`. A remote ref whose commit the repository does not
+  store is no current ref. Under the `[core] collection-id`, the command
+  reads no ref under `refs/remotes/`. A read of the current ref that fails
   refuses the ref.
 - The command pulls each ref at depth 0, with its own transaction, and reads
   no static delta. It refuses a commit that is older than the commit of the
   current ref, and a commit whose timestamp is not the timestamp that the
-  media summary lists for the ref.
+  media summary lists for the ref. If the command pulls a ref whose current
+  ref is the ref at the place that the command writes, and the repository
+  does not store the commit of the current ref, the command refuses the ref.
 - Before the first pull, the command checks each REF, finds the media
   repository, finds each REF on the media, and finds the matched remote of
   each collection. A failure writes one `error:` line to standard error and

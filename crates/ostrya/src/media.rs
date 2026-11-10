@@ -20,7 +20,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use ostrya_core::{Checksum, Ref, RefSelector, RepoMode, is_valid_collection_id};
+use ostrya_core::{Checksum, ObjectType, Ref, RefSelector, RepoMode, is_valid_collection_id};
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
@@ -387,8 +387,10 @@ impl Repo {
     /// repository. The current ref of `@ID:NAME` is the ref at that place.
     /// If this repository has no ref at that place, and the `collection-id`
     /// of the matched remote `R` is `ID`, the current ref is
-    /// `refs/remotes/R/NAME`. Under the `[core] collection-id`, the import
-    /// reads no ref under `refs/remotes/`.
+    /// `refs/remotes/R/NAME`. A remote ref whose commit this repository
+    /// does not store gives no current ref. Under the
+    /// `[core] collection-id`, the import reads no ref under
+    /// `refs/remotes/`.
     ///
     /// The import does not pull a ref whose current ref holds the commit of
     /// the media. It makes one local pull from the media repository for each
@@ -397,9 +399,11 @@ impl Repo {
     /// no static delta. It takes the `.commitmeta` and the dependencies of
     /// field 2 of the commit. The `ostree.collection-binding` of the commit
     /// must state `ID`, and the ref-binding check applies. The pull refuses
-    /// a commit that is older than the commit of the current ref. It also
-    /// refuses a commit whose timestamp is not the timestamp that the
-    /// summary lists for the ref.
+    /// a commit that is older than the commit of the current ref. If the
+    /// current ref is the ref at the place that the import writes, and this
+    /// repository does not store its commit, the pull refuses the ref with
+    /// [`Error::ObjectNotFound`]. It also refuses a commit whose timestamp
+    /// is not the timestamp that the summary lists for the ref.
     ///
     /// A read of the current ref that fails refuses its ref, and so does a
     /// pull that fails. The import then continues with the next ref.
@@ -596,7 +600,8 @@ impl Repo {
             .collect();
 
         // The current ref is the ref that the pull writes. If that ref is
-        // absent, it is the remote ref of the remote in `tracked`.
+        // absent, it is the remote ref of the remote in `tracked`. A remote
+        // ref whose commit this repository does not store is no current ref.
         let mut tips = Vec::with_capacity(selected.len());
         for &(id, ref name, _) in &selected {
             let mut check = TimestampCheck::CurrentRef;
@@ -604,7 +609,11 @@ impl Repo {
             if let (Ok(None), Some(&remote)) = (&tip, tracked.get(id)) {
                 tip = self.resolve_ref_tip(&Ref::remote(remote, name)).await;
                 if let Ok(Some(remote_tip)) = tip {
-                    check = TimestampCheck::Rev(remote_tip);
+                    match self.has_object(ObjectType::Commit, &remote_tip).await {
+                        Ok(true) => check = TimestampCheck::Rev(remote_tip),
+                        Ok(false) => tip = Ok(None),
+                        Err(e) => tip = Err(e),
+                    }
                 }
             }
             tips.push((tip, check));

@@ -17,7 +17,7 @@ use common::{TmpDir, file_inventory};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
     Error, FsckOptions, MediaExportOptions, MediaImportOptions, MediaImportReport, MutableTree,
-    Ref, Repo, RepoMode, SummaryOptions, Type, Value,
+    ObjectType, Ref, Repo, RepoMode, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -562,6 +562,73 @@ fn a_remote_ref_that_cannot_be_read_refuses_the_ref() {
         assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
         assert_eq!(names(&report.refused), [format!("@{X}:a")]);
         assert_eq!(ref_files(&c), ["refs/remotes/origin/a"]);
+    });
+}
+
+/// A remote ref whose commit the client does not store is no current ref,
+/// also when it names the commit of the media. The import writes the
+/// mirror ref and does not change the remote ref.
+#[test]
+fn a_remote_ref_whose_commit_is_absent_is_no_current_ref() {
+    let tmp = TmpDir::new("media-import-absent-remote-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let b = signed(&src, dir, X, "b", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        let refs = [Ref::collection(X, "a"), Ref::collection(X, "b")];
+        export(&src, &mount, &refs).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let absent = Checksum::sha256(b"a commit that the client does not store");
+        c.set_ref_immediate(&Ref::remote("origin", "a"), Some(&absent))
+            .await
+            .unwrap();
+        c.set_ref_immediate(&Ref::remote("origin", "b"), Some(&b))
+            .await
+            .unwrap();
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert_eq!(report.written, [(refs[0].clone(), a), (refs[1].clone(), b)]);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(a));
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/b")), Some(b));
+        assert_eq!(ref_file(&c, "remotes/origin/a"), Some(absent));
+        assert_eq!(ref_file(&c, "remotes/origin/b"), Some(b));
+        for tip in [a, b] {
+            assert!(c.has_object(ObjectType::Commit, &tip).await.unwrap());
+        }
+    });
+}
+
+/// A mirror ref whose commit the client does not store refuses the ref
+/// that the import pulls, and the mirror ref does not change.
+#[test]
+fn a_mirror_ref_whose_commit_is_absent_refuses_the_ref() {
+    let tmp = TmpDir::new("media-import-absent-mirror-ref");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        signed(&src, dir, X, "a", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(&src, &mount, &[Ref::collection(X, "a")]).await;
+        let c = client(dir, "client", None, &origin()).await;
+        let absent = Checksum::sha256(b"a commit that the client does not store");
+        c.set_ref_immediate(&Ref::collection(X, "a"), Some(&absent))
+            .await
+            .unwrap();
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert_eq!(names(&report.refused), [format!("@{X}:a")]);
+        assert!(
+            matches!(&report.refused[0].1, Error::ObjectNotFound { .. }),
+            "{:?}",
+            report.refused[0].1
+        );
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(absent));
     });
 }
 

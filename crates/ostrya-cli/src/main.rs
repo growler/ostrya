@@ -5285,12 +5285,16 @@ enum MediaCommand {
     /// `collection-id` of this repository. The current ref is the ref at that
     /// place. If this repository has no ref at that place, and the
     /// `collection-id` of the matched remote R is ID, the current ref is
-    /// `refs/remotes/R/NAME`. Under the `collection-id` of this repository,
-    /// the command reads no ref under `refs/remotes/`. The command does not
-    /// pull a ref whose current ref holds the commit of the media. It refuses
-    /// a commit that is older than the commit of the current ref, a commit
-    /// whose timestamp is not the timestamp that the summary lists for the
-    /// ref, and a ref whose current ref it cannot read.
+    /// `refs/remotes/R/NAME`. A remote ref whose commit this repository does
+    /// not store is no current ref. Under the `collection-id` of this
+    /// repository, the command reads no ref under `refs/remotes/`. The
+    /// command does not pull a ref whose current ref holds the commit of the
+    /// media. It refuses a commit that is older than the commit of the
+    /// current ref, a commit whose timestamp is not the timestamp that the
+    /// summary lists for the ref, and a ref whose current ref it cannot read.
+    /// If the command pulls a ref whose current ref is the ref at the place
+    /// that the command writes, and this repository does not store the
+    /// commit of the current ref, the command refuses the ref.
     ///
     /// Before the first pull, the command checks each REF, finds the media
     /// repository, and finds each REF and the matched remote of each

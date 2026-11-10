@@ -5650,8 +5650,10 @@ The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
 The current ref of `@ID:NAME` is the ref of the client at that place. If
 the client has no ref at that place, and the `collection-id` of the matched
 remote `R` is `ID`, the current ref is `refs/remotes/R/NAME`. A remote that
-matches through `mirrored-collection-ids` alone gives no current ref. Under
-the `[core] collection-id`, the import reads no ref under `refs/remotes/`.
+matches through `mirrored-collection-ids` alone gives no current ref. A
+remote ref whose commit the client does not store gives no current ref.
+Under the `[core] collection-id`, the import reads no ref under
+`refs/remotes/`.
 
 A ref whose current ref holds the commit of the media is unchanged. The
 import does not pull it, and writes no ref for it. For each other ref, the
@@ -5661,10 +5663,12 @@ the `.commitmeta` of the commit, and the dependencies of field 2 of the
 commit as loose objects. The `ostree.collection-binding` of the commit must
 state `ID`, and the ref-binding check applies. The pull refuses a commit
 whose timestamp is older than the timestamp of the commit of the current
-ref. The `ostree` command moves the ref back. The pull also refuses a
-commit whose timestamp is not the timestamp that the summary lists for the
-ref. Under `[ex-ostrya] generate-composefs`, the transaction builds the
-composefs image of the commit, as each pull does.
+ref. The `ostree` command moves the ref back. If the current ref is the
+ref at the place that the import writes, and the client does not store its
+commit, the pull refuses the ref. The pull also refuses a commit whose
+timestamp is not the timestamp that the summary lists for the ref. Under
+`[ex-ostrya] generate-composefs`, the transaction builds the composefs
+image of the commit, as each pull does.
 
 A read of the current ref that fails refuses its ref, and so does a pull
 that fails. The import then continues with the next ref. The result of the

@@ -167,8 +167,8 @@ struct Scan {
     /// The device, the inode, and the path of each media repository, in the
     /// order of the mounts.
     found: Vec<(Identity, PathBuf)>,
-    /// The repository and the summary of the media repository, while the
-    /// scan has found one media repository alone.
+    /// The repository and the summary of the first media repository that
+    /// the scan found.
     first: Option<(Repo, Vec<u8>)>,
 }
 
@@ -251,7 +251,9 @@ impl Scan {
                 Probe::Skipped(skip) => self.skipped.push((path, skip)),
                 Probe::Found => return Ok(()),
                 Probe::Media(id, repo, summary) => {
-                    self.first = self.found.is_empty().then_some((repo, summary));
+                    if self.first.is_none() {
+                        self.first = Some((repo, summary));
+                    }
                     self.found.push((id, path));
                     return Ok(());
                 }
@@ -263,14 +265,14 @@ impl Scan {
     /// Applies the one-media rule to the result of the scan.
     fn choice(self) -> MediaChoice {
         let mut paths: Vec<PathBuf> = self.found.into_iter().map(|(_, path)| path).collect();
-        match (self.first, paths.len()) {
-            (_, 0) => MediaChoice::None(self.skipped),
-            (Some((repo, summary)), 1) => MediaChoice::One(FoundMedia {
+        match self.first {
+            None => MediaChoice::None(self.skipped),
+            Some((repo, summary)) if paths.len() == 1 => MediaChoice::One(FoundMedia {
                 path: paths.remove(0),
                 repo,
                 summary,
             }),
-            _ => MediaChoice::Many(paths),
+            Some(_) => MediaChoice::Many(paths),
         }
     }
 }

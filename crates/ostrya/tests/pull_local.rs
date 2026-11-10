@@ -1911,7 +1911,8 @@ fn untrusted_rejects_a_corrupt_source_object() {
                 .unwrap()
         );
 
-        // Untrusted: the pull reads each object first, so it fails.
+        // Untrusted: the pull hashes each linked object after the link, so it
+        // fails.
         let (untrusted_dir, untrusted) = make_repo(base, "untrusted", RepoMode::BareUser).await;
         let err = untrusted
             .pull_local(
@@ -1968,7 +1969,8 @@ fn a_cross_mode_clone_is_trusted_and_untrusted_verifies_it() {
             bytes
         );
 
-        // `UNTRUSTED` reads the object once, before the clone, and rejects it.
+        // `UNTRUSTED` reads the staged object once, after the clone, and
+        // rejects it.
         let (untrusted_dir, untrusted) =
             make_repo(base, "untrusted", RepoMode::BareUserShared).await;
         let err = untrusted

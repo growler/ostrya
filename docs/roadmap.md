@@ -51,15 +51,22 @@ for it.
   of a static delta. So the HTTP pull of the port stops at the first absent
   optional file of a bucket repository whose anonymous policy gives no
   `s3:ListBucket` (`ostrya-repo(5)`, section BUCKET REPOSITORIES).
-- A local pull under `PullFlags::UNTRUSTED` hashes a metadata object, and
-  the payload of a reflink clone, in one read, and copies, clones, or links
-  the object in a second step. A source that changes between the two steps
-  can pass the hash. On the hardlink path, the import links the source file
-  first, and then hashes the file that it opens again at the same path. A
-  rename between the two steps stages another inode than the inode that it
-  hashes. The destination also shares the inode with the source after the
+- Under `PullFlags::UNTRUSTED`, a local pull hardlinks a content object
+  that the two repositories store in the same form, and hashes the
+  linked inode. The destination shares the inode with the source after the
   pull, so a later change of the source file changes the object in the
-  destination. A fix copies and hashes each object in one read.
+  destination.
+- A local pull reads a commit from the source two times. The signature
+  check, the ref-binding check, and the timestamp check use the first
+  read, and the pull does not hash it. The import hashes and stages the
+  second read. The walk of the tree also parses each dirtree from a read
+  of the source that the pull does not hash. The HTTP pull reads a commit
+  and a dirtree from a localcache repository in the same way. The
+  signature check and the import of a `.commitmeta` also use two reads. A
+  source that changes between two reads can make the signature of one
+  commit pass for another commit. It can also make the pull walk a tree
+  that is not the staged tree. A fix checks and walks the bytes that the
+  pull hashes and stages.
 
 ## Gaps in the commands
 

@@ -212,7 +212,6 @@ use ostrya_core::{
     Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, Ref, RepoMode, Value,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
-use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
@@ -1436,6 +1435,10 @@ impl Repo {
     ///   it makes a byte copy. The new inode is that of a metadata object written
     ///   into this repository: mode 0644, no xattrs, and the ownership of the
     ///   writing process.
+    /// - Write of a metadata object: under
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), a metadata object takes neither
+    ///   the hardlink nor the reflink or copy. The pull reads it once and
+    ///   writes the bytes that it hashes, as `# Trust` states.
     /// - Clone: the pull clones a regular file if the two modes share its
     ///   payload bytes and not its inode metadata, as two modes of the bare
     ///   family do. The clone is a `FICLONE`
@@ -1537,7 +1540,9 @@ impl Repo {
     /// a reflinked payload shares the extents of the source. So a pull of
     /// objects that the destination shares with the source can run on a file
     /// system with no space for a second copy. A byte-copied or re-ingested
-    /// object is charged its full stored size.
+    /// object is charged its full stored size. Under
+    /// [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull writes each metadata
+    /// object, so each one is charged its full size.
     ///
     /// # Trust
     ///
@@ -1549,8 +1554,16 @@ impl Repo {
     /// The `.filez` copy and the re-ingest path hash each object as they
     /// stream, and compare the result with the name, whatever the flags say.
     /// So these paths refuse a corrupt source with or without the flag. The
-    /// other paths move bytes without a hash, and the flag adds one read of
-    /// each object. An untrusted pull thus hashes each object once.
+    /// other paths move bytes without a hash. On these paths, the flag reads a
+    /// metadata object once, hashes the bytes, and writes the same bytes. The
+    /// flag hashes a linked or cloned content object after the link or the
+    /// clone. It reads the staged object as this repository stores it, and
+    /// makes the hash and the mode checks of the pull on that one read. So a
+    /// source that changes during the import cannot pass the hash. An
+    /// untrusted pull hashes each object once.
+    ///
+    /// A hardlinked object shares its inode with the source. So a later change
+    /// of the source file changes the object in this repository.
     ///
     /// A signature covers the commit or the summary alone. A signature check
     /// of this pull does not set the flag. A caller that checks the
@@ -2382,8 +2395,16 @@ impl Repo {
         if name.ty != ObjectType::File {
             // A metadata object is a plain file of its serialized bytes in each
             // mode, so the two repositories always store it in the same form.
+            // An untrusted import reads the object once and writes the bytes
+            // that it hashes, so a source that changes after the read cannot
+            // pass the hash. The write charges each object in full.
             if flags.contains(PullFlags::UNTRUSTED) {
-                verify_metadata(src, name).await?;
+                let bytes = src.load_object_bytes(name.ty, &name.checksum).await?;
+                #[cfg(test)]
+                import_seam::run(self.repo_fd());
+                txn.write_metadata_owned(name.ty, Some(&name.checksum), bytes)
+                    .await?;
+                return Ok(());
             }
             link_import(txn, src, name, flags).await?;
             return Ok(());
@@ -2394,17 +2415,15 @@ impl Repo {
         let untrusted = flags.contains(PullFlags::UNTRUSTED);
 
         // The mode checks read the logical form of the object, before each
-        // import path. An untrusted verification reads the same form, and it
-        // waits for the import path. The link and the clone move bytes without
-        // a hash, so the pull verifies them here. A `.filez` copy and a
-        // re-ingest hash the object as they write it and compare the result
-        // with its name. A verification before them reads the payload twice,
-        // so the pull makes none.
-        let loaded = if checks.any() || untrusted {
+        // import path. The link and the clone move bytes without a hash, so an
+        // untrusted pull checks and hashes the staged object after them, as
+        // `verify_staged_content` states. A `.filez` copy and a re-ingest hash
+        // the object as they write it and compare the result with its name.
+        // A second verification of them reads the payload twice, so the pull
+        // makes none.
+        let loaded = if checks.any() {
             let file = src.load_file(&name.checksum).await?;
-            if checks.any() {
-                checks.check(&name.checksum, &file.meta())?;
-            }
+            checks.check(&name.checksum, &file.meta())?;
             Some(file)
         } else {
             None
@@ -2413,8 +2432,8 @@ impl Repo {
         // Two repositories of one mode store a content object in the same form,
         // inode included, so the import shares the source inode.
         if same_mode && link_import(txn, src, name, flags).await? {
-            if untrusted && let Some(file) = &loaded {
-                verify_content(&name.checksum, file, verify_buf).await?;
+            if untrusted {
+                verify_staged_content(txn, name, checks, verify_buf).await?;
             }
             return Ok(());
         }
@@ -2435,7 +2454,7 @@ impl Repo {
                     && link_import(txn, src, name, flags).await?
                 {
                     if untrusted {
-                        verify_content(&name.checksum, &file, verify_buf).await?;
+                        verify_staged_content(txn, name, checks, verify_buf).await?;
                     }
                     return Ok(());
                 }
@@ -2447,11 +2466,11 @@ impl Repo {
             }
             FileKind::Regular { size } => {
                 if payload_shared(src.mode(), self.mode()) {
-                    if untrusted {
-                        verify_content(&name.checksum, &file, verify_buf).await?;
-                    }
                     txn.stage_clone_content(src, name.checksum, meta.regular_header(), *size)
                         .await?;
+                    if untrusted {
+                        verify_staged_content(txn, name, checks, verify_buf).await?;
+                    }
                     return Ok(());
                 }
                 if src.mode().is_archive() && self.mode().is_archive() {
@@ -4240,7 +4259,9 @@ impl ModeChecks {
     /// applies.
     ///
     /// The caller calls it before the write of the bytes of the object, so a
-    /// refused object leaves nothing.
+    /// refused object leaves nothing. An untrusted local import also calls it
+    /// on the object that a link or a clone staged, as
+    /// [`verify_staged_content`] states. A refusal there fails the pull.
     pub(crate) fn check(&self, checksum: &Checksum, meta: &FileMeta) -> Result<()> {
         if self.bareuseronly_files {
             check_bareuseronly(checksum, meta)?;
@@ -4301,25 +4322,27 @@ fn check_bareuseronly(checksum: &Checksum, meta: &FileMeta) -> Result<()> {
     )))
 }
 
-/// Verifies that the serialized bytes of a metadata object hash to its name.
+/// Verifies that the content object `name`, which a link or a clone staged in
+/// `txn`, passes `checks` and hashes to its name.
 ///
-/// A metadata object can be as large as
-/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), so the read and the hash
-/// run in one call on the blocking pool.
-async fn verify_metadata(src: &Repo, name: ObjectName) -> Result<()> {
-    let src = src.clone();
-    ostrya_rt::unblock(move || {
-        let bytes = src.load_object_bytes_blocking(name.ty, &name.checksum)?;
-        let actual = Checksum::from_bytes(Sha256::digest(&bytes).into());
-        if actual != name.checksum {
-            return Err(Error::ChecksumMismatch {
-                expected: name.checksum,
-                actual,
-            });
-        }
-        Ok(())
-    })
-    .await
+/// The function loads the object as the destination stores it, and makes the
+/// mode checks and the hash on that one load. So the checks and the hash
+/// cover the object that the transaction publishes, and a source that changes
+/// during the import cannot pass them. `buf` is the read buffer of
+/// [`verify_content`].
+async fn verify_staged_content(
+    txn: &Transaction,
+    name: ObjectName,
+    checks: ModeChecks,
+    buf: &mut Vec<u8>,
+) -> Result<()> {
+    #[cfg(test)]
+    import_seam::run(txn.repo().repo_fd());
+    let file = txn.load_file_staged_first(&name.checksum).await?;
+    if checks.any() {
+        checks.check(&name.checksum, &file.meta())?;
+    }
+    verify_content(&name.checksum, &file, buf).await
 }
 
 /// Verifies that the framed header and the streamed payload of a content
@@ -4360,6 +4383,54 @@ const _: fn() = || {
     assert_send_sync::<PullOptions>();
     assert_send_sync::<TimestampCheck>();
 };
+
+/// A seam for the unit tests in the local import.
+///
+/// A test arms an action for one destination repository root. An untrusted
+/// import runs the action once, where a change of the source object can come
+/// between the bytes that the import stages and the bytes that it hashes:
+/// after the read of a metadata object and before its write, and after the
+/// link or the clone of a content object and before its hash. The calls
+/// compile out of a build that is not a test build.
+#[cfg(test)]
+pub(crate) mod import_seam {
+    use std::os::fd::BorrowedFd;
+    use std::sync::{Mutex, PoisonError};
+
+    /// A repository root, by device and inode.
+    type Root = (u64, u64);
+
+    type Action = Box<dyn FnOnce() + Send>;
+
+    static ACTIONS: Mutex<Vec<(Root, Action)>> = Mutex::new(Vec::new());
+
+    /// Arms `f` for the next import into the repository at `root`.
+    pub(crate) fn arm(root: &std::path::Path, f: impl FnOnce() + Send + 'static) {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(root).unwrap();
+        ACTIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(((meta.dev(), meta.ino()), Box::new(f)));
+    }
+
+    /// Runs the action armed for the repository whose root is open at
+    /// `repo_fd`, if one is armed.
+    pub(crate) fn run(repo_fd: BorrowedFd<'_>) {
+        let stat = rustix::fs::fstat(repo_fd).unwrap();
+        let root = (stat.st_dev, stat.st_ino);
+        let action = {
+            let mut actions = ACTIONS.lock().unwrap_or_else(PoisonError::into_inner);
+            actions
+                .iter()
+                .position(|(at, _)| *at == root)
+                .map(|at| actions.remove(at).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -4883,5 +4954,182 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(matches!(result, Ok(true)), "{result:?}");
         assert!(staged);
+    }
+
+    /// An untrusted import stages the bytes that it hashes. The seam replaces
+    /// the source object between the read that the import hashes and the read
+    /// that it stages. A good object that goes bad there is staged from the
+    /// good bytes. A bad object that comes good there is refused.
+    #[test]
+    fn an_untrusted_import_stages_only_the_bytes_that_it_hashes() {
+        let (untrusted, copy) = (
+            PullFlags::UNTRUSTED,
+            PullFlags::UNTRUSTED | PullFlags::FORCE_COPY,
+        );
+        for (src_mode, dst_mode, flags, index) in [
+            (RepoMode::Archive, RepoMode::Archive, untrusted, 0),
+            (RepoMode::Archive, RepoMode::Archive, untrusted, 1),
+            (RepoMode::BareUser, RepoMode::BareUserOnly, untrusted, 0),
+            (RepoMode::BareUser, RepoMode::BareUser, copy, 0),
+            (RepoMode::BareUser, RepoMode::BareUser, untrusted, 0),
+            (RepoMode::BareUser, RepoMode::BareUserShared, untrusted, 2),
+        ] {
+            for goes_bad in [true, false] {
+                let (dir, strict, names, _, dst) = strict_fixture("untrusted", src_mode, dst_mode);
+                let name = names[index];
+                // The bad object is another valid object of the same type.
+                let other = ostrya_rt::block_on(async {
+                    let src = Repo::open(&dir.join("src")).await.unwrap();
+                    let txn = src.transaction().await.unwrap();
+                    let other = match index {
+                        0 => {
+                            let meta = FileMeta::regular(0, 0, 0o644);
+                            txn.write_regfile_inline(None, &meta, b"outside\n").await
+                        }
+                        1 => {
+                            txn.write_dirmeta(&ostrya_core::DirMeta {
+                                uid: 0,
+                                gid: 0,
+                                mode: 0o40700,
+                                xattrs: Default::default(),
+                            })
+                            .await
+                        }
+                        _ => {
+                            let meta = FileMeta::regular(0, 0, 0o777);
+                            txn.write_symlink("outside", &meta, None).await
+                        }
+                    };
+                    txn.commit().await.unwrap();
+                    other.unwrap()
+                });
+                let objects = dir.join("src/objects");
+                let object = objects.join(name.loose_path(src_mode));
+                let other = ObjectName {
+                    checksum: other,
+                    ty: name.ty,
+                };
+                let other = objects.join(other.loose_path(src_mode));
+                let good = std::fs::read(&object).unwrap();
+                let (tmp, aside) = (dir.join("tmp"), dir.join("aside"));
+                let at = object.clone();
+                let put_bad = move || {
+                    std::fs::hard_link(&other, &tmp).unwrap();
+                    std::fs::rename(&tmp, &at).unwrap();
+                };
+                if goes_bad {
+                    import_seam::arm(&dir.join("dst"), put_bad);
+                } else {
+                    std::fs::rename(&object, &aside).unwrap();
+                    put_bad();
+                    let at = object.clone();
+                    import_seam::arm(&dir.join("dst"), move || {
+                        std::fs::rename(&aside, &at).unwrap()
+                    });
+                }
+
+                let (result, staged) = ostrya_rt::block_on(async {
+                    let txn = dst.transaction().await.unwrap();
+                    let result = dst
+                        .import_from(&txn, &strict, name, flags, &mut Vec::new())
+                        .await;
+                    let staged = crate::write::flat_name(&name.checksum, name.ty, dst_mode);
+                    let staged = rustix::fs::openat(
+                        txn.staging_fd(),
+                        staged.as_str(),
+                        OFlags::RDONLY | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .ok()
+                    .map(|fd| {
+                        let mut bytes = Vec::new();
+                        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes)
+                            .unwrap();
+                        bytes
+                    });
+                    (result, staged)
+                });
+                let ran = (std::fs::read(&object).unwrap() == good) != goes_bad;
+                let _ = std::fs::remove_dir_all(&dir);
+                let row = format!("{src_mode:?} -> {dst_mode:?} {flags:?} goes_bad={goes_bad}");
+                assert!(ran, "{row}: the seam did not run");
+                if goes_bad {
+                    assert!(result.is_ok(), "{row}: {result:?}");
+                    assert!(
+                        staged.as_deref() == Some(&good[..]),
+                        "{row}: bad bytes staged"
+                    );
+                } else {
+                    match result {
+                        Err(Error::ChecksumMismatch { expected, .. }) => {
+                            assert_eq!(expected, name.checksum, "{row}")
+                        }
+                        other => panic!("{row}: {other:?}"),
+                    }
+                }
+            }
+        }
+    }
+
+    /// An untrusted import makes the mode checks on the object that it hashes.
+    /// A `bare-user-only` destination refuses a setuid object. The source path
+    /// holds a 0755 inode at the mode check of the source, and the seam sets
+    /// the setuid bit on the linked inode before the hash.
+    #[test]
+    fn an_untrusted_link_checks_the_modes_of_the_staged_object() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, strict, _, _, dst) = strict_fixture(
+            "staged-modes",
+            RepoMode::BareUserOnly,
+            RepoMode::BareUserOnly,
+        );
+        let payload = b"setuid\n";
+        let plain = ostrya_rt::block_on(async {
+            let src = Repo::open(&dir.join("src")).await.unwrap();
+            let txn = src.transaction().await.unwrap();
+            let plain = txn
+                .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o755), payload)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            ObjectName {
+                checksum: plain,
+                ty: ObjectType::File,
+            }
+        });
+        let mut hasher =
+            ContentHasher::new(&FileMeta::regular(0, 0, 0o4755).regular_header()).unwrap();
+        hasher.update(payload);
+        let name = ObjectName {
+            checksum: hasher.finish(),
+            ty: ObjectType::File,
+        };
+        let objects = dir.join("src/objects");
+        let object = objects.join(name.loose_path(RepoMode::BareUserOnly));
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        std::fs::hard_link(
+            objects.join(plain.loose_path(RepoMode::BareUserOnly)),
+            &object,
+        )
+        .unwrap();
+        let at = object.clone();
+        import_seam::arm(&dir.join("dst"), move || {
+            std::fs::set_permissions(&at, std::fs::Permissions::from_mode(0o4755)).unwrap()
+        });
+
+        let result = ostrya_rt::block_on(async {
+            let txn = dst.transaction().await.unwrap();
+            dst.import_from(&txn, &strict, name, PullFlags::UNTRUSTED, &mut Vec::new())
+                .await
+        });
+        let mode = std::fs::metadata(&object).unwrap().permissions().mode();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(mode & 0o7777, 0o4755, "the seam did not run");
+        match result {
+            Err(Error::Pull(message)) => {
+                assert!(message.contains("cannot be imported"), "{message}")
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }

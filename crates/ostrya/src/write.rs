@@ -778,6 +778,34 @@ impl Transaction {
         expected: Option<&Checksum>,
         bytes: &[u8],
     ) -> Result<Checksum> {
+        let checksum = self.check_metadata(ty, expected, bytes)?;
+        self.stage_metadata(checksum, ty, bytes.to_vec()).await
+    }
+
+    /// Writes a metadata object as [`write_metadata`] does, and stages the
+    /// buffer `bytes` with no copy.
+    ///
+    /// [`write_metadata`]: Transaction::write_metadata
+    pub(crate) async fn write_metadata_owned(
+        &self,
+        ty: ObjectType,
+        expected: Option<&Checksum>,
+        bytes: Vec<u8>,
+    ) -> Result<Checksum> {
+        let checksum = self.check_metadata(ty, expected, &bytes)?;
+        self.stage_metadata(checksum, ty, bytes).await
+    }
+
+    /// Makes the checks of [`write_metadata`] before the write, and returns
+    /// the checksum of `bytes`.
+    ///
+    /// [`write_metadata`]: Transaction::write_metadata
+    fn check_metadata(
+        &self,
+        ty: ObjectType,
+        expected: Option<&Checksum>,
+        bytes: &[u8],
+    ) -> Result<Checksum> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
             return Err(Error::Unsupported(
                 "bare-split-xattrs is read-only; the port does not write it".into(),
@@ -797,7 +825,7 @@ impl Transaction {
                 actual: checksum,
             });
         }
-        self.stage_metadata(checksum, ty, bytes.to_vec()).await
+        Ok(checksum)
     }
 }
 
@@ -1641,8 +1669,8 @@ fn confirm_linked(
 /// nothing of the source inode carries over.
 ///
 /// The function does not read the payload into memory and does not hash it
-/// again. A caller that needs a checksum check reads the object before the
-/// call.
+/// again. A caller that needs a checksum check hashes the staged object after
+/// the call.
 ///
 /// # Strict source
 ///

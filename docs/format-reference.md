@@ -7024,8 +7024,10 @@ The checks of the daemon, in order:
    `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is not a
    regular file. The load of a file object opens its fan-out directory
    `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
-   `RESOLVE_NO_SYMLINKS`. So a symlink at any component of the path stops
-   the read, and the request is `repository`. The daemon opens the image
+   `RESOLVE_NO_SYMLINKS`. A read of the payload of the file object opens the
+   object file relative to it in the same way as a metadata object. So a
+   symlink at any component of the path stops the read, and the request is
+   `repository`. The daemon opens the image
    `extensions/ostrya/composefs/<xx>/<rest>.cfs` under the repository
    directory. An error of `openat2`, `ENOSYS` included, fails the read: the
    daemon has no fallback to `openat`.

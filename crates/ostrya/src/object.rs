@@ -153,13 +153,15 @@ pub(crate) fn object_size(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::i
 /// Opens a content object as a [`std::fs::File`] positioned after `skip` bytes.
 ///
 /// For an archive object, `skip` is the length of the framed header. The caller
-/// gives the file to a streaming reader.
+/// gives the file to a streaming reader. If `strict` is set, the open is the
+/// strict open of [`open_regular_file`].
 pub(crate) fn open_content_file(
     dir: rustix::fd::BorrowedFd<'_>,
     path: &str,
     skip: u64,
+    strict: bool,
 ) -> std::io::Result<std::fs::File> {
-    let fd = open_object(dir, path)?;
+    let fd = open_regular_file(dir, path, strict)?;
     let mut file = std::fs::File::from(fd);
     if skip > 0 {
         use std::io::Seek;

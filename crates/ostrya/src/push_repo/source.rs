@@ -103,7 +103,7 @@ impl RepoSource {
         // The size bounds the read-ahead. The `fstat` runs on the pool
         // thread of the open.
         let opened = ostrya_rt::unblock(move || {
-            let file = object::open_content_file(repo.objects_fd(), &path, 0)?;
+            let file = object::open_content_file(repo.objects_fd(), &path, 0, false)?;
             let len = file.metadata()?.len();
             Ok::<_, std::io::Error>((file, len))
         })

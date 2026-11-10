@@ -647,6 +647,114 @@ fn the_strict_reader_refuses_a_fanout_symlinked_after_the_load() {
     }
 }
 
+/// Creates a repository `repo` of `mode` under `tmp` with one regular file
+/// object. Returns the file object that a strict handle loaded, the same
+/// object that a handle of the default open loaded, and the path of the
+/// object file.
+fn strict_reader_fixture(
+    tmp: &TmpDir,
+    mode: RepoMode,
+) -> (ostrya::FileObject, ostrya::FileObject, PathBuf) {
+    let repo = block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(mode),
+    ))
+    .expect("create");
+    let checksum = block_on(async {
+        let txn = repo.transaction().await.unwrap();
+        let checksum = txn
+            .write_regfile_inline(None, &ostrya::FileMeta::regular(0, 0, 0o644), b"payload\n")
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        checksum
+    });
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let fd = parent.as_fd();
+    let strict = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap();
+    let plain = block_on(Repo::open_at(fd, Path::new("repo"))).unwrap();
+    let strict_file = block_on(strict.load_file(&checksum)).unwrap();
+    let plain_file = block_on(plain.load_file(&checksum)).unwrap();
+    let path = tmp.path().join("repo/objects").join(ostrya::loose_path(
+        &checksum,
+        ostrya::ObjectType::File,
+        mode,
+    ));
+    (strict_file, plain_file, path)
+}
+
+/// The reader of a regular file that a strict handle loaded follows no
+/// symlink at the object path. A symlink that replaces the object file after
+/// the load fails the reader with `ELOOP`. The reader of a handle of the
+/// default open follows the symlink.
+#[test]
+fn the_strict_reader_refuses_an_object_symlinked_after_the_load() {
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let tmp = TmpDir::new("strict-reader-object");
+        let (strict_file, plain_file, path) = strict_reader_fixture(&tmp, mode);
+        let outside = tmp.path().join("outside");
+        std::fs::rename(&path, &outside).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+
+        block_on(plain_file.reader()).expect("the default handle follows");
+        let err = block_on(strict_file.reader())
+            .err()
+            .expect("the strict reader refuses the symlink");
+        match err {
+            Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode:?} {e}"),
+            other => panic!("{mode:?}: {other}"),
+        }
+    }
+}
+
+/// The reader of a regular file that a strict handle loaded refuses a FIFO
+/// that replaces the object file after the load, and does not wait for a
+/// writer.
+#[test]
+fn the_strict_reader_refuses_a_fifo_swapped_in_after_the_load() {
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let tmp = TmpDir::new("strict-reader-fifo");
+        let (strict_file, _, path) = strict_reader_fixture(&tmp, mode);
+        std::fs::remove_file(&path).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(block_on(strict_file.reader()).map(drop));
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        let result = match rx.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => {
+                // A writer releases the blocked open, so the thread ends.
+                let _ = rustix::fs::open(
+                    &path,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                );
+                let _ = rx.recv_timeout(timeout);
+                panic!("{mode:?}: the reader waits on the FIFO");
+            }
+        };
+        match result {
+            Err(Error::Io(e)) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{mode:?} {e}");
+                assert!(e.to_string().contains("not a regular file"), "{mode:?} {e}");
+            }
+            other => panic!("{mode:?}: {other:?}"),
+        }
+    }
+}
+
 /// Returns the error number `ELOOP`.
 fn eloop() -> i32 {
     rustix::io::Errno::LOOP.raw_os_error()

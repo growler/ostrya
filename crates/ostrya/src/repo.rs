@@ -653,7 +653,11 @@ impl Repo {
     ///   `RESOLVE_NO_SYMLINKS`, and loads the object relative to it. A symlink
     ///   at `objects/<xx>` fails the load. Each open of the payload by the
     ///   [`FileObject`](crate::FileObject) of the load opens `objects/<xx>`
-    ///   again in the same way.
+    ///   again in the same way. It then opens the object file relative to it
+    ///   with `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+    ///   `O_NONBLOCK`, and refuses a file that is not a regular file. A
+    ///   symlink at the object path, a FIFO, or a device fails the open and
+    ///   does not block it.
     /// - A local pull from the handle into an `archive` repository can copy
     ///   the bytes of a `.filez` file when it does not make a hardlink. That
     ///   copy opens the `.filez` file with `openat2`, `RESOLVE_BENEATH`,

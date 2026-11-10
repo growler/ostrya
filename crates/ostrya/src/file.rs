@@ -176,8 +176,10 @@ impl FileObject {
     ///
     /// - [`Error::Io`] if the open of the object file fails. A missing object
     ///   file also gives this variant. In the strict open mode of
-    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` gives this
-    ///   variant with `ELOOP`.
+    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` or at the
+    ///   object path gives this variant with `ELOOP`. An object file that is
+    ///   not a regular file also gives this variant. If such a file opens, as
+    ///   a FIFO does, the error has the kind `ErrorKind::InvalidData`.
     /// - [`Error::ObjectNotFound`] in the strict open mode if the fan-out
     ///   directory `objects/<xx>` of the object is absent.
     pub async fn reader(&self) -> Result<ContentReader> {
@@ -211,7 +213,11 @@ impl FileObject {
     ///
     /// - [`Error::Io`] if the open of the object file, a read of the payload,
     ///   or a write to `writer` fails. An `archive` payload that does not
-    ///   inflate also gives this variant.
+    ///   inflate also gives this variant. In the strict open mode of
+    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` or at the
+    ///   object path gives this variant with `ELOOP`. An object file that is
+    ///   not a regular file also gives this variant. If such a file opens, as
+    ///   a FIFO does, the error has the kind `ErrorKind::InvalidData`.
     /// - [`Error::ObjectNotFound`] in the strict open mode of
     ///   [`Repo::open_at_strict`] if the fan-out directory `objects/<xx>` of
     ///   the object is absent.
@@ -262,9 +268,13 @@ impl FileObject {
     ///
     /// In the strict open mode of [`Repo::open_at_strict`], the fan-out
     /// directory of a loose object opens first, as [`open_fanout_beneath`]
-    /// states, and the object file opens relative to it. So a symlink at
-    /// `objects/<xx>` fails the open with `ELOOP`, also if it replaced the
-    /// directory after the load.
+    /// states, and the object file opens relative to it with the strict open
+    /// of [`object::open_regular_file`]. So a symlink at `objects/<xx>` or at
+    /// the object path fails the open with `ELOOP`, also if it replaced the
+    /// directory or the file after the load. An object file that is not a
+    /// regular file fails the open. If such a file opens, as a FIFO does, the
+    /// error has the kind `ErrorKind::InvalidData`. The open of a FIFO does
+    /// not wait for a writer.
     async fn open_payload(&self, payload_offset: u64, measure: bool) -> Result<Payload> {
         let (dir, path) = self.payload_location()?;
         let beneath = matches!(self.store, ObjectStore::Repo) && self.repo.is_strict();
@@ -273,9 +283,9 @@ impl FileObject {
             let file = match path.split_once('/').filter(|_| beneath) {
                 Some((fanout, name)) => {
                     let sub = open_fanout_beneath(dir.as_fd(), fanout, &checksum)?;
-                    object::open_content_file(sub.as_fd(), name, payload_offset)?
+                    object::open_content_file(sub.as_fd(), name, payload_offset, true)?
                 }
-                None => object::open_content_file(dir.as_fd(), &path, payload_offset)?,
+                None => object::open_content_file(dir.as_fd(), &path, payload_offset, false)?,
             };
             let len = if measure {
                 file.metadata()?.len().saturating_sub(payload_offset)

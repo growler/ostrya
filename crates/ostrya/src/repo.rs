@@ -658,12 +658,18 @@ impl Repo {
     ///   `O_NONBLOCK`, and refuses a file that is not a regular file. A
     ///   symlink at the object path, a FIFO, or a device fails the open and
     ///   does not block it.
-    /// - A local pull from the handle into an `archive` repository can copy
-    ///   the bytes of a `.filez` file when it does not make a hardlink. That
-    ///   copy opens the `.filez` file with `openat2`, `RESOLVE_BENEATH`,
-    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuses a file that is
-    ///   not a regular file. A symlink at `objects/<xx>`, a FIFO, or a device
-    ///   fails the copy and does not block it.
+    /// - The link, the copy, and the clone of an object by a local pull from
+    ///   the handle follow no symlink at `objects/<xx>`. Before a hardlink,
+    ///   the pull opens `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
+    ///   `RESOLVE_NO_SYMLINKS`, and makes the link relative to it. The link refuses a source object that is
+    ///   not a regular file, except a symlink content object of a `bare`,
+    ///   `bare-user-only`, or `bare-split-xattrs` repository. It also refuses
+    ///   an object that changed between its check and its link. A copy of a
+    ///   metadata object, a clone of a payload, and a copy of the bytes of a
+    ///   `.filez` file open the object with `openat2`, `RESOLVE_BENEATH`,
+    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is
+    ///   not a regular file. A symlink at the object path, a FIFO, or a
+    ///   device fails the copy and does not block it.
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.

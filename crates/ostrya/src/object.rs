@@ -73,6 +73,24 @@ pub(crate) fn open_regular_file(
     Ok(fd)
 }
 
+/// Opens the fan-out directory `fanout` under `objects_fd` as a path
+/// descriptor with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`.
+///
+/// A symlink there fails the open with `ELOOP`. A missing entry gives the
+/// kind `ErrorKind::NotFound`.
+pub(crate) fn open_fanout_beneath(
+    objects_fd: rustix::fd::BorrowedFd<'_>,
+    fanout: &str,
+) -> std::io::Result<OwnedFd> {
+    Ok(rustix::fs::openat2(
+        objects_fd,
+        fanout,
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    )?)
+}
+
 /// Returns the error of a metadata read for an object larger than the size cap.
 ///
 /// The buffered loader and the streaming reader both return this error, so the

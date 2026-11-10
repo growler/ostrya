@@ -1427,12 +1427,28 @@ pub(crate) fn discard_image_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
 /// stored as a regular file is sealed. For this reason, a repository that
 /// seals its writes copies each object, and seals the copy as it seals each
 /// new write.
+///
+/// # Strict source
+///
+/// If `strict` is set, the source is a handle in the strict open mode of
+/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). Before a link,
+/// the function opens the fan-out directory `objects/<xx>` of the source with
+/// [`open_fanout_beneath`](crate::object::open_fanout_beneath), and makes
+/// the stat and the link relative to it. The link refuses a source object
+/// that is not the type that the source mode stores, as [`check_leaf_type`]
+/// states. After the link, the function confirms that the staged entry is
+/// the inode of the stat, as [`confirm_linked`] states. The copy of a
+/// metadata object is the strict open of
+/// [`open_regular_file`](crate::object::open_regular_file) on the object
+/// path. A symlink at `objects/<xx>` fails the link and the copy with
+/// `ELOOP`.
 pub(crate) fn stage_import_blocking(
     ctx: &StageCtx<'_>,
     src_objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
     ty: ObjectType,
     src_mode: RepoMode,
+    strict: bool,
     link_owner: Option<(u32, u32)>,
 ) -> Result<Option<StageOutcome>> {
     // An import is a write like any other: a bare-split-xattrs destination needs
@@ -1451,14 +1467,31 @@ pub(crate) fn stage_import_blocking(
     let staging_name = flat_name(checksum, ty, ctx.mode);
 
     if let Some(fresh_owner) = link_owner {
+        // A strict source names the object relative to its fan-out directory,
+        // which the strict open gives.
+        let fanout_fd;
+        let (src_dir, src_name) = if strict {
+            let (fanout, leaf) = src_path
+                .split_once('/')
+                .expect("a loose path names its fan-out directory");
+            fanout_fd = match crate::object::open_fanout_beneath(src_objects_fd, fanout) {
+                Ok(fd) => fd,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    return Err(Error::ObjectNotFound {
+                        checksum: *checksum,
+                        ty,
+                    });
+                }
+                Err(e) => return Err(e.into()),
+            };
+            (fanout_fd.as_fd(), leaf)
+        } else {
+            (src_objects_fd, src_path.as_str())
+        };
         // The stat of the source decides if the link is allowed. It also gives
         // the size of the staged object, because a hardlink is the inode that
         // it stats.
-        let stat = match rustix::fs::statat(
-            src_objects_fd,
-            src_path.as_str(),
-            AtFlags::SYMLINK_NOFOLLOW,
-        ) {
+        let stat = match rustix::fs::statat(src_dir, src_name, AtFlags::SYMLINK_NOFOLLOW) {
             Ok(stat) => stat,
             Err(rustix::io::Errno::NOENT) => {
                 return Err(Error::ObjectNotFound {
@@ -1468,19 +1501,26 @@ pub(crate) fn stage_import_blocking(
             }
             Err(e) => return Err(e.into()),
         };
+        if strict {
+            check_leaf_type(&stat, ty, src_mode, &src_path)?;
+        }
         let owned_as_written = (ty == ObjectType::File && ctx.mode == RepoMode::Bare)
             || (stat.st_uid, stat.st_gid) == fresh_owner;
         if owned_as_written {
             match rustix::fs::linkat(
-                src_objects_fd,
-                src_path.as_str(),
+                src_dir,
+                src_name,
                 ctx.staging_fd,
                 staging_name.as_str(),
                 AtFlags::empty(),
             ) {
                 // An entry already under this name is the same object staged
-                // earlier in this transaction.
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {
+                // earlier in this transaction. A strict source confirms only
+                // the new link.
+                linked @ (Ok(()) | Err(rustix::io::Errno::EXIST)) => {
+                    if strict && linked.is_ok() {
+                        confirm_linked(ctx.staging_fd, &staging_name, &stat, &src_path)?;
+                    }
                     return Ok(Some(StageOutcome {
                         deduped: false,
                         on_disk_size: stat.st_size.max(0) as u64,
@@ -1520,7 +1560,8 @@ pub(crate) fn stage_import_blocking(
         return Ok(None);
     }
 
-    let (on_disk_size, blocks) = clone_metadata(ctx, src_objects_fd, &src_path, &staging_name)?;
+    let (on_disk_size, blocks) =
+        clone_metadata(ctx, src_objects_fd, &src_path, &staging_name, strict)?;
     Ok(Some(StageOutcome {
         deduped: false,
         on_disk_size,
@@ -1529,6 +1570,65 @@ pub(crate) fn stage_import_blocking(
         staging_name,
         dest,
     }))
+}
+
+/// Refuses a source object of a strict source whose file type is not the
+/// type that the source mode stores for it.
+///
+/// A loose object is a regular file. A symlink content object is a symlink
+/// in the modes `bare`, `bare-user-only`, and `bare-split-xattrs`. Each other
+/// symlink gives `ELOOP`. Each other file type gives an error of the kind
+/// `ErrorKind::InvalidData`.
+fn check_leaf_type(
+    stat: &rustix::fs::Stat,
+    ty: ObjectType,
+    src_mode: RepoMode,
+    path: &str,
+) -> Result<()> {
+    match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
+        rustix::fs::FileType::RegularFile => Ok(()),
+        rustix::fs::FileType::Symlink
+            if ty == ObjectType::File
+                && matches!(
+                    src_mode,
+                    RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs
+                ) =>
+        {
+            Ok(())
+        }
+        rustix::fs::FileType::Symlink => Err(rustix::io::Errno::LOOP.into()),
+        _ => Err(Error::Io(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{path} is not a regular file"),
+        ))),
+    }
+}
+
+/// Confirms that the entry `staging_name` of the staging directory is the
+/// inode of `stat`, the stat of the source object `path` before its link.
+///
+/// The source object can change between the stat and the link. If the entry
+/// has another device, another inode number, or another file type, the
+/// function removes the entry and returns an error of the kind
+/// `ErrorKind::InvalidData`.
+fn confirm_linked(
+    staging_fd: BorrowedFd<'_>,
+    staging_name: &str,
+    stat: &rustix::fs::Stat,
+    path: &str,
+) -> Result<()> {
+    let linked = rustix::fs::statat(staging_fd, staging_name, AtFlags::SYMLINK_NOFOLLOW)?;
+    let file_type = |st: &rustix::fs::Stat| rustix::fs::FileType::from_raw_mode(st.st_mode);
+    if (linked.st_dev, linked.st_ino, file_type(&linked))
+        == (stat.st_dev, stat.st_ino, file_type(stat))
+    {
+        return Ok(());
+    }
+    let _ = rustix::fs::unlinkat(staging_fd, staging_name, AtFlags::empty());
+    Err(Error::Io(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{path} changed during the link"),
+    )))
 }
 
 /// Imports one regular-file content object between two modes of the bare
@@ -1543,11 +1643,22 @@ pub(crate) fn stage_import_blocking(
 /// The function does not read the payload into memory and does not hash it
 /// again. A caller that needs a checksum check reads the object before the
 /// call.
+///
+/// # Strict source
+///
+/// If `strict` is set, the source is a handle in the strict open mode of
+/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). The open of the
+/// source object is the strict open of
+/// [`open_regular_file`](crate::object::open_regular_file). A symlink at
+/// `objects/<xx>` or at the object path fails the clone with `ELOOP`. A
+/// source object that is not a regular file fails the clone, and a FIFO does
+/// not block it.
 pub(crate) fn stage_clone_content_blocking(
     ctx: &StageCtx<'_>,
     src_objects_fd: BorrowedFd<'_>,
     checksum: &Checksum,
     src_mode: RepoMode,
+    strict: bool,
     header: &FileHeader,
     unpacked: u64,
 ) -> Result<StageOutcome> {
@@ -1562,16 +1673,22 @@ pub(crate) fn stage_clone_content_blocking(
         ));
     }
     let src_path = loose_path(checksum, ObjectType::File, src_mode);
-    let src = match rustix::fs::openat(
-        src_objects_fd,
-        src_path.as_str(),
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    ) {
+    let opened = if strict {
+        crate::object::open_regular_file(src_objects_fd, &src_path, true)
+    } else {
+        rustix::fs::openat(
+            src_objects_fd,
+            src_path.as_str(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(Into::into)
+    };
+    let src = match opened {
         Ok(src) => src,
         // If the source object disappeared between the plan and the import,
         // report it as a missing object, as the link path does.
-        Err(rustix::io::Errno::NOENT) => {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(Error::ObjectNotFound {
                 checksum: *checksum,
                 ty: ObjectType::File,
@@ -1637,18 +1754,32 @@ fn clone_payload(
 /// xattrs, and the uid and gid of the writing process. The staging temp file has this uid and
 /// gid by construction. The function returns the size on disk and the method
 /// that moved the bytes.
+///
+/// # Strict source
+///
+/// If `strict` is set, the source is a handle in the strict open mode of
+/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). The open of the
+/// source object is the strict open of
+/// [`open_regular_file`](crate::object::open_regular_file). A symlink at a
+/// component of `src_path` fails the copy with `ELOOP`. A source object that
+/// is not a regular file fails the copy, and a FIFO does not block it.
 fn clone_metadata(
     ctx: &StageCtx<'_>,
     src_dir: BorrowedFd<'_>,
     src_path: &str,
     staging_name: &str,
+    strict: bool,
 ) -> Result<(u64, Blocks)> {
-    let src = rustix::fs::openat(
-        src_dir,
-        src_path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )?;
+    let src = if strict {
+        crate::object::open_regular_file(src_dir, src_path, true)?
+    } else {
+        rustix::fs::openat(
+            src_dir,
+            src_path,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?
+    };
     let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
     let apply = || -> Result<(u64, Blocks)> {
         rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
@@ -2380,5 +2511,57 @@ mod temp_tests {
         drop(PendingTemp::new(dir_fd.as_fd(), TempKind::Anonymous));
         assert!(dir.join(".ostrya-tmp-kept").exists());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use std::os::fd::{AsFd, OwnedFd};
+
+    use rustix::fs::AtFlags;
+
+    use super::{confirm_linked, unique};
+    use crate::error::Error;
+
+    /// A staged entry that is the inode of the source stat stays. A staged
+    /// entry that is another inode, or the same inode with another file type
+    /// in the stat, is removed, and the error names the source path.
+    #[test]
+    fn a_link_to_another_inode_is_removed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-confirm-linked-{}-{}",
+            std::process::id(),
+            unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir_fd: OwnedFd = std::fs::File::open(&dir).unwrap().into();
+        std::fs::write(dir.join("source"), b"source").unwrap();
+        std::fs::write(dir.join("other"), b"other").unwrap();
+        std::fs::hard_link(dir.join("source"), dir.join("linked")).unwrap();
+        let stat = rustix::fs::statat(dir_fd.as_fd(), "source", AtFlags::SYMLINK_NOFOLLOW).unwrap();
+
+        confirm_linked(dir_fd.as_fd(), "linked", &stat, "ab/cd.dirmeta").unwrap();
+        assert!(dir.join("linked").exists());
+
+        // The same inode number with another file type is another object.
+        let mut fifo = stat;
+        fifo.st_mode = rustix::fs::FileType::Fifo.as_raw_mode() | (stat.st_mode & 0o7777);
+        let fifo_refused =
+            confirm_linked(dir_fd.as_fd(), "linked", &fifo, "ab/cd.dirmeta").is_err();
+        let linked_exists = dir.join("linked").exists();
+
+        let err = confirm_linked(dir_fd.as_fd(), "other", &stat, "ab/cd.dirmeta").unwrap_err();
+        let exists = dir.join("other").exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(fifo_refused);
+        assert!(!linked_exists);
+        match err {
+            Error::Io(e) => {
+                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+                assert_eq!(e.to_string(), "ab/cd.dirmeta changed during the link");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!exists);
     }
 }

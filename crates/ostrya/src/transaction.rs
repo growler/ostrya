@@ -1198,13 +1198,14 @@ impl Transaction {
         Ok(written)
     }
 
-    /// Imports one object from the `objects/` directory of another local
-    /// repository with a hardlink, which shares the source inode.
+    /// Imports one object from the `objects/` directory of the local
+    /// repository `src` with a hardlink, which shares the source inode.
     ///
     /// The two repositories must store the object in the same form. The source
     /// inode must have the ownership that a write here gives already.
-    /// [`stage_import_blocking`] states the rules. The local pull path calls
-    /// this method.
+    /// [`stage_import_blocking`] states the rules. If `src` is a handle in the
+    /// strict open mode, the import follows the rules of a strict source of
+    /// that function. The local pull path calls this method.
     ///
     /// Returns `true` if the object is staged. `false` is a content object
     /// whose link the call refused. The caller then imports it through the
@@ -1212,10 +1213,9 @@ impl Transaction {
     /// link or by copy.
     pub(crate) async fn stage_import(
         &self,
-        src_objects_fd: BorrowedFd<'_>,
+        src: &Repo,
         checksum: Checksum,
         ty: ObjectType,
-        src_mode: RepoMode,
         force_copy: bool,
     ) -> Result<bool> {
         let mode = self.repo.mode();
@@ -1223,7 +1223,8 @@ impl Transaction {
         let verity = self.verity()?;
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let source = src_objects_fd.try_clone_to_owned()?;
+        let source = src.objects_fd().try_clone_to_owned()?;
+        let (src_mode, strict) = (src.mode(), src.is_strict());
         // The ownership that a link must match. The call measures it only if it
         // tries a link. The measure creates and removes a staging temporary,
         // and a forced copy or a sealing repository never reads the result.
@@ -1243,7 +1244,15 @@ impl Transaction {
                     sync_metadata: false,
                     verity,
                 };
-                stage_import_blocking(&ctx, source.as_fd(), &checksum, ty, src_mode, link_owner)
+                stage_import_blocking(
+                    &ctx,
+                    source.as_fd(),
+                    &checksum,
+                    ty,
+                    src_mode,
+                    strict,
+                    link_owner,
+                )
             })
             .await?;
         let Some(outcome) = outcome else {
@@ -1256,18 +1265,18 @@ impl Transaction {
         Ok(true)
     }
 
-    /// Imports one regular-file content object from another local repository
-    /// with a clone of its payload.
+    /// Imports one regular-file content object from the local repository
+    /// `src` with a clone of its payload.
     ///
     /// The call applies the inode policy of this repository from the logical
     /// header of the object. The two modes must store the payload in the same
-    /// form. [`stage_clone_content_blocking`] states the rules. The local pull
-    /// path calls this method.
+    /// form. [`stage_clone_content_blocking`] states the rules. If `src` is a
+    /// handle in the strict open mode, the clone follows the rules of a strict
+    /// source of that function. The local pull path calls this method.
     pub(crate) async fn stage_clone_content(
         &self,
-        src_objects_fd: BorrowedFd<'_>,
+        src: &Repo,
         checksum: Checksum,
-        src_mode: RepoMode,
         header: ostrya_core::FileHeader,
         unpacked: u64,
     ) -> Result<()> {
@@ -1276,7 +1285,8 @@ impl Transaction {
         let verity = self.verity()?;
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let source = src_objects_fd.try_clone_to_owned()?;
+        let source = src.objects_fd().try_clone_to_owned()?;
+        let (src_mode, strict) = (src.mode(), src.is_strict());
         let outcome = self
             .unblock(move || {
                 let ctx = StageCtx {
@@ -1293,6 +1303,7 @@ impl Transaction {
                     source.as_fd(),
                     &checksum,
                     src_mode,
+                    strict,
                     &header,
                     unpacked,
                 )
@@ -2225,9 +2236,8 @@ mod tests {
             let checksum = Checksum::from_bytes([0x11; 32]);
             let err = txn
                 .stage_clone_content(
-                    src.objects_fd(),
+                    &src,
                     checksum,
-                    src.mode(),
                     FileMeta::regular(0, 0, 0o644).regular_header(),
                     0,
                 )

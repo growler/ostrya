@@ -12,9 +12,7 @@ use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::FileReader;
-use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, ResolveFlags, Statx, StatxAttributes, StatxFlags,
-};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
@@ -756,14 +754,10 @@ fn open_fanout_beneath(
     fanout: &str,
     checksum: &Checksum,
 ) -> Result<OwnedFd> {
-    rustix::fs::openat2(
-        objects_fd,
-        fanout,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-    )
-    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+    object::open_fanout_beneath(objects_fd, fanout).map_err(|e| match Errno::from_io_error(&e) {
+        Some(errno) => map_object_error(errno, checksum, ObjectType::File),
+        None => Error::Io(e),
+    })
 }
 
 /// Opens a regular-file object and follows no symlink. A missing object gives

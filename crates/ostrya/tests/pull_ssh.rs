@@ -1370,8 +1370,10 @@ fn a_mirror_pull_over_the_stream_source_writes_the_collection_of_the_summary() {
         pulled.unwrap();
         served.unwrap();
 
+        let mut mirrors = dest.list_mirror_refs().await.unwrap();
+        mirrors.sort();
         assert_eq!(
-            dest.list_mirror_refs().await.unwrap(),
+            mirrors,
             [
                 (REMOTE_ID.to_owned(), "c".to_owned(), c),
                 (ID_Y.to_owned(), "b".to_owned(), b)

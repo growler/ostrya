@@ -10994,8 +10994,10 @@ fn a_pull_from_a_remote_takes_plain_and_collection_refs() {
             dest.resolve_rev("origin:main", false).await.unwrap(),
             Some(main)
         );
+        let mut mirrors = dest.list_mirror_refs().await.unwrap();
+        mirrors.sort();
         assert_eq!(
-            dest.list_mirror_refs().await.unwrap(),
+            mirrors,
             [
                 (ID_X.to_owned(), "a".to_owned(), a),
                 (ID_Y.to_owned(), "b".to_owned(), b)
@@ -11450,8 +11452,10 @@ fn a_mirror_pull_writes_a_plain_ref_in_the_collection_of_the_summary() {
         dest.pull("origin", mirror_of(&["c", &at(ID_Y, "b")]))
             .await
             .unwrap();
+        let mut mirrors = dest.list_mirror_refs().await.unwrap();
+        mirrors.sort();
         assert_eq!(
-            dest.list_mirror_refs().await.unwrap(),
+            mirrors,
             [
                 (REMOTE_ID.to_owned(), "c".to_owned(), c),
                 (ID_Y.to_owned(), "b".to_owned(), b)
@@ -11534,8 +11538,10 @@ fn a_mirror_pull_of_every_ref_takes_the_collection_map() {
 
         let dest = mirror_dest(dir.path(), None, &url).await;
         dest.pull("origin", mirror_of(&[])).await.unwrap();
+        let mut mirrors = dest.list_mirror_refs().await.unwrap();
+        mirrors.sort();
         assert_eq!(
-            dest.list_mirror_refs().await.unwrap(),
+            mirrors,
             [
                 (REMOTE_ID.to_owned(), "c".to_owned(), c),
                 (REMOTE_ID.to_owned(), "ostree-metadata".to_owned(), metadata),
@@ -11552,8 +11558,10 @@ fn a_mirror_pull_of_every_ref_takes_the_collection_map() {
         let dest = mirror_dest(dir.path(), Some(ID_X), &url).await;
         dest.pull("origin", mirror_of(&[])).await.unwrap();
         assert_eq!(dest.list_refs(None).await.unwrap(), [("a".to_owned(), a)]);
+        let mut mirrors = dest.list_mirror_refs().await.unwrap();
+        mirrors.sort();
         assert_eq!(
-            dest.list_mirror_refs().await.unwrap(),
+            mirrors,
             [
                 (REMOTE_ID.to_owned(), "c".to_owned(), c),
                 (REMOTE_ID.to_owned(), "ostree-metadata".to_owned(), metadata),

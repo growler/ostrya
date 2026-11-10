@@ -57,6 +57,10 @@ pub struct CollectionRefEntry {
     ///
     /// The collection id of the repository qualifies a ref under `refs/heads`.
     pub local: bool,
+    /// The remote whose `collection-id` qualifies a ref under
+    /// `refs/remotes/R/`, or `None` for a ref under `refs/heads` or
+    /// `refs/mirrors`.
+    pub remote: Option<String>,
 }
 
 /// A ref stored as an alias: a relative symlink to the file of another ref.
@@ -680,11 +684,12 @@ impl Repo {
         // remote, and the first remote by name wins over the others.
         all.extend(
             refs.into_iter()
-                .map(|(collection, name, commit)| CollectionRefEntry {
+                .map(|(remote, collection, name, commit)| CollectionRefEntry {
                     collection,
                     name,
                     commit,
                     local: false,
+                    remote: Some(remote),
                 }),
         );
         all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
@@ -847,6 +852,7 @@ impl Repo {
                     name: name.clone(),
                     commit: *commit,
                     local: true,
+                    remote: None,
                 });
             }
         }
@@ -859,6 +865,7 @@ impl Repo {
                 name,
                 commit,
                 local: false,
+                remote: None,
             });
         }
         all.sort_by(|a, b| (&a.collection, &a.name).cmp(&(&b.collection, &b.name)));
@@ -1773,14 +1780,14 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
 }
 
 /// Collects each ref under `refs/remotes/R/` of each remote R of `remotes`,
-/// as `(collection_id, ref_name, commit)` triples. `remotes` maps a remote
-/// name to its collection id. The refs come in the order of the remotes in
+/// as `(remote, collection_id, ref_name, commit)` tuples. `remotes` maps a
+/// remote name to its collection id. The refs come in the order of the remotes in
 /// the map. A directory `R` that is absent, a regular file, or a symlink
 /// gives no ref.
 fn collect_remote_collections(
     repo: &Repo,
     remotes: &BTreeMap<String, String>,
-) -> Result<Vec<(String, String, Checksum)>> {
+) -> Result<Vec<(String, String, String, Checksum)>> {
     let Some(dir) = open_refs_dir(repo, "refs/remotes")? else {
         return Ok(Vec::new());
     };
@@ -1792,7 +1799,12 @@ fn collect_remote_collections(
         walk_ref_dir(sub.as_fd(), "", &mut |entry| {
             if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
                 let checksum = parse_ref_content(&bytes)?;
-                out.push((collection.clone(), entry.path.to_owned(), checksum));
+                out.push((
+                    remote.clone(),
+                    collection.clone(),
+                    entry.path.to_owned(),
+                    checksum,
+                ));
             }
             Ok(())
         })?;

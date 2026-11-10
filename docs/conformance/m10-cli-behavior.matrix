@@ -518,15 +518,16 @@ loss: two rules of the rows of a remote (`cli-surface.md`, "P1"). The tool lists
  tool takes a remote ref, where the port takes the mirror ref, and then the
  first remote by name. The cited test pins the port side of both.
 evidence: ostrya_cli::cli::refs_collections_of_a_remote_match_the_tool,
- ostrya_cli::cli::refs_collections_skip_a_remote_with_a_malformed_collection_id_like_the_tool
+ ostrya_cli::cli::refs_collections_skip_a_remote_with_a_malformed_collection_id_like_the_tool,
+ ostrya_cli::cli::refs_delete_collection_keeps_a_remote_ref_with_an_invalid_name
 spec: cli-behavior.md#refs
 note: `-c` listing the refs of a remote under the `collection-id` of the remote,
  `-c -r` and a positional collection id over these rows, no row for a remote
  with no `collection-id`, with an invalid one, with one that holds a malformed
  escape sequence, or with no config group, and
- `-c --delete` of the id of a remote removing no file under `refs/remotes`. The
- setup binds no `collection-id` and no remote, so the cited test builds the
- repository.
+ `-c --delete` of the id of a remote removing no file under `refs/remotes` and
+ checking no name of a ref of a remote. The setup binds no `collection-id` and
+ no remote, so the cited tests build the repository.
 
 # ---------------------------------------------------------------------------
 # refs -- creating and deleting.

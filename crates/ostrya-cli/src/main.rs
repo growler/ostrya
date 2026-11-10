@@ -12046,10 +12046,11 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// they stay. The command checks each
 /// selected ref that it removes with [`Ref::validate`] before it removes the
 /// first ref. A ref under `refs/heads` is a [`Ref::Local`] and takes the
-/// ref-name rule, so a name with `:` fails. A mirror ref and a ref of a
-/// remote take the collection-id rule and the ref-name rule. If one selected
-/// ref fails, the command fails with [`Error::InvalidRefspec`] and removes no
-/// ref. The command removes no file under `refs/remotes`.
+/// ref-name rule, so a name with `:` fails. A mirror ref takes the
+/// collection-id rule and the ref-name rule. If one selected ref fails, the
+/// command fails with [`Error::InvalidRefspec`] and removes no ref. The
+/// command checks no ref of a remote and removes no file under
+/// `refs/remotes`.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -12059,12 +12060,13 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // only the refs under `refs/heads`: the listing holds no mirror ref of
         // that id. A foreign id removes the mirror refs that it names. A ref
         // of a remote is in the listing only if no mirror ref has its name, so
-        // its mirror path holds no ref file, and no file under `refs/remotes`
-        // is removed.
+        // its mirror path holds no ref file. The command skips it: it checks
+        // no ref of a remote and removes no file under `refs/remotes`.
         let selected = select_collection_refs(repo, &args.prefix).await?;
         // The refs to remove. A ref under `refs/heads` has no id.
         let removed: Vec<Ref> = selected
             .into_iter()
+            .filter(|entry| entry.remote.is_none())
             .map(|entry| {
                 if entry.local {
                     Ref::local(entry.name)

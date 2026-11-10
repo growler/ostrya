@@ -195,16 +195,16 @@ them are observed and deliberately not reproduced:
   ref. The `-c` listing of the port leaves out the mirror refs of the own
   `collection-id`, so they stay, and the check does not read them. If the ref
   store refuses one selected ref by its id or its name, the
-  command removes no ref and exits 1. A mirror ref or a ref of a remote whose
-  id fails the collection-id rule or is longer than 255 bytes, or whose name
-  fails the ref-name rule, gives `error: Invalid refspec @<id>:<name>`. A ref
+  command removes no ref and exits 1. A mirror ref whose id fails the
+  collection-id rule or is longer than 255 bytes, or whose name fails the
+  ref-name rule, gives `error: Invalid refspec @<id>:<name>`. A ref
   under `refs/heads` whose name fails the ref-name rule gives `error: Invalid
   refspec <name>`. The ref-name rule refuses a name with `:`. The `-c` listing
   of the tool prints no row for a ref of a remote whose name fails the
   ref-name rule, such as `a:b`, `-bad`, or `.hid/x`. The `-c` listing of the
-  port prints the row. Then `refs -c --delete <id>` of the port gives `error:
-  Invalid refspec @<id>:a:b`, exits 1, and removes no ref. The tool removes
-  the mirror refs of `<id>` and exits 0;
+  port prints the row. `refs -c --delete <id>` checks no ref of a remote, so
+  in both it removes the mirror refs of `<id>`, keeps the ref of the remote,
+  and exits 0;
 - a file under `refs/heads` whose name holds `:`, for example
   `refs/heads/origin:main` in a repository with `[core] collection-id`. Such a
   file comes from an out-of-band change alone. The `-c` listing of the tool

@@ -12539,6 +12539,54 @@ fn refs_delete_collection_refuses_a_local_name_with_a_colon() {
     }
 }
 
+/// `refs -c --delete ID` does not check the name of a ref of a remote whose
+/// `collection-id` is ID. The command removes no file under `refs/remotes`,
+/// so the ref `refs/remotes/origin/-bad` stays, and the command removes the
+/// mirror refs of ID and exits 0, as the tool does.
+#[test]
+fn refs_delete_collection_keeps_a_remote_ref_with_an_invalid_name() {
+    let tmp = TmpDir::new("refs-delete-coll-remote-invalid-name");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let head = commit_tree(&repo, "keep", &base.join("src"), None);
+    append_config(
+        &repo,
+        "[remote \"origin\"]\nurl=file:///nonexistent\ncollection-id=org.example.Os\n",
+    );
+    write_ref_file(&repo, "remotes/origin/-bad", &head);
+    write_ref_file(&repo, "mirrors/org.example.Os/m", &head);
+    let args = ["refs", "-c", "--delete", "org.example.Os"];
+
+    if ostree_available() {
+        let port = clone_repo(base, &repo, "remote-invalid-name-port");
+        let tool = clone_repo(base, &repo, "remote-invalid-name-tool");
+        assert_agrees(&port, &tool, &args);
+        assert_eq!(
+            describe_refs(&port),
+            describe_refs(&tool),
+            "deleting a collection with a bad-name ref of a remote left \
+             different refs trees",
+        );
+    }
+
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(
+        &["refs", &repo_arg, "-c", "--delete", "org.example.Os"],
+        None,
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(run.status.success(), "the port failed: {stderr}");
+    assert!(
+        !repo.join("refs/mirrors/org.example.Os/m").exists(),
+        "the port kept refs/mirrors/org.example.Os/m"
+    );
+    for path in ["refs/remotes/origin/-bad", "refs/heads/keep"] {
+        assert!(repo.join(path).exists(), "the port removed {path}");
+    }
+}
+
 /// `refs --delete` with a plain prefix checks each selected name before it
 /// removes a ref. A file `refs/heads/test/x:y` has a name that is not a local
 /// or a remote ref, so the command stops, and no ref of the prefix is removed.

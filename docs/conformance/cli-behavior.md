@@ -3508,11 +3508,13 @@ names.
 
 The command removes no file under `refs/remotes`. The `-c` listing holds the
 refs of a remote under the `collection-id` of the remote (`refs`, "Collection
-refs"), and the removal of the id leaves them. In the repository of that
-section, `refs -c --delete org.example.Os` removes
-`refs/mirrors/org.example.Os/os/main` alone, and
-`refs -c --delete org.example.Local` removes the refs under `refs/heads` alone.
-Observed with libostree 2026.1 on 2026-11-08.
+refs"), and the removal of the id leaves them. The command does not check the
+name of a ref of a remote, so a ref `refs/remotes/origin/-bad` stays, and the
+command exits 0. In the repository of that section,
+`refs -c --delete org.example.Os` removes `refs/mirrors/org.example.Os/os/main`
+alone, and `refs -c --delete org.example.Local` removes the refs under
+`refs/heads` alone. Observed with libostree 2026.1 on 2026-11-08 and, for the
+ref `-bad`, on 2026-11-10.
 
 The `-c` listing prints both sets for either id. So the two ids share one
 selection and differ in the removal. The own id removes nothing and exits 0

@@ -231,6 +231,7 @@ fn the_readers_of_the_own_collection_id_ignore_the_mirror_refs() {
             name: name.to_owned(),
             commit: checksum(byte),
             local,
+            remote: None,
         };
         assert_eq!(
             repo.list_collection_refs().await.unwrap(),
@@ -266,6 +267,7 @@ fn the_collection_ref_listing_does_not_read_the_mirror_refs_of_the_own_id() {
             name: name.to_owned(),
             commit: checksum(byte),
             local,
+            remote: None,
         };
         assert_eq!(
             repo.list_collection_refs().await.unwrap(),
@@ -328,19 +330,22 @@ fn the_collection_ref_listing_lists_the_refs_of_a_remote_with_a_collection_id() 
             std::fs::write(dir.join("text"), "no checksum\n").unwrap();
         }
 
-        let entry = |collection: &str, name: &str, byte: u8, local: bool| CollectionRefEntry {
-            collection: collection.to_owned(),
-            name: name.to_owned(),
-            commit: checksum(byte),
-            local,
+        let entry = |collection: &str, name: &str, byte: u8, local: bool, remote: Option<&str>| {
+            CollectionRefEntry {
+                collection: collection.to_owned(),
+                name: name.to_owned(),
+                commit: checksum(byte),
+                local,
+                remote: remote.map(str::to_owned),
+            }
         };
         assert_eq!(
             repo.list_collection_refs().await.unwrap(),
             [
-                entry(OTHER, "x", 2, false),
-                entry(OTHER, "y", 4, false),
-                entry(OTHER, "z", 6, false),
-                entry(OWN, "main", 1, true),
+                entry(OTHER, "x", 2, false, None),
+                entry(OTHER, "y", 4, false, Some("origin")),
+                entry(OTHER, "z", 6, false, Some("origin2")),
+                entry(OWN, "main", 1, true, None),
             ]
         );
     });
@@ -382,15 +387,21 @@ fn the_collection_ref_listing_skips_a_remote_whose_collection_id_has_a_malformed
             .await
             .unwrap();
 
-        let entry = |collection: &str, name: &str, byte: u8, local: bool| CollectionRefEntry {
-            collection: collection.to_owned(),
-            name: name.to_owned(),
-            commit: checksum(byte),
-            local,
+        let entry = |collection: &str, name: &str, byte: u8, local: bool, remote: Option<&str>| {
+            CollectionRefEntry {
+                collection: collection.to_owned(),
+                name: name.to_owned(),
+                commit: checksum(byte),
+                local,
+                remote: remote.map(str::to_owned),
+            }
         };
         assert_eq!(
             repo.list_collection_refs().await.unwrap(),
-            [entry(OTHER, "o", 2, false), entry(OWN, "main", 1, true)]
+            [
+                entry(OTHER, "o", 2, false, Some("origin")),
+                entry(OWN, "main", 1, true, None),
+            ]
         );
     });
 }

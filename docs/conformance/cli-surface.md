@@ -6868,12 +6868,13 @@ ostrya media import [--repo=PATH] [--mount=PATH] [-c|--collection ID] [REF...]
   current ref does not hold the commit of the media.
 - The command writes `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when `ID`
   is the `[core] collection-id` of the repository. The current ref is the
-  ref at that place. If the repository has no ref at that place, and the
-  `collection-id` of the matched remote `R` is `ID`, the current ref is
-  `refs/remotes/R/NAME`. A remote ref whose commit the repository does not
-  store is no current ref. Under the `[core] collection-id`, the command
-  reads no ref under `refs/remotes/`. A read of the current ref that fails
-  refuses the ref.
+  ref at that place. A directory at that place, or a path to that place
+  through a file, fails the read of the current ref. If the repository has
+  no ref at that place, and the `collection-id` of the matched remote `R` is
+  `ID`, the current ref is `refs/remotes/R/NAME`. A remote ref whose commit
+  the repository does not store is no current ref. Under the
+  `[core] collection-id`, the command reads no ref under `refs/remotes/`. A
+  read of the current ref that fails refuses the ref.
 - The command pulls each ref at depth 0, with its own transaction, and reads
   no static delta. It refuses a commit that is older than the commit of the
   current ref, and a commit whose timestamp is not the timestamp that the

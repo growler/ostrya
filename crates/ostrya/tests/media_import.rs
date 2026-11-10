@@ -664,6 +664,54 @@ fn a_remote_ref_path_with_no_ref_file_gives_no_current_ref() {
     });
 }
 
+/// A directory at the place that the import writes refuses the ref before
+/// the pull, with or without a remote ref of the matched remote. The import
+/// stores no commit of the media.
+#[test]
+fn a_directory_at_the_write_place_refuses_the_ref_before_the_pull() {
+    let tmp = TmpDir::new("media-import-write-place-dir");
+    let dir = tmp.path();
+    block_on(async {
+        let src = source(dir).await;
+        let a = signed(&src, dir, X, "a", 1000).await;
+        let b = signed(&src, dir, X, "b", 1000).await;
+        let mount = mount_dir(dir, "mnt");
+        export(
+            &src,
+            &mount,
+            &[Ref::collection(X, "a"), Ref::collection(X, "b")],
+        )
+        .await;
+        let c = client(dir, "client", None, &origin()).await;
+        for name in ["a", "b"] {
+            std::fs::create_dir_all(c.path().join(format!("refs/mirrors/{X}/{name}/inner")))
+                .unwrap();
+        }
+        let tracked = Ref::remote("origin", "a");
+        commit(&c, dir, "old", &tracked, Some(X), 500, Some(SECRET_B64)).await;
+
+        let report = import(&c, &mount, &[], &[]).await.unwrap();
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
+        assert_eq!(
+            names(&report.refused),
+            [format!("@{X}:a"), format!("@{X}:b")]
+        );
+        for (_, err) in &report.refused {
+            assert!(
+                matches!(err, Error::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+                "{err:?}"
+            );
+        }
+        for tip in [a, b] {
+            assert!(
+                !c.has_object(ObjectType::Commit, &tip).await.unwrap(),
+                "{tip}"
+            );
+        }
+    });
+}
+
 /// The trust of the matched remote checks each commit. A remote that checks
 /// no commit signature makes the import check the GPG signature, and a
 /// build with no GPG engine refuses the ref with its own text. A commit

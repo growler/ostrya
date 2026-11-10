@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::pull::{
     PullVerify, TimestampCheck, check_collection_binding, check_ref_binding, collection_refs,
 };
+use crate::refs::ref_relpath;
 use crate::related::RelatedRule;
 use crate::repo::{CreateOptions, Repo};
 use crate::summary::{OSTREE_METADATA_REF, SummaryOptions};
@@ -385,12 +386,13 @@ impl Repo {
     /// The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
     /// `refs/heads/NAME` when `ID` is the `[core] collection-id` of this
     /// repository. The current ref of `@ID:NAME` is the ref at that place.
-    /// If this repository has no ref at that place, and the `collection-id`
-    /// of the matched remote `R` is `ID`, the current ref is
-    /// `refs/remotes/R/NAME`. A remote ref whose commit this repository
-    /// does not store gives no current ref. Under the
-    /// `[core] collection-id`, the import reads no ref under
-    /// `refs/remotes/`.
+    /// A directory at that place, or a path to that place through a file,
+    /// fails the read of the current ref with [`Error::Io`]. If this
+    /// repository has no ref at that place, and the `collection-id` of the
+    /// matched remote `R` is `ID`, the current ref is `refs/remotes/R/NAME`.
+    /// A remote ref whose commit this repository does not store gives no
+    /// current ref. Under the `[core] collection-id`, the import reads no
+    /// ref under `refs/remotes/`.
     ///
     /// The import does not pull a ref whose current ref holds the commit of
     /// the media. It makes one local pull from the media repository for each
@@ -602,10 +604,15 @@ impl Repo {
         // The current ref is the ref that the pull writes. If that ref is
         // absent, it is the remote ref of the remote in `tracked`. A remote
         // ref whose commit this repository does not store is no current ref.
+        // The ref that the pull writes is read with the reader of the pull,
+        // so a directory at that place fails the read.
         let mut tips = Vec::with_capacity(selected.len());
         for &(id, ref name, _) in &selected {
             let mut check = TimestampCheck::CurrentRef;
-            let mut tip = self.resolve_ref_tip(&Ref::collection(id, name)).await;
+            let mut tip = match ref_relpath(own, &Ref::collection(id, name)) {
+                Ok(relpath) => self.resolve_relpath_tip(relpath).await,
+                Err(e) => Err(e),
+            };
             if let (Ok(None), Some(&remote)) = (&tip, tracked.get(id)) {
                 tip = self.resolve_ref_tip(&Ref::remote(remote, name)).await;
                 if let Ok(Some(remote_tip)) = tip {

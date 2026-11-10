@@ -5647,13 +5647,14 @@ the feature.
 
 The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
 `refs/heads/NAME` when `ID` is the `[core] collection-id` of the client.
-The current ref of `@ID:NAME` is the ref of the client at that place. If
-the client has no ref at that place, and the `collection-id` of the matched
-remote `R` is `ID`, the current ref is `refs/remotes/R/NAME`. A remote that
-matches through `mirrored-collection-ids` alone gives no current ref. A
-remote ref whose commit the client does not store gives no current ref.
-Under the `[core] collection-id`, the import reads no ref under
-`refs/remotes/`.
+The current ref of `@ID:NAME` is the ref of the client at that place. A
+directory at that place, or a path to that place through a file, fails the
+read of the current ref. If the client has no ref at that place, and the
+`collection-id` of the matched remote `R` is `ID`, the current ref is
+`refs/remotes/R/NAME`. A remote that matches through
+`mirrored-collection-ids` alone gives no current ref. A remote ref whose
+commit the client does not store gives no current ref. Under the
+`[core] collection-id`, the import reads no ref under `refs/remotes/`.
 
 A ref whose current ref holds the commit of the media is unchanged. The
 import does not pull it, and writes no ref for it. For each other ref, the

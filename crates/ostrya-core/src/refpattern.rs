@@ -251,6 +251,16 @@ impl RefSelector {
         Ok(RefSelector { positive, negative })
     }
 
+    /// Makes a selector of the positive patterns `positive` and the negative
+    /// patterns `negative`.
+    ///
+    /// The call cannot fail. The selector keeps the patterns in their order,
+    /// with repeats. It is the selector that [`parse`](RefSelector::parse)
+    /// gives for the same entries.
+    pub fn new(positive: Vec<RefPattern>, negative: Vec<RefPattern>) -> RefSelector {
+        RefSelector { positive, negative }
+    }
+
     /// Returns `true` if the selector selects `name`.
     ///
     /// The name is not checked against the ref-name rule.
@@ -471,6 +481,19 @@ mod tests {
         assert_eq!(pos, ["b", "a", "b"]);
         assert_eq!(neg, ["x", "y/*", "x"]);
         assert!(s.matches("a") && !s.matches("x"));
+    }
+
+    #[test]
+    fn selector_new_equals_parse() {
+        let s = RefSelector::new(
+            vec![pat("b"), pat("a"), pat("b")],
+            vec![pat("x"), pat("y/*"), pat("x")],
+        );
+        assert_eq!(s, sel(&["b", "!x", "a", "b", "!y/*", "!x"]));
+        assert_eq!(
+            RefSelector::new(Vec::new(), Vec::new()),
+            RefSelector::parse(std::iter::empty()).unwrap()
+        );
     }
 
     #[test]

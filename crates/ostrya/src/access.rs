@@ -16,7 +16,7 @@
 //!   [`AccessModes`]. [`NamespaceRules`] holds the rules of each namespace.
 //! - [`ServerSettings`] holds the keys of `[ex-ostrya server]`.
 //! - [`Claims`] holds the claims of a client certificate, and
-//!   [`ClientAccess::claim_rules`] gives their rules for one namespace.
+//!   [`Claims::rules`] gives their rules for one namespace.
 //! - [`ForwardedHeader`] is a value of `trusted-proxy-header`, and
 //!   [`is_header_name`] checks a value of `trusted-proxy-client-cert`.
 //! - [`ReadAccess`] holds the read rights of one identified client, which
@@ -210,7 +210,8 @@ use crate::error::{Error, Result};
 /// The namespace of a request: the local refs or the refs of one
 /// collection.
 ///
-/// [`ClientAccess::namespace`] maps a collection id to a namespace.
+/// [`Namespace::of`] and [`ClientAccess::namespace`] map a collection id to
+/// a namespace.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Namespace {
     /// The local refs, under `refs/heads/`.
@@ -225,7 +226,7 @@ impl Namespace {
     ///
     /// `None` and `own` give [`Local`](Namespace::Local). Each other id gives
     /// [`Collection`](Namespace::Collection).
-    pub(crate) fn of(collection: Option<&str>, own: Option<&str>) -> Namespace {
+    pub fn of(collection: Option<&str>, own: Option<&str>) -> Namespace {
         match collection {
             Some(id) if Some(id) != own => Namespace::Collection(id.to_owned()),
             _ => Namespace::Local,
@@ -725,6 +726,9 @@ impl ClientAccess {
     /// rules of a group with `tls-accept-claim=true`. The [module
     /// doc](crate::access#claims) states the rule.
     ///
+    /// The call gives the rules of [`Claims::rules`], with
+    /// `[core] collection-id` as the own collection id.
+    ///
     /// # Examples
     ///
     /// ```
@@ -751,33 +755,7 @@ impl ClientAccess {
     /// # Ok::<(), ostrya::Error>(())
     /// ```
     pub fn claim_rules(&self, claims: &Claims, namespace: &Namespace) -> Option<AccessRules> {
-        let namespace = match namespace {
-            Namespace::Collection(id) if Some(id.as_str()) == self.collection_id.as_deref() => {
-                &Namespace::Local
-            }
-            other => other,
-        };
-        let mut rules = AccessRules::default();
-        let mut found = false;
-        for claim in claims.as_slice() {
-            let names = match (&claim.namespace, namespace) {
-                (Namespace::Local, Namespace::Local) => true,
-                (Namespace::Collection(id), Namespace::Local) => {
-                    Some(id.as_str()) == self.collection_id.as_deref()
-                }
-                (Namespace::Collection(id), Namespace::Collection(wanted)) => id == wanted,
-                (Namespace::Local, Namespace::Collection(_)) => false,
-            };
-            if !names {
-                continue;
-            }
-            found = true;
-            match &claim.rule {
-                ClaimRule::Allow(item) => rules.allow.push(item.clone()),
-                ClaimRule::Deny(pattern) => rules.deny.push(pattern.clone()),
-            }
-        }
-        found.then_some(rules)
+        claims.rules(namespace, self.collection_id.as_deref())
     }
 
     /// Returns the rules of `group`, with the claims of `claims`.
@@ -1308,6 +1286,36 @@ secret-key-file=/etc/ostrya/release.secret
         let own = Claims::parse(["ostrya:ref:w:@own.id:main"]).unwrap();
         assert!(no_own_id.claim_rules(&own, &Namespace::Local).is_none());
         assert!(no_own_id.claim_rules(&own, &collection("own.id")).is_some());
+    }
+
+    /// `Claims::rules` gives the rules of `claim_rules` for each namespace,
+    /// with and without an own collection id.
+    #[test]
+    fn the_rules_of_the_claims_are_the_claim_rules() {
+        let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
+        let with_own = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let claims = Claims::parse([
+            "ostrya:ref:w:main",
+            "ostrya:ref:t:@a.b:os/**",
+            "ostrya:ref:!secret/**",
+            "ostrya:ref:d:@own.id:devel/**",
+            "ostrya:ref:!@a.b:os/secret",
+        ])
+        .unwrap();
+        for (access, own) in [(&with_own, Some("own.id")), (&self::access(""), None)] {
+            for namespace in [
+                Namespace::Local,
+                collection("a.b"),
+                collection("own.id"),
+                collection("c.d"),
+            ] {
+                assert_eq!(
+                    claims.rules(&namespace, own),
+                    access.claim_rules(&claims, &namespace),
+                    "{own:?} {namespace:?}"
+                );
+            }
+        }
     }
 
     /// The namespace of the own collection id gives the rules of the local

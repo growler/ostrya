@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use ostrya_core::{MAX_COLLECTION_ID_LEN, RefPattern, is_valid_collection_id};
+use ostrya_core::{MAX_COLLECTION_ID_LEN, RefPattern, RefSelector, is_valid_collection_id};
 
 use super::Namespace;
 use crate::error::{Error, Result};
@@ -145,7 +145,8 @@ impl AllowItem {
 
 impl AllowItem {
     /// Returns `true` if the item gives `r`: it has `r`, `w`, `c`, or `t`.
-    pub(crate) fn gives_read(&self) -> bool {
+    /// An item with `d` alone gives no `r`.
+    pub fn gives_read(&self) -> bool {
         self.modes
             .intersects(push_modes_with_read().union(AccessModes::READ))
     }
@@ -276,8 +277,55 @@ impl AccessRules {
 
     /// Returns `true` if an allow item gives `r`: it has `r`, `w`, `c`, or
     /// `t`. The deny items have no effect on the result.
-    pub(crate) fn gives_read(&self) -> bool {
+    pub fn gives_read(&self) -> bool {
         self.allow.iter().any(AllowItem::gives_read)
+    }
+
+    /// Returns the selector of the refs that the rules give `r` on, or
+    /// `None` if no allow item gives `r`.
+    ///
+    /// The selector has a positive entry for the pattern of each allow item
+    /// that gives `r`, in the order of [`allow`](AccessRules::allow). It has
+    /// a negative entry for each deny item, in the order of
+    /// [`deny`](AccessRules::deny). A selector with no positive entry
+    /// selects each name, so the result is `None` when no allow item gives
+    /// `r`. With `Some`, the selector selects a name exactly when
+    /// [`rights`](AccessRules::rights) of the name holds `r`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::RefPattern;
+    /// use ostrya::access::{AccessRules, AllowItem};
+    ///
+    /// let rules = AccessRules {
+    ///     allow: vec![AllowItem::parse("w:os/**")?, AllowItem::parse("d:tmp/**")?],
+    ///     deny: vec![RefPattern::parse("os/secret")?],
+    /// };
+    /// let selector = rules.read_selector().unwrap();
+    /// assert_eq!(selector.positive().len(), 1);
+    /// assert!(selector.matches("os/stable"));
+    /// assert!(!selector.matches("os/secret"));
+    /// assert!(!selector.matches("tmp/a"));
+    ///
+    /// let delete_only = AccessRules {
+    ///     allow: vec![AllowItem::parse("d:**")?],
+    ///     deny: Vec::new(),
+    /// };
+    /// assert!(delete_only.read_selector().is_none());
+    /// # Ok::<(), ostrya::Error>(())
+    /// ```
+    pub fn read_selector(&self) -> Option<RefSelector> {
+        let positive: Vec<RefPattern> = self
+            .allow
+            .iter()
+            .filter(|item| item.gives_read())
+            .map(|item| item.pattern.clone())
+            .collect();
+        if positive.is_empty() {
+            return None;
+        }
+        Some(RefSelector::new(positive, self.deny.clone()))
     }
 }
 
@@ -540,6 +588,48 @@ mod tests {
         assert_eq!(r.rights("public"), modes("rwctd"));
         let r = rules(&[], &["**"]);
         assert_eq!(r.rights("a"), AccessModes::NONE);
+    }
+
+    /// The read selector is `None` when no allow item gives `r`. Else it
+    /// selects a name exactly when the rights of the name hold `r`.
+    #[test]
+    fn the_read_selector_selects_the_refs_with_read() {
+        assert!(rules(&[], &[]).read_selector().is_none());
+        assert!(rules(&[], &["secret/**"]).read_selector().is_none());
+        assert!(rules(&["d:**"], &[]).read_selector().is_none());
+        let names = [
+            "main",
+            "os/stable",
+            "os/secret",
+            "os/secret/a",
+            "devel/x",
+            "devel/x/y",
+            "tmp/a",
+            "a",
+            "b/c",
+        ];
+        for (allow, deny) in [
+            (&["r:**"][..], &[][..]),
+            (&["w:os/**", "d:tmp/**", "t:devel/*"], &["os/secret/**"]),
+            (&["d:**", "c:main", "r:a"], &["a", "tmp/**"]),
+            (&["rd:b/*", "r:os/*", "w:os/**"], &["os/secret"]),
+        ] {
+            let r = rules(allow, deny);
+            let selector = r.read_selector().unwrap();
+            for name in names {
+                assert_eq!(
+                    selector.matches(name),
+                    r.rights(name).contains(AccessModes::READ),
+                    "{allow:?} {deny:?} {name:?}"
+                );
+            }
+        }
+        let r = rules(&["w:b", "d:x", "a"], &["y", "z"]);
+        let selector = r.read_selector().unwrap();
+        let positive: Vec<&str> = selector.positive().iter().map(RefPattern::as_str).collect();
+        let negative: Vec<&str> = selector.negative().iter().map(RefPattern::as_str).collect();
+        assert_eq!(positive, ["b", "a"]);
+        assert_eq!(negative, ["y", "z"]);
     }
 
     /// A push session needs an allow item with `w`, `c`, `t`, or `d`, and a

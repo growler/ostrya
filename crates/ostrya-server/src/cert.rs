@@ -124,7 +124,7 @@ impl ClaimFault {
     /// The URI SAN that is no claim, if one is.
     pub(crate) fn san(&self) -> Option<&str> {
         match self {
-            ClaimFault::Claim(ClaimError::Malformed { uri, .. }) => Some(uri),
+            ClaimFault::Claim(ClaimError::Malformed { claim, .. }) => Some(claim),
             _ => None,
         }
     }
@@ -825,7 +825,7 @@ mod tests {
     #[test]
     fn a_fault_escapes_control_characters() {
         let fault = ClaimFault::Claim(ClaimError::Malformed {
-            uri: "ostrya:ref:a\nb".to_owned(),
+            claim: "ostrya:ref:a\nb".to_owned(),
             reason: "why\r".to_owned(),
         });
         assert_eq!(

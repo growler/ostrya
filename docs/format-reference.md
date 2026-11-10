@@ -4909,6 +4909,8 @@ These rules apply to each ref of the two parts:
   is no regular file, for example a directory.
 - An alias whose target is absent, and a ref file that a write removes during
   the walk, are not in the listing.
+- A ref entry that is a FIFO or a socket when the server opens it is not in
+  the listing. The open does not wait for a writer.
 - These refs fail the whole listing when the client reads them, and the
   server leaves out no ref for these causes:
   - a ref file that is not UTF-8, or that holds no checksum;
@@ -5558,14 +5560,15 @@ and pulls collection refs from it into the client repository.
 
 A ref `(ID, NAME)` is on the media when the ref files of the media
 repository and its `summary` both list it. `Repo::list_collection_refs_in`
-of the media repository reads the ref files. For a collection that only
-operands `NAME` and `@ID:NAME` select, it reads the ref files of these names
-alone. The summary lists the refs of `ID` in field 0 when it states the
-collection id `ID` (`ostree.summary.collection-id`), and else in the first
-entry of `ID` in `ostree.summary.collection-map`. The import ignores the
-ref `ostree-metadata` in field 0, because it is the anchor ref of the media
-repository. The import ignores an entry of the collection map for the
-collection id that the summary states.
+of the media repository reads the ref files. A ref entry that is a FIFO or a
+socket lists no ref ("The ref listing"). For a
+collection that only operands `NAME` and `@ID:NAME` select, it reads the ref
+files of these names alone. The summary lists the refs of `ID` in field 0
+when it states the collection id `ID` (`ostree.summary.collection-id`), and
+else in the first entry of `ID` in `ostree.summary.collection-map`. The
+import ignores the ref `ostree-metadata` in field 0, because it is the
+anchor ref of the media repository. The import ignores an entry of the
+collection map for the collection id that the summary states.
 The first entry of a name counts. The import ignores a name that fails the
 ref-name rule. The commit of a ref is the commit that the summary lists, so
 a stale summary pins an old commit. The timestamp of a ref is the

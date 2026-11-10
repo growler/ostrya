@@ -500,7 +500,8 @@ impl Repo {
     /// `refs/` by one link, and `access` reads the target path. The call
     /// opens the target with no symlink followed. An alias that breaks one
     /// of these rules, and an alias whose target names no regular file, are
-    /// not in the result.
+    /// not in the result. A ref entry that is a FIFO or a socket at the open
+    /// is not in the result, and its open does not wait for a writer.
     ///
     /// # Collection refs
     ///
@@ -719,6 +720,8 @@ impl Repo {
     /// collection-id` with one link. The result holds the alias by its own
     /// name, with the commit of the target. An alias whose target is absent,
     /// is outside these directories, or is an alias is not in the result.
+    /// A ref entry that is a FIFO or a socket at the open is not in the
+    /// result, and its open does not wait for a writer.
     ///
     /// The call does not check a name that it finds against the ref-name
     /// rule. A wildcard of `refs` selects a name that the rule refuses.
@@ -1662,14 +1665,16 @@ fn negative_covers(selector: &RefSelector) -> Vec<Vec<&str>> {
         .collect()
 }
 
-/// Reads the ref of the entry `entry` of a walk of the directory `root`
-/// under `refs/` for the listing of `access`, or returns `None`.
+/// Reads the ref of the entry `entry` of a ref-tree walk of the directory
+/// `root` under `refs/` for the listing of `access`, or returns `None`.
 ///
 /// The result holds the bytes of the ref file, and the target path of an
 /// alias. An alias goes to [`read_alias_ref`]. The call opens each other
-/// entry with no symlink followed. An entry that is an alias at the open goes
-/// to `read_alias_ref`, as the classification of the walk sends an alias. An
-/// entry removed after the walk read its type gives `None`.
+/// entry with [`walk`], so the open follows no symlink and does not wait for
+/// a writer. An entry that is an alias at the open goes to `read_alias_ref`,
+/// as the ref-tree walk sends an alias. An entry removed after the ref-tree
+/// walk read its type gives `None`. An entry that is a FIFO or a socket at
+/// the open gives `None`.
 fn read_listed_ref(
     repo: &Repo,
     root: &str,
@@ -1682,22 +1687,15 @@ fn read_listed_ref(
     if entry.file_type == FileType::Symlink {
         return alias();
     }
-    let fd = match rustix::fs::openat(
-        entry.dir,
-        entry.name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(Errno::LOOP) => return alias(),
-        Err(e) => return Err(Error::Io(e.into())),
-    };
-    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
-    std::fs::File::from(fd)
-        .take(REF_READ_CAP)
-        .read_to_end(&mut buf)?;
-    Ok(Some((buf, None)))
+    match walk(entry.dir, entry.name, false)? {
+        Walked::File(file, _) => {
+            let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
+            file.take(REF_READ_CAP).read_to_end(&mut buf)?;
+            Ok(Some((buf, None)))
+        }
+        Walked::NotFound => Ok(None),
+        Walked::Refused | Walked::Alias(_) => alias(),
+    }
 }
 
 /// Reads the ref that the alias `entry` of a walk of the directory `root`
@@ -3220,6 +3218,58 @@ mod tests {
             assert_eq!(parse_ref_content(&read).unwrap(), commit);
             assert_eq!(target.as_deref(), Some("refs/heads/secret"));
         });
+    }
+
+    /// The listing gives no ref for an entry that is a FIFO at the open, and
+    /// the open does not wait for a writer. This holds when the walk read the
+    /// entry as a FIFO, and when the walk read a regular file that a FIFO
+    /// replaced.
+    #[test]
+    fn a_listed_ref_entry_that_is_a_fifo_at_the_open_gives_no_ref() {
+        let root = Root::new("listed-fifo");
+        let repo = ostrya_rt::block_on(Repo::create(
+            &root.dir.join("repo"),
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap();
+        let heads = root.dir.join("repo/refs/heads");
+        let fifo = heads.join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        for file_type in [FileType::Fifo, FileType::RegularFile] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let (repo, heads) = (repo.clone(), heads.clone());
+            std::thread::spawn(move || {
+                let dir = std::fs::File::open(&heads).unwrap();
+                let entry = RefEntry {
+                    dir: dir.as_fd(),
+                    name: "fifo",
+                    path: "fifo",
+                    file_type,
+                };
+                let reads = repo.implicit_reads();
+                let _ =
+                    tx.send(read_listed_ref(&repo, HEADS_DIR, &entry, reads).map(|r| r.is_none()));
+            });
+            let timeout = std::time::Duration::from_secs(10);
+            let Ok(result) = rx.recv_timeout(timeout) else {
+                // A writer releases the blocked open, so the thread ends.
+                let _ = rustix::fs::open(
+                    &fifo,
+                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                    Mode::empty(),
+                );
+                let _ = rx.recv_timeout(timeout);
+                panic!("{file_type:?}: the open waits on the FIFO");
+            };
+            assert!(result.unwrap(), "{file_type:?}");
+        }
     }
 
     /// The collection id of the repositories of the own-collection tests.

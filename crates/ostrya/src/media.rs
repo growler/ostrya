@@ -327,7 +327,9 @@ impl Repo {
     /// `/tmp` or `/dev/shm`. On each mount, it probes each entry of
     /// `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
     /// `var/lib/flatpak/repo`. The media repository of a mount is the first
-    /// candidate whose summary lists a collection ref.
+    /// candidate whose summary lists a collection ref. When the summary
+    /// states a collection id, the finder does not count the anchor ref
+    /// `ostree-metadata` in field 0.
     /// The finder skips a candidate on another file system than the mount,
     /// the client repository, and a candidate that it cannot read. The
     /// import needs exactly one media repository.

@@ -161,6 +161,15 @@ for it.
   `Repo::load_commit_with_bytes` run two jobs on the blocking pool: one for
   the read of the object and one for the check of the `.commitpartial`
   marker. One job can do the read, the parse, and the check.
+- One rule for a collection ref in the media finder and the media import.
+  The finder counts a ref of the summary that the import does not take in
+  these cases, so the media repository that the finder selects can give no
+  ref to the import:
+  - An entry of `ostree.summary.collection-map` for the collection id that
+    the summary states. The import reads the refs of that id in field 0.
+  - A second entry of one id in `ostree.summary.collection-map`. The import
+    reads the first entry of the id.
+  - A ref name that fails the ref-name rule. The import leaves out the name.
 
 ## Gaps of bucket repositories
 

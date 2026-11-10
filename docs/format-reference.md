@@ -5532,12 +5532,15 @@ not a directory. It skips a candidate for these reasons:
   (`Repo::open_at_strict`), so the open reads no remotes directory.
 - The summary lists no collection ref, or the candidate has no `summary`.
 
-A summary lists a collection ref when field 0 holds a ref and the summary
-states a collection id (`ostree.summary.collection-id`), or when an entry of
+A summary lists a collection ref when field 0 holds a ref other than
+`ostree-metadata` and the summary states a collection id
+(`ostree.summary.collection-id`), or when an entry of
 `ostree.summary.collection-map` holds a ref. The first case is the media of
 the tool in a destination with a collection id, and a repository with a
 collection id and local refs, for example a system repository at
-`MOUNT/ostree/repo`.
+`MOUNT/ostree/repo`. The finder skips a repository whose field 0 holds only
+its anchor ref `ostree-metadata` and whose collection map holds no ref,
+because the import takes no ref from it.
 
 The media repository of a mount is the first candidate that the finder does
 not skip. The finder probes no later candidate of that mount. A mount with

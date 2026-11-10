@@ -15,8 +15,8 @@ use super::mountinfo::{self, Mount};
 use crate::error::Result;
 use crate::repo::Repo;
 use crate::summary::{
-    SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list, read_root_file_with,
-    summary_collection_id,
+    OSTREE_METADATA_REF, SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list,
+    read_root_file_with, summary_collection_id,
 };
 
 /// The directory of the repository entries of the tool on a volume.
@@ -380,16 +380,20 @@ pub(super) fn identity(fd: impl AsFd) -> std::result::Result<Identity, Errno> {
 }
 
 /// Returns `true` if the summary `bytes` lists a collection ref: a ref in
-/// the collection map, or a ref in field 0 when the summary states a
-/// collection id. The call parses the global metadata dict, and parses the
-/// refs of field 0 only when the summary states a collection id.
+/// the collection map, or a ref in field 0 other than the anchor ref
+/// `ostree-metadata` when the summary states a collection id. The call
+/// parses the global metadata dict, and parses the refs of field 0 only
+/// when the summary states a collection id.
 fn lists_collection_ref(bytes: &[u8]) -> Result<bool> {
     let metadata = Summary::parse_metadata(bytes)?;
     if collection_map_has_ref(&metadata)? {
         return Ok(true);
     }
     let own = summary_collection_id(&metadata).is_some();
-    Ok(own && !parse_ref_list(bytes)?.is_empty())
+    Ok(own
+        && parse_ref_list(bytes)?
+            .iter()
+            .any(|entry| entry.name != OSTREE_METADATA_REF))
 }
 
 #[cfg(test)]
@@ -630,6 +634,48 @@ mod tests {
                     (repos_d.join("d"), "NoCollectionRef".to_owned()),
                 ]
             );
+        });
+    }
+
+    /// A summary with its own collection id whose field 0 lists only the
+    /// anchor ref `ostree-metadata` lists no collection ref. A second ref
+    /// in field 0 makes the candidate media. The anchor ref in an entry of
+    /// the collection map is a collection ref, also when the summary states
+    /// the collection id of the entry.
+    #[test]
+    fn a_repository_with_only_its_anchor_ref_is_no_media() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new(&std::env::temp_dir());
+            let client = repo_at(&scratch.root.join("client"), None).await;
+            let mount = scratch.dir("mount");
+            let path = mount.join("ostree/repo");
+            let anchor = summary(Some(ID), &["ostree-metadata"], &[]);
+            repo_at(&path, Some(&anchor)).await;
+
+            let choice = find_media_in(&client, &mount).await;
+            assert_eq!(
+                skipped(choice.unwrap()),
+                [(path.clone(), "NoCollectionRef".to_owned())]
+            );
+
+            let both = summary(Some(ID), &["ostree-metadata", "os/stable"], &[]);
+            std::fs::write(path.join("summary"), both).unwrap();
+            let choice = find_media_in(&client, &mount).await;
+            assert_eq!(one(choice.unwrap()).path, path);
+
+            let map = summary(None, &[], &[(ID, &["ostree-metadata"])]);
+            std::fs::write(path.join("summary"), map).unwrap();
+            let choice = find_media_in(&client, &mount).await;
+            assert_eq!(one(choice.unwrap()).path, path);
+
+            let own_map = summary(
+                Some(ID),
+                &["ostree-metadata"],
+                &[(ID, &["ostree-metadata"])],
+            );
+            std::fs::write(path.join("summary"), own_map).unwrap();
+            let choice = find_media_in(&client, &mount).await;
+            assert_eq!(one(choice.unwrap()).path, path);
         });
     }
 

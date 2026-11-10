@@ -5256,10 +5256,11 @@ enum MediaCommand {
     /// write, such as /tmp or /dev/shm. On each mount, it probes each entry
     /// of `.ostree/repos.d/`, then `.ostree/repo`, `ostree/repo`, and
     /// `var/lib/flatpak/repo`. The media repository of a mount is the first
-    /// of these repositories whose summary lists a collection ref. The
-    /// command skips a repository on another file system than the mount, a
-    /// repository that it cannot read, and this repository. The command
-    /// needs exactly one media repository.
+    /// of these repositories whose summary lists a collection ref. For the
+    /// collection id that the summary states, the command does not count the
+    /// anchor ref `ostree-metadata`. The command skips a repository on
+    /// another file system than the mount, a repository that it cannot read,
+    /// and this repository. The command needs exactly one media repository.
     ///
     /// A ref @ID:NAME is on the media when the ref files of the media
     /// repository and its summary both list it. For the collection id that

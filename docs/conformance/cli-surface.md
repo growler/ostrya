@@ -4683,7 +4683,9 @@ No matrix cell needs these. The shell suite invokes them.
   - The port also reads media whose `[core] collection-id` is the id of a
     ref, where field 0 of the summary lists the ref. The port ignores the
     ref `ostree-metadata` in field 0, because it is the anchor ref of the
-    media repository. The tool was not observed on such media.
+    media repository. A candidate whose field 0 lists only this ref, and
+    whose collection map holds no ref, is no media. The tool was not
+    observed on such media.
   - The port takes a candidate in a btrfs subvolume of the mount, although
     the `st_dev` of the subvolume is not the `st_dev` of the mount. A btrfs
     subvolume is no mount point. The tool was not observed on such media.

@@ -1,5 +1,4 @@
-# build.les -- builds the ostrya Debian packages for each release. Local test
-# harness; not committed.
+# build.les -- builds the ostrya Debian packages for each release.
 #
 #   packages.ostrya_<distr>          the ostrya .deb for one release
 #                                    ("13" = trixie, "12" = bookworm),
@@ -7,10 +6,13 @@
 #   packages.ostrya-mountd_<distr>   the ostrya-mountd .deb for one release,
 #                                    captured under /root/packages.
 #
+# The packages are the only buildable exports. test.les loads the function
+# build_env and the constant RUST_VERSION.
+#
 # Run:  debles check build.les   (then: debles lock / fetch / build / cp)
 
 _SNAPSHOT = datetime.from_iso("2026-11-01").to_iso()
-_RUST_VERSION = ["1.92.0", "2025-12-11"]
+RUST_VERSION = ["1.92.0", "2025-12-11"]
 _DEBEMAIL = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
 
 # The apt universe for one release: the main Debian archive (release, -updates,
@@ -102,10 +104,12 @@ _build_packages = [
     "libdistro-info-perl",
 ]
 
-def _build_env(version):
+# The build environment of one release: the base, the build packages, and the
+# Rust toolchain. test.les loads this function.
+def build_env(version):
     return apply(
         apply(_base(version), layer(require = _build_packages)),
-        _rust(*_RUST_VERSION),
+        _rust(*RUST_VERSION),
     )
 
 # Vendor the workspace so the package builds run offline. tests/ is staged
@@ -114,7 +118,7 @@ def _build_env(version):
 # stanza is appended to it.
 _src = derive(
     tree = apply(
-        _build_env(_releases.keys()[0]),
+        build_env(_releases.keys()[0]),
         layer(stage = [
             directory(url = "crates", target = "/root/ostrya/crates"),
             directory(url = "tests",  target = "/root/ostrya/tests"),
@@ -148,7 +152,7 @@ _src = derive(
 # capture the artifacts under /root/packages.
 def _build(version, crate):
     return derive(
-        tree = apply(_build_env(version), layer(stage = [_src])),
+        tree = apply(build_env(version), layer(stage = [_src])),
         env = {
             "DEBEMAIL": _DEBEMAIL,
             "VERSION_ID": version,
@@ -180,423 +184,3 @@ packages = {
     for source, crate in _sources.items()
     for distr in _releases.keys()
 }
-
-# The CI gates.
-#
-#   gates   runs the steps of the CI workflow, and the s3 tests of
-#           ostrya-remote and the push_s3 tests of ostrya under the smol
-#           backend, in the trixie build environment as the user `ci` in the
-#           groups ci, adm, and users. The steps that install tools are left
-#           out: _gate_tools and _rust_extras supply those tools. The output
-#           at /ostrya-gates holds summary.tsv (step, exit status, seconds,
-#           name), verdict, probe.txt, setup.log, logs/, and steps/. debles
-#           discards $TARGET when the script exits non-zero, so the script
-#           exits 0 also when a step fails. Read verdict and summary.tsv for
-#           the result.
-
-_RCLONE_VERSION = "v1.75.1"
-_RCLONE_SHA256 = "982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab"
-
-# The tools that the CI steps install with apt, or that the runner image
-# holds. pkgconf lets pcre2-sys find the system libpcre2-8, so the PCRE2 step
-# tests the PCRE2_SYS_STATIC pin. llvm puts llvm-dlltool on PATH. The apt of
-# trixie verifies with sqv, so gpgv is not in the base. readelf comes with
-# build-essential; useradd and setpriv are in the base. rclone is the release
-# archive of the rclone project, with the version and SHA-256 the CI workflow
-# pins.
-_gate_tools = layer(
-    require = ["gnupg", "gpgv", "jq", "libpcre2-dev", "llvm", "pkgconf"],
-    stage = [
-        zipfile(
-            url    = f"https://downloads.rclone.org/{_RCLONE_VERSION}/rclone-{_RCLONE_VERSION}-linux-amd64.zip",
-            target = "/usr/opt/rclone",
-            hash   = f"sha256:{_RCLONE_SHA256}",
-        ),
-    ],
-    build_env = {"RCLONE_VERSION": _RCLONE_VERSION},
-    build = r"""
-        set -e
-        install -D -m 0755 "usr/opt/rclone/rclone-${RCLONE_VERSION}-linux-amd64/rclone" usr/local/bin/rclone
-        rm -rf usr/opt/rclone
-    """,
-)
-
-# The toolchain parts that the CI workflow installs with rustup and _rust does
-# not: rustfmt and clippy for the host, and the standard library of the three
-# non-Linux targets. A separate layer keeps the key of _rust, and so the keys
-# of the package targets. Each install.sh adds its component to the prefix of
-# _rust, as the loop of _rust does.
-def _rust_extras(version, date):
-    host = ARCH.triple("rust")
-    stems = [f"{c}-{version}-{host}" for c in ["rustfmt", "clippy"]] + [
-        f"rust-std-{version}-{t}"
-        for t in ["x86_64-pc-windows-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"]
-    ]
-    return layer(
-        stage = [
-            tarfile(url = f"https://static.rust-lang.org/dist/{date}/{stem}.tar.xz", target = "/usr/opt")
-            for stem in stems
-        ],
-        build_env = {
-            "RUST_VERSION": version,
-            "RUST_COMPONENTS": " ".join(stems),
-        },
-        build = r"""
-            set -e
-            prefix=/usr/opt/rust-${RUST_VERSION}
-            for component in ${RUST_COMPONENTS}; do
-                "usr/opt/${component}/install.sh" --prefix="${prefix}" --disable-ldconfig
-                rm -rf "usr/opt/${component}"
-                rm -f "${prefix}/lib/rustlib/uninstall.sh"
-            done
-            for b in "${prefix}"/bin/*; do ln -sf "../opt/rust-${RUST_VERSION}/bin/$(basename "$b")" usr/bin/; done
-        """,
-    )
-
-# The root half of the run: add the user `ci`, copy the source, add the
-# vendor stanza to the cargo config, run the steps as `ci` with a clean
-# environment (debles sets SOURCE_DATE_EPOCH, and ostrya reads it), and copy
-# the results to $TARGET. The sandbox has no /dev/shm, so the script makes it.
-# The tests make their scratch directories in /tmp, and on the overlay of the
-# sandbox a `mknod` of a whiteout device fails with EPERM, so /tmp is a tmpfs.
-# The verdict is pass only when the steps script exits 0, summary.tsv has one
-# row for each `step` call of the steps script, and each row has the exit
-# status 0.
-_GATES_RUN = r"""
-    #!/bin/bash
-    set -u
-    mkdir -p "$TARGET"
-    (
-        set -ex
-        id
-        cat /proc/self/uid_map /proc/self/gid_map /proc/self/setgroups
-        mount -t tmpfs -o mode=1777 tmpfs /tmp
-        mkdir -p /dev/shm && chmod 1777 /dev/shm
-        groupadd --gid 1000 ci
-        useradd --uid 1000 --gid ci --groups adm,users --create-home --shell /bin/bash ci
-        cp -a /root/ostrya /home/ci/ostrya
-        printf '\n[source.crates-io]\nreplace-with = "vendored-sources"\n[source.vendored-sources]\ndirectory = "vendor/"\n' \
-            >>/home/ci/ostrya/.cargo/config.toml
-        chown -R ci:ci /home/ci
-    ) >"$TARGET/setup.log" 2>&1
-    setup=$?
-    steps=/usr/local/libexec/ostrya-gates/steps
-    status=1
-    if [ "$setup" -eq 0 ]; then
-        setpriv --reuid=ci --regid=ci --init-groups -- \
-            env -i HOME=/home/ci USER=ci LOGNAME=ci SHELL=/bin/bash LANG=C.UTF-8 \
-                PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin \
-                /bin/bash "$steps" </dev/null
-        status=$?
-        echo "steps: exit status $status" >>"$TARGET/setup.log"
-        cp -r /home/ci/gates-out/. "$TARGET/"
-    else
-        printf 'setup\t%s\t0\tsetup failed, see setup.log\n' "$setup" >"$TARGET/summary.tsv"
-    fi
-    planned=$(grep -c '^step ' "$steps")
-    rows=$(cat "$TARGET/summary.tsv" 2>/dev/null | wc -l)
-    echo "steps: $rows of $planned rows" >>"$TARGET/setup.log"
-    if [ "$status" -eq 0 ] && [ "$rows" -eq "$planned" ] &&
-        awk -F'\t' '$2 != 0 { bad = 1 } END { exit bad }' "$TARGET/summary.tsv"; then
-        echo pass >"$TARGET/verdict"
-    else
-        echo fail >"$TARGET/verdict"
-    fi
-    echo "gates: $(cat "$TARGET/verdict")"
-    exit 0
-"""
-
-# The steps, run as `ci` in /home/ci/ostrya. `step NAME [VAR=VALUE]...` reads
-# one step body on standard input: the `run:` text of the CI step, with the
-# `sudo apt-get` lines removed. The VAR=VALUE words are the `env:` of the step.
-# Each body runs with `bash -e`, the shell of a GitHub Actions step with no
-# `shell:` key, with standard input from /dev/null. A failed step does not
-# stop the run.
-_GATES_STEPS = r"""
-    #!/bin/bash
-    set -u
-    out=/home/ci/gates-out
-    mkdir -p "$out/logs" "$out/steps"
-    cd /home/ci/ostrya || exit 1
-    n=0
-    step() {
-        local name=$1; shift
-        n=$((n + 1))
-        local id slug body start rc
-        id=$(printf '%02d' "$n")
-        slug=$(printf '%s' "$name" | tr -cs 'A-Za-z0-9' '-' | sed 's/^-//; s/-$//')
-        body="$out/steps/$id-$slug.sh"
-        cat >"$body"
-        start=$SECONDS
-        env "$@" bash -e "$body" </dev/null >"$out/logs/$id-$slug.log" 2>&1
-        rc=$?
-        printf '%s\t%s\t%s\t%s\n' "$id" "$rc" "$((SECONDS - start))" "$name" >>"$out/summary.tsv"
-        printf 'gates: %s %s: exit %s\n' "$id" "$name" "$rc"
-    }
-
-    {
-        id; cat /proc/self/setgroups; nproc; df -h / /tmp; cat /proc/self/mountinfo
-        env | sort
-        rustc -vV; cargo -V; cargo fmt --version; cargo clippy --version
-        for t in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-            ls -d "$(rustc --print sysroot)/lib/rustlib/$t/lib"
-        done
-        rclone version; llvm-dlltool --version; gpg --version; gpgv --version
-        jq --version; readelf --version; pkg-config --modversion libpcre2-8
-    } >"$out/probe.txt" 2>&1
-
-    step "Format check" <<'STEP'
-    cargo fmt --all -- --check
-    STEP
-    step "Clippy" <<'STEP'
-    cargo clippy --workspace --all-targets --all-features -- -D warnings
-    STEP
-    step "Rustdoc" "RUSTDOCFLAGS=-D warnings" <<'STEP'
-    cargo doc --workspace --no-deps --all-features
-    crates=$(cargo metadata --format-version 1 --no-deps \
-      | jq -r '.packages[] | select(.publish != []) | .name')
-    test -n "$crates"
-    for crate in $crates; do
-      cargo doc -p "$crate" --no-deps
-    done
-    cargo doc -p ostrya --no-deps --no-default-features --features smol,verify-gpg
-    cargo doc -p ostrya-sign --no-deps --no-default-features --features gpg
-    STEP
-    step "PCRE2 stays in ostrya-cli" <<'STEP'
-    cargo metadata --format-version 1 --all-features \
-      | jq -e '[.packages[]
-                | select(.name | test("^pcre2") | not)
-                | select(any(.dependencies[]?.name; test("^pcre2")))
-                | .name] == ["ostrya-cli"]'
-    STEP
-    step "PCRE2 is linked statically" <<'STEP'
-    cargo build -p ostrya-cli
-    ! readelf -d target/debug/ostrya | grep -qi pcre2
-    STEP
-    step "The shipped binaries link xz statically" <<'STEP'
-    for package in ostrya-cli ostrya-mountd; do
-      cargo tree -p "$package" -e normal,build -f "{p} {f}" \
-        | grep -qE 'liblzma-sys v[0-9.]+ .*\bstatic\b'
-    done
-    STEP
-    step "Every license is permissive" <<'STEP'
-    cargo metadata --format-version 1 --all-features \
-      | jq -e -r '
-          ["MIT", "Apache-2.0", "Apache-2.0 WITH LLVM-exception",
-           "0BSD", "BSD-1-Clause", "BSD-2-Clause", "BSD-3-Clause",
-           "ISC", "Zlib", "Unlicense", "BSL-1.0", "Unicode-3.0"] as $ok
-          | [ .packages[]
-              | { crate: "\(.name) \(.version)",
-                  spdx: (.license // ""
-                         | gsub("\\s*/\\s*"; " OR ")
-                         | gsub("[()]"; "")) }
-              | select(
-                  [ .spdx
-                    | split(" AND ")[]
-                    | [ split(" OR ")[] | sub("^ +"; "") | sub(" +$"; "") ]
-                    | any(. as $t | $ok | index($t)) ]
-                  | length == 0 or (all | not))
-              | "  \(.crate): \(if .spdx == "" then "<no license field>"
-                                else .spdx end)" ]
-          | if length == 0
-            then "every package in the graph carries a permissive license"
-            else ("packages whose license is not permissive:\n"
-                  + join("\n") + "\n" | halt_error(1))
-            end'
-    STEP
-    step "Only allowlisted packages link a native library" <<'STEP'
-    cargo metadata --format-version 1 --all-features \
-      | jq -e -r '
-          ["liblzma-sys", "ring"] as $ok
-          | [ .resolve.nodes[].id ] as $resolved
-          | [ .packages[]
-              | select(.id as $id | $resolved | index($id))
-              | select(.links != null)
-              | select(.name as $n | $ok | index($n) | not)
-              | "  \(.name) \(.version) links=\(.links)" ]
-          | if length == 0
-            then "no package outside the allowlist links a native library"
-            else ("packages linking a native library outside the "
-                  + "allowlist:\n" + join("\n") + "\n" | halt_error(1))
-            end'
-    STEP
-    step "verify-gpg without sign-gpg compiles" <<'STEP'
-    cargo check -p ostrya --no-default-features --features smol,verify-gpg
-    STEP
-    step "A build without a GPG feature compiles" <<'STEP'
-    cargo check -p ostrya --no-default-features --features smol
-    STEP
-    step "The receive feature without a GPG feature compiles" <<'STEP'
-    cargo check -p ostrya --no-default-features --features smol,receive
-    STEP
-    step "The push feature without the receive feature compiles" <<'STEP'
-    cargo check -p ostrya --no-default-features --features smol,push
-    STEP
-    step "The s3 feature without other features compiles" <<'STEP'
-    cargo check -p ostrya --no-default-features --features smol,s3
-    STEP
-    step "The endpoint tests without the s3 feature pass" <<'STEP'
-    cargo test -p ostrya --no-default-features --features smol --lib endpoint::
-    STEP
-    step "ostrya-cli without the s3 feature refuses an s3 address" <<'STEP'
-    cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent
-    STEP
-    step "receive --one-way with an open input under the smol backend" <<'STEP'
-    cargo test -p ostrya-cli --test cli receive_one_way_open_input
-    STEP
-    step "ostrya-server on the smol backend compiles" <<'STEP'
-    cargo check -p ostrya-server --no-default-features --features smol
-    cargo check -p ostrya-cli --no-default-features --features smol,serve
-    STEP
-    step "ostrya-mount on the smol backend compiles" <<'STEP'
-    cargo check -p ostrya-mount --no-default-features --features smol
-    cargo check -p ostrya-mount --no-default-features --features smol,server
-    cargo check -p ostrya-mountd --no-default-features --features smol
-    STEP
-    step "ostrya send without the push features compiles" <<'STEP'
-    cargo check -p ostrya-cli --no-default-features --features smol,send
-    STEP
-    step "ostrya-sign without a runtime compiles" <<'STEP'
-    cargo check -p ostrya-sign --no-default-features --features spki,gpg
-    STEP
-    step "ostrya-sign with the GPG verifier feature alone compiles" <<'STEP'
-    cargo clippy -p ostrya-sign --no-default-features --features gpg --all-targets -- -D warnings
-    STEP
-    step "The ostrya-sign unit tests pass with the GPG verifier feature alone" <<'STEP'
-    cargo test -p ostrya-sign --no-default-features --features gpg --lib
-    STEP
-    step "ostrya-sign with the spki feature alone compiles" <<'STEP'
-    cargo clippy -p ostrya-sign --no-default-features --features spki --all-targets -- -D warnings
-    STEP
-    step "The ostrya-sign unit tests pass with the spki feature alone" <<'STEP'
-    cargo test -p ostrya-sign --no-default-features --features spki --lib
-    STEP
-    step "The spki tests pass with the sign-spki feature alone" <<'STEP'
-    cargo test -p ostrya --no-default-features --features smol,sign-spki --test sign_spki --test sign_spki_p384 --test sign_spki_ed25519 --test sign_spki_rsa --test sign_spki_fixtures
-    STEP
-    step "ostrya-sign with the X.509 feature alone compiles" <<'STEP'
-    cargo clippy -p ostrya-sign --no-default-features --features x509 --all-targets -- -D warnings
-    STEP
-    step "The ostrya-sign unit tests pass with the X.509 feature alone" <<'STEP'
-    cargo test -p ostrya-sign --no-default-features --features x509 --lib
-    STEP
-    step "ostrya-sign with the X.509 feature and the spki feature compiles" <<'STEP'
-    cargo clippy -p ostrya-sign --no-default-features --features x509,spki --all-targets -- -D warnings
-    STEP
-    step "The ostrya-sign unit tests pass with the X.509 feature and the spki feature" <<'STEP'
-    cargo test -p ostrya-sign --no-default-features --features x509,spki --lib
-    STEP
-    step "ostrya-cli with the spki feature alone compiles" <<'STEP'
-    cargo clippy -p ostrya-cli --no-default-features --features smol,spki --all-targets -- -D warnings
-    STEP
-    step "ostrya-cli with the gpg feature alone compiles" <<'STEP'
-    cargo clippy -p ostrya-cli --no-default-features --features smol,gpg --all-targets -- -D warnings
-    STEP
-    step "The portable crates check on the non-Linux targets" <<'STEP'
-    for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-      cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-remote
-      cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
-      cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
-      cargo check --target "$target" -p ostrya-remote --features s3
-      cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio,s3
-      cargo check --target "$target" -p ostrya-sign --features spki,gpg,gpg-sign,x509
-      cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,spki,gpg,gpg-sign,x509
-    done
-    STEP
-    step "ostrya-fetch builds for the non-Linux targets" "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_RUSTFLAGS=-C dlltool=llvm-dlltool" <<'STEP'
-    for target in x86_64-pc-windows-gnu x86_64-apple-darwin aarch64-apple-darwin; do
-      cargo build --lib --target "$target" -p ostrya-fetch
-      cargo build --lib --target "$target" -p ostrya-fetch --no-default-features --features tokio
-    done
-    STEP
-    step "A tokio build holds no smol" <<'STEP'
-    for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
-      package=${build%%:*}
-      features=${build#*:}
-      if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then
-        echo "a build of $package with $features holds smol:"
-        echo "$out"
-        exit 1
-      fi
-      if ! grep -q 'package ID specification `smol` did not match any packages' <<<"$out"; then
-        echo "cargo tree failed with an unexpected error:"
-        echo "$out"
-        exit 1
-      fi
-    done
-    STEP
-    step "Test" OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1 OSTRYA_REQUIRE_S3=1 <<'STEP'
-    cargo test --workspace --all-features
-    STEP
-    step "Conformance evidence check" <<'STEP'
-    cargo run -p ostrya-conformance -- check --verify-evidence
-    STEP
-    step "smol: the s3 tests of ostrya-remote" OSTRYA_REQUIRE_S3=1 <<'STEP'
-    cargo test -p ostrya-remote --features s3
-    STEP
-    step "smol: the push_s3 tests of ostrya" OSTRYA_REQUIRE_S3=1 <<'STEP'
-    cargo test -p ostrya --features push,s3 --test push_s3
-    STEP
-"""
-
-# The vendored crates of the workspace for the gates. The tree holds the root
-# manifest, the lock file, the cargo config, and the manifest of each crate,
-# so an edit to a source file does not run `cargo vendor` again. cargo needs a
-# target in each manifest, so the script writes an empty src/lib.rs in each
-# crate.
-def _gates_vendor(version):
-    return derive(
-        tree = apply(
-            _build_env(version),
-            layer(stage = [
-                directory(
-                    url = "crates",
-                    target = "/root/ostrya/crates",
-                    ignore = ["*", "!/*/", "!/*/Cargo.toml"],
-                ),
-                file(url = "Cargo.toml",         target = "/root/ostrya/Cargo.toml"),
-                file(url = "Cargo.lock",         target = "/root/ostrya/Cargo.lock"),
-                file(url = ".cargo/config.toml", target = "/root/ostrya/.cargo/config.toml"),
-            ]),
-        ),
-        build = """
-            set -e
-            cd /root/ostrya
-            for crate in crates/*/; do
-                mkdir -p "${crate}src"
-                : >"${crate}src/lib.rs"
-            done
-            cargo vendor --locked vendor/
-            mkdir -p "$(dirname "${TARGET}")"
-            mv vendor "${TARGET}"
-        """,
-        target = "/root/ostrya/vendor",
-    )
-
-def _gates(version):
-    return derive(
-        tree = apply(
-            apply(apply(_build_env(version), _gate_tools), _rust_extras(*_RUST_VERSION)),
-            layer(stage = [
-                directory(url = "crates", target = "/root/ostrya/crates"),
-                directory(url = "tests",  target = "/root/ostrya/tests"),
-                directory(url = "docs",   target = "/root/ostrya/docs"),
-                file(url = "Cargo.toml",         target = "/root/ostrya/Cargo.toml"),
-                file(url = "Cargo.lock",         target = "/root/ostrya/Cargo.lock"),
-                file(url = "README.md",          target = "/root/ostrya/README.md"),
-                file(url = "LICENSE",            target = "/root/ostrya/LICENSE"),
-                file(url = ".cargo/config.toml", target = "/root/ostrya/.cargo/config.toml"),
-                _gates_vendor(version),
-                file(text = _GATES_RUN,   target = "/usr/local/libexec/ostrya-gates/run",   mode = 0o755),
-                file(text = _GATES_STEPS, target = "/usr/local/libexec/ostrya-gates/steps", mode = 0o755),
-            ]),
-        ),
-        # Change the value to run an unchanged recipe again.
-        env = {"GATES_RUN": "1"},
-        # debles passes the build script to /bin/sh on standard input, so a
-        # child that reads standard input would read the rest of the script.
-        build = "exec /bin/bash /usr/local/libexec/ostrya-gates/run </dev/null\n",
-        target = "/ostrya-gates",
-    )
-
-gates = _gates("13")

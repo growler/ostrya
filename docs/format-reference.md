@@ -3338,11 +3338,12 @@ refs and to a pull of collection refs:
 - The pull checks no signature of a dependency commit. Field 2 holds the
   checksum of the dependency, and the checksum and the signatures of the
   commit that names it cover field 2. An untrusted pull (`--untrusted`,
-  `PullFlags::UNTRUSTED`) hashes the dependency commit that it imports and
-  compares the result with that checksum. The pull from a local candidate of
-  a collection pull whose keys check signatures does the same. A pull
-  without the flag trusts the source for a dependency as for each other
-  object. The pull makes no ref-binding check on a dependency.
+  `PullFlags::UNTRUSTED`) hashes the dependency commit that it reads and
+  imports, and compares the result with that checksum. The pull from a
+  local candidate of a collection pull whose keys check signatures does
+  the same. A pull without the flag trusts the source for a dependency as
+  for each other object. The pull makes no ref-binding check on a
+  dependency.
 - A target, a parent that the depth of the pull takes, and a commit of a
   chain of static deltas keep the checks of that role, also if a field 2
   names them.
@@ -5165,14 +5166,17 @@ probe, as for a remote. Under a summary policy, the listed timestamps come
 from the verified summary, and the pull reads and verifies the `summary` and
 the `summary.sig` of the source again. Without a summary policy, the probe
 reads each tip commit for its timestamp, and keeps no bytes for the pull.
-With `--untrusted`, the import hashes each commit one time and compares the
-result with the name of the commit. If the keys of the
+With `--untrusted`, the pull hashes each commit that it reads for the checks
+and for the walk of the chain, and each dirtree that the walk of the tree
+reads. It compares each result with the name of the object before it uses
+the bytes. It also hashes each object that it imports. If the keys of the
 candidate check the signatures of the commits or of the summary
 (`gpg-verify`, `sign-verify`, `gpg-verify-summary`, `sign-verify-summary`,
-or a trust group), the pull hashes each object that it imports and compares
-the result with the name of the object, as under `--untrusted`. A signature
-covers the commit or the summary alone, and the hash carries the proof to
-the objects of the tree. Otherwise, without `--untrusted`, the pull links,
+or a trust group), the pull makes the same hashes, as under `--untrusted`.
+A signature covers the commit, or the summary the checksum of the commit.
+The commit names its root dirtree, and each dirtree names the objects below
+it. So each object that the pull imports is an object of the tree of the
+verified commit. Otherwise, without `--untrusted`, the pull links,
 clones, or copies an object with no hash, and an object that it writes again
 in another form always gets a hash. A pull from a local candidate counts no
 fetch, unless it reads static deltas. When the pull fetched nothing and

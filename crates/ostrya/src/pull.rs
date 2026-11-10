@@ -1559,8 +1559,15 @@ impl Repo {
     /// flag hashes a linked or cloned content object after the link or the
     /// clone. It reads the staged object as this repository stores it, and
     /// makes the hash and the mode checks of the pull on that one read. So a
-    /// source that changes during the import cannot pass the hash. An
-    /// untrusted pull hashes each object once.
+    /// source that changes during the import cannot pass the hash. The import
+    /// hashes each object once.
+    ///
+    /// The flag also hashes each commit and each dependency that the walk of
+    /// the chains reads from a source, and each dirtree that the walk of the
+    /// tree reads from a source. It compares each result with the name of the
+    /// object before the pull uses the bytes. So the signature check, the
+    /// ref-binding check, the timestamp check, and the walk read the objects
+    /// that the pull imports.
     ///
     /// A hardlinked object shares its inode with the source. So a later change
     /// of the source file changes the object in this repository.
@@ -1586,6 +1593,12 @@ impl Repo {
     /// a source is the "no metadata" marker, and it replaces the copy of this
     /// repository. If no source holds a `.commitmeta`, the signature
     /// verification reads the copy of this repository.
+    ///
+    /// If the policy checks the signatures of the commits, the check keeps the
+    /// SHA-256 of the `.commitmeta` that it read from a source. If the sources
+    /// do not hold the same `.commitmeta` at the import, the pull fails and
+    /// stages no `.commitmeta` of the commit. The pull does not compare the
+    /// copy of this repository.
     ///
     /// If the pull fails before the ref step of its commit, a
     /// [`LockTimeout`](Error::LockTimeout) at that step included, it leaves no
@@ -1727,6 +1740,10 @@ impl Repo {
     ///   error.
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
+    /// - [`Error::Pull`] if the policy checks the signatures of the commits and
+    ///   the `.commitmeta` of a commit in the sources at the import is not the
+    ///   `.commitmeta` that the signature check read. The error names the
+    ///   commit.
     /// - [`Error::Pull`] if the ref binding of a commit does not name its ref.
     ///   Also, without [`no_ref_writes`](PullOptions::no_ref_writes), if the
     ///   `ostree.collection-binding` of the tip commit of an `@ID:NAME` name
@@ -1752,8 +1769,12 @@ impl Repo {
     ///   file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the `.filez`
-    ///   copy and the re-ingest path. Also if a delta superblock does not
-    ///   match its advertised digest or its digest in the list.
+    ///   copy and the re-ingest path. Also under
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), if a commit or a dependency that
+    ///   the walk of the chains reads from a source, or a dirtree that the walk
+    ///   of the tree reads from a source, does not hash to its name. Also if a
+    ///   delta superblock does not match its advertised digest or its digest
+    ///   in the list.
     /// - [`Error::InsufficientFreeSpace`] if an imported object needs more
     ///   space than the free-space budget of the transaction holds.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
@@ -1959,19 +1980,19 @@ impl Repo {
         // The pull checks each commit of the chain before the transaction
         // opens, so a source with signatures that fail the policy imports
         // nothing. The walk of the chain checks each commit over the bytes that
-        // it read to find the parent. A check binds to the source objects as
-        // they are while it runs. The walk also keeps the root dirtree and
-        // dirmeta of each commit, so the plan of the tree reads no source
-        // commit again.
+        // it read to find the parent. Under `UNTRUSTED`, the walk hashes these
+        // bytes and compares the result with the name of the commit before it
+        // uses them. The import reads and hashes the commit again. The walk
+        // also keeps the root dirtree and dirmeta of each commit, so the plan
+        // of the tree reads no source commit again.
         //
         // The import loop reads the `.commitmeta` a second time, where it
-        // copies the bytes. If the source changes between the check and the
-        // import, the pull imports the source as it is at the import. A
-        // concurrent sign of the source commit is the writer that replaces a
-        // `.commitmeta` in place. A carry of the verified metadata to the
-        // import needs one entry for each commit of the chain. A `depth=-1`
-        // pull puts no bound on that count, so the pull reads the metadata
-        // twice.
+        // copies the bytes. The check keeps the SHA-256 of the bytes that it
+        // read, and the import fails on other bytes. A concurrent sign of the
+        // source commit replaces its `.commitmeta` in place, and so fails the
+        // pull. A carry of the verified metadata to the import needs one
+        // entry for each commit of the chain. A `depth=-1` pull puts no bound
+        // on that count, so the pull keeps one digest for each commit.
         //
         // Discovery checked each commit of a chain, so the walk does not check
         // it again.
@@ -2016,8 +2037,9 @@ impl Repo {
             });
             tips[slot].1.push(ref_name.as_str());
         }
+        let untrusted = flags.contains(PullFlags::UNTRUSTED);
         for (tip, refs) in &tips {
-            let loaded = load_commit(src, tip).await?;
+            let loaded = load_commit(src, tip, untrusted).await?;
             // Discovery made the binding checks of each ref that names a
             // commit of a chain.
             if !deltas.checked(tip) {
@@ -2028,6 +2050,7 @@ impl Repo {
                 *tip,
                 loaded,
                 opts.depth,
+                untrusted,
                 &mut commits,
                 &mut seen,
                 check.as_mut(),
@@ -2043,8 +2066,16 @@ impl Repo {
                     deps.inner.record(*commit, entries);
                 }
             }
-            appended =
-                collect_dependencies(self, &sources, deps, &done, &mut commits, &mut seen).await?;
+            appended = collect_dependencies(
+                self,
+                &sources,
+                deps,
+                &done,
+                untrusted,
+                &mut commits,
+                &mut seen,
+            )
+            .await?;
         }
         // The pull reports a defect that the walk finds before a failed check.
         if let Some(ChainCheck {
@@ -2181,6 +2212,7 @@ impl Repo {
                         root_dirmeta: parsed.root_dirmeta,
                         held,
                         dependency: false,
+                        detached: deltas.checked_detached(commit),
                     });
                 }
                 // Discovery counted the `.commitmeta` of each intermediate
@@ -2200,6 +2232,7 @@ impl Repo {
                         &txn,
                         &sources,
                         &chain_commit.checksum,
+                        chain_commit.detached,
                         related,
                         None,
                     )
@@ -2273,8 +2306,15 @@ impl Repo {
                 // A dependency that this repository holds complete keeps the
                 // detached metadata of this repository.
                 if !(chain_commit.dependency && chain_commit.held) {
-                    self.import_detached_metadata(&txn, &sources, commit, related, count)
-                        .await?;
+                    self.import_detached_metadata(
+                        &txn,
+                        &sources,
+                        commit,
+                        chain_commit.detached,
+                        related,
+                        count,
+                    )
+                    .await?;
                 }
             }
             if !opts.no_ref_writes {
@@ -2337,7 +2377,10 @@ impl Repo {
         verify_buf: &mut Vec<u8>,
         count: Option<&PullCounters>,
     ) -> Result<()> {
-        for name in plan_commit(txn, sources, commit, flags, plan).await? {
+        let names = plan_commit(txn, sources, commit, flags, plan).await?;
+        #[cfg(test)]
+        import_seam::run(self.repo_fd());
+        for name in names {
             let imported = self
                 .import_object(txn, sources, name, flags, verify_buf)
                 .await?;
@@ -2497,19 +2540,36 @@ impl Repo {
     /// count is the length of the bytes that the call read, before the rule.
     /// A rule that fails counts the bytes first.
     ///
-    /// The read and the rule run in one call on the blocking pool.
+    /// `checked` is what the signature check of the commit read of the
+    /// `.commitmeta`. If the sources do not hold the same `.commitmeta` now,
+    /// the call stages nothing and fails.
+    ///
+    /// The read, the compare, and the rule run in one call on the blocking
+    /// pool.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Pull`] if the `.commitmeta` that the sources hold is not the
+    /// `.commitmeta` that `checked` gives.
     async fn import_detached_metadata(
         &self,
         txn: &Transaction,
         sources: &[&Repo],
         commit: &Checksum,
+        checked: CheckedDetached,
         rule: RelatedRule,
         count: Option<&PullCounters>,
     ) -> Result<()> {
         let owned: Vec<Repo> = sources.iter().map(|src| (*src).clone()).collect();
         let key = *commit;
         let read = ostrya_rt::unblock(move || -> Result<_> {
-            let Some((at, bytes)) = detached_bytes_from_blocking(&owned, &key)? else {
+            let held = detached_bytes_from_blocking(&owned, &key)?;
+            if !checked.matches(held.as_ref().map(|(_, bytes)| bytes.as_slice())) {
+                return Err(Error::Pull(format!(
+                    "the .commitmeta of commit {key} changed after its signature check"
+                )));
+            }
+            let Some((at, bytes)) = held else {
                 return Ok(None);
             };
             let len = bytes.len() as u64;
@@ -2774,10 +2834,12 @@ fn operand_collection(name: &str) -> Option<(&str, &str)> {
 ///
 /// `tip_commit` holds the bytes of the tip, the commit parsed from them, and
 /// the format check of its field 2. The walk reads each parent from `src`.
-/// If `check` is present, it runs on each commit when the walk appends it,
-/// over the bytes that the walk read. The walk appends each commit with the
-/// root of its tree, so the plan of the tree does not read the commit object
-/// again.
+/// If `untrusted` is set, the walk hashes each parent and compares the result
+/// with the name of the parent before the parse. If `check` is present, it
+/// runs on each commit when the walk appends it, over the bytes that the walk
+/// read. The walk appends each commit with the root of its tree and with
+/// what the check read of its `.commitmeta`, so the plan of the tree does not
+/// read the commit object again.
 ///
 /// The walk takes the format check of field 2 of each commit when it appends
 /// the commit, also if `deps` is `None`. If `deps` is present, the walk
@@ -2787,14 +2849,17 @@ fn operand_collection(name: &str) -> Option<(&str, &str)> {
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] if field 2 of a commit of the chain has an entry
-/// with an empty name or with a checksum that is not 32 bytes.
+/// - [`Error::InvalidRelated`] if field 2 of a commit of the chain has an
+///   entry with an empty name or with a checksum that is not 32 bytes.
+/// - [`Error::ChecksumMismatch`] if `untrusted` is set and a parent does not
+///   hash to its name.
 #[allow(clippy::too_many_arguments)]
 async fn collect_chain(
     src: &Repo,
     tip: Checksum,
     tip_commit: LoadedCommit,
     depth: i32,
+    untrusted: bool,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
     mut check: Option<&mut ChainCheck<'_>>,
@@ -2823,16 +2888,18 @@ async fn collect_chain(
         }
         if seen.insert(checksum, remaining).is_none() {
             let dependencies = dependencies?;
+            let detached = match check.as_deref_mut() {
+                Some(check) => check.check(&checksum, &bytes).await,
+                None => CheckedDetached::Unchecked,
+            };
             out.push(ChainCommit {
                 checksum,
                 root_dirtree: commit.root_dirtree,
                 root_dirmeta: commit.root_dirmeta,
                 held: false,
                 dependency: false,
+                detached,
             });
-            if let Some(check) = check.as_deref_mut() {
-                check.check(&checksum, &bytes).await;
-            }
             if let Some(deps) = deps.as_deref_mut() {
                 deps.inner.record(checksum, dependencies);
             }
@@ -2844,7 +2911,7 @@ async fn collect_chain(
         let Some(parent) = commit.parent else {
             return Ok(());
         };
-        current = try_load_commit(src, &parent)
+        current = try_load_commit(src, &parent, untrusted)
             .await?
             .map(|parent_commit| (parent, parent_commit));
         if remaining > 0 {
@@ -2870,6 +2937,44 @@ struct ChainCommit {
     /// a commit is a dependency alone: a target, a parent, and a commit of a
     /// chain are not appended.
     dependency: bool,
+    /// What the signature check of the commit read of its `.commitmeta`.
+    detached: CheckedDetached,
+}
+
+/// What the signature check of a commit of a local pull read of its
+/// `.commitmeta` in the sources.
+///
+/// The check keeps the SHA-256 of the bytes alone, so the import can find
+/// other bytes with no copy of the verified bytes.
+#[derive(Clone, Copy)]
+enum CheckedDetached {
+    /// The pull checked no signature of the commit.
+    Unchecked,
+    /// No source held a `.commitmeta` of the commit.
+    Absent,
+    /// The source at position `at` held a `.commitmeta` of `len` bytes with
+    /// the SHA-256 `digest`.
+    Read {
+        at: usize,
+        len: u64,
+        digest: Checksum,
+    },
+}
+
+impl CheckedDetached {
+    /// Returns `true` if `held`, the `.commitmeta` bytes that the sources
+    /// hold now, are the bytes that the check read. A commit with no check
+    /// matches each value.
+    fn matches(&self, held: Option<&[u8]>) -> bool {
+        match (self, held) {
+            (CheckedDetached::Unchecked, _) => true,
+            (CheckedDetached::Absent, held) => held.is_none(),
+            (CheckedDetached::Read { digest, .. }, Some(bytes)) => {
+                Checksum::sha256(bytes) == *digest
+            }
+            (CheckedDetached::Read { .. }, None) => false,
+        }
+    }
 }
 
 /// The dependencies that the walk of the chains of a local pull met, and the
@@ -2899,12 +3004,14 @@ struct ChainDependencies {
 /// dependency.
 ///
 /// The function reads the dependencies that neither `seen` nor `made` holds in
-/// one call on the blocking pool, in the order of `deps`. The call stops at
-/// the first failure. If no dependency needs a read, the function makes no
-/// call. The call reads no dependency after the first dependency that `seen`
-/// or `made` holds and that names dependencies of its own. If the caller drops
-/// the future, the blocking call continues to the end of its list or to the
-/// first failure.
+/// one call on the blocking pool, in the order of `deps`. If `untrusted` is
+/// set, it hashes each dependency that it reads from a source, as
+/// [`load_dependencies_blocking`] states. The call stops at the first
+/// failure. If no dependency needs a read, the function makes no call. The
+/// call reads no dependency after the first dependency that `seen` or `made`
+/// holds and that names dependencies of its own. If the caller drops the
+/// future, the blocking call continues to the end of its list or to the first
+/// failure.
 ///
 /// The call checks no signature of a dependency. Field 2 of the commit that
 /// names the dependency holds its checksum, and the checksum and the
@@ -2920,6 +3027,8 @@ struct ChainDependencies {
 ///   The error names the dependency.
 /// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds a
 ///   dependency.
+/// - [`Error::ChecksumMismatch`] if `untrusted` is set and a dependency that
+///   the call reads from a source does not hash to its name.
 /// - [`Error::Core`] if the commit object of a dependency does not parse.
 /// - [`Error::Io`] if a file system operation fails, or if the commit object
 ///   of a dependency is larger than
@@ -2929,6 +3038,7 @@ async fn collect_dependencies(
     sources: &[&Repo],
     deps: &ChainDependencies,
     made: &HashSet<Checksum>,
+    untrusted: bool,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
 ) -> Result<Vec<Checksum>> {
@@ -2964,8 +3074,10 @@ async fn collect_dependencies(
             .collect();
         // The closure gives the position in `wanted` of a nested dependency.
         // The names stay here.
-        loaded = match ostrya_rt::unblock(move || load_dependencies_blocking(&holders, &wanted))
-            .await?
+        loaded = match ostrya_rt::unblock(move || {
+            load_dependencies_blocking(&holders, &wanted, untrusted)
+        })
+        .await?
         {
             Ok(loaded) => loaded,
             Err(nested) => return Err(nested_error(&order[positions[nested]])),
@@ -2985,6 +3097,7 @@ async fn collect_dependencies(
             root_dirmeta: dependency.root_dirmeta,
             held: false,
             dependency: true,
+            detached: CheckedDetached::Unchecked,
         });
     }
     Ok(appended)
@@ -3012,20 +3125,29 @@ struct ChainCheck<'a> {
 impl ChainCheck<'_> {
     /// Checks `commit`, whose object holds `bytes`, unless a check failed
     /// before, and records a failure.
-    async fn check(&mut self, commit: &Checksum, bytes: &Arc<Vec<u8>>) {
-        if self.failed.is_none()
-            && let Err(err) = self.check_one(commit, bytes).await
-        {
-            self.failed = Some(err);
+    ///
+    /// Returns what the check read of the `.commitmeta`, or
+    /// [`CheckedDetached::Unchecked`] after a failure.
+    async fn check(&mut self, commit: &Checksum, bytes: &Arc<Vec<u8>>) -> CheckedDetached {
+        if self.failed.is_some() {
+            return CheckedDetached::Unchecked;
+        }
+        match self.check_one(commit, bytes).await {
+            Ok(detached) => detached,
+            Err(err) => {
+                self.failed = Some(err);
+                CheckedDetached::Unchecked
+            }
         }
     }
 
     /// Checks `commit`, whose object holds `bytes`, against the commit policy.
     ///
-    /// A commit that discovery checked passes with no read.
-    async fn check_one(&self, commit: &Checksum, bytes: &Arc<Vec<u8>>) -> Result<()> {
+    /// A commit that discovery checked passes with no read, with what
+    /// discovery read of its `.commitmeta`.
+    async fn check_one(&self, commit: &Checksum, bytes: &Arc<Vec<u8>>) -> Result<CheckedDetached> {
         if self.plan.checked(commit) {
-            return Ok(());
+            return Ok(self.plan.checked_detached(commit));
         }
         // The verification reads the detached metadata as the source holds
         // it. That is the `.commitmeta` of the first source that holds one,
@@ -3035,7 +3157,6 @@ impl ChainCheck<'_> {
         let sources: Vec<Repo> = self.sources.iter().map(|src| (*src).clone()).collect();
         check_local_commit_signatures(self.repo, self.verification, sources, commit, bytes.into())
             .await
-            .map(drop)
     }
 }
 
@@ -3087,26 +3208,33 @@ async fn check_commit_signatures(
 /// the errors of [`check_commit_signatures`] over the bytes of the sources, in
 /// the same order.
 ///
-/// Returns the position in `sources` and the length of the `.commitmeta` that
-/// the check read from a source, or `None` if no source holds one. The caller
-/// makes sure that the policy checks commits.
+/// Returns what the check read of the `.commitmeta` in the sources: the
+/// position in `sources`, the length, and the SHA-256 of the bytes, or
+/// [`CheckedDetached::Absent`] if no source holds one. The caller makes sure
+/// that the policy checks commits.
 async fn check_local_commit_signatures(
     repo: &Repo,
     verification: &verify::Verification,
     sources: Vec<Repo>,
     commit: &Checksum,
     bytes: Payload<'_>,
-) -> Result<Option<(usize, u64)>> {
+) -> Result<CheckedDetached> {
     let repo = repo.clone();
     let key = *commit;
     let (read, dict) = ostrya_rt::unblock(move || -> Result<_> {
         if let Some((at, held)) = detached_bytes_from_blocking(&sources, &key)? {
             let dict = crate::summary::parse_signature_dict(&held)?;
-            return Ok((Some((at, held.len() as u64)), dict));
+            let read = CheckedDetached::Read {
+                at,
+                len: held.len() as u64,
+                digest: Checksum::sha256(&held),
+            };
+            return Ok((read, dict));
         }
+        let read = CheckedDetached::Absent;
         match repo.load_object_bytes_blocking(ObjectType::CommitMeta, &key) {
-            Ok(held) => Ok((None, crate::summary::parse_signature_dict(&held)?)),
-            Err(Error::ObjectNotFound { .. }) => Ok((None, None)),
+            Ok(held) => Ok((read, crate::summary::parse_signature_dict(&held)?)),
+            Err(Error::ObjectNotFound { .. }) => Ok((read, None)),
             Err(e) => Err(e),
         }
     })
@@ -3226,9 +3354,11 @@ impl PlanState {
 /// refers to are present, and the walk reads nothing.
 ///
 /// The root of the tree comes from the commit object that the walk of the
-/// chain read. [`plan_absent`] finds the objects that this repository lacks:
-/// first the root dirtree and dirmeta, then the children of each dirtree. It
-/// makes one blocking call for each dirtree.
+/// chain read. Under [`UNTRUSTED`](PullFlags::UNTRUSTED), the walk hashes each
+/// dirtree that it reads from a source before the parse, as
+/// [`load_dirtree_from`] states. [`plan_absent`] finds the objects that this
+/// repository lacks: first the root dirtree and dirmeta, then the children of
+/// each dirtree. It makes one blocking call for each dirtree.
 /// [`pull_local`](Repo::pull_local) states the rules of the walk. A dirtree
 /// that `txn` staged from a delta part counts as held. A dirtree that neither
 /// this repository nor a source holds gives its own name and nothing below it.
@@ -3267,7 +3397,9 @@ async fn plan_commit(
         let dirtree = if here {
             txn.load_dirtree_staged_first(&checksum).await?
         } else {
-            match load_dirtree_from(sources, &checksum).await? {
+            match load_dirtree_from(sources, &checksum, flags.contains(PullFlags::UNTRUSTED))
+                .await?
+            {
                 Some(dirtree) => dirtree,
                 None => continue,
             }
@@ -3393,22 +3525,38 @@ fn parse_loaded(checksum: Checksum, bytes: Arc<Vec<u8>>) -> Result<LoadedCommit>
 /// Loads a commit from a repository: its bytes, the commit parsed from them,
 /// and the format check of its field 2.
 ///
+/// If `hash` is set, the call hashes the bytes and compares the result with
+/// `checksum` before the parse.
+///
 /// A commit object can be as large as [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-/// so the read, the parse, and the check run in one call on the blocking
-/// pool.
-async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<LoadedCommit> {
+/// so the read, the hash, the parse, and the check run in one call on the
+/// blocking pool.
+///
+/// # Errors
+///
+/// [`Error::ChecksumMismatch`] if `hash` is set and the bytes do not hash to
+/// `checksum`.
+async fn load_commit(repo: &Repo, checksum: &Checksum, hash: bool) -> Result<LoadedCommit> {
     let repo = repo.clone();
     let checksum = *checksum;
     ostrya_rt::unblock(move || {
         let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &checksum)?;
+        if hash {
+            check_hash(&checksum, &bytes)?;
+        }
         parse_loaded(checksum, Arc::new(bytes))
     })
     .await
 }
 
-/// Loads a commit, or returns `None` for an absent object.
-async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<LoadedCommit>> {
-    match load_commit(repo, checksum).await {
+/// Loads a commit as [`load_commit`] does, or returns `None` for an absent
+/// object.
+async fn try_load_commit(
+    repo: &Repo,
+    checksum: &Checksum,
+    hash: bool,
+) -> Result<Option<LoadedCommit>> {
+    match load_commit(repo, checksum, hash).await {
         Ok(loaded) => Ok(Some(loaded)),
         Err(Error::ObjectNotFound { .. }) => Ok(None),
         Err(e) => Err(e),
@@ -3419,10 +3567,12 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Load
 /// of `holders` that holds it.
 ///
 /// For each dependency, the call parses the commit and checks the format of
-/// its field 2. It keeps the root of the tree of the commit alone, and drops
-/// the bytes before it reads the next dependency. It stops at the first
-/// failure. The inner `Err` holds the position in `wanted` of a dependency
-/// that names dependencies of its own.
+/// its field 2. If `untrusted` is set, it first hashes a commit that it read
+/// from a repository other than the last of `holders`, and compares the
+/// result with the checksum of the dependency. It keeps the root of the tree
+/// of the commit alone, and drops the bytes before it reads the next
+/// dependency. It stops at the first failure. The inner `Err` holds the
+/// position in `wanted` of a dependency that names dependencies of its own.
 ///
 /// The function reads on the calling thread. A caller on the executor calls
 /// it in one call on the blocking pool for all dependencies.
@@ -3431,6 +3581,8 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Load
 ///
 /// - [`Error::ObjectNotFound`] if no repository of `holders` holds a
 ///   dependency.
+/// - [`Error::ChecksumMismatch`] if `untrusted` is set and a commit that the
+///   call hashes does not hash to the checksum of its dependency.
 /// - [`Error::InvalidRelated`] if field 2 of a dependency has an entry with
 ///   an empty name or with a checksum that is not 32 bytes. The error names
 ///   the dependency.
@@ -3439,13 +3591,17 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Load
 fn load_dependencies_blocking(
     holders: &[Repo],
     wanted: &[Checksum],
+    untrusted: bool,
 ) -> Result<std::result::Result<Vec<LoadedDependency>, usize>> {
     let mut loaded = Vec::with_capacity(wanted.len());
     for (at, checksum) in wanted.iter().enumerate() {
         let mut bytes = None;
-        for held in holders {
+        for (position, held) in holders.iter().enumerate() {
             match held.load_object_bytes_blocking(ObjectType::Commit, checksum) {
                 Ok(read) => {
+                    if untrusted && position + 1 < holders.len() {
+                        check_hash(checksum, &read)?;
+                    }
                     bytes = Some(read);
                     break;
                 }
@@ -3481,9 +3637,10 @@ fn load_dependencies_blocking(
 /// The result holds the position of that source in `sources` and the bytes.
 ///
 /// This function alone selects the detached metadata of a local pull. The
-/// signature verification reads these bytes, and
-/// [`Repo::import_detached_metadata`] writes them, so the verified metadata
-/// and the stored metadata agree. A
+/// signature verification reads these bytes and keeps their SHA-256.
+/// [`Repo::import_detached_metadata`] reads them again, compares their
+/// SHA-256, and writes them, so the verified metadata and the stored metadata
+/// agree. A
 /// zero-length file counts as a source that holds one. It is the "no metadata"
 /// marker, and it replaces the copy of the destination.
 ///
@@ -3503,11 +3660,53 @@ fn detached_bytes_from_blocking(
     Ok(None)
 }
 
+/// Hashes `bytes` and compares the result with `expected`, the checksum of
+/// the object that the bytes are read as.
+///
+/// # Errors
+///
+/// [`Error::ChecksumMismatch`] if the bytes do not hash to `expected`.
+fn check_hash(expected: &Checksum, bytes: &[u8]) -> Result<()> {
+    let actual = Checksum::sha256(bytes);
+    if actual != *expected {
+        return Err(Error::ChecksumMismatch {
+            expected: *expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
 /// Loads a dirtree from the first source that holds it, or returns `None` if
 /// no source holds it.
-async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Option<DirTree>> {
+///
+/// If `untrusted` is set, the call hashes the bytes and compares the result
+/// with `checksum` before the parse. The read, the hash, and the parse then
+/// run in one call on the blocking pool.
+///
+/// # Errors
+///
+/// [`Error::ChecksumMismatch`] if `untrusted` is set and the bytes do not
+/// hash to `checksum`.
+async fn load_dirtree_from(
+    sources: &[&Repo],
+    checksum: &Checksum,
+    untrusted: bool,
+) -> Result<Option<DirTree>> {
     for src in sources {
-        match src.load_dirtree(checksum).await {
+        let loaded = if untrusted {
+            let src = (*src).clone();
+            let checksum = *checksum;
+            ostrya_rt::unblock(move || {
+                let bytes = src.load_object_bytes_blocking(ObjectType::DirTree, &checksum)?;
+                check_hash(&checksum, &bytes)?;
+                Ok(DirTree::parse(&bytes)?)
+            })
+            .await
+        } else {
+            src.load_dirtree(checksum).await
+        };
+        match loaded {
             Ok(dirtree) => return Ok(Some(dirtree)),
             Err(Error::ObjectNotFound { .. }) => continue,
             Err(e) => return Err(e),
@@ -4381,7 +4580,11 @@ const _: fn() = || {
 /// import runs the action once, where a change of the source object can come
 /// between the bytes that the import stages and the bytes that it hashes:
 /// after the read of a metadata object and before its write, and after the
-/// link or the clone of a content object and before its hash. The calls
+/// link or the clone of a content object and before its hash. A local pull
+/// also runs it after the plan of the tree of a commit and before the import
+/// of its objects, and a pull from a remote after the read of a commit from a
+/// localcache repository and before the checks of the commit. The action
+/// runs at the first of these points that the pull gets to. The calls
 /// compile out of a build that is not a test build.
 #[cfg(test)]
 pub(crate) mod import_seam {
@@ -4420,6 +4623,22 @@ pub(crate) mod import_seam {
         if let Some(action) = action {
             action();
         }
+    }
+
+    /// Removes the action armed for the repository at `root`, if one is
+    /// armed. Returns `true` if one was armed.
+    ///
+    /// A test calls it after the pull, so that an action that did not run
+    /// does not run in a later test whose repository root gets the same
+    /// inode.
+    pub(crate) fn disarm(root: &std::path::Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let meta = std::fs::metadata(root).unwrap();
+        let root = (meta.dev(), meta.ino());
+        let mut actions = ACTIONS.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = actions.len();
+        actions.retain(|(at, _)| *at != root);
+        actions.len() != before
     }
 }
 

@@ -3951,10 +3951,13 @@ struct PullArgs {
     /// candidate is a pull of its own, so a failure of a later candidate
     /// keeps the refs of the earlier ones. The keys of the selected candidate
     /// apply. If the keys of a `file://` candidate check the signatures of
-    /// the commits or of the summary, the pull hashes each object that it
-    /// imports from it, as --untrusted does. A signature covers the commit or
-    /// the summary alone, and the hash carries the proof to the objects of
-    /// the tree.
+    /// the commits or of the summary, the pull runs as with --untrusted: it
+    /// hashes each commit that it reads for the checks and the walk of the
+    /// chain, each dirtree that the walk of the tree reads from the
+    /// candidate, and each object that it imports, and compares the result
+    /// with the name of the object. A signature covers the commit or the summary
+    /// alone. The commit names its tree, so each imported object is an object
+    /// of the tree of the verified commit.
     /// Each commit must be bound to ID. If a commit has a ref binding, the
     /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`. If
     /// the `collection-id` of this repository is ID, the pull writes

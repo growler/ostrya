@@ -56,17 +56,6 @@ for it.
   linked inode. The destination shares the inode with the source after the
   pull, so a later change of the source file changes the object in the
   destination.
-- A local pull reads a commit from the source two times. The signature
-  check, the ref-binding check, and the timestamp check use the first
-  read, and the pull does not hash it. The import hashes and stages the
-  second read. The walk of the tree also parses each dirtree from a read
-  of the source that the pull does not hash. The HTTP pull reads a commit
-  and a dirtree from a localcache repository in the same way. The
-  signature check and the import of a `.commitmeta` also use two reads. A
-  source that changes between two reads can make the signature of one
-  commit pass for another commit. It can also make the pull walk a tree
-  that is not the staged tree. A fix checks and walks the bytes that the
-  pull hashes and stages.
 
 ## Gaps in the commands
 

@@ -115,8 +115,8 @@ use super::drive::Slots;
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
-    CheckedMeta, TipChecks, check_commit_signatures_filtered, check_local_commit_signatures,
-    check_tip_refs, count_fetched, source_size,
+    CheckedDetached, CheckedMeta, TipChecks, check_commit_signatures_filtered,
+    check_local_commit_signatures, check_tip_refs, count_fetched, source_size,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -385,6 +385,7 @@ impl DeltaPlan {
                 Detached::Checked {
                     kept: Some(range),
                     filtered,
+                    ..
                 },
                 Some(store),
             ) => Ok(CommitCheck::Checked {
@@ -398,6 +399,7 @@ impl DeltaPlan {
                 Detached::Checked {
                     kept: None,
                     filtered,
+                    ..
                 },
                 _,
             ) => Ok(CommitCheck::Checked {
@@ -413,6 +415,17 @@ impl DeltaPlan {
         self.records
             .get(commit)
             .is_some_and(|record| matches!(record.detached, Detached::Checked { .. }))
+    }
+
+    /// Returns what the check of `commit` in discovery read of its
+    /// `.commitmeta` in a local source, or [`CheckedDetached::Unchecked`] if
+    /// discovery did not check the commit or read no local source. The call
+    /// reads nothing.
+    pub(super) fn checked_detached(&self, commit: &Checksum) -> CheckedDetached {
+        match self.records.get(commit).map(|record| &record.detached) {
+            Some(Detached::Checked { local, .. }) => *local,
+            _ => CheckedDetached::Unchecked,
+        }
     }
 
     /// Takes the entries of field 2 of each intermediate commit of the
@@ -481,6 +494,8 @@ enum Detached {
         /// `true` if `kept` holds the result of the rule, as
         /// [`CommitCheck::Checked`] states.
         filtered: bool,
+        /// What the check read of the `.commitmeta` in a local source.
+        local: CheckedDetached,
     },
 }
 
@@ -493,23 +508,13 @@ struct Checked {
     /// [`CommitCheck::Checked`] states.
     filtered: bool,
     /// What the check read of the `.commitmeta` in a local source.
-    local: LocalRead,
+    /// [`CheckedDetached::Unchecked`] if the source is a remote, or if the
+    /// policy checks no commit.
+    local: CheckedDetached,
     /// The entries of field 2 of the commit, in the stored order, after the
     /// format check. The list is empty for a remote source: a pull from a
     /// remote reads field 2 when it stages the commit.
     dependencies: Vec<(String, Checksum)>,
-}
-
-/// What the check of a commit of a chain read of its `.commitmeta` in a local
-/// source.
-enum LocalRead {
-    /// The check read nothing from a local source: the source is a remote,
-    /// or the policy checks no commit.
-    Nothing,
-    /// The local source holds no `.commitmeta` of the commit.
-    Absent,
-    /// The local source holds a `.commitmeta` of this size.
-    Size(u64),
 }
 
 /// The file that keeps the raw superblocks and the verified `.commitmeta`
@@ -1580,9 +1585,9 @@ async fn discover_chain(
     if let DeltaSource::Local(src) = source {
         for commit in pass.plan.levels.iter().flatten() {
             let size = match checked.get(commit).map(|check| &check.local) {
-                Some(LocalRead::Size(size)) => Some(*size),
-                Some(LocalRead::Absent) => None,
-                Some(LocalRead::Nothing) | None => {
+                Some(CheckedDetached::Read { at: 0, len, .. }) => Some(*len),
+                Some(CheckedDetached::Absent | CheckedDetached::Read { .. }) => None,
+                Some(CheckedDetached::Unchecked) | None => {
                     source_size(src, ObjectType::CommitMeta, commit).await?
                 }
             };
@@ -1605,6 +1610,7 @@ async fn discover_chain(
             record.detached = Detached::Checked {
                 kept: check.kept,
                 filtered: check.filtered,
+                local: check.local,
             };
             if intermediate.contains(commit) && !check.dependencies.is_empty() {
                 dependencies.insert(*commit, check.dependencies);
@@ -1849,9 +1855,11 @@ async fn fetch_step(
 ///   the first localcache repository that holds it. The reads and the parse
 ///   run in one call on the blocking pool. The record keeps no bytes. If the
 ///   policy checks no commit, discovery reads no `.commitmeta`. The result
-///   holds the size of the file that the source holds. [`discover_chain`]
-///   counts the file at its end, for each intermediate commit of the last
-///   plan alone.
+///   holds the position of the source that holds the file, the size of the
+///   file, and its SHA-256. The import of the commit compares the SHA-256
+///   with the file that the sources hold then, and fails on other bytes.
+///   [`discover_chain`] counts the file at its end, for each intermediate
+///   commit of the last plan alone.
 ///
 /// If no repository holds a `.commitmeta`, the check reads the detached
 /// metadata of this repository.
@@ -1947,14 +1955,14 @@ async fn check_step_commit(
             Checked {
                 kept,
                 filtered,
-                local: LocalRead::Nothing,
+                local: CheckedDetached::Unchecked,
                 dependencies: Vec::new(),
             }
         }
         DeltaSource::Local(_) if !ctx.verification.checks_commits() => Checked {
             kept: None,
             filtered: false,
-            local: LocalRead::Nothing,
+            local: CheckedDetached::Unchecked,
             dependencies: Vec::new(),
         },
         DeltaSource::Local(src) => {
@@ -1963,7 +1971,7 @@ async fn check_step_commit(
             let sources: Vec<Repo> = std::iter::once((*src).clone())
                 .chain(ctx.localcache.iter().cloned())
                 .collect();
-            let read = check_local_commit_signatures(
+            let local = check_local_commit_signatures(
                 ctx.repo,
                 ctx.verification,
                 sources,
@@ -1971,10 +1979,6 @@ async fn check_step_commit(
                 (&commit_bytes).into(),
             )
             .await?;
-            let local = match read {
-                Some((0, size)) => LocalRead::Size(size),
-                _ => LocalRead::Absent,
-            };
             Checked {
                 kept: None,
                 filtered: false,

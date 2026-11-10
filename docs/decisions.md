@@ -896,6 +896,22 @@ Two alternatives were rejected:
 - The config read with no off switch. A configured check would then apply
   to each local pull of the remote, and a command line could not turn it off.
 
+The signature check of a commit keeps the SHA-256 of the `.commitmeta` that
+it read from a source. The import reads the `.commitmeta` again. If the
+sources do not hold the same bytes, the import fails the pull with
+`Error::Pull` and stages no `.commitmeta`. So the pull stores the
+`.commitmeta` that the check verified. The rule applies to each pull whose
+policy checks the signatures of the commits, with or without
+`PullFlags::UNTRUSTED`.
+
+Two alternatives were rejected:
+
+- A carry of the verified bytes to the import. The pull would keep one
+  buffer for each commit of the chain, and a `depth=-1` pull puts no bound
+  on the number of commits.
+- A second signature check at the import. The pull would verify each commit
+  two times.
+
 ## The trust group of a remote
 
 The remote key `trust=NAME` names a trust group `[ex-ostrya trust "NAME"]`.
@@ -3271,17 +3287,18 @@ These alternatives were rejected:
   the probe, as over HTTP. Under a summary policy, it reads the `summary` and
   the `summary.sig` of the source again, and checks them under the trust of
   the remote. It does not compare the refs of that summary with the commits
-  of the probe: the import hashes each commit against its name.
+  of the probe: the pull hashes each commit that it reads against its name.
 - The probe keeps no commit bytes and no summary for the pull. Without a
   summary policy, it reads each tip commit for its timestamp, and drops the
   bytes before it reads the next commit. A commit is named by its hash. In a
   source that does not change, a second read of a tip gives the same bytes.
   The check of the listed timestamp finds a tip commit whose timestamp
   changed between the probe and the pull. Under `PullFlags::UNTRUSTED`, the
-  import hashes each commit one time, and a commit that does not hash to its
-  name fails the pull with `Error::ChecksumMismatch`. The second read of each
-  tip commit without a summary policy, and of the summary under a summary
-  policy, is the cost of this design.
+  pull hashes the read of each tip commit before the checks, and a tip
+  commit that does not hash to its name fails the pull with
+  `Error::ChecksumMismatch` before the check of the listed timestamp. The
+  second read of each tip commit without a summary policy, and of the
+  summary under a summary policy, is the cost of this design.
 - The client groups of the source do not apply. The file permissions are
   the access.
 - Each error of the open and of the probe skips the candidate.
@@ -3304,10 +3321,14 @@ These alternatives were rejected:
 - Each other pull from a remote, and the fetch of a summary, keep the
   refusal of a `file://` address by the HTTP client.
 - If the trust of the remote checks the signatures of the commits or of the
-  summary, the pull from the candidate hashes each object that it imports,
-  as under `PullFlags::UNTRUSTED`. A signature covers the commit, or the
-  summary the checksum of the commit, and the hash carries the proof to the
-  objects of the tree. Otherwise the flags of the caller apply.
+  summary, the pull from the candidate runs as under
+  `PullFlags::UNTRUSTED`. It hashes each commit that it reads for the checks
+  and each dirtree that it reads for the walk of the tree before it uses the
+  bytes, and it hashes each object that it imports. A signature covers the
+  commit, or the summary the checksum of the commit. The commit names its
+  root dirtree, and each dirtree names the objects below it, so the hashes
+  bind each imported object to the verified commit. Otherwise the flags of
+  the caller apply.
 - `CollectionPullStats::local` holds the counts of the pulls from local
   candidates, and `CollectionPullStats::stats` the counts of all pulls. When
   the pull fetched objects, and the local candidates imported objects and

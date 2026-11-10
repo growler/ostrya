@@ -1790,11 +1790,11 @@ impl Repo {
         mut read_buf: Vec<u8>,
     ) -> Result<(Step, Vec<u8>)> {
         let step = match item {
-            Item::Commit(commit) => self.fetch_commit(ctx, commit, &mut read_buf).await?,
+            Item::Commit(commit) => self.fetch_commit(ctx, commit).await?,
             Item::Object(name) if name.ty == ObjectType::File => {
                 self.fetch_content(ctx, name, &mut read_buf).await?
             }
-            Item::Object(name) => self.fetch_metadata(ctx, name, &mut read_buf).await?,
+            Item::Object(name) => self.fetch_metadata(ctx, name).await?,
             Item::Load(commit) => {
                 if let RunDeltas::Lazy(found) = ctx.deltas {
                     found.load_job(self, &commit).await?;
@@ -1835,12 +1835,7 @@ impl Repo {
     /// In the run of the dependencies, the step checks no signature. For a
     /// dependency that this repository holds complete, it requests no
     /// detached metadata.
-    async fn fetch_commit(
-        &self,
-        ctx: &StepCtx<'_>,
-        item: CommitItem,
-        read_buf: &mut Vec<u8>,
-    ) -> Result<Step> {
+    async fn fetch_commit(&self, ctx: &StepCtx<'_>, item: CommitItem) -> Result<Step> {
         let checksum = item.checksum;
         let name = ObjectName::new(checksum, ObjectType::Commit);
         if ctx.done.contains(&checksum) {
@@ -1888,9 +1883,9 @@ impl Repo {
             (detached, Arc::new(bytes))
         } else if let Some(src) = cached_source(ctx.sources, name).await? {
             // A localcache source holds the object. The pull reads the bytes
-            // from there, and the import runs after the checks, in the order of
-            // the fetched branches.
-            staging = CommitStaging::Import(src);
+            // from there one time. The checks read these bytes, and the write
+            // after the checks hashes and stages them, in the order of the
+            // fetched branches.
             let detached = match known.take() {
                 Some(detached) => detached,
                 None => {
@@ -1898,10 +1893,11 @@ impl Repo {
                         .await?
                 }
             };
-            (
-                detached,
-                Arc::new(src.load_object_bytes(ObjectType::Commit, &checksum).await?),
-            )
+            let bytes = Arc::new(src.load_object_bytes(ObjectType::Commit, &checksum).await?);
+            #[cfg(test)]
+            super::import_seam::run(self.repo_fd());
+            staging = CommitStaging::Write(Arc::clone(&bytes));
+            (detached, bytes)
         } else if let Some(commit_bytes) = ctx.deltas.commit_bytes(&checksum).await? {
             // A delta carries the target commit in its superblock, and these
             // bytes come from there. The parse of the superblock verified that
@@ -2014,30 +2010,26 @@ impl Repo {
             ctx.txn.track(self.partial_marker_job(&checksum)).await?;
         }
         // The pull stages the commit here, after its marker and before its
-        // tree. Each path hashes the bytes and compares the result with the
-        // requested name. The write path does this for bytes in memory, and the
-        // untrusted import for an object of a localcache source. So a commit
-        // stored under a wrong name fails here, before the pull fetches its
-        // tree, and nothing stays after the step. The marker guards a reader
-        // against a commit whose tree is not yet complete. The pull clears the
-        // marker after the transaction publishes.
+        // tree. The write hashes the bytes that the checks read and compares
+        // the result with the requested name. So a commit stored under a wrong
+        // name fails here, before the pull fetches its tree, and nothing stays
+        // after the step. The marker guards a reader against a commit whose
+        // tree is not yet complete. The pull clears the marker after the
+        // transaction publishes.
         match staging {
             CommitStaging::Held => {}
-            CommitStaging::Import(src) => {
-                self.import_from(
-                    ctx.txn,
-                    src,
-                    name,
-                    ctx.flags | PullFlags::UNTRUSTED,
-                    read_buf,
-                )
-                .await?;
-            }
-            CommitStaging::Write(bytes) => {
-                ctx.txn
-                    .write_metadata(ObjectType::Commit, Some(&checksum), &bytes)
-                    .await?;
-            }
+            CommitStaging::Write(bytes) => match Arc::try_unwrap(bytes) {
+                Ok(bytes) => {
+                    ctx.txn
+                        .write_metadata_owned(ObjectType::Commit, Some(&checksum), bytes)
+                        .await?;
+                }
+                Err(bytes) => {
+                    ctx.txn
+                        .write_metadata(ObjectType::Commit, Some(&checksum), &bytes)
+                        .await?;
+                }
+            },
         }
         // The commit object is here, so the pull stages its detached metadata
         // now. The transaction commit writes it before the ref that names the
@@ -2184,12 +2176,7 @@ impl Repo {
 
     /// Fetches one dirtree or dirmeta object and stores it. A dirtree also
     /// reports what it references, for the scan to walk on from.
-    async fn fetch_metadata(
-        &self,
-        ctx: &StepCtx<'_>,
-        name: ObjectName,
-        read_buf: &mut Vec<u8>,
-    ) -> Result<Step> {
+    async fn fetch_metadata(&self, ctx: &StepCtx<'_>, name: ObjectName) -> Result<Step> {
         // The pull does not fetch an object that is here. It still reads a
         // dirtree: an object that it references can be missing, and the walk
         // finds that.
@@ -2204,15 +2191,21 @@ impl Repo {
                 .await;
         }
         if let Some(src) = cached_source(ctx.sources, name).await? {
-            self.import_from(
-                ctx.txn,
-                src,
-                name,
-                ctx.flags | PullFlags::UNTRUSTED,
-                read_buf,
-            )
-            .await?;
-            return self.walked(name, || src.load_dirtree(&name.checksum)).await;
+            // The pull reads the object from the localcache source one time.
+            // The write hashes these bytes and compares the result with the
+            // requested name, and the walk reads the same bytes. So a source
+            // that changes after the read cannot pass the hash or change the
+            // walk.
+            let bytes = src.load_object_bytes(name.ty, &name.checksum).await?;
+            #[cfg(test)]
+            super::import_seam::run(self.repo_fd());
+            ctx.txn
+                .write_metadata(name.ty, Some(&name.checksum), &bytes)
+                .await?;
+            return match name.ty {
+                ObjectType::DirTree => Ok(Step::DirTree(name.checksum, DirTree::parse(&bytes)?)),
+                _ => Ok(Step::Done),
+            };
         }
         let path = object_path(&name.checksum, name.ty);
         let bytes = ctx
@@ -2776,11 +2769,9 @@ struct CommitOutcome {
 
 /// How a commit object reaches the object store, after the commit passes the
 /// checks of its step.
-enum CommitStaging<'a> {
+enum CommitStaging {
     /// This repository holds it.
     Held,
-    /// A localcache repository holds it, and the pull imports it from there.
-    Import(&'a Repo),
     /// Its bytes are in memory, and the pull writes them into the transaction.
     Write(Arc<Vec<u8>>),
 }
@@ -5140,6 +5131,16 @@ mod tests {
     /// Pulls the refs `left` and `right` from `src` into `dest` through a
     /// stream session, with `Repo::send` as the server of `src`.
     async fn pull_both_refs(src: &Repo, dest: &Repo) -> Result<PullStats> {
+        let opts = PullOptions {
+            refs: vec!["left".to_owned(), "right".to_owned()],
+            ..PullOptions::default()
+        };
+        pull_over_stream(src, dest, opts).await
+    }
+
+    /// Pulls from `src` into `dest` with `opts` through a stream session,
+    /// with `Repo::send` as the server of `src`.
+    async fn pull_over_stream(src: &Repo, dest: &Repo, opts: PullOptions) -> Result<PullStats> {
         let (to_server, server_in) = test_pipe::pipe(64 * 1024);
         let (server_out, from_server) = test_pipe::pipe(64 * 1024);
         let access = crate::access::ReadAccess::new(
@@ -5147,10 +5148,6 @@ mod tests {
             crate::access::AuthItem::Anonymous,
             None,
         );
-        let opts = PullOptions {
-            refs: vec!["left".to_owned(), "right".to_owned()],
-            ..PullOptions::default()
-        };
         let (pulled, _) = futures_lite::future::zip(
             async {
                 let session = PullSession::over_stream(
@@ -5232,6 +5229,104 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect();
         assert!(staging.is_empty(), "{staging:?}");
+        drop(fixture.dir);
+    }
+
+    /// Returns the path of the object `checksum` of type `ty` in the archive
+    /// repository `repo`.
+    fn object_file(repo: &Repo, checksum: &Checksum, ty: ObjectType) -> std::path::PathBuf {
+        repo.path()
+            .join("objects")
+            .join(ostrya_core::loose_path(checksum, ty, RepoMode::Archive))
+    }
+
+    /// Copies the object file `from` to the object file `to`, in place of a
+    /// file at `to`.
+    fn put_object_file(from: &std::path::Path, to: &std::path::Path) {
+        let _ = std::fs::remove_file(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(from, to).unwrap();
+    }
+
+    /// The pull hashes the commit bytes that the checks read from a
+    /// localcache repository, and stages these bytes. The cache holds the
+    /// bytes of `right` under the name of `left`, and the right bytes after
+    /// the read. The pull fails with [`Error::ChecksumMismatch`], and does
+    /// not store `left`.
+    #[test]
+    fn a_localcache_commit_that_changes_after_the_checks_fails_the_pull() {
+        let fixture = block_on(two_refs("cache-commit"));
+        let cache = block_on(Repo::create(
+            &fixture.dir.0.join("cache"),
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap();
+        let commit =
+            |repo: &Repo, checksum: &Checksum| object_file(repo, checksum, ObjectType::Commit);
+        let cached = commit(&cache, &fixture.left);
+        put_object_file(&commit(&fixture.src, &fixture.right), &cached);
+        let good = commit(&fixture.src, &fixture.left);
+        let dest_root = fixture.dest.path().to_path_buf();
+        super::super::import_seam::arm(&dest_root, move || put_object_file(&good, &cached));
+        let opts = PullOptions {
+            refs: vec!["left".to_owned()],
+            localcache_repos: vec![cache],
+            ..PullOptions::default()
+        };
+        let pulled = block_on(pull_over_stream(&fixture.src, &fixture.dest, opts));
+        let armed = super::super::import_seam::disarm(&dest_root);
+        assert!(!armed, "the pull did not read the cache");
+        match pulled {
+            Err(Error::ChecksumMismatch { expected, actual }) => {
+                assert_eq!((expected, actual), (fixture.left, fixture.right));
+            }
+            other => panic!("{other:?}"),
+        }
+        let stored = block_on(fixture.dest.has_object(ObjectType::Commit, &fixture.left));
+        assert!(!stored.unwrap(), "the pull stored the commit");
+        drop(fixture.dir);
+    }
+
+    /// The walk reads a dirtree of a localcache repository from the bytes that
+    /// the pull hashed and staged. The cache holds the root dirtree of `left`,
+    /// and the root dirtree of `right` under its name after the read. The
+    /// pull stores the file of `left` and not the file of `right`.
+    #[test]
+    fn the_walk_reads_the_localcache_dirtree_that_the_pull_staged() {
+        let fixture = block_on(two_refs("cache-dirtree"));
+        let cache = block_on(Repo::create(
+            &fixture.dir.0.join("cache"),
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap();
+        let root = |commit: &Checksum| {
+            let (commit, _) = block_on(fixture.src.load_commit(commit)).unwrap();
+            commit.root_dirtree
+        };
+        let (left_root, right_root) = (root(&fixture.left), root(&fixture.right));
+        let dirtree =
+            |repo: &Repo, checksum: &Checksum| object_file(repo, checksum, ObjectType::DirTree);
+        let cached = dirtree(&cache, &left_root);
+        put_object_file(&dirtree(&fixture.src, &left_root), &cached);
+        let other = dirtree(&fixture.src, &right_root);
+        let dest_root = fixture.dest.path().to_path_buf();
+        super::super::import_seam::arm(&dest_root, move || put_object_file(&other, &cached));
+        let opts = PullOptions {
+            refs: vec!["left".to_owned()],
+            localcache_repos: vec![cache],
+            ..PullOptions::default()
+        };
+        let pulled = block_on(pull_over_stream(&fixture.src, &fixture.dest, opts));
+        let armed = super::super::import_seam::disarm(&dest_root);
+        assert!(!armed, "the pull did not read the cache");
+        pulled.unwrap();
+        let file = |root: &Checksum| block_on(fixture.src.load_dirtree(root)).unwrap().files[0].1;
+        let (left_file, right_file) = (file(&left_root), file(&right_root));
+        let held = |checksum: &Checksum| {
+            block_on(fixture.dest.has_object(ObjectType::File, checksum)).unwrap()
+        };
+        assert!(held(&left_file), "the pull did not store the file of left");
+        assert!(!held(&right_file), "the pull stored the file of right");
         drop(fixture.dir);
     }
 }

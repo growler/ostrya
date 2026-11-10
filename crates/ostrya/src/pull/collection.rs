@@ -617,11 +617,14 @@ impl Repo {
     /// repository does not hold fails the pull.
     ///
     /// If the trust of the remote checks the signatures of the commits or of
-    /// the summary, the pull hashes each object that it imports and compares
-    /// the result with the name of the object, as with
-    /// [`UNTRUSTED`](PullFlags::UNTRUSTED). A signature covers the commit or
-    /// the summary alone, and the hash carries the proof to the objects of
-    /// the tree. Otherwise the flags of the caller apply: without
+    /// the summary, the pull runs as with [`UNTRUSTED`](PullFlags::UNTRUSTED).
+    /// It hashes each commit that it reads for the checks, each dirtree that
+    /// the walk of the tree reads, and each object that it imports, and
+    /// compares each result with the name of the object. A signature covers
+    /// the commit or the summary alone. The commit names its root dirtree,
+    /// and each dirtree names the objects below it. So each object that the
+    /// pull imports is an object of the tree of the verified commit.
+    /// Otherwise the flags of the caller apply: without
     /// [`UNTRUSTED`](PullFlags::UNTRUSTED), the pull links, clones, or copies
     /// an object with no hash, and an object that it writes again in another
     /// form always gets a hash. The counts of the pull go to
@@ -1197,9 +1200,12 @@ impl Repo {
     ///
     /// If `trust` checks the signatures of the commits or of the summary, the
     /// call adds [`UNTRUSTED`](PullFlags::UNTRUSTED) to the flags. A
-    /// signature covers the commit or the checksum of the summary alone, and
-    /// the hash of each imported object against its name carries the proof
-    /// to the objects of the tree.
+    /// signature covers the commit or the checksum of the summary alone.
+    /// Under the flag, the pull hashes each commit that it reads for the
+    /// checks and the walk of the chain, each dirtree that the walk of the
+    /// tree reads from `src`, and each object that it imports, against its
+    /// name. So each imported object is an object of the tree of the verified
+    /// commit.
     async fn pull_local_candidate(
         &self,
         src: &Repo,
@@ -2013,6 +2019,7 @@ mod tests {
 
     use super::*;
     use crate::fetch::FetcherOptions;
+    use crate::pull::import_seam;
     use crate::summary::COLLECTION_ID_KEY;
 
     /// The transport of an S3 endpoint builds its fetcher and connects to no
@@ -2567,6 +2574,23 @@ mod tests {
         timestamp: u64,
         content: &[u8],
     ) -> Checksum {
+        let options = crate::commit::CommitOptions {
+            parent,
+            timestamp: Some(timestamp),
+            ..crate::commit::CommitOptions::default()
+        };
+        local_commit_with(repo, names, options, content).await
+    }
+
+    /// Writes a commit with `options` whose tree holds the file `f` with
+    /// `content`, points the collection ref of each name of `names` in
+    /// [`LOCAL_ID`] at it, and returns it.
+    async fn local_commit_with(
+        repo: &Repo,
+        names: &[&str],
+        options: crate::commit::CommitOptions,
+        content: &[u8],
+    ) -> Checksum {
         let txn = repo.transaction().await.unwrap();
         let dirmeta = ostrya_core::DirMeta {
             uid: 0,
@@ -2586,11 +2610,6 @@ mod tests {
         mtree.set_metadata_checksum(dirmeta);
         mtree.replace_file("f", file).unwrap();
         let root = txn.write_mtree(&mut mtree).await.unwrap();
-        let options = crate::commit::CommitOptions {
-            parent,
-            timestamp: Some(timestamp),
-            ..crate::commit::CommitOptions::default()
-        };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();
         for name in names {
@@ -2645,18 +2664,42 @@ mod tests {
         }
     }
 
+    /// Returns the path of the object `checksum` of type `ty` in the archive
+    /// repository at `dir`.
+    fn object_file(dir: &Path, checksum: &Checksum, ty: ObjectType) -> PathBuf {
+        dir.join("objects").join(ostrya_core::loose_path(
+            checksum,
+            ty,
+            crate::RepoMode::Archive,
+        ))
+    }
+
+    /// Puts the bytes of the object `from` of type `ty` of the archive
+    /// repository at `dir` under the name of its object `to`.
+    fn replace_object_file(dir: &Path, ty: ObjectType, to: &Checksum, from: &Checksum) {
+        let _ = std::fs::remove_file(object_file(dir, to, ty));
+        std::fs::copy(object_file(dir, from, ty), object_file(dir, to, ty)).unwrap();
+    }
+
     /// Puts the bytes of the commit `from` of the archive repository at `dir`
     /// under the name of its commit `to`.
     fn replace_commit_file(dir: &Path, to: &Checksum, from: &Checksum) {
-        let path = |commit: &Checksum| {
-            dir.join("objects").join(ostrya_core::loose_path(
-                commit,
-                ObjectType::Commit,
-                crate::RepoMode::Archive,
-            ))
-        };
-        std::fs::remove_file(path(to)).unwrap();
-        std::fs::copy(path(from), path(to)).unwrap();
+        replace_object_file(dir, ObjectType::Commit, to, from);
+    }
+
+    /// Returns an action that puts `bytes` back as the object `checksum` of
+    /// type `ty` of the archive repository at `dir`.
+    fn restore_object_file(
+        dir: &Path,
+        checksum: &Checksum,
+        ty: ObjectType,
+    ) -> impl FnOnce() + Send + 'static {
+        let path = object_file(dir, checksum, ty);
+        let bytes = std::fs::read(&path).unwrap();
+        move || {
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&path, bytes).unwrap();
+        }
     }
 
     /// Asserts that the repository `dst` at `dir` holds no object, no
@@ -2821,10 +2864,11 @@ mod tests {
     }
 
     /// Under `UNTRUSTED`, a tip commit file that does not hash to its name
-    /// fails the pull with [`Error::ChecksumMismatch`] at the import. The
-    /// file has the listed timestamp, so the listed check passes. The pull
-    /// publishes no object and writes no ref, and it leaves no
-    /// `.commitpartial` marker and no staging directory.
+    /// fails the pull with [`Error::ChecksumMismatch`] at the read of the
+    /// tip, before the listed check. The file has the listed timestamp, so
+    /// the hash is the one check that can fail. The pull publishes no object
+    /// and writes no ref, and it leaves no `.commitpartial` marker and no
+    /// staging directory.
     #[test]
     fn a_commit_that_does_not_hash_to_its_name_fails_an_untrusted_pull() {
         ostrya_rt::block_on(async {
@@ -2855,8 +2899,9 @@ mod tests {
 
     /// A tip commit whose timestamp changes between the probe and the pull
     /// of a local candidate fails the check of the listed timestamp with
-    /// [`Error::Pull`], with and without `UNTRUSTED`. The pull writes
-    /// nothing.
+    /// [`Error::Pull`]. Under `UNTRUSTED`, the commit file does not hash to
+    /// its name, and the pull fails with [`Error::ChecksumMismatch`] at the
+    /// read of the tip, before the check. The pull writes nothing.
     #[test]
     fn a_tip_commit_that_changes_after_the_probe_fails_the_listed_check() {
         ostrya_rt::block_on(async {
@@ -2896,8 +2941,13 @@ mod tests {
                     .pull_local_candidate(&src, PullTrust::unverified(), related, run, &pinned)
                     .await;
                 match pulled {
-                    Err(Error::Pull(message)) => {
+                    Err(Error::Pull(message)) if flags == PullFlags::NONE => {
                         assert!(message.contains("timestamp"), "case {at}: {message}");
+                    }
+                    Err(Error::ChecksumMismatch { expected, actual })
+                        if flags == PullFlags::UNTRUSTED =>
+                    {
+                        assert_eq!((expected, actual), (one, two), "case {at}");
                     }
                     other => panic!("case {at}: {other:?}"),
                 }
@@ -2962,6 +3012,175 @@ mod tests {
                 let cref = crate::Ref::collection(LOCAL_ID, name);
                 assert_eq!(dst.resolve_ref_tip(&cref).await.unwrap(), Some(tip));
             }
+        });
+    }
+
+    /// Under a commit policy, the pull hashes the commit that the signature
+    /// check reads. The source holds the bytes and the `.commitmeta` of a
+    /// signed commit under the name of an unsigned commit, and holds the
+    /// bytes of the unsigned commit again before the import. The pull fails
+    /// with [`Error::ChecksumMismatch`] at the read of the tip, and writes
+    /// nothing.
+    #[test]
+    fn a_commit_that_changes_after_its_signature_check_fails_the_pull() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let signed = local_commit(&src, &[], None, 1_700_000_001, b"one").await;
+            src.sign_commit(&signed, &ed25519_signer()).await.unwrap();
+            let unsigned = local_commit(&src, &["os/a"], None, 1_700_000_001, b"two").await;
+            let src_dir = scratch.root.join("src");
+            replace_object_file(&src_dir, ObjectType::CommitMeta, &unsigned, &signed);
+            let restore = restore_object_file(&src_dir, &unsigned, ObjectType::Commit);
+            replace_commit_file(&src_dir, &unsigned, &signed);
+            let dst = scratch.create("dst").await;
+            let dst_dir = scratch.root.join("dst");
+            import_seam::arm(&dst_dir, restore);
+            let pulled = probe_and_pull(
+                &dst,
+                &src,
+                PullTrust::commits(ed25519_keys()),
+                &["os/a"],
+                PullFlags::NONE,
+                0,
+            )
+            .await;
+            let armed = import_seam::disarm(&dst_dir);
+            match pulled {
+                Err(Error::ChecksumMismatch { expected, actual }) => {
+                    assert_eq!((expected, actual), (unsigned, signed));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(armed, "the pull got to the import");
+            assert_nothing_written(&dst, &dst_dir).await;
+        });
+    }
+
+    /// Under `UNTRUSTED`, the pull hashes each dirtree that the walk of the
+    /// tree reads. The source holds the bytes of another dirtree under the
+    /// name of the root dirtree of the tip, and holds the right bytes again
+    /// before the import. The pull fails with [`Error::ChecksumMismatch`] at
+    /// the walk, and writes nothing.
+    #[test]
+    fn a_dirtree_that_changes_after_the_walk_fails_an_untrusted_pull() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let tip = local_commit(&src, &["os/a"], None, 1_700_000_001, b"one").await;
+            let other = local_commit(&src, &[], None, 1_700_000_001, b"two").await;
+            let root = src.load_commit(&tip).await.unwrap().0.root_dirtree;
+            let other_root = src.load_commit(&other).await.unwrap().0.root_dirtree;
+            let src_dir = scratch.root.join("src");
+            let restore = restore_object_file(&src_dir, &root, ObjectType::DirTree);
+            replace_object_file(&src_dir, ObjectType::DirTree, &root, &other_root);
+            let dst = scratch.create("dst").await;
+            let dst_dir = scratch.root.join("dst");
+            import_seam::arm(&dst_dir, restore);
+            let pulled = probe_and_pull(
+                &dst,
+                &src,
+                PullTrust::unverified(),
+                &["os/a"],
+                PullFlags::UNTRUSTED,
+                0,
+            )
+            .await;
+            let armed = import_seam::disarm(&dst_dir);
+            match pulled {
+                Err(Error::ChecksumMismatch { expected, actual }) => {
+                    assert_eq!((expected, actual), (root, other_root));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(armed, "the pull got to the import");
+            assert_nothing_written(&dst, &dst_dir).await;
+        });
+    }
+
+    /// Under a commit policy, the import stages the `.commitmeta` that the
+    /// signature check read. The source holds the `.commitmeta` of another
+    /// signed commit after the check. The pull fails with [`Error::Pull`],
+    /// and writes nothing.
+    #[test]
+    fn a_commitmeta_that_changes_after_the_signature_check_fails_the_pull() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let tip = local_commit(&src, &["os/a"], None, 1_700_000_001, b"one").await;
+            let other = local_commit(&src, &[], None, 1_700_000_001, b"two").await;
+            for commit in [&tip, &other] {
+                src.sign_commit(commit, &ed25519_signer()).await.unwrap();
+            }
+            let src_dir = scratch.root.join("src");
+            let dst = scratch.create("dst").await;
+            let dst_dir = scratch.root.join("dst");
+            import_seam::arm(&dst_dir, move || {
+                replace_object_file(&src_dir, ObjectType::CommitMeta, &tip, &other)
+            });
+            let pulled = probe_and_pull(
+                &dst,
+                &src,
+                PullTrust::commits(ed25519_keys()),
+                &["os/a"],
+                PullFlags::NONE,
+                0,
+            )
+            .await;
+            let armed = import_seam::disarm(&dst_dir);
+            assert!(!armed, "the pull did not get to the import");
+            match pulled {
+                Err(Error::Pull(message)) => {
+                    assert!(message.contains(".commitmeta"), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+            assert_nothing_written(&dst, &dst_dir).await;
+        });
+    }
+
+    /// Under `UNTRUSTED`, the pull hashes each dependency that it reads for
+    /// the walk. The source holds the bytes of another commit under the name
+    /// of the dependency, and holds the right bytes again before the import.
+    /// The pull fails with [`Error::ChecksumMismatch`] at the read of the
+    /// dependency, and writes nothing.
+    #[test]
+    fn a_dependency_that_changes_after_the_walk_fails_an_untrusted_pull() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new();
+            let src = scratch.create("src").await;
+            let dependency = local_commit(&src, &[], None, 1_700_000_001, b"dep").await;
+            let other = local_commit(&src, &[], None, 1_700_000_001, b"other").await;
+            let options = crate::commit::CommitOptions {
+                timestamp: Some(1_700_000_001),
+                related: vec![("lib/b".to_owned(), dependency)],
+                ..crate::commit::CommitOptions::default()
+            };
+            local_commit_with(&src, &["os/a"], options, b"one").await;
+            let src_dir = scratch.root.join("src");
+            let restore = restore_object_file(&src_dir, &dependency, ObjectType::Commit);
+            replace_commit_file(&src_dir, &dependency, &other);
+            let dst = scratch.create("dst").await;
+            let dst_dir = scratch.root.join("dst");
+            import_seam::arm(&dst_dir, restore);
+            let pulled = probe_and_pull(
+                &dst,
+                &src,
+                PullTrust::unverified(),
+                &["os/a"],
+                PullFlags::UNTRUSTED,
+                0,
+            )
+            .await;
+            let armed = import_seam::disarm(&dst_dir);
+            match pulled {
+                Err(Error::ChecksumMismatch { expected, actual }) => {
+                    assert_eq!((expected, actual), (dependency, other));
+                }
+                other => panic!("{other:?}"),
+            }
+            assert!(armed, "the pull got to the import");
+            assert_nothing_written(&dst, &dst_dir).await;
         });
     }
 }

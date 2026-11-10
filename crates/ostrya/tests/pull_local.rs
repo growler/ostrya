@@ -8690,10 +8690,10 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
 /// checksum in field 2 of the tip fails the pull with
 /// `Error::ChecksumMismatch` for that checksum, and the pull leaves nothing.
 /// The source holds the bytes of a different commit with an empty field 2 at
-/// the path of the dependency, so the format check of field 2 passes and the
-/// hash of the import finds the defect. The pull checks no signature of the
-/// dependency, so under a remote with `sign-verify` and a signed tip the pull
-/// fails with the same error.
+/// the path of the dependency. The walk hashes the bytes that it reads, so
+/// the hash finds the defect before the walk reads field 2. The pull checks
+/// no signature of the dependency, so under a remote with `sign-verify` and a
+/// signed tip the pull fails with the same error.
 #[test]
 fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
     let tmp = TmpDir::new("pull-local-dependency-wrong-bytes");

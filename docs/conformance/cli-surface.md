@@ -2519,6 +2519,16 @@ at exit 1. A BRANCH of `--retain-branch-depth` selects the ref that it names
 as a ref, so a value that is not a ref, for example `main^`, selects no
 branch.
 
+The port also reads the config key `[ex-ostrya] gc-weak-references`, a port
+extension that the tool does not have (`ostrya-config(1)`, "EXTENSION
+KEYS", and `../decisions.md`, "The weak refs of a prune"). With
+`--refs-only`, `--only-branch`, `--retain-branch-depth`, or
+`--keep-younger-than`, each ref that the key selects is weak. The port
+deletes a weak ref whose commit the walk does not reach, and writes no line
+for it. Each `prune` of the port refuses a malformed value at exit 1 and
+removes nothing. Without the key, the refs and the objects that `prune`
+keeps are those of the tool.
+
 A symlink under `refs/` that names a directory ends `prune --refs-only` of the
 tool with exit 1. It ends each `prune` of the port with exit 1, in different
 words ("P1", `refs`). The default `prune` of the tool exits 0.

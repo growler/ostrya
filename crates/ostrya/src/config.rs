@@ -13,6 +13,7 @@ use std::path::Path;
 use ostrya_core::{KeyFile, RepoMode};
 
 use crate::error::{Error, Result};
+use crate::pattern::ReceiveSelector;
 use crate::remotes_dir;
 use crate::repo::{Repo, check_config_size};
 use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
@@ -48,8 +49,9 @@ const CONFIG_FILE: &str = "config";
 /// - `[remote "<name>"]`: one section for each remote, read through
 ///   [`Remote`].
 /// - `[ex-ostrya]`: the keys that are ostrya extensions,
-///   [`keep_detached_related`](RepoConfig::keep_detached_related) and
-///   [`generate_composefs`](RepoConfig::generate_composefs).
+///   [`keep_detached_related`](RepoConfig::keep_detached_related),
+///   [`generate_composefs`](RepoConfig::generate_composefs), and
+///   [`gc_weak_references`](RepoConfig::gc_weak_references).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
 ///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
 ///   the keys that verify and sign the commits that it receives.
@@ -642,6 +644,57 @@ impl RepoConfig {
             ));
         }
         Ok(on)
+    }
+
+    /// Returns the selector of the refs that a prune marks weak, or `None` if
+    /// the key is absent.
+    ///
+    /// The key is `[ex-ostrya] gc-weak-references`, and it is an ostrya
+    /// extension. The value is a `;` list of ref patterns, the entries of a
+    /// `ReceiveSelector`. An entry has one of these forms, with `*` and `**`
+    /// in the name part:
+    ///
+    /// - `NAME` -- the local refs that `NAME` matches.
+    /// - `REMOTE:NAME` -- the refs of the remote `REMOTE` that `NAME`
+    ///   matches.
+    /// - `*:NAME` -- the remote refs of each remote that `NAME` matches.
+    /// - `@ID:NAME` -- the refs of the collection `ID` that `NAME` matches.
+    ///
+    /// An entry that starts with `!` is an exclusion. The selector selects a
+    /// ref when a positive entry matches it, and no exclusion matches it. If
+    /// the list has no positive entry, each ref that no exclusion matches is
+    /// selected. Thus an empty value selects each ref, and a list of
+    /// exclusions alone selects each ref that no exclusion matches. The order
+    /// of the entries has no effect. Pass the `[core] collection-id` of the
+    /// repository as `own` to `ReceiveSelector::matches`: `@OWN:NAME` then
+    /// matches the local ref `NAME`.
+    ///
+    /// [`Repo::prune`] reads no config key for its ref classifier. The
+    /// `ostrya prune` command reads this key and marks each selected ref weak
+    /// through [`PruneOptions::weak_ref_filter`].
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if an entry is not a valid ref pattern. The
+    ///   text names the key and the entry.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
+    ///
+    /// [`PruneOptions::weak_ref_filter`]: crate::PruneOptions::weak_ref_filter
+    pub fn gc_weak_references(&self) -> Result<Option<ReceiveSelector>> {
+        let Some(entries) = self
+            .keyfile
+            .get_string_list(EX_OSTRYA, "gc-weak-references")?
+        else {
+            return Ok(None);
+        };
+        ReceiveSelector::parse(entries.iter().map(String::as_str))
+            .map(Some)
+            .map_err(|err| match err {
+                Error::InvalidFormat(m) => {
+                    Error::InvalidFormat(format!("[{EX_OSTRYA}] gc-weak-references: {m}"))
+                }
+                other => other,
+            })
     }
 
     /// Returns `true` if a ref change regenerates the summary.
@@ -1449,6 +1502,7 @@ fn parse_size(raw: &str) -> Option<SizeSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ostrya_core::Ref;
 
     const ARCHIVE_CONFIG: &str = "[core]\nrepo_version=1\nmode=archive-z2\n";
 
@@ -1691,6 +1745,46 @@ mod tests {
             read("archive", "true"),
             Err(Error::Unsupported(_))
         ));
+    }
+
+    #[test]
+    fn gc_weak_references_is_none_when_absent() {
+        let cfg = RepoConfig::parse("[core]\nrepo_version=1\nmode=bare\n").unwrap();
+        assert!(cfg.gc_weak_references().unwrap().is_none());
+    }
+
+    #[test]
+    fn gc_weak_references_reads_a_pattern_list() {
+        let read = |value: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
+                 gc-weak-references={value}\n"
+            ))
+            .unwrap()
+            .gc_weak_references()
+        };
+        let sel = read("tmp/**;!tmp/keep;*:**;@org.example.X:**")
+            .unwrap()
+            .unwrap();
+        let own = Some("org.example.Own");
+        assert!(sel.matches(&Ref::local("tmp/a"), own));
+        assert!(sel.matches(&Ref::local("tmp/a/b"), own));
+        assert!(!sel.matches(&Ref::local("tmp/keep"), own));
+        assert!(!sel.matches(&Ref::local("main"), own));
+        assert!(sel.matches(&Ref::remote("origin", "main"), own));
+        assert!(sel.matches(&Ref::collection("org.example.X", "main"), own));
+        assert!(!sel.matches(&Ref::collection("org.example.Y", "main"), own));
+
+        let empty = read("").unwrap().unwrap();
+        assert!(empty.matches(&Ref::local("main"), None));
+
+        let err = read("tmp/**;r*:x").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m.contains("[ex-ostrya] gc-weak-references")
+                    && m.contains("malformed receive pattern")),
+            "{err}"
+        );
     }
 
     /// Summary regeneration is off by default, each key alone turns it on, and

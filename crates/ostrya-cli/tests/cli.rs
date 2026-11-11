@@ -48058,6 +48058,100 @@ fn prune_only_branch_of_the_own_id_selects_the_local_ref() {
     );
 }
 
+/// Creates an archive repository under `base` for the tests of
+/// `[ex-ostrya] gc-weak-references`, and appends the key with `value`.
+///
+/// `main` holds the commit `second` with the parent `first`. `tmp/a` holds
+/// the commit `lone`, which no other ref reaches. `tmp/b` holds `first`.
+/// Returns the repository and the commits `(first, second, lone)`.
+fn weak_refs_repo(base: &Path, value: &str) -> (PathBuf, String, String, String) {
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = init_archive(&base.join("repo"), None);
+    let first = commit_no_parent(&repo, &["-b", "main", "-s=first"], &src)
+        .ok()
+        .stdout_trimmed();
+    let second = ostrya_at(
+        &repo,
+        &[
+            "commit",
+            FIXED_TIMESTAMP,
+            "-b",
+            "main",
+            "-s=second",
+            src.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    let lone = commit_no_parent(&repo, &["-b", "tmp/a", "-s=lone"], &src)
+        .ok()
+        .stdout_trimmed();
+    std::fs::write(repo.join("refs/heads/tmp/b"), format!("{first}\n")).unwrap();
+    let mut config = config_text(&repo);
+    config.push_str(&format!("\n[ex-ostrya]\ngc-weak-references={value}\n"));
+    std::fs::write(repo.join("config"), config).unwrap();
+    (repo, first, second, lone)
+}
+
+/// `prune --refs-only` deletes the weak ref `tmp/a`, whose commit no strong
+/// ref reaches, and the commit. The weak ref `tmp/b` survives, because `main`
+/// reaches its commit over the `parent` edge.
+#[test]
+fn prune_refs_only_deletes_an_unreached_gc_weak_reference() {
+    let tmp = TmpDir::new("prune-gc-weak-references");
+    let (repo, first, second, lone) = weak_refs_repo(tmp.path(), "tmp/**");
+
+    ostrya_at(&repo, &["prune", "--refs-only"]).ok();
+
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), None);
+    assert!(!holds_commit(&repo, &lone));
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/b"), Some(first.clone()));
+    assert_eq!(ref_file(&repo, "refs/heads/main"), Some(second.clone()));
+    assert!(holds_commit(&repo, &first));
+    assert!(holds_commit(&repo, &second));
+}
+
+/// `prune --refs-only --no-prune` deletes no weak ref and no object. A plain
+/// `prune` does not apply the key, so it keeps the weak ref and its commit.
+#[test]
+fn prune_keeps_a_gc_weak_reference_without_a_refs_alone_run() {
+    let tmp = TmpDir::new("prune-gc-weak-references-kept");
+    let (repo, _, _, lone) = weak_refs_repo(tmp.path(), "tmp/**");
+    let before = prune_inventory(&repo);
+
+    ostrya_at(&repo, &["prune", "--refs-only", "--no-prune"]).ok();
+    assert_eq!(prune_inventory(&repo), before);
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone.clone()));
+
+    ostrya_at(&repo, &["prune"]).ok();
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone.clone()));
+    assert!(holds_commit(&repo, &lone));
+}
+
+/// A malformed `[ex-ostrya] gc-weak-references` refuses the prune with
+/// `--refs-only` and the plain prune, and the repository does not change.
+#[test]
+fn prune_refuses_a_malformed_gc_weak_references() {
+    let tmp = TmpDir::new("prune-gc-weak-references-bad");
+    let (repo, _, _, lone) = weak_refs_repo(tmp.path(), "tmp/**;r*:x");
+    let before = prune_inventory(&repo);
+
+    let run = ostrya_at(&repo, &["prune", "--refs-only"]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("gc-weak-references"), "{stderr}");
+    assert_eq!(prune_inventory(&repo), before);
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone.clone()));
+
+    let run = ostrya_at(&repo, &["prune"]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(stderr.contains("gc-weak-references"), "{stderr}");
+    assert_eq!(prune_inventory(&repo), before);
+    assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone));
+}
+
 /// Creates a repository at `base/repo` whose collection id is [`OWN_ID`],
 /// with one commit at the local ref `main`. Returns the path and the commit.
 fn own_repo_with_main(base: &Path) -> (PathBuf, String) {

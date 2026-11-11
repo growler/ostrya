@@ -105,9 +105,6 @@ for it.
 - A parallel verify pass in `fsck`. The pass verifies one object at a time,
   so the handoff to the blocking pool is a large part of a run over many
   small objects. The `Slots` driver of the pull has the necessary shape.
-- A config key that marks weak refs by a pattern, for local refs, remote
-  refs, and collection refs. `Repo::prune` takes the classification as a
-  function of the `Ref` of each ref.
 - The detached metadata in an offline apply.
   `Repo::apply_static_delta_offline` and `Repo::apply_static_delta` write no
   `.commitmeta`. The `ostree` command writes the `.commitmeta` of the target

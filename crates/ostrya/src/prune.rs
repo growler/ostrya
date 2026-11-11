@@ -292,6 +292,9 @@ pub struct PruneOptions {
     /// A set filter needs [`refs_only`](PruneOptions::refs_only). If
     /// `refs_only` is `false`, the prune fails with [`Error::InvalidFormat`]
     /// before the run reads anything. This field is an ostrya extension.
+    /// [`Repo::prune`] reads no config key for the filter.
+    /// [`RepoConfig::gc_weak_references`](crate::RepoConfig::gc_weak_references)
+    /// reads the list of weak refs that the `ostrya prune` command uses.
     ///
     /// The run reads a ref as a [`Ref`] by these rules, and the filter gets
     /// that [`Ref`] for each ref that it classifies:

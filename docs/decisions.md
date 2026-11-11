@@ -3183,6 +3183,17 @@ The rules of the classification:
   compare-and-delete guard.
 - An emptied `refs/mirrors/ID/` directory stays, as an emptied directory
   under `refs/heads` does.
+- The `ostrya` command builds the filter from the key
+  `[ex-ostrya] gc-weak-references`, which `RepoConfig::gc_weak_references`
+  reads as a `ReceiveSelector`. The filter marks each ref that the selector
+  selects weak, with the `[core] collection-id` of the repository as the own
+  id. `Repo::prune` reads no config key for the filter, so a library caller
+  keeps full control of it. `ostrya prune` applies the key when the roots are
+  the refs alone: `--refs-only`, `--only-branch`, `--retain-branch-depth`, or
+  `--keep-younger-than`. In these runs it also sets `refs_only`, which
+  changes no root. Each run reads and checks the key, so a bad value refuses
+  each prune before it deletes anything. `ostrya remote prune` does not read
+  the key, because the prune of a bucket refuses a weak ref filter.
 - `PruneOptions` and `PruneStats` have no `#[non_exhaustive]`. With the
   attribute, no other crate can use `..PruneOptions::default()`, and the
   `ostrya` command uses it. A new field in either struct takes a minor
@@ -3216,6 +3227,12 @@ These alternatives were rejected:
 - A selection by the listed name of a ref, with the path `ID/NAME` for a
   mirror ref. The name `ID/NAME` is also a valid local ref name, so one
   value selects two refs.
+- A read of `[ex-ostrya] gc-weak-references` in `Repo::prune`. A library
+  caller then cannot give a filter of its own that the key does not
+  change.
+- The key in a plain `ostrya prune`, with `refs_only` set. Each commit in
+  the store then stops being a root, so the key changes which objects a
+  plain prune keeps.
 - A resolve of each `only_branch` value as a revision, as
   `Repo::resolve_rev` does. A hex branch name, for example `cafe`, then
   goes to the abbreviated-checksum lookup first. If two commits start with

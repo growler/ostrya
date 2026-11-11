@@ -67,8 +67,8 @@ use ostrya::{
     PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RefNamespace,
     RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer,
     Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
-    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, Xattrs,
-    from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
+    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, WeakRefFilter,
+    Xattrs, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
     validate_refspec,
 };
 #[cfg(feature = "gpg")]
@@ -301,6 +301,13 @@ enum Command {
     /// --refs-only, --only-branch, --retain-branch-depth, and
     /// --keep-younger-than start the walk from the refs alone. The depth and
     /// date options then limit the history of each ref.
+    ///
+    /// The config key `[ex-ostrya] gc-weak-references` is a list of ref
+    /// patterns. If the walk starts from the refs alone, each ref that the
+    /// list selects is weak: it is not a root, and the command deletes it if
+    /// the walk does not reach its commit. Each run reads the key, and a bad
+    /// value stops the command before it deletes anything. ostrya-config(1)
+    /// states the key.
     ///
     /// The related commits of each commit that the walk reaches are also
     /// roots, under the bound of --depth or --keep-younger-than. A related
@@ -15263,12 +15270,30 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     for value in &args.only_branch {
         only_branch.push(branch_ref(value));
     }
-    let retain_branch_depth = retain_branch_depth
+    let retain_branch_depth: Vec<_> = retain_branch_depth
         .into_iter()
         .map(|(branch, depth)| (branch_ref(&branch), depth))
         .collect();
+    // `[ex-ostrya] gc-weak-references` marks the refs that it selects weak.
+    // Each run reads and checks the key, so a bad value refuses each prune
+    // before it writes. `Repo::prune` takes a weak ref filter only with
+    // `refs_only`, so the filter applies only when the roots are the refs
+    // alone. `refs_only` then changes no root.
+    let weak_refs = repo.config().gc_weak_references()?;
+    let refs_alone = args.refs_only
+        || keep_younger_than.is_some()
+        || !only_branch.is_empty()
+        || !retain_branch_depth.is_empty();
+    let (refs_only, weak_ref_filter) = match weak_refs {
+        Some(selector) if refs_alone => {
+            let own = repo.config().collection_id().map(str::to_owned);
+            let filter = WeakRefFilter::new(move |r, _| !selector.matches(r, own.as_deref()));
+            (true, filter)
+        }
+        _ => (args.refs_only, WeakRefFilter::default()),
+    };
     let opts = PruneOptions {
-        refs_only: args.refs_only,
+        refs_only,
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
@@ -15277,6 +15302,7 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         retain_branch_depth,
         commit_only: args.commit_only,
         static_deltas_only: args.static_deltas_only,
+        weak_ref_filter,
         ..PruneOptions::default()
     };
     // If the config of a repository sets `[core] locking` to false, the prune
@@ -15286,9 +15312,10 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     //
     // The config reads of a prune come in this order:
     //
-    // 1. `[core] locking`, here, for the warning line.
-    // 2. `[core] locking` and `[core] lock-timeout-secs`, at the lock.
-    // 3. `[core] tombstone-commits` and `[core] fsync`, in the run.
+    // 1. `[ex-ostrya] gc-weak-references`, above, for the weak ref filter.
+    // 2. `[core] locking`, here, for the warning line.
+    // 3. `[core] locking` and `[core] lock-timeout-secs`, at the lock.
+    // 4. `[core] tombstone-commits` and `[core] fsync`, in the run.
     //
     // The read is here, after the options are assembled.
     // `commit` reads the four `[core]` keys of its transaction at the top of

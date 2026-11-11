@@ -492,6 +492,36 @@ If ostrya cannot read a file that a TLS key or \fB\%push\-token\-file\fR names, 
 The keys of the group \fB\%[ex\-ostrya]\fR.
 The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 .TP
+\fB\%gc\-weak\-references\fR (list)
+The refs that \fB\%ostrya prune\fR marks weak.
+Each other ref is strong.
+A strong ref is a root of the walk of the prune.
+A weak ref is not a root.
+A weak ref stays if the walk reaches its commit from a strong ref or from a commit that the prune keeps, for example as the parent of the commit of a strong ref.
+Otherwise the prune deletes the weak ref, and then deletes its commit and the objects that no kept commit reaches.
+.IP
+The value is a list of ref patterns, separated by \fB\%;\fR.
+A pattern has one of these forms:
+\fB\%NAME\fR, a local ref;
+\fB\%REMOTE:NAME\fR, a ref of the remote \fB\%REMOTE\fR;
+\fB\%*:NAME\fR, a ref of each remote;
+\fB\%@ID:NAME\fR, a ref of the collection \fB\%ID\fR.
+In \fB\%NAME\fR, a part \fB\%*\fR matches one part of a ref name, and a part \fB\%**\fR matches one or more parts.
+A pattern that starts with \fB\%!\fR is an exclusion.
+A ref is weak when a pattern with no \fB\%!\fR matches it, and no exclusion matches it.
+If the list has no pattern without \fB\%!\fR, each ref that no exclusion matches is weak.
+Thus an empty value marks each ref weak.
+The order of the patterns has no effect.
+The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id matches the local ref \fB\%NAME\fR.
+A ref under \fB\%refs/mirrors/\fR of that id is always strong.
+.IP
+\fB\%ostrya prune\fR applies the key only when the walk starts from the refs alone: with \fB\%\-\-refs\-only\fR, \fB\%\-\-only\-branch\fR, \fB\%\-\-retain\-branch\-depth\fR, or \fB\%\-\-keep\-younger\-than\fR.
+With \fB\%\-\-no\-prune\fR, the prune deletes no ref.
+The prune writes no line for a deleted ref.
+Each prune reads and checks the key, also a prune that does not apply the key.
+A malformed pattern stops the prune before it deletes anything.
+\fB\%ostrya remote prune\fR does not read the key.
+.TP
 \fB\%generate\-composefs\fR (boolean, default false)
 Store the composefs image of each complete commit that a write adds and that carries the key \fB\%ostree.composefs.digest.v0\fR.
 \fB\%ostrya\-repo\fR(5) describes the image file.

@@ -21477,6 +21477,84 @@ fn commit_tag_refuses_a_ref_created_during_the_commit() {
     assert_eq!(resolve(&repo, "late"), resolve(&repo, "held"));
 }
 
+/// `commit --tag` queues each tag with the expectation of no ref, so
+/// `Transaction::commit` refuses a ref that another writer creates after the
+/// second check. The test holds the update guard, waits until the command
+/// publishes its objects, and then writes the tag under the guard. The
+/// refusal moves no branch and keeps the ref of the other writer.
+#[test]
+fn commit_tag_refuses_a_ref_created_after_the_publish() {
+    use std::time::Instant;
+
+    let tmp = TmpDir::new("commit-tag-publish");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_unlimited_wait_repo(base);
+    let first = commit_no_parent(&repo, &["-b", "main"], &base.join("src"))
+        .ok()
+        .stdout_trimmed();
+    let changed = base.join("changed");
+    build_fixture_source(&changed);
+    std::fs::write(changed.join("src/extra.txt"), b"extra\n").unwrap();
+
+    let objects = loose_objects(&repo).len();
+    let shown = "commit -b main --tag=t";
+    let out = block_on(async {
+        let handle = Repo::open(&repo).await.unwrap();
+        let guard = handle.begin_update().await.unwrap();
+        let mut child = KillOnDrop {
+            inner: Some(
+                Command::new(env!("CARGO_BIN_EXE_ostrya"))
+                    .arg(format!("--repo={}", repo.display()))
+                    .args(["commit", FIXED_TIMESTAMP, "-b", "main", "--tag=t"])
+                    .arg(changed.join("src"))
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .expect("spawn ostrya"),
+            ),
+        };
+        let deadline = Instant::now() + GUARD_WAIT;
+        while loose_objects(&repo).len() <= objects {
+            assert!(
+                child.child().try_wait().unwrap().is_none(),
+                "`{shown}` ended while the guard was held"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "`{shown}` published no object in {GUARD_WAIT:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        guard
+            .set_ref(
+                &"t".parse::<Ref>().unwrap(),
+                Some(&Checksum::from_hex(&first).unwrap()),
+            )
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+
+        let deadline = Instant::now() + GUARD_WAIT;
+        while child.child().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "`{shown}` still ran {GUARD_WAIT:?} after the guard finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        child.take().wait_with_output().expect("wait ostrya")
+    });
+    assert_eq!(out.status.code(), Some(1), "the ref of t was not refused");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr).trim(),
+        "error: --tag specified but ref t already exists",
+    );
+    assert_eq!(resolve(&repo, "main").as_deref(), Some(first.as_str()));
+    assert_eq!(resolve(&repo, "t").as_deref(), Some(first.as_str()));
+}
+
 /// `commit --tag` refuses a bad name before it reads the tree: a remote
 /// ref, a name that the ref-name rule refuses, a checksum-shaped name, the
 /// branch name, a name given twice, and a tag with no branch and no

@@ -769,7 +769,7 @@ namespace. `ostree.collection-binding` holds the id of the namespace, or the
 implicit parent of `-b @ID:NAME` is the commit of that ref.
 
 The port refuses these `--tag` values at exit 1, before it takes the
-repository lock:
+repository lock. The last item also gives the checks after that point:
 
 - a remote ref `REMOTE:NAME`, with `error: --tag <name> names a remote ref,
   and a tag is a local ref or a collection ref`;
@@ -792,11 +792,12 @@ repository lock:
   specified but ref <name> already exists`. The port reads the path again
   before it publishes the objects, and refuses an entry that came after the
   first read. If another writer creates a ref at the path after the second
-  read, the port replaces that ref.
+  read, the port refuses the value with the same message after it publishes
+  the objects. It writes no ref, and the objects stay until a prune.
 
-A refusal writes no object and no ref. Without `-b`, the option needs
-`--orphan`, as each commit does. `--orphan --tag=NAME` creates `NAME` and
-moves no branch. `--tag` conflicts with `--no-bindings` and with
+A refusal before the publish writes no object and no ref. Without `-b`, the
+option needs `--orphan`, as each commit does. `--orphan --tag=NAME` creates
+`NAME` and moves no branch. `--tag` conflicts with `--no-bindings` and with
 `--skip-if-unchanged`, and `clap` refuses each pair at exit 1.
 
 `--related=NAME=CHECKSUM` of the port names one dependency of the commit in

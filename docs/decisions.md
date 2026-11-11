@@ -3962,6 +3962,30 @@ ref. The rules of a conditional write:
   of `set_ref` alone. It compares each update with the current commit that
   it reads under the update lock, so it sends a mismatch as a wire error
   before it publishes an object.
+- The server commit of a receive queues each tag with `set_ref`, and the
+  branch too if the branch moves. `publish` can also queue the anchor ref
+  `ostree-metadata` with `set_ref`. The server commit reads these refs and
+  the tip of the anchor ref after it takes the update lock. `publish` runs
+  `commit_under` under the same hold of the lock. A receive with no server
+  commit also runs `commit_under` under the update lock that its caller
+  holds. These ref writers of the port take the update lock, also under
+  `[core] locking=false`: `Transaction::commit`, `Repo::set_ref_immediate`,
+  `Repo::set_ref_alias_immediate`, `Repo::remove_ref_alias_immediate`, and
+  each write of an `UpdateGuard`. So none of them can change a ref between
+  the read and the commit. For these writers, a compare of
+  `set_ref_expecting` finds the state that the read found, so it adds no
+  check.
+- `Repo::prune` takes no update lock, and it holds the repository lock
+  exclusive. The server commit holds the repository lock shared. A two-way
+  receive refuses a repository with `[core] locking=false`, and a one-way
+  stream carries no server commit. So a prune does not run between the
+  read and the commit. Other writers take no update lock, so they can
+  change a ref after the read. These are the `ostree` command, a hand edit
+  of a ref file, and a prune whose handle reads `[core] locking=false`
+  after a change of the config. Each handle reads the config once at the
+  open, so the server can still hold a handle that read `true`. Such a
+  change can also come after the compare of a conditional write, so
+  `set_ref_expecting` does not close that window.
 
 These alternatives were rejected:
 

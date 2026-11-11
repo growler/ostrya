@@ -999,7 +999,9 @@ ref aliases, `config` and the remote keyrings, `summary` and `summary.sig`, the
 files under `extensions/ostrya/summary/` ("Summaries of auth items"), and
 `.commitmeta` files. The writers are an update guard (`Repo::begin_update`),
 each writer outside a transaction, and the step of a transaction commit that
-writes detached metadata and refs.
+writes detached metadata and refs. A prune takes no update lock. It deletes weak
+refs and `.commitmeta` files under the repository lock exclusive, which it holds
+if `[core] locking` is true.
 
 A transaction commit outside a receive publishes its objects before it takes
 the lock. A receive takes the lock before its transaction commit ("Locks and

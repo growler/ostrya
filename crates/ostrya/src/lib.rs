@@ -99,6 +99,7 @@ pub mod modifier;
 pub mod mtree;
 mod object;
 mod overlay;
+mod pattern;
 mod perm;
 pub mod prune;
 pub mod pull;
@@ -215,6 +216,8 @@ pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,
 };
 #[doc(hidden)]
+pub use pattern::{ReceivePattern, ReceiveSelector};
+#[doc(hidden)]
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]
 pub use pull::{
@@ -228,10 +231,10 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]
 #[doc(hidden)]
 pub use receive::{
-    HookFuture, HookRefusal, HostEntry, ReceiveCommit, ReceiveHooks, ReceivePattern,
-    ReceivePolicies, ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport,
-    ReceiveServerCommit, ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, ServerSigner,
-    StreamPolicy, StreamRule, UpdatePlan,
+    HookFuture, HookRefusal, HostEntry, ReceiveCommit, ReceiveHooks, ReceivePolicies,
+    ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport, ReceiveServerCommit,
+    ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, ServerSigner, StreamPolicy,
+    StreamRule, UpdatePlan,
 };
 #[doc(hidden)]
 pub use refs::{CollectionRefEntry, RefAlias, validate_refspec};

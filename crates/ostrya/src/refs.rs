@@ -2688,10 +2688,9 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 // empty, does not start with `-` or `.`, and holds ASCII alphanumerics, `-`,
 // `.`, `_`, and alphanumeric characters that are not ASCII. `is_component` is
 // the wider one-component rule that the remote part of a receive pattern uses
-// (`receive/pattern.rs`): not empty, not `.` or `..`, no slash, no NUL.
+// (`pattern.rs`): not empty, not `.` or `..`, no slash, no NUL.
 // `ostrya-core` holds the rules, and a collection id takes
 // `ostrya_core::is_valid_collection_id`.
-#[cfg(feature = "receive")]
 pub(crate) use ostrya_core::is_ref_component as is_component;
 pub(crate) use ostrya_core::is_ref_name as is_ref_path;
 

@@ -1,4 +1,4 @@
-//! The ref patterns of the rules of a one-way stream.
+//! The patterns that select local refs, remote refs, and collection refs.
 
 use ostrya_core::{Ref, RefPattern};
 
@@ -32,8 +32,9 @@ use crate::refs::is_component;
 /// [`ReceivePattern::parse`] refuses each other form:
 ///
 /// - A `!` at the start of the pattern or in the name part. A receive pattern
-///   has no negative form. A `!` in a remote part follows the component rule
-///   of the remote part.
+///   has no negative form, and a `!` entry of a `ReceiveSelector` is an
+///   exclusion. A `!` in a remote part follows the component rule of the
+///   remote part.
 /// - A `*` in a remote part other than the whole part `*`.
 /// - An `@` with no `:`, or a collection part that is not a collection id.
 /// - A `*` in a name part other than the whole part `*` or `**`.
@@ -42,9 +43,17 @@ use crate::refs::is_component;
 /// - A literal part that fails the ref-name rule, for example one with a space
 ///   or one that starts with `-`.
 ///
-/// If more than one pattern matches a ref,
-/// [`StreamPolicy::rule_for`](super::StreamPolicy::rule_for) states which
-/// rule applies.
+#[cfg_attr(
+    feature = "receive",
+    doc = "If more than one pattern matches a ref, \
+           [`StreamPolicy::rule_for`](crate::receive::StreamPolicy::rule_for) \
+           states which rule applies."
+)]
+#[cfg_attr(
+    not(feature = "receive"),
+    doc = "If more than one pattern matches a ref, `StreamPolicy::rule_for` \
+           states which rule applies."
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivePattern {
     /// The pattern as written.
@@ -195,6 +204,75 @@ impl ReceivePattern {
         })
     }
 }
+
+/// A list of [`ReceivePattern`] entries that selects refs of each kind.
+///
+/// An entry is a pattern with an optional first `!`. An entry with `!` is a
+/// negative pattern, and each other entry is a positive pattern.
+///
+/// A ref is selected when the list has no positive pattern or a positive
+/// pattern matches it, and no negative pattern matches it. The order of the
+/// entries has no effect, and an empty list selects each ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceiveSelector {
+    /// The patterns of the entries with no `!`, in their order.
+    positive: Vec<ReceivePattern>,
+    /// The patterns of the entries with `!`, in their order, with no `!`.
+    negative: Vec<ReceivePattern>,
+}
+
+impl ReceiveSelector {
+    /// Parses a list of entries. An entry is a [`ReceivePattern`] with an
+    /// optional first `!`. The selector keeps the entries in their order, with
+    /// repeats.
+    ///
+    /// The call does not split an entry at `;`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] if an entry, with no first `!`, is not a valid
+    /// [`ReceivePattern`]. The text names the entry with no first `!`. An
+    /// entry that starts with `!!` is not valid.
+    pub fn parse<'a>(entries: impl IntoIterator<Item = &'a str>) -> Result<ReceiveSelector> {
+        let mut positive = Vec::new();
+        let mut negative = Vec::new();
+        for entry in entries {
+            match entry.strip_prefix('!') {
+                Some(rest) => negative.push(ReceivePattern::parse(rest)?),
+                None => positive.push(ReceivePattern::parse(entry)?),
+            }
+        }
+        Ok(ReceiveSelector { positive, negative })
+    }
+
+    /// Returns `true` if the selector selects the ref `r`, in a repository
+    /// whose collection id is `own`.
+    ///
+    /// The patterns match the canonical form of `r`, from [`Ref::canonical`].
+    /// Thus the pattern `@OWN:NAME` matches the local ref `NAME`, and the
+    /// pattern `NAME` matches the collection ref `@OWN:NAME`. If `own` is
+    /// `None`, a pattern with a collection part matches only collection refs.
+    pub fn matches(&self, r: &Ref, own: Option<&str>) -> bool {
+        let local;
+        let r = match r {
+            Ref::Collection { id, name } if Some(id.as_str()) == own => {
+                local = Ref::local(name.as_str());
+                &local
+            }
+            _ => r,
+        };
+        let hit = |p: &ReceivePattern| p.specificity(r, own).is_some();
+        (self.positive.is_empty() || self.positive.iter().any(hit))
+            && !self.negative.iter().any(hit)
+    }
+}
+
+/// The pattern types move freely across tasks and threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReceivePattern>();
+    assert_send_sync::<ReceiveSelector>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -372,6 +450,101 @@ mod tests {
         ));
         for pattern in ["**", "*:**", "origin:**"] {
             assert!(!matches_ref(pattern, &os("a")), "{pattern}");
+        }
+    }
+
+    fn selects(entries: &[&str], r: &Ref, own: Option<&str>) -> bool {
+        ReceiveSelector::parse(entries.iter().copied())
+            .unwrap()
+            .matches(r, own)
+    }
+
+    /// Each form of a pattern parses as an entry of a list, with and without
+    /// a first `!`.
+    #[test]
+    fn a_selector_parses_each_form() {
+        let forms = [
+            "main",
+            "apps/*",
+            "apps/**",
+            "origin:main",
+            "origin:apps/*",
+            "*:main",
+            "*:**",
+            "@org.example.Os:main",
+            "@org.example.Os:**",
+        ];
+        let negative: Vec<String> = forms.iter().map(|f| format!("!{f}")).collect();
+        let selector = ReceiveSelector::parse(forms.iter().copied()).unwrap();
+        assert_eq!(selector.positive.len(), forms.len());
+        assert!(selector.negative.is_empty());
+        let selector = ReceiveSelector::parse(negative.iter().map(String::as_str)).unwrap();
+        assert!(selector.positive.is_empty());
+        let texts: Vec<&str> = selector.negative.iter().map(|p| p.as_str()).collect();
+        assert_eq!(texts, forms);
+    }
+
+    /// A list with a bad entry is refused with the text of the pattern parse.
+    #[test]
+    fn a_selector_refuses_a_bad_entry() {
+        for entries in [&["main", "a b"][..], &["!!a"], &["!"], &[""], &["r*:x"]] {
+            let err = ReceiveSelector::parse(entries.iter().copied()).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if m.contains("malformed receive pattern")),
+                "{entries:?}: {err}"
+            );
+        }
+    }
+
+    /// A negative pattern wins over a positive pattern, and a list of
+    /// negative patterns alone selects each other ref.
+    #[test]
+    fn a_selector_applies_the_negative_patterns() {
+        let main = Ref::local("main");
+        let web = Ref::local("apps/web");
+        let remote = Ref::remote("origin", "apps/web");
+        assert!(selects(&["apps/**", "main"], &web, None));
+        assert!(!selects(&["apps/**", "!apps/web"], &web, None));
+        assert!(!selects(&["!apps/web", "apps/**"], &web, None));
+        assert!(!selects(&["apps/**"], &main, None));
+        assert!(selects(&["!apps/**"], &main, None));
+        assert!(!selects(&["!apps/**"], &web, None));
+        assert!(selects(&["!apps/**"], &remote, None));
+        assert!(!selects(&["!*:**"], &remote, None));
+        for r in [&main, &web, &remote] {
+            assert!(selects(&[], r, None));
+        }
+    }
+
+    /// The own collection id joins a collection pattern and a plain pattern.
+    #[test]
+    fn a_selector_matches_the_canonical_ref() {
+        let own = Some("org.example.Os");
+        let local = Ref::local("x");
+        let in_own = Ref::collection("org.example.Os", "x");
+        assert!(selects(&["@org.example.Os:x"], &local, own));
+        assert!(selects(&["@org.example.Os:x"], &in_own, own));
+        assert!(selects(&["x"], &in_own, own));
+        assert!(!selects(&["!x"], &in_own, own));
+        assert!(!selects(&["!@org.example.Os:x"], &local, own));
+        assert!(!selects(&["@org.example.Other:x"], &local, own));
+        assert!(!selects(&["@org.example.Os:x"], &local, None));
+        assert!(!selects(&["x"], &in_own, None));
+        assert!(selects(&["@org.example.Os:x"], &in_own, None));
+    }
+
+    /// A remote pattern matches only a remote ref, and never the plain ref or
+    /// the own collection ref of the same name.
+    #[test]
+    fn a_selector_remote_pattern_matches_only_remote_refs() {
+        let own = Some("org.example.Os");
+        let remote = Ref::remote("origin", "x");
+        let local = Ref::local("x");
+        let in_own = Ref::collection("org.example.Os", "x");
+        for pattern in ["origin:x", "*:x"] {
+            assert!(selects(&[pattern], &remote, own), "{pattern}");
+            assert!(!selects(&[pattern], &local, own), "{pattern}");
+            assert!(!selects(&[pattern], &in_own, own), "{pattern}");
         }
     }
 }

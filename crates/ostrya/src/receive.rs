@@ -28,7 +28,6 @@ mod finish;
 mod hooks;
 mod ingest;
 mod merge;
-mod pattern;
 mod policy;
 mod reader;
 mod server_commit;
@@ -44,12 +43,12 @@ pub use crate::access::{
     AccessModes, AccessRules, AllowItem, AuthItem, ClientAccess, ClientGroup, IpNet, Namespace,
     NamespaceRules, ServerSettings,
 };
+pub use crate::pattern::ReceivePattern;
 pub use crate::verify::TrustedKeys;
 pub use hooks::{
     HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceiveRefUpdate, ReceiveServerCommit,
     UpdatePlan,
 };
-pub use pattern::ReceivePattern;
 pub use policy::{ReceivePolicies, ReceivePolicy, ReceiveVerify};
 pub use service::ReceiveService;
 pub use session::{ReceiveCommit, ReceiveRefOutcome, ReceiveReport, ReceiveStep, ReceiveWarning};
@@ -67,7 +66,6 @@ const _: fn() = || {
     assert_send_sync::<ReceiveVerify>();
     assert_send_sync::<StreamPolicy>();
     assert_send_sync::<StreamRule>();
-    assert_send_sync::<ReceivePattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
     assert_send_sync::<ReceiveReport>();

@@ -3433,13 +3433,14 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   back. A failure is `ParseRefError`, which holds the text. The `ostrya`
   crate maps it to `Error::InvalidRefspec` with the same text.
 - The ref store has one method for each operation, and it takes `&Ref`:
-  `Transaction::set_ref`, `Repo::set_ref_immediate`,
-  `UpdateGuard::read_ref`, `UpdateGuard::set_ref`, and
-  `Repo::resolve_ref_tip`. `resolve_ref_tip` gives `None` for an absent
-  ref. A ref path that names a directory, or that passes through a file,
-  holds no ref, so it also gives `None`. A caller that needs an error gives
-  `Error::RefNotFound` with the text of the ref. `Repo::resolve_rev` reads
-  a revision, and it fails with `Error::Io` for such a path.
+  `Transaction::set_ref`, `Transaction::set_ref_expecting`,
+  `Repo::set_ref_immediate`, `UpdateGuard::read_ref`,
+  `UpdateGuard::set_ref`, and `Repo::resolve_ref_tip`. `resolve_ref_tip`
+  gives `None` for an absent ref. A ref path that names a directory, or
+  that passes through a file, holds no ref, so it also gives `None`. A
+  caller that needs an error gives `Error::RefNotFound` with the text of
+  the ref. `Repo::resolve_rev` reads a revision, and it fails with
+  `Error::Io` for such a path.
 - A value from a caller can be `@OWN:NAME`, and the ref store maps it to
   the local ref. A value that the library gives is canonical: a ref of the
   own id is `Local`.
@@ -3545,7 +3546,8 @@ The `[core] collection-id` of a repository is its local namespace. The
 refs of that id are the local refs, under `refs/heads/`. The rules:
 
 - Each writer of the collection ref `@ID:NAME` of the own id writes
-  `refs/heads/NAME`: `Transaction::set_ref`, `Repo::set_ref_immediate`,
+  `refs/heads/NAME`: `Transaction::set_ref`,
+  `Transaction::set_ref_expecting`, `Repo::set_ref_immediate`,
   `UpdateGuard::set_ref`, `refs -c --create`, `refs --create`, `commit`,
   `Repo::pull_collection`, `Repo::pull_local` and `Repo::pull` with an
   `@ID:NAME` name, the receive path, and the S3 push. The same
@@ -3871,6 +3873,102 @@ These alternatives were rejected:
 - The protocol types alone for the hooks and the report. Each host then
   parses the names and reads the own collection id of the server to
   compare `main` with `@OWN:main`.
+
+## The ref check of a transaction commit
+
+`Transaction::commit` writes the queued refs one by one, each with a temp
+file and a rename. A write that fails stops the commit. So the commit checks
+the whole queue against the ref store before the first write. The rules:
+
+- The check runs under the update lock, in the trip to the blocking pool
+  that writes the detached metadata and the refs. It runs before the
+  detached metadata and before the first ref write. `commit_under` runs the
+  same check. The receive path reads each ref path under the update lock
+  before it queues its writes. Its compare of the expectations, its policy
+  checks, the fast-forward walk, the parent of a server commit, and its
+  reply need the current commit. It sends each refusal as a wire error
+  before it publishes an object. The commit check then reads each queued
+  path again with one `lstat`.
+- The check reads each queued path of `Transaction::set_ref` with `lstat`
+  alone. A queued write or removal fails with `Error::RefNotWritable` if
+  its path names a directory, passes through a file, or names a special
+  file: a FIFO, a socket, or a device file.
+- A queued removal whose path passes through a file passes when an earlier
+  removal of the same queue removes a path above it at any level, for
+  example `a` for `a/b/c`. The unlink of `a` leaves `a/b/c` absent, if no
+  write below an alias writes `a` again. The earlier removal can be an
+  entry of `set_ref` or of `set_ref_expecting`. The other order, a removal
+  of `a/b` and then of `a`, fails. A conditional removal does not take this
+  exception. A path that names a directory or a special file stays refused.
+- Two queued entries where the path of one names a directory of the path of
+  the other fail with `Error::RefNotWritable`, if one of the two is a write.
+  Examples are a write of `a` and a write of `a/b`, or a removal of `a` and
+  a write of `a/b`. The error names the outer ref. Two removals pass this
+  rule.
+- The check reads the ref store as it is before the first write. It does
+  not look through an alias in a parent directory of a queued path. So a
+  write below such an alias can fail after the commit writes earlier refs,
+  and these refs stay. Examples are a write of `old/x`, where `old` is an
+  alias that points to no ref, and a write of `x`, then a write of `al/y`,
+  where `al` is an alias of `x`. A write below such an alias can also write
+  a ref at a path that the check read for another entry. A later entry can
+  then fail after the commit writes earlier refs. A removal of `x`, then a
+  removal of `al/b`, where `al` is an alias of the ref file `x`, fails the
+  commit. The check refuses `al/b` before the first write, because its path
+  passes through a file.
+- A queued write over an alias passes. The rename replaces the link with a
+  ref file.
+- A refused commit leaves the published objects, and writes no detached
+  metadata and no ref. `gc` removes the objects.
+- An I/O error between two ref writes, for example on a full disk, leaves
+  the refs written before it. There is no rollback.
+
+`Transaction::set_ref_expecting(r, expected, new)` queues a conditional
+write. `expected = None` expects that no file stands at the path of the
+ref. `Some(c)` expects a ref file that names `c`. `new = None` removes the
+ref. The rules of a conditional write:
+
+- The check above compares each conditional entry with the ref store, in
+  queue order with the other entries. The first failure stops the commit.
+- The compare reads the ref store as it is before the first write. This is
+  also true when an earlier entry of the same queue writes the same ref.
+- A ref that does not have the state `expected` fails with
+  `Error::RefMismatch`. The error holds the name of the ref, the expected
+  state, and the state in the store.
+- A conditional entry whose path names an alias fails with
+  `Error::RefNotWritable`, reason `names an alias`. The receive path
+  refuses an alias in the same way.
+- A conditional entry whose path names a directory or passes through a file
+  fails with `Error::RefNotWritable`, also for `expected = None`.
+  `Repo::resolve_ref_tip` gives `None` for such a path, so a caller that
+  gives back that `None` as `expected` gets this error.
+- A conditional entry whose ref file does not parse fails with the error
+  of the parse, because the compare needs the content.
+- An entry of `set_ref` costs one `lstat`. A conditional entry costs one
+  `lstat` and one `O_NOFOLLOW` open, with a read of at most 4096 bytes and
+  a parse.
+- `commit_under` runs the same compare. The receive path queues entries
+  of `set_ref` alone. It compares each update with the current commit that
+  it reads under the update lock, so it sends a mismatch as a wire error
+  before it publishes an object.
+
+These alternatives were rejected:
+
+- A rollback of the written refs after a failed write. The rollback is a
+  second set of writes that can fail too, and a reader can see the refs
+  between the two sets.
+- A skip of the refused ref, with the other refs written. The caller then
+  gets a part of a set that it queued as one, which is the failure that the
+  check prevents.
+- A check in `set_ref`, or before the commit takes the update lock. Another
+  writer can change the ref store between the check and the writes.
+- A check that replays the queue on a model of the ref store, so that each
+  entry sees the result of the entries before it. The model must apply each
+  write and each removal in queue order, as a second copy of the rules of
+  the ref store. The `lstat` of each path reads the store itself.
+- A parse of the content of each ref file in the check. A write over a ref
+  file whose content does not parse then fails, and the write replaces that
+  file in each other case.
 
 ## The pull scheduler
 

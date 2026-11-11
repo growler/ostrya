@@ -32,7 +32,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
 use crate::read::CommitState;
-use crate::refs::RefFileState;
+use crate::refs::{RefFileState, nested_ref_paths};
 use crate::related::{self, HeldDependency, RelatedRule};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
@@ -1552,7 +1552,7 @@ pub(super) fn check_ref_paths(
                     "ref '{name}' is an alias of another ref"
                 )));
             }
-            RefFileState::NotARef => {
+            RefFileState::NotARef(_) => {
                 return Err(ref_denied(format!(
                     "ref '{name}' names a directory or a path below a ref file, \
                      which a ref write cannot replace"
@@ -1560,21 +1560,14 @@ pub(super) fn check_ref_paths(
             }
         });
     }
-    let writes = || refs.iter().filter(|(_, _, writes)| *writes);
-    let mut written: HashMap<&str, &str> = HashMap::new();
-    for &(name, relpath, _) in writes() {
-        written.insert(relpath, name);
-    }
-    for &(name, relpath, _) in writes() {
-        let mut path = relpath;
-        while let Some((parent, _)) = path.rsplit_once('/') {
-            if let Some(other) = written.get(parent) {
-                return Err(ref_denied(format!(
-                    "ref '{name}' names a path below ref '{other}' of the same message"
-                )));
-            }
-            path = parent;
-        }
+    let writes = || refs.iter().filter(|&&(_, _, writes)| writes);
+    let entries: Vec<(&str, bool)> = writes().map(|&(_, relpath, _)| (relpath, true)).collect();
+    if let Some((outer, inner)) = nested_ref_paths(&entries) {
+        let write_name = |i| writes().nth(i).expect("an index of a write entry").0;
+        let (name, other) = (write_name(inner), write_name(outer));
+        return Err(ref_denied(format!(
+            "ref '{name}' names a path below ref '{other}' of the same message"
+        )));
     }
     Ok(current)
 }

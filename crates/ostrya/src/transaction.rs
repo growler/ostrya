@@ -309,7 +309,8 @@ pub struct Transaction {
     // directory go first, then the lock.
     staged: Mutex<Staged>,
     /// The refspec-to-checksum writes that [`set_ref`](Transaction::set_ref)
-    /// queues. [`commit`](Transaction::commit) applies them after object
+    /// and [`set_ref_expecting`](Transaction::set_ref_expecting) queue.
+    /// [`commit`](Transaction::commit) applies them after object
     /// publication, for durability.
     pub(crate) refs: Mutex<Vec<crate::refs::RefWrite>>,
     /// The detached-metadata edits that
@@ -1516,13 +1517,21 @@ impl Transaction {
     ///    `extensions/ostrya/composefs/<xx>/`. So an image is in place only
     ///    after each object of the transaction. The rename of an image
     ///    replaces a stored image of the same commit.
-    /// 4. The call writes the queued detached-metadata edits.
-    /// 5. The call writes the queued refs. Each ref write is atomic: a temp
+    /// 4. The call checks the queued refs against the ref store, as
+    ///    [`set_ref`](Transaction::set_ref) states. It also compares each
+    ///    entry of [`set_ref_expecting`](Transaction::set_ref_expecting) with
+    ///    the ref store. On a refusal the call writes no detached metadata
+    ///    and no ref.
+    /// 5. The call writes the queued detached-metadata edits.
+    /// 6. The call writes the queued refs. Each ref write is atomic: a temp
     ///    file, then a rename. The set of ref writes is not atomic as a whole.
-    /// 6. The call removes the staging directory and releases the repository
+    ///    If a ref write fails after the check, for example on a full disk or
+    ///    below an alias as [`set_ref`](Transaction::set_ref) states, the refs
+    ///    written before it stay. The call does not roll them back.
+    /// 7. The call removes the staging directory and releases the repository
     ///    lock.
     ///
-    /// Steps 4 and 5 run in one trip to the blocking pool.
+    /// Steps 4, 5, and 6 run in one trip to the blocking pool.
     ///
     /// # Composefs images
     ///
@@ -1581,7 +1590,7 @@ impl Transaction {
     /// and 3 run with no update lock.
     ///
     /// If the transaction writes a ref, a ref removal included, or detached
-    /// metadata, the call takes the update lock for steps 4 and 5. The update
+    /// metadata, the call takes the update lock for steps 4 to 6. The update
     /// lock excludes the other writers of refs and detached metadata, as
     /// [`UpdateGuard`](crate::UpdateGuard) states. The wait is for the update
     /// lock alone, because the transaction holds the repository lock already. A
@@ -1590,7 +1599,7 @@ impl Transaction {
     /// # Cancellation
     ///
     /// The update lock, the repository lock, and the staging directory move
-    /// into the blocking closure of steps 4 and 5. The closure releases them
+    /// into the blocking closure of steps 4 to 6. The closure releases them
     /// when its writes end. If a caller drops the returned future, the writes
     /// complete, and the locks and the staged files stay until the writes end.
     ///
@@ -1624,6 +1633,17 @@ impl Transaction {
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`. The published objects stay, and the call
     ///   writes no detached metadata and no ref.
+    /// - [`Error::RefNotWritable`] if the check of step 4 refuses a queued
+    ///   ref. The published objects stay, and the call writes no detached
+    ///   metadata and no ref.
+    /// - [`Error::RefMismatch`] if the ref of an entry of
+    ///   [`set_ref_expecting`](Transaction::set_ref_expecting) does not have
+    ///   the expected state. The published objects stay, and the call writes
+    ///   no detached metadata and no ref.
+    /// - [`Error::InvalidFormat`] or [`Error::Core`] if the ref file of an
+    ///   entry of [`set_ref_expecting`](Transaction::set_ref_expecting) does
+    ///   not parse. The published objects stay, and the call writes no
+    ///   detached metadata and no ref.
     /// - [`Error::Core`] if `[core] fsync`, `[core] per-object-fsync`, or
     ///   `[core] lock-timeout-secs` has a value that does not parse.
     /// - [`Error::Core`] if the stored detached metadata of a commit does not
@@ -1631,6 +1651,11 @@ impl Transaction {
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
     ///   `-1`, or if a signature entry of the stored detached metadata is not
     ///   an array.
+    /// - [`Error::Io`] if the check of step 4 cannot read a queued ref path,
+    ///   or cannot open or read the ref file of an entry of
+    ///   [`set_ref_expecting`](Transaction::set_ref_expecting), for example
+    ///   with `EACCES` or `ELOOP`. The call then writes no detached metadata
+    ///   and no ref.
     /// - [`Error::Io`] if a rename, a sync, or a write of a ref or of the
     ///   detached metadata fails.
     pub async fn commit(mut self) -> Result<TransactionStats> {
@@ -1682,9 +1707,9 @@ impl Transaction {
         Ok(())
     }
 
-    /// Writes the queued detached metadata and then `refs`, removes the
-    /// staging directory, and releases the locks, in one trip to the blocking
-    /// pool.
+    /// Checks `refs`, writes the queued detached metadata and then `refs`,
+    /// removes the staging directory, and releases the locks, in one trip to
+    /// the blocking pool.
     ///
     /// `synced` is `true` if the publication step ran its `syncfs`. The staging
     /// directory, the repository lock, and `held`, if given, move into the
@@ -1696,7 +1721,7 @@ impl Transaction {
     /// release a lock or remove a staged file while the writes run.
     async fn write_tail(
         mut self,
-        refs: Vec<(String, Option<Checksum>)>,
+        refs: Vec<crate::refs::ResolvedRef>,
         synced: bool,
         held: Option<UpdateLockHeld>,
     ) -> Result<TransactionStats> {
@@ -1714,15 +1739,17 @@ impl Transaction {
             #[cfg(test)]
             test_tail::pass(repo_fd.as_fd());
             let tmp_fd = staging.tmp_fd();
-            let written = detached.run(tmp_fd).and_then(|()| {
-                crate::refs::write_resolved_refs_blocking(
-                    repo_fd.as_fd(),
-                    tmp_fd,
-                    &refs,
-                    fsync,
-                    repo_mode,
-                )
-            });
+            let written = crate::refs::check_resolved_refs_blocking(repo_fd.as_fd(), &refs)
+                .and_then(|()| detached.run(tmp_fd))
+                .and_then(|()| {
+                    crate::refs::write_resolved_refs_blocking(
+                        repo_fd.as_fd(),
+                        tmp_fd,
+                        &refs,
+                        fsync,
+                        repo_mode,
+                    )
+                });
             drop(held);
             drop(staging);
             drop(lock);
@@ -2444,6 +2471,612 @@ mod tests {
                 assert!(!commitmeta(&root, &commit).exists());
             }
             drop(held);
+        });
+    }
+
+    /// Assert that `err` refuses the ref `name` with a reason that holds
+    /// `reason`.
+    fn assert_not_writable(err: Error, name: &str, reason: &str) {
+        match err {
+            Error::RefNotWritable { name: n, reason: r } => {
+                assert_eq!(n, name);
+                assert!(r.contains(reason), "{r}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The commit of the local ref `name`, or `None`.
+    async fn tip(repo: &crate::Repo, name: &str) -> Option<Checksum> {
+        repo.resolve_ref_tip(&Ref::local(name)).await.unwrap()
+    }
+
+    /// A ref that names a directory refuses the commit before the detached
+    /// metadata and before the first ref write. The update lock is free
+    /// after the refusal.
+    #[test]
+    fn a_ref_that_names_a_directory_refuses_the_whole_commit() {
+        let scratch = Scratch::new("ref-check-dir");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_immediate(&Ref::local("host/main"), Some(&a))
+                .await
+                .unwrap();
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_commit_detached_metadata(&c, string_dict("a", "x"));
+            txn.set_ref(&Ref::local("main"), Some(&c));
+            txn.set_ref(&Ref::local("host"), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "host", "names a directory");
+            assert_eq!(tip(&repo, "main").await, Some(a));
+            assert_eq!(tip(&repo, "host/main").await, Some(a));
+            assert!(!commitmeta(&root, &c).exists());
+            drop(repo.lock_update().await.unwrap());
+        });
+    }
+
+    /// A ref path through a ref file refuses the commit, and a ref queued
+    /// before it keeps its commit.
+    #[test]
+    fn a_ref_that_passes_through_a_file_refuses_the_commit() {
+        let scratch = Scratch::new("ref-check-file");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            for name in ["rel/main", "app"] {
+                repo.set_ref_immediate(&Ref::local(name), Some(&a))
+                    .await
+                    .unwrap();
+            }
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("rel/main"), Some(&c));
+            txn.set_ref(&Ref::local("app/x"), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "app/x", "passes through a file");
+            assert_eq!(tip(&repo, "rel/main").await, Some(a));
+            assert_eq!(tip(&repo, "app").await, Some(a));
+        });
+    }
+
+    /// A removal of a path that names a directory refuses the commit.
+    #[test]
+    fn a_removal_of_a_directory_refuses_the_commit() {
+        let scratch = Scratch::new("ref-check-remove-dir");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            repo.set_ref_immediate(&Ref::local("d/e"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("d"), None);
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "d", "names a directory");
+            assert_eq!(tip(&repo, "d/e").await, Some(a));
+        });
+    }
+
+    /// Two queued refs where the path of one names a directory of the other
+    /// refuse the commit: two writes in each order, and a write with a
+    /// removal. The commit writes nothing.
+    #[test]
+    fn nested_queued_refs_refuse_the_commit() {
+        let scratch = Scratch::new("ref-check-nested");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let c = Checksum::from_bytes([0x43; 32]);
+            let queues: [[(&str, Option<&Checksum>); 2]; 3] = [
+                [("a", Some(&c)), ("a/b", Some(&c))],
+                [("a/b", Some(&c)), ("a", Some(&c))],
+                [("a/b", Some(&c)), ("a", None)],
+            ];
+            for queue in queues {
+                let txn = repo.transaction().await.unwrap();
+                for (name, checksum) in queue {
+                    txn.set_ref(&Ref::local(name), checksum);
+                }
+                let err = txn.commit().await.unwrap_err();
+                assert_not_writable(
+                    err,
+                    "a",
+                    "names a directory of ref a/b of the same transaction",
+                );
+                assert!(!root.join("refs/heads/a").exists());
+            }
+        });
+    }
+
+    /// A removal of the ref file `a` and a write of `a/b` refuse the commit,
+    /// and `a` keeps its commit.
+    #[test]
+    fn a_removal_of_a_ref_file_and_a_write_below_it_refuse_the_commit() {
+        let scratch = Scratch::new("ref-check-before");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("a"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("a"), None);
+            txn.set_ref(&Ref::local("a/b"), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "a/b", "passes through a file");
+            assert_eq!(tip(&repo, "a").await, Some(a));
+        });
+    }
+
+    /// Two removals on nested paths pass the check, and so do two writes where
+    /// the name of one starts with the name of the other but is not below it.
+    #[test]
+    fn nested_removals_and_prefix_names_pass_the_check() {
+        let scratch = Scratch::new("ref-check-pass");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let c = Checksum::from_bytes([0x43; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("a"), None);
+            txn.set_ref(&Ref::local("a/b"), None);
+            txn.commit().await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("a"), Some(&c));
+            txn.set_ref(&Ref::local("ab"), Some(&c));
+            txn.commit().await.unwrap();
+            assert_eq!(tip(&repo, "a").await, Some(c));
+            assert_eq!(tip(&repo, "ab").await, Some(c));
+        });
+    }
+
+    /// A removal of the ref file `a`, then removals of `a/b` and `a/b/c`,
+    /// pass the check, and the commit removes `a`. A conditional removal of
+    /// `a`, then a removal of `a/b`, also pass.
+    #[test]
+    fn removals_below_a_removed_ref_file_pass_the_check() {
+        let scratch = Scratch::new("ref-check-remove-below");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let a = Checksum::from_bytes([0x41; 32]);
+            repo.set_ref_immediate(&Ref::local("a"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("a"), None);
+            txn.set_ref(&Ref::local("a/b"), None);
+            txn.set_ref(&Ref::local("a/b/c"), None);
+            txn.commit().await.unwrap();
+            assert!(!root.join("refs/heads/a").exists());
+
+            repo.set_ref_immediate(&Ref::local("a"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("a"), Some(&a), None);
+            txn.set_ref(&Ref::local("a/b"), None);
+            txn.commit().await.unwrap();
+            assert!(!root.join("refs/heads/a").exists());
+        });
+    }
+
+    /// A removal below the ref file `a` before the removal of `a` refuses
+    /// the commit, and so does a conditional removal below `a` after the
+    /// removal of `a`. Each ref keeps its commit.
+    #[test]
+    fn a_removal_below_a_ref_file_without_an_earlier_removal_of_it_fails() {
+        let scratch = Scratch::new("ref-check-remove-below-order");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            for name in ["main", "a"] {
+                repo.set_ref_immediate(&Ref::local(name), Some(&a))
+                    .await
+                    .unwrap();
+            }
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("main"), Some(&c));
+            txn.set_ref(&Ref::local("a/b"), None);
+            txn.set_ref(&Ref::local("a"), None);
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "a/b", "passes through a file");
+            assert_eq!(tip(&repo, "main").await, Some(a));
+            assert_eq!(tip(&repo, "a").await, Some(a));
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("a"), None);
+            txn.set_ref_expecting(&Ref::local("a/b"), None, None);
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "a/b", "passes through a file");
+            assert_eq!(tip(&repo, "a").await, Some(a));
+        });
+    }
+
+    /// A removal of the ref file `x`, then a removal of `al/b`, where `al`
+    /// is an alias of `x`, refuses the commit before the first write. Each
+    /// ref keeps its commit.
+    #[test]
+    fn a_removal_below_an_alias_of_a_removed_ref_file_fails() {
+        let scratch = Scratch::new("ref-check-remove-below-alias");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            for name in ["main", "x"] {
+                repo.set_ref_immediate(&Ref::local(name), Some(&a))
+                    .await
+                    .unwrap();
+            }
+            repo.set_ref_alias_immediate("al", "x").await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("main"), Some(&c));
+            txn.set_ref(&Ref::local("x"), None);
+            txn.set_ref(&Ref::local("al/b"), None);
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "al/b", "passes through a file");
+            assert_eq!(tip(&repo, "main").await, Some(a));
+            assert_eq!(tip(&repo, "x").await, Some(a));
+        });
+    }
+
+    /// A write over an alias replaces the link with a ref file, and the
+    /// target of the alias keeps its commit.
+    #[test]
+    fn a_write_over_an_alias_replaces_the_link() {
+        let scratch = Scratch::new("ref-check-alias");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("target"), Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_alias_immediate("alias", "target")
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("alias"), Some(&c));
+            txn.commit().await.unwrap();
+            let link = std::fs::symlink_metadata(root.join("refs/heads/alias")).unwrap();
+            assert!(link.file_type().is_file());
+            assert_eq!(tip(&repo, "alias").await, Some(c));
+            assert_eq!(tip(&repo, "target").await, Some(a));
+        });
+    }
+
+    /// A FIFO at a ref path refuses the commit.
+    #[test]
+    fn a_ref_that_names_a_special_file_refuses_the_commit() {
+        let scratch = Scratch::new("ref-check-fifo");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let fifo = root.join("refs/heads/fifo");
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &fifo,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("fifo"), Some(&Checksum::from_bytes([0x43; 32])));
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "fifo", "names a special file");
+            let kind = std::fs::symlink_metadata(&fifo).unwrap().file_type();
+            assert!(std::os::unix::fs::FileTypeExt::is_fifo(&kind));
+        });
+    }
+
+    /// A commit under a lock that the caller holds checks the refs too.
+    #[test]
+    fn a_commit_under_a_held_lock_checks_the_refs() {
+        let scratch = Scratch::new("ref-check-under");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("host/main"), Some(&a))
+                .await
+                .unwrap();
+            let held = repo.lock_update().await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("host"), Some(&c));
+            let err = txn.commit_under(&held).await.unwrap_err();
+            assert_not_writable(err, "host", "names a directory");
+            assert_eq!(tip(&repo, "host/main").await, Some(a));
+            drop(held);
+        });
+    }
+
+    /// Assert that `err` is a mismatch of the ref `name` with the states
+    /// `expected` and `current`.
+    fn assert_mismatch(
+        err: Error,
+        name: &str,
+        expected: Option<Checksum>,
+        current: Option<Checksum>,
+    ) {
+        match err {
+            Error::RefMismatch {
+                name: n,
+                expected: e,
+                current: c,
+            } => assert_eq!((n.as_str(), e, c), (name, expected, current)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A conditional write that expects an absent ref writes the ref.
+    #[test]
+    fn a_conditional_write_on_an_absent_ref_passes() {
+        let scratch = Scratch::new("ref-cas-absent");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let c = Checksum::from_bytes([0x43; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), None, Some(&c));
+            txn.commit().await.unwrap();
+            assert_eq!(tip(&repo, "main").await, Some(c));
+        });
+    }
+
+    /// A conditional write that expects an absent ref refuses a present ref,
+    /// and the ref keeps its commit.
+    #[test]
+    fn a_conditional_write_on_a_present_ref_against_absent_fails() {
+        let scratch = Scratch::new("ref-cas-present");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), None, Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("ref mismatch: main: expected absent, found {a}")
+            );
+            assert_mismatch(err, "main", None, Some(a));
+            assert_eq!(tip(&repo, "main").await, Some(a));
+        });
+    }
+
+    /// A conditional write whose expected commit matches moves the ref.
+    #[test]
+    fn a_conditional_write_that_matches_moves_the_ref() {
+        let scratch = Scratch::new("ref-cas-match");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&a), Some(&c));
+            txn.commit().await.unwrap();
+            assert_eq!(tip(&repo, "main").await, Some(c));
+        });
+    }
+
+    /// A conditional write whose expected commit does not match fails, on a
+    /// present ref and on an absent ref.
+    #[test]
+    fn a_conditional_write_that_does_not_match_fails() {
+        let scratch = Scratch::new("ref-cas-mismatch");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&b), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_mismatch(err, "main", Some(b), Some(a));
+            assert_eq!(tip(&repo, "main").await, Some(a));
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("other"), Some(&b), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_mismatch(err, "other", Some(b), None);
+            assert_eq!(tip(&repo, "other").await, None);
+        });
+    }
+
+    /// A conditional write on an alias fails. The link and its target stay.
+    #[test]
+    fn a_conditional_write_on_an_alias_fails() {
+        let scratch = Scratch::new("ref-cas-alias");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("target"), Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_alias_immediate("alias", "target")
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("alias"), Some(&a), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_not_writable(err, "alias", "names an alias");
+            let link = std::fs::symlink_metadata(root.join("refs/heads/alias")).unwrap();
+            assert!(link.file_type().is_symlink());
+            assert_eq!(tip(&repo, "target").await, Some(a));
+        });
+    }
+
+    /// A conditional removal removes the ref on a match and keeps it on a
+    /// mismatch.
+    #[test]
+    fn a_conditional_removal_obeys_the_expectation() {
+        let scratch = Scratch::new("ref-cas-remove");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&b), None);
+            let err = txn.commit().await.unwrap_err();
+            assert_mismatch(err, "main", Some(b), Some(a));
+            assert_eq!(tip(&repo, "main").await, Some(a));
+
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&Ref::local("main"), Some(&a), None);
+            txn.commit().await.unwrap();
+            assert_eq!(tip(&repo, "main").await, None);
+        });
+    }
+
+    /// A mismatch on the second entry refuses the whole commit: the first
+    /// ref keeps its commit, and the detached metadata is not written.
+    #[test]
+    fn a_mismatch_on_the_second_entry_refuses_the_whole_commit() {
+        let scratch = Scratch::new("ref-cas-second");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&a))
+                .await
+                .unwrap();
+            repo.set_ref_immediate(&Ref::local("tag"), Some(&b))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_commit_detached_metadata(&c, string_dict("a", "x"));
+            txn.set_ref_expecting(&Ref::local("main"), Some(&a), Some(&c));
+            txn.set_ref_expecting(&Ref::local("tag"), None, Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_mismatch(err, "tag", None, Some(b));
+            assert_eq!(tip(&repo, "main").await, Some(a));
+            assert_eq!(tip(&repo, "tag").await, Some(b));
+            assert!(!commitmeta(&root, &c).exists());
+        });
+    }
+
+    /// A conditional entry compares with the store before the first write,
+    /// also when an earlier entry writes the same ref.
+    #[test]
+    fn a_conditional_entry_reads_the_store_before_the_first_write() {
+        let scratch = Scratch::new("ref-cas-twice");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let c = Checksum::from_bytes([0x43; 32]);
+            let d = Checksum::from_bytes([0x44; 32]);
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref(&Ref::local("x"), Some(&c));
+            txn.set_ref_expecting(&Ref::local("x"), None, Some(&d));
+            txn.commit().await.unwrap();
+            assert_eq!(tip(&repo, "x").await, Some(d));
+        });
+    }
+
+    /// A mismatch on a collection ref of the own collection id names the
+    /// local ref.
+    #[test]
+    fn a_conditional_mismatch_on_the_own_collection_id_names_the_local_ref() {
+        let scratch = Scratch::new("ref-cas-own");
+        block_on(async {
+            let repo = crate::Repo::create(
+                &scratch.0.join("repo"),
+                CreateOptions::new(RepoMode::Archive).collection_id("org.example.Os"),
+            )
+            .await
+            .unwrap();
+            let a = Checksum::from_bytes([0x41; 32]);
+            let b = Checksum::from_bytes([0x42; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            repo.set_ref_immediate(&Ref::local("x"), Some(&a))
+                .await
+                .unwrap();
+            let own = Ref::Collection {
+                id: "org.example.Os".into(),
+                name: "x".into(),
+            };
+            let txn = repo.transaction().await.unwrap();
+            txn.set_ref_expecting(&own, Some(&b), Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert_mismatch(err, "x", Some(b), Some(a));
+            assert_eq!(tip(&repo, "x").await, Some(a));
+        });
+    }
+
+    /// A conditional entry whose ref file does not parse fails with the
+    /// error of the parse. The commit writes no detached metadata and no
+    /// ref.
+    #[test]
+    fn a_conditional_entry_on_a_ref_file_that_does_not_parse_fails() {
+        let scratch = Scratch::new("ref-cas-junk");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let c = Checksum::from_bytes([0x43; 32]);
+            let path = root.join("refs/heads/x");
+            std::fs::write(&path, "not a checksum\n").unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_commit_detached_metadata(&c, string_dict("a", "x"));
+            txn.set_ref_expecting(&Ref::local("x"), None, Some(&c));
+            let err = txn.commit().await.unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{err:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), b"not a checksum\n");
+            assert!(!commitmeta(&root, &c).exists());
+        });
+    }
+
+    /// A path that names a directory, or that passes through a file, reads
+    /// as an absent ref. A conditional entry that gives back this absent tip
+    /// fails, and the refs in the store keep their commits.
+    #[test]
+    fn a_conditional_entry_on_the_absent_tip_of_a_path_that_is_not_a_ref_fails() {
+        let scratch = Scratch::new("ref-cas-absent-tip");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            for name in ["app", "host/main"] {
+                repo.set_ref_immediate(&Ref::local(name), Some(&a))
+                    .await
+                    .unwrap();
+            }
+            for (name, reason) in [
+                ("app/x", "passes through a file"),
+                ("host", "names a directory"),
+            ] {
+                let expected = tip(&repo, name).await;
+                assert_eq!(expected, None);
+                let txn = repo.transaction().await.unwrap();
+                txn.set_ref_expecting(&Ref::local(name), expected.as_ref(), Some(&c));
+                let err = txn.commit().await.unwrap_err();
+                assert_not_writable(err, name, reason);
+            }
+            assert_eq!(tip(&repo, "app").await, Some(a));
+            assert_eq!(tip(&repo, "host/main").await, Some(a));
         });
     }
 

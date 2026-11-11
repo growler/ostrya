@@ -875,8 +875,9 @@ not apply the guard.
 
 A ref of either hidden shape can arrive in these ways:
 
-- a direct ref write of the library: `Transaction::set_ref` and
-  `Repo::set_ref_immediate` write both shapes;
+- a direct ref write of the library: `Transaction::set_ref`,
+  `Transaction::set_ref_expecting`, and `Repo::set_ref_immediate` write
+  both shapes;
 - a pull of every ref of a source that holds a ref of the checksum shape, which
   the port copies (`conformance/cli-surface.md`, "P2");
 - an out-of-band write into `refs/`.
@@ -5217,7 +5218,8 @@ In a repository with `[core] collection-id=ID`, the pull writes
 `refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. Delta discovery
 and the timestamp check read the current commit of `refs/heads/REF`. A
 write of a collection ref through `Transaction::set_ref`,
-`Repo::set_ref_immediate`, `UpdateGuard::set_ref`, or
+`Transaction::set_ref_expecting`, `Repo::set_ref_immediate`,
+`UpdateGuard::set_ref`, or
 `ostrya refs -c --create` follows the same rule. `ostree refs --collections
 --create=ID:REF` writes `refs/heads/REF` for the own collection id too
 (observed).

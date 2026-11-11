@@ -72,6 +72,46 @@ pub enum Error {
     /// the caller gave it.
     #[error("refspec not unique: {0}")]
     AmbiguousRefspec(String),
+    /// A queued ref that the ref store cannot take.
+    ///
+    /// [`Transaction::commit`](crate::Transaction::commit) gives this error
+    /// when it checks the queued refs under the update lock. The cause is a
+    /// ref path that names a directory, passes through a file, or names a
+    /// special file, or two queued refs where the path of one names a
+    /// directory of the other and one of the two is a write. A conditional
+    /// write of [`Transaction::set_ref_expecting`](crate::Transaction::set_ref_expecting)
+    /// whose path names an alias is also a cause. The published objects
+    /// stay, and the commit writes no detached metadata and no ref.
+    #[error("ref not writable: {name}: {reason}")]
+    RefNotWritable {
+        /// The ref as text: `<name>`, `<remote>:<name>`, or
+        /// `@<collection-id>:<name>` for a collection ref.
+        name: String,
+        /// The cause, for example `names a directory`.
+        reason: String,
+    },
+    /// A conditional ref write whose ref does not have the expected state.
+    ///
+    /// [`Transaction::commit`](crate::Transaction::commit) gives this error
+    /// when it compares a write of
+    /// [`Transaction::set_ref_expecting`](crate::Transaction::set_ref_expecting)
+    /// with the ref store under the update lock. The message shows an absent
+    /// ref as `absent`. The published objects stay, and the commit writes no
+    /// detached metadata and no ref.
+    #[error(
+        "ref mismatch: {name}: expected {}, found {}",
+        .expected.map_or_else(|| "absent".to_owned(), |c| c.to_string()),
+        .current.map_or_else(|| "absent".to_owned(), |c| c.to_string())
+    )]
+    RefMismatch {
+        /// The ref as text: `<name>`, `<remote>:<name>`, or
+        /// `@<collection-id>:<name>` for a collection ref.
+        name: String,
+        /// The commit that the caller expected, or `None` for an absent ref.
+        expected: Option<Checksum>,
+        /// The commit of the ref file, or `None` for an absent ref.
+        current: Option<Checksum>,
+    },
     /// A `^` suffix of a revision that asks for the parent of a root commit.
     ///
     /// The payload is the checksum of the root commit.

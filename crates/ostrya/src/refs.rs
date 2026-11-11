@@ -72,8 +72,8 @@ pub struct RefAlias {
     pub target: String,
 }
 
-/// The state of one ref path, as the receive path reads it under its lock.
-#[cfg(feature = "receive")]
+/// The state of one ref path, as [`ref_file_state`] and [`lstat_ref_state`]
+/// read it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefFileState {
     /// No file stands at the path.
@@ -82,9 +82,9 @@ pub(crate) enum RefFileState {
     Commit(Checksum),
     /// A symlink: an alias of another ref.
     Alias,
-    /// Something a ref write cannot replace: a directory, a path that passes
-    /// through a file, or a special file.
-    NotARef,
+    /// Something a ref write cannot replace, and the reason: the path names
+    /// a directory, passes through a file, or names a special file.
+    NotARef(&'static str),
 }
 
 /// One queued ref write: a target and the checksum to point it at (`None`
@@ -92,6 +92,24 @@ pub(crate) enum RefFileState {
 pub(crate) struct RefWrite {
     target: Ref,
     checksum: Option<Checksum>,
+    /// The state that the ref must have before the write. `None` sets no
+    /// expectation. `Some(None)` expects that no file stands at the path.
+    /// `Some(Some(c))` expects a ref file that names `c`.
+    expected: Option<Option<Checksum>>,
+}
+
+/// One queued ref write, with the path of its ref under the repository.
+pub(crate) struct ResolvedRef {
+    /// The ref that the transaction queued, in its canonical form: a ref of
+    /// the own collection id is a local ref.
+    name: Ref,
+    /// The path of the ref under the repository.
+    relpath: String,
+    /// The commit to write, or `None` to remove the ref.
+    checksum: Option<Checksum>,
+    /// The state that the ref must have before the write, as
+    /// [`RefWrite`] holds it.
+    expected: Option<Option<Checksum>>,
 }
 
 /// Methods that queue ref writes for the transaction commit.
@@ -112,27 +130,235 @@ impl Transaction {
     /// which holds the text of the ref. The commit then publishes no object
     /// and writes no ref.
     ///
+    /// The commit checks the queued refs under the update lock, before the
+    /// first write. It fails with [`Error::RefNotWritable`] and writes no ref
+    /// in these cases:
+    ///
+    /// - The path of a queued write or removal names a directory, passes
+    ///   through a file, or names a special file. A removal whose path passes
+    ///   through a file passes the check when an earlier removal of the same
+    ///   transaction removes a path above it at any level, for example `a`
+    ///   for `a/b/c`. The unlink of `a` leaves `a/b/c` absent, if no write
+    ///   below an alias writes `a` again. A removal of `a/b`, then a removal
+    ///   of `a`, fails. An entry of
+    ///   [`set_ref_expecting`](Transaction::set_ref_expecting) does not take
+    ///   this exception.
+    /// - The path of one queued ref names a directory of the path of another
+    ///   queued ref, and one of the two is a write. Examples are a write of
+    ///   `a` and a write of `a/b`, or a removal of `a` and a write of `a/b`.
+    ///
+    /// The check reads the ref store as it is before the first write. It does
+    /// not look through an alias in a parent directory of a queued path. So a
+    /// write below such an alias can fail after the commit writes earlier
+    /// refs, and these refs stay. Two examples:
+    ///
+    /// - A write of `old/x`, where `old` is an alias that points to no ref.
+    /// - A write of `x`, then a write of `al/y`, where `al` is an alias of
+    ///   `x`.
+    ///
+    /// A write below such an alias can also write a ref at a path that the
+    /// check read for another entry. A later entry can then fail after the
+    /// commit writes earlier refs.
+    ///
+    /// For the same reason, a removal of `x`, then a removal of `al/b`, where
+    /// `al` is an alias of the ref file `x`, fails the commit. The check
+    /// refuses `al/b` before the first write, because its path passes
+    /// through a file.
+    ///
+    /// A write over an alias replaces the link with a ref file.
+    ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
     /// such a ref by hand.
+    ///
+    /// To write the ref only if it has a known state, use
+    /// [`set_ref_expecting`](Transaction::set_ref_expecting).
     pub fn set_ref(&self, r: &Ref, checksum: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
             target: r.clone(),
             checksum: checksum.copied(),
+            expected: None,
         });
     }
 
-    /// Maps each queued ref to its path under the repository. A malformed
-    /// ref fails the call. [`commit`](Transaction::commit) calls it first,
-    /// so a malformed ref fails before the commit publishes any object.
-    pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<(String, Option<Checksum>)>> {
+    /// Queues a ref write for the transaction commit, on the condition that
+    /// the ref has the state `expected`.
+    ///
+    /// The arguments are:
+    ///
+    /// - `r`: the ref to write or remove.
+    /// - `expected`: the state of the ref before the write. `None` expects
+    ///   that no file stands at the path of the ref. `Some(c)` expects a ref
+    ///   file that names `c`. If the path of the ref names a directory or
+    ///   passes through a file, the commit fails with
+    ///   [`Error::RefNotWritable`], also for `None`.
+    ///   [`Repo::resolve_ref_tip`] gives `None` for such a path, so a caller
+    ///   that gives back that `None` as `expected` gets this error.
+    /// - `new`: the commit to write. If `new` is `None`, the commit removes
+    ///   the ref.
+    ///
+    /// The path rules and the checks of [`set_ref`](Transaction::set_ref)
+    /// apply. The commit compares each conditional entry in the same check,
+    /// under the update lock, before it writes the detached metadata and the
+    /// first ref. The compare reads the ref store as it is before the first
+    /// write. This is also true when an earlier entry of the same transaction
+    /// writes the same ref.
+    ///
+    /// The commit fails and writes no detached metadata and no ref in these
+    /// cases:
+    ///
+    /// - The ref does not have the state `expected`:
+    ///   [`Error::RefMismatch`].
+    /// - The path of the ref names an alias: [`Error::RefNotWritable`].
+    /// - The ref file does not parse: [`Error::InvalidFormat`] or
+    ///   [`Error::Core`].
+    pub fn set_ref_expecting(&self, r: &Ref, expected: Option<&Checksum>, new: Option<&Checksum>) {
+        self.refs.lock().unwrap().push(RefWrite {
+            target: r.clone(),
+            checksum: new.copied(),
+            expected: Some(expected.copied()),
+        });
+    }
+
+    /// Takes the queued refs out of the queue and maps each one to its path
+    /// under the repository. A malformed ref fails the call.
+    /// [`commit`](Transaction::commit) calls it first, so a malformed ref
+    /// fails before the commit publishes any object.
+    pub(crate) fn resolve_ref_queue(&self) -> Result<Vec<ResolvedRef>> {
         let own = self.repo().config().collection_id();
-        let queue = self.refs.lock().unwrap();
+        let queue = std::mem::take(&mut *self.refs.lock().unwrap());
         queue
-            .iter()
-            .map(|w| Ok((ref_relpath(own, &w.target)?, w.checksum)))
+            .into_iter()
+            .map(|w| {
+                let relpath = ref_relpath(own, &w.target)?;
+                Ok(ResolvedRef {
+                    name: w.target.canonical(own),
+                    relpath,
+                    checksum: w.checksum,
+                    expected: w.expected,
+                })
+            })
             .collect()
     }
+}
+
+/// Checks the resolved refs of a transaction against the ref store, on the
+/// blocking pool.
+///
+/// The caller holds the update lock and calls this before the first write.
+/// The check reads the path of an entry with no expectation with `lstat`
+/// alone, and does not read the content of a ref file. It reads the path of
+/// a conditional entry with `lstat` and an `O_NOFOLLOW` open, and parses the
+/// ref file. It gives the first failure:
+///
+/// 1. In queue order, a write or a removal whose path names a directory,
+///    passes through a file, or names a special file:
+///    [`Error::RefNotWritable`]. A path that names an alias passes for an
+///    entry with no expectation, because the rename of a write replaces the
+///    link. For a conditional entry, an alias gives
+///    [`Error::RefNotWritable`], a state other than the expected state gives
+///    [`Error::RefMismatch`], and a ref file that does not parse gives the
+///    error of the parse. A removal with no expectation whose path passes
+///    through a file passes when an earlier removal of the queue, with or
+///    without an expectation, removes a path above it at any level, for
+///    example `a` for `a/b/c`.
+/// 2. Two entries where the path of one names a directory of the path of the
+///    other, and one of the two is a write: [`Error::RefNotWritable`]. The
+///    error names the outer ref. Two removals pass, and so does one path
+///    queued two times.
+pub(crate) fn check_resolved_refs_blocking(
+    repo_fd: BorrowedFd<'_>,
+    refs: &[ResolvedRef],
+) -> Result<()> {
+    let not_writable = |r: &ResolvedRef, reason: String| Error::RefNotWritable {
+        name: r.name.to_string(),
+        reason,
+    };
+    // The paths of the removals queued so far.
+    let mut removed: HashSet<&str> = HashSet::new();
+    for r in refs {
+        match r.expected {
+            None => {
+                if let Some(RefFileState::NotARef(reason)) = lstat_ref_state(repo_fd, &r.relpath)?
+                    && !(reason == PASSES_THROUGH_A_FILE
+                        && r.checksum.is_none()
+                        && parent_paths(&r.relpath).any(|p| removed.contains(p)))
+                {
+                    return Err(not_writable(r, reason.to_owned()));
+                }
+            }
+            Some(expected) => {
+                let current = match ref_file_state(repo_fd, &r.relpath)? {
+                    RefFileState::Absent => None,
+                    RefFileState::Commit(c) => Some(c),
+                    RefFileState::Alias => {
+                        return Err(not_writable(r, "names an alias".to_owned()));
+                    }
+                    RefFileState::NotARef(reason) => {
+                        return Err(not_writable(r, reason.to_owned()));
+                    }
+                };
+                if current != expected {
+                    return Err(Error::RefMismatch {
+                        name: r.name.to_string(),
+                        expected,
+                        current,
+                    });
+                }
+            }
+        }
+        if r.checksum.is_none() {
+            removed.insert(&r.relpath);
+        }
+    }
+    let entries: Vec<(&str, bool)> = refs
+        .iter()
+        .map(|r| (r.relpath.as_str(), r.checksum.is_some()))
+        .collect();
+    if let Some((outer, inner)) = nested_ref_paths(&entries) {
+        return Err(not_writable(
+            &refs[outer],
+            format!(
+                "names a directory of ref {} of the same transaction",
+                refs[inner].name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the parent directories of the ref path `path`, nearest first:
+/// `a/b` and `a` for `a/b/c`.
+fn parent_paths(path: &str) -> impl Iterator<Item = &str> {
+    std::iter::successors(Some(path), |p| p.rsplit_once('/').map(|(parent, _)| parent)).skip(1)
+}
+
+/// Finds two entries where the path of one names a directory of the path of
+/// the other, and one of the two is a write.
+///
+/// Each entry is a ref path and `true` for a write. The result is the index
+/// of the outer entry and the index of the inner entry. The outer entry is
+/// the first entry at its path, and a path writes if an entry at it writes.
+/// The call tries the inner entries in order, and the parents of each one
+/// nearest first. One path queued two times is no pair.
+pub(crate) fn nested_ref_paths(entries: &[(&str, bool)]) -> Option<(usize, usize)> {
+    // For each path: the first entry at it, and `true` if an entry at it
+    // writes.
+    let mut paths: HashMap<&str, (usize, bool)> = HashMap::new();
+    for (i, &(path, writes)) in entries.iter().enumerate() {
+        paths.entry(path).or_insert((i, false)).1 |= writes;
+    }
+    entries
+        .iter()
+        .enumerate()
+        .find_map(|(inner, &(path, inner_writes))| {
+            parent_paths(path).find_map(|parent| match paths.get(parent) {
+                Some(&(outer, outer_writes)) if outer_writes || inner_writes => {
+                    Some((outer, inner))
+                }
+                _ => None,
+            })
+        })
 }
 
 /// Writes the resolved refs of a transaction, each one atomically, on the
@@ -155,19 +381,17 @@ impl Transaction {
 pub(crate) fn write_resolved_refs_blocking(
     repo_fd: BorrowedFd<'_>,
     tmp_fd: BorrowedFd<'_>,
-    refs: &[(String, Option<Checksum>)],
+    refs: &[ResolvedRef],
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = refs
-        .iter()
-        .try_for_each(|(relpath, checksum)| match checksum {
-            Some(checksum) => put_ref_file_blocking(
-                repo_fd, tmp_fd, relpath, *checksum, fsync, repo_mode, &mut dirs,
-            ),
-            None => remove_ref_blocking(repo_fd, relpath, fsync, &mut dirs),
-        });
+    let written = refs.iter().try_for_each(|r| match r.checksum {
+        Some(checksum) => put_ref_file_blocking(
+            repo_fd, tmp_fd, &r.relpath, checksum, fsync, repo_mode, &mut dirs,
+        ),
+        None => remove_ref_blocking(repo_fd, &r.relpath, fsync, &mut dirs),
+    });
     if !fsync {
         return written;
     }
@@ -2252,21 +2476,37 @@ fn is_not_a_ref_path(e: &std::io::Error) -> bool {
     )
 }
 
+/// The reason of [`RefFileState::NotARef`] for a path that passes through a
+/// file.
+const PASSES_THROUGH_A_FILE: &str = "passes through a file";
+
+/// Returns the state of the ref path `relpath`, read with `lstat` alone.
+///
+/// `None` is a regular file, whose content the caller reads. The call never
+/// returns [`RefFileState::Commit`]. A path that passes through a file
+/// (`ENOTDIR`) is [`RefFileState::NotARef`]. Each other error of `lstat`, for
+/// example `EACCES`, fails the call.
+fn lstat_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<Option<RefFileState>> {
+    let stat = match rustix::fs::statat(dir, relpath, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(Errno::NOENT) => return Ok(Some(RefFileState::Absent)),
+        Err(Errno::NOTDIR) => return Ok(Some(RefFileState::NotARef(PASSES_THROUGH_A_FILE))),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match FileType::from_raw_mode(stat.st_mode) {
+        FileType::RegularFile => None,
+        FileType::Symlink => Some(RefFileState::Alias),
+        FileType::Directory => Some(RefFileState::NotARef("names a directory")),
+        _ => Some(RefFileState::NotARef("names a special file")),
+    })
+}
+
 /// Returns the state of the ref path `relpath`, read with `lstat` and then an
 /// `O_NOFOLLOW` open of a regular file. A path that passes through a file
 /// (`ENOTDIR`) is [`RefFileState::NotARef`].
-#[cfg(feature = "receive")]
 fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
-    let stat = match rustix::fs::statat(dir, relpath, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => stat,
-        Err(Errno::NOENT) => return Ok(RefFileState::Absent),
-        Err(Errno::NOTDIR) => return Ok(RefFileState::NotARef),
-        Err(e) => return Err(e.into()),
-    };
-    match FileType::from_raw_mode(stat.st_mode) {
-        FileType::Symlink => return Ok(RefFileState::Alias),
-        FileType::RegularFile => {}
-        _ => return Ok(RefFileState::NotARef),
+    if let Some(state) = lstat_ref_state(dir, relpath)? {
+        return Ok(state);
     }
     let fd = match rustix::fs::openat(
         dir,

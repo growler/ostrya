@@ -3007,11 +3007,12 @@ version. The pull over HTTP sends no version message.
 ## Configuration keys of the port
 
 The `[ex-ostrya]` group, the server group, the client groups, the trust
-groups, the key groups, and eight keys of a `[remote "NAME"]` group are
-extensions of the port. The eight keys are `push-url`, `ssh-command`,
-`receive-command`, `push-token-file`, `push-user`, `pull-url`,
-`send-command`, and `trust`. The `ostree` tool defines none of them and reads
-none.
+groups, the key groups, and 14 keys of a `[remote "NAME"]` group are
+extensions of the port. The 14 keys are `push-url`, `push-branches`,
+`ssh-command`, `receive-command`, `push-token-file`, `push-user`,
+`pull-url`, `send-command`, `mirrored-collection-ids`, `trust`,
+`s3-region`, `s3-endpoint`, `s3-addressing`, and `s3-profile`. The `ostree`
+tool defines none of them and reads none.
 `ostrya-config(1)` states each key, its type, its default, its precedence,
 each refusal, and the operations that read it. "EXTENSION KEYS" and "CLIENT
 AND SERVER GROUPS" state the groups, and "REMOTE KEYS" states the keys of a

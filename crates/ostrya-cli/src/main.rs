@@ -626,6 +626,16 @@ enum Command {
     /// The push also sends the dependencies that field 2 of each pushed commit
     /// names, each with no parent and no ref, unless it takes --onto.
     ///
+    /// With no refspec, the command reads the key `push-branches` of the
+    /// section of REMOTE, a list of ref patterns. It lists each local ref and
+    /// each ref under `refs/mirrors/ID/`, and for each ref that the list
+    /// selects, it sends the commit that the listing read to the ref of the
+    /// same name: the local refs by name, then the collection refs by id and
+    /// name. A remote ref is never sent. If no ref matches, the command
+    /// writes a message to standard error and exits 0.
+    /// Without the key, with an address, or with --onto, a refspec is
+    /// required. ostrya-config(1) states the key.
+    ///
     /// On success, standard output carries one line for each ref, in the order
     /// of the refspecs and then of the tags. A line holds the DST name, the
     /// old state, and the new state. The old state is a full commit checksum,
@@ -4893,7 +4903,8 @@ struct PushArgs {
     /// address, the push writes the bucket repository at that address. A
     /// build without the feature `s3` refuses an `s3://` address.
     remote: Option<String>,
-    /// The refspecs, each `SRC[:DST]`. At least one refspec is required.
+    /// The refspecs, each `SRC[:DST]`. At least one refspec is required,
+    /// unless the section of REMOTE has the key `push-branches`.
     ///
     /// SRC is a revision of this repository, and DST is the ref of the server
     /// that takes its commit: a local ref NAME, or @ID:NAME, the ref NAME of
@@ -6262,9 +6273,24 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         exit_with_error(name, "REMOTE must be specified");
     };
     let remote = remote.as_str();
-    if args.refspecs.is_empty() {
-        exit_with_error(name, "REFSPEC must be specified");
-    }
+    // With no refspec, `push-branches` of the section of a remote names the
+    // refs. An address has no section, and `--onto` takes one REF.
+    let push_branches = if args.refspecs.is_empty() {
+        let selector = if args.onto.is_none() && !ostrya::is_push_address(remote) {
+            match repo.config().remote(remote) {
+                Some(section) => section.push_branches()?,
+                None => None,
+            }
+        } else {
+            None
+        };
+        let Some(selector) = selector else {
+            exit_with_error(name, "REFSPEC must be specified");
+        };
+        Some(selector)
+    } else {
+        None
+    };
     // The id is one name under `refs/mirrors/` on the server, and a file
     // system takes a name of 255 bytes at most.
     if let Some(id) = &args.collection
@@ -6284,6 +6310,13 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
                  one",
                 ostrya::remote::without_userinfo(remote)
             ));
+        }
+    }
+    if let Some(selector) = push_branches {
+        args.refspecs = push_branch_refspecs(&repo, &selector).await?;
+        if args.refspecs.is_empty() {
+            eprintln!("no ref matches [remote \"{remote}\"] push-branches");
+            return Ok(());
         }
     }
     if args.onto.is_some() {
@@ -6357,6 +6390,41 @@ fn parse_refs(texts: &[String]) -> Result<Vec<Ref>> {
         .iter()
         .map(|text| text.parse::<Ref>())
         .collect::<std::result::Result<_, _>>()?)
+}
+
+/// Returns the refspecs of a push that names no ref: each local ref and each
+/// ref under `refs/mirrors/ID/` that `selector` selects.
+///
+/// Each refspec is `CHECKSUM:NAME` or `CHECKSUM:@ID:NAME`, with the commit
+/// that the listing read for the ref. The push then does not resolve the
+/// name again, so a name of hex characters is not read as a checksum.
+///
+/// The local refs come first, by name, and then the collection refs, by id
+/// and name. The own collection id and an id that is not valid are skipped.
+/// The result names no remote ref.
+#[cfg(feature = "push")]
+async fn push_branch_refspecs(
+    repo: &Repo,
+    selector: &ostrya::ReceiveSelector,
+) -> Result<Vec<String>> {
+    let own = repo.config().collection_id();
+    let mut refspecs = Vec::new();
+    for (name, checksum) in repo.list_refs(None).await? {
+        let r = Ref::local(name);
+        if selector.matches(&r, own) {
+            refspecs.push(format!("{checksum}:{r}"));
+        }
+    }
+    let mut mirrors = repo.list_mirror_refs().await?;
+    mirrors.retain(|(id, _, _)| Some(id.as_str()) != own && ostrya::is_valid_collection_id(id));
+    mirrors.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+    for (id, name, checksum) in mirrors {
+        let r = Ref::collection(id, name);
+        if selector.matches(&r, own) {
+            refspecs.push(format!("{checksum}:{r}"));
+        }
+    }
+    Ok(refspecs)
 }
 
 /// Pushes the tree of the commit of one revision to a remote over ssh or

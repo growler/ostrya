@@ -681,20 +681,7 @@ impl RepoConfig {
     ///
     /// [`PruneOptions::weak_ref_filter`]: crate::PruneOptions::weak_ref_filter
     pub fn gc_weak_references(&self) -> Result<Option<ReceiveSelector>> {
-        let Some(entries) = self
-            .keyfile
-            .get_string_list(EX_OSTRYA, "gc-weak-references")?
-        else {
-            return Ok(None);
-        };
-        ReceiveSelector::parse(entries.iter().map(String::as_str))
-            .map(Some)
-            .map_err(|err| match err {
-                Error::InvalidFormat(m) => {
-                    Error::InvalidFormat(format!("[{EX_OSTRYA}] gc-weak-references: {m}"))
-                }
-                other => other,
-            })
+        read_selector(&self.keyfile, EX_OSTRYA, "gc-weak-references")
     }
 
     /// Returns `true` if a ref change regenerates the summary.
@@ -1216,6 +1203,38 @@ impl Remote<'_> {
         self.string("push-url")
     }
 
+    /// Returns the selector of the refs that a push with no refspec sends, or
+    /// `None` if the key is absent.
+    ///
+    /// The key is `push-branches`, and it is an ostrya extension. The value is
+    /// a `;` list of ref patterns, the entries of a `ReceiveSelector`. An
+    /// entry has one of these forms, with `*` and `**` in the name part:
+    ///
+    /// - `NAME` -- the local refs that `NAME` matches.
+    /// - `REMOTE:NAME` -- the refs of the remote `REMOTE` that `NAME`
+    ///   matches.
+    /// - `@ID:NAME` -- the refs of the collection `ID` that `NAME` matches.
+    ///
+    /// An entry that starts with `!` is an exclusion. The selector selects a
+    /// ref when a positive entry matches it, and no exclusion matches it. If
+    /// the list has no positive entry, each ref that no exclusion matches is
+    /// selected. Thus an empty value selects each ref. The order of the
+    /// entries has no effect. Pass the `[core] collection-id` of the
+    /// repository as `own` to `ReceiveSelector::matches`: `@OWN:NAME` then
+    /// matches the local ref `NAME`.
+    ///
+    /// `Repo::push` reads no config key for its refs.
+    /// The `ostrya push` command reads this key when it gets no refspec.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if an entry is not a valid ref pattern. The
+    ///   text names the section, the key, and the entry.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn push_branches(&self) -> Result<Option<ReceiveSelector>> {
+        read_selector(self.keyfile, &self.group, "push-branches")
+    }
+
     /// Returns the `ssh-command` key: the ssh command line of this remote.
     ///
     /// A push to this remote and a pull over ssh from it run this command. The
@@ -1438,6 +1457,20 @@ pub fn check_mirrored_collection_ids(own: Option<&str>, ids: Vec<String>) -> Res
         }
     }
     Ok(out)
+}
+
+/// Reads the `;` list of ref patterns of `[group] key`, or `None` if the key
+/// is absent. The error text of a bad entry names the group and the key.
+fn read_selector(keyfile: &KeyFile, group: &str, key: &str) -> Result<Option<ReceiveSelector>> {
+    let Some(entries) = keyfile.get_string_list(group, key)? else {
+        return Ok(None);
+    };
+    ReceiveSelector::parse(entries.iter().map(String::as_str))
+        .map(Some)
+        .map_err(|err| match err {
+            Error::InvalidFormat(m) => Error::InvalidFormat(format!("[{group}] {key}: {m}")),
+            other => other,
+        })
 }
 
 /// Returns the key-file group name of a remote: `remote "<name>"`.
@@ -1782,6 +1815,50 @@ mod tests {
         assert!(
             matches!(&err, Error::InvalidFormat(m)
                 if m.contains("[ex-ostrya] gc-weak-references")
+                    && m.contains("malformed receive pattern")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn push_branches_is_none_when_absent() {
+        let cfg = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=bare\n[remote \"origin\"]\nurl=http://a/\n",
+        )
+        .unwrap();
+        let origin = cfg.remote("origin").unwrap();
+        assert!(origin.push_branches().unwrap().is_none());
+    }
+
+    #[test]
+    fn push_branches_reads_a_pattern_list() {
+        let read = |value: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode=bare\n[remote \"origin\"]\n\
+                 url=http://a/\npush-branches={value}\n"
+            ))
+            .unwrap()
+            .remote("origin")
+            .unwrap()
+            .push_branches()
+        };
+        let sel = read("apps/**;!apps/b;@org.example.X:**;@org.example.Own:**")
+            .unwrap()
+            .unwrap();
+        let own = Some("org.example.Own");
+        assert!(sel.matches(&Ref::local("apps/a"), own));
+        assert!(!sel.matches(&Ref::local("apps/b"), own));
+        assert!(sel.matches(&Ref::local("main"), own));
+        assert!(sel.matches(&Ref::collection("org.example.X", "main"), own));
+        assert!(!sel.matches(&Ref::collection("org.example.Y", "main"), own));
+
+        let empty = read("").unwrap().unwrap();
+        assert!(empty.matches(&Ref::local("main"), None));
+
+        let err = read("apps/**;r*:x").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m.contains("[remote \"origin\"] push-branches")
                     && m.contains("malformed receive pattern")),
             "{err}"
         );

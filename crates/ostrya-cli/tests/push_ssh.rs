@@ -1407,6 +1407,167 @@ mod cli {
         assert_eq!(server_tip(&dest, "main"), None);
     }
 
+    /// Appends the section `[remote "origin"]` to the config of the client,
+    /// with the push address of `dest` and the lines of `keys`.
+    fn add_origin(setup: &Setup, dest: &Path, keys: &str) {
+        let config = setup.client.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(&format!(
+            "\n[remote \"origin\"]\npush-url={}\n{keys}",
+            address(dest)
+        ));
+        std::fs::write(&config, text).unwrap();
+    }
+
+    /// Runs `ostrya push` on the client over the stand-in to the remote
+    /// `origin`, with `args` after the remote name.
+    fn push_origin(setup: &Setup, args: &[&str]) -> Output {
+        let ssh = setup.ssh_command();
+        let receive = receive_command();
+        let mut all = vec![ssh.as_str(), receive.as_str(), "origin"];
+        all.extend_from_slice(args);
+        setup.push(&all, &[])
+    }
+
+    /// With no refspec, the push sends each local ref that `push-branches`
+    /// selects, in the order of the names, and no other ref.
+    #[test]
+    fn a_push_with_no_refspec_sends_the_push_branches() {
+        let setup = Setup::new("cli-push-branches", "archive");
+        let a = setup.commit("apps/a", FILES, &[]);
+        let b = setup.commit("apps/b", FILES, &[]);
+        let main = setup.commit("main", FILES, &[]);
+        let other = setup.commit("other", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=apps/**;main\n");
+        let out = push_origin(&setup, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(
+            stdout(&out),
+            format!("apps/a (new) {a}\napps/b (new) {b}\nmain (new) {main}\n")
+        );
+        assert_eq!(server_tip(&dest, "apps/a"), Some(a));
+        assert_eq!(server_tip(&dest, "apps/b"), Some(b));
+        assert_eq!(server_tip(&dest, "main"), Some(main));
+        assert_eq!(server_tip(&dest, "other"), None);
+        assert!(!server_has_commit(&dest, &other));
+    }
+
+    /// A ref whose name is a hex prefix of another commit checksum goes to
+    /// the server with its own commit.
+    #[test]
+    fn push_branches_sends_a_hex_ref_name_with_its_own_commit() {
+        let setup = Setup::new("cli-push-branches-hex", "archive");
+        let main = setup.commit("main", FILES, &[]);
+        let branch = main.to_hex()[..4].to_owned();
+        let own = setup.commit(&branch, &[("a", "other\n")], &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, &format!("push-branches={branch}\n"));
+        let out = push_origin(&setup, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("{branch} (new) {own}\n"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("refs/heads").join(&branch)).unwrap(),
+            format!("{own}\n")
+        );
+        assert!(!server_has_commit(&dest, &main));
+    }
+
+    /// Without `push-branches`, and with `--onto`, a push with no refspec
+    /// fails with the usage text before it starts ssh.
+    #[test]
+    fn a_push_with_no_refspec_needs_push_branches() {
+        let setup = Setup::new("cli-push-branches-absent", "archive");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "");
+        let out = push_origin(&setup, &[]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(err.ends_with("error: REFSPEC must be specified\n"), "{err}");
+        assert!(!setup.ssh_started());
+
+        // The section of `origin` is the last section of the config.
+        let config = setup.client.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("push-branches=main\n");
+        std::fs::write(&config, text).unwrap();
+        let out = push_origin(&setup, &["--onto=main"]);
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(stdout(&out), "");
+        let err = stderr(&out);
+        assert!(err.ends_with("error: REFSPEC must be specified\n"), "{err}");
+        assert!(!setup.ssh_started());
+    }
+
+    /// An exclusion of `push-branches` keeps a ref out of the push.
+    #[test]
+    fn an_exclusion_of_push_branches_keeps_a_ref_out() {
+        let setup = Setup::new("cli-push-branches-exclusion", "archive");
+        let a = setup.commit("apps/a", FILES, &[]);
+        setup.commit("apps/b", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=apps/**;!apps/b\n");
+        let out = push_origin(&setup, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("apps/a (new) {a}\n"));
+        assert_eq!(server_tip(&dest, "apps/a"), Some(a));
+        assert_eq!(server_tip(&dest, "apps/b"), None);
+    }
+
+    /// `push-branches` selects a collection ref of the client, and the push
+    /// writes it under `refs/mirrors/ID/` of the server.
+    #[test]
+    fn push_branches_selects_a_collection_ref() {
+        let setup = Setup::new("cli-push-branches-collection", "archive");
+        setup.commit("main", FILES, &[]);
+        let a = setup.commit("@org.example.A:a", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:@org.example.A:**");
+        add_origin(&setup, &dest, "push-branches=@org.example.A:**\n");
+        let out = push_origin(&setup, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("@org.example.A:a (new) {a}\n"));
+        assert_eq!(
+            std::fs::read_to_string(dest.join("refs/mirrors/org.example.A/a")).unwrap(),
+            format!("{a}\n")
+        );
+        assert_eq!(server_tip(&dest, "main"), None);
+    }
+
+    /// With no ref that `push-branches` selects, the push writes one line to
+    /// standard error, exits 0, and does not start ssh.
+    #[test]
+    fn push_branches_with_no_match_exits_0() {
+        let setup = Setup::new("cli-push-branches-nomatch", "archive");
+        setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=nomatch/**\n");
+        let out = push_origin(&setup, &[]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "no ref matches [remote \"origin\"] push-branches\n"
+        );
+        assert!(!setup.ssh_started());
+    }
+
+    /// A malformed `push-branches` fails the push before it starts ssh.
+    #[test]
+    fn a_malformed_push_branches_fails_before_ssh_starts() {
+        let setup = Setup::new("cli-push-branches-bad", "archive");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=r*:x\n");
+        let out = push_origin(&setup, &[]);
+        assert_failed(
+            &out,
+            "error: invalid format: [remote \"origin\"] push-branches: malformed receive \
+             pattern 'r*:x'",
+        );
+        assert!(!setup.ssh_started());
+    }
+
     /// With no remote the push fails with the usage text before it starts
     /// ssh.
     #[test]

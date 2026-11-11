@@ -54,6 +54,10 @@ pub struct RepoPushOptions {
     /// This rule also applies to the name part of a `DST` `@OWN:NAME`, where
     /// `OWN` is the collection id of the server, because the server keeps
     /// that ref at `refs/heads/NAME`. A delete can name such a `DST`.
+    ///
+    /// [`Repo::push`] reads no config key for this list. The `ostrya push`
+    /// command fills the list from the key `push-branches` of the remote
+    /// when the command line gives no refspec.
     pub refspecs: Vec<String>,
     /// The depth of the parent chain that the push reads for each source
     /// commit.

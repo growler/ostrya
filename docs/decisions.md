@@ -3891,6 +3891,44 @@ These alternatives were rejected:
   parses the names and reads the own collection id of the server to
   compare `main` with `@OWN:main`.
 
+## The refs of a push with no refspec
+
+The key `push-branches` of a `[remote "NAME"]` section is a list of ref
+patterns, which `Remote::push_branches` reads as a `ReceiveSelector`. The
+rules:
+
+- The `ostrya push` command reads the key when the command line gives no
+  refspec. A refspec on the command line has precedence, so a bad value
+  does not block it. `--onto` and an address do not read the key, and a
+  refspec is then still required.
+- `Repo::push` reads no config key for its refs. The command fills
+  `RepoPushOptions::refspecs` from the key.
+- The command lists the local refs and the refs under `refs/mirrors/ID/`,
+  and keeps each ref that the selector selects, with the
+  `[core] collection-id` of the repository as the own id. The list skips
+  the own id and each id that is not valid. Each match goes to the push as
+  the refspec `CHECKSUM:NAME` or `CHECKSUM:@ID:NAME`, with the commit that
+  the listing read: the local refs by name, and then the collection refs by
+  id and name. An alias is a match like each other ref. A refusal of one
+  match by the server fails the whole push.
+- With no match, the command writes a line to standard error, writes
+  nothing to standard output, exits 0, and opens no connection. The ref
+  listing and this check come after the checks of `--collection` and of the
+  S3 options, and before the push address resolves.
+
+These alternatives were rejected:
+
+- A read of `push-branches` in `Repo::push`. A library caller then cannot
+  give a list of refs that the key does not change.
+- A refspec of the name alone. The push resolves the name again, and a
+  revision of lowercase hex characters reads as an abbreviated checksum
+  first. A ref such as `cafe` then resolves to a commit whose checksum
+  starts with `cafe`, and the push fails because a checksum source needs a
+  destination.
+- A listing of the remote refs that are collection refs. The key selects
+  the refs of the local repository. A ref under `refs/remotes/` is the copy
+  of a ref that a pull from another remote wrote.
+
 ## The ref check of a transaction commit
 
 `Transaction::commit` writes the queued refs one by one, each with a temp

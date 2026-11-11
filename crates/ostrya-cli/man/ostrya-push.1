@@ -18,6 +18,8 @@ With \%\-\-onto, the push sends the tree of one local commit, and the server mak
 .PP
 The push also sends the dependencies that field \%2 of each pushed commit names, each with no parent and no ref, unless it takes \%\-\-onto.
 .PP
+With no refspec, the command reads the key \fB\%push\-branches\fR of the section of REMOTE, a list of ref patterns. It lists each local ref and each ref under \fB\%refs/mirrors/ID/\fR, and for each ref that the list selects, it sends the commit that the listing read to the ref of the same name: the local refs by name, then the collection refs by id and name. A remote ref is never sent. If no ref matches, the command writes a message to standard error and exits \%0. Without the key, with an address, or with \%\-\-onto, a refspec is required. \%ostrya\-config(1) states the key.
+.PP
 On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&. With \%\-\-onto, standard output carries the checksum of the new commit alone.
 .PP
 Under \%\-\-verbose, one statistics line goes to standard error. If standard error is a terminal and \fB\%TERM\fR is set and is not \fB\%dumb\fR, standard error shows a progress bar while the push runs. A push to a bucket repository shows no bar while it lists the bucket and walks the commits. With \%\-\-break\-lock, a push that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
@@ -31,7 +33,7 @@ A value with a \fB\%:\fR or a \fB\%/\fR is an address: \fB\%ssh://[USER@]HOST[:P
 To an ssh address, the push runs the ssh client with the receive command on the remote side. To an HTTP address, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&. To an \fB\%s3://\fR address, the push writes the bucket repository at that address. A build without the feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .TP
 \fIREFSPECS...\fR
-The refspecs, each \fB\%SRC[:DST]\fR\&. At least one refspec is required.
+The refspecs, each \fB\%SRC[:DST]\fR\&. At least one refspec is required, unless the section of REMOTE has the key \fB\%push\-branches\fR\&.
 .IP
 SRC is a revision of this repository, and DST is the ref of the server that takes its commit: a local ref NAME, or \%@ID:NAME, the ref NAME of the collection ID. If SRC is a ref, DST defaults to the text of SRC. A SRC that is a checksum, or that has a \fB\%^\fR suffix, needs a DST. \fB\%:DST\fR deletes the ref DST of the server.
 .IP

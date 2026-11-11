@@ -5698,7 +5698,17 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
   With no refspec it writes the usage text and `error: REFSPEC must be
   specified`. Both exit 1. No ssh client starts, and no HTTP request is
-  sent.
+  sent. A remote whose section has the key `push-branches` is the exception
+  to the second refusal, when the command has no `--onto`.
+- With no refspec, the command reads the key `push-branches` of the section
+  of `REMOTE`, a port extension (`ostrya-config(1)`, "REMOTE KEYS", and
+  `../decisions.md`, "The refs of a push with no refspec"). It lists each
+  local ref and each ref under `refs/mirrors/ID/`. For each ref that the
+  list selects, it sends the commit that the listing read to the ref of the
+  same name on the server. With no match, it writes `no ref matches
+  [remote "NAME"] push-branches` to standard error and nothing to standard
+  output, exits 0, and starts no ssh client. A malformed value fails at
+  exit 1 before the push connects.
 - The push then resolves `REMOTE` and makes the transport ready, before it
   reads `--depth` and the refspecs. It refuses an option of the other
   transport and a bad HTTP option. It reads the token file of an HTTP push,

@@ -393,6 +393,31 @@ If this key is absent and \fB\%url\fR does not start with \fB\%http://\fR or \fB
 The bucket repository needs a \fB\%config\fR first, which \fB\%ostrya remote init\fR writes.
 \fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, \fB\%ostrya remote prune\fR, and \fB\%ostrya remote summary \-u\fR take the \fB\%s3://\fR address of this key, else the \fB\%s3://\fR address of \fB\%pull\-url\fR.
 .TP
+\fB\%push\-branches\fR (list)
+The refs that \fB\%ostrya push\fR sends to the remote when the command line gives no refspec.
+The command lists each local ref and each ref under \fB\%refs/mirrors/ID/\fR.
+For each ref that the list selects, it sends the commit that the listing read to the ref of the same name on the remote.
+It sends the local refs in the order of their names, and then the collection refs in the order of their ids and names.
+A remote ref is never sent.
+.IP
+The value is a list of ref patterns, separated by \fB\%;\fR.
+A pattern has one of these forms:
+\fB\%NAME\fR, a local ref;
+\fB\%REMOTE:NAME\fR, a ref of the remote \fB\%REMOTE\fR;
+\fB\%@ID:NAME\fR, a ref of the collection \fB\%ID\fR.
+In \fB\%NAME\fR, a part \fB\%*\fR matches one part of a ref name, and a part \fB\%**\fR matches one or more parts.
+A pattern that starts with \fB\%!\fR is an exclusion.
+A ref is selected when a pattern with no \fB\%!\fR matches it, and no exclusion matches it.
+If the list has no pattern without \fB\%!\fR, each ref that no exclusion matches is selected.
+Thus an empty value selects each ref.
+The order of the patterns has no effect.
+The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id matches the local ref \fB\%NAME\fR.
+.IP
+If no ref matches, \fB\%ostrya push\fR writes a message to standard error, writes nothing to standard output, and exits 0.
+A malformed pattern stops the push before it connects.
+A refspec on the command line has precedence over the key, and the push then does not read it.
+\fB\%ostrya push \-\-onto\fR and a push to an address do not read the key.
+.TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.
 For a push, \fB\%\-\-ssh\-command\fR and \fB\%OSTRYA_SSH_COMMAND\fR have precedence over it.

@@ -11216,6 +11216,8 @@ fn refs_whole_remote_prefix_matches_the_tool() {
     // left. `origin:rr` empties the remote, so the whole-remote prefix after
     // it matches nothing, and the command exits 0. If a prefix empties part of
     // the remote, the whole-remote prefix matches the rest and is refused.
+    // The port refuses a delete without `-A` that selects an alias, so these
+    // clones hold no alias.
     for (args, name) in [
         (vec!["refs", "--delete", "origin:rr", "origin:"], "emptied"),
         (
@@ -11225,6 +11227,9 @@ fn refs_whole_remote_prefix_matches_the_tool() {
     ] {
         let port = clone_repo(base, &repo, &format!("live-port-{name}"));
         let tool = clone_repo(base, &repo, &format!("live-tool-{name}"));
+        for clone in [&port, &tool] {
+            std::fs::remove_file(clone.join("refs/remotes/origin/rr/remal")).unwrap();
+        }
         assert_agrees(&port, &tool, &args);
         assert_eq!(
             describe_refs(&port),
@@ -11570,9 +11575,9 @@ fn refs_delete_alias_guard_matches_the_tool() {
     // - the ref that the link resolves to, which its body does not name
     //   (`test/other`, where `test/al2 -> other`)
     // - a remote ref that two aliases name, one in each body form
-    // - an alias that no alias names
-    // - an alias that the prefix before it freed, because the alias set is
-    //   read as the prefixes before it left it
+    // - with `-A`, an alias that no alias names
+    // - with `-A`, an alias that the prefix before it freed, because the
+    //   alias set is read as the prefixes before it left it
     for (name, args, gone) in [
         (
             "link-resolves-here",
@@ -11586,12 +11591,12 @@ fn refs_delete_alias_guard_matches_the_tool() {
         ),
         (
             "alias-nothing-names",
-            vec!["refs", "--delete", "ral"],
+            vec!["refs", "-A", "--delete", "ral"],
             vec!["refs/heads/ral"],
         ),
         (
             "alias-then-its-target",
-            vec!["refs", "--delete", "alal", "test/al"],
+            vec!["refs", "-A", "--delete", "alal", "test/al"],
             vec!["refs/heads/alal", "refs/heads/test/al"],
         ),
     ] {
@@ -11611,6 +11616,39 @@ fn refs_delete_alias_guard_matches_the_tool() {
                 args.join(" "),
             );
         }
+    }
+
+    // Without `-A`, the tool removes an alias outside the guard. The port
+    // refuses the alias before the first removal and removes no ref.
+    for (name, args, alias) in [
+        (
+            "alias-nothing-names",
+            vec!["refs", "--delete", "ral"],
+            "ral",
+        ),
+        (
+            "alias-then-its-target",
+            vec!["refs", "--delete", "alal", "test/al"],
+            "alal",
+        ),
+    ] {
+        let port = clone_repo(base, &repo, &format!("plain-port-{name}"));
+        let tool = clone_repo(base, &repo, &format!("plain-tool-{name}"));
+        let before = describe_refs(&port);
+        let (port_run, tool_run) = run_both(&port, &tool, &args);
+        refused_with_message(
+            &port_run,
+            &format!("ref not writable: {alias}: names an alias"),
+        );
+        assert_eq!(describe_refs(&port), before, "the port removed a ref");
+        assert_eq!(tool_run.status.code(), Some(0), "{name}");
+        assert!(
+            tool.join("refs/heads")
+                .join(alias)
+                .symlink_metadata()
+                .is_err(),
+            "the tool kept {alias}",
+        );
     }
 
     // A prefix that matches more than one guarded ref: both commands refuse,
@@ -11670,9 +11708,10 @@ fn refs_delete_alias_guard_matches_the_tool() {
     }
     assert!(port.join("refs/heads/test/other").exists());
 
-    // With `-c`, the guard does not apply: the refs of the collection are
-    // removed, and the aliases among them too. The same repository refuses the
-    // same ref without `-c`.
+    // With `-c`, the guard does not apply. The tool removes the refs of the
+    // collection and the aliases among them. The port refuses the alias and
+    // removes no ref. The same repository refuses the same ref without `-c`
+    // in both.
     let coll = base.join("coll");
     ostrya(
         &[
@@ -11693,19 +11732,18 @@ fn refs_delete_alias_guard_matches_the_tool() {
     std::os::unix::fs::symlink("../test/main", coll.join("refs/heads/test/al")).unwrap();
     let port = clone_repo(base, &coll, "coll-port");
     let tool = clone_repo(base, &coll, "coll-tool");
-    assert_agrees(
+    let before = describe_refs(&port);
+    let (port_run, tool_run) = run_both(
         &port,
         &tool,
         &["refs", "-c", "--delete", "org.example.Coll"],
     );
-    assert_eq!(
-        describe_refs(&port),
-        describe_refs(&tool),
-        "the two collection deletes left different refs trees",
-    );
+    refused_with_message(&port_run, "ref not writable: test/al: names an alias");
+    assert_eq!(describe_refs(&port), before, "the port removed a ref");
+    assert_eq!(tool_run.status.code(), Some(0));
     assert!(
-        port.join("refs/heads/test/al").symlink_metadata().is_err(),
-        "the `-c` delete kept the alias",
+        tool.join("refs/heads/test/al").symlink_metadata().is_err(),
+        "the tool kept the alias",
     );
     let port = clone_repo(base, &coll, "coll-plain-port");
     let tool = clone_repo(base, &coll, "coll-plain-tool");
@@ -12083,9 +12121,9 @@ fn refs_delete_aliases_matches_the_tool() {
         "the tool kept the local ref its own name reached",
     );
 
-    // `-c` wins over `-A` in each order, so both commands remove the refs of
-    // the collection and the aliases among them. The repository has no mirror
-    // ref, so the two trees compare without the own-collection-id divergence.
+    // `-c` wins over `-A` in each order. The tool removes the refs of the
+    // collection and the aliases among them. The port refuses the alias, as
+    // a `-c --delete` does, and removes no ref.
     let coll = base.join("coll");
     ostrya(
         &[
@@ -12115,23 +12153,18 @@ fn refs_delete_aliases_matches_the_tool() {
     ] {
         let port = clone_repo(base, &coll, &format!("coll-sel-port-{name}"));
         let tool = clone_repo(base, &coll, &format!("coll-sel-tool-{name}"));
-        assert_agrees(&port, &tool, &args);
-        assert_eq!(
-            describe_refs(&port),
-            describe_refs(&tool),
-            "`{}` left different refs trees",
-            args.join(" "),
-        );
-        assert!(
-            port.join("refs/heads/test/al").symlink_metadata().is_err(),
-            "`{}` kept the alias",
-            args.join(" "),
-        );
-        assert!(
-            port.join("refs/heads/other").symlink_metadata().is_err(),
-            "`{}` kept a ref",
-            args.join(" "),
-        );
+        let before = describe_refs(&port);
+        let (port_run, tool_run) = run_both(&port, &tool, &args);
+        refused_with_message(&port_run, "ref not writable: test/al: names an alias");
+        assert_eq!(describe_refs(&port), before, "the port removed a ref");
+        assert_eq!(tool_run.status.code(), Some(0), "{name}");
+        for path in ["refs/heads/test/al", "refs/heads/other"] {
+            assert!(
+                tool.join(path).symlink_metadata().is_err(),
+                "the tool kept {path} for `{}`",
+                args.join(" "),
+            );
+        }
     }
 }
 
@@ -12167,11 +12200,12 @@ fn build_own_collection_repo(base: &Path) -> PathBuf {
 }
 
 /// If the id of `refs -c --delete` is the `collection-id` of the repository,
-/// the command removes the refs under `refs/heads` and the aliases among them.
-/// It keeps the mirror refs with that id. A foreign id removes the mirror refs
-/// that it names. The `-c` listing of the tool prints the mirror refs of the
-/// own id, and the listing of the port leaves them out. The other rows of the
-/// listing and each removal agree.
+/// the command removes the refs under `refs/heads`. It keeps the mirror refs
+/// with that id. A foreign id removes the mirror refs that it names. The `-c`
+/// listing of the tool prints the mirror refs of the own id, and the listing
+/// of the port leaves them out. The other rows of the listing agree. The tool
+/// also removes the aliases under `refs/heads`, and the port refuses an alias
+/// and removes no ref. Each other removal agrees.
 #[test]
 fn refs_delete_collection_own_id_matches_the_tool() {
     if !ostree_available() {
@@ -12208,22 +12242,31 @@ fn refs_delete_collection_own_id_matches_the_tool() {
     }
     assert_agrees(&repo, &repo, &["refs", "-c", "org.example.Other"]);
 
-    for (name, args, gone, kept) in [
-        (
-            "own-id",
-            vec!["refs", "-c", "--delete", "org.example.Coll"],
-            vec![
-                "refs/heads/other",
-                "refs/heads/test/main",
-                "refs/heads/test/other",
-                "refs/heads/test/al",
-            ],
-            vec![
-                "refs/mirrors/org.example.Coll/mm",
-                "refs/mirrors/org.example.Coll/deep/x",
-                "refs/mirrors/org.example.Other/om",
-            ],
-        ),
+    // The own id selects the alias `test/al`. The tool removes it with the
+    // refs, and the port refuses it before the first removal.
+    let args = ["refs", "-c", "--delete", "org.example.Coll"];
+    let port = clone_repo(base, &repo, "own-port-own-id");
+    let tool = clone_repo(base, &repo, "own-tool-own-id");
+    let before = describe_refs(&port);
+    let (port_run, tool_run) = run_both(&port, &tool, &args);
+    refused_with_message(&port_run, "ref not writable: test/al: names an alias");
+    assert_eq!(describe_refs(&port), before, "the port removed a ref");
+    assert_eq!(tool_run.status.code(), Some(0), "own-id");
+    for path in [
+        "refs/heads/other",
+        "refs/heads/test/main",
+        "refs/heads/test/al",
+    ] {
+        assert!(
+            tool.join(path).symlink_metadata().is_err(),
+            "the tool kept {path} for `{}`",
+            args.join(" "),
+        );
+    }
+
+    // The port refuses a `-c --delete` that selects an alias, so the clones of
+    // the cases that select the own id hold no alias.
+    for (name, args, drop_alias, gone, kept) in [
         (
             "own-id-twice",
             vec![
@@ -12233,7 +12276,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
                 "org.example.Coll",
                 "org.example.Coll",
             ],
-            vec!["refs/heads/other", "refs/heads/test/al"],
+            true,
+            vec!["refs/heads/other"],
             vec![
                 "refs/mirrors/org.example.Coll/mm",
                 "refs/mirrors/org.example.Coll/deep/x",
@@ -12242,6 +12286,7 @@ fn refs_delete_collection_own_id_matches_the_tool() {
         (
             "foreign-id",
             vec!["refs", "-c", "--delete", "org.example.Other"],
+            false,
             vec!["refs/mirrors/org.example.Other/om"],
             vec![
                 "refs/heads/other",
@@ -12258,11 +12303,8 @@ fn refs_delete_collection_own_id_matches_the_tool() {
                 "org.example.Coll",
                 "org.example.Other",
             ],
-            vec![
-                "refs/heads/other",
-                "refs/heads/test/al",
-                "refs/mirrors/org.example.Other/om",
-            ],
+            true,
+            vec!["refs/heads/other", "refs/mirrors/org.example.Other/om"],
             vec![
                 "refs/mirrors/org.example.Coll/mm",
                 "refs/mirrors/org.example.Coll/deep/x",
@@ -12271,12 +12313,18 @@ fn refs_delete_collection_own_id_matches_the_tool() {
         (
             "absent-id",
             vec!["refs", "-c", "--delete", "org.example.Absent"],
+            false,
             vec![],
             vec!["refs/heads/other", "refs/mirrors/org.example.Coll/mm"],
         ),
     ] {
         let port = clone_repo(base, &repo, &format!("own-port-{name}"));
         let tool = clone_repo(base, &repo, &format!("own-tool-{name}"));
+        if drop_alias {
+            for clone in [&port, &tool] {
+                std::fs::remove_file(clone.join("refs/heads/test/al")).unwrap();
+            }
+        }
         assert_agrees(&port, &tool, &args);
         assert_eq!(
             describe_refs(&port),
@@ -13804,7 +13852,8 @@ fn checksum_case_matches_the_tool() {
         &["refs", "--delete", &upper],
         &format!("error: Ref '{upper}' has an active alias: 'al'"),
     );
-    assert_agrees(&port_repo, &tool_repo, &["refs", "--delete", "al", &upper]);
+    assert_agrees(&port_repo, &tool_repo, &["refs", "-A", "--delete", "al"]);
+    assert_agrees(&port_repo, &tool_repo, &["refs", "--delete", &upper]);
     same_refs(
         &port_repo,
         &tool_repo,
@@ -48248,6 +48297,62 @@ fn refs_alias_refuses_a_collection_ref() {
             .stdout_trimmed(),
         "al -> main"
     );
+}
+
+/// A ref write or a ref removal at the path of an alias is refused, and the
+/// link and its target stay: `refs --create=al --force main`, `commit -b al`,
+/// `refs --delete al`, and `refs -c --delete OWN`. `refs --delete origin:rr`
+/// refuses the remote alias `origin:rr/remal` in the same way. `refs -A
+/// --delete al` removes the alias and keeps its target.
+#[test]
+fn ref_writes_refuse_an_alias() {
+    let tmp = TmpDir::new("refs-write-alias");
+    let base = tmp.path();
+    let (repo, main) = own_repo_with_main(base);
+    ostrya_at(&repo, &["refs", "-A", "--create=al", "main"]).ok();
+    let alias = repo.join("refs/heads/al");
+    let refs = describe_refs(&repo);
+    assert!(refs.contains(&"heads/al -> main".to_owned()), "{refs:?}");
+
+    let src = base.join("src");
+    let repo_arg = format!("--repo={}", repo.display());
+    for run in [
+        ostrya_at(&repo, &["refs", "--create=al", "--force", "main"]),
+        ostrya(
+            &[
+                "commit",
+                &repo_arg,
+                FIXED_TIMESTAMP,
+                "-b",
+                "al",
+                "-s",
+                "onto the alias",
+                src.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        ),
+        ostrya_at(&repo, &["refs", "--delete", "al"]),
+        ostrya_at(&repo, &["refs", "-c", "--delete", OWN_ID]),
+    ] {
+        refused_with_message(&run, "ref not writable: al: names an alias");
+        assert_eq!(describe_refs(&repo), refs);
+        assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+    }
+
+    // A prefix that selects a remote alias removes no ref.
+    write_ref_file(&repo, "remotes/origin/rr/x", &main);
+    std::os::unix::fs::symlink("x", repo.join("refs/remotes/origin/rr/remal")).unwrap();
+    let refs = describe_refs(&repo);
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", "origin:rr"]),
+        "ref not writable: origin:rr/remal: names an alias",
+    );
+    assert_eq!(describe_refs(&repo), refs);
+
+    ostrya_at(&repo, &["refs", "-A", "--delete", "al"]).ok();
+    assert!(alias.symlink_metadata().is_err());
+    assert_eq!(ref_file(&repo, "refs/heads/main").as_ref(), Some(&main));
 }
 
 // --- media export ------------------------------------------------------------

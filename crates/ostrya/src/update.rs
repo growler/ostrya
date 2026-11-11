@@ -22,7 +22,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
     put_alias_blocking, put_ref_blocking, ref_relpath, refspec_to_relpath, relative_link,
-    sync_dirs_all,
+    remove_alias_blocking, sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config_blocking};
@@ -99,7 +99,8 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// - [`Transaction::commit`](crate::Transaction::commit) of a transaction
 ///   that writes a ref or detached metadata, at the step that writes them. A
 ///   pull and the transaction commit of a receive session wait at this step.
-/// - [`Repo::set_ref_immediate`] and [`Repo::set_ref_alias_immediate`].
+/// - [`Repo::set_ref_immediate`], [`Repo::set_ref_alias_immediate`], and
+///   [`Repo::remove_ref_alias_immediate`].
 /// - [`Repo::write_config`], [`Repo::remove_remote_keyring`], and, under the
 ///   `verify-gpg` feature, `Repo::gpg_import_keys`.
 /// - [`Repo::regenerate_summary`], [`Repo::regenerate_summaries`],
@@ -362,18 +363,25 @@ impl UpdateGuard {
     /// open. The ref resolve, the collection ref listings, and the summary of
     /// a new open ignore that file.
     ///
+    /// The call does not write or remove an alias. To remove an alias, use
+    /// [`remove_ref_alias`](UpdateGuard::remove_ref_alias).
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   call writes nothing.
+    /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
+    ///   call writes nothing, and the alias stays.
     /// - [`Error::Io`] if a file system operation fails.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
     /// such a ref by hand.
     pub async fn set_ref(&self, r: &Ref, checksum: Option<&Checksum>) -> Result<()> {
-        let relpath = ref_relpath(self.repo().config().collection_id(), r)?;
-        self.set_relpath(relpath, checksum).await
+        let own = self.repo().config().collection_id();
+        let relpath = ref_relpath(own, r)?;
+        let name = r.clone().canonical(own).to_string();
+        self.set_relpath(name, relpath, checksum).await
     }
 
     /// Writes `refspec` as an alias of `target`, as
@@ -394,6 +402,29 @@ impl UpdateGuard {
         let repo_mode = self.repo().mode();
         self.write(move |repo_fd, fsync, dirs| {
             put_alias_blocking(repo_fd, &relpath, &link, fsync, repo_mode, dirs)
+        })
+        .await
+    }
+
+    /// Removes the alias `refspec`, as [`Repo::remove_ref_alias_immediate`]
+    /// removes it.
+    ///
+    /// The ref that the alias names stays. The removal of an absent path is
+    /// not an error. The sync of the directory that held the link waits for
+    /// [`finish`](UpdateGuard::finish).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
+    ///   names a directory, passes through a file, or names a special file.
+    ///   The call removes nothing.
+    /// - [`Error::Io`] if a file system operation fails.
+    pub async fn remove_ref_alias(&self, refspec: &str) -> Result<()> {
+        let relpath = refspec_to_relpath(refspec)?;
+        let name = refspec.to_owned();
+        self.write(move |repo_fd, fsync, dirs| {
+            remove_alias_blocking(repo_fd, &name, &relpath, fsync, dirs)
         })
         .await
     }
@@ -809,11 +840,16 @@ impl UpdateGuard {
         ostrya_rt::unblock(move || held.finish_blocking()).await
     }
 
-    async fn set_relpath(&self, relpath: String, checksum: Option<&Checksum>) -> Result<()> {
+    async fn set_relpath(
+        &self,
+        name: String,
+        relpath: String,
+        checksum: Option<&Checksum>,
+    ) -> Result<()> {
         let checksum = checksum.copied();
         let repo_mode = self.repo().mode();
         self.write(move |repo_fd, fsync, dirs| {
-            put_ref_blocking(repo_fd, &relpath, checksum, fsync, repo_mode, dirs)
+            put_ref_blocking(repo_fd, &name, &relpath, checksum, fsync, repo_mode, dirs)
         })
         .await
     }
@@ -1183,6 +1219,7 @@ mod tests {
                 go_rx.recv().unwrap();
                 let written = put_ref_blocking(
                     repo_fd,
+                    "late/one",
                     "refs/heads/late/one",
                     Some(checksum()),
                     fsync,

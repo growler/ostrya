@@ -27,8 +27,9 @@ use common::{
     ostree_available,
 };
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, FileMeta,
-    MutableTree, ObjectType, Ref, Repo, RepoMode, RepoTree, Transaction, TreeEntry, Type, Value,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DirMeta, Error,
+    FileMeta, MutableTree, ObjectType, Ref, Repo, RepoMode, RepoTree, Transaction, TreeEntry, Type,
+    Value,
 };
 use ostrya_core::{Xattrs, loose_path};
 use ostrya_rt::block_on;
@@ -470,7 +471,7 @@ fn ref_writes_run_under_both_fsync_settings() {
                 Some(a)
             );
 
-            repo.set_ref_immediate(&Ref::local("branch/alias"), None)
+            repo.remove_ref_alias_immediate("branch/alias")
                 .await
                 .unwrap();
             repo.set_ref_immediate(&Ref::remote("origin", "branch/two"), None)
@@ -495,12 +496,11 @@ fn ref_writes_run_under_both_fsync_settings() {
 }
 
 #[test]
-fn set_ref_over_alias_replaces_symlink() {
-    // Observed with the `ostree` command (2026.1): a ref write to a relative
-    // symlink alias replaces the symlink with a regular ref file.
-    // The alias target does not change. This occurs for a commit onto the alias
-    // and for `ostree refs --create --force`. The rename-over-target write of
-    // ostrya gives the same result, and this test pins it.
+fn set_ref_over_alias_is_refused() {
+    // The `ostree` command (2026.1) replaces a relative symlink alias with a
+    // regular ref file when it writes a ref at the path of the alias. The
+    // alias target keeps its old commit. ostrya refuses a write and a removal
+    // at the path of an alias, and the link and its target stay.
     let tmp = TmpDir::new("commit-alias");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -519,21 +519,73 @@ fn set_ref_over_alias_replaces_symlink() {
         // The read path follows the alias to A.
         assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(a));
 
-        // A write of B onto the alias replaces the symlink with a regular file.
-        repo.set_ref_immediate(&Ref::local("test/foo"), Some(&b))
+        // A write of B onto the alias, and a removal of the alias, fail.
+        for checksum in [Some(&b), None] {
+            let err = repo
+                .set_ref_immediate(&Ref::local("test/foo"), checksum)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::RefNotWritable { name, reason }
+                        if name == "test/foo" && reason == "names an alias"
+                ),
+                "{err:?}"
+            );
+            let foo_meta = std::fs::symlink_metadata(heads.join("foo")).unwrap();
+            assert!(foo_meta.file_type().is_symlink(), "the alias stays");
+            assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(a));
+            assert_eq!(repo.resolve_rev("test/bar", false).await.unwrap(), Some(a));
+        }
+    });
+}
+
+#[test]
+fn remove_ref_alias_removes_an_alias_alone() {
+    // The call unlinks an alias and keeps its target. An absent path is not
+    // an error. A ref file and a directory are refused, and stay.
+    let tmp = TmpDir::new("commit-remove-alias");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        let foo_meta = std::fs::symlink_metadata(heads.join("foo")).unwrap();
-        assert!(
-            foo_meta.file_type().is_file(),
-            "the alias symlink is replaced by a regular ref file"
-        );
-        assert_eq!(repo.resolve_rev("test/foo", false).await.unwrap(), Some(b));
+        repo.set_ref_immediate(&Ref::local("plain"), Some(&a))
+            .await
+            .unwrap();
+        repo.set_ref_immediate(&Ref::local("deep/nest"), Some(&a))
+            .await
+            .unwrap();
+        repo.set_ref_alias_immediate("al", "plain").await.unwrap();
+        let heads = root_dir.join("refs/heads");
 
-        // The alias target does not change: test/bar still points at A.
-        let bar_meta = std::fs::symlink_metadata(heads.join("bar")).unwrap();
-        assert!(bar_meta.file_type().is_file());
-        assert_eq!(repo.resolve_rev("test/bar", false).await.unwrap(), Some(a));
+        repo.remove_ref_alias_immediate("al").await.unwrap();
+        assert!(std::fs::symlink_metadata(heads.join("al")).is_err());
+        assert_eq!(repo.resolve_rev("plain", false).await.unwrap(), Some(a));
+
+        repo.remove_ref_alias_immediate("al").await.unwrap();
+        repo.remove_ref_alias_immediate("nosuch/deeper")
+            .await
+            .unwrap();
+
+        for (name, reason) in [
+            ("plain", "names a ref file"),
+            ("deep", "names a directory"),
+            ("plain/x", "passes through a file"),
+        ] {
+            let err = repo.remove_ref_alias_immediate(name).await.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::RefNotWritable { name: n, reason: r } if n == name && r == reason
+                ),
+                "{name}: {err:?}"
+            );
+        }
+        assert_eq!(repo.resolve_rev("plain", false).await.unwrap(), Some(a));
+        assert_eq!(repo.resolve_rev("deep/nest", false).await.unwrap(), Some(a));
     });
 }
 

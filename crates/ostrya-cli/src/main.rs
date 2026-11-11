@@ -1618,7 +1618,8 @@ struct RefsArgs {
     /// that directory stay. This switch wins over -A.
     #[arg(short = 'c', long)]
     collections: bool,
-    /// With --create, replace an existing ref.
+    /// With --create, replace an existing ref. An alias is not replaced;
+    /// remove it with -A --delete.
     #[arg(long)]
     force: bool,
     /// The ref-name prefixes to match, or the collection ids with -c.
@@ -12034,16 +12035,19 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// # Prefix order
 ///
 /// Each prefix reads the ref set and the alias set as the prior prefixes left
-/// them. `refs --delete alal test/al` removes the alias and then the ref that
-/// it named. If a prefix removes the last ref of a remote, a later
-/// whole-remote prefix matches nothing, and both commands exit 0.
+/// them. `refs -A --delete alal test/al` removes the alias `alal` and then the
+/// alias `test/al` that it named. If a prefix removes the last ref of a
+/// remote, a later whole-remote prefix matches nothing, and both commands
+/// exit 0.
 ///
 /// # Aliases (`-A`)
 ///
 /// With `-A`, each prefix selects the set that a `-A` listing prints: the ref
 /// that the prefix names exactly, or the aliases under it. `-c` wins over
 /// `-A`. The prefix rules, the whole-remote refusal, and the alias guard apply
-/// to the set that the prefix selected.
+/// to the set that the prefix selected. The command removes each selected
+/// alias with [`Repo::remove_ref_alias_immediate`], and each selected ref
+/// file as a ref.
 ///
 /// # Collection refs
 ///
@@ -12061,6 +12065,13 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// local or a remote ref before the command removes the first ref of the
 /// prefix. If one name fails, the command fails with
 /// [`Error::InvalidRefspec`], and the prefix removes no ref.
+///
+/// Without `-A`, a selected alias fails the command with
+/// [`Error::RefNotWritable`] in the same check, after the alias guard. The
+/// prefix then removes no ref. The `ostree` command removes the alias. This
+/// is a recorded divergence. A prefix `@X:` or `@X:PREFIX` of another id
+/// selects an alias under `refs/mirrors/X/` only after an out-of-band write.
+/// The ref store refuses its removal.
 ///
 /// If a prefix `@X:` or `@OWN:` with an empty rest selects one or more refs
 /// or aliases, the command fails with [`Error::InvalidRefspec`], and the
@@ -12080,7 +12091,12 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// collection-id rule and the ref-name rule. If one selected ref fails, the
 /// command fails with [`Error::InvalidRefspec`] and removes no ref. The
 /// command checks no ref of a remote and removes no file under
-/// `refs/remotes`.
+/// `refs/remotes`. A selected ref under `refs/heads` that is an alias fails
+/// the command in the same check with [`Error::RefNotWritable`]. An alias
+/// under `refs/mirrors` comes from an out-of-band write alone. The ref store
+/// refuses its removal, and the refs that the command removed before it stay
+/// removed. The `ostree` command removes both aliases. This is a recorded
+/// divergence.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -12108,9 +12124,20 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // Each ref to remove passes the rule of the ref store before the
         // first removal. A ref under `refs/heads` takes the ref-name rule, so
         // a name with `:` fails. A mirror ref takes the collection-id rule
-        // and the ref-name rule.
+        // and the ref-name rule. A local alias is refused: only `-A --delete`
+        // removes an alias. The ref store refuses a mirror alias.
+        let aliases = if removed.iter().any(|r| matches!(r, Ref::Local { .. })) {
+            repo.list_ref_aliases().await?
+        } else {
+            Vec::new()
+        };
         for r in &removed {
             r.validate()?;
+            if let Ref::Local { name } = r
+                && aliases.iter().any(|alias| &alias.refspec == name)
+            {
+                return Err(alias_not_writable(name));
+            }
         }
         for r in &removed {
             repo.set_ref_immediate(r, None).await?;
@@ -12185,8 +12212,9 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 repo.set_ref_immediate(r, None).await?;
             }
         } else {
-            // Each selected name parses before the first removal.
-            let mut removed: Vec<Ref> = Vec::new();
+            // Each selected name parses before the first removal. Without
+            // `-A`, a selected alias is refused before the first removal.
+            let mut removed: Vec<(&str, Ref, bool)> = Vec::new();
             for refspec in &selected {
                 // A listed name is a refspec. A name with `@` from outside the
                 // port fails here, and it is not read as a collection ref.
@@ -12194,10 +12222,19 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 if matches!(r, Ref::Collection { .. }) {
                     return Err(Error::InvalidRefspec(refspec.clone()));
                 }
-                removed.push(r);
+                let is_alias = alias_names.contains(refspec);
+                if is_alias && !args.alias {
+                    return Err(alias_not_writable(refspec));
+                }
+                removed.push((refspec, r, is_alias));
             }
-            for r in &removed {
-                repo.set_ref_immediate(r, None).await?;
+            // A `-A` prefix that names a ref file exactly removes that ref.
+            for (refspec, r, is_alias) in &removed {
+                if *is_alias {
+                    repo.remove_ref_alias_immediate(refspec).await?;
+                } else {
+                    repo.set_ref_immediate(r, None).await?;
+                }
             }
         }
         all.retain(|(name, _)| !selected.contains(name));
@@ -12205,6 +12242,15 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         alias_names.retain(|alias| !selected.contains(alias));
     }
     Ok(())
+}
+
+/// Returns the error of a `refs --delete` without `-A` that selects the alias
+/// `name`. The text is the text of the ref store for a write over an alias.
+fn alias_not_writable(name: &str) -> Error {
+    Error::RefNotWritable {
+        name: name.to_owned(),
+        reason: "names an alias".to_owned(),
+    }
 }
 
 /// Returns the aliases that one `-A --delete` prefix removes.

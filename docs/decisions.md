@@ -3891,8 +3891,8 @@ the whole queue against the ref store before the first write. The rules:
   path again with one `lstat`.
 - The check reads each queued path of `Transaction::set_ref` with `lstat`
   alone. A queued write or removal fails with `Error::RefNotWritable` if
-  its path names a directory, passes through a file, or names a special
-  file: a FIFO, a socket, or a device file.
+  its path names an alias, names a directory, passes through a file, or
+  names a special file: a FIFO, a socket, or a device file.
 - A queued removal whose path passes through a file passes when an earlier
   removal of the same queue removes a path above it at any level, for
   example `a` for `a/b/c`. The unlink of `a` leaves `a/b/c` absent, if no
@@ -3916,8 +3916,22 @@ the whole queue against the ref store before the first write. The rules:
   removal of `al/b`, where `al` is an alias of the ref file `x`, fails the
   commit. The check refuses `al/b` before the first write, because its path
   passes through a file.
-- A queued write over an alias passes. The rename replaces the link with a
-  ref file.
+- A queued write or removal whose path names an alias fails with
+  `Error::RefNotWritable`, reason `names an alias`. This applies to an
+  entry of `set_ref` and to an entry of `set_ref_expecting`.
+  `Repo::set_ref_immediate` and `UpdateGuard::set_ref` refuse a write or a
+  removal over an alias with the same error, under the update lock, before
+  the rename or the unlink. The receive path refuses an alias in the same
+  way. The reason: a write through the alias replaces the link with a ref
+  file, and the target of the alias keeps its old commit, with no error.
+- `Repo::remove_ref_alias_immediate(refspec)` and
+  `UpdateGuard::remove_ref_alias(refspec)` remove an alias. They unlink the
+  link, and the target ref stays. An absent path is success, as for the
+  removal of an absent ref. A path that names a ref file fails with
+  `Error::RefNotWritable`, reason `names a ref file`. A path that names a
+  directory or a special file, or that passes through a file, fails with
+  `Error::RefNotWritable` and the reason of the `lstat` read. In the CLI,
+  only `refs -A --delete` removes an alias.
 - A refused commit leaves the published objects, and writes no detached
   metadata and no ref. `gc` removes the objects.
 - An I/O error between two ref writes, for example on a full disk, leaves
@@ -3935,9 +3949,6 @@ ref. The rules of a conditional write:
 - A ref that does not have the state `expected` fails with
   `Error::RefMismatch`. The error holds the name of the ref, the expected
   state, and the state in the store.
-- A conditional entry whose path names an alias fails with
-  `Error::RefNotWritable`, reason `names an alias`. The receive path
-  refuses an alias in the same way.
 - A conditional entry whose path names a directory or passes through a file
   fails with `Error::RefNotWritable`, also for `expected = None`.
   `Repo::resolve_ref_tip` gives `None` for such a path, so a caller that
@@ -3969,6 +3980,9 @@ These alternatives were rejected:
 - A parse of the content of each ref file in the check. A write over a ref
   file whose content does not parse then fails, and the write replaces that
   file in each other case.
+- A write over an alias that replaces the link with a ref file, as the
+  `ostree` command does. The target of the alias then keeps its old commit,
+  and the caller gets no error.
 
 ## The pull scheduler
 

@@ -605,13 +605,16 @@ ref file in either case. Only an out-of-band write puts other content in a ref
 file. `conformance/cli-surface.md`, "P1", records how the tool reads it, and
 "P2" records the same reader at `commit --parent`.
 
-A write of a ref whose file is an alias symlink replaces the symlink with a
-regular ref file, and the alias target stays unchanged. Both implementations
-rename a new temp file over the ref name, and the rename replaces the symlink at
-that name. Example: `refs/heads/foo` is a relative symlink to the sibling `bar`.
-A commit onto `foo`, or `ostree refs --create --force` on it, makes
+The tool replaces an alias symlink with a regular ref file when it writes a
+ref at the path of the alias, and the alias target stays unchanged. The tool
+renames a new temp file over the ref name, and the rename replaces the symlink
+at that name. Example: `refs/heads/foo` is a relative symlink to the sibling
+`bar`. A commit onto `foo`, or `ostree refs --create --force` on it, makes
 `refs/heads/foo` a 65-byte regular file that holds the new checksum.
-`refs/heads/bar` keeps its old checksum.
+`refs/heads/bar` keeps its old checksum. The port refuses a ref write or a ref
+removal at the path of an alias with `Error::RefNotWritable`, reason `names an
+alias`, and changes no ref. `conformance/cli-surface.md`, "P1", records the
+commands where the two implementations differ.
 
 ### Ref name validation
 

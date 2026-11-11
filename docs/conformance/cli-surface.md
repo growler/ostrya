@@ -85,7 +85,7 @@ Done, Phase 17b:
 - `cat` -- `COMMIT` and one or more `PATH`.
 
 Their output formats are recorded in `cli-behavior.md`, "CLI output
-formats", `refs`, `rev-parse`, and `cat`. Twenty-two tool behaviors around
+formats", `refs`, `rev-parse`, and `cat`. Twenty-three tool behaviors around
 them are observed and deliberately not reproduced:
 
 - the tool names an `-A` alias that lives under `refs/remotes/<remote>/` by its
@@ -155,8 +155,38 @@ them are observed and deliberately not reproduced:
   `-c --create=<id>:<ref>` completes over a link under `refs/heads`. `-A` lists
   the dangling alias, and `-A` with a `PREFIX` naming it exactly prints nothing.
   The port skips the dangling entry everywhere else: it lists the rest, writes
-  every `--create` form, and removes what a prefix matched. `--delete` naming
-  the link itself exits 0 and leaves the link in place in both;
+  each `--create` form whose NEWREF is not the link, and removes what a prefix
+  matched. A `--create` or a `--create --force` whose NEWREF is the link exits
+  1 in both, and the port refuses it as the next item states. `--delete`
+  naming the link itself exits 0 and leaves the link in place in both;
+- a ref write or a ref removal at the path of an alias. The tool replaces the
+  link with a ref file, or removes the link. The port refuses the ref with
+  `error: ref not writable: <name>: names an alias` at exit 1, and the link
+  and its target stay (`../format-reference.md`, "Ref files"). These forms of
+  `refs` part the two:
+  - `refs --create=<alias> --force REV`. Without `--force`, both refuse a
+    NEWREF that resolves, with `error: --create specified but ref <alias>
+    already exists`;
+  - `refs --create=<alias> REV`, with or without `--force`, where the alias
+    is dangling. The tool refuses it with `error: Listing refs:
+    openat(<alias>): No such file or directory`, so both exit 1 and write no
+    ref;
+  - `refs --delete PREFIX`, where the prefix selects an alias under
+    `refs/heads` or `refs/remotes`, and `refs -c --delete <id>`, where the
+    id selects an alias under `refs/heads`. The tool removes the alias. The
+    port refuses it before the prefix removes its first ref, after the alias
+    guard. So with the ref `origin:rr/x` and the alias `origin:rr/remal`,
+    `refs --delete origin:rr` gives `error: ref not writable:
+    origin:rr/remal: names an alias` at exit 1 and removes no ref, and the
+    tool removes both. `refs -A --delete` removes the alias in both;
+  - `refs -c --delete <id>` and `refs --delete @<id>:PREFIX`, where `<id>` is
+    not the `collection-id` of the repository and the selection holds an
+    alias under `refs/mirrors/<id>/`. Only an out-of-band write puts an alias
+    there. The port refuses the alias when it reaches it, and the refs that
+    the command removed before it stay removed.
+
+  `commit -b`, a pull, and `summary -u` take the same refusal ("P2",
+  `commit`, `pull`, and `summary`);
 - a symlink under `refs/` that names a directory. Such a link comes from an
   out-of-band change alone, because `refs -A --create` validates its target as
   a ref in both implementations. In both implementations, `-A` lists the link
@@ -179,8 +209,9 @@ them are observed and deliberately not reproduced:
     `-A`. It does the same from `--delete`, whatever the prefix matches, and
     from `fsck` and `prune`. `summary -u` leaves the link out of the summary
     and exits 0. Where `summary -u` writes the anchor commit and the link is
-    `refs/heads/ostree-metadata`, the port replaces the link with the anchor
-    ref;
+    `refs/heads/ostree-metadata`, the port refuses the anchor ref with
+    `error: ref not writable: ostree-metadata: names an alias`, exits 1, and
+    writes no summary;
 - an invalid collection id aborts the tool when it names a directory under
   `refs/mirrors`. The tool prints `ostree_collection_ref_new: assertion
   'collection_id == NULL || ostree_validate_collection_id (collection_id,
@@ -799,6 +830,13 @@ A refusal before the publish writes no object and no ref. Without `-b`, the
 option needs `--orphan`, as each commit does. `--orphan --tag=NAME` creates
 `NAME` and moves no branch. `--tag` conflicts with `--no-bindings` and with
 `--skip-if-unchanged`, and `clap` refuses each pair at exit 1.
+
+A `-b` ref whose path names an alias parts the two. The tool replaces the
+link with a ref file that names the new commit, and the target of the alias
+keeps its old commit (`../format-reference.md`, "Ref files"). The port
+refuses the ref with `error: ref not writable: <branch>: names an alias` at
+exit 1, after it publishes the objects. It writes no ref, the link stays,
+and the objects stay until a prune.
 
 `--related=NAME=CHECKSUM` of the port names one dependency of the commit in
 field 2 of the commit object (`../format-reference.md`, "Commit --
@@ -2890,8 +2928,12 @@ of the spki engine holds PEM `PRIVATE KEY` blocks, the form of a `sign
 that names a directory ends `summary -u` of the tool with exit 1. The port
 leaves the link out of the summary and exits 0. In a repository with a
 collection id, a link at `refs/heads/ostree-metadata` makes the tool report
-`Couldn't open ref 'ostree-metadata': Is a directory`, and the port replaces
-the link with the anchor ref ("P1", `refs`). The port's `summary
+`Couldn't open ref 'ostree-metadata': Is a directory`, and the port reports
+`error: ref not writable: ostree-metadata: names an alias`. Both exit 1 and
+write no summary ("P1", `refs`). An alias of a ref at
+`refs/heads/ostree-metadata` makes the tool replace the link with the anchor
+ref and exit 0. The port refuses it with the same error at exit 1, and writes
+no ref and no summary. The port's `summary
 --verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
 output formats", `sign`, "The key sources of `sign`"), with one verifier for
 each engine, and refuses `--sign` and `--gpg-sign`. With `--remote`, it reads
@@ -3647,6 +3689,13 @@ The port reads the remote key `trust=NAME`, and the trust group
 `[ex-ostrya trust "NAME"]` then checks the commits of the pull
 (`ostrya-config(1)`, "REMOTE KEYS"). The tool keeps the key and ignores it
 (`cli-behavior.md`, "Signature verification during a pull").
+
+A pull whose local ref path names an alias parts the two. The tool replaces
+the link with a ref file that names the pulled commit. The port refuses the
+ref with `error: ref not writable: <ref>: names an alias` at exit 1, after it
+publishes the objects. It writes no ref, the link stays, and the objects stay
+until a prune. `pull-local` does the same. An alias under `refs/remotes` or
+`refs/mirrors` comes from an out-of-band write alone.
 
 `pull` also fetches the dependencies that field 2 of each pulled commit
 names, each at depth 0 and with no ref, unless the pull is commit-only or has a

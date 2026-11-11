@@ -223,12 +223,14 @@ fn assert_timeout<T: std::fmt::Debug>(result: ostrya::Result<T>) {
 /// The names of the writers that take the update lock.
 ///
 /// Each call writes data when it runs. If a writer does not wait for a held
-/// guard, the snapshot changes. `gpg_import_keys` builds only under the
-/// `verify-gpg` feature.
-const WRITERS: [&str; 12] = [
+/// guard, the snapshot changes. `remove_ref_alias_immediate` removes the
+/// alias that `set_ref_alias_immediate` wrote before it. `gpg_import_keys`
+/// builds only under the `verify-gpg` feature.
+const WRITERS: [&str; 13] = [
     "set_ref_immediate",
     "set_ref_immediate_collection",
     "set_ref_alias_immediate",
+    "remove_ref_alias_immediate",
     "write_config",
     "remove_remote_keyring",
     "gpg_import_keys",
@@ -260,6 +262,7 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
             repo.set_ref_immediate(&cref, Some(commit)).await
         }
         "set_ref_alias_immediate" => repo.set_ref_alias_immediate("current", "main").await,
+        "remove_ref_alias_immediate" => repo.remove_ref_alias_immediate("current").await,
         "write_config" => {
             let mut keyfile = repo.config().keyfile().clone();
             keyfile.set_value("ex-test", "written", "yes").unwrap();

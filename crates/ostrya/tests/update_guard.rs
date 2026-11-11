@@ -511,6 +511,59 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
     );
 }
 
+/// A ref write and a ref removal of the guard refuse an alias, and the link
+/// stays. `remove_ref_alias` removes the alias and keeps its target.
+#[test]
+fn the_guard_refuses_a_ref_write_over_an_alias() {
+    let tmp = TmpDir::new("guard-alias");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let repo = open(&path);
+    let link = path.join("refs/heads/current");
+    block_on(async {
+        let guard = repo.begin_update().await.unwrap();
+        guard
+            .set_ref(&Ref::local("host/main"), Some(&checksum(1)))
+            .await
+            .unwrap();
+        guard.set_ref_alias("current", "host/main").await.unwrap();
+        for c in [Some(checksum(2)), None] {
+            let err = guard
+                .set_ref(&Ref::local("current"), c.as_ref())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::RefNotWritable { name, reason }
+                        if name == "current" && reason == "names an alias"
+                ),
+                "{err:?}"
+            );
+            assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+            assert_eq!(
+                guard.read_ref(&Ref::local("host/main")).await.unwrap(),
+                Some(checksum(1))
+            );
+        }
+        guard.remove_ref_alias("current").await.unwrap();
+        assert!(std::fs::symlink_metadata(&link).is_err());
+        assert_eq!(
+            guard.read_ref(&Ref::local("host/main")).await.unwrap(),
+            Some(checksum(1))
+        );
+        let err = guard.remove_ref_alias("host/main").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::RefNotWritable { name, reason }
+                    if name == "host/main" && reason == "names a ref file"
+            ),
+            "{err:?}"
+        );
+        guard.finish().await.unwrap();
+    });
+}
+
 /// A guard of one handle reads the config that the guard of another handle
 /// wrote. The first handle keeps the config that it read at open.
 #[test]

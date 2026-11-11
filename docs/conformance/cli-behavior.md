@@ -3334,7 +3334,8 @@ argument names. It writes `refs/heads/<NEWREF>`, or
 parent directories. `--create` has precedence over `--delete` when both are
 given.
 `--force` replaces an existing ref. It also replaces a regular ref file with an
-alias symlink, and an alias symlink with a regular ref file.
+alias symlink, and an alias symlink with a regular ref file. The port refuses
+to replace an alias symlink (`cli-surface.md`, "P1").
 
 With `-A`, `--create` writes a relative symlink. For a target under
 `refs/heads`, the link body is the path from the directory of the alias to the
@@ -3563,7 +3564,8 @@ whose body is `other` names the ref `other`, although the link resolves to
 `refs --delete test/other` removes the ref. A matched ref that is itself an
 alias has the same guard. So the command refuses `refs --delete test/al` where
 `refs/heads/alal` links to `test/al`. The removal of an alias that no alias
-names succeeds, so `refs --delete alal test/al` removes both.
+names succeeds, so `refs --delete alal test/al` removes both. The port refuses
+the removal of an alias without `-A` (`cli-surface.md`, "P1").
 
 Outside `refs/heads`, the removal continues. The command removes a ref under
 `refs/remotes` that an alias names. This holds for an alias with a path body

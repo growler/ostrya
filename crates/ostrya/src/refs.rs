@@ -143,6 +143,9 @@ impl Transaction {
     ///   of `a`, fails. An entry of
     ///   [`set_ref_expecting`](Transaction::set_ref_expecting) does not take
     ///   this exception.
+    /// - The path of a queued write or removal names an alias. To remove an
+    ///   alias, use [`Repo::remove_ref_alias_immediate`] or
+    ///   [`UpdateGuard::remove_ref_alias`](crate::UpdateGuard::remove_ref_alias).
     /// - The path of one queued ref names a directory of the path of another
     ///   queued ref, and one of the two is a write. Examples are a write of
     ///   `a` and a write of `a/b`, or a removal of `a` and a write of `a/b`.
@@ -164,8 +167,6 @@ impl Transaction {
     /// `al` is an alias of the ref file `x`, fails the commit. The check
     /// refuses `al/b` before the first write, because its path passes
     /// through a file.
-    ///
-    /// A write over an alias replaces the link with a ref file.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
@@ -252,16 +253,13 @@ impl Transaction {
 /// ref file. It gives the first failure:
 ///
 /// 1. In queue order, a write or a removal whose path names a directory,
-///    passes through a file, or names a special file:
-///    [`Error::RefNotWritable`]. A path that names an alias passes for an
-///    entry with no expectation, because the rename of a write replaces the
-///    link. For a conditional entry, an alias gives
-///    [`Error::RefNotWritable`], a state other than the expected state gives
-///    [`Error::RefMismatch`], and a ref file that does not parse gives the
-///    error of the parse. A removal with no expectation whose path passes
-///    through a file passes when an earlier removal of the queue, with or
-///    without an expectation, removes a path above it at any level, for
-///    example `a` for `a/b/c`.
+///    passes through a file, names a special file, or names an alias:
+///    [`Error::RefNotWritable`]. For a conditional entry, a state other than
+///    the expected state gives [`Error::RefMismatch`], and a ref file that
+///    does not parse gives the error of the parse. A removal with no
+///    expectation whose path passes through a file passes when an earlier
+///    removal of the queue, with or without an expectation, removes a path
+///    above it at any level, for example `a` for `a/b/c`.
 /// 2. Two entries where the path of one names a directory of the path of the
 ///    other, and one of the two is a write: [`Error::RefNotWritable`]. The
 ///    error names the outer ref. Two removals pass, and so does one path
@@ -278,21 +276,25 @@ pub(crate) fn check_resolved_refs_blocking(
     let mut removed: HashSet<&str> = HashSet::new();
     for r in refs {
         match r.expected {
-            None => {
-                if let Some(RefFileState::NotARef(reason)) = lstat_ref_state(repo_fd, &r.relpath)?
-                    && !(reason == PASSES_THROUGH_A_FILE
+            None => match lstat_ref_state(repo_fd, &r.relpath)? {
+                Some(RefFileState::Alias) => {
+                    return Err(not_writable(r, NAMES_AN_ALIAS.to_owned()));
+                }
+                Some(RefFileState::NotARef(reason))
+                    if !(reason == PASSES_THROUGH_A_FILE
                         && r.checksum.is_none()
-                        && parent_paths(&r.relpath).any(|p| removed.contains(p)))
+                        && parent_paths(&r.relpath).any(|p| removed.contains(p))) =>
                 {
                     return Err(not_writable(r, reason.to_owned()));
                 }
-            }
+                _ => {}
+            },
             Some(expected) => {
                 let current = match ref_file_state(repo_fd, &r.relpath)? {
                     RefFileState::Absent => None,
                     RefFileState::Commit(c) => Some(c),
                     RefFileState::Alias => {
-                        return Err(not_writable(r, "names an alias".to_owned()));
+                        return Err(not_writable(r, NAMES_AN_ALIAS.to_owned()));
                     }
                     RefFileState::NotARef(reason) => {
                         return Err(not_writable(r, reason.to_owned()));
@@ -1164,6 +1166,8 @@ impl Repo {
     ///
     /// A ref can also be an alias: a relative symlink to the file of another
     /// ref. A read follows the link and reads the checksum of the target ref.
+    /// The call does not write or remove an alias. To remove an alias, use
+    /// [`remove_ref_alias_immediate`](Repo::remove_ref_alias_immediate).
     /// [`Ref::validate`] checks each component of the ref against the
     /// ref-name rule, so a ref path stays inside `refs/`. If a directory of
     /// `refs/mirrors/` has a name that fails the rule, a ref under it cannot
@@ -1213,6 +1217,8 @@ impl Repo {
     ///
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   error holds the text of the ref, and the call writes nothing.
+    /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
+    ///   call writes nothing, and the alias stays.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
@@ -1220,16 +1226,23 @@ impl Repo {
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_immediate(&self, r: &Ref, checksum: Option<&Checksum>) -> Result<()> {
-        let relpath = ref_relpath(self.config().collection_id(), r)?;
-        self.write_ref_relpath(relpath, checksum).await
+        let own = self.config().collection_id();
+        let relpath = ref_relpath(own, r)?;
+        let name = r.clone().canonical(own).to_string();
+        self.write_ref_relpath(name, relpath, checksum).await
     }
 
-    async fn write_ref_relpath(&self, relpath: String, checksum: Option<&Checksum>) -> Result<()> {
+    async fn write_ref_relpath(
+        &self,
+        name: String,
+        relpath: String,
+        checksum: Option<&Checksum>,
+    ) -> Result<()> {
         let fsync = self.config().fsync()?;
         let repo_mode = self.mode();
         let checksum = checksum.copied();
         self.write_locked(move |repo| {
-            write_ref_blocking(repo.repo_fd(), &relpath, checksum, fsync, repo_mode)
+            write_ref_blocking(repo.repo_fd(), &name, &relpath, checksum, fsync, repo_mode)
         })
         .await
     }
@@ -1266,6 +1279,38 @@ impl Repo {
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
         self.write_locked(move |repo| {
             write_alias_blocking(repo.repo_fd(), &relpath, &link, fsync, repo_mode)
+        })
+        .await
+    }
+
+    /// Removes the alias `refspec`, outside a transaction.
+    ///
+    /// The call unlinks the symlink at the path of `refspec`. The ref that
+    /// the alias names stays. The removal of an absent path is not an error.
+    /// If `[core] fsync` is on, the call runs `fsync` on the directory that
+    /// held the link. The locks are those of
+    /// [`set_ref_immediate`](Repo::set_ref_immediate).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
+    /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
+    ///   names a directory, passes through a file, or names a special file.
+    ///   The call removes nothing.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
+    ///   lock-timeout-secs` does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::Io`] if a file system operation fails.
+    pub async fn remove_ref_alias_immediate(&self, refspec: &str) -> Result<()> {
+        let fsync = self.config().fsync()?;
+        let relpath = refspec_to_relpath(refspec)?;
+        let name = refspec.to_owned();
+        self.write_locked(move |repo| {
+            let mut dirs = Vec::new();
+            let removed = remove_alias_blocking(repo.repo_fd(), &name, &relpath, fsync, &mut dirs);
+            removed.and(sync_ref_dirs(repo.repo_fd(), dirs))
         })
         .await
     }
@@ -2480,6 +2525,10 @@ fn is_not_a_ref_path(e: &std::io::Error) -> bool {
 /// file.
 const PASSES_THROUGH_A_FILE: &str = "passes through a file";
 
+/// The reason of [`Error::RefNotWritable`] for a ref write or a ref removal
+/// whose path names an alias.
+const NAMES_AN_ALIAS: &str = "names an alias";
+
 /// Returns the state of the ref path `relpath`, read with `lstat` alone.
 ///
 /// `None` is a regular file, whose content the caller reads. The call never
@@ -2701,7 +2750,8 @@ const REF_DIR_MODE: u32 = 0o777;
 ///
 /// If `tmp/` is on a different file system, the rename fails with `EXDEV`,
 /// and the call removes the temp file. `None` unlinks the ref and does not
-/// use `tmp/`. An absent file is success.
+/// use `tmp/`. An absent file is success. A path that names an alias fails,
+/// as [`put_ref_blocking`] states.
 ///
 /// Under `fsync`, the call runs `fsync` on the directory that holds the ref
 /// after the rename or the unlink. So the name that the operation created or
@@ -2711,13 +2761,16 @@ const REF_DIR_MODE: u32 = 0o777;
 /// before the failure.
 fn write_ref_blocking(
     repo_fd: BorrowedFd<'_>,
+    name: &str,
     relpath: &str,
     checksum: Option<Checksum>,
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = put_ref_blocking(repo_fd, relpath, checksum, fsync, repo_mode, &mut dirs);
+    let written = put_ref_blocking(
+        repo_fd, name, relpath, checksum, fsync, repo_mode, &mut dirs,
+    );
     written.and(sync_ref_dirs(repo_fd, dirs))
 }
 
@@ -2729,14 +2782,24 @@ fn write_ref_blocking(
 /// and the directory that holds each parent that this write created. The
 /// call adds a created parent when it creates it, so a write that fails after
 /// that step still adds it.
+///
+/// If `relpath` names an alias, the call fails with
+/// [`Error::RefNotWritable`] for the ref `name`, and changes nothing.
 pub(crate) fn put_ref_blocking(
     repo_fd: BorrowedFd<'_>,
+    name: &str,
     relpath: &str,
     checksum: Option<Checksum>,
     fsync: bool,
     repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
+    if lstat_ref_state(repo_fd, relpath)? == Some(RefFileState::Alias) {
+        return Err(Error::RefNotWritable {
+            name: name.to_owned(),
+            reason: NAMES_AN_ALIAS.to_owned(),
+        });
+    }
     match checksum {
         Some(checksum) => {
             let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
@@ -2947,6 +3010,31 @@ pub(crate) fn put_alias_blocking(
         dirs.push(ref_parent(relpath).to_owned());
     }
     Ok(())
+}
+
+/// Unlinks the alias `relpath`, and leaves the directory syncs to the caller.
+/// Under `fsync`, the call adds the directory that held the link to `dirs`.
+///
+/// An absent path is success. A ref file, a directory, a special file, or a
+/// path that passes through a file fails with [`Error::RefNotWritable`] for
+/// the ref `name`.
+pub(crate) fn remove_alias_blocking(
+    repo_fd: BorrowedFd<'_>,
+    name: &str,
+    relpath: &str,
+    fsync: bool,
+    dirs: &mut Vec<String>,
+) -> Result<()> {
+    let reason = match lstat_ref_state(repo_fd, relpath)? {
+        Some(RefFileState::Absent) => return Ok(()),
+        Some(RefFileState::Alias) => return remove_ref_blocking(repo_fd, relpath, fsync, dirs),
+        Some(RefFileState::NotARef(reason)) => reason,
+        None | Some(RefFileState::Commit(_)) => "names a ref file",
+    };
+    Err(Error::RefNotWritable {
+        name: name.to_owned(),
+        reason: reason.to_owned(),
+    })
 }
 
 /// Removes each ref that still names the checksum that the caller recorded
@@ -3620,10 +3708,12 @@ mod tests {
         // file in `tmp/` is created, and the rename over the ref name fails.
         let long = "r".repeat(256);
         let mut dirs = Vec::new();
-        let relpath = format!("refs/heads/new/deep/{long}");
+        let name = format!("new/deep/{long}");
+        let relpath = format!("refs/heads/{name}");
         let checksum = Some(Checksum::from_bytes([7; 32]));
         put_ref_blocking(
             root.fd(),
+            &name,
             &relpath,
             checksum,
             true,

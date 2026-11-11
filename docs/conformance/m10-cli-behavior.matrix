@@ -1087,8 +1087,10 @@ note: a prefix matching a ref under `refs/heads` that an alias names ends a
  in the plain form and in the `-A` form. The cited test also
  compares the cases the guard leaves alone: the ref an alias's link resolves to
  where its body names another, a remote ref an alias names in either body form,
- an alias no alias names, an alias the prefix ahead of it freed, and `-c`, which
- removes a collection's refs with the aliases among them. Where one prefix
+ and, in the `-A` form, an alias no alias names and an alias the prefix ahead of
+ it freed. Without `-A`, and with `-c`, the tool removes a selected alias and the
+ port refuses it before the first removal and removes no ref (`cli-surface.md`,
+ "P1"); the cited test pins both sides. Where one prefix
  matches more than one guarded ref the two name different pairs, so
  `stderr-text` is not an oracle there, and neither is the refs tree
  (`cli-surface.md`, "P1"). The setup binds
@@ -1114,8 +1116,10 @@ note: `-A --delete` removes, for each prefix, the set a `-A` listing prints for
  two selections over one prefix, the exact-match forms over an alias, a plain ref,
  a remote ref, and a remote alias, a prefix holding no alias, the per-prefix and
  live-set order, the guard over the selected set, the shared no-prefix message,
- the whole-remote refusal, and `-c` winning over `-A` in either flag order. It
- also pins the divergence the `loss` field states. The setup binds no alias and
+ the whole-remote refusal, and `-c` winning over `-A` in either flag order,
+ where the tool removes the alias the `-c` selection holds and the port refuses
+ it and removes no ref (`cli-surface.md`, "P1"). It also pins the divergence the
+ `loss` field states. The setup binds no alias and
  no collection id, so the cited test builds the repositories.
 
 family: M10
@@ -1127,17 +1131,22 @@ severity: interop
 evidence: ostrya_cli::cli::refs_delete_collection_own_id_matches_the_tool
 spec: cli-behavior.md#refs
 note: `-c --delete` of the id equal to the repository's own `collection-id`
- removes the refs under `refs/heads`, the aliases among them, and keeps the mirror
- refs carrying that id, where a foreign id removes the mirror refs it names. The
- cited test compares the own id, the foreign id, both together, the own id twice,
- and an id no ref carries, over a repository holding both sources of a collection
- ref under its own id, and the three narrower repositories -- the own id with no
- local ref, a local ref carrying a mirror ref's name, and no `collection-id` at
- all. It also compares the `-c` listing: the tool prints a row for each mirror
- ref of the own id, and the port ignores that directory and prints the other
- rows alone, the divergence `cli-surface.md`, "P1", records. Each removal
- agrees. The setup binds no collection id and writes no mirror ref, so the cited
- test builds the repositories.
+ removes the refs under `refs/heads` and keeps the mirror refs carrying that id,
+ where a foreign id removes the mirror refs it names. Where the own id selects an
+ alias under `refs/heads`, the tool removes it with the refs, and the port refuses
+ it before the first removal and removes no ref (`cli-surface.md`, "P1"). The
+ cited test runs the own id over a repository holding both sources of a
+ collection ref under its own id and an alias under `refs/heads`, and pins that
+ refusal and the removal of the tool. It compares the foreign id and an id no ref
+ carries over that repository, and the own id twice and both ids together over
+ clones from which it removed the alias. It also compares the three narrower
+ repositories -- the own id with no local ref, a local ref carrying a mirror
+ ref's name, and no `collection-id` at all. It also compares the `-c` listing:
+ the tool prints a row for each mirror ref of the own id, and the port ignores
+ that directory and prints the other rows alone, the divergence
+ `cli-surface.md`, "P1", records. Each compared removal agrees. The setup binds
+ no collection id and writes no mirror ref, so the cited test builds the
+ repositories.
 
 family: M10
 subcommand: refs

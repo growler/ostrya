@@ -2728,10 +2728,10 @@ mod tests {
         });
     }
 
-    /// A write over an alias replaces the link with a ref file, and the
-    /// target of the alias keeps its commit.
+    /// A queued write or removal over an alias refuses the commit before the
+    /// first ref write. The link and its target stay.
     #[test]
-    fn a_write_over_an_alias_replaces_the_link() {
+    fn a_write_or_a_removal_over_an_alias_refuses_the_commit() {
         let scratch = Scratch::new("ref-check-alias");
         block_on(async {
             let repo = no_wait_repo(&scratch).await;
@@ -2744,13 +2744,18 @@ mod tests {
             repo.set_ref_alias_immediate("alias", "target")
                 .await
                 .unwrap();
-            let txn = repo.transaction().await.unwrap();
-            txn.set_ref(&Ref::local("alias"), Some(&c));
-            txn.commit().await.unwrap();
-            let link = std::fs::symlink_metadata(root.join("refs/heads/alias")).unwrap();
-            assert!(link.file_type().is_file());
-            assert_eq!(tip(&repo, "alias").await, Some(c));
-            assert_eq!(tip(&repo, "target").await, Some(a));
+            for checksum in [Some(&c), None] {
+                let txn = repo.transaction().await.unwrap();
+                txn.set_ref(&Ref::local("main"), Some(&c));
+                txn.set_ref(&Ref::local("alias"), checksum);
+                let err = txn.commit().await.unwrap_err();
+                assert_not_writable(err, "alias", "names an alias");
+                let link = std::fs::symlink_metadata(root.join("refs/heads/alias")).unwrap();
+                assert!(link.file_type().is_symlink());
+                assert_eq!(tip(&repo, "alias").await, Some(a));
+                assert_eq!(tip(&repo, "target").await, Some(a));
+                assert_eq!(tip(&repo, "main").await, None);
+            }
         });
     }
 

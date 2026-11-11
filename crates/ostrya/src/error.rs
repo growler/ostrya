@@ -72,16 +72,23 @@ pub enum Error {
     /// the caller gave it.
     #[error("refspec not unique: {0}")]
     AmbiguousRefspec(String),
-    /// A queued ref that the ref store cannot take.
+    /// A ref write or a ref removal that the ref store cannot take.
     ///
     /// [`Transaction::commit`](crate::Transaction::commit) gives this error
     /// when it checks the queued refs under the update lock. The cause is a
-    /// ref path that names a directory, passes through a file, or names a
-    /// special file, or two queued refs where the path of one names a
-    /// directory of the other and one of the two is a write. A conditional
-    /// write of [`Transaction::set_ref_expecting`](crate::Transaction::set_ref_expecting)
-    /// whose path names an alias is also a cause. The published objects
-    /// stay, and the commit writes no detached metadata and no ref.
+    /// ref path that names an alias, names a directory, passes through a
+    /// file, or names a special file, or two queued refs where the path of
+    /// one names a directory of the other and one of the two is a write. The
+    /// published objects stay, and the commit writes no detached metadata
+    /// and no ref.
+    ///
+    /// [`Repo::set_ref_immediate`](crate::Repo::set_ref_immediate) and
+    /// [`UpdateGuard::set_ref`](crate::UpdateGuard::set_ref) give this error
+    /// for a ref path that names an alias.
+    /// [`Repo::remove_ref_alias_immediate`](crate::Repo::remove_ref_alias_immediate)
+    /// and [`UpdateGuard::remove_ref_alias`](crate::UpdateGuard::remove_ref_alias)
+    /// give it for a path that names a ref file, names a directory, passes
+    /// through a file, or names a special file.
     #[error("ref not writable: {name}: {reason}")]
     RefNotWritable {
         /// The ref as text: `<name>`, `<remote>:<name>`, or

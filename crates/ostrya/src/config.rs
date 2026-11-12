@@ -651,7 +651,7 @@ impl RepoConfig {
     ///
     /// The key is `[ex-ostrya] gc-weak-references`, and it is an ostrya
     /// extension. The value is a `;` list of ref patterns, the entries of a
-    /// `ReceiveSelector`. An entry has one of these forms, with `*` and `**`
+    /// [`ReceiveSelector`]. An entry has one of these forms, with `*` and `**`
     /// in the name part:
     ///
     /// - `NAME` -- the local refs that `NAME` matches.
@@ -665,7 +665,7 @@ impl RepoConfig {
     /// list must hold at least one positive entry. An empty value and a list
     /// of exclusions alone are not valid. The order of the entries has no
     /// effect. Pass the `[core] collection-id` of the repository as `own` to
-    /// `ReceiveSelector::matches`: `@OWN:NAME` then matches the local ref
+    /// [`ReceiveSelector::matches`]: `@OWN:NAME` then matches the local ref
     /// `NAME`.
     ///
     /// [`Repo::prune`] reads no config key for its ref classifier. The
@@ -1145,7 +1145,7 @@ impl Remote<'_> {
     /// takes, or `None` if the key is absent.
     ///
     /// The key is `pull-branches`, and it is an ostrya extension. The value is
-    /// a `;` list of ref patterns, the entries of a `ReceiveSelector`. An
+    /// a `;` list of ref patterns, the entries of a [`ReceiveSelector`]. An
     /// entry has one of these forms, with `*` and `**` in the name part:
     ///
     /// - `NAME` -- the local refs that `NAME` matches.
@@ -1258,7 +1258,7 @@ impl Remote<'_> {
     /// `None` if the key is absent.
     ///
     /// The key is `push-branches`, and it is an ostrya extension. The value is
-    /// a `;` list of ref patterns, the entries of a `ReceiveSelector`. An
+    /// a `;` list of ref patterns, the entries of a [`ReceiveSelector`]. An
     /// entry has one of these forms, with `*` and `**` in the name part:
     ///
     /// - `NAME` -- the local refs that `NAME` matches.
@@ -1271,7 +1271,7 @@ impl Remote<'_> {
     /// the list has no positive entry, each ref that no exclusion matches is
     /// selected. Thus an empty value selects each ref. The order of the
     /// entries has no effect. Pass the `[core] collection-id` of the
-    /// repository as `own` to `ReceiveSelector::matches`: `@OWN:NAME` then
+    /// repository as `own` to [`ReceiveSelector::matches`]: `@OWN:NAME` then
     /// matches the local ref `NAME`.
     ///
     /// `Repo::push` reads no config key for its refs.

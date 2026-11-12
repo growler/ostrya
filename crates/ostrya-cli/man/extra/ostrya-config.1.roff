@@ -434,7 +434,7 @@ The two keys do not merge.
 A ref on the command line has precedence over the key, and the pull then does not read it.
 \fB\%ostrya pull \-\-mirror\fR and \fB\%ostrya pull \-\-collection\fR do not read the key.
 .IP
-A malformed pattern stops the pull before its first object request.
+A malformed pattern stops the pull before it connects.
 If the remote has no summary, or no ref of the summary matches, the pull fails, exits 1, and writes no object and no ref.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)

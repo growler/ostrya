@@ -153,8 +153,10 @@ impl Repo {
     /// `NAME` is. A ref `NAME` of the entry of `ID` in
     /// `ostree.summary.collection-map` is the ref `@ID:NAME`, and the pull
     /// writes it and checks its tip as a requested `@ID:NAME` ref. The pull
-    /// reads the key after it reads the summary and the `config` of the
-    /// remote, and before it reads a ref file or an object.
+    /// parses the key before it resolves the endpoint, so a malformed value
+    /// stops the pull before its first request. The pull matches the refs of
+    /// the summary after it reads the summary and the `config` of the remote,
+    /// and before it reads a ref file or an object.
     ///
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
     /// select the prefix of the written refs.
@@ -630,6 +632,11 @@ impl Repo {
     /// - The errors of
     ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
     ///   for this repository.
+    /// - [`Error::InvalidFormat`] if [`refs`](PullOptions::refs) is empty,
+    ///   [`MIRROR`](PullFlags::MIRROR) is not set, and an entry of the key
+    ///   `pull-branches` of the remote is not a valid ref pattern. Under the
+    ///   same conditions, [`Error::Core`] if the value of the key holds a
+    ///   malformed escape sequence.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
     ///   over 1 MiB is [`Error::InvalidInput`].
@@ -663,9 +670,6 @@ impl Repo {
     ///   `ostree.summary.collection-map` that is malformed, and the pull reads
     ///   it for an `@ID:NAME` ref, for a `MIRROR` pull of every ref, or for
     ///   the key `pull-branches`.
-    /// - [`Error::InvalidFormat`] if [`refs`](PullOptions::refs) is empty,
-    ///   [`MIRROR`](PullFlags::MIRROR) is not set, and an entry of the key
-    ///   `pull-branches` of the remote is not a valid ref pattern.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a ref file of the remote holds no checksum.
     /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, a
@@ -798,6 +802,15 @@ impl Repo {
         // The commit of the transaction reads the key again. This read fails
         // a bad value before the first request.
         self.config().generate_composefs()?;
+        // A pull with no ref and no `MIRROR` takes the refs that
+        // `pull-branches` selects. A malformed value stops the pull here,
+        // before it resolves the endpoint and before it connects.
+        if opts.refs.is_empty()
+            && !opts.flags.contains(PullFlags::MIRROR)
+            && let Some(section) = self.config().remote(remote)
+        {
+            section.pull_branches()?;
+        }
         let edges = take_static_deltas(&mut opts).await?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -1588,7 +1601,9 @@ impl Repo {
             let section = self.config().remote(remote);
             // The key `pull-branches` has precedence over `branches`. It
             // selects refs of the summary, so a remote with no summary fails
-            // the pull before its first object request.
+            // the pull before its first object request. `Repo::pull` parsed
+            // the key before it connected, so a malformed value does not
+            // fail this read.
             let pull_branches = match &section {
                 Some(section) => section.pull_branches()?,
                 None => None,

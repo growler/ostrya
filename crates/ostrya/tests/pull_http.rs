@@ -11120,15 +11120,77 @@ fn an_explicit_ref_wins_over_pull_branches() {
     });
 }
 
-/// With `pull-branches`, a remote with no summary, a malformed value, and a
-/// list that selects no ref fail the pull before its first object request.
+/// A `MIRROR` pull with no ref does not read `pull-branches`, so a malformed
+/// value does not block it.
+#[test]
+fn a_mirror_pull_ignores_pull_branches() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-branches-mirror");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            "pull-branches=r*:x\n",
+        )
+        .await;
+        let opts = PullOptions {
+            flags: PullFlags::MIRROR,
+            ..PullOptions::default()
+        };
+        dest.pull("origin", opts).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("test/main", true).await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
+/// The pull parses `pull-branches` before it resolves the endpoint, so a
+/// malformed value is the error of a pull from a remote that cannot be
+/// reached. The pull publishes nothing.
+#[test]
+fn a_malformed_pull_branches_fails_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-branches-dead");
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            DEAD_URL,
+            "pull-branches=apps/**;r*:x\n",
+        )
+        .await;
+        let err = dest
+            .pull("origin", PullOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == BAD_PULL_BRANCHES),
+            "{err}"
+        );
+        assert_nothing_published(&dest).await;
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+        assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}
+
+/// The message of [`Error::InvalidFormat`] for the `pull-branches` entry
+/// `r*:x` of the remote `origin`.
+const BAD_PULL_BRANCHES: &str = "[remote \"origin\"] pull-branches: malformed receive \
+     pattern 'r*:x': a remote part is one remote or '*'";
+
+/// With `pull-branches`, a malformed value fails the pull before its first
+/// request. A remote with no summary and a list that selects no ref fail the
+/// pull before its first object request.
 #[test]
 fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
     block_on(async {
         let dir = TmpDir::new("pull-http-pull-branches-fail");
         let server = collection_server(dir.path()).await;
         for (i, (summary, value, want)) in [
-            (true, "r*:x", "[remote \"origin\"] pull-branches"),
+            (true, "r*:x", BAD_PULL_BRANCHES),
             (
                 true,
                 "absent/**",
@@ -11156,11 +11218,15 @@ fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
             let err = result.unwrap_err();
             let kind_ok = match &err {
                 Error::Pull(m) => m == want,
-                Error::InvalidFormat(m) => value == "r*:x" && m.contains(want),
+                Error::InvalidFormat(m) => value == "r*:x" && m == want,
                 _ => false,
             };
             assert!(kind_ok, "{value}: {err}");
             assert!(remote_refs.is_empty() && mirror_refs.is_empty(), "{value}");
+            // A malformed value stops the pull before its first request.
+            if value == "r*:x" {
+                assert!(seen.is_empty(), "{value}: {seen:?}");
+            }
             assert!(
                 !seen.iter().any(|path| path.starts_with("objects/")),
                 "{value}: {seen:?}"

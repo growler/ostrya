@@ -468,9 +468,9 @@ enum Command {
     /// REMOTE, a list of ref patterns. It takes each ref of the summary of
     /// the remote that the list selects: a ref of the ref list of the summary
     /// as REF, and a ref of its collection map as @ID:REF. It writes each one
-    /// as a pull of that ref does. Without the key, it takes the `branches`
-    /// key. --mirror and --collection do not read the key. ostrya-config(1)
-    /// states the key.
+    /// as a pull of that ref does. A malformed value stops the pull before it
+    /// connects. Without the key, it takes the `branches` key. --mirror and
+    /// --collection do not read the key. ostrya-config(1) states the key.
     ///
     /// The pull also fetches the dependencies that field 2 of each pulled
     /// commit names, each with no parent and no ref, unless it takes

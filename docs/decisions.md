@@ -4002,10 +4002,14 @@ patterns, which `Remote::pull_branches` reads as a `ReceiveSelector`. The
 rules:
 
 - `Repo::pull` reads the key when `PullOptions::refs` is empty and `MIRROR`
-  is not set. The selector matches the refs of the summary, and the summary
-  is available inside the pull alone. `Repo::pull` also reads `branches`
-  there. The pull reads the key after it reads the summary and the `config`
-  of the remote, and before it reads a ref file or an object.
+  is not set. Under the same conditions, it parses the key directly after
+  the option checks and before it resolves the endpoint. A malformed value
+  thus stops the pull before it reads a PEM file, an AWS file, or a keyring,
+  and before it connects. The selector matches the refs of the summary, and
+  the summary is available inside the pull alone. `Repo::pull` also reads
+  `branches` there. The pull matches the refs after it reads the summary
+  and the `config` of the remote, and before it reads a ref file or an
+  object.
 - `Repo::pull_with_session` has no remote section, so it reads neither key
   and refuses an empty ref list. A `--collection` pull does not read the
   key.
@@ -4035,6 +4039,8 @@ These alternatives were rejected:
 - A read of `pull-branches` in the `ostrya pull` command. The command then
   fetches the summary one time to select the refs, and the pull fetches it
   again.
+- A parse of `pull-branches` at the match alone. A connection error, a TLS
+  error, or a summary-signature error then hides a malformed value.
 - A match of the written names, `REMOTE:NAME`. The key selects refs of the
   remote, and the summary lists them with no remote part.
 - A list of the matches as names for the path that reads `branches`. That

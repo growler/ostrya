@@ -582,8 +582,8 @@ A pattern has one of these forms:
 In \fB\%NAME\fR, a part \fB\%*\fR matches one part of a ref name, and a part \fB\%**\fR matches one or more parts.
 A pattern that starts with \fB\%!\fR is an exclusion.
 A ref is weak when a pattern with no \fB\%!\fR matches it, and no exclusion matches it.
-If the list has no pattern without \fB\%!\fR, each ref that no exclusion matches is weak.
-Thus an empty value marks each ref weak.
+The list must hold at least one pattern without \fB\%!\fR.
+An empty value and a list of exclusions alone are not valid.
 The order of the patterns has no effect.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id matches the local ref \fB\%NAME\fR.
 A ref under \fB\%refs/mirrors/\fR of that id is always strong.
@@ -592,7 +592,7 @@ A ref under \fB\%refs/mirrors/\fR of that id is always strong.
 With \fB\%\-\-no\-prune\fR, the prune deletes no ref.
 The prune writes no line for a deleted ref.
 Each prune reads and checks the key, also a prune that does not apply the key.
-A malformed pattern stops the prune before it deletes anything.
+A malformed pattern, an empty value, or a list of exclusions alone stops the prune before it deletes anything.
 \fB\%ostrya remote prune\fR does not read the key.
 .TP
 \fB\%generate\-composefs\fR (boolean, default false)

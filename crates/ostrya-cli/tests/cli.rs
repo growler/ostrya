@@ -48152,6 +48152,37 @@ fn prune_refuses_a_malformed_gc_weak_references() {
     assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone));
 }
 
+/// An empty `[ex-ostrya] gc-weak-references` and a list of `!` patterns
+/// alone refuse the prune with `--refs-only` and the plain prune, and the
+/// repository does not change.
+#[test]
+fn prune_refuses_a_gc_weak_references_with_no_positive_pattern() {
+    let tmp = TmpDir::new("prune-gc-weak-references-no-positive");
+    let (repo, first, second, lone) = weak_refs_repo(tmp.path(), "tmp/**");
+    let before = prune_inventory(&repo);
+    for value in ["", "!tmp/**"] {
+        ostrya_at(
+            &repo,
+            &["config", "set", "ex-ostrya.gc-weak-references", value],
+        )
+        .ok();
+
+        for args in [&["prune", "--refs-only"][..], &["prune"][..]] {
+            let run = ostrya_at(&repo, args);
+            assert_eq!(run.status.code(), Some(1), "{value:?} {args:?}");
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert!(
+                stderr.contains("gc-weak-references: the list holds no pattern without '!'"),
+                "{stderr}"
+            );
+            assert_eq!(prune_inventory(&repo), before, "{value:?} {args:?}");
+            assert_eq!(ref_file(&repo, "refs/heads/main"), Some(second.clone()));
+            assert_eq!(ref_file(&repo, "refs/heads/tmp/a"), Some(lone.clone()));
+            assert_eq!(ref_file(&repo, "refs/heads/tmp/b"), Some(first.clone()));
+        }
+    }
+}
+
 /// Creates a repository at `base/repo` whose collection id is [`OWN_ID`],
 /// with one commit at the local ref `main`. Returns the path and the commit.
 fn own_repo_with_main(base: &Path) -> (PathBuf, String) {

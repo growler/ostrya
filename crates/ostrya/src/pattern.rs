@@ -265,6 +265,11 @@ impl ReceiveSelector {
         (self.positive.is_empty() || self.positive.iter().any(hit))
             && !self.negative.iter().any(hit)
     }
+
+    /// Returns `true` if the list holds an entry with no `!`.
+    pub(crate) fn has_positive(&self) -> bool {
+        !self.positive.is_empty()
+    }
 }
 
 /// The pattern types move freely across tasks and threads.

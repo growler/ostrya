@@ -311,9 +311,10 @@ enum Command {
     /// The config key `[ex-ostrya] gc-weak-references` is a list of ref
     /// patterns. If the walk starts from the refs alone, each ref that the
     /// list selects is weak: it is not a root, and the command deletes it if
-    /// the walk does not reach its commit. Each run reads the key, and a bad
-    /// value stops the command before it deletes anything. ostrya-config(1)
-    /// states the key.
+    /// the walk does not reach its commit. An empty value and a list of `!`
+    /// patterns alone are bad values. Each run reads the key, and a bad value
+    /// stops the command before it deletes anything. ostrya-config(1) states
+    /// the key.
     ///
     /// The related commits of each commit that the walk reaches are also
     /// roots, under the bound of --depth or --keep-younger-than. A related

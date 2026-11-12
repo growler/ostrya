@@ -661,13 +661,12 @@ impl RepoConfig {
     /// - `@ID:NAME` -- the refs of the collection `ID` that `NAME` matches.
     ///
     /// An entry that starts with `!` is an exclusion. The selector selects a
-    /// ref when a positive entry matches it, and no exclusion matches it. If
-    /// the list has no positive entry, each ref that no exclusion matches is
-    /// selected. Thus an empty value selects each ref, and a list of
-    /// exclusions alone selects each ref that no exclusion matches. The order
-    /// of the entries has no effect. Pass the `[core] collection-id` of the
-    /// repository as `own` to `ReceiveSelector::matches`: `@OWN:NAME` then
-    /// matches the local ref `NAME`.
+    /// ref when a positive entry matches it, and no exclusion matches it. The
+    /// list must hold at least one positive entry. An empty value and a list
+    /// of exclusions alone are not valid. The order of the entries has no
+    /// effect. Pass the `[core] collection-id` of the repository as `own` to
+    /// `ReceiveSelector::matches`: `@OWN:NAME` then matches the local ref
+    /// `NAME`.
     ///
     /// [`Repo::prune`] reads no config key for its ref classifier. The
     /// `ostrya prune` command reads this key and marks each selected ref weak
@@ -677,11 +676,20 @@ impl RepoConfig {
     ///
     /// - [`Error::InvalidFormat`] if an entry is not a valid ref pattern. The
     ///   text names the key and the entry.
+    /// - [`Error::InvalidFormat`] if the list holds no positive entry, for
+    ///   example an empty value or a list of exclusions alone. The text names
+    ///   the key.
     /// - [`Error::Core`] if the value holds a malformed escape sequence.
     ///
     /// [`PruneOptions::weak_ref_filter`]: crate::PruneOptions::weak_ref_filter
     pub fn gc_weak_references(&self) -> Result<Option<ReceiveSelector>> {
-        read_selector(&self.keyfile, EX_OSTRYA, "gc-weak-references")
+        let selector = read_selector(&self.keyfile, EX_OSTRYA, "gc-weak-references")?;
+        if selector.as_ref().is_some_and(|s| !s.has_positive()) {
+            return Err(Error::InvalidFormat(format!(
+                "[{EX_OSTRYA}] gc-weak-references: the list holds no pattern without '!'"
+            )));
+        }
+        Ok(selector)
     }
 
     /// Returns `true` if a ref change regenerates the summary.
@@ -1851,8 +1859,14 @@ mod tests {
         assert!(sel.matches(&Ref::collection("org.example.X", "main"), own));
         assert!(!sel.matches(&Ref::collection("org.example.Y", "main"), own));
 
-        let empty = read("").unwrap().unwrap();
-        assert!(empty.matches(&Ref::local("main"), None));
+        for value in ["", " ", ";", "!tmp/**", "!tmp/a;!tmp/b"] {
+            let err = read(value).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m)
+                    if m.contains("[ex-ostrya] gc-weak-references")),
+                "{value:?}: {err}"
+            );
+        }
 
         let err = read("tmp/**;r*:x").unwrap_err();
         assert!(

@@ -3200,7 +3200,9 @@ The rules of the classification:
   the refs alone: `--refs-only`, `--only-branch`, `--retain-branch-depth`, or
   `--keep-younger-than`. In these runs it also sets `refs_only`, which
   changes no root. Each run reads and checks the key, so a bad value refuses
-  each prune before it deletes anything. `ostrya remote prune` does not read
+  each prune before it deletes anything. `RepoConfig::gc_weak_references`
+  refuses a value with no pattern without `!`, so an empty value and a list
+  of exclusions alone are bad values. `ostrya remote prune` does not read
   the key, because the prune of a bucket refuses a weak ref filter.
 - `PruneOptions` and `PruneStats` have no `#[non_exhaustive]`. With the
   attribute, no other crate can use `..PruneOptions::default()`, and the
@@ -3238,6 +3240,12 @@ These alternatives were rejected:
 - A read of `[ex-ostrya] gc-weak-references` in `Repo::prune`. A library
   caller then cannot give a filter of its own that the key does not
   change.
+- An empty value or a list of exclusions alone that selects each ref that
+  no exclusion matches, as `pull-branches` and `push-branches` read it. An
+  empty value then marks weak each ref that gets a `Ref`. Only the mirror
+  refs of the own collection and the refs that get no `Ref` stay strong.
+  `prune --refs-only` then deletes each weak ref whose commit the walk does
+  not reach, and each object that no root reaches.
 - The key in a plain `ostrya prune`, with `refs_only` set. Each commit in
   the store then stops being a root, so the key changes which objects a
   plain prune keeps.

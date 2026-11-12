@@ -1553,6 +1553,164 @@ mod cli {
         assert!(!setup.ssh_started());
     }
 
+    /// Under `--collection=ID`, `push-branches` keeps the selected local
+    /// refs, each sent as `@ID:NAME`, and drops a selected ref of another
+    /// collection with no message.
+    #[test]
+    fn push_branches_under_collection_drops_the_refs_of_another_collection() {
+        let setup = Setup::new("cli-push-branches-coll-drop", "archive");
+        set_collection_id(&setup.client, Some("org.example.A"));
+        let main = setup.commit("main", FILES, &[]);
+        let x = setup.commit("@org.example.B:x", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:@org.example.A:**;w:@org.example.B:**");
+        add_origin(&setup, &dest, "push-branches=**;@org.example.B:**\n");
+        let out = push_origin(&setup, &["--collection=org.example.A"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("@org.example.A:main (new) {main}\n"));
+        assert_eq!(stderr(&out), "");
+        assert_eq!(
+            std::fs::read_to_string(dest.join("refs/mirrors/org.example.A/main")).unwrap(),
+            format!("{main}\n")
+        );
+        assert!(!dest.join("refs/mirrors/org.example.B").exists());
+        assert!(!server_has_commit(&dest, &x));
+    }
+
+    /// Under `--collection=ID`, `push-branches` keeps the selected refs of
+    /// `refs/mirrors/ID/`.
+    #[test]
+    fn push_branches_under_collection_keeps_the_refs_of_that_collection() {
+        let setup = Setup::new("cli-push-branches-coll-keep", "archive");
+        let y = setup.commit("@org.example.A:y", FILES, &[]);
+        let x = setup.commit("@org.example.B:x", &[("c", "gamma\n")], &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:@org.example.A:**;w:@org.example.B:**");
+        add_origin(
+            &setup,
+            &dest,
+            "push-branches=@org.example.A:**;@org.example.B:**\n",
+        );
+        let out = push_origin(&setup, &["--collection=org.example.A"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("@org.example.A:y (new) {y}\n"));
+        assert!(!dest.join("refs/mirrors/org.example.B").exists());
+        assert!(!server_has_commit(&dest, &x));
+    }
+
+    /// Under `--collection=ID`, when each selected ref is of another
+    /// collection, the push writes the no-match line, exits 0, and does not
+    /// start ssh.
+    #[test]
+    fn push_branches_under_collection_with_no_ref_of_it_exits_0() {
+        let setup = Setup::new("cli-push-branches-coll-none", "archive");
+        setup.commit("main", FILES, &[]);
+        setup.commit("@org.example.B:x", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=@org.example.B:**\n");
+        let out = push_origin(&setup, &["--collection=org.example.A"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "no ref matches [remote \"origin\"] push-branches\n"
+        );
+        assert!(!setup.ssh_started());
+    }
+
+    /// Under `--collection=ID`, a selected local ref `x` and a selected
+    /// mirror ref `@ID:x` name one destination, and the push refuses them
+    /// before it starts ssh.
+    #[test]
+    fn push_branches_under_collection_refuses_a_local_and_a_mirror_ref_of_one_name() {
+        let setup = Setup::new("cli-push-branches-coll-twice", "archive");
+        setup.commit("x", FILES, &[]);
+        setup.commit("@org.example.A:x", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=**;@org.example.A:**\n");
+        let out = push_origin(&setup, &["--collection=org.example.A"]);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "error: invalid input: the destination '@org.example.A:x' is named twice\n"
+        );
+        assert!(!setup.ssh_started());
+        assert!(!dest.join("refs/mirrors/org.example.A").exists());
+    }
+
+    /// Makes the symlink `rel` of the repository at `repo`, which names its
+    /// own directory.
+    fn dir_link(repo: &Path, rel: &str) {
+        let link = repo.join(rel);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(".", link).unwrap();
+    }
+
+    /// A ref alias that names a directory and that `push-branches` does not
+    /// select is not read: the push sends the selected refs. An exclusion
+    /// keeps the alias out.
+    #[test]
+    fn push_branches_does_not_read_an_unselected_alias_that_names_a_directory() {
+        for (tag, keys) in [
+            ("cli-push-branches-dirlink-other", "push-branches=main\n"),
+            (
+                "cli-push-branches-dirlink-excluded",
+                "push-branches=**;!lnk\n",
+            ),
+        ] {
+            let setup = Setup::new(tag, "archive");
+            let main = setup.commit("main", FILES, &[]);
+            dir_link(&setup.client, "refs/heads/lnk");
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            add_origin(&setup, &dest, keys);
+            let out = push_origin(&setup, &[]);
+            assert!(out.status.success(), "{keys}: {}", stderr(&out));
+            assert_eq!(stdout(&out), format!("main (new) {main}\n"), "{keys}");
+            assert_eq!(server_tip(&dest, "main"), Some(main), "{keys}");
+        }
+    }
+
+    /// A ref alias that names a directory and that `push-branches` selects
+    /// fails the push with the error of the read, before ssh starts.
+    #[test]
+    fn push_branches_fails_on_a_selected_alias_that_names_a_directory() {
+        let setup = Setup::new("cli-push-branches-dirlink-selected", "archive");
+        setup.commit("main", FILES, &[]);
+        dir_link(&setup.client, "refs/heads/lnk");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=lnk\n");
+        let out = push_origin(&setup, &[]);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "error: i/o error: Is a directory (os error 21)\n"
+        );
+        assert!(!setup.ssh_started());
+        assert_eq!(server_tip(&dest, "main"), None);
+    }
+
+    /// `push-branches` reads no entry of `refs/mirrors/OWN/` and of a
+    /// directory under `refs/mirrors/` whose name is no collection id, so an
+    /// alias there that names a directory does not stop the push.
+    #[test]
+    fn push_branches_does_not_read_the_own_or_an_invalid_collection_directory() {
+        let setup = Setup::new("cli-push-branches-dirlink-mirrors", "archive");
+        // The commit has no collection binding, so a server with no
+        // collection id takes it.
+        let main = setup.commit("main", FILES, &[]);
+        set_collection_id(&setup.client, Some("org.example.Own"));
+        dir_link(&setup.client, "refs/mirrors/org.example.Own/lnk");
+        dir_link(&setup.client, "refs/mirrors/nodot/lnk");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=**\n");
+        let out = push_origin(&setup, &[]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {main}\n"));
+        assert_eq!(server_tip(&dest, "main"), Some(main));
+    }
+
     /// Checks the refusal of `--tag` under `push-branches`: exit 1, the
     /// error line alone, no ssh, and no tag on the server.
     fn assert_tag_refused(setup: &Setup, dest: &Path, out: &Output) {

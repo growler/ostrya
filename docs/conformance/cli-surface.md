@@ -211,7 +211,14 @@ them are observed and deliberately not reproduced:
     an enumeration reaches it. The port reports `error: i/o error: Is a
     directory (os error 21)` and exits 1 from each listing form other than
     `-A`. It does the same from `--delete`, whatever the prefix matches, and
-    from `fsck` and `prune`. `summary -u` leaves the link out of the summary
+    from `fsck` and `prune`. `ostrya push` with no refspec reads only the
+    ref files that `push-branches` selects and that the filter of
+    `--collection` keeps. So it reads at no step a link that the key does
+    not select or that the filter drops. A link that the key selects and
+    that the filter keeps gives the same error before the ssh client
+    starts. The listing of `ostrya push`
+    reads no entry under `refs/mirrors/ID/` of the own collection id or of
+    an id that is not valid. `summary -u` leaves the link out of the summary
     and exits 0. Where `summary -u` writes the anchor commit and the link is
     `refs/heads/ostree-metadata`, the port refuses the anchor ref with
     `error: ref not writable: ostree-metadata: names an alias`, exits 1, and
@@ -5719,7 +5726,16 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   `../decisions.md`, "The refs of a push with no refspec"). It lists each
   local ref and each ref under `refs/mirrors/ID/`. For each ref that the
   list selects, it sends the commit that the listing read to the ref of the
-  same name on the server. With no match, it writes `no ref matches
+  same name on the server. The listing reads only the ref files that the
+  list selects. With `--collection=ID`, it keeps only the selected local
+  refs and the selected refs of `refs/mirrors/ID/`, and drops each other
+  selected ref with no message. A file under `refs/heads` whose name
+  ostrya does not write is outside this rule: the push reads its refspec
+  text as the command line does. A selected local ref `NAME` and a selected
+  ref `@ID:NAME` then name one destination, and the push refuses them with
+  `error: invalid input: the destination '@ID:NAME' is named twice` at
+  exit 1 before the ssh client starts. With no match, also when the filter
+  of `--collection` keeps no ref, it writes `no ref matches
   [remote "NAME"] push-branches` to standard error and nothing to standard
   output, exits 0, and starts no ssh client. A malformed value fails at
   exit 1 before the push connects. With the key in use, the command
@@ -5750,7 +5766,8 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   `@Y:NAME` is such a `DST`. An `ID` that fails the collection-id rule or
   is longer than 255 bytes is refused with `error: Invalid collection ID
   ID` at exit 1. Each of these refusals comes before the ssh client starts
-  and before the first HTTP request.
+  and before the first HTTP request. With no refspec, the option keeps the
+  refs of `push-branches` that go to `ID`, and drops the other refs.
 - The push reads the `ostree.collection-binding` of each source commit
   before the ssh client starts and before the first HTTP request. A binding
   that fails the collection-id rule or is longer than 255 bytes is refused

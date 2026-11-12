@@ -685,3 +685,170 @@ fn remove_refs_immediate_with_an_empty_batch_takes_no_lock() {
         assert_eq!(ref_file(&path, "refs/heads/main"), Some(checksum(1)));
     });
 }
+
+/// A collection id that sorts before [`OTHER`].
+const FIRST: &str = "org.example.First";
+
+/// Writes `checksum` to the file `rel` of the repository at `path` by hand,
+/// as a source outside the port does.
+fn put_file(path: &Path, rel: &str, checksum: &Checksum) {
+    let file = path.join(rel);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, format!("{}\n", checksum.to_hex())).unwrap();
+}
+
+/// Makes the symlink `rel` of the repository at `path`, which names its own
+/// directory.
+fn dir_link(path: &Path, rel: &str) {
+    let link = path.join(rel);
+    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(".", link).unwrap();
+}
+
+/// `list_refs_where` gives the local refs by name, then the refs of each
+/// other valid collection id by id and name. It follows an alias, and an
+/// alias whose target names no ref is not in the result. On a healthy store
+/// the result is the result of `list_refs(None)` and the entries of
+/// `list_mirror_refs` of the valid ids other than the own id.
+#[test]
+fn list_refs_where_gives_the_local_refs_then_the_collection_refs() {
+    let tmp = TmpDir::new("ref-store-where-order");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "b", &checksum(1)).await;
+        put_local(&repo, "a", &checksum(2)).await;
+        put_local(&repo, "d/e", &checksum(3)).await;
+        repo.set_ref_alias_immediate("cur", "a").await.unwrap();
+        std::os::unix::fs::symlink("missing", path.join("refs/heads/gone")).unwrap();
+        put(&repo, OTHER, "x", &checksum(4)).await;
+        put(&repo, OTHER, "a/b", &checksum(5)).await;
+        put(&repo, FIRST, "z", &checksum(6)).await;
+        put_own_mirror(&path, "m", &checksum(7));
+        put_file(&path, "refs/mirrors/nodot/q", &checksum(8));
+
+        let all = repo.list_refs_where(|_| true).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                (Ref::local("a"), checksum(2)),
+                (Ref::local("b"), checksum(1)),
+                (Ref::local("cur"), checksum(2)),
+                (Ref::local("d/e"), checksum(3)),
+                (Ref::collection(FIRST, "z"), checksum(6)),
+                (Ref::collection(OTHER, "a/b"), checksum(5)),
+                (Ref::collection(OTHER, "x"), checksum(4)),
+            ]
+        );
+
+        let mut expected: Vec<(Ref, Checksum)> = repo
+            .list_refs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, c)| (Ref::local(name), c))
+            .collect();
+        let mut mirrors = repo.list_mirror_refs().await.unwrap();
+        mirrors.retain(|(id, _, _)| id != OWN && ostrya::is_valid_collection_id(id));
+        mirrors.sort();
+        expected.extend(
+            mirrors
+                .into_iter()
+                .map(|(id, name, c)| (Ref::collection(id, name), c)),
+        );
+        assert_eq!(all, expected);
+
+        let only = repo
+            .list_refs_where(|r| matches!(r, Ref::Collection { .. }) || r.name() == "b")
+            .await
+            .unwrap();
+        assert_eq!(
+            only,
+            vec![
+                (Ref::local("b"), checksum(1)),
+                (Ref::collection(FIRST, "z"), checksum(6)),
+                (Ref::collection(OTHER, "a/b"), checksum(5)),
+                (Ref::collection(OTHER, "x"), checksum(4)),
+            ]
+        );
+    });
+}
+
+/// `list_refs_where` applies `keep` to a name before it reads the ref file.
+/// An alias that names a directory and that `keep` drops is never read. A
+/// selected one fails the call with the error of `list_refs`.
+#[test]
+fn list_refs_where_does_not_read_an_entry_that_keep_drops() {
+    let tmp = TmpDir::new("ref-store-where-keep");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        put(&repo, OTHER, "x", &checksum(2)).await;
+        dir_link(&path, "refs/heads/lnk");
+        dir_link(&path, &format!("refs/mirrors/{OTHER}/lnk"));
+
+        let refs = repo.list_refs_where(|r| r.name() != "lnk").await.unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                (Ref::local("main"), checksum(1)),
+                (Ref::collection(OTHER, "x"), checksum(2)),
+            ]
+        );
+
+        for name in [Ref::local("lnk"), Ref::collection(OTHER, "lnk")] {
+            let want = name.clone();
+            match repo.list_refs_where(move |r| *r == want).await {
+                Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+        match repo.list_refs(None).await {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
+            other => panic!("list_refs: {other:?}"),
+        }
+    });
+}
+
+/// `list_refs_where` reads no entry of `refs/mirrors/OWN/`, of a directory
+/// whose name fails the collection-id rule, and directly under
+/// `refs/mirrors/`. `keep` is not called for them.
+#[test]
+fn list_refs_where_does_not_read_the_own_or_an_invalid_collection() {
+    let tmp = TmpDir::new("ref-store-where-skip");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        put(&repo, OTHER, "x", &checksum(2)).await;
+        dir_link(&path, &format!("refs/mirrors/{OWN}/lnk"));
+        dir_link(&path, "refs/mirrors/nodot/lnk");
+        dir_link(&path, "refs/mirrors/top");
+
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        let refs = repo
+            .list_refs_where(move |r| {
+                record.lock().unwrap().push(r.clone());
+                true
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            refs,
+            vec![
+                (Ref::local("main"), checksum(1)),
+                (Ref::collection(OTHER, "x"), checksum(2)),
+            ]
+        );
+        let mut seen = seen.lock().unwrap().clone();
+        seen.sort_by_key(|r| r.to_string());
+        assert_eq!(seen, vec![Ref::collection(OTHER, "x"), Ref::local("main")]);
+
+        match repo.list_mirror_refs().await {
+            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
+            other => panic!("list_mirror_refs: {other:?}"),
+        }
+    });
+}

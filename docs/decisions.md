@@ -3951,18 +3951,40 @@ rules:
   refspec is then still required.
 - `Repo::push` reads no config key for its refs. The command fills
   `RepoPushOptions::refspecs` from the key.
-- The command lists the local refs and the refs under `refs/mirrors/ID/`,
-  and keeps each ref that the selector selects, with the
-  `[core] collection-id` of the repository as the own id. The list skips
-  the own id and each id that is not valid. Each match goes to the push as
-  the refspec `CHECKSUM:NAME` or `CHECKSUM:@ID:NAME`, with the commit that
-  the listing read: the local refs by name, and then the collection refs by
-  id and name. An alias is a match like each other ref. A refusal of one
-  match by the server fails the whole push.
-- With no match, the command writes a line to standard error, writes
-  nothing to standard output, exits 0, and opens no connection. The ref
-  listing and this check come after the checks of `--collection` and of the
-  S3 options, and before the push address resolves.
+- The command lists the local refs and the refs under `refs/mirrors/ID/`
+  with `Repo::list_refs_where`, and keeps each ref that the selector
+  selects, with the `[core] collection-id` of the repository as the own id.
+  The listing skips the own id and each id that is not valid, and it does
+  not read their directories. It applies the selector to the name of a ref
+  before it reads the ref file, so it reads only the selected ref files. An
+  alias that names a directory and that the selector does not select is
+  never read, and an exclusion `!NAME` keeps it out of the push. A selected
+  alias that names a directory and that the filter of `--collection` keeps
+  fails the push with `i/o error: Is a directory (os error 21)` at exit 1,
+  before the connection. An alias that the filter drops is never read.
+- With `--collection=X`, the listing keeps only the selected refs that the
+  push writes to the collection X: each local ref, which goes to `@X:NAME`,
+  and each ref of `refs/mirrors/X/`. It drops each other selected ref with
+  no message. Refspecs on the command line keep the refusal of a
+  destination of another collection.
+- The filter decides on the ref that the listing reads. A ref name that
+  ostrya does not write is outside this rule. An example is a file under
+  `refs/heads` that is made outside ostrya, with a name that starts with
+  `@` or holds `:`. The push takes its refspec text as the command line
+  does, and can refuse the whole push.
+- Each kept ref goes to the push as the refspec `CHECKSUM:NAME` or
+  `CHECKSUM:@ID:NAME`, with the commit that the listing read: the local
+  refs by name, and then the collection refs by id and name. The push then
+  takes the refspecs as refspecs of the command line. An alias is a match
+  like each other ref. A refusal of one match by the server fails the whole
+  push. Under `--collection=X`, a selected local ref `NAME` and a selected
+  ref `@X:NAME` name one destination, and the push refuses them with `the
+  destination '@X:NAME' is named twice` at exit 1, before the connection.
+- With no match, also when the filter of `--collection` keeps no ref, the
+  command writes a line to standard error, writes nothing to standard
+  output, exits 0, and opens no connection. The ref listing and this check
+  come after the checks of `--collection` and of the S3 options, and before
+  the push address resolves.
 - The command refuses `--tag` when it reads the key, with `--tag needs a
   refspec, and [remote "NAME"] push-branches gives none` at exit 1. The
   refusal comes after the checks of `--collection` and of the S3 options,
@@ -3994,6 +4016,37 @@ These alternatives were rejected:
   that push then does not get `REFSPEC must be specified`.
 - A tag at each matched commit. This reads `--tag` with a meaning of its
   own, and writes refs that the user did not request.
+- Under `--collection`, a refusal of a selected ref of another collection
+  that names the key. A selector such as `**;@Y:**` then cannot serve a
+  push to one collection, and the user must keep a second remote section.
+- Under `--collection`, no read of the key, so that a refspec is required.
+  The key then does not apply to a push to a collection.
+- A line on standard error for each dropped ref. A dropped ref is a ref of
+  another collection, which the push to X cannot write, and the line adds
+  only noise.
+- A filter by the local namespace: the local refs only when X is the own
+  collection id. A push of local refs to `@X:NAME` is valid for each X, as
+  with refspecs on the command line.
+- An error for an alias that names a directory and that the selector does
+  not select, recorded as a known limit. The exclusion `!NAME` then cannot
+  keep a damaged alias out of the push.
+- A read of each ref that skips the error `EISDIR`. The push then reads ref
+  files that it does not send, and a selected alias that names a directory
+  goes out of the push with no message.
+- A skip of a selected alias that names a directory. The push then does
+  not send a ref that the user selected, and it exits 0.
+- A check of each listed name that skips or refuses a name that does not
+  parse back to the ref that the listing read. Only an edit outside ostrya
+  makes such a name, and ostrya adds no gate for that edit.
+- A listing method that takes `&ReceiveSelector`. A predicate also takes
+  the `--collection` filter, and the method does not depend on the
+  selector type.
+- A listing method that is hidden from the documentation. The method is a
+  general listing of the library, and a library caller can use it.
+- The alias rule of the archive view, which `select_refs` and
+  `list_collection_refs_in` apply. The listing follows an alias through
+  the file system, as `list_refs` does, so a ref that `list_refs` reads has
+  the same commit in the push.
 
 ## The refs of a pull with no ref
 

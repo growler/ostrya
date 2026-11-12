@@ -648,9 +648,12 @@ enum Command {
     /// each ref under `refs/mirrors/ID/`, and for each ref that the list
     /// selects, it sends the commit that the listing read to the ref of the
     /// same name: the local refs by name, then the collection refs by id and
-    /// name. A remote ref is never sent. If no ref matches, the command
-    /// writes a message to standard error and exits 0. The command refuses
-    /// --tag before it lists the refs.
+    /// name. The listing reads only the ref files that the list selects. A
+    /// remote ref is never sent. With --collection=ID, the command keeps only
+    /// the selected local refs and the selected refs of `refs/mirrors/ID/`,
+    /// and drops each other selected ref with no message. If no ref matches,
+    /// the command writes a message to standard error and exits 0. The
+    /// command refuses --tag before it lists the refs.
     /// Without the key, with an address, or with --onto, a refspec is
     /// required. ostrya-config(1) states the key.
     ///
@@ -4771,6 +4774,10 @@ struct PushArgs {
     /// With --onto, the option applies to BRANCH and to each --tag, and does
     /// not change --bind-ref.
     ///
+    /// With no refspec, the option keeps the local refs and the refs of
+    /// `refs/mirrors/ID/` that `push-branches` selects, and drops each other
+    /// selected ref.
+    ///
     /// To a bucket repository, the `config` of the bucket takes the role of
     /// the server: @ID:NAME of the collection id of the bucket writes
     /// `refs/heads/NAME`, and each other ID writes `refs/mirrors/ID/NAME`,
@@ -6293,7 +6300,8 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     };
     let remote = remote.as_str();
     // With no refspec, `push-branches` of the section of a remote names the
-    // refs. An address has no section, and `--onto` takes one REF.
+    // refs, and `--collection` keeps the refs of its collection alone. An
+    // address has no section, and `--onto` takes one REF.
     let push_branches = if args.refspecs.is_empty() {
         let selector = if args.onto.is_none() && !ostrya::is_push_address(remote) {
             match repo.config().remote(remote) {
@@ -6339,7 +6347,7 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
                 "--tag needs a refspec, and [remote \"{remote}\"] push-branches gives none"
             ));
         }
-        args.refspecs = push_branch_refspecs(&repo, &selector).await?;
+        args.refspecs = push_branch_refspecs(&repo, &selector, args.collection.as_deref()).await?;
         if args.refspecs.is_empty() {
             eprintln!("no ref matches [remote \"{remote}\"] push-branches");
             return Ok(());
@@ -6421,9 +6429,15 @@ fn parse_refs(texts: &[String]) -> Result<Vec<Ref>> {
 /// Returns the refspecs of a push that names no ref: each local ref and each
 /// ref under `refs/mirrors/ID/` that `selector` selects.
 ///
+/// With `collection`, the result keeps only the selected refs that the push
+/// sends to that collection: each local ref, and each ref of
+/// `refs/mirrors/ID/` of that id. It drops each other selected ref with no
+/// message.
+///
 /// Each refspec is `CHECKSUM:NAME` or `CHECKSUM:@ID:NAME`, with the commit
 /// that the listing read for the ref. The push then does not resolve the
-/// name again, so a name of hex characters is not read as a checksum.
+/// name again, so a name of hex characters is not read as a checksum. The
+/// listing reads no ref file that the result drops.
 ///
 /// The local refs come first, by name, and then the collection refs, by id
 /// and name. The own collection id and an id that is not valid are skipped.
@@ -6432,25 +6446,25 @@ fn parse_refs(texts: &[String]) -> Result<Vec<Ref>> {
 async fn push_branch_refspecs(
     repo: &Repo,
     selector: &ostrya::ReceiveSelector,
+    collection: Option<&str>,
 ) -> Result<Vec<String>> {
-    let own = repo.config().collection_id();
-    let mut refspecs = Vec::new();
-    for (name, checksum) in repo.list_refs(None).await? {
-        let r = Ref::local(name);
-        if selector.matches(&r, own) {
-            refspecs.push(format!("{checksum}:{r}"));
-        }
-    }
-    let mut mirrors = repo.list_mirror_refs().await?;
-    mirrors.retain(|(id, _, _)| Some(id.as_str()) != own && ostrya::is_valid_collection_id(id));
-    mirrors.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
-    for (id, name, checksum) in mirrors {
-        let r = Ref::collection(id, name);
-        if selector.matches(&r, own) {
-            refspecs.push(format!("{checksum}:{r}"));
-        }
-    }
-    Ok(refspecs)
+    let own = repo.config().collection_id().map(str::to_owned);
+    let selector = selector.clone();
+    let collection = collection.map(str::to_owned);
+    let refs = repo
+        .list_refs_where(move |r| {
+            let in_collection = match (&collection, r) {
+                (None, _) | (Some(_), Ref::Local { .. }) => true,
+                (Some(want), Ref::Collection { id, .. }) => id == want,
+                (Some(_), Ref::Remote { .. }) => false,
+            };
+            in_collection && selector.matches(r, own.as_deref())
+        })
+        .await?;
+    Ok(refs
+        .into_iter()
+        .map(|(r, checksum)| format!("{checksum}:{r}"))
+        .collect())
 }
 
 /// Pushes the tree of the commit of one revision to a remote over ssh or

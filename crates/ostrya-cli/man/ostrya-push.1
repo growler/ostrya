@@ -18,7 +18,7 @@ With \%\-\-onto, the push sends the tree of one local commit, and the server mak
 .PP
 The push also sends the dependencies that field \%2 of each pushed commit names, each with no parent and no ref, unless it takes \%\-\-onto.
 .PP
-With no refspec, the command reads the key \fB\%push\-branches\fR of the section of REMOTE, a list of ref patterns. It lists each local ref and each ref under \fB\%refs/mirrors/ID/\fR, and for each ref that the list selects, it sends the commit that the listing read to the ref of the same name: the local refs by name, then the collection refs by id and name. A remote ref is never sent. If no ref matches, the command writes a message to standard error and exits \%0. The command refuses \%\-\-tag before it lists the refs. Without the key, with an address, or with \%\-\-onto, a refspec is required. \%ostrya\-config(1) states the key.
+With no refspec, the command reads the key \fB\%push\-branches\fR of the section of REMOTE, a list of ref patterns. It lists each local ref and each ref under \fB\%refs/mirrors/ID/\fR, and for each ref that the list selects, it sends the commit that the listing read to the ref of the same name: the local refs by name, then the collection refs by id and name. The listing reads only the ref files that the list selects. A remote ref is never sent. With \%\-\-collection=ID, the command keeps only the selected local refs and the selected refs of \fB\%refs/mirrors/ID/\fR, and drops each other selected ref with no message. If no ref matches, the command writes a message to standard error and exits \%0. The command refuses \%\-\-tag before it lists the refs. Without the key, with an address, or with \%\-\-onto, a refspec is required. \%ostrya\-config(1) states the key.
 .PP
 On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&. With \%\-\-onto, standard output carries the checksum of the new commit alone.
 .PP
@@ -64,6 +64,8 @@ A plain DST or tag NAME becomes \%@ID:NAME. A DST or tag \%@ID:NAME stays. The c
 The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. The bindings of the source commits select no namespace.
 .IP
 With \%\-\-onto, the option applies to BRANCH and to each \%\-\-tag, and does not change \%\-\-bind\-ref.
+.IP
+With no refspec, the option keeps the local refs and the refs of \fB\%refs/mirrors/ID/\fR that \fB\%push\-branches\fR selects, and drops each other selected ref.
 .IP
 To a bucket repository, the \fB\%config\fR of the bucket takes the role of the server: \%@ID:NAME of the collection id of the bucket writes \fB\%refs/heads/NAME\fR, and each other ID writes \fB\%refs/mirrors/ID/NAME\fR, also in a bucket with no collection id.
 .TP

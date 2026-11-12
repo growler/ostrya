@@ -679,14 +679,91 @@ impl Repo {
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails, for example for
     ///   an alias that names a directory.
+    ///
+    /// [`list_refs_where`](Repo::list_refs_where) lists the local refs and the
+    /// collection refs that a predicate selects, and it reads no ref file
+    /// that the predicate drops.
     pub async fn list_refs(&self, prefix: Option<&str>) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
-        let mut refs = ostrya_rt::unblock(move || collect_heads(&repo)).await?;
+        let mut refs = ostrya_rt::unblock(move || collect_heads(&repo, &|_| true)).await?;
         if let Some(prefix) = prefix {
             refs.retain(|(name, _)| ref_prefixes(name).any(|part| part == prefix));
         }
         refs.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(refs)
+    }
+
+    /// Returns the local refs and the collection refs that `keep` selects,
+    /// each with its commit.
+    ///
+    /// The call lists these refs:
+    ///
+    /// - Each ref under `refs/heads`, as a [`Ref::Local`].
+    /// - Each ref under `refs/mirrors/ID/` of a valid collection id other
+    ///   than the `[core] collection-id` of the repository, as a
+    ///   [`Ref::Collection`] of `ID`.
+    ///
+    /// The call applies `keep` to each ref before it reads the ref file, so
+    /// it never reads a ref file that `keep` drops. It does not read
+    /// `refs/mirrors/ID/` of the `[core] collection-id` of the repository,
+    /// a directory under `refs/mirrors` whose name fails
+    /// [`is_valid_collection_id`](crate::is_valid_collection_id), or an entry
+    /// directly under `refs/mirrors`, and it does not call `keep` for them.
+    /// The result holds no remote ref.
+    ///
+    /// The call follows each alias that `keep` selects, as
+    /// [`list_refs`](Repo::list_refs) does. An alias whose target names no
+    /// ref is not in the result.
+    ///
+    /// The local refs come first, sorted by name. The collection refs come
+    /// after them, sorted by collection id and then by name. The sort is the
+    /// byte order of the strings.
+    ///
+    /// The call runs on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// For a ref that `keep` selects:
+    ///
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::Core`] if the ref file holds no checksum.
+    /// - [`Error::Io`] if a read from the file system fails, for example for
+    ///   an alias that names a directory.
+    ///
+    /// Also [`Error::Io`] if the read of a directory under `refs/heads` or
+    /// `refs/mirrors` fails.
+    pub async fn list_refs_where(
+        &self,
+        keep: impl Fn(&Ref) -> bool + Send + 'static,
+    ) -> Result<Vec<(Ref, Checksum)>> {
+        let repo = self.clone();
+        let own = self.config().collection_id().map(str::to_owned);
+        ostrya_rt::unblock(move || {
+            let mut heads = collect_heads(&repo, &|name| keep(&Ref::local(name)))?;
+            heads.sort_by(|a, b| a.0.cmp(&b.0));
+            // A directory directly under `refs/mirrors` is a collection. The
+            // walk skips the own id and an id that is not valid.
+            let skip = |path: &str| {
+                !path.contains('/')
+                    && (Some(path) == own.as_deref() || !ostrya_core::is_valid_collection_id(path))
+            };
+            // An entry directly under `refs/mirrors` has no collection id.
+            let keep_mirror = |path: &str| {
+                path.split_once('/')
+                    .is_some_and(|(id, name)| keep(&Ref::collection(id, name)))
+            };
+            let mut mirrors = collect_mirrors(&repo, &skip, &keep_mirror)?;
+            mirrors.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
+            let mut out = Vec::with_capacity(heads.len() + mirrors.len());
+            out.extend(heads.into_iter().map(|(name, c)| (Ref::local(name), c)));
+            out.extend(
+                mirrors
+                    .into_iter()
+                    .map(|(id, name, c)| (Ref::collection(id, name), c)),
+            );
+            Ok(out)
+        })
+        .await
     }
 
     /// Returns the refs that `refs` and `collections` select and `access`
@@ -836,7 +913,7 @@ impl Repo {
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || collect_mirrors(&repo, None)).await
+        ostrya_rt::unblock(move || collect_mirrors(&repo, &|_| false, &|_| true)).await
     }
 
     /// Returns the collection-qualified refs, sorted by collection id and ref
@@ -1084,7 +1161,10 @@ impl Repo {
         }
         let repo = self.clone();
         let skip = skip.map(str::to_owned);
-        let mirrors = ostrya_rt::unblock(move || collect_mirrors(&repo, skip.as_deref())).await?;
+        let mirrors = ostrya_rt::unblock(move || {
+            collect_mirrors(&repo, &|path| Some(path) == skip.as_deref(), &|_| true)
+        })
+        .await?;
         for (collection, name, commit) in mirrors {
             all.push(CollectionRefEntry {
                 collection,
@@ -1528,13 +1608,20 @@ pub(crate) fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
     parts.join("/")
 }
 
-/// Collects each ref under `refs/heads` and its subdirectories.
-fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
+/// Collects each ref under `refs/heads` and its subdirectories whose name
+/// `keep` selects. The walk applies `keep` to the name before it reads the
+/// ref file.
+fn collect_heads(repo: &Repo, keep: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Checksum)>> {
     let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    walk_ref_dir(heads.as_fd(), "", &mut |entry| push_head(&mut out, &entry))?;
+    walk_ref_dir(heads.as_fd(), "", &mut |entry| {
+        if keep(entry.path) {
+            push_head(&mut out, &entry)?;
+        }
+        Ok(())
+    })?;
     Ok(out)
 }
 
@@ -2196,14 +2283,21 @@ fn open_refs_dir(repo: &Repo, relpath: &str) -> Result<Option<OwnedFd>> {
 
 /// Collects each ref under `refs/mirrors`, split into its collection id (the
 /// first path component) and its ref name (the rest of the path). The walk
-/// does not read the directory `refs/mirrors/skip/`.
-fn collect_mirrors(repo: &Repo, skip: Option<&str>) -> Result<Vec<(String, String, Checksum)>> {
+/// does not read a directory whose path below `refs/mirrors` `skip` selects,
+/// and it does not read an entry whose path `keep` drops.
+fn collect_mirrors(
+    repo: &Repo,
+    skip: &dyn Fn(&str) -> bool,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, String, Checksum)>> {
     let Some(mirrors) = open_refs_dir(repo, "refs/mirrors")? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let skip = |path: &str| Some(path) == skip;
-    walk_ref_dir_skipping(mirrors.as_fd(), "", &skip, &mut |entry| {
+    walk_ref_dir_skipping(mirrors.as_fd(), "", skip, &mut |entry| {
+        if !keep(entry.path) {
+            return Ok(());
+        }
         let Some(bytes) = read_ref_file(entry.dir, entry.name)? else {
             return Ok(());
         };

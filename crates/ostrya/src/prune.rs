@@ -397,15 +397,80 @@ impl PruneOptions {
         }
     }
 
-    /// Returns `true` if the roots are the refs alone.
+    /// Returns `true` if the options root the walk of [`Repo::prune`] on the
+    /// refs alone.
     ///
-    /// A time bound, a branch selection, and a depth for one branch each have
-    /// the same effect as `refs_only`.
-    pub(crate) fn roots_on_refs_alone(&self) -> bool {
-        self.refs_only
-            || self.keep_younger_than.is_some()
-            || !self.only_branch.is_empty()
-            || !self.retain_branch_depth.is_empty()
+    /// The method returns `true` if one or more of these options is set:
+    ///
+    /// - [`refs_only`](PruneOptions::refs_only) if it is `true`.
+    /// - [`keep_younger_than`](PruneOptions::keep_younger_than) if it is
+    ///   `Some`.
+    /// - [`only_branch`](PruneOptions::only_branch) if it is not empty.
+    /// - [`retain_branch_depth`](PruneOptions::retain_branch_depth) if it is
+    ///   not empty.
+    ///
+    /// If it returns `false`, each commit object in the store is also a root.
+    /// [`Repo::prune`], "Roots", states the roots of the walk.
+    ///
+    /// A set [`weak_ref_filter`](PruneOptions::weak_ref_filter) needs
+    /// [`refs_only`](PruneOptions::refs_only) set to `true`, also if this
+    /// method returns `true`. If the filter is set and `refs_only` is `false`,
+    /// [`Repo::prune`] fails with [`Error::InvalidFormat`]. If this method
+    /// returns `true`, the change of `refs_only` to `true` changes no root.
+    ///
+    /// # Examples
+    ///
+    /// The function `add_filter` adds a weak ref filter only if the options
+    /// root the walk on the refs alone. It sets `refs_only` to `true` with the
+    /// filter, so the roots of the walk do not change. A time bound roots the
+    /// walk on the refs alone, so the function adds the filter. The default
+    /// options root each commit in the store, so the function adds no filter.
+    ///
+    /// ```
+    /// use ostrya::{PruneOptions, Ref, WeakRefFilter};
+    ///
+    /// fn add_filter(opts: &mut PruneOptions) -> bool {
+    ///     if !opts.roots_on_refs_alone() {
+    ///         return false;
+    ///     }
+    ///     opts.refs_only = true;
+    ///     opts.weak_ref_filter =
+    ///         WeakRefFilter::new(|r, _| !matches!(r, Ref::Collection { .. }));
+    ///     true
+    /// }
+    ///
+    /// let mut bounded = PruneOptions {
+    ///     keep_younger_than: Some(1_700_000_000),
+    ///     ..PruneOptions::default()
+    /// };
+    /// assert!(add_filter(&mut bounded));
+    /// assert!(bounded.refs_only);
+    ///
+    /// let mut default = PruneOptions::default();
+    /// assert!(!add_filter(&mut default));
+    /// assert!(!default.refs_only);
+    /// ```
+    pub fn roots_on_refs_alone(&self) -> bool {
+        // The pattern names each field. A new field then fails to compile
+        // here until its author decides if the field roots the walk on the
+        // refs alone.
+        let PruneOptions {
+            refs_only,
+            depth: _,
+            no_prune: _,
+            delete_commit: _,
+            keep_younger_than,
+            only_branch,
+            retain_branch_depth,
+            commit_only: _,
+            static_deltas_only: _,
+            traverse_parent: _,
+            weak_ref_filter: _,
+        } = self;
+        *refs_only
+            || keep_younger_than.is_some()
+            || !only_branch.is_empty()
+            || !retain_branch_depth.is_empty()
     }
 
     /// Returns the options with each collection ref of the own collection id

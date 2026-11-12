@@ -15412,26 +15412,8 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         .into_iter()
         .map(|(branch, depth)| (branch_ref(&branch), depth))
         .collect();
-    // `[ex-ostrya] gc-weak-references` marks the refs that it selects weak.
-    // Each run reads and checks the key, so a bad value refuses each prune
-    // before it writes. `Repo::prune` takes a weak ref filter only with
-    // `refs_only`, so the filter applies only when the roots are the refs
-    // alone. `refs_only` then changes no root.
-    let weak_refs = repo.config().gc_weak_references()?;
-    let refs_alone = args.refs_only
-        || keep_younger_than.is_some()
-        || !only_branch.is_empty()
-        || !retain_branch_depth.is_empty();
-    let (refs_only, weak_ref_filter) = match weak_refs {
-        Some(selector) if refs_alone => {
-            let own = repo.config().collection_id().map(str::to_owned);
-            let filter = WeakRefFilter::new(move |r, _| !selector.matches(r, own.as_deref()));
-            (true, filter)
-        }
-        _ => (args.refs_only, WeakRefFilter::default()),
-    };
-    let opts = PruneOptions {
-        refs_only,
+    let mut opts = PruneOptions {
+        refs_only: args.refs_only,
         depth: args.depth,
         no_prune: args.no_prune,
         delete_commit,
@@ -15440,9 +15422,21 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         retain_branch_depth,
         commit_only: args.commit_only,
         static_deltas_only: args.static_deltas_only,
-        weak_ref_filter,
         ..PruneOptions::default()
     };
+    // `[ex-ostrya] gc-weak-references` marks the refs that it selects weak.
+    // Each run reads and checks the key, so a bad value refuses each prune
+    // before it writes. `Repo::prune` takes a weak ref filter only with
+    // `refs_only`, so the filter applies only when
+    // `PruneOptions::roots_on_refs_alone` gives `true`. `refs_only` then
+    // changes no root.
+    if let Some(selector) = repo.config().gc_weak_references()?
+        && opts.roots_on_refs_alone()
+    {
+        let own = repo.config().collection_id().map(str::to_owned);
+        opts.refs_only = true;
+        opts.weak_ref_filter = WeakRefFilter::new(move |r, _| !selector.matches(r, own.as_deref()));
+    }
     // If the config of a repository sets `[core] locking` to false, the prune
     // takes no lock. The run then shares the repository with each other
     // writer. The `ostree` command writes nothing at this point, so this line

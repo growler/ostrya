@@ -22,7 +22,7 @@ use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
     Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Ref, Repo, RepoMode,
-    static_delta_relative_dir,
+    WeakRefFilter, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -1339,6 +1339,71 @@ fn a_tombstone_is_written_when_the_config_key_is_set() {
             "tombstone markers are outside the total"
         );
     });
+}
+
+/// Returns the default options with the change `shape`.
+fn options_with(shape: impl FnOnce(&mut PruneOptions)) -> PruneOptions {
+    let mut opts = PruneOptions::default();
+    shape(&mut opts);
+    opts
+}
+
+#[test]
+fn roots_on_refs_alone_is_true_for_each_rooting_option_and_false_for_the_others() {
+    assert!(
+        !PruneOptions::default().roots_on_refs_alone(),
+        "the default roots each commit in the store"
+    );
+    let rooting = [
+        ("refs_only", options_with(|o| o.refs_only = true)),
+        (
+            "keep_younger_than",
+            options_with(|o| o.keep_younger_than = Some(BASE_TS)),
+        ),
+        (
+            "only_branch",
+            options_with(|o| o.only_branch = vec![Ref::local("main")]),
+        ),
+        (
+            "retain_branch_depth",
+            options_with(|o| o.retain_branch_depth = vec![(Ref::local("main"), 1)]),
+        ),
+    ];
+    for (field, opts) in rooting {
+        assert!(
+            opts.roots_on_refs_alone(),
+            "{field} alone roots the walk on the refs alone"
+        );
+    }
+    let other = [
+        ("depth", options_with(|o| o.depth = 0)),
+        ("no_prune", options_with(|o| o.no_prune = true)),
+        (
+            "delete_commit",
+            options_with(|o| {
+                o.delete_commit = Some(Checksum::from_hex(&"ab".repeat(32)).unwrap());
+            }),
+        ),
+        ("commit_only", options_with(|o| o.commit_only = true)),
+        (
+            "static_deltas_only",
+            options_with(|o| o.static_deltas_only = true),
+        ),
+        (
+            "traverse_parent",
+            options_with(|o| o.traverse_parent = false),
+        ),
+        (
+            "weak_ref_filter",
+            options_with(|o| o.weak_ref_filter = WeakRefFilter::new(|_, _| true)),
+        ),
+    ];
+    for (field, opts) in other {
+        assert!(
+            !opts.roots_on_refs_alone(),
+            "{field} alone leaves each commit in the store a root"
+        );
+    }
 }
 
 #[test]

@@ -110,8 +110,9 @@ mod man;
          the `ostree` command.\n\n",
         "Each subcommand operates on one repository. The command finds the \
          repository in this order: the --repo option, the current directory, \
-         and the `OSTREE_REPO` environment variable. Run `ostrya <COMMAND> \
-         --help` to see the options of a subcommand."
+         the `OSTREE_REPO` environment variable, and the system repository \
+         `/ostree/repo`. Run `ostrya <COMMAND> --help` to see the options of \
+         a subcommand."
     )
 )]
 struct Cli {
@@ -120,14 +121,18 @@ struct Cli {
     /// The option is accepted before and after the subcommand name. If both
     /// positions give a value, the value after the name wins. Without this
     /// option, the command opens the current directory if it is a repository.
-    /// Else it opens the path in `OSTREE_REPO` if that path is a repository.
-    /// If no source gives a repository, the command prints its usage text and
-    /// `error: Command requires a --repo argument`, then exits 1.
+    /// Else, if `OSTREE_REPO` is set and not empty, the command opens that
+    /// path, and no other source follows. Else, if the command cannot find an
+    /// entry named `config` in the current directory (a stat of the entry
+    /// fails), it opens the system repository `/ostree/repo`. A source that
+    /// does not open gives no repository. If no source gives a repository, the
+    /// command prints its usage text and `error: Command requires a --repo
+    /// argument`, then exits 1.
     ///
     /// `init` creates a new repository only at an explicit --repo. Without the
-    /// option, `init` reuses a repository that it finds in the current
-    /// directory or at `OSTREE_REPO`. Each other subcommand exits 1 if an
-    /// explicit --repo does not open as a repository.
+    /// option, `init` reuses a repository that it finds through the same
+    /// sources. Each other subcommand exits 1 if an explicit --repo does not
+    /// open as a repository.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
     /// The remotes directory of the repository.
@@ -185,8 +190,9 @@ enum Command {
     /// The command is idempotent. It keeps each part of the layout that
     /// exists. If the `config` file exists, the command keeps it unchanged,
     /// and the repository keeps its mode and its collection id. Without
-    /// --repo, the command reuses a repository in the current directory or at
-    /// `OSTREE_REPO`. It prints nothing on success.
+    /// --repo, the command reuses a repository that the current directory,
+    /// `OSTREE_REPO`, or `/ostree/repo` gives, in the order of the global
+    /// option --repo. It prints nothing on success.
     Init(InitArgs),
     /// Commit a tree into the repository and print the new commit checksum.
     ///
@@ -1914,11 +1920,10 @@ enum RemoteCommand {
     /// `config`. The command needs the S3 permissions `s3:GetObject`,
     /// `s3:PutObject`, `s3:ListBucket`, and `s3:DeleteObject`.
     ///
-    /// With an address, the command needs no repository and reads no
-    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
-    /// reads the remote from the config of the repository. With
-    /// --break-lock, an init that removed the writer lock of another writer
-    /// writes one `warning: removed the writer lock of HOLDER` line to
+    /// With an address, the command needs no repository and opens none. With
+    /// a remote name, it reads the remote from the config of the repository.
+    /// With --break-lock, an init that removed the writer lock of another
+    /// writer writes one `warning: removed the writer lock of HOLDER` line to
     /// standard error.
     #[cfg(feature = "s3")]
     Init(RemoteInitArgs),
@@ -1986,9 +1991,8 @@ enum RemoteCommand {
     /// and `s3:ListBucketMultipartUploads`. With --delete, it also needs
     /// `s3:PutObject` and `s3:DeleteObject`.
     ///
-    /// With an address, the command needs no repository and reads no
-    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
-    /// reads the remote from the config of the repository.
+    /// With an address, the command needs no repository and opens none. With
+    /// a remote name, it reads the remote from the config of the repository.
     #[cfg(feature = "s3")]
     Fsck(RemoteFsckArgs),
     /// Delete the unreachable objects of a bucket repository in an S3 bucket.
@@ -2060,11 +2064,10 @@ enum RemoteCommand {
     /// `s3:ListBucketMultipartUploads`. It refuses a bucket repository whose
     /// `config` sets `[core] tombstone-commits` to true.
     ///
-    /// With an address, the command needs no repository and reads no
-    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
-    /// reads the remote from the config of the repository. With
-    /// --break-lock, a prune that removed the writer lock of another writer
-    /// writes one `warning: removed the writer lock of HOLDER` line to
+    /// With an address, the command needs no repository and opens none. With
+    /// a remote name, it reads the remote from the config of the repository.
+    /// With --break-lock, a prune that removed the writer lock of another
+    /// writer writes one `warning: removed the writer lock of HOLDER` line to
     /// standard error, after the other lines.
     #[cfg(feature = "s3")]
     Prune(RemotePruneArgs),
@@ -2142,11 +2145,10 @@ enum RemoteCommand {
     /// The command takes the writer lock of the bucket repository, and
     /// removes it at the end. It needs the S3 permissions `s3:GetObject`,
     /// `s3:PutObject`, `s3:ListBucket`, and `s3:DeleteObject`. With an
-    /// address, it needs no repository and reads no `--repo`, current
-    /// directory, or `OSTREE_REPO`. With a remote name, it reads the remote
-    /// from the config of the repository. With --break-lock, an update that
-    /// removed the writer lock of another writer writes one `warning: removed
-    /// the writer lock of HOLDER` line to standard error.
+    /// address, it needs no repository and opens none. With a remote name, it
+    /// reads the remote from the config of the repository. With --break-lock,
+    /// an update that removed the writer lock of another writer writes one
+    /// `warning: removed the writer lock of HOLDER` line to standard error.
     Summary(RemoteSummaryArgs),
     /// Import GPG keys into the trusted keyring of a remote.
     ///
@@ -5198,7 +5200,7 @@ struct PushTreeArgs {
     /// repository, and the command ignores --repo for it. Each other value
     /// names a `[remote "<name>"]` section with a push address. The section
     /// is in the config of the repository that --repo, the current directory,
-    /// or `OSTREE_REPO` names.
+    /// `OSTREE_REPO`, or `/ostree/repo` names.
     ///
     /// To an `s3://` address, the push writes the bucket repository at that
     /// address, which `remote init` created. A build without the feature
@@ -6607,8 +6609,8 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
 /// these steps come before the ssh client starts or the first HTTP request.
 ///
 /// A remote name is looked up in the repository that `--repo`, the current
-/// directory, or `OSTREE_REPO` gives. An address opens no repository, so the
-/// command reads none of the three for it.
+/// directory, `OSTREE_REPO`, or `/ostree/repo` gives. An address opens no
+/// repository, so the command reads none of these sources for it.
 ///
 /// # Output
 ///
@@ -7097,6 +7099,8 @@ fn exit_requires_repo(subcommand: &str) -> ! {
 }
 
 /// The path of the system repository of an ostree host.
+///
+/// This path is the last source of the repository chain of [`find_repo`].
 const SYSTEM_REPO: &str = "/ostree/repo";
 
 /// The remotes directory of the system repository.
@@ -7144,17 +7148,18 @@ fn open_options(path: &Path, remotes_dir: Option<&Path>, system_repo: &Path) -> 
 ///
 /// 1. An explicit `--repo`, in either position. If this repository does not
 ///    open, the process ends with an error.
-/// 2. The current directory, if it opens as a repository.
-/// 3. `OSTREE_REPO`, if it opens as a repository.
+/// 2. The current directory, if it opens as a repository. If it does not
+///    open, the chain goes on to step 3.
+/// 3. `OSTREE_REPO`, if it is set and not empty. If this repository does not
+///    open, the chain ends with no repository. An empty value counts as unset.
+/// 4. [`SYSTEM_REPO`], if `OSTREE_REPO` is not set or is empty, and the
+///    command cannot find an entry named `config` in the current directory
+///    (a stat of the entry fails). If the stat finds the entry, or if this
+///    repository does not open, the chain ends with no repository.
 ///
-/// The chain ends there. The `ostree` command has one more source after
-/// `OSTREE_REPO`. Its help text names `/sysroot/ostree/repo`, and the observed
-/// source is `/ostree/repo`. ostrya does not use this source, so an omitted
-/// `--repo` never makes `ostrya` act on a live system repository.
-///
-/// Each candidate opens with the options of [`open_options`], which select
-/// the remotes directory. A candidate of step 2 or 3 that does not open is
-/// skipped, also when its remotes directory fails the open.
+/// [`find_repo`] gives steps 2 to 4. Each candidate opens with the options of
+/// [`open_options`], which select the remotes directory. A candidate does not
+/// open also when its remotes directory fails the open.
 ///
 /// If no source gives a repository, the function prints the usage text of
 /// `subcommand` and the error line of `ostree`, then exits.
@@ -7178,23 +7183,58 @@ async fn resolve_repo(repo: RepoArgs<'_>, verbose: bool, subcommand: &str) -> (R
             }
         }
     }
-    let cwd = Path::new(".");
-    if let Ok(repo) = open(cwd).open(cwd).await {
-        if verbose {
-            eprintln!("ostrya: using repository {}", cwd.display());
-        }
-        return (repo, cwd.to_owned());
+    let found = find_repo(
+        Path::new("."),
+        std::env::var_os("OSTREE_REPO").map(PathBuf::from),
+        repo.remotes_dir,
+        Path::new(SYSTEM_REPO),
+    )
+    .await;
+    let Some((repo, path)) = found else {
+        exit_requires_repo(subcommand);
+    };
+    if verbose {
+        eprintln!("ostrya: using repository {}", path.display());
     }
-    if let Ok(val) = std::env::var("OSTREE_REPO") {
-        let path = PathBuf::from(val);
-        if let Ok(repo) = open(&path).open(&path).await {
-            if verbose {
-                eprintln!("ostrya: using repository {}", path.display());
-            }
-            return (repo, path);
-        }
+    (repo, path)
+}
+
+/// Finds the repository of a command with no `--repo`.
+///
+/// The function tries these sources in this order:
+///
+/// 1. `cwd`, if it opens as a repository. If it does not open, the chain
+///    goes on to step 2.
+/// 2. `env_repo`, the value of `OSTREE_REPO`, if it is set and not empty. If
+///    it does not open, the chain ends with no repository. An empty value
+///    counts as unset.
+/// 3. `system_repo`, if `env_repo` is not set or is empty, and a stat of the
+///    entry `config` in `cwd` fails. If the stat finds the entry, or if
+///    `system_repo` does not open, the chain ends with no repository.
+///
+/// Each candidate opens with the options of [`open_options`]. A candidate does
+/// not open also when its remotes directory fails the open. The function
+/// returns the repository and the path of the source that gave it, or `None`
+/// if no source gives a repository.
+async fn find_repo(
+    cwd: &Path,
+    env_repo: Option<PathBuf>,
+    remotes_dir: Option<&Path>,
+    system_repo: &Path,
+) -> Option<(Repo, PathBuf)> {
+    if let Ok(repo) = open_options(cwd, remotes_dir, system_repo).open(cwd).await {
+        return Some((repo, cwd.to_owned()));
     }
-    exit_requires_repo(subcommand);
+    let path = match env_repo {
+        Some(val) if !val.as_os_str().is_empty() => val,
+        _ if std::fs::symlink_metadata(cwd.join("config")).is_err() => system_repo.to_owned(),
+        _ => return None,
+    };
+    let repo = open_options(&path, remotes_dir, system_repo)
+        .open(&path)
+        .await
+        .ok()?;
+    Some((repo, path))
 }
 
 /// Resolves the path at which `init` creates or reuses a repository.
@@ -7203,9 +7243,9 @@ async fn resolve_repo(repo: RepoArgs<'_>, verbose: bool, subcommand: &str) -> (R
 ///
 /// - An explicit `--repo` path is used as given, valid or not, because the new
 ///   repository does not need to exist there.
-/// - The current directory and `OSTREE_REPO` apply only if the path opens as a
-///   repository with the options of [`open_options`]. Then the call is an
-///   idempotent re-init.
+/// - The sources of [`find_repo`] apply only if the path opens as a repository
+///   with the options of [`open_options`]. Then the call is an idempotent
+///   re-init.
 ///
 /// `init` never creates a new repository at a path that it did not get
 /// explicitly. If no source gives a path, [`exit_requires_repo`] ends the
@@ -7214,18 +7254,17 @@ async fn resolve_init_path(repo: RepoArgs<'_>, subcommand: &str) -> PathBuf {
     if let Some(path) = repo.path {
         return path.to_owned();
     }
-    let open = |path: &Path| open_options(path, repo.remotes_dir, Path::new(SYSTEM_REPO));
-    let cwd = Path::new(".");
-    if open(cwd).open(cwd).await.is_ok() {
-        return cwd.to_owned();
+    let found = find_repo(
+        Path::new("."),
+        std::env::var_os("OSTREE_REPO").map(PathBuf::from),
+        repo.remotes_dir,
+        Path::new(SYSTEM_REPO),
+    )
+    .await;
+    match found {
+        Some((_, path)) => path,
+        None => exit_requires_repo(subcommand),
     }
-    if let Ok(val) = std::env::var("OSTREE_REPO") {
-        let path = PathBuf::from(val);
-        if open(&path).open(&path).await.is_ok() {
-            return path;
-        }
-    }
-    exit_requires_repo(subcommand);
 }
 
 /// Creates a new empty repository, or reuses one at the resolved path.
@@ -18913,5 +18952,146 @@ mod tests {
             plain.remotes_dir(),
             Some(RemotesDir::Path(p)) if p == Path::new(SYSTEM_REMOTES_DIR)
         ));
+    }
+
+    /// Creates a scratch root for the tests of [`find_repo`]. The root holds
+    /// the empty directory `empty` and an archive repository for each name in
+    /// `repos`.
+    fn chain_root(name: &str, repos: &[&str]) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("ostrya-cli-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        for repo in repos {
+            let opts = CreateOptions::new(RepoMode::Archive);
+            ostrya_rt::block_on(Repo::create(&root.join(repo), opts)).unwrap();
+        }
+        root
+    }
+
+    /// Returns the path that [`find_repo`] selects.
+    fn chain_path(cwd: &Path, env: Option<PathBuf>, system: &Path) -> Option<PathBuf> {
+        ostrya_rt::block_on(find_repo(cwd, env, None, system)).map(|(_, path)| path)
+    }
+
+    /// With no repository in the current directory and no `OSTREE_REPO`, the
+    /// chain gives the system repository. It opens with
+    /// [`SYSTEM_REMOTES_DIR`].
+    #[test]
+    fn the_system_repository_is_the_fallback() {
+        let root = chain_root("chain-fallback", &["system"]);
+        let system = root.join("system");
+        let found = ostrya_rt::block_on(find_repo(&root.join("empty"), None, None, &system));
+        let _ = std::fs::remove_dir_all(&root);
+        let (repo, path) = found.unwrap();
+        assert_eq!(path, system);
+        assert!(matches!(
+            repo.remotes_dir(),
+            Some(RemotesDir::Path(p)) if p == Path::new(SYSTEM_REMOTES_DIR)
+        ));
+    }
+
+    /// A repository in the current directory comes before the system
+    /// repository.
+    #[test]
+    fn a_current_directory_repository_comes_before_the_system_repository() {
+        let root = chain_root("chain-cwd", &["cwd", "system"]);
+        let found = chain_path(&root.join("cwd"), None, &root.join("system"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(root.join("cwd")));
+    }
+
+    /// A repository in the current directory comes before an `OSTREE_REPO`
+    /// that opens.
+    #[test]
+    fn a_current_directory_repository_comes_before_an_ostree_repo() {
+        let root = chain_root("chain-cwd-env", &["cwd", "env"]);
+        let found = chain_path(
+            &root.join("cwd"),
+            Some(root.join("env")),
+            &root.join("absent"),
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(root.join("cwd")));
+    }
+
+    /// An `OSTREE_REPO` that opens comes before the system repository.
+    #[test]
+    fn an_ostree_repo_that_opens_comes_before_the_system_repository() {
+        let root = chain_root("chain-env", &["env", "system"]);
+        let env = root.join("env");
+        let found = chain_path(&root.join("empty"), Some(env.clone()), &root.join("system"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(env));
+    }
+
+    /// A current directory with a `config` that does not open goes on to an
+    /// `OSTREE_REPO` that opens.
+    #[test]
+    fn a_current_directory_config_that_does_not_open_goes_on_to_ostree_repo() {
+        let root = chain_root("chain-cwd-config-env", &["env"]);
+        let empty = root.join("empty");
+        std::fs::write(empty.join("config"), "[x]\n").unwrap();
+        let env = root.join("env");
+        let found = chain_path(&empty, Some(env.clone()), &root.join("absent"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(env));
+    }
+
+    /// An `OSTREE_REPO` that does not open ends the chain, also when the
+    /// system repository opens.
+    #[test]
+    fn an_ostree_repo_that_does_not_open_ends_the_chain() {
+        let root = chain_root("chain-env-bad", &["system"]);
+        let (empty, system) = (root.join("empty"), root.join("system"));
+        let found =
+            [root.join("absent"), empty.clone()].map(|env| chain_path(&empty, Some(env), &system));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, [None, None]);
+    }
+
+    /// An empty `OSTREE_REPO` counts as unset, so the chain reaches the system
+    /// repository.
+    #[test]
+    fn an_empty_ostree_repo_reaches_the_system_repository() {
+        let root = chain_root("chain-env-empty", &["system"]);
+        let system = root.join("system");
+        let found = chain_path(&root.join("empty"), Some(PathBuf::new()), &system);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, Some(system));
+    }
+
+    /// A system repository that is absent or does not open ends the chain.
+    #[test]
+    fn a_system_repository_that_does_not_open_ends_the_chain() {
+        let root = chain_root("chain-system-bad", &[]);
+        let empty = root.join("empty");
+        let found =
+            [root.join("absent"), empty.clone()].map(|system| chain_path(&empty, None, &system));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, [None, None]);
+    }
+
+    /// A current directory with a `config` that does not open ends the chain,
+    /// also when the system repository opens.
+    #[test]
+    fn a_current_directory_config_that_does_not_open_ends_the_chain() {
+        let root = chain_root("chain-cwd-config", &["system"]);
+        let empty = root.join("empty");
+        std::fs::write(empty.join("config"), "[x]\n").unwrap();
+        let found = chain_path(&empty, None, &root.join("system"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, None);
+    }
+
+    /// A dangling symlink named `config` in the current directory ends the
+    /// chain, also when the system repository opens.
+    #[test]
+    fn a_dangling_config_symlink_in_the_current_directory_ends_the_chain() {
+        let root = chain_root("chain-cwd-dangling", &["system"]);
+        let empty = root.join("empty");
+        std::os::unix::fs::symlink(root.join("absent"), empty.join("config")).unwrap();
+        let found = chain_path(&empty, None, &root.join("system"));
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(found, None);
     }
 }

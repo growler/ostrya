@@ -10,7 +10,7 @@ ostrya [OPTIONS] [COMMAND]
 .PP
 ostrya reads and writes ostree repositories. A repository keeps file trees as commits. Each file, directory, and commit is stored as objects, and the \%SHA\-256 checksum of an object is its name. A ref is a name that points to a commit. The \%on\-disk format is the format of the \fB\%ostree\fR command.
 .PP
-Each subcommand operates on one repository. The command finds the repository in this order: the \%\-\-repo option, the current directory, and the \fB\%OSTREE_REPO\fR environment variable. Run \fB\%ostrya <COMMAND> \-\-help\fR to see the options of a subcommand.
+Each subcommand operates on one repository. The command finds the repository in this order: the \%\-\-repo option, the current directory, the \fB\%OSTREE_REPO\fR environment variable, and the system repository \fB\%/ostree/repo\fR\&. Run \fB\%ostrya <COMMAND> \-\-help\fR to see the options of a subcommand.
 .SH OPTIONS
 The options below are global. Each one is accepted before and after
 the subcommand name.
@@ -18,9 +18,9 @@ the subcommand name.
 \fB\-\-repo\fR \fIREPO\fR
 The path of the repository to operate on.
 .IP
-The option is accepted before and after the subcommand name. If both positions give a value, the value after the name wins. Without this option, the command opens the current directory if it is a repository. Else it opens the path in \fB\%OSTREE_REPO\fR if that path is a repository. If no source gives a repository, the command prints its usage text and \fB\%error: Command requires a \-\-repo argument\fR, then exits \%1.
+The option is accepted before and after the subcommand name. If both positions give a value, the value after the name wins. Without this option, the command opens the current directory if it is a repository. Else, if \fB\%OSTREE_REPO\fR is set and not empty, the command opens that path, and no other source follows. Else, if the command cannot find an entry named \fB\%config\fR in the current directory (a stat of the entry fails), it opens the system repository \fB\%/ostree/repo\fR\&. A source that does not open gives no repository. If no source gives a repository, the command prints its usage text and \fB\%error: Command requires a \-\-repo argument\fR, then exits \%1.
 .IP
-\fB\%init\fR creates a new repository only at an explicit \%\-\-repo. Without the option, \fB\%init\fR reuses a repository that it finds in the current directory or at \fB\%OSTREE_REPO\fR\&. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
+\fB\%init\fR creates a new repository only at an explicit \%\-\-repo. Without the option, \fB\%init\fR reuses a repository that it finds through the same sources. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
 .TP
 \fB\-\-remotes\-config\-dir\fR \fIPATH\fR
 The remotes directory of the repository.
@@ -125,6 +125,8 @@ Serve one pull session over standard input and standard output
 \fBOSTREE_REPO\fR
 The repository to operate on when \fB\-\-repo\fR is not given and the
 current directory is not a repository.
+If the variable is set and not empty, the command does not fall back to the system repository \fB\%/ostree/repo\fR.
+If the variable is not set or is empty, and the command cannot find an entry named \fBconfig\fR in the current directory (a stat of the entry fails), the command opens \fB\%/ostree/repo\fR.
 .SH EXAMPLES
 Create an archive repository, commit a directory to the ref \fBmain\fR, and
 show the log of the ref:

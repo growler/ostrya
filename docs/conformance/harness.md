@@ -257,22 +257,24 @@ applies where a reference is present, since only the reference converts its
 messages through the locale.
 
 The reference tool resolves a repository from the current directory, then
-`OSTREE_REPO`, then the compiled-in `/ostree/repo`, and the third source stands
-outside the environment's reach. The help text of the tool names
-`/sysroot/ostree/repo`, and the observed third source is `/ostree/repo`. On an
-ostree host, `/ostree` leads to `/sysroot/ostree`, so the two paths name one
-repository. The harness reads the two paths from the host: startup records the
-first of `/ostree/repo` and `/sysroot/ostree/repo` that is present, and the
-`host:` banner line ends with `system repo PATH` or `no system repo` on every
-run. Where the host carries one, every invocation the harness
-makes binds a repository -- through `--repo`, through `OSTREE_REPO`, or through
-a working directory that opens as one -- and an invocation binding none is
-refused before the process starts. Declared cells, probes, setups, oracles, and
-`observe` all reach the one function that starts a process, which is where the
-refusal sits. The argv and the bound environment are read textually, and the
-check refuses where the reading is uncertain, as it is for an argv ending in a
-bare `--repo`. The working directory is read from disk, since it is the first
-source in the chain and an invocation resolving there never reaches the third.
+`OSTREE_REPO`, then the compiled-in `/ostree/repo`. The port resolves the same
+chain. When `OSTREE_REPO` is set and not empty, the chain ends at that source:
+a value that does not open gives no repository, and neither command tries the
+third source. The help text of the tool names `/sysroot/ostree/repo`, and the
+observed third source is `/ostree/repo`. On an ostree host, `/ostree` leads
+to `/sysroot/ostree`, so the two paths name one repository. The harness reads
+the two paths from the host: startup records the first of `/ostree/repo` and
+`/sysroot/ostree/repo` that is present, and the `host:` banner line ends with
+`system repo PATH` or `no system repo` on every run. Where the host carries
+one, every invocation the harness makes binds a repository -- through
+`--repo`, through `OSTREE_REPO`, or through a working directory that opens as
+one -- and an invocation binding none is refused before the process starts.
+Declared cells, probes, setups, oracles, and `observe` all reach the one
+function that starts a process, which is where the refusal sits. The argv and
+the bound environment are read textually, and the check refuses where the
+reading is uncertain, as it is for an argv ending in a bare `--repo`. The
+working directory is read from disk, since it is the first source in the chain
+and an invocation resolving there never reaches the third.
 
 Captured text holds scratch paths, wall-clock values, and checksums, so the text
 oracles and `refs-bytes` normalize before comparison:
@@ -395,9 +397,9 @@ Three verdicts. A cell reports exactly one.
 
 A `system-repo` skip states that the host carries `/ostree/repo` or
 `/sysroot/ostree/repo` and the cell holds an invocation binding no repository.
-When `/ostree/repo` exists, the reference tool opens it for such an invocation,
-so the claim the cell states cannot be made here. When `/sysroot/ostree/repo`
-exists and `/ostree` does not, the tool reports
+When `/ostree/repo` exists, the reference tool and the port open it for such an
+invocation, so the claim the cell states cannot be made here. When
+`/sysroot/ostree/repo` exists and `/ostree` does not, the tool reports
 `Command requires a --repo argument` for such an invocation. The harness skips
 the cell on that host too, because the help text of the tool names
 `/sysroot/ostree/repo`. This guard is wider than the rule of the tool.

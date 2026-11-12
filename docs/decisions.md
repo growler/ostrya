@@ -311,9 +311,9 @@ order:
 
 `ostrya init` gives the option to `CreateOptions::remotes_dir`, so the create
 writes the key. The create does not apply step 3. With no `--repo`, `init`
-opens the current directory and `OSTREE_REPO` in the four steps, as each
-other subcommand does. The option has no environment variable. These forms
-were rejected:
+opens the current directory, `OSTREE_REPO`, and `/ostree/repo` in the four
+steps, as each other subcommand does. The option has no environment
+variable. These forms were rejected:
 
 - A command that reads the key alone. The tool reads the remotes of the
   system repository from `/etc/ostree/remotes.d` with no key, and it ignores
@@ -326,6 +326,14 @@ were rejected:
   `config` has a remote name of the directory. With the default for the
   system repository alone, the harness never reaches the directory, and the
   command needs no option to turn the default off.
+
+With no `--repo`, the `ostrya` command resolves the repository from the
+current directory, then `OSTREE_REPO`, then `/ostree/repo`. The chain ends at
+`/ostree/repo`, as the chain of the tool does. The reason is functional
+compatibility with the tool. The port runs on ostree hosts, and there the
+users of the tool expect a command with no `--repo` to act on the system
+repository. So a command that writes also acts on the system repository, and
+`remote add` on it writes into `/etc/ostree/remotes.d`.
 
 The system repository is the directory of `/ostree/repo`, as the tool selects
 it. The command compares the device and the inode of the two paths, and it

@@ -20,7 +20,7 @@ On success, standard output carries the commit checksum alone. Under \%\-\-verbo
 \fIREMOTE\fR
 The remote: a remote name, or an ssh, HTTP, or \fB\%s3://\fR address. Required.
 .IP
-A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, \fB\%https://\fR, or \fB\%s3://BUCKET[/PREFIX]\fR address. An address opens no repository, and the command ignores \%\-\-repo for it. Each other value names a \fB\%[remote "<name>"]\fR section with a push address. The section is in the config of the repository that \%\-\-repo, the current directory, or \fB\%OSTREE_REPO\fR names.
+A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, \fB\%https://\fR, or \fB\%s3://BUCKET[/PREFIX]\fR address. An address opens no repository, and the command ignores \%\-\-repo for it. Each other value names a \fB\%[remote "<name>"]\fR section with a push address. The section is in the config of the repository that \%\-\-repo, the current directory, \fB\%OSTREE_REPO\fR, or \fB\%/ostree/repo\fR names.
 .IP
 To an \fB\%s3://\fR address, the push writes the bucket repository at that address, which \fB\%remote init\fR created. A build without the feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .TP

@@ -104,7 +104,7 @@ The command writes the \fB\%config\fR of a new bucket repository at the \fB\%s3:
 .PP
 The command takes the writer lock of the bucket repository, writes the \fB\%config\fR only if the bucket repository holds none, and removes the lock. It refuses a bucket repository that holds a \fB\%config\fR, so the collection id of a bucket repository never changes. A push needs the \fB\%config\fR\&. The command needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&.
 .PP
-With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an init that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
+With an address, the command needs no repository and opens none. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an init that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
 .PP
 .nf
 ostrya remote init [OPTIONS] [NAME]
@@ -177,7 +177,7 @@ If the repair fails after its first change, the command prints the report with t
 .PP
 The command needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:ListBucketMultipartUploads\fR\&. With \%\-\-delete, it also needs \fB\%s3:PutObject\fR and \fB\%s3:DeleteObject\fR\&.
 .PP
-With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository.
+With an address, the command needs no repository and opens none. With a remote name, it reads the remote from the config of the repository.
 .PP
 .nf
 ostrya remote fsck [OPTIONS] [NAME]
@@ -250,7 +250,7 @@ The command prints the lines of \fB\%ostrya prune\fR: \fB\%Total objects: N\fR, 
 .PP
 The command takes the writer lock of the bucket repository, also with \%\-\-no\-prune, and removes it at the end. It needs the \%S3 permissions of a push, \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, \fB\%s3:DeleteObject\fR, and \fB\%s3:AbortMultipartUpload\fR, and also \fB\%s3:ListBucketMultipartUploads\fR\&. It refuses a bucket repository whose \fB\%config\fR sets \fB\%[core] tombstone\-commits\fR to true.
 .PP
-With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, a prune that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error, after the other lines.
+With an address, the command needs no repository and opens none. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, a prune that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error, after the other lines.
 .PP
 .nf
 ostrya remote prune [OPTIONS] [NAME]
@@ -416,7 +416,7 @@ With \%\-u, the command writes the summary of the bucket repository at the \fB\%
 .PP
 Each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%\-\-keys\-file key signs the summary, in this order. The command writes \fB\%summary\fR, and then \fB\%summary.sig\fR when it has a key. Between the two writes, a pull that verifies the summary refuses it. If the write of \fB\%summary.sig\fR fails after the write of \fB\%summary\fR, the command fails with an error that states that the two keys can fail to match, and a run again with the same keys writes a matching pair. The command never deletes \fB\%summary.sig\fR, so a bucket repository that holds one refuses an update with no signing key.
 .PP
-The command takes the writer lock of the bucket repository, and removes it at the end. It needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&. With an address, it needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an update that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
+The command takes the writer lock of the bucket repository, and removes it at the end. It needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&. With an address, it needs no repository and opens none. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an update that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
 .PP
 .nf
 ostrya remote summary [OPTIONS] [NAME]

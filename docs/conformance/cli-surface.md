@@ -884,14 +884,12 @@ tar stream from standard input, which is the form it has carried since Phase 10.
 `--tree=tar=-` and `--tree=tar=/dev/stdin`, the spellings the tool reaches
 standard input by, are accepted by both and are how a script states the stdin
 source in either. The port keeps its own default because an omitted argument
-would otherwise walk and commit whatever directory the caller happens to stand
-in, which is the class of accident the omitted `/ostree/repo` fallback
-is left out for ("Global conventions"). Two consequences: `ostrya commit -b b
---base=REV` with no source reads standard input where `ostree commit -b b
---base=REV` overlays the working directory on the base, and `ostrya commit -b b`
-with standard input on a terminal waits for that input where `ostree commit -b b`
-commits the working directory. `--tree=dir=.` states the tool's default source in
-either implementation.
+would otherwise walk and commit whatever directory the caller stands in. Two
+consequences: `ostrya commit -b b --base=REV` with no source reads standard
+input where `ostree commit -b b --base=REV` overlays the working directory on
+the base, and `ostrya commit -b b` with standard input on a terminal waits for
+that input where `ostree commit -b b` commits the working directory.
+`--tree=dir=.` states the tool's default source in either implementation.
 
 The second is the wording of an archive that opens and does not parse. An
 archive that does not open reports `error: archive_read_open_filename: Failed to
@@ -6316,8 +6314,8 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=NAME|@ID:NAME
   `s3://BUCKET[/PREFIX]` address, or a remote name that the config of the
   local repository holds with a push address. The command reads the local
   repository for a remote name alone, from `--repo`, then the current
-  directory, then `OSTREE_REPO`. For an address the command opens no
-  repository, and it ignores `--repo`.
+  directory, then `OSTREE_REPO`, then `/ostree/repo`. For an address the
+  command opens no repository, and it ignores `--repo`.
 - `BRANCH` and each `--tag` are `NAME` or `@ID:NAME`. The command refuses
   each other form, for example a remote ref `REMOTE:NAME`, a name that the
   ref-name rule refuses, which includes a name that holds `^`, a tag equal
@@ -7011,22 +7009,32 @@ Observed by running the tool (2026.1).
   `r2`. The port is more lenient here: it accepts both forms in both
   positions, which is a superset of the tool's syntax, not a divergence any
   matrix cell exercises.
-- With no `--repo`, the precedence is: the current directory, when it is a
-  repository the tool can open; otherwise `OSTREE_REPO`, when set and openable;
-  otherwise the compiled-in path `/ostree/repo`, when the host carries
-  one; otherwise the tool prints the subcommand's usage text to standard error,
-  followed by `error: Command requires a --repo argument`, and exits 1. A
-  current directory that opens (has a `[core]` section with a recognized
-  `mode` key) is preferred even when `OSTREE_REPO` names a different, valid
-  repository; a current directory whose `config` exists but does not parse as
-  a repository (no `[core]` section, or no `mode` key) falls through to
-  `OSTREE_REPO` the same as a current directory with no `config` at all. A
-  current directory whose `config` has a `[core]` section with an
-  unparseable `mode` value is a third case: the tool treats that directory as
-  the intended repository and reports the specific open failure (see below)
-  rather than falling through; the port does not reproduce this third case,
-  since it is not exercised by any `cli-surface.md`-required option and adds a
-  parse-depth distinction with no matrix weight.
+- With no `--repo`, the tool resolves the repository in this order. The
+  records of the order come from `ostree` 2026.1, observed on 2026-11-12 in a
+  `bwrap` sandbox.
+  1. The current directory, when it opens as a repository. It comes first
+     also when `OSTREE_REPO` names an empty directory or a different, valid
+     repository.
+  2. `OSTREE_REPO`, when it is set and not empty. A value that does not open
+     ends the chain: with `OSTREE_REPO` set to an empty directory and to an
+     absent path, the tool reports `error: Command requires a --repo
+     argument` at exit 1, also when `/ostree/repo` is a valid repository. An
+     empty `OSTREE_REPO` counts as unset, and the tool resolves
+     `/ostree/repo`.
+  3. The compiled-in path `/ostree/repo`, when the current directory does not
+     open and `OSTREE_REPO` is not set or is empty. A current directory whose
+     `config` has no `[core]` group goes on to this source. A repository in
+     the current directory at mode 000 goes on to this source too. An
+     `/ostree/repo` that is an empty directory or whose `config` has no
+     `[core]` group gives no repository, and so does an `/ostree` with no
+     `repo`.
+
+  If no source gives a repository, the tool prints the subcommand's usage
+  text to standard error, followed by `error: Command requires a --repo
+  argument`, and exits 1. A current directory whose `config` has a `[core]`
+  section with an unparseable `mode` value is a special case: the tool treats
+  that directory as the intended repository and reports the specific open
+  failure (see below).
 - The third source is a path the tool compiles in, and its help text states the
   chain: `--repo=PATH   Path to OSTree repository (defaults to current
   directory or /sysroot/ostree/repo)`, with `OSTREE_REPO` sitting between the
@@ -7035,41 +7043,64 @@ Observed by running the tool (2026.1).
   `/sysroot/ostree/repo` present, a repo-less `remote list` reports `error:
   Command requires a --repo argument` at exit 1 (`cli-behavior.md`, `remote`,
   "The remotes directory"). On an ostree host, `/ostree` leads to
-  `/sysroot/ostree`, so the two paths name one repository. An `OSTREE_REPO`
-  value that does not open as a repository leaves the chain running: with
-  `OSTREE_REPO` set to an empty directory and to an absent path, the tool
-  reports `error: Command requires a --repo argument` on a host with no system
-  repository, so it passes over the value and continues. No environment
-  variable closes the third source. A repo-less tool invocation on an
-  ostree-managed host therefore resolves the system repository, and a writing
-  subcommand acts on it. The port's chain is the current directory, then
-  `OSTREE_REPO`, and it ends there. Resolving no third source keeps `ostrya`
-  from acting on a live system repository through an omitted `--repo`, and it
-  costs `ostrya prune` an explicit `--repo` where `ostree prune` needs none on
-  an ostree-managed host. The port holds this divergence by intent.
+  `/sysroot/ostree`, so the two paths name one repository. A repo-less tool
+  invocation on an ostree-managed host therefore resolves the system
+  repository, and a writing subcommand acts on it. The port resolves the same
+  chain, with these divergences:
+  - The port tries `/ostree/repo` when it cannot find an entry named
+    `config` in the current directory, that is, when a stat of the entry
+    fails. The stat fails when the entry is absent, and when the current
+    directory is at mode 000. For a repository in the current directory at
+    mode 000, the port thus goes on to `/ostree/repo`, as the tool does. The
+    stat does not follow a symlink, so it finds a dangling symlink. A
+    current directory with a `config` entry that the stat finds and that does
+    not open ends the chain with `error: Command requires a --repo argument`.
+    The tool goes on to `/ostree/repo` when that `config` has no `[core]`
+    group.
+  - The port passes over each source that does not open. With no other
+    source, it reports `error: Command requires a --repo argument` at exit 1.
+    For some open failures of a source, the tool reports `error: opening
+    repo: <reason>` at exit 1. One is an unparseable `mode` value in the
+    current directory (see above). The others were observed with `ostree`
+    2026.1 on 2026-11-12: an unparseable `mode` value in `OSTREE_REPO` or in
+    `/ostree/repo` (`opening repo: Invalid mode 'bogus' in repository
+    configuration`), an `OSTREE_REPO` path or an `/ostree/repo` at mode 000
+    (`opening repo: opendir(<path>): Permission denied`), and a system
+    repository whose remotes directory fails the open (see the bullet on the
+    remotes directory below).
 - `init` uses this same precedence, not a special case: with no explicit
-  `--repo`, a current directory or an `OSTREE_REPO` target that already opens
-  as a repository is reused (an idempotent re-init, same as passing that path
-  to `--repo` explicitly); one that does not open falls through to the
-  `Command requires a --repo argument` form, the same as every other
-  subcommand -- `init` never creates a brand-new repository at a cwd- or
-  env-resolved path, only at an explicit `--repo`. A quirk specific to this
-  fallback path: reusing an existing repository through the cwd or
-  `OSTREE_REPO` fallback crashes with `error: Key file does not have key
+  `--repo`, a source of the chain that already opens as a repository is
+  reused (an idempotent re-init, same as passing that path to `--repo`
+  explicitly); a chain that gives no repository ends in the `Command requires
+  a --repo argument` form, the same as every other subcommand -- `init` never
+  creates a brand-new repository at a path that the chain resolves, only at
+  an explicit `--repo`. Observed on 2026-11-12 with `ostree` 2026.1: with no
+  `--repo`, `ostree init` reports `error: Command requires a --repo argument`
+  at exit 1 and writes nothing with `/ostree` absent, with an empty
+  `/ostree`, with `OSTREE_REPO` set to an empty directory or to an absent
+  path, and with `/ostree/repo` a writable empty directory. With
+  `/ostree/repo` a valid repository and `OSTREE_REPO` set to an empty
+  directory, it reports the same error. With `/ostree/repo` an archive
+  repository whose `config` has a `collection-id`, `ostree init --mode=bare`
+  and `ostree init --collection-id=org.example.T` exit 0, and the `config`
+  does not change. The port reuses `/ostree/repo` in the same way. A quirk
+  specific to this fallback path: reusing an existing repository through the
+  chain crashes with `error: Key file does not have key
   "collection-id" in group "core"` when that repository's config has no
   `collection-id` key, even though the very same reuse through an explicit
-  `--repo` succeeds (exit 0, config untouched) on the identical
-  repository. The port does not reproduce this crash: its cwd/`OSTREE_REPO`
-  fallback resolution and its explicit-`--repo` path share one idempotent
-  `Repo::create` call, so both succeed uniformly regardless of whether
-  `collection-id` was ever set.
+  `--repo` succeeds (exit 0, config untouched) on the identical repository.
+  Through `/ostree/repo`, `ostree init --mode=bare` gives this error at exit
+  1, and the `config` does not change, so the tool reads `/ostree/repo` for
+  `init`. The port does not reproduce this crash: its chain resolution and
+  its explicit-`--repo` path share one idempotent `Repo::create` call, so
+  both succeed uniformly regardless of whether `collection-id` was ever set.
 - When `--repo` is given explicitly (either position) and fails to open, the
   tool reports `error: opening repo: <reason>` (no usage text) and exits 1.
   Confirmed for a missing path (`opening repo: opendir(...): No such file or
   directory`) and for a rejected mode value (`opening repo: Invalid mode
-  '<mode>' in repository configuration`). The cwd-default and `OSTREE_REPO`
-  fallbacks do not get this specific-reason treatment: an open failure there
-  is folded into the generic `Command requires a --repo argument` case above.
+  '<mode>' in repository configuration`). The tool gives the same form for
+  some open failures of a source of the chain (see the third-source bullet
+  above). The port gives this form for an explicit `--repo` alone.
 - A typed `[core]` value is read more strictly by the port than by the tool,
   so a set of malformed values opens under the tool and is refused by the port.
   The tool's key-file reader takes the leading run of decimal digits from an
@@ -7172,19 +7203,27 @@ Observed by running the tool (2026.1).
   valid UTF-8 at the open. The tool opens a repository with a value that is
   not valid UTF-8, and fails only a command that reads that value. It skips a
   group whose name is not valid UTF-8 with no message.
-- With no `--repo`, a current directory or an `OSTREE_REPO` path whose open
-  fails on its remotes directory does not open. The resolution then passes
-  over it with no message, as it passes over a directory whose `config` does
-  not parse. Examples are an empty `[ex-ostrya] remotes-config-dir`, a `.conf`
-  file that is not a valid key file, and a remote name in two sources. With
-  an explicit `--repo`, the command reports the error of the open. The rule
-  also applies to `/etc/ostree/remotes.d` when the current directory or the
-  `OSTREE_REPO` path is the system repository. If that directory fails the
-  open, the resolution passes over the system repository, and with no other
-  source the command reports `error: Command requires a --repo argument` at
-  exit 1. With an explicit `--repo`, the tool reports the error of the open
-  (`cli-behavior.md`, `remote`, "The remotes directory"). Not observed: the
-  answer of the tool with no `--repo`.
+- With no `--repo`, a current directory, an `OSTREE_REPO` path, or
+  `/ostree/repo` whose open fails on its remotes directory does not open. The
+  resolution then passes over it with no message, as it passes over a
+  directory whose `config` does not parse. Examples are an empty `[ex-ostrya]
+  remotes-config-dir`, a `.conf` file that is not a valid key file, and a
+  remote name in two sources. With an explicit `--repo`, the command reports
+  the error of the open. The rule also applies to `/etc/ostree/remotes.d`
+  when the source is the system repository: `/ostree/repo`, or a current
+  directory or an `OSTREE_REPO` path that is the system repository. If that
+  directory fails the open, the resolution passes over the system repository,
+  and with no other source the command reports `error: Command requires a
+  --repo argument` at exit 1. With an explicit `--repo`, the tool reports the
+  error of the open (`cli-behavior.md`, `remote`, "The remotes directory").
+  With no `--repo`, the tool also reports the error of the open. Observed on
+  2026-11-12 with `ostree` 2026.1 and a `.conf` file in
+  `/etc/ostree/remotes.d` that is not a valid key file: `remote list` reports
+  `error: opening repo: Reloading remotes: Failed to parse
+  /etc/ostree/remotes.d/a.conf:` and the reason at exit 1, with
+  `/ostree/repo` as the third source, with the current directory at
+  `/ostree/repo`, and with `OSTREE_REPO=/ostree/repo`. `ostree init` with no
+  `--repo` reports the same error.
 - Every subcommand that opens a transaction reaps `tmp/`, in the port and in
   the tool. Both skip `cache`, and both remove an entry that is not a staging
   entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole

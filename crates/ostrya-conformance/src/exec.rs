@@ -124,8 +124,8 @@ impl Outcome {
 ///
 /// # System repository
 ///
-/// The `ostree` command resolves a repository from these sources, in this
-/// order:
+/// The `ostree` command and the `ostrya` command resolve a repository from
+/// these sources, in this order:
 ///
 /// 1. The current directory.
 /// 2. The environment variable `OSTREE_REPO`.

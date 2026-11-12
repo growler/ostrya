@@ -3,6 +3,8 @@
 \fBOSTREE_REPO\fR
 The repository to operate on when \fB\-\-repo\fR is not given and the
 current directory is not a repository.
+If the variable is set and not empty, the command does not fall back to the system repository \fB\%/ostree/repo\fR.
+If the variable is not set or is empty, and the command cannot find an entry named \fBconfig\fR in the current directory (a stat of the entry fails), the command opens \fB\%/ostree/repo\fR.
 .SH EXAMPLES
 Create an archive repository, commit a directory to the ref \fBmain\fR, and
 show the log of the ref:

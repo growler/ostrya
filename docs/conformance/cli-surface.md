@@ -7080,32 +7080,39 @@ Observed by running the tool (2026.1).
     (`opening repo: opendir(<path>): Permission denied`), and a system
     repository whose remotes directory fails the open (see the bullet on the
     remotes directory below).
-- `init` uses this same precedence, not a special case: with no explicit
-  `--repo`, a source of the chain that already opens as a repository is
-  reused (an idempotent re-init, same as passing that path to `--repo`
-  explicitly); a chain that gives no repository ends in the `Command requires
-  a --repo argument` form, the same as every other subcommand -- `init` never
-  creates a brand-new repository at a path that the chain resolves, only at
-  an explicit `--repo`. Observed on 2026-11-12 with `ostree` 2026.1: with no
-  `--repo`, `ostree init` reports `error: Command requires a --repo argument`
-  at exit 1 and writes nothing with `/ostree` absent, with an empty
-  `/ostree`, with `OSTREE_REPO` set to an empty directory or to an absent
-  path, and with `/ostree/repo` a writable empty directory. With
-  `/ostree/repo` a valid repository and `OSTREE_REPO` set to an empty
-  directory, it reports the same error. With `/ostree/repo` an archive
-  repository whose `config` has a `collection-id`, `ostree init --mode=bare`
-  and `ostree init --collection-id=org.example.T` exit 0, and the `config`
-  does not change. The port reuses `/ostree/repo` in the same way. A quirk
-  specific to this fallback path: reusing an existing repository through the
-  chain crashes with `error: Key file does not have key
-  "collection-id" in group "core"` when that repository's config has no
-  `collection-id` key, even though the very same reuse through an explicit
-  `--repo` succeeds (exit 0, config untouched) on the identical repository.
-  Through `/ostree/repo`, `ostree init --mode=bare` gives this error at exit
-  1, and the `config` does not change, so the tool reads `/ostree/repo` for
-  `init`. The port does not reproduce this crash: its chain resolution and
-  its explicit-`--repo` path share one idempotent `Repo::create` call, so
-  both succeed uniformly regardless of whether `collection-id` was ever set.
+- `init` uses this same precedence. With no explicit `--repo`, the tool
+  takes a source of the chain that opens as a repository, as if that path
+  were the `--repo` value. A chain that gives no repository ends in the
+  `Command requires a --repo argument` form, the same as each other
+  subcommand. `init` creates a new repository only at an explicit `--repo`,
+  and never at a path that the chain resolves. Observed on 2026-11-12 with
+  `ostree` 2026.1: with no `--repo`, `ostree init` reports `error: Command
+  requires a --repo argument` at exit 1 and writes nothing with `/ostree`
+  absent, with an empty `/ostree`, with `OSTREE_REPO` set to an empty
+  directory or to an absent path, and with `/ostree/repo` a writable empty
+  directory. With `/ostree/repo` a valid repository and `OSTREE_REPO` set to
+  an empty directory, it reports the same error. With `/ostree/repo` an
+  archive repository whose `config` has a `collection-id`, `ostree init
+  --mode=bare` and `ostree init --collection-id=org.example.T` exit 0, and
+  the `config` does not change. A quirk of the chain: `init` on an existing
+  repository through the chain crashes with `error: Key file does not have
+  key "collection-id" in group "core"` when the `config` of that repository
+  has no `collection-id` key. The same `init` through an explicit `--repo`
+  on the same repository exits 0 and keeps `config`. Through `/ostree/repo`,
+  `ostree init --mode=bare` gives this error at exit 1, and the `config` does
+  not change, so the tool reads `/ostree/repo` for `init`. The port resolves
+  the same chain, with this divergence:
+  - The port refuses a path that holds an entry `config` of any type, through
+    the chain and through an explicit `--repo`. It prints `error: repository
+    exists: PATH` and exits 1, and it writes nothing. PATH is the path as
+    `init` got it: `.` for the current directory, the value of `OSTREE_REPO`,
+    `/ostree/repo`, or the `--repo` value. The tool exits 0 and keeps
+    `config`. Each source of the chain is a repository that opens, so `init`
+    with no `--repo` refuses that repository or reports `error: Command
+    requires a --repo argument`, and it never writes into `/ostree/repo`. A
+    directory that has entries and no `config` takes a new repository. The
+    port refuses a repository with no `collection-id` in the same way, so it
+    does not reproduce the crash of the tool.
 - When `--repo` is given explicitly (either position) and fails to open, the
   tool reports `error: opening repo: <reason>` (no usage text) and exits 1.
   Confirmed for a missing path (`opening repo: opendir(...): No such file or

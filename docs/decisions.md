@@ -155,6 +155,35 @@ refuses it and does not give it that meaning. A caller with an absolute
 directory gives a `RemotesDir::Path` value. A create also refuses a path that
 is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
+## The create of a repository
+
+`Repo::create` and `Repo::create_at` create a new repository only. If the
+path holds an entry `config` of any type, the create refuses with
+`Error::RepoExists` and writes nothing. The error gives the path as the
+caller gave it. The check is an lstat of `config` after the mkdir of the root
+and before the first layout directory, so the create also refuses a damaged
+repository and a dangling symlink `config`. The exclusive open of the new
+`config` gives the same refusal if another process writes `config` after
+the check and before the create writes its own `config`. In that case, the
+layout directories that the create wrote stay. A directory that has entries
+and no `config` gets the layout and a new `config`. A caller that wants an
+existing repository calls `Repo::open`.
+`Repo::export_media` calls `Repo::open` when the create refuses.
+
+The reason is `ostrya init` with no `--repo`. The command resolves the
+repository from the chain of the global option, and the chain ends at
+`/ostree/repo`. A refusal writes nothing into the live system repository,
+and the error names the path.
+
+This form was rejected:
+
+- An idempotent create, as the `ostree init` command does. The tool exits 0
+  on an existing repository and keeps `config`. Through the chain, an
+  idempotent create on `/ostree/repo` exits 0, ignores `--mode` and
+  `--collection-id` with no diagnostic, and writes each missing layout
+  directory into the live repository. `cli-surface.md`, "Global
+  conventions", records the divergence from the tool.
+
 ## The read of the remotes directory
 
 The open selects the remotes directory of the handle in this order: the value
@@ -176,11 +205,9 @@ The open reads `config` and each `.conf` file into the snapshot of
 `Repo::config`, and `UpdateGuard::read_config` reads both again. A read on
 first use was rejected: `Repo::config` is not async, so the read would block
 the task, or each reader would change. A create reads the directory of its
-value, or, with no value, the directory that the key of an existing `config`
-names, so the handle of a create agrees with its `Repo::remotes_dir`. A later
+value, so the handle of a create agrees with its `Repo::remotes_dir`. A later
 open gives the same remotes when the key names the same directory. A `Fd`
-value writes no key, and a create over an existing `config` writes no key, so
-a later open can select another directory.
+value writes no key, so a later open can select another directory.
 
 The own collection id of a handle, `[core] collection-id`, is in the same
 snapshot. A handle and each `UpdateGuard` of it map a collection ref with the
@@ -312,8 +339,10 @@ order:
 `ostrya init` gives the option to `CreateOptions::remotes_dir`, so the create
 writes the key. The create does not apply step 3. With no `--repo`, `init`
 opens the current directory, `OSTREE_REPO`, and `/ostree/repo` in the four
-steps, as each other subcommand does. The option has no environment
-variable. These forms were rejected:
+steps, as each other subcommand does. The create then refuses the repository
+that the chain gives, so `init` with no `--repo` writes nothing ("The create
+of a repository"). The option has no environment variable. These forms were
+rejected:
 
 - A command that reads the key alone. The tool reads the remotes of the
   system repository from `/etc/ostree/remotes.d` with no key, and it ignores

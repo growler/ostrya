@@ -106,7 +106,8 @@ The extended attributes of a file object in a \fB\%bare\-split\-xattrs\fR reposi
 The byte layout of each object type is in \fB\%docs/format\-reference.md\fR of the ostrya source tree.
 .SH LAYOUT
 \fB\%ostrya init\fR makes the directories \fB\%objects\fR, \fB\%tmp\fR, \fB\%tmp/cache\fR, \fB\%refs\fR, \fB\%refs/heads\fR, \fB\%refs/remotes\fR, \fB\%refs/mirrors\fR, \fB\%state\fR, and \fB\%extensions\fR, and the file \fB\%config\fR.
-It keeps an existing \fB\%config\fR unchanged.
+It refuses a path that holds an entry \fB\%config\fR of any type with \fB\%repository exists: PATH\fR, exits 1, and writes nothing.
+In a directory that has entries and no \fB\%config\fR, it keeps each entry.
 The other entries below appear when a command first needs them.
 .TP
 \fB\%<repo>/config\fR

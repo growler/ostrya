@@ -144,23 +144,27 @@ note: both implementations write that one line to standard error and leave no
 
 family: M10
 subcommand: init
-cell: init/fallback-reuse
+cell: init/fallback-refusal
 setup: empty-dir
-probe: init-reuse-via-cwd-and-env
-outcome: full
+probe: init-refusal-via-cwd-and-env
+expect-exit: 1
+ref-expect-exit: 0
+outcome: lossy
 severity: interop
+loss: the port refuses an existing repository that the chain resolves, with
+ `error: repository exists: PATH` at exit 1, and writes nothing. The tool
+ exits 0 and keeps `config` (cli-surface.md, "Global conventions").
 spec: cli-surface.md#global-conventions
 note: the probe runs `init` with the repository as the current directory, and
- again through `OSTREE_REPO` with a non-repository current directory. Both
- implementations reuse the existing repository idempotently (exit 0, config
- unchanged) rather than requiring an explicit `--repo`: `init` shares the
- cwd/`OSTREE_REPO` precedence every other subcommand uses. The probe builds
- the repository with `collection-id` set, so the cell does not also exercise
- the tool's fallback-only crash on a repository lacking one (`error: Key file
- does not have key "collection-id" in group "core"`), which the identical
- reuse through an explicit `--repo` does not produce and which the port does
- not reproduce (cli-surface.md, "Global conventions"). The cell carries no
- claim about that divergence either way. A probe states this cell because the
+ again through `OSTREE_REPO` with a current directory that is not a
+ repository. `init` shares the precedence of the current directory and
+ `OSTREE_REPO` with each other subcommand. The `config` of the repository does
+ not change on either side. The probe builds the repository with
+ `collection-id` set, so the cell does not reach the crash of the tool on a
+ fallback to a repository with no `collection-id` (`error: Key file does not
+ have key "collection-id" in group "core"`). The port refuses that repository
+ as it refuses each other, so it does not reproduce the crash
+ (cli-surface.md, "Global conventions"). A probe states this cell because the
  working directory and the environment are what it varies, and a `run:` line
  states neither.
 
@@ -182,7 +186,7 @@ note: the same repository resolves whether `--repo` is given before the
  subcommand, after it, or via `OSTREE_REPO` with no `--repo` at all and a
  non-repository current directory; all three forms report the same object
  count, for both implementations. A probe states this cell for the same
- reason as `init/fallback-reuse`.
+ reason as `init/fallback-refusal`.
 
 family: M10
 subcommand: export

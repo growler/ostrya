@@ -662,8 +662,9 @@ fn remove_refs_immediate_refuses_an_invalid_ref_before_any_removal() {
 fn remove_refs_immediate_with_an_empty_batch_takes_no_lock() {
     let tmp = TmpDir::new("ref-store-remove-empty");
     let path = create(&tmp, Some(OWN));
+    let writer = open(&path);
     block_on(async {
-        put_local(&open(&path), "main", &checksum(1)).await;
+        put_local(&writer, "main", &checksum(1)).await;
     });
     let config = path.join("config");
     let text = std::fs::read_to_string(&config).unwrap();

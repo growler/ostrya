@@ -168,8 +168,9 @@ impl Repo {
     /// changes a file. It refuses a `mount/.ostree/repo` that is this
     /// repository: the same device and inode, also through a symlink. Then
     /// it creates `mount/.ostree` and the media repository in `archive`
-    /// mode, if they do not exist. An existing repository keeps its mode and
-    /// its `[core] collection-id`.
+    /// mode, if they do not exist. If `mount/.ostree/repo` holds an entry
+    /// `config`, the call opens that repository. It keeps its mode and its
+    /// `[core] collection-id`.
     ///
     /// The call makes one pull for each collection, in the order of the
     /// first operand of each collection. Each pull is a local pull at depth
@@ -215,8 +216,9 @@ impl Repo {
     /// - [`Error::InvalidInput`] if `mount/.ostree/repo` is this repository.
     ///   The errors above and this error come before the call creates a
     ///   file.
-    /// - The errors of [`CreateOptions::create`], of
-    ///   [`pull_local`](Repo::pull_local), of
+    /// - The errors of [`CreateOptions::create`] other than
+    ///   [`Error::RepoExists`], of [`Repo::open`] for an existing media
+    ///   repository, of [`pull_local`](Repo::pull_local), of
     ///   [`write_config`](Repo::write_config), and of
     ///   [`regenerate_summary`](Repo::regenerate_summary).
     pub async fn export_media(
@@ -258,7 +260,10 @@ impl Repo {
         let dir = mount.to_owned();
         ostrya_rt::unblock(move || make_media_dir_blocking(&source, &dir)).await?;
         let path = mount.join(MEDIA_REPO);
-        let mut media = CreateOptions::new(RepoMode::Archive).create(&path).await?;
+        let mut media = match CreateOptions::new(RepoMode::Archive).create(&path).await {
+            Err(Error::RepoExists(_)) => Repo::open(&path).await?,
+            created => created?,
+        };
 
         // One pull for each collection, in the order of its first ref.
         let mut collections: Vec<(&str, Vec<(String, Checksum)>)> = Vec::new();

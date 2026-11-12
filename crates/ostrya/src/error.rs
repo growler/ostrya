@@ -49,6 +49,12 @@ pub enum Error {
     /// The payload is the name of the remote.
     #[error("remote already exists: {0}")]
     RemoteExists(String),
+    /// A path where [`Repo::create`](crate::Repo::create) must create a
+    /// repository, and that holds an entry `config` of any type.
+    ///
+    /// The payload is the path as the caller gave it.
+    #[error("repository exists: {}", .0.display())]
+    RepoExists(std::path::PathBuf),
     /// A refspec that does not name a path in the `refs/` tree.
     ///
     /// The causes are:
@@ -874,7 +880,8 @@ impl From<Error> for std::io::Error {
             Error::EntryExists { .. }
             | Error::MergeConflict(_)
             | Error::ReplaceDirWithFile(_)
-            | Error::RemoteExists(_) => ErrorKind::AlreadyExists,
+            | Error::RemoteExists(_)
+            | Error::RepoExists(_) => ErrorKind::AlreadyExists,
             Error::MutableTree(_) | Error::InvalidInput(_) => ErrorKind::InvalidInput,
             _ => ErrorKind::Other,
         };
@@ -962,6 +969,7 @@ mod tests {
                 Error::RemoteExists("origin".into()),
                 ErrorKind::AlreadyExists,
             ),
+            (Error::RepoExists("repo".into()), ErrorKind::AlreadyExists),
             (
                 Error::MutableTree("bad name".into()),
                 ErrorKind::InvalidInput,

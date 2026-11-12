@@ -129,10 +129,10 @@ struct Cli {
     /// command prints its usage text and `error: Command requires a --repo
     /// argument`, then exits 1.
     ///
-    /// `init` creates a new repository only at an explicit --repo. Without the
-    /// option, `init` reuses a repository that it finds through the same
-    /// sources. Each other subcommand exits 1 if an explicit --repo does not
-    /// open as a repository.
+    /// `init` takes an explicit --repo as given. Without the option, `init`
+    /// takes the path of the repository that the same sources give, and
+    /// refuses it because a repository exists there. Each other subcommand
+    /// exits 1 if an explicit --repo does not open as a repository.
     #[arg(long, global = true)]
     repo: Option<PathBuf>,
     /// The remotes directory of the repository.
@@ -187,12 +187,14 @@ enum Command {
     /// --remotes-config-dir, the `[ex-ostrya]` group holds
     /// `remotes-config-dir` with the absolute path of its value.
     ///
-    /// The command is idempotent. It keeps each part of the layout that
-    /// exists. If the `config` file exists, the command keeps it unchanged,
-    /// and the repository keeps its mode and its collection id. Without
-    /// --repo, the command reuses a repository that the current directory,
-    /// `OSTREE_REPO`, or `/ostree/repo` gives, in the order of the global
-    /// option --repo. It prints nothing on success.
+    /// The command creates a new repository only. If the path holds an entry
+    /// named `config` of any type, the command prints `error: repository
+    /// exists: PATH`, exits 1, and writes nothing. In a directory that has
+    /// entries and no `config`, the command keeps each part of the layout
+    /// that exists. Without --repo, each source of the global option --repo
+    /// gives a repository, so the command refuses it, or prints `error:
+    /// Command requires a --repo argument` and exits 1. It prints nothing on
+    /// success.
     Init(InitArgs),
     /// Commit a tree into the repository and print the new commit checksum.
     ///
@@ -921,14 +923,13 @@ struct InitArgs {
     /// `bare-user-only`, and `bare-user-shared`. `archive` is an alias for
     /// `archive-z2`, and the `config` file records `archive-z2`.
     /// `bare-user-shared` is an ostrya extension. The command refuses any
-    /// other value and exits 1. A repository that exists keeps its mode.
+    /// other value and exits 1.
     #[arg(long, default_value = "bare")]
     mode: String,
     /// A globally unique id for this repository as a collection of refs.
     ///
     /// The command writes the value to `[core] collection-id` in the `config`
-    /// file. A repository that exists keeps its `config` file unchanged.
-    /// `commit` records this id in the `ostree.collection-binding` metadata
+    /// file. `commit` records this id in the `ostree.collection-binding` metadata
     /// key of each commit, unless --no-bindings is given.
     #[arg(long = "collection-id")]
     collection_id: Option<String>,
@@ -7250,15 +7251,15 @@ async fn find_repo(
     Some((repo, path))
 }
 
-/// Resolves the path at which `init` creates or reuses a repository.
+/// Resolves the path at which `init` creates a repository.
 ///
 /// The precedence is the precedence of [`resolve_repo`], with these changes:
 ///
 /// - An explicit `--repo` path is used as given, valid or not, because the new
 ///   repository does not need to exist there.
 /// - The sources of [`find_repo`] apply only if the path opens as a repository
-///   with the options of [`open_options`]. Then the call is an idempotent
-///   re-init.
+///   with the options of [`open_options`]. `Repo::create` then refuses the
+///   path with `Error::RepoExists`.
 ///
 /// `init` never creates a new repository at a path that it did not get
 /// explicitly. If no source gives a path, [`exit_requires_repo`] ends the
@@ -7280,9 +7281,10 @@ async fn resolve_init_path(repo: RepoArgs<'_>, subcommand: &str) -> PathBuf {
     }
 }
 
-/// Creates a new empty repository, or reuses one at the resolved path.
+/// Creates a new empty repository at the resolved path.
 ///
-/// The reuse is idempotent, as in `Repo::create`.
+/// `Repo::create` refuses a path that holds an entry `config`, and the
+/// command then exits 1.
 async fn init(repo: RepoArgs<'_>, verbose: bool, name: &str, args: InitArgs) -> Result<()> {
     let path = resolve_init_path(repo, name).await;
     let mode = parse_init_mode(&args.mode);

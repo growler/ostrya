@@ -402,7 +402,7 @@ fn ed25519_trusted_revoked_directory_convention() {
     std::fs::write(revoked_d.join("bad"), format!("{PUBLIC_B64}\n")).unwrap();
 
     block_on(async {
-        let (repo, _) = build_committed_repo(base).await;
+        let repo = Repo::open(&base.join("repo")).await.unwrap();
         let keys = load_sign_keys_from(&[keys_dir.as_path()], "ed25519").unwrap();
         assert_eq!(keys.trusted.len(), 1);
         assert_eq!(keys.revoked.len(), 1);

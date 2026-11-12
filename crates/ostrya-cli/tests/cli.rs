@@ -17312,8 +17312,8 @@ fn remote_add_without_a_remotes_dir_writes_config() {
 
 /// `init --remotes-config-dir` writes the absolute path of a relative value
 /// into the key, and a later `remote add` with no option writes into that
-/// directory. An `init` over an existing `config` leaves it unchanged. An
-/// empty value is refused at exit 1.
+/// directory. An `init` over an existing `config` refuses at exit 1 and
+/// leaves it unchanged. An empty value is refused at exit 1.
 #[test]
 fn init_writes_the_remotes_config_dir_key() {
     let tmp = TmpDir::new("init-remote-dir");
@@ -17343,13 +17343,15 @@ fn init_writes_the_remotes_config_dir_key() {
     ])
     .ok();
     assert!(dir.join("x.conf").is_file());
-    in_tmp(&[
+    let again = in_tmp(&[
         "init",
         "--repo=repo",
         "--mode=archive",
         "--remotes-config-dir=other.d",
-    ])
-    .ok();
+    ]);
+    let (code, stderr) = code_and_stderr(&again);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("repository exists"), "{stderr}");
     assert_eq!(config_text(&repo), config);
 
     let refused = in_tmp(&["init", "--repo=empty", "--remotes-config-dir="]);
@@ -17360,8 +17362,9 @@ fn init_writes_the_remotes_config_dir_key() {
 }
 
 /// `init` with no `--repo` finds the repository of the current directory with
-/// `--remotes-config-dir`, as other subcommands do. The key of the repository
-/// names a regular file, so an open without the option fails.
+/// `--remotes-config-dir`, as other subcommands do, and refuses it at exit 1.
+/// The key of the repository names a regular file, so an open without the
+/// option fails.
 #[test]
 fn init_finds_the_current_repository_with_the_remotes_config_dir_option() {
     let tmp = TmpDir::new("init-remote-dir-cwd");
@@ -17374,8 +17377,81 @@ fn init_finds_the_current_repository_with_the_remotes_config_dir_option() {
     let in_repo = |args: &[&str]| ostrya_in(Some(&repo), args, None, &[]);
 
     in_repo(&[&opt_arg, "remote", "list"]).ok();
-    in_repo(&["init", "--mode=archive", &opt_arg]).ok();
+    let (code, stderr) = code_and_stderr(&in_repo(&["init", "--mode=archive", &opt_arg]));
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("repository exists"), "{stderr}");
     assert_eq!(config_text(&repo), before);
+}
+
+/// `init` refuses a path that holds an entry `config`: through `--repo`,
+/// through the current directory, through `OSTREE_REPO`, and for a dangling
+/// symlink `config`. Each refusal exits 1, prints `error: repository exists:
+/// PATH` with the path as `init` got it, and writes nothing. A directory that
+/// has entries and no `config` takes a new repository.
+#[test]
+fn init_refuses_a_path_that_holds_config() {
+    let tmp = TmpDir::new("init-exists");
+    let repo = create_repo(tmp.path(), RepoMode::Bare);
+    let entries = |dir: &Path| {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let (config, listed) = (config_text(&repo), entries(&repo));
+    let plain = tmp.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    let dangling = tmp.path().join("dangling");
+    std::fs::create_dir(&dangling).unwrap();
+    std::os::unix::fs::symlink("absent", dangling.join("config")).unwrap();
+    let repo_env = repo.to_str().unwrap();
+
+    let cases = [
+        (
+            Some(tmp.path()),
+            vec!["init", "--repo=repo"],
+            vec![],
+            "repo",
+        ),
+        (Some(repo.as_path()), vec!["init"], vec![], "."),
+        (
+            Some(plain.as_path()),
+            vec!["init"],
+            vec![("OSTREE_REPO", repo_env)],
+            repo_env,
+        ),
+        (
+            Some(tmp.path()),
+            vec!["init", "--repo=dangling"],
+            vec![],
+            "dangling",
+        ),
+    ];
+    for (cwd, mut args, env, shown) in cases {
+        args.push("--mode=archive");
+        let run = ostrya_in(cwd, &args, None, &env);
+        let (code, stderr) = code_and_stderr(&run);
+        assert_eq!(code, Some(1), "{args:?}: {stderr}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            stderr,
+            format!("error: repository exists: {shown}\n"),
+            "{args:?}"
+        );
+    }
+    assert_eq!(config_text(&repo), config);
+    assert_eq!(entries(&repo), listed);
+    assert!(entries(&plain).is_empty());
+    assert_eq!(entries(&dangling), ["config"]);
+
+    let filled = tmp.path().join("filled");
+    std::fs::create_dir(&filled).unwrap();
+    std::fs::write(filled.join("foo"), "keep").unwrap();
+    ostrya_in(Some(tmp.path()), &["init", "--repo=filled"], None, &[]).ok();
+    assert_eq!(config_text(&filled), "[core]\nrepo_version=1\nmode=bare\n");
+    assert_eq!(std::fs::read_to_string(filled.join("foo")).unwrap(), "keep");
 }
 
 /// `pull-local` opens its source repository and each --localcache-repo
@@ -29077,7 +29153,9 @@ fn prune_totals_match_the_tool() {
     // repository has a `.commitmeta`, the total is the same as for the
     // repository with none. The bytes that a removed `.commitmeta` freed are
     // not in the sum.
-    let detached = create_repo(base, RepoMode::BareUser);
+    let detached_base = base.join("detached");
+    std::fs::create_dir(&detached_base).unwrap();
+    let detached = create_repo(&detached_base, RepoMode::BareUser);
     let tree = base.join("detached-tree");
     std::fs::create_dir_all(&tree).unwrap();
     for step in 0..2u64 {

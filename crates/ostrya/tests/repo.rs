@@ -117,21 +117,122 @@ fn create_builds_expected_layout() {
     assert_eq!(config_mode, 0o644, "config file mode");
 }
 
+/// A second create on one path refuses with `RepoExists` and the path as
+/// given. It writes no mode, no collection id, and no remotes directory key
+/// into `config`, and it creates no remotes directory.
 #[test]
-fn create_is_idempotent_and_preserves_config() {
-    let tmp = TmpDir::new("idem");
+fn create_refuses_an_existing_repository() {
+    let tmp = TmpDir::new("exists");
     let repo_path = tmp.path().join("repo");
     block_on(Repo::create(&repo_path, CreateOptions::new(RepoMode::Bare))).expect("first create");
-    // A second create with a different mode must keep the original config.
-    // `ostree init` does the same.
-    let repo = block_on(Repo::create(
-        &repo_path,
-        CreateOptions::new(RepoMode::Archive),
-    ))
-    .expect("second create");
-    assert_eq!(repo.mode(), RepoMode::Bare, "original mode is preserved");
+    let remotes = tmp.path().join("remotes.d");
+    let opts = CreateOptions::new(RepoMode::Archive)
+        .collection_id("org.example.Os")
+        .remotes_dir(RemotesDir::path(&remotes));
+    let err = block_on(opts.create(&repo_path)).expect_err("second create refuses");
+    assert!(
+        matches!(&err, Error::RepoExists(p) if *p == repo_path),
+        "{err:?}"
+    );
+    assert_eq!(
+        err.to_string(),
+        format!("repository exists: {}", repo_path.display())
+    );
     let bytes = std::fs::read(repo_path.join("config")).unwrap();
     assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=bare\n");
+    assert!(!remotes.exists());
+}
+
+/// Returns the sorted names of the entries of `dir`.
+fn entry_names(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// An entry `config` of each type makes a create refuse. The check does not
+/// follow a symlink. The refusal writes no layout directory, and a
+/// `bare-user-shared` create keeps the mode of the root.
+#[test]
+fn create_refuses_an_entry_config_of_each_type() {
+    let tmp = TmpDir::new("cfgtype");
+    for name in ["file", "link", "dangling", "dir", "fifo"] {
+        let path = tmp.path().join(name);
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = path.join("config");
+        match name {
+            "file" => std::fs::write(&config, b"not a key file").unwrap(),
+            "link" => {
+                std::fs::write(path.join("target"), b"[core]\n").unwrap();
+                std::os::unix::fs::symlink("target", &config).unwrap();
+            }
+            "dangling" => std::os::unix::fs::symlink("absent", &config).unwrap(),
+            "dir" => std::fs::create_dir(&config).unwrap(),
+            _ => rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &config,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o644),
+                0,
+            )
+            .unwrap(),
+        }
+        let before = entry_names(&path);
+        let err = block_on(Repo::create(
+            &path,
+            CreateOptions::new(RepoMode::BareUserShared),
+        ))
+        .expect_err("create refuses");
+        assert!(
+            matches!(&err, Error::RepoExists(p) if *p == path),
+            "{name}: {err:?}"
+        );
+        assert_eq!(entry_names(&path), before, "{name}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o755, "{name}");
+    }
+}
+
+/// A refusal of `create_at` names the path relative to the directory fd.
+#[test]
+fn create_at_refuses_with_the_relative_path() {
+    let tmp = TmpDir::new("atexists");
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let opts = CreateOptions::new(RepoMode::Archive);
+    block_on(Repo::create_at(
+        parent.as_fd(),
+        Path::new("repo"),
+        opts.clone(),
+    ))
+    .expect("first create_at");
+    let err = block_on(Repo::create_at(parent.as_fd(), Path::new("repo"), opts))
+        .expect_err("second create_at refuses");
+    assert!(
+        matches!(&err, Error::RepoExists(p) if p == Path::new("repo")),
+        "{err:?}"
+    );
+    assert_eq!(err.to_string(), "repository exists: repo");
+}
+
+/// A directory that has entries and no `config` takes the layout and a new
+/// `config`, and keeps its entries.
+#[test]
+fn create_fills_a_directory_with_no_config() {
+    let tmp = TmpDir::new("noconfig");
+    let path = tmp.path().join("repo");
+    std::fs::create_dir_all(path.join("objects")).unwrap();
+    std::fs::write(path.join("foo"), b"keep").unwrap();
+    let repo =
+        block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    assert_eq!(repo.mode(), RepoMode::Archive);
+    let bytes = std::fs::read(path.join("config")).unwrap();
+    assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=archive-z2\n");
+    assert_eq!(std::fs::read(path.join("foo")).unwrap(), b"keep");
+    assert!(path.join("refs/heads").is_dir());
 }
 
 #[test]
@@ -1017,25 +1118,6 @@ fn create_writes_a_key_value_that_reads_back() {
     assert_eq!(remotes_config_dir_key(&path).as_deref(), Some(text));
 }
 
-/// A create over an existing `config` writes no key, and the handle still
-/// holds the value.
-#[test]
-fn create_over_an_existing_config_writes_no_key() {
-    let tmp = TmpDir::new("rdidem");
-    let path = tmp.path().join("repo");
-    block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("first create");
-    let value = RemotesDir::path(tmp.path().join("remotes.d"));
-    let created = block_on(
-        CreateOptions::new(RepoMode::Archive)
-            .remotes_dir(value.clone())
-            .create(&path),
-    )
-    .expect("second create");
-    assert_same_dir(created.remotes_dir(), &value);
-    let bytes = std::fs::read(path.join("config")).unwrap();
-    assert_eq!(bytes, b"[core]\nrepo_version=1\nmode=archive-z2\n");
-}
-
 /// Writes the file `name` with `text` in the directory `dir`, and creates
 /// the directory if it is absent.
 fn write_conf(dir: &Path, name: &str, text: &str) {
@@ -1509,8 +1591,8 @@ fn read_config_reads_the_remotes_dir_again() {
     assert_eq!(file.remotes().count(), 0);
 }
 
-/// A create reads the remotes directory of its value. With no value, it
-/// takes the key of an existing `config`.
+/// A create reads the remotes directory of its value. An open of the new
+/// repository takes the key that the create wrote.
 #[test]
 fn create_reads_the_remotes_dir() {
     let tmp = TmpDir::new("rdcreate");
@@ -1525,8 +1607,7 @@ fn create_reads_the_remotes_dir() {
     .expect("create");
     assert_eq!(remote_names(&created), ["x"]);
 
-    let again =
-        block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
+    let again = block_on(Repo::open(&path)).expect("open");
     assert_same_dir(again.remotes_dir(), &RemotesDir::path(&dir));
     assert_eq!(remote_names(&again), ["x"]);
 }

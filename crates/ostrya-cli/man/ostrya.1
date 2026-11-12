@@ -20,7 +20,7 @@ The path of the repository to operate on.
 .IP
 The option is accepted before and after the subcommand name. If both positions give a value, the value after the name wins. Without this option, the command opens the current directory if it is a repository. Else, if \fB\%OSTREE_REPO\fR is set and not empty, the command opens that path, and no other source follows. Else, if the command cannot find an entry named \fB\%config\fR in the current directory (a stat of the entry fails), it opens the system repository \fB\%/ostree/repo\fR\&. A source that does not open gives no repository. If no source gives a repository, the command prints its usage text and \fB\%error: Command requires a \-\-repo argument\fR, then exits \%1.
 .IP
-\fB\%init\fR creates a new repository only at an explicit \%\-\-repo. Without the option, \fB\%init\fR reuses a repository that it finds through the same sources. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
+\fB\%init\fR takes an explicit \%\-\-repo as given. Without the option, \fB\%init\fR takes the path of the repository that the same sources give, and refuses it because a repository exists there. Each other subcommand exits \%1 if an explicit \%\-\-repo does not open as a repository.
 .TP
 \fB\-\-remotes\-config\-dir\fR \fIPATH\fR
 The remotes directory of the repository.

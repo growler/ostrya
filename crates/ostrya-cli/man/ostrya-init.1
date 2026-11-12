@@ -10,18 +10,18 @@ Initialize a new empty repository.
 .PP
 The command creates the directory at the \%\-\-repo path if it does not exist. The parent directory must exist. Then the command writes the directories of the repository layout and the \fB\%config\fR file. The \fB\%[core]\fR group of \fB\%config\fR holds \fB\%repo_version=1\fR, \fB\%mode\fR, and \fB\%collection\-id\fR if \%\-\-collection\-id is given. With the global option \%\-\-remotes\-config\-dir, the \fB\%[ex\-ostrya]\fR group holds \fB\%remotes\-config\-dir\fR with the absolute path of its value.
 .PP
-The command is idempotent. It keeps each part of the layout that exists. If the \fB\%config\fR file exists, the command keeps it unchanged, and the repository keeps its mode and its collection id. Without \%\-\-repo, the command reuses a repository that the current directory, \fB\%OSTREE_REPO\fR, or \fB\%/ostree/repo\fR gives, in the order of the global option \%\-\-repo. It prints nothing on success.
+The command creates a new repository only. If the path holds an entry named \fB\%config\fR of any type, the command prints \fB\%error: repository exists: PATH\fR, exits \%1, and writes nothing. In a directory that has entries and no \fB\%config\fR, the command keeps each part of the layout that exists. Without \%\-\-repo, each source of the global option \%\-\-repo gives a repository, so the command refuses it, or prints \fB\%error: Command requires a \-\-repo argument\fR and exits \%1. It prints nothing on success.
 .SH OPTIONS
 .TP
 \fB\-\-mode\fR \fIMODE\fR
 The storage mode of the new repository.
 .IP
-The values are \fB\%archive\fR, \fB\%archive\-z2\fR, \fB\%bare\fR, \fB\%bare\-user\fR, \fB\%bare\-user\-only\fR, and \fB\%bare\-user\-shared\fR\&. \fB\%archive\fR is an alias for \fB\%archive\-z2\fR, and the \fB\%config\fR file records \fB\%archive\-z2\fR\&. \fB\%bare\-user\-shared\fR is an ostrya extension. The command refuses any other value and exits \%1. A repository that exists keeps its mode. Default: bare.
+The values are \fB\%archive\fR, \fB\%archive\-z2\fR, \fB\%bare\fR, \fB\%bare\-user\fR, \fB\%bare\-user\-only\fR, and \fB\%bare\-user\-shared\fR\&. \fB\%archive\fR is an alias for \fB\%archive\-z2\fR, and the \fB\%config\fR file records \fB\%archive\-z2\fR\&. \fB\%bare\-user\-shared\fR is an ostrya extension. The command refuses any other value and exits \%1. Default: bare.
 .TP
 \fB\-\-collection\-id\fR \fICOLLECTION_ID\fR
 A globally unique id for this repository as a collection of refs.
 .IP
-The command writes the value to \fB\%[core] collection\-id\fR in the \fB\%config\fR file. A repository that exists keeps its \fB\%config\fR file unchanged. \fB\%commit\fR records this id in the \fB\%ostree.collection\-binding\fR metadata key of each commit, unless \%\-\-no\-bindings is given.
+The command writes the value to \fB\%[core] collection\-id\fR in the \fB\%config\fR file. \fB\%commit\fR records this id in the \fB\%ostree.collection\-binding\fR metadata key of each commit, unless \%\-\-no\-bindings is given.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

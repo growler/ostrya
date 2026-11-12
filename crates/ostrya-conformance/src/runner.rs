@@ -469,7 +469,7 @@ fn one(matrix: &Matrix, cell: &Cell, options: &Options) -> CellResult {
     // each invocation of the probe. Of the two registered probes,
     // `repo-position-precedence` binds `--repo` or `OSTREE_REPO` in each of
     // the three invocations of `repo_position_precedence`. The `init` of
-    // `init_reuse_via_cwd_and_env` with the repository as the current
+    // `init_refusal_via_cwd_and_env` with the repository as the current
     // directory uses the current-directory source on purpose. The `cwd` term
     // of the guard admits it.
     let directory = options.artifact_dir.join(&cell.id);

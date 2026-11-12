@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ostrya_core::{KeyFile, RepoMode};
-use rustix::fs::{Mode, OFlags};
+use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess};
@@ -373,13 +373,9 @@ impl CreateOptions {
     /// - An [`InRepo`](RemotesDir::InRepo) value writes its path as given.
     /// - A [`Fd`](RemotesDir::Fd) value writes no key.
     ///
-    /// A create over an existing `config` writes no key. The handle that a
-    /// create returns holds `dir` in each case, and
+    /// The handle that a create returns holds `dir` in each case, and
     /// [`Repo::remotes_dir`] gives it. The create reads the remotes of the
     /// directory, as an open does.
-    ///
-    /// With no value, the handle takes the remotes directory that the key of
-    /// an existing `config` names, as [`OpenOptions`] describes.
     pub fn remotes_dir(mut self, dir: RemotesDir) -> Self {
         self.remotes_dir = Some(dir);
         self
@@ -388,11 +384,16 @@ impl CreateOptions {
     /// Creates and opens a repository at `path`, relative to the working
     /// directory.
     ///
-    /// The call is idempotent. [`Repo::create`] describes the layout that it
-    /// writes.
+    /// The call creates a new repository only. [`Repo::create`] describes
+    /// the layout that it writes.
     ///
     /// # Errors
     ///
+    /// - [`Error::RepoExists`] if `path` holds an entry `config` of any
+    ///   type. The call checks the entry without following a symlink, and it
+    ///   writes nothing. If another process writes `config` after the check
+    ///   and before the call writes its own `config`, the call gives the
+    ///   same error, and the layout directories that it wrote stay.
     /// - [`Error::InvalidInput`] if the remotes directory value is an empty
     ///   path, a path that holds a NUL byte, or an absolute
     ///   [`InRepo`](RemotesDir::InRepo) path, or if the value of the key is
@@ -403,14 +404,8 @@ impl CreateOptions {
     ///   [`Path`](RemotesDir::Path) value.
     /// - [`Error::Io`] if the parent directory of `path` does not exist, or if
     ///   `path`, `objects`, `tmp`, or `refs` exists and is not a directory.
-    /// - [`Error::Io`] if a create, a write, or a read fails.
-    /// - [`Error::InvalidFormat`] if an existing `config` is larger than 1 MiB
-    ///   (1048576 bytes) or is not valid UTF-8.
-    /// - [`Error::InvalidFormat`] if the `[core]` group of an existing `config`
-    ///   fails the checks of [`RepoConfig::from_keyfile`].
-    /// - [`Error::Core`] if an existing `config` is not a valid key file, or if
-    ///   a `[core]` value that [`RepoConfig::from_keyfile`] reads does not
-    ///   parse.
+    /// - [`Error::Io`] if a create, a write, a read, or the check of the
+    ///   entry `config` fails.
     /// - The errors of [`OpenOptions::open`] for the key
     ///   `[ex-ostrya] remotes-config-dir`, the remotes directory, and its
     ///   `.conf` files. The call reads them after it writes the layout and
@@ -428,8 +423,9 @@ impl CreateOptions {
     /// Creates and opens a repository at `path`, relative to the directory
     /// `dir`.
     ///
-    /// The call is idempotent. [`Repo::create`] describes the layout that it
-    /// writes.
+    /// The call creates a new repository only. [`Repo::create`] describes
+    /// the layout that it writes. The path of [`Error::RepoExists`] is
+    /// `path`, relative to `dir`.
     ///
     /// # Errors
     ///
@@ -704,9 +700,12 @@ impl Repo {
     ///
     /// The call is [`opts.create(path)`](CreateOptions::create).
     ///
-    /// The call is idempotent. If `config` exists, the call does not change it,
-    /// and the handle reads the mode from it. The `ostree init` command also
-    /// keeps an existing `config`. The handle stores `path` as given.
+    /// The call creates a new repository only. If `path` holds an entry
+    /// `config` before the call, the call refuses with [`Error::RepoExists`]
+    /// and writes nothing. The errors of [`CreateOptions::create`] describe
+    /// a `config` that another process writes during the call. To get a
+    /// handle of an existing repository, use [`Repo::open`]. The handle
+    /// stores `path` as given.
     ///
     /// # Layout
     ///
@@ -726,10 +725,10 @@ impl Repo {
     /// the `ostree` command does. The `config` file gets the mode `0644`, and
     /// the umask does not change it.
     ///
-    /// The call keeps each entry of the layout that exists. It does not check
-    /// the type of an existing `tmp/cache`, `refs/heads`, `refs/remotes`,
-    /// `refs/mirrors`, `state`, or `extensions`. A file at such a path does not
-    /// make the call fail.
+    /// In a directory that has no `config`, the call keeps each entry of the
+    /// layout that exists. It does not check the type of an existing
+    /// `tmp/cache`, `refs/heads`, `refs/remotes`, `refs/mirrors`, `state`, or
+    /// `extensions`. A file at such a path does not make the call fail.
     ///
     /// In a `bare-user-shared` repository, the call sets the mode `02770` on
     /// each directory that it creates. The umask does not change this mode.
@@ -759,8 +758,8 @@ impl Repo {
     /// Creates and opens a repository at `path`, relative to the directory `dir`.
     ///
     /// The call is [`opts.create_at(dir, path)`](CreateOptions::create_at).
-    /// It is idempotent. [`create`](Repo::create) describes the layout that it
-    /// writes.
+    /// It creates a new repository only. [`create`](Repo::create) describes
+    /// the layout that it writes.
     ///
     /// # Errors
     ///
@@ -818,9 +817,9 @@ impl Repo {
     /// `[ex-ostrya] remotes-config-dir` gives a [`Path`](RemotesDir::Path)
     /// value for an absolute path and an [`InRepo`](RemotesDir::InRepo) value
     /// for a relative path. For a create, the value is the value of
-    /// [`CreateOptions::remotes_dir`], or else the value of the key of an
-    /// existing `config`. A handle with no remotes directory gives `None`,
-    /// for example a handle of [`Repo::open_at_strict`].
+    /// [`CreateOptions::remotes_dir`], or `None` if the create got no value.
+    /// A handle with no remotes directory gives `None`, for example a handle
+    /// of [`Repo::open_at_strict`].
     pub fn remotes_dir(&self) -> Option<&RemotesDir> {
         self.inner.remotes_dir.as_ref()
     }
@@ -1232,19 +1231,26 @@ fn open_materials<Fd: AsFd>(
     materials.select_remotes_dir(opts.remotes_dir.as_ref(), opts.default_remotes_dir.as_ref())
 }
 
-/// Makes sure that the repository layout and the config exist, then gathers
-/// the materials.
+/// Creates the repository layout and the config, then gathers the
+/// materials.
 ///
 /// The call makes the text of a new `config` before it creates a directory,
-/// so a refusal of the remotes directory value writes nothing.
+/// so a refusal of the remotes directory value writes nothing. The call
+/// refuses a root that holds an entry `config` before it creates a layout
+/// directory, so that refusal writes nothing either.
 fn create_materials<Fd: AsFd>(dir: Fd, path: &Path, opts: &CreateOptions) -> Result<Materials> {
     let config = initial_config_text(opts)?;
     mkdir_idempotent(&dir, path, opts.mode)?;
     let repo_fd = open_dir(&dir, path)?;
+    match rustix::fs::statat(&repo_fd, CONFIG, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => return Err(Error::RepoExists(path.to_owned())),
+        Err(Errno::NOENT) => {}
+        Err(e) => return Err(e.into()),
+    }
     for sub in LAYOUT_DIRS {
         mkdir_idempotent(&repo_fd, Path::new(sub), opts.mode)?;
     }
-    write_initial_config(&repo_fd, &config)?;
+    write_initial_config(&repo_fd, path, &config)?;
     materials_from_repo(repo_fd, false)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
 }
 
@@ -1310,10 +1316,14 @@ fn mkdir_idempotent<Fd: AsFd>(dir: Fd, path: &Path, mode: RepoMode) -> std::io::
     }
 }
 
-/// Writes the initial `config` text if `config` does not exist. The call
+/// Writes the initial `config` text into a new file `config`. The call
 /// forces the mode `0644` on the file whatever the umask, as the `ostree`
 /// command does.
-fn write_initial_config<Fd: AsFd>(repo_fd: Fd, config: &str) -> std::io::Result<()> {
+///
+/// The open is exclusive. If an entry `config` exists, the call gives
+/// [`Error::RepoExists`] with `path`, the path of the root as the caller
+/// gave it.
+fn write_initial_config<Fd: AsFd>(repo_fd: Fd, path: &Path, config: &str) -> Result<()> {
     let fd = match rustix::fs::openat(
         repo_fd,
         CONFIG,
@@ -1321,12 +1331,12 @@ fn write_initial_config<Fd: AsFd>(repo_fd: Fd, config: &str) -> std::io::Result<
         Mode::from_raw_mode(CONFIG_MODE),
     ) {
         Ok(fd) => fd,
-        // An existing config means the repository is already initialized.
-        Err(Errno::EXIST) => return Ok(()),
+        Err(Errno::EXIST) => return Err(Error::RepoExists(path.to_owned())),
         Err(e) => return Err(e.into()),
     };
     rustix::fs::fchmod(&fd, Mode::from_raw_mode(CONFIG_MODE))?;
-    std::fs::File::from(fd).write_all(config.as_bytes())
+    std::fs::File::from(fd).write_all(config.as_bytes())?;
+    Ok(())
 }
 
 /// Returns the exact config bytes of a new repository.
@@ -1413,5 +1423,28 @@ mod tests {
         assert_eq!(lock_timeout(-1), None);
         assert_eq!(lock_timeout(0), Some(Duration::ZERO));
         assert_eq!(lock_timeout(5), Some(Duration::from_secs(5)));
+    }
+
+    /// A `config` that appears after the check of the create, before the
+    /// exclusive open, gives `RepoExists` and keeps its bytes.
+    #[test]
+    fn initial_config_write_refuses_an_existing_config() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-initial-config-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(CONFIG), b"race").unwrap();
+        let fd = open_dir(rustix::fs::CWD, &dir).unwrap();
+
+        let err = write_initial_config(&fd, Path::new("repo"), "[core]\n").unwrap_err();
+        assert!(
+            matches!(&err, Error::RepoExists(p) if p == Path::new("repo")),
+            "{err:?}"
+        );
+        assert_eq!(std::fs::read(dir.join(CONFIG)).unwrap(), b"race");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

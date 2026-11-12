@@ -42,16 +42,17 @@ pub type Probe = fn(&Env<'_>) -> Result<Vec<String>, String>;
 /// Each probe controls the working directory and the environment of its
 /// invocations. A `run:` line does not state them.
 ///
-/// - `init-reuse-via-cwd-and-env` checks that `init` uses the same order of
-///   repository sources as the other subcommands. If the current directory or
-///   `OSTREE_REPO` resolves an existing repository, `init` reuses it. The
-///   `config` of the repository does not change.
+/// - `init-refusal-via-cwd-and-env` checks `init` with no `--repo` where the
+///   current directory or `OSTREE_REPO` resolves an existing repository. The
+///   port refuses the repository and exits non-zero with `repository
+///   exists`. The `ostree` command exits 0. The `config` of the repository
+///   does not change on either side.
 /// - `repo-position-precedence` checks that `--repo` before the subcommand,
 ///   `--repo` after it, and `OSTREE_REPO` with no `--repo` resolve the same
 ///   repository. The three `prune` invocations must write the same standard
 ///   output.
 ///
-/// The repository of `init-reuse-via-cwd-and-env` has a `collection-id`. If a
+/// The repository of `init-refusal-via-cwd-and-env` has a `collection-id`. If a
 /// repository has no `collection-id`, the `ostree` command crashes when it
 /// finds the repository through the current directory or `OSTREE_REPO`.
 /// ostrya does not reproduce that crash, and the probe does not reach it.
@@ -59,7 +60,7 @@ pub type Probe = fn(&Env<'_>) -> Result<Vec<String>, String>;
 /// [`check`](crate::check::check) gives an error for each probe that no record
 /// names, so this list does not grow past the matrix.
 pub const PROBES: [(&str, Probe); 2] = [
-    ("init-reuse-via-cwd-and-env", init_reuse_via_cwd_and_env),
+    ("init-refusal-via-cwd-and-env", init_refusal_via_cwd_and_env),
     ("repo-position-precedence", repo_position_precedence),
 ];
 
@@ -76,13 +77,15 @@ pub fn lookup(name: &str) -> Option<Probe> {
         .map(|(_, probe)| *probe)
 }
 
-/// Checks that `init` reuses an existing repository that the current
-/// directory or `OSTREE_REPO` resolves, and that its `config` does not change.
+/// Checks `init` on an existing repository that the current directory or
+/// `OSTREE_REPO` resolves. The port exits non-zero with `repository exists`,
+/// and the `ostree` command exits 0. The `config` of the repository does not
+/// change on either side.
 ///
 /// The repository has a `collection-id`, so the cell does not reach the crash
 /// of the `ostree` command on a fallback to a repository with no
 /// `collection-id`. ostrya does not reproduce that crash.
-fn init_reuse_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
+fn init_refusal_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
     let mut notes = Vec::new();
     for side in &env.sides {
         let repo = binding(side, "REPO")?;
@@ -104,17 +107,21 @@ fn init_reuse_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
         )?;
         let before = config_of(&repo)?;
 
-        succeeded(
-            side,
+        let refuses = side.tool.role == "port";
+        let init = |cwd: &Path, vars: &[(String, String)], what: &str| {
+            let args = ["init".to_owned(), "--mode=bare".to_owned()];
+            match refuses {
+                true => refused(side, cwd, &args, vars, what, "repository exists"),
+                false => succeeded(side, cwd, &args, vars, what).map(|_| ()),
+            }
+        };
+        init(
             Path::new(&repo),
-            &["init".to_owned(), "--mode=bare".to_owned()],
             &[],
             "init with the repository as the current directory",
         )?;
-        succeeded(
-            side,
+        init(
             &elsewhere,
-            &["init".to_owned(), "--mode=bare".to_owned()],
             &[("OSTREE_REPO".to_owned(), repo.clone())],
             "init with OSTREE_REPO set",
         )?;
@@ -122,13 +129,18 @@ fn init_reuse_via_cwd_and_env(env: &Env<'_>) -> Result<Vec<String>, String> {
         let after = config_of(&repo)?;
         if before != after {
             return Err(format!(
-                "{}: the reused repository's config changed",
+                "{}: the config of the existing repository changed",
                 side.tool.role
             ));
         }
         notes.push(format!(
-            "{}: both fallbacks reused the repository, config untouched",
-            side.tool.role
+            "{}: both fallbacks {}, config untouched",
+            side.tool.role,
+            if refuses {
+                "refused the repository"
+            } else {
+                "exited 0"
+            }
         ));
     }
     Ok(notes)
@@ -196,6 +208,29 @@ fn binding(side: &SideEnv<'_>, name: &str) -> Result<String, String> {
 fn config_of(repo: &str) -> Result<String, String> {
     std::fs::read_to_string(Path::new(repo).join("config"))
         .map_err(|err| format!("{repo}/config: {err}"))
+}
+
+/// Runs one invocation and checks that it exits non-zero and that its
+/// standard error holds `text`.
+fn refused(
+    side: &SideEnv<'_>,
+    cwd: &Path,
+    args: &[String],
+    env: &[(String, String)],
+    what: &str,
+    text: &str,
+) -> Result<(), String> {
+    let outcome = exec::run(side.tool, cwd, args, env)?;
+    let stderr = String::from_utf8_lossy(&outcome.stderr);
+    if matches!(outcome.status, Some(0) | None) || !stderr.contains(text) {
+        return Err(format!(
+            "{}: {what} exited {} and did not refuse with `{text}`: {}",
+            side.tool.role,
+            outcome.status_text(),
+            stderr.trim()
+        ));
+    }
+    Ok(())
 }
 
 fn succeeded(

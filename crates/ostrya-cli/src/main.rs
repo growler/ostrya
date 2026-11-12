@@ -1040,13 +1040,15 @@ struct CommitArgs {
     /// name of 64 lowercase hexadecimal characters. NAME is not the --branch
     /// ref, and each ref occurs one time. No ref of --branch and --tag is a
     /// path below another of these refs. The command refuses a NAME that has
-    /// an entry at its path: a ref, an alias, or a directory of refs. It also
-    /// refuses a NAME below a ref. A NAME refused before the publish gives no
-    /// new object and no ref. The command reads the path of each NAME again
-    /// before it publishes the objects. If another writer creates a ref at
-    /// the path after this read, the command refuses NAME with the same error
-    /// and writes no ref. The published objects stay until a prune. The
-    /// option conflicts with --no-bindings and --skip-if-unchanged.
+    /// an entry at its path: a ref, an alias (also a dangling one), a
+    /// directory, or a special file. It also refuses a NAME below a ref file
+    /// or a special file. A NAME refused before the publish gives no new
+    /// object and no ref. The command reads the path of each NAME again
+    /// before it publishes the objects. After this read, another writer can
+    /// create such an entry at the path, or a ref file or a special file
+    /// above it. The command then refuses NAME with the same error and writes
+    /// no ref. The published objects stay until a prune. The option conflicts
+    /// with --no-bindings and --skip-if-unchanged.
     #[arg(
         long = "tag",
         value_name = "NAME",
@@ -9639,11 +9641,14 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     refuse!(sign_staged_commit(&txn, &checksum, &args).await?);
     // A ref can appear at the path of a tag while the command reads the tree.
     // The second check refuses it, and the abort publishes no staged object.
-    // Each tag is queued with the expectation of no ref, so `txn.commit` also
-    // refuses a ref that another writer creates at the path of a tag during
-    // the commit, with the same text. The objects of the refused commit are
-    // then published and stay until a prune. The branch does not move,
-    // because `txn.commit` checks the whole ref queue before it writes a ref.
+    // Each tag is queued with the expectation of no ref. So `txn.commit` also
+    // refuses an entry that another writer creates during the commit, with
+    // the same text. At the path of the tag, this entry is a ref, an alias, a
+    // directory, or a special file. Above the path, it is a ref file or a
+    // special file. The objects of the refused commit are then published and
+    // stay until a prune. The branch does not move, because `txn.commit`
+    // refuses such an entry when it checks the whole ref queue, before it
+    // writes a ref.
     for tag in &args.tags {
         if let Some(message) = existing_tag_refusal(repo.path(), tag, own) {
             txn.abort().await?;
@@ -9796,6 +9801,11 @@ fn tag_exists_refusal(tag: &str) -> String {
 /// Returns the `--tag` value whose ref `err` of `Transaction::commit`
 /// refuses, or `None` if `err` refuses no tag. `own` is the
 /// `[core] collection-id` of the repository.
+///
+/// `Error::RefMismatch` is a ref at the path of the tag.
+/// `Error::RefNotWritable` is an alias, a directory, or a special file at the
+/// path, or a ref file or a special file above the path. Both get the text of
+/// `existing_tag_refusal`, which refuses the same entries before the publish.
 fn refused_tag<'a>(err: &Error, tags: &'a [String], own: Option<&str>) -> Option<&'a str> {
     let (Error::RefMismatch { name, .. } | Error::RefNotWritable { name, .. }) = err else {
         return None;

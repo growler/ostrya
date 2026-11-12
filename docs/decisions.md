@@ -4225,6 +4225,15 @@ ref. The rules of a conditional write:
   change can also come after the compare of a conditional write, so
   `set_ref_expecting` does not close that window.
 
+`ostrya commit --tag` gives one text for a set of entries: `--tag specified
+but ref NAME already exists`, at exit 1. At the path of the tag, the set
+holds a ref, an alias (also a dangling one), a directory, and a special
+file. Above the path, the set holds a ref file and a special file. The
+command gives this text at the two checks before the publish and at the
+transaction commit. Each tag is queued with `set_ref_expecting` and
+`expected = None`. At the transaction commit, `Error::RefMismatch` is a ref
+at the path. `Error::RefNotWritable` is each other entry of the set.
+
 These alternatives were rejected:
 
 - A rollback of the written refs after a failed write. The rollback is a
@@ -4253,6 +4262,13 @@ These alternatives were rejected:
   one with `Repo::set_ref_immediate`. The CLI holds no lock between the
   check and the unlinks, so another writer can put an alias in place after
   the check.
+- The text of `Error::RefNotWritable` from the library for `commit --tag`
+  at the transaction commit alone. An entry of the set then gets two texts:
+  the text of the CLI before the publish and the text of the library after
+  it.
+- A text for each cause of a `commit --tag` refusal, for example one text
+  for an alias and one text for a directory. The CLI then holds a copy of
+  the reason texts of the ref store.
 
 ## The pull scheduler
 

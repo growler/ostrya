@@ -829,13 +829,15 @@ repository lock. The last item also gives the checks after that point:
   `error: --branch <branch> names a path below --tag <tag>`. A
   `-b REMOTE:NAME` is a ref under `refs/remotes`, so it is below no tag;
 - a value that has an entry at its path under `refs/heads` or
-  `refs/mirrors/ID`: a ref, an alias (also a dangling one), or a directory of
-  refs. A path below a ref is refused too. The message is `error: --tag
-  specified but ref <name> already exists`. The port reads the path again
-  before it publishes the objects, and refuses an entry that came after the
-  first read. If another writer creates a ref at the path after the second
-  read, the port refuses the value with the same message after it publishes
-  the objects. It writes no ref, and the objects stay until a prune.
+  `refs/mirrors/ID`: a ref, an alias (also a dangling one), a directory, or a
+  special file. A path below a ref file or a special file is refused too. The
+  message is `error: --tag specified but ref <name> already exists`. The port
+  reads the path again before it publishes the objects, and refuses an entry
+  that came after the first read. After the second read, another writer can
+  create a ref, an alias, a directory, or a special file at the path. It can
+  also create a ref file or a special file above the path. The port then
+  refuses the value with the same message after it publishes the objects. It
+  writes no ref, and the objects stay until a prune.
 
 A refusal before the publish writes no object and no ref. Without `-b`, the
 option needs `--orphan`, as each commit does. `--orphan --tag=NAME` creates

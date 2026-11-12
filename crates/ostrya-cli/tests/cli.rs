@@ -21602,17 +21602,22 @@ fn commit_tag_refuses_a_ref_created_during_the_commit() {
     assert_eq!(resolve(&repo, "late"), resolve(&repo, "held"));
 }
 
-/// `commit --tag` queues each tag with the expectation of no ref, so
-/// `Transaction::commit` refuses a ref that another writer creates after the
-/// second check. The test holds the update guard, waits until the command
-/// publishes its objects, and then writes the tag under the guard. The
-/// refusal moves no branch and keeps the ref of the other writer.
-#[test]
-fn commit_tag_refuses_a_ref_created_after_the_publish() {
+/// Runs `commit -b main --tag=TAG` in a new repository under `base` while
+/// the test holds the update guard, and gives back the repository, the
+/// first commit of `main`, and the output of the command.
+///
+/// The function commits `main`, holds the update guard, and starts the
+/// command. It waits until the command publishes its objects, so the command
+/// is past its checks before the publish. Then it calls `write` with
+/// `refs/heads` and the first commit, under the guard, releases the guard,
+/// and waits until the command ends.
+fn commit_tag_with_a_late_entry(
+    base: &Path,
+    tag: &str,
+    write: impl FnOnce(&Path, &str),
+) -> (PathBuf, String, std::process::Output) {
     use std::time::Instant;
 
-    let tmp = TmpDir::new("commit-tag-publish");
-    let base = tmp.path();
     build_fixture_source(base);
     let repo = create_unlimited_wait_repo(base);
     let first = commit_no_parent(&repo, &["-b", "main"], &base.join("src"))
@@ -21623,7 +21628,7 @@ fn commit_tag_refuses_a_ref_created_after_the_publish() {
     std::fs::write(changed.join("src/extra.txt"), b"extra\n").unwrap();
 
     let objects = loose_objects(&repo).len();
-    let shown = "commit -b main --tag=t";
+    let shown = format!("commit -b main --tag={tag}");
     let out = block_on(async {
         let handle = Repo::open(&repo).await.unwrap();
         let guard = handle.begin_update().await.unwrap();
@@ -21631,7 +21636,8 @@ fn commit_tag_refuses_a_ref_created_after_the_publish() {
             inner: Some(
                 Command::new(env!("CARGO_BIN_EXE_ostrya"))
                     .arg(format!("--repo={}", repo.display()))
-                    .args(["commit", FIXED_TIMESTAMP, "-b", "main", "--tag=t"])
+                    .args(["commit", FIXED_TIMESTAMP, "-b", "main"])
+                    .arg(format!("--tag={tag}"))
                     .arg(changed.join("src"))
                     .stdin(Stdio::null())
                     .stdout(Stdio::piped())
@@ -21652,13 +21658,7 @@ fn commit_tag_refuses_a_ref_created_after_the_publish() {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        guard
-            .set_ref(
-                &"t".parse::<Ref>().unwrap(),
-                Some(&Checksum::from_hex(&first).unwrap()),
-            )
-            .await
-            .unwrap();
+        write(&repo.join("refs/heads"), &first);
         guard.finish().await.unwrap();
 
         let deadline = Instant::now() + GUARD_WAIT;
@@ -21671,6 +21671,20 @@ fn commit_tag_refuses_a_ref_created_after_the_publish() {
         }
         child.take().wait_with_output().expect("wait ostrya")
     });
+    (repo, first, out)
+}
+
+/// `commit --tag` queues each tag with the expectation of no ref, so
+/// `Transaction::commit` refuses a ref that another writer creates after the
+/// second check. The test holds the update guard, waits until the command
+/// publishes its objects, and then writes the tag under the guard. The
+/// refusal moves no branch and keeps the ref of the other writer.
+#[test]
+fn commit_tag_refuses_a_ref_created_after_the_publish() {
+    let tmp = TmpDir::new("commit-tag-publish");
+    let (repo, first, out) = commit_tag_with_a_late_entry(tmp.path(), "t", |heads, first| {
+        std::fs::write(heads.join("t"), format!("{first}\n")).unwrap();
+    });
     assert_eq!(out.status.code(), Some(1), "the ref of t was not refused");
     assert_eq!(
         String::from_utf8_lossy(&out.stderr).trim(),
@@ -21678,6 +21692,87 @@ fn commit_tag_refuses_a_ref_created_after_the_publish() {
     );
     assert_eq!(resolve(&repo, "main").as_deref(), Some(first.as_str()));
     assert_eq!(resolve(&repo, "t").as_deref(), Some(first.as_str()));
+}
+
+/// `commit --tag` gives the text of a ref that exists for each entry that
+/// another writer creates after the second check: an alias and a directory
+/// at the path of the tag, and a ref file above the path. `Transaction::commit`
+/// refuses each of them with `Error::RefNotWritable`. The refusal moves no
+/// branch, keeps the entry of the other writer, and writes no ref.
+#[test]
+fn commit_tag_refuses_each_entry_created_after_the_publish_with_one_text() {
+    let tmp = TmpDir::new("commit-tag-publish-entries");
+    // The writer of the entry, and the check that the entry stays. Each
+    // takes `refs/heads` and the first commit.
+    type Entry = fn(&Path, &str);
+    let cases: [(&str, Entry, Entry); 3] = [
+        (
+            "al",
+            |heads, _| std::os::unix::fs::symlink("main", heads.join("al")).unwrap(),
+            |heads, _| {
+                let meta = std::fs::symlink_metadata(heads.join("al")).unwrap();
+                assert!(meta.file_type().is_symlink(), "al is not an alias");
+                assert_eq!(
+                    std::fs::read_link(heads.join("al")).unwrap(),
+                    Path::new("main")
+                );
+            },
+        ),
+        (
+            "dir",
+            |heads, first| {
+                std::fs::create_dir(heads.join("dir")).unwrap();
+                std::fs::write(heads.join("dir/x"), format!("{first}\n")).unwrap();
+            },
+            |heads, first| {
+                let meta = std::fs::symlink_metadata(heads.join("dir")).unwrap();
+                assert!(meta.is_dir(), "dir is not a directory");
+                let names: Vec<_> = std::fs::read_dir(heads.join("dir"))
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect();
+                assert_eq!(names, ["x"], "the refusal wrote into dir");
+                assert_eq!(
+                    std::fs::read_to_string(heads.join("dir/x")).unwrap(),
+                    format!("{first}\n")
+                );
+            },
+        ),
+        (
+            "up/x",
+            |heads, first| std::fs::write(heads.join("up"), format!("{first}\n")).unwrap(),
+            |heads, first| {
+                let meta = std::fs::symlink_metadata(heads.join("up")).unwrap();
+                assert!(meta.is_file(), "up is not a ref file");
+                assert_eq!(
+                    std::fs::read_to_string(heads.join("up")).unwrap(),
+                    format!("{first}\n")
+                );
+            },
+        ),
+    ];
+    for (index, (tag, write, check)) in cases.into_iter().enumerate() {
+        let base = tmp.path().join(format!("case-{index}"));
+        let (repo, first, out) = commit_tag_with_a_late_entry(&base, tag, write);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "the entry at {tag} was not refused:\n{}",
+            String::from_utf8_lossy(&out.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("error: --tag specified but ref {tag} already exists\n"),
+            "the entry at {tag} was refused in other words",
+        );
+        assert_eq!(
+            resolve(&repo, "main").as_deref(),
+            Some(first.as_str()),
+            "the refusal of {tag} moved main"
+        );
+        let heads = repo.join("refs/heads");
+        check(&heads, &first);
+    }
 }
 
 /// `commit --tag` refuses a bad name before it reads the tree: a remote

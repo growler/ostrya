@@ -2,7 +2,8 @@
 //! case and each collection id reads and writes, the read of
 //! `refs/heads/NAME` under the collection id of the repository, aliases,
 //! absent refs, the read errors, the read while another handle holds the
-//! update lock, and the revisions `@ID:NAME` and `@ID:NAME^`.
+//! update lock, the revisions `@ID:NAME` and `@ID:NAME^`, and the removal of
+//! a set of refs.
 
 mod common;
 
@@ -567,5 +568,119 @@ fn a_parsed_ref_of_the_own_collection_writes_the_local_ref() {
         assert_eq!(ref_file(&path, "refs/heads/a"), Some(checksum(1)));
         assert_eq!(resolve(&repo, &Ref::local("a")).await, Some(checksum(1)));
         assert!(!path.join("refs/mirrors").join(OWN).exists());
+    });
+}
+
+#[test]
+fn remove_refs_immediate_refuses_a_batch_with_a_mirror_alias() {
+    let tmp = TmpDir::new("ref-store-remove-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put(&repo, OTHER, "a/b", &checksum(1)).await;
+        let mirror = path.join("refs/mirrors").join(OTHER);
+        std::os::unix::fs::symlink("b", mirror.join("a/c")).unwrap();
+        let batch = [Ref::collection(OTHER, "a/b"), Ref::collection(OTHER, "a/c")];
+        match repo.remove_refs_immediate(&batch).await {
+            Err(Error::RefNotWritable { name, reason }) => {
+                assert_eq!(name, format!("@{OTHER}:a/c"));
+                assert_eq!(reason, "names an alias");
+            }
+            other => panic!("expected RefNotWritable, got {other:?}"),
+        }
+        assert!(mirror.join("a/b").symlink_metadata().unwrap().is_file());
+        assert!(mirror.join("a/c").symlink_metadata().unwrap().is_symlink());
+
+        put_local(&repo, "main", &checksum(2)).await;
+        put_local(&repo, "other", &checksum(3)).await;
+        repo.set_ref_alias_immediate("al", "main").await.unwrap();
+        let batch = [Ref::local("other"), Ref::local("al")];
+        match repo.remove_refs_immediate(&batch).await {
+            Err(Error::RefNotWritable { name, reason }) => {
+                assert_eq!(name, "al");
+                assert_eq!(reason, "names an alias");
+            }
+            other => panic!("expected RefNotWritable, got {other:?}"),
+        }
+        assert_eq!(ref_file(&path, "refs/heads/other"), Some(checksum(3)));
+        let heads = path.join("refs/heads");
+        assert!(heads.join("al").symlink_metadata().unwrap().is_symlink());
+        assert_eq!(ref_file(&path, "refs/heads/main"), Some(checksum(2)));
+    });
+}
+
+#[test]
+fn remove_refs_immediate_removes_each_ref() {
+    let tmp = TmpDir::new("ref-store-remove-each");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        let mut batch = Vec::new();
+        for (r, _) in cases() {
+            repo.set_ref_immediate(&r, Some(&checksum(1)))
+                .await
+                .unwrap();
+            batch.push(r);
+        }
+        batch.push(Ref::local("absent"));
+        batch.push(Ref::local("a/b"));
+        repo.remove_refs_immediate(&batch).await.unwrap();
+        for (r, rel) in cases() {
+            assert_eq!(ref_file(&path, rel), None, "{r}");
+        }
+        for dir in [
+            "refs/heads/a",
+            "refs/remotes/origin/a",
+            "refs/mirrors/org.example.Other/a",
+        ] {
+            assert!(path.join(dir).is_dir(), "{dir}");
+        }
+        assert!(!path.join("refs/mirrors").join(OWN).exists());
+    });
+}
+
+#[test]
+fn remove_refs_immediate_refuses_an_invalid_ref_before_any_removal() {
+    let tmp = TmpDir::new("ref-store-remove-invalid");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        let batch = [Ref::local("main"), Ref::local("-bad")];
+        match repo.remove_refs_immediate(&batch).await {
+            Err(Error::InvalidRefspec(name)) => assert_eq!(name, "-bad"),
+            other => panic!("expected InvalidRefspec, got {other:?}"),
+        }
+        assert_eq!(ref_file(&path, "refs/heads/main"), Some(checksum(1)));
+    });
+}
+
+/// An empty batch reads no lock key and takes no lock. With `[core]
+/// lock-timeout-secs=-2`, the empty batch succeeds, and a batch with one ref
+/// fails with the config error and removes nothing.
+#[test]
+fn remove_refs_immediate_with_an_empty_batch_takes_no_lock() {
+    let tmp = TmpDir::new("ref-store-remove-empty");
+    let path = create(&tmp, Some(OWN));
+    block_on(async {
+        put_local(&open(&path), "main", &checksum(1)).await;
+    });
+    let config = path.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let text = text.replacen("[core]\n", "[core]\nlock-timeout-secs=-2\n", 1);
+    std::fs::write(&config, text).unwrap();
+    let repo = open(&path);
+    block_on(async {
+        repo.remove_refs_immediate(&[]).await.unwrap();
+        match repo.remove_refs_immediate(&[Ref::local("main")]).await {
+            Err(Error::InvalidFormat(message)) => {
+                assert!(
+                    message.contains("lock-timeout-secs -2 is below -1"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+        assert_eq!(ref_file(&path, "refs/heads/main"), Some(checksum(1)));
     });
 }

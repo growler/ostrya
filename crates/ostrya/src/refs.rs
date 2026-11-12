@@ -1147,7 +1147,9 @@ impl Repo {
     /// If `checksum` is `None`, the call removes the ref file. The removal of
     /// an absent ref file is not an error. The call reads `[core] fsync` from
     /// the config. A transaction writes its queued refs in the same way, under
-    /// its own fsync policy (see [`Transaction::commit`]).
+    /// its own fsync policy (see [`Transaction::commit`]). To remove a set of
+    /// refs under one check, use
+    /// [`remove_refs_immediate`](Repo::remove_refs_immediate).
     ///
     /// # Ref files
     ///
@@ -1230,6 +1232,72 @@ impl Repo {
         let relpath = ref_relpath(own, r)?;
         let name = r.clone().canonical(own).to_string();
         self.write_ref_relpath(name, relpath, checksum).await
+    }
+
+    /// Removes a set of refs, outside a transaction.
+    ///
+    /// The ref gives the path, as
+    /// [`set_ref_immediate`](Repo::set_ref_immediate) states. The removal of
+    /// an absent ref is not an error, and a ref given more than one time is
+    /// removed one time. The parent directories of a ref stay.
+    ///
+    /// The call checks all refs before it removes the first ref. The check is
+    /// the check that [`Transaction::commit`] applies to the refs of
+    /// [`Transaction::set_ref`]. Then the call removes the refs in the given
+    /// order. The call uses no staging directory and does not use `tmp/`. If
+    /// an unlink fails, the refs removed before it stay removed.
+    ///
+    /// If `[core] fsync` is on, the call runs `fsync` one time on each
+    /// directory that lost a name, after the last removal, deepest first. A
+    /// removal that fails still syncs the directories that the removals
+    /// before it changed.
+    ///
+    /// The locks are those of [`set_ref_immediate`](Repo::set_ref_immediate).
+    /// The call holds the update lock from the check to the last sync.
+    ///
+    /// If `refs` is empty, the call does no I/O. It reads no config key,
+    /// takes no lock, and returns `Ok`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if a ref fails [`Ref::validate`]. The
+    ///   error holds the text of the first ref that fails, and the call
+    ///   removes nothing.
+    /// - [`Error::RefNotWritable`] if the path of a ref names an alias, names
+    ///   a directory, passes through a file, or names a special file. The
+    ///   error names the first such ref, and the call removes nothing.
+    /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
+    ///   lock-timeout-secs` does not parse.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`.
+    /// - [`Error::Io`] if a file system operation fails.
+    pub async fn remove_refs_immediate(&self, refs: &[Ref]) -> Result<()> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        let own = self.config().collection_id();
+        let resolved = refs
+            .iter()
+            .map(|r| {
+                Ok(ResolvedRef {
+                    relpath: ref_relpath(own, r)?,
+                    name: r.clone().canonical(own),
+                    checksum: None,
+                    expected: None,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let fsync = self.config().fsync()?;
+        self.write_locked(move |repo| {
+            check_resolved_refs_blocking(repo.repo_fd(), &resolved)?;
+            let mut dirs = Vec::new();
+            let removed = resolved.iter().try_for_each(|r| {
+                remove_ref_blocking(repo.repo_fd(), &r.relpath, fsync, &mut dirs)
+            });
+            removed.and(sync_ref_dirs(repo.repo_fd(), dirs))
+        })
+        .await
     }
 
     async fn write_ref_relpath(

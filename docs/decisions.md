@@ -3586,7 +3586,8 @@ refs of that id are the local refs, under `refs/heads/`. The rules:
   `UpdateGuard::set_ref`, `refs -c --create`, `refs --create`, `commit`,
   `Repo::pull_collection`, `Repo::pull_local` and `Repo::pull` with an
   `@ID:NAME` name, the receive path, and the S3 push. The same
-  writers remove `refs/heads/NAME` for a removal. No writer creates
+  writers remove `refs/heads/NAME` for a removal, and so does
+  `Repo::remove_refs_immediate`. No writer creates
   `refs/mirrors/ID/` of the own id. `ostree refs --collections
   --create=ID:NAME` writes `refs/heads/NAME` for the own id too (observed).
 - The readers ignore `refs/mirrors/ID/` of the own id:
@@ -4070,6 +4071,17 @@ the whole queue against the ref store before the first write. The rules:
   directory or a special file, or that passes through a file, fails with
   `Error::RefNotWritable` and the reason of the `lstat` read. In the CLI,
   only `refs -A --delete` removes an alias.
+- `Repo::remove_refs_immediate(refs)` removes a set of refs outside a
+  transaction. It takes the update lock one time for the set. Under the
+  lock, it applies the check of `Transaction::set_ref` to the whole set
+  before the first unlink, so a path that names an alias, names a
+  directory, passes through a file, or names a special file stops the
+  removal before the first ref goes. It uses no staging directory and does
+  not use `tmp/`. An absent ref is success, and the parent directories
+  stay. `refs --delete @<id>:PREFIX` removes the refs of each prefix, and
+  `refs -c --delete` the refs of all ids, with one call. So an alias under
+  `refs/mirrors/<id>/` stops the prefix, or the `-c` deletion, before it
+  removes a ref.
 - A refused commit leaves the published objects, and writes no detached
   metadata and no ref. `gc` removes the objects.
 - An I/O error between two ref writes, for example on a full disk, leaves
@@ -4108,11 +4120,11 @@ ref. The rules of a conditional write:
   commit also runs `commit_under` under the update lock that its caller
   holds. These ref writers of the port take the update lock, also under
   `[core] locking=false`: `Transaction::commit`, `Repo::set_ref_immediate`,
-  `Repo::set_ref_alias_immediate`, `Repo::remove_ref_alias_immediate`, and
-  each write of an `UpdateGuard`. So none of them can change a ref between
-  the read and the commit. For these writers, a compare of
-  `set_ref_expecting` finds the state that the read found, so it adds no
-  check.
+  `Repo::remove_refs_immediate`, `Repo::set_ref_alias_immediate`,
+  `Repo::remove_ref_alias_immediate`, and each write of an `UpdateGuard`. So
+  none of them can change a ref between the read and the commit. For these
+  writers, a compare of `set_ref_expecting` finds the state that the read
+  found, so it adds no check.
 - `Repo::prune` takes no update lock, and it holds the repository lock
   exclusive. The server commit holds the repository lock shared. A two-way
   receive refuses a repository with `[core] locking=false`, and a one-way
@@ -4145,6 +4157,14 @@ These alternatives were rejected:
 - A write over an alias that replaces the link with a ref file, as the
   `ostree` command does. The target of the alias then keeps its old commit,
   and the caller gets no error.
+- One `Transaction` for each set of `Repo::remove_refs_immediate`. A
+  transaction creates a staging directory, scans `tmp/`, and parses
+  `tmp-expiry-secs`, the `min-free-space-*` keys, and `generate-composefs`.
+  It can fail with `ENOSPC` on a full disk, where a removal frees space.
+- A wider check in the CLI before it removes the refs of a prefix one by
+  one with `Repo::set_ref_immediate`. The CLI holds no lock between the
+  check and the unlinks, so another writer can put an alias in place after
+  the check.
 
 ## The pull scheduler
 

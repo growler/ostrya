@@ -172,18 +172,22 @@ them are observed and deliberately not reproduced:
     openat(<alias>): No such file or directory`, so both exit 1 and write no
     ref;
   - `refs --delete PREFIX`, where the prefix selects an alias under
-    `refs/heads` or `refs/remotes`, and `refs -c --delete <id>`, where the
-    id selects an alias under `refs/heads`. The tool removes the alias. The
-    port refuses it before the prefix removes its first ref, after the alias
-    guard. So with the ref `origin:rr/x` and the alias `origin:rr/remal`,
+    `refs/heads`, `refs/remotes`, or `refs/mirrors/<id>/`, and `refs -c
+    --delete <id>`, where the id selects an alias under `refs/heads` or
+    `refs/mirrors/<id>/`. Here `<id>` is not the `collection-id` of the
+    repository. Only an out-of-band write puts an alias under
+    `refs/mirrors/<id>/`. The tool removes the alias. The port refuses it
+    before the prefix removes its first ref, after the alias guard where the
+    guard runs. With `-c`, the port refuses it before the command removes its
+    first ref. So with the ref `origin:rr/x` and the alias `origin:rr/remal`,
     `refs --delete origin:rr` gives `error: ref not writable:
     origin:rr/remal: names an alias` at exit 1 and removes no ref, and the
-    tool removes both. `refs -A --delete` removes the alias in both;
-  - `refs -c --delete <id>` and `refs --delete @<id>:PREFIX`, where `<id>` is
-    not the `collection-id` of the repository and the selection holds an
-    alias under `refs/mirrors/<id>/`. Only an out-of-band write puts an alias
-    there. The port refuses the alias when it reaches it, and the refs that
-    the command removed before it stay removed.
+    tool removes both. With the ref `@<id>:a/b` and the alias `@<id>:a/c`,
+    `refs --delete @<id>:a` and `refs -c --delete <id>` give `error: ref not
+    writable: @<id>:a/c: names an alias` at exit 1 and remove no ref.
+    `refs -A --delete` removes an alias under `refs/heads` or `refs/remotes`
+    in both. `-c` wins over `-A`, so the port also refuses the alias in
+    `refs -c -A --delete`;
 
   `commit -b`, a pull, and `summary -u` take the same refusal ("P2",
   `commit`, `pull`, and `summary`);

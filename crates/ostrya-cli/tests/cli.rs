@@ -48480,6 +48480,71 @@ fn ref_writes_refuse_an_alias() {
     assert_eq!(ref_file(&repo, "refs/heads/main").as_ref(), Some(&main));
 }
 
+/// An alias under `refs/mirrors/X/` is refused before the deletion removes a
+/// ref: `refs --delete @X:a` and `refs -c --delete X` remove no ref. In
+/// `refs --delete @Y:z @X:a`, the prefix `@Y:z` removes its ref, and the
+/// prefix `@X:a` removes no ref.
+#[test]
+fn refs_delete_refuses_a_mirror_alias_before_it_removes_a_ref() {
+    let tmp = TmpDir::new("refs-delete-mirror-alias");
+    let base = tmp.path();
+    let (repo, _main) = own_repo_with_main(base);
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a/b", "main"]).ok();
+    ostrya_at(&repo, &["refs", "--create=@org.example.Y:z", "main"]).ok();
+    std::os::unix::fs::symlink("b", repo.join("refs/mirrors/org.example.X/a/c")).unwrap();
+    let refs = describe_refs(&repo);
+    let message = "ref not writable: @org.example.X:a/c: names an alias";
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", "@org.example.X:a"]),
+        message,
+    );
+    assert_eq!(describe_refs(&repo), refs);
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "-c", "--delete", "org.example.X"]),
+        message,
+    );
+    assert_eq!(describe_refs(&repo), refs);
+
+    refused_with_message(
+        &ostrya_at(
+            &repo,
+            &["refs", "--delete", "@org.example.Y:z", "@org.example.X:a"],
+        ),
+        message,
+    );
+    let left = describe_refs(&repo);
+    assert!(
+        !repo.join("refs/mirrors/org.example.Y/z").exists(),
+        "{left:?}"
+    );
+    let x: Vec<&String> = refs
+        .iter()
+        .filter(|line| line.starts_with("mirrors/org.example.X/"))
+        .collect();
+    assert_eq!(x.len(), 4, "{refs:?}");
+    for line in x {
+        assert!(left.contains(line), "{line}: {left:?}");
+    }
+}
+
+/// A deletion that selects no ref takes no lock. With `[core]
+/// lock-timeout-secs=-2`, `refs --delete @X:nomatch` and `refs -c --delete`
+/// of an id with no ref exit 0 and remove no ref.
+#[test]
+fn refs_delete_of_an_empty_selection_takes_no_lock() {
+    let tmp = TmpDir::new("refs-delete-empty-selection");
+    let base = tmp.path();
+    let (repo, _main) = own_repo_with_main(base);
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+    set_core_key(&repo, "lock-timeout-secs=-2");
+    let refs = describe_refs(&repo);
+
+    ostrya_at(&repo, &["refs", "--delete", "@org.example.X:nomatch"]).ok();
+    ostrya_at(&repo, &["refs", "-c", "--delete", "org.example.None"]).ok();
+    assert_eq!(describe_refs(&repo), refs);
+}
+
 // --- media export ------------------------------------------------------------
 
 /// Returns the lines that `media export` prints on standard output: the media

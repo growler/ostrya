@@ -20,7 +20,7 @@ A PREFIX matches the ref with that name and each ref below it. \fB\%<remote>:\fR
 \fB\-\-delete\fR
 Delete the refs that each PREFIX matches.
 .IP
-The command then lists no ref. At least one PREFIX is required. A PREFIX that matches nothing is not an error. With \%\-A, each PREFIX selects the aliases that a \%\-A listing prints for it. With \%\-c, each PREFIX is a collection id. Without \%\-c, if an alias under \fB\%refs/heads\fR names a local ref that a PREFIX matches, the command fails, and that PREFIX deletes nothing. Without \%\-c, if a PREFIX \fB\%<remote>:\fR or \fB\%@ID:\fR matches a ref, the command fails, and that PREFIX deletes nothing. This applies to each ID, also to the collection id of the repository.
+The command then lists no ref. At least one PREFIX is required. A PREFIX that matches nothing is not an error. With \%\-A, each PREFIX selects the aliases that a \%\-A listing prints for it. With \%\-c, each PREFIX is a collection id. Without \%\-c, if an alias under \fB\%refs/heads\fR names a local ref that a PREFIX matches, the command fails, and that PREFIX deletes nothing. Without \%\-c, if a PREFIX \fB\%<remote>:\fR or \fB\%@ID:\fR matches a ref, the command fails, and that PREFIX deletes nothing. This applies to each ID, also to the collection id of the repository. Without \%\-c and \%\-A, if a PREFIX selects an alias, the command fails, and that PREFIX deletes nothing. With \%\-c, if a PREFIX selects an alias, the command fails and deletes nothing, also with \%\-A.
 .TP
 \fB\-\-list\fR
 Print the whole name of each ref, with the matched PREFIX in it.

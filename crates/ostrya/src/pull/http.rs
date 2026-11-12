@@ -92,8 +92,9 @@ impl Repo {
     /// Pulls refs and their objects from a remote over HTTP or over ssh.
     ///
     /// `remote` names a `[remote "<name>"]` section of the config of this
-    /// repository. The section gives the signature policy and the `branches`
-    /// key. By default, the name gives the prefix of the written refs.
+    /// repository. The section gives the signature policy and the keys
+    /// `pull-branches` and `branches`. By default, the name gives the prefix
+    /// of the written refs.
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
     /// change this. The section also gives the address, the TLS material, and
     /// the proxy, and [`overrides`](PullOptions::overrides) changes them. The
@@ -131,8 +132,8 @@ impl Repo {
     /// group of [`trust_group`](PullOptions::trust_group) if the field is set.
     /// So a refused policy starts no fetcher and no ssh client. Then the pull runs as
     /// [`pull_with_session`](Repo::pull_with_session) with that session and
-    /// that trust, with the `branches` key and the summary copy of this
-    /// method.
+    /// that trust, with the keys `pull-branches` and `branches` and the
+    /// summary copy of this method.
     ///
     /// # Refs
     ///
@@ -140,6 +141,20 @@ impl Repo {
     /// If the summary does not list the ref, or the remote serves no summary,
     /// the pull reads `refs/heads/<ref>` of the remote.
     /// [`refs`](PullOptions::refs) states what an empty list takes.
+    ///
+    /// If [`refs`](PullOptions::refs) is empty and
+    /// [`MIRROR`](PullFlags::MIRROR) is not set, the pull reads the key
+    /// `pull-branches` of the section with
+    /// [`Remote::pull_branches`](crate::config::Remote::pull_branches). If
+    /// the section has the key, the pull takes each ref of the summary that
+    /// the key selects, and does not read `branches`. The own id of the
+    /// match is the `ostree.summary.collection-id` of the summary. A ref
+    /// `NAME` of field 0 of the summary is written as a requested ref
+    /// `NAME` is. A ref `NAME` of the entry of `ID` in
+    /// `ostree.summary.collection-map` is the ref `@ID:NAME`, and the pull
+    /// writes it and checks its tip as a requested `@ID:NAME` ref. The pull
+    /// reads the key after it reads the summary and the `config` of the
+    /// remote, and before it reads a ref file or an object.
     ///
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
     /// select the prefix of the written refs.
@@ -646,11 +661,16 @@ impl Repo {
     ///   UTF-8.
     /// - [`Error::InvalidFormat`] if the summary holds an
     ///   `ostree.summary.collection-map` that is malformed, and the pull reads
-    ///   it for an `@ID:NAME` ref or for a `MIRROR` pull of every ref.
+    ///   it for an `@ID:NAME` ref, for a `MIRROR` pull of every ref, or for
+    ///   the key `pull-branches`.
+    /// - [`Error::InvalidFormat`] if [`refs`](PullOptions::refs) is empty,
+    ///   [`MIRROR`](PullFlags::MIRROR) is not set, and an entry of the key
+    ///   `pull-branches` of the remote is not a valid ref pattern.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a ref file of the remote holds no checksum.
-    /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, or
-    ///   a name of the `branches` key of the remote, is not a valid ref name.
+    /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, a
+    ///   ref of the summary that the key `pull-branches` selects, or a name
+    ///   of the `branches` key of the remote, is not a valid ref name.
     ///   A `MIRROR` pull of every ref
     ///   fails with this error if the summary lists one name that the ref-name
     ///   rule refuses, or one collection id that the collection-id rule
@@ -662,7 +682,9 @@ impl Repo {
     /// - [`Error::RefNotFound`] if neither the summary nor the ref file of the
     ///   remote names a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
-    ///   serves no summary under `MIRROR`, or the remote has no `branches`.
+    ///   serves no summary under `MIRROR` or with the key `pull-branches`, if
+    ///   no ref of the summary matches `pull-branches`, or if the remote has
+    ///   no key `pull-branches` and no ref in the key `branches`.
     /// - These errors of the commit of
     ///   [`TimestampCheck::Rev`](crate::TimestampCheck::Rev), if
     ///   [`timestamp_check`](PullOptions::timestamp_check) is that check and
@@ -1519,8 +1541,9 @@ impl Repo {
     }
 
     /// Resolves what to pull: the requested refs, the summary refs of the
-    /// remote under [`MIRROR`](PullFlags::MIRROR), or the `branches` key of
-    /// the remote that `wanted` names.
+    /// remote under [`MIRROR`](PullFlags::MIRROR), the summary refs that the
+    /// `pull-branches` key of the remote that `wanted` names selects, or else
+    /// the `branches` key of that remote.
     ///
     /// `remote_id` is the `[core] collection-id` of the `config` of the
     /// remote. The target of an `@ID:NAME` name keeps the name as given.
@@ -1557,12 +1580,42 @@ impl Repo {
                         .into(),
                 ));
             };
-            return mirror_targets(summary, summary_id, place);
+            return summary_targets(summary, summary_id, |_| true, place);
         } else {
             let Wanted::Config(remote) = wanted else {
                 return Err(no_refs());
             };
-            let branches = match self.config().remote(remote) {
+            let section = self.config().remote(remote);
+            // The key `pull-branches` has precedence over `branches`. It
+            // selects refs of the summary, so a remote with no summary fails
+            // the pull before its first object request.
+            let pull_branches = match &section {
+                Some(section) => section.pull_branches()?,
+                None => None,
+            };
+            if let Some(selector) = pull_branches {
+                let Some(summary) = summary else {
+                    return Err(Error::Pull(format!(
+                        "[remote \"{remote}\"] pull-branches selects refs of the summary, \
+                         but the remote repository does not have a summary"
+                    )));
+                };
+                // A ref of field 0 stays the target `NAME`, and the pull
+                // writes it under the prefix of `place`.
+                let targets = summary_targets(
+                    summary,
+                    None,
+                    |r| selector.matches(r, summary_collection_id),
+                    place,
+                )?;
+                if targets.is_empty() {
+                    return Err(Error::Pull(format!(
+                        "no ref of the summary matches [remote \"{remote}\"] pull-branches"
+                    )));
+                }
+                return Ok(targets);
+            }
+            let branches = match section {
                 Some(section) => section.branches()?.unwrap_or_default(),
                 None => Vec::new(),
             };
@@ -2536,8 +2589,9 @@ pub(super) enum Wanted<'a> {
     /// No other ref. [`Repo::pull_with_session`] refuses an empty list.
     Named,
     /// Under [`MIRROR`](PullFlags::MIRROR), each ref of the summary of the
-    /// remote. Otherwise, the `branches` key of the remote section of this
-    /// name.
+    /// remote. Otherwise, the refs of the summary that the `pull-branches`
+    /// key of the remote section of this name selects, or else the
+    /// `branches` key of that section.
     Config(&'a str),
     /// The refs of a collection pull, each at the commit that the pull
     /// selected. The pull reads no ref of the remote, and does not read
@@ -3333,24 +3387,26 @@ fn check_remote_mode(config: Option<Vec<u8>>) -> Result<Option<String>> {
     )))
 }
 
-/// Returns the targets of a [`MIRROR`](PullFlags::MIRROR) pull of each ref
-/// that `summary` lists.
+/// Returns the targets of each ref that `summary` lists and `keep` keeps: the
+/// targets of a [`MIRROR`](PullFlags::MIRROR) pull of every ref, or of the
+/// key `pull-branches`.
 ///
-/// A ref of field 0 is the target `@ID:NAME` if `summary_id`, the collection
-/// id that the summary states, is `ID`, and else the target `NAME`. A ref of
-/// the entry of `ID` in `ostree.summary.collection-map` is the target
-/// `@ID:NAME`. If the summary lists one target two times, the first ref
-/// counts.
+/// A ref of field 0 is the target `@ID:NAME` if `summary_id` is `ID`, and
+/// else the target `NAME`. A ref of the entry of `ID` in
+/// `ostree.summary.collection-map` is the target `@ID:NAME`. `keep` gets the
+/// ref of each target. If the summary lists one target two times, the first
+/// ref counts.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidFormat`] if the collection map is malformed.
-/// - [`Error::InvalidRefspec`] if a target fails the rule of
-///   [`Ref::validate`].
+/// - [`Error::InvalidRefspec`] if a target that `keep` keeps fails the rule
+///   of [`Ref::validate`].
 /// - [`Error::Pull`] if two targets write one ref at `place`.
-fn mirror_targets(
+fn summary_targets(
     summary: &Summary,
     summary_id: Option<&str>,
+    keep: impl Fn(&Ref) -> bool,
     place: RefPlace<'_>,
 ) -> Result<Vec<(String, Checksum)>> {
     let mut refs = Vec::with_capacity(summary.refs.len());
@@ -3359,11 +3415,16 @@ fn mirror_targets(
             Some(id) => Ref::collection(id, entry.name.as_str()),
             None => Ref::local(entry.name.as_str()),
         };
-        refs.push((r, entry.commit));
+        if keep(&r) {
+            refs.push((r, entry.commit));
+        }
     }
     for (id, entries) in summary.collection_map()? {
         for entry in entries {
-            refs.push((Ref::collection(id.as_str(), entry.name), entry.commit));
+            let r = Ref::collection(id.as_str(), entry.name);
+            if keep(&r) {
+                refs.push((r, entry.commit));
+            }
         }
     }
     // A target becomes a ref that this pull writes. The pull checks it

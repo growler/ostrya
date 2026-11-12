@@ -319,6 +319,43 @@ fn a_pull_over_ssh_writes_the_refs_and_the_objects() {
     }
 }
 
+/// A pull over ssh with no ref takes the refs of the summary that
+/// `pull-branches` selects. With no summary on the remote, the pull fails and
+/// writes no ref.
+#[test]
+fn a_pull_over_ssh_with_no_ref_reads_pull_branches() {
+    let setup = Setup::new("pull-branches", "archive", "archive");
+    setup.configure(&format!(
+        "pull-url={}\n{}pull-branches=main\n",
+        setup.address(),
+        setup.standin_keys()
+    ));
+    let out = setup.client(&["pull", "origin"], &[]);
+    setup.assert_pulled(&out);
+
+    let fresh = Setup::new("pull-branches-no-summary", "archive", "archive");
+    fresh.configure(&format!(
+        "pull-url={}\n{}pull-branches=main\n",
+        fresh.address(),
+        fresh.standin_keys()
+    ));
+    let served = fresh.src.join(format!(
+        "extensions/ostrya/summary/{}",
+        ostrya::Checksum::sha256(b"anonymous")
+    ));
+    std::fs::remove_file(&served).unwrap();
+    let _ = std::fs::remove_file(served.with_extension("sig"));
+    let out = fresh.client(&["pull", "origin"], &[]);
+    assert_failed(
+        &out,
+        "pull: [remote \"origin\"] pull-branches selects refs of the summary, but the \
+         remote repository does not have a summary",
+    );
+    let out = fresh.client(&["refs"], &[]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+}
+
 /// ostrya refuses an ssh address in `url`, in the `ssh://` form and in the scp
 /// form. The ssh client does not start.
 #[test]

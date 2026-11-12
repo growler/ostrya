@@ -563,9 +563,12 @@ pub struct PullOptions {
     ///
     /// With an empty list, a local pull takes each ref of the source under
     /// `refs/heads`. [`Repo::pull`] takes each ref that the summary of the
-    /// remote lists under [`MIRROR`](PullFlags::MIRROR), and the configured
-    /// `branches` of the remote otherwise. [`Repo::pull_with_session`]
-    /// refuses an empty list with [`Error::InvalidInput`].
+    /// remote lists under [`MIRROR`](PullFlags::MIRROR). Otherwise it takes
+    /// the refs of the summary that the `pull-branches` key of the remote
+    /// selects, as [`Remote::pull_branches`](crate::config::Remote::pull_branches)
+    /// states, or the configured `branches` of the remote if the section
+    /// does not have that key. [`Repo::pull_with_session`] reads neither key,
+    /// and refuses an empty list with [`Error::InvalidInput`].
     ///
     /// A local pull reads each name as a revision of the source, `@ID:NAME`
     /// and a `^` suffix included, as [`Repo::pull_local`] states.

@@ -276,6 +276,7 @@ A pull refuses an ssh address and an \fB\%s3://\fR address in this key, and a pu
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
+The key \fB\%pull\-branches\fR has precedence over this key, and the pull then does not read this key.
 .TP
 \fB\%collection\-id\fR (string)
 The collection that the remote serves.
@@ -447,6 +448,23 @@ If no ref matches, \fB\%ostrya push\fR writes a message to standard error, write
 A malformed pattern stops the push before it connects.
 A refspec on the command line has precedence over the key, and the push then does not read it.
 \fB\%ostrya push \-\-onto\fR and a push to an address do not read the key.
+.TP
+\fB\%pull\-branches\fR (list)
+The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
+The pull reads the summary of the remote, and takes each ref of the summary that the list selects.
+A ref of the ref list of the summary is the ref \fB\%NAME\fR, and a ref of the entry of \fB\%ID\fR in its collection map is the ref \fB\%@ID:NAME\fR.
+The \fB\%ostree.summary.collection\-id\fR of the summary names the refs of its ref list, so \fB\%@ID:NAME\fR of that id matches the ref \fB\%NAME\fR of the ref list.
+A pattern \fB\%REMOTE:NAME\fR matches no ref of the summary.
+The pull writes each ref as a pull that names it does: a ref \fB\%NAME\fR to \fB\%refs/remotes/REMOTE/NAME\fR, and a ref \fB\%@ID:NAME\fR to \fB\%refs/mirrors/ID/NAME\fR, or to \fB\%refs/heads/NAME\fR if \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR.
+.IP
+The value is a list of ref patterns in the form of \fB\%push\-branches\fR.
+This key has precedence over \fB\%branches\fR, and the pull then does not read \fB\%branches\fR.
+The two keys do not merge.
+A ref on the command line has precedence over the key, and the pull then does not read it.
+\fB\%ostrya pull \-\-mirror\fR and \fB\%ostrya pull \-\-collection\fR do not read the key.
+.IP
+A malformed pattern stops the pull before its first object request.
+If the remote has no summary, or no ref of the summary matches, the pull fails, exits 1, and writes no object and no ref.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.

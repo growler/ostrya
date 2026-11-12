@@ -3700,6 +3700,17 @@ The port reads the remote key `trust=NAME`, and the trust group
 (`ostrya-config(1)`, "REMOTE KEYS"). The tool keeps the key and ignores it
 (`cli-behavior.md`, "Signature verification during a pull").
 
+The port reads the remote key `pull-branches`, a list of ref patterns, when
+the command gives no ref and no `--mirror` (`ostrya-config(1)`, "REMOTE
+KEYS", and `../decisions.md`, "The refs of a pull with no ref"). The pull
+takes each ref of the summary of the remote that the list selects, a ref of
+the ref list as `REF` and a ref of the collection map as `@ID:REF`, and
+writes each one as a pull that names it does. The key has precedence over
+`branches`, and the pull then does not read `branches`. A malformed value, a
+remote with no summary, and a list that selects no ref fail the pull at exit
+1 before the first object request, and the pull writes no object and no ref.
+`--collection` does not read the key. The tool does not define the key.
+
 A pull whose local ref path names an alias parts the two. The tool replaces
 the link with a ref file that names the pulled commit. The port refuses the
 ref with `error: ref not writable: <ref>: names an alias` at exit 1, after it

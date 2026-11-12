@@ -11013,6 +11013,162 @@ fn a_pull_from_a_remote_takes_plain_and_collection_refs() {
     });
 }
 
+/// Builds the remote of [`build_collection_remote`] under `dir` and starts a
+/// server for it.
+async fn collection_server(dir: &Path) -> RepoServer {
+    build_collection_remote(dir).await;
+    RepoServer::start(&dir.join("remote"), false).await
+}
+
+/// Pulls with the ref list `refs` from `server` into a new destination under
+/// `dir`, with the `origin` keys `extra`. Returns the result, the remote refs
+/// and the mirror refs that the pull wrote, and the paths that the server saw
+/// during the pull.
+async fn pull_with_keys(
+    server: &RepoServer,
+    dir: &Path,
+    extra: &str,
+    refs: &[&str],
+) -> (
+    ostrya::Result<PullStats>,
+    Vec<(String, Checksum)>,
+    Vec<(String, String, Checksum)>,
+    Vec<String>,
+) {
+    std::fs::create_dir_all(dir).unwrap();
+    let before = server.seen().len();
+    let dest = build_dest(dir, RepoMode::Archive, &server.url(), extra).await;
+    let result = dest.pull("origin", refs_of(refs)).await;
+    assert!(dest.list_refs(None).await.unwrap().is_empty());
+    let mut mirrors = dest.list_mirror_refs().await.unwrap();
+    mirrors.sort();
+    (
+        result,
+        dest.list_remote_refs().await.unwrap(),
+        mirrors,
+        server.seen().split_off(before),
+    )
+}
+
+/// With no ref, the pull takes the refs of the summary that `pull-branches`
+/// selects: a ref of field 0 as `NAME`, written under `refs/remotes/`, and a
+/// ref of the collection map as `@ID:NAME`, written under `refs/mirrors/`.
+/// `@ID:NAME` of the collection id of the summary selects a ref of field 0.
+/// Field 0 also lists `ostree-metadata`. The key has precedence over
+/// `branches`, whose ref `absent` the remote does not hold.
+#[test]
+fn pull_branches_selects_the_refs_of_the_summary() {
+    block_on(async {
+        let names = |refs: &[(String, Checksum)]| -> Vec<String> {
+            refs.iter().map(|(name, _)| name.clone()).collect()
+        };
+        let x_a = (ID_X.to_owned(), "a".to_owned());
+        let dir = TmpDir::new("pull-http-pull-branches");
+        let server = collection_server(dir.path()).await;
+        for (i, (extra, remote, mirrors)) in [
+            (
+                "pull-branches=main;c\n".to_owned(),
+                &["origin:c", "origin:main"][..],
+                None,
+            ),
+            (
+                format!("pull-branches=@{ID_X}:**;@{REMOTE_ID}:c\n"),
+                &["origin:c"][..],
+                Some(&x_a),
+            ),
+            (
+                format!("pull-branches=!ostree-metadata;!@{ID_Y}:**\n"),
+                &["origin:c", "origin:main"][..],
+                Some(&x_a),
+            ),
+            (
+                "branches=absent;\npull-branches=main\n".to_owned(),
+                &["origin:main"][..],
+                None,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let case = dir.path().join(i.to_string());
+            let (result, remote_refs, mirror_refs, _) =
+                pull_with_keys(&server, &case, &extra, &[]).await;
+            result.unwrap();
+            assert_eq!(names(&remote_refs), remote, "{extra}");
+            let mirror_refs: Vec<_> = mirror_refs
+                .into_iter()
+                .map(|(id, name, _)| (id, name))
+                .collect();
+            assert_eq!(mirror_refs, Vec::from_iter(mirrors.cloned()), "{extra}");
+        }
+    });
+}
+
+/// A ref of the pull has precedence over `pull-branches`, so a malformed
+/// value does not block it.
+#[test]
+fn an_explicit_ref_wins_over_pull_branches() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-branches-ref");
+        let server = collection_server(dir.path()).await;
+        let (result, remote_refs, mirror_refs, _) =
+            pull_with_keys(&server, dir.path(), "pull-branches=r*:x\n", &["c"]).await;
+        result.unwrap();
+        assert_eq!(remote_refs.len(), 1);
+        assert_eq!(remote_refs[0].0, "origin:c");
+        assert!(mirror_refs.is_empty());
+    });
+}
+
+/// With `pull-branches`, a remote with no summary, a malformed value, and a
+/// list that selects no ref fail the pull before its first object request.
+#[test]
+fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-branches-fail");
+        let server = collection_server(dir.path()).await;
+        for (i, (summary, value, want)) in [
+            (true, "r*:x", "[remote \"origin\"] pull-branches"),
+            (
+                true,
+                "absent/**",
+                "no ref of the summary matches [remote \"origin\"] pull-branches",
+            ),
+            (
+                false,
+                "main",
+                "[remote \"origin\"] pull-branches selects refs of the summary, but the \
+                 remote repository does not have a summary",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            // The server reads each file at the request, so the removal
+            // takes effect for this case and the cases after it.
+            if !summary {
+                std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+            }
+            let extra = format!("pull-branches={value}\n");
+            let case = dir.path().join(i.to_string());
+            let (result, remote_refs, mirror_refs, seen) =
+                pull_with_keys(&server, &case, &extra, &[]).await;
+            let err = result.unwrap_err();
+            let kind_ok = match &err {
+                Error::Pull(m) => m == want,
+                Error::InvalidFormat(m) => value == "r*:x" && m.contains(want),
+                _ => false,
+            };
+            assert!(kind_ok, "{value}: {err}");
+            assert!(remote_refs.is_empty() && mirror_refs.is_empty(), "{value}");
+            assert!(
+                !seen.iter().any(|path| path.starts_with("objects/")),
+                "{value}: {seen:?}"
+            );
+        }
+    });
+}
+
 /// With no summary, the pull reads `refs/heads/NAME` for a plain ref and
 /// `refs/mirrors/ID/NAME` for a collection ref of a collection that the
 /// remote mirrors.

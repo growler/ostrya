@@ -3929,6 +3929,53 @@ These alternatives were rejected:
   the refs of the local repository. A ref under `refs/remotes/` is the copy
   of a ref that a pull from another remote wrote.
 
+## The refs of a pull with no ref
+
+The key `pull-branches` of a `[remote "NAME"]` section is a list of ref
+patterns, which `Remote::pull_branches` reads as a `ReceiveSelector`. The
+rules:
+
+- `Repo::pull` reads the key when `PullOptions::refs` is empty and `MIRROR`
+  is not set. The selector matches the refs of the summary, and the summary
+  is available inside the pull alone. `Repo::pull` also reads `branches`
+  there. The pull reads the key after it reads the summary and the `config`
+  of the remote, and before it reads a ref file or an object.
+- `Repo::pull_with_session` has no remote section, so it reads neither key
+  and refuses an empty ref list. A `--collection` pull does not read the
+  key.
+- A ref on the command line has precedence over `pull-branches`, and
+  `pull-branches` has precedence over `branches`. The two keys do not
+  merge, so a section with both keys takes the refs of `pull-branches`
+  alone.
+- A ref of field 0 of the summary is the ref `NAME`, and a ref of the entry
+  of `ID` in `ostree.summary.collection-map` is the ref `@ID:NAME`. The own
+  id of the match is the `ostree.summary.collection-id` of the summary, or
+  none if the summary states none. So `@ID:NAME` of that id matches a ref
+  of field 0. A pattern `REMOTE:NAME` matches no ref of the summary.
+- A match of field 0 is written to `refs/remotes/NAME/REF`, as a ref of
+  `branches` is, also when an `@ID:NAME` pattern selected it. A match of the
+  collection map is the target `@ID:NAME`, and the pull writes it and checks
+  its tip as a requested `@ID:NAME` ref.
+- Only the matches go through the ref-name rule. A bad name of a ref that
+  the key does not select does not fail the pull.
+- A remote with no summary fails the pull with `[remote "NAME"]
+  pull-branches selects refs of the summary, but the remote repository does
+  not have a summary`. A list that selects no ref of the summary fails the
+  pull with `no ref of the summary matches [remote "NAME"] pull-branches`.
+  Both are `Error::Pull`, and the pull writes no object and no ref.
+
+These alternatives were rejected:
+
+- A read of `pull-branches` in the `ostrya pull` command. The command then
+  fetches the summary one time to select the refs, and the pull fetches it
+  again.
+- A match of the written names, `REMOTE:NAME`. The key selects refs of the
+  remote, and the summary lists them with no remote part.
+- A list of the matches as names for the path that reads `branches`. That
+  path reads each name as a plain ref, so it refuses a match `@ID:NAME` of
+  the collection map. It also looks up each match in the summary a second
+  time.
+
 ## The ref check of a transaction commit
 
 `Transaction::commit` writes the queued refs one by one, each with a temp

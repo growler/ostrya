@@ -12,6 +12,8 @@ The address is \%\-\-url, else the \fB\%pull\-url\fR key of the remote, else its
 .PP
 The pull stores the objects in one transaction, and then writes each ref under \fB\%refs/remotes/<remote>/\fR, or under \fB\%refs/heads/\fR with \%\-\-mirror. It verifies the signatures that the config of the remote or the verify options ask for. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, the pull drops \fB\%ostrya.related\fR\&.
 .PP
+With no REF, the pull reads the key \fB\%pull\-branches\fR of the section of REMOTE, a list of ref patterns. It takes each ref of the summary of the remote that the list selects: a ref of the ref list of the summary as REF, and a ref of its collection map as \%@ID:REF. It writes each one as a pull of that ref does. Without the key, it takes the \fB\%branches\fR key. \%\-\-mirror and \%\-\-collection do not read the key. \%ostrya\-config(1) states the key.
+.PP
 The pull also fetches the dependencies that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
 .PP
 With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
@@ -27,7 +29,7 @@ The remote name is also the prefix of the written refs, \fB\%refs/remotes/<name>
 \fIREFS...\fR
 The refs to pull.
 .IP
-With none, the pull takes the configured \fB\%branches\fR of the remote, or with \%\-\-mirror every ref that its summary lists. The pull looks up each ref in the summary of the remote. If the summary does not list the ref, the pull reads \fB\%refs/heads/<ref>\fR of the remote. With \%\-\-collection, these are the other refs of the collection.
+With none, the pull takes every ref that the summary of the remote lists with \%\-\-mirror. Else it takes the refs of the summary that the \fB\%pull\-branches\fR key of the remote selects, or the configured \fB\%branches\fR of the remote without that key. The pull looks up each ref in the summary of the remote. If the summary does not list the ref, the pull reads \fB\%refs/heads/<ref>\fR of the remote. With \%\-\-collection, these are the other refs of the collection.
 .IP
 A ref is REF or \%@ID:REF, the ref REF of the collection ID. One pull takes both forms, and the refs of more than one collection. The command refuses \%REMOTE:REF and a \fB\%^\fR suffix before the first request. The pull looks up \%@ID:REF in the summary: in the ref list if the summary states the collection id ID, else in its collection map. If the summary does not list the ref, the pull reads \fB\%refs/heads/REF\fR of the remote if the \fB\%[core] collection\-id\fR of the \fB\%config\fR file that the remote serves is ID, else \fB\%refs/mirrors/ID/REF\fR\&. If the remote serves no \fB\%config\fR file, or the file has no \fB\%collection\-id\fR, the pull uses the collection id of the summary in its place. The pull writes \fB\%refs/mirrors/ID/REF\fR, or \fB\%refs/heads/REF\fR if the \fB\%collection\-id\fR of this repository is ID. The commit must be bound to ID, also with \%\-\-disable\-verify\-bindings. The \%ref\-binding check reads REF. A ref named two times counts one time. The command refuses two other refs that write one ref, after it reads the summary and before it reads a ref file.
 .SH OPTIONS

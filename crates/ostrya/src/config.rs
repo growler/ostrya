@@ -1121,6 +1121,9 @@ impl Remote<'_> {
 
     /// Returns the `branches` key: the refs of a pull that names no ref.
     ///
+    /// If the section has the key `pull-branches`, a pull reads that key and
+    /// not this one. See [`pull_branches`](Remote::pull_branches).
+    ///
     /// # Errors
     ///
     /// [`Error::Core`] if the value holds a malformed escape sequence.
@@ -1128,6 +1131,46 @@ impl Remote<'_> {
         self.keyfile
             .get_string_list(&self.group, "branches")
             .map_err(Error::from)
+    }
+
+    /// Returns the selector of the summary refs that a pull with no ref
+    /// takes, or `None` if the key is absent.
+    ///
+    /// The key is `pull-branches`, and it is an ostrya extension. The value is
+    /// a `;` list of ref patterns, the entries of a `ReceiveSelector`. An
+    /// entry has one of these forms, with `*` and `**` in the name part:
+    ///
+    /// - `NAME` -- the local refs that `NAME` matches.
+    /// - `REMOTE:NAME` -- the refs of the remote `REMOTE` that `NAME`
+    ///   matches.
+    /// - `@ID:NAME` -- the refs of the collection `ID` that `NAME` matches.
+    ///
+    /// An entry that starts with `!` is an exclusion. The selector selects a
+    /// ref when a positive entry matches it, and no exclusion matches it. If
+    /// the list has no positive entry, each ref that no exclusion matches is
+    /// selected. Thus an empty value selects each ref. The order of the
+    /// entries has no effect.
+    ///
+    /// The selector matches the refs of the summary of the remote. A ref of
+    /// the ref list of the summary is the ref `NAME`, and a ref of the entry
+    /// of `ID` in `ostree.summary.collection-map` is the ref `@ID:NAME`. The
+    /// own id of the match is the `ostree.summary.collection-id` of the
+    /// summary, so `@ID:NAME` of that id matches the ref `NAME` of the ref
+    /// list. A pattern `REMOTE:NAME` matches no ref of the summary.
+    ///
+    /// [`Repo::pull`](crate::Repo::pull) reads this key when
+    /// [`refs`](crate::PullOptions::refs) is empty and
+    /// [`MIRROR`](crate::PullFlags::MIRROR) is not set. The key has
+    /// precedence over [`branches`](Remote::branches), and the pull then does
+    /// not read `branches`. The two keys do not merge.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if an entry is not a valid ref pattern. The
+    ///   text names the section, the key, and the entry.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn pull_branches(&self) -> Result<Option<ReceiveSelector>> {
+        read_selector(self.keyfile, &self.group, "pull-branches")
     }
 
     /// Returns the `tls-ca-path` key: a PEM file of trust anchors for TLS.
@@ -1859,6 +1902,45 @@ mod tests {
         assert!(
             matches!(&err, Error::InvalidFormat(m)
                 if m.contains("[remote \"origin\"] push-branches")
+                    && m.contains("malformed receive pattern")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn pull_branches_is_none_when_absent() {
+        let cfg = RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=bare\n[remote \"origin\"]\nurl=http://a/\n\
+             branches=main;\n",
+        )
+        .unwrap();
+        let origin = cfg.remote("origin").unwrap();
+        assert!(origin.pull_branches().unwrap().is_none());
+    }
+
+    #[test]
+    fn pull_branches_reads_a_pattern_list() {
+        let read = |value: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode=bare\n[remote \"origin\"]\n\
+                 url=http://a/\npull-branches={value}\n"
+            ))
+            .unwrap()
+            .remote("origin")
+            .unwrap()
+            .pull_branches()
+        };
+        let sel = read("apps/**;!apps/b;@org.example.X:**").unwrap().unwrap();
+        let own = Some("org.example.Own");
+        assert!(sel.matches(&Ref::local("apps/a"), own));
+        assert!(!sel.matches(&Ref::local("apps/b"), own));
+        assert!(sel.matches(&Ref::collection("org.example.X", "main"), own));
+        assert!(!sel.matches(&Ref::collection("org.example.Y", "main"), own));
+
+        let err = read("apps/**;r*:x").unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m.contains("[remote \"origin\"] pull-branches")
                     && m.contains("malformed receive pattern")),
             "{err}"
         );

@@ -1553,6 +1553,71 @@ mod cli {
         assert!(!setup.ssh_started());
     }
 
+    /// Checks the refusal of `--tag` under `push-branches`: exit 1, the
+    /// error line alone, no ssh, and no tag on the server.
+    fn assert_tag_refused(setup: &Setup, dest: &Path, out: &Output) {
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(out));
+        assert_eq!(stdout(out), "");
+        assert_eq!(
+            stderr(out),
+            "error: --tag needs a refspec, and [remote \"origin\"] push-branches gives none\n"
+        );
+        assert!(!setup.ssh_started());
+        assert_eq!(server_tip(dest, "v1"), None);
+    }
+
+    /// With `push-branches` and one match, the push refuses `--tag` before
+    /// it starts ssh.
+    #[test]
+    fn push_branches_refuses_a_tag_with_one_match() {
+        let setup = Setup::new("cli-push-branches-tag", "archive");
+        setup.commit("main", FILES, &["--bind-ref=v1"]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=main\n");
+        let out = push_origin(&setup, &["--tag=v1"]);
+        assert_tag_refused(&setup, &dest, &out);
+        assert_eq!(server_tip(&dest, "main"), None);
+    }
+
+    /// With `push-branches` and no match, the push refuses `--tag` and does
+    /// not exit 0.
+    #[test]
+    fn push_branches_refuses_a_tag_with_no_match() {
+        let setup = Setup::new("cli-push-branches-tag-nomatch", "archive");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=nomatch/**\n");
+        let out = push_origin(&setup, &["--tag=v1"]);
+        assert_tag_refused(&setup, &dest, &out);
+    }
+
+    /// With `push-branches`, the push refuses a bad `--collection` before it
+    /// refuses `--tag`.
+    #[test]
+    fn push_branches_refuses_a_bad_collection_before_a_tag() {
+        let setup = Setup::new("cli-push-branches-tag-collection", "archive");
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        add_origin(&setup, &dest, "push-branches=main\n");
+        let out = push_origin(&setup, &["--tag=v1", "--collection=no-dot"]);
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(stderr(&out), "error: Invalid collection ID no-dot\n");
+        assert!(!setup.ssh_started());
+    }
+
+    /// With `push-branches` set, a push with a refspec on the command line
+    /// creates the `--tag` ref.
+    #[test]
+    fn push_branches_keeps_a_tag_with_a_refspec() {
+        let setup = Setup::new("cli-push-branches-tag-refspec", "archive");
+        let c = setup.commit("main", FILES, &["--bind-ref=v1"]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        client_group(&dest, "w:main;t:v1");
+        add_origin(&setup, &dest, "push-branches=nomatch/**\n");
+        let out = push_origin(&setup, &["--tag=v1", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\nv1 (new) {c}\n"));
+        assert_eq!(server_tip(&dest, "v1"), Some(c));
+    }
+
     /// A malformed `push-branches` fails the push before it starts ssh.
     #[test]
     fn a_malformed_push_branches_fails_before_ssh_starts() {

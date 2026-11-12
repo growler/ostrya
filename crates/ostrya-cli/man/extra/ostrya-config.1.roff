@@ -416,6 +416,7 @@ The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:N
 .IP
 If no ref matches, \fB\%ostrya push\fR writes a message to standard error, writes nothing to standard output, and exits 0.
 A malformed pattern stops the push before it connects.
+\fB\%ostrya push\fR refuses \fB\%\-\-tag\fR with no refspec when it reads the key, before it lists the refs and before it connects.
 A refspec on the command line has precedence over the key, and the push then does not read it.
 \fB\%ostrya push \-\-onto\fR and a push to an address do not read the key.
 .TP

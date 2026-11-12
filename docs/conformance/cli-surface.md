@@ -5717,7 +5717,13 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   same name on the server. With no match, it writes `no ref matches
   [remote "NAME"] push-branches` to standard error and nothing to standard
   output, exits 0, and starts no ssh client. A malformed value fails at
-  exit 1 before the push connects.
+  exit 1 before the push connects. With the key in use, the command
+  refuses `--tag` with `error: --tag needs a refspec, and [remote "NAME"]
+  push-branches gives none` at exit 1, with no usage text. The refusal
+  comes after the checks of `--collection` and of the S3 options, before
+  the command lists the refs, before the push reads the shared AWS files,
+  and before the ssh client starts or the first HTTP request. It does not
+  depend on the local refs.
 - The push then resolves `REMOTE` and makes the transport ready, before it
   reads `--depth` and the refspecs. It refuses an option of the other
   transport and a bad HTTP option. It reads the token file of an HTTP push,
@@ -6173,8 +6179,10 @@ allow-cleartext-credentials`.
   `--push-token-file`,
   `--push-user`, the keys `push-token-file` and `push-user`, and the ssh
   options. It reads the environment and the shared AWS files before it
-  refuses `--tag` and `--compress`, and sends no request for either
-  refusal. The ref lines and the exit status are those of a push over a
+  refuses `--compress`, and before it refuses `--tag` with a refspec on the
+  command line. It sends no request for either refusal. When
+  `push-branches` gives the refs, the push refuses `--tag` before it reads
+  the shared AWS files. The ref lines and the exit status are those of a push over a
   session. The push uploads the stored `.filez` of an `archive` repository
   as it is, and builds the `.filez` of each other mode at the
   `[archive] zlib-level` of the `config` of the bucket. With

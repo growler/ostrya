@@ -647,7 +647,8 @@ enum Command {
     /// selects, it sends the commit that the listing read to the ref of the
     /// same name: the local refs by name, then the collection refs by id and
     /// name. A remote ref is never sent. If no ref matches, the command
-    /// writes a message to standard error and exits 0.
+    /// writes a message to standard error and exits 0. The command refuses
+    /// --tag before it lists the refs.
     /// Without the key, with an address, or with --onto, a refspec is
     /// required. ostrya-config(1) states the key.
     ///
@@ -4785,7 +4786,8 @@ struct PushArgs {
     /// and is not a DST. The name part of a tag @OWN:NAME is not 64
     /// lowercase hex characters either, where OWN is the collection id of
     /// the server. The client group of the push needs `t` or `w` on the
-    /// tag in its namespace.
+    /// tag in its namespace. With no refspec on the command line, the command
+    /// refuses the option.
     ///
     /// With --onto, the server creates the tag at the new commit, and the
     /// `ostree.ref-binding` of that commit holds its name part. The tag is
@@ -6326,6 +6328,13 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         }
     }
     if let Some(selector) = push_branches {
+        // A tag needs one source commit, and the selection can give none or
+        // more than one.
+        if !args.tags.is_empty() {
+            exit_error(&format!(
+                "--tag needs a refspec, and [remote \"{remote}\"] push-branches gives none"
+            ));
+        }
         args.refspecs = push_branch_refspecs(&repo, &selector).await?;
         if args.refspecs.is_empty() {
             eprintln!("no ref matches [remote \"{remote}\"] push-branches");

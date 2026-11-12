@@ -2203,7 +2203,9 @@ address when it uses the remote. `remote show-url` and `remote list -u`
 then fail for the remote, because it has no `url`.
 
 `resolve_push` reads the environment and the shared AWS files before the
-library refuses `--tag` and `--compress` for an S3 destination. A check of
+library refuses `--tag` and `--compress` for an S3 destination. When
+`push-branches` gives the refs of a push with no refspec, the command
+refuses `--tag` before the resolution and reads no AWS file. A check of
 these options in the command before the resolution was rejected: it copies
 a rule of the library, and the read of the files sends no request.
 
@@ -3931,6 +3933,12 @@ rules:
   nothing to standard output, exits 0, and opens no connection. The ref
   listing and this check come after the checks of `--collection` and of the
   S3 options, and before the push address resolves.
+- The command refuses `--tag` when it reads the key, with `--tag needs a
+  refspec, and [remote "NAME"] push-branches gives none` at exit 1. The
+  refusal comes after the checks of `--collection` and of the S3 options,
+  and before the ref listing and the connection. It does not depend on the
+  local refs. A tag needs one source commit, and the selection gives no
+  commit, one commit, or more than one.
 
 These alternatives were rejected:
 
@@ -3944,6 +3952,18 @@ These alternatives were rejected:
 - A listing of the remote refs that are collection refs. The key selects
   the refs of the local repository. A ref under `refs/remotes/` is the copy
   of a ref that a pull from another remote wrote.
+- A tag at the one commit of the selection. The result then depends on the
+  local refs: the same command creates the tag or fails when a local ref
+  moves.
+- A push with no match that drops `--tag` and exits 0. The push then does
+  not create a ref that the user requested, and the exit status reports
+  success.
+- A clap `requires` rule between `--tag` and the refspecs. The refusal then
+  writes the usage text of clap, and its text does not name the key. The
+  rule also refuses `--tag` with no refspec when the remote has no key, and
+  that push then does not get `REFSPEC must be specified`.
+- A tag at each matched commit. This reads `--tag` with a meaning of its
+  own, and writes refs that the user did not request.
 
 ## The refs of a pull with no ref
 

@@ -4166,9 +4166,10 @@ the whole queue against the ref store before the first write. The rules:
   directory, passes through a file, or names a special file stops the
   removal before the first ref goes. It uses no staging directory and does
   not use `tmp/`. An absent ref is success, and the parent directories
-  stay. `refs --delete @<id>:PREFIX` removes the refs of each prefix, and
-  `refs -c --delete` the refs of all ids, with one call. So an alias under
-  `refs/mirrors/<id>/` stops the prefix, or the `-c` deletion, before it
+  stay. `refs --delete PREFIX` without `-A` and
+  `refs --delete @<id>:PREFIX` remove the refs of each prefix with one
+  call, and `refs -c --delete` removes the refs of all ids with one call.
+  So an alias that a prefix or the `-c` deletion selects stops it before it
   removes a ref.
 - A refused commit leaves the published objects, and writes no detached
   metadata and no ref. `gc` removes the objects.

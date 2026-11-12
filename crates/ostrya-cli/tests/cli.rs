@@ -48701,6 +48701,30 @@ fn refs_delete_refuses_a_mirror_alias_before_it_removes_a_ref() {
     }
 }
 
+/// A plain prefix checks each ref it selects before it removes a ref. In
+/// `refs --delete zz test`, the prefix `zz` removes its ref. The prefix `test`
+/// selects `test/a` and the alias `test/al`. It refuses the alias and removes
+/// no ref. `test/a` sorts before the alias, and it stays.
+#[test]
+fn refs_delete_prefix_checks_each_ref_before_it_removes_one() {
+    let tmp = TmpDir::new("refs-delete-prefix-alias");
+    let base = tmp.path();
+    let (repo, main) = own_repo_with_main(base);
+    ostrya_at(&repo, &["refs", "--create=zz", "main"]).ok();
+    ostrya_at(&repo, &["refs", "--create=test/a", "main"]).ok();
+    ostrya_at(&repo, &["refs", "-A", "--create=test/al", "main"]).ok();
+    let alias = repo.join("refs/heads/test/al");
+
+    refused_with_message(
+        &ostrya_at(&repo, &["refs", "--delete", "zz", "test"]),
+        "ref not writable: test/al: names an alias",
+    );
+    assert_eq!(ref_file(&repo, "refs/heads/zz"), None);
+    assert_eq!(ref_file(&repo, "refs/heads/test/a").as_ref(), Some(&main));
+    assert!(alias.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_link(&alias).unwrap(), Path::new("../main"));
+}
+
 /// A deletion that selects no ref takes no lock. With `[core]
 /// lock-timeout-secs=-2`, `refs --delete @X:nomatch` and `refs -c --delete`
 /// of an id with no ref exit 0 and remove no ref.

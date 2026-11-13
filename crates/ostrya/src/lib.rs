@@ -111,6 +111,7 @@ pub mod receive;
 pub mod refs;
 mod related;
 mod remotes_dir;
+mod repo_fs;
 mod rollsum;
 mod send;
 #[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]

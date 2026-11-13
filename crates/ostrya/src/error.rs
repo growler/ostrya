@@ -108,6 +108,16 @@ pub enum Error {
         /// The cause, for example `names a directory`.
         reason: String,
     },
+    /// A ref path that names an entry that is not a regular file, such as a
+    /// directory, a FIFO, or a socket.
+    #[error("not a ref: {name}: {reason}")]
+    NotARef {
+        /// The ref as text: `<name>`, `<remote>:<name>`, or
+        /// `@<collection-id>:<name>` for a collection ref.
+        name: String,
+        /// The cause, for example `is not a regular file`.
+        reason: String,
+    },
     /// A conditional ref write whose ref does not have the expected state.
     ///
     /// [`Transaction::commit`](crate::Transaction::commit) gives this error
@@ -985,6 +995,13 @@ mod tests {
                 ErrorKind::InvalidInput,
             ),
             (Error::SymlinkLoop { path: path() }, ErrorKind::Other),
+            (
+                Error::NotARef {
+                    name: "origin:main".into(),
+                    reason: "is not a regular file".into(),
+                },
+                ErrorKind::Other,
+            ),
             (Error::Staging("directory is gone".into()), ErrorKind::Other),
             (
                 Error::HttpStatus {
@@ -1190,6 +1207,19 @@ mod tests {
             assert_eq!(io.kind(), expected, "kind for {rendered}");
             assert_eq!(io.to_string(), rendered);
         }
+    }
+
+    #[test]
+    fn not_a_ref_shows_the_name_and_the_reason() {
+        let err = Error::NotARef {
+            name: "@org.example.Os:main".into(),
+            reason: "is not a regular file".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "not a ref: @org.example.Os:main: is not a regular file"
+        );
+        assert!(std::error::Error::source(&err).is_none());
     }
 
     #[test]

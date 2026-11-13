@@ -1016,6 +1016,7 @@ pub(crate) mod tests {
     /// A selection of engines builds the selected engines alone. The call
     /// reads no key source of an engine that it does not select, and refuses
     /// an engine that the switches do not turn on before it reads a key.
+    #[cfg(feature = "verify-gpg")]
     #[test]
     fn remote_keys_build_the_selected_engines_alone() {
         use crate::verify::RemoteKeys;

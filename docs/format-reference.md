@@ -593,6 +593,16 @@ The refspec `remote:ref` maps to `refs/remotes/remote/ref`, and a bare `ref`
 maps to `refs/heads/ref`. A NULL rev deletes the ref. An alias is a relative
 symlink.
 
+When the port reads a ref file, the open does not wait for a writer. The port
+checks the type of the file after the open. A FIFO, a socket, or a device file
+at a ref path is no ref, also through an alias. A ref listing does not hold
+it, and a resolve of its name finds no ref. A ref listing reads the type of
+each entry before the open, and it does not open a FIFO, a socket, or a device
+file. So the listing leaves out such an entry also when the permissions refuse
+its open. A read of one ref name opens the file, also at a FIFO. A listing
+opens each other entry and the target of each alias. When the permissions
+refuse one of these opens, the read fails with the error of the open.
+
 A remote ref `refs/remotes/R/REF` belongs to the collection that the
 `collection-id` of the remote `R` names. The port lists it under that id in
 the collection ref listing and in `refs -c` alone, and never under the

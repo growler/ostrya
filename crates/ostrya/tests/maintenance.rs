@@ -897,6 +897,68 @@ fn fsck_refuses_a_ref_symlink_naming_a_directory() {
 }
 
 #[test]
+fn fsck_and_prune_skip_a_ref_entry_that_is_a_fifo() {
+    // A FIFO under refs/ is no ref. The ref walks of fsck and prune leave it
+    // out, and their opens do not wait for a writer. The run happens on a
+    // thread, so a regression fails the test and does not hang it.
+    let tmp = TmpDir::new("maint-fsck-fifo");
+    let (repo, commit) = block_on(build_library_repo(tmp.path()));
+    let fifos: Vec<_> = [
+        "refs/heads/fifo",
+        "refs/remotes/o/fifo",
+        "refs/mirrors/org.example.Other/fifo",
+    ]
+    .iter()
+    .map(|rel| {
+        let fifo = tmp.path().join("repo").join(rel);
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        fifo
+    })
+    .collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = repo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(block_on(async {
+            let opts = ostrya::PruneOptions {
+                refs_only: true,
+                ..ostrya::PruneOptions::new()
+            };
+            let pruned = handle.prune(&opts).await;
+            let report = handle.fsck(&FsckOptions::new()).await;
+            (pruned, report)
+        }));
+    });
+    let timeout = Duration::from_secs(10);
+    let Ok((pruned, report)) = rx.recv_timeout(timeout) else {
+        // A writer releases a blocked open, so the thread ends.
+        for fifo in &fifos {
+            let _ = rustix::fs::open(
+                fifo,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+        }
+        let _ = rx.recv_timeout(timeout);
+        panic!("the open waits on a FIFO");
+    };
+    assert_eq!(pruned.unwrap().pruned_objects, 0);
+    let report = report.unwrap();
+    assert!(report.is_ok(), "fsck: {:?}", report.errors);
+    assert_eq!(report.commits_checked, 1);
+    assert!(block_on(repo.has_object(ObjectType::Commit, &commit)).unwrap());
+}
+
+#[test]
 fn fsck_detects_content_corruption() {
     let tmp = TmpDir::new("maint-fsck-content");
     block_on(async {

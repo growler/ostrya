@@ -852,3 +852,134 @@ fn list_refs_where_does_not_read_the_own_or_an_invalid_collection() {
         }
     });
 }
+
+/// Makes a FIFO at `rel` of the repository at `path` and returns its path.
+fn put_fifo(path: &Path, rel: &str) -> PathBuf {
+    let fifo = path.join(rel);
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+    fifo
+}
+
+/// Runs `call` with `repo` on a thread and returns its result. If the call
+/// does not end in 10 seconds, a writer opens each FIFO of `fifos`, so that a
+/// blocked open ends, and the test fails.
+fn without_wait<T: Send + 'static>(
+    repo: &Repo,
+    fifos: &[PathBuf],
+    what: &str,
+    call: impl FnOnce(Repo) -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let repo = repo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(call(repo));
+    });
+    let timeout = std::time::Duration::from_secs(10);
+    let Ok(result) = rx.recv_timeout(timeout) else {
+        for fifo in fifos {
+            let _ = rustix::fs::open(
+                fifo,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+        }
+        let _ = rx.recv_timeout(timeout);
+        panic!("{what}: the open waits on a FIFO");
+    };
+    result
+}
+
+/// A ref entry that is a FIFO is no ref. The listings leave it out, a
+/// resolve finds no ref, and no read waits for a writer.
+#[test]
+fn a_ref_entry_that_is_a_fifo_is_no_ref() {
+    let tmp = TmpDir::new("ref-store-fifo");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        repo.set_ref_immediate(&Ref::remote("o", "x"), Some(&checksum(2)))
+            .await
+            .unwrap();
+        put(&repo, OTHER, "x", &checksum(3)).await;
+    });
+    let fifos = [
+        put_fifo(&path, "refs/heads/fifo"),
+        put_fifo(&path, "refs/remotes/o/fifo"),
+        put_fifo(&path, &format!("refs/mirrors/{OTHER}/fifo")),
+    ];
+
+    let heads = without_wait(&repo, &fifos, "list_refs", |r| block_on(r.list_refs(None)));
+    assert_eq!(heads.unwrap(), vec![("main".to_owned(), checksum(1))]);
+    let remotes = without_wait(&repo, &fifos, "list_remote_refs", |r| {
+        block_on(r.list_remote_refs())
+    });
+    assert_eq!(remotes.unwrap(), vec![("o:x".to_owned(), checksum(2))]);
+    let mirrors = without_wait(&repo, &fifos, "list_mirror_refs", |r| {
+        block_on(r.list_mirror_refs())
+    });
+    assert_eq!(
+        mirrors.unwrap(),
+        vec![(OTHER.to_owned(), "x".to_owned(), checksum(3))]
+    );
+    let all = without_wait(&repo, &fifos, "list_refs_where", |r| {
+        block_on(r.list_refs_where(|_| true))
+    });
+    assert_eq!(
+        all.unwrap(),
+        vec![
+            (Ref::local("main"), checksum(1)),
+            (Ref::collection(OTHER, "x"), checksum(3)),
+        ]
+    );
+    let collections = without_wait(&repo, &fifos, "list_collection_refs", |r| {
+        block_on(r.list_collection_refs())
+    });
+    let collections: Vec<_> = collections
+        .unwrap()
+        .into_iter()
+        .map(|e| (e.collection, e.name, e.commit))
+        .collect();
+    assert_eq!(
+        collections,
+        vec![
+            (OTHER.to_owned(), "x".to_owned(), checksum(3)),
+            (OWN.to_owned(), "main".to_owned(), checksum(1)),
+        ]
+    );
+
+    let other_fifo = format!("@{OTHER}:fifo");
+    for rev in ["fifo", "o:fifo", other_fifo.as_str()] {
+        let owned = rev.to_owned();
+        let strict = without_wait(&repo, &fifos, rev, move |r| {
+            block_on(r.resolve_rev(&owned, false))
+        });
+        assert_not_found(strict, rev);
+        let owned = rev.to_owned();
+        let lenient = without_wait(&repo, &fifos, rev, move |r| {
+            block_on(r.resolve_rev(&owned, true))
+        });
+        assert_eq!(lenient.unwrap(), None, "{rev}");
+    }
+    for r in [
+        Ref::local("fifo"),
+        Ref::remote("o", "fifo"),
+        Ref::collection(OTHER, "fifo"),
+    ] {
+        let what = r.to_string();
+        let tip = without_wait(&repo, &fifos, &what, move |repo| {
+            block_on(repo.resolve_ref_tip(&r))
+        });
+        assert_eq!(tip.unwrap(), None, "{what}");
+    }
+}

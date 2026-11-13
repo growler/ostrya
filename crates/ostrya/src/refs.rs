@@ -427,7 +427,10 @@ impl Repo {
     ///    `@ID:NAME` reads `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when
     ///    `ID` is the `[core] collection-id` of the repository. A ref path
     ///    that names a directory, or that passes through a file, fails with
-    ///    [`Error::Io`].
+    ///    [`Error::Io`]. A ref path that names a FIFO, a socket, or a device
+    ///    file holds no ref. The call checks the type of the file after the
+    ///    open, and the open does not wait for a writer. An open that the
+    ///    permissions refuse fails with [`Error::Io`], also at a FIFO.
     ///
     /// A checksum is in lowercase hex only. A 64-character name with an
     /// uppercase character is a refspec.
@@ -545,9 +548,13 @@ impl Repo {
     /// checksum, or with a `^` suffix. If the ref is an alias, the call
     /// follows the link. An alias whose target is absent reads as an absent
     /// ref. A ref path that names a directory, or that passes through a
-    /// file, holds no ref. The result is `None` if the store holds no such
-    /// ref. A caller that needs an error for an absent ref gives
-    /// [`Error::RefNotFound`] with the text of the ref.
+    /// file, holds no ref. A ref path that names a FIFO, a socket, or a
+    /// device file holds no ref. The call checks the type of the file after
+    /// the open, and the open does not wait for a writer. An open that the
+    /// permissions refuse fails with [`Error::Io`], also at a FIFO. The
+    /// result is `None` if the store holds no such ref. A caller that needs
+    /// an error for an absent ref gives [`Error::RefNotFound`] with the text
+    /// of the ref.
     ///
     /// Callers that hold a ref name and not a revision use this call. These
     /// are a media export and a media import for their refs, a summary for
@@ -586,7 +593,10 @@ impl Repo {
     /// Returns the commit that the ref file at `relpath` names. The call
     /// follows an alias. The result is `None` if no file is at the path. A
     /// path that names a directory, or that passes through a file, fails
-    /// with [`Error::Io`].
+    /// with [`Error::Io`]. A path that names a FIFO, a socket, or a device
+    /// file finds no ref. The call checks the type of the file after the
+    /// open, and the open does not wait for a writer. An open that the
+    /// permissions refuse fails with [`Error::Io`], also at a FIFO.
     ///
     /// The read and the parse run in one call on the blocking pool.
     pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
@@ -671,7 +681,12 @@ impl Repo {
     /// The local refs are under `refs/heads`. If `prefix` is given, the result
     /// holds only the ref named `prefix` and the refs below `prefix/`. The call
     /// follows each alias. An alias whose target names no ref is not in the
-    /// result.
+    /// result. A ref entry that is a FIFO, a socket, or a device file is not
+    /// in the result. The call does not open such an entry, so its permissions
+    /// have no effect on the call. An alias to such a file is not in the
+    /// result. The call checks the type of each file that it opens, and an
+    /// open does not wait for a writer. An open that the permissions refuse
+    /// fails the call, also at the target of an alias.
     ///
     /// # Errors
     ///
@@ -713,7 +728,12 @@ impl Repo {
     ///
     /// The call follows each alias that `keep` selects, as
     /// [`list_refs`](Repo::list_refs) does. An alias whose target names no
-    /// ref is not in the result.
+    /// ref is not in the result. A ref entry that is a FIFO, a socket, or a
+    /// device file is not in the result. The call does not open such an
+    /// entry, so its permissions have no effect on the call. An alias to such
+    /// a file is not in the result. The call checks the type of each file
+    /// that it opens, and an open does not wait for a writer. An open that the
+    /// permissions refuse fails the call, also at the target of an alias.
     ///
     /// The local refs come first, sorted by name. The collection refs come
     /// after them, sorted by collection id and then by name. The sort is the
@@ -879,7 +899,12 @@ impl Repo {
     /// The remote refs are under `refs/remotes`. The first path component
     /// below `refs/remotes` is the remote name, so the refspec of each ref is
     /// `remote:name`. A file directly under `refs/remotes` names no remote,
-    /// and the result does not hold it.
+    /// and the result does not hold it. A ref entry that is a FIFO, a socket,
+    /// or a device file is not in the result. The call does not open such an
+    /// entry, so its permissions have no effect on the call. An alias to such
+    /// a file is not in the result. The call checks the type of each file that
+    /// it opens, and an open does not wait for a writer. An open that the
+    /// permissions refuse fails the call, also at the target of an alias.
     ///
     /// # Errors
     ///
@@ -898,7 +923,13 @@ impl Repo {
     /// The mirror refs are under `refs/mirrors`. The first path component
     /// below `refs/mirrors` is the collection id. The rest of the path is the
     /// ref name, which can contain `/`. A file directly under `refs/mirrors`
-    /// has no collection id, and the result does not hold it.
+    /// has no collection id, and the result does not hold it. A ref entry
+    /// that is a FIFO, a socket, or a device file is not in the result. The
+    /// call does not open such an entry, so its permissions have no effect on
+    /// the call. An alias to such a file is not in the result. The call checks
+    /// the type of each file that it opens, and an open does not wait for a
+    /// writer. An open that the permissions refuse fails the call, also at the
+    /// target of an alias.
     ///
     /// The result holds the refs of `refs/mirrors/ID/` of the
     /// `[core] collection-id` of the repository. The ref resolve, the
@@ -940,6 +971,13 @@ impl Repo {
     /// time. A ref under `refs/mirrors` wins over a ref of a remote with the
     /// same pair. Among remotes with the same pair, the first remote in the
     /// byte order of the names wins.
+    ///
+    /// A ref entry that is a FIFO, a socket, or a device file is not in the
+    /// result. The call does not open such an entry, so its permissions have
+    /// no effect on the call. An alias to such a file is not in the result.
+    /// The call checks the type of each file that it opens, and an open does
+    /// not wait for a writer. An open that the permissions refuse fails the
+    /// call, also at the target of an alias.
     ///
     /// [`list_collection_refs_in`](Repo::list_collection_refs_in) lists the
     /// refs of one collection that a selector selects. It does not read
@@ -2174,6 +2212,9 @@ fn read_alias_ref(
 /// `out`. An alias resolves to the commit of its target, and a dangling alias
 /// adds nothing.
 fn push_head(out: &mut Vec<(String, Checksum)>, entry: &RefEntry<'_>) -> Result<()> {
+    if !entry.can_hold_ref() {
+        return Ok(());
+    }
     if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
         out.push((entry.path.to_owned(), parse_ref_content(&bytes)?));
     }
@@ -2189,6 +2230,9 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     };
     let mut out = Vec::new();
     walk_ref_dir(remotes.as_fd(), "", &mut |entry| {
+        if !entry.can_hold_ref() {
+            return Ok(());
+        }
         let Some(bytes) = read_ref_file(entry.dir, entry.name)? else {
             return Ok(());
         };
@@ -2221,6 +2265,9 @@ fn collect_remote_collections(
             continue;
         };
         walk_ref_dir(sub.as_fd(), "", &mut |entry| {
+            if !entry.can_hold_ref() {
+                return Ok(());
+            }
             if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
                 let checksum = parse_ref_content(&bytes)?;
                 out.push((
@@ -2295,7 +2342,7 @@ fn collect_mirrors(
     };
     let mut out = Vec::new();
     walk_ref_dir_skipping(mirrors.as_fd(), "", skip, &mut |entry| {
-        if !keep(entry.path) {
+        if !keep(entry.path) || !entry.can_hold_ref() {
             return Ok(());
         }
         let Some(bytes) = read_ref_file(entry.dir, entry.name)? else {
@@ -2325,6 +2372,15 @@ pub(crate) struct RefEntry<'a> {
     pub(crate) path: &'a str,
     /// The type of the entry, read with no symlink followed.
     pub(crate) file_type: FileType,
+}
+
+impl RefEntry<'_> {
+    /// Returns `true` if the entry is a regular file or a symlink. Only such
+    /// an entry can hold a ref. A listing does not open a FIFO, a socket, or
+    /// a device file.
+    pub(crate) fn can_hold_ref(&self) -> bool {
+        matches!(self.file_type, FileType::RegularFile | FileType::Symlink)
+    }
 }
 
 /// Walks a directory under `refs/`. The walk descends into each subdirectory
@@ -2651,20 +2707,32 @@ fn read_alias_target(entry: &RefEntry<'_>) -> Result<Option<String>> {
 
 /// Reads a ref file relative to `dir`, and follows alias symlinks. Returns
 /// `None` if the file does not exist.
-fn read_ref_file(
+///
+/// The call checks the type of the file after the open, and the open does
+/// not wait for a writer. A FIFO, a socket, or a device file at the path
+/// gives `None`. A path that names a directory gives `EISDIR`. An open that
+/// fails with an error other than `ENOENT` or `ENXIO`, for example `EACCES`,
+/// gives that error.
+pub(crate) fn read_ref_file(
     dir: rustix::fd::BorrowedFd<'_>,
     relpath: &str,
 ) -> std::io::Result<Option<Vec<u8>>> {
     let fd = match rustix::fs::openat(
         dir,
         relpath,
-        OFlags::RDONLY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
+        // The open of a socket fails with ENXIO.
+        Err(Errno::NOENT | Errno::NXIO) => return Ok(None),
         Err(e) => return Err(e.into()),
     };
+    match FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) {
+        FileType::RegularFile => {}
+        FileType::Directory => return Err(Errno::ISDIR.into()),
+        _ => return Ok(None),
+    }
     // The buffer holds the whole cap before the read, so a ref file takes
     // one read and the read that finds its end.
     let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
@@ -2687,6 +2755,14 @@ fn is_not_a_ref_path(e: &std::io::Error) -> bool {
 /// file.
 const PASSES_THROUGH_A_FILE: &str = "passes through a file";
 
+/// The reason of [`RefFileState::NotARef`] for a path that names a
+/// directory.
+const NAMES_A_DIRECTORY: &str = "names a directory";
+
+/// The reason of [`RefFileState::NotARef`] for a path that names a FIFO, a
+/// socket, or a device file.
+const NAMES_A_SPECIAL_FILE: &str = "names a special file";
+
 /// The reason of [`Error::RefNotWritable`] for a ref write or a ref removal
 /// whose path names an alias.
 const NAMES_AN_ALIAS: &str = "names an alias";
@@ -2707,8 +2783,8 @@ fn lstat_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<Option<RefFileS
     Ok(match FileType::from_raw_mode(stat.st_mode) {
         FileType::RegularFile => None,
         FileType::Symlink => Some(RefFileState::Alias),
-        FileType::Directory => Some(RefFileState::NotARef("names a directory")),
-        _ => Some(RefFileState::NotARef("names a special file")),
+        FileType::Directory => Some(RefFileState::NotARef(NAMES_A_DIRECTORY)),
+        _ => Some(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
     })
 }
 
@@ -2719,17 +2795,35 @@ fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
     if let Some(state) = lstat_ref_state(dir, relpath)? {
         return Ok(state);
     }
+    open_ref_state(dir, relpath)
+}
+
+/// Returns the state of the ref path `relpath`, read with an `O_NOFOLLOW`
+/// open alone. [`ref_file_state`] calls it after `lstat` found a regular
+/// file.
+///
+/// The open does not wait for a writer. A directory, a FIFO, a socket, or a
+/// device file at the open gives the [`RefFileState::NotARef`] that
+/// [`lstat_ref_state`] gives for it.
+fn open_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
     let fd = match rustix::fs::openat(
         dir,
         relpath,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
         Mode::empty(),
     ) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Ok(RefFileState::Absent),
         Err(Errno::LOOP) => return Ok(RefFileState::Alias),
+        // The open of a socket fails with ENXIO.
+        Err(Errno::NXIO) => return Ok(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
         Err(e) => return Err(e.into()),
     };
+    match FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) {
+        FileType::RegularFile => {}
+        FileType::Directory => return Ok(RefFileState::NotARef(NAMES_A_DIRECTORY)),
+        _ => return Ok(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
+    }
     let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
     std::fs::File::from(fd)
         .take(REF_READ_CAP)
@@ -2739,7 +2833,7 @@ fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
 
 /// Parses the content of a ref file: a hex checksum with trailing white
 /// space.
-fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
+pub(crate) fn parse_ref_content(bytes: &[u8]) -> Result<Checksum> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("ref content is not valid UTF-8".into()))?;
     Ok(Checksum::from_hex(text.trim())?)
@@ -3214,7 +3308,10 @@ pub(crate) fn remove_alias_blocking(
 ///
 /// A read that finds no file unlinks all the same. The name that the caller
 /// recorded is gone or dangles. `unlinkat` removes a symlink and not the file
-/// that it names, and an absent name is success.
+/// that it names, and an absent name is success. A FIFO, a socket, or a
+/// device file at the path is no ref, so the call unlinks it. The read checks
+/// the type of the file after the open, and the open does not wait for a
+/// writer. An open that the permissions refuse fails the call.
 ///
 /// Under `fsync`, after the last unlink, the call runs `fsync` once on each
 /// directory from which an unlink removed a name. So each removed name is
@@ -3770,6 +3867,292 @@ mod tests {
                 panic!("{file_type:?}: the open waits on the FIFO");
             };
             assert!(result.unwrap(), "{file_type:?}");
+        }
+    }
+
+    /// Runs `read` on a thread with a new descriptor of the directory `dir`,
+    /// and returns its result. If the call does not end in 10 seconds, a
+    /// writer opens `fifo`, so that a blocked open ends, and the test fails.
+    fn read_without_wait<T: Send + 'static>(
+        dir: &std::path::Path,
+        fifo: &std::path::Path,
+        what: &str,
+        read: impl FnOnce(BorrowedFd<'_>) -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dir = dir.to_owned();
+        std::thread::spawn(move || {
+            let dir = std::fs::File::open(&dir).unwrap();
+            let _ = tx.send(read(dir.as_fd()));
+        });
+        let timeout = std::time::Duration::from_secs(10);
+        let Ok(result) = rx.recv_timeout(timeout) else {
+            // A writer releases the blocked open, so the thread ends.
+            let _ = rustix::fs::open(
+                fifo,
+                OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            );
+            let _ = rx.recv_timeout(timeout);
+            panic!("{what}: the open waits on the FIFO");
+        };
+        result
+    }
+
+    /// Makes in `refs/heads` of `root` a FIFO `fifo`, an alias `to-fifo` to
+    /// it, a socket `sock`, an absolute alias `null` to `/dev/null`, a
+    /// directory `dir`, and an alias `to-dir` to it. Returns the path of the
+    /// FIFO and the socket, which lives while the caller holds it.
+    fn special_ref_entries(root: &Root) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
+        let heads = root.dir.join("refs/heads");
+        let fifo = heads.join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("fifo", heads.join("to-fifo")).unwrap();
+        // The path of a socket has a short length limit, so the bind uses a
+        // short path and a rename moves the socket into place.
+        let short = root.dir.join("s");
+        let socket = std::os::unix::net::UnixListener::bind(&short).unwrap();
+        std::fs::rename(&short, heads.join("sock")).unwrap();
+        std::os::unix::fs::symlink("/dev/null", heads.join("null")).unwrap();
+        std::fs::create_dir(heads.join("dir")).unwrap();
+        std::os::unix::fs::symlink("dir", heads.join("to-dir")).unwrap();
+        (fifo, socket)
+    }
+
+    /// The ref reader finds no ref at a FIFO, at a socket, and at a device
+    /// file, also through an alias, and its open does not wait for a writer.
+    /// A path that names a directory fails the read with `EISDIR`.
+    #[test]
+    fn a_ref_file_that_is_a_fifo_a_socket_or_a_device_reads_as_no_ref() {
+        let root = Root::new("special");
+        let (fifo, _socket) = special_ref_entries(&root);
+        for name in ["fifo", "to-fifo", "sock", "null"] {
+            let relpath = format!("refs/heads/{name}");
+            let result = read_without_wait(&root.dir, &fifo, name, move |dir| {
+                read_ref_file(dir, &relpath)
+            });
+            assert!(matches!(result, Ok(None)), "{name}: {result:?}");
+        }
+        for name in ["dir", "to-dir"] {
+            let err = read_ref_file(root.fd(), &format!("refs/heads/{name}")).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{name}");
+        }
+        let commit = Checksum::from_bytes([1; 32]);
+        std::fs::write(
+            root.dir.join("refs/heads/main"),
+            format!("{}\n", commit.to_hex()),
+        )
+        .unwrap();
+        let bytes = read_ref_file(root.fd(), "refs/heads/main")
+            .unwrap()
+            .unwrap();
+        assert_eq!(parse_ref_content(&bytes).unwrap(), commit);
+    }
+
+    /// The state of a ref path that names a FIFO or a socket is a special
+    /// file, and the state of a directory is a directory. This holds for
+    /// the `lstat` and for the open of the write-path check, and the open
+    /// does not wait for a writer.
+    #[test]
+    fn the_ref_state_of_a_fifo_a_socket_or_a_directory_is_no_ref() {
+        let root = Root::new("special-state");
+        let (fifo, _socket) = special_ref_entries(&root);
+        for (name, reason) in [
+            ("fifo", "names a special file"),
+            ("sock", "names a special file"),
+            ("dir", "names a directory"),
+        ] {
+            let relpath = format!("refs/heads/{name}");
+            let (checked, opened) = read_without_wait(&root.dir, &fifo, name, move |dir| {
+                (ref_file_state(dir, &relpath), open_ref_state(dir, &relpath))
+            });
+            assert_eq!(checked.unwrap(), RefFileState::NotARef(reason), "{name}");
+            assert_eq!(opened.unwrap(), RefFileState::NotARef(reason), "{name}");
+        }
+    }
+
+    /// The ref listings leave out a FIFO entry that the walk found, and do
+    /// not open it. During the listings, a writer waits in a blocking open of
+    /// each FIFO. An open of the FIFO by a reader ends the wait of its writer,
+    /// so a writer that stops its wait shows an open by a listing.
+    #[test]
+    fn the_ref_listings_do_not_open_a_fifo_entry() {
+        let root = Root::new("listing-fifo");
+        let repo = ostrya_rt::block_on(Repo::create(
+            &root.dir.join("repo"),
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap();
+        let fifos: Vec<std::path::PathBuf> = [
+            "refs/heads/fifo",
+            "refs/remotes/o/fifo",
+            "refs/mirrors/org.example.Other/fifo",
+        ]
+        .iter()
+        .map(|rel| {
+            let fifo = root.dir.join("repo").join(rel);
+            std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &fifo,
+                FileType::Fifo,
+                Mode::from_raw_mode(0o644),
+                0,
+            )
+            .unwrap();
+            fifo
+        })
+        .collect();
+        let (task_tx, task_rx) = std::sync::mpsc::channel();
+        let (open_tx, open_rx) = std::sync::mpsc::channel();
+        for fifo in &fifos {
+            let (task_tx, open_tx, fifo) = (task_tx.clone(), open_tx.clone(), fifo.clone());
+            std::thread::spawn(move || {
+                task_tx
+                    .send(std::fs::read_link("/proc/thread-self").unwrap())
+                    .unwrap();
+                let _ = rustix::fs::open(&fifo, OFlags::WRONLY | OFlags::CLOEXEC, Mode::empty());
+                let _ = open_tx.send(());
+            });
+        }
+        // Each reader open releases the writer of its FIFO. The call waits for
+        // the `waiting` writers that did not end yet.
+        let release = |waiting: usize| {
+            let readers: Vec<_> = fifos
+                .iter()
+                .map(|fifo| {
+                    rustix::fs::open(
+                        fifo,
+                        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                        Mode::empty(),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            for _ in 0..waiting {
+                let _ = open_rx.recv_timeout(std::time::Duration::from_secs(10));
+            }
+            drop(readers);
+        };
+        // The writer sleeps in its open when its task state is `S`.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for _ in &fifos {
+            let task = task_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let stat = std::path::Path::new("/proc").join(task).join("stat");
+            loop {
+                let text = std::fs::read_to_string(&stat).unwrap();
+                let state = text.rsplit_once(") ").map(|(_, rest)| &rest[..1]);
+                if state == Some("S") {
+                    break;
+                }
+                if std::time::Instant::now() > deadline {
+                    release(fifos.len());
+                    panic!("a writer does not wait in its open: {text}");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        let remotes = BTreeMap::from([("o".to_owned(), "org.example.O".to_owned())]);
+        let heads = collect_heads(&repo, &|_| true);
+        let remote_refs = collect_remotes(&repo);
+        let remote_collections = collect_remote_collections(&repo, &remotes);
+        let mirrors = collect_mirrors(&repo, &|_| false, &|_| true);
+        let all = ostrya_rt::block_on(repo.list_all_refs());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let ended = open_rx.try_iter().count();
+        release(fifos.len() - ended);
+        assert_eq!(ended, 0, "a listing opened a FIFO");
+        assert!(heads.unwrap().is_empty());
+        assert!(remote_refs.unwrap().is_empty());
+        assert!(remote_collections.unwrap().is_empty());
+        assert!(mirrors.unwrap().is_empty());
+        assert!(all.unwrap().is_empty());
+    }
+
+    /// The ref listings leave out a FIFO entry with mode 000, and the
+    /// listings do not fail. A read of its ref path fails with the error of
+    /// the open. The root user opens a file whatever its mode, so the test
+    /// does not run as root.
+    #[test]
+    fn the_ref_listings_leave_out_a_special_entry_that_the_permissions_refuse() {
+        if rustix::process::geteuid().is_root() {
+            eprintln!("skipped: the root user opens a FIFO with mode 000");
+            return;
+        }
+        let root = Root::new("listing-locked");
+        let repo_dir = root.dir.join("repo");
+        let repo = ostrya_rt::block_on(Repo::create(
+            &repo_dir,
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap();
+        let commit = Checksum::from_bytes([1; 32]);
+        let dirs = [
+            "refs/heads",
+            "refs/remotes/o",
+            "refs/mirrors/org.example.Other",
+        ];
+        for dir in dirs {
+            let dir = repo_dir.join(dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("main"), format!("{}\n", commit.to_hex())).unwrap();
+            rustix::fs::mknodat(
+                rustix::fs::CWD,
+                dir.join("locked"),
+                FileType::Fifo,
+                Mode::empty(),
+                0,
+            )
+            .unwrap();
+        }
+        let remotes = BTreeMap::from([("o".to_owned(), "org.example.O".to_owned())]);
+        assert_eq!(
+            collect_heads(&repo, &|_| true).unwrap(),
+            [("main".to_owned(), commit)]
+        );
+        assert_eq!(
+            collect_remotes(&repo).unwrap(),
+            [("o:main".to_owned(), commit)]
+        );
+        assert_eq!(
+            collect_remote_collections(&repo, &remotes).unwrap(),
+            [(
+                "o".to_owned(),
+                "org.example.O".to_owned(),
+                "main".to_owned(),
+                commit
+            )]
+        );
+        assert_eq!(
+            collect_mirrors(&repo, &|_| false, &|_| true).unwrap(),
+            [("org.example.Other".to_owned(), "main".to_owned(), commit)]
+        );
+        let mut all: Vec<(String, Checksum)> = ostrya_rt::block_on(repo.list_all_refs())
+            .unwrap()
+            .into_iter()
+            .map(|listed| (listed.name, listed.checksum))
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                ("main".to_owned(), commit),
+                ("o:main".to_owned(), commit),
+                ("org.example.Other/main".to_owned(), commit),
+            ]
+        );
+        for dir in dirs {
+            let err = read_ref_file(repo.repo_fd(), &format!("{dir}/locked")).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{dir}");
         }
     }
 

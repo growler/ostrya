@@ -587,6 +587,13 @@ impl Repo {
 
     /// Returns each ref in `refs/heads`, `refs/remotes`, and `refs/mirrors`.
     ///
+    /// A ref entry that is a FIFO, a socket, or a device file is not in the
+    /// result. The call does not open such an entry, so its permissions have
+    /// no effect on the call. An alias to such a file is not in the result.
+    /// The call checks the type of each file that it opens, and an open does
+    /// not wait for a writer. An open that the permissions refuse fails the
+    /// call, also at the target of an alias.
+    ///
     /// The name of each kind of ref:
     ///
     /// - A local ref: its path under `refs/heads`. A nested name keeps its `/`.
@@ -1421,6 +1428,9 @@ fn collect_named_refs(
         Err(e) => return Err(Error::Io(e.into())),
     };
     walk_ref_dir(dir.as_fd(), "", &mut |entry| {
+        if !entry.can_hold_ref() {
+            return Ok(());
+        }
         if let Some(checksum) = read_ref_target(entry.dir, entry.name)? {
             let name = match space {
                 RefSpace::Remotes => entry.path.replacen('/', ":", 1),
@@ -1441,29 +1451,15 @@ fn collect_named_refs(
     })
 }
 
-/// The largest ref file that the reader loads, in bytes.
-///
-/// A ref file is 65 bytes.
-const REF_READ_CAP: u64 = 4096;
-
 /// Returns the target checksum of the ref file `name` in `dir`.
 ///
 /// The read follows alias symlinks. Returns `None` if the file is absent.
+/// The read checks the type of the file after the open, and the open does
+/// not wait for a writer. A FIFO, a socket, or a device file gives `None`.
 fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> {
-    use std::io::Read;
-    let fd = match rustix::fs::openat(dir, name, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(Error::Io(e.into())),
-    };
-    let mut buf = Vec::new();
-    std::fs::File::from(fd)
-        .take(REF_READ_CAP)
-        .read_to_end(&mut buf)
-        .map_err(Error::Io)?;
-    let text = std::str::from_utf8(&buf)
-        .map_err(|_| Error::InvalidFormat("ref content is not valid UTF-8".into()))?;
-    Ok(Some(Checksum::from_hex(text.trim())?))
+    crate::refs::read_ref_file(dir, name)?
+        .map(|bytes| crate::refs::parse_ref_content(&bytes))
+        .transpose()
 }
 
 #[cfg(test)]

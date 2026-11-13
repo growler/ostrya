@@ -1,3 +1,9 @@
+ostrya (0.12.0) UNRELEASED; urgency=medium
+
+  * New upstream release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 13 Nov 2026 18:36:42 +0100
+
 ostrya (0.11.2) unstable; urgency=medium
 
   * Add the key [ex-ostrya] gc-weak-references. When the roots of the

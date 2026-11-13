@@ -246,7 +246,7 @@ A pull refuses an ssh address and an \fB\%s3://\fR address in this key, and a pu
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
-The key \fB\%pull\-branches\fR has precedence over this key, and the pull then does not read this key.
+The pull also takes the refs of the summary that the key \fB\%pull\-branches\fR selects, as that key states.
 .TP
 \fB\%collection\-id\fR (string)
 The collection that the remote serves.
@@ -435,13 +435,17 @@ A pattern \fB\%REMOTE:NAME\fR matches no ref of the summary.
 The pull writes each ref as a pull that names it does: a ref \fB\%NAME\fR to \fB\%refs/remotes/REMOTE/NAME\fR, and a ref \fB\%@ID:NAME\fR to \fB\%refs/mirrors/ID/NAME\fR, or to \fB\%refs/heads/NAME\fR if \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR.
 .IP
 The value is a list of ref patterns in the form of \fB\%push\-branches\fR.
-This key has precedence over \fB\%branches\fR, and the pull then does not read \fB\%branches\fR.
-The two keys do not merge.
-A ref on the command line has precedence over the key, and the pull then does not read it.
-\fB\%ostrya pull \-\-mirror\fR and \fB\%ostrya pull \-\-collection\fR do not read the key.
+The pull takes each ref of \fB\%branches\fR and each ref of the summary that this key selects.
+The refs of \fB\%branches\fR come first, in the order of that key, and then the selected refs, in the order of the summary.
+A name \fB\%NAME\fR of \fB\%branches\fR and a selected ref \fB\%NAME\fR of the ref list of the summary write one ref \fB\%refs/remotes/REMOTE/NAME\fR, and the pull takes it one time.
+A ref on the command line has precedence over both keys, and the pull then reads neither key.
+\fB\%ostrya pull \-\-mirror\fR and \fB\%ostrya pull \-\-collection\fR read neither key.
 .IP
 A malformed pattern stops the pull before it connects.
-If the remote has no summary, or no ref of the summary matches, the pull fails, exits 1, and writes no object and no ref.
+If the remote has no summary, the pull fails, also when \fB\%branches\fR holds refs.
+If no ref of the summary matches, the pull takes the refs of \fB\%branches\fR.
+If no ref of the summary matches and \fB\%branches\fR holds no ref, the pull fails.
+A pull that fails for one of these reasons exits 1, and writes no object and no ref.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.

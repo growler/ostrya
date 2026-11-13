@@ -145,18 +145,21 @@ impl Repo {
     /// If [`refs`](PullOptions::refs) is empty and
     /// [`MIRROR`](PullFlags::MIRROR) is not set, the pull reads the key
     /// `pull-branches` of the section with
-    /// [`Remote::pull_branches`](crate::config::Remote::pull_branches). If
-    /// the section has the key, the pull takes each ref of the summary that
-    /// the key selects, and does not read `branches`. The own id of the
+    /// [`Remote::pull_branches`](crate::config::Remote::pull_branches) and
+    /// the key `branches` of the section. The pull takes each ref of
+    /// `branches` and each ref of the summary that `pull-branches` selects.
+    /// [`Remote::pull_branches`](crate::config::Remote::pull_branches) states
+    /// the rules of the two keys together. The own id of the
     /// match is the `ostree.summary.collection-id` of the summary. A ref
     /// `NAME` of field 0 of the summary is written as a requested ref
     /// `NAME` is. A ref `NAME` of the entry of `ID` in
     /// `ostree.summary.collection-map` is the ref `@ID:NAME`, and the pull
     /// writes it and checks its tip as a requested `@ID:NAME` ref. The pull
-    /// parses the key before it resolves the endpoint, so a malformed value
-    /// stops the pull before its first request. The pull matches the refs of
-    /// the summary after it reads the summary and the `config` of the remote,
-    /// and before it reads a ref file or an object.
+    /// parses the key `pull-branches` before it resolves the endpoint, so a
+    /// malformed value stops the pull before its first request. The pull
+    /// matches the refs of the summary, and then parses the key `branches`,
+    /// after it reads the summary and the `config` of the remote, and before
+    /// it reads a ref file or an object.
     ///
     /// [`remote`](PullOptions::remote) and [`MIRROR`](PullFlags::MIRROR)
     /// select the prefix of the written refs.
@@ -672,6 +675,9 @@ impl Repo {
     ///   the key `pull-branches`.
     /// - [`Error::Core`] if the `config` of the remote does not parse as a key
     ///   file, or if a ref file of the remote holds no checksum.
+    /// - [`Error::Core`] if [`refs`](PullOptions::refs) is empty,
+    ///   [`MIRROR`](PullFlags::MIRROR) is not set, and the value of the key
+    ///   `branches` of the remote holds a malformed escape sequence.
     /// - [`Error::InvalidRefspec`] if a ref of the summary under `MIRROR`, a
     ///   ref of the summary that the key `pull-branches` selects, or a name
     ///   of the `branches` key of the remote, is not a valid ref name.
@@ -684,11 +690,12 @@ impl Repo {
     ///   collection-id rule.
     /// - [`Error::Pull`] if two names of the pull write one ref.
     /// - [`Error::RefNotFound`] if neither the summary nor the ref file of the
-    ///   remote names a requested ref.
+    ///   remote names a requested ref or a name of the key `branches`.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and the remote
     ///   serves no summary under `MIRROR` or with the key `pull-branches`, if
-    ///   no ref of the summary matches `pull-branches`, or if the remote has
-    ///   no key `pull-branches` and no ref in the key `branches`.
+    ///   no ref of the summary matches `pull-branches` and the key `branches`
+    ///   holds no ref, or if the remote has no key `pull-branches` and no ref
+    ///   in the key `branches`.
     /// - These errors of the commit of
     ///   [`TimestampCheck::Rev`](crate::TimestampCheck::Rev), if
     ///   [`timestamp_check`](PullOptions::timestamp_check) is that check and
@@ -1554,9 +1561,9 @@ impl Repo {
     }
 
     /// Resolves what to pull: the requested refs, the summary refs of the
-    /// remote under [`MIRROR`](PullFlags::MIRROR), the summary refs that the
-    /// `pull-branches` key of the remote that `wanted` names selects, or else
-    /// the `branches` key of that remote.
+    /// remote under [`MIRROR`](PullFlags::MIRROR), or the refs of the
+    /// `branches` key of the remote that `wanted` names and the summary refs
+    /// that the `pull-branches` key of that remote selects.
     ///
     /// `remote_id` is the `[core] collection-id` of the `config` of the
     /// remote. The target of an `@ID:NAME` name keeps the name as given.
@@ -1583,8 +1590,8 @@ impl Repo {
             .and_then(|summary| summary.metadata_value(COLLECTION_ID_KEY))
             .and_then(Value::as_str);
         let summary_id = summary_collection_id.filter(|_| mirror);
-        let names = if !opts.refs.is_empty() {
-            opts.refs.clone()
+        let (names, mut selected) = if !opts.refs.is_empty() {
+            (opts.refs.clone(), Vec::new())
         } else if mirror {
             let Some(summary) = summary else {
                 return Err(Error::Pull(
@@ -1593,53 +1600,66 @@ impl Repo {
                         .into(),
                 ));
             };
-            return summary_targets(summary, summary_id, |_| true, place);
+            let targets = summary_targets(summary, summary_id, |_| true)?;
+            check_one_place(
+                place,
+                targets
+                    .iter()
+                    .map(|(text, _)| (text.as_str(), text.as_str())),
+            )?;
+            return Ok(targets);
         } else {
             let Wanted::Config(remote) = wanted else {
                 return Err(no_refs());
             };
             let section = self.config().remote(remote);
-            // The key `pull-branches` has precedence over `branches`. It
+            // The pull takes each ref of `branches` and each ref of the
+            // summary that `pull-branches` selects. The key `pull-branches`
             // selects refs of the summary, so a remote with no summary fails
-            // the pull before its first object request. `Repo::pull` parsed
-            // the key before it connected, so a malformed value does not
-            // fail this read.
+            // the pull before its first object request, also when `branches`
+            // holds refs. `Repo::pull` parsed the key before it connected, so
+            // a malformed value does not fail this read.
             let pull_branches = match &section {
                 Some(section) => section.pull_branches()?,
                 None => None,
             };
-            if let Some(selector) = pull_branches {
-                let Some(summary) = summary else {
-                    return Err(Error::Pull(format!(
-                        "[remote \"{remote}\"] pull-branches selects refs of the summary, \
-                         but the remote repository does not have a summary"
-                    )));
-                };
-                // A ref of field 0 stays the target `NAME`, and the pull
-                // writes it under the prefix of `place`.
-                let targets = summary_targets(
-                    summary,
-                    None,
-                    |r| selector.matches(r, summary_collection_id),
-                    place,
-                )?;
-                if targets.is_empty() {
-                    return Err(Error::Pull(format!(
-                        "no ref of the summary matches [remote \"{remote}\"] pull-branches"
-                    )));
+            let selected = match pull_branches {
+                Some(selector) => {
+                    let Some(summary) = summary else {
+                        return Err(Error::Pull(format!(
+                            "[remote \"{remote}\"] pull-branches selects refs of the summary, \
+                             but the remote repository does not have a summary"
+                        )));
+                    };
+                    // A ref of field 0 stays the target `NAME`, and the pull
+                    // writes it under the prefix of `place`. The check of
+                    // `place` below covers these targets.
+                    Some(summary_targets(summary, None, |r| {
+                        selector.matches(r, summary_collection_id)
+                    })?)
                 }
-                return Ok(targets);
-            }
+                None => None,
+            };
             let branches = match section {
                 Some(section) => section.branches()?.unwrap_or_default(),
                 None => Vec::new(),
             };
             if branches.is_empty() {
-                return Err(Error::Pull(format!(
-                    "no configured branches for remote {remote}"
-                )));
+                match &selected {
+                    None => {
+                        return Err(Error::Pull(format!(
+                            "no configured branches for remote {remote}"
+                        )));
+                    }
+                    Some(targets) if targets.is_empty() => {
+                        return Err(Error::Pull(format!(
+                            "no ref of the summary matches [remote \"{remote}\"] pull-branches"
+                        )));
+                    }
+                    Some(_) => {}
+                }
             }
-            branches
+            (branches, selected.unwrap_or_default())
         };
 
         // The entry checked each name of `refs`, so an `@ID:NAME` name holds a
@@ -1671,15 +1691,24 @@ impl Repo {
             };
             wanted_refs.push((name, target, operand));
         }
+        // A name of `branches` is its own target, and a ref of field 0 that
+        // `pull-branches` selects is the target `NAME`. So a ref that both
+        // keys give is one target, and the pull takes it one time.
+        selected.retain(|(target, _)| !seen.contains(target));
         check_one_place(
             place,
             wanted_refs
                 .iter()
-                .map(|(name, target, _)| (name.as_str(), target.as_str())),
+                .map(|(name, target, _)| (name.as_str(), target.as_str()))
+                .chain(
+                    selected
+                        .iter()
+                        .map(|(target, _)| (target.as_str(), target.as_str())),
+                ),
         )?;
 
         let mut listed = HashMap::new();
-        let mut out = Vec::with_capacity(wanted_refs.len());
+        let mut out = Vec::with_capacity(wanted_refs.len() + selected.len());
         for (name, target, operand) in wanted_refs {
             let checksum = match operand {
                 Some((id, ref_name)) => {
@@ -1702,6 +1731,7 @@ impl Repo {
             let checksum = checksum.ok_or_else(|| Error::RefNotFound(name.clone()))?;
             out.push((target, checksum));
         }
+        out.extend(selected);
         Ok(out)
     }
 
@@ -2604,9 +2634,9 @@ pub(super) enum Wanted<'a> {
     /// No other ref. [`Repo::pull_with_session`] refuses an empty list.
     Named,
     /// Under [`MIRROR`](PullFlags::MIRROR), each ref of the summary of the
-    /// remote. Otherwise, the refs of the summary that the `pull-branches`
-    /// key of the remote section of this name selects, or else the
-    /// `branches` key of that section.
+    /// remote. Otherwise, the refs of the `branches` key of the remote
+    /// section of this name and the refs of the summary that the
+    /// `pull-branches` key of that section selects.
     Config(&'a str),
     /// The refs of a collection pull, each at the commit that the pull
     /// selected. The pull reads no ref of the remote, and does not read
@@ -3410,19 +3440,17 @@ fn check_remote_mode(config: Option<Vec<u8>>) -> Result<Option<String>> {
 /// else the target `NAME`. A ref of the entry of `ID` in
 /// `ostree.summary.collection-map` is the target `@ID:NAME`. `keep` gets the
 /// ref of each target. If the summary lists one target two times, the first
-/// ref counts.
+/// ref counts. The caller checks that no two targets write one ref.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidFormat`] if the collection map is malformed.
 /// - [`Error::InvalidRefspec`] if a target that `keep` keeps fails the rule
 ///   of [`Ref::validate`].
-/// - [`Error::Pull`] if two targets write one ref at `place`.
 fn summary_targets(
     summary: &Summary,
     summary_id: Option<&str>,
     keep: impl Fn(&Ref) -> bool,
-    place: RefPlace<'_>,
 ) -> Result<Vec<(String, Checksum)>> {
     let mut refs = Vec::with_capacity(summary.refs.len());
     for entry in &summary.refs {
@@ -3455,10 +3483,6 @@ fn summary_targets(
             out.push((text, commit));
         }
     }
-    check_one_place(
-        place,
-        out.iter().map(|(text, _)| (text.as_str(), text.as_str())),
-    )?;
     Ok(out)
 }
 

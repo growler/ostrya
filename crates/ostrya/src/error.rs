@@ -399,6 +399,7 @@ pub enum Error {
     ///   with no summary on the remote
     /// - a pull of the refs of the remote key `pull-branches` with no summary
     ///   on the remote, or with no ref of the summary that the key selects
+    ///   and no ref in the remote key `branches`
     /// - a commit whose `ostree.ref-binding` does not name the ref of the pull
     /// - a commit that is older than the commit that its ref holds
     /// - a content object whose mode the destination repository cannot store

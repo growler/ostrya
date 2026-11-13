@@ -4103,16 +4103,16 @@ rules:
   thus stops the pull before it reads a PEM file, an AWS file, or a keyring,
   and before it connects. The selector matches the refs of the summary, and
   the summary is available inside the pull alone. `Repo::pull` also reads
-  `branches` there. The pull matches the refs after it reads the summary
-  and the `config` of the remote, and before it reads a ref file or an
-  object.
+  `branches` there. The pull matches the refs, and then parses `branches`,
+  after it reads the summary and the `config` of the remote, and before it
+  reads a ref file or an object.
 - `Repo::pull_with_session` has no remote section, so it reads neither key
-  and refuses an empty ref list. A `--collection` pull does not read the
-  key.
-- A ref on the command line has precedence over `pull-branches`, and
-  `pull-branches` has precedence over `branches`. The two keys do not
-  merge, so a section with both keys takes the refs of `pull-branches`
-  alone.
+  and refuses an empty ref list. A `--collection` pull reads neither key.
+- A ref on the command line has precedence over both keys. Without one,
+  the pull takes each ref of `branches` and each ref of the summary that
+  `pull-branches` selects. The refs of `branches` come first, in the order
+  of the key, and then the matches, in the order of the summary. A pull
+  with one of the two keys alone takes the refs of that key.
 - A ref of field 0 of the summary is the ref `NAME`, and a ref of the entry
   of `ID` in `ostree.summary.collection-map` is the ref `@ID:NAME`. The own
   id of the match is the `ostree.summary.collection-id` of the summary, or
@@ -4122,13 +4122,21 @@ rules:
   `branches` is, also when an `@ID:NAME` pattern selected it. A match of the
   collection map is the target `@ID:NAME`, and the pull writes it and checks
   its tip as a requested `@ID:NAME` ref.
+- A name `REF` of `branches` and a match `REF` of field 0 are one target,
+  `refs/remotes/NAME/REF`, also when an `@ID:REF` pattern selected the
+  match. The pull takes the target one time. A name of `branches` that the
+  summary does not list falls back to `refs/heads/REF` of the remote, and
+  a miss fails the pull with `Error::RefNotFound`.
 - Only the matches go through the ref-name rule. A bad name of a ref that
   the key does not select does not fail the pull.
 - A remote with no summary fails the pull with `[remote "NAME"]
   pull-branches selects refs of the summary, but the remote repository does
-  not have a summary`. A list that selects no ref of the summary fails the
-  pull with `no ref of the summary matches [remote "NAME"] pull-branches`.
-  Both are `Error::Pull`, and the pull writes no object and no ref.
+  not have a summary`, also when `branches` holds refs. The pull makes this
+  check before it parses `branches`. A list that selects no ref of the
+  summary gives the refs of `branches` alone. If `branches` holds no ref,
+  the pull fails with `no ref of the summary matches [remote "NAME"]
+  pull-branches`. Both errors are `Error::Pull`, and the pull writes no
+  object and no ref.
 
 These alternatives were rejected:
 
@@ -4143,6 +4151,10 @@ These alternatives were rejected:
   path reads each name as a plain ref, so it refuses a match `@ID:NAME` of
   the collection map. It also looks up each match in the summary a second
   time.
+- Precedence of `pull-branches` over `branches`, with no merge. A ref of
+  `branches` that the list does not select is then not pulled, and a list
+  that selects no ref fails the pull while `branches` holds refs. Both keys
+  are defaults of a pull with no ref, so the pull takes the refs of both.
 
 ## The ref check of a transaction commit
 

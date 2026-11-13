@@ -321,7 +321,7 @@ fn a_pull_over_ssh_writes_the_refs_and_the_objects() {
 
 /// A pull over ssh with no ref takes the refs of the summary that
 /// `pull-branches` selects. With no summary on the remote, the pull fails and
-/// writes no ref.
+/// writes no ref, also when `branches` holds refs.
 #[test]
 fn a_pull_over_ssh_with_no_ref_reads_pull_branches() {
     let setup = Setup::new("pull-branches", "archive", "archive");
@@ -335,7 +335,7 @@ fn a_pull_over_ssh_with_no_ref_reads_pull_branches() {
 
     let fresh = Setup::new("pull-branches-no-summary", "archive", "archive");
     fresh.configure(&format!(
-        "pull-url={}\n{}pull-branches=main\n",
+        "pull-url={}\n{}branches=main;\npull-branches=main\n",
         fresh.address(),
         fresh.standin_keys()
     ));

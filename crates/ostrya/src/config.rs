@@ -1129,8 +1129,9 @@ impl Remote<'_> {
 
     /// Returns the `branches` key: the refs of a pull that names no ref.
     ///
-    /// If the section has the key `pull-branches`, a pull reads that key and
-    /// not this one. See [`pull_branches`](Remote::pull_branches).
+    /// A pull with no ref also takes the refs of the summary that the key
+    /// `pull-branches` selects. [`pull_branches`](Remote::pull_branches)
+    /// states the rules of the two keys together.
     ///
     /// # Errors
     ///
@@ -1168,9 +1169,16 @@ impl Remote<'_> {
     ///
     /// [`Repo::pull`](crate::Repo::pull) reads this key when
     /// [`refs`](crate::PullOptions::refs) is empty and
-    /// [`MIRROR`](crate::PullFlags::MIRROR) is not set. The key has
-    /// precedence over [`branches`](Remote::branches), and the pull then does
-    /// not read `branches`. The two keys do not merge.
+    /// [`MIRROR`](crate::PullFlags::MIRROR) is not set. The pull takes each
+    /// ref of [`branches`](Remote::branches) and each ref of the summary that
+    /// this key selects. The refs of `branches` come first, in the order of
+    /// the key, and then the selected refs, in the order of the summary. A
+    /// name `NAME` of `branches` and a selected ref `NAME` of the ref list of
+    /// the summary are one target, and the pull takes it one time.
+    ///
+    /// If the remote has no summary, the pull fails, also when `branches`
+    /// holds refs. If no ref of the summary matches, the pull takes the refs
+    /// of `branches`, and it fails if `branches` holds no ref.
     ///
     /// # Errors
     ///

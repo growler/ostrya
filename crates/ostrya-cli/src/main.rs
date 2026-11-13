@@ -464,13 +464,15 @@ enum Command {
     /// the verify options ask for. With `[ex-ostrya]
     /// keep-detached-related=false`, the pull drops `ostrya.related`.
     ///
-    /// With no REF, the pull reads the key `pull-branches` of the section of
-    /// REMOTE, a list of ref patterns. It takes each ref of the summary of
-    /// the remote that the list selects: a ref of the ref list of the summary
-    /// as REF, and a ref of its collection map as @ID:REF. It writes each one
-    /// as a pull of that ref does. A malformed value stops the pull before it
-    /// connects. Without the key, it takes the `branches` key. --mirror and
-    /// --collection do not read the key. ostrya-config(1) states the key.
+    /// With no REF, the pull reads the keys `branches` and `pull-branches`
+    /// of the section of REMOTE. It takes each ref of `branches`, and each
+    /// ref of the summary of the remote that the list of ref patterns of
+    /// `pull-branches` selects: a ref of the ref list of the summary as REF,
+    /// and a ref of its collection map as @ID:REF. It writes each one as a
+    /// pull of that ref does, and a ref that both keys give one time. A
+    /// malformed `pull-branches` value stops the pull before it connects.
+    /// --mirror and --collection read neither key. ostrya-config(1) states
+    /// the keys.
     ///
     /// The pull also fetches the dependencies that field 2 of each pulled
     /// commit names, each with no parent and no ref, unless it takes
@@ -4263,9 +4265,9 @@ struct PullArgs {
     /// The refs to pull.
     ///
     /// With none, the pull takes every ref that the summary of the remote
-    /// lists with --mirror. Else it takes the refs of the summary that the
-    /// `pull-branches` key of the remote selects, or the configured
-    /// `branches` of the remote without that key. The pull looks up each
+    /// lists with --mirror. Else it takes the configured `branches` of the
+    /// remote and the refs of the summary that the `pull-branches` key of
+    /// the remote selects. The pull looks up each
     /// ref in the summary of the remote. If the summary does not list the ref,
     /// the pull reads `refs/heads/<ref>` of the remote. With --collection,
     /// these are the other refs of the collection.

@@ -11050,57 +11050,151 @@ async fn pull_with_keys(
     )
 }
 
+/// A case of [`assert_pulls_with_no_ref`]: the `origin` keys, the remote refs
+/// that the pull must write, and the mirror ref, an id and a name, that it
+/// must write, if any.
+type NoRefCase<'a> = (String, &'a [&'a str], Option<(&'a str, &'a str)>);
+
+/// Pulls with no ref from the remote of [`build_collection_remote`] under the
+/// new directory `name`, one destination for each case. Each pull must
+/// succeed and read no ref file, because the summary lists each ref of the
+/// cases.
+async fn assert_pulls_with_no_ref(name: &str, cases: Vec<NoRefCase<'_>>) {
+    let dir = TmpDir::new(name);
+    let server = collection_server(dir.path()).await;
+    for (i, (extra, remote, mirror)) in cases.into_iter().enumerate() {
+        let case = dir.path().join(i.to_string());
+        let (result, remote_refs, mirror_refs, seen) =
+            pull_with_keys(&server, &case, &extra, &[]).await;
+        result.unwrap();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("refs/")),
+            "{extra}: {seen:?}"
+        );
+        let remote_refs: Vec<_> = remote_refs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(remote_refs, remote, "{extra}");
+        let mirror_refs: Vec<_> = mirror_refs
+            .iter()
+            .map(|(id, name, _)| (id.as_str(), name.as_str()))
+            .collect();
+        assert_eq!(mirror_refs, Vec::from_iter(mirror), "{extra}");
+    }
+}
+
 /// With no ref, the pull takes the refs of the summary that `pull-branches`
 /// selects: a ref of field 0 as `NAME`, written under `refs/remotes/`, and a
 /// ref of the collection map as `@ID:NAME`, written under `refs/mirrors/`.
 /// `@ID:NAME` of the collection id of the summary selects a ref of field 0.
-/// Field 0 also lists `ostree-metadata`. The key has precedence over
-/// `branches`, whose ref `absent` the remote does not hold.
+/// Field 0 also lists `ostree-metadata`.
 #[test]
 fn pull_branches_selects_the_refs_of_the_summary() {
-    block_on(async {
-        let names = |refs: &[(String, Checksum)]| -> Vec<String> {
-            refs.iter().map(|(name, _)| name.clone()).collect()
-        };
-        let x_a = (ID_X.to_owned(), "a".to_owned());
-        let dir = TmpDir::new("pull-http-pull-branches");
-        let server = collection_server(dir.path()).await;
-        for (i, (extra, remote, mirrors)) in [
+    block_on(assert_pulls_with_no_ref(
+        "pull-http-pull-branches",
+        vec![
             (
                 "pull-branches=main;c\n".to_owned(),
-                &["origin:c", "origin:main"][..],
+                &["origin:c", "origin:main"],
                 None,
             ),
             (
                 format!("pull-branches=@{ID_X}:**;@{REMOTE_ID}:c\n"),
-                &["origin:c"][..],
-                Some(&x_a),
+                &["origin:c"],
+                Some((ID_X, "a")),
             ),
             (
                 format!("pull-branches=!ostree-metadata;!@{ID_Y}:**\n"),
-                &["origin:c", "origin:main"][..],
-                Some(&x_a),
+                &["origin:c", "origin:main"],
+                Some((ID_X, "a")),
             ),
+        ],
+    ));
+}
+
+/// With no ref, the pull takes the refs of `branches` and the refs of the
+/// summary that `pull-branches` selects. A ref that both keys give is one
+/// target, also when an `@ID:NAME` pattern of the collection id of the
+/// summary selects it, so the pull takes it one time and succeeds. If no ref
+/// of the summary matches, the pull takes the refs of `branches`.
+#[test]
+fn pull_branches_and_branches_take_the_union() {
+    block_on(assert_pulls_with_no_ref(
+        "pull-http-pull-branches-union",
+        vec![
             (
-                "branches=absent;\npull-branches=main\n".to_owned(),
-                &["origin:main"][..],
+                "branches=c;\npull-branches=main\n".to_owned(),
+                &["origin:c", "origin:main"],
                 None,
             ),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let case = dir.path().join(i.to_string());
-            let (result, remote_refs, mirror_refs, _) =
-                pull_with_keys(&server, &case, &extra, &[]).await;
-            result.unwrap();
-            assert_eq!(names(&remote_refs), remote, "{extra}");
-            let mirror_refs: Vec<_> = mirror_refs
-                .into_iter()
-                .map(|(id, name, _)| (id, name))
-                .collect();
-            assert_eq!(mirror_refs, Vec::from_iter(mirrors.cloned()), "{extra}");
-        }
+            (
+                format!("branches=main;\npull-branches=@{ID_X}:**\n"),
+                &["origin:main"],
+                Some((ID_X, "a")),
+            ),
+            (
+                "branches=main;c;\npull-branches=main\n".to_owned(),
+                &["origin:c", "origin:main"],
+                None,
+            ),
+            (
+                format!("branches=c;\npull-branches=@{REMOTE_ID}:c\n"),
+                &["origin:c"],
+                None,
+            ),
+            (
+                "branches=main;\npull-branches=absent/**\n".to_owned(),
+                &["origin:main"],
+                None,
+            ),
+        ],
+    ));
+}
+
+/// A name of `branches` that the summary does not list falls back to the ref
+/// file `refs/heads/NAME` of the remote, also with `pull-branches`. A name
+/// that the remote does not hold fails the pull with [`Error::RefNotFound`]
+/// before its first object request.
+#[test]
+fn a_branches_name_with_pull_branches_reads_the_ref_file() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-pull-branches-late");
+        let (remote, _) = build_collection_remote(dir.path()).await;
+        let late = commit_bound(&remote, dir.path(), "src", &Ref::local("late"), None).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+
+        let (result, remote_refs, mirror_refs, seen) = pull_with_keys(
+            &server,
+            &dir.path().join("late"),
+            "branches=late;\npull-branches=main\n",
+            &[],
+        )
+        .await;
+        result.unwrap();
+        let names: Vec<_> = remote_refs.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, ["origin:late", "origin:main"]);
+        assert_eq!(remote_refs[0].1, late);
+        assert!(mirror_refs.is_empty());
+        assert!(
+            seen.iter().any(|path| path == "refs/heads/late"),
+            "{seen:?}"
+        );
+
+        let (result, remote_refs, mirror_refs, seen) = pull_with_keys(
+            &server,
+            &dir.path().join("absent"),
+            "branches=absent;\npull-branches=main\n",
+            &[],
+        )
+        .await;
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, Error::RefNotFound(name) if name == "absent"),
+            "{err}"
+        );
+        assert!(remote_refs.is_empty() && mirror_refs.is_empty());
+        assert!(
+            !seen.iter().any(|path| path.starts_with("objects/")),
+            "{seen:?}"
+        );
     });
 }
 
@@ -11182,54 +11276,63 @@ const BAD_PULL_BRANCHES: &str = "[remote \"origin\"] pull-branches: malformed re
      pattern 'r*:x': a remote part is one remote or '*'";
 
 /// With `pull-branches`, a malformed value fails the pull before its first
-/// request. A remote with no summary and a list that selects no ref fail the
-/// pull before its first object request.
+/// request. A remote with no summary fails the pull before it reads a ref file
+/// or an object, also when `branches` holds refs. A list that selects no ref
+/// fails the pull the same way when `branches` is absent or empty. The pull
+/// parses `branches` after these checks of the summary, so a malformed
+/// `branches` value fails a pull from a remote with a summary with
+/// [`Error::Core`], and a pull from a remote with no summary with the
+/// no-summary error.
 #[test]
 fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
     block_on(async {
+        let no_match = "no ref of the summary matches [remote \"origin\"] pull-branches";
+        let no_summary = "[remote \"origin\"] pull-branches selects refs of the summary, but \
+                          the remote repository does not have a summary";
         let dir = TmpDir::new("pull-http-pull-branches-fail");
         let server = collection_server(dir.path()).await;
-        for (i, (summary, value, want)) in [
-            (true, "r*:x", BAD_PULL_BRANCHES),
-            (
-                true,
-                "absent/**",
-                "no ref of the summary matches [remote \"origin\"] pull-branches",
-            ),
-            (
-                false,
-                "main",
-                "[remote \"origin\"] pull-branches selects refs of the summary, but the \
-                 remote repository does not have a summary",
-            ),
+        // An empty text is the malformed escape sequence of `branches`, which
+        // fails with `Error::Core`.
+        for (i, (summary, extra, want)) in [
+            (true, "pull-branches=r*:x\n", BAD_PULL_BRANCHES),
+            (true, "pull-branches=absent/**\n", no_match),
+            (true, "branches=\npull-branches=absent/**\n", no_match),
+            (true, "branches=a\\q;\npull-branches=absent/**\n", ""),
+            (false, "pull-branches=main\n", no_summary),
+            (false, "branches=main;\npull-branches=main\n", no_summary),
+            (false, "branches=a\\q;\npull-branches=main\n", no_summary),
         ]
         .into_iter()
         .enumerate()
         {
             // The server reads each file at the request, so the removal
             // takes effect for this case and the cases after it.
-            if !summary {
-                std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+            let summary_path = dir.path().join("remote/summary");
+            if !summary && summary_path.exists() {
+                std::fs::remove_file(summary_path).unwrap();
             }
-            let extra = format!("pull-branches={value}\n");
+            let malformed = extra.contains("r*:x");
             let case = dir.path().join(i.to_string());
             let (result, remote_refs, mirror_refs, seen) =
-                pull_with_keys(&server, &case, &extra, &[]).await;
+                pull_with_keys(&server, &case, extra, &[]).await;
             let err = result.unwrap_err();
             let kind_ok = match &err {
                 Error::Pull(m) => m == want,
-                Error::InvalidFormat(m) => value == "r*:x" && m == want,
+                Error::InvalidFormat(m) => malformed && m == want,
+                Error::Core(_) => want.is_empty(),
                 _ => false,
             };
-            assert!(kind_ok, "{value}: {err}");
-            assert!(remote_refs.is_empty() && mirror_refs.is_empty(), "{value}");
+            assert!(kind_ok, "{extra}: {err}");
+            assert!(remote_refs.is_empty() && mirror_refs.is_empty(), "{extra}");
             // A malformed value stops the pull before its first request.
-            if value == "r*:x" {
-                assert!(seen.is_empty(), "{value}: {seen:?}");
+            if malformed {
+                assert!(seen.is_empty(), "{extra}: {seen:?}");
             }
             assert!(
-                !seen.iter().any(|path| path.starts_with("objects/")),
-                "{value}: {seen:?}"
+                !seen
+                    .iter()
+                    .any(|path| path.starts_with("objects/") || path.starts_with("refs/")),
+                "{extra}: {seen:?}"
             );
         }
     });

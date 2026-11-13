@@ -3617,9 +3617,28 @@ These forms of the tool complete over the same link:
 A `--delete` that names the link reports `error: Listing refs: opendir(lnk):
 Not a directory` and exits 1. `-A` lists the link as `lnk -> deep`. A link that
 names its own directory (`refs/heads/selfdir -> .`) gives the same results as a
-link to another directory. Such a link comes from an out-of-band change alone,
-because `refs -A --create` validates its target as a ref. `cli-surface.md`,
-"P1", `refs`, records the port side.
+link to another directory.
+
+`refs -A --create` refuses a target that is no ref. An alias names a directory
+when its target ref is removed and a ref is then written below the target path.
+With the refs `test/other` and `other`, this sequence gives these results:
+
+- `refs -A --create=test/al2 test/other` writes the link body `../test/other`
+  and exits 0.
+- `refs --delete test/other` reports `error: Ref 'test/other' has an active
+  alias: 'test/al2'`, exits 1, and removes no ref.
+- `commit -b test/other/x` reports `error: openat(refs/heads/test/other/x): Not
+  a directory`, exits 1, and writes no ref.
+- `refs` and `refs --list` print `other`, `test/al2`, and `test/other`, and
+  exit 0. `refs -A` prints `test/al2 -> test/other`.
+
+A second sequence then runs in the same repository with an alias of a remote
+ref. `refs --create=origin:rb REV` exits 0. `refs -A --create=up9 origin:rb`
+writes the link body `origin:rb` and exits 0. `refs --delete origin:rb` then
+exits 0. A later `refs --create=origin:rb/z` reports `error: Listing refs:
+openat(up9): No such file or directory` and exits 1. In these two sequences, the
+tool writes no link that names a directory. `cli-surface.md`, "P1", `refs`,
+records the port side.
 
 ### `rev-parse`
 

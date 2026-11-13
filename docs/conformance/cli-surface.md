@@ -191,12 +191,44 @@ them are observed and deliberately not reproduced:
 
   `commit -b`, a pull, and `summary -u` take the same refusal ("P2",
   `commit`, `pull`, and `summary`);
-- a symlink under `refs/` that names a directory. Such a link comes from an
-  out-of-band change alone, because `refs -A --create` validates its target as
-  a ref in both implementations. In both implementations, `-A` lists the link
-  as `lnk -> deep`. In each implementation, a link that names its own
-  directory (`refs/heads/selfdir -> .`) gives the same results as a link to
-  another directory. The other results part as follows:
+- a symlink under `refs/` that names a directory. In both implementations,
+  `refs -A --create` refuses a target that is no ref, such as a directory or a
+  dangling alias. No command of the port writes a link that names its own
+  directory. Port writers make a link that names a directory in these ways:
+  - `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` do not
+    examine the target path, so each writes such a link in one step. With
+    the ref `deep/nest/ing`, `set_ref_alias_immediate("dal", "deep")` returns
+    `Ok`, and `Repo::list_refs` then fails with `Error::Io` of the kind
+    `IsADirectory`. On an empty repository, `set_ref_alias_immediate("a/b",
+    "a")` returns `Ok` and writes `refs/heads/a/b -> ../a`, a link that names
+    its own directory.
+  - A writer removes the target ref of an alias and keeps the alias. Then a
+    writer writes a ref below the target path. `refs --delete` of a remote
+    ref keeps the alias. So after `refs -A --create=up9 origin:rb`, which
+    writes `refs/heads/up9 -> ../remotes/origin/rb`, `refs --delete
+    origin:rb` exits 0. The link body of an alias omits the leading
+    directories that the alias and its target share. The alias guard of
+    `refs --delete` reads the body without its leading `../` components as a
+    name under `refs/heads`. So `refs --delete` of a local ref keeps an alias
+    that shares leading directories with the ref. After `refs -A
+    --create=a/b/al a/c/r`, which writes the body `../c/r`, `-A` prints
+    `a/b/al -> c/r`, and `refs --delete a/c/r` exits 0. After `refs -A
+    --create=test/al2 test/other`, which writes the body `other`, `refs
+    --delete test/other` exits 0. The guard refuses `refs --delete top` with
+    the alias `test/al -> top`, whose body is `../top`. It also refuses `refs
+    --delete b/r` with the alias `a/al -> b/r`, whose body is `../b/r`. These
+    writers also remove the target and keep the alias: a delete refspec
+    `:DST` of `ostrya push` that `ostrya receive` takes,
+    `Repo::remove_refs_immediate`, `Repo::set_ref_immediate`,
+    `UpdateGuard::set_ref`, and `Transaction::set_ref` with the checksum
+    `None`, and `Transaction::set_ref_expecting` with `new` set to `None`.
+    These writers then write a ref below the target path: `commit -b`,
+    `commit --tag`, `refs --create`, `pull`, `pull-local`, and a push.
+
+  In both implementations, `-A` lists the link as `lnk -> deep`. In each
+  implementation, a link that names its own directory (`refs/heads/selfdir
+  -> .`) gives the same results as a link to another directory. The other
+  results part as follows:
   - The tool reports `error: Listing refs: Is a directory` and exits 1 from
     the default listing, `--list`, `-r`, `fsck`, `summary -u`, and `prune
     --refs-only`. The default `prune` of the tool reads no ref and exits 0.

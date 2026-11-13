@@ -704,7 +704,13 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
     // reads it as a ref and does not descend into it. As a result, a link to a
     // directory fails the read with EISDIR. This is the `Listing refs: Is a
     // directory` refusal of the `ostree` command. Without this rule, a self-link
-    // recurses without end. Only an out-of-band change can create these links.
+    // recurses without end. No command of the port writes a self-link.
+    // `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` do not
+    // examine the target path, so they write a link to a directory or a
+    // self-link in one step: `set_ref_alias_immediate("a/b", "a")` writes
+    // `refs/heads/a/b -> ../a`. Other port writers make a link to another
+    // directory in two steps: they remove the target ref of an alias, then
+    // write a ref below the target path.
     let tmp = TmpDir::new("commit-refs-dirlink");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);

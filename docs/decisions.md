@@ -2234,9 +2234,11 @@ then fail for the remote, because it has no `url`.
 `resolve_push` reads the environment and the shared AWS files before the
 library refuses `--tag` and `--compress` for an S3 destination. When
 `push-branches` gives the refs of a push with no refspec, the command
-refuses `--tag` before the resolution and reads no AWS file. A check of
-these options in the command before the resolution was rejected: it copies
-a rule of the library, and the read of the files sends no request.
+refuses `--tag` before the resolution and reads no AWS file. When
+`push-branches` selects no ref, `RepoPushOptions::check` refuses
+`--compress` with no AWS read. A copy of the rules of these options in the
+command before the resolution was rejected: it copies a rule of the
+library, and the read of the files sends no request.
 
 A push to a bucket repository shows no progress bar while it lists the
 bucket and walks the commits, because the bar of `push` shows nothing in
@@ -3985,6 +3987,36 @@ rules:
   output, exits 0, and opens no connection. The ref listing and this check
   come after the checks of `--collection` and of the S3 options, and before
   the push address resolves.
+- Before the exit with no match, the command makes each refusal of the push
+  that reads no file, with the library rules. `check_push` makes the
+  refusals of `resolve_push` up to the first file read: the config checks,
+  the options of the other transport, the HTTP options up to the key
+  `proxy`, the token and ssh options of an `s3://` address, and the
+  addressing style. Then it makes each refusal of `PushSession::prepare`
+  that reads no file, with `PushSession::check`. For an ssh address, that
+  is an empty ssh command or receive command, and a bad
+  `OSTRYA_SSH_COMMAND`. For an HTTP address, that is the push address as
+  the one mirror, and each refusal of `Fetcher::new` before its TLS setup,
+  through `ostrya_fetch::check_options`: a low-speed rule with a zero, a
+  bad mirror URL, a credential header to an `http://` address, a bad
+  header, and a bad proxy URL of the key `proxy` or of the proxy variables
+  of the environment. `Fetcher::new` and `PushSession::prepare` make these
+  refusals through the same code, so the order and the text are those of
+  a push of a refspec, and the environment is read once. For an `s3://`
+  address, it refuses a malformed address, as `S3Endpoint::resolve` does
+  before it reads a file.
+  `RepoPushOptions::check` then refuses the options of the other kind of
+  push, a depth below -1, a bad collection id, and a bad tag name. A
+  refusal exits 1 with the error that a push of a refspec gives. The checks
+  that read a file stay after the exit, so the command reads no token file,
+  no TLS file, no shared AWS file, and no trust store. The refusal of an
+  `http://` S3 endpoint with no `allow-cleartext-credentials` is one of
+  them, because the endpoint can come from the shared AWS files. The
+  refusal of a proxy URL for an `s3://` address is one of them too: the
+  HTTP client of the bucket makes it, and the push builds that client
+  after it reads the shared AWS files. For an HTTP push, the refusals of
+  the HTTP client that need the token stay after the exit too: the token
+  syntax, and an `Authorization` header beside the token.
 - The command refuses `--tag` when it reads the key, with `--tag needs a
   refspec, and [remote "NAME"] push-branches gives none` at exit 1. The
   refusal comes after the checks of `--collection` and of the S3 options,
@@ -4047,6 +4079,17 @@ These alternatives were rejected:
   `list_collection_refs_in` apply. The listing follows an alias through
   the file system, as `list_refs` does, so a ref that `list_refs` reads has
   the same commit in the push.
+- With no match, an exit after `resolve_push`. The resolution reads the
+  token file, the PEM files, and the shared AWS files, and a push with no
+  match to an `s3://` address with no key pair then fails.
+- With no match, a private flag of the resolver that stops it before the
+  first file read. The flag goes through the S3 resolution, which the pull
+  also uses.
+- With no match, a copy of the rules in the command, or a clap range on
+  `--depth`. Both copy rules of the library. A clap error exits 2, and a
+  range does not cover the transport checks.
+- Exit 1 with no match. A selection with no ref is a valid result of a
+  pattern list, for example on a host that holds no ref of the list yet.
 
 ## The refs of a pull with no ref
 

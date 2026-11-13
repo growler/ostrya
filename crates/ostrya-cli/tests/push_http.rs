@@ -1671,6 +1671,113 @@ mod cli {
         silent.assert_untouched();
     }
 
+    /// With no ref that `push-branches` selects, an HTTP push refuses an
+    /// empty `--push-user` with the error of a push of a refspec. It reads
+    /// no token file and makes no connection.
+    #[test]
+    fn push_branches_with_no_match_refuses_an_empty_push_user() {
+        let setup = Setup::new("cli-push-branches-nomatch");
+        let client = setup.init("client", "archive");
+        let silent = Silent::new();
+        add_config(
+            &client,
+            &format!(
+                "[remote \"origin\"]\nurl={}\npush-branches=nomatch/**\n",
+                silent.url("https")
+            ),
+        );
+        let token = format!("--push-token-file={}", setup.path("absent").display());
+        let args = [token.as_str(), "--push-user=", "origin"];
+        let out = push_from(&client, &args);
+        let refspec = push_from(&client, &[&args[..], &["main"]].concat());
+        for out in [&out, &refspec] {
+            assert_eq!(
+                stderr(out),
+                "error: invalid input: push-user is empty or holds ':', which a Basic \
+                 credential cannot carry\n"
+            );
+            assert_eq!(out.status.code(), Some(1));
+            assert_eq!(stdout(out), "");
+        }
+        // The token file is absent, so a read of it would fail the push.
+        let out = push_from(&client, &[token.as_str(), "--push-user=u", "origin"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "no ref matches [remote \"origin\"] push-branches\n"
+        );
+        silent.assert_untouched();
+    }
+
+    /// With no ref that `push-branches` selects, an HTTP push refuses the
+    /// push address and a proxy URL that the HTTP client refuses, from the
+    /// key `proxy` and from the proxy variables, with the error of a push of
+    /// a refspec. A refused address comes before a refused proxy. The push
+    /// makes no connection.
+    #[test]
+    fn push_branches_with_no_match_refuses_the_options_of_the_http_client() {
+        let setup = Setup::new("cli-push-branches-nomatch-proxy");
+        let client = setup.init("client", "archive");
+        let silent = Silent::new();
+        let url = silent.url("http");
+        add_config(
+            &client,
+            &format!(
+                "[remote \"keyed\"]\nurl={url}\nproxy=ftp://proxy:3128\n\
+                 push-branches=nomatch/**\n\n\
+                 [remote \"plain\"]\nurl={url}\npush-branches=nomatch/**\n\n\
+                 [remote \"query\"]\nurl={url}?x=1\npush-branches=nomatch/**\n\n\
+                 [remote \"both\"]\nurl={url}?x=1\nproxy=ftp://proxy:3128\n\
+                 push-branches=nomatch/**\n",
+            ),
+        );
+        let run = |args: &[&str], variable: Option<(&str, &str)>| {
+            let mut command = command(ostrya_bin());
+            command
+                .arg(format!("--repo={}", client.display()))
+                .arg("push")
+                .args(args)
+                .env_remove("OSTREE_REPO");
+            if let Some((name, value)) = variable {
+                command.env(name, value);
+            }
+            command.output().unwrap()
+        };
+        let proxy = |proxy: &str| {
+            format!(
+                "error: unsupported: proxy url {proxy}: a proxy is reached over \
+                 http://host[:port], socks5://host[:port], or socks5h://host[:port] alone\n"
+            )
+        };
+        let query = format!(
+            "error: invalid input: address: fetch: mirror url {url}?x=1 carries a query \
+             string, which the fetcher does not send\n"
+        );
+        for (remote, variable, expected) in [
+            ("keyed", None, proxy("ftp://proxy:3128")),
+            ("plain", Some(("http_proxy", "ftp://x")), proxy("ftp://x")),
+            ("query", None, query.clone()),
+            ("both", None, query.clone()),
+            ("query", Some(("http_proxy", "ftp://x")), query.clone()),
+        ] {
+            for args in [&[remote][..], &[remote, "main"]] {
+                let out = run(args, variable);
+                assert_eq!(stderr(&out), expected, "{args:?} {variable:?}");
+                assert_eq!(out.status.code(), Some(1), "{args:?}");
+                assert_eq!(stdout(&out), "", "{args:?}");
+            }
+        }
+        let out = run(&["plain"], None);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "no ref matches [remote \"plain\"] push-branches\n"
+        );
+        silent.assert_untouched();
+    }
+
     /// The push ignores `tls-permissive=true` on a remote whose push address
     /// is `http://`. The push uses no TLS, and it succeeds.
     #[test]

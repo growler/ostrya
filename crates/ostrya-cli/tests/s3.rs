@@ -859,6 +859,80 @@ fn a_push_to_an_s3_address_refuses_the_token_options() {
     assert!(server.state().requests.is_empty());
 }
 
+/// With no ref that `push-branches` selects, a push to an `s3://` remote
+/// refuses each option that the S3 push refuses, and a malformed address,
+/// with the error of a push of a refspec. With valid options it exits 0. It
+/// reads no key pair and no shared AWS file: the runs with no match have no
+/// key pair, and the AWS files are at absent paths.
+#[cfg(feature = "push")]
+#[test]
+fn push_branches_with_no_match_to_an_s3_remote_reads_no_aws_file() {
+    let scratch = Scratch::new("push-branches-nomatch");
+    let repo = scratch.repo("local");
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"b\"]\npush-url={ADDRESS}\ns3-endpoint=http://127.0.0.1:1\n\
+             push-branches=nomatch/**\n\n\
+             [remote \"bad\"]\npush-url=s3://Bad_Bucket/x\n\
+             s3-endpoint=http://127.0.0.1:1\npush-branches=nomatch/**\n"
+        ),
+    );
+    let no_keys = [("AWS_ACCESS_KEY_ID", None), ("AWS_SECRET_ACCESS_KEY", None)];
+    for (remote, option, message) in [
+        (
+            "b",
+            "--compress=6",
+            "a push to an s3:// address uploads each object in archive form, and the push \
+             names a compression",
+        ),
+        (
+            "b",
+            "--push-user=u",
+            "push-user applies to an HTTP address, and 's3://bkt/repo' is an s3:// address",
+        ),
+        (
+            "b",
+            "--receive-command=x",
+            "receive-command applies to an ssh address, and 's3://bkt/repo' is an s3:// \
+             address",
+        ),
+        (
+            "b",
+            "--tls-client-cert-path=/absent",
+            "remote 'b': a client certificate needs both tls-client-cert-path and \
+             tls-client-key-path",
+        ),
+        ("b", "--depth=-2", "depth -2 is below -1"),
+        (
+            "bad",
+            "--depth=-1",
+            "S3 address: the bucket name \"Bad_Bucket\" holds a character other than a \
+             lowercase letter, a digit, '.', or '-'",
+        ),
+    ] {
+        let expected = format!("error: invalid input: {message}\n");
+        let out = scratch.run_with(&[&repo, "push", remote, CLEARTEXT, option], &no_keys);
+        assert_eq!(out.status.code(), Some(1), "{option}: {}", stderr(&out));
+        assert_eq!(stdout(&out), "", "{option}");
+        assert_eq!(stderr(&out), expected, "{option}");
+        // A push of a refspec, with the key pair, gives the same error with
+        // no request.
+        let message = scratch.fails(&[&repo, "push", remote, "main", CLEARTEXT, option]);
+        assert_eq!(message, expected, "{option}");
+    }
+    let out = scratch.run_with(
+        &[&repo, "push", "b", CLEARTEXT, "--depth=-1", "--force"],
+        &no_keys,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        stderr(&out),
+        "no ref matches [remote \"b\"] push-branches\n"
+    );
+}
+
 /// The S3 options and `--break-lock` are refused for an HTTP or an ssh
 /// destination, with the name of the option.
 #[cfg(feature = "push")]

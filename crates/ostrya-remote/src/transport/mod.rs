@@ -294,12 +294,15 @@ impl PushSession {
     /// For an ssh endpoint, the call reads the `OSTRYA_SSH_COMMAND`
     /// environment variable and builds the command line of the ssh client by
     /// the rules of the [ssh command line](SshOptions#ssh-command-line).
+    /// [`check`](PushSession::check) makes the same checks alone.
     ///
     /// For an HTTP endpoint, the call builds the HTTP client from the options,
     /// as [`connect`](PushSession::connect) states. With
     /// [`TrustRoots::System`](ostrya_fetch::TrustRoots::System), an `https://`
     /// endpoint reads the trust store of the host, by the rule of
     /// [`Fetcher::new`](ostrya_fetch::Fetcher::new).
+    /// [`check`](PushSession::check) makes the checks of the options that
+    /// read no file alone.
     ///
     /// The call starts no ssh client and sends no request. It refuses each
     /// value that [`connect`](PushSession::connect) refuses before it starts
@@ -333,6 +336,60 @@ impl PushSession {
         let inner = prepare_with(endpoint, env.as_deref()).await?;
         Ok(PreparedSession { inner })
     }
+
+    /// Makes each refusal of [`prepare`](PushSession::prepare) that reads no
+    /// file, in the order of [`prepare`](PushSession::prepare), with the same
+    /// errors.
+    ///
+    /// For an ssh endpoint, the call reads the `OSTRYA_SSH_COMMAND`
+    /// environment variable and applies the rules of the
+    /// [ssh command line](SshOptions#ssh-command-line). For an HTTP endpoint,
+    /// it checks the push address and makes the checks of
+    /// [`check_options`](ostrya_fetch::check_options), so it reads the proxy
+    /// variables of the environment for
+    /// [`Proxy::Environment`](ostrya_fetch::Proxy::Environment). It reads no
+    /// file and no trust store, starts no ssh client, and builds no HTTP
+    /// client. A caller can make these checks before it resolves the files of
+    /// an endpoint, for example its token file and its PEM files.
+    ///
+    /// For an HTTP endpoint, [`prepare`](PushSession::prepare) also makes the
+    /// refusals of the TLS setup. So a success of this call does not show
+    /// that [`prepare`](PushSession::prepare) succeeds.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the ssh command or the receive command is
+    ///   empty or holds only white space, or if the value of
+    ///   `OSTRYA_SSH_COMMAND` is not UTF-8. [`SshOptions`] states the full
+    ///   rule under [Empty values](SshOptions#empty-values).
+    /// - [`Error::InvalidInput`] if the options of an HTTP endpoint do not name
+    ///   exactly one mirror, or if
+    ///   [`check_base_url`](ostrya_fetch::check_base_url) refuses the mirror.
+    ///   The message holds no userinfo.
+    /// - [`Error::InvalidInput`] for an `Endpoint::S3`.
+    /// - [`Error::Fetch`] if [`check_options`](ostrya_fetch::check_options)
+    ///   refuses the options of an HTTP endpoint, for example a bad header, a
+    ///   low-speed rule with a zero, or a bad proxy URL.
+    pub fn check(endpoint: &Endpoint) -> Result<()> {
+        match endpoint {
+            Endpoint::Ssh { options, .. } => {
+                let env = std::env::var_os("OSTRYA_SSH_COMMAND");
+                ssh_parts(options, env.as_deref()).map(drop)
+            }
+            Endpoint::Http(http) => http::check(http),
+            #[cfg(feature = "s3")]
+            Endpoint::S3(_) => Err(Error::InvalidInput(S3_SESSION.into())),
+        }
+    }
+}
+
+/// Returns the ssh command line and the receive command of a push with
+/// `options`, with `env` as the value of the `OSTRYA_SSH_COMMAND`
+/// environment variable.
+fn ssh_parts<'a>(options: &'a SshOptions, env: Option<&OsStr>) -> Result<(Vec<String>, &'a str)> {
+    let program = options.program(env)?;
+    let receive = ssh::receive_command(options.remote_command.as_deref())?;
+    Ok((program, receive))
 }
 
 /// A push session whose transport is checked and ready to open.
@@ -408,8 +465,7 @@ pub(crate) enum Prepared {
 async fn prepare_with(endpoint: Endpoint, env: Option<&OsStr>) -> Result<Prepared> {
     match endpoint {
         Endpoint::Ssh { address, options } => {
-            let program = options.program(env)?;
-            let receive = ssh::receive_command(options.remote_command.as_deref())?;
+            let (program, receive) = ssh_parts(&options, env)?;
             Ok(Prepared::Ssh(address.command_line(program, receive)))
         }
         // The HTTP preparation builds the fetcher. Its future is boxed, so

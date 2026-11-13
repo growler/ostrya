@@ -2995,116 +2995,11 @@ impl Fetcher {
     /// - [`Error::Fetch`] if the system trust store holds no certificate, and
     ///   one or more mirrors are `https` or the mirror list is empty.
     pub async fn new(options: FetcherOptions) -> Result<Fetcher> {
-        // A limit of zero or a time of zero measures nothing. No rate is under
-        // a zero limit, and each transfer fails a zero time immediately.
-        if let Some(low) = options.low_speed
-            && (low.limit == 0 || low.time.is_zero())
-        {
-            return Err(Error::Fetch(format!(
-                "low-speed limit {} bytes per second over {:?}: neither may be zero",
-                low.limit, low.time
-            )));
-        }
-        let mirrors = options
-            .mirrors
-            .iter()
-            .map(|url| parse_mirror(url))
-            .collect::<Result<Vec<_>>>()?;
-        // The fetcher sends a credential with each request to each mirror. So
-        // one cleartext entry in the list puts the credential on the wire in
-        // the clear, and the fetcher refuses such a configuration, unless the
-        // caller permits it. A fetch that withholds the credential gets a 401
-        // that does not state why.
-        let cleartext = if options.allow_cleartext_credentials {
-            None
-        } else {
-            options
-                .mirrors
-                .iter()
-                .zip(&mirrors)
-                .find(|(_, mirror)| !mirror.origin.tls)
-                .map(|(url, _)| url.as_str())
-        };
-        let credential = match (&options.basic_auth, &options.bearer_token) {
-            (Some(_), Some(_)) => return Err(Error::Fetch(BASIC_AND_BEARER.into())),
-            (Some(_), None) => Some("basic-auth credentials"),
-            (None, Some(_)) => Some("the bearer token"),
-            (None, None) if options.signer.is_some() => Some("the signature of the request signer"),
-            (None, None) => None,
-        };
-        if options.signer.is_some() {
-            refuse_beside_signer(
-                &options.headers,
-                options.basic_auth.is_some(),
-                options.bearer_token.is_some(),
-            )?;
-        }
-        if let Some(credential) = credential
-            && let Some(url) = cleartext
-        {
-            return Err(Error::Fetch(format!(
-                "{credential} would reach the http mirror {url} in the clear: \
-                 use https mirrors, drop the credentials, or set \
-                 FetcherOptions::allow_cleartext_credentials"
-            )));
-        }
-        let mut headers = vec![
-            (
-                hyper::header::USER_AGENT,
-                HeaderValue::from_static(USER_AGENT),
-            ),
-            (
-                hyper::header::ACCEPT_ENCODING,
-                HeaderValue::from_static(IDENTITY),
-            ),
-        ];
-        // The length of the part of the list that the fetcher sets. A
-        // configured header of one of those names replaces that entry, as a
-        // request header replaces a fetcher header of the same name. Without
-        // this rule, both go on the wire and give one question two answers.
-        // After this part, the list holds configured headers, and two entries
-        // of one name both go on the wire.
-        let mut base = headers.len();
-        for (name, value) in &options.headers {
-            let name = HeaderName::try_from(name.as_str())
-                .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
-            if name == hyper::header::HOST {
-                return Err(Error::Fetch(HOST_COMES_FROM_THE_URL.into()));
-            }
-            if is_connection_header(&name) {
-                return Err(connection_header_refused(&name));
-            }
-            if name == hyper::header::AUTHORIZATION && options.basic_auth.is_some() {
-                return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
-            }
-            if name == hyper::header::AUTHORIZATION && options.bearer_token.is_some() {
-                return Err(Error::Fetch(AMBIGUOUS_BEARER.into()));
-            }
-            if is_credential(&name)
-                && let Some(url) = cleartext
-            {
-                return Err(Error::Fetch(format!(
-                    "the {name} header carries credentials, which the http mirror {url} \
-                     would receive in the clear: use https mirrors, drop the header, or set \
-                     FetcherOptions::allow_cleartext_credentials"
-                )));
-            }
-            let mut value = HeaderValue::try_from(value.as_str())
-                .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
-            value.set_sensitive(is_credential(&name));
-            if let Some(at) = headers[..base].iter().position(|(held, _)| *held == name) {
-                headers.remove(at);
-                base -= 1;
-            }
-            headers.push((name, value));
-        }
-        if let Some(auth) = &options.basic_auth {
-            headers.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
-        }
-        if let Some(token) = &options.bearer_token {
-            headers.push((hyper::header::AUTHORIZATION, bearer_value(token)?));
-        }
-        let proxies = resolve_proxy(&options.proxy)?;
+        let Checked {
+            mirrors,
+            headers,
+            proxies,
+        } = checked(&options)?;
         let max_outstanding = options.max_outstanding.max(1);
         // A fetcher with no mirror serves the URLs of its requests, and each
         // of them can be `https`. So it must hold trust anchors, and an empty
@@ -6230,6 +6125,198 @@ fn signed<'a>(
     Ok(Cow::Owned(merged))
 }
 
+/// The state that the refusals of [`Fetcher::new`] that read no file give.
+struct Checked {
+    mirrors: Vec<Mirror>,
+    headers: Vec<(HeaderName, HeaderValue)>,
+    proxies: Proxies,
+}
+
+/// Makes each refusal of [`Fetcher::new`] that reads no file, in its order,
+/// and gives the mirrors, the headers, and the proxies of `options`.
+fn checked(options: &FetcherOptions) -> Result<Checked> {
+    // A limit of zero or a time of zero measures nothing. No rate is under
+    // a zero limit, and each transfer fails a zero time immediately.
+    if let Some(low) = options.low_speed
+        && (low.limit == 0 || low.time.is_zero())
+    {
+        return Err(Error::Fetch(format!(
+            "low-speed limit {} bytes per second over {:?}: neither may be zero",
+            low.limit, low.time
+        )));
+    }
+    let mirrors = options
+        .mirrors
+        .iter()
+        .map(|url| parse_mirror(url))
+        .collect::<Result<Vec<_>>>()?;
+    // The fetcher sends a credential with each request to each mirror. So
+    // one cleartext entry in the list puts the credential on the wire in
+    // the clear, and the fetcher refuses such a configuration, unless the
+    // caller permits it. A fetch that withholds the credential gets a 401
+    // that does not state why.
+    let cleartext = if options.allow_cleartext_credentials {
+        None
+    } else {
+        options
+            .mirrors
+            .iter()
+            .zip(&mirrors)
+            .find(|(_, mirror)| !mirror.origin.tls)
+            .map(|(url, _)| url.as_str())
+    };
+    let credential = match (&options.basic_auth, &options.bearer_token) {
+        (Some(_), Some(_)) => return Err(Error::Fetch(BASIC_AND_BEARER.into())),
+        (Some(_), None) => Some("basic-auth credentials"),
+        (None, Some(_)) => Some("the bearer token"),
+        (None, None) if options.signer.is_some() => Some("the signature of the request signer"),
+        (None, None) => None,
+    };
+    if options.signer.is_some() {
+        refuse_beside_signer(
+            &options.headers,
+            options.basic_auth.is_some(),
+            options.bearer_token.is_some(),
+        )?;
+    }
+    if let Some(credential) = credential
+        && let Some(url) = cleartext
+    {
+        return Err(Error::Fetch(format!(
+            "{credential} would reach the http mirror {url} in the clear: \
+             use https mirrors, drop the credentials, or set \
+             FetcherOptions::allow_cleartext_credentials"
+        )));
+    }
+    let mut headers = vec![
+        (
+            hyper::header::USER_AGENT,
+            HeaderValue::from_static(USER_AGENT),
+        ),
+        (
+            hyper::header::ACCEPT_ENCODING,
+            HeaderValue::from_static(IDENTITY),
+        ),
+    ];
+    // The length of the part of the list that the fetcher sets. A
+    // configured header of one of those names replaces that entry, as a
+    // request header replaces a fetcher header of the same name. Without
+    // this rule, both go on the wire and give one question two answers.
+    // After this part, the list holds configured headers, and two entries
+    // of one name both go on the wire.
+    let mut base = headers.len();
+    for (name, value) in &options.headers {
+        let name = HeaderName::try_from(name.as_str())
+            .map_err(|_| Error::Fetch(format!("invalid header name: {name}")))?;
+        if name == hyper::header::HOST {
+            return Err(Error::Fetch(HOST_COMES_FROM_THE_URL.into()));
+        }
+        if is_connection_header(&name) {
+            return Err(connection_header_refused(&name));
+        }
+        if name == hyper::header::AUTHORIZATION && options.basic_auth.is_some() {
+            return Err(Error::Fetch(AMBIGUOUS_AUTHORIZATION.into()));
+        }
+        if name == hyper::header::AUTHORIZATION && options.bearer_token.is_some() {
+            return Err(Error::Fetch(AMBIGUOUS_BEARER.into()));
+        }
+        if is_credential(&name)
+            && let Some(url) = cleartext
+        {
+            return Err(Error::Fetch(format!(
+                "the {name} header carries credentials, which the http mirror {url} \
+                 would receive in the clear: use https mirrors, drop the header, or set \
+                 FetcherOptions::allow_cleartext_credentials"
+            )));
+        }
+        let mut value = HeaderValue::try_from(value.as_str())
+            .map_err(|_| Error::Fetch(format!("invalid value for header {name}")))?;
+        value.set_sensitive(is_credential(&name));
+        if let Some(at) = headers[..base].iter().position(|(held, _)| *held == name) {
+            headers.remove(at);
+            base -= 1;
+        }
+        headers.push((name, value));
+    }
+    if let Some(auth) = &options.basic_auth {
+        headers.push((hyper::header::AUTHORIZATION, basic_auth_value(auth)?));
+    }
+    if let Some(token) = &options.bearer_token {
+        headers.push((hyper::header::AUTHORIZATION, bearer_value(token)?));
+    }
+    let proxies = resolve_proxy(&options.proxy)?;
+    Ok(Checked {
+        mirrors,
+        headers,
+        proxies,
+    })
+}
+
+/// Makes each refusal of [`Fetcher::new`] that reads no file, in the order of
+/// [`Fetcher::new`], with the same errors.
+///
+/// The check reads the low-speed rule, the mirrors, the credentials, the
+/// headers, and the proxy of `options`. For [`Proxy::Environment`], it reads
+/// the proxy variables of the process environment. It reads no file and no
+/// trust store, parses no TLS material, builds no client, resolves no name,
+/// and opens no connection. A caller can check the options of a fetcher with
+/// it before it reads the files that complete the options, for example a
+/// token file or a PEM file.
+///
+/// [`Fetcher::new`] makes these refusals first, and then the refusals of the
+/// TLS setup. So a success of this check does not show that [`Fetcher::new`]
+/// succeeds.
+///
+/// # Errors
+///
+/// - [`Error::Fetch`] if a [`low_speed`](FetcherOptions::low_speed) rule
+///   holds a zero.
+/// - [`Error::Fetch`] if a mirror URL is not a valid absolute URL, has no
+///   usable host, or holds a query string or userinfo.
+/// - [`Error::Fetch`] if a mirror URL names a port that is not a number
+///   from 0 to 65535.
+/// - [`Error::Unsupported`] if the scheme of a mirror URL is neither `http`
+///   nor `https`.
+/// - [`Error::Fetch`] if a header name or value is invalid, or if a header
+///   is `Host` or a header that the connection layer sets.
+/// - [`Error::Fetch`] if a mirror is cleartext `http`, the options hold a
+///   credential, and
+///   [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+///   is `false`. [`Fetcher::new`] lists the credentials.
+/// - [`Error::Fetch`] if two of these are set:
+///   [`basic_auth`](FetcherOptions::basic_auth),
+///   [`bearer_token`](FetcherOptions::bearer_token),
+///   [`signer`](FetcherOptions::signer), and an `Authorization` header.
+/// - [`Error::Fetch`] if [`basic_auth`](FetcherOptions::basic_auth) does
+///   not give a valid header value, or if
+///   [`bearer_token`](FetcherOptions::bearer_token) does not have the
+///   token68 syntax.
+/// - [`Error::Unsupported`] if a proxy URL is not `http://host[:port]`,
+///   `socks5://host[:port]`, or `socks5h://host[:port]`, from the options
+///   or from the environment.
+/// - [`Error::Unsupported`] if a SOCKS5 URL has a userinfo that
+///   [SOCKS proxies](Proxy#socks-proxies) refuses, or if an `http://` proxy
+///   URL has a userinfo that the fetcher cannot send.
+/// - [`Error::Unsupported`] if a proxy variable has
+///   [white space](Proxy#white-space) around its value.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya_fetch::{Error, FetcherOptions, Proxy, check_options};
+///
+/// let mut options = FetcherOptions::new("https://example.com/repo");
+/// options.proxy = Proxy::Url("http://proxy.example.com:3128".into());
+/// check_options(&options).unwrap();
+/// options.proxy = Proxy::Url("ftp://proxy.example.com".into());
+/// assert!(matches!(check_options(&options), Err(Error::Unsupported(_))));
+/// options.headers = vec![("Host".into(), "other.example.com".into())];
+/// assert!(matches!(check_options(&options), Err(Error::Fetch(_))));
+/// ```
+pub fn check_options(options: &FetcherOptions) -> Result<()> {
+    checked(options).map(drop)
+}
+
 /// Resolves the proxy configuration into the state that a fetch reads.
 ///
 /// The function resolves each form once. So a fetch reads no environment and
@@ -9098,6 +9185,104 @@ mod tests {
         resolve_variables(&variables(&[("HTTP_PROXY", "http://cgi.example:3128 ")])).unwrap();
         // A URL the caller states in the options keeps its trim.
         resolve_proxy(&Proxy::Url("http://p:3128 ".into())).unwrap();
+    }
+
+    /// `check_options` takes the options that the constructor takes up to
+    /// its TLS setup, and refuses each other value with the error of the
+    /// constructor, in the order of the constructor.
+    #[test]
+    fn check_options_gives_the_refusals_of_the_constructor_that_read_no_file() {
+        let base = || direct_options("http://origin.example/repo");
+        let proxy = |proxy: Proxy| FetcherOptions { proxy, ..base() };
+        let headers = |pairs: &[(&str, &str)]| FetcherOptions {
+            headers: pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            ..base()
+        };
+        let bearer = |token: &str| {
+            Some(BearerToken {
+                token: token.to_owned(),
+            })
+        };
+        for options in [
+            base(),
+            proxy(Proxy::Url("http://proxy.example:3128".into())),
+            proxy(Proxy::Url("socks5h://socks.example".into())),
+            proxy(Proxy::Variables(vec![
+                ("https_proxy".into(), "http://proxy.example:3128".into()),
+                ("no_proxy".into(), ".internal.example".into()),
+            ])),
+            headers(&[("X-Trace", "1")]),
+        ] {
+            check_options(&options).unwrap();
+        }
+        let refused = [
+            FetcherOptions {
+                low_speed: Some(LowSpeed {
+                    limit: 0,
+                    time: Duration::from_secs(30),
+                }),
+                ..base()
+            },
+            FetcherOptions {
+                mirrors: vec!["http://origin.example/repo?x=1".into()],
+                ..base()
+            },
+            FetcherOptions {
+                mirrors: vec!["ftp://origin.example/repo".into()],
+                ..base()
+            },
+            headers(&[("Host", "other.example")]),
+            headers(&[("bad name", "1")]),
+            headers(&[("Connection", "close")]),
+            headers(&[("X-Trace", "a\nb")]),
+            headers(&[("Cookie", "id=1")]),
+            FetcherOptions {
+                bearer_token: bearer("tok"),
+                ..base()
+            },
+            FetcherOptions {
+                bearer_token: bearer("tok"),
+                allow_cleartext_credentials: true,
+                ..headers(&[("Authorization", "Bearer other")])
+            },
+            FetcherOptions {
+                bearer_token: bearer("not token68"),
+                allow_cleartext_credentials: true,
+                ..base()
+            },
+            proxy(Proxy::Url("ftp://proxy.example:3128".into())),
+            proxy(Proxy::Url("http://proxy.example:3128/squid".into())),
+            proxy(Proxy::Variables(vec![(
+                "http_proxy".into(),
+                "ftp://x".into(),
+            )])),
+            proxy(Proxy::Variables(vec![(
+                "all_proxy".into(),
+                "socks4://x".into(),
+            )])),
+            proxy(Proxy::Variables(vec![(
+                "https_proxy".into(),
+                "http://p:1 ".into(),
+            )])),
+            // A bad header comes before a bad proxy.
+            FetcherOptions {
+                proxy: Proxy::Url("ftp://proxy.example:3128".into()),
+                ..headers(&[("Host", "other.example")])
+            },
+        ];
+        for options in refused {
+            let checked = check_options(&options).unwrap_err();
+            let built = rt::block_on(Fetcher::new(options.clone())).err().unwrap();
+            assert_eq!(checked.to_string(), built.to_string(), "{options:?}");
+        }
+        let both = FetcherOptions {
+            proxy: Proxy::Url("ftp://proxy.example:3128".into()),
+            ..headers(&[("Host", "other.example")])
+        };
+        assert!(matches!(check_options(&both), Err(Error::Fetch(_))));
     }
 
     /// What `no_proxy` exempts: an exact host, a host under a listed domain, a

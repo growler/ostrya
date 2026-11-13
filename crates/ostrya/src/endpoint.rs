@@ -13,7 +13,11 @@
 //! credentials and settings from the environment of the process and from the
 //! shared AWS files. A build without the feature refuses an `s3://` address.
 //! [`pull_address_is_s3`] tells if the address of a pull is an `s3://`
-//! address, with no file and no environment.
+//! address, with no file and no environment. `check_push` makes each refusal
+//! of `resolve_push` that needs no file, the refusals of
+//! `PushSession::prepare` that need no file, and the parse of an `s3://`
+//! address. It gives the kind of the
+//! push.
 //!
 //! [`Repo::pull`](crate::Repo::pull) calls [`resolve_pull`] with
 //! [`PullOptions::overrides`](crate::PullOptions::overrides).
@@ -734,11 +738,13 @@ async fn pull_s3(
         invalid: Error::InvalidInput,
         remote: Error::Pull,
     };
-    s3_endpoint(remote, section, address, o, env, refusals).await
+    let (settings, http) = s3_settings(remote, section, o, refusals)?;
+    s3_resolve(address, &settings, http, env, refusals).await
 }
 
-/// The errors of the refusals of [`s3_endpoint`].
+/// The errors of the refusals of [`s3_settings`] and [`s3_resolve`].
 #[cfg(feature = "s3")]
+#[derive(Clone, Copy)]
 struct S3Refusals {
     /// The error of a value that the caller or a key gives.
     invalid: fn(String) -> Error,
@@ -746,23 +752,33 @@ struct S3Refusals {
     remote: fn(String) -> Error,
 }
 
-/// Completes the S3 endpoint of the `s3://` address `address` of `remote`,
-/// from the S3 fields and the HTTP fields of `o`, the keys of `section`, and
-/// `env`.
-///
-/// The call reads no ssh field of `o`. It refuses an addressing style other
-/// than `path` and `virtual`, and an `http://` endpoint with no
-/// `allow_cleartext_credentials`.
 #[cfg(feature = "s3")]
-async fn s3_endpoint(
+impl S3Refusals {
+    /// Returns the error of `e`, an error of `S3Endpoint::resolve` of
+    /// `ostrya_remote::s3`.
+    fn resolve_error(self, e: remote::Error) -> Error {
+        match e {
+            remote::Error::InvalidInput(msg) => (self.invalid)(msg),
+            remote::Error::Io(e) => Error::Io(e),
+            other => Error::Remote(other),
+        }
+    }
+}
+
+/// Reads the S3 fields and the HTTP fields of `o` and the keys of `section`,
+/// the section of `remote`, for an S3 endpoint.
+///
+/// The call reads no ssh field of `o`, no file, and no environment. It refuses an addressing style
+/// other than `path` and `virtual`, and each value that [`PullHttp::read`]
+/// refuses.
+#[cfg(feature = "s3")]
+fn s3_settings(
     remote: &str,
     section: Option<&Remote<'_>>,
-    address: &str,
     mut o: EndpointOverrides,
-    env: &S3Environment,
     refusals: S3Refusals,
-) -> Result<Endpoint> {
-    use remote::s3::{Addressing, S3Endpoint, Settings};
+) -> Result<(remote::s3::Settings, PullHttp)> {
+    use remote::s3::{Addressing, Settings};
 
     let region = or_key(o.s3_region.take(), section, |s| s.s3_region())?;
     let endpoint = or_key(o.s3_endpoint.take(), section, |s| s.s3_endpoint())?;
@@ -786,13 +802,27 @@ async fn s3_endpoint(
         Error::Pull(msg) => (refusals.remote)(msg),
         other => other,
     })?;
-    let mut endpoint = S3Endpoint::resolve(address, &settings, env)
+    Ok((settings, http))
+}
+
+/// Completes the S3 endpoint of the `s3://` address `address` from
+/// `settings`, `http`, and `env`.
+///
+/// The call reads the shared AWS files and the PEM files. It refuses an
+/// `http://` endpoint with no `allow_cleartext_credentials`.
+#[cfg(feature = "s3")]
+async fn s3_resolve(
+    address: &str,
+    settings: &remote::s3::Settings,
+    http: PullHttp,
+    env: &S3Environment,
+    refusals: S3Refusals,
+) -> Result<Endpoint> {
+    use remote::s3::S3Endpoint;
+
+    let mut endpoint = S3Endpoint::resolve(address, settings, env)
         .await
-        .map_err(|e| match e {
-            remote::Error::InvalidInput(msg) => (refusals.invalid)(msg),
-            remote::Error::Io(e) => Error::Io(e),
-            other => Error::Remote(other),
-        })?;
+        .map_err(|e| refusals.resolve_error(e))?;
     let url = endpoint.location.endpoint();
     let cleartext = url
         .get(..7)
@@ -1009,6 +1039,10 @@ impl PullHttp {
 /// # Errors
 ///
 /// The function makes each refusal that needs no file before it reads a file.
+/// [`check_push`] makes these refusals alone, with no file read. It also
+/// makes the refusals of
+/// [`PushSession::prepare`](crate::remote::PushSession::prepare) that need
+/// no file, and the refusal of a malformed `s3://` address.
 /// Each refusal of the list is [`Error::Remote`] with
 /// [`InvalidInput`](crate::remote::Error::InvalidInput):
 ///
@@ -1087,6 +1121,148 @@ pub(crate) async fn resolve_push_in(
     overrides: EndpointOverrides,
     env: &S3Environment,
 ) -> Result<Endpoint> {
+    match checked_push(config, remote_or_address, overrides)? {
+        CheckedPush::Ssh(address, options) => Ok(Endpoint::Ssh { address, options }),
+        CheckedPush::Http(push) => push.read_files().await,
+        #[cfg(feature = "s3")]
+        CheckedPush::S3(push) => {
+            Box::pin(s3_resolve(
+                &push.address,
+                &push.settings,
+                push.http,
+                env,
+                push.refusals,
+            ))
+            .await
+        }
+    }
+}
+
+/// The kind of a push that [`check_push`] gives.
+#[cfg(feature = "push")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushKind {
+    /// A push over ssh or HTTP. [`Repo::push`](crate::Repo::push) sends it
+    /// through a push session.
+    Session,
+    /// A push to a bucket repository at an `s3://` address. A build without
+    /// the `s3` feature never gives it, because [`check_push`] refuses the
+    /// address.
+    Bucket,
+}
+
+/// Makes each refusal of [`resolve_push`] that needs no file, and gives the
+/// kind of the push.
+///
+/// The function reads the keys of the remote section as [`resolve_push`]
+/// reads them, up to the first file. It reads no token file, no PEM file, no
+/// shared AWS file, no AWS credential of the environment, and no trust
+/// store, and it opens no connection. It also makes these checks, which need
+/// no file:
+///
+/// - For an ssh or an HTTP address, the checks of
+///   [`PushSession::check`](crate::remote::PushSession::check), on the
+///   endpoint with no file read. These are the refusals of
+///   [`PushSession::prepare`](crate::remote::PushSession::prepare) that read
+///   no file. For ssh, the function reads the `OSTRYA_SSH_COMMAND`
+///   environment variable. For HTTP, it checks the push address, the headers,
+///   the low-speed rule, and the proxy, and for [`Proxy::Environment`] it
+///   reads the proxy variables of the environment.
+/// - For an `s3://` address, the parse of the address, which
+///   `S3Endpoint::resolve` of `ostrya_remote::s3` makes before it reads a
+///   file.
+///
+/// A caller can check the options of a push with it when it does not go on
+/// to the push, for example when the push selects no ref.
+///
+/// The function does not make the refusals that come after a file read.
+/// These are the errors of [`read_token_file`] and [`read_pem_file`], and,
+/// for an `s3://` address, the other refusals of `S3Endpoint::resolve`, the
+/// refusal of an `http://` S3 endpoint with no
+/// `allow_cleartext_credentials`, and the refusal of the proxy by the HTTP
+/// client of the bucket. For an HTTP address, it does not make the refusals
+/// of the TLS setup of the HTTP client, and the refusals of the HTTP client
+/// that depend on the token, because it reads no token file. So a success
+/// of this function does not show that [`resolve_push`] or the push
+/// succeeds.
+///
+/// # Errors
+///
+/// - Each error of the list of [`resolve_push`] that comes before a file
+///   read, with the same variant and the same message. These include the
+///   refusal of an option of the other transport, of a bad `push_user`, of a
+///   `push_user` or a token file for an `s3://` address, of a client
+///   certificate with no key, of a token to an `http://` address with no
+///   `allow_cleartext_credentials`, of the key `proxy`, of an addressing
+///   style, and of an `s3://` address in a build without the `s3` feature.
+/// - [`Error::Remote`] with
+///   [`InvalidInput`](crate::remote::Error::InvalidInput) for an `s3://`
+///   address that `Address::parse` of `ostrya_remote::s3` refuses, with the
+///   message of [`resolve_push`].
+/// - [`Error::Remote`] with the error of
+///   [`PushSession::check`](crate::remote::PushSession::check) for an ssh
+///   or an HTTP address. For ssh: an empty ssh command or receive command,
+///   or an `OSTRYA_SSH_COMMAND` that is empty or not UTF-8. For HTTP: an
+///   error of [`check_options`](crate::fetch::check_options), for example a
+///   bad header or a proxy URL of the key `proxy` or of the environment that
+///   the HTTP client refuses.
+#[cfg(feature = "push")]
+pub fn check_push(
+    config: Option<&RepoConfig>,
+    remote_or_address: &str,
+    overrides: EndpointOverrides,
+) -> Result<PushKind> {
+    match checked_push(config, remote_or_address, overrides)? {
+        CheckedPush::Ssh(address, options) => {
+            remote::PushSession::check(&Endpoint::Ssh { address, options })?;
+            Ok(PushKind::Session)
+        }
+        CheckedPush::Http(push) => {
+            remote::PushSession::check(&Endpoint::Http(push.http))?;
+            Ok(PushKind::Session)
+        }
+        #[cfg(feature = "s3")]
+        CheckedPush::S3(push) => {
+            remote::s3::Address::parse(&push.address)
+                .map_err(|e| push.refusals.resolve_error(e))?;
+            Ok(PushKind::Bucket)
+        }
+    }
+}
+
+/// A push after the refusals that need no file.
+// The HTTP variant is much larger than the ssh variant. A push resolves one
+// address, so a box saves no work, and the variant stays inline.
+#[cfg(feature = "push")]
+#[allow(clippy::large_enum_variant)]
+enum CheckedPush {
+    /// The address and the options of an ssh push. The push reads no file.
+    Ssh(SshAddress, SshOptions),
+    /// An HTTP push before the read of its token file and its PEM files.
+    Http(HttpPush),
+    /// A push to an `s3://` address before the read of the shared AWS files
+    /// and of the PEM files.
+    #[cfg(feature = "s3")]
+    S3(S3Push),
+}
+
+/// A push to an `s3://` address after the refusals that need no file.
+#[cfg(feature = "s3")]
+struct S3Push {
+    address: String,
+    settings: remote::s3::Settings,
+    http: PullHttp,
+    refusals: S3Refusals,
+}
+
+/// Makes each refusal of [`resolve_push_in`] that needs no file, in the
+/// order of [`resolve_push`].
+#[cfg(feature = "push")]
+fn checked_push(
+    config: Option<&RepoConfig>,
+    remote_or_address: &str,
+    overrides: EndpointOverrides,
+) -> Result<CheckedPush> {
     let remote = remote_or_address;
     if overrides.url.is_some() {
         return Err(push_invalid("url applies to a pull, and this is a push"));
@@ -1136,7 +1312,7 @@ pub(crate) async fn resolve_push_in(
             None => remote::without_userinfo(remote),
         };
         #[cfg(feature = "s3")]
-        return Box::pin(push_s3(&name, section.as_ref(), &address, overrides, env)).await;
+        return check_push_s3(&name, section.as_ref(), address, overrides).map(CheckedPush::S3);
         #[cfg(not(feature = "s3"))]
         return Err(Error::Unsupported(format!(
             "the push address '{}' is an s3:// address, and this build of ostrya has no S3 \
@@ -1152,7 +1328,8 @@ pub(crate) async fn resolve_push_in(
                     remote::without_userinfo(&address)
                 )));
             }
-            push_http(remote, section.as_ref(), &address, http, overrides).await
+            check_push_http(remote, section.as_ref(), &address, http, overrides)
+                .map(CheckedPush::Http)
         }
         Endpoint::Ssh { address, .. } => {
             if let Some(name) = s3_field(&overrides) {
@@ -1161,27 +1338,27 @@ pub(crate) async fn resolve_push_in(
                     address.without_user()
                 )));
             }
-            push_ssh(section.as_ref(), address, overrides)
+            let options = push_ssh(section.as_ref(), &address, overrides)?;
+            Ok(CheckedPush::Ssh(address, options))
         }
         _ => Err(neither_ssh_nor_http("a push")),
     }
 }
 
-/// Completes the endpoint of a push of `remote` to the `s3://` address
-/// `address`, from `o`, the keys of `section`, and `env`.
+/// Makes each refusal of a push of `remote` to the `s3://` address `address`
+/// that needs no file, from `o` and the keys of `section`.
 ///
 /// [`resolve_bucket`] gives the endpoint of each other writer of a bucket
 /// repository through this function, so each writer makes the refusals of a
 /// push.
 #[cfg(feature = "s3")]
-async fn push_s3(
+fn check_push_s3(
     remote: &str,
     section: Option<&Remote<'_>>,
-    address: &str,
+    address: String,
     o: EndpointOverrides,
-    env: &S3Environment,
-) -> Result<Endpoint> {
-    let shown = remote::without_userinfo(address);
+) -> Result<S3Push> {
+    let shown = remote::without_userinfo(&address);
     let (token_key, user_key) = match section {
         Some(section) => (
             section.push_token_file()?.is_some(),
@@ -1215,7 +1392,13 @@ async fn push_s3(
         invalid: |msg| push_invalid(msg),
         remote: |msg| push_invalid(msg),
     };
-    s3_endpoint(remote, section, address, o, env, refusals).await
+    let (settings, http) = s3_settings(remote, section, o, refusals)?;
+    Ok(S3Push {
+        address,
+        settings,
+        http,
+        refusals,
+    })
 }
 
 /// Resolves a remote name or an `s3://` address to the endpoint of a writer
@@ -1331,23 +1514,48 @@ pub(crate) async fn resolve_bucket_in(
         Some(_) => std::borrow::Cow::Borrowed(value),
         None => remote::without_userinfo(value),
     };
-    let endpoint = Box::pin(push_s3(&name, section.as_ref(), &address, overrides, env)).await?;
+    let push = check_push_s3(&name, section.as_ref(), address, overrides)?;
+    let endpoint = Box::pin(s3_resolve(
+        &push.address,
+        &push.settings,
+        push.http,
+        env,
+        push.refusals,
+    ))
+    .await?;
     let Endpoint::S3(endpoint) = endpoint else {
         unreachable!("the endpoint of an s3:// address is an S3 endpoint");
     };
     Ok(endpoint)
 }
 
-/// Completes `http`, the options of an HTTP push to `address`, from `o` and
-/// the keys of `section`, the section of `remote`.
+/// An HTTP push after the refusals that need no file.
 #[cfg(feature = "push")]
-async fn push_http(
+struct HttpPush {
+    /// The options of the push, with each value that needs no file.
+    http: FetcherOptions,
+    /// The token file of the push.
+    token_file: Option<PathBuf>,
+    /// The user of a Basic credential.
+    user: Option<String>,
+    /// The PEM file of the trust anchors.
+    ca_path: Option<PathBuf>,
+    /// The PEM files of the client certificate chain and of its key.
+    client_files: Option<(PathBuf, PathBuf)>,
+    /// `true` for an `http://` address.
+    cleartext: bool,
+}
+
+/// Makes each refusal of an HTTP push to `address` that needs no file, with
+/// `http`, `o`, and the keys of `section`, the section of `remote`.
+#[cfg(feature = "push")]
+fn check_push_http(
     remote: &str,
     section: Option<&Remote<'_>>,
     address: &str,
     mut http: FetcherOptions,
     mut o: EndpointOverrides,
-) -> Result<Endpoint> {
+) -> Result<HttpPush> {
     if let Some(section) = section
         && address.starts_with("https://")
         && section.tls_permissive()?
@@ -1380,7 +1588,7 @@ async fn push_http(
             o.tls_client_key_path = path(section.tls_client_key_path()?);
         }
     }
-    let client_files = match (o.tls_client_cert_path, o.tls_client_key_path) {
+    let client_files = match (o.tls_client_cert_path.take(), o.tls_client_key_path.take()) {
         (Some(cert), Some(key)) => Some((cert, key)),
         (None, None) => None,
         _ => {
@@ -1413,26 +1621,6 @@ async fn push_http(
         Some(section) => remote_proxy(remote, section)?,
         None => Proxy::Environment,
     };
-    if let Some(path) = &o.push_token_file {
-        let token = read_token_file(path).await?;
-        match o.push_user {
-            Some(user) => {
-                http.basic_auth = Some(BasicAuth {
-                    user,
-                    password: token,
-                })
-            }
-            None => http.bearer_token = Some(BearerToken { token }),
-        }
-    }
-    // The HTTP client of a push session follows no redirect, so an `http://`
-    // address uses no TLS, and the push reads no TLS file.
-    if !cleartext && let Some(path) = &o.tls_ca_path {
-        http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", path).await?);
-    }
-    if !cleartext && let Some((cert, key)) = client_files {
-        http.tls.client_identity = Some(client_identity(&cert, &key).await?);
-    }
     http.headers = o.http_headers;
     http.allow_cleartext_credentials = o.allow_cleartext_credentials;
     if let Some(retries) = o.max_retries {
@@ -1441,17 +1629,60 @@ async fn push_http(
     if o.low_speed_limit_bytes.is_some() || o.low_speed_time.is_some() {
         http.low_speed = low_speed(o.low_speed_limit_bytes, o.low_speed_time);
     }
-    Ok(Endpoint::Http(http))
+    Ok(HttpPush {
+        http,
+        token_file: o.push_token_file,
+        user: o.push_user,
+        ca_path: o.tls_ca_path,
+        client_files,
+        cleartext,
+    })
 }
 
-/// Gives the endpoint of a push to the ssh address `address`, with `o` and
-/// the ssh keys of `section`.
+#[cfg(feature = "push")]
+impl HttpPush {
+    /// Reads the token file and the PEM files, and completes the endpoint.
+    async fn read_files(self) -> Result<Endpoint> {
+        let HttpPush {
+            mut http,
+            token_file,
+            user,
+            ca_path,
+            client_files,
+            cleartext,
+        } = self;
+        if let Some(path) = &token_file {
+            let token = read_token_file(path).await?;
+            match user {
+                Some(user) => {
+                    http.basic_auth = Some(BasicAuth {
+                        user,
+                        password: token,
+                    })
+                }
+                None => http.bearer_token = Some(BearerToken { token }),
+            }
+        }
+        // The HTTP client of a push session follows no redirect, so an
+        // `http://` address uses no TLS, and the push reads no TLS file.
+        if !cleartext && let Some(path) = &ca_path {
+            http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", path).await?);
+        }
+        if !cleartext && let Some((cert, key)) = client_files {
+            http.tls.client_identity = Some(client_identity(&cert, &key).await?);
+        }
+        Ok(Endpoint::Http(http))
+    }
+}
+
+/// Gives the ssh options of a push to the ssh address `address`, with `o`
+/// and the ssh keys of `section`.
 #[cfg(feature = "push")]
 fn push_ssh(
     section: Option<&Remote<'_>>,
-    address: SshAddress,
+    address: &SshAddress,
     o: EndpointOverrides,
-) -> Result<Endpoint> {
+) -> Result<SshOptions> {
     let name = push_field(&o).or_else(|| http_field(&o));
     if let Some(name) = name {
         return Err(push_invalid(format!(
@@ -1469,13 +1700,10 @@ fn push_ssh(
         ),
         None => (None, o.remote_command),
     };
-    Ok(Endpoint::Ssh {
-        address,
-        options: SshOptions {
-            command: o.ssh_command,
-            config_command,
-            remote_command,
-        },
+    Ok(SshOptions {
+        command: o.ssh_command,
+        config_command,
+        remote_command,
     })
 }
 
@@ -3497,6 +3725,172 @@ mod tests {
                 }
             }
         }
+
+        /// `check_push` gives the error of `resolve_push` for each refusal
+        /// that needs no file.
+        #[test]
+        fn check_push_gives_the_refusals_of_resolve_push_that_need_no_file() {
+            let dir = Dir::new();
+            let config = config(CONFIG);
+            let d = EndpointOverrides::default;
+            let cases = [
+                (
+                    "https",
+                    EndpointOverrides {
+                        url: Some("https://ex.com/".into()),
+                        ..d()
+                    },
+                ),
+                ("absent", d()),
+                ("none", d()),
+                ("permissive", d()),
+                ("file", d()),
+                (
+                    "https",
+                    EndpointOverrides {
+                        s3_region: Some("eu-west-1".into()),
+                        ..d()
+                    },
+                ),
+                (
+                    "https",
+                    EndpointOverrides {
+                        remote_command: Some("receive".into()),
+                        ..d()
+                    },
+                ),
+                (
+                    "https",
+                    EndpointOverrides {
+                        push_user: Some(String::new()),
+                        push_token_file: Some(dir.absent("token")),
+                        ..d()
+                    },
+                ),
+                (
+                    "http",
+                    EndpointOverrides {
+                        push_token_file: Some(dir.absent("token")),
+                        ..d()
+                    },
+                ),
+                (
+                    "both",
+                    EndpointOverrides {
+                        push_user: Some("u".into()),
+                        ..d()
+                    },
+                ),
+            ];
+            for (name, o) in cases {
+                let checked = check_push(Some(&config), name, o.clone());
+                let resolved = push(Some(&config), name, o);
+                assert!(checked.is_err(), "{name}: {checked:?}");
+                assert_eq!(
+                    format!("{checked:?}"),
+                    format!("{:?}", resolved.map(drop)),
+                    "{name}"
+                );
+            }
+        }
+
+        /// `check_push` reads no token file and no PEM file, and makes the
+        /// ssh checks of the push session.
+        #[test]
+        fn check_push_reads_no_file_and_checks_the_ssh_command() {
+            let dir = Dir::new();
+            let o = EndpointOverrides {
+                push_token_file: Some(dir.absent("token")),
+                push_user: Some("alice".into()),
+                tls_ca_path: Some(dir.absent("ca.pem")),
+                ..EndpointOverrides::default()
+            };
+            assert_eq!(
+                check_push(None, "https://h/", o.clone()).unwrap(),
+                PushKind::Session
+            );
+            assert!(matches!(push(None, "https://h/", o), Err(Error::Io(_))));
+            let ssh = |command: Vec<String>| EndpointOverrides {
+                ssh_command: Some(command),
+                ..EndpointOverrides::default()
+            };
+            assert_eq!(
+                check_push(None, "ssh://h/srv/repo", ssh(vec!["ssh".into()])).unwrap(),
+                PushKind::Session
+            );
+            // The resolver takes an empty ssh command, and the push session
+            // refuses it.
+            push(None, "ssh://h/srv/repo", ssh(Vec::new())).unwrap();
+            match check_push(None, "ssh://h/srv/repo", ssh(Vec::new())) {
+                Err(Error::Remote(remote::Error::InvalidInput(msg))) => {
+                    assert_eq!(msg, "the ssh command of the options is empty")
+                }
+                other => panic!("{other:?}"),
+            }
+            let o = EndpointOverrides {
+                ssh_command: Some(vec!["ssh".into()]),
+                remote_command: Some(" ".into()),
+                ..EndpointOverrides::default()
+            };
+            assert!(matches!(
+                check_push(None, "ssh://h/srv/repo", o),
+                Err(Error::Remote(remote::Error::InvalidInput(_)))
+            ));
+        }
+
+        /// `check_push` refuses the options of an HTTP push that the HTTP
+        /// client of the push session refuses before its TLS setup, with the
+        /// error of the push session, and reads no token file.
+        #[test]
+        fn check_push_makes_the_refusals_of_the_push_session_that_need_no_file() {
+            let dir = Dir::new();
+            let config = config(
+                "[remote \"proxied\"]\nurl=https://h/repo\nproxy=ftp://proxy:3128\n\n\
+                 [remote \"plain\"]\nurl=https://h/repo\nproxy=http://proxy:3128\n\n\
+                 [remote \"cleartext\"]\nurl=http://h/repo\nproxy=http://proxy:3128\n",
+            );
+            let d = EndpointOverrides::default;
+            let headers = |pairs: &[(&str, &str)]| EndpointOverrides {
+                http_headers: pairs
+                    .iter()
+                    .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                    .collect(),
+                ..d()
+            };
+            // The last case has a bad header and a bad proxy. The header
+            // comes first in both calls.
+            for (name, o) in [
+                ("proxied", d()),
+                ("plain", headers(&[("Host", "other")])),
+                ("plain", headers(&[("Connection", "close")])),
+                ("cleartext", headers(&[("Cookie", "id=1")])),
+                ("proxied", headers(&[("Host", "other")])),
+            ] {
+                let endpoint = push(Some(&config), name, o.clone()).unwrap();
+                let prepared = ostrya_rt::block_on(remote::PushSession::prepare(endpoint))
+                    .map(drop)
+                    .map_err(Error::Remote);
+                let checked = check_push(Some(&config), name, o);
+                assert!(
+                    matches!(checked, Err(Error::Remote(remote::Error::Fetch(_)))),
+                    "{checked:?}"
+                );
+                assert_eq!(format!("{checked:?}"), format!("{prepared:?}"), "{name}");
+            }
+            assert_eq!(
+                check_push(Some(&config), "plain", d()).unwrap(),
+                PushKind::Session
+            );
+            // The token file is absent, so a read of it would fail the check.
+            let o = EndpointOverrides {
+                push_token_file: Some(dir.absent("token")),
+                ..d()
+            };
+            assert!(matches!(
+                check_push(Some(&config), "proxied", o),
+                Err(Error::Remote(remote::Error::Fetch(_)))
+            ));
+        }
     }
 
     /// Returns each S3 field alone, with the name of its key.
@@ -4072,6 +4466,65 @@ mod tests {
             match result {
                 Err(Error::Remote(remote::Error::InvalidInput(msg))) => msg,
                 other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+
+        /// `check_push` gives the kind of a push to an `s3://` address with
+        /// no key pair and with the shared AWS files at absent paths. It
+        /// gives the refusals of `resolve_push` that need no file.
+        #[cfg(feature = "push")]
+        #[test]
+        fn check_push_reads_no_aws_file() {
+            let dir = Dir::new();
+            let no_keys = Environment::Variables(vec![
+                (
+                    "AWS_CONFIG_FILE".to_owned(),
+                    dir.absent("aws-config").display().to_string(),
+                ),
+                (
+                    "AWS_SHARED_CREDENTIALS_FILE".to_owned(),
+                    dir.absent("aws-credentials").display().to_string(),
+                ),
+            ]);
+            let config = config(S3_SECTIONS);
+            let d = EndpointOverrides::default;
+            assert!(push_in(Some(&config), "push", d(), &no_keys).is_err());
+            assert_eq!(
+                check_push(Some(&config), "push", d()).unwrap(),
+                PushKind::Bucket
+            );
+            assert_eq!(
+                check_push(None, "s3://bkt/x", d()).unwrap(),
+                PushKind::Bucket
+            );
+            for o in [
+                EndpointOverrides {
+                    push_user: Some("u".into()),
+                    ..d()
+                },
+                EndpointOverrides {
+                    remote_command: Some("x".into()),
+                    ..d()
+                },
+                EndpointOverrides {
+                    s3_addressing: Some("other".into()),
+                    ..d()
+                },
+                EndpointOverrides {
+                    tls_client_cert_path: Some(dir.absent("cert.pem")),
+                    ..d()
+                },
+            ] {
+                let checked = check_push(Some(&config), "push", o.clone());
+                let resolved = push_in(Some(&config), "push", o, &env(&dir, &[]));
+                assert_eq!(push_refused(checked), push_refused(resolved));
+            }
+            // The resolution parses the address before it reads a file.
+            for address in ["s3://Bad_Bucket/x", "s3://bkt/a//b"] {
+                let checked = push_refused(check_push(None, address, d()));
+                let resolved = push_refused(push_in(None, address, d(), &no_keys));
+                assert!(checked.starts_with("S3 address: "), "{checked}");
+                assert_eq!(checked, resolved);
             }
         }
 

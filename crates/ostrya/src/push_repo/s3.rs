@@ -165,7 +165,7 @@ pub(super) async fn read_state(bucket: &BucketRepo, refs: &[&Ref]) -> Result<Buc
 
 /// Refuses the options that a push to a bucket repository cannot carry:
 /// tags, a compression, and a delete refspec `:DST`, `:@ID:NAME` included.
-fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
+pub(super) fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
     if !opts.tags.is_empty() {
         return Err(invalid(
             "a push to an s3:// address creates no tag, and the push names tags",

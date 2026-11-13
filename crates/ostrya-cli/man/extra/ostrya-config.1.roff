@@ -418,6 +418,9 @@ The order of the patterns has no effect.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id matches the local ref \fB\%NAME\fR.
 .IP
 If no ref matches, also after the filter of \fB\%\-\-collection\fR, \fB\%ostrya push\fR writes a message to standard error, writes nothing to standard output, and exits 0.
+Before it exits, it checks the options, the keys of the remote, and the environment as a push of a refspec checks them, up to the first file read.
+A refused value fails at exit 1 with the error of a push of a refspec.
+The push then does not read the token file, the TLS files, or the shared AWS files, and does not connect.
 A malformed pattern stops the push before it connects.
 \fB\%ostrya push\fR refuses \fB\%\-\-tag\fR with no refspec when it reads the key, before it lists the refs and before it connects.
 A refspec on the command line has precedence over the key, and the push then does not read it.

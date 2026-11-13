@@ -5739,8 +5739,10 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   exit 1 before the ssh client starts. With no match, also when the filter
   of `--collection` keeps no ref, it writes `no ref matches
   [remote "NAME"] push-branches` to standard error and nothing to standard
-  output, exits 0, and starts no ssh client. A malformed value fails at
-  exit 1 before the push connects. With the key in use, the command
+  output, exits 0, and starts no ssh client. Before that line, it makes
+  each refusal of the next item and of `--depth` that reads no file, with
+  the error and the exit status of a push of a refspec. A malformed value
+  fails at exit 1 before the push connects. With the key in use, the command
   refuses `--tag` with `error: --tag needs a refspec, and [remote "NAME"]
   push-branches gives none` at exit 1, with no usage text. The refusal
   comes after the checks of `--collection` and of the S3 options, before
@@ -5752,7 +5754,17 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   transport and a bad HTTP option. It reads the token file of an HTTP push,
   and the TLS files of an `https://` push. So
   `push --push-user=bob https://HOST/ nosuchref` fails with the refusal of
-  `--push-user`, and does not name the refspec.
+  `--push-user`, and does not name the refspec. When `push-branches`
+  selects no ref, the push makes the refusals of this step that read no
+  file. These are the refusals of the resolution up to the first file
+  read, the refusal of an empty ssh command or receive command, the
+  refusals of the HTTP client of an HTTP push before its TLS setup, and
+  the refusal of a malformed `s3://` address. The HTTP client refuses a
+  push address that is not one valid mirror URL and a proxy URL that it
+  cannot use, from the key `proxy` or from the proxy variables of the
+  environment. Then it makes the refusal of `--depth`. It reads no token
+  file, no TLS file, no shared AWS file, and no trust store, and exits 0
+  if no value is refused.
 - Each `DST` and each tag names its namespace on the server: a plain
   `NAME` is a local ref of the server, and `@ID:NAME` is a ref of the
   collection `ID`. The server writes the refs of its own collection id
@@ -6206,7 +6218,12 @@ allow-cleartext-credentials`.
   refuses `--compress`, and before it refuses `--tag` with a refspec on the
   command line. It sends no request for either refusal. When
   `push-branches` gives the refs, the push refuses `--tag` before it reads
-  the shared AWS files. The ref lines and the exit status are those of a push over a
+  the shared AWS files. When `push-branches` selects no ref, the push
+  refuses `--compress`, the token options, the ssh options, and a
+  malformed `s3://` address before the exit, and reads no shared AWS file
+  and no key pair. The HTTP client of the bucket refuses a proxy URL after
+  the read of the shared AWS files, so a push with no match does not refuse
+  it. The ref lines and the exit status are those of a push over a
   session. The push uploads the stored `.filez` of an `archive` repository
   as it is, and builds the `.filez` of each other mode at the
   `[archive] zlib-level` of the `config` of the bucket. With

@@ -19,6 +19,30 @@ const MAX_OUTSTANDING: usize = MAX_PARALLEL as usize + 1;
 /// `max_outstanding` to [`MAX_OUTSTANDING`] and `max_redirects` to 0. It sends
 /// no request.
 pub(super) async fn prepare(mut http: FetcherOptions) -> Result<Endpoint> {
+    let url = push_address(&http)?;
+    http.max_outstanding = MAX_OUTSTANDING;
+    http.max_redirects = 0;
+    // The future of the construction is large. The box keeps it out of the
+    // connect futures of the session.
+    let fetcher = Box::pin(Fetcher::new(http)).await.map_err(Error::Fetch)?;
+    Ok(Endpoint { fetcher, url })
+}
+
+/// Makes each refusal of [`prepare`] that reads no file, in its order.
+///
+/// The call makes the checks of [`push_address`], and then the checks of
+/// [`check_options`](ostrya_fetch::check_options). It reads no trust store
+/// and builds no fetcher.
+pub(super) fn check(http: &FetcherOptions) -> Result<()> {
+    push_address(http)?;
+    ostrya_fetch::check_options(http).map_err(Error::Fetch)
+}
+
+/// Returns the push address, the one mirror of `http`.
+///
+/// The call refuses `http` with no mirror or with more than one, and an
+/// address that [`check_base_url`](ostrya_fetch::check_base_url) refuses.
+fn push_address(http: &FetcherOptions) -> Result<String> {
     let url = match http.mirrors.as_slice() {
         [url] => url.clone(),
         mirrors => {
@@ -31,12 +55,7 @@ pub(super) async fn prepare(mut http: FetcherOptions) -> Result<Endpoint> {
     };
     // The message of the fetcher holds no userinfo.
     ostrya_fetch::check_base_url(&url).map_err(|e| Error::InvalidInput(format!("address: {e}")))?;
-    http.max_outstanding = MAX_OUTSTANDING;
-    http.max_redirects = 0;
-    // The future of the construction is large. The box keeps it out of the
-    // connect futures of the session.
-    let fetcher = Box::pin(Fetcher::new(http)).await.map_err(Error::Fetch)?;
-    Ok(Endpoint { fetcher, url })
+    Ok(url)
 }
 
 /// Checks `http` and `opts` for a pull, and builds the fetcher of the pull.

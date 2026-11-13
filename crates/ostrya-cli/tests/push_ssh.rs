@@ -1536,7 +1536,9 @@ mod cli {
     }
 
     /// With no ref that `push-branches` selects, the push writes one line to
-    /// standard error, exits 0, and does not start ssh.
+    /// standard error, exits 0, and does not start ssh. Before it exits, it
+    /// makes each refusal that reads no file, with the error that a push of
+    /// a refspec gives.
     #[test]
     fn push_branches_with_no_match_exits_0() {
         let setup = Setup::new("cli-push-branches-nomatch", "archive");
@@ -1551,6 +1553,71 @@ mod cli {
             "no ref matches [remote \"origin\"] push-branches\n"
         );
         assert!(!setup.ssh_started());
+
+        // Valid options do not change the exit.
+        let out = push_origin(&setup, &["--depth=-1", "--compress=6", "--force"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "no ref matches [remote \"origin\"] push-branches\n"
+        );
+        assert!(!setup.ssh_started());
+
+        let config = setup.client.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[remote \"bucket\"]\nurl=s3://bucket/os\npush-branches=nomatch/**\n");
+        std::fs::write(&config, text).unwrap();
+        let ssh = setup.ssh_command();
+        let receive = receive_command();
+        // The second field is the value of `OSTRYA_SSH_COMMAND`.
+        let cases: [(&[&str], Option<&str>, &str); 6] = [
+            (
+                &[&ssh, &receive, "origin", "--depth=-2"],
+                None,
+                "error: invalid input: depth -2 is below -1\n",
+            ),
+            (
+                &[&ssh, &receive, "origin", "--push-user=u"],
+                None,
+                "error: invalid input: push-user applies to an HTTP address, and '",
+            ),
+            (
+                &["--ssh-command=", &receive, "origin"],
+                None,
+                "error: invalid input: the ssh command of the options is empty\n",
+            ),
+            (
+                &[&receive, "origin"],
+                Some(" "),
+                "error: invalid input: OSTRYA_SSH_COMMAND is empty\n",
+            ),
+            (
+                &[&ssh, "--receive-command=", "origin"],
+                None,
+                "error: invalid input: the receive command is empty\n",
+            ),
+            (
+                &["bucket"],
+                None,
+                "error: invalid input: remote 'bucket' has no push-url, and its url \
+                 's3://bucket/os' is an s3:// address",
+            ),
+        ];
+        for (args, ssh_env, prefix) in cases {
+            let envs: Vec<_> = ssh_env
+                .map(|v| ("OSTRYA_SSH_COMMAND", v))
+                .into_iter()
+                .collect();
+            let out = setup.push(args, &envs);
+            assert_failed(&out, prefix);
+            let refspec = setup.push(&[args, &["main"]].concat(), &envs);
+            assert_failed(&refspec, prefix);
+            assert_eq!(stderr(&out), stderr(&refspec), "{args:?}");
+            assert!(!stderr(&out).contains("no ref matches"), "{args:?}");
+            assert!(!setup.ssh_started(), "{args:?}");
+            assert_eq!(server_tip(&dest, "main"), None, "{args:?}");
+        }
     }
 
     /// Under `--collection=ID`, `push-branches` keeps the selected local

@@ -167,6 +167,77 @@ fn refuse_bucket_fields(opts: &RepoPushOptions) -> Result<()> {
     }
 }
 
+impl RepoPushOptions {
+    /// Makes each refusal of the push that needs no repository and no
+    /// endpoint.
+    ///
+    /// `to_bucket` tells if the push goes to a bucket repository, as
+    /// [`check_push`](crate::endpoint::check_push) gives it. With
+    /// `to_bucket`, the call refuses tags, a compression, and a delete
+    /// refspec, as `Repo::push_to_bucket` does. Else it refuses
+    /// [`break_lock`](RepoPushOptions::break_lock) and a part size, as
+    /// [`Repo::push`] does. Then it makes the checks that [`Repo::push`] and
+    /// `Repo::push_to_bucket` make first in their checks of the options: the
+    /// depth, the collection id, and the tag names.
+    ///
+    /// The call reads no file and resolves no refspec. A caller can check the
+    /// options of a push with it when it does not go on to the push, for
+    /// example when the push selects no ref.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if `to_bucket`
+    ///   is `true` and the options name tags, a compression, or a delete
+    ///   refspec, `:@ID:NAME` included.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if `to_bucket`
+    ///   is `false` and the options set
+    ///   [`break_lock`](RepoPushOptions::break_lock) or a part size.
+    /// - [`Error::Unsupported`] if `to_bucket` is `true` in a build without
+    ///   the `s3` feature.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the depth is
+    ///   below -1, or if the collection id is not valid.
+    /// - [`Error::InvalidRefspec`] with the text of the tag if a tag is not a
+    ///   valid ref name, is a remote ref, or is a local ref of 64 lowercase
+    ///   hex characters.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if a tag is not
+    ///   in the collection of the push, or if a tag is named twice.
+    pub fn check(&self, to_bucket: bool) -> Result<()> {
+        if to_bucket {
+            #[cfg(feature = "s3")]
+            super::s3::refuse_options(self)?;
+            #[cfg(not(feature = "s3"))]
+            return Err(Error::Unsupported(
+                "a push to an s3:// address needs the S3 support of ostrya, and this build has \
+                 none: turn on the feature s3 of ostrya"
+                    .into(),
+            ));
+        } else {
+            refuse_bucket_fields(self)?;
+        }
+        self.checked_tags().map(drop)
+    }
+
+    /// Refuses a depth below -1, a collection id that is not valid, and a
+    /// tag that the push cannot create, and returns the tags after the
+    /// collection of the push applied.
+    fn checked_tags(&self) -> Result<Vec<Ref>> {
+        if let Some(depth) = self.depth
+            && depth < -1
+        {
+            return Err(invalid(format!("depth {depth} is below -1")));
+        }
+        let collection = self.collection.as_deref();
+        if let Some(reason) = collection.and_then(collection_id_refusal) {
+            return Err(invalid(reason));
+        }
+        check_tag_names(&self.tags, collection)
+    }
+}
+
 /// A commit of a chain, as the local repository holds it.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum Local {
@@ -702,16 +773,8 @@ impl Repo {
     /// Runs the refusals and the commit walk of a push, under the repository
     /// lock held shared.
     pub(super) async fn plan_push(&self, opts: &RepoPushOptions) -> Result<Plan> {
-        if let Some(depth) = opts.depth
-            && depth < -1
-        {
-            return Err(invalid(format!("depth {depth} is below -1")));
-        }
+        let tags = opts.checked_tags()?;
         let collection = opts.collection.as_deref();
-        if let Some(reason) = collection.and_then(collection_id_refusal) {
-            return Err(invalid(reason));
-        }
-        let tags = check_tag_names(&opts.tags, collection)?;
         let lock = self.lock_repo(LockKind::Shared).await?;
         let targets = self.push_targets(&opts.refspecs, collection).await?;
 
@@ -1635,5 +1698,69 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// `check` refuses the fields of the other kind of push, and then the
+    /// depth, the collection id, and the tag names.
+    #[test]
+    fn check_refuses_the_options_that_need_no_repository() {
+        let d = RepoPushOptions::default;
+        let message = |result: Result<()>| match result {
+            Err(Error::Remote(crate::remote::Error::InvalidInput(message))) => message,
+            other => panic!("expected InvalidInput, got {other:?}"),
+        };
+        let valid = RepoPushOptions {
+            depth: Some(-1),
+            collection: Some("org.example.A".into()),
+            tags: vec![Ref::local("v1")],
+            force: true,
+            ..d()
+        };
+        valid.check(false).unwrap();
+        let deep = RepoPushOptions {
+            depth: Some(-2),
+            ..d()
+        };
+        assert_eq!(message(deep.check(false)), "depth -2 is below -1");
+        let bad_id = RepoPushOptions {
+            collection: Some("a".into()),
+            ..d()
+        };
+        assert!(bad_id.check(false).is_err());
+        let checksum_tag = RepoPushOptions {
+            tags: vec![Ref::local("a".repeat(64))],
+            ..d()
+        };
+        assert!(matches!(
+            checksum_tag.check(false),
+            Err(Error::InvalidRefspec(_))
+        ));
+        // The fields of the other kind come first.
+        let both = RepoPushOptions {
+            break_lock: true,
+            ..deep.clone()
+        };
+        assert_eq!(
+            message(both.check(false)),
+            "break_lock applies to a push to an s3:// address"
+        );
+        #[cfg(feature = "s3")]
+        {
+            let compressed = RepoPushOptions {
+                compression: Compression::Deflate { level: 6 },
+                ..deep.clone()
+            };
+            assert!(message(compressed.check(true)).contains("names a compression"));
+            assert!(message(valid.check(true)).contains("creates no tag"));
+            assert_eq!(message(deep.check(true)), "depth -2 is below -1");
+            RepoPushOptions {
+                break_lock: true,
+                ..d()
+            }
+            .check(true)
+            .unwrap();
+        }
+        #[cfg(not(feature = "s3"))]
+        assert!(matches!(d().check(true), Err(Error::Unsupported(_))));
     }
 }

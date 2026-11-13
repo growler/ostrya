@@ -652,8 +652,13 @@ enum Command {
     /// remote ref is never sent. With --collection=ID, the command keeps only
     /// the selected local refs and the selected refs of `refs/mirrors/ID/`,
     /// and drops each other selected ref with no message. If no ref matches,
-    /// the command writes a message to standard error and exits 0. The
-    /// command refuses --tag before it lists the refs.
+    /// the command checks the options, the keys of the remote, and the
+    /// environment as a push of a refspec checks them, up to the first file
+    /// read, then writes a message to standard error and exits 0. A refused
+    /// value fails at exit 1 with the error of a push of a refspec. The
+    /// command does not read the token file, the TLS files, or the shared
+    /// AWS files, and does not connect. The command refuses --tag before it
+    /// lists the refs.
     /// Without the key, with an address, or with --onto, a refspec is
     /// required. ostrya-config(1) states the key.
     ///
@@ -6289,9 +6294,11 @@ async fn send_one_way(repo: Repo, args: SendArgs) -> Result<()> {
 /// standard error. A failure writes nothing to standard output.
 ///
 /// The S3 options and `--break-lock` are refused for a destination that is
-/// not `s3://`, before the remote resolves. A push to a bucket repository
-/// goes through `Repo::push_to_bucket`, and a writer lock that `--break-lock`
-/// removed gives one warning line on standard error.
+/// not `s3://`, before the remote resolves. If `push-branches` selects no
+/// ref, the command makes the refusals of `check_push` and of
+/// `RepoPushOptions::check`, which read no file, and then exits 0. A push to
+/// a bucket repository goes through `Repo::push_to_bucket`, and a writer lock
+/// that `--break-lock` removed gives one warning line on standard error.
 ///
 /// On a terminal, standard error shows the progress bar of [`PushBar`] while
 /// the push runs.
@@ -6351,6 +6358,11 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         }
         args.refspecs = push_branch_refspecs(&repo, &selector, args.collection.as_deref()).await?;
         if args.refspecs.is_empty() {
+            // The push stops here, so it makes the refusals that read no
+            // file before it exits 0.
+            let overrides = push_overrides(&mut args);
+            let kind = ostrya::endpoint::check_push(Some(repo.config()), remote, overrides)?;
+            push_options(args, None)?.check(kind == ostrya::endpoint::PushKind::Bucket)?;
             eprintln!("no ref matches [remote \"{remote}\"] push-branches");
             return Ok(());
         }
@@ -6361,20 +6373,7 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
-    let tags = parse_refs(&args.tags)?;
-    let opts = ostrya::RepoPushOptions {
-        refspecs: args.refspecs,
-        depth: args.depth,
-        collection: args.collection,
-        tags,
-        disable_verify_bindings: args.disable_verify_bindings,
-        compression: push_compression(args.compress),
-        force: args.force,
-        progress,
-        #[cfg(feature = "s3")]
-        break_lock: args.break_lock,
-        ..Default::default()
-    };
+    let opts = push_options(args, progress)?;
     let outcome = match endpoint {
         #[cfg(feature = "s3")]
         ostrya::remote::Endpoint::S3(s3) => {
@@ -6411,6 +6410,31 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         eprintln!("{}", push_statistics_line(&outcome.stats));
     }
     Ok(())
+}
+
+/// Returns the options of a push of the refspecs of `args`, with `progress`.
+///
+/// # Errors
+///
+/// The errors of [`parse_refs`] for the tags.
+#[cfg(feature = "push")]
+fn push_options(
+    args: PushArgs,
+    progress: Option<ostrya::remote::PushProgress>,
+) -> Result<ostrya::RepoPushOptions> {
+    Ok(ostrya::RepoPushOptions {
+        refspecs: args.refspecs,
+        depth: args.depth,
+        collection: args.collection,
+        tags: parse_refs(&args.tags)?,
+        disable_verify_bindings: args.disable_verify_bindings,
+        compression: push_compression(args.compress),
+        force: args.force,
+        progress,
+        #[cfg(feature = "s3")]
+        break_lock: args.break_lock,
+        ..Default::default()
+    })
 }
 
 /// Reads each branch or tag of a push as a ref: `NAME`, `REMOTE:NAME`, or

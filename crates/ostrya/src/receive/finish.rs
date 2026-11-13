@@ -1554,8 +1554,8 @@ pub(super) fn check_ref_paths(
             }
             RefFileState::NotARef(_) => {
                 return Err(ref_denied(format!(
-                    "ref '{name}' names a directory or a path below a ref file, \
-                     which a ref write cannot replace"
+                    "ref '{name}' names a directory or a path below a ref file \
+                     or an alias, which a ref write cannot replace"
                 )));
             }
         });

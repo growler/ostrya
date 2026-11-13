@@ -22,7 +22,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, Ref, RefPattern, RefSelector, RepoMode};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
 use crate::access::{AccessRules, Namespace, ReadAccess};
@@ -83,7 +83,8 @@ pub(crate) enum RefFileState {
     /// A symlink: an alias of another ref.
     Alias,
     /// Something a ref write cannot replace, and the reason: the path names
-    /// a directory, passes through a file, or names a special file.
+    /// a directory, passes through a file or an alias, or names a special
+    /// file.
     NotARef(&'static str),
 }
 
@@ -138,35 +139,29 @@ impl Transaction {
     ///   through a file, or names a special file. A removal whose path passes
     ///   through a file passes the check when an earlier removal of the same
     ///   transaction removes a path above it at any level, for example `a`
-    ///   for `a/b/c`. The unlink of `a` leaves `a/b/c` absent, if no write
-    ///   below an alias writes `a` again. A removal of `a/b`, then a removal
-    ///   of `a`, fails. An entry of
+    ///   for `a/b/c`. The unlink of `a` leaves `a/b/c` absent. A removal of
+    ///   `a/b`, then a removal of `a`, fails. An entry of
     ///   [`set_ref_expecting`](Transaction::set_ref_expecting) does not take
     ///   this exception.
     /// - The path of a queued write or removal names an alias. To remove an
     ///   alias, use [`Repo::remove_ref_alias_immediate`] or
     ///   [`UpdateGuard::remove_ref_alias`](crate::UpdateGuard::remove_ref_alias).
+    /// - The path of a queued write or removal passes through an alias: a
+    ///   symlink at a component above the ref, from the repository root
+    ///   down, also a dangling one. The reason is `passes through an alias`.
     /// - The path of one queued ref names a directory of the path of another
     ///   queued ref, and one of the two is a write. Examples are a write of
     ///   `a` and a write of `a/b`, or a removal of `a` and a write of `a/b`.
     ///
-    /// The check reads the ref store as it is before the first write. It does
-    /// not look through an alias in a parent directory of a queued path. So a
-    /// write below such an alias can fail after the commit writes earlier
-    /// refs, and these refs stay. Two examples:
+    /// The check opens the directory of each queued path with `openat2`,
+    /// `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. The open has no
+    /// fallback. On a kernel without `openat2`, the commit fails with
+    /// [`Error::Io`].
     ///
-    /// - A write of `old/x`, where `old` is an alias that points to no ref.
-    /// - A write of `x`, then a write of `al/y`, where `al` is an alias of
-    ///   `x`.
-    ///
-    /// A write below such an alias can also write a ref at a path that the
-    /// check read for another entry. A later entry can then fail after the
-    /// commit writes earlier refs.
-    ///
-    /// For the same reason, a removal of `x`, then a removal of `al/b`, where
-    /// `al` is an alias of the ref file `x`, fails the commit. The check
-    /// refuses `al/b` before the first write, because its path passes
-    /// through a file.
+    /// The check reads the ref store as it is before the first write. The
+    /// writes resolve each path by name, so the check is the guard. A writer
+    /// that does not take the update lock can put a symlink above a queued
+    /// path after the check, and a write can then go through that symlink.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
@@ -191,10 +186,13 @@ impl Transaction {
     /// - `expected`: the state of the ref before the write. `None` expects
     ///   that no file stands at the path of the ref. `Some(c)` expects a ref
     ///   file that names `c`. If the path of the ref names a directory or
-    ///   passes through a file, the commit fails with
+    ///   passes through a file or an alias, the commit fails with
     ///   [`Error::RefNotWritable`], also for `None`.
-    ///   [`Repo::resolve_ref_tip`] gives `None` for such a path, so a caller
-    ///   that gives back that `None` as `expected` gets this error.
+    ///   [`Repo::resolve_ref_tip`] gives `None` for a path that names a
+    ///   directory or passes through a file, so a caller that gives back that
+    ///   `None` as `expected` gets this error. [`Repo::resolve_ref_tip`]
+    ///   follows an alias above the path, so an `expected` taken from it for
+    ///   such a path also gets this error.
     /// - `new`: the commit to write. If `new` is `None`, the commit removes
     ///   the ref.
     ///
@@ -210,7 +208,8 @@ impl Transaction {
     ///
     /// - The ref does not have the state `expected`:
     ///   [`Error::RefMismatch`].
-    /// - The path of the ref names an alias: [`Error::RefNotWritable`].
+    /// - The path of the ref names an alias, or passes through an alias:
+    ///   [`Error::RefNotWritable`].
     /// - The ref file does not parse: [`Error::InvalidFormat`] or
     ///   [`Error::Core`].
     pub fn set_ref_expecting(&self, r: &Ref, expected: Option<&Checksum>, new: Option<&Checksum>) {
@@ -247,13 +246,15 @@ impl Transaction {
 /// blocking pool.
 ///
 /// The caller holds the update lock and calls this before the first write.
-/// The check reads the path of an entry with no expectation with `lstat`
-/// alone, and does not read the content of a ref file. It reads the path of
-/// a conditional entry with `lstat` and an `O_NOFOLLOW` open, and parses the
-/// ref file. It gives the first failure:
+/// The check opens the directory of each path with [`open_ref_parent`], so
+/// it follows no symlink above the ref. It reads the path of an entry with
+/// no expectation with `lstat` alone, and does not read the content of a ref
+/// file. It reads the path of a conditional entry with `lstat` and an
+/// `O_NOFOLLOW` open, and parses the ref file. It gives the first failure:
 ///
 /// 1. In queue order, a write or a removal whose path names a directory,
-///    passes through a file, names a special file, or names an alias:
+///    passes through a file or an alias, names a special file, or names an
+///    alias:
 ///    [`Error::RefNotWritable`]. For a conditional entry, a state other than
 ///    the expected state gives [`Error::RefMismatch`], and a ref file that
 ///    does not parse gives the error of the parse. A removal with no
@@ -644,9 +645,10 @@ impl Repo {
     /// `refs/`, and the commit of the refspec `tip`, in one pass on the
     /// blocking pool. The result holds one state for each path, in order.
     ///
-    /// The call reads each ref path with `lstat` first. It then opens a
-    /// regular file with `O_NOFOLLOW` and parses it. A ref that does not parse
-    /// fails the call.
+    /// The call opens the directory of each ref path with
+    /// [`open_ref_parent`], and reads the last component with `lstat` first.
+    /// It then opens a regular file with `O_NOFOLLOW` and parses it. A ref
+    /// that does not parse fails the call.
     ///
     /// If `tip` is given, the call reads it at the path where
     /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. A path that names
@@ -1293,6 +1295,15 @@ impl Repo {
     /// `refs/mirrors/` has a name that fails the rule, a ref under it cannot
     /// be written or removed through this call. Remove such a ref by hand.
     ///
+    /// A read also follows a symlink above the ref. A write or a removal
+    /// refuses a symlink above the ref, from the repository root down. Under
+    /// the update lock, before the write, the call opens the directory of the
+    /// ref with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. The
+    /// open has no fallback. On a kernel without `openat2`, the call fails
+    /// with [`Error::Io`]. The write itself resolves the path by name. A
+    /// writer that does not take the update lock can put a symlink above the
+    /// ref after the check, and the write can then go through that symlink.
+    ///
     /// The call creates the missing parent directories of a name with `/` in
     /// it. It requests mode `0777` for them, which the umask reduces. In a
     /// `bare-user-shared` repository, each directory that the call creates
@@ -1338,7 +1349,10 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   error holds the text of the ref, and the call writes nothing.
     /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
-    ///   call writes nothing, and the alias stays.
+    ///   call writes nothing, and the alias stays. The call gives the same
+    ///   error, with the reason `passes through an alias`, if a component
+    ///   above the ref is a symlink, also a dangling one. It then writes
+    ///   nothing through the symlink.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
@@ -1382,8 +1396,9 @@ impl Repo {
     ///   error holds the text of the first ref that fails, and the call
     ///   removes nothing.
     /// - [`Error::RefNotWritable`] if the path of a ref names an alias, names
-    ///   a directory, passes through a file, or names a special file. The
-    ///   error names the first such ref, and the call removes nothing.
+    ///   a directory, passes through a file or an alias, or names a special
+    ///   file. The error names the first such ref, and the call removes
+    ///   nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
@@ -1452,6 +1467,9 @@ impl Repo {
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
     ///   refspec.
+    /// - [`Error::RefNotWritable`] if a component above the path of
+    ///   `refspec` is a symlink, also a dangling one. The reason is `passes
+    ///   through an alias`, and the call writes nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
@@ -1463,8 +1481,9 @@ impl Repo {
         let repo_mode = self.mode();
         let relpath = refspec_to_relpath(refspec)?;
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
+        let name = refspec.to_owned();
         self.write_locked(move |repo| {
-            write_alias_blocking(repo.repo_fd(), &relpath, &link, fsync, repo_mode)
+            write_alias_blocking(repo.repo_fd(), &name, &relpath, &link, fsync, repo_mode)
         })
         .await
     }
@@ -1481,8 +1500,8 @@ impl Repo {
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
     /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
-    ///   names a directory, passes through a file, or names a special file.
-    ///   The call removes nothing.
+    ///   names a directory, passes through a file or an alias, or names a
+    ///   special file. The call removes nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
@@ -2755,6 +2774,10 @@ fn is_not_a_ref_path(e: &std::io::Error) -> bool {
 /// file.
 const PASSES_THROUGH_A_FILE: &str = "passes through a file";
 
+/// The reason of [`RefFileState::NotARef`] for a path that passes through a
+/// symlink: an alias above the ref, dangling or not.
+const PASSES_THROUGH_AN_ALIAS: &str = "passes through an alias";
+
 /// The reason of [`RefFileState::NotARef`] for a path that names a
 /// directory.
 const NAMES_A_DIRECTORY: &str = "names a directory";
@@ -2767,17 +2790,74 @@ const NAMES_A_SPECIAL_FILE: &str = "names a special file";
 /// whose path names an alias.
 const NAMES_AN_ALIAS: &str = "names an alias";
 
+/// Opens the directory that holds the ref path `relpath`, relative to the
+/// repository root `dir`, for the reads of the last component.
+///
+/// The open is an `openat2` of a path descriptor with `RESOLVE_BENEATH` and
+/// `RESOLVE_NO_SYMLINKS`. So it follows no symlink at any component above the
+/// ref, from the repository root down, and `refs`, `refs/heads`, and
+/// `refs/remotes/R` are components too. The open has no fallback. On a kernel
+/// without `openat2`, the call fails.
+///
+/// `Err` holds the state of a path that the open cannot reach:
+///
+/// - A symlink above the ref (`ELOOP`), dangling or not, is
+///   [`RefFileState::NotARef`] with the reason [`PASSES_THROUGH_AN_ALIAS`].
+///   The walk stops at the first component that is not a directory, so a
+///   symlink there gives `ELOOP` before a file below it can give `ENOTDIR`.
+/// - A file or a special file above the ref (`ENOTDIR`) is
+///   [`RefFileState::NotARef`] with the reason [`PASSES_THROUGH_A_FILE`].
+/// - A missing directory above the ref (`ENOENT`) is
+///   [`RefFileState::Absent`].
+///
+/// Each other error of the open fails the call.
+fn open_ref_parent(
+    dir: BorrowedFd<'_>,
+    relpath: &str,
+) -> Result<std::result::Result<OwnedFd, RefFileState>> {
+    match rustix::fs::openat2(
+        dir,
+        ref_parent(relpath),
+        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+    ) {
+        Ok(fd) => Ok(Ok(fd)),
+        Err(Errno::LOOP) => Ok(Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS))),
+        Err(Errno::NOTDIR) => Ok(Err(RefFileState::NotARef(PASSES_THROUGH_A_FILE))),
+        Err(Errno::NOENT) => Ok(Err(RefFileState::Absent)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Returns the last component of the ref path `relpath`: the name of the ref
+/// file in the directory that [`open_ref_parent`] opens.
+fn ref_file_name(relpath: &str) -> &str {
+    relpath.rsplit_once('/').map_or(relpath, |(_, name)| name)
+}
+
 /// Returns the state of the ref path `relpath`, read with `lstat` alone.
 ///
+/// The call opens the directory of the ref with [`open_ref_parent`], and
+/// reads the last component relative to it. A path that the open cannot
+/// reach has the state that [`open_ref_parent`] gives.
+///
 /// `None` is a regular file, whose content the caller reads. The call never
-/// returns [`RefFileState::Commit`]. A path that passes through a file
-/// (`ENOTDIR`) is [`RefFileState::NotARef`]. Each other error of `lstat`, for
-/// example `EACCES`, fails the call.
+/// returns [`RefFileState::Commit`]. Each other error of `lstat`, for example
+/// `EACCES`, fails the call.
 fn lstat_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<Option<RefFileState>> {
-    let stat = match rustix::fs::statat(dir, relpath, AtFlags::SYMLINK_NOFOLLOW) {
+    match open_ref_parent(dir, relpath)? {
+        Ok(parent) => lstat_ref_entry(parent.as_fd(), ref_file_name(relpath)),
+        Err(state) => Ok(Some(state)),
+    }
+}
+
+/// Returns the state of the entry `name` of the open ref directory `parent`,
+/// read with `lstat` alone, as [`lstat_ref_state`] gives it.
+fn lstat_ref_entry(parent: BorrowedFd<'_>, name: &str) -> Result<Option<RefFileState>> {
+    let stat = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
         Ok(stat) => stat,
         Err(Errno::NOENT) => return Ok(Some(RefFileState::Absent)),
-        Err(Errno::NOTDIR) => return Ok(Some(RefFileState::NotARef(PASSES_THROUGH_A_FILE))),
         Err(e) => return Err(e.into()),
     };
     Ok(match FileType::from_raw_mode(stat.st_mode) {
@@ -2789,26 +2869,32 @@ fn lstat_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<Option<RefFileS
 }
 
 /// Returns the state of the ref path `relpath`, read with `lstat` and then an
-/// `O_NOFOLLOW` open of a regular file. A path that passes through a file
-/// (`ENOTDIR`) is [`RefFileState::NotARef`].
+/// `O_NOFOLLOW` open of a regular file. The call opens the directory of the
+/// ref one time, with [`open_ref_parent`], and reads the last component
+/// relative to it.
 fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
-    if let Some(state) = lstat_ref_state(dir, relpath)? {
+    let parent = match open_ref_parent(dir, relpath)? {
+        Ok(parent) => parent,
+        Err(state) => return Ok(state),
+    };
+    let name = ref_file_name(relpath);
+    if let Some(state) = lstat_ref_entry(parent.as_fd(), name)? {
         return Ok(state);
     }
-    open_ref_state(dir, relpath)
+    open_ref_entry(parent.as_fd(), name)
 }
 
-/// Returns the state of the ref path `relpath`, read with an `O_NOFOLLOW`
-/// open alone. [`ref_file_state`] calls it after `lstat` found a regular
-/// file.
+/// Returns the state of the entry `name` of the open ref directory `parent`,
+/// read with an `O_NOFOLLOW` open alone. [`ref_file_state`] calls it after
+/// `lstat` found a regular file.
 ///
 /// The open does not wait for a writer. A directory, a FIFO, a socket, or a
 /// device file at the open gives the [`RefFileState::NotARef`] that
-/// [`lstat_ref_state`] gives for it.
-fn open_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
+/// [`lstat_ref_entry`] gives for it.
+fn open_ref_entry(parent: BorrowedFd<'_>, name: &str) -> Result<RefFileState> {
     let fd = match rustix::fs::openat(
-        dir,
-        relpath,
+        parent,
+        name,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
         Mode::empty(),
     ) {
@@ -3038,8 +3124,8 @@ fn write_ref_blocking(
 /// call adds a created parent when it creates it, so a write that fails after
 /// that step still adds it.
 ///
-/// If `relpath` names an alias, the call fails with
-/// [`Error::RefNotWritable`] for the ref `name`, and changes nothing.
+/// If `relpath` names an alias, or passes through an alias, the call fails
+/// with [`Error::RefNotWritable`] for the ref `name`, and changes nothing.
 pub(crate) fn put_ref_blocking(
     repo_fd: BorrowedFd<'_>,
     name: &str,
@@ -3049,10 +3135,15 @@ pub(crate) fn put_ref_blocking(
     repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    if lstat_ref_state(repo_fd, relpath)? == Some(RefFileState::Alias) {
+    let reason = match lstat_ref_state(repo_fd, relpath)? {
+        Some(RefFileState::Alias) => Some(NAMES_AN_ALIAS),
+        Some(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) => Some(PASSES_THROUGH_AN_ALIAS),
+        _ => None,
+    };
+    if let Some(reason) = reason {
         return Err(Error::RefNotWritable {
             name: name.to_owned(),
-            reason: NAMES_AN_ALIAS.to_owned(),
+            reason: reason.to_owned(),
         });
     }
     match checksum {
@@ -3235,13 +3326,14 @@ pub(crate) mod test_syncs {
 /// failure.
 fn write_alias_blocking(
     repo_fd: BorrowedFd<'_>,
+    name: &str,
     relpath: &str,
     link: &str,
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = put_alias_blocking(repo_fd, relpath, link, fsync, repo_mode, &mut dirs);
+    let written = put_alias_blocking(repo_fd, name, relpath, link, fsync, repo_mode, &mut dirs);
     written.and(sync_ref_dirs(repo_fd, dirs))
 }
 
@@ -3249,14 +3341,25 @@ fn write_alias_blocking(
 /// to the caller. Under `fsync`, the call adds to `dirs` the directory that
 /// holds the link, and the directory that holds each parent that this write
 /// created. It adds each parent when it creates it.
+///
+/// If `relpath` passes through an alias, the call fails with
+/// [`Error::RefNotWritable`] for the alias `name`, and changes nothing.
 pub(crate) fn put_alias_blocking(
     repo_fd: BorrowedFd<'_>,
+    name: &str,
     relpath: &str,
     link: &str,
     fsync: bool,
     repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
+    if let Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) = open_ref_parent(repo_fd, relpath)?
+    {
+        return Err(Error::RefNotWritable {
+            name: name.to_owned(),
+            reason: PASSES_THROUGH_AN_ALIAS.to_owned(),
+        });
+    }
     let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
     create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
     TempEntry::create_symlink(tmp_fd.as_fd(), REF_TEMP_PREFIX, link)?
@@ -3271,8 +3374,8 @@ pub(crate) fn put_alias_blocking(
 /// Under `fsync`, the call adds the directory that held the link to `dirs`.
 ///
 /// An absent path is success. A ref file, a directory, a special file, or a
-/// path that passes through a file fails with [`Error::RefNotWritable`] for
-/// the ref `name`.
+/// path that passes through a file or an alias fails with
+/// [`Error::RefNotWritable`] for the ref `name`.
 pub(crate) fn remove_alias_blocking(
     repo_fd: BorrowedFd<'_>,
     name: &str,
@@ -3292,6 +3395,33 @@ pub(crate) fn remove_alias_blocking(
     })
 }
 
+/// Checks that no ref to delete passes through an alias, relative to
+/// `repo_fd`, and removes nothing.
+///
+/// The call maps each key to its path with `relpath`, as
+/// [`delete_matching_refs_blocking`] does. It opens the directory of each
+/// path one time with [`open_ref_parent`], and closes it before the next
+/// open. If a path passes through an alias, the call fails with
+/// [`Error::RefNotWritable`] for that key, reason `passes through an alias`.
+/// The other states of [`open_ref_parent`] pass the check.
+pub(crate) fn check_refs_to_delete_blocking<K: std::fmt::Display>(
+    repo_fd: BorrowedFd<'_>,
+    refs: &[(K, Checksum)],
+    relpath: impl Fn(&K) -> Result<String>,
+) -> Result<()> {
+    for (key, _) in refs {
+        if let Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) =
+            open_ref_parent(repo_fd, &relpath(key)?)?
+        {
+            return Err(Error::RefNotWritable {
+                name: key.to_string(),
+                reason: PASSES_THROUGH_AN_ALIAS.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Removes each ref that still names the checksum that the caller recorded
 /// for it, relative to `repo_fd`, in one blocking pass.
 ///
@@ -3300,6 +3430,11 @@ pub(crate) fn remove_alias_blocking(
 /// for a refspec or [`ref_relpath`] for a [`Ref`]. So
 /// the read and the unlink address the same file as the rest of the library.
 /// One pass can hold keys of more than one space under `refs/`.
+///
+/// Before the first unlink, the call runs [`check_refs_to_delete_blocking`]
+/// on the whole batch. If a path passes through an alias, the call fails
+/// with its error and removes no ref. So no unlink goes through a symlink
+/// above a ref. The unlinks themselves resolve each path by name.
 ///
 /// Each read comes immediately before its own unlink. The call leaves a ref
 /// that now names a different commit where it is. This covers a repository
@@ -3325,12 +3460,13 @@ pub(crate) fn remove_alias_blocking(
 /// holds costs no allocation.
 ///
 /// Returns the keys that it removed, in the order that it got them.
-pub(crate) fn delete_matching_refs_blocking<K>(
+pub(crate) fn delete_matching_refs_blocking<K: std::fmt::Display>(
     repo_fd: BorrowedFd<'_>,
     refs: Vec<(K, Checksum)>,
     relpath: impl Fn(&K) -> Result<String>,
     fsync: bool,
 ) -> Result<Vec<K>> {
+    check_refs_to_delete_blocking(repo_fd, &refs, &relpath)?;
     let mut removed = Vec::with_capacity(refs.len());
     let mut parents: Vec<String> = Vec::new();
     let mut held: HashSet<String> = HashSet::new();
@@ -3971,10 +4107,87 @@ mod tests {
         ] {
             let relpath = format!("refs/heads/{name}");
             let (checked, opened) = read_without_wait(&root.dir, &fifo, name, move |dir| {
-                (ref_file_state(dir, &relpath), open_ref_state(dir, &relpath))
+                let parent = open_ref_parent(dir, &relpath).unwrap().unwrap();
+                (
+                    ref_file_state(dir, &relpath),
+                    open_ref_entry(parent.as_fd(), name),
+                )
             });
             assert_eq!(checked.unwrap(), RefFileState::NotARef(reason), "{name}");
             assert_eq!(opened.unwrap(), RefFileState::NotARef(reason), "{name}");
+        }
+    }
+
+    /// A symlink above a ref path, dangling or not, gives the state "passes
+    /// through an alias", also at `refs` and at `refs/heads`. A ref file or a
+    /// FIFO above the path gives "passes through a file", and the read does
+    /// not wait on the FIFO. A symlink at the last component is an alias.
+    #[test]
+    fn the_ref_state_of_a_path_below_an_alias_is_no_ref() {
+        use std::os::unix::fs::symlink;
+
+        let root = Root::new("below-alias");
+        let heads = root.dir.join("refs/heads");
+        let content = format!("{}\n", Checksum::from_bytes([1; 32]).to_hex());
+        std::fs::create_dir(heads.join("d0")).unwrap();
+        std::fs::write(heads.join("d0/x"), &content).unwrap();
+        std::fs::write(heads.join("file"), &content).unwrap();
+        symlink("nosuch", heads.join("dangling")).unwrap();
+        symlink("d0", heads.join("to-dir")).unwrap();
+        symlink("file", heads.join("to-file")).unwrap();
+        let fifo = heads.join("fifo");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+        let alias = RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS);
+        let file = RefFileState::NotARef(PASSES_THROUGH_A_FILE);
+        for (relpath, state) in [
+            ("refs/heads/dangling/x", alias),
+            ("refs/heads/to-dir/x", alias),
+            ("refs/heads/to-dir/deeper/x", alias),
+            ("refs/heads/to-file/x", alias),
+            ("refs/heads/file/x", file),
+            ("refs/heads/fifo/x", file),
+            ("refs/heads/dangling", RefFileState::Alias),
+            ("refs/heads/to-dir", RefFileState::Alias),
+            ("refs/heads/nosuch/x", RefFileState::Absent),
+        ] {
+            let (lstat, checked) = read_without_wait(&root.dir, &fifo, relpath, move |dir| {
+                (lstat_ref_state(dir, relpath), ref_file_state(dir, relpath))
+            });
+            assert_eq!(lstat.unwrap(), Some(state), "{relpath}");
+            assert_eq!(checked.unwrap(), state, "{relpath}");
+        }
+
+        for top in ["refs/heads", "refs"] {
+            let root = Root::new("below-alias-top");
+            let real = root.dir.join("real");
+            std::fs::rename(root.dir.join(top), &real).unwrap();
+            let link = if top == "refs" { "real" } else { "../real" };
+            symlink(link, root.dir.join(top)).unwrap();
+            let main = if top == "refs" {
+                "real/heads/main"
+            } else {
+                "real/main"
+            };
+            std::fs::write(root.dir.join(main), &content).unwrap();
+            for relpath in ["refs/heads/main", "refs/heads/sub/x"] {
+                assert_eq!(
+                    lstat_ref_state(root.fd(), relpath).unwrap(),
+                    Some(alias),
+                    "{top}: {relpath}"
+                );
+                assert_eq!(
+                    ref_file_state(root.fd(), relpath).unwrap(),
+                    alias,
+                    "{top}: {relpath}"
+                );
+            }
         }
     }
 
@@ -4277,6 +4490,7 @@ mod tests {
         let relpath = "refs/heads/other/deep/alias";
         put_alias_blocking(
             root.fd(),
+            "other/deep/alias",
             relpath,
             &link,
             true,

@@ -3222,6 +3222,15 @@ The rules of the classification:
   path of each key. One blocking hop and one set of `fsync` calls cover the
   refs under `refs/heads`, `refs/remotes`, and `refs/mirrors`, with one
   compare-and-delete guard.
+- Before the first unlink, the helper opens the directory of each ref to
+  delete one time with `openat2`, `RESOLVE_BENEATH`, and
+  `RESOLVE_NO_SYMLINKS`. A ref whose path passes through an alias, for
+  example below a symlink `refs/heads`, fails the prune with
+  `Error::RefNotWritable`, reason `passes through an alias`. The ref
+  deletion comes before the commit deletion and the sweep, so the run then
+  deletes no ref and no object. A `no_prune` dry run runs the same check
+  and fails with the same error, and it deletes nothing. The open has no
+  fallback. On a kernel without `openat2`, the prune fails.
 - An emptied `refs/mirrors/ID/` directory stays, as an emptied directory
   under `refs/heads` does.
 - The `ostrya` command builds the filter from the key
@@ -4175,34 +4184,50 @@ the whole queue against the ref store before the first write. The rules:
   checks, the fast-forward walk, the parent of a server commit, and its
   reply need the current commit. It sends each refusal as a wire error
   before it publishes an object. The commit check then reads each queued
-  path again with one `lstat`.
-- The check reads each queued path of `Transaction::set_ref` with `lstat`
-  alone. A queued write or removal fails with `Error::RefNotWritable` if
-  its path names an alias, names a directory, passes through a file, or
-  names a special file: a FIFO, a socket, or a device file.
+  path again with one `openat2` of its directory and one `lstat`.
+- The check reads each queued path of `Transaction::set_ref` with one
+  `openat2` of its directory and one `lstat`. A queued write or removal
+  fails with `Error::RefNotWritable` if its path names an alias, names a
+  directory, passes through a file or an alias, or names a special file: a
+  FIFO, a socket, or a device file.
 - A queued removal whose path passes through a file passes when an earlier
   removal of the same queue removes a path above it at any level, for
-  example `a` for `a/b/c`. The unlink of `a` leaves `a/b/c` absent, if no
-  write below an alias writes `a` again. The earlier removal can be an
-  entry of `set_ref` or of `set_ref_expecting`. The other order, a removal
-  of `a/b` and then of `a`, fails. A conditional removal does not take this
-  exception. A path that names a directory or a special file stays refused.
+  example `a` for `a/b/c`. The unlink of `a` leaves `a/b/c` absent. The
+  earlier removal can be an entry of `set_ref` or of `set_ref_expecting`.
+  The other order, a removal of `a/b` and then of `a`, fails. A conditional
+  removal does not take this exception. A path that names a directory or a
+  special file, or that passes through an alias, stays refused.
 - Two queued entries where the path of one names a directory of the path of
   the other fail with `Error::RefNotWritable`, if one of the two is a write.
   Examples are a write of `a` and a write of `a/b`, or a removal of `a` and
   a write of `a/b`. The error names the outer ref. Two removals pass this
   rule.
-- The check reads the ref store as it is before the first write. It does
-  not look through an alias in a parent directory of a queued path. So a
-  write below such an alias can fail after the commit writes earlier refs,
-  and these refs stay. Examples are a write of `old/x`, where `old` is an
-  alias that points to no ref, and a write of `x`, then a write of `al/y`,
-  where `al` is an alias of `x`. A write below such an alias can also write
-  a ref at a path that the check read for another entry. A later entry can
-  then fail after the commit writes earlier refs. A removal of `x`, then a
-  removal of `al/b`, where `al` is an alias of the ref file `x`, fails the
-  commit. The check refuses `al/b` before the first write, because its path
-  passes through a file.
+- The check reads the ref store as it is before the first write. It opens
+  the directory of each queued path with `openat2`, `RESOLVE_BENEATH`, and
+  `RESOLVE_NO_SYMLINKS`, and reads the last component relative to it. So it
+  follows no symlink at any component above the ref, from the repository
+  root down, `refs` and `refs/heads` included. A queued write or removal
+  whose path has a symlink above the ref fails with `Error::RefNotWritable`,
+  reason `passes through an alias`. This applies to a dangling alias, to an
+  alias to a directory, and to an alias to a ref file. Examples are a write
+  of `old/x`, where `old` is an alias that points to no ref, and a write of
+  `x`, then a write of `al/y`, where `al` is an alias of `x`. A removal of
+  `x`, then a removal of `al/b`, where `al` is an alias of the ref file `x`,
+  also fails before the first write. A ref file or a special file above the
+  ref keeps the reason `passes through a file`. The open has no fallback. On
+  a kernel without `openat2`, the check fails.
+- The reason: a write that resolves its path through an alias to a
+  directory writes its ref file in that directory, under a ref name that
+  the caller did not give. A write through a dangling alias fails at the
+  write, after the commit writes earlier refs.
+- The writes themselves resolve each path by name: the creation of the
+  parent directories, the rename, and the unlink. The check under the
+  update lock is the guard. A writer outside the update lock, for example
+  an out-of-band edit or a writer of a repository whose `[core] locking` is
+  false, can put a symlink above a ref path after the check. A write can
+  then go through that symlink.
+- The reads follow an alias above the path: the resolve, `rev-parse`, and
+  the ref listings.
 - A queued write or removal whose path names an alias fails with
   `Error::RefNotWritable`, reason `names an alias`. This applies to an
   entry of `set_ref` and to an entry of `set_ref_expecting`.
@@ -4211,22 +4236,30 @@ the whole queue against the ref store before the first write. The rules:
   the rename or the unlink. The receive path refuses an alias in the same
   way. The reason: a write through the alias replaces the link with a ref
   file, and the target of the alias keeps its old commit, with no error.
+- `Repo::set_ref_immediate` and `UpdateGuard::set_ref` refuse a write or a
+  removal below an alias with `Error::RefNotWritable`, reason `passes
+  through an alias`, under the update lock, before the rename or the
+  unlink. `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias`
+  refuse a new alias below an alias with the same error. `Repo::prune`
+  refuses a weak ref to delete below an alias with the same error, before
+  it deletes a ref ("The weak refs of a prune"). The receive path refuses a
+  path below an alias with `ref-denied`.
 - `Repo::remove_ref_alias_immediate(refspec)` and
   `UpdateGuard::remove_ref_alias(refspec)` remove an alias. They unlink the
   link, and the target ref stays. An absent path is success, as for the
   removal of an absent ref. A path that names a ref file fails with
   `Error::RefNotWritable`, reason `names a ref file`. A path that names a
-  directory or a special file, or that passes through a file, fails with
-  `Error::RefNotWritable` and the reason of the `lstat` read. In the CLI,
+  directory or a special file, or that passes through a file or an alias,
+  fails with `Error::RefNotWritable` and the reason of the read. In the CLI,
   only `refs -A --delete` removes an alias.
 - `Repo::remove_refs_immediate(refs)` removes a set of refs outside a
   transaction. It takes the update lock one time for the set. Under the
   lock, it applies the check of `Transaction::set_ref` to the whole set
   before the first unlink, so a path that names an alias, names a
-  directory, passes through a file, or names a special file stops the
-  removal before the first ref goes. It uses no staging directory and does
-  not use `tmp/`. An absent ref is success, and the parent directories
-  stay. `refs --delete PREFIX` without `-A` and
+  directory, passes through a file or an alias, or names a special file
+  stops the removal before the first ref goes. It uses no staging
+  directory and does not use `tmp/`. An absent ref is success, and the
+  parent directories stay. `refs --delete PREFIX` without `-A` and
   `refs --delete @<id>:PREFIX` remove the refs of each prefix with one
   call, and `refs -c --delete` removes the refs of all ids with one call.
   So an alias that a prefix or the `-c` deletion selects stops it before it
@@ -4249,13 +4282,17 @@ ref. The rules of a conditional write:
   `Error::RefMismatch`. The error holds the name of the ref, the expected
   state, and the state in the store.
 - A conditional entry whose path names a directory or passes through a file
-  fails with `Error::RefNotWritable`, also for `expected = None`.
-  `Repo::resolve_ref_tip` gives `None` for such a path, so a caller that
-  gives back that `None` as `expected` gets this error.
+  or an alias fails with `Error::RefNotWritable`, also for
+  `expected = None`. `Repo::resolve_ref_tip` gives `None` for a path that
+  names a directory or passes through a file, so a caller that gives back
+  that `None` as `expected` gets this error. `Repo::resolve_ref_tip`
+  follows an alias above the path, so an `expected` taken from it for such
+  a path also gets this error.
 - A conditional entry whose ref file does not parse fails with the error
   of the parse, because the compare needs the content.
-- An entry of `set_ref` costs one `lstat`. A conditional entry costs one
-  `lstat` and one `O_NOFOLLOW` open, with a read of at most 4096 bytes and
+- An entry of `set_ref` costs one `openat2` of its directory and one
+  `lstat`. A conditional entry costs one `openat2` of its directory, one
+  `lstat`, and one `O_NOFOLLOW` open, with a read of at most 4096 bytes and
   a parse.
 - `commit_under` runs the same compare. The receive path queues entries
   of `set_ref` alone. It compares each update with the current commit that

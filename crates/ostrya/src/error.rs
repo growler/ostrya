@@ -83,18 +83,23 @@ pub enum Error {
     /// [`Transaction::commit`](crate::Transaction::commit) gives this error
     /// when it checks the queued refs under the update lock. The cause is a
     /// ref path that names an alias, names a directory, passes through a
-    /// file, or names a special file, or two queued refs where the path of
-    /// one names a directory of the other and one of the two is a write. The
-    /// published objects stay, and the commit writes no detached metadata
-    /// and no ref.
+    /// file or an alias, or names a special file, or two queued refs where
+    /// the path of one names a directory of the other and one of the two is
+    /// a write. The published objects stay, and the commit writes no
+    /// detached metadata and no ref.
     ///
     /// [`Repo::set_ref_immediate`](crate::Repo::set_ref_immediate) and
     /// [`UpdateGuard::set_ref`](crate::UpdateGuard::set_ref) give this error
-    /// for a ref path that names an alias.
+    /// for a ref path that names an alias or passes through an alias.
+    /// [`Repo::set_ref_alias_immediate`](crate::Repo::set_ref_alias_immediate)
+    /// and [`UpdateGuard::set_ref_alias`](crate::UpdateGuard::set_ref_alias)
+    /// give it for a path that passes through an alias.
     /// [`Repo::remove_ref_alias_immediate`](crate::Repo::remove_ref_alias_immediate)
     /// and [`UpdateGuard::remove_ref_alias`](crate::UpdateGuard::remove_ref_alias)
     /// give it for a path that names a ref file, names a directory, passes
-    /// through a file, or names a special file.
+    /// through a file or an alias, or names a special file.
+    /// [`Repo::prune`](crate::Repo::prune) gives it for a weak ref to delete
+    /// whose path passes through an alias.
     #[error("ref not writable: {name}: {reason}")]
     RefNotWritable {
         /// The ref as text: `<name>`, `<remote>:<name>`, or

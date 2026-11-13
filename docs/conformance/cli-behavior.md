@@ -3640,6 +3640,24 @@ openat(up9): No such file or directory` and exits 1. In these two sequences, the
 tool writes no link that names a directory. `cli-surface.md`, "P1", `refs`,
 records the port side.
 
+The tool writes a ref below an alias to a directory through the link. The
+probe uses the tool at version 2026.4 and an `archive` repository with the
+ref `main` and the empty directory `refs/heads/d0`. Each case starts from a
+new repository with one link `refs/heads/lnk`:
+
+- With `lnk -> d0`, `commit -b lnk/x --tree=dir=SRC` prints the new commit
+  and exits 0. It writes the ref file `refs/heads/d0/x` through the link, and
+  the link stays.
+- With the dangling link `lnk -> nosuch`, `commit -b lnk/x --tree=dir=SRC`
+  reports `error: open(O_TMPFILE): No such file or directory` and exits 1. It
+  writes no ref, and the new commit object stays in `objects/`.
+- `refs --create=lnk/x REV`, with or without `--force`, lists the refs before
+  the write. It reports `error: Listing refs: Is a directory` for `lnk -> d0`
+  and `error: Listing refs: openat(lnk): No such file or directory` for the
+  dangling link. It exits 1 and writes no ref.
+
+`cli-surface.md`, "P2", `commit`, records the port side.
+
 ### `rev-parse`
 
 The command prints the resolved 64-character commit checksum and a newline for

@@ -224,6 +224,16 @@ them are observed and deliberately not reproduced:
     `None`, and `Transaction::set_ref_expecting` with `new` set to `None`.
     These writers then write a ref below the target path: `commit -b`,
     `commit --tag`, `refs --create`, `pull`, `pull-local`, and a push.
+    Each ref write, ref removal, and alias write of the port refuses a path
+    that has a symlink above the ref. The library and the `ostrya` commands
+    give `error: ref not writable: <name>: passes through an alias` at exit
+    1. A push that `ostrya receive` takes gets the ref-denied text `ref
+    '<name>' names a directory or a path below a ref file or an alias, which
+    a ref write cannot replace`. `commit --tag` gives `error: --tag
+    specified but ref <name> already exists`. So no writer of the port
+    writes a ref through the link. `refs --create=lnk/x REV` below a link
+    exits 1 in both and writes no ref. The tool reports the listing error
+    of the link (`cli-behavior.md`, "Symlinks under refs").
 
   In both implementations, `-A` lists the link as `lnk -> deep`. In each
   implementation, a link that names its own directory (`refs/heads/selfdir
@@ -862,14 +872,17 @@ repository lock. The last item also gives the checks after that point:
   `-b REMOTE:NAME` is a ref under `refs/remotes`, so it is below no tag;
 - a value that has an entry at its path under `refs/heads` or
   `refs/mirrors/ID`: a ref, an alias (also a dangling one), a directory, or a
-  special file. A path below a ref file or a special file is refused too. The
-  message is `error: --tag specified but ref <name> already exists`. The port
-  reads the path again before it publishes the objects, and refuses an entry
-  that came after the first read. After the second read, another writer can
-  create a ref, an alias, a directory, or a special file at the path. It can
-  also create a ref file or a special file above the path. The port then
-  refuses the value with the same message after it publishes the objects. It
-  writes no ref, and the objects stay until a prune.
+  special file. A path below a ref file, a special file, or an alias is
+  refused too. The message is `error: --tag specified but ref <name> already
+  exists`. The port refuses a symbolic link at `refs`, `refs/heads`, or
+  `refs/mirrors/ID` after it publishes the objects, with the same message,
+  and the new objects stay until a prune. The port reads the path again
+  before it publishes the objects, and refuses an entry that came after the
+  first read. After the second read, another writer can create a ref, an
+  alias, a directory, or a special file at the path. It can also create a
+  ref file, a special file, or an alias above the path. The port then
+  refuses the value with the same message after it publishes the objects.
+  It writes no ref, and the objects stay until a prune.
 
 A refusal before the publish writes no object and no ref. Without `-b`, the
 option needs `--orphan`, as each commit does. `--orphan --tag=NAME` creates
@@ -882,6 +895,15 @@ keeps its old commit (`../format-reference.md`, "Ref files"). The port
 refuses the ref with `error: ref not writable: <branch>: names an alias` at
 exit 1, after it publishes the objects. It writes no ref, the link stays,
 and the objects stay until a prune.
+
+A `-b` ref whose path passes through an alias also parts the two. With the
+link `refs/heads/lnk -> d0`, the tool writes `commit -b lnk/x` to
+`refs/heads/d0/x` through the link and exits 0. With a dangling `lnk`, the
+tool reports `error: open(O_TMPFILE): No such file or directory` and exits 1
+(`cli-behavior.md`, "Symlinks under refs"). The port refuses both with
+`error: ref not writable: lnk/x: passes through an alias` at exit 1, after
+it publishes the objects. It writes no ref, the link stays, and the objects
+stay until a prune.
 
 `--related=NAME=CHECKSUM` of the port names one dependency of the commit in
 field 2 of the commit object (`../format-reference.md`, "Commit --

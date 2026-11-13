@@ -371,7 +371,10 @@ impl UpdateGuard {
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   call writes nothing.
     /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
-    ///   call writes nothing, and the alias stays.
+    ///   call writes nothing, and the alias stays. The call gives the same
+    ///   error, with the reason `passes through an alias`, if a component
+    ///   above the ref is a symlink, also a dangling one. It then writes
+    ///   nothing through the symlink.
     /// - [`Error::Io`] if a file system operation fails.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
@@ -395,13 +398,17 @@ impl UpdateGuard {
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
     ///   refspec.
+    /// - [`Error::RefNotWritable`] if a component above the path of
+    ///   `refspec` is a symlink, also a dangling one. The reason is `passes
+    ///   through an alias`, and the call writes nothing.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_alias(&self, refspec: &str, target: &str) -> Result<()> {
         let relpath = refspec_to_relpath(refspec)?;
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
         let repo_mode = self.repo().mode();
+        let name = refspec.to_owned();
         self.write(move |repo_fd, fsync, dirs| {
-            put_alias_blocking(repo_fd, &relpath, &link, fsync, repo_mode, dirs)
+            put_alias_blocking(repo_fd, &name, &relpath, &link, fsync, repo_mode, dirs)
         })
         .await
     }
@@ -417,8 +424,8 @@ impl UpdateGuard {
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
     /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
-    ///   names a directory, passes through a file, or names a special file.
-    ///   The call removes nothing.
+    ///   names a directory, passes through a file or an alias, or names a
+    ///   special file. The call removes nothing.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn remove_ref_alias(&self, refspec: &str) -> Result<()> {
         let relpath = refspec_to_relpath(refspec)?;

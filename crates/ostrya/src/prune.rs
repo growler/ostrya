@@ -177,6 +177,10 @@ pub struct PruneOptions {
     ///
     /// The run also keeps the commit that
     /// [`delete_commit`](PruneOptions::delete_commit) names.
+    ///
+    /// The dry run checks the weak refs to delete as a real run does. If the
+    /// path of such a ref passes through an alias, the dry run fails with
+    /// [`Error::RefNotWritable`].
     pub no_prune: bool,
     /// A commit object that the run removes before the sweep.
     ///
@@ -348,7 +352,10 @@ pub struct PruneOptions {
     ///
     /// The run deletes each weak ref that the walk did not reach, and names it
     /// in [`PruneStats::deleted_refs`]. The run leaves an emptied directory
-    /// under `refs/` in place, for example `refs/mirrors/ID/`.
+    /// under `refs/` in place, for example `refs/mirrors/ID/`. If the path of
+    /// such a ref passes through an alias, the run fails with
+    /// [`Error::RefNotWritable`] and deletes no ref and no object. A
+    /// [`no_prune`](PruneOptions::no_prune) dry run fails in the same way.
     ///
     /// The branch selection has nothing to select for a weak ref, because a
     /// weak ref roots nothing. The filter also classifies a weak ref outside an
@@ -906,6 +913,12 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if a value of
     ///   [`only_branch`](PruneOptions::only_branch) fails [`Ref::validate`],
     ///   for example `main^`.
+    /// - [`Error::RefNotWritable`] if the path of a weak ref to delete passes
+    ///   through an alias: a symlink at a component above the ref, for example
+    ///   `refs/heads`. The reason is `passes through an alias`. The run checks
+    ///   each weak ref to delete before the first unlink, so it then deletes
+    ///   no ref and no object. A [`no_prune`](PruneOptions::no_prune) dry run
+    ///   runs the same check.
     /// - An error of [`resolve_ref_tip`](Repo::resolve_ref_tip) if the read
     ///   of a value of [`only_branch`](PruneOptions::only_branch) fails. Each
     ///   run, a [`static_deltas_only`](PruneOptions::static_deltas_only) run
@@ -1178,9 +1191,18 @@ impl Repo {
         let mut doomed_refs = weak_refs;
         doomed_refs
             .retain(|(_, target)| !keep.contains(&ObjectName::new(*target, ObjectType::Commit)));
-        // A dry run reports what the walk decided and touches nothing, so it
-        // reads no ref a second time.
+        // A dry run reports what the walk decided and touches nothing. It
+        // runs the check of the real run, so it fails where the real run
+        // fails before its first unlink.
         let mut deleted_refs: Vec<Ref> = if opts.no_prune {
+            let repo = self.clone();
+            let doomed_refs = ostrya_rt::unblock(move || {
+                crate::refs::check_refs_to_delete_blocking(repo.repo_fd(), &doomed_refs, |r| {
+                    crate::refs::ref_relpath(None, r)
+                })
+                .map(|()| doomed_refs)
+            })
+            .await?;
             doomed_refs.into_iter().map(|(r, _)| r).collect()
         } else {
             let repo = self.clone();

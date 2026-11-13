@@ -3408,6 +3408,47 @@ fn a_ref_path_that_a_write_cannot_replace_is_ref_denied() {
     }
 }
 
+/// A ref path below an alias is `ref-denied` under the lock: below a
+/// dangling alias and below an alias to a directory of refs. The session
+/// writes nothing through the alias.
+#[test]
+fn a_ref_path_below_an_alias_is_ref_denied() {
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let new = Some(commit.checksum);
+    for (link, target) in [("up", "nosuch"), ("up2", "d0")] {
+        let tmp = TmpDir::new("recv-ref-below-alias");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let heads = repo.path().join("refs/heads");
+        std::fs::create_dir(heads.join("d0")).unwrap();
+        std::os::unix::fs::symlink(target, heads.join(link)).unwrap();
+        let before = snapshot(&repo);
+        let name = format!("{link}/x");
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &objects,
+                &[],
+                vec![update(&name, Expected::Absent, new)],
+                false,
+            ),
+            ErrorCode::RefDenied,
+        );
+        assert_eq!(
+            error.message,
+            format!(
+                "ref '{name}' names a directory or a path below a ref file or an \
+                 alias, which a ref write cannot replace"
+            )
+        );
+        assert_unchanged(&repo, &before);
+        assert!(!heads.join("d0/x").exists());
+        assert!(!heads.join("nosuch").exists());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Faults of the server.
 // ---------------------------------------------------------------------------

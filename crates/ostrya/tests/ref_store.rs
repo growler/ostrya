@@ -983,3 +983,120 @@ fn a_ref_entry_that_is_a_fifo_is_no_ref() {
         assert_eq!(tip.unwrap(), None, "{what}");
     }
 }
+
+/// Asserts that `result` is `Error::RefNotWritable` for `name`, with the
+/// reason `passes through an alias`.
+fn assert_through_alias<T: std::fmt::Debug>(result: ostrya::Result<T>, name: &str) {
+    match result {
+        Err(Error::RefNotWritable { name: n, reason }) => {
+            assert_eq!(n, name);
+            assert_eq!(reason, "passes through an alias", "{name}");
+        }
+        other => panic!("{name}: expected RefNotWritable, got {other:?}"),
+    }
+}
+
+/// Each ref write and each removal refuses a path below an alias: a
+/// dangling alias, an alias to a directory of refs, and an alias that stands
+/// for `refs/remotes/R`. So is an alias write below an alias. Nothing is
+/// written through the alias, and a read still follows it.
+#[test]
+fn a_ref_write_below_an_alias_is_refused() {
+    let tmp = TmpDir::new("ref-store-below-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let heads = path.join("refs/heads");
+    block_on(async {
+        put_local(&repo, "d0/y", &checksum(1)).await;
+        repo.set_ref_immediate(&Ref::remote("real", "y"), Some(&checksum(1)))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink("nosuch", heads.join("up")).unwrap();
+        std::os::unix::fs::symlink("d0", heads.join("up2")).unwrap();
+        std::os::unix::fs::symlink("real", path.join("refs/remotes/origin")).unwrap();
+        let refs = [
+            Ref::local("up/x"),
+            Ref::local("up2/x"),
+            Ref::local("up2/y"),
+            Ref::remote("origin", "x"),
+            Ref::remote("origin", "y"),
+        ];
+        for r in &refs {
+            let name = r.to_string();
+            for checksum in [Some(checksum(2)), None] {
+                assert_through_alias(repo.set_ref_immediate(r, checksum.as_ref()).await, &name);
+                let guard = repo.begin_update().await.unwrap();
+                assert_through_alias(guard.set_ref(r, checksum.as_ref()).await, &name);
+                guard.finish().await.unwrap();
+            }
+            assert_through_alias(
+                repo.remove_refs_immediate(std::slice::from_ref(r)).await,
+                &name,
+            );
+        }
+        for refspec in ["up/al", "up2/al", "origin:al"] {
+            assert_through_alias(repo.set_ref_alias_immediate(refspec, "d0/y").await, refspec);
+            let guard = repo.begin_update().await.unwrap();
+            assert_through_alias(guard.set_ref_alias(refspec, "d0/y").await, refspec);
+            guard.finish().await.unwrap();
+        }
+        assert_eq!(
+            std::fs::read_dir(heads.join("d0"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            ["y"]
+        );
+        assert_eq!(
+            std::fs::read_dir(path.join("refs/remotes/real"))
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            ["y"]
+        );
+        assert!(!heads.join("nosuch").exists());
+        assert_eq!(ref_file(&path, "refs/heads/d0/y"), Some(checksum(1)));
+        assert_eq!(
+            resolve(&repo, &Ref::local("up2/y")).await,
+            Some(checksum(1))
+        );
+        assert_eq!(
+            resolve(&repo, &Ref::remote("origin", "y")).await,
+            Some(checksum(1))
+        );
+    });
+}
+
+/// An alias removal refuses a path below an alias: an alias to a directory
+/// that holds an alias at the path, and a dangling alias with nothing below
+/// it. Nothing is unlinked through the alias.
+#[test]
+fn an_alias_removal_below_an_alias_is_refused() {
+    let tmp = TmpDir::new("ref-store-alias-removal-below-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let heads = path.join("refs/heads");
+    block_on(async {
+        put_local(&repo, "d0/y", &checksum(1)).await;
+        repo.set_ref_alias_immediate("d0/al", "d0/y").await.unwrap();
+        std::os::unix::fs::symlink("d0", heads.join("up2")).unwrap();
+        std::os::unix::fs::symlink("nosuch", heads.join("up")).unwrap();
+        for refspec in ["up2/al", "up/al"] {
+            assert_through_alias(repo.remove_ref_alias_immediate(refspec).await, refspec);
+            let guard = repo.begin_update().await.unwrap();
+            assert_through_alias(guard.remove_ref_alias(refspec).await, refspec);
+            guard.finish().await.unwrap();
+        }
+        assert!(
+            std::fs::symlink_metadata(heads.join("d0/al"))
+                .unwrap()
+                .is_symlink(),
+            "the alias behind the link stays"
+        );
+        assert_eq!(
+            resolve(&repo, &Ref::local("d0/al")).await,
+            Some(checksum(1))
+        );
+        assert!(!heads.join("nosuch").exists());
+    });
+}

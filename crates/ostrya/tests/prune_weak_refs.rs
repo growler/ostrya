@@ -220,6 +220,56 @@ fn an_unreached_weak_ref_is_deleted_and_its_objects_swept() {
     });
 }
 
+/// `refs/heads` is a symlink to a directory that holds a weak ref that the
+/// walk does not reach. The run fails with `RefNotWritable` before it deletes
+/// anything, so the ref file behind the link and its commit stay.
+#[test]
+fn a_weak_ref_below_an_alias_fails_the_prune() {
+    prune_below_an_alias("weak-refs-below-alias", false);
+}
+
+/// A `no_prune` dry run checks the weak refs to delete as a real run does. It
+/// fails with the same error, and deletes nothing.
+#[test]
+fn a_weak_ref_below_an_alias_fails_the_dry_run() {
+    prune_below_an_alias("weak-refs-below-alias-dry", true);
+}
+
+/// Runs a prune with the given `no_prune` in a repository whose `refs/heads`
+/// is a symlink to a directory that holds the unreached weak ref `pool/a`.
+/// Asserts that the run fails with `RefNotWritable` for `pool/a`, and that the
+/// ref file behind the link and its commit stay.
+fn prune_below_an_alias(name: &str, no_prune: bool) {
+    let tmp = TmpDir::new(name);
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
+        let base = tmp.path().join("repo");
+        std::fs::rename(base.join("refs/heads"), base.join("real")).unwrap();
+        std::os::unix::fs::symlink("../real", base.join("refs/heads")).unwrap();
+
+        let opts = PruneOptions {
+            no_prune,
+            ..weak_options(pool_is_weak())
+        };
+        let err = repo.prune(&opts).await.unwrap_err();
+
+        match err {
+            Error::RefNotWritable { name, reason } => {
+                assert_eq!(name, "pool/a");
+                assert_eq!(reason, "passes through an alias");
+            }
+            other => panic!("expected RefNotWritable, got {other:?}"),
+        }
+        assert!(
+            base.join("real/pool/a").is_file(),
+            "the ref file behind the link stays"
+        );
+        assert!(holds(&repo, &orphan).await, "and so does its commit");
+    });
+}
+
 #[test]
 fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
     let tmp = TmpDir::new("weak-refs-rule-b");

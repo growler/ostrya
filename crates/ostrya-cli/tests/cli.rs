@@ -48653,6 +48653,61 @@ fn ref_writes_refuse_an_alias() {
     assert_eq!(ref_file(&repo, "refs/heads/main").as_ref(), Some(&main));
 }
 
+/// A ref write below an alias is refused, and nothing is written through the
+/// alias: `commit -b up2/y`, `refs --create=up2/z main`, and `refs -A
+/// --create=up2/al main` with the alias `up2 -> d0`, and the same with the
+/// dangling alias `up`. `commit --tag=up2/t` keeps the refusal of an existing
+/// tag.
+#[test]
+fn ref_writes_refuse_a_path_below_an_alias() {
+    let tmp = TmpDir::new("refs-write-below-alias");
+    let base = tmp.path();
+    let (repo, main) = own_repo_with_main(base);
+    let heads = repo.join("refs/heads");
+    std::fs::create_dir(heads.join("d0")).unwrap();
+    std::os::unix::fs::symlink("nosuch", heads.join("up")).unwrap();
+    std::os::unix::fs::symlink("d0", heads.join("up2")).unwrap();
+    let refs = describe_refs(&repo);
+    let src = base.join("src");
+    let repo_arg = format!("--repo={}", repo.display());
+    let commit = |args: &[&str]| {
+        let mut argv = vec!["commit", &repo_arg, FIXED_TIMESTAMP];
+        argv.extend_from_slice(args);
+        argv.extend_from_slice(&["-s", "below the alias", src.to_str().unwrap()]);
+        ostrya(&argv, None, &[])
+    };
+    for link in ["up", "up2"] {
+        let (y, z, al) = (
+            format!("{link}/y"),
+            format!("--create={link}/z"),
+            format!("--create={link}/al"),
+        );
+        for (run, name) in [
+            (commit(&["-b", &y]), y.clone()),
+            (ostrya_at(&repo, &["refs", &z, "main"]), format!("{link}/z")),
+            (
+                ostrya_at(&repo, &["refs", "-A", &al, "main"]),
+                format!("{link}/al"),
+            ),
+        ] {
+            refused_with_message(
+                &run,
+                &format!("ref not writable: {name}: passes through an alias"),
+            );
+            assert_eq!(describe_refs(&repo), refs, "{name}");
+            assert_eq!(std::fs::read_dir(heads.join("d0")).unwrap().count(), 0);
+            assert!(heads.join("nosuch").symlink_metadata().is_err());
+        }
+        let tag = format!("--tag={link}/t");
+        refused_with_message(
+            &commit(&["-b", "main", &tag]),
+            &format!("--tag specified but ref {link}/t already exists"),
+        );
+        assert_eq!(describe_refs(&repo), refs, "{tag}");
+    }
+    assert_eq!(ref_file(&repo, "refs/heads/main").as_ref(), Some(&main));
+}
+
 /// An alias under `refs/mirrors/X/` is refused before the deletion removes a
 /// ref: `refs --delete @X:a` and `refs -c --delete X` remove no ref. In
 /// `refs --delete @Y:z @X:a`, the prefix `@Y:z` removes its ref, and the

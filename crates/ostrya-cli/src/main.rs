@@ -1048,14 +1048,17 @@ struct CommitArgs {
     /// ref, and each ref occurs one time. No ref of --branch and --tag is a
     /// path below another of these refs. The command refuses a NAME that has
     /// an entry at its path: a ref, an alias (also a dangling one), a
-    /// directory, or a special file. It also refuses a NAME below a ref file
-    /// or a special file. A NAME refused before the publish gives no new
-    /// object and no ref. The command reads the path of each NAME again
-    /// before it publishes the objects. After this read, another writer can
-    /// create such an entry at the path, or a ref file or a special file
-    /// above it. The command then refuses NAME with the same error and writes
-    /// no ref. The published objects stay until a prune. The option conflicts
-    /// with --no-bindings and --skip-if-unchanged.
+    /// directory, or a special file. It also refuses a NAME below a ref file,
+    /// a special file, or an alias. A NAME refused before the publish gives no
+    /// new object and no ref. The command refuses a symbolic link at `refs`,
+    /// `refs/heads`, or `refs/mirrors/ID` after the publish, with the same
+    /// error, and the new objects stay until a prune. The command reads the
+    /// path of each NAME again before it publishes the objects. After this
+    /// read, another writer can create such an entry at the path, or a ref
+    /// file, a special file, or an alias above it. The command then refuses
+    /// NAME with the same error and writes no ref. The published objects stay
+    /// until a prune. The option conflicts with --no-bindings and
+    /// --skip-if-unchanged.
     #[arg(
         long = "tag",
         value_name = "NAME",
@@ -9830,8 +9833,9 @@ fn tag_exists_refusal(tag: &str) -> String {
 ///
 /// `Error::RefMismatch` is a ref at the path of the tag.
 /// `Error::RefNotWritable` is an alias, a directory, or a special file at the
-/// path, or a ref file or a special file above the path. Both get the text of
-/// `existing_tag_refusal`, which refuses the same entries before the publish.
+/// path, or a ref file, a special file, or an alias above the path. Both get
+/// the text of `existing_tag_refusal`, which refuses the same entries before
+/// the publish.
 fn refused_tag<'a>(err: &Error, tags: &'a [String], own: Option<&str>) -> Option<&'a str> {
     let (Error::RefMismatch { name, .. } | Error::RefNotWritable { name, .. }) = err else {
         return None;

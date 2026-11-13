@@ -141,6 +141,11 @@ A local ref.
 The file holds the 64 hexadecimal characters of a commit checksum and a newline.
 A \fB\%/\fR in the ref name makes a subdirectory.
 An alias is a relative symbolic link to another ref.
+Each write and removal of a ref or an alias refuses a symbolic link above the ref, at each directory from \fB\%refs/\fR down.
+The ostrya library and the \fB\%ostrya\fR commands give the error \fB\%ref not writable: <ref>: passes through an alias\fR.
+A push that \fB\%ostrya receive\fR takes gets the error \fB\%ref '<ref>' names a directory or a path below a ref file or an alias, which a ref write cannot replace\fR.
+\fB\%ostrya commit \-\-tag\fR gives \fB\%\-\-tag specified but ref <ref> already exists\fR.
+A read of a ref follows such a link.
 .TP
 \fB\%<repo>/refs/remotes/<remote>/<ref>\fR
 A ref that a pull from the remote \fB\%<remote>\fR wrote.

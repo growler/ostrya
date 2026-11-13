@@ -2722,9 +2722,49 @@ mod tests {
             txn.set_ref(&Ref::local("x"), None);
             txn.set_ref(&Ref::local("al/b"), None);
             let err = txn.commit().await.unwrap_err();
-            assert_not_writable(err, "al/b", "passes through a file");
+            assert_not_writable(err, "al/b", "passes through an alias");
             assert_eq!(tip(&repo, "main").await, Some(a));
             assert_eq!(tip(&repo, "x").await, Some(a));
+        });
+    }
+
+    /// A queued write, conditional write, or removal below an alias refuses
+    /// the commit before the first ref write: below a dangling alias and
+    /// below an alias to a directory of refs. A ref queued before it keeps
+    /// its commit, and the commit writes nothing through the alias.
+    #[test]
+    fn a_ref_below_an_alias_refuses_the_commit() {
+        let scratch = Scratch::new("ref-check-below-alias");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let heads = scratch.0.join("repo/refs/heads");
+            let a = Checksum::from_bytes([0x41; 32]);
+            let c = Checksum::from_bytes([0x43; 32]);
+            for name in ["main", "d0/y"] {
+                repo.set_ref_immediate(&Ref::local(name), Some(&a))
+                    .await
+                    .unwrap();
+            }
+            std::os::unix::fs::symlink("nosuch", heads.join("up")).unwrap();
+            std::os::unix::fs::symlink("d0", heads.join("up2")).unwrap();
+            for name in ["up/x", "up2/x", "up2/y"] {
+                for entry in 0..3 {
+                    let txn = repo.transaction().await.unwrap();
+                    txn.set_ref(&Ref::local("main"), Some(&c));
+                    let r = Ref::local(name);
+                    match entry {
+                        0 => txn.set_ref_expecting(&r, None, Some(&c)),
+                        1 => txn.set_ref(&r, Some(&c)),
+                        _ => txn.set_ref(&r, None),
+                    }
+                    let err = txn.commit().await.unwrap_err();
+                    assert_not_writable(err, name, "passes through an alias");
+                    assert_eq!(tip(&repo, "main").await, Some(a), "{name}");
+                    assert!(!heads.join("d0/x").exists(), "{name}");
+                    assert_eq!(tip(&repo, "d0/y").await, Some(a), "{name}");
+                    assert!(!heads.join("nosuch").exists(), "{name}");
+                }
+            }
         });
     }
 

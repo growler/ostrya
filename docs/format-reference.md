@@ -623,8 +623,11 @@ at that name. Example: `refs/heads/foo` is a relative symlink to the sibling
 `refs/heads/foo` a 65-byte regular file that holds the new checksum.
 `refs/heads/bar` keeps its old checksum. The port refuses a ref write or a ref
 removal at the path of an alias with `Error::RefNotWritable`, reason `names an
-alias`, and changes no ref. `conformance/cli-surface.md`, "P1", records the
-commands where the two implementations differ.
+alias`, and changes no ref. It refuses a ref write, a ref removal, or an alias
+write below a symlink with the reason `passes through an alias`. A symlink at
+each directory from `refs/` down counts. The tool writes a ref below an alias
+to a directory through the link. `conformance/cli-surface.md`, "P1" and "P2",
+records the commands where the two implementations differ.
 
 ### Ref name validation
 

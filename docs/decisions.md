@@ -4101,11 +4101,14 @@ rules:
   is not set. Under the same conditions, it parses the key directly after
   the option checks and before it resolves the endpoint. A malformed value
   thus stops the pull before it reads a PEM file, an AWS file, or a keyring,
-  and before it connects. The selector matches the refs of the summary, and
-  the summary is available inside the pull alone. `Repo::pull` also reads
-  `branches` there. The pull matches the refs, and then parses `branches`,
-  after it reads the summary and the `config` of the remote, and before it
-  reads a ref file or an object.
+  and before it connects. Directly after `pull-branches`, it parses
+  `branches` and checks each name of that key with the ref-name rule. So a
+  malformed value of either key stops the pull at the same step. If both
+  keys are malformed, the error of `pull-branches` comes first. The
+  selector matches the refs of the summary, and the summary is available
+  inside the pull alone. The pull matches the refs after it reads the
+  summary and the `config` of the remote, and before it reads a ref file
+  or an object.
 - `Repo::pull_with_session` has no remote section, so it reads neither key
   and refuses an empty ref list. A `--collection` pull reads neither key.
 - A ref on the command line has precedence over both keys. Without one,
@@ -4131,12 +4134,11 @@ rules:
   the key does not select does not fail the pull.
 - A remote with no summary fails the pull with `[remote "NAME"]
   pull-branches selects refs of the summary, but the remote repository does
-  not have a summary`, also when `branches` holds refs. The pull makes this
-  check before it parses `branches`. A list that selects no ref of the
-  summary gives the refs of `branches` alone. If `branches` holds no ref,
-  the pull fails with `no ref of the summary matches [remote "NAME"]
-  pull-branches`. Both errors are `Error::Pull`, and the pull writes no
-  object and no ref.
+  not have a summary`, also when `branches` holds refs. A list that selects
+  no ref of the summary gives the refs of `branches` alone. If `branches`
+  holds no ref, the pull fails with `no ref of the summary matches [remote
+  "NAME"] pull-branches`. Both errors are `Error::Pull`, and the pull writes
+  no object and no ref.
 
 These alternatives were rejected:
 
@@ -4145,6 +4147,9 @@ These alternatives were rejected:
   again.
 - A parse of `pull-branches` at the match alone. A connection error, a TLS
   error, or a summary-signature error then hides a malformed value.
+- A parse of `branches` after the checks of the summary. A connection
+  error, a TLS error, or a summary-signature error then hides a malformed
+  value.
 - A match of the written names, `REMOTE:NAME`. The key selects refs of the
   remote, and the summary lists them with no remote part.
 - A list of the matches as names for the path that reads `branches`. That

@@ -8421,6 +8421,15 @@ fn no_proxy_key_reads_the_environment() {
 /// fail.
 const DEAD_URL: &str = "http://127.0.0.1:1/";
 
+/// Returns the remote key `tls-ca-path` that names the absent file
+/// `dir/absent-ca.pem`. The resolve of the endpoint reads the file, so a pull
+/// with this key fails with [`Error::Io`] before it connects. A pull that
+/// fails with another error checked that value before it resolved the
+/// endpoint.
+fn absent_ca_key(dir: &Path) -> String {
+    format!("tls-ca-path={}\n", dir.join("absent-ca.pem").display())
+}
+
 /// Pulls `test/main` through an HTTP session of the options `http`, with no
 /// check of signatures, into refs under the remote name `origin`.
 async fn pull_main_over(dest: &Repo, http: FetcherOptions) -> Result<PullStats, Error> {
@@ -10958,6 +10967,70 @@ fn a_bad_generate_composefs_value_refuses_an_http_pull() {
     }
 }
 
+/// A value of `[core] fsync` or `[core] per-object-fsync` that is not a
+/// boolean stops a pull before its first request: a pull of a named ref, a
+/// `MIRROR` pull, a pull through a session, a pull from a remote that cannot
+/// be reached, and a pull whose endpoint does not resolve. The pull publishes
+/// nothing.
+#[test]
+fn a_bad_fsync_value_refuses_an_http_pull() {
+    for key in ["fsync", "per-object-fsync"] {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-fsync-bad-value");
+            build_remote(dir.path()).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let open = |base: &Path, url: String, extra: String| {
+                let base = base.to_owned();
+                async move {
+                    drop(build_dest(&base, RepoMode::Archive, &url, &extra).await);
+                    let path = base.join("dest");
+                    let config = path.join("config");
+                    let text = std::fs::read_to_string(&config).unwrap();
+                    std::fs::write(
+                        &config,
+                        text.replacen("[core]\n", &format!("[core]\n{key}=maybe\n"), 1),
+                    )
+                    .unwrap();
+                    Repo::open(&path).await.unwrap()
+                }
+            };
+            let dest = open(dir.path(), server.url(), String::new()).await;
+
+            let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{key}: {err}");
+            let mirror = PullOptions {
+                flags: PullFlags::MIRROR,
+                ..PullOptions::default()
+            };
+            let err = dest.pull("origin", mirror).await.unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{key}: {err}");
+            let err = dest
+                .pull_with_session(
+                    http_session(&server).await,
+                    PullTrust::unverified(),
+                    refs_of(&["test/main"]),
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{key}: {err}");
+            assert!(server.seen().is_empty(), "{key}: {:?}", server.seen());
+            assert_left_nothing(&dest).await;
+
+            for (name, extra) in [
+                ("dead", String::new()),
+                ("no-ca", absent_ca_key(dir.path())),
+            ] {
+                let base = dir.path().join(name);
+                std::fs::create_dir_all(&base).unwrap();
+                let dest = open(&base, DEAD_URL.to_owned(), extra).await;
+                let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+                assert!(matches!(err, Error::Core(_)), "{key} {name}: {err}");
+                assert_left_nothing(&dest).await;
+            }
+        });
+    }
+}
+
 // --- collection refs from a named remote --------------------------------------
 
 /// Returns the options of a pull of the refs `names`.
@@ -11198,15 +11271,20 @@ fn a_branches_name_with_pull_branches_reads_the_ref_file() {
     });
 }
 
-/// A ref of the pull has precedence over `pull-branches`, so a malformed
-/// value does not block it.
+/// A ref of the pull has precedence over `pull-branches` and `branches`, so
+/// a malformed value of either key does not block it.
 #[test]
 fn an_explicit_ref_wins_over_pull_branches() {
     block_on(async {
         let dir = TmpDir::new("pull-http-pull-branches-ref");
         let server = collection_server(dir.path()).await;
-        let (result, remote_refs, mirror_refs, _) =
-            pull_with_keys(&server, dir.path(), "pull-branches=r*:x\n", &["c"]).await;
+        let (result, remote_refs, mirror_refs, _) = pull_with_keys(
+            &server,
+            dir.path(),
+            "pull-branches=r*:x\nbranches=a\\q;\n",
+            &["c"],
+        )
+        .await;
         result.unwrap();
         assert_eq!(remote_refs.len(), 1);
         assert_eq!(remote_refs[0].0, "origin:c");
@@ -11214,8 +11292,8 @@ fn an_explicit_ref_wins_over_pull_branches() {
     });
 }
 
-/// A `MIRROR` pull with no ref does not read `pull-branches`, so a malformed
-/// value does not block it.
+/// A `MIRROR` pull with no ref does not read `pull-branches` or `branches`,
+/// so a malformed value of either key does not block it.
 #[test]
 fn a_mirror_pull_ignores_pull_branches() {
     block_on(async {
@@ -11226,7 +11304,7 @@ fn a_mirror_pull_ignores_pull_branches() {
             dir.path(),
             RepoMode::Archive,
             &server.url(),
-            "pull-branches=r*:x\n",
+            "pull-branches=r*:x\nbranches=a\\q;\n",
         )
         .await;
         let opts = PullOptions {
@@ -11243,30 +11321,42 @@ fn a_mirror_pull_ignores_pull_branches() {
 
 /// The pull parses `pull-branches` before it resolves the endpoint, so a
 /// malformed value is the error of a pull from a remote that cannot be
-/// reached. The pull publishes nothing.
+/// reached, and of a pull whose endpoint does not resolve. The pull publishes
+/// nothing. With no `pull-branches`, the same endpoint fails the pull with
+/// [`Error::Io`].
 #[test]
 fn a_malformed_pull_branches_fails_before_the_first_request() {
     block_on(async {
         let dir = TmpDir::new("pull-http-pull-branches-dead");
-        let dest = build_dest(
-            dir.path(),
-            RepoMode::Archive,
-            DEAD_URL,
-            "pull-branches=apps/**;r*:x\n",
-        )
-        .await;
+        let absent_ca = absent_ca_key(dir.path());
+        drop(build_dest(dir.path(), RepoMode::Archive, DEAD_URL, "").await);
+        for extra in [String::new(), absent_ca.clone()] {
+            let keys = format!("pull-branches=apps/**;r*:x\n{extra}");
+            let dest = reconfigure_dest(dir.path(), DEAD_URL, &keys).await;
+            let err = dest
+                .pull("origin", PullOptions::default())
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if m == BAD_PULL_BRANCHES),
+                "{extra}: {err}"
+            );
+            assert_nothing_published(&dest).await;
+            assert!(dest.list_remote_refs().await.unwrap().is_empty());
+            assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+            assert!(dest.list_objects().await.unwrap().is_empty());
+        }
+
+        let dest = reconfigure_dest(dir.path(), DEAD_URL, &absent_ca).await;
         let err = dest
             .pull("origin", PullOptions::default())
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::InvalidFormat(m) if m == BAD_PULL_BRANCHES),
+            matches!(&err, Error::Io(e) if e.to_string().contains("tls-ca-path")),
             "{err}"
         );
         assert_nothing_published(&dest).await;
-        assert!(dest.list_remote_refs().await.unwrap().is_empty());
-        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
-        assert!(dest.list_objects().await.unwrap().is_empty());
     });
 }
 
@@ -11275,14 +11365,107 @@ fn a_malformed_pull_branches_fails_before_the_first_request() {
 const BAD_PULL_BRANCHES: &str = "[remote \"origin\"] pull-branches: malformed receive \
      pattern 'r*:x': a remote part is one remote or '*'";
 
-/// With `pull-branches`, a malformed value fails the pull before its first
-/// request. A remote with no summary fails the pull before it reads a ref file
-/// or an object, also when `branches` holds refs. A list that selects no ref
-/// fails the pull the same way when `branches` is absent or empty. The pull
-/// parses `branches` after these checks of the summary, so a malformed
-/// `branches` value fails a pull from a remote with a summary with
-/// [`Error::Core`], and a pull from a remote with no summary with the
-/// no-summary error.
+/// The pull parses `branches` before it resolves the endpoint, also with
+/// `pull-branches`, so a malformed value is the error of a pull from a remote
+/// that cannot be reached, and of a pull whose endpoint does not resolve. A
+/// malformed escape sequence is [`Error::Core`]. A name that fails the
+/// ref-name rule, an empty name included, is [`Error::InvalidRefspec`]. If
+/// both keys are malformed, the error is the error of `pull-branches`. The
+/// pull publishes nothing.
+#[test]
+fn a_malformed_branches_value_fails_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-branches-dead");
+        let collection_ref = at(ID_X, "a");
+        let cases = [
+            ("a\\q;".to_owned(), None),
+            ("../x;".to_owned(), Some("../x")),
+            ("a;;b".to_owned(), Some("")),
+            (format!("{collection_ref};"), Some(collection_ref.as_str())),
+        ];
+        let absent_ca = absent_ca_key(dir.path());
+        let endpoints = ["", absent_ca.as_str()];
+        for (i, (branches, want)) in cases.iter().enumerate() {
+            for (j, pull_branches) in ["", "pull-branches=main\n"].into_iter().enumerate() {
+                for (k, endpoint) in endpoints.into_iter().enumerate() {
+                    let case = dir.path().join(format!("{i}-{j}-{k}"));
+                    std::fs::create_dir_all(&case).unwrap();
+                    let extra = format!("branches={branches}\n{pull_branches}{endpoint}");
+                    let dest = build_dest(&case, RepoMode::Archive, DEAD_URL, &extra).await;
+                    let err = dest
+                        .pull("origin", PullOptions::default())
+                        .await
+                        .unwrap_err();
+                    let kind_ok = match (&err, want) {
+                        (Error::Core(_), None) => true,
+                        (Error::InvalidRefspec(got), Some(want)) => got == want,
+                        _ => false,
+                    };
+                    assert!(kind_ok, "{extra}: {err}");
+                    assert_left_nothing(&dest).await;
+                    assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+                }
+            }
+        }
+
+        let case = dir.path().join("both");
+        std::fs::create_dir_all(&case).unwrap();
+        let extra = format!("branches=a\\q;\npull-branches=apps/**;r*:x\n{absent_ca}");
+        let dest = build_dest(&case, RepoMode::Archive, DEAD_URL, &extra).await;
+        let err = dest
+            .pull("origin", PullOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == BAD_PULL_BRANCHES),
+            "{err}"
+        );
+        assert_left_nothing(&dest).await;
+    });
+}
+
+/// A summary signature that the remote does not trust does not hide a
+/// malformed `branches` value. The pull parses the key before its first
+/// request, so the server sees no request.
+#[test]
+fn a_malformed_branches_value_fails_before_the_summary_check() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-branches-summary-sig");
+        build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        for (i, (branches, want)) in [("a\\q;", None), ("../x;", Some("../x"))]
+            .into_iter()
+            .enumerate()
+        {
+            let case = dir.path().join(i.to_string());
+            std::fs::create_dir_all(&case).unwrap();
+            let extra = format!(
+                "sign-verify=false\nsign-verify-summary=true\n\
+                 verification-ed25519-key={OTHER_PUBLIC_B64}\nbranches={branches}\n"
+            );
+            let dest = build_dest(&case, RepoMode::Archive, &server.url(), &extra).await;
+            let err = dest
+                .pull("origin", PullOptions::default())
+                .await
+                .unwrap_err();
+            let kind_ok = match (&err, want) {
+                (Error::Core(_), None) => true,
+                (Error::InvalidRefspec(got), Some(want)) => got == want,
+                _ => false,
+            };
+            assert!(kind_ok, "{branches}: {err}");
+            assert!(server.seen().is_empty(), "{branches}: {:?}", server.seen());
+            assert_left_nothing(&dest).await;
+        }
+    });
+}
+
+/// With `pull-branches`, a malformed value of `pull-branches` or `branches`
+/// fails the pull before its first request. A malformed escape sequence in
+/// `branches` is [`Error::Core`], also for a remote with no summary. A remote
+/// with no summary fails the pull before it reads a ref file or an object,
+/// also when `branches` holds refs. A list that selects no ref fails the pull
+/// the same way when `branches` is absent or empty.
 #[test]
 fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
     block_on(async {
@@ -11300,7 +11483,7 @@ fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
             (true, "branches=a\\q;\npull-branches=absent/**\n", ""),
             (false, "pull-branches=main\n", no_summary),
             (false, "branches=main;\npull-branches=main\n", no_summary),
-            (false, "branches=a\\q;\npull-branches=main\n", no_summary),
+            (false, "branches=a\\q;\npull-branches=main\n", ""),
         ]
         .into_iter()
         .enumerate()
@@ -11311,7 +11494,7 @@ fn pull_branches_fails_with_no_summary_a_bad_value_or_no_match() {
             if !summary && summary_path.exists() {
                 std::fs::remove_file(summary_path).unwrap();
             }
-            let malformed = extra.contains("r*:x");
+            let malformed = extra.contains("r*:x") || extra.contains("\\q");
             let case = dir.path().join(i.to_string());
             let (result, remote_refs, mirror_refs, seen) =
                 pull_with_keys(&server, &case, extra, &[]).await;
@@ -11585,7 +11768,7 @@ fn a_remote_ref_operand_is_refused_before_the_first_request() {
 }
 
 /// The `branches` key holds plain names alone. A pull with no ref refuses a
-/// collection ref in the key, and requests no ref file.
+/// collection ref in the key before its first request.
 #[test]
 fn a_collection_ref_in_the_branches_key_is_refused() {
     block_on(async {
@@ -11605,11 +11788,7 @@ fn a_collection_ref_in_the_branches_key_is_refused() {
             matches!(&err, Error::InvalidRefspec(got) if *got == x_a),
             "{err}"
         );
-        let seen = server.seen();
-        assert!(
-            !seen.iter().any(|path| path.starts_with("refs/")),
-            "{seen:?}"
-        );
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
         assert!(dest.list_mirror_refs().await.unwrap().is_empty());
     });
 }

@@ -682,6 +682,8 @@ impl Repo {
     /// - The errors of
     ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
     ///   for this repository.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` of
+    ///   this repository is not a boolean.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
     ///   for each remote, and the errors of
     ///   [`trust_group`](PullOptions::trust_group).
@@ -759,6 +761,10 @@ impl Repo {
         // The commit of each transaction reads the key again. This read fails
         // a bad value before the first request.
         self.config().generate_composefs()?;
+        // The writes of the transaction read these keys again. This read
+        // fails a bad value before the first request.
+        self.config().fsync()?;
+        self.config().per_object_fsync()?;
         let names = first_of_each(names.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come

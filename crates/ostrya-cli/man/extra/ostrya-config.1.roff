@@ -247,6 +247,7 @@ A pull refuses an ssh address and an \fB\%s3://\fR address in this key, and a pu
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
 The pull also takes the refs of the summary that the key \fB\%pull\-branches\fR selects, as that key states.
+A malformed value stops the pull before it connects.
 .TP
 \fB\%collection\-id\fR (string)
 The collection that the remote serves.

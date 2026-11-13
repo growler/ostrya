@@ -470,7 +470,7 @@ enum Command {
     /// `pull-branches` selects: a ref of the ref list of the summary as REF,
     /// and a ref of its collection map as @ID:REF. It writes each one as a
     /// pull of that ref does, and a ref that both keys give one time. A
-    /// malformed `pull-branches` value stops the pull before it connects.
+    /// malformed value of either key stops the pull before it connects.
     /// --mirror and --collection read neither key. ostrya-config(1) states
     /// the keys.
     ///

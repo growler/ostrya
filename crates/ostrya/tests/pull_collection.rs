@@ -1200,6 +1200,36 @@ fn a_bad_generate_composefs_value_refuses_a_collection_pull() {
     }
 }
 
+/// A value of `[core] fsync` or `[core] per-object-fsync` that is not a
+/// boolean stops a collection pull before its first request.
+#[test]
+fn a_bad_fsync_value_refuses_a_collection_pull() {
+    for key in ["fsync", "per-object-fsync"] {
+        block_on(async {
+            let dir = TmpDir::new("pull-collection-fsync-bad-value");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+            summarize(&a).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            drop(dest(dir.path(), None, &[("a", &server_a.url(), "")]).await);
+            let config = dir.path().join("dest/config");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                text.replacen("[core]\n", &format!("[core]\n{key}=maybe\n"), 1),
+            )
+            .unwrap();
+            let dest = Repo::open(&dir.path().join("dest")).await.unwrap();
+
+            let (opts, _) = options(&[REF]);
+            let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{key}: {err}");
+            assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+            assert_nothing_written(&dest).await;
+        });
+    }
+}
+
 // --- dependencies ------------------------------------------------------------
 
 /// A collection pull fetches the dependency that field 2 of the pulled commit

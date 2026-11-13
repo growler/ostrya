@@ -3717,11 +3717,11 @@ KEYS", and `../decisions.md`, "The refs of a pull with no ref"). The pull
 takes each ref of `branches` and each ref of the summary of the remote that
 the list selects, a ref of the ref list as `REF` and a ref of the collection
 map as `@ID:REF`, and writes each one as a pull that names it does. A ref
-that both keys give is pulled one time. A malformed value fails the pull at
-exit 1 before it connects. A remote with no summary fails the pull at exit 1
-before the first object request, also when `branches` holds refs. A list
-that selects no ref fails the pull the same way when `branches` holds no
-ref. The pull then writes no object and no ref.
+that both keys give is pulled one time. A malformed value of `pull-branches`
+or `branches` fails the pull at exit 1 before it connects. A remote with no
+summary fails the pull at exit 1 before the first object request, also when
+`branches` holds refs. A list that selects no ref fails the pull the same way
+when `branches` holds no ref. The pull then writes no object and no ref.
 `--collection` reads neither key. The tool does not define the key.
 
 A pull whose local ref path names an alias parts the two. The tool replaces

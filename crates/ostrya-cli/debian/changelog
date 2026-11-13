@@ -1,3 +1,39 @@
+ostrya (0.11.2) unstable; urgency=medium
+
+  * Add the key [ex-ostrya] gc-weak-references. When the roots of the
+    walk are the refs alone, prune makes each ref that the list selects
+    weak. A weak ref is not a root, and prune deletes a weak ref whose
+    commit no kept commit reaches. A value with no positive pattern
+    stops each prune before it deletes a ref or an object.
+  * Add the key [remote "NAME"] push-branches. push REMOTE with no
+    refspec sends each local ref and each ref under refs/mirrors/ID/
+    that the list selects. With --collection=ID, the push keeps the
+    local refs and the refs of ID alone. The push refuses --tag with no
+    refspec. If no ref matches, the push makes each option check that
+    reads no file, and then exits 0.
+  * pull NAME with no ref and no --mirror takes the refs of branches,
+    and then the refs of the summary that the key [remote "NAME"]
+    pull-branches selects. A ref that both keys give is pulled one
+    time. The pull checks both keys before it connects.
+  * A remote pull reads [core] fsync and [core] per-object-fsync before
+    it connects, so a connection error does not hide a malformed value.
+  * With no --repo, a command opens /ostree/repo when the current
+    directory holds no repository and OSTREE_REPO is not set or is
+    empty, as the ostree command does.
+  * init refuses a path that holds an entry config, and exits 1 before
+    it writes. init does not write into /ostree/repo.
+  * commit --tag refuses a ref that another writer makes at the path of
+    a tag while the commit runs. The branch does not move.
+  * A ref write and a ref removal refuse a path that names an alias or
+    that passes through an alias. A read of a ref follows an alias.
+    refs --delete and refs -c --delete check each selected ref under
+    the update lock before the first removal, and refuse an alias.
+    refs -A --delete removes an alias.
+  * Each read of a ref opens the ref file with no wait on a FIFO. A
+    FIFO, a socket, or a device file is no ref.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 13 Nov 2026 15:49:12 +0100
+
 ostrya (0.11.1) unstable; urgency=medium
 
   * A command that writes refs in one transaction checks each ref path

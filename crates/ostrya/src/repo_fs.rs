@@ -24,6 +24,8 @@ use rustix::io::Errno;
 
 use crate::error::Error;
 
+mod dir;
+
 /// The error of a file system operation in a repository.
 ///
 /// The path in a kind is relative to the repository root.
@@ -470,6 +472,9 @@ impl RootFile {
 /// An open directory of a repository and its kind.
 ///
 /// A clone shares the descriptor and the context of the repository.
+///
+/// A handle with no repository mode is not shared: its operations use the
+/// plain modes and never force a shared mode.
 #[derive(Debug, Clone)]
 pub(crate) struct RepoDir {
     /// The descriptor of the directory.
@@ -478,6 +483,26 @@ pub(crate) struct RepoDir {
     kind: RepoLayout,
     /// The context of the repository.
     ctx: Arc<RepoContext>,
+    /// The path of the directory, relative to the repository root. An error
+    /// gives its path from this value.
+    path: DirPath,
+}
+
+/// The path of a [`RepoDir`], relative to the repository root.
+///
+/// The root is the empty path. A primitive joins the parts of the path only
+/// to make the path of an error.
+#[derive(Debug, Clone)]
+enum DirPath {
+    /// The fixed path of the root or of a layout kind.
+    Fixed(&'static str),
+    /// The path of a directory below the root or a layout kind.
+    Nested {
+        /// The fixed path of the root or of the layout kind.
+        base: &'static str,
+        /// The path of the directory, relative to `base`.
+        rel: Arc<str>,
+    },
 }
 
 /// The state that the [`RepoDir`] handles of one repository share.
@@ -509,6 +534,7 @@ impl RepoDir {
             }),
             fd,
             kind: RepoLayout::Root,
+            path: DirPath::Fixed(""),
         }
     }
 
@@ -533,6 +559,7 @@ impl RepoDir {
             }),
             fd: self.fd,
             kind: self.kind,
+            path: self.path,
         }
     }
 
@@ -674,6 +701,64 @@ impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+/// The step after a `mkdirat` that a test fault fails.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FaultStep {
+    /// The open of a new temp directory.
+    Open,
+    /// The `fchmod` that forces the shared mode on each new directory in a
+    /// `bare-user-shared` repository.
+    Fchmod,
+}
+
+/// A point in a primitive where a test runs a hook.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookPoint {
+    /// After the read of each subdirectory of a tree removal. The hook gets
+    /// the name of the subdirectory.
+    Descend,
+    /// In `ensure_dir`, after the open of the full path gives `ENOENT` and
+    /// before the walk of the components. The hook gets the path.
+    Walk,
+    /// Before the first `getdents` of each read of a directory. The hook gets
+    /// an empty name.
+    Getdents,
+    /// Before the typing of each entry of a directory read. The hook gets the
+    /// name of the entry.
+    Entry,
+}
+
+/// A hook that a test runs at a [`HookPoint`].
+#[cfg(test)]
+type Hook = Box<dyn FnMut(&[u8])>;
+
+/// The faults that a test injects into the primitives of its own thread.
+#[cfg(test)]
+#[derive(Default)]
+struct Faults {
+    /// Fails the step after a `mkdirat` with the errno.
+    fail_after_mkdir: Option<(FaultStep, Errno)>,
+    /// Gives `EEXIST` in place of each `mkdirat` of a temp directory. The
+    /// primitive makes no `mkdirat` call.
+    force_eexist: bool,
+    /// The hooks, at most one for each point.
+    hooks: Vec<(HookPoint, Hook)>,
+    /// Gives the unknown type in place of the `getdents` type of each entry of
+    /// a directory read.
+    unknown_type: bool,
+    /// The device and inode of each directory that a primitive syncs, in the
+    /// order of the syncs. `None` records nothing.
+    synced: Option<Vec<(u64, u64)>>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The faults of the thread. Each test thread starts with no fault.
+    static FAULTS: std::cell::RefCell<Faults> = std::cell::RefCell::default();
 }
 
 #[cfg(test)]

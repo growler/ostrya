@@ -25,6 +25,8 @@ use rustix::io::Errno;
 use crate::error::Error;
 
 mod dir;
+mod lock;
+mod named;
 mod read;
 mod temp;
 mod write;
@@ -33,7 +35,8 @@ pub(crate) use temp::{TempFile, TempLink};
 
 /// The error of a file system operation in a repository.
 ///
-/// The path in a kind is relative to the repository root.
+/// The path in a kind is relative to the repository root. A path that the
+/// caller names shows as the caller gives it.
 ///
 /// `From<FsError> for Error` converts each kind with one rule:
 ///
@@ -85,6 +88,8 @@ pub(crate) enum Reason {
         /// The cap, in bytes.
         cap: u64,
     },
+    /// A relative path has a `..` component.
+    ParentDir,
 }
 
 impl fmt::Display for Reason {
@@ -97,6 +102,9 @@ impl fmt::Display for Reason {
             Reason::NotDirectory => f.write_str("is not a directory"),
             Reason::NotRegular(_) => f.write_str("is not a regular file"),
             Reason::TooLarge { cap } => write!(f, "is larger than its cap of {cap} bytes"),
+            Reason::ParentDir => {
+                f.write_str("has a `..` component, which a relative path in a config cannot have")
+            }
         }
     }
 }
@@ -793,7 +801,8 @@ fn io_err<T: fmt::Debug>(result: Result<T, FsError>) -> std::io::Error {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FaultStep {
-    /// The open of a new temp directory.
+    /// The open of a new temp directory, and the open for the `fchmod` of a
+    /// new directory of `ensure_named_dir`.
     Open,
     /// The `fchmod` that forces the shared mode on each new directory and
     /// each new exclusive file in a `bare-user-shared` repository.
@@ -819,6 +828,12 @@ enum HookPoint {
     /// Before the create of each temp file name and temp symlink name. The
     /// hook gets the name.
     TempName,
+    /// In `open_lock`, after the create of a lock file gives `EEXIST` and
+    /// before the open of the existing file. The hook gets the name.
+    LockOpen,
+    /// In `open_lock`, before each create of a lock file. The hook gets the
+    /// name.
+    LockCreate,
 }
 
 /// A hook that a test runs at a [`HookPoint`].
@@ -954,6 +969,92 @@ fn is_symlink(path: &std::path::Path) -> bool {
         .is_symlink()
 }
 
+/// Returns the mode of a directory that a `mkdir` with the mode `request`
+/// makes in `parent`. The umask, a set-group-ID parent, and a default ACL
+/// of `parent` change the mode as they change each other new directory.
+#[cfg(test)]
+fn reference_mode(parent: &std::path::Path, request: u32) -> u32 {
+    use std::os::unix::fs::DirBuilderExt;
+
+    let path = parent.join(".reference-mode");
+    std::fs::DirBuilder::new()
+        .mode(request)
+        .create(&path)
+        .unwrap();
+    let mode = mode_of(&path);
+    std::fs::remove_dir(&path).unwrap();
+    mode
+}
+
+/// Returns the mode of a file that a create with the mode `request` makes in
+/// `parent`. The umask and a default ACL of `parent` change the mode as they
+/// change each other new file.
+#[cfg(test)]
+fn reference_file_mode(parent: &std::path::Path, request: u32) -> u32 {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = parent.join(".reference-file-mode");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(request)
+        .open(&path)
+        .unwrap();
+    let mode = mode_of(&path);
+    std::fs::remove_file(&path).unwrap();
+    mode
+}
+
+/// Makes a FIFO at `path`.
+#[cfg(test)]
+fn mkfifo(path: &std::path::Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+}
+
+/// Runs `f` in a new thread, and gives its result. If `f` does not return in
+/// 10 seconds, the function opens the FIFO `fifo` for write, which releases a
+/// blocked open, and panics.
+#[cfg(test)]
+fn without_block<T: Send + 'static>(
+    fifo: &std::path::Path,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::time::Duration;
+
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(value) => {
+            worker.join().unwrap();
+            value
+        }
+        Err(RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("the worker sends a value before it ends"),
+        },
+        Err(RecvTimeoutError::Timeout) => {
+            let _ = rustix::fs::open(
+                fifo,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+            panic!("a read of the FIFO {} blocked", fifo.display());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::fd::AsRawFd;
@@ -984,7 +1085,7 @@ mod tests {
     }
 
     /// Returns each reason and its `Display` text.
-    fn reason_cases() -> [(Reason, &'static str); 6] {
+    fn reason_cases() -> [(Reason, &'static str); 7] {
         [
             (
                 Reason::Symlink,
@@ -1003,6 +1104,10 @@ mod tests {
             (
                 Reason::TooLarge { cap: u64::MAX },
                 "is larger than its cap of 18446744073709551615 bytes",
+            ),
+            (
+                Reason::ParentDir,
+                "has a `..` component, which a relative path in a config cannot have",
             ),
         ]
     }

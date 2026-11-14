@@ -888,7 +888,7 @@ fn check_dir_entry(parent: BorrowedFd<'_>, name: &str) -> Result<(), Errno> {
 /// Forces the mode `force` on the new directory `name` of `parent`, open at
 /// `fd`. If the `fchmod` fails, the function removes the directory, and gives
 /// the error of the `fchmod`.
-fn force_new_dir_mode<P: rustix::path::Arg + Copy>(
+pub(super) fn force_new_dir_mode<P: rustix::path::Arg + Copy>(
     parent: BorrowedFd<'_>,
     name: P,
     fd: BorrowedFd<'_>,
@@ -953,7 +953,7 @@ fn open_temp_dir(tmp: BorrowedFd<'_>, name: &str, force: Option<u32>) -> Result<
 
 /// Gives the errno of a test fault at `step`.
 #[cfg(test)]
-fn fault_after_mkdir(step: super::FaultStep) -> Result<(), Errno> {
+pub(super) fn fault_after_mkdir(step: super::FaultStep) -> Result<(), Errno> {
     match super::FAULTS.with(|faults| faults.borrow().fail_after_mkdir) {
         Some((at, errno)) if at == step => Err(errno),
         _ => Ok(()),
@@ -1056,8 +1056,10 @@ fn identity(fd: BorrowedFd<'_>) -> Result<Identity, FsError> {
     ))
 }
 
-/// Maps the error of the open or the create of the root at `path`.
-fn root_error(errno: Errno, path: &Path) -> FsError {
+/// Maps the error of the open or the create of the root, or of a path that a
+/// caller or a config names, at `path`. The path of the error is `path` as
+/// the caller gives it.
+pub(super) fn root_error(errno: Errno, path: &Path) -> FsError {
     match errno {
         Errno::NOENT => FsError::Absent {
             path: path.display().to_string(),
@@ -1088,29 +1090,15 @@ pub(super) fn require<T>(value: Option<T>, what: &'static str) -> Result<T, FsEr
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::rc::Rc;
 
     use super::super::{
         FaultStep, HookPoint, TestDir, id_of, invalid, io_err, is_symlink, mode_of, names_with,
-        record_syncs, root, set_faults, set_hook, take_synced,
+        record_syncs, reference_mode, root, set_faults, set_hook, take_synced,
     };
     use super::*;
-
-    /// Returns the mode of a directory that a `mkdir` with the mode `request`
-    /// makes in `parent`. The umask, a set-group-ID parent, and a default ACL
-    /// of `parent` change the mode as they change each other new directory.
-    fn reference_mode(parent: &Path, request: u32) -> u32 {
-        let path = parent.join(".reference-mode");
-        std::fs::DirBuilder::new()
-            .mode(request)
-            .create(&path)
-            .unwrap();
-        let mode = mode_of(&path);
-        std::fs::remove_dir(&path).unwrap();
-        mode
-    }
 
     fn set_mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();

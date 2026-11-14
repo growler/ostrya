@@ -44,7 +44,7 @@ const FILE_OPEN: OFlags = OFlags::RDONLY
 /// The flags of the open of a keyring file at the root. They are the flags of
 /// [`FILE_OPEN`] with no `O_NOFOLLOW`, because a keyring file can be a
 /// symlink.
-const KEYRING_OPEN: OFlags = OFlags::RDONLY
+pub(super) const KEYRING_OPEN: OFlags = OFlags::RDONLY
     .union(OFlags::NONBLOCK)
     .union(OFlags::NOCTTY)
     .union(OFlags::CLOEXEC);
@@ -133,16 +133,9 @@ impl RepoDir {
                 path: self.err_path(name),
             }),
             Err(e @ (Errno::NXIO | Errno::NODEV)) => {
-                match rustix::fs::statx(self, name.as_str(), AtFlags::empty(), StatxFlags::TYPE) {
-                    Ok(stx) => match FileType::from_raw_mode(u32::from(stx.stx_mode)) {
-                        FileType::RegularFile => Err(io_error(e)),
-                        other => Err(FsError::Invalid {
-                            path: self.err_path(name),
-                            reason: Reason::NotRegular(other),
-                        }),
-                    },
-                    Err(e) => Err(io_error(e)),
-                }
+                Err(followed_type_error(self.as_fd(), name.as_str(), e, || {
+                    self.err_path(name)
+                }))
             }
             Err(e) => Err(io_error(e)),
         }
@@ -390,7 +383,7 @@ impl RepoDir {
     /// Gives the file open at `fd` and its status, or [`Reason::NotRegular`]
     /// if the file is not a regular file. `path` is the path of the file
     /// below this handle, for an error.
-    fn finish(&self, fd: OwnedFd, path: &str) -> Result<Opened, FsError> {
+    pub(super) fn finish(&self, fd: OwnedFd, path: &str) -> Result<Opened, FsError> {
         let stat = stat_fd(fd.as_fd())?;
         if stat.file_type != FileType::RegularFile {
             return Err(FsError::Invalid {
@@ -412,7 +405,7 @@ impl RepoDir {
     /// not a regular file gives [`Reason::NotRegular`], a regular file gives
     /// [`FsError::Io`] with `errno`, and an error of the `lstat` stays as it
     /// is. Each other errno gives the result of [`FsError::at`].
-    fn open_error(&self, errno: Errno, path: &str) -> FsError {
+    pub(super) fn open_error(&self, errno: Errno, path: &str) -> FsError {
         if !matches!(errno, Errno::NXIO | Errno::NODEV) {
             return FsError::at(errno, self.err_path(path));
         }
@@ -424,6 +417,32 @@ impl RepoDir {
             Ok(_) => io_error(errno),
             Err(e) => e,
         }
+    }
+}
+
+/// Returns the error of `errno`, `ENXIO` or `ENODEV`, from an open of `path`
+/// relative to `base` that follows each symlink.
+///
+/// A socket and a device with no driver give these errnos. One `statx` that
+/// follows each symlink reads the type: an entry that is not a regular file
+/// gives [`Reason::NotRegular`] with the path from `err_path`, and a regular
+/// file gives [`FsError::Io`] with `errno`. An error of the `statx` gives
+/// [`FsError::Io`].
+pub(super) fn followed_type_error<P: rustix::path::Arg>(
+    base: BorrowedFd<'_>,
+    path: P,
+    errno: Errno,
+    err_path: impl FnOnce() -> String,
+) -> FsError {
+    match rustix::fs::statx(base, path, AtFlags::empty(), StatxFlags::TYPE) {
+        Ok(stx) => match FileType::from_raw_mode(u32::from(stx.stx_mode)) {
+            FileType::RegularFile => io_error(errno),
+            other => FsError::Invalid {
+                path: err_path(),
+                reason: Reason::NotRegular(other),
+            },
+        },
+        Err(e) => io_error(e),
     }
 }
 
@@ -559,60 +578,17 @@ mod tests {
     use std::fmt::Debug;
     use std::os::unix::fs::symlink;
     use std::os::unix::net::UnixListener;
-    use std::path::Path;
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::time::Duration;
 
     use ostrya_composefs::FsVerityHasher;
     use rustix::fs::XattrFlags;
 
-    use super::super::{TestDir, invalid, io_err, root};
+    use super::super::{TestDir, invalid, io_err, mkfifo, root, without_block};
     use super::*;
 
     /// Makes `objects/ab` in `dir`, and returns a handle of `objects/`.
     fn objects(dir: &TestDir) -> RepoDir {
         std::fs::create_dir_all(dir.path().join("objects/ab")).unwrap();
         root(dir).open_layout(RepoLayout::Objects).unwrap()
-    }
-
-    /// Makes a FIFO at `path`.
-    fn mkfifo(path: &Path) {
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            path,
-            FileType::Fifo,
-            Mode::from_raw_mode(0o600),
-            0,
-        )
-        .unwrap();
-    }
-
-    /// Runs `f` in a new thread, and gives its result. If `f` does not return
-    /// in 10 seconds, the function opens the FIFO `fifo` for write, which
-    /// releases a blocked open, and panics.
-    fn without_block<T: Send + 'static>(fifo: &Path, f: impl FnOnce() -> T + Send + 'static) -> T {
-        let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        match rx.recv_timeout(Duration::from_secs(10)) {
-            Ok(value) => {
-                worker.join().unwrap();
-                value
-            }
-            Err(RecvTimeoutError::Disconnected) => match worker.join() {
-                Err(panic) => std::panic::resume_unwind(panic),
-                Ok(()) => unreachable!("the worker sends a value before it ends"),
-            },
-            Err(RecvTimeoutError::Timeout) => {
-                let _ = rustix::fs::open(
-                    fifo,
-                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    Mode::empty(),
-                );
-                panic!("a read of the FIFO {} blocked", fifo.display());
-            }
-        }
     }
 
     /// Returns the path and the file type of a `NotRegular` error.

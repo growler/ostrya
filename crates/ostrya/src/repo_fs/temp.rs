@@ -448,7 +448,7 @@ fn open_tmpfile(home: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
 ///
 /// The function tries [`TEMP_ATTEMPTS`] names at most, and then gives an
 /// `AlreadyExists` error. `map` gives the error of each other errno.
-fn make_temp_name<T>(
+pub(super) fn make_temp_name<T>(
     mut make: impl FnMut(&str) -> Result<T, Errno>,
     map: fn(Errno) -> FsError,
 ) -> Result<(String, T), FsError> {

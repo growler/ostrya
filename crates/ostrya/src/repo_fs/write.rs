@@ -176,7 +176,10 @@ impl RepoDir {
         let is_shared = self.ctx.is_shared();
         let request = if is_shared { shared & 0o777 } else { plain };
         let fd = rustix::fs::openat2(at, leaf, NAMED_OPEN, Mode::from_raw_mode(request), BENEATH)
-            .map_err(|e| FsError::at(e, self.err_path(path)))?;
+            .map_err(|e| match e {
+            Errno::EXIST => FsError::Exists,
+            e => FsError::at(e, self.err_path(path)),
+        })?;
         if is_shared && let Err(e) = fchmod_new(fd.as_fd(), shared) {
             let _ = rustix::fs::unlinkat(at, leaf, AtFlags::empty());
             return Err(io_error(e));

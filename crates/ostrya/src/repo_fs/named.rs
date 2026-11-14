@@ -118,9 +118,12 @@ pub(crate) fn open_named(
 /// file. The temp name is unlinked after an error and after
 /// [`Published::Existed`].
 ///
-/// The mode of an existing regular file at `name` stays: an `fchmod` sets it
-/// on the new file before the write of `bytes`. Each other entry at `name`
-/// gets the mode of a new file: `0666`, which the umask reduces.
+/// The mode of an existing regular file at `name` stays. The create of the
+/// temp file requests the permission bits of that mode, and the umask
+/// reduces them. An `fchmod` then sets the full mode, with the special bits,
+/// before the write of `bytes`. Thus the temp file never has a permission
+/// bit that the kept mode does not have. Each other entry at `name` gets the
+/// mode of a new file: `0666`, which the umask reduces.
 /// [`Publish::Replace`] replaces a symlink at `name` with a regular file, and
 /// never writes through it. The target of the symlink keeps its content. It
 /// also replaces a FIFO and a socket. With [`Publish::Replace`], a directory
@@ -161,10 +164,15 @@ pub(crate) fn put_named(
         Err(Errno::NOENT) => None,
         Err(e) => return Err(io_error(e)),
     };
+    // The create request has no permission bit beyond the final mode, and
+    // the umask can only remove bits.
+    let request = Mode::from_raw_mode(kept.unwrap_or(NEW_FILE_MODE) & 0o777);
     let (temp, fd) = make_temp_name(
-        |temp| rustix::fs::openat(dir, temp, NAMED_OPEN, Mode::from_raw_mode(NEW_FILE_MODE)),
+        |temp| rustix::fs::openat(dir, temp, NAMED_OPEN, request),
         io_error,
     )?;
+    #[cfg(test)]
+    super::dir::run_hook(super::HookPoint::NamedCreated, temp.as_bytes());
     let mut temp = Some(temp);
     let placed = fill(File::from(fd), bytes, kept, fsync)
         .and_then(|()| place_named(dir, &mut temp, dir, name, how, false));
@@ -340,8 +348,9 @@ fn open_new_dir(parent: BorrowedFd<'_>, name: &OsStr) -> Result<OwnedFd, Errno> 
 
 /// Sets the mode `mode` on the new file `file` with `fchmod` if there is
 /// one, writes `bytes` to it, and syncs the file with `fsync` if `fsync` is
-/// set. The `fchmod` comes before the write, so the bytes are never readable
-/// with a wider mode.
+/// set. The `fchmod` comes before the write, so the bytes are written with
+/// the mode `mode` in place. The caller creates the file with no permission
+/// bit beyond `mode`.
 fn fill(mut file: File, bytes: &[u8], mode: Option<u32>, fsync: bool) -> Result<(), FsError> {
     if let Some(mode) = mode {
         rustix::fs::fchmod(&file, Mode::from_raw_mode(mode)).map_err(io_error)?;
@@ -572,6 +581,28 @@ mod tests {
         assert_eq!(result.unwrap(), Published::Created);
         assert_eq!(mode_of(&path), 0o600);
         assert_eq!(std::fs::read(&path).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn put_named_creates_the_temp_file_with_no_bit_beyond_the_kept_mode() {
+        let dir = TestDir::new("named-put-create-mode");
+        let path = dir.path().join("x.conf");
+        std::fs::write(&path, b"old").unwrap();
+        set_mode(&path, 0o600);
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let hook_seen = Rc::clone(&seen);
+        let hook_dir = dir.path().to_owned();
+        let _hook = set_hook(HookPoint::NamedCreated, move |name| {
+            let temp = hook_dir.join(std::str::from_utf8(name).unwrap());
+            hook_seen.borrow_mut().push(mode_of(&temp));
+        });
+
+        let result = put_named(dir.fd(), "x.conf", b"secret", Publish::Replace, false);
+        assert_eq!(result.unwrap(), Published::Created);
+        let seen = seen.borrow().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0] & !0o600, 0, "temp mode {:o}", seen[0]);
+        assert_eq!(mode_of(&path), 0o600);
     }
 
     #[test]

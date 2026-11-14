@@ -19,7 +19,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, OnceLock};
 
 use ostrya_core::{Checksum, ObjectType, RepoMode};
-use rustix::fs::{AtFlags, FileType, StatxAttributes, StatxFlags};
+use rustix::fs::{AtFlags, FileType, Statx, StatxAttributes, StatxFlags};
 use rustix::io::Errno;
 
 use crate::error::Error;
@@ -686,7 +686,7 @@ pub(crate) enum Published {
     Existed,
 }
 
-/// The `statx` fields that [`stat_fd`] reads.
+/// The `statx` fields that [`stat_fd`] and [`RepoDir::lstat`] read.
 const STAT_FIELDS: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::MODE)
     .union(StatxFlags::UID)
@@ -697,14 +697,23 @@ const STAT_FIELDS: StatxFlags = StatxFlags::TYPE
 
 /// Returns the status of the inode open at `fd`, from one `statx` call.
 ///
-/// The verity flag comes from the attributes word alone. The function does not
-/// read the attribute mask, because btrfs sets the attribute and leaves it out
-/// of the mask.
+/// The verity flag comes from the attributes word alone, as
+/// [`stat_from_statx`] states.
 pub(crate) fn stat_fd(fd: BorrowedFd<'_>) -> Result<Stat, FsError> {
     let stx = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, STAT_FIELDS)
         .map_err(|errno| FsError::Io(errno.into()))?;
+    Ok(stat_from_statx(&stx))
+}
+
+/// Returns the [`Stat`] of the result `stx` of a `statx` call with the fields
+/// [`STAT_FIELDS`].
+///
+/// The verity flag comes from the attributes word alone. The function does not
+/// read the attribute mask, because btrfs sets the attribute and leaves it out
+/// of the mask.
+fn stat_from_statx(stx: &Statx) -> Stat {
     let mode = u32::from(stx.stx_mode);
-    Ok(Stat {
+    Stat {
         file_type: FileType::from_raw_mode(mode),
         mode,
         uid: stx.stx_uid,
@@ -715,7 +724,7 @@ pub(crate) fn stat_fd(fd: BorrowedFd<'_>) -> Result<Stat, FsError> {
         mtime_sec: stx.stx_mtime.tv_sec,
         mtime_nsec: stx.stx_mtime.tv_nsec,
         verity: stx.stx_attributes.contains(StatxAttributes::VERITY),
-    })
+    }
 }
 
 /// A temp directory that a test removes when it drops.
@@ -828,6 +837,12 @@ enum HookPoint {
     /// Before the create of each temp file name and temp symlink name. The
     /// hook gets the name.
     TempName,
+    /// In `put_named`, after the create of the temp file and before the
+    /// `fchmod` of its mode. The hook gets the temp name.
+    NamedCreated,
+    /// Before each `O_TMPFILE` open of a temp file. The hook gets an empty
+    /// name.
+    Tmpfile,
     /// In `open_lock`, after the create of a lock file gives `EEXIST` and
     /// before the open of the existing file. The hook gets the name.
     LockOpen,

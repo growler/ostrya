@@ -30,7 +30,10 @@ use rustix::fs::{AtFlags, FileType, Mode, OFlags, StatxFlags};
 use rustix::io::Errno;
 
 use super::dir::{BENEATH, DIR_OPEN, io_error, is_component, require};
-use super::{FsError, ObjectEntry, Opened, Reason, RepoDir, RepoLayout, RootFile, Stat, stat_fd};
+use super::{
+    FsError, ObjectEntry, Opened, Reason, RepoDir, RepoLayout, RootFile, STAT_FIELDS, Stat,
+    stat_fd, stat_from_statx,
+};
 
 /// The flags of the open of a regular file. `O_NOFOLLOW` refuses a symlink at
 /// the leaf, and `O_NONBLOCK` keeps the open of a FIFO from waiting for a
@@ -244,13 +247,23 @@ impl RepoDir {
     /// Returns the status of the entry at `path` below this handle. A
     /// symlink at the leaf gives the status of the symlink itself.
     ///
-    /// One `openat2` with `O_PATH|O_NOFOLLOW` opens the entry, and one
-    /// `statx` reads its status. The path rules and the errors of the open
-    /// are those of [`open_dir`](RepoDir::open_dir). A symlink at a component
-    /// before the leaf gives [`Reason::Symlink`]. An error of the `statx`
-    /// gives [`FsError::Io`].
+    /// A `path` of one component costs one `statx` with
+    /// `AT_SYMLINK_NOFOLLOW` relative to this handle. The path has no
+    /// directory component to resolve, and the `statx` does not follow the
+    /// leaf. Its errno maps by [`FsError::at`] with `path`.
+    ///
+    /// A longer `path` costs one `openat2` with `O_PATH|O_NOFOLLOW`, one
+    /// `statx` on the descriptor, and one `close`. The path rules and the
+    /// errors of the open are those of [`open_dir`](RepoDir::open_dir). A
+    /// symlink at a component before the leaf gives [`Reason::Symlink`]. An
+    /// error of the `statx` gives [`FsError::Io`].
     pub(crate) fn lstat(&self, path: &str) -> Result<Stat, FsError> {
         self.check_path(path)?;
+        if !path.contains('/') {
+            return rustix::fs::statx(self, path, AtFlags::SYMLINK_NOFOLLOW, STAT_FIELDS)
+                .map(|stx| stat_from_statx(&stx))
+                .map_err(|e| FsError::at(e, self.err_path(path)));
+        }
         let fd = self.open_link(path)?;
         stat_fd(fd.as_fd())
     }
@@ -258,15 +271,22 @@ impl RepoDir {
     /// Returns `true` if an entry exists at `path` below this handle. A
     /// symlink at the leaf exists, also when its target does not.
     ///
-    /// The check is one `openat2` with `O_PATH|O_NOFOLLOW`. An absent entry
-    /// gives `false`. Each other error of the open stays an error, as in
+    /// A `path` of one component costs one `statx` with
+    /// `AT_SYMLINK_NOFOLLOW`, as in [`lstat`](RepoDir::lstat). A longer
+    /// `path` costs one `openat2` with `O_PATH|O_NOFOLLOW` and one `close`.
+    /// An absent entry gives `false`. Each other error stays an error, as in
     /// [`lstat`](RepoDir::lstat): a symlink at a component before the leaf
     /// gives [`Reason::Symlink`], and a file there gives
     /// [`Reason::NotDirectory`].
     pub(crate) fn exists(&self, path: &str) -> Result<bool, FsError> {
         self.check_path(path)?;
-        match rustix::fs::openat2(self, path, LINK_OPEN, Mode::empty(), BENEATH) {
-            Ok(_) => Ok(true),
+        let found = if path.contains('/') {
+            rustix::fs::openat2(self, path, LINK_OPEN, Mode::empty(), BENEATH).map(drop)
+        } else {
+            rustix::fs::statx(self, path, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE).map(drop)
+        };
+        match found {
+            Ok(()) => Ok(true),
             Err(Errno::NOENT) => Ok(false),
             Err(e) => Err(FsError::at(e, self.err_path(path))),
         }
@@ -891,6 +911,54 @@ mod tests {
         assert_eq!(stat.size, 16);
         assert_eq!(objects.lstat("ab").unwrap().file_type, FileType::Directory);
         assert_eq!(absent(objects.lstat("ab/none")), "objects/ab/none");
+    }
+
+    /// Returns each field of `stat`.
+    fn stat_fields(stat: &Stat) -> (FileType, u32, u32, u32, u64, u64, u64, i64, u32, bool) {
+        (
+            stat.file_type,
+            stat.mode,
+            stat.uid,
+            stat.gid,
+            stat.size,
+            stat.dev,
+            stat.ino,
+            stat.mtime_sec,
+            stat.mtime_nsec,
+            stat.verity,
+        )
+    }
+
+    #[test]
+    fn lstat_and_exists_of_one_component_match_a_longer_path() {
+        let dir = TestDir::new("read-lstat-one");
+        let objects = objects(&dir);
+        let ab_dir = objects.open_dir("ab").unwrap();
+        let ab = dir.path().join("objects/ab");
+        std::fs::write(ab.join("file"), b"0123456789abcdef").unwrap();
+        std::fs::create_dir(ab.join("sub")).unwrap();
+        symlink("file", ab.join("link")).unwrap();
+        symlink("nowhere-at-all", ab.join("dangling")).unwrap();
+
+        for (name, file_type) in [
+            ("file", FileType::RegularFile),
+            ("sub", FileType::Directory),
+            ("link", FileType::Symlink),
+            ("dangling", FileType::Symlink),
+        ] {
+            let one = ab_dir.lstat(name).unwrap();
+            let long = objects.lstat(&format!("ab/{name}")).unwrap();
+            assert_eq!(one.file_type, file_type, "{name}");
+            assert_eq!(stat_fields(&one), stat_fields(&long), "{name}");
+            assert!(ab_dir.exists(name).unwrap(), "{name}");
+        }
+        assert_eq!(ab_dir.lstat("link").unwrap().size, 4);
+        assert_eq!(absent(ab_dir.lstat("none")), "objects/ab/none");
+        assert!(!ab_dir.exists("none").unwrap());
+        assert_eq!(
+            stat_fields(&objects.lstat("ab").unwrap()),
+            stat_fields(&stat_fd(ab_dir.as_fd()).unwrap())
+        );
     }
 
     #[test]

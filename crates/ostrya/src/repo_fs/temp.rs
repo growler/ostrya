@@ -7,11 +7,12 @@
 //! directory and for `tmp/`. The publish thus puts the entry on the file
 //! system of its home.
 //!
-//! A temp file is an anonymous `O_TMPFILE` inode where the file system
-//! supports it. On each other file system it is a named file
-//! `.ostrya-tmp-<pid>-XXXXXX`, where `XXXXXX` is six random characters from
-//! `[A-Za-z0-9]`. A temp symlink always has a name of this form. The drop of
-//! an entry that has a name in its home unlinks the name.
+//! A temp file of [`TempFile::create`] is an anonymous `O_TMPFILE` inode
+//! where the file system supports it. On each other file system it is a named
+//! file `.ostrya-tmp-<pid>-XXXXXX`, where `XXXXXX` is six random characters
+//! from `[A-Za-z0-9]`. A temp file of [`TempFile::create_named`] and a temp
+//! symlink always have a name of this form. The drop of an entry that has a
+//! name in its home unlinks the name.
 //!
 //! The publish of an entry at a path that exists follows a [`Publish`] rule:
 //!
@@ -21,7 +22,10 @@
 //!   Where the file system refuses that flag, a `linkat` of the name puts the
 //!   entry in place, and the drop then unlinks the temp name.
 //! - [`Publish::Replace`] replaces the existing entry with one `renameat`. An
-//!   anonymous file first links at a temp name in its home.
+//!   anonymous file first links at a temp name in its home. A caller that
+//!   knows the rule before the create, such as
+//!   [`RepoDir::write_atomic`], makes a named file for [`Publish::Replace`],
+//!   so the publish needs no link.
 
 use std::ffi::CStr;
 use std::fs::File;
@@ -141,28 +145,47 @@ impl TempFile {
     /// [`tmp_dir`](RepoDir::tmp_dir).
     pub(crate) fn create(dir: &RepoDir) -> Result<TempFile, FsError> {
         let home = temp_home(dir)?;
-        let (fd, name) = match open_tmpfile(home.as_fd()) {
-            Ok(fd) => (fd, None),
-            Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => {
-                let (name, fd) = make_temp_name(
-                    |name| {
-                        rustix::fs::openat2(
-                            &home,
-                            name,
-                            NAMED_OPEN,
-                            Mode::from_raw_mode(TEMP_MODE),
-                            BENEATH,
-                        )
-                    },
-                    io_error,
-                )?;
-                (fd, Some(name))
-            }
-            Err(e) => return Err(io_error(e)),
-        };
+        match open_tmpfile(home.as_fd()) {
+            Ok(fd) => Ok(TempFile {
+                file: File::from(fd),
+                entry: TempName { home, name: None },
+                mode_set: false,
+            }),
+            Err(Errno::OPNOTSUPP | Errno::ISDIR | Errno::INVAL) => TempFile::create_named_in(home),
+            Err(e) => Err(io_error(e)),
+        }
+    }
+
+    /// Makes a named temp file for a write to `dir`, open for read and write.
+    ///
+    /// The function makes no `O_TMPFILE` open. The rules of the name, the
+    /// mode, and the errors are those of the named file of
+    /// [`create`](TempFile::create). A publish with [`Publish::Replace`] then
+    /// costs one `renameat`, with no link of the file at a temp name.
+    pub(super) fn create_named(dir: &RepoDir) -> Result<TempFile, FsError> {
+        TempFile::create_named_in(temp_home(dir)?)
+    }
+
+    /// Makes a named temp file in the temp home `home` with `O_CREAT|O_EXCL`.
+    fn create_named_in(home: RepoDir) -> Result<TempFile, FsError> {
+        let (name, fd) = make_temp_name(
+            |name| {
+                rustix::fs::openat2(
+                    &home,
+                    name,
+                    NAMED_OPEN,
+                    Mode::from_raw_mode(TEMP_MODE),
+                    BENEATH,
+                )
+            },
+            io_error,
+        )?;
         Ok(TempFile {
             file: File::from(fd),
-            entry: TempName { home, name },
+            entry: TempName {
+                home,
+                name: Some(name),
+            },
             mode_set: false,
         })
     }
@@ -436,6 +459,8 @@ fn temp_home(dir: &RepoDir) -> Result<RepoDir, FsError> {
 
 /// Opens an anonymous temp file in `home` with `O_TMPFILE`.
 fn open_tmpfile(home: BorrowedFd<'_>) -> Result<OwnedFd, Errno> {
+    #[cfg(test)]
+    super::dir::run_hook(super::HookPoint::Tmpfile, b"");
     #[cfg(test)]
     if super::FAULTS.with(|faults| faults.borrow().no_tmpfile) {
         return Err(Errno::OPNOTSUPP);

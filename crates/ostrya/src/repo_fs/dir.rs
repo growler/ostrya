@@ -4,7 +4,9 @@
 //! Each open of a path below a [`RepoDir`] is one `openat2` with
 //! `RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`. The kernel refuses a symlink at each
 //! component with `ELOOP`. Each primitive refuses a `..`, `.`, or empty
-//! component, and an absolute path, before the call.
+//! component, and an absolute path, before the call. The opens of a tree
+//! removal also use `RESOLVE_NO_XDEV`, so the removal does not go into a
+//! mount.
 //!
 //! A primitive that changes the names in a directory takes `fsync`. With
 //! `fsync`, it syncs the directory that it changed with `fsync` before it
@@ -33,6 +35,11 @@ pub(super) const DIR_OPEN: OFlags = OFlags::RDONLY
 
 /// The resolve flags of each open below a handle.
 pub(super) const BENEATH: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
+
+/// The resolve flags of each open of a tree removal. They are the flags of
+/// [`BENEATH`] with `RESOLVE_NO_XDEV`, so the open of a mount point gives
+/// `EXDEV`.
+const BENEATH_SAME_MOUNT: ResolveFlags = BENEATH.union(ResolveFlags::NO_XDEV);
 
 /// The size of the `getdents` buffer of a listing or a tree removal.
 const LIST_BUF_LEN: usize = 32 * 1024;
@@ -403,6 +410,14 @@ impl RepoDir {
     /// directory. An entry that is gone before the removal gets to it is
     /// skipped.
     ///
+    /// Each open of the removal uses `RESOLVE_NO_XDEV`, so the removal does
+    /// not go into a mount. A mount on the directory `name` or on a directory
+    /// below it gives [`Reason::Escape`] with the path of the mount point.
+    /// The removal then stops. The mount point and its content stay. The
+    /// entries that the removal did not get to yet also stay. The removal
+    /// reads each directory before it descends, so the entries of the parent
+    /// of the mount point that are not directories are already gone.
+    ///
     /// With `fsync`, the function syncs this directory after it removes the
     /// directory `name`. It syncs nothing after an error.
     pub(crate) fn remove_tree(&self, name: &OsStr, fsync: bool) -> Result<bool, FsError> {
@@ -414,7 +429,7 @@ impl RepoDir {
                 reason: Reason::Escape,
             });
         }
-        let top = match open_beneath(self.as_fd(), name) {
+        let top = match open_same_mount(self.as_fd(), name) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(false),
             Err(e) => return Err(FsError::at(e, err_path())),
@@ -474,7 +489,7 @@ impl RepoDir {
                 .map_err(|e| FsError::at(e, self.tree_path(&levels, &[cleared.name.as_slice()])))?;
                 continue;
             };
-            let child_fd = match open_beneath(level_fd.as_fd(), child.as_slice()) {
+            let child_fd = match open_same_mount(level_fd.as_fd(), child.as_slice()) {
                 Ok(fd) => fd,
                 Err(Errno::NOENT) => continue,
                 Err(e) => {
@@ -792,6 +807,13 @@ pub(super) fn open_beneath<P: rustix::path::Arg>(
     path: P,
 ) -> Result<OwnedFd, Errno> {
     rustix::fs::openat2(dir, path, DIR_OPEN, Mode::empty(), BENEATH)
+}
+
+/// Opens the directory `path` below `dir` with one `openat2`, as
+/// [`open_beneath`] does. The open also refuses a mount point at each
+/// component with `EXDEV`.
+fn open_same_mount<P: rustix::path::Arg>(dir: BorrowedFd<'_>, path: P) -> Result<OwnedFd, Errno> {
+    rustix::fs::openat2(dir, path, DIR_OPEN, Mode::empty(), BENEATH_SAME_MOUNT)
 }
 
 /// Opens the directory `name` of `parent`, and makes it if it is missing. It
@@ -1868,6 +1890,86 @@ mod tests {
         assert!(victim.is_dir());
         assert!(elsewhere.is_dir());
         assert_eq!(std::fs::read(elsewhere.join("planted")).unwrap(), b"p");
+    }
+
+    /// The variable that holds the base directory of
+    /// `remove_tree_stops_at_a_mount_point_and_keeps_it` in its child
+    /// process.
+    const MOUNT_BASE_VAR: &str = "OSTRYA_TEST_REMOVE_TREE_MOUNT_BASE";
+
+    /// Mounts a tmpfs at `below/mnt` and at `top` of a base directory, and
+    /// runs the removal in a child process in a new user and mount
+    /// namespace. The test skips when the child cannot make the namespace or
+    /// the mounts.
+    #[test]
+    fn remove_tree_stops_at_a_mount_point_and_keeps_it() {
+        if let Some(base) = std::env::var_os(MOUNT_BASE_VAR) {
+            let base = PathBuf::from(base);
+            std::fs::write(base.join("below/mnt/inside"), b"x").unwrap();
+            std::fs::write(base.join("top/inside"), b"x").unwrap();
+            let repo = RepoDir::open_root(rustix::fs::CWD, &base).unwrap();
+
+            let (path, reason) = invalid(repo.remove_tree(OsStr::new("below"), false));
+            assert_eq!(path, "below/mnt");
+            assert!(matches!(reason, Reason::Escape), "{reason:?}");
+            assert!(base.join("below/mnt/inside").is_file());
+            assert!(!base.join("below/file").exists());
+
+            let (path, reason) = invalid(repo.remove_tree(OsStr::new("top"), false));
+            assert_eq!(path, "top");
+            assert!(matches!(reason, Reason::Escape), "{reason:?}");
+            assert!(base.join("top/inside").is_file());
+            std::fs::write(base.join("ran"), b"").unwrap();
+            return;
+        }
+
+        let dir = TestDir::new("remove-mount");
+        std::fs::create_dir_all(dir.path().join("below/mnt")).unwrap();
+        std::fs::write(dir.path().join("below/file"), b"x").unwrap();
+        std::fs::create_dir(dir.path().join("top")).unwrap();
+        let module = module_path!().split_once("::").unwrap().1;
+        let name = format!("{module}::remove_tree_stops_at_a_mount_point_and_keeps_it");
+        let script = "mount -t tmpfs tmpfs \"$1/below/mnt\" && \
+                      mount -t tmpfs tmpfs \"$1/top\" || exit 77; \
+                      exec \"$2\" --exact \"$3\" --test-threads=1";
+        let output = std::process::Command::new("unshare")
+            .args(["--user", "--map-root-user", "--mount", "--", "sh", "-c"])
+            .arg(script)
+            .arg("sh")
+            .arg(dir.path())
+            .arg(std::env::current_exe().unwrap())
+            .arg(&name)
+            .env(MOUNT_BASE_VAR, dir.path())
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(e) => {
+                eprintln!("skipped: unshare does not run: {e}");
+                return;
+            }
+        };
+        let log = || {
+            format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        };
+        match output.status.code() {
+            Some(0) => {}
+            // libtest exits with 101 when a test fails.
+            Some(101) | None => panic!("the child test failed: {}\n{}", output.status, log()),
+            Some(_) => {
+                eprintln!(
+                    "skipped: no user and mount namespace with a tmpfs:\n{}",
+                    log()
+                );
+                return;
+            }
+        }
+        assert!(dir.path().join("ran").is_file(), "the child ran no test");
+        assert!(dir.path().join("below/mnt").is_dir());
+        assert!(dir.path().join("top").is_dir());
     }
 
     #[test]

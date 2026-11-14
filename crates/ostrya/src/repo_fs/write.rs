@@ -47,6 +47,14 @@ impl RepoDir {
     /// the mode is the shared file mode of the kind. `path` can have more
     /// than one component, and its parent directory must exist.
     ///
+    /// For [`Publish::Replace`], the temp file is a named file
+    /// `.ostrya-tmp-<pid>-XXXXXX` in the temp home, from
+    /// [`TempFile::create_named`]. The publish moves it with one `renameat`.
+    /// For [`Publish::KeepExisting`], the temp file is the file of
+    /// [`TempFile::create`]: an anonymous `O_TMPFILE` file that the publish
+    /// links into place, or a named file where the file system has no
+    /// `O_TMPFILE`.
+    ///
     /// The caller holds all of `bytes` in memory, so the function is for
     /// metadata whose size the format caps. File content whose size the
     /// format does not cap goes through a temp file in chunks of bounded size.
@@ -55,7 +63,9 @@ impl RepoDir {
     /// publish syncs the parent directory after [`Published::Created`].
     ///
     /// The errors are those of [`TempFile::create`] and
-    /// [`TempFile::publish`]. An error of the write gives [`FsError::Io`]. A
+    /// [`TempFile::publish`]. [`TempFile::create_named`] gives the errors of
+    /// the named file of [`TempFile::create`]. An error of the write gives
+    /// [`FsError::Io`]. A
     /// kind with no file mode is a defect of the caller: it fails a debug
     /// assertion, and gives an `InvalidInput` error in a release build.
     pub(crate) fn write_atomic(
@@ -76,8 +86,9 @@ impl RepoDir {
     /// Writes `bytes` to the root file `file` in one atomic step, by the rule
     /// `how`, and gives the result. The call is on the root handle.
     ///
-    /// The steps, the sync, and the errors are those of
-    /// [`write_atomic`](RepoDir::write_atomic). The temp file is in `tmp/`.
+    /// The steps, the temp file of each [`Publish`] rule, the sync, and the
+    /// errors are those of [`write_atomic`](RepoDir::write_atomic). The temp
+    /// file is in `tmp/`.
     /// The mode is the mode of `file`, or its shared mode in a
     /// `bare-user-shared` repository.
     ///
@@ -226,6 +237,10 @@ impl RepoDir {
     /// Writes `bytes` to a new temp file, sets the mode `mode`, and publishes
     /// the file at `path` by the rule `how`. With `fsync`, the function syncs
     /// the file before the publish. The caller checks `path`.
+    ///
+    /// [`Publish::Replace`] writes a named temp file, which the publish moves
+    /// with one `renameat`. [`Publish::KeepExisting`] writes the file of
+    /// [`TempFile::create`].
     fn write_temp(
         &self,
         path: &str,
@@ -234,7 +249,10 @@ impl RepoDir {
         how: Publish,
         fsync: bool,
     ) -> Result<Published, FsError> {
-        let mut temp = TempFile::create(self)?;
+        let mut temp = match how {
+            Publish::Replace => TempFile::create_named(self)?,
+            Publish::KeepExisting => TempFile::create(self)?,
+        };
         temp.file_mut().write_all(bytes).map_err(FsError::Io)?;
         temp.set_mode(mode)?;
         if fsync {
@@ -377,7 +395,7 @@ fn reflink(dst: BorrowedFd<'_>, src: BorrowedFd<'_>) -> Result<(), Errno> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::fs::OpenOptions;
     use std::io::Read;
     use std::os::fd::OwnedFd;
@@ -507,6 +525,54 @@ mod tests {
             assert_eq!(take_synced(), [id_of(&heads)], "{named}");
             assert_eq!(std::fs::read(heads.join("other")).unwrap(), b"new");
         }
+    }
+
+    #[test]
+    fn replace_writes_a_named_temp_file_and_keep_existing_an_anonymous_one() {
+        let dir = TestDir::new("write-placement");
+        let refs = refs(&dir);
+        let repo = root(&dir);
+        let names = Rc::new(RefCell::new(Vec::new()));
+        let hook_names = Rc::clone(&names);
+        let _names = set_hook(HookPoint::TempName, move |name| {
+            hook_names
+                .borrow_mut()
+                .push(String::from_utf8(name.to_vec()).unwrap());
+        });
+        let tmpfiles = Rc::new(Cell::new(0));
+        let hook_tmpfiles = Rc::clone(&tmpfiles);
+        let _tmpfiles = set_hook(HookPoint::Tmpfile, move |_| {
+            hook_tmpfiles.set(hook_tmpfiles.get() + 1);
+        });
+        // Returns the temp names and the `O_TMPFILE` opens since the last call.
+        let take = || {
+            (
+                std::mem::take(&mut *names.borrow_mut()),
+                tmpfiles.replace(0),
+            )
+        };
+
+        let result = refs.write_atomic("heads/main", b"a", Publish::Replace, false);
+        assert_eq!(result.unwrap(), Published::Created);
+        let (drawn, opens) = take();
+        assert_eq!((drawn.len(), opens), (1, 0), "{drawn:?}");
+        assert!(drawn[0].starts_with(super::super::temp::TEMP_PREFIX));
+        assert!(temp_names(&dir).is_empty());
+
+        let result = repo.write_root_file(RootFile::Summary, b"s", Publish::Replace, false);
+        assert_eq!(result.unwrap(), Published::Created);
+        let (drawn, opens) = take();
+        assert_eq!((drawn.len(), opens), (1, 0), "{drawn:?}");
+        assert!(temp_names(&dir).is_empty());
+
+        let result = refs.write_atomic("heads/other", b"b", Publish::KeepExisting, false);
+        assert_eq!(result.unwrap(), Published::Created);
+        assert_eq!(take(), (Vec::new(), 1));
+
+        let result = repo.write_root_file(RootFile::Config, b"c", Publish::KeepExisting, false);
+        assert_eq!(result.unwrap(), Published::Created);
+        assert_eq!(take(), (Vec::new(), 1));
+        assert!(temp_names(&dir).is_empty());
     }
 
     #[test]

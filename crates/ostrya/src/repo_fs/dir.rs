@@ -41,16 +41,17 @@ const LIST_BUF_LEN: usize = 32 * 1024;
 /// longer path costs one more allocation.
 const JOIN_BUF_LEN: usize = 512;
 
-/// The character set of the random suffix of a temp directory name (the
-/// alphabet of `mkdtemp`).
+/// The character set of the random suffix of a temp name (the alphabet of
+/// `mkdtemp`).
 const SUFFIX_ALPHABET: &[u8; 62] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
-/// The length of the random suffix of a temp directory name.
-const SUFFIX_LEN: usize = 6;
+/// The length of the random suffix of a temp name.
+pub(super) const SUFFIX_LEN: usize = 6;
 
-/// The maximum number of names that [`RepoDir::make_temp_dir`] tries.
-const TEMP_DIR_ATTEMPTS: u32 = 128;
+/// The maximum number of names that the create of a temp directory, a temp
+/// file, or a temp symlink tries.
+pub(super) const TEMP_ATTEMPTS: u32 = 128;
 
 /// The device and the inode of a directory.
 type Identity = (u64, u64);
@@ -322,7 +323,7 @@ impl RepoDir {
             RepoLayout::Staging.rules().dir_mode,
         );
         let pid = std::process::id();
-        for _ in 0..TEMP_DIR_ATTEMPTS {
+        for _ in 0..TEMP_ATTEMPTS {
             let mut name = String::with_capacity(prefix.len() + SUFFIX_LEN);
             name.push_str(prefix);
             push_random_suffix(&mut name, pid);
@@ -639,7 +640,7 @@ impl RepoDir {
 
 impl RepoContext {
     /// Returns `true` if the repository mode is `bare-user-shared`.
-    fn is_shared(&self) -> bool {
+    pub(super) fn is_shared(&self) -> bool {
         self.mode == Some(RepoMode::BareUserShared)
     }
 }
@@ -786,7 +787,10 @@ fn entry_type(
 
 /// Opens the directory `path` below `dir` with one `openat2`. The open
 /// refuses a symlink at each component, and a path that leaves `dir`.
-fn open_beneath<P: rustix::path::Arg>(dir: BorrowedFd<'_>, path: P) -> Result<OwnedFd, Errno> {
+pub(super) fn open_beneath<P: rustix::path::Arg>(
+    dir: BorrowedFd<'_>,
+    path: P,
+) -> Result<OwnedFd, Errno> {
     rustix::fs::openat2(dir, path, DIR_OPEN, Mode::empty(), BENEATH)
 }
 
@@ -903,7 +907,7 @@ fn fchmod_new(fd: BorrowedFd<'_>, force: u32) -> Result<(), Errno> {
 }
 
 /// Syncs the directory open at `fd` with `fsync`.
-fn fsync_dir(fd: BorrowedFd<'_>) -> Result<(), Errno> {
+pub(super) fn fsync_dir(fd: BorrowedFd<'_>) -> Result<(), Errno> {
     #[cfg(test)]
     record_sync(fd);
     rustix::fs::fsync(fd)
@@ -957,7 +961,7 @@ fn fault_after_mkdir(step: super::FaultStep) -> Result<(), Errno> {
 
 /// Runs the test hook at `point`, if the thread has one, with `name`.
 #[cfg(test)]
-fn run_hook(point: super::HookPoint, name: &[u8]) {
+pub(super) fn run_hook(point: super::HookPoint, name: &[u8]) {
     let taken = super::FAULTS.with(|faults| {
         let mut faults = faults.borrow_mut();
         let at = faults.hooks.iter().position(|(p, _)| *p == point)?;
@@ -980,11 +984,13 @@ fn record_sync(fd: BorrowedFd<'_>) {
     });
 }
 
-/// Appends a six-character `[A-Za-z0-9]` suffix to `name`, from a seed of the
-/// time, the process id `pid`, and a counter of the process.
+/// Appends a six-character `[A-Za-z0-9]` suffix to the temp name `name`, from
+/// a seed of the time, the process id `pid`, and a counter of the process.
+/// The temp name is the name of a temp directory, a temp file, or a temp
+/// symlink.
 ///
 /// The name must be unique on the host only. A collision causes a new attempt.
-fn push_random_suffix(name: &mut String, pid: u32) {
+pub(super) fn push_random_suffix(name: &mut String, pid: u32) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -1081,17 +1087,15 @@ pub(super) fn require<T>(value: Option<T>, what: &'static str) -> Result<T, FsEr
 mod tests {
     use std::cell::{Cell, RefCell};
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use super::super::{FAULTS, FaultStep, Faults, HookPoint, TestDir, invalid, io_err, root};
+    use super::super::{
+        FaultStep, HookPoint, TestDir, id_of, invalid, io_err, is_symlink, mode_of, names_with,
+        record_syncs, root, set_faults, set_hook, take_synced,
+    };
     use super::*;
-
-    /// Returns the permission bits and the special bits of `path`.
-    fn mode_of(path: &Path) -> u32 {
-        std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
-    }
 
     /// Returns the mode of a directory that a `mkdir` with the mode `request`
     /// makes in `parent`. The umask, a set-group-ID parent, and a default ACL
@@ -1107,66 +1111,8 @@ mod tests {
         mode
     }
 
-    /// Returns the device and inode of `path`, with no follow.
-    fn id_of(path: &Path) -> Identity {
-        let meta = std::fs::symlink_metadata(path).unwrap();
-        (meta.dev(), meta.ino())
-    }
-
-    fn is_symlink(path: &Path) -> bool {
-        std::fs::symlink_metadata(path)
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    }
-
     fn set_mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    /// Returns the names of the entries of `path` that start with `prefix`.
-    fn names_with(path: &Path, prefix: &str) -> Vec<String> {
-        std::fs::read_dir(path)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(prefix))
-            .collect()
-    }
-
-    /// Clears the faults of the thread when it drops.
-    struct FaultReset;
-
-    impl Drop for FaultReset {
-        fn drop(&mut self) {
-            FAULTS.with(|f| *f.borrow_mut() = Faults::default());
-        }
-    }
-
-    fn set_faults(set: impl FnOnce(&mut Faults)) -> FaultReset {
-        FAULTS.with(|f| set(&mut f.borrow_mut()));
-        FaultReset
-    }
-
-    /// Adds a hook at `point` to the faults of the thread.
-    fn set_hook(point: HookPoint, hook: impl FnMut(&[u8]) + 'static) -> FaultReset {
-        set_faults(|f| f.hooks.push((point, Box::new(hook))))
-    }
-
-    /// Starts the record of the directory syncs of the thread.
-    fn record_syncs() -> FaultReset {
-        set_faults(|f| f.synced = Some(Vec::new()))
-    }
-
-    /// Returns the directory syncs that the thread recorded, and empties the
-    /// record.
-    fn take_synced() -> Vec<Identity> {
-        FAULTS.with(|f| {
-            f.borrow_mut()
-                .synced
-                .as_mut()
-                .map(std::mem::take)
-                .expect("the thread records its syncs")
-        })
     }
 
     /// A claim of a temp directory name. Its drop records whether the
@@ -1630,7 +1576,7 @@ mod tests {
             err.to_string(),
             "could not allocate a unique temp directory"
         );
-        assert_eq!(claims.get(), TEMP_DIR_ATTEMPTS);
+        assert_eq!(claims.get(), TEMP_ATTEMPTS);
         assert_eq!(drops.get(), Some(false));
         assert!(names_with(&dir.path().join("tmp"), "pfx-").is_empty());
     }

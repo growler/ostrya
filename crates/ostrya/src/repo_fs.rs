@@ -26,6 +26,9 @@ use crate::error::Error;
 
 mod dir;
 mod read;
+mod temp;
+
+pub(crate) use temp::{TempFile, TempLink};
 
 /// The error of a file system operation in a repository.
 ///
@@ -569,6 +572,18 @@ impl RepoDir {
     pub(crate) fn repo_mode(&self) -> Option<RepoMode> {
         self.ctx.mode
     }
+
+    /// Returns the mode of each file of the kind of the directory, or `None`
+    /// if the kind sets no file mode. In a `bare-user-shared` repository it
+    /// is the shared file mode of the kind.
+    pub(crate) fn file_mode(&self) -> Option<u32> {
+        let rules = self.kind.rules();
+        if self.ctx.is_shared() {
+            rules.shared_file_mode
+        } else {
+            rules.file_mode
+        }
+    }
 }
 
 impl AsFd for RepoDir {
@@ -583,6 +598,10 @@ const _: fn() = || {
     assert_send_sync::<FsError>();
     assert_send_sync::<Opened>();
     assert_send_sync::<ObjectEntry>();
+    assert_send_sync::<TempFile>();
+    assert_send_sync::<TempLink>();
+    assert_send_sync::<Publish>();
+    assert_send_sync::<Published>();
 };
 
 /// The status of an inode, from one `statx` call.
@@ -638,6 +657,26 @@ pub(crate) enum ObjectEntry {
     Symlink(Vec<u8>),
 }
 
+/// The rule of a publish for an entry that exists at the target path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Publish {
+    /// The existing entry stays, and the publish gives
+    /// [`Published::Existed`].
+    KeepExisting,
+    /// The new entry replaces the existing entry in one atomic step.
+    Replace,
+}
+
+/// The result of a publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Published {
+    /// The publish put the new entry at the target path.
+    Created,
+    /// An entry existed at the target path, and it stays. The publish does
+    /// not examine the type or the content of that entry.
+    Existed,
+}
+
 /// The `statx` fields that [`stat_fd`] reads.
 const STAT_FIELDS: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::MODE)
@@ -684,12 +723,17 @@ impl TestDir {
     /// Creates a new directory `ostrya-repo-fs-<tag>-<pid>-<n>` in the temp
     /// directory of the system and opens it.
     pub(crate) fn new(tag: &str) -> TestDir {
+        TestDir::new_in(&std::env::temp_dir(), tag)
+    }
+
+    /// Creates a new directory `ostrya-repo-fs-<tag>-<pid>-<n>` in `base` and
+    /// opens it.
+    pub(crate) fn new_in(base: &std::path::Path, tag: &str) -> TestDir {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("ostrya-repo-fs-{tag}-{}-{n}", std::process::id()));
+        let path = base.join(format!("ostrya-repo-fs-{tag}-{}-{n}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         let fd = rustix::fs::open(
             &path,
@@ -771,6 +815,9 @@ enum HookPoint {
     /// Before the typing of each entry of a directory read. The hook gets the
     /// name of the entry.
     Entry,
+    /// Before the create of each temp file name and temp symlink name. The
+    /// hook gets the name.
+    TempName,
 }
 
 /// A hook that a test runs at a [`HookPoint`].
@@ -783,9 +830,16 @@ type Hook = Box<dyn FnMut(&[u8])>;
 struct Faults {
     /// Fails the step after a `mkdirat` with the errno.
     fail_after_mkdir: Option<(FaultStep, Errno)>,
-    /// Gives `EEXIST` in place of each `mkdirat` of a temp directory. The
-    /// primitive makes no `mkdirat` call.
+    /// Gives `EEXIST` in place of each `mkdirat` of a temp directory and each
+    /// create of a temp file name or a temp symlink name. The primitive makes
+    /// no create call.
     force_eexist: bool,
+    /// Gives `EOPNOTSUPP` in place of each `O_TMPFILE` open. The primitive
+    /// makes no `openat` call.
+    no_tmpfile: bool,
+    /// Gives `EINVAL` in place of each `renameat2` with `RENAME_NOREPLACE`.
+    /// The primitive makes no `renameat2` call.
+    no_rename_noreplace: bool,
     /// The hooks, at most one for each point.
     hooks: Vec<(HookPoint, Hook)>,
     /// Gives the unknown type in place of the `getdents` type of each entry of
@@ -800,6 +854,87 @@ struct Faults {
 thread_local! {
     /// The faults of the thread. Each test thread starts with no fault.
     static FAULTS: std::cell::RefCell<Faults> = std::cell::RefCell::default();
+}
+
+/// Clears the faults of the thread when it drops.
+#[cfg(test)]
+struct FaultReset;
+
+#[cfg(test)]
+impl Drop for FaultReset {
+    fn drop(&mut self) {
+        FAULTS.with(|f| *f.borrow_mut() = Faults::default());
+    }
+}
+
+/// Changes the faults of the thread with `set`. The faults clear when the
+/// returned value drops.
+#[cfg(test)]
+fn set_faults(set: impl FnOnce(&mut Faults)) -> FaultReset {
+    FAULTS.with(|f| set(&mut f.borrow_mut()));
+    FaultReset
+}
+
+/// Adds a hook at `point` to the faults of the thread.
+#[cfg(test)]
+fn set_hook(point: HookPoint, hook: impl FnMut(&[u8]) + 'static) -> FaultReset {
+    set_faults(|f| f.hooks.push((point, Box::new(hook))))
+}
+
+/// Starts the record of the directory syncs of the thread.
+#[cfg(test)]
+fn record_syncs() -> FaultReset {
+    set_faults(|f| f.synced = Some(Vec::new()))
+}
+
+/// Returns the directory syncs that the thread recorded, and empties the
+/// record.
+#[cfg(test)]
+fn take_synced() -> Vec<(u64, u64)> {
+    FAULTS.with(|f| {
+        f.borrow_mut()
+            .synced
+            .as_mut()
+            .map(std::mem::take)
+            .expect("the thread records its syncs")
+    })
+}
+
+/// Returns the names of the entries of `path` that start with `prefix`.
+#[cfg(test)]
+fn names_with(path: &std::path::Path, prefix: &str) -> Vec<String> {
+    std::fs::read_dir(path)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(prefix))
+        .collect()
+}
+
+/// Returns the permission bits and the special bits of `path`, with no
+/// follow.
+#[cfg(test)]
+fn mode_of(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::symlink_metadata(path).unwrap().mode() & 0o7777
+}
+
+/// Returns the device and inode of `path`, with no follow.
+#[cfg(test)]
+fn id_of(path: &std::path::Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+
+    let meta = std::fs::symlink_metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+/// Returns `true` if `path` is a symlink.
+#[cfg(test)]
+fn is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .unwrap()
+        .file_type()
+        .is_symlink()
 }
 
 #[cfg(test)]

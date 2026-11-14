@@ -10,8 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use futures_io::AsyncRead;
 use ostrya_core::{
-    Checksum, ObjectName, ObjectType, Ref, RepoMode, choose_offset_size, loose_path,
-    offset_size_for,
+    Checksum, ObjectName, ObjectType, Ref, RepoMode, choose_offset_size, offset_size_for,
 };
 
 use super::hooks::ReceiveHooks;
@@ -20,7 +19,7 @@ use super::merge::check_incoming;
 use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveCommit, aborted, codec, next, out_of_order};
 use crate::error::Result;
-use crate::object::{MAX_METADATA_SIZE, object_exists};
+use crate::object::MAX_METADATA_SIZE;
 use crate::refs::ref_relpath;
 use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
@@ -220,20 +219,16 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
                 names.len()
             ))));
         }
-        let mode = self.repo.mode();
-        let paths: Vec<Option<String>> = names
+        let probes: Vec<Option<ObjectName>> = names
             .iter()
-            .map(|n| {
-                (!self.txn.is_staged(&n.checksum, n.ty))
-                    .then(|| loose_path(&n.checksum, n.ty, mode))
-            })
+            .map(|n| (!self.txn.is_staged(&n.checksum, n.ty)).then_some(*n))
             .collect();
         let repo = self.repo.clone();
         let present = ostrya_rt::unblock(move || {
-            paths
+            probes
                 .iter()
-                .map(|path| match path {
-                    Some(path) => object_exists(repo.objects_fd(), path),
+                .map(|probe| match probe {
+                    Some(n) => repo.has_object_blocking(n.ty, &n.checksum),
                     None => Ok(true),
                 })
                 .collect::<Result<Vec<bool>>>()
@@ -471,7 +466,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
 /// 2. The repository mode `bare-split-xattrs`.
 /// 3. `[core] locking=false`, for a two-way `Hello`.
 /// 4. Each ref name: `NAME`, `REMOTE:NAME`, or `@ID:NAME`, as
-///    [`Ref`](ostrya_core::Ref) reads it (`invalid-ref`).
+///    [`Ref`] reads it (`invalid-ref`).
 /// 5. No two names of `hello` name one ref (`protocol`). A name sent two
 ///    times names one ref, and so do `NAME` and `@ID:NAME` with `ID` the
 ///    collection id of the repository.

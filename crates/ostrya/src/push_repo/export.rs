@@ -198,10 +198,12 @@ impl Repo {
     ///   file fails.
     /// - [`Error::Io`](crate::Error::Io) if a read of a commit or of a
     ///   dependency, of its `.commitpartial` marker, or of a dirtree fails, or
-    ///   if a lookup of a dirmeta fails. A new commit, a dependency with no
-    ///   partial marker, or a dirtree that is not a regular file, or that is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), also
-    ///   gives this error.
+    ///   if a lookup of a dirmeta fails.
+    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if a new
+    ///   commit, a dependency with no partial marker, or a dirtree is not a
+    ///   regular file, is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or has a symlink on
+    ///   its path.
     ///
     /// After the first byte, the call returns:
     ///

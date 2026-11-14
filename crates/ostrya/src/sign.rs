@@ -97,8 +97,11 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::InvalidFormat`] if the value of the key of the engine is not
     ///   an array.
-    /// - [`Error::Io`] if the commit object or the `.commitmeta` file is larger
-    ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
@@ -167,9 +170,10 @@ impl Repo {
     /// - [`Error::InvalidFormat`] or [`Error::Core`] if a verifier of another
     ///   crate fails with the variant of the same name of
     ///   [`ostrya_sign::Error`].
-    /// - [`Error::Io`] if the commit object or the `.commitmeta` file is larger
-    ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file
-    ///   system operation fails.
+    /// - [`Error::InvalidFormat`] if the commit object or the `.commitmeta`
+    ///   file is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    ///   or is not a regular file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     ///
     /// [`Error::ObjectNotFound`]: crate::Error::ObjectNotFound
     /// [`Error::Core`]: crate::Error::Core
@@ -238,8 +242,11 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::InvalidFormat`] if the value of `metadata_key` is not an
     ///   array.
-    /// - [`Error::Io`] if the commit object or the `.commitmeta` file is larger
-    ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.

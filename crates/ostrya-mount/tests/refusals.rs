@@ -174,6 +174,16 @@ fn is_eloop(err: &Error) -> bool {
     )
 }
 
+/// Returns `true` if `err` is the refusal of a symlink on the path of an
+/// object.
+fn is_symlink_refusal(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Repo(ostrya::Error::InvalidFormat(m))
+            if m.ends_with("passes through a symlink; ostrya refuses a symlink in the repository")
+    )
+}
+
 /// Replaces the directory `path` with a symlink to `moved`, runs `f`, and
 /// puts the directory back.
 async fn with_symlink<F: std::future::Future<Output = ()>>(path: &Path, moved: &Path, f: F) {
@@ -221,7 +231,8 @@ fn a_symlink_in_the_image_path_stops_a_stored_mount() {
 /// With a handle of the strict open mode, a symlink at the fan-out directory
 /// of the commit stops a stored mount, and a symlink at the fan-out
 /// directory of the commit, of the root dirtree, of the root dirmeta, or of a
-/// file stops a built mount, each with `ELOOP`.
+/// file stops a built mount, each with the refusal of a symlink in the
+/// repository.
 #[test]
 fn a_symlinked_fanout_stops_a_mount_of_a_strict_handle() {
     let scratch = TmpDir::new("fanout-symlink");
@@ -255,7 +266,7 @@ fn a_symlinked_fanout_stops_a_mount_of_a_strict_handle() {
                 .mount_stored(&repo, &commit, &target, &opts)
                 .await
                 .unwrap_err();
-            assert!(is_eloop(&err), "stored commit: {err}");
+            assert!(is_symlink_refusal(&err), "stored commit: {err}");
         })
         .await;
         for (what, dir) in [
@@ -269,7 +280,7 @@ fn a_symlinked_fanout_stops_a_mount_of_a_strict_handle() {
                     .mount_built(&repo, &commit, &target, &opts)
                     .await
                     .unwrap_err();
-                assert!(is_eloop(&err), "built {what}: {err}");
+                assert!(is_symlink_refusal(&err), "built {what}: {err}");
             })
             .await;
         }

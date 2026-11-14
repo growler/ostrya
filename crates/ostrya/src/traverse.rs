@@ -10,6 +10,7 @@
 //! use these listings and walks.
 
 use std::collections::{HashMap, HashSet};
+use std::ops::ControlFlow;
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Value};
@@ -21,6 +22,7 @@ use crate::pull::drive::Slots;
 use crate::refs::walk_ref_dir;
 use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
 use crate::repo::Repo;
+use crate::repo_fs::{FsResultExt, RepoDir};
 
 /// The bound that a walk puts on the `parent` chain of one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,12 +301,16 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] if an entry of `objects/` with a name of two
+    ///   hexadecimal characters is a symlink or is not a directory. The
+    ///   message is `objects/<xx> passes through a symlink; ostrya refuses a
+    ///   symlink in the repository` or `objects/<xx> is not a directory`.
     /// - [`Error::Io`] if the read of `objects/` or of a fanout directory
     ///   fails. A fanout directory that is removed during the listing is
     ///   skipped.
     pub async fn list_objects(&self) -> Result<HashSet<ObjectName>> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || list_objects_blocking(repo.objects_fd())).await
+        ostrya_rt::unblock(move || list_objects_blocking(repo.objects())).await
     }
 
     /// Returns the checksums of the commit objects, in sorted order.
@@ -317,7 +323,7 @@ impl Repo {
         let mut commits = ostrya_rt::unblock(move || -> Result<Vec<Checksum>> {
             let mut out = Vec::new();
             for_each_object(
-                repo.objects_fd(),
+                repo.objects(),
                 |ty| ty == ObjectType::Commit,
                 |name| out.push(name.checksum),
             )?;
@@ -338,7 +344,7 @@ impl Repo {
         F: Fn(ObjectType) -> bool + Send + 'static,
     {
         let repo = self.clone();
-        ostrya_rt::unblock(move || count_objects_blocking(repo.objects_fd(), keep)).await
+        ostrya_rt::unblock(move || count_objects_blocking(repo.objects(), keep)).await
     }
 
     /// Returns the name of each object that `commit` and its parents reach.
@@ -370,10 +376,11 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the repository does not hold `commit`.
     /// - [`Error::Core`] if a commit or a dirtree that the walk reads does not
     ///   parse.
-    /// - [`Error::Io`] if a read of the object store fails. This includes a
-    ///   commit or a dirtree that is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
-    ///   regular file.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree that the walk
+    ///   reads is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    ///   or is not a regular file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read of the object store fails.
     pub async fn traverse_commit(
         &self,
         commit: &Checksum,
@@ -431,10 +438,11 @@ impl Repo {
     ///
     /// - [`Error::Core`] if a commit or a dirtree that the walk reads does not
     ///   parse.
-    /// - [`Error::Io`] if a read of the object store fails. This includes a
-    ///   commit or a dirtree that is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
-    ///   regular file.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree that the walk
+    ///   reads is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    ///   or is not a regular file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read of the object store fails.
     pub async fn traverse_reachable(
         &self,
         roots: impl IntoIterator<Item = Checksum>,
@@ -1282,52 +1290,70 @@ pub(crate) fn reaches_at_least(prev: i32, depth: i32) -> bool {
     }
 }
 
-/// Calls `f` with the [`ObjectName`] of each loose object under the
-/// `objects/` directory `objects_fd`.
+/// Calls `f` with the [`ObjectName`] of each loose object below the
+/// `objects/` handle `objects`.
 ///
 /// The function calls `keep` with the type from the extension of the entry,
 /// before it parses the checksum. So it parses no hexadecimal name of another
 /// type.
 ///
-/// The listing holds one directory open at a time and borrows each entry name
-/// from the reader. So it makes no allocation for each object.
+/// The listing holds one fanout directory open at a time and borrows each
+/// entry name from the reader. So it makes no allocation for each object. A
+/// fanout directory that is a symlink or is not a directory fails the
+/// listing. A fanout directory that is removed during the listing is skipped.
 fn for_each_object(
-    objects_fd: BorrowedFd<'_>,
+    objects: &RepoDir,
     keep: impl Fn(ObjectType) -> bool,
     mut f: impl FnMut(ObjectName),
 ) -> Result<()> {
-    for_each_dir_name(objects_fd, |fanout| {
+    let mut failed = None;
+    objects.for_each_entry(|fanout, _| {
         // The name of a fanout directory is two hexadecimal characters. Any
         // other entry of `objects/` (a stray file, a cache directory) is not
         // a fanout directory.
-        if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
-            return Ok(());
-        }
-        let dir = match rustix::fs::openat(
-            objects_fd,
-            fanout,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => return Ok(()),
-            Err(e) => return Err(Error::Io(e.into())),
+        let Some(fanout) = fanout
+            .to_str()
+            .ok()
+            .filter(|f| f.len() == 2 && f.bytes().all(|b| b.is_ascii_hexdigit()))
+        else {
+            return ControlFlow::Continue(());
         };
-        for_each_dir_name(dir.as_fd(), |entry| {
-            if let Some(name) = parse_object_entry(fanout, entry, &keep) {
-                f(name);
+        let listed = objects
+            .open_dir(fanout)
+            .optional()
+            .and_then(|dir| match dir {
+                Some(dir) => dir.for_each_entry(|entry, _| {
+                    if let Some(name) = entry
+                        .to_str()
+                        .ok()
+                        .and_then(|entry| parse_object_entry(fanout, entry, &keep))
+                    {
+                        f(name);
+                    }
+                    ControlFlow::Continue(())
+                }),
+                None => Ok(()),
+            });
+        match listed {
+            Ok(()) => ControlFlow::Continue(()),
+            Err(e) => {
+                failed = Some(e);
+                ControlFlow::Break(())
             }
-            Ok(())
-        })
-    })
+        }
+    })?;
+    match failed {
+        Some(e) => Err(e.into()),
+        None => Ok(()),
+    }
 }
 
-/// Returns the name of each loose object under the `objects/` directory
-/// `objects_fd`.
-fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectName>> {
+/// Returns the name of each loose object below the `objects/` handle
+/// `objects`.
+fn list_objects_blocking(objects: &RepoDir) -> Result<HashSet<ObjectName>> {
     let mut out = HashSet::new();
     for_each_object(
-        objects_fd,
+        objects,
         |_| true,
         |name| {
             out.insert(name);
@@ -1336,16 +1362,13 @@ fn list_objects_blocking(objects_fd: BorrowedFd<'_>) -> Result<HashSet<ObjectNam
     Ok(out)
 }
 
-/// Returns the number of loose objects under the `objects/` directory
-/// `objects_fd` whose type `keep` accepts.
+/// Returns the number of loose objects below the `objects/` handle `objects`
+/// whose type `keep` accepts.
 ///
 /// The count keeps no name.
-fn count_objects_blocking(
-    objects_fd: BorrowedFd<'_>,
-    keep: impl Fn(ObjectType) -> bool,
-) -> Result<usize> {
+fn count_objects_blocking(objects: &RepoDir, keep: impl Fn(ObjectType) -> bool) -> Result<usize> {
     let mut count = 0usize;
-    for_each_object(objects_fd, keep, |_| {
+    for_each_object(objects, keep, |_| {
         count += 1;
     })?;
     Ok(count)

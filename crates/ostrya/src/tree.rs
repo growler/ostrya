@@ -65,9 +65,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum, or if a commit
     ///   object does not parse.
-    /// - [`Error::Io`] if the commit object is larger than
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
-    ///   file, or if a read from the file system fails.
+    ///   file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](crate::Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn read_commit(&self, rev: &str) -> Result<(RepoTree, Checksum)> {
         let checksum = self
             .resolve_rev(rev, false)
@@ -114,9 +116,11 @@ impl RepoTree {
     ///
     /// - [`Error::ObjectNotFound`] if the dirtree object is not in the object
     ///   store.
-    /// - [`Error::Io`] if the dirtree object is larger than
+    /// - [`Error::InvalidFormat`] if the dirtree object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
-    ///   file, or if a read from the file system fails.
+    ///   file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](crate::Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read from the file system fails.
     /// - [`Error::Core`] if the dirtree object does not parse.
     pub async fn read_dir(&self) -> Result<Vec<TreeEntry>> {
         let dirtree = self.repo.load_dirtree(&self.dirtree).await?;
@@ -155,9 +159,11 @@ impl RepoTree {
     ///
     /// - [`Error::ObjectNotFound`] if a dirtree object on the path is not in
     ///   the object store.
-    /// - [`Error::Io`] if a dirtree object is larger than
+    /// - [`Error::InvalidFormat`] if a dirtree object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
-    ///   file, or if a read from the file system fails.
+    ///   file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](crate::Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read from the file system fails.
     /// - [`Error::Core`] if a dirtree object does not parse.
     pub async fn lookup(&self, path: &Path) -> Result<Option<TreeEntry>> {
         let components = normalize(path);

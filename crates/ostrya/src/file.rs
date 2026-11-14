@@ -4,26 +4,31 @@
 //! [`FileKind`] tells a regular file from a symlink. [`FileObject::reader`]
 //! gives a [`ContentReader`] over the payload of a regular file.
 
+use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::FileReader;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxAttributes, StatxFlags};
-use rustix::io::Errno;
+use rustix::fs::{FileType, Statx, StatxAttributes};
 
 use crate::error::{Error, Result};
 use crate::inflate::{ArchiveDecoder, archive_decoder};
-use crate::object::{self, MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
+use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
+use crate::read::object_path_error;
 use crate::repo::Repo;
+use crate::repo_fs::{self, FsError, ObjectEntry, Opened, Reason, RepoDir, Stat};
 use crate::write::FileMeta;
 
 /// The largest symlink target that a load reads from a `bare-user` object.
 /// A target is a path, so it is much shorter than this limit.
 const SYMLINK_READ_CAP: u64 = 64 * 1024;
+
+/// The longest target that a load reads from a symlink object. It is the
+/// longest symlink target on Linux.
+const LINK_TARGET_CAP: u64 = 4095;
 
 /// The kind of a file object: a regular file or a symlink.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,11 +92,11 @@ enum ObjectStore {
     /// path comes from the checksum and the mode at read time.
     Repo,
     /// An object with a flat name in the staging directory of a transaction,
-    /// not published yet. The directory fd is in an `Arc`, so the object
-    /// stays `Clone` and self-contained.
+    /// not published yet. A clone of the handle shares its descriptor, so the
+    /// object stays `Clone` and self-contained.
     Staging {
         /// The staging directory that holds the object.
-        dir: Arc<OwnedFd>,
+        dir: RepoDir,
         /// The flat staging name of the object (`<hex>.file` or `<hex>.filez`).
         name: String,
     },
@@ -122,6 +127,8 @@ pub struct FileObject {
     /// The fs-verity digest the kernel held for the payload at load time. A
     /// load that does not ask for it leaves `None`.
     kernel_verity: Option<[u8; 32]>,
+    /// The size of the object file on disk at load time, in bytes.
+    stored_size: u64,
 }
 
 impl FileObject {
@@ -172,14 +179,16 @@ impl FileObject {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the open of the object file fails. A missing object
-    ///   file also gives this variant. In the strict open mode of
-    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` or at the
-    ///   object path gives this variant with `ELOOP`. An object file that is
-    ///   not a regular file also gives this variant. If such a file opens, as
-    ///   a FIFO does, the error has the kind `ErrorKind::InvalidData`.
-    /// - [`Error::ObjectNotFound`] in the strict open mode if the fan-out
-    ///   directory `objects/<xx>` of the object is absent.
+    /// - [`Error::ObjectNotFound`] if the object file or its fan-out
+    ///   directory `objects/<xx>` is absent.
+    /// - [`Error::InvalidFormat`] if a symlink is at `objects/<xx>` or at the
+    ///   object path, or if the object file is not a regular file. The
+    ///   message is `<path> passes through a symlink; ostrya refuses a symlink
+    ///   in the repository` or `<path> is not a regular file`. The open of a
+    ///   FIFO does not wait for a writer.
+    /// - [`Error::InvalidFormat`] with the message `<path> is not a directory`
+    ///   if `objects/<xx>` is not a directory.
+    /// - [`Error::Io`] for each other failure of the open.
     pub async fn reader(&self) -> Result<ContentReader> {
         let payload = match &self.source {
             ReaderSource::None => None,
@@ -209,16 +218,9 @@ impl FileObject {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the open of the object file, a read of the payload,
-    ///   or a write to `writer` fails. An `archive` payload that does not
-    ///   inflate also gives this variant. In the strict open mode of
-    ///   [`Repo::open_at_strict`], a symlink at `objects/<xx>` or at the
-    ///   object path gives this variant with `ELOOP`. An object file that is
-    ///   not a regular file also gives this variant. If such a file opens, as
-    ///   a FIFO does, the error has the kind `ErrorKind::InvalidData`.
-    /// - [`Error::ObjectNotFound`] in the strict open mode of
-    ///   [`Repo::open_at_strict`] if the fan-out directory `objects/<xx>` of
-    ///   the object is absent.
+    /// - The errors of the open of [`reader`](FileObject::reader).
+    /// - [`Error::Io`] if a read of the payload or a write to `writer` fails.
+    ///   An `archive` payload that does not inflate also gives this variant.
     pub async fn write_to<W: futures_io::AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
         let reader = self.reader().await?;
         crate::write::copy_stream(reader, writer)
@@ -243,50 +245,54 @@ impl FileObject {
         self.kernel_verity
     }
 
-    /// Returns the directory descriptor and the path of the payload.
+    /// Returns the size of the object on disk at load time, in bytes: the size
+    /// that the `statx` of the load gave. In an `archive` repository it is the
+    /// size of the `.filez` file.
+    pub(crate) fn stored_size(&self) -> u64 {
+        self.stored_size
+    }
+
+    /// Returns the reader over `payload`, the object file that a load with
+    /// [`Repo::open_file`] kept open. The reader is the one that
+    /// [`reader`](FileObject::reader) gives. `None` gives a reader with no
+    /// bytes.
+    pub(crate) fn reader_over(&self, payload: Option<Payload>) -> ContentReader {
+        self.source.reader_over(payload)
+    }
+
+    /// Returns the directory handle and the path of the payload.
     ///
     /// The path is a loose path under `objects/`, or the flat staging name of
     /// an object that is not published yet.
-    fn payload_location(&self) -> Result<(OwnedFd, String)> {
+    fn payload_location(&self) -> (RepoDir, String) {
         match &self.store {
             ObjectStore::Repo => {
                 let path = loose_path(&self.checksum, ObjectType::File, self.repo.mode());
-                Ok((self.repo.objects_fd().try_clone_to_owned()?, path))
+                (self.repo.objects().clone(), path)
             }
-            ObjectStore::Staging { dir, name } => {
-                Ok((dir.as_fd().try_clone_to_owned()?, name.clone()))
-            }
+            ObjectStore::Staging { dir, name } => (dir.clone(), name.clone()),
         }
     }
 
     /// Opens the object file on the blocking pool, positioned after its first
     /// `payload_offset` bytes. If `measure` is set, the same pool call also
-    /// reads the number of bytes from there to the end of the file. If it is
+    /// gives the number of bytes from there to the end of the file. If it is
     /// clear, that number is 0.
     ///
-    /// In the strict open mode of [`Repo::open_at_strict`], the fan-out
-    /// directory of a loose object opens first, as [`open_fanout_beneath`]
-    /// states, and the object file opens relative to it with the strict open
-    /// of [`object::open_regular_file`]. So a symlink at `objects/<xx>` or at
-    /// the object path fails the open with `ELOOP`, also if it replaced the
-    /// directory or the file after the load. An object file that is not a
-    /// regular file fails the open. If such a file opens, as a FIFO does, the
-    /// error has the kind `ErrorKind::InvalidData`. The open of a FIFO does
-    /// not wait for a writer.
+    /// The open is [`RepoDir::open_regular_at`]: it follows no symlink at
+    /// `objects/<xx>` or at the object path, also if the symlink replaced the
+    /// directory or the file after the load, and it refuses an object file
+    /// that is not a regular file. The open of a FIFO does not wait for a
+    /// writer. An absent entry gives [`Error::ObjectNotFound`].
     async fn open_payload(&self, payload_offset: u64, measure: bool) -> Result<Payload> {
-        let (dir, path) = self.payload_location()?;
-        let beneath = matches!(self.store, ObjectStore::Repo) && self.repo.is_strict();
+        let (dir, path) = self.payload_location();
         let checksum = self.checksum;
         ostrya_rt::unblock(move || {
-            let file = match path.split_once('/').filter(|_| beneath) {
-                Some((fanout, name)) => {
-                    let sub = open_fanout_beneath(dir.as_fd(), fanout, &checksum)?;
-                    object::open_content_file(sub.as_fd(), name, payload_offset, true)?
-                }
-                None => object::open_content_file(dir.as_fd(), &path, payload_offset, false)?,
-            };
+            let Opened { file, stat } = dir
+                .open_regular_at(&path, payload_offset)
+                .map_err(|e| e.into_object_error(&checksum, ObjectType::File))?;
             let len = if measure {
-                file.metadata()?.len().saturating_sub(payload_offset)
+                stat.size.saturating_sub(payload_offset)
             } else {
                 0
             };
@@ -336,13 +342,27 @@ impl Repo {
     ///   - a `bare-user` object has no `user.ostreemeta` xattr
     ///   - a `bare-split-xattrs` object has no `.file-xattrs-link`
     ///   - a `bare`, `bare-user-only`, or `bare-split-xattrs` object is not a
-    ///     regular file or a symlink
+    ///     regular file or a symlink, with the message `<path> is not a
+    ///     regular file`
+    ///   - an `archive`, `bare-user`, or `bare-user-shared` object, or a
+    ///     `.file-xattrs-link`, is not a regular file, with the same message
     ///   - a symlink target is not valid UTF-8, or has an interior NUL
+    ///   - the content of a `bare-user` symlink object is larger than 65536
+    ///     bytes, with the message `<path> is larger than its cap of 65536
+    ///     bytes`
+    ///   - a `.file-xattrs-link` is larger than [`MAX_METADATA_SIZE`]
+    /// - [`Error::InvalidFormat`] if a symlink is at `objects/<xx>`, at a
+    ///   `.file-xattrs-link`, or at the object path in the `archive`,
+    ///   `bare-user`, and `bare-user-shared` modes. The message is `<path>
+    ///   passes through a symlink; ostrya refuses a symlink in the
+    ///   repository`. In the other modes, a symlink at the object path is a
+    ///   symlink object, and the load reads its target.
     /// - [`Error::Core`] if the file header, the `user.ostreemeta` value, or
     ///   the xattr set of a `.file-xattrs-link` does not parse.
-    /// - [`Error::Io`] for other failures of the file system. In the
-    ///   `archive`, `bare-user`, and `bare-user-shared` modes, a symlink at
-    ///   the object path gives this variant with `ELOOP`.
+    /// - [`Error::Io`] of kind [`InvalidData`](std::io::ErrorKind::InvalidData)
+    ///   if the xattrs of a `bare` object do not make a valid set. An xattr
+    ///   name need not be UTF-8.
+    /// - [`Error::Io`] for other failures of the file system.
     ///
     /// # Examples
     ///
@@ -383,43 +403,37 @@ impl Repo {
         checksum: &Checksum,
         measure: bool,
     ) -> Result<FileObject> {
-        let mode = self.mode();
-        let path = loose_path(checksum, ObjectType::File, mode);
-        let repo = self.clone();
-        let key = *checksum;
-        let loaded =
-            ostrya_rt::unblock(move || load_loose(&repo, &path, &key, mode, measure, false))
-                .await?;
-        Ok(FileObject {
-            repo: self.clone(),
-            checksum: *checksum,
-            uid: loaded.uid,
-            gid: loaded.gid,
-            mode: loaded.mode,
-            xattrs: loaded.xattrs,
-            kind: loaded.kind,
-            source: loaded.source,
-            store: ObjectStore::Repo,
-            kernel_verity: loaded.kernel_verity,
-        })
+        let loaded = self.load_loose(checksum, measure, false).await?;
+        Ok(self.file_object(checksum, loaded).0)
     }
 
-    /// Loads a file object as [`Repo::load_file`] does, and returns a reader
-    /// over its payload. The reader is the one that [`FileObject::reader`]
-    /// gives. It streams from the descriptor that the load opened, so the
-    /// object opens once.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    /// Loads a file object as [`Repo::load_file`] does, and keeps the object
+    /// file of a regular file open at the start of its payload.
+    ///
+    /// The second value is that file and the number of bytes on disk from
+    /// there to the end, or `None` for a symlink.
+    /// [`FileObject::reader_over`] gives the reader over it, so the object
+    /// opens once.
     pub(crate) async fn open_file(
         &self,
         checksum: &Checksum,
-    ) -> Result<(FileObject, ContentReader)> {
+    ) -> Result<(FileObject, Option<Payload>)> {
+        let loaded = self.load_loose(checksum, false, true).await?;
+        Ok(self.file_object(checksum, loaded))
+    }
+
+    /// Runs the loader of the repository mode on the blocking pool for the
+    /// loose file object `checksum`. `measure` and `keep` are the flags of
+    /// [`load_by_mode`].
+    async fn load_loose(&self, checksum: &Checksum, measure: bool, keep: bool) -> Result<Loaded> {
         let mode = self.mode();
         let path = loose_path(checksum, ObjectType::File, mode);
         let repo = self.clone();
         let key = *checksum;
-        let loaded =
-            ostrya_rt::unblock(move || load_loose(&repo, &path, &key, mode, false, true)).await?;
-        Ok(self.opened(checksum, loaded))
+        ostrya_rt::unblock(move || {
+            load_by_mode(repo.objects(), &path, mode, measure, keep).map_err(|e| e.into_error(&key))
+        })
+        .await
     }
 
     /// Returns the sum of the content bytes of the file objects `checksums`.
@@ -433,15 +447,17 @@ impl Repo {
     ///
     /// The pass reads no payload byte:
     ///
-    /// - A stored `.filez` takes one `statat`.
+    /// - A stored `.filez` takes one [`RepoDir::lstat`].
     /// - An `archive` object without `stored` takes an open and the read of
     ///   its file header.
     /// - A `bare-user` object is a regular file, also for a symlink. It takes
-    ///   an open, the read of its `user.ostreemeta` xattr, and an `fstat`.
-    /// - An object of the other modes takes one `statat`.
+    ///   an open and the read of its `user.ostreemeta` xattr.
+    /// - An object of the other modes takes one [`RepoDir::lstat`].
     ///
     /// Each path resolves as the loads of the session resolve it: relative to
-    /// `objects/`, with no symlink followed at the object itself.
+    /// `objects/`, with no symlink followed at any component. The errors are
+    /// those of the loads: an entry of a type that the mode does not store
+    /// fails the pass.
     #[cfg_attr(not(feature = "push"), allow(dead_code))]
     pub(crate) fn content_size_blocking(
         &self,
@@ -464,48 +480,64 @@ impl Repo {
         stored: bool,
     ) -> Result<u64> {
         let mode = self.mode();
-        let dir = self.objects_fd();
+        let dir = self.objects();
         let path = loose_path(checksum, ObjectType::File, mode);
-        let statat = || {
-            rustix::fs::statat(dir, path.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|e| map_object_error(e, checksum, ObjectType::File))
-        };
-        Ok(match mode {
-            RepoMode::Archive if stored => statat()?.st_size.max(0) as u64,
-            RepoMode::Archive => match load_archive(dir, &path, checksum, false)?.kind {
-                FileKind::Regular { size } => size,
-                FileKind::Symlink { .. } => 0,
-            },
-            RepoMode::BareUser | RepoMode::BareUserShared => {
-                bare_user_payload_size(dir, &path, checksum)?
-            }
-            RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
-                let stat = statat()?;
-                match FileType::from_raw_mode(stat.st_mode) {
-                    FileType::Symlink => 0,
-                    _ => stat.st_size.max(0) as u64,
+        let size = (|| -> std::result::Result<u64, LoadError> {
+            Ok(match mode {
+                RepoMode::Archive if stored => {
+                    let stat = dir.lstat(&path)?;
+                    if stat.file_type == FileType::RegularFile {
+                        stat.size
+                    } else {
+                        // The open refuses the type with the error of a load.
+                        dir.open_regular(&path)?.stat.size
+                    }
                 }
-            }
-        })
+                RepoMode::Archive => match load_archive(dir, &path, false)?.kind {
+                    FileKind::Regular { size } => size,
+                    FileKind::Symlink { .. } => 0,
+                },
+                RepoMode::BareUser | RepoMode::BareUserShared => {
+                    bare_user_payload_size(dir, &path)?
+                }
+                RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
+                    let stat = dir.lstat(&path)?;
+                    match stat.file_type {
+                        FileType::Symlink => 0,
+                        FileType::RegularFile => stat.size,
+                        // The open refuses the type with the error of a load.
+                        _ => match dir.open_object(&path)? {
+                            ObjectEntry::Regular(opened) => opened.stat.size,
+                            ObjectEntry::Symlink(_) => 0,
+                        },
+                    }
+                }
+            })
+        })();
+        size.map_err(|e| e.into_error(checksum))
     }
 
-    /// Loads a file object as [`Repo::open_file`] does, on the calling thread,
-    /// and follows no symlink on the object path.
+    /// Loads a file object as [`Repo::open_file`] does, on the calling
+    /// thread, and gives a typed outcome.
     ///
-    /// The fan-out directory under `objects/` opens with `O_NOFOLLOW`, and the
-    /// object loads relative to it. A symlink at the fan-out directory or at a
-    /// regular-file object fails with `ELOOP`. In a mode that stores a symlink
-    /// as a symlink, the load reads a symlink object with `readlinkat`, as
-    /// every load does. The caller runs the function on the blocking pool and
-    /// takes the result with [`Repo::contained_file`].
-    pub(crate) fn load_contained_blocking(&self, checksum: &Checksum) -> Result<Contained> {
+    /// The load follows no symlink at any component of the object path, as
+    /// each load does. In a mode that stores a symlink as a symlink, the load
+    /// reads a symlink object with `readlinkat`. An absent object, and an
+    /// entry at `objects/<xx>` that is not a directory, give
+    /// [`Contained::NotFound`]. A symlink on the object path gives
+    /// [`Contained::Refused`]. Each other failure of the load is an error.
+    /// The caller runs the function on the blocking pool and takes the result
+    /// with [`Repo::contained_file`].
+    pub(crate) fn load_contained_blocking(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<Contained<ContainedFile>> {
         let mode = self.mode();
         let path = loose_path(checksum, ObjectType::File, mode);
-        let (fanout, name) = path
-            .split_once('/')
-            .expect("a loose path names its fan-out directory");
-        let dir = open_fanout(self.objects_fd(), fanout, checksum)?;
-        load_by_mode(dir.as_fd(), name, checksum, mode, false, true).map(Contained)
+        match load_by_mode(self.objects(), &path, mode, false, true) {
+            Ok(loaded) => Ok(Contained::Found(ContainedFile { loaded })),
+            Err(e) => e.into_contained(checksum),
+        }
     }
 
     /// Returns the file object and the payload reader of a
@@ -513,55 +545,55 @@ impl Repo {
     pub(crate) fn contained_file(
         &self,
         checksum: &Checksum,
-        contained: Contained,
+        contained: ContainedFile,
     ) -> (FileObject, ContentReader) {
-        self.opened(checksum, contained.0)
+        let (file, payload) = self.file_object(checksum, contained.loaded);
+        let reader = file.reader_over(payload);
+        (file, reader)
     }
 
     /// Checks on the calling thread that the content object `checksum` is
     /// present, and reads nothing of it.
     ///
-    /// The check uses the path rules of [`Repo::load_contained_blocking`]. It
-    /// reads no xattr and no byte of the payload. It opens a regular-file
-    /// object, so a file that the process cannot read fails as the load fails.
+    /// The check uses the path rules and the outcomes of
+    /// [`Repo::load_contained_blocking`]. It reads no xattr and no byte of
+    /// the payload. It opens a regular-file object, so a file that the
+    /// process cannot read fails as the load fails.
     ///
     /// In a mode that stores a symlink as a symlink, a symlink object passes.
-    /// In the other modes, it fails with `ELOOP`. In `bare-split-xattrs`, one
-    /// `statat` checks the `.file-xattrs-link` beside the object. A symlink
-    /// there fails with `ELOOP`, and a missing link fails as the load fails.
-    pub(crate) fn probe_contained_blocking(&self, checksum: &Checksum) -> Result<()> {
+    /// In the other modes, it gives [`Contained::Refused`]. In
+    /// `bare-split-xattrs`, an open of the `.file-xattrs-link` beside the
+    /// object follows the open of the object. An absent object gives
+    /// [`Contained::NotFound`], as the load does. A symlink at the link gives
+    /// [`Contained::Refused`], and a missing link fails as the load fails.
+    pub(crate) fn probe_contained_blocking(&self, checksum: &Checksum) -> Result<Contained<()>> {
         let mode = self.mode();
         let path = loose_path(checksum, ObjectType::File, mode);
-        let (fanout, name) = path
-            .split_once('/')
-            .expect("a loose path names its fan-out directory");
-        let dir = open_fanout(self.objects_fd(), fanout, checksum)?;
-        let symlinks = matches!(
-            mode,
-            RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs
-        );
-        if mode == RepoMode::BareSplitXattrs {
-            probe_split_xattrs_link(dir.as_fd(), name)?;
-        }
-        match rustix::fs::openat(&dir, name, OBJECT_OPEN, Mode::empty()) {
-            Ok(fd) => {
-                let stat = rustix::fs::fstat(&fd)?;
-                if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-                    return Err(Error::InvalidFormat(
-                        "content object is neither a regular file nor a symlink".into(),
-                    ));
+        let objects = self.objects();
+        let probed = (|| -> std::result::Result<(), LoadError> {
+            match mode {
+                RepoMode::Bare | RepoMode::BareUserOnly => {
+                    objects.open_object(&path)?;
                 }
-                Ok(())
+                RepoMode::BareSplitXattrs => {
+                    objects.open_object(&path)?;
+                    probe_split_xattrs_link(objects, &path)?;
+                }
+                RepoMode::Archive | RepoMode::BareUser | RepoMode::BareUserShared => {
+                    objects.open_regular(&path)?;
+                }
             }
-            Err(Errno::LOOP) if symlinks => Ok(()),
-            Err(e) => Err(map_object_error(e, checksum, ObjectType::File)),
+            Ok(())
+        })();
+        match probed {
+            Ok(()) => Ok(Contained::Found(())),
+            Err(e) => e.into_contained(checksum),
         }
     }
 
-    /// Returns the file object of a load that kept its payload, and the
-    /// reader over that payload.
-    fn opened(&self, checksum: &Checksum, loaded: Loaded) -> (FileObject, ContentReader) {
-        let reader = loaded.source.reader_over(loaded.payload);
+    /// Returns the file object of a load of the loose object `checksum`, and
+    /// the payload that the load kept.
+    fn file_object(&self, checksum: &Checksum, loaded: Loaded) -> (FileObject, Option<Payload>) {
         let file = FileObject {
             repo: self.clone(),
             checksum: *checksum,
@@ -573,8 +605,9 @@ impl Repo {
             source: loaded.source,
             store: ObjectStore::Repo,
             kernel_verity: loaded.kernel_verity,
+            stored_size: loaded.stored_size,
         };
-        (file, reader)
+        (file, loaded.payload)
     }
 }
 
@@ -587,18 +620,17 @@ impl Repo {
 /// directory. `measure` is the flag of [`Repo::load_file_with`].
 pub(crate) async fn load_staged_file(
     repo: &Repo,
-    staging_fd: BorrowedFd<'_>,
+    staging: &RepoDir,
     checksum: &Checksum,
     measure: bool,
 ) -> Result<FileObject> {
     let mode = repo.mode();
     let name = crate::write::flat_name(checksum, ObjectType::File, mode);
-    let dir = Arc::new(staging_fd.try_clone_to_owned()?);
     let key = *checksum;
-    let load_dir = dir.clone();
+    let load_dir = staging.clone();
     let load_name = name.clone();
     let loaded = ostrya_rt::unblock(move || {
-        load_by_mode(load_dir.as_fd(), &load_name, &key, mode, measure, false)
+        load_by_mode(&load_dir, &load_name, mode, measure, false).map_err(|e| e.into_error(&key))
     })
     .await?;
     Ok(FileObject {
@@ -610,13 +642,103 @@ pub(crate) async fn load_staged_file(
         xattrs: loaded.xattrs,
         kind: loaded.kind,
         source: loaded.source,
-        store: ObjectStore::Staging { dir, name },
+        store: ObjectStore::Staging {
+            dir: staging.clone(),
+            name,
+        },
         kernel_verity: loaded.kernel_verity,
+        stored_size: loaded.stored_size,
     })
 }
 
+/// The outcome of [`Repo::load_contained_blocking`] and of
+/// [`Repo::probe_contained_blocking`].
+pub(crate) enum Contained<T> {
+    /// The object is present. The payload is the result of the load or of the
+    /// probe.
+    Found(T),
+    /// The object is absent.
+    NotFound,
+    /// A symlink is on the object path.
+    Refused,
+}
+
 /// The result of [`Repo::load_contained_blocking`], which keeps its payload.
-pub(crate) struct Contained(Loaded);
+pub(crate) struct ContainedFile {
+    /// The fields of the load and the open payload.
+    loaded: Loaded,
+}
+
+/// The error of the loader of one mode.
+///
+/// An error of a file system operation on the object path stays an
+/// [`FsError`], so the caller selects its result: [`LoadError::into_error`]
+/// gives the error of a load, and [`LoadError::into_contained`] gives the
+/// outcome of the archive view.
+enum LoadError {
+    /// An error of a file system operation on the object path.
+    Fs(FsError),
+    /// Each other error.
+    Other(Error),
+}
+
+impl From<FsError> for LoadError {
+    fn from(err: FsError) -> LoadError {
+        LoadError::Fs(err)
+    }
+}
+
+impl From<Error> for LoadError {
+    fn from(err: Error) -> LoadError {
+        LoadError::Other(err)
+    }
+}
+
+impl From<io::Error> for LoadError {
+    fn from(err: io::Error) -> LoadError {
+        LoadError::Other(Error::Io(err))
+    }
+}
+
+impl From<ostrya_core::Error> for LoadError {
+    fn from(err: ostrya_core::Error) -> LoadError {
+        LoadError::Other(err.into())
+    }
+}
+
+impl LoadError {
+    /// Converts the error of a load of the file object `checksum` into an
+    /// [`Error`]. An absent entry gives [`Error::ObjectNotFound`].
+    fn into_error(self, checksum: &Checksum) -> Error {
+        match self {
+            LoadError::Fs(err) => err.into_object_error(checksum, ObjectType::File),
+            LoadError::Other(err) => err,
+        }
+    }
+
+    /// Converts the error of a load of the file object `checksum` into the
+    /// outcome of [`Repo::load_contained_blocking`].
+    ///
+    /// An absent entry, and an entry that is not a directory at the place of
+    /// the fan-out directory, give [`Contained::NotFound`]. A symlink on the
+    /// path gives [`Contained::Refused`]. Each other error stays an error.
+    fn into_contained<T>(self, checksum: &Checksum) -> Result<Contained<T>> {
+        match self {
+            LoadError::Fs(
+                FsError::Absent { .. }
+                | FsError::Invalid {
+                    reason: Reason::NotDirectory,
+                    ..
+                },
+            ) => Ok(Contained::NotFound),
+            LoadError::Fs(FsError::Invalid {
+                reason: Reason::Symlink,
+                ..
+            }) => Ok(Contained::Refused),
+            other => Err(other.into_error(checksum)),
+        }
+    }
+}
 
 /// The fields that the loader of one mode produces, before a [`FileObject`]
 /// is built from them.
@@ -628,6 +750,8 @@ struct Loaded {
     kind: FileKind,
     source: ReaderSource,
     kernel_verity: Option<[u8; 32]>,
+    /// The size of the object on disk, from the `statx` of the load.
+    stored_size: u64,
     /// The object file of a regular file, at the start of its payload, and the
     /// number of bytes on disk from there to the end. Only a load that keeps
     /// the payload sets it.
@@ -636,174 +760,36 @@ struct Loaded {
 
 /// An object file at the start of its payload, and the number of bytes on
 /// disk from there to the end.
-type Payload = (std::fs::File, u64);
+pub(crate) type Payload = (File, u64);
 
 /// Calls the loader of the repository mode.
 ///
-/// `object_path` locates the object relative to `dir_fd`: a loose path under
-/// `objects/`, or a flat name in a staging directory. `measure` asks a
+/// `object_path` locates the object below `dir`: a loose path below the
+/// `objects/` handle, or a flat name below a staging handle. `measure` asks a
 /// raw-payload loader for the fs-verity digest of the kernel. An `archive`
 /// object never has one. `keep` asks the loader of a regular file to keep its
-/// object file open at the payload.
-fn load_by_mode(
-    dir_fd: BorrowedFd<'_>,
-    object_path: &str,
-    checksum: &Checksum,
-    mode: RepoMode,
-    measure: bool,
-    keep: bool,
-) -> Result<Loaded> {
-    match mode {
-        RepoMode::Archive => load_archive(dir_fd, object_path, checksum, keep),
-        RepoMode::BareUser | RepoMode::BareUserShared => {
-            load_bare_user(dir_fd, object_path, checksum, measure, keep)
-        }
-        RepoMode::Bare => load_bare(dir_fd, object_path, checksum, measure, keep),
-        RepoMode::BareUserOnly => load_bare_user_only(dir_fd, object_path, checksum, measure, keep),
-        RepoMode::BareSplitXattrs => {
-            load_bare_split_xattrs(dir_fd, object_path, checksum, measure, keep)
-        }
-    }
-}
-
-/// Calls the loader of the repository mode for the loose object at `path`
-/// under `objects/` of `repo`, as [`load_by_mode`] does.
+/// object file open at the payload. With neither flag, the `bare-user-only`
+/// and `bare-split-xattrs` loaders do not open a regular file.
 ///
-/// In the strict open mode of [`Repo::open_at_strict`], the fan-out directory
-/// opens first, as [`open_fanout_beneath`] states, and the object loads
-/// relative to it. So a symlink at `objects/<xx>` fails the load with
-/// `ELOOP`.
-fn load_loose(
-    repo: &Repo,
-    path: &str,
-    checksum: &Checksum,
+/// Each operation is a primitive of [`RepoDir`], so the loaders follow no
+/// symlink at any component of the path, and refuse an entry of a type that
+/// the mode does not store.
+fn load_by_mode(
+    dir: &RepoDir,
+    object_path: &str,
     mode: RepoMode,
     measure: bool,
     keep: bool,
-) -> Result<Loaded> {
-    if !repo.is_strict() {
-        return load_by_mode(repo.objects_fd(), path, checksum, mode, measure, keep);
-    }
-    let (fanout, name) = path
-        .split_once('/')
-        .expect("a loose path names its fan-out directory");
-    let dir = open_fanout_beneath(repo.objects_fd(), fanout, checksum)?;
-    load_by_mode(dir.as_fd(), name, checksum, mode, measure, keep)
-}
-
-/// Maps a syscall error to `ObjectNotFound` for a missing object, and to `Io`
-/// for all other errors.
-fn map_object_error(err: Errno, checksum: &Checksum, ty: ObjectType) -> Error {
-    if err == Errno::NOENT {
-        Error::ObjectNotFound {
-            checksum: *checksum,
-            ty,
+) -> std::result::Result<Loaded, LoadError> {
+    match mode {
+        RepoMode::Archive => load_archive(dir, object_path, keep),
+        RepoMode::BareUser | RepoMode::BareUserShared => {
+            load_bare_user(dir, object_path, measure, keep)
         }
-    } else {
-        Error::Io(err.into())
+        RepoMode::Bare => load_bare(dir, object_path, measure, keep),
+        RepoMode::BareUserOnly => load_bare_user_only(dir, object_path, measure, keep),
+        RepoMode::BareSplitXattrs => load_bare_split_xattrs(dir, object_path, measure, keep),
     }
-}
-
-/// The flags of a read-only open of an object that must be a regular file.
-/// `O_NOFOLLOW` makes a symlink at the path fail with `ELOOP`. `O_NONBLOCK`
-/// keeps the open of a FIFO from waiting for a writer, so a FIFO fails the
-/// load at its first read. The flag changes no read of a regular file.
-const OBJECT_OPEN: OFlags = OFlags::RDONLY
-    .union(OFlags::NOFOLLOW)
-    .union(OFlags::NONBLOCK)
-    .union(OFlags::NOCTTY)
-    .union(OFlags::CLOEXEC);
-
-/// Opens a loose object fd and follows no symlink. A missing object gives
-/// `ObjectNotFound`. Every object that these loaders open with this call is a
-/// regular file, so a symlink at the path fails with `ELOOP`.
-fn open_object(objects_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<OwnedFd> {
-    rustix::fs::openat(objects_fd, path, OBJECT_OPEN, Mode::empty())
-        .map_err(|e| map_object_error(e, checksum, ObjectType::File))
-}
-
-/// Opens the fan-out directory `fanout` of `objects/` as a path descriptor,
-/// and follows no symlink. A symlink there fails with `ELOOP`. A missing
-/// entry, and an entry that is not a directory, give `ObjectNotFound`.
-fn open_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, checksum: &Checksum) -> Result<OwnedFd> {
-    match rustix::fs::openat(
-        objects_fd,
-        fanout,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => Ok(fd),
-        Err(Errno::NOTDIR | Errno::LOOP) => {
-            let stat = rustix::fs::statat(objects_fd, fanout, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|e| map_object_error(e, checksum, ObjectType::File))?;
-            if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink {
-                Err(Error::Io(Errno::LOOP.into()))
-            } else {
-                Err(map_object_error(Errno::NOENT, checksum, ObjectType::File))
-            }
-        }
-        Err(e) => Err(map_object_error(e, checksum, ObjectType::File)),
-    }
-}
-
-/// Opens the fan-out directory `fanout` of `objects/` as a path descriptor
-/// with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. A symlink
-/// there fails with `ELOOP`. A missing entry gives `ObjectNotFound`.
-fn open_fanout_beneath(
-    objects_fd: BorrowedFd<'_>,
-    fanout: &str,
-    checksum: &Checksum,
-) -> Result<OwnedFd> {
-    object::open_fanout_beneath(objects_fd, fanout).map_err(|e| match Errno::from_io_error(&e) {
-        Some(errno) => map_object_error(errno, checksum, ObjectType::File),
-        None => Error::Io(e),
-    })
-}
-
-/// Opens a regular-file object and follows no symlink. A missing object gives
-/// `ObjectNotFound`.
-fn open_regular(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<OwnedFd> {
-    rustix::fs::openat(dir_fd, path, OBJECT_OPEN, Mode::empty())
-        .map_err(|e| map_object_error(e, checksum, ObjectType::File))
-}
-
-/// Returns the fs-verity digest of the regular-file object at `path`, as
-/// [`sealed_digest`] reads it, and the object file if `keep` is set. A kept
-/// file opens once, and the digest is read on it.
-fn open_sealed_regular(
-    dir_fd: BorrowedFd<'_>,
-    path: &str,
-    checksum: &Checksum,
-    size: u64,
-    probe: bool,
-    keep: bool,
-) -> Result<(Option<[u8; 32]>, Option<Payload>)> {
-    if !keep {
-        return Ok((sealed_digest_at(dir_fd, path, size, probe), None));
-    }
-    let fd = open_regular(dir_fd, path, checksum)?;
-    let digest = sealed_digest(fd.as_fd(), size, probe);
-    Ok((digest, Some((std::fs::File::from(fd), size))))
-}
-
-/// The `statx` fields that the loaders read: the file type, mode, owner, and
-/// size. The kernel returns the attribute words for each mask.
-const STATX_FIELDS: StatxFlags = StatxFlags::TYPE
-    .union(StatxFlags::MODE)
-    .union(StatxFlags::UID)
-    .union(StatxFlags::GID)
-    .union(StatxFlags::SIZE);
-
-/// Runs `statx` on a loose object and follows no symlink. A missing object
-/// gives `ObjectNotFound`.
-fn stat_object(
-    objects_fd: BorrowedFd<'_>,
-    path: &str,
-    checksum: &Checksum,
-    ty: ObjectType,
-) -> Result<Statx> {
-    rustix::fs::statx(objects_fd, path, AtFlags::SYMLINK_NOFOLLOW, STATX_FIELDS)
-        .map_err(|e| map_object_error(e, checksum, ty))
 }
 
 /// Returns `true` if `statx` reports the inode as sealed with fs-verity. The
@@ -833,25 +819,19 @@ pub(crate) fn sealed_digest(fd: BorrowedFd<'_>, size: u64, probe: bool) -> Optio
     ostrya_sys::measure_verity(fd).ok()
 }
 
-/// Returns [`sealed_digest`] for an object that a loader reached by path
-/// alone. If `probe` is clear, the function opens nothing.
-fn sealed_digest_at(
-    dir_fd: BorrowedFd<'_>,
-    path: &str,
-    size: u64,
-    probe: bool,
-) -> Option<[u8; 32]> {
-    if !probe {
+/// Returns the fs-verity digest that the kernel holds for the raw-payload
+/// object `file` with the status `stat`, if `measure` is set and the status
+/// reports the object as sealed. Each other case gives `None`.
+fn kernel_digest(file: &File, stat: &Stat, measure: bool) -> Option<[u8; 32]> {
+    if !(measure && stat.verity) {
         return None;
     }
-    let fd = rustix::fs::openat(dir_fd, path, OBJECT_OPEN, Mode::empty()).ok()?;
-    sealed_digest(fd.as_fd(), size, probe)
+    repo_fs::verity_digest(file.as_fd(), stat.size)
 }
 
-/// Reads the target of a symlink object.
-fn read_link_target(objects_fd: BorrowedFd<'_>, path: &str) -> Result<String> {
-    let link = rustix::fs::readlinkat(objects_fd, path, Vec::new())?;
-    link.into_string()
+/// Returns the target of a symlink object, from the bytes of the target.
+fn link_target(target: Vec<u8>) -> Result<String> {
+    String::from_utf8(target)
         .map_err(|_| Error::InvalidFormat("symlink target is not valid UTF-8".into()))
 }
 
@@ -869,29 +849,28 @@ fn symlink_target_from_content(content: &[u8]) -> Result<String> {
         .map_err(|_| Error::InvalidFormat("symlink target is not valid UTF-8".into()))
 }
 
-fn load_archive(
-    dir_fd: BorrowedFd<'_>,
-    path: &str,
-    checksum: &Checksum,
-    keep: bool,
-) -> Result<Loaded> {
+/// Returns the logical header of the `bare-user` object open as `file`, from
+/// its `user.ostreemeta` xattr.
+fn bare_user_header(file: &File) -> std::result::Result<FileHeader, LoadError> {
+    let meta = repo_fs::xattr(file.as_fd(), "user.ostreemeta")?.ok_or_else(|| {
+        Error::InvalidFormat("bare-user .file is missing its user.ostreemeta xattr".into())
+    })?;
+    Ok(FileHeader::parse_stat_metadata(&meta)?)
+}
+
+fn load_archive(dir: &RepoDir, path: &str, keep: bool) -> std::result::Result<Loaded, LoadError> {
     use std::io::Read;
 
-    let fd = open_object(dir_fd, path, checksum)?;
-    let mut file = std::fs::File::from(fd);
+    let Opened { mut file, stat } = dir.open_regular(path)?;
 
     let mut prefix = [0u8; 8];
     file.read_exact(&mut prefix)?;
     if prefix[4..8] != [0u8; 4] {
-        return Err(Error::InvalidFormat(
-            "content framing padding is not zero".into(),
-        ));
+        return Err(Error::InvalidFormat("content framing padding is not zero".into()).into());
     }
     let header_len = u32::from_be_bytes(prefix[..4].try_into().unwrap()) as u64;
     if header_len > MAX_FILE_HEADER_SIZE {
-        return Err(Error::InvalidFormat(
-            "content header exceeds the size cap".into(),
-        ));
+        return Err(Error::InvalidFormat("content header exceeds the size cap".into()).into());
     }
     let mut header_bytes = vec![0u8; header_len as usize];
     file.read_exact(&mut header_bytes)?;
@@ -915,13 +894,7 @@ fn load_archive(
             ReaderSource::Archive {
                 payload_offset: 8 + header_len,
             },
-            match keep {
-                true => {
-                    let len = file.metadata()?.len().saturating_sub(8 + header_len);
-                    Some((file, len))
-                }
-                false => None,
-            },
+            keep.then(|| (file, stat.size.saturating_sub(8 + header_len))),
         )
     };
     Ok(Loaded {
@@ -932,33 +905,29 @@ fn load_archive(
         kind,
         source,
         kernel_verity: None,
+        stored_size: stat.size,
         payload,
     })
 }
 
+/// Loads a `bare-user` object.
+///
+/// The object is a regular file. A symlink object holds its target as
+/// content, and the loader reads that content with a second open, with a cap
+/// of 64 KiB.
 fn load_bare_user(
-    dir_fd: BorrowedFd<'_>,
+    dir: &RepoDir,
     path: &str,
-    checksum: &Checksum,
     measure: bool,
     keep: bool,
-) -> Result<Loaded> {
-    use std::io::Read;
+) -> std::result::Result<Loaded, LoadError> {
+    let Opened { file, stat } = dir.open_regular(path)?;
+    let header = bare_user_header(&file)?;
 
-    let fd = open_object(dir_fd, path, checksum)?;
-    let meta = object::read_xattr(fd.as_fd(), "user.ostreemeta")
-        .map_err(Error::Io)?
-        .ok_or_else(|| {
-            Error::InvalidFormat("bare-user .file is missing its user.ostreemeta xattr".into())
-        })?;
-    let header = FileHeader::parse_stat_metadata(&meta)?;
-    let stat = rustix::fs::statx(&fd, "", AtFlags::EMPTY_PATH, StatxFlags::SIZE)?;
-
+    let stored_size = stat.size;
     let (kind, source, kernel_verity, payload) = if header.is_symlink() {
-        let mut content = Vec::new();
-        std::fs::File::from(fd)
-            .take(SYMLINK_READ_CAP)
-            .read_to_end(&mut content)?;
+        drop(file);
+        let content = dir.read_capped(path, SYMLINK_READ_CAP)?;
         (
             FileKind::Symlink {
                 target: symlink_target_from_content(&content)?,
@@ -968,13 +937,13 @@ fn load_bare_user(
             None,
         )
     } else {
-        let size = stat.stx_size;
-        let kernel_verity = sealed_digest(fd.as_fd(), size, measure && is_sealed(&stat));
+        let size = stat.size;
+        let kernel_verity = kernel_digest(&file, &stat, measure);
         (
             FileKind::Regular { size },
             ReaderSource::Plain,
             kernel_verity,
-            keep.then(|| (std::fs::File::from(fd), size)),
+            keep.then_some((file, size)),
         )
     };
     Ok(Loaded {
@@ -985,6 +954,7 @@ fn load_bare_user(
         kind,
         source,
         kernel_verity,
+        stored_size,
         payload,
     })
 }
@@ -992,124 +962,172 @@ fn load_bare_user(
 /// Returns the payload size of the `bare-user` object at `path`: its length,
 /// or 0 if its `user.ostreemeta` xattr names a symlink. The function does not
 /// read the object content.
-fn bare_user_payload_size(dir_fd: BorrowedFd<'_>, path: &str, checksum: &Checksum) -> Result<u64> {
-    let fd = open_object(dir_fd, path, checksum)?;
-    let meta = object::read_xattr(fd.as_fd(), "user.ostreemeta")
-        .map_err(Error::Io)?
-        .ok_or_else(|| {
-            Error::InvalidFormat("bare-user .file is missing its user.ostreemeta xattr".into())
-        })?;
-    if FileHeader::parse_stat_metadata(&meta)?.is_symlink() {
+fn bare_user_payload_size(dir: &RepoDir, path: &str) -> std::result::Result<u64, LoadError> {
+    let Opened { file, stat } = dir.open_regular(path)?;
+    if bare_user_header(&file)?.is_symlink() {
         return Ok(0);
     }
-    Ok(rustix::fs::fstat(&fd)?.st_size.max(0) as u64)
+    Ok(stat.size)
+}
+
+/// A loose object of a mode that stores a symlink as a symlink, as
+/// [`bare_entry`] reads it.
+enum BareEntry {
+    /// A regular file, its status, and the file if the read opened it.
+    Regular(Stat, Option<File>),
+    /// A symlink, its status, its target, and its xattrs if the read took
+    /// them.
+    Symlink(Stat, Vec<u8>, Xattrs),
+}
+
+/// Reads the loose object at `path` below `dir` in a mode that stores a
+/// symlink as a symlink.
+///
+/// With `open`, the read starts with [`RepoDir::open_object`]. Otherwise it
+/// starts with one [`RepoDir::lstat`], so an object that the process cannot
+/// read loads. It then opens a regular file only if `measure` is set and the
+/// file is sealed with fs-verity. An entry of another type opens as the
+/// object, so the open refuses it with its type.
+///
+/// A symlink gives its status, its target, and with `link_xattrs` its
+/// xattrs. An error of the xattr read at the parent directory of a loose
+/// object names the object path.
+fn bare_entry(
+    dir: &RepoDir,
+    path: &str,
+    open: bool,
+    measure: bool,
+    link_xattrs: bool,
+) -> std::result::Result<BareEntry, LoadError> {
+    let opened = if open {
+        match dir.open_object(path)? {
+            ObjectEntry::Regular(Opened { file, stat }) => {
+                return Ok(BareEntry::Regular(stat, Some(file)));
+            }
+            ObjectEntry::Symlink(target) => Some(target),
+        }
+    } else {
+        None
+    };
+    let stat = dir.lstat(path)?;
+    let target = match opened {
+        Some(target) => target,
+        None => match stat.file_type {
+            FileType::Symlink => dir.read_link(path, LINK_TARGET_CAP)?,
+            FileType::RegularFile if !(measure && stat.verity) => {
+                return Ok(BareEntry::Regular(stat, None));
+            }
+            _ => return bare_entry(dir, path, true, measure, link_xattrs),
+        },
+    };
+    let xattrs = if link_xattrs {
+        dir.link_xattrs(path)
+            .map_err(|e| object_path_error(e, path))?
+    } else {
+        Xattrs::empty()
+    };
+    Ok(BareEntry::Symlink(stat, target, xattrs))
+}
+
+/// Returns the fields of a symlink object of the bare family with the status
+/// `stat`, the target `target`, and the logical `uid`, `gid`, and `xattrs`.
+fn symlink_loaded(
+    stat: &Stat,
+    uid: u32,
+    gid: u32,
+    xattrs: Xattrs,
+    target: Vec<u8>,
+) -> std::result::Result<Loaded, LoadError> {
+    Ok(Loaded {
+        uid,
+        gid,
+        mode: stat.mode,
+        xattrs,
+        kind: FileKind::Symlink {
+            target: link_target(target)?,
+        },
+        source: ReaderSource::None,
+        kernel_verity: None,
+        stored_size: stat.size,
+        payload: None,
+    })
+}
+
+/// Returns the fields of a regular-file object of the bare family with the
+/// status `stat` and the logical `uid`, `gid`, and `xattrs`. The whole file
+/// is the payload.
+///
+/// `file` is the object file if the load opened it. `measure` reads the
+/// fs-verity digest of the kernel from it, and `keep` keeps it open at the
+/// payload.
+fn regular_loaded(
+    stat: &Stat,
+    file: Option<File>,
+    uid: u32,
+    gid: u32,
+    xattrs: Xattrs,
+    measure: bool,
+    keep: bool,
+) -> Loaded {
+    Loaded {
+        uid,
+        gid,
+        mode: stat.mode,
+        xattrs,
+        kind: FileKind::Regular { size: stat.size },
+        source: ReaderSource::Plain,
+        kernel_verity: file.as_ref().and_then(|f| kernel_digest(f, stat, measure)),
+        stored_size: stat.size,
+        payload: file.filter(|_| keep).map(|f| (f, stat.size)),
+    }
 }
 
 fn load_bare(
-    dir_fd: BorrowedFd<'_>,
+    dir: &RepoDir,
     path: &str,
-    checksum: &Checksum,
     measure: bool,
     keep: bool,
-) -> Result<Loaded> {
-    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
-    let uid = stat.stx_uid;
-    let gid = stat.stx_gid;
-    let mode = u32::from(stat.stx_mode);
-
-    match FileType::from_raw_mode(mode) {
-        FileType::Symlink => Ok(Loaded {
-            uid,
-            gid,
-            mode,
-            xattrs: object::read_link_xattrs(dir_fd, path)?,
-            kind: FileKind::Symlink {
-                target: read_link_target(dir_fd, path)?,
-            },
-            source: ReaderSource::None,
-            kernel_verity: None,
-            payload: None,
-        }),
-        FileType::RegularFile => {
-            let fd = open_regular(dir_fd, path, checksum)?;
-            let xattrs = object::read_all_xattrs(fd.as_fd())?;
-            let size = stat.stx_size;
-            Ok(Loaded {
-                uid,
-                gid,
-                mode,
-                xattrs,
-                kind: FileKind::Regular { size },
-                source: ReaderSource::Plain,
-                kernel_verity: sealed_digest(fd.as_fd(), size, measure && is_sealed(&stat)),
-                payload: keep.then(|| (std::fs::File::from(fd), size)),
-            })
+) -> std::result::Result<Loaded, LoadError> {
+    // The xattrs of a regular file come from its descriptor, so the load
+    // opens the object.
+    Ok(match bare_entry(dir, path, true, measure, true)? {
+        BareEntry::Symlink(stat, target, xattrs) => {
+            symlink_loaded(&stat, stat.uid, stat.gid, xattrs, target)?
         }
-        _ => Err(Error::InvalidFormat(
-            "bare object is neither a regular file nor a symlink".into(),
-        )),
-    }
+        BareEntry::Regular(stat, file) => {
+            let xattrs = match &file {
+                Some(file) => repo_fs::xattrs(file.as_fd())?,
+                None => Xattrs::empty(),
+            };
+            regular_loaded(&stat, file, stat.uid, stat.gid, xattrs, measure, keep)
+        }
+    })
 }
 
 fn load_bare_user_only(
-    dir_fd: BorrowedFd<'_>,
+    dir: &RepoDir,
     path: &str,
-    checksum: &Checksum,
     measure: bool,
     keep: bool,
-) -> Result<Loaded> {
-    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
+) -> std::result::Result<Loaded, LoadError> {
     // This mode does not keep the uid and the gid, so they read back as 0.
     // The inode carries the canonical mode. The mode stores no xattrs.
-    let mode = u32::from(stat.stx_mode);
-    match FileType::from_raw_mode(mode) {
-        FileType::Symlink => Ok(Loaded {
-            uid: 0,
-            gid: 0,
-            mode,
-            xattrs: Xattrs::empty(),
-            kind: FileKind::Symlink {
-                target: read_link_target(dir_fd, path)?,
-            },
-            source: ReaderSource::None,
-            kernel_verity: None,
-            payload: None,
-        }),
-        FileType::RegularFile => {
-            let (kernel_verity, payload) = open_sealed_regular(
-                dir_fd,
-                path,
-                checksum,
-                stat.stx_size,
-                measure && is_sealed(&stat),
-                keep,
-            )?;
-            Ok(Loaded {
-                uid: 0,
-                gid: 0,
-                mode,
-                xattrs: Xattrs::empty(),
-                kind: FileKind::Regular {
-                    size: stat.stx_size,
-                },
-                source: ReaderSource::Plain,
-                kernel_verity,
-                payload,
-            })
+    Ok(match bare_entry(dir, path, keep, measure, false)? {
+        BareEntry::Symlink(stat, target, _) => {
+            symlink_loaded(&stat, 0, 0, Xattrs::empty(), target)?
         }
-        _ => Err(Error::InvalidFormat(
-            "bare-user-only object is neither a regular file nor a symlink".into(),
-        )),
-    }
+        BareEntry::Regular(stat, file) => {
+            regular_loaded(&stat, file, 0, 0, Xattrs::empty(), measure, keep)
+        }
+    })
 }
 
 fn load_bare_split_xattrs(
-    dir_fd: BorrowedFd<'_>,
+    dir: &RepoDir,
     path: &str,
-    checksum: &Checksum,
     measure: bool,
     keep: bool,
-) -> Result<Loaded> {
+) -> std::result::Result<Loaded, LoadError> {
     // The storage is bare: the inode carries the logical uid, gid, and mode.
     // A regular file holds the raw payload, and a symlink is a real symlink.
     // The inode holds no xattrs. A separate object holds the logical set, and
@@ -1117,53 +1135,23 @@ fn load_bare_split_xattrs(
     //
     // A bare-split-xattrs repository is read-only, and nothing is staged in
     // it. The link is beside the object. Its name is the object name with the
-    // suffix `-xattrs-link`, so it resolves relative to `dir_fd` as the object
-    // does.
-    let stat = stat_object(dir_fd, path, checksum, ObjectType::File)?;
-    let uid = stat.stx_uid;
-    let gid = stat.stx_gid;
-    let mode = u32::from(stat.stx_mode);
-    let xattrs = load_split_xattrs(dir_fd, path)?;
-
-    match FileType::from_raw_mode(mode) {
-        FileType::Symlink => Ok(Loaded {
-            uid,
-            gid,
-            mode,
-            xattrs,
-            kind: FileKind::Symlink {
-                target: read_link_target(dir_fd, path)?,
-            },
-            source: ReaderSource::None,
-            kernel_verity: None,
-            payload: None,
-        }),
-        FileType::RegularFile => {
-            let (kernel_verity, payload) = open_sealed_regular(
-                dir_fd,
-                path,
-                checksum,
-                stat.stx_size,
-                measure && is_sealed(&stat),
-                keep,
-            )?;
-            Ok(Loaded {
-                uid,
-                gid,
-                mode,
-                xattrs,
-                kind: FileKind::Regular {
-                    size: stat.stx_size,
-                },
-                source: ReaderSource::Plain,
-                kernel_verity,
-                payload,
-            })
+    // suffix `-xattrs-link`, so it resolves below `dir` as the object does.
+    let entry = bare_entry(dir, path, keep, measure, false)?;
+    let xattrs = load_split_xattrs(dir, path)?;
+    Ok(match entry {
+        BareEntry::Symlink(stat, target, _) => {
+            symlink_loaded(&stat, stat.uid, stat.gid, xattrs, target)?
         }
-        _ => Err(Error::InvalidFormat(
-            "bare-split-xattrs object is neither a regular file nor a symlink".into(),
-        )),
-    }
+        BareEntry::Regular(stat, file) => {
+            regular_loaded(&stat, file, stat.uid, stat.gid, xattrs, measure, keep)
+        }
+    })
+}
+
+/// Returns the error of a `bare-split-xattrs` object with no
+/// `.file-xattrs-link`.
+fn missing_xattrs_link() -> LoadError {
+    Error::InvalidFormat("bare-split-xattrs .file is missing its .file-xattrs-link".into()).into()
 }
 
 /// Reads the logical xattrs of a file object from its `.file-xattrs-link`
@@ -1175,45 +1163,29 @@ fn load_bare_split_xattrs(
 /// file with no xattrs links to the shared empty-set object), so a missing
 /// link means a malformed repository.
 ///
-/// `file_path` is the path of the `.file` object relative to `dir_fd`. The
-/// link opens with `O_NOFOLLOW` and `O_NONBLOCK`. It is a hardlink, so a
-/// symlink at its path fails with `ELOOP`, and a FIFO there does not block the
-/// open.
-fn load_split_xattrs(dir_fd: BorrowedFd<'_>, file_path: &str) -> Result<Xattrs> {
+/// `file_path` is the path of the `.file` object below `dir`. The read is
+/// [`RepoDir::read_capped`] with the metadata cap. The link is a hardlink, so
+/// a symlink at its path fails the read, and a FIFO there does not block it.
+fn load_split_xattrs(dir: &RepoDir, file_path: &str) -> std::result::Result<Xattrs, LoadError> {
     let path = format!("{file_path}-xattrs-link");
-    let bytes = rustix::fs::openat(dir_fd, path.as_str(), OBJECT_OPEN, Mode::empty())
-        .map_err(std::io::Error::from)
-        .and_then(|fd| object::read_meta_fd(fd, MAX_METADATA_SIZE))
-        .map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                Error::InvalidFormat(
-                    "bare-split-xattrs .file is missing its .file-xattrs-link".into(),
-                )
-            } else {
-                Error::Io(e)
-            }
-        })?;
+    let bytes = match dir.read_capped(&path, MAX_METADATA_SIZE) {
+        Ok(bytes) => bytes,
+        Err(FsError::Absent { .. }) => return Err(missing_xattrs_link()),
+        Err(e) => return Err(e.into()),
+    };
     Ok(Xattrs::from_gvariant(&bytes)?)
 }
 
-/// Checks the `.file-xattrs-link` of the `.file` object at `file_path` under
-/// `dir_fd`, and reads none of its bytes. The results are the results that
+/// Checks the `.file-xattrs-link` of the `.file` object at `file_path` below
+/// `dir`, and reads none of its bytes. The check is one open with
+/// [`RepoDir::open_regular`]. The results are the results that
 /// [`load_split_xattrs`] gives.
-fn probe_split_xattrs_link(dir_fd: BorrowedFd<'_>, file_path: &str) -> Result<()> {
+fn probe_split_xattrs_link(dir: &RepoDir, file_path: &str) -> std::result::Result<(), LoadError> {
     let path = format!("{file_path}-xattrs-link");
-    match rustix::fs::statat(dir_fd, path.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => match FileType::from_raw_mode(stat.st_mode) {
-            FileType::RegularFile => Ok(()),
-            FileType::Symlink => Err(Error::Io(Errno::LOOP.into())),
-            _ => Err(Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "object is not a regular file",
-            ))),
-        },
-        Err(Errno::NOENT) => Err(Error::InvalidFormat(
-            "bare-split-xattrs .file is missing its .file-xattrs-link".into(),
-        )),
-        Err(e) => Err(Error::Io(e.into())),
+    match dir.open_regular(&path) {
+        Ok(_) => Ok(()),
+        Err(FsError::Absent { .. }) => Err(missing_xattrs_link()),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -1312,7 +1284,7 @@ mod sealed_verity_tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use super::{FileKind, is_sealed, sealed_digest_at, stat_object};
+    use super::{FileKind, sealed_digest};
     use crate::{CreateOptions, FileMeta, Repo, Transaction};
     use ostrya_composefs::FsVerityHasher;
     use ostrya_core::{Checksum, ObjectType, RepoMode, loose_path};
@@ -1394,8 +1366,7 @@ mod sealed_verity_tests {
     /// sealed.
     fn sealed(repo: &Repo, checksum: &Checksum) -> bool {
         let path = loose_path(checksum, ObjectType::File, repo.mode());
-        let stat = stat_object(repo.objects_fd(), &path, checksum, ObjectType::File).unwrap();
-        is_sealed(&stat)
+        repo.objects().lstat(&path).unwrap().verity
     }
 
     /// Check that a `mode` object the write path sealed yields the kernel's
@@ -1497,10 +1468,10 @@ mod sealed_verity_tests {
 
             let path = loose_path(&sealed_sum, ObjectType::File, RepoMode::BareUser);
             let size = payload().len() as u64;
-            let objects = sealed_repo.objects_fd();
-            assert!(sealed_digest_at(objects, &path, size, true).is_some());
+            let opened = sealed_repo.objects().open_regular(&path).unwrap();
+            assert!(sealed_digest(opened.file.as_fd(), size, true).is_some());
             assert_eq!(
-                sealed_digest_at(objects, &path, size, false),
+                sealed_digest(opened.file.as_fd(), size, false),
                 None,
                 "a clear probe issues no ioctl"
             );
@@ -1702,7 +1673,7 @@ mod sealed_verity_tests {
         use rustix::fs::{Mode, OFlags};
 
         let path = loose_path(checksum, ObjectType::File, repo.mode());
-        let stat = stat_object(repo.objects_fd(), &path, checksum, ObjectType::File).unwrap();
+        let stat = repo.objects().lstat(&path).unwrap();
         let fd = rustix::fs::openat(
             repo.objects_fd(),
             path.as_str(),
@@ -1712,13 +1683,13 @@ mod sealed_verity_tests {
         .ok();
         let xattr = |name: &str| {
             fd.as_ref()
-                .and_then(|fd| crate::object::read_xattr(fd.as_fd(), name).unwrap())
+                .and_then(|fd| crate::repo_fs::xattr(fd.as_fd(), name).unwrap())
         };
         Inode {
-            perm: u32::from(stat.stx_mode) & 0o7777,
-            uid: stat.stx_uid,
-            gid: stat.stx_gid,
-            sealed: is_sealed(&stat),
+            perm: stat.mode & 0o7777,
+            uid: stat.uid,
+            gid: stat.gid,
+            sealed: stat.verity,
             ostreemeta: xattr("user.ostreemeta"),
             seal_xattr: xattr(SEAL_XATTR),
         }
@@ -2003,8 +1974,7 @@ mod sealed_verity_tests {
                         Mode::empty(),
                     )
                     .unwrap();
-                    let stored =
-                        crate::object::read_xattr(fd.as_fd(), "security.capability").unwrap();
+                    let stored = crate::repo_fs::xattr(fd.as_fd(), "security.capability").unwrap();
                     if stored.as_deref() != Some(&cap[..]) {
                         failures.push(format!(
                             "fsverity={fsverity} {tag}: security.capability is {stored:02x?}"
@@ -2106,5 +2076,107 @@ mod sealed_verity_tests {
             let expected = meta.regular_header().serialize_stat_metadata().unwrap();
             assert_eq!(inode.ostreemeta.as_deref(), Some(&expected[..]));
         });
+    }
+}
+
+#[cfg(test)]
+mod content_size_tests {
+    use std::path::Path;
+
+    use ostrya_core::{Checksum, ObjectType, RepoMode, loose_path};
+    use ostrya_rt::block_on;
+
+    use crate::repo_fs::TestDir;
+    use crate::{CreateOptions, Error, Repo};
+
+    /// The text that follows the path in the refusal of a symlink in a
+    /// repository.
+    const SYMLINK_TEXT: &str =
+        "passes through a symlink; ostrya refuses a symlink in the repository";
+
+    /// The kinds of entry that the test puts at an object path.
+    #[derive(Debug, Clone, Copy)]
+    enum Kind {
+        Symlink,
+        Fifo,
+    }
+
+    /// Creates a `mode` repository under `dir`, puts an entry of `kind` at the
+    /// path of a file object, and gives the result of the content size of
+    /// that object, with the path of the object relative to the repository.
+    fn size_of_entry(dir: &Path, mode: RepoMode, kind: Kind, stored: bool) -> (Error, String) {
+        let root = dir.join(format!("{mode:?}-{kind:?}-{stored}"));
+        let repo = block_on(Repo::create(&root, CreateOptions::new(mode))).unwrap();
+        let checksum = Checksum::from_hex(&format!("ab{}", "c".repeat(62))).unwrap();
+        let rel = loose_path(&checksum, ObjectType::File, mode);
+        let path = root.join("objects").join(&rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        match kind {
+            Kind::Symlink => std::os::unix::fs::symlink("../../config", &path).unwrap(),
+            Kind::Fifo => rustix::fs::mknodat(
+                rustix::fs::CWD,
+                &path,
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o600),
+                0,
+            )
+            .unwrap(),
+        }
+        let err = repo.content_size_blocking(&[checksum], stored).unwrap_err();
+        (err, format!("objects/{rel}"))
+    }
+
+    /// The content size refuses a symlink where the mode stores a regular
+    /// file, and a FIFO in each mode, with the error of a load. In a mode that
+    /// stores a symlink as a symlink, a symlink object counts 0.
+    #[test]
+    fn content_size_refuses_a_type_that_the_mode_does_not_store() {
+        let dir = TestDir::new("content-size-type");
+        let cases = [
+            (RepoMode::Archive, Kind::Symlink, true, SYMLINK_TEXT),
+            (RepoMode::Archive, Kind::Fifo, true, "is not a regular file"),
+            (
+                RepoMode::Archive,
+                Kind::Fifo,
+                false,
+                "is not a regular file",
+            ),
+            (RepoMode::BareUser, Kind::Symlink, false, SYMLINK_TEXT),
+            (
+                RepoMode::BareUser,
+                Kind::Fifo,
+                false,
+                "is not a regular file",
+            ),
+            (
+                RepoMode::BareUserOnly,
+                Kind::Fifo,
+                false,
+                "is not a regular file",
+            ),
+            (RepoMode::Bare, Kind::Fifo, false, "is not a regular file"),
+        ];
+        for (mode, kind, stored, text) in cases {
+            let (err, path) = size_of_entry(dir.path(), mode, kind, stored);
+            match err {
+                Error::InvalidFormat(m) => {
+                    assert_eq!(m, format!("{path} {text}"), "{mode:?} {kind:?} {stored}")
+                }
+                other => panic!("{mode:?} {kind:?} {stored}: {other}"),
+            }
+        }
+
+        let root = dir.path().join("buo-link");
+        let repo = block_on(Repo::create(
+            &root,
+            CreateOptions::new(RepoMode::BareUserOnly),
+        ))
+        .unwrap();
+        let checksum = Checksum::from_hex(&format!("ab{}", "d".repeat(62))).unwrap();
+        let rel = loose_path(&checksum, ObjectType::File, RepoMode::BareUserOnly);
+        let path = root.join("objects").join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink("target", &path).unwrap();
+        assert_eq!(repo.content_size_blocking(&[checksum], false).unwrap(), 0);
     }
 }

@@ -842,9 +842,12 @@ impl Repo {
     ///   are the listing of the refs and of the objects, the read of a commit
     ///   that a ref names or of a dirtree, the check for a `.commitpartial`
     ///   marker, the unlink of an object, and the write of a marker or a
-    ///   tombstone. A commit that a ref names, or a dirtree, larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) also gives this
-    ///   error.
+    ///   tombstone.
+    /// - [`Error::InvalidFormat`] if a commit that a ref names, or a dirtree,
+    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is
+    ///   not a regular file, or if a symlink is on its path. The listing of
+    ///   the objects also gives this error for a symlink or an entry that is
+    ///   not a directory at `objects/<xx>`.
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport> {
         let note = self.config().generate_composefs()?;
         let mut ctx = Ctx::default();
@@ -1261,6 +1264,9 @@ impl Repo {
 
     /// Verifies the checksum of a content object over its framed header and
     /// its streamed payload, and records each fault.
+    ///
+    /// The load keeps the object file open, and the payload streams from it,
+    /// so the object opens once.
     async fn fsck_hash_content(
         &self,
         name: ObjectName,
@@ -1268,8 +1274,8 @@ impl Repo {
         ctx: &mut Ctx,
     ) -> Result<()> {
         let checksum = name.checksum;
-        let file = match self.load_file(&checksum).await {
-            Ok(file) => file,
+        let (file, payload) = match self.open_file(&checksum).await {
+            Ok(opened) => opened,
             Err(Error::ObjectNotFound { .. }) => {
                 ctx.record(name, FsckErrorKind::Missing);
                 return Ok(());
@@ -1291,7 +1297,7 @@ impl Repo {
 
         let mut hasher = ContentHasher::new(&file.header())?;
 
-        let mut reader = file.reader().await?;
+        let mut reader = file.reader_over(payload);
         loop {
             match reader.read(buf).await {
                 Ok(0) => break,

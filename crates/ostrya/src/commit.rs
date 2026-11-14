@@ -28,6 +28,7 @@ use crate::file::FileKind;
 use crate::perm;
 use crate::related::{self, CommitRelated, RelatedField};
 use crate::repo::Repo;
+use crate::repo_fs::FsResultExt;
 use crate::staging::{META_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
@@ -224,9 +225,10 @@ impl Transaction {
     ///   `ostree.sizes` and a file object from `objects/` does not load.
     /// - [`Error::InsufficientFreeSpace`] if the commit object needs more
     ///   space than the free-space budget of the transaction holds.
-    /// - [`Error::Io`] if the call adds `ostree.sizes` and a dirtree that the
-    ///   commit reaches is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the call adds `ostree.sizes` and a
+    ///   dirtree that the commit reaches is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_commit(&self, mut opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
         self.resolve_commit_options(&mut opts)?;
@@ -288,9 +290,10 @@ impl Transaction {
     ///   `ostree.sizes` and a file object from `objects/` does not load.
     /// - [`Error::InsufficientFreeSpace`] if the commit object needs more
     ///   space than the free-space budget of the transaction holds.
-    /// - [`Error::Io`] if the call adds `ostree.sizes` and a dirtree that the
-    ///   commit reaches is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the call adds `ostree.sizes` and a
+    ///   dirtree that the commit reaches is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_commit_checked(
         &self,
@@ -357,9 +360,11 @@ impl Transaction {
     ///   dependency is absent, partial, or has a dependency of its own.
     /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
     ///   or if its field 2 does not decode.
-    /// - [`Error::Io`] if the commit object of a dependency with no partial
-    ///   marker is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-    ///   or if a file system operation fails.
+    /// - [`Error::InvalidFormat`] if the commit object of a dependency with no
+    ///   partial marker is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn check_related(
         &self,
         related: &[(String, Checksum)],
@@ -474,17 +479,21 @@ impl Transaction {
     /// - the serialized length of a metadata object
     /// - the uncompressed payload length of a regular file
     /// - the target length of a symlink
+    ///
+    /// The load of a file object gives both sizes.
     async fn recover_size_entry(&self, checksum: Checksum, ty: ObjectType) -> Result<SizeEntry> {
-        let compressed = self.repo().loose_object_size(ty, &checksum).await?;
-        let unpacked = if ty == ObjectType::File {
-            match self.repo().load_file(&checksum).await?.kind {
-                FileKind::Regular { size } => size,
+        let (compressed, unpacked) = if ty == ObjectType::File {
+            let file = self.repo().load_file(&checksum).await?;
+            let unpacked = match &file.kind {
+                FileKind::Regular { size } => *size,
                 FileKind::Symlink { target } => target.len() as u64,
-            }
+            };
+            (file.stored_size(), unpacked)
         } else {
             // A metadata object is stored uncompressed, so its unpacked size
             // is its size on disk.
-            compressed
+            let size = self.repo().loose_object_size(ty, &checksum).await?;
+            (size, size)
         };
         Ok(SizeEntry {
             checksum,
@@ -546,20 +555,14 @@ impl Transaction {
     /// against `objects/`.
     async fn load_staged_dirtree(&self, checksum: &Checksum) -> Result<Option<DirTree>> {
         let name = crate::write::flat_name(checksum, ObjectType::DirTree, self.repo().mode());
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let res = ostrya_rt::unblock(move || {
-            crate::object::read_meta_object(
-                staging.as_fd(),
-                &name,
-                crate::object::MAX_METADATA_SIZE,
-            )
+        let staging = self.staging_dir().clone();
+        let bytes = ostrya_rt::unblock(move || {
+            staging
+                .read_capped(&name, crate::object::MAX_METADATA_SIZE)
+                .optional()
         })
-        .await;
-        match res {
-            Ok(bytes) => Ok(Some(DirTree::parse(&bytes)?)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(Error::Io(e)),
-        }
+        .await?;
+        bytes.map(|bytes| Ok(DirTree::parse(&bytes)?)).transpose()
     }
 }
 
@@ -576,9 +579,10 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::Core`] if the file does not parse as an `a{sv}` dict.
-    /// - [`Error::Io`] if the file is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
-    ///   operation fails.
+    /// - [`Error::InvalidFormat`] if the file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn read_commit_detached_metadata(
         &self,
         checksum: &Checksum,
@@ -613,9 +617,10 @@ impl Repo {
     ///   of either field has an empty name or a checksum that is not 32
     ///   bytes, or if the value of `ostrya.related` is not a variant of type
     ///   `a(say)`.
-    /// - [`Error::Io`] if the commit object or the detached metadata is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a
-    ///   file system operation fails.
+    /// - [`Error::InvalidFormat`] if the commit object or the detached
+    ///   metadata is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    ///   or is not a regular file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn read_commit_related(&self, commit: &Checksum) -> Result<CommitRelated> {
         let repo = self.clone();
         let commit = *commit;
@@ -682,9 +687,10 @@ impl Repo {
     ///
     /// - [`Error::Core`] if the file holds the bytes of the key
     ///   `ostrya.related` and does not parse as an `a{sv}` dict.
-    /// - [`Error::Io`] if the file is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
-    ///   operation fails.
+    /// - [`Error::InvalidFormat`] if the file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     pub(crate) fn read_build_source_dict_blocking(
         &self,
         checksum: &Checksum,

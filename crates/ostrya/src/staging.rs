@@ -12,8 +12,8 @@
 //! removal. As a result, each directory that a reaper of the same process can
 //! list is in the map.
 //!
-//! Each entry of the map holds a descriptor of the `tmp/` directory that holds
-//! the staging directory. With these descriptors, [`reap_owned`] removes each
+//! Each entry of the map holds a handle of the `tmp/` directory that holds the
+//! staging directory. With these handles, [`reap_owned`] removes each
 //! owned directory without a live [`StagingDir`]. A process that ends without
 //! its destructors calls it through
 //! [`reap_process_staging`](crate::reap_process_staging). A ref write, a
@@ -30,7 +30,9 @@ use ostrya_core::RepoMode;
 use rustix::fs::{AtFlags, Dir, FileType, FlockOperation, Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::error::Result;
 use crate::perm;
+use crate::repo_fs::{RepoDir, RepoLayout};
 
 /// The requested mode of a staging directory, the same mode that the `ostree`
 /// command requests. The process umask reduces it. In a `bare-user-shared`
@@ -57,11 +59,25 @@ const MKDTEMP_ATTEMPTS: u32 = 128;
 
 /// Returns the map of the staging directories that this process owns.
 ///
-/// The map keys each name to a descriptor of the `tmp/` directory that holds
-/// the staging directory.
-fn active() -> &'static Mutex<HashMap<String, OwnedFd>> {
-    static ACTIVE: OnceLock<Mutex<HashMap<String, OwnedFd>>> = OnceLock::new();
+/// The map keys each name to a handle of the `tmp/` directory that holds the
+/// staging directory.
+fn active() -> &'static Mutex<HashMap<String, RepoDir>> {
+    static ACTIVE: OnceLock<Mutex<HashMap<String, RepoDir>>> = OnceLock::new();
     ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The claim of a staging name in the map of [`active`]. The drop removes the
+/// name from the map.
+#[derive(Debug)]
+struct Claim {
+    /// The claimed name.
+    name: String,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        active().lock().unwrap().remove(&self.name);
+    }
 }
 
 /// Removes the staging directories that this process owns and their sibling
@@ -74,8 +90,8 @@ fn active() -> &'static Mutex<HashMap<String, OwnedFd>> {
 /// objects gone.
 pub(crate) fn reap_owned() {
     let owned = std::mem::take(&mut *active().lock().unwrap());
-    for (name, tmp_fd) in owned {
-        remove_staging(tmp_fd.as_fd(), &name);
+    for (name, tmp) in owned {
+        remove_staging(tmp.as_fd(), &name);
     }
 }
 
@@ -210,14 +226,21 @@ impl Drop for TempEntry<'_> {
 }
 
 /// The staging area of a transaction: the directory, its held sibling lock,
-/// and the descriptor of the `tmp/` directory that holds them.
+/// and the handle of the `tmp/` directory that holds them.
 #[derive(Debug)]
 pub(crate) struct StagingDir {
-    tmp_fd: OwnedFd,
-    /// The descriptor of the staging directory. The write path ingests objects
-    /// into this directory. The transaction commit renames them from it into
-    /// `objects/`.
-    dir_fd: OwnedFd,
+    /// The claim of the name in `active`. It drops first after the body of
+    /// the drop of the value, so the claim ends after the directory and its
+    /// sibling lock are gone. Otherwise a concurrent reaper of this process
+    /// can find the directory without protection while its lock still exists.
+    #[allow(dead_code)]
+    claim: Claim,
+    tmp: RepoDir,
+    /// The handle of the staging directory, of kind
+    /// [`Staging`](crate::repo_fs::RepoLayout::Staging). The write path
+    /// ingests objects into this directory. The transaction commit renames
+    /// them from it into `objects/`.
+    dir: RepoDir,
     /// The descriptor of the sibling lock. The value holds it while the
     /// transaction lives, as the mark of an owned directory. Only its lock has
     /// a function, and nothing reads it.
@@ -227,40 +250,67 @@ pub(crate) struct StagingDir {
 }
 
 impl StagingDir {
-    /// Creates a new staging directory under the repository at `repo_fd`.
+    /// Creates a new staging directory in `tmp/` of the repository of the
+    /// root handle `root`.
     ///
-    /// It removes the stale leftovers first. Its calls to the file system are
-    /// synchronous, so the caller must run it on the blocking pool.
+    /// Each call opens `tmp/` again with [`RepoDir::ensure_layout`], which
+    /// makes `tmp/` and `tmp/cache` if they are absent and refuses a symlink
+    /// at each of them. Thus a `tmp/` that is removed after a transaction
+    /// comes back at the next one. The function removes the stale leftovers
+    /// first. The staging directory comes from [`RepoDir::make_temp_dir`].
+    /// Its calls to the file system are synchronous, so the caller must run it
+    /// on the blocking pool.
     pub(crate) fn create(
-        repo_fd: BorrowedFd<'_>,
+        root: &RepoDir,
         expiry_secs: i64,
         repo_mode: RepoMode,
-    ) -> io::Result<StagingDir> {
-        let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
+    ) -> Result<StagingDir> {
+        let tmp = root.ensure_layout(RepoLayout::Tmp, false)?;
 
-        reap_stale(tmp_fd.as_fd(), expiry_secs);
+        reap_stale(tmp.as_fd(), expiry_secs);
 
         let prefix = format!("staging-{}-", boot_id()?);
-        // `mkdtemp` claims the name in `active` before the directory exists, so
-        // a concurrent reaper of this process never finds it without a claim.
-        let (name, dir_fd) = mkdtemp(tmp_fd.as_fd(), &prefix, repo_mode)?;
+        // The claim of a name in `active` comes before the `mkdirat` that
+        // publishes the name, so each directory that a reaper of this process
+        // can list already has a claim. In one process, the claim is the only
+        // barrier that holds. The record locks are process-associated, so a
+        // reaper of this process takes the sibling lock of a live directory
+        // without conflict and removes the directory. A name that another
+        // live transaction of this process owns stays with its owner.
+        let (name, dir, claim) = tmp.make_temp_dir(&prefix, |name| {
+            let mut active = active().lock().unwrap();
+            if active.contains_key(name) {
+                return None;
+            }
+            active.insert(name.to_owned(), tmp.clone());
+            Some(Claim {
+                name: name.to_owned(),
+            })
+        })?;
 
         let lock_name = format!("{name}-lock");
-        let lock_fd = match acquire_staging_lock(tmp_fd.as_fd(), &lock_name, repo_mode) {
+        let lock_fd = match acquire_staging_lock(tmp.as_fd(), &lock_name, repo_mode) {
             Ok(fd) => fd,
             Err(e) => {
-                active().lock().unwrap().remove(&name);
-                let _ = remove_tree_at(tmp_fd.as_fd(), &name);
-                return Err(e);
+                let _ = remove_tree_at(tmp.as_fd(), name.as_str());
+                drop(claim);
+                return Err(e.into());
             }
         };
 
         Ok(StagingDir {
-            tmp_fd,
-            dir_fd,
+            claim,
+            tmp,
+            dir,
             lock_fd,
             name,
         })
+    }
+
+    /// Returns the handle of the staging directory, of kind
+    /// [`Staging`](crate::repo_fs::RepoLayout::Staging).
+    pub(crate) fn dir(&self) -> &RepoDir {
+        &self.dir
     }
 
     /// Returns the descriptor of the staging directory.
@@ -268,26 +318,22 @@ impl StagingDir {
     /// The write path ingests objects here. The transaction commit renames them
     /// into `objects/`.
     pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
-        self.dir_fd.as_fd()
+        self.dir.as_fd()
     }
 
     /// Returns the descriptor of the `tmp/` directory of the repository, which
     /// holds the staging directory.
     pub(crate) fn tmp_fd(&self) -> BorrowedFd<'_> {
-        self.tmp_fd.as_fd()
+        self.tmp.as_fd()
     }
 }
 
 impl Drop for StagingDir {
     fn drop(&mut self) {
-        remove_staging(self.tmp_fd.as_fd(), &self.name);
-        // Release the claim in `active` only after the directory and its
-        // sibling lock are gone. Otherwise a concurrent reaper of this process
-        // can find the directory without protection while its lock still
-        // exists.
-        active().lock().unwrap().remove(&self.name);
-        // The descriptor fields close after this body. Their close releases the
-        // sibling lock and the directory handle.
+        remove_staging(self.tmp.as_fd(), &self.name);
+        // The fields drop after this body: first the claim in `active`, then
+        // the descriptors. Their close releases the sibling lock and the
+        // directory handle.
     }
 }
 
@@ -295,11 +341,11 @@ impl Drop for StagingDir {
 ///
 /// A new lock file has no other holder, so the attempt does not block.
 ///
-/// The name is the sibling of the directory that [`mkdtemp`] created just
-/// before, so this open usually creates the file. A removal unlinks a staging
-/// directory before its sibling lock. If a process ends between the two steps,
-/// it leaves a lock file without its directory. A later staging directory that
-/// draws the same name finds that file.
+/// The name is the sibling of the directory that [`RepoDir::make_temp_dir`]
+/// created just before, so this open usually creates the file. A removal
+/// unlinks a staging directory before its sibling lock. If a process ends
+/// between the two steps, it leaves a lock file without its directory. A later
+/// staging directory that draws the same name finds that file.
 ///
 /// `O_EXCL` separates the two cases. In a `bare-user-shared` repository, this
 /// function forces a lock file that it creates to [`perm::SHARED_LOCK_MODE`].
@@ -307,10 +353,10 @@ impl Drop for StagingDir {
 /// member of the group can own it. The second open has `O_CREAT`, because a
 /// reaper in another process can remove the leftover before the second open.
 ///
-/// The second open never reaches a lock file that this process holds.
-/// [`mkdtemp`] skips a name in `active`, and its `mkdirat` fails on a directory
-/// that exists. As a result, the name belongs to no live [`StagingDir`] of this
-/// process.
+/// The second open never reaches a lock file that this process holds. The
+/// claim of [`StagingDir::create`] skips a name in `active`, and the `mkdirat`
+/// of [`RepoDir::make_temp_dir`] fails on a directory that exists. As a
+/// result, the name belongs to no live [`StagingDir`] of this process.
 fn acquire_staging_lock(
     tmp_fd: BorrowedFd<'_>,
     lock_name: &str,
@@ -361,75 +407,6 @@ fn boot_id() -> io::Result<&'static str> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "empty boot id"));
     }
     Ok(BOOT_ID.get_or_init(|| id))
-}
-
-/// Creates a directory with the unique name `prefix + suffix` under `tmp_fd`.
-///
-/// On a name collision, it draws a new suffix. The returned name has a claim
-/// in `active`. The caller releases the claim when the staging directory ends.
-///
-/// The claim comes before the `mkdirat` that publishes the name, so each
-/// directory that a reaper of this process can list already has a claim. In
-/// one process, the claim is the only barrier that holds. The record locks are
-/// process-associated, so a reaper of this process takes the sibling lock of a
-/// live directory without conflict and removes the directory.
-///
-/// The claim holds its own duplicate of `tmp_fd`. [`reap_owned`] removes the
-/// directory through this duplicate.
-fn mkdtemp(
-    tmp_fd: BorrowedFd<'_>,
-    prefix: &str,
-    repo_mode: RepoMode,
-) -> io::Result<(String, OwnedFd)> {
-    for _ in 0..MKDTEMP_ATTEMPTS {
-        let name = format!("{prefix}{}", random_suffix());
-        let claim = tmp_fd.try_clone_to_owned()?;
-        // Leave a name that another live transaction of this process owns to
-        // its owner. A release of that claim here removes its protection.
-        {
-            let mut active = active().lock().unwrap();
-            if active.contains_key(&name) {
-                continue;
-            }
-            active.insert(name.clone(), claim);
-        }
-        match rustix::fs::mkdirat(tmp_fd, name.as_str(), Mode::from_raw_mode(STAGING_DIR_MODE)) {
-            Ok(()) => {
-                match rustix::fs::openat(
-                    tmp_fd,
-                    name.as_str(),
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                    Mode::empty(),
-                ) {
-                    Ok(dir_fd) => {
-                        if let Err(e) =
-                            perm::force_created_mode(&dir_fd, repo_mode, perm::SHARED_DIR_MODE)
-                        {
-                            active().lock().unwrap().remove(&name);
-                            return Err(e);
-                        }
-                        return Ok((name, dir_fd));
-                    }
-                    Err(e) => {
-                        active().lock().unwrap().remove(&name);
-                        return Err(e.into());
-                    }
-                }
-            }
-            Err(Errno::EXIST) => {
-                active().lock().unwrap().remove(&name);
-                continue;
-            }
-            Err(e) => {
-                active().lock().unwrap().remove(&name);
-                return Err(e.into());
-            }
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::AlreadyExists,
-        "could not allocate a unique staging directory",
-    ))
 }
 
 /// Returns a six-character `[A-Za-z0-9]` suffix from a seed of the time, the

@@ -30,7 +30,7 @@ use rustix::io::Errno;
 
 use crate::access::{AuthItem, ReadAccess};
 use crate::config::RepoConfig;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
 use crate::summary::{ACCESS_SUFFIX, SIG_SUFFIX, SUMMARY_DIR, access_file_bytes};
@@ -307,6 +307,10 @@ impl ArchiveView {
     /// - [`Error::InvalidFormat`] or [`Error::Core`] if the content object
     ///   for a built `.filez` is not a valid object, or its archive header
     ///   cannot be written.
+    ///
+    /// [`Error::Core`]: crate::Error::Core
+    /// [`Error::InvalidFormat`]: crate::Error::InvalidFormat
+    /// [`Error::Io`]: crate::Error::Io
     pub async fn get(&self, path: &str, access: &ReadAccess) -> Result<ArchiveAnswer> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveAnswer::Bytes(built_config(
@@ -367,10 +371,14 @@ impl ArchiveView {
     /// - [`Error::InvalidFormat`] if the content object for a built `.filez`
     ///   is neither a regular file nor a symlink.
     /// - [`Error::InvalidFormat`] if the repository mode is `bare-split-xattrs`
-    ///   and the object path has no `.file-xattrs-link` entry next to it. The
-    ///   view checks this entry before the object, so a missing object in a
-    ///   fan-out directory that exists also gives this error. For the same
-    ///   path, [`get`](ArchiveView::get) gives [`ArchiveAnswer::NotFound`].
+    ///   and the object has no `.file-xattrs-link` entry next to it. The view
+    ///   checks the object before this entry, so an absent object gives
+    ///   [`ArchiveHead::NotFound`], as [`get`](ArchiveView::get) gives
+    ///   [`ArchiveAnswer::NotFound`].
+    ///
+    /// [`Error::Core`]: crate::Error::Core
+    /// [`Error::InvalidFormat`]: crate::Error::InvalidFormat
+    /// [`Error::Io`]: crate::Error::Io
     pub async fn head(&self, path: &str, access: &ReadAccess) -> Result<ArchiveHead> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveHead::Found {
@@ -397,10 +405,10 @@ impl ArchiveView {
                 let repo = self.repo.clone();
                 let probed =
                     ostrya_rt::unblock(move || repo.probe_contained_blocking(&checksum)).await;
-                Ok(match object_answer(probed)? {
-                    Object::Found(()) => ArchiveHead::Found { len: None },
-                    Object::NotFound => ArchiveHead::NotFound,
-                    Object::Refused => ArchiveHead::Refused,
+                Ok(match probed? {
+                    Contained::Found(()) => ArchiveHead::Found { len: None },
+                    Contained::NotFound => ArchiveHead::NotFound,
+                    Contained::Refused => ArchiveHead::Refused,
                 })
             }
             Route::NotFound => Ok(ArchiveHead::NotFound),
@@ -575,10 +583,10 @@ impl ArchiveView {
             (None, Some(stat)) => archive_level(self.config_for(&stat?).await?.zlib_level()?),
             (None, None) => unreachable!("a view with no fixed level reads the statx of config"),
         };
-        let contained: Contained = match object_answer(loaded)? {
-            Object::Found(contained) => contained,
-            Object::NotFound => return Ok(ArchiveAnswer::NotFound),
-            Object::Refused => return Ok(ArchiveAnswer::Refused),
+        let contained = match loaded? {
+            Contained::Found(contained) => contained,
+            Contained::NotFound => return Ok(ArchiveAnswer::NotFound),
+            Contained::Refused => return Ok(ArchiveAnswer::Refused),
         };
         let (file, reader) = self.repo.contained_file(checksum, contained);
         let (size, payload) = match file.kind {
@@ -607,30 +615,6 @@ impl ArchiveView {
                 compressors: self.compressors.clone(),
             }),
         })
-    }
-}
-
-/// The outcome of a load of a content object for a `.filez` built on
-/// request.
-enum Object<T> {
-    Found(T),
-    NotFound,
-    /// A symlink on the object path.
-    Refused,
-}
-
-/// Maps `loaded` to an outcome.
-///
-/// A missing object is not found. A symlink on its path (`ELOOP`) is refused.
-/// Every other error stays an error.
-fn object_answer<T>(loaded: Result<T>) -> Result<Object<T>> {
-    match loaded {
-        Ok(found) => Ok(Object::Found(found)),
-        Err(Error::ObjectNotFound { .. }) => Ok(Object::NotFound),
-        Err(Error::Io(e)) if e.raw_os_error() == Some(Errno::LOOP.raw_os_error()) => {
-            Ok(Object::Refused)
-        }
-        Err(e) => Err(e),
     }
 }
 

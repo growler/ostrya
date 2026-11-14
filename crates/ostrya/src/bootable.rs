@@ -92,11 +92,14 @@ impl Transaction {
     ///
     /// - [`Error::ObjectNotFound`] if a dirtree on the search path is not
     ///   staged and not in `objects/`.
-    /// - [`Error::Io`] if the read of a dirtree fails, or if a dirtree is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if a dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the read of a dirtree fails.
     /// - [`Error::Core`] if a dirtree does not parse.
     ///
     /// [`Error::ObjectNotFound`]: crate::error::Error::ObjectNotFound
+    /// [`Error::InvalidFormat`]: crate::error::Error::InvalidFormat
     /// [`Error::Io`]: crate::error::Error::Io
     /// [`Error::Core`]: crate::error::Error::Core
     pub async fn kernel_version(
@@ -138,12 +141,14 @@ impl RepoTree {
     /// - [`Error::ObjectNotFound`] if a dirtree on the search path is not in
     ///   the object store. This includes a dirtree that a transaction staged
     ///   before its transaction commit.
-    /// - [`Error::Io`] if a dirtree is larger than
+    /// - [`Error::InvalidFormat`] if a dirtree is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
-    ///   file, and for other failures of the file system.
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] for other failures of the file system.
     /// - [`Error::Core`] if a dirtree does not parse.
     ///
     /// [`Error::ObjectNotFound`]: crate::error::Error::ObjectNotFound
+    /// [`Error::InvalidFormat`]: crate::error::Error::InvalidFormat
     /// [`Error::Io`]: crate::error::Error::Io
     /// [`Error::Core`]: crate::error::Error::Core
     pub async fn kernel_version(&self) -> Result<std::result::Result<String, BootableRefusal>> {

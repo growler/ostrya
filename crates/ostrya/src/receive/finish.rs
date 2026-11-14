@@ -7,12 +7,9 @@
 use std::any::Any;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd;
 use std::sync::Arc;
 
-use ostrya_core::{
-    Checksum, Commit, ObjectName, ObjectType, Ref, Type, Value, loose_path, to_bytes, validate,
-};
+use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Ref, Type, Value, to_bytes, validate};
 
 use super::ancestry::{Parents, Walks};
 use super::hooks::{self, HookRefusal, HostEntry, ReceiveHooks, ReceiveRefUpdate, UpdatePlan};
@@ -30,7 +27,6 @@ use crate::access::ClientAccess;
 use crate::composefs::RecordedBuildError;
 use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
-use crate::object::read_meta_object;
 use crate::read::CommitState;
 use crate::refs::{RefFileState, nested_ref_paths};
 use crate::related::{self, HeldDependency, RelatedRule};
@@ -1027,8 +1023,8 @@ async fn read_commits(
     targets: usize,
 ) -> Result<Vec<ReadCommit>> {
     let mode = txn.repo().mode();
-    let objects = txn.repo().objects_fd().try_clone_to_owned()?;
-    let staging = txn.staging_fd().try_clone_to_owned()?;
+    let repo = txn.repo().clone();
+    let staging = txn.staging_dir().clone();
     ostrya_rt::unblock(move || {
         reads
             .into_iter()
@@ -1036,15 +1032,12 @@ async fn read_commits(
             .map(|(i, (checksum, staged))| {
                 let bytes = if staged {
                     let name = flat_name(&checksum, ObjectType::Commit, mode);
-                    read_meta_object(staging.as_fd(), &name, MAX_METADATA_SIZE)?
+                    staging.read_capped(&name, MAX_METADATA_SIZE)?
                 } else {
-                    let path = loose_path(&checksum, ObjectType::Commit, mode);
-                    match read_meta_object(objects.as_fd(), &path, MAX_METADATA_SIZE) {
+                    match repo.load_object_bytes_blocking(ObjectType::Commit, &checksum) {
                         Ok(bytes) => bytes,
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                            return Ok(ReadCommit::Absent);
-                        }
-                        Err(e) => return Err(Error::Io(e)),
+                        Err(Error::ObjectNotFound { .. }) => return Ok(ReadCommit::Absent),
+                        Err(e) => return Err(e),
                     }
                 };
                 Ok(match Commit::parse(&bytes) {
@@ -1405,23 +1398,18 @@ pub(super) async fn sign_server_commit(
 /// The reads run in one trip to the blocking pool. The result is `None` for no
 /// file and for the zero-length "no metadata" marker.
 async fn read_stored(repo: &Repo, commits: Vec<Checksum>) -> Checked<Vec<Option<Bytes>>> {
-    let mode = repo.mode();
-    let objects = repo
-        .objects_fd()
-        .try_clone_to_owned()
-        .map_err(|e| Failure::Internal(e.into()))?;
+    let repo = repo.clone();
     ostrya_rt::unblock(move || {
         commits
             .iter()
-            .map(|commit| {
-                let path = loose_path(commit, ObjectType::CommitMeta, mode);
-                match read_meta_object(objects.as_fd(), &path, MAX_METADATA_SIZE) {
+            .map(
+                |commit| match repo.load_object_bytes_blocking(ObjectType::CommitMeta, commit) {
                     Ok(bytes) if bytes.is_empty() => Ok(None),
                     Ok(bytes) => Ok(Some(Arc::new(bytes))),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                    Err(e) => Err(Error::Io(e)),
-                }
-            })
+                    Err(Error::ObjectNotFound { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                },
+            )
             .collect::<Result<Vec<_>>>()
     })
     .await

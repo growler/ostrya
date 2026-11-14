@@ -1047,7 +1047,11 @@ fn an_oversize_commitmeta_without_the_key_fails_the_prune() {
             .unwrap();
         let before = repo.list_objects().await.unwrap();
         let err = repo.prune(&refs_only()).await.unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m.ends_with(".commitmeta is larger than its cap of 134217728 bytes")),
+            "got {err:?}"
+        );
         assert_eq!(
             repo.list_objects().await.unwrap(),
             before,

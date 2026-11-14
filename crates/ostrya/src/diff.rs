@@ -28,7 +28,6 @@ use sha2::{Digest, Sha256};
 use crate::error::{Error, Result};
 use crate::ingest::{adjust_meta, to_dirmeta};
 use crate::modifier::{CommitModifierFlags, Owner};
-use crate::object;
 use crate::repo::Repo;
 use crate::write::FileMeta;
 
@@ -350,10 +349,11 @@ impl Repo {
     /// - [`Error::Core`] if a commit or a dirtree does not parse.
     /// - [`Error::InvalidFormat`] if the name of an extended attribute on a
     ///   directory side is not valid UTF-8.
-    /// - [`Error::Io`] if a read of the repository fails. This includes a
-    ///   commit or a dirtree that is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
-    ///   regular file.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read of the repository fails.
     /// - [`Error::Io`] if a read of a directory side fails. The message has the
     ///   form `call(path): reason`, for example
     ///   `open(/srv/tree/etc/shadow): Permission denied`. The call is
@@ -396,10 +396,11 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the repository does not hold `from` or
     ///   `to`, or if a dirtree that the walk reads is absent.
     /// - [`Error::Core`] if a commit or a dirtree does not parse.
-    /// - [`Error::Io`] if a read of the repository fails. This includes a
-    ///   commit or a dirtree that is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
-    ///   regular file.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read of the repository fails.
     pub async fn diff_commits(&self, from: &Checksum, to: &Checksum) -> Result<Vec<DiffEntry>> {
         self.diff(
             DiffSide::Commit(from),
@@ -434,10 +435,12 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the repository does not hold an object of
     ///   the intersection.
     /// - [`Error::Core`] if a commit or a dirtree does not parse.
-    /// - [`Error::Io`] if a read of the object store fails. This includes a
-    ///   commit or a dirtree that is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or that is not a
-    ///   regular file.
+    /// - [`Error::InvalidFormat`] if a commit or a dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is at `objects/<xx>` or at the path of an
+    ///   object that the call reads, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::Io`] if a read of the object store fails.
     pub async fn diff_stats(&self, from: &Checksum, to: &Checksum) -> Result<DiffStats> {
         let from_set = self.traverse_commit(from, 0).await?;
         let to_set = self.traverse_commit(to, 0).await?;
@@ -448,22 +451,16 @@ impl Repo {
         let repo = self.clone();
         let mode = self.mode();
         let common_bytes = ostrya_rt::unblock(move || {
-            let dir = repo.objects_fd();
             let mut total = 0u64;
             for name in &common {
                 let path = loose_path(&name.checksum, name.ty, mode);
-                match object::object_size(dir, &path) {
-                    Ok(size) => total += size,
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(Error::ObjectNotFound {
-                            checksum: name.checksum,
-                            ty: name.ty,
-                        });
-                    }
-                    Err(err) => return Err(Error::Io(err)),
-                }
+                let stat = repo
+                    .objects()
+                    .lstat(&path)
+                    .map_err(|e| e.into_object_error(&name.checksum, name.ty))?;
+                total += stat.size;
             }
-            Ok(total)
+            Ok::<_, Error>(total)
         })
         .await?;
         Ok(DiffStats {
@@ -1122,10 +1119,11 @@ fn read_xattrs(
 ) -> Result<HashMap<usize, Xattrs>> {
     let mut out = HashMap::with_capacity(asked.len());
     for (at, name) in asked {
-        let xattrs = object::read_link_xattrs(root, rel.join(&name)).map_err(|err| match err {
-            Error::Io(io) => path_error_io("getxattr", &path.join(&name), &io),
-            other => other,
-        })?;
+        let xattrs =
+            crate::ingest::read_link_xattrs(root, rel.join(&name)).map_err(|err| match err {
+                Error::Io(io) => path_error_io("getxattr", &path.join(&name), &io),
+                other => other,
+            })?;
         out.insert(at, xattrs);
     }
     Ok(out)

@@ -740,8 +740,10 @@ impl Repo {
     ///   parent or of a dependency, the push decodes the tuple frame, the
     ///   parent and root checksums, and field 2 alone, and gives this error
     ///   if one of them does not decode.
-    /// - [`Error::Io`] if a read from the file system fails, or if a metadata
-    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a read from the file system fails.
     /// - [`Error::Remote`] with
     ///   [`RefMismatch`](crate::remote::Error::RefMismatch) if `HelloReply`
     ///   reports a commit for a tag.

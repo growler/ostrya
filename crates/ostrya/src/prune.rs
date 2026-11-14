@@ -27,6 +27,7 @@ use crate::error::{Error, Result};
 use crate::lock::LockKind;
 use crate::related::RelatedWarning;
 use crate::repo::Repo;
+use crate::repo_fs::{FsResultExt, RepoDir};
 use crate::tombstone::write_tombstone;
 use crate::traverse::{ListedRef, ParentBound, RefSpace, WeakBounds};
 
@@ -786,11 +787,10 @@ impl Repo {
     ///
     /// A `.commitmeta` that is larger than
     /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) fails the prune, also
-    /// if it does not hold the key. The open of a `.commitmeta` follows a
-    /// symlink. An open file that is not a regular file, for example a
-    /// directory, fails the prune. In the strict open mode of
-    /// `Repo::open_at_strict`, the open follows no symlink, and each
-    /// `.commitmeta` that is not a regular file fails the prune.
+    /// if it does not hold the key. The open of a `.commitmeta` follows no
+    /// symlink, in each open mode. A symlink at the `.commitmeta` or at its
+    /// fan-out directory, and a `.commitmeta` that is not a regular file,
+    /// fail the prune.
     ///
     /// # Bounds
     ///
@@ -925,8 +925,11 @@ impl Repo {
     ///   too, reads the values before it takes the lock and removes anything.
     /// - [`Error::Io`] if a read, a write, or a removal on the file system
     ///   fails.
-    /// - [`Error::Io`] if a metadata object is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path. The listing of the objects also
+    ///   gives this error for a symlink or an entry that is not a directory at
+    ///   `objects/<xx>`.
     ///
     /// # Examples
     ///
@@ -1456,14 +1459,11 @@ fn sync_dirs(objects_fd: BorrowedFd<'_>, dirs: &BTreeSet<String>) -> Result<()> 
 }
 
 /// Returns the on-disk size of a loose object, or `None` if it is absent.
-fn object_size(objects_fd: BorrowedFd<'_>, path: &str) -> Result<Option<u64>> {
-    match rustix::fs::statat(objects_fd, path, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(stat.st_size.max(0) as u64)),
-        // A concurrent removal took it, or it was never present. Nothing to
-        // free.
-        Err(Errno::NOENT) => Ok(None),
-        Err(e) => Err(Error::Io(e.into())),
-    }
+///
+/// An absent object was taken by a concurrent removal, or was never present.
+/// Nothing is then to free.
+fn object_size(objects: &RepoDir, path: &str) -> Result<Option<u64>> {
+    Ok(objects.lstat(path).optional()?.map(|stat| stat.size))
 }
 
 /// Stats each doomed object, unlinks it unless `no_prune` is set, and returns
@@ -1538,7 +1538,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         None
     };
     for name in doomed_commits() {
-        let Some(size) = object_size(objects_fd, &name.loose_path(sweep.mode))? else {
+        let Some(size) = object_size(repo.objects(), &name.loose_path(sweep.mode))? else {
             continue;
         };
         if !sweep.no_prune {
@@ -1561,7 +1561,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         .filter(|o| o.ty.is_commit_sidecar() && !removed_commits.contains(&o.checksum))
     {
         let path = name.loose_path(sweep.mode);
-        let Some(size) = object_size(objects_fd, &path)? else {
+        let Some(size) = object_size(repo.objects(), &path)? else {
             continue;
         };
         if !sweep.no_prune && unlink_optional(objects_fd, &path)? {
@@ -1581,7 +1581,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         .filter(|o| o.ty != ObjectType::Commit && !o.ty.is_commit_sidecar())
     {
         let path = name.loose_path(sweep.mode);
-        let Some(size) = object_size(objects_fd, &path)? else {
+        let Some(size) = object_size(repo.objects(), &path)? else {
             continue;
         };
         if !sweep.no_prune {

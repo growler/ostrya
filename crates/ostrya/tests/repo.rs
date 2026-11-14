@@ -775,47 +775,50 @@ fn create_leaves_only_cache_in_tmp() {
     assert_eq!(entry_names(&repo.join("tmp")), ["cache"]);
 }
 
-/// A handle in the strict open mode refuses a metadata object that is a
-/// symlink. A handle of the default open follows it.
+/// Asserts that `err` is `Error::InvalidFormat` with the message `<path>
+/// <text>`. `path` is relative to the repository.
+fn assert_invalid_at(err: &Error, path: &str, text: &str, what: &str) {
+    match err {
+        Error::InvalidFormat(m) => assert_eq!(m, &format!("{path} {text}"), "{what}"),
+        other => panic!("{what}: {other}"),
+    }
+}
+
+/// Each open mode refuses a metadata object that is a symlink.
 #[test]
-fn the_strict_open_refuses_a_symlinked_metadata_object() {
-    let tmp = TmpDir::new("strict-meta");
+fn each_open_refuses_a_symlinked_metadata_object() {
+    let tmp = TmpDir::new("symlinked-meta");
     let parent = strict_fixture(&tmp);
     let fanout = tmp.path().join("repo/objects/ab");
     std::fs::create_dir_all(&fanout).unwrap();
     let rest = "c".repeat(62);
     std::os::unix::fs::symlink("../../config", fanout.join(format!("{rest}.dirtree"))).unwrap();
     let checksum: ostrya::Checksum = format!("ab{rest}").parse().unwrap();
+    let path = format!("objects/ab/{rest}.dirtree");
 
     let fd = std::os::fd::AsFd::as_fd(&parent);
     let plain = block_on(Repo::open_at(fd, Path::new("repo"))).unwrap();
-    let bytes = block_on(plain.load_object_bytes(ostrya::ObjectType::DirTree, &checksum))
-        .expect("the default handle follows the symlink");
-    assert!(bytes.starts_with(b"[core]"));
-
     let strict = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap();
-    let err =
-        block_on(strict.load_object_bytes(ostrya::ObjectType::DirTree, &checksum)).unwrap_err();
-    match err {
-        ostrya::Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{e}"),
-        other => panic!("{other}"),
+    for (what, repo) in [("open_at", plain), ("open_at_strict", strict)] {
+        let err =
+            block_on(repo.load_object_bytes(ostrya::ObjectType::DirTree, &checksum)).unwrap_err();
+        assert_invalid_at(&err, &path, SYMLINK_TEXT, what);
+        let err = block_on(repo.metadata_reader(ostrya::ObjectType::DirTree, &checksum))
+            .err()
+            .expect("the reader refuses the symlink");
+        assert_invalid_at(&err, &path, SYMLINK_TEXT, what);
     }
-    let err = block_on(strict.metadata_reader(ostrya::ObjectType::DirTree, &checksum))
-        .err()
-        .expect("the strict reader refuses the symlink");
-    assert!(matches!(err, ostrya::Error::Io(_)), "{err}");
 }
 
-/// A handle in the strict open mode refuses each object whose fan-out
-/// directory `objects/<xx>` is a symlink: a commit, a dirtree, a dirmeta, and
-/// a file, in `bare-user` and in `bare`. A handle of the default open follows
-/// the symlink.
+/// Each open mode refuses each object whose fan-out directory `objects/<xx>`
+/// is a symlink: a commit, a dirtree, a dirmeta, and a file, in `bare-user`
+/// and in `bare`.
 #[test]
-fn the_strict_open_refuses_a_symlinked_fanout() {
+fn each_open_refuses_a_symlinked_fanout() {
     use ostrya::ObjectType;
 
     for mode in ["bare-user", "bare"] {
-        let tmp = TmpDir::new("strict-fanout");
+        let tmp = TmpDir::new("symlinked-fanout");
         let status = Command::new("cp")
             .arg("-a")
             .arg(fixture_repo(mode))
@@ -850,34 +853,27 @@ fn the_strict_open_refuses_a_symlinked_fanout() {
             (ObjectType::DirMeta, commit_obj.root_dirmeta),
             (ObjectType::File, file),
         ];
+        let repo_mode = plain.mode();
         for (ty, checksum) in objects {
             let hex = checksum.to_hex();
             let fanout = tmp.path().join("repo/objects").join(&hex[..2]);
             let moved = tmp.path().join("moved");
             std::fs::rename(&fanout, &moved).unwrap();
             std::os::unix::fs::symlink(&moved, &fanout).unwrap();
+            let path = format!("objects/{}", ostrya::loose_path(&checksum, ty, repo_mode));
 
-            if ty == ObjectType::File {
-                block_on(plain.load_file(&checksum)).expect("the default handle follows");
-                let err = block_on(strict.load_file(&checksum)).err().unwrap();
-                match err {
-                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
-                    other => panic!("{mode} {ty:?}: {other}"),
-                }
-            } else {
-                block_on(plain.load_object_bytes(ty, &checksum))
-                    .expect("the default handle follows");
-                let err = block_on(strict.load_object_bytes(ty, &checksum)).unwrap_err();
-                match err {
-                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
-                    other => panic!("{mode} {ty:?}: {other}"),
-                }
-                let err = block_on(strict.metadata_reader(ty, &checksum))
-                    .err()
-                    .expect("the strict reader refuses the symlink");
-                match err {
-                    Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
-                    other => panic!("{mode} {ty:?}: {other}"),
+            for (open, repo) in [("open_at", &plain), ("open_at_strict", &strict)] {
+                let what = format!("{mode} {open} {ty:?}");
+                if ty == ObjectType::File {
+                    let err = block_on(repo.load_file(&checksum)).err().unwrap();
+                    assert_invalid_at(&err, &path, SYMLINK_TEXT, &what);
+                } else {
+                    let err = block_on(repo.load_object_bytes(ty, &checksum)).unwrap_err();
+                    assert_invalid_at(&err, &path, SYMLINK_TEXT, &what);
+                    let err = block_on(repo.metadata_reader(ty, &checksum))
+                        .err()
+                        .expect("the reader refuses the symlink");
+                    assert_invalid_at(&err, &path, SYMLINK_TEXT, &what);
                 }
             }
 
@@ -887,16 +883,15 @@ fn the_strict_open_refuses_a_symlinked_fanout() {
     }
 }
 
-/// The reader of a regular file that a strict handle loaded opens the object
-/// again through its fan-out directory, and follows no symlink there. A
-/// symlink that replaces `objects/<xx>` after the load fails the reader with
-/// `ELOOP`. The reader of a handle of the default open follows the symlink.
+/// The reader of a regular file opens the object again, and follows no
+/// symlink at `objects/<xx>`. A symlink that replaces `objects/<xx>` after
+/// the load fails the reader, in each open mode.
 #[test]
-fn the_strict_reader_refuses_a_fanout_symlinked_after_the_load() {
+fn each_reader_refuses_a_fanout_symlinked_after_the_load() {
     use ostrya::ObjectType;
 
     for mode in ["bare-user", "bare"] {
-        let tmp = TmpDir::new("strict-reader-fanout");
+        let tmp = TmpDir::new("reader-fanout");
         let status = Command::new("cp")
             .arg("-a")
             .arg(fixture_repo(mode))
@@ -932,13 +927,15 @@ fn the_strict_reader_refuses_a_fanout_symlinked_after_the_load() {
         std::fs::remove_dir_all(&fanout).unwrap();
         std::os::unix::fs::symlink(&copy, &fanout).unwrap();
 
-        block_on(plain_file.reader()).expect("the default handle follows");
-        let err = block_on(strict_file.reader())
-            .err()
-            .expect("the strict reader refuses the symlink");
-        match err {
-            Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode} {e}"),
-            other => panic!("{mode}: {other}"),
+        let path = format!(
+            "objects/{}",
+            ostrya::loose_path(strict_file.checksum(), ObjectType::File, plain.mode())
+        );
+        for (open, file) in [("open_at", &plain_file), ("open_at_strict", &strict_file)] {
+            let err = block_on(file.reader())
+                .err()
+                .expect("the reader refuses the symlink");
+            assert_invalid_at(&err, &path, SYMLINK_TEXT, &format!("{mode} {open}"));
         }
     }
 }
@@ -979,38 +976,45 @@ fn strict_reader_fixture(
     (strict_file, plain_file, path)
 }
 
-/// The reader of a regular file that a strict handle loaded follows no
-/// symlink at the object path. A symlink that replaces the object file after
-/// the load fails the reader with `ELOOP`. The reader of a handle of the
-/// default open follows the symlink.
+/// Returns the path of the object file `path` relative to the repository
+/// `repo` under `tmp`.
+fn repo_relative(tmp: &TmpDir, path: &Path) -> String {
+    path.strip_prefix(tmp.path().join("repo"))
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned()
+}
+
+/// The reader of a regular file follows no symlink at the object path. A
+/// symlink that replaces the object file after the load fails the reader, in
+/// each open mode.
 #[test]
-fn the_strict_reader_refuses_an_object_symlinked_after_the_load() {
+fn each_reader_refuses_an_object_symlinked_after_the_load() {
     for mode in [RepoMode::Archive, RepoMode::BareUser] {
-        let tmp = TmpDir::new("strict-reader-object");
+        let tmp = TmpDir::new("reader-object");
         let (strict_file, plain_file, path) = strict_reader_fixture(&tmp, mode);
         let outside = tmp.path().join("outside");
         std::fs::rename(&path, &outside).unwrap();
         std::os::unix::fs::symlink(&outside, &path).unwrap();
 
-        block_on(plain_file.reader()).expect("the default handle follows");
-        let err = block_on(strict_file.reader())
-            .err()
-            .expect("the strict reader refuses the symlink");
-        match err {
-            Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{mode:?} {e}"),
-            other => panic!("{mode:?}: {other}"),
+        let relative = repo_relative(&tmp, &path);
+        for (open, file) in [("open_at", &plain_file), ("open_at_strict", &strict_file)] {
+            let err = block_on(file.reader())
+                .err()
+                .expect("the reader refuses the symlink");
+            assert_invalid_at(&err, &relative, SYMLINK_TEXT, &format!("{mode:?} {open}"));
         }
     }
 }
 
-/// The reader of a regular file that a strict handle loaded refuses a FIFO
-/// that replaces the object file after the load, and does not wait for a
-/// writer.
+/// The reader of a regular file refuses a FIFO that replaces the object file
+/// after the load, in each open mode, and does not wait for a writer.
 #[test]
-fn the_strict_reader_refuses_a_fifo_swapped_in_after_the_load() {
+fn each_reader_refuses_a_fifo_swapped_in_after_the_load() {
     for mode in [RepoMode::Archive, RepoMode::BareUser] {
-        let tmp = TmpDir::new("strict-reader-fifo");
-        let (strict_file, _, path) = strict_reader_fixture(&tmp, mode);
+        let tmp = TmpDir::new("reader-fifo");
+        let (strict_file, plain_file, path) = strict_reader_fixture(&tmp, mode);
         std::fs::remove_file(&path).unwrap();
         rustix::fs::mknodat(
             rustix::fs::CWD,
@@ -1021,34 +1025,298 @@ fn the_strict_reader_refuses_a_fifo_swapped_in_after_the_load() {
         )
         .unwrap();
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(block_on(strict_file.reader()).map(drop));
-        });
-        let timeout = std::time::Duration::from_secs(10);
-        let result = match rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(_) => {
-                // A writer releases the blocked open, so the thread ends.
-                let _ = rustix::fs::open(
-                    &path,
-                    rustix::fs::OFlags::WRONLY
-                        | rustix::fs::OFlags::NONBLOCK
-                        | rustix::fs::OFlags::CLOEXEC,
-                    rustix::fs::Mode::empty(),
-                );
-                let _ = rx.recv_timeout(timeout);
-                panic!("{mode:?}: the reader waits on the FIFO");
-            }
-        };
-        match result {
-            Err(Error::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{mode:?} {e}");
-                assert!(e.to_string().contains("not a regular file"), "{mode:?} {e}");
-            }
-            other => panic!("{mode:?}: {other:?}"),
+        let relative = repo_relative(&tmp, &path);
+        for (open, file) in [("open_at", plain_file), ("open_at_strict", strict_file)] {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(block_on(file.reader()).map(drop));
+            });
+            let timeout = std::time::Duration::from_secs(10);
+            let result = match rx.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(_) => {
+                    // A writer releases the blocked open, so the thread ends.
+                    let _ = rustix::fs::open(
+                        &path,
+                        rustix::fs::OFlags::WRONLY
+                            | rustix::fs::OFlags::NONBLOCK
+                            | rustix::fs::OFlags::CLOEXEC,
+                        rustix::fs::Mode::empty(),
+                    );
+                    let _ = rx.recv_timeout(timeout);
+                    panic!("{mode:?} {open}: the reader waits on the FIFO");
+                }
+            };
+            let err = result.expect_err("the reader refuses the FIFO");
+            assert_invalid_at(
+                &err,
+                &relative,
+                "is not a regular file",
+                &format!("{mode:?} {open}"),
+            );
         }
     }
+}
+
+/// Copies the fixture of `mode` to `repo` under `tmp`, and returns the
+/// repository and its commit.
+fn fixture_copy(tmp: &TmpDir, mode: &str) -> (Repo, ostrya::Checksum) {
+    let status = Command::new("cp")
+        .arg("-a")
+        .arg(fixture_repo(mode))
+        .arg(tmp.path().join("repo"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "cp -a of the {mode} fixture");
+    let repo = block_on(Repo::open(&tmp.path().join("repo"))).unwrap();
+    let commit = block_on(repo.list_objects())
+        .unwrap()
+        .into_iter()
+        .find(|name| name.ty == ostrya::ObjectType::Commit)
+        .expect("the fixture holds a commit")
+        .checksum;
+    (repo, commit)
+}
+
+/// Replaces the fan-out directory of `checksum` in `repo` under `tmp` with
+/// a symlink to a copy of it, and returns its path relative to the
+/// repository.
+fn symlink_fanout(tmp: &TmpDir, checksum: &ostrya::Checksum) -> String {
+    let fanout = format!("objects/{}", &checksum.to_hex()[..2]);
+    let path = tmp.path().join("repo").join(&fanout);
+    let moved = tmp.path().join("moved");
+    std::fs::rename(&path, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &path).unwrap();
+    fanout
+}
+
+/// The listing of the objects, the device and inode cache, the resolve of an
+/// abbreviated checksum, the presence check, the object sizes of a diff, and
+/// a checkout each fail at a symlinked fan-out directory, and the error names
+/// the path.
+#[test]
+fn the_object_reads_refuse_a_symlinked_fanout() {
+    use ostrya::ObjectType;
+
+    let tmp = TmpDir::new("fanout-reads");
+    let (repo, commit) = fixture_copy(&tmp, "bare-user");
+    let hex = commit.to_hex();
+    let fanout = symlink_fanout(&tmp, &commit);
+    let object = format!(
+        "objects/{}",
+        ostrya::loose_path(&commit, ObjectType::Commit, repo.mode())
+    );
+
+    let err = block_on(repo.list_objects()).unwrap_err();
+    assert_invalid_at(&err, &fanout, SYMLINK_TEXT, "list_objects");
+    let err = block_on(repo.devino_cache()).err().unwrap();
+    assert_invalid_at(&err, &fanout, SYMLINK_TEXT, "devino_cache");
+    for prefix in [&hex[..1], &hex[..2], &hex[..8]] {
+        let err = block_on(repo.resolve_rev(prefix, false)).unwrap_err();
+        assert_invalid_at(&err, &fanout, SYMLINK_TEXT, prefix);
+    }
+    let err = block_on(repo.has_object(ObjectType::Commit, &commit)).unwrap_err();
+    assert_invalid_at(&err, &object, SYMLINK_TEXT, "has_object");
+    let err = block_on(repo.diff_stats(&commit, &commit)).unwrap_err();
+    assert_invalid_at(&err, &object, SYMLINK_TEXT, "diff_stats");
+    let err = block_on(repo.commit_sizes(&commit)).unwrap_err();
+    assert_invalid_at(&err, &object, SYMLINK_TEXT, "commit_sizes");
+
+    let base = std::fs::File::open(tmp.path()).unwrap();
+    for force_copy in [false, true] {
+        let mut opts = ostrya::CheckoutOptions::new(ostrya::CheckoutMode::User);
+        opts.force_copy = force_copy;
+        let err = block_on(repo.checkout_at(&mut opts, base.as_fd(), Path::new("dest"), &commit))
+            .unwrap_err();
+        assert_invalid_at(&err, &object, SYMLINK_TEXT, "checkout");
+    }
+}
+
+/// The listing of the objects and the resolve of an abbreviated checksum fail
+/// at an entry of two hexadecimal characters in `objects/` that is not a
+/// directory.
+#[test]
+fn the_object_reads_refuse_a_file_at_a_fanout() {
+    let tmp = TmpDir::new("fanout-file");
+    let (repo, _) = fixture_copy(&tmp, "bare-user");
+    let free = (0..=255u8)
+        .map(|b| format!("{b:02x}"))
+        .find(|name| !tmp.path().join("repo/objects").join(name).exists())
+        .expect("a free fan-out name");
+    std::fs::write(tmp.path().join("repo/objects").join(&free), b"").unwrap();
+    let fanout = format!("objects/{free}");
+
+    let err = block_on(repo.list_objects()).unwrap_err();
+    assert_invalid_at(&err, &fanout, "is not a directory", "list_objects");
+    let err = block_on(repo.devino_cache()).err().unwrap();
+    assert_invalid_at(&err, &fanout, "is not a directory", "devino_cache");
+    let err = block_on(repo.resolve_rev(&free, false)).unwrap_err();
+    assert_invalid_at(&err, &fanout, "is not a directory", "resolve_rev");
+}
+
+/// The presence check gives `false` for an object whose fan-out directory
+/// is absent, and `true` for a symlink content object of a `bare`
+/// repository.
+#[test]
+fn has_object_sees_an_absent_fanout_and_a_symlink_object() {
+    use ostrya::ObjectType;
+
+    let tmp = TmpDir::new("has-object");
+    let repo = block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::Bare),
+    ))
+    .unwrap();
+    let absent: ostrya::Checksum = "ab".repeat(32).parse().unwrap();
+    assert!(!block_on(repo.has_object(ObjectType::File, &absent)).unwrap());
+
+    let owner = std::fs::metadata(tmp.path()).unwrap();
+    let link = block_on(async {
+        let txn = repo.transaction().await.unwrap();
+        let link = txn
+            .write_symlink(
+                "target",
+                &ostrya::FileMeta::regular(
+                    std::os::unix::fs::MetadataExt::uid(&owner),
+                    std::os::unix::fs::MetadataExt::gid(&owner),
+                    0o777,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        link
+    });
+    let path = tmp.path().join("repo/objects").join(ostrya::loose_path(
+        &link,
+        ObjectType::File,
+        RepoMode::Bare,
+    ));
+    assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+    assert!(block_on(repo.has_object(ObjectType::File, &link)).unwrap());
+    let file = block_on(repo.load_file(&link)).unwrap();
+    assert_eq!(
+        file.kind,
+        ostrya::FileKind::Symlink {
+            target: "target".to_owned()
+        }
+    );
+}
+
+/// The load of a `bare-user` symlink object refuses a content of more than
+/// 65536 bytes, and does not truncate it.
+#[test]
+fn a_bare_user_symlink_object_over_its_cap_fails_the_load() {
+    use ostrya::ObjectType;
+
+    let tmp = TmpDir::new("bare-user-link-cap");
+    let repo = block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::BareUser),
+    ))
+    .unwrap();
+    let link = block_on(async {
+        let txn = repo.transaction().await.unwrap();
+        let link = txn
+            .write_symlink("target", &ostrya::FileMeta::regular(0, 0, 0o777), None)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        link
+    });
+    let relative = format!(
+        "objects/{}",
+        ostrya::loose_path(&link, ObjectType::File, RepoMode::BareUser)
+    );
+    let path = tmp.path().join("repo").join(&relative);
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o644);
+    std::fs::set_permissions(&path, perms).unwrap();
+
+    // The write keeps the inode, so the object keeps its `user.ostreemeta`.
+    std::fs::write(&path, vec![b'a'; 65536]).unwrap();
+    let file = block_on(repo.load_file(&link)).unwrap();
+    assert_eq!(
+        file.kind,
+        ostrya::FileKind::Symlink {
+            target: "a".repeat(65536)
+        }
+    );
+    std::fs::write(&path, vec![b'a'; 65537]).unwrap();
+    let err = block_on(repo.load_file(&link)).unwrap_err();
+    assert_invalid_at(
+        &err,
+        &relative,
+        "is larger than its cap of 65536 bytes",
+        "load_file",
+    );
+}
+
+/// The read of the state of a commit, and so the load of a commit, refuses a
+/// symlink at `state`.
+#[test]
+fn the_commit_state_refuses_a_symlinked_state() {
+    let tmp = TmpDir::new("state-symlink");
+    let (repo, commit) = fixture_copy(&tmp, "bare-user");
+    let state = tmp.path().join("repo/state");
+    let moved = tmp.path().join("moved");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::rename(&state, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &state).unwrap();
+    let marker = format!("state/{}.commitpartial", commit.to_hex());
+
+    let err = block_on(repo.commit_state(&commit)).unwrap_err();
+    assert_invalid_at(&err, &marker, SYMLINK_TEXT, "commit_state");
+    let err = block_on(repo.load_commit(&commit)).unwrap_err();
+    assert_invalid_at(&err, &marker, SYMLINK_TEXT, "load_commit");
+}
+
+/// The begin of a transaction refuses a symlink at `tmp` and at
+/// `tmp/cache`, and makes each of them that is absent.
+#[test]
+fn a_transaction_refuses_a_symlinked_tmp() {
+    let tmp = TmpDir::new("tmp-symlink");
+    let path = tmp.path().join("repo");
+    block_on(Repo::create(&path, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    for name in ["tmp", "tmp/cache"] {
+        let target = path.join(name);
+        let moved = tmp.path().join("moved");
+        std::fs::rename(&target, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &target).unwrap();
+        let repo = block_on(Repo::open(&path)).unwrap();
+        let err = block_on(repo.transaction()).err().unwrap();
+        assert_invalid_at(&err, name, SYMLINK_TEXT, name);
+        std::fs::remove_file(&target).unwrap();
+        std::fs::rename(&moved, &target).unwrap();
+    }
+
+    std::fs::remove_dir_all(path.join("tmp")).unwrap();
+    let repo = block_on(Repo::open(&path)).unwrap();
+    drop(block_on(repo.transaction()).unwrap());
+    assert!(path.join("tmp/cache").is_dir());
+}
+
+/// Each begin of a transaction on one handle opens `tmp` again. A `tmp`
+/// that is removed after a transaction comes back at the next begin, with
+/// `tmp/cache`. A symlink that replaces `tmp` after a transaction fails the
+/// next begin.
+#[test]
+fn each_begin_opens_tmp_again() {
+    let tmp = TmpDir::new("tmp-again");
+    let path = tmp.path().join("repo");
+    let repo = block_on(Repo::create(&path, CreateOptions::new(RepoMode::BareUser))).unwrap();
+    block_on(async { repo.transaction().await.unwrap().commit().await.unwrap() });
+
+    std::fs::remove_dir_all(path.join("tmp")).unwrap();
+    block_on(async { repo.transaction().await.unwrap().commit().await.unwrap() });
+    assert!(path.join("tmp/cache").is_dir());
+
+    let moved = tmp.path().join("moved");
+    std::fs::rename(path.join("tmp"), &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, path.join("tmp")).unwrap();
+    let err = block_on(repo.transaction()).err().unwrap();
+    assert_invalid_at(&err, "tmp", SYMLINK_TEXT, "tmp");
 }
 
 /// Returns the error number `ELOOP`.

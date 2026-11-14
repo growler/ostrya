@@ -7367,9 +7367,10 @@ fn a_hole_below_a_dirtree_no_source_holds_fails_the_pull() {
 }
 
 /// The destination holds a dirtree as a dangling symlink. The pull reads the
-/// dirtree from the destination and fails with [`Error::ObjectNotFound`] for
-/// it. The source holds the dirtree, and the pull still fails. The pull
-/// publishes no commit object, no marker, and no ref.
+/// dirtree from the destination and fails with [`Error::InvalidFormat`],
+/// because the read refuses the symlink. The source holds the dirtree, and
+/// the pull still fails. The pull publishes no commit object, no marker, and
+/// no ref.
 #[test]
 fn a_dangling_symlink_at_a_dirtree_the_destination_holds_fails_the_pull() {
     let tmp = TmpDir::new("pull-held-dirtree-symlink");
@@ -7394,10 +7395,12 @@ fn a_dangling_symlink_at_a_dirtree_the_destination_holds_fails_the_pull() {
             .await
             .unwrap_err();
 
+        let expected = format!(
+            "objects/{} passes through a symlink; ostrya refuses a symlink in the repository",
+            subdir.loose_path(RepoMode::BareUser)
+        );
         match err {
-            Error::ObjectNotFound { checksum, ty } => {
-                assert_eq!(ObjectName::new(checksum, ty), subdir)
-            }
+            Error::InvalidFormat(m) => assert_eq!(m, expected),
             other => panic!("{other:?}"),
         }
         assert!(!dst.has_object(ObjectType::Commit, &c2).await.unwrap());
@@ -9395,8 +9398,7 @@ fn a_local_pull_reads_a_dependency_from_its_first_holder() {
             .await
             .unwrap_err();
             assert!(
-                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData)
-                    && err.to_string().contains("not a regular file"),
+                matches!(&err, Error::InvalidFormat(m) if m.ends_with(".commit is not a regular file")),
                 "{second}: {err:?}"
             );
             assert!(dst.list_refs(None).await.unwrap().is_empty());

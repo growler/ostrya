@@ -410,8 +410,10 @@ impl Repo {
     ///   or if `[core] fsync` in the config is not a boolean.
     /// - [`Error::Signature`] if a signer fails. A signer can also return
     ///   [`Error::InvalidFormat`] or [`Error::Core`].
-    /// - [`Error::Io`] if a metadata object is larger than 128 MiB, or if a
-    ///   read, a write, or an unlink on the file system fails.
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than 128 MiB
+    ///   or is not a regular file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a read, a write, or an unlink on the file system
+    ///   fails.
     pub async fn generate_static_delta(
         &self,
         from: Option<&Checksum>,

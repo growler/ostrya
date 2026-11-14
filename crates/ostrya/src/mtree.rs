@@ -207,8 +207,10 @@ impl MutableTree {
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum, or if the commit or
     ///   the root dirtree does not parse.
-    /// - [`Error::Io`] if a read from the file system fails, or if an object is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if an object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn from_commit(repo: &Repo, rev: &str) -> Result<MutableTree> {
         let checksum = repo
             .resolve_rev(rev, true)
@@ -275,8 +277,10 @@ impl MutableTree {
     /// - [`Error::ObjectNotFound`] if the dirtree of the committed child is not
     ///   in the repository.
     /// - [`Error::Core`] if the dirtree of the committed child does not parse.
-    /// - [`Error::Io`] if the read of that dirtree fails, or if the dirtree is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if that dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the read of that dirtree fails.
     pub async fn ensure_dir(&mut self, name: &str) -> Result<&mut MutableTree> {
         self.descend(name, Absent::Create).await
     }
@@ -303,8 +307,10 @@ impl MutableTree {
     /// - [`Error::ObjectNotFound`] if the dirtree of the committed child is not
     ///   in the repository.
     /// - [`Error::Core`] if the dirtree of the committed child does not parse.
-    /// - [`Error::Io`] if the read of that dirtree fails, or if the dirtree is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if that dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the read of that dirtree fails.
     pub async fn subtree(&mut self, name: &str) -> Result<&mut MutableTree> {
         self.descend(name, Absent::Refuse).await
     }

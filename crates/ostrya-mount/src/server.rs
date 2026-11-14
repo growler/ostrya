@@ -403,8 +403,8 @@ async fn build(
     // and the deadline of the connection cannot stop them. The worker
     // refused a repository on FUSE, and the copy of the repository mount
     // holds no mount of the caller below it. So no read waits on a file
-    // system server of the caller. The strict open mode refuses a symlink, a
-    // FIFO, and a device in place of a file that the daemon reads.
+    // system server of the caller. The reads of the repository refuse a
+    // symlink, a FIFO, and a device in place of a file that the daemon reads.
     let repo = Repo::open_at_strict(repo_fd.as_fd(), Path::new("."))
         .await
         .map_err(|e| failure_of(Error::Repo(e)))?;

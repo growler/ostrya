@@ -591,6 +591,36 @@ Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>`, with
 the `z` suffix that "Repository modes and on-disk storage" states. The checksum
 must be exactly 64 hex characters.
 
+The port reads each loose object with one `openat2` relative to `objects/`,
+with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, in each open
+mode. One `statx` on the open file then refuses each entry that is not a
+regular file, with the message `<path> is not a regular file`. The open of a
+FIFO does not wait for a writer. A symlink at `objects/<xx>`, or at the path
+of an object that the repository mode stores as a regular file, fails the
+read with the message `<path> passes through a symlink; ostrya refuses a
+symlink in the repository`. `<path>` is relative to the repository root. In
+the `bare`, `bare-user-only`, and `bare-split-xattrs` modes, a symlink at the
+path of a `.file` object is a symlink content object. The port reads its
+target with `readlinkat` and does not follow it. A target of more than 4095
+bytes fails the read.
+
+The check of the presence of an object is one `openat2` of the object path
+with `O_PATH` and `O_NOFOLLOW`. An entry of each type at the object path is
+present, also a symlink. An absent `objects/<xx>` gives no object. A listing
+of `objects/` reads each entry whose name is two hexadecimal characters as a
+fan-out directory. A symlink there, or an entry that is not a directory,
+fails the listing of the objects, the device and inode cache of a commit
+with `--link-checkout-speedup`, and the resolve of an abbreviated checksum.
+
+The port reads at most 134217728 bytes of a metadata object
+(`MAX_METADATA_SIZE`). A larger object fails the read with the message
+`<path> is larger than its cap of 134217728 bytes`, at the open and during a
+streamed read. A `bare-user` symlink object holds its target and one NUL byte
+as content. The port reads at most 65536 bytes of this content, and a larger
+content fails the read with the message `<path> is larger than its cap of
+65536 bytes`. `conformance/cli-surface.md`, "Global conventions", records the
+reads of the tool in these cases.
+
 ### Ref files
 
 A ref file holds 64 lowercase hex characters and a single `\n` (65 bytes). Each
@@ -6063,22 +6093,18 @@ Over HTTP, `ostrya serve` applies these rules:
 
 A `HEAD` gets the status and the `Content-Length` of a `GET`, with no body.
 For a `.filez` built on request, a `HEAD` reads no byte of the object, no
-xattr, and no `config`. So the two methods give different statuses in these
-cases:
+xattr, and no `config`. In a `bare-split-xattrs` repository, both methods
+check the object before its `.file-xattrs-link` entry. A missing object gets
+404, and a present object with no `.file-xattrs-link` entry gets 500, for
+both methods. These cases get 200 for `HEAD` and 500 for `GET`:
 
-- In a `bare-split-xattrs` repository, a `HEAD` checks the
-  `.file-xattrs-link` entry before the object. A `GET` checks the object
-  first. A missing object in a fan-out directory that exists gets 500 for
-  `HEAD` and 404 for `GET`. A present object with no `.file-xattrs-link`
-  entry gets 500 for both methods.
-- These cases get 200 for `HEAD` and 500 for `GET`:
-  - xattrs of a `bare-split-xattrs` object that do not parse;
-  - an object whose metadata does not parse, or whose archive header the
-    view cannot write;
-  - a `config` that the server cannot read as a repository config;
-  - an `[archive] zlib-level` value that is not a signed 64-bit decimal
-    integer, a value with a leading `+` included. The view clamps a value in
-    that range to the range 1 to 9.
+- xattrs of a `bare-split-xattrs` object that do not parse;
+- an object whose metadata does not parse, or whose archive header the view
+  cannot write;
+- a `config` that the server cannot read as a repository config;
+- an `[archive] zlib-level` value that is not a signed 64-bit decimal
+  integer, a value with a leading `+` included. The view clamps a value in
+  that range to the range 1 to 9.
 
 For a built `.filez`, the result of the `config` read of a `GET` has
 precedence over the result of the object lookup. So a missing object in a
@@ -7082,14 +7108,12 @@ The checks of the daemon, in order:
    the inode of the directory that the client opened. Else the request is
    `access`. The open of the repository opens `objects` and reads `config`
    with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`, as each open
-   does. The reads of the metadata objects and of the image open each file
-   with `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-   `O_NONBLOCK`, and refuse a file that is not a regular file. The load of a
-   file object opens its fan-out directory `objects/<xx>` with `openat2`,
-   `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. A read of the payload of the
-   file object opens the object file relative to it in the same way as a
-   metadata object. So a symlink at any component of the path stops the read,
-   and the request is `repository`. The daemon opens the image
+   does. Each read of an object and the read of the image open the file with
+   `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and
+   refuse a file that is not a regular file, as "Object store layout" states.
+   So a symlink at a directory component of the path, or at a file that the
+   repository mode stores as a regular file, stops the read, and the request
+   is `repository`. The daemon opens the image
    `extensions/ostrya/composefs/<xx>/<rest>.cfs` under the repository
    directory. An error of `openat2`, `ENOSYS` included, fails the read: the
    daemon has no fallback to `openat`.

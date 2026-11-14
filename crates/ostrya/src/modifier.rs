@@ -11,16 +11,14 @@
 //! - a [`DevInoCache`], which is optional
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 
 use ostrya_core::{Checksum, Xattrs};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-use rustix::io::Errno;
+use rustix::fs::FileType;
 
 use crate::error::Result;
 use crate::repo::Repo;
-use crate::traverse::read_dir_names;
+use crate::repo_fs::{FsResultExt, RepoDir};
 use crate::write::FileMeta;
 
 /// The file-name suffix of a loose uncompressed content object. A compressed
@@ -194,19 +192,24 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if an entry of
+    ///   `objects/` with a name of two lower-case hexadecimal characters is a
+    ///   symlink or is not a directory. The message is `objects/<xx> passes
+    ///   through a symlink; ostrya refuses a symlink in the repository` or
+    ///   `objects/<xx> is not a directory`.
     /// - [`Error::Io`](crate::Error::Io) if the read of `objects/` or of a
     ///   fanout directory fails.
     /// - [`Error::Io`](crate::Error::Io) if the open of a fanout directory
     ///   fails with an error other than `ENOENT`.
     pub async fn devino_cache(&self) -> Result<DevInoCache> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || devino_cache_blocking(repo.objects_fd())).await
+        ostrya_rt::unblock(move || devino_cache_blocking(repo.objects())).await
     }
 }
 
-/// Scans an `objects/` directory descriptor for loose uncompressed content
+/// Scans the `objects/` handle `objects` for loose uncompressed content
 /// objects.
-fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
+fn devino_cache_blocking(objects: &RepoDir) -> Result<DevInoCache> {
     let mut cache = DevInoCache::new();
     // The scan reads lower-case names only, because ostrya and the `ostree`
     // command write only these. An upper-case hex name folds to a checksum
@@ -214,7 +217,10 @@ fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
     // that checksum for a source file hardlinked to the object. Only a writer
     // outside ostrya and the `ostree` command can make such a name, so no
     // test produces one.
-    for fanout in read_dir_names(objects_fd)? {
+    for fanout in objects.list()? {
+        let Ok(fanout) = String::from_utf8(fanout.name) else {
+            continue;
+        };
         if fanout.len() != 2
             || !fanout
                 .bytes()
@@ -222,17 +228,13 @@ fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
         {
             continue;
         }
-        let dir = match rustix::fs::openat(
-            objects_fd,
-            fanout.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(Errno::NOENT) => continue,
-            Err(e) => return Err(e.into()),
+        let Some(dir) = objects.open_dir(&fanout).optional()? else {
+            continue;
         };
-        for entry in read_dir_names(dir.as_fd())? {
+        for entry in dir.list()? {
+            let Ok(entry) = String::from_utf8(entry.name) else {
+                continue;
+            };
             let Some(rest) = entry.strip_suffix(CONTENT_SUFFIX) else {
                 continue;
             };
@@ -242,21 +244,17 @@ fn devino_cache_blocking(objects_fd: BorrowedFd<'_>) -> Result<DevInoCache> {
             let Ok(checksum) = Checksum::from_hex_lower(&format!("{fanout}{rest}")) else {
                 continue;
             };
-            let Ok(st) = rustix::fs::statat(dir.as_fd(), entry.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            else {
+            let Ok(st) = dir.lstat(&entry) else {
                 continue;
             };
             // A `bare` repository stores a symlink object as a symlink. A
             // hardlinking checkout links that inode into the destination, so
             // both file types can be one end of a hardlink pair with a source
             // entry. No other entry under `objects/` can.
-            if !matches!(
-                FileType::from_raw_mode(st.st_mode),
-                FileType::RegularFile | FileType::Symlink
-            ) {
+            if !matches!(st.file_type, FileType::RegularFile | FileType::Symlink) {
                 continue;
             }
-            cache.insert(st.st_dev, st.st_ino, checksum);
+            cache.insert(st.dev, st.ino, checksum);
         }
     }
     Ok(cache)

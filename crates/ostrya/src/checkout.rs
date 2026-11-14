@@ -18,11 +18,12 @@ use rustix::fs::{AtFlags, CWD, Dir, FileType, Gid, Mode, OFlags, RenameFlags, Ui
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
-use crate::file::{FileKind, FileObject};
+use crate::file::{FileKind, FileObject, Payload};
 use crate::ingest::join_path;
 use crate::modifier::{DevInoCache, FilterResult};
-use crate::read::CommitState;
+use crate::read::{CommitState, object_path_error};
 use crate::repo::Repo;
+use crate::repo_fs::{self, FsError, Published};
 use crate::tree::{Comp, RepoTree, TreeEntry};
 use crate::write::{FileMeta, TempKind};
 
@@ -571,8 +572,9 @@ impl Repo {
                 // destination on another file system. It refuses the other
                 // shapes at the link. The `EXDEV` arms of `place_regular` and
                 // `place_symlink` make that refusal.
-                let obj = self.load_file(&checksum).await?;
-                checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, &obj).await?;
+                let (obj, payload) = load_entry(self, policy, &checksum).await?;
+                let entry = Entry { obj: &obj, payload };
+                checkout_entry(self, opts, policy, dir_fd.as_fd(), &entry_name, entry).await?;
                 if policy.enable_fsync {
                     fsync_dir(dir_fd).await?;
                 }
@@ -748,7 +750,7 @@ fn checkout_dir<'a>(
         }
 
         for (name, checksum) in &dirtree.files {
-            let obj = repo.load_file(checksum).await?;
+            let (obj, payload) = load_entry(repo, policy, checksum).await?;
             // The filter decides the entry ahead of the whiteout verdict, so a
             // pruned marker removes nothing and writes no device.
             if let Some(filter) = &mut opts.filter {
@@ -763,7 +765,8 @@ fn checkout_dir<'a>(
                     continue;
                 }
             }
-            checkout_entry(repo, &mut *opts, policy, dir_fd.as_fd(), name, &obj).await?;
+            let entry = Entry { obj: &obj, payload };
+            checkout_entry(repo, &mut *opts, policy, dir_fd.as_fd(), name, entry).await?;
         }
 
         for (name, sub_dirtree, sub_dirmeta) in &dirtree.dirs {
@@ -818,6 +821,33 @@ fn checkout_dir<'a>(
     })
 }
 
+/// Loads the file object `checksum` of an entry of the checkout.
+///
+/// If the checkout copies a regular file, the load keeps its object file
+/// open, and the copy reads that file. The second value is that file, or
+/// `None`.
+async fn load_entry(
+    repo: &Repo,
+    policy: Policy,
+    checksum: &Checksum,
+) -> Result<(FileObject, Option<Payload>)> {
+    if hardlink_regular(policy) {
+        Ok((repo.load_file(checksum).await?, None))
+    } else {
+        repo.open_file(checksum).await
+    }
+}
+
+/// A file entry of a tree: its object, and the object file that the load
+/// kept open for a copy.
+struct Entry<'o> {
+    /// The file object.
+    obj: &'o FileObject,
+    /// The object file of a regular file at the start of its payload, if the
+    /// load kept it.
+    payload: Option<Payload>,
+}
+
 /// Acts on one file entry of a tree.
 ///
 /// If a whiteout switch claims the name, the function applies the whiteout
@@ -833,8 +863,9 @@ async fn checkout_entry(
     policy: Policy,
     dir_fd: BorrowedFd<'_>,
     name: &str,
-    obj: &FileObject,
+    entry: Entry<'_>,
 ) -> Result<()> {
+    let obj = entry.obj;
     match whiteout_verdict(policy, name, obj)? {
         Some(Whiteout::Drop) => Ok(()),
         Some(Whiteout::Remove(target)) => {
@@ -842,7 +873,7 @@ async fn checkout_entry(
             ostrya_rt::unblock(move || remove_dir_entry(d.as_fd(), &target)).await
         }
         Some(Whiteout::Device(target)) => place_whiteout_device(policy, dir_fd, &target, obj).await,
-        None => checkout_file(repo, opts, policy, dir_fd, name, obj).await,
+        None => checkout_file(repo, opts, policy, dir_fd, name, entry).await,
     }
 }
 
@@ -860,8 +891,9 @@ async fn checkout_file(
     policy: Policy,
     dir_fd: BorrowedFd<'_>,
     name: &str,
-    obj: &FileObject,
+    entry: Entry<'_>,
 ) -> Result<()> {
+    let obj = entry.obj;
     if require_hardlinks_refuses(policy, obj) {
         return Err(Error::RequireHardlinks(name.to_owned()));
     }
@@ -869,7 +901,7 @@ async fn checkout_file(
         FileKind::Symlink { target } => {
             place_symlink(repo, policy, dir_fd, name, obj, target).await
         }
-        FileKind::Regular { .. } => place_regular(repo, opts, policy, dir_fd, name, obj).await,
+        FileKind::Regular { .. } => place_regular(repo, opts, policy, dir_fd, name, entry).await,
     }
 }
 
@@ -1058,8 +1090,9 @@ async fn place_regular(
     policy: Policy,
     dir_fd: BorrowedFd<'_>,
     name: &str,
-    obj: &FileObject,
+    entry: Entry<'_>,
 ) -> Result<()> {
+    let Entry { obj, payload } = entry;
     let checksum = obj.checksum();
     let remove_existing =
         match pre_check(dir_fd, name, policy.overwrite, widens_type_conflict(policy))? {
@@ -1080,7 +1113,7 @@ async fn place_regular(
     // refused. The device check of the directory walk does not reach a single
     // file or symlink target. This check does.
     if hardlink_regular_object(policy, obj) {
-        match try_link_object(repo, policy, dir_fd, name, checksum, remove_existing).await? {
+        match try_link_object(repo, dir_fd, name, checksum, remove_existing).await? {
             Some((dev, ino)) => {
                 record_devino(opts, dev, ino, checksum);
                 return Ok(());
@@ -1100,7 +1133,7 @@ async fn place_regular(
     // proof of the payload, so that mode always copies.
     if !(policy.repo_mode != RepoMode::Archive && matches!(obj.kind, FileKind::Regular { size: 0 }))
     {
-        copy_object(repo, obj, &temp, policy).await?;
+        copy_object(repo, obj, payload, &temp, policy).await?;
     }
     let plan = FinishCopy {
         dir: dir_fd.try_clone_to_owned()?,
@@ -1149,7 +1182,7 @@ async fn place_symlink(
     // `require_hardlinks`, the switch refuses a copy, and a new link is a
     // copy.
     if hardlink_symlink(policy) {
-        match try_link_object(repo, policy, dir_fd, name, checksum, remove_existing).await? {
+        match try_link_object(repo, dir_fd, name, checksum, remove_existing).await? {
             Some(_) => return Ok(()),
             None if policy.require_hardlinks => {
                 return hardlink_across_devices(repo, dir_fd);
@@ -1235,21 +1268,20 @@ fn pre_check(
 }
 
 /// Returns the `(st_dev, st_ino)` and the permission bits of the inode of a
-/// loose content object, for the identity comparison.
-fn loose_object_stat(repo: &Repo, mode: RepoMode, checksum: &Checksum) -> Result<(u64, u64, u32)> {
-    let path = loose_path(checksum, ObjectType::File, mode);
-    let st =
-        rustix::fs::statat(repo.objects_fd(), &path, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
-            if e == Errno::NOENT {
-                Error::ObjectNotFound {
-                    checksum: *checksum,
-                    ty: ObjectType::File,
-                }
-            } else {
-                e.into()
-            }
-        })?;
-    Ok((st.st_dev, st.st_ino, st.st_mode & PERM_MASK))
+/// loose content object, for the identity comparison. The `lstat` runs on the
+/// blocking pool.
+async fn loose_object_stat(repo: &Repo, checksum: &Checksum) -> Result<(u64, u64, u32)> {
+    let path = loose_path(checksum, ObjectType::File, repo.mode());
+    let repo = repo.clone();
+    let checksum = *checksum;
+    ostrya_rt::unblock(move || {
+        let st = repo
+            .objects()
+            .lstat(&path)
+            .map_err(|e| e.into_object_error(&checksum, ObjectType::File))?;
+        Ok((st.dev, st.ino, st.mode & PERM_MASK))
+    })
+    .await
 }
 
 /// Returns `true` if an existing destination entry matches the object, for
@@ -1283,7 +1315,7 @@ async fn destination_is_identical(
             if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile {
                 return Ok(false);
             }
-            let (dev, ino, obj_perm) = loose_object_stat(repo, policy.repo_mode, obj.checksum())?;
+            let (dev, ino, obj_perm) = loose_object_stat(repo, obj.checksum()).await?;
             if st.st_dev == dev && st.st_ino == ino {
                 return Ok(true);
             }
@@ -1303,7 +1335,7 @@ async fn destination_is_identical(
                 uid: st.st_uid,
                 gid: st.st_gid,
                 mode: st.st_mode,
-                xattrs: crate::object::read_all_xattrs(fd.as_fd())?,
+                xattrs: crate::ingest::read_all_xattrs(fd.as_fd())?,
             };
             let header = crate::write::canonical_header(policy.repo_mode, meta.regular_header());
             if header != crate::write::canonical_header(policy.repo_mode, obj.header()) {
@@ -1437,38 +1469,43 @@ fn open_dir(parent: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
 
 /// Tries to hardlink a loose object to its destination name.
 ///
-/// Returns the destination `(dev, ino)` if the link succeeds. Returns `None`
-/// if the link crossed a file system (`EXDEV`), and the caller must copy.
+/// The link is [`repo_fs::link`], so it follows no symlink on the path of the
+/// object. Returns the destination `(dev, ino)` if the link succeeds. Returns
+/// `None` if the link crossed a file system (`EXDEV`), and the caller must
+/// copy. An absent object or fan-out directory gives
+/// [`Error::ObjectNotFound`]. An error at the fan-out directory names the
+/// object path.
 async fn try_link_object(
     repo: &Repo,
-    policy: Policy,
     dir_fd: BorrowedFd<'_>,
     name: &str,
     checksum: &Checksum,
     remove_existing: bool,
 ) -> Result<Option<(u64, u64)>> {
-    let objects = repo.objects_fd().try_clone_to_owned()?;
+    let objects = repo.objects().clone();
     let dir = dir_fd.try_clone_to_owned()?;
-    let loose = loose_path(checksum, ObjectType::File, policy.repo_mode);
+    let loose = loose_path(checksum, ObjectType::File, repo.mode());
     let name = name.to_owned();
+    let checksum = *checksum;
     ostrya_rt::unblock(move || {
         if remove_existing {
             remove_dir_entry(dir.as_fd(), &name)?;
         }
-        match rustix::fs::linkat(
-            objects.as_fd(),
-            &loose,
-            dir.as_fd(),
-            &name,
-            AtFlags::empty(),
-        ) {
-            Ok(()) => {
+        let errno = |e: &std::io::Error| e.raw_os_error().map(Errno::from_raw_os_error);
+        match repo_fs::link(&objects, &loose, dir.as_fd(), &name, false) {
+            Ok(Published::Created) => {
                 let st = rustix::fs::statat(dir.as_fd(), &name, AtFlags::SYMLINK_NOFOLLOW)?;
                 Ok(Some((st.st_dev, st.st_ino)))
             }
-            Err(Errno::XDEV) => Ok(None),
-            Err(Errno::EXIST) => Err(collision(&name)),
-            Err(e) => Err(e.into()),
+            Ok(Published::Existed) => Err(collision(&name)),
+            Err(FsError::Io(e)) if errno(&e) == Some(Errno::XDEV) => Ok(None),
+            Err(FsError::Io(e)) if errno(&e) == Some(Errno::NOENT) => Err(Error::ObjectNotFound {
+                checksum,
+                ty: ObjectType::File,
+            }),
+            Err(e) => {
+                Err(object_path_error(e, &loose).into_object_error(&checksum, ObjectType::File))
+            }
         }
     })
     .await
@@ -1476,46 +1513,54 @@ async fn try_link_object(
 
 /// Fills the destination temp file with the payload of the object.
 ///
+/// `payload` is the object file that the load kept open, if it kept one.
+///
 /// If the loose object holds the raw payload (the bare family), the function
-/// tries a `FICLONE` reflink. Otherwise it streams the bytes through
-/// [`FileObject::reader`], which inflates an archive object while it reads. No
-/// whole payload is in memory.
-async fn copy_object(repo: &Repo, obj: &FileObject, temp: &OwnedFd, policy: Policy) -> Result<()> {
+/// fills the temp file from the object file with [`repo_fs::clone_or_copy`]:
+/// a `FICLONE` reflink, or a copy in chunks of bounded size. With no kept
+/// file, the function opens the object with
+/// [`open_regular`](crate::repo_fs::RepoDir::open_regular). An absent object
+/// gives [`Error::ObjectNotFound`], and each other error fails the checkout.
+/// Otherwise the function streams the bytes through the reader of the object,
+/// which inflates an archive object while it reads. No whole payload is in
+/// memory.
+async fn copy_object(
+    repo: &Repo,
+    obj: &FileObject,
+    payload: Option<Payload>,
+    temp: &OwnedFd,
+    policy: Policy,
+) -> Result<()> {
     if policy.repo_mode != RepoMode::Archive {
-        let objects = repo.objects_fd().try_clone_to_owned()?;
-        let loose = loose_path(obj.checksum(), ObjectType::File, policy.repo_mode);
-        let dst = temp.as_fd().try_clone_to_owned()?;
-        let cloned =
-            ostrya_rt::unblock(move || reflink_object(objects.as_fd(), &loose, dst.as_fd())).await;
-        if cloned {
-            return Ok(());
-        }
+        let objects = repo.objects().clone();
+        let checksum = *obj.checksum();
+        let loose = loose_path(&checksum, ObjectType::File, policy.repo_mode);
+        let dst = std::fs::File::from(temp.as_fd().try_clone_to_owned()?);
+        return ostrya_rt::unblock(move || {
+            let src = match payload {
+                Some((file, _)) => file,
+                None => {
+                    objects
+                        .open_regular(&loose)
+                        .map_err(|e| e.into_object_error(&checksum, ObjectType::File))?
+                        .file
+                }
+            };
+            repo_fs::clone_or_copy(&src, &dst)?;
+            Ok(())
+        })
+        .await;
     }
-    let reader = obj.reader().await?;
+    let reader = match payload {
+        Some(payload) => obj.reader_over(Some(payload)),
+        None => obj.reader().await?,
+    };
     let mut writer = RtFile::from(temp.as_fd().try_clone_to_owned()?);
     crate::write::copy_stream(reader, &mut writer)
         .await
         .map_err(Error::Io)?;
     crate::write::flush(&mut writer).await.map_err(Error::Io)?;
     Ok(())
-}
-
-/// Tries to clone the extents of a loose object into `dst` with `FICLONE`.
-///
-/// Each failure returns `false`, and the caller then streams the payload. The
-/// failures include a file system without reflink, a destination on another
-/// file system, and a missing object. If `FICLONE` fails, it writes nothing,
-/// so `dst` stays empty for the stream.
-fn reflink_object(objects: BorrowedFd<'_>, loose: &str, dst: BorrowedFd<'_>) -> bool {
-    match rustix::fs::openat(
-        objects,
-        loose,
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(src) => rustix::fs::ioctl_ficlone(dst, &src).is_ok(),
-        Err(_) => false,
-    }
 }
 
 /// The data that the blocking pool needs to finish a copied regular file.
@@ -2004,7 +2049,7 @@ fn check_hardlink_device(repo: &Repo, policy: Policy, dest: BorrowedFd<'_>) -> R
     if !policy.require_hardlinks {
         return Ok(());
     }
-    let src = rustix::fs::fstat(repo.objects_fd())?.st_dev;
+    let src = repo_fs::stat_fd(repo.objects_fd())?.dev;
     let dst = rustix::fs::fstat(dest)?.st_dev;
     if src == dst {
         return Ok(());
@@ -2016,7 +2061,7 @@ fn check_hardlink_device(repo: &Repo, policy: Policy, dest: BorrowedFd<'_>) -> R
 /// the device of each side. The caller knows that the link crossed a file
 /// system, so this function always returns the error.
 fn hardlink_across_devices(repo: &Repo, dest: BorrowedFd<'_>) -> Result<()> {
-    let src = rustix::fs::fstat(repo.objects_fd())?.st_dev;
+    let src = repo_fs::stat_fd(repo.objects_fd())?.dev;
     let dst = rustix::fs::fstat(dest)?.st_dev;
     Err(Error::HardlinkAcrossDevices { src, dst })
 }

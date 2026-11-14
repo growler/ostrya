@@ -33,7 +33,7 @@ use std::sync::Arc;
 
 use ostrya_core::{
     Checksum, Commit, DirMeta, ObjectType, Ref, RefSelector, RepoMode, Type, Value,
-    choose_offset_size, from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
+    choose_offset_size, from_bytes, to_bytes, tuple_field_from_bytes, write_offset,
 };
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
@@ -2001,16 +2001,7 @@ impl CommitFacts {
 /// The call reads the commit object under the size cap of a metadata object,
 /// on the calling thread.
 fn read_commit_facts(repo: &Repo, commit: &Checksum) -> Result<CommitFacts> {
-    let path = loose_path(commit, ObjectType::Commit, repo.mode());
-    let bytes =
-        crate::object::read_meta_object(repo.objects_fd(), &path, crate::object::MAX_METADATA_SIZE)
-            .map_err(|e| match e.kind() {
-                std::io::ErrorKind::NotFound => Error::ObjectNotFound {
-                    checksum: *commit,
-                    ty: ObjectType::Commit,
-                },
-                _ => Error::Io(e),
-            })?;
+    let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, commit)?;
     CommitFacts::parse(&bytes)
 }
 
@@ -3169,6 +3160,8 @@ const _: fn() = || {
 
 #[cfg(test)]
 mod tests {
+    use ostrya_core::loose_path;
+
     use super::*;
 
     /// The rights of an anonymous client under the implicit group.

@@ -37,7 +37,6 @@
 //!   dependencies and writes nothing for them.
 
 use std::collections::{BTreeMap, HashSet};
-use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::LazyLock;
 
 use ostrya_core::{Checksum, ObjectType, Type, Value, tuple_field_from_bytes};
@@ -46,6 +45,7 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::read::CommitState;
 use crate::repo::Repo;
+use crate::repo_fs::RepoDir;
 use crate::transaction::Transaction;
 
 /// The detached metadata key of the build sources.
@@ -720,12 +720,14 @@ pub(crate) enum HeldDependency<T = ()> {
 ///
 /// - [`Error::Core`] if the commit tuple does not frame, or if its field 2
 ///   does not decode.
-/// - [`Error::Io`] if a file system operation fails, or if the commit object
-///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+/// - [`Error::InvalidFormat`] if the commit object is larger than
+///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+///   file, or if a symlink is on its path.
+/// - [`Error::Io`] if a file system operation fails.
 /// - Each error of `read`.
 pub(crate) fn held_dependency_blocking<T>(
     repo: &Repo,
-    staging: Option<BorrowedFd<'_>>,
+    staging: Option<&RepoDir>,
     checksum: &Checksum,
     read: impl FnOnce(&[u8]) -> Result<T>,
 ) -> Result<HeldDependency<T>> {
@@ -740,7 +742,7 @@ pub(crate) fn held_dependency_blocking<T>(
     let bytes = match staging {
         Some(staging) => {
             let flat = crate::write::flat_name(checksum, ObjectType::Commit, repo.mode());
-            crate::object::read_meta_object(staging, &flat, crate::object::MAX_METADATA_SIZE)?
+            staging.read_capped(&flat, crate::object::MAX_METADATA_SIZE)?
         }
         None => match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
             Ok(bytes) => bytes,
@@ -858,9 +860,11 @@ pub(crate) fn check_order<'a>(
 ///   absent, partial, or nested.
 /// - [`Error::Core`] if the commit tuple of a dependency with no partial
 ///   marker does not frame, or if its field 2 does not decode.
-/// - [`Error::Io`] if a file system operation fails, or if the commit object
-///   of a dependency with no partial marker is larger than
-///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+/// - [`Error::InvalidFormat`] if the commit object of a dependency with no
+///   partial marker is larger than
+///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+///   file, or if a symlink is on its path.
+/// - [`Error::Io`] if a file system operation fails.
 pub(crate) async fn check_dependencies<'a>(
     txn: &Transaction,
     commit: Option<Checksum>,
@@ -873,7 +877,7 @@ pub(crate) async fn check_dependencies<'a>(
     let checksums: Vec<Checksum> = deps.iter().map(|(_, checksum)| *checksum).collect();
     let staged = txn.staged_flags(ObjectType::Commit, &checksums);
     let staging = if staged.contains(&true) {
-        Some(txn.staging_fd().try_clone_to_owned()?)
+        Some(txn.staging_dir().clone())
     } else {
         None
     };
@@ -888,7 +892,7 @@ pub(crate) async fn check_dependencies<'a>(
             if !checked.insert(*checksum) {
                 continue;
             }
-            let staging = staging.as_ref().filter(|_| staged).map(|fd| fd.as_fd());
+            let staging = staging.as_ref().filter(|_| staged);
             let defect = match held_dependency_blocking(&repo, staging, checksum, |_| Ok(()))? {
                 HeldDependency::Absent => "which is in neither the repository nor the transaction",
                 HeldDependency::Partial => PARTIAL_REASON,

@@ -138,6 +138,12 @@ An exclusive lock that serializes each write of refs, \fB\%config\fR, keyrings, 
 \fB\%<repo>/objects/\fR
 The object store.
 The section OBJECTS gives its layout.
+Each read of an object refuses a symbolic link at \fB\%objects/<xx>\fR, with the error \fB\%invalid format: objects/<xx>/<name> passes through a symlink; ostrya refuses a symlink in the repository\fR.
+It refuses a symbolic link at an object that the repository mode stores as a regular file, with the same error.
+It refuses each other object that is not a regular file, with the error \fB\%invalid format: objects/<xx>/<name> is not a regular file\fR.
+In a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository, a symbolic link at a \fB\%.file\fR object is a symbolic link object.
+The read of a FIFO does not wait for a writer.
+A listing of the objects, the device and inode cache of \fB\%ostrya commit \-\-link\-checkout\-speedup\fR, and the resolve of an abbreviated checksum refuse a symbolic link and an entry that is not a directory at \fB\%objects/<xx>\fR.
 .TP
 \fB\%<repo>/refs/heads/<ref>\fR
 A local ref.
@@ -172,11 +178,13 @@ Remove such a ref by hand.
 A marker of a commit that the repository does not hold in full.
 A pull writes it before it fetches the objects of the commit, and removes it when the pull completes.
 A pull with \fB\%\-\-subpath\fR or \fB\%\-\-commit\-metadata\-only\fR keeps it.
+The read of the state of a commit refuses a symbolic link at \fB\%state\fR.
 .TP
 \fB\%<repo>/tmp/\fR
 The staging area.
 Each transaction makes a directory \fB\%tmp/staging\-<boot\-id>\-<6 characters>/\fR and a lock file with the same name and the suffix \fB\%\-lock\fR.
 A transaction writes its objects there and moves them into \fB\%objects/\fR when it commits.
+Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 At the start of each transaction, ostrya removes each staging directory whose lock is free.
 It removes a staging directory with no lock file, and each other entry except a staging lock file, when the entry is older than \fB\%core.tmp\-expiry\-secs\fR.
 \fB\%tmp/cache/\fR is never removed.
@@ -185,7 +193,8 @@ It removes a staging directory with no lock file, and each other entry except a 
 Reserved.
 \fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored, except \fB\%extensions/ostrya/\fR.
 The repository holds no symbolic link.
-A ref alias and a symbolic link object of a \fB\%bare\fR repository are entries of the format, and the rule does not apply to them.
+A ref alias and a symbolic link object of a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository are entries of the format, and the rule does not apply to them.
+The read of a symbolic link object reads its target and does not follow it.
 Each read and write of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, and these two directories.
 Each prune and fsck of the composefs images refuses the same symbolic links.
 The error names the path relative to the repository: \fB\%invalid format: <path> is a symlink; ostrya refuses a symlink in the repository\fR.

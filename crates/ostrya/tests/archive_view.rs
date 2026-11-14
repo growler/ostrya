@@ -406,6 +406,14 @@ fn a_built_filez_carries_the_split_xattrs() {
         symlink("/etc/passwd", &link_path).unwrap();
         let filez = object_path(ObjectType::File, &regular);
         assert_both(&view, &filez, true).await;
+
+        // The view checks the object before its link. An absent object is not
+        // found, in a fan-out directory that exists and in one that does not.
+        let hex = regular.to_hex();
+        for fanout in [&hex[..2], "00"] {
+            let absent = format!("objects/{fanout}/{}.filez", "e".repeat(62));
+            assert_both(&view, &absent, false).await;
+        }
     });
 }
 

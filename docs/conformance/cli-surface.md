@@ -7317,6 +7317,71 @@ Observed by running the tool (2026.1).
   `refs/heads`, `state`, or `extensions`, it exits 0, keeps the symlink, and
   makes the directories below `tmp` and `refs` in the target. With a regular
   file at `state`, it exits 0 and keeps the file.
+  A symlink at `objects/<xx>` fails each read of an object below it in the
+  port, in each open mode, with `invalid format: objects/<xx>/<name> passes
+  through a symlink; ostrya refuses a symlink in the repository`. The listing
+  of the objects, the device and inode cache of `commit
+  --link-checkout-speedup`, and the resolve of an abbreviated checksum fail
+  with `invalid format: objects/<xx> passes through a symlink; ostrya refuses
+  a symlink in the repository`. These reads also fail at an entry
+  `objects/<xx>` that is not a directory, with `is not a directory` in place
+  of the symlink text. With libostree 2026.4 on 2026-11-13, against a
+  repository with an absolute symlink at the fan-out directory of its commit,
+  `refs`, `rev-parse`, `ls`, `fsck`, `commit`, `checkout -U`, `pull-local
+  --commit-metadata-only`, `summary -u`, `prune --refs-only`, `config set`,
+  and `config get` exit 0 with the output of a repository with no symlink.
+  The tool writes the new objects through the symlink.
+  A symlink at the path of a metadata object, at a `.filez` object of an
+  `archive` repository, or at a `.file` object of a `bare-user` repository
+  fails each read of the object in the port, in each open mode, with
+  `invalid format: objects/<xx>/<name> passes through a symlink; ostrya
+  refuses a symlink in the repository`. In the `bare`, `bare-user-only`, and
+  `bare-split-xattrs` modes, the port reads a symlink at the path of a
+  `.file` object as a symlink content object: it reads the target with
+  `readlinkat` and does not follow it. A check of the checksum of that
+  object, as `fsck` makes it, finds a mismatch. A FIFO at the path of an
+  object fails each read in the port with `invalid format:
+  objects/<xx>/<name> is not a regular file`, and the read does not wait for
+  a writer. With libostree 2026.4 on 2026-11-14, against repositories in the
+  modes `archive`, `bare-user`, and `bare`, with an absolute symlink or a
+  FIFO at the path of an object, the tool gives these results for `ls`, `ls
+  -R`, `cat`, `fsck`, `checkout`, `checkout -U` (`bare-user` alone),
+  `pull-local` into a new repository of the same mode, and `log`:
+  - A symlink at a `.commit` or `.dirtree` object, in each mode: the tool
+    follows the symlink, and each command exits 0.
+  - A symlink at a `.filez` object: the tool follows the symlink, and each
+    command exits 0.
+  - A symlink at a `.file` object of `bare-user`: each command except `log`
+    exits 1 with `Opening content object <checksum>:
+    fgetxattr(user.ostreemeta): Bad file descriptor`. `log` exits 0.
+  - A symlink at a `.file` object of `bare`: the tool reads the symlink as a
+    symlink content object. `ls`, `ls -R`, `checkout`, and `pull-local` exit
+    0. `cat` exits 1 with `No such file or directory`. `fsck` exits 1 with
+    `Corrupted file object; checksum expected=...`. `log` exits 0.
+  - A FIFO at a `.filez` object: `ls`, `ls -R`, `cat`, `fsck`, and
+    `checkout` do not end, and a timeout of 10 seconds stops them.
+    `pull-local` and `log` exit 0.
+  - A FIFO at a `.file` object of `bare-user` or `bare`: each command except
+    `log` exits 1 with `Opening content object <checksum>: Not a regular
+    file or symlink`. `log` exits 0.
+  - A FIFO at a `.dirtree` object, in each mode: each command except `log`
+    does not end. `log` exits 0.
+
+  A symlink at `state` fails the read of the state of a commit in the port,
+  with `invalid format: state/<checksum>.commitpartial passes through a
+  symlink; ostrya refuses a symlink in the repository`. Each load of a
+  commit reads its state, so `log`, `show`, `ls`, and the other commands that
+  load a commit fail. With libostree 2026.4 on 2026-11-13, against a
+  repository with an absolute symlink at `state`, the commands of the first
+  list above exit 0, and `pull-local --commit-metadata-only` writes
+  `state/<checksum>.commitpartial` through the symlink.
+  A symlink at `tmp` or at `tmp/cache`, or an entry that is not a directory
+  there, fails the begin of each transaction in the port, for example in
+  `commit` and `pull-local`, with `invalid format: tmp passes through a
+  symlink; ostrya refuses a symlink in the repository` or the same text for
+  `tmp/cache`. A transaction makes `tmp` and `tmp/cache` if they are
+  absent. With libostree 2026.4 on 2026-11-13, against a repository with an
+  absolute symlink at `tmp`, the commands of the first list above exit 0.
 - The global option `--remotes-config-dir=PATH` and the key `[ex-ostrya]
   remotes-config-dir` are port extensions. The tool has no such option and
   ignores the key. The `ostrya` command selects the remotes directory of a

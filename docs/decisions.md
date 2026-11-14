@@ -155,12 +155,13 @@ refuses it and does not give it that meaning. A caller with an absolute
 directory gives a `RemotesDir::Path` value. A create also refuses a path that
 is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
-The open of `objects` and the read of `config` do not depend on the open
-mode. Each is one `openat2` from the root with `RESOLVE_BENEATH` and
+The open of `objects`, the read of `config`, and each read of an object do
+not depend on the open mode. Each is one `openat2` with `RESOLVE_BENEATH` and
 `RESOLVE_NO_SYMLINKS`, with no fallback to `openat`. A symlink at `objects`
-or at `config` fails each open. `Repo::open_at_strict` reads no remotes
-directory. The open follows a symlink in the path of the root, because the
-caller names that path.
+or at `config` fails each open. A symlink at `objects/<xx>`, or at an object
+that the repository mode stores as a regular file, fails each read of the
+object. `Repo::open_at_strict` reads no remotes directory. The open follows
+a symlink in the path of the root, because the caller names that path.
 
 ## The create of a repository
 

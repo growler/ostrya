@@ -21,6 +21,7 @@ use crate::error::{Error, Result};
 use crate::jobs::{Jobs, Tracked};
 use crate::lock::{LockGuard, UpdateLockHeld};
 use crate::repo::Repo;
+use crate::repo_fs::RepoDir;
 use crate::staging::StagingDir;
 use crate::write::{
     Blocks, StageCtx, StageOutcome, TempKind, probe_fresh_owner, publish_blocking,
@@ -225,6 +226,10 @@ struct DetachedQueue {
 /// transaction lives, it holds an exclusive record lock on the sibling file
 /// `staging-<boot-id>-XXXXXX-lock`.
 ///
+/// The transaction makes `tmp/` and `tmp/cache` if they are absent. It
+/// follows no symlink at `tmp` or at `tmp/cache`: a symlink there, or an
+/// entry that is not a directory, fails the begin.
+///
 /// The boot id separates the directories of the current boot from the
 /// directories of earlier boots. The owner of a directory of the current boot
 /// can still be alive. The owner of a directory of an earlier boot is gone.
@@ -416,6 +421,14 @@ impl Transaction {
     /// Returns the repository that this transaction writes to.
     pub(crate) fn repo(&self) -> &Repo {
         &self.repo
+    }
+
+    /// Returns the handle of the staging directory, where the objects go.
+    pub(crate) fn staging_dir(&self) -> &RepoDir {
+        self.staging
+            .as_ref()
+            .expect("staging directory present during the transaction")
+            .dir()
     }
 
     /// Returns the descriptor of the staging directory, where the objects go.
@@ -679,7 +692,7 @@ impl Transaction {
         measure: bool,
     ) -> Result<crate::file::FileObject> {
         if self.is_staged(checksum, ObjectType::File) {
-            crate::file::load_staged_file(&self.repo, self.staging_fd(), checksum, measure).await
+            crate::file::load_staged_file(&self.repo, self.staging_dir(), checksum, measure).await
         } else {
             self.repo.load_file_with(checksum, measure).await
         }
@@ -699,16 +712,11 @@ impl Transaction {
     ) -> Result<ostrya_core::DirTree> {
         if self.is_staged(checksum, ObjectType::DirTree) {
             let name = crate::write::flat_name(checksum, ObjectType::DirTree, self.repo.mode());
-            let staging = self.staging_fd().try_clone_to_owned()?;
+            let staging = self.staging_dir().clone();
             let bytes = ostrya_rt::unblock(move || {
-                crate::object::read_meta_object(
-                    staging.as_fd(),
-                    &name,
-                    crate::object::MAX_METADATA_SIZE,
-                )
+                staging.read_capped(&name, crate::object::MAX_METADATA_SIZE)
             })
-            .await
-            .map_err(Error::Io)?;
+            .await?;
             Ok(ostrya_core::DirTree::parse(&bytes)?)
         } else {
             self.repo.load_dirtree(checksum).await
@@ -727,16 +735,11 @@ impl Transaction {
     ) -> Result<ostrya_core::DirMeta> {
         if self.is_staged(checksum, ObjectType::DirMeta) {
             let name = crate::write::flat_name(checksum, ObjectType::DirMeta, self.repo.mode());
-            let staging = self.staging_fd().try_clone_to_owned()?;
+            let staging = self.staging_dir().clone();
             let bytes = ostrya_rt::unblock(move || {
-                crate::object::read_meta_object(
-                    staging.as_fd(),
-                    &name,
-                    crate::object::MAX_METADATA_SIZE,
-                )
+                staging.read_capped(&name, crate::object::MAX_METADATA_SIZE)
             })
-            .await
-            .map_err(Error::Io)?;
+            .await?;
             Ok(ostrya_core::DirMeta::parse(&bytes)?)
         } else {
             self.repo.load_dirmeta(checksum).await
@@ -762,8 +765,10 @@ impl Transaction {
     ///
     /// - [`Error::ObjectNotFound`] if the dirtree of `tree` is not staged and
     ///   not in `objects/`.
-    /// - [`Error::Io`] if the read of the dirtree fails, or if the dirtree is
-    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the dirtree is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the read of the dirtree fails.
     /// - [`Error::Core`] if the dirtree does not parse.
     pub async fn read_dir(&self, tree: &crate::RepoTree) -> Result<Vec<crate::TreeEntry>> {
         let dirtree = self
@@ -970,8 +975,10 @@ impl Transaction {
     ///
     /// - [`Error::ObjectNotFound`] if the commit is not staged and not in
     ///   `objects/`.
-    /// - [`Error::Io`] if the read of the commit object fails, or if the object
-    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if the read of the commit object fails.
     /// - [`Error::Signature`] if `signer` cannot make a signature. An error of
     ///   a signer can also convert to [`Error::InvalidFormat`] or
     ///   [`Error::Core`].
@@ -1010,16 +1017,13 @@ impl Transaction {
                 .await;
         }
         let name = crate::write::flat_name(checksum, ObjectType::Commit, self.repo.mode());
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
-            crate::object::read_meta_object(
-                staging.as_fd(),
-                &name,
-                crate::object::MAX_METADATA_SIZE,
-            )
-        })
-        .await
-        .map_err(Error::Io)
+        let staging = self.staging_dir().clone();
+        Ok(
+            ostrya_rt::unblock(move || {
+                staging.read_capped(&name, crate::object::MAX_METADATA_SIZE)
+            })
+            .await?,
+        )
     }
 
     /// Loads a commit object as
@@ -1041,14 +1045,9 @@ impl Transaction {
             .await;
         }
         let name = crate::write::flat_name(checksum, ObjectType::Commit, self.repo.mode());
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let staging = self.staging_dir().clone();
         ostrya_rt::unblock(move || {
-            let bytes = crate::object::read_meta_object(
-                staging.as_fd(),
-                &name,
-                crate::object::MAX_METADATA_SIZE,
-            )
-            .map_err(Error::Io)?;
+            let bytes = staging.read_capped(&name, crate::object::MAX_METADATA_SIZE)?;
             Ok(Commit::parse(&bytes)?)
         })
         .await

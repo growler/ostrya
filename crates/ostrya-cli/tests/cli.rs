@@ -1644,6 +1644,16 @@ fn strace_available() -> bool {
         .unwrap_or(false)
 }
 
+/// Returns `true` if the `strace` line `line` is an open of a file for a
+/// read: an `open`, `openat`, or `openat2` call with no `O_PATH`. An open
+/// with `O_PATH` checks for an entry and reads no byte.
+fn is_read_open(line: &str) -> bool {
+    ["open(", "openat(", "openat2("]
+        .iter()
+        .any(|call| line.contains(call))
+        && !line.contains("O_PATH")
+}
+
 /// The `fsync`, `fdatasync`, and `syncfs` calls of one `commit`, in call order.
 /// Each call is a pair of the call name and the path that `strace -y` prints
 /// for the descriptor. The path is relative to the repository, and `.` is the
@@ -4611,7 +4621,7 @@ fn sign_verify_with_two_engines_reads_the_commit_once() {
     .stdout_trimmed();
     let trace = base.join("trace");
     let out = Command::new("strace")
-        .args(["-y", "-f", "-e", "trace=openat", "-o"])
+        .args(["-y", "-f", "-e", "trace=openat,openat2", "-o"])
         .arg(&trace)
         .arg(env!("CARGO_BIN_EXE_ostrya"))
         .args([
@@ -4641,7 +4651,7 @@ fn sign_verify_with_two_engines_reads_the_commit_once() {
     let opens = |suffix: &str| {
         let path = format!("{}/{}.{suffix}\"", &commit[..2], &commit[2..]);
         text.lines()
-            .filter(|line| line.contains("openat(") && line.contains(&path))
+            .filter(|line| is_read_open(line) && line.contains(&path))
             .count()
     };
     assert_eq!(opens("commit"), 1, "the opens of the commit object");
@@ -15409,7 +15419,13 @@ fn commit_related_checks_each_dependency_once() {
     let tree = ex_ostrya_tree(base, "head");
     let trace = base.join("trace");
     let out = Command::new("strace")
-        .args(["-y", "-f", "-e", "trace=openat,newfstatat,statx", "-o"])
+        .args([
+            "-y",
+            "-f",
+            "-e",
+            "trace=openat,openat2,newfstatat,statx",
+            "-o",
+        ])
         .arg(&trace)
         .arg(env!("CARGO_BIN_EXE_ostrya"))
         .args([
@@ -15435,7 +15451,7 @@ fn commit_related_checks_each_dependency_once() {
     let marker = format!("{dep}.commitpartial\"");
     let opens = text
         .lines()
-        .filter(|line| line.contains("openat(") && line.contains(&object))
+        .filter(|line| is_read_open(line) && line.contains(&object))
         .count();
     let stats = text.lines().filter(|line| line.contains(&marker)).count();
     assert_eq!(opens, 1, "the opens of the dependency commit object");
@@ -15783,7 +15799,7 @@ fn show_and_log_open_each_file_once() {
     ] {
         let trace = base.join(format!("trace-{command}"));
         let out = Command::new("strace")
-            .args(["-y", "-f", "-e", "trace=openat", "-o"])
+            .args(["-y", "-f", "-e", "trace=openat,openat2", "-o"])
             .arg(&trace)
             .arg(env!("CARGO_BIN_EXE_ostrya"))
             .args([command, "--repo", repo_s, rev])
@@ -15802,7 +15818,7 @@ fn show_and_log_open_each_file_once() {
         let opens = |path: &str| {
             let path = format!("{path}\"");
             text.lines()
-                .filter(|line| line.contains("openat(") && line.contains(&path))
+                .filter(|line| is_read_open(line) && line.contains(&path))
                 .count()
         };
         for commit in signed {
@@ -46776,7 +46792,9 @@ fn pull_local_gpg_verify_adds_no_commit_read() {
             .map(|commit| {
                 let object = format!("{}/{}.commit\"", &commit[..2], &commit[2..]);
                 text.lines()
-                    .filter(|line| line.contains(src_s) && line.contains(&object))
+                    .filter(|line| {
+                        is_read_open(line) && line.contains(src_s) && line.contains(&object)
+                    })
                     .count()
             })
             .collect()

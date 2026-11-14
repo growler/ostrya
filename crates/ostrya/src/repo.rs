@@ -525,10 +525,10 @@ struct RepoInner {
     // The remotes directory that the open selected, or that the create took.
     // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
-    // The strict open mode of `Repo::open_at_strict`: the reads of the
-    // objects and of the composefs image follow no symlink in any component
-    // of their path, do not block on a FIFO, and refuse a file that is not a
-    // regular file.
+    // The strict open mode of `Repo::open_at_strict`: the read of the
+    // composefs image, the read of `summary`, and the object copies of a
+    // local pull follow no symlink in any component of their path, do not
+    // block on a FIFO, and refuse a file that is not a regular file.
     strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
@@ -653,23 +653,12 @@ impl Repo {
     ///
     /// - The open reads no `[ex-ostrya] remotes-config-dir` key and no remotes
     ///   directory, so the handle has no remotes directory.
-    /// - The reads of each metadata object, of the stored
-    ///   composefs image, and of `summary` by
+    /// - The reads of the stored composefs image and of `summary` by
     ///   [`read_summary`](Repo::read_summary) open the file with `openat2`,
     ///   `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and
     ///   refuse a file that is not a regular file. A symlink at any
     ///   component of the path, a FIFO, or a device fails the read and does
     ///   not block it.
-    /// - The load of a file object opens its fan-out directory
-    ///   `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
-    ///   `RESOLVE_NO_SYMLINKS`, and loads the object relative to it. A symlink
-    ///   at `objects/<xx>` fails the load. Each open of the payload by the
-    ///   [`FileObject`](crate::FileObject) of the load opens `objects/<xx>`
-    ///   again in the same way. It then opens the object file relative to it
-    ///   with `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-    ///   `O_NONBLOCK`, and refuses a file that is not a regular file. A
-    ///   symlink at the object path, a FIFO, or a device fails the open and
-    ///   does not block it.
     /// - The link, the copy, and the clone of an object by a local pull from
     ///   the handle follow no symlink at `objects/<xx>`. Before a hardlink,
     ///   the pull opens `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
@@ -677,14 +666,15 @@ impl Repo {
     ///   not a regular file, except a symlink content object of a `bare`,
     ///   `bare-user-only`, or `bare-split-xattrs` repository. It also refuses
     ///   an object that changed between its check and its link. A copy of a
-    ///   metadata object, a clone of a payload, and a copy of the bytes of a
-    ///   `.filez` file open the object with `openat2`, `RESOLVE_BENEATH`,
-    ///   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is
-    ///   not a regular file. A symlink at the object path, a FIFO, or a
-    ///   device fails the copy and does not block it.
+    ///   metadata object and a clone of a payload open the object with
+    ///   `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+    ///   `O_NONBLOCK`, and refuse a file that is not a regular file. A
+    ///   symlink at the object path, a FIFO, or a device fails the copy and
+    ///   does not block it.
     ///
-    /// The open of `objects` and the read of `config` are the same as in
-    /// [`open_at`](Repo::open_at).
+    /// The open of `objects`, the read of `config`, and each read of an
+    /// object by the handle, also the copy of the bytes of a `.filez` file by
+    /// a local pull, are the same as in [`open_at`](Repo::open_at).
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.
@@ -927,6 +917,8 @@ impl Repo {
     /// - The errors of [`RepoConfig::generate_composefs`]: a value of
     ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
     ///   `true` in an `archive` repository.
+    /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory. The call makes each of them that is absent.
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction(&self) -> Result<Transaction> {
@@ -971,6 +963,8 @@ impl Repo {
     /// - The errors of [`RepoConfig::generate_composefs`]: a value of
     ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
     ///   `true` in an `archive` repository.
+    /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory. The call makes each of them that is absent.
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
@@ -987,7 +981,7 @@ impl Repo {
         let repo = self.clone();
         let staging = ostrya_rt::unblock(move || {
             let mode = repo.inner.config.mode();
-            StagingDir::create(repo.repo_fd(), expiry_secs, mode)
+            StagingDir::create(repo.root_dir(), expiry_secs, mode)
         })
         .await?;
 
@@ -1168,6 +1162,12 @@ impl Repo {
     /// access to `refs/`, `state/`, and the rest of the layout starts from it.
     pub(crate) fn repo_fd(&self) -> BorrowedFd<'_> {
         self.inner.root.as_fd()
+    }
+
+    /// Returns the handle of `objects/`. Each read of a loose object starts
+    /// from it.
+    pub(crate) fn objects(&self) -> &RepoDir {
+        &self.inner.objects
     }
 
     /// Returns the descriptor of `objects/`. Access to loose objects starts

@@ -344,7 +344,7 @@ fn is_whiteout(rdev: u64) -> bool {
 /// Reads the owner, the mode, and the full xattr set of a directory.
 fn read_dir_own(dir: BorrowedFd<'_>) -> Result<(u32, u32, u32, Xattrs)> {
     let stat = rustix::fs::fstat(dir)?;
-    let xattrs = crate::object::read_all_xattrs(dir)?;
+    let xattrs = crate::ingest::read_all_xattrs(dir)?;
     Ok((stat.st_uid, stat.st_gid, stat.st_mode, xattrs))
 }
 
@@ -414,11 +414,11 @@ fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &OverlayKind) -> Res
     let oflags = match kind {
         OverlayKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         OverlayKind::Dir => OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        OverlayKind::Symlink(_) => return crate::object::read_link_xattrs(dir, name),
+        OverlayKind::Symlink(_) => return crate::ingest::read_link_xattrs(dir, name),
         OverlayKind::Whiteout => return Ok(Xattrs::empty()),
     };
     let fd = rustix::fs::openat(dir, name, oflags, Mode::empty())?;
-    crate::object::read_all_xattrs(fd.as_fd())
+    crate::ingest::read_all_xattrs(fd.as_fd())
 }
 
 /// Opens the subdirectory `name` of `parent` with no-follow.

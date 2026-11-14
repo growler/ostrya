@@ -400,9 +400,11 @@ impl Transaction {
     ///   the repository mode. [`Repo::load_file`] lists the cases.
     /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
     ///   [`Repo::export_composefs`] lists the limits.
-    /// - [`Error::Io`] if a file system operation fails, if a metadata object
-    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
-    ///   an `archive` payload does not inflate.
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails, or if an `archive`
+    ///   payload does not inflate.
     pub async fn composefs_digest(&self, root: &RepoTree) -> Result<[u8; 32]> {
         let dir = composefs_model(
             ObjectSource::Staged(self),
@@ -533,8 +535,10 @@ impl Transaction {
     /// - [`Error::Core`] if the commit object does not parse.
     /// - [`Error::InsufficientFreeSpace`] if the image needs more space than
     ///   the free-space budget of the transaction holds.
-    /// - [`Error::Io`] if a file system operation fails, or if the commit
-    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails.
     pub async fn attach_composefs_image(
         &self,
         commit: &Checksum,
@@ -890,9 +894,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if a file object does not have the form of
     ///   the repository mode. [`Repo::load_file`] lists the cases.
     /// - [`Error::Unsupported`] if the tree does not fit a limit of the image.
-    /// - [`Error::Io`] if a file system operation fails, if a metadata object
-    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
-    ///   an `archive` payload does not inflate.
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails, or if an `archive`
+    ///   payload does not inflate.
     pub async fn export_composefs(
         &self,
         commit: &Checksum,
@@ -929,9 +935,11 @@ impl Repo {
     ///   [`export_composefs`](Repo::export_composefs) lists the limits.
     /// - [`Error::Io`] if the duplicate of `out` fails, or if a write to `out`
     ///   or its flush fails.
-    /// - [`Error::Io`] if another file system operation fails, if a metadata
-    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-    ///   or if an `archive` payload does not inflate.
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if another file system operation fails, or if an
+    ///   `archive` payload does not inflate.
     pub async fn export_composefs_to(
         &self,
         commit: &Checksum,
@@ -1090,9 +1098,11 @@ impl Repo {
     ///   repository config is malformed.
     /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
     ///   `[ex-integrity] composefs` in the repository config is malformed.
-    /// - [`Error::Io`] if a file system operation fails, if a metadata object
-    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if
-    ///   an `archive` payload does not inflate.
+    /// - [`Error::InvalidFormat`] if a metadata object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
+    /// - [`Error::Io`] if a file system operation fails, or if an `archive`
+    ///   payload does not inflate.
     /// - If `[ex-ostrya] generate-composefs` is `true`, the errors of
     ///   [`build_composefs_image`](Transaction::build_composefs_image) and of
     ///   [`attach_composefs_image`](Transaction::attach_composefs_image).
@@ -1222,9 +1232,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the first entry of
     ///   `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
     ///   bytes.
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a read of the image or another file system operation
-    ///   fails, or if the commit object is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    ///   fails.
     pub async fn check_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageState> {
         let bytes = self.load_object_bytes(ObjectType::Commit, commit).await?;
         let commit_obj = Commit::parse(&bytes)?;
@@ -1273,9 +1285,11 @@ impl Repo {
     /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
     ///   the key.
     /// - [`Error::Core`] if the commit object does not parse.
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+    ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a read of the image or another file system operation
-    ///   fails, or if the commit object is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    ///   fails.
     pub async fn open_composefs_image_checked(
         &self,
         commit: &Checksum,

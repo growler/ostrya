@@ -400,6 +400,65 @@ fn bare_user_only_force_copy_makes_an_independent_copy() {
     });
 }
 
+/// A checkout refuses a symlink at the fan-out directory of a content
+/// object, with the hardlink and with `force_copy`. The commit, the dirtree,
+/// and the dirmeta are in other fan-out directories, so they load. The error
+/// names the path of the object.
+#[test]
+fn checkout_refuses_a_symlinked_fanout_of_a_content_object() {
+    let tmp = TmpDir::new("co-fanout-link");
+    let base = tmp.path();
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let repo_dir = base.join("repo");
+
+    block_on(async {
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::BareUserOnly))
+            .await
+            .unwrap();
+        // A content that puts the file in a fan-out directory of its own.
+        let (commit, file) = 'found: {
+            for n in 0u32.. {
+                std::fs::write(src.join("f"), format!("payload {n}\n")).unwrap();
+                let commit = commit_tree(&repo, base, "src").await;
+                let (commit_obj, _) = repo.load_commit(&commit).await.unwrap();
+                let file = file_checksum(&repo, &commit.to_hex(), "f").await;
+                let others = [commit, commit_obj.root_dirtree, commit_obj.root_dirmeta];
+                if others
+                    .iter()
+                    .all(|other| other.as_bytes()[0] != file.as_bytes()[0])
+                {
+                    break 'found (commit, file);
+                }
+            }
+            unreachable!("the loop ends at a file of its own fan-out directory");
+        };
+        let hex = file.to_hex();
+        let fanout = repo_dir.join("objects").join(&hex[..2]);
+        let moved = base.join("moved");
+        std::fs::rename(&fanout, &moved).unwrap();
+        symlink(&moved, &fanout).unwrap();
+        let want = format!(
+            "objects/{} passes through a symlink; ostrya refuses a symlink in the repository",
+            loose_path(&file, ObjectType::File, RepoMode::BareUserOnly)
+        );
+
+        let base_fd = std::fs::File::open(base).unwrap();
+        for (dest, force_copy) in [("co-link", false), ("co-copy", true)] {
+            let mut opts = CheckoutOptions::new(CheckoutMode::None);
+            opts.force_copy = force_copy;
+            let err = repo
+                .checkout_at(&mut opts, base_fd.as_fd(), Path::new(dest), &commit)
+                .await
+                .unwrap_err();
+            match err {
+                ostrya::Error::InvalidFormat(m) => assert_eq!(m, want, "{dest}"),
+                other => panic!("{dest}: {other}"),
+            }
+        }
+    });
+}
+
 // --- round-trip stability -----------------------------------------------
 
 #[test]

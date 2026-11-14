@@ -31,6 +31,7 @@ use crate::config::valid_remote_name;
 use crate::error::{Error, Result};
 use crate::perm;
 use crate::repo::Repo;
+use crate::repo_fs::{FsResultExt, RepoDir};
 use crate::staging::{REF_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::summary::SelectionFloor;
 use crate::transaction::Transaction;
@@ -520,7 +521,7 @@ impl Repo {
         if is_abbreviated_checksum(rev) {
             let repo = self.clone();
             let prefix = rev.to_owned();
-            match ostrya_rt::unblock(move || match_abbreviated(repo.objects_fd(), &prefix)).await? {
+            match ostrya_rt::unblock(move || match_abbreviated(repo.objects(), &prefix)).await? {
                 AbbrevMatch::One(checksum) => return Ok(Some((checksum, RevKind::Checksum))),
                 AbbrevMatch::Ambiguous => return Err(Error::AmbiguousRefspec(rev.to_owned())),
                 AbbrevMatch::None => {}
@@ -1571,24 +1572,30 @@ enum AbbrevMatch {
 /// first two characters, and the call opens that directory by name. A
 /// one-character prefix scans the sixteen fanouts whose name starts with it,
 /// found from a listing of `objects/`.
-fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevMatch> {
+///
+/// A fanout directory that the scan reads and that is a symlink or is not a
+/// directory fails the scan.
+fn match_abbreviated(objects: &RepoDir, prefix: &str) -> Result<AbbrevMatch> {
     let mut found: Option<Checksum> = None;
     if prefix.len() >= 2 {
         let (fanout, within) = prefix.split_at(2);
-        if scan_fanout(objects_fd, fanout, within, &mut found)? {
+        if scan_fanout(objects, fanout, within, &mut found)? {
             return Ok(AbbrevMatch::Ambiguous);
         }
     } else {
-        for fanout in read_dir_names(objects_fd)? {
+        for entry in objects.list()? {
             // The name of an object fanout directory is two hex characters.
             // Each other entry under `objects/` is not a loose-object fanout.
+            let Ok(fanout) = std::str::from_utf8(&entry.name) else {
+                continue;
+            };
             if fanout.len() != 2 || !fanout.bytes().all(|b| b.is_ascii_hexdigit()) {
                 continue;
             }
             if !fanout.starts_with(prefix) {
                 continue;
             }
-            if scan_fanout(objects_fd, &fanout, "", &mut found)? {
+            if scan_fanout(objects, fanout, "", &mut found)? {
                 return Ok(AbbrevMatch::Ambiguous);
             }
         }
@@ -1603,23 +1610,19 @@ fn match_abbreviated(objects_fd: BorrowedFd<'_>, prefix: &str) -> Result<AbbrevM
 /// starts with `within`, and records each match in `found`. An absent fanout
 /// directory holds no match. Returns `true` if the prefix is ambiguous.
 fn scan_fanout(
-    objects_fd: BorrowedFd<'_>,
+    objects: &RepoDir,
     fanout: &str,
     within: &str,
     found: &mut Option<Checksum>,
 ) -> Result<bool> {
-    let dir = match rustix::fs::openat(
-        objects_fd,
-        fanout,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(false),
-        Err(e) => return Err(Error::Io(e.into())),
+    let Some(dir) = objects.open_dir(fanout).optional()? else {
+        return Ok(false);
     };
-    for entry in read_dir_names(dir.as_fd())? {
-        let Some(checksum) = matching_commit(fanout, &entry, within) else {
+    for entry in dir.list()? {
+        let Some(checksum) = std::str::from_utf8(&entry.name)
+            .ok()
+            .and_then(|entry| matching_commit(fanout, entry, within))
+        else {
             continue;
         };
         // The fanout holds the first two characters of a checksum, so two

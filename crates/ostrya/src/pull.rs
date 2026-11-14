@@ -1397,7 +1397,7 @@ impl Repo {
     ///
     /// - a file that this process cannot read.
     /// - an entry that is not a regular file.
-    /// - a symlink that points to no file.
+    /// - a symlink at the dirtree or at its fan-out directory.
     /// - a file larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - bytes that do not parse as a dirtree.
     ///
@@ -1795,12 +1795,15 @@ impl Repo {
     ///   or of a dependency when the pull applies its delta. Also if a
     ///   `.filez` that the pull copies has bytes after its payload, or a
     ///   payload that does not inflate to the size that its header declares.
+    /// - [`Error::InvalidFormat`] for a held dirtree that is not a regular
+    ///   file, that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or that has a
+    ///   symlink on its path.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
-    ///   dirtree that the pull cannot read, that is not a regular file, or that
-    ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    ///   Also if the read of a ref file of `src` fails, for example with
-    ///   `EACCES`, or if the path of a requested ref names a directory or
-    ///   goes through a file, before the pull writes an object.
+    ///   dirtree that the pull cannot read. Also if the read of a ref file of
+    ///   `src` fails, for example with `EACCES`, or if the path of a requested
+    ///   ref names a directory or goes through a file, before the pull writes
+    ///   an object.
     pub async fn pull_local(&self, src: &Repo, mut opts: PullOptions) -> Result<PullStats> {
         let started = Instant::now();
         // A local pull copies whole trees. The `ostree pull-local` command
@@ -3033,9 +3036,10 @@ struct ChainDependencies {
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a dependency that
 ///   the call reads from a source does not hash to its name.
 /// - [`Error::Core`] if the commit object of a dependency does not parse.
-/// - [`Error::Io`] if a file system operation fails, or if the commit object
-///   of a dependency is larger than
-///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+/// - [`Error::InvalidFormat`] if the commit object of a dependency is larger
+///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
+///   file, or if a symlink is on its path.
+/// - [`Error::Io`] if a file system operation fails.
 async fn collect_dependencies(
     repo: &Repo,
     sources: &[&Repo],
@@ -4341,8 +4345,8 @@ async fn link_import(
 /// to its name, and a payload that does not inflate to the size that its
 /// header declares. `meta` is the logical metadata of the object.
 ///
-/// If `src` is a handle in the strict open mode, the open of the `.filez`
-/// file is the strict open of [`Repo::open_at_strict`].
+/// The open of the `.filez` file follows no symlink at any component of its
+/// path below `objects/`, and refuses a file that is not a regular file.
 async fn import_filez(
     txn: &Transaction,
     src: &Repo,
@@ -4352,26 +4356,16 @@ async fn import_filez(
 ) -> Result<()> {
     let path = name.loose_path(src.mode());
     let repo = src.clone();
-    let (file, len) = ostrya_rt::unblock(move || -> Result<_> {
-        let opened =
-            crate::object::open_regular_file_nofollow(repo.objects_fd(), &path, repo.is_strict());
-        let fd = match opened {
-            Ok(fd) => fd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::ObjectNotFound {
-                    checksum: name.checksum,
-                    ty: ObjectType::File,
-                });
-            }
-            Err(e) => return Err(e.into()),
-        };
-        let file = std::fs::File::from(fd);
-        let len = file.metadata()?.len();
-        Ok((file, len))
+    let opened = ostrya_rt::unblock(move || {
+        repo.objects()
+            .open_regular(&path)
+            .map_err(|e| e.into_object_error(&name.checksum, ObjectType::File))
     })
     .await?;
-    let (header, declared, framed, body) =
-        http::read_archive_header(ostrya_rt::FileReader::with_len_hint(file, len)).await?;
+    let (header, declared, framed, body) = http::read_archive_header(
+        ostrya_rt::FileReader::with_len_hint(opened.file, opened.stat.size),
+    )
+    .await?;
     http::store_filez_payload(
         txn,
         &name.checksum,
@@ -4895,42 +4889,44 @@ mod tests {
         }
     }
 
-    /// The `.filez` copy from a handle in the strict open mode opens the
-    /// fan-out directory `objects/<xx>` again, and follows no symlink there.
-    /// A symlink that replaces `objects/<xx>` after the load fails the copy
-    /// with `ELOOP`.
+    /// The `.filez` copy follows no symlink at the fan-out directory
+    /// `objects/<xx>`, from a handle of each open mode. A symlink that
+    /// replaces `objects/<xx>` after the load fails the copy.
     #[test]
-    fn a_strict_filez_copy_refuses_a_fanout_symlinked_after_the_load() {
+    fn a_filez_copy_refuses_a_fanout_symlinked_after_the_load() {
         let (dir, strict, [name, ..], meta, dst) =
             strict_fixture("filez-fanout", RepoMode::Archive, RepoMode::Archive);
+        let plain = ostrya_rt::block_on(Repo::open(&dir.join("src"))).unwrap();
         let hex = name.checksum.to_hex();
         let fanout = dir.join("src/objects").join(&hex[..2]);
         let moved = dir.join("moved");
         std::fs::rename(&fanout, &moved).unwrap();
         std::os::unix::fs::symlink(&moved, &fanout).unwrap();
 
-        let result = ostrya_rt::block_on(async {
+        let results = ostrya_rt::block_on(async {
             let txn = dst.transaction().await.unwrap();
-            import_filez(&txn, &strict, name, &meta, &mut Vec::new()).await
+            [
+                import_filez(&txn, &strict, name, &meta, &mut Vec::new()).await,
+                import_filez(&txn, &plain, name, &meta, &mut Vec::new()).await,
+            ]
         });
         let _ = std::fs::remove_dir_all(&dir);
-        match result {
-            Err(Error::Io(e)) => {
-                assert_eq!(
-                    e.raw_os_error(),
-                    Some(rustix::io::Errno::LOOP.raw_os_error()),
-                    "{e}"
-                )
+        let expected = format!(
+            "objects/{} passes through a symlink; ostrya refuses a symlink in the repository",
+            name.loose_path(RepoMode::Archive)
+        );
+        for result in results {
+            match result {
+                Err(Error::InvalidFormat(m)) => assert_eq!(m, expected),
+                other => panic!("{other:?}"),
             }
-            other => panic!("{other:?}"),
         }
     }
 
-    /// The `.filez` copy from a handle in the strict open mode refuses a
-    /// FIFO that replaces the `.filez` file after the load, and does not wait
-    /// for a writer.
+    /// The `.filez` copy refuses a FIFO that replaces the `.filez` file after
+    /// the load, and does not wait for a writer.
     #[test]
-    fn a_strict_filez_copy_refuses_a_fifo_swapped_in_after_the_load() {
+    fn a_filez_copy_refuses_a_fifo_swapped_in_after_the_load() {
         let (dir, strict, [name, ..], meta, dst) =
             strict_fixture("filez-fifo", RepoMode::Archive, RepoMode::Archive);
         let filez = dir
@@ -4970,9 +4966,8 @@ mod tests {
         };
         let _ = std::fs::remove_dir_all(&dir);
         match result {
-            Err(Error::Io(e)) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-                assert!(e.to_string().contains("not a regular file"), "{e}");
+            Err(Error::InvalidFormat(m)) => {
+                assert!(m.ends_with(".filez is not a regular file"), "{m}");
             }
             other => panic!("{other:?}"),
         }

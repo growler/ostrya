@@ -131,6 +131,34 @@ fn reads_bare_user_only_discarding_ownership() {
     });
 }
 
+/// A load of a `bare-user-only` or `bare-split-xattrs` object reads its
+/// status alone, so an object with no read permission loads. The test runs
+/// as each user, and root reads each file anyway.
+#[test]
+fn a_load_reads_an_object_with_no_read_permission() {
+    block_on(async {
+        for mode in [RepoMode::BareUserOnly, RepoMode::BareSplitXattrs] {
+            let tmp = TmpDir::new("no-read");
+            let root = tmp.path().join("repo");
+            let repo = Repo::create(&root, CreateOptions::new(mode))
+                .await
+                .expect("create the repository");
+            let reg = csum(&"cc".repeat(32));
+            let reg_path = object_path(&root, &reg, ObjectType::File, mode);
+            fs::write(&reg_path, b"data").unwrap();
+            if mode == RepoMode::BareSplitXattrs {
+                // The link of a file with no xattrs holds the empty set.
+                fs::write(format!("{}-xattrs-link", reg_path.display()), b"").unwrap();
+            }
+            fs::set_permissions(&reg_path, fs::Permissions::from_mode(0o000)).unwrap();
+
+            let file = repo.load_file(&reg).await.unwrap();
+            assert_eq!(file.mode & 0o7777, 0, "{mode:?}");
+            assert_eq!(file.kind, FileKind::Regular { size: 4 }, "{mode:?}");
+        }
+    });
+}
+
 #[test]
 fn reads_bare_user_shared_like_bare_user() {
     block_on(async {

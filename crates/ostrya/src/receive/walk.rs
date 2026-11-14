@@ -3,14 +3,12 @@
 //! present in the repository.
 
 use std::collections::HashSet;
-use std::os::fd::AsFd;
-use std::sync::Arc;
 
-use ostrya_core::{Checksum, DirTree, ObjectName, ObjectType, loose_path};
+use ostrya_core::{Checksum, DirTree, ObjectName, ObjectType};
 
 use super::session::Failure;
 use crate::error::{Error, Result};
-use crate::object::{MAX_METADATA_SIZE, object_exists, read_meta_object};
+use crate::object::MAX_METADATA_SIZE;
 use crate::remote::{self, proto::MAX_HAVE};
 use crate::transaction::Transaction;
 use crate::write::flat_name;
@@ -84,8 +82,10 @@ struct Walk<'a> {
 
 /// Where the walk reads one dirtree from.
 enum TreeSource {
+    /// The staging directory, with the flat name of the dirtree.
     Staged(String),
-    Stored(String),
+    /// `objects/`.
+    Stored,
 }
 
 impl Walk<'_> {
@@ -108,13 +108,7 @@ impl Walk<'_> {
     async fn run(&mut self) -> std::result::Result<(), Failure> {
         let repo = self.txn.repo();
         let mode = repo.mode();
-        let clone = |fd: std::os::fd::BorrowedFd<'_>| {
-            fd.try_clone_to_owned()
-                .map(Arc::new)
-                .map_err(|e| Failure::Internal(e.into()))
-        };
-        let objects = clone(repo.objects_fd())?;
-        let staging = clone(self.txn.staging_fd())?;
+        let staging = self.txn.staging_dir();
         loop {
             let tree = self.trees.pop();
             if tree.is_none() && self.probes.is_empty() {
@@ -125,32 +119,30 @@ impl Walk<'_> {
                 let source = if self.txn.is_staged(&checksum, ObjectType::DirTree) {
                     TreeSource::Staged(flat_name(&checksum, ObjectType::DirTree, mode))
                 } else {
-                    TreeSource::Stored(loose_path(&checksum, ObjectType::DirTree, mode))
+                    TreeSource::Stored
                 };
                 (checksum, source)
             });
-            let objects = Arc::clone(&objects);
-            let staging = Arc::clone(&staging);
+            let repo = repo.clone();
+            let staging = staging.clone();
             // The blocking pool parses the dirtree with its read, so a large
             // dirtree does not hold the async executor.
             let (probes, present, read) = ostrya_rt::unblock(move || -> Result<_> {
                 let present = probes
                     .iter()
-                    .map(|n| object_exists(objects.as_fd(), &loose_path(&n.checksum, n.ty, mode)))
+                    .map(|n| repo.has_object_blocking(n.ty, &n.checksum))
                     .collect::<Result<Vec<bool>>>()?;
                 let read = match source {
                     None => None,
                     Some((checksum, TreeSource::Staged(name))) => {
-                        let bytes = read_meta_object(staging.as_fd(), &name, MAX_METADATA_SIZE)?;
+                        let bytes = staging.read_capped(&name, MAX_METADATA_SIZE)?;
                         Some((checksum, true, Some(DirTree::parse(&bytes))))
                     }
-                    Some((checksum, TreeSource::Stored(path))) => {
-                        match read_meta_object(objects.as_fd(), &path, MAX_METADATA_SIZE) {
+                    Some((checksum, TreeSource::Stored)) => {
+                        match repo.load_object_bytes_blocking(ObjectType::DirTree, &checksum) {
                             Ok(bytes) => Some((checksum, false, Some(DirTree::parse(&bytes)))),
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                                Some((checksum, false, None))
-                            }
-                            Err(e) => return Err(Error::Io(e)),
+                            Err(Error::ObjectNotFound { .. }) => Some((checksum, false, None)),
+                            Err(e) => return Err(e),
                         }
                     }
                 };

@@ -234,7 +234,8 @@ fn commit_loads_refuse_with_the_same_error() {
                 } else if key == garbage {
                     matches!(e, ostrya::Error::Core(_))
                 } else {
-                    matches!(e, ostrya::Error::Io(_))
+                    matches!(e, ostrya::Error::InvalidFormat(m)
+                        if m.ends_with("is larger than its cap of 134217728 bytes"))
                 }
             };
             assert!(
@@ -512,8 +513,9 @@ fn streams_a_metadata_object_in_chunks() {
     }
 }
 
-/// If the `fstat` measures an object larger than the cap, the open refuses it.
-/// The error is the same error that the buffered loader gives for the object.
+/// If the `statx` of the open measures an object larger than the cap, the open
+/// refuses it. The error is the same error that the buffered loader gives for
+/// the object.
 #[test]
 fn metadata_reader_refuses_an_oversized_object_at_the_open() {
     let tmp = TmpDir::new("meta-cap-open");
@@ -529,15 +531,15 @@ fn metadata_reader_refuses_an_oversized_object_at_the_open() {
             Ok(_) => panic!("the open accepted an oversized object"),
             Err(e) => e,
         };
-        let ostrya::Error::Io(io_err) = &err else {
-            panic!("expected an I/O refusal, got {err:?}");
+        let ostrya::Error::InvalidFormat(message) = &err else {
+            panic!("expected an invalid format refusal, got {err:?}");
         };
-        assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            io_err
-                .to_string()
-                .contains("object exceeds the metadata size cap"),
-            "message: {io_err}"
+        assert_eq!(
+            message,
+            &format!(
+                "objects/{} is larger than its cap of 134217728 bytes",
+                ostrya::loose_path(&key, ObjectType::Commit, repo.mode())
+            )
         );
 
         // The buffered loader refuses the same object with the same message, so
@@ -671,7 +673,7 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
             .await
             .expect("create repo");
         let key = csum(&"33".repeat(32));
-        // The size is one byte under the cap, so the `fstat` at the open passes.
+        // The size is one byte under the cap, so the `statx` at the open passes.
         let path = place_sparse_object(&repo_dir, repo.mode(), &key, MAX_METADATA_SIZE - 1);
         let mut reader = repo
             .metadata_reader(ObjectType::Commit, &key)
@@ -706,12 +708,12 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
                 Err(e) => break e,
             }
         };
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(
-            err.to_string()
-                .contains("object exceeds the metadata size cap"),
-            "message: {err}"
+        let expected = format!(
+            "objects/{} is larger than its cap of 134217728 bytes",
+            ostrya::loose_path(&key, ObjectType::Commit, repo.mode())
         );
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), expected);
         assert_eq!(
             taken, MAX_METADATA_SIZE,
             "the reader stops at the cap, having handed over every byte up to it"
@@ -725,12 +727,7 @@ fn metadata_reader_refuses_an_object_that_grows_past_the_cap() {
                 Ok(n) => panic!("read {round} after the refusal returned {n} bytes"),
                 Err(again) => {
                     assert_eq!(again.kind(), std::io::ErrorKind::InvalidData);
-                    assert!(
-                        again
-                            .to_string()
-                            .contains("object exceeds the metadata size cap"),
-                        "message: {again}"
-                    );
+                    assert_eq!(again.to_string(), expected);
                 }
             }
         }

@@ -34,8 +34,9 @@ use ostrya_core::{
 use ostrya_rt::FileReader;
 
 use crate::error::{Error, Result};
-use crate::object::{self, MAX_METADATA_SIZE};
+use crate::object::MAX_METADATA_SIZE;
 use crate::repo::Repo;
+use crate::repo_fs::{FsError, Opened};
 
 /// The object totals that the `ostree.sizes` metadata of a commit states.
 ///
@@ -95,13 +96,21 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::ObjectNotFound`] if the object is not in the object store.
-    /// - [`Error::Io`] of kind [`InvalidData`](std::io::ErrorKind::InvalidData)
-    ///   with the message `object exceeds the metadata size cap` if the object
-    ///   is larger than [`MAX_METADATA_SIZE`]. The load also gives this error
-    ///   if the file grows past the cap during the read.
-    /// - [`Error::Io`] of kind [`InvalidData`](std::io::ErrorKind::InvalidData)
-    ///   with the message `object is not a regular file` if the object is not
-    ///   a regular file.
+    /// - [`Error::InvalidFormat`] with the message `<path> is larger than its
+    ///   cap of 134217728 bytes` if the object is larger than
+    ///   [`MAX_METADATA_SIZE`]. The load also gives this error if the file
+    ///   grows past the cap during the read. `<path>` is the path of the
+    ///   object relative to the repository, for example
+    ///   `objects/ab/<62 hex>.dirtree`.
+    /// - [`Error::InvalidFormat`] with the message `<path> is not a regular
+    ///   file` if the object is not a regular file. The open of a FIFO does
+    ///   not wait for a writer.
+    /// - [`Error::InvalidFormat`] with the message `<path> passes through a
+    ///   symlink; ostrya refuses a symlink in the repository` if a symlink is
+    ///   at `objects/<xx>` or at the object path. `<path>` is the path of the
+    ///   object.
+    /// - [`Error::InvalidFormat`] with the message `<path> is not a directory`
+    ///   if `objects/<xx>` is not a directory.
     /// - [`Error::Io`] for other failures of the file system.
     pub async fn load_object_bytes(&self, ty: ObjectType, checksum: &Checksum) -> Result<Vec<u8>> {
         let repo = self.clone();
@@ -117,19 +126,9 @@ impl Repo {
         checksum: &Checksum,
     ) -> Result<Vec<u8>> {
         let path = loose_path(checksum, ty, self.mode());
-        match object::read_meta_object_with(
-            self.objects_fd(),
-            &path,
-            MAX_METADATA_SIZE,
-            self.is_strict(),
-        ) {
-            Ok(bytes) => Ok(bytes),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::ObjectNotFound {
-                checksum: *checksum,
-                ty,
-            }),
-            Err(e) => Err(Error::Io(e)),
-        }
+        self.objects()
+            .read_capped(&path, MAX_METADATA_SIZE)
+            .map_err(|e| e.into_object_error(checksum, ty))
     }
 
     /// Opens a streaming reader over the bytes of a metadata object.
@@ -147,10 +146,14 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::ObjectNotFound`] if the object is not in the object store.
-    /// - [`Error::Io`] of kind [`InvalidData`](std::io::ErrorKind::InvalidData)
-    ///   with the message `object exceeds the metadata size cap` if the
-    ///   object is larger than the cap at the open. No bytes stream in this
-    ///   case.
+    /// - [`Error::InvalidFormat`] with the message `<path> is larger than its
+    ///   cap of 134217728 bytes` if the object is larger than the cap at the
+    ///   open. No bytes stream in this case.
+    /// - [`Error::InvalidFormat`] if the object is not a regular file, or if
+    ///   a symlink is at `objects/<xx>` or at the object path, as
+    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] with the message `<path> is not a directory`
+    ///   if `objects/<xx>` is not a directory.
     /// - [`Error::Io`] for other failures of the file system.
     pub async fn metadata_reader(
         &self,
@@ -160,20 +163,25 @@ impl Repo {
         let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
         let key = *checksum;
-        let res =
-            ostrya_rt::unblock(move || open_meta_file(repo.objects_fd(), &path, repo.is_strict()))
-                .await;
-        match res {
-            Ok((file, size)) => Ok(MetadataReader {
-                file: FileReader::with_len_hint(file, size),
+        ostrya_rt::unblock(move || {
+            let objects = repo.objects();
+            let Opened { file, stat } = objects
+                .open_regular(&path)
+                .map_err(|e| e.into_object_error(&key, ty))?;
+            // The path of the cap error is relative to the repository root,
+            // as the errors of the open give it.
+            let path = format!("objects/{path}");
+            if stat.size > MAX_METADATA_SIZE {
+                return Err(Error::InvalidFormat(cap_text(&path)));
+            }
+            Ok(MetadataReader {
+                file: FileReader::with_len_hint(file, stat.size),
+                path,
                 taken: 0,
                 refused: false,
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::ObjectNotFound { checksum: key, ty })
-            }
-            Err(e) => Err(Error::Io(e)),
-        }
+            })
+        })
+        .await
     }
 
     /// Loads a metadata object as a dynamic [`Value`] tree.
@@ -191,9 +199,10 @@ impl Repo {
     ///   [`ObjectType::DirMeta`], [`ObjectType::Commit`], or
     ///   [`ObjectType::CommitMeta`].
     /// - [`Error::ObjectNotFound`] if the object is not in the object store.
-    /// - [`Error::Io`] if the object is larger than [`MAX_METADATA_SIZE`] or
-    ///   is not a regular file, as
-    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] if the object is larger than
+    ///   [`MAX_METADATA_SIZE`], if it is not a regular file, or if a symlink
+    ///   is on its path, as [`load_object_bytes`](Repo::load_object_bytes)
+    ///   states.
     /// - [`Error::Io`] for other failures of the file system.
     /// - [`Error::Core`] if the bytes do not parse as the type string.
     pub async fn load_variant(&self, ty: ObjectType, checksum: &Checksum) -> Result<Value> {
@@ -225,9 +234,10 @@ impl Repo {
     ///
     /// - [`Error::ObjectNotFound`] if the commit object is not in the object
     ///   store.
-    /// - [`Error::Io`] if the object is larger than [`MAX_METADATA_SIZE`] or
-    ///   is not a regular file, as
-    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] if the object is larger than
+    ///   [`MAX_METADATA_SIZE`], if it is not a regular file, or if a symlink
+    ///   is on its path, as [`load_object_bytes`](Repo::load_object_bytes)
+    ///   states.
     /// - [`Error::Io`] for other failures of the file system, also in the
     ///   check of the `.commitpartial` marker.
     /// - [`Error::Core`] if the bytes do not parse as a commit object.
@@ -257,9 +267,10 @@ impl Repo {
     ///
     /// - [`Error::ObjectNotFound`] if the dirtree object is not in the object
     ///   store.
-    /// - [`Error::Io`] if the object is larger than [`MAX_METADATA_SIZE`] or
-    ///   is not a regular file, as
-    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] if the object is larger than
+    ///   [`MAX_METADATA_SIZE`], if it is not a regular file, or if a symlink
+    ///   is on its path, as [`load_object_bytes`](Repo::load_object_bytes)
+    ///   states.
     /// - [`Error::Io`] for other failures of the file system.
     /// - [`Error::Core`] if the bytes do not parse as a dirtree object.
     pub async fn load_dirtree(&self, checksum: &Checksum) -> Result<DirTree> {
@@ -275,9 +286,10 @@ impl Repo {
     ///
     /// - [`Error::ObjectNotFound`] if the dirmeta object is not in the object
     ///   store.
-    /// - [`Error::Io`] if the object is larger than [`MAX_METADATA_SIZE`] or
-    ///   is not a regular file, as
-    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] if the object is larger than
+    ///   [`MAX_METADATA_SIZE`], if it is not a regular file, or if a symlink
+    ///   is on its path, as [`load_object_bytes`](Repo::load_object_bytes)
+    ///   states.
     /// - [`Error::Io`] for other failures of the file system.
     /// - [`Error::Core`] if the bytes do not parse as a dirmeta object.
     pub async fn load_dirmeta(&self, checksum: &Checksum) -> Result<DirMeta> {
@@ -309,9 +321,11 @@ impl Repo {
     ///   - a size is not a valid varint
     ///   - the type byte names no object type
     ///   - trailing bytes follow the sizes
-    /// - [`Error::Io`] if the commit object is larger than
-    ///   [`MAX_METADATA_SIZE`] or is not a regular file, as
-    ///   [`load_object_bytes`](Repo::load_object_bytes) states.
+    /// - [`Error::InvalidFormat`] if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`], if it is not a regular file, or if a symlink
+    ///   is on its path, as [`load_object_bytes`](Repo::load_object_bytes)
+    ///   states. The check of each recorded object gives the errors of
+    ///   [`has_object`](Repo::has_object).
     /// - [`Error::Io`] for other failures of the file system.
     pub async fn commit_sizes(&self, checksum: &Checksum) -> Result<Option<CommitSizes>> {
         let (commit, _) = self.load_commit(checksum).await?;
@@ -356,23 +370,31 @@ impl Repo {
         let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
         let key = *checksum;
-        let res = ostrya_rt::unblock(move || object::object_size(repo.objects_fd(), &path)).await;
-        match res {
-            Ok(size) => Ok(size),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                Err(Error::ObjectNotFound { checksum: key, ty })
-            }
-            Err(e) => Err(Error::Io(e)),
-        }
+        ostrya_rt::unblock(move || {
+            repo.objects()
+                .lstat(&path)
+                .map(|stat| stat.size)
+                .map_err(|e| e.into_object_error(&key, ty))
+        })
+        .await
     }
 
     /// Returns `true` if a loose object of the given type is in the object
     /// store.
     ///
+    /// An entry of any type at the object path is present, also a symlink.
+    /// An absent fan-out directory `objects/<xx>` gives `false`. The check
+    /// is one `openat2` of the object path with `RESOLVE_BENEATH`,
+    /// `RESOLVE_NO_SYMLINKS`, `O_PATH`, and `O_NOFOLLOW`, and one `close`.
+    ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the `lstat` of the object path fails with an error
-    ///   other than `ENOENT`.
+    /// - [`Error::InvalidFormat`] with the message `objects/<xx>/<name>
+    ///   passes through a symlink; ostrya refuses a symlink in the
+    ///   repository` if `objects/<xx>` is a symlink, or with the message
+    ///   `objects/<xx>/<name> is not a directory` if `objects/<xx>` is not a
+    ///   directory.
+    /// - [`Error::Io`] if the open fails with another error.
     pub async fn has_object(&self, ty: ObjectType, checksum: &Checksum) -> Result<bool> {
         let repo = self.clone();
         let key = *checksum;
@@ -382,7 +404,7 @@ impl Repo {
     /// Runs [`has_object`](Repo::has_object) on the calling thread.
     pub(crate) fn has_object_blocking(&self, ty: ObjectType, checksum: &Checksum) -> Result<bool> {
         let path = loose_path(checksum, ty, self.mode());
-        object::object_exists(self.objects_fd(), &path)
+        Ok(self.objects().exists(&path)?)
     }
 
     /// Returns the completeness state of a commit.
@@ -392,10 +414,17 @@ impl Repo {
     /// [`Normal`](CommitState::Normal). The method does not check that the
     /// commit object exists.
     ///
+    /// The check of the marker follows no symlink at `state` and at the
+    /// marker. A symlink at the marker is a marker.
+    ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the `lstat` of the marker path fails with an error
-    ///   other than `ENOENT`.
+    /// - [`Error::InvalidFormat`] with the message
+    ///   `state/<checksum>.commitpartial passes through a symlink; ostrya
+    ///   refuses a symlink in the repository` if `state` is a symlink, or with
+    ///   the message `state/<checksum>.commitpartial is not a directory` if
+    ///   `state` is not a directory.
+    /// - [`Error::Io`] if the check fails with another error.
     pub async fn commit_state(&self, checksum: &Checksum) -> Result<CommitState> {
         let repo = self.clone();
         let key = *checksum;
@@ -405,7 +434,7 @@ impl Repo {
     /// Runs [`commit_state`](Repo::commit_state) on the calling thread.
     pub(crate) fn commit_state_blocking(&self, checksum: &Checksum) -> Result<CommitState> {
         let path = crate::pull::partial_path(checksum);
-        Ok(if object::object_exists(self.repo_fd(), &path)? {
+        Ok(if self.root_dir().exists(&path)? {
             CommitState::Partial
         } else {
             CommitState::Normal
@@ -413,32 +442,34 @@ impl Repo {
     }
 }
 
-/// Opens a metadata object for streaming, and returns the file and its size.
+/// Returns the text of the refusal of the metadata object at `path` for its
+/// size. It is the text of the cap error of a capped read.
+fn cap_text(path: &str) -> String {
+    format!("{path} is larger than its cap of {MAX_METADATA_SIZE} bytes")
+}
+
+/// Gives the error `err` of an operation on the loose object at `path`,
+/// relative to `objects/`, with the path of the object.
 ///
-/// The size is the size that the `fstat` gives. The function refuses an
-/// object that is larger than [`MAX_METADATA_SIZE`] at the `fstat`.
-/// `object::read_meta_object` does the same check at the open, so the
-/// streaming path and the buffered path refuse an oversized object with the
-/// same error.
-///
-/// This function checks the file type only in the strict open mode of
-/// `object::open_regular_file`. `object::read_meta_object` also refuses an
-/// object that is not a regular file.
-///
-/// This check and the running total in [`MetadataReader`] both read
-/// [`MAX_METADATA_SIZE`], so the open and the read hold one bound.
-fn open_meta_file(
-    dir: rustix::fd::BorrowedFd<'_>,
-    path: &str,
-    strict: bool,
-) -> std::io::Result<(std::fs::File, u64)> {
-    let fd = object::open_regular_file(dir, path, strict)?;
-    let stat = rustix::fs::fstat(&fd)?;
-    let size = stat.st_size.max(0) as u64;
-    if size > MAX_METADATA_SIZE {
-        return Err(object::metadata_cap_exceeded());
+/// An operation that opens the parent directory of the object first names
+/// that directory, `objects/<xx>`, in an error of the open. The function
+/// gives such an [`FsError::Absent`] or [`FsError::Invalid`] the path
+/// `objects/<path>`. Each other error stays as it is.
+pub(crate) fn object_path_error(err: FsError, path: &str) -> FsError {
+    let Some((parent, _)) = path.rsplit_once('/') else {
+        return err;
+    };
+    let at_parent = |p: &str| p.strip_prefix("objects/") == Some(parent);
+    match err {
+        FsError::Absent { path: p } if at_parent(&p) => FsError::Absent {
+            path: format!("objects/{path}"),
+        },
+        FsError::Invalid { path: p, reason } if at_parent(&p) => FsError::Invalid {
+            path: format!("objects/{path}"),
+            reason,
+        },
+        other => other,
     }
-    Ok((std::fs::File::from(fd), size))
 }
 
 /// An async reader over the bytes of a metadata object.
@@ -457,15 +488,17 @@ fn open_meta_file(
 /// The reader applies the [`MAX_METADATA_SIZE`] cap twice, as
 /// [`Repo::load_object_bytes`] does:
 ///
-/// - At the open, the `fstat` refuses an object that is already larger than
-///   the cap.
+/// - At the open, the `statx` of the open file refuses an object that is
+///   already larger than the cap, with [`Error::InvalidFormat`] and the
+///   message of the read failure below.
 /// - During the read, a running total of the bytes given to the caller guards
 ///   against an object that grows. If the total is at the cap and the object
 ///   holds one more byte, the read fails.
 ///
 /// The read failure is an [`io::Error`] of kind
-/// [`InvalidData`](io::ErrorKind::InvalidData) with the message `object
-/// exceeds the metadata size cap`. Before the failure, the reader gives no
+/// [`InvalidData`](io::ErrorKind::InvalidData) with the message `<path> is
+/// larger than its cap of 134217728 bytes`, where `<path>` is the path of the
+/// object relative to the repository. Before the failure, the reader gives no
 /// more than [`MAX_METADATA_SIZE`] bytes.
 ///
 /// The failure is final, so an object that is too large never reads back as
@@ -473,6 +506,8 @@ fn open_meta_file(
 /// Before a failure, a read into an empty buffer returns `Ok(0)`.
 pub struct MetadataReader {
     file: FileReader,
+    /// The path of the object relative to the repository, for the cap error.
+    path: String,
     /// The number of bytes that the caller has read.
     taken: u64,
     /// `true` after the running total refused the object.
@@ -484,6 +519,11 @@ pub struct MetadataReader {
 }
 
 impl MetadataReader {
+    /// Returns the error of a read past the cap.
+    fn cap_exceeded(&self) -> io::Error {
+        io::Error::new(io::ErrorKind::InvalidData, cap_text(&self.path))
+    }
+
     /// Runs the read step that both trait implementations call.
     ///
     /// `rt::FileReader` gives `futures_io::AsyncRead` under each runtime
@@ -491,7 +531,7 @@ impl MetadataReader {
     fn poll_read_bytes(&mut self, cx: &mut Context<'_>, out: &mut [u8]) -> Poll<io::Result<usize>> {
         use futures_io::AsyncRead;
         if self.refused {
-            return Poll::Ready(Err(object::metadata_cap_exceeded()));
+            return Poll::Ready(Err(self.cap_exceeded()));
         }
         if out.is_empty() {
             return Poll::Ready(Ok(0));
@@ -511,7 +551,7 @@ impl MetadataReader {
                 return Poll::Ready(Ok(0));
             }
             self.refused = true;
-            return Poll::Ready(Err(object::metadata_cap_exceeded()));
+            return Poll::Ready(Err(self.cap_exceeded()));
         }
         // The limit is the number of bytes left under the cap. After a short
         // read or a full read, `taken` equals the number of bytes that the

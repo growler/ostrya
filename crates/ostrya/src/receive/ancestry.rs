@@ -2,13 +2,11 @@
 //! commit of a ref is in the parent chain of the new commit.
 
 use std::collections::{HashMap, HashSet};
-use std::os::fd::AsFd;
 
-use ostrya_core::{Checksum, Commit, ObjectType, loose_path};
+use ostrya_core::{Checksum, Commit, ObjectType};
 
 use super::session::Failure;
 use crate::error::{Error, Result};
-use crate::object::{MAX_METADATA_SIZE, read_meta_object};
 use crate::transaction::Transaction;
 
 /// The parent of each commit that a walk can read without a read of the
@@ -190,14 +188,12 @@ impl Chain {
 /// reads only stored commits. A stored commit that does not parse is a
 /// failure of the server side.
 async fn stored_parent(txn: &Transaction, commit: Checksum) -> Result<Option<Option<Checksum>>> {
-    let repo = txn.repo();
-    let path = loose_path(&commit, ObjectType::Commit, repo.mode());
-    let objects = repo.objects_fd().try_clone_to_owned()?;
+    let repo = txn.repo().clone();
     ostrya_rt::unblock(move || {
-        let bytes = match read_meta_object(objects.as_fd(), &path, MAX_METADATA_SIZE) {
+        let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &commit) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(Error::Io(e)),
+            Err(Error::ObjectNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
         };
         let commit = Commit::parse(&bytes)
             .map_err(|e| Error::InvalidFormat(format!("commit {commit} does not parse: {e}")))?;

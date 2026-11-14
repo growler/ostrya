@@ -706,8 +706,10 @@ impl Repo {
     ///   static delta superblock.
     ///   - [`Error::ObjectNotFound`] if this repository does not hold the
     ///     commit.
-    ///   - [`Error::Io`] if the commit object is larger than
-    ///     [`MAX_METADATA_SIZE`], is not a regular file, or a read of it fails.
+    ///   - [`Error::InvalidFormat`] if the commit object is larger than
+    ///     [`MAX_METADATA_SIZE`] or is not a regular file, or if a symlink is
+    ///     on its path.
+    ///   - [`Error::Io`] if a read of the commit object fails.
     ///   - [`Error::Core`] if the tuple frame, the subject, or the body of the
     ///     commit is not in normal form, or if its parent, root dirtree, or
     ///     root dirmeta checksum has a wrong length.

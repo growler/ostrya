@@ -6,10 +6,10 @@ use ostrya_rt::FileReader;
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
-use crate::object;
 use crate::related::RelatedRule;
 use crate::remote::{BoxFuture, DetachedMetadata, Encoding, ObjectData, ObjectSource};
 use crate::repo::Repo;
+use crate::repo_fs::Opened;
 
 /// The [`ObjectSource`] over a local repository.
 ///
@@ -60,7 +60,8 @@ impl RepoSource {
         if encoding == Encoding::Deflate && self.repo.mode().is_archive() {
             return self.stored_filez(&name.checksum).await;
         }
-        let (file, reader) = self.repo.open_file(&name.checksum).await?;
+        let (file, kept) = self.repo.open_file(&name.checksum).await?;
+        let reader = file.reader_over(kept);
         let (size, payload, symlink_target) = match file.kind {
             FileKind::Regular { size } => (size, Some(Box::new(reader) as _), String::new()),
             FileKind::Symlink { target } => (0, None, target),
@@ -100,27 +101,18 @@ impl RepoSource {
     async fn stored_filez(&self, checksum: &Checksum) -> Result<ObjectData> {
         let path = loose_path(checksum, ObjectType::File, self.repo.mode());
         let repo = self.repo.clone();
-        // The size bounds the read-ahead. The `fstat` runs on the pool
-        // thread of the open.
-        let opened = ostrya_rt::unblock(move || {
-            let file = object::open_content_file(repo.objects_fd(), &path, 0, false)?;
-            let len = file.metadata()?.len();
-            Ok::<_, std::io::Error>((file, len))
+        let key = *checksum;
+        // The size bounds the read-ahead. It comes from the `statx` of the
+        // open.
+        let Opened { file, stat } = ostrya_rt::unblock(move || {
+            repo.objects()
+                .open_regular(&path)
+                .map_err(|e| e.into_object_error(&key, ObjectType::File))
         })
-        .await;
-        let (file, len) = match opened {
-            Ok(opened) => opened,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::ObjectNotFound {
-                    checksum: *checksum,
-                    ty: ObjectType::File,
-                });
-            }
-            Err(e) => return Err(Error::Io(e)),
-        };
+        .await?;
         Ok(ObjectData::Encoded {
             encoding: Encoding::Deflate,
-            reader: Box::new(FileReader::with_len_hint(file, len)),
+            reader: Box::new(FileReader::with_len_hint(file, stat.size)),
         })
     }
 

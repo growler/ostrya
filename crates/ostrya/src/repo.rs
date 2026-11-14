@@ -5,7 +5,6 @@
 //! a repository with options. [`RemotesDir`] names the remotes directory of a
 //! handle.
 
-use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -13,44 +12,28 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use ostrya_core::{KeyFile, RepoMode};
-use rustix::fs::{AtFlags, Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::config::{EX_OSTRYA, MinFreeSpace, REMOTES_CONFIG_DIR, RepoConfig, Tristate};
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
-use crate::perm;
 use crate::remotes_dir;
+use crate::repo_fs::{Publish, Published, RepoDir, RepoLayout, RootFile};
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
-
-/// The path of the config file in a repository.
-const CONFIG: &str = "config";
 
 /// The largest `config` file that a read accepts, in bytes. A read refuses a
 /// larger file with [`Error::InvalidFormat`].
 pub(crate) const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
-/// The mode that a directory create requests. The process umask reduces it.
-const DIR_MODE: u32 = 0o775;
-
-/// The mode that a create forces on the config file. The umask does not
-/// change it.
-const CONFIG_MODE: u32 = 0o644;
-
-/// The directories of a repository, in an order that puts each parent before
-/// its children.
-const LAYOUT_DIRS: &[&str] = &[
-    "objects",
-    "tmp",
-    "tmp/cache",
-    "refs",
-    "refs/heads",
-    "refs/remotes",
-    "refs/mirrors",
-    "state",
-    "extensions",
+/// The directory kinds that the create of a repository makes, in the order
+/// of the create. The create of each kind also makes its initial children.
+const INIT_KINDS: [RepoLayout; 5] = [
+    RepoLayout::Objects,
+    RepoLayout::Tmp,
+    RepoLayout::Refs,
+    RepoLayout::State,
+    RepoLayout::Extensions,
 ];
 
 /// The remotes directory of a repository handle: a directory of `.conf` files
@@ -229,8 +212,19 @@ impl OpenOptions {
     ///   path, a path that holds a NUL byte, or an absolute
     ///   [`InRepo`](RemotesDir::InRepo) path. The call checks the values
     ///   before it opens a file.
-    /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`
-    ///   directory or no `config` file, or if a read fails.
+    /// - [`Error::Io`] of kind `NotFound` if a component of `path` does not
+    ///   exist, if a symlink in `path` has no target, or if `objects` or
+    ///   `config` does not exist. The message is `<path> does not exist`,
+    ///   with `path` as given, and with `objects` and `config` relative to
+    ///   the repository.
+    /// - [`Error::InvalidFormat`] if `path`, a component of it, or `objects`
+    ///   is not a directory, or if `config` is not a regular file. A FIFO at
+    ///   `config` does not block the open.
+    /// - [`Error::InvalidFormat`] if `objects` or `config` is a symlink. The
+    ///   open follows a symlink in `path`, and no symlink at `objects` or
+    ///   `config`.
+    /// - [`Error::Io`] if a read fails, or if the kernel has no `openat2`
+    ///   (Linux 5.6 or later).
     /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB (1048576
     ///   bytes) or is not valid UTF-8.
     /// - [`Error::InvalidFormat`] if the `[core]` group of `config` fails the
@@ -274,8 +268,19 @@ impl OpenOptions {
     ///   [`InRepo`](RemotesDir::InRepo) path. The call checks the values
     ///   before it opens a file.
     /// - [`Error::Io`] if the call cannot duplicate `dir`.
-    /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`
-    ///   directory or no `config` file, or if a read fails.
+    /// - [`Error::Io`] of kind `NotFound` if a component of `path` does not
+    ///   exist, if a symlink in `path` has no target, or if `objects` or
+    ///   `config` does not exist. The message is `<path> does not exist`,
+    ///   with `path` as given, and with `objects` and `config` relative to
+    ///   the repository.
+    /// - [`Error::InvalidFormat`] if `path`, a component of it, or `objects`
+    ///   is not a directory, or if `config` is not a regular file. A FIFO at
+    ///   `config` does not block the open.
+    /// - [`Error::InvalidFormat`] if `objects` or `config` is a symlink. The
+    ///   open follows a symlink in `path`, and no symlink at `objects` or
+    ///   `config`.
+    /// - [`Error::Io`] if a read fails, or if the kernel has no `openat2`
+    ///   (Linux 5.6 or later).
     /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB (1048576
     ///   bytes) or is not valid UTF-8.
     /// - [`Error::InvalidFormat`] if the `[core]` group of `config` fails the
@@ -392,8 +397,8 @@ impl CreateOptions {
     /// - [`Error::RepoExists`] if `path` holds an entry `config` of any
     ///   type. The call checks the entry without following a symlink, and it
     ///   writes nothing. If another process writes `config` after the check
-    ///   and before the call writes its own `config`, the call gives the
-    ///   same error, and the layout directories that it wrote stay.
+    ///   and before the call puts its own `config` in place, the call gives
+    ///   the same error, and the layout directories that it wrote stay.
     /// - [`Error::InvalidInput`] if the remotes directory value is an empty
     ///   path, a path that holds a NUL byte, or an absolute
     ///   [`InRepo`](RemotesDir::InRepo) path, or if the value of the key is
@@ -402,8 +407,17 @@ impl CreateOptions {
     ///   call checks the id before it writes.
     /// - [`Error::Io`] if the call cannot make the absolute form of a
     ///   [`Path`](RemotesDir::Path) value.
-    /// - [`Error::Io`] if the parent directory of `path` does not exist, or if
-    ///   `path`, `objects`, `tmp`, or `refs` exists and is not a directory.
+    /// - [`Error::Io`] of kind `NotFound` if a component of `path` above the
+    ///   last does not exist, or if a symlink in `path` has no target. The
+    ///   message is `<path> does not exist`, with `path` as given.
+    /// - [`Error::InvalidFormat`] if `path` or a component of it is not a
+    ///   directory, or if a directory of the layout is a symlink or is not a
+    ///   directory. The call then writes no `config`.
+    /// - [`Error::Io`] of kind `NotFound` if the file system of `tmp/` has
+    ///   `O_TMPFILE` and `/proc/self/fd` is not available. The message starts
+    ///   with `a link through /proc/self/fd gives ENOENT`. The layout
+    ///   directories then stay with no `config`, and a later create at
+    ///   `path` writes `config`.
     /// - [`Error::Io`] if a create, a write, a read, or the check of the
     ///   entry `config` fails.
     /// - The errors of [`OpenOptions::open`] for the key
@@ -498,23 +512,23 @@ pub struct Repo {
 
 #[derive(Debug)]
 struct RepoInner {
-    // All descriptor-relative I/O starts from the root descriptor and the
-    // `objects/` descriptor. The open makes them one time, and the read path
-    // and the write path use them.
-    repo_fd: OwnedFd,
-    objects_fd: OwnedFd,
+    // All access to the repository starts from the handle of the root and
+    // the handle of `objects/`. The open makes them one time, and the read
+    // path and the write path use them.
+    root: RepoDir,
+    objects: RepoDir,
     config: RepoConfig,
     // The path that opened or created the handle, stored as the caller gave
     // it. It is a record of the argument of the caller, and no I/O uses it.
-    // Each access goes through `repo_fd` and `objects_fd`.
+    // Each access goes through `root` and `objects`.
     path: PathBuf,
     // The remotes directory that the open selected, or that the create took.
     // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
-    // The strict open mode of `Repo::open_at_strict`: the reads of `config`,
-    // of the objects, and of the composefs image follow no symlink in any
-    // component of their path, do not block on a FIFO, and refuse a file that
-    // is not a regular file.
+    // The strict open mode of `Repo::open_at_strict`: the reads of the
+    // objects and of the composefs image follow no symlink in any component
+    // of their path, do not block on a FIFO, and refuse a file that is not a
+    // regular file.
     strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
@@ -538,7 +552,7 @@ impl RepoInner {
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = RepoLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
+        let lock = RepoLock::get_or_create(self.root.as_fd(), self.config.mode())?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -551,7 +565,7 @@ impl RepoInner {
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = UpdateLock::get_or_create(self.repo_fd.as_fd(), self.config.mode())?;
+        let lock = UpdateLock::get_or_create(self.root.as_fd(), self.config.mode())?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -560,8 +574,8 @@ impl RepoInner {
 /// The materials of a handle that come from the file system. The blocking
 /// pool makes them, and the async side assembles them into a [`Repo`].
 struct Materials {
-    repo_fd: OwnedFd,
-    objects_fd: OwnedFd,
+    root: RepoDir,
+    objects: RepoDir,
     config: RepoConfig,
     remotes_dir: Option<RemotesDir>,
     strict: bool,
@@ -579,7 +593,7 @@ impl Materials {
         let key = remotes_dir::from_key(&self.config)?;
         let selected = first.cloned().or(key).or_else(|| default.cloned());
         if let Some(dir) = &selected {
-            self.config = remotes_dir::read_remotes(self.config, self.repo_fd.as_fd(), dir)?;
+            self.config = remotes_dir::read_remotes(self.config, self.root.as_fd(), dir)?;
         }
         self.remotes_dir = selected;
         Ok(self)
@@ -603,10 +617,13 @@ impl Repo {
     /// reads the boot id when it begins, as the `ostree` command does. Each
     /// write that needs `tmp/` opens it, and creates it if it is absent.
     ///
+    /// The open opens `objects` and reads `config` with one `openat2` each,
+    /// with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. A symlink at
+    /// `objects` or at `config` fails each open, also an open in the strict
+    /// open mode.
+    ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`
-    ///   directory or no `config` file, or if a read fails.
     /// - The errors of [`OpenOptions::open`].
     pub async fn open(path: &Path) -> Result<Repo> {
         OpenOptions::new().open(path).await
@@ -636,8 +653,7 @@ impl Repo {
     ///
     /// - The open reads no `[ex-ostrya] remotes-config-dir` key and no remotes
     ///   directory, so the handle has no remotes directory.
-    /// - The open of `objects` follows no symlink.
-    /// - The reads of `config`, of each metadata object, of the stored
+    /// - The reads of each metadata object, of the stored
     ///   composefs image, and of `summary` by
     ///   [`read_summary`](Repo::read_summary) open the file with `openat2`,
     ///   `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and
@@ -667,6 +683,9 @@ impl Repo {
     ///   not a regular file. A symlink at the object path, a FIFO, or a
     ///   device fails the copy and does not block it.
     ///
+    /// The open of `objects` and the read of `config` are the same as in
+    /// [`open_at`](Repo::open_at).
+    ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.
     ///
@@ -676,8 +695,6 @@ impl Repo {
     ///
     /// - The errors of [`open_at`](Repo::open_at), except the errors of the
     ///   remotes directory.
-    /// - [`Error::Io`] if `objects` or `config` is a symlink, or if `config`
-    ///   is not a regular file.
     #[doc(hidden)]
     pub async fn open_at_strict(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
         let dir = dir.try_clone_to_owned()?;
@@ -693,7 +710,10 @@ impl Repo {
     /// strict open mode of [`open_at_strict`](Repo::open_at_strict). The
     /// handle stores `path`. Blocks the calling thread.
     pub(crate) fn open_strict_blocking(repo_fd: OwnedFd, path: PathBuf) -> Result<Repo> {
-        Ok(Repo::assemble(materials_from_repo(repo_fd, true)?, path))
+        Ok(Repo::assemble(
+            materials_from_root(RepoDir::from_root_fd(repo_fd), true)?,
+            path,
+        ))
     }
 
     /// Creates and opens a repository at `path`, relative to the working directory.
@@ -725,10 +745,19 @@ impl Repo {
     /// the `ostree` command does. The `config` file gets the mode `0644`, and
     /// the umask does not change it.
     ///
-    /// In a directory that has no `config`, the call keeps each entry of the
-    /// layout that exists. It does not check the type of an existing
-    /// `tmp/cache`, `refs/heads`, `refs/remotes`, `refs/mirrors`, `state`, or
-    /// `extensions`. A file at such a path does not make the call fail.
+    /// In a directory that has no `config`, the call keeps each directory of
+    /// the layout that exists. A symlink or an entry that is not a directory
+    /// at a path of the layout makes the call fail before it writes `config`.
+    /// The call writes `config` to a temp file in `tmp/`, syncs it, and puts
+    /// it at `config` in one step. A crash thus leaves no partial `config`.
+    /// Where the file system of `tmp/` has `O_TMPFILE`, the temp file has no
+    /// name, and the call links it at `config` through `/proc/self/fd`. The
+    /// call then needs `/proc`. Without it, the call fails after it makes the
+    /// layout directories, and it writes no `config`.
+    ///
+    /// The call syncs the parent directory of a root that it creates, each
+    /// directory that it adds an entry to, and the root after it puts
+    /// `config` in place.
     ///
     /// In a `bare-user-shared` repository, the call sets the mode `02770` on
     /// each directory that it creates. The umask does not change this mode.
@@ -958,7 +987,7 @@ impl Repo {
         let repo = self.clone();
         let staging = ostrya_rt::unblock(move || {
             let mode = repo.inner.config.mode();
-            StagingDir::create(repo.inner.repo_fd.as_fd(), expiry_secs, mode)
+            StagingDir::create(repo.repo_fd(), expiry_secs, mode)
         })
         .await?;
 
@@ -1106,7 +1135,7 @@ impl Repo {
     /// The handle keeps the config that it read at the open.
     pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || read_config_blocking(repo.repo_fd(), repo.is_strict())).await
+        ostrya_rt::unblock(move || read_config(repo.root_dir())).await
     }
 
     /// Reads `config` and the `.conf` files of the remotes directory of the
@@ -1115,7 +1144,7 @@ impl Repo {
     pub(crate) async fn read_config_and_remotes(&self) -> Result<RepoConfig> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            let config = read_config_blocking(repo.repo_fd(), repo.is_strict())?;
+            let config = read_config(repo.root_dir())?;
             match repo.remotes_dir() {
                 Some(dir) => remotes_dir::read_remotes(config, repo.repo_fd(), dir),
                 None => Ok(config),
@@ -1130,16 +1159,21 @@ impl Repo {
         self.inner.strict
     }
 
+    /// Returns the handle of the repository root.
+    pub(crate) fn root_dir(&self) -> &RepoDir {
+        &self.inner.root
+    }
+
     /// Returns the descriptor of the repository root. Descriptor-relative
     /// access to `refs/`, `state/`, and the rest of the layout starts from it.
     pub(crate) fn repo_fd(&self) -> BorrowedFd<'_> {
-        self.inner.repo_fd.as_fd()
+        self.inner.root.as_fd()
     }
 
     /// Returns the descriptor of `objects/`. Access to loose objects starts
     /// from it.
     pub(crate) fn objects_fd(&self) -> BorrowedFd<'_> {
-        self.inner.objects_fd.as_fd()
+        self.inner.objects.as_fd()
     }
 
     /// Assembles the handle. `path` is the argument that the caller gave the
@@ -1147,8 +1181,8 @@ impl Repo {
     fn assemble(materials: Materials, path: PathBuf) -> Repo {
         Repo {
             inner: Arc::new(RepoInner {
-                repo_fd: materials.repo_fd,
-                objects_fd: materials.objects_fd,
+                root: materials.root,
+                objects: materials.objects,
                 config: materials.config,
                 path,
                 remotes_dir: materials.remotes_dir,
@@ -1162,32 +1196,30 @@ impl Repo {
 }
 
 /// Refuses the bytes of a `config` larger than [`MAX_CONFIG_SIZE`], so that a
-/// write leaves no file that an open refuses.
+/// write leaves no file that an open refuses. The message is the message of
+/// the read of such a file.
 pub(crate) fn check_config_size(bytes: &[u8]) -> Result<()> {
     if bytes.len() as u64 > MAX_CONFIG_SIZE {
         return Err(Error::InvalidFormat(format!(
-            "config exceeds the {MAX_CONFIG_SIZE}-byte size cap"
+            "config is larger than its cap of {MAX_CONFIG_SIZE} bytes"
         )));
     }
     Ok(())
 }
 
-/// Reads `config` at the repository root and parses it, as the open of a
-/// handle does. Blocks the calling thread.
+/// Reads `config` at the repository root `root` and parses it, as the open of
+/// a handle does. Blocks the calling thread.
 ///
-/// If `strict` is set, the read uses the strict open mode: the open follows no
-/// symlink and does not block, and a file that is not a regular file is
-/// refused.
-pub(crate) fn read_config_blocking(repo_fd: BorrowedFd<'_>, strict: bool) -> Result<RepoConfig> {
-    parse_config(&read_file(repo_fd, CONFIG, strict)?)
+/// The read is [`RepoDir::read_capped`] with the cap [`MAX_CONFIG_SIZE`]. It
+/// follows no symlink, does not block on a FIFO, and refuses a file that is
+/// not a regular file or that is larger than the cap.
+pub(crate) fn read_config(root: &RepoDir) -> Result<RepoConfig> {
+    parse_config(&root.read_capped(RootFile::Config.name(), MAX_CONFIG_SIZE)?)
 }
 
-/// Parses the bytes of `config`. This step is CPU work only.
-///
-/// A read of `config` stops one byte after [`MAX_CONFIG_SIZE`], so an input
-/// longer than the cap stands for a file over the cap.
+/// Parses the bytes of `config`. This step is CPU work only. The read of the
+/// file refuses a file larger than [`MAX_CONFIG_SIZE`].
 fn parse_config(bytes: &[u8]) -> Result<RepoConfig> {
-    check_config_size(bytes)?;
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::InvalidFormat("config is not valid UTF-8".into()))?;
     RepoConfig::parse(text)
@@ -1223,8 +1255,7 @@ fn open_materials<Fd: AsFd>(
     strict: bool,
     opts: &OpenOptions,
 ) -> Result<Materials> {
-    let repo_fd = open_dir(dir, path)?;
-    let materials = materials_from_repo(repo_fd, strict)?;
+    let materials = materials_from_root(RepoDir::open_root(dir, path)?, strict)?;
     if strict {
         return Ok(materials);
     }
@@ -1237,106 +1268,62 @@ fn open_materials<Fd: AsFd>(
 /// The call makes the text of a new `config` before it creates a directory,
 /// so a refusal of the remotes directory value writes nothing. The call
 /// refuses a root that holds an entry `config` before it creates a layout
-/// directory, so that refusal writes nothing either.
+/// directory, so that refusal writes nothing either. A symlink or an entry
+/// that is not a directory at a path of the layout fails the call before it
+/// writes `config`.
 fn create_materials<Fd: AsFd>(dir: Fd, path: &Path, opts: &CreateOptions) -> Result<Materials> {
     let config = initial_config_text(opts)?;
-    mkdir_idempotent(&dir, path, opts.mode)?;
-    let repo_fd = open_dir(&dir, path)?;
-    match rustix::fs::statat(&repo_fd, CONFIG, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => return Err(Error::RepoExists(path.to_owned())),
-        Err(Errno::NOENT) => {}
-        Err(e) => return Err(e.into()),
+    let root = RepoDir::create_root(dir, path, opts.mode, true)?;
+    if root.exists(RootFile::Config.name())? {
+        return Err(Error::RepoExists(path.to_owned()));
     }
-    for sub in LAYOUT_DIRS {
-        mkdir_idempotent(&repo_fd, Path::new(sub), opts.mode)?;
+    for kind in INIT_KINDS {
+        // The handle of `tmp/` stays in the context of the root, for the temp
+        // file of `config`. Each other handle drops at once.
+        match kind {
+            RepoLayout::Tmp => root.tmp_dir(true)?,
+            kind => root.ensure_layout(kind, true)?,
+        };
     }
-    write_initial_config(&repo_fd, path, &config)?;
-    materials_from_repo(repo_fd, false)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
+    write_initial_config(&root, path, &config)?;
+    materials_from_root(root, false)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
 }
 
-/// Opens the `objects/` directory and reads and parses the config, given the
-/// descriptor of the repository root. In the strict open mode, the open of
-/// `objects/` follows no symlink. The materials have no remotes directory.
-fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> Result<Materials> {
-    let objects_fd = match strict {
-        true => rustix::fs::openat(
-            &repo_fd,
-            "objects",
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )?,
-        false => open_dir(&repo_fd, Path::new("objects"))?,
-    };
-    let config = read_config_blocking(repo_fd.as_fd(), strict)?;
+/// Reads and parses the config, and opens `objects/`, given the handle of the
+/// repository root. The materials have no remotes directory.
+///
+/// The open of `objects/` comes after the handle of the root takes the mode of
+/// the config, so the handle of `objects/` has that mode too.
+fn materials_from_root(root: RepoDir, strict: bool) -> Result<Materials> {
+    let config = read_config(&root)?;
+    let root = root.with_repo_mode(config.mode());
+    let objects = root.open_layout(RepoLayout::Objects)?;
     Ok(Materials {
-        repo_fd,
-        objects_fd,
+        root,
+        objects,
         config,
         remotes_dir: None,
         strict,
     })
 }
 
-/// Opens a directory relative to `dir` for descriptor-relative access.
-fn open_dir<Fd: AsFd>(dir: Fd, path: &Path) -> std::io::Result<OwnedFd> {
-    let fd = rustix::fs::openat(
-        dir,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    Ok(fd)
-}
-
-/// Reads the config file relative to `dir`, up to one byte after
-/// [`MAX_CONFIG_SIZE`].
+/// Writes the initial `config` text `text` at the repository root `root`.
 ///
-/// The parse can then refuse a file over the cap, and the read stops there.
-/// In the strict open mode, the open follows no symlink and does not block,
-/// and a file that is not a regular file is refused.
-fn read_file<Fd: AsFd>(dir: Fd, path: &str, strict: bool) -> std::io::Result<Vec<u8>> {
-    let fd = crate::object::open_regular_file(dir.as_fd(), path, strict)?;
-    let mut buf = Vec::new();
-    std::fs::File::from(fd)
-        .take(MAX_CONFIG_SIZE + 1)
-        .read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
-/// Creates a directory, and treats an existing entry as success.
-///
-/// In a `bare-user-shared` repository, the call forces
-/// [`perm::SHARED_DIR_MODE`] on a directory that it creates. An entry that
-/// exists keeps its mode and its group.
-fn mkdir_idempotent<Fd: AsFd>(dir: Fd, path: &Path, mode: RepoMode) -> std::io::Result<()> {
-    match rustix::fs::mkdirat(&dir, path, Mode::from_raw_mode(DIR_MODE)) {
-        Ok(()) => perm::force_created_dir(&dir, path, mode),
-        Err(Errno::EXIST) => Ok(()),
-        Err(e) => Err(e.into()),
+/// The call writes a temp file in `tmp/`, forces the mode `0644` on it
+/// whatever the umask, as the `ostree` command does, syncs it, and puts it at
+/// `config` only if no entry `config` exists. It then syncs the root. If an
+/// entry `config` exists, the call keeps it and gives [`Error::RepoExists`]
+/// with `path`, the path of the root as the caller gave it.
+fn write_initial_config(root: &RepoDir, path: &Path, text: &str) -> Result<()> {
+    match root.write_root_file(
+        RootFile::Config,
+        text.as_bytes(),
+        Publish::KeepExisting,
+        true,
+    )? {
+        Published::Created => Ok(()),
+        Published::Existed => Err(Error::RepoExists(path.to_owned())),
     }
-}
-
-/// Writes the initial `config` text into a new file `config`. The call
-/// forces the mode `0644` on the file whatever the umask, as the `ostree`
-/// command does.
-///
-/// The open is exclusive. If an entry `config` exists, the call gives
-/// [`Error::RepoExists`] with `path`, the path of the root as the caller
-/// gave it.
-fn write_initial_config<Fd: AsFd>(repo_fd: Fd, path: &Path, config: &str) -> Result<()> {
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        CONFIG,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        Mode::from_raw_mode(CONFIG_MODE),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::EXIST) => return Err(Error::RepoExists(path.to_owned())),
-        Err(e) => return Err(e.into()),
-    };
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(CONFIG_MODE))?;
-    std::fs::File::from(fd).write_all(config.as_bytes())?;
-    Ok(())
 }
 
 /// Returns the exact config bytes of a new repository.
@@ -1426,25 +1413,64 @@ mod tests {
     }
 
     /// A `config` that appears after the check of the create, before the
-    /// exclusive open, gives `RepoExists` and keeps its bytes.
+    /// publish of the new file, gives `RepoExists` and keeps its bytes.
+    /// `tmp/` then holds no named temp file. On a file system with
+    /// `O_TMPFILE`, the write makes no named temp file, so this check can
+    /// fail only on a file system without `O_TMPFILE`.
     #[test]
     fn initial_config_write_refuses_an_existing_config() {
-        let dir = std::env::temp_dir().join(format!(
-            "ostrya-initial-config-{}-{}",
-            std::process::id(),
-            crate::write::unique()
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join(CONFIG), b"race").unwrap();
-        let fd = open_dir(rustix::fs::CWD, &dir).unwrap();
+        let dir = crate::repo_fs::TestDir::new("initial-config");
+        std::fs::write(dir.path().join("config"), b"race").unwrap();
+        let root = RepoDir::from_root_fd(rustix::io::dup(dir.fd()).unwrap());
 
-        let err = write_initial_config(&fd, Path::new("repo"), "[core]\n").unwrap_err();
+        let err = write_initial_config(&root, Path::new("repo"), "[core]\n").unwrap_err();
         assert!(
             matches!(&err, Error::RepoExists(p) if p == Path::new("repo")),
             "{err:?}"
         );
-        assert_eq!(std::fs::read(dir.join(CONFIG)).unwrap(), b"race");
-        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(std::fs::read(dir.path().join("config")).unwrap(), b"race");
+        let temps: Vec<_> = std::fs::read_dir(dir.path().join("tmp"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|name| name.as_bytes().starts_with(b".ostrya-tmp-"))
+            .collect();
+        assert!(temps.is_empty(), "{temps:?}");
+    }
+
+    /// The create makes each kind that the table of the layout marks as made
+    /// at the create, and that has a fixed path. The match has no wildcard
+    /// arm, so a new kind fails to compile here until the match names it.
+    /// Add each kind that the match names to the list `all` too.
+    #[test]
+    fn init_kinds_are_the_kinds_created_at_init() {
+        let all = [
+            RepoLayout::Root,
+            RepoLayout::Objects,
+            RepoLayout::Staging,
+            RepoLayout::Tmp,
+            RepoLayout::Refs,
+            RepoLayout::State,
+            RepoLayout::Extensions,
+            RepoLayout::Deltas,
+            RepoLayout::DeltaIndexes,
+        ];
+        for kind in all {
+            match kind {
+                RepoLayout::Root
+                | RepoLayout::Objects
+                | RepoLayout::Staging
+                | RepoLayout::Tmp
+                | RepoLayout::Refs
+                | RepoLayout::State
+                | RepoLayout::Extensions
+                | RepoLayout::Deltas
+                | RepoLayout::DeltaIndexes => {}
+            }
+        }
+        let made: Vec<_> = all
+            .into_iter()
+            .filter(|kind| kind.rules().created_at_init && kind.rules().path.is_some())
+            .collect();
+        assert_eq!(made, INIT_KINDS);
     }
 }

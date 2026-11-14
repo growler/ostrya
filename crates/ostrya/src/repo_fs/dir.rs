@@ -106,10 +106,18 @@ impl RepoDir {
     /// created the directory. If the `fchmod` fails, the function removes the
     /// directory that it created. An existing directory keeps its mode. The
     /// open and its errors are those of [`open_root`](RepoDir::open_root).
+    ///
+    /// With `fsync`, the function syncs the parent directory of a root that
+    /// it created. It opens the parent with one `openat` of `..` relative to
+    /// the new root, so the sync reaches the directory that holds the new
+    /// entry, also when `path` passes through a symlink. An existing root
+    /// syncs nothing. An error of the open or of the sync gives
+    /// [`FsError::Io`], and the new root stays.
     pub(crate) fn create_root(
         base: impl AsFd,
         path: &Path,
         mode: RepoMode,
+        fsync: bool,
     ) -> Result<RepoDir, FsError> {
         let base = base.as_fd();
         let (request, force) = dir_modes(
@@ -125,6 +133,11 @@ impl RepoDir {
         let root = RepoDir::open_root(base, path)?.with_repo_mode(mode);
         if let Some(force) = force.filter(|_| created) {
             force_new_dir_mode(base, path, root.as_fd(), force).map_err(io_error)?;
+        }
+        if created && fsync {
+            let parent =
+                rustix::fs::openat(&root, "..", DIR_OPEN, Mode::empty()).map_err(io_error)?;
+            fsync_dir(parent.as_fd()).map_err(io_error)?;
         }
         Ok(root)
     }
@@ -2004,7 +2017,8 @@ mod tests {
     #[test]
     fn create_root_makes_the_root_with_its_mode() {
         let dir = TestDir::new("create-root");
-        let repo = RepoDir::create_root(dir.fd(), Path::new("plain"), RepoMode::BareUser).unwrap();
+        let repo =
+            RepoDir::create_root(dir.fd(), Path::new("plain"), RepoMode::BareUser, false).unwrap();
         assert_eq!(repo.kind(), RepoLayout::Root);
         assert_eq!(repo.repo_mode(), Some(RepoMode::BareUser));
         assert_eq!(
@@ -2012,23 +2026,28 @@ mod tests {
             reference_mode(dir.path(), 0o775)
         );
 
-        let repo =
-            RepoDir::create_root(dir.fd(), Path::new("shared"), RepoMode::BareUserShared).unwrap();
+        let repo = RepoDir::create_root(
+            dir.fd(),
+            Path::new("shared"),
+            RepoMode::BareUserShared,
+            true,
+        )
+        .unwrap();
         assert_eq!(repo.repo_mode(), Some(RepoMode::BareUserShared));
         assert_eq!(mode_of(&dir.path().join("shared")), 0o2770);
 
         // An existing root keeps its mode.
         std::fs::create_dir(dir.path().join("old")).unwrap();
         set_mode(&dir.path().join("old"), 0o700);
-        let repo =
-            RepoDir::create_root(dir.fd(), Path::new("old"), RepoMode::BareUserShared).unwrap();
+        let repo = RepoDir::create_root(dir.fd(), Path::new("old"), RepoMode::BareUserShared, true)
+            .unwrap();
         assert_eq!(
             identity(repo.as_fd()).unwrap(),
             id_of(&dir.path().join("old"))
         );
         assert_eq!(mode_of(&dir.path().join("old")), 0o700);
 
-        match RepoDir::create_root(dir.fd(), Path::new("missing/repo"), RepoMode::Archive) {
+        match RepoDir::create_root(dir.fd(), Path::new("missing/repo"), RepoMode::Archive, true) {
             Err(FsError::Absent { path }) => assert_eq!(path, "missing/repo"),
             other => panic!("{other:?}"),
         }
@@ -2042,9 +2061,29 @@ mod tests {
             dir.fd(),
             Path::new("shared"),
             RepoMode::BareUserShared,
+            true,
         ));
         assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()));
         assert!(!dir.path().join("shared").exists());
+    }
+
+    #[test]
+    fn create_root_with_fsync_syncs_the_parent_of_a_new_root_alone() {
+        let dir = TestDir::new("create-root-sync");
+        std::fs::create_dir(dir.path().join("real")).unwrap();
+        symlink("real", dir.path().join("link")).unwrap();
+        let _reset = record_syncs();
+
+        RepoDir::create_root(dir.fd(), Path::new("plain"), RepoMode::BareUser, true).unwrap();
+        assert_eq!(take_synced(), [id_of(dir.path())]);
+        RepoDir::create_root(dir.fd(), Path::new("link/repo"), RepoMode::Archive, true).unwrap();
+        assert_eq!(take_synced(), [id_of(&dir.path().join("real"))]);
+
+        // An existing root syncs nothing, and no fsync syncs nothing.
+        RepoDir::create_root(dir.fd(), Path::new("plain"), RepoMode::BareUser, true).unwrap();
+        RepoDir::create_root(dir.fd(), Path::new("quiet"), RepoMode::BareUser, false).unwrap();
+        assert!(take_synced().is_empty());
+        assert!(dir.path().join("quiet").is_dir());
     }
 
     #[test]

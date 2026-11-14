@@ -528,31 +528,69 @@ fn open_in_time(
         .expect("the open returns in time")
 }
 
-/// The strict open mode refuses a `config` that is a symlink. The default
-/// open follows it.
-#[test]
-fn the_strict_open_refuses_a_symlinked_config() {
-    let tmp = TmpDir::new("strict-link");
-    let parent = strict_fixture(&tmp);
-    let repo = tmp.path().join("repo");
-    std::fs::rename(repo.join("config"), tmp.path().join("real-config")).unwrap();
-    std::os::unix::fs::symlink("../real-config", repo.join("config")).unwrap();
+/// The text that follows the path in the refusal of a symlink in a
+/// repository.
+const SYMLINK_TEXT: &str = "passes through a symlink; ostrya refuses a symlink in the repository";
 
-    let fd = std::os::fd::AsFd::as_fd(&parent);
-    block_on(Repo::open_at(fd, Path::new("repo"))).expect("the default open follows it");
-    let err = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap_err();
-    match err {
-        ostrya::Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{e}"),
-        other => panic!("{other}"),
+/// Runs each open of the repository `repo` under `tmp`:
+/// [`Repo::open_at`], [`Repo::open`], and [`Repo::open_at_strict`].
+fn each_open(tmp: &TmpDir) -> [(&'static str, ostrya::Result<Repo>); 3] {
+    let parent = std::fs::File::open(tmp.path()).unwrap();
+    let fd = parent.as_fd();
+    [
+        ("open_at", block_on(Repo::open_at(fd, Path::new("repo")))),
+        ("open", block_on(Repo::open(&tmp.path().join("repo")))),
+        (
+            "open_at_strict",
+            block_on(Repo::open_at_strict(fd, Path::new("repo"))),
+        ),
+    ]
+}
+
+/// Asserts that each open of the repository `repo` under `tmp` fails with
+/// `Error::InvalidFormat` and the message `text`.
+fn assert_each_open_invalid(tmp: &TmpDir, text: &str) {
+    for (open, result) in each_open(tmp) {
+        match result {
+            Err(Error::InvalidFormat(m)) => assert_eq!(m, text, "{open}"),
+            Err(other) => panic!("{open}: {other}"),
+            Ok(_) => panic!("{open}: the open succeeds"),
+        }
     }
 }
 
-/// The strict open mode refuses a `config` that is a FIFO, and the open does
-/// not wait for a writer.
+/// Asserts that each open of the repository `repo` under `tmp` fails with
+/// `Error::Io` of kind `NotFound` and the message `text`.
+fn assert_each_open_not_found(tmp: &TmpDir, text: &str) {
+    for (open, result) in each_open(tmp) {
+        let err = io_error(result);
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{open}: {err}");
+        assert_eq!(err.to_string(), text, "{open}");
+    }
+}
+
+/// Each open refuses a `config` that is a symlink, and the target keeps its
+/// bytes.
 #[test]
-fn the_strict_open_refuses_a_fifo_config() {
-    let tmp = TmpDir::new("strict-fifo");
-    let parent = strict_fixture(&tmp);
+fn each_open_refuses_a_symlinked_config() {
+    let tmp = TmpDir::new("link-config");
+    strict_fixture(&tmp);
+    let repo = tmp.path().join("repo");
+    let real = tmp.path().join("real-config");
+    std::fs::rename(repo.join("config"), &real).unwrap();
+    let bytes = std::fs::read(&real).unwrap();
+    std::os::unix::fs::symlink("../real-config", repo.join("config")).unwrap();
+
+    assert_each_open_invalid(&tmp, &format!("config {SYMLINK_TEXT}"));
+    assert_eq!(std::fs::read(&real).unwrap(), bytes);
+}
+
+/// Each open refuses a `config` that is a FIFO, and the open does not wait
+/// for a writer.
+#[test]
+fn each_open_refuses_a_fifo_config() {
+    let tmp = TmpDir::new("fifo-config");
+    let parent = Arc::new(strict_fixture(&tmp));
     let repo = tmp.path().join("repo");
     std::fs::remove_file(repo.join("config")).unwrap();
     rustix::fs::mknodat(
@@ -564,20 +602,177 @@ fn the_strict_open_refuses_a_fifo_config() {
     )
     .unwrap();
 
-    let err = open_in_time(move || {
-        block_on(Repo::open_at_strict(
-            std::os::fd::AsFd::as_fd(&parent),
-            Path::new("repo"),
-        ))
-    })
-    .unwrap_err();
-    match err {
-        ostrya::Error::Io(e) => {
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-            assert!(e.to_string().contains("not a regular file"), "{e}");
+    for strict in [false, true] {
+        let parent = Arc::clone(&parent);
+        let err = open_in_time(move || {
+            let fd = parent.as_fd();
+            match strict {
+                false => block_on(Repo::open_at(fd, Path::new("repo"))),
+                true => block_on(Repo::open_at_strict(fd, Path::new("repo"))),
+            }
+        })
+        .unwrap_err();
+        match err {
+            Error::InvalidFormat(m) => assert_eq!(m, "config is not a regular file", "{strict}"),
+            other => panic!("{strict}: {other}"),
         }
-        other => panic!("{other}"),
     }
+}
+
+/// Each open refuses an `objects` that is a symlink, relative or absolute.
+#[test]
+fn each_open_refuses_a_symlinked_objects() {
+    for absolute in [false, true] {
+        let tmp = TmpDir::new("link-objects");
+        strict_fixture(&tmp);
+        let repo = tmp.path().join("repo");
+        let real = tmp.path().join("real-objects");
+        std::fs::rename(repo.join("objects"), &real).unwrap();
+        let target = match absolute {
+            false => PathBuf::from("../real-objects"),
+            true => real.clone(),
+        };
+        std::os::unix::fs::symlink(&target, repo.join("objects")).unwrap();
+
+        assert_each_open_invalid(&tmp, &format!("objects {SYMLINK_TEXT}"));
+    }
+}
+
+/// Each open refuses an `objects` that is a file, and names a missing
+/// `objects`.
+#[test]
+fn each_open_refuses_a_file_at_objects_and_names_a_missing_objects() {
+    let tmp = TmpDir::new("file-objects");
+    strict_fixture(&tmp);
+    let objects = tmp.path().join("repo/objects");
+    std::fs::remove_dir_all(&objects).unwrap();
+    assert_each_open_not_found(&tmp, "objects does not exist");
+
+    std::fs::write(&objects, b"x").unwrap();
+    assert_each_open_invalid(&tmp, "objects is not a directory");
+}
+
+/// Each open names a missing `config`.
+#[test]
+fn open_names_a_missing_config() {
+    let tmp = TmpDir::new("no-config");
+    strict_fixture(&tmp);
+    std::fs::remove_file(tmp.path().join("repo/config")).unwrap();
+    assert_each_open_not_found(&tmp, "config does not exist");
+}
+
+/// An open refuses a root that is a file, and names the path as given.
+#[test]
+fn open_refuses_a_root_that_is_a_file() {
+    let tmp = TmpDir::new("file-root");
+    let path = tmp.path().join("repo");
+    std::fs::write(&path, b"x").unwrap();
+    for (open, result) in each_open(&tmp) {
+        // `Repo::open` gets the full path, and the others get `repo`.
+        let want = match open {
+            "open" => format!("{} is not a directory", path.display()),
+            _ => "repo is not a directory".to_owned(),
+        };
+        match result {
+            Err(Error::InvalidFormat(m)) => assert_eq!(m, want, "{open}"),
+            Err(other) => panic!("{open}: {other}"),
+            Ok(_) => panic!("{open}: the open succeeds"),
+        }
+    }
+}
+
+/// An open follows a symlink in the path of the root, in each open mode.
+#[test]
+fn open_follows_a_symlink_at_the_root() {
+    let tmp = TmpDir::new("link-root");
+    let parent = strict_fixture(&tmp);
+    std::os::unix::fs::symlink("repo", tmp.path().join("link")).unwrap();
+    let fd = parent.as_fd();
+
+    block_on(Repo::open(&tmp.path().join("link"))).expect("open");
+    block_on(Repo::open_at(fd, Path::new("link"))).expect("open_at");
+    block_on(Repo::open_at_strict(fd, Path::new("link"))).expect("open_at_strict");
+}
+
+/// Each open refuses a `config` over the cap of 1048576 bytes, with the text
+/// of the cap.
+#[test]
+fn open_refuses_a_config_over_the_cap_with_the_cap_text() {
+    let tmp = TmpDir::new("config-cap");
+    strict_fixture(&tmp);
+    let config = tmp.path().join("repo/config");
+    let mut bytes = std::fs::read(&config).unwrap();
+    bytes.resize(1024 * 1024 + 1, b'\n');
+    std::fs::write(&config, &bytes).unwrap();
+    assert_each_open_invalid(&tmp, "config is larger than its cap of 1048576 bytes");
+}
+
+/// A symlink at each directory of the layout fails the create before it
+/// writes `config`. The target of the symlink stays empty.
+#[test]
+fn create_refuses_a_symlink_at_each_layout_directory() {
+    let names = [
+        "objects",
+        "tmp",
+        "tmp/cache",
+        "refs",
+        "refs/heads",
+        "refs/remotes",
+        "refs/mirrors",
+        "state",
+        "extensions",
+    ];
+    for name in names {
+        let tmp = TmpDir::new("create-link");
+        let repo = tmp.path().join("repo");
+        let link = repo.join(name);
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let err = block_on(Repo::create(&repo, CreateOptions::new(RepoMode::BareUser)))
+            .expect_err("the create refuses");
+        match err {
+            Error::InvalidFormat(m) => assert_eq!(m, format!("{name} {SYMLINK_TEXT}")),
+            other => panic!("{name}: {other}"),
+        }
+        assert!(!repo.join("config").exists(), "{name}");
+        assert!(entry_names(&target).is_empty(), "{name}");
+    }
+}
+
+/// A file at a directory of the layout fails the create before it writes
+/// `config`.
+#[test]
+fn create_refuses_a_file_at_a_layout_directory() {
+    for name in ["state", "refs/heads"] {
+        let tmp = TmpDir::new("create-file");
+        let repo = tmp.path().join("repo");
+        let file = repo.join(name);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"x").unwrap();
+
+        let err = block_on(Repo::create(&repo, CreateOptions::new(RepoMode::Archive)))
+            .expect_err("the create refuses");
+        match err {
+            Error::InvalidFormat(m) => assert_eq!(m, format!("{name} is not a directory")),
+            other => panic!("{name}: {other}"),
+        }
+        assert!(!repo.join("config").exists(), "{name}");
+    }
+}
+
+/// After a create, `tmp/` holds the directory `cache` and no other entry.
+/// On a file system with `O_TMPFILE`, the temp file of `config` has no name,
+/// so the test cannot find it there. On such a file system, the test checks
+/// the other entries of `tmp/` alone.
+#[test]
+fn create_leaves_only_cache_in_tmp() {
+    let tmp = TmpDir::new("create-temp");
+    let repo = tmp.path().join("repo");
+    block_on(Repo::create(&repo, CreateOptions::new(RepoMode::BareUser))).expect("create");
+    assert_eq!(entry_names(&repo.join("tmp")), ["cache"]);
 }
 
 /// A handle in the strict open mode refuses a metadata object that is a

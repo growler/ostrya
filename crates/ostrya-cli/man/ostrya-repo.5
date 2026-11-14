@@ -111,6 +111,8 @@ The byte layout of each object type is in \fB\%docs/format\-reference.md\fR of t
 \fB\%ostrya init\fR makes the directories \fB\%objects\fR, \fB\%tmp\fR, \fB\%tmp/cache\fR, \fB\%refs\fR, \fB\%refs/heads\fR, \fB\%refs/remotes\fR, \fB\%refs/mirrors\fR, \fB\%state\fR, and \fB\%extensions\fR, and the file \fB\%config\fR.
 It refuses a path that holds an entry \fB\%config\fR of any type with \fB\%repository exists: PATH\fR, exits 1, and writes nothing.
 In a directory that has entries and no \fB\%config\fR, it keeps each entry.
+It refuses a symbolic link and an entry that is not a directory at each directory that it makes, and then writes no \fB\%config\fR.
+Where the file system has \fB\%O_TMPFILE\fR, it links the new \fB\%config\fR into place through \fB\%/proc/self/fd\fR, so it needs \fB\%/proc\fR.
 The other entries below appear when a command first needs them.
 .TP
 \fB\%<repo>/config\fR
@@ -120,6 +122,7 @@ A create through the ostrya library with a remotes directory also writes the key
 \fB\%ostrya init \-\-remotes\-config\-dir\fR writes it.
 The key names the remotes directory that each open reads.
 \fB\%ostrya\-config\fR(1) lists the keys.
+Each open refuses a symbolic link at \fB\%objects\fR and at \fB\%config\fR.
 .TP
 \fB\%<repo>/.lock\fR
 The repository lock.

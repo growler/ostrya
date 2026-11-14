@@ -7,7 +7,7 @@
 //! guard.
 
 use std::collections::BTreeSet;
-use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ostrya_core::{Checksum, KeyFile, Ref};
@@ -25,7 +25,8 @@ use crate::refs::{
     remove_alias_blocking, sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
-use crate::repo::{RemotesDir, Repo, check_config_size, read_config_blocking};
+use crate::repo::{RemotesDir, Repo, check_config_size, read_config};
+use crate::repo_fs::RepoDir;
 use crate::summary::put_root_file_blocking;
 
 /// The config file name at the repository root.
@@ -407,8 +408,8 @@ impl UpdateGuard {
         let link = relative_link(&relpath, &refspec_to_relpath(target)?);
         let repo_mode = self.repo().mode();
         let name = refspec.to_owned();
-        self.write(move |repo_fd, fsync, dirs| {
-            put_alias_blocking(repo_fd, &name, &relpath, &link, fsync, repo_mode, dirs)
+        self.write(move |root, fsync, dirs| {
+            put_alias_blocking(root.as_fd(), &name, &relpath, &link, fsync, repo_mode, dirs)
         })
         .await
     }
@@ -430,8 +431,8 @@ impl UpdateGuard {
     pub async fn remove_ref_alias(&self, refspec: &str) -> Result<()> {
         let relpath = refspec_to_relpath(refspec)?;
         let name = refspec.to_owned();
-        self.write(move |repo_fd, fsync, dirs| {
-            remove_alias_blocking(repo_fd, &name, &relpath, fsync, dirs)
+        self.write(move |root, fsync, dirs| {
+            remove_alias_blocking(root.as_fd(), &name, &relpath, fsync, dirs)
         })
         .await
     }
@@ -447,8 +448,9 @@ impl UpdateGuard {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB or is not
-    ///   UTF-8.
+    /// - [`Error::Io`] of kind `NotFound` if `config` does not exist.
+    /// - [`Error::InvalidFormat`] if `config` is a symlink, is not a regular
+    ///   file, is larger than 1 MiB (1048576 bytes), or is not UTF-8.
     /// - An error of [`RepoConfig::parse`] if `config` does not parse.
     /// - [`Error::Io`] if the read fails.
     /// - The errors of [`OpenOptions::open`](crate::OpenOptions::open) for the
@@ -465,8 +467,9 @@ impl UpdateGuard {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if `config` is larger than 1 MiB or is not
-    ///   UTF-8.
+    /// - [`Error::Io`] of kind `NotFound` if `config` does not exist.
+    /// - [`Error::InvalidFormat`] if `config` is a symlink, is not a regular
+    ///   file, is larger than 1 MiB (1048576 bytes), or is not UTF-8.
     /// - An error of [`RepoConfig::parse`] if `config` does not parse.
     /// - [`Error::Io`] if the read fails.
     #[doc(hidden)]
@@ -504,9 +507,9 @@ impl UpdateGuard {
         let bytes = config_bytes(keyfile)?;
         let names = remotes_dir::config_remote_names(keyfile);
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
-            remotes_dir::check_config_remotes(repo_fd, dir.as_ref(), &names)?;
-            put_config_blocking(repo_fd, &bytes, fsync, dirs)
+        self.edit_config(move |root, fsync, dirs| {
+            remotes_dir::check_config_remotes(root.as_fd(), dir.as_ref(), &names)?;
+            put_config_blocking(root.as_fd(), &bytes, fsync, dirs)
         })
         .await
     }
@@ -572,8 +575,8 @@ impl UpdateGuard {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
-            let (config, writer) = read_sources(repo_fd, dir.as_ref(), fsync)?;
+        self.edit_config(move |root, fsync, dirs| {
+            let (config, writer) = read_sources(root, dir.as_ref(), fsync)?;
             if config.remote(&name).is_some() {
                 return Err(Error::RemoteExists(name));
             }
@@ -596,7 +599,7 @@ impl UpdateGuard {
                     writer.check_absent(&file)?;
                     writer.put(&file, keyfile.to_string().as_bytes(), None)
                 }
-                None => put_config_blocking(repo_fd, &config_bytes(&keyfile)?, fsync, dirs),
+                None => put_config_blocking(root.as_fd(), &config_bytes(&keyfile)?, fsync, dirs),
             }
         })
         .await
@@ -628,16 +631,16 @@ impl UpdateGuard {
         let key = key.to_owned();
         let value = value.to_owned();
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
+        self.edit_config(move |root, fsync, dirs| {
             let group = remote_group(&name);
-            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
+            let mut source = Source::read(root, dir.as_ref(), fsync, &name)?;
             check_key(&key)?;
             let keyfile = source.keyfile_mut();
             if matches!(keyfile.get_string(&group, &key), Ok(Some(held)) if held == value) {
                 return Ok(());
             }
             keyfile.set_string(&group, &key, &value)?;
-            source.put(repo_fd, fsync, dirs)
+            source.put(root.as_fd(), fsync, dirs)
         })
         .await
     }
@@ -665,13 +668,13 @@ impl UpdateGuard {
         let name = name.to_owned();
         let key = key.to_owned();
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
+        self.edit_config(move |root, fsync, dirs| {
             let group = remote_group(&name);
-            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
+            let mut source = Source::read(root, dir.as_ref(), fsync, &name)?;
             if !source.keyfile_mut().remove_key(&group, &key) {
                 return Ok(false);
             }
-            source.put(repo_fd, fsync, dirs)?;
+            source.put(root.as_fd(), fsync, dirs)?;
             Ok(true)
         })
         .await
@@ -714,16 +717,16 @@ impl UpdateGuard {
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect();
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
+        self.edit_config(move |root, fsync, dirs| {
             let group = remote_group(&name);
-            let mut source = Source::read(repo_fd, dir.as_ref(), fsync, &name)?;
+            let mut source = Source::read(root, dir.as_ref(), fsync, &name)?;
             let keyfile = source.keyfile_mut();
             keyfile.remove_group(&group);
             for (key, value) in &keys {
                 check_key(key)?;
                 keyfile.set_string(&group, key, value)?;
             }
-            source.put(repo_fd, fsync, dirs)
+            source.put(root.as_fd(), fsync, dirs)
         })
         .await
     }
@@ -772,15 +775,15 @@ impl UpdateGuard {
         }
         let name = name.to_owned();
         let dir = self.repo().remotes_dir().cloned();
-        self.edit_config(move |repo_fd, fsync, dirs| {
+        self.edit_config(move |root, fsync, dirs| {
             let group = remote_group(&name);
             let keyring = remote_keyring_name(&name);
-            match Source::read(repo_fd, dir.as_ref(), fsync, &name)? {
+            match Source::read(root, dir.as_ref(), fsync, &name)? {
                 Source::Config(mut keyfile) => {
                     keyfile.remove_group(&group);
                     let bytes = config_bytes(&keyfile)?;
-                    let removed = remove_keyring_blocking(repo_fd, &keyring)?;
-                    let put = put_root_file_blocking(repo_fd, CONFIG_FILE, &bytes, fsync);
+                    let removed = remove_keyring_blocking(root.as_fd(), &keyring)?;
+                    let put = put_root_file_blocking(root.as_fd(), CONFIG_FILE, &bytes, fsync);
                     if fsync && (removed || put.is_ok()) {
                         dirs.push(ROOT_DIR.to_owned());
                     }
@@ -800,7 +803,7 @@ impl UpdateGuard {
                     } else {
                         None
                     };
-                    if remove_keyring_blocking(repo_fd, &keyring)? && fsync {
+                    if remove_keyring_blocking(root.as_fd(), &keyring)? && fsync {
                         dirs.push(ROOT_DIR.to_owned());
                     }
                     match rewrite {
@@ -855,8 +858,16 @@ impl UpdateGuard {
     ) -> Result<()> {
         let checksum = checksum.copied();
         let repo_mode = self.repo().mode();
-        self.write(move |repo_fd, fsync, dirs| {
-            put_ref_blocking(repo_fd, &name, &relpath, checksum, fsync, repo_mode, dirs)
+        self.write(move |root, fsync, dirs| {
+            put_ref_blocking(
+                root.as_fd(),
+                &name,
+                &relpath,
+                checksum,
+                fsync,
+                repo_mode,
+                dirs,
+            )
         })
         .await
     }
@@ -865,13 +876,13 @@ impl UpdateGuard {
     /// runs it, and holds the `config` lock of the guard for the whole edit.
     async fn edit_config<T, F>(&self, edit: F) -> Result<T>
     where
-        F: FnOnce(BorrowedFd<'_>, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
+        F: FnOnce(&RepoDir, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let held = self.held.clone();
-        self.write(move |repo_fd, fsync, dirs| {
+        self.write(move |root, fsync, dirs| {
             let _config = held.config.lock().unwrap_or_else(PoisonError::into_inner);
-            edit(repo_fd, fsync, dirs)
+            edit(root, fsync, dirs)
         })
         .await
     }
@@ -885,14 +896,14 @@ impl UpdateGuard {
     /// [`finish`](UpdateGuard::finish) back until it ends.
     async fn write<T, F>(&self, put: F) -> Result<T>
     where
-        F: FnOnce(BorrowedFd<'_>, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
+        F: FnOnce(&RepoDir, bool, &mut Vec<String>) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let flight = InFlight::start(&self.held);
         ostrya_rt::unblock(move || {
             let held = &flight.held;
             let mut dirs = Vec::new();
-            let written = put(held.repo.repo_fd(), held.fsync, &mut dirs);
+            let written = put(held.repo.root_dir(), held.fsync, &mut dirs);
             if held.fsync {
                 held.writes().dirs.extend(dirs);
             }
@@ -922,13 +933,13 @@ fn remote_file_name(name: &str) -> String {
 /// disk, as [`UpdateGuard::read_config`] reads them. Returns the directory
 /// open for a write if the handle has one.
 fn read_sources<'a>(
-    repo_fd: BorrowedFd<'a>,
+    root: &'a RepoDir,
     dir: Option<&'a RemotesDir>,
     fsync: bool,
 ) -> Result<(RepoConfig, Option<DirWriter<'a>>)> {
-    let config = read_config_blocking(repo_fd, false)?;
+    let config = read_config(root)?;
     match dir {
-        Some(dir) => remotes_dir::open_for_write(config, repo_fd, dir, fsync)
+        Some(dir) => remotes_dir::open_for_write(config, root.as_fd(), dir, fsync)
             .map(|(config, writer)| (config, Some(writer))),
         None => Ok((config, None)),
     }
@@ -955,12 +966,12 @@ impl<'a> Source<'a> {
     /// [`Error::RemoteNotFound`] if no source holds the remote, and the
     /// errors of the read.
     fn read(
-        repo_fd: BorrowedFd<'a>,
+        root: &'a RepoDir,
         dir: Option<&'a RemotesDir>,
         fsync: bool,
         name: &str,
     ) -> Result<Source<'a>> {
-        let (config, writer) = read_sources(repo_fd, dir, fsync)?;
+        let (config, writer) = read_sources(root, dir, fsync)?;
         let not_found = || Error::RemoteNotFound(name.to_owned());
         let file = match config.remote(name).ok_or_else(not_found)?.source() {
             RemoteSource::Config => None,
@@ -1221,11 +1232,11 @@ mod tests {
             let (go_tx, go_rx) = mpsc::channel::<()>();
             let ended = Arc::new(AtomicBool::new(false));
             let ended_in = ended.clone();
-            let mut write = Box::pin(guard.write(move |repo_fd, fsync, dirs| {
+            let mut write = Box::pin(guard.write(move |root, fsync, dirs| {
                 started_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
                 let written = put_ref_blocking(
-                    repo_fd,
+                    root.as_fd(),
                     "late/one",
                     "refs/heads/late/one",
                     Some(checksum()),

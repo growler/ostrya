@@ -125,8 +125,7 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// The view opens a stored file one component at a time, with `openat` and
 /// `O_NOFOLLOW`. The walk starts at the descriptor of the repository or of
 /// `objects/`, so it needs no `openat2`. The repository handle opened these
-/// descriptors. Because of this, a symlink at `objects/` itself is part of
-/// the layout of the repository. The handle follows it once, when it opens.
+/// descriptors. The open of the handle refuses a symlink at `objects`.
 ///
 /// The view reads the repository `config` again if its inode number, size,
 /// modification time, or change time differs from the last parse. The next

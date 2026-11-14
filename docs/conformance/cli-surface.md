@@ -7285,10 +7285,38 @@ Observed by running the tool (2026.1).
   on a repository that takes no lock. A `--static-deltas-only` run returns
   before the last two, so it refuses neither of them.
 - The port reads at most 1048576 bytes of `config`. It refuses a larger file
-  with `config exceeds the 1048576-byte size cap` when it opens a repository,
-  and at each later read of the file. The tool reads a `config` of any size.
-  The cap bounds the memory of a read of `config` (`../../CLAUDE.md`,
-  "Working conventions").
+  at the open of a repository, at each later read, and at a write, with
+  `config is larger than its cap of 1048576 bytes`. The tool reads a `config`
+  of any size. The cap bounds the memory of a read of `config`
+  (`../../CLAUDE.md`, "Working conventions").
+- A symlink at `objects` or at `config` fails the command in the port, in
+  each open mode. The open of a repository fails with `invalid format:
+  objects passes through a symlink; ostrya refuses a symlink in the
+  repository`, or the same text for `config`. With `--repo`, the command
+  prints `error: opening repo:` and this text, and exits 1. With no
+  `--repo`, the resolution passes over such a repository, as it passes over
+  each repository that does not open. The tool follows each symlink. With
+  libostree 2026.4 on 2026-11-13, against a repository with an absolute
+  symlink at `objects` or at `config`, `refs`, `rev-parse`, `ls`, `fsck`,
+  `commit`, `checkout -U`, `pull-local --commit-metadata-only`, `summary
+  -u`, `prune --refs-only`, `config set`, and `config get` exit 0 with the
+  output of a repository with no symlink. `ostree config set` replaces a
+  symlink at `config` with a regular file, and the target keeps its old
+  content. The port follows a symlink in the path of the root, as the tool
+  does.
+  In a directory with no `config`, `ostrya init` refuses a symlink or an
+  entry that is not a directory at `objects`, `tmp`, `tmp/cache`, `refs`,
+  `refs/heads`, `refs/remotes`, `refs/mirrors`, `state`, and `extensions`.
+  It then writes no `config` and exits 1. With libostree 2026.4 on
+  2026-11-14, `ostree init --mode=archive` gives these results in such a
+  directory. With a symlink at `objects` to an empty directory, it exits 1
+  with `error: opening repo: openat(config): No such file or directory` and
+  writes no `config`. With a dangling symlink at `objects`, it writes
+  `config` and exits 1 with `error: opening repo: opendir(objects): No such
+  file or directory`. With a symlink at `tmp`, `tmp/cache`, `refs`,
+  `refs/heads`, `state`, or `extensions`, it exits 0, keeps the symlink, and
+  makes the directories below `tmp` and `refs` in the target. With a regular
+  file at `state`, it exits 0 and keeps the file.
 - The global option `--remotes-config-dir=PATH` and the key `[ex-ostrya]
   remotes-config-dir` are port extensions. The tool has no such option and
   ignores the key. The `ostrya` command selects the remotes directory of a

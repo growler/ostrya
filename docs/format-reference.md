@@ -581,6 +581,12 @@ holds only `.filez` content objects and uncompressed metadata.
   summary.sig                     (lazy)
 ```
 
+Outside `bare-user-shared` mode, a create makes the root, `objects/`, `tmp/`,
+`tmp/cache/`, `refs/`, `refs/heads/`, `refs/remotes/`, `refs/mirrors/`,
+`state/`, and `extensions/` with the request mode 0775, which the umask
+reduces. The tool requests the same mode (libostree 2026.4, umask 0000, 0022,
+and 0077). `config` gets 0644 at each umask.
+
 Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>`, with
 the `z` suffix that "Repository modes and on-disk storage" states. The checksum
 must be exactly 64 hex characters.
@@ -1260,6 +1266,15 @@ of a new archive repository is exactly
 directory given as a path also writes the group `[ex-ostrya]` with the key
 `remotes-config-dir`. "Configuration keys of the port" in "Port extensions"
 states the value.
+
+The port opens `config` with one `openat2` relative to the repository root,
+with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, in each open
+mode. A symlink at `config` and an entry that is not a regular file fail the
+open. A FIFO does not block it. The tool follows a symlink at `config`
+(`conformance/cli-surface.md`, "Global conventions"). A new `config` gets the
+mode 0644 at each umask, as the tool gives it. The create of the port writes
+`config` to a temp file in `tmp/`, syncs it, and puts it at `config` only if
+no entry `config` exists.
 
 `ostrya-config(1)` lists each key of `config`, its type, and its default. The
 list includes the keys of the port, the client groups, and the server group.
@@ -6010,7 +6025,7 @@ repository root in this way:
   - a symlink at another place on a path.
 
   The walk starts at the `objects/` directory that the repository handle
-  opened, so the view follows a symlink at `objects/` itself.
+  opened. The open of the handle refuses a symlink at `objects`.
 - The view refuses these paths:
   - `.lock` and `.update.lock`;
   - `tmp` and `state`, and each path under them;
@@ -7065,15 +7080,16 @@ The checks of the daemon, in order:
    copy of the mount of `repo`, which holds no mount below `repo`. The
    `objects` directory that the repository opens must have the device and
    the inode of the directory that the client opened. Else the request is
-   `access`. The reads of `config`, of the metadata objects, and of the
-   image open each file with `openat2`, `RESOLVE_BENEATH`,
-   `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and refuse a file that is not a
-   regular file. The load of a file object opens its fan-out directory
-   `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
-   `RESOLVE_NO_SYMLINKS`. A read of the payload of the file object opens the
-   object file relative to it in the same way as a metadata object. So a
-   symlink at any component of the path stops the read, and the request is
-   `repository`. The daemon opens the image
+   `access`. The open of the repository opens `objects` and reads `config`
+   with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`, as each open
+   does. The reads of the metadata objects and of the image open each file
+   with `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+   `O_NONBLOCK`, and refuse a file that is not a regular file. The load of a
+   file object opens its fan-out directory `objects/<xx>` with `openat2`,
+   `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. A read of the payload of the
+   file object opens the object file relative to it in the same way as a
+   metadata object. So a symlink at any component of the path stops the read,
+   and the request is `repository`. The daemon opens the image
    `extensions/ostrya/composefs/<xx>/<rest>.cfs` under the repository
    directory. An error of `openat2`, `ENOSYS` included, fails the read: the
    daemon has no fallback to `openat`.

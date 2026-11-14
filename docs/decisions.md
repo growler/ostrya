@@ -155,6 +155,13 @@ refuses it and does not give it that meaning. A caller with an absolute
 directory gives a `RemotesDir::Path` value. A create also refuses a path that
 is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
+The open of `objects` and the read of `config` do not depend on the open
+mode. Each is one `openat2` from the root with `RESOLVE_BENEATH` and
+`RESOLVE_NO_SYMLINKS`, with no fallback to `openat`. A symlink at `objects`
+or at `config` fails each open. `Repo::open_at_strict` reads no remotes
+directory. The open follows a symlink in the path of the root, because the
+caller names that path.
+
 ## The create of a repository
 
 `Repo::create` and `Repo::create_at` create a new repository only. If the
@@ -162,11 +169,19 @@ path holds an entry `config` of any type, the create refuses with
 `Error::RepoExists` and writes nothing. The error gives the path as the
 caller gave it. The check is an lstat of `config` after the mkdir of the root
 and before the first layout directory, so the create also refuses a damaged
-repository and a dangling symlink `config`. The exclusive open of the new
-`config` gives the same refusal if another process writes `config` after
-the check and before the create writes its own `config`. In that case, the
-layout directories that the create wrote stay. A directory that has entries
-and no `config` gets the layout and a new `config`. A caller that wants an
+repository and a dangling symlink `config`. The create writes the new
+`config` to a temp file in `tmp/`. It puts the file in place only if no
+entry `config` exists, with `linkat` or with `renameat2` and
+`RENAME_NOREPLACE`. If another process writes `config` after the check, the
+create refuses in the same way and keeps that file. A crash leaves no
+partial `config`. An exclusive open and a write in place were rejected,
+because a crash can leave a partial `config` that each open then refuses.
+Where the file system has `O_TMPFILE`, the temp file has no name, and the
+create links it into place through `/proc/self/fd`. The create then needs
+`/proc`. Without it, the create fails after it writes the layout directories,
+and a later create writes `config`. If the create refuses after the check,
+the layout directories that it wrote stay. A directory that has entries and
+no `config` gets the layout and a new `config`. A caller that wants an
 existing repository calls `Repo::open`.
 `Repo::export_media` calls `Repo::open` when the create refuses.
 

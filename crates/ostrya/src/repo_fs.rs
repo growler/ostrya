@@ -27,6 +27,7 @@ use crate::error::Error;
 mod dir;
 mod read;
 mod temp;
+mod write;
 
 pub(crate) use temp::{TempFile, TempLink};
 
@@ -794,8 +795,8 @@ fn io_err<T: fmt::Debug>(result: Result<T, FsError>) -> std::io::Error {
 enum FaultStep {
     /// The open of a new temp directory.
     Open,
-    /// The `fchmod` that forces the shared mode on each new directory in a
-    /// `bare-user-shared` repository.
+    /// The `fchmod` that forces the shared mode on each new directory and
+    /// each new exclusive file in a `bare-user-shared` repository.
     Fchmod,
 }
 
@@ -828,7 +829,8 @@ type Hook = Box<dyn FnMut(&[u8])>;
 #[cfg(test)]
 #[derive(Default)]
 struct Faults {
-    /// Fails the step after a `mkdirat` with the errno.
+    /// Fails the step after a `mkdirat` with the errno. The step
+    /// [`FaultStep::Fchmod`] also fails after the create of an exclusive file.
     fail_after_mkdir: Option<(FaultStep, Errno)>,
     /// Gives `EEXIST` in place of each `mkdirat` of a temp directory and each
     /// create of a temp file name or a temp symlink name. The primitive makes
@@ -840,6 +842,9 @@ struct Faults {
     /// Gives `EINVAL` in place of each `renameat2` with `RENAME_NOREPLACE`.
     /// The primitive makes no `renameat2` call.
     no_rename_noreplace: bool,
+    /// Gives the errno in place of each `FICLONE` reflink. The primitive makes
+    /// no `ioctl` call.
+    reflink_error: Option<Errno>,
     /// The hooks, at most one for each point.
     hooks: Vec<(HookPoint, Hook)>,
     /// Gives the unknown type in place of the `getdents` type of each entry of
@@ -898,6 +903,18 @@ fn take_synced() -> Vec<(u64, u64)> {
             .map(std::mem::take)
             .expect("the thread records its syncs")
     })
+}
+
+/// Makes `refs/` and its children in `dir`, and returns a handle of it.
+#[cfg(test)]
+fn refs(dir: &TestDir) -> RepoDir {
+    root(dir).ensure_layout(RepoLayout::Refs, false).unwrap()
+}
+
+/// Returns the names of the temp entries in `tmp/` of `dir`.
+#[cfg(test)]
+fn temp_names(dir: &TestDir) -> Vec<String> {
+    names_with(&dir.path().join("tmp"), temp::TEMP_PREFIX)
 }
 
 /// Returns the names of the entries of `path` that start with `prefix`.

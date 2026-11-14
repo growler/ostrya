@@ -899,8 +899,9 @@ fn force_new_dir_mode<P: rustix::path::Arg + Copy>(
     })
 }
 
-/// Sets the mode `force` on the new directory open at `fd` with `fchmod`.
-fn fchmod_new(fd: BorrowedFd<'_>, force: u32) -> Result<(), Errno> {
+/// Sets the mode `force` on the new directory or the new file open at `fd`
+/// with `fchmod`.
+pub(super) fn fchmod_new(fd: BorrowedFd<'_>, force: u32) -> Result<(), Errno> {
     #[cfg(test)]
     fault_after_mkdir(super::FaultStep::Fchmod)?;
     rustix::fs::fchmod(fd, Mode::from_raw_mode(force))

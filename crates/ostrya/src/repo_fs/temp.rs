@@ -40,7 +40,7 @@ use super::{FsError, Publish, Published, RepoDir, TempHome};
 use crate::config::Tristate;
 
 /// The prefix of the name of a named temp entry.
-const TEMP_PREFIX: &str = ".ostrya-tmp-";
+pub(super) const TEMP_PREFIX: &str = ".ostrya-tmp-";
 
 /// The number of decimal digits of the largest `u32`, the largest process id
 /// and the largest descriptor number.
@@ -90,8 +90,8 @@ const SEAL_PAUSE: Duration = Duration::from_millis(1);
 /// The flags of the open of an anonymous temp file.
 const TMPFILE_OPEN: OFlags = OFlags::RDWR.union(OFlags::TMPFILE).union(OFlags::CLOEXEC);
 
-/// The flags of the create of a named temp file.
-const NAMED_OPEN: OFlags = OFlags::RDWR
+/// The flags of the create of a named temp file and of an exclusive create.
+pub(super) const NAMED_OPEN: OFlags = OFlags::RDWR
     .union(OFlags::CREATE)
     .union(OFlags::EXCL)
     .union(OFlags::NOFOLLOW)
@@ -482,7 +482,10 @@ fn make_temp_name<T>(
 /// Opens the parent directory of `path` below `dir`, and gives it and the
 /// leaf. A path with one component gives `None` for the parent: the parent is
 /// `dir`. The caller checks `path`.
-fn open_parent<'p>(dir: &RepoDir, path: &'p str) -> Result<(Option<OwnedFd>, &'p str), FsError> {
+pub(super) fn open_parent<'p>(
+    dir: &RepoDir,
+    path: &'p str,
+) -> Result<(Option<OwnedFd>, &'p str), FsError> {
     let Some((parent, leaf)) = path.rsplit_once('/') else {
         return Ok((None, path));
     };
@@ -493,7 +496,7 @@ fn open_parent<'p>(dir: &RepoDir, path: &'p str) -> Result<(Option<OwnedFd>, &'p
 /// Puts the temp entry `name` of `home` at `leaf` of `parent` by the rule
 /// `how`, and syncs `parent` with `fsync` when the entry is in place. The
 /// function sets `name` to `None` when a rename moved the entry.
-fn place_named(
+pub(super) fn place_named(
     home: BorrowedFd<'_>,
     name: &mut Option<String>,
     parent: BorrowedFd<'_>,
@@ -542,7 +545,7 @@ fn rename_noreplace(
 }
 
 /// Syncs `parent` with `fsync`, and gives [`Published::Created`].
-fn created(parent: BorrowedFd<'_>, fsync: bool) -> Result<Published, FsError> {
+pub(super) fn created(parent: BorrowedFd<'_>, fsync: bool) -> Result<Published, FsError> {
     if fsync {
         fsync_dir(parent).map_err(io_error)?;
     }
@@ -611,7 +614,7 @@ mod tests {
     use super::super::read::verity_digest;
     use super::super::{
         FaultReset, HookPoint, RepoLayout, TestDir, id_of, io_err, is_symlink, mode_of, names_with,
-        record_syncs, root, set_faults, set_hook, stat_fd, take_synced,
+        record_syncs, refs, root, set_faults, set_hook, stat_fd, take_synced, temp_names,
     };
     use super::*;
 
@@ -641,21 +644,11 @@ mod tests {
         }))
     }
 
-    /// Makes `refs/` and its children in `dir`, and returns a handle of it.
-    fn refs(dir: &TestDir) -> RepoDir {
-        root(dir).ensure_layout(RepoLayout::Refs, false).unwrap()
-    }
-
     /// Makes a temp file for a write to `dir`, with the content `data`.
     fn temp_with(dir: &RepoDir, data: &[u8]) -> TempFile {
         let mut temp = TempFile::create(dir).unwrap();
         temp.file_mut().write_all(data).unwrap();
         temp
-    }
-
-    /// Returns the names of the temp entries in `tmp/` of `dir`.
-    fn temp_names(dir: &TestDir) -> Vec<String> {
-        names_with(&dir.path().join("tmp"), TEMP_PREFIX)
     }
 
     /// Gives `true` if the result is an error of `errno`.

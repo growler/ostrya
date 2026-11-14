@@ -27,12 +27,12 @@ use rustix::io::Errno;
 use super::{DirPath, Entry, FsError, Reason, RepoContext, RepoDir, RepoLayout};
 
 /// The flags of each directory open.
-const DIR_OPEN: OFlags = OFlags::RDONLY
+pub(super) const DIR_OPEN: OFlags = OFlags::RDONLY
     .union(OFlags::DIRECTORY)
     .union(OFlags::CLOEXEC);
 
 /// The resolve flags of each open below a handle.
-const BENEATH: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
+pub(super) const BENEATH: ResolveFlags = ResolveFlags::BENEATH.union(ResolveFlags::NO_SYMLINKS);
 
 /// The size of the `getdents` buffer of a listing or a tree removal.
 const LIST_BUF_LEN: usize = 32 * 1024;
@@ -131,7 +131,7 @@ impl RepoDir {
     /// and gives an `InvalidInput` error in a release build.
     pub(crate) fn open_layout(&self, kind: RepoLayout) -> Result<RepoDir, FsError> {
         let path = self.layout_path(kind)?;
-        let fd = open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, path))?;
+        let fd = open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, path.to_owned()))?;
         Ok(self.handle(fd, kind, DirPath::Fixed(path)))
     }
 
@@ -154,7 +154,7 @@ impl RepoDir {
         )?;
         self.check_path(path)?;
         let fd =
-            open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, &self.err_path(path)))?;
+            open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, self.err_path(path)))?;
         Ok(self.nested(fd, path))
     }
 
@@ -178,12 +178,12 @@ impl RepoDir {
         let rules = kind.rules();
         let (request, force) = dir_modes(self.ctx.mode, kind, rules.dir_mode);
         let (fd, _) = ensure_component(self.as_fd(), path, request, force, fsync)
-            .map_err(|e| FsError::at(e, path))?;
+            .map_err(|e| FsError::at(e, path.to_owned()))?;
         let dir = self.handle(fd, kind, DirPath::Fixed(path));
         let mut made = false;
         for child in rules.init_children {
             made |= ensure_child(dir.as_fd(), child, request, force)
-                .map_err(|e| FsError::at(e, &dir.err_path(child)))?;
+                .map_err(|e| FsError::at(e, dir.err_path(child)))?;
         }
         if made && fsync {
             fsync_dir(dir.as_fd()).map_err(io_error)?;
@@ -224,7 +224,7 @@ impl RepoDir {
         match open_beneath(self.as_fd(), path) {
             Ok(fd) => return Ok(self.nested(fd, path)),
             Err(Errno::NOENT) => {}
-            Err(e) => return Err(FsError::at(e, &self.err_path(path))),
+            Err(e) => return Err(FsError::at(e, self.err_path(path))),
         }
         #[cfg(test)]
         run_hook(super::HookPoint::Walk, path.as_bytes());
@@ -244,7 +244,7 @@ impl RepoDir {
             } else {
                 ensure_component(at, component, request, force, fsync)
             };
-            let (fd, created) = result.map_err(|e| FsError::at(e, &self.err_path(&path[..end])))?;
+            let (fd, created) = result.map_err(|e| FsError::at(e, self.err_path(&path[..end])))?;
             made |= created;
             parent = Some(fd);
             end += 1;
@@ -332,7 +332,7 @@ impl RepoDir {
             match mkdir_temp(self.as_fd(), &name, request) {
                 Ok(()) => {}
                 Err(Errno::EXIST) => continue,
-                Err(e) => return Err(FsError::at(e, &self.err_path(&name))),
+                Err(e) => return Err(FsError::at(e, self.err_path(&name))),
             }
             match open_temp_dir(self.as_fd(), &name, force) {
                 Ok(fd) => {
@@ -341,7 +341,7 @@ impl RepoDir {
                 }
                 Err(e) => {
                     let _ = rustix::fs::unlinkat(self, name.as_str(), AtFlags::REMOVEDIR);
-                    return Err(FsError::at(e, &self.err_path(&name)));
+                    return Err(FsError::at(e, self.err_path(&name)));
                 }
             }
         }
@@ -367,7 +367,7 @@ impl RepoDir {
         &self,
         visit: impl FnMut(&CStr, FileType) -> ControlFlow<()>,
     ) -> Result<(), FsError> {
-        reopen_and_visit(self.as_fd(), visit).map_err(|e| FsError::at(e, &self.err_path("")))
+        reopen_and_visit(self.as_fd(), visit).map_err(|e| FsError::at(e, self.err_path("")))
     }
 
     /// Returns the entries of the directory, with no `.` and no `..`.
@@ -416,11 +416,11 @@ impl RepoDir {
         let top = match open_beneath(self.as_fd(), name) {
             Ok(fd) => fd,
             Err(Errno::NOENT) => return Ok(false),
-            Err(e) => return Err(FsError::at(e, &err_path())),
+            Err(e) => return Err(FsError::at(e, err_path())),
         };
         self.clear_tree(bytes, top)?;
         unlink_entry(self.as_fd(), name, AtFlags::REMOVEDIR)
-            .map_err(|e| FsError::at(e, &err_path()))?;
+            .map_err(|e| FsError::at(e, err_path()))?;
         if fsync {
             fsync_dir(self.as_fd()).map_err(io_error)?;
         }
@@ -457,7 +457,7 @@ impl RepoDir {
                 // guards the open.
                 let up = rustix::fs::openat(level_fd.as_fd(), c"..", DIR_OPEN, Mode::empty())
                     .map_err(|e| {
-                        FsError::at(e, &self.tree_path(&levels, &[cleared.name.as_slice()]))
+                        FsError::at(e, self.tree_path(&levels, &[cleared.name.as_slice()]))
                     })?;
                 if Some(identity(up.as_fd())?) != parent.id {
                     return Err(FsError::Io(io::Error::other(
@@ -470,19 +470,14 @@ impl RepoDir {
                     cleared.name.as_slice(),
                     AtFlags::REMOVEDIR,
                 )
-                .map_err(|e| {
-                    FsError::at(e, &self.tree_path(&levels, &[cleared.name.as_slice()]))
-                })?;
+                .map_err(|e| FsError::at(e, self.tree_path(&levels, &[cleared.name.as_slice()])))?;
                 continue;
             };
             let child_fd = match open_beneath(level_fd.as_fd(), child.as_slice()) {
                 Ok(fd) => fd,
                 Err(Errno::NOENT) => continue,
                 Err(e) => {
-                    return Err(FsError::at(
-                        e,
-                        &self.tree_path(&levels, &[child.as_slice()]),
-                    ));
+                    return Err(FsError::at(e, self.tree_path(&levels, &[child.as_slice()])));
                 }
             };
             let mut subdirs = Vec::new();
@@ -493,7 +488,7 @@ impl RepoDir {
             if subdirs.is_empty() {
                 drop(child_fd);
                 unlink_entry(level_fd.as_fd(), child.as_slice(), AtFlags::REMOVEDIR)
-                    .map_err(|e| FsError::at(e, &self.tree_path(&levels, &[child.as_slice()])))?;
+                    .map_err(|e| FsError::at(e, self.tree_path(&levels, &[child.as_slice()])))?;
                 continue;
             }
             // The removal descends, and drops the descriptor of this level.
@@ -521,7 +516,7 @@ impl RepoDir {
     pub(crate) fn sync_dir(&self, path: &str) -> Result<(), FsError> {
         self.check_path(path)?;
         let fd =
-            open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, &self.err_path(path)))?;
+            open_beneath(self.as_fd(), path).map_err(|e| FsError::at(e, self.err_path(path)))?;
         fsync_dir(fd.as_fd()).map_err(io_error)
     }
 
@@ -541,7 +536,7 @@ impl RepoDir {
 
     /// Refuses a `path` that is empty or absolute, or that has a `..`, `.`,
     /// or empty component, with [`Reason::Escape`].
-    fn check_path(&self, path: &str) -> Result<(), FsError> {
+    pub(super) fn check_path(&self, path: &str) -> Result<(), FsError> {
         if path.split('/').all(|c| is_component(c.as_bytes())) {
             return Ok(());
         }
@@ -592,7 +587,7 @@ impl RepoDir {
     /// Returns the path of an error at `rel`, relative to this directory, as
     /// a path relative to the repository root. An empty `rel` gives the path
     /// of this directory. The root itself shows as `.`.
-    fn err_path(&self, rel: &str) -> String {
+    pub(super) fn err_path(&self, rel: &str) -> String {
         let (base, mid) = match &self.path {
             DirPath::Fixed(base) => (*base, ""),
             DirPath::Nested { base, rel } => (*base, &**rel),
@@ -638,7 +633,7 @@ impl RepoDir {
         (errno, entry): ClearError,
     ) -> FsError {
         let tail: Vec<&[u8]> = child.into_iter().chain(entry.as_deref()).collect();
-        FsError::at(errno, &self.tree_path(levels, &tail))
+        FsError::at(errno, self.tree_path(levels, &tail))
     }
 }
 
@@ -1022,7 +1017,7 @@ fn unlink_entry<P: rustix::path::Arg>(
 
 /// Returns `true` if `name` is one path component: not empty, not `.`, not
 /// `..`, and with no `/`.
-fn is_component(name: &[u8]) -> bool {
+pub(super) fn is_component(name: &[u8]) -> bool {
     !matches!(name, b"" | b"." | b"..") && !name.contains(&b'/')
 }
 
@@ -1069,7 +1064,7 @@ fn root_error(errno: Errno, path: &Path) -> FsError {
 }
 
 /// Returns an errno as [`FsError::Io`].
-fn io_error(errno: Errno) -> FsError {
+pub(super) fn io_error(errno: Errno) -> FsError {
     FsError::Io(errno.into())
 }
 
@@ -1077,7 +1072,7 @@ fn io_error(errno: Errno) -> FsError {
 ///
 /// `None` is a defect of the caller, and `what` states the rule. It fails a
 /// debug assertion, and gives an `InvalidInput` error in a release build.
-fn require<T>(value: Option<T>, what: &'static str) -> Result<T, FsError> {
+pub(super) fn require<T>(value: Option<T>, what: &'static str) -> Result<T, FsError> {
     debug_assert!(value.is_some(), "{what}");
     value.ok_or_else(|| FsError::Io(io::Error::new(io::ErrorKind::InvalidInput, what)))
 }
@@ -1085,19 +1080,13 @@ fn require<T>(value: Option<T>, what: &'static str) -> Result<T, FsError> {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
-    use std::fmt::Debug;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt, symlink};
     use std::path::PathBuf;
     use std::rc::Rc;
 
-    use super::super::{FAULTS, FaultStep, Faults, HookPoint, TestDir};
+    use super::super::{FAULTS, FaultStep, Faults, HookPoint, TestDir, invalid, io_err, root};
     use super::*;
-
-    /// Returns a root handle on a duplicate of the descriptor of `dir`.
-    fn root(dir: &TestDir) -> RepoDir {
-        RepoDir::from_root_fd(rustix::io::dup(dir.fd()).unwrap())
-    }
 
     /// Returns the permission bits and the special bits of `path`.
     fn mode_of(path: &Path) -> u32 {
@@ -1133,22 +1122,6 @@ mod tests {
 
     fn set_mode(path: &Path, mode: u32) {
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
-    }
-
-    /// Returns the path and the reason of an `Invalid` error.
-    fn invalid<T: Debug>(result: Result<T, FsError>) -> (String, Reason) {
-        match result {
-            Err(FsError::Invalid { path, reason }) => (path, reason),
-            other => panic!("{other:?}"),
-        }
-    }
-
-    /// Returns the error of an `Io` error.
-    fn io_err<T: Debug>(result: Result<T, FsError>) -> io::Error {
-        match result {
-            Err(FsError::Io(e)) => e,
-            other => panic!("{other:?}"),
-        }
     }
 
     /// Returns the names of the entries of `path` that start with `prefix`.

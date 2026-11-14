@@ -25,6 +25,7 @@ use rustix::io::Errno;
 use crate::error::Error;
 
 mod dir;
+mod read;
 
 /// The error of a file system operation in a repository.
 ///
@@ -104,21 +105,16 @@ impl FsError {
     /// [`Exists`](FsError::Exists), `ELOOP` gives [`Reason::Symlink`], `EXDEV`
     /// gives [`Reason::Escape`], and `ENOTDIR` gives [`Reason::NotDirectory`].
     /// Each other errno gives [`Io`](FsError::Io) with the same raw errno.
-    pub(crate) fn at(errno: Errno, path: &str) -> FsError {
-        let invalid = |reason| FsError::Invalid {
-            path: path.to_owned(),
-            reason,
+    pub(crate) fn at(errno: Errno, path: String) -> FsError {
+        let reason = match errno {
+            Errno::NOENT => return FsError::Absent { path },
+            Errno::EXIST => return FsError::Exists,
+            Errno::LOOP => Reason::Symlink,
+            Errno::XDEV => Reason::Escape,
+            Errno::NOTDIR => Reason::NotDirectory,
+            other => return FsError::Io(other.into()),
         };
-        match errno {
-            Errno::NOENT => FsError::Absent {
-                path: path.to_owned(),
-            },
-            Errno::EXIST => FsError::Exists,
-            Errno::LOOP => invalid(Reason::Symlink),
-            Errno::XDEV => invalid(Reason::Escape),
-            Errno::NOTDIR => invalid(Reason::NotDirectory),
-            other => FsError::Io(other.into()),
-        }
+        FsError::Invalid { path, reason }
     }
 
     /// Converts the error of an operation on the loose object `checksum` of
@@ -585,6 +581,8 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RepoDir>();
     assert_send_sync::<FsError>();
+    assert_send_sync::<Opened>();
+    assert_send_sync::<ObjectEntry>();
 };
 
 /// The status of an inode, from one `statx` call.
@@ -619,6 +617,25 @@ pub(crate) struct Entry {
     pub(crate) name: Vec<u8>,
     /// The file type of the entry.
     pub(crate) file_type: FileType,
+}
+
+/// An open regular file and its status.
+#[derive(Debug)]
+pub(crate) struct Opened {
+    /// The open file. It is open read-only, with `O_NONBLOCK`.
+    pub(crate) file: std::fs::File,
+    /// The status of the file, from one `statx` on the open descriptor.
+    pub(crate) stat: Stat,
+}
+
+/// A loose object that [`RepoDir::open_object`] opened: a regular file, or the
+/// target of a symlink object.
+#[derive(Debug)]
+pub(crate) enum ObjectEntry {
+    /// A regular file.
+    Regular(Opened),
+    /// A symlink. The payload is the target, as bytes.
+    Symlink(Vec<u8>),
 }
 
 /// The `statx` fields that [`stat_fd`] reads.
@@ -700,6 +717,30 @@ impl TestDir {
 impl Drop for TestDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Returns a root handle on a duplicate of the descriptor of `dir`.
+#[cfg(test)]
+fn root(dir: &TestDir) -> RepoDir {
+    RepoDir::from_root_fd(rustix::io::dup(dir.fd()).unwrap())
+}
+
+/// Returns the path and the reason of an `Invalid` error.
+#[cfg(test)]
+fn invalid<T: fmt::Debug>(result: Result<T, FsError>) -> (String, Reason) {
+    match result {
+        Err(FsError::Invalid { path, reason }) => (path, reason),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Returns the error of an `Io` error.
+#[cfg(test)]
+fn io_err<T: fmt::Debug>(result: Result<T, FsError>) -> std::io::Error {
+    match result {
+        Err(FsError::Io(e)) => e,
+        other => panic!("{other:?}"),
     }
 }
 
@@ -831,24 +872,27 @@ mod tests {
     fn each_errno_maps_to_its_kind_and_keeps_the_path() {
         let path = "refs/heads/main";
         assert!(matches!(
-            FsError::at(Errno::NOENT, path),
+            FsError::at(Errno::NOENT, path.to_owned()),
             FsError::Absent { path: p } if p == path
         ));
-        assert!(matches!(FsError::at(Errno::EXIST, path), FsError::Exists));
         assert!(matches!(
-            FsError::at(Errno::LOOP, path),
+            FsError::at(Errno::EXIST, path.to_owned()),
+            FsError::Exists
+        ));
+        assert!(matches!(
+            FsError::at(Errno::LOOP, path.to_owned()),
             FsError::Invalid { path: p, reason: Reason::Symlink } if p == path
         ));
         assert!(matches!(
-            FsError::at(Errno::XDEV, path),
+            FsError::at(Errno::XDEV, path.to_owned()),
             FsError::Invalid { path: p, reason: Reason::Escape } if p == path
         ));
         assert!(matches!(
-            FsError::at(Errno::NOTDIR, path),
+            FsError::at(Errno::NOTDIR, path.to_owned()),
             FsError::Invalid { path: p, reason: Reason::NotDirectory } if p == path
         ));
         for errno in [Errno::NOSYS, Errno::PERM, Errno::ACCESS, Errno::NXIO] {
-            match FsError::at(errno, path) {
+            match FsError::at(errno, path.to_owned()) {
                 FsError::Io(e) => assert_eq!(e.raw_os_error(), Some(errno.raw_os_error())),
                 other => panic!("{errno:?} gave {other:?}"),
             }

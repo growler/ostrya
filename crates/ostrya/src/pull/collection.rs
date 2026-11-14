@@ -1426,7 +1426,7 @@ fn collection_names(collection_id: &str, names: &[String]) -> Result<Vec<String>
 /// # Errors
 ///
 /// - [`Error::InvalidInput`] if `collection_id` fails
-///   [`is_valid_collection_id`](ostrya_core::is_valid_collection_id): the
+///   [`is_valid_collection_id`]: the
 ///   collection-id rule or the length limit.
 fn check_collection_id(collection_id: &str) -> Result<()> {
     if !is_valid_collection_id(collection_id) {

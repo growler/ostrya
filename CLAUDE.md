@@ -242,6 +242,46 @@ again after the change:
 OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
 ```
 
+## Requirement: repository file access goes through `repo_fs`
+
+The module `repo_fs` of `ostrya` is `crates/ostrya/src/repo_fs.rs` and the
+files in `crates/ostrya/src/repo_fs/`. It holds the primitives for the
+low-level file operations on a repository. Each primitive applies the same
+rules for symlinks, FIFOs, file types, size caps, errors, modes, and sync.
+
+All access to the repository content must go through the API of `repo_fs`.
+This applies to each file operation of non-test code on a path in scope. No
+other module calls `rustix::fs` or `std::fs` for such a path. `ostrya-cli` and `ostrya-sign` get the content of such a file from
+`ostrya`. A site that does not use the module yet moves to it. Do not add a
+new site.
+
+The paths in scope are:
+
+- the paths inside a repository, and the files of a source repository that
+  a local pull reads;
+- the paths that a config names, the remotes directory, and the files in it.
+
+These paths are outside the scope: the target tree of a checkout, the source
+tree of a commit or an ingest, the files that a caller names by a path or a
+descriptor, `gpg-homedir` of `[ex-ostrya key]`, and the mount scan of
+`media/find.rs`.
+
+Each change to `repo_fs` needs the explicit confirmation of the maintainer
+before the edit. This rule applies to each change to the files of the
+module: a new primitive, a change to a signature or a behavior, a fix, a
+test, a comment, and the removal of a primitive. It also applies to a change
+that a plan lists.
+
+Keep the changes to `repo_fs` to the absolute minimum. A caller adapts to the
+API of the module. The module does not change to fit one caller. Before you
+propose a change, try to do the work with the primitives that exist. When
+you propose a change, state:
+
+- the change and the files that it touches;
+- the caller that needs it, and why the primitives that exist cannot do the
+  work;
+- the effect of the change on the rules of the module.
+
 ## Requirement: confirm every dependency before adding
 
 Before adding any crate to any `Cargo.toml` -- a regular dependency, a

@@ -25,7 +25,6 @@
 //! With the feature `sign-x509`, the trait `X509Signer` gives the X.509
 //! certificate chain of a signer for a CMS signature.
 
-use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -100,8 +99,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
-    /// - [`Error::Io`] if the `.commitmeta` file is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), is not a regular
+    ///   file, or is a symlink.
+    /// - [`Error::InvalidFormat`] if `tmp` or `objects/<xx>` of the
+    ///   `.commitmeta` file is a symlink or is not a directory.
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
@@ -120,10 +122,9 @@ impl Repo {
         let checksum = *checksum;
         let appends = vec![(signer.metadata_key().to_owned(), signature)];
         self.write_locked(move |repo| {
-            let tmp_fd = crate::staging::open_tmp_dir(repo.repo_fd(), repo_mode)?;
             crate::commit::merge_detached_blocking(
-                tmp_fd.as_fd(),
-                repo.objects_fd(),
+                None,
+                repo.objects(),
                 &checksum,
                 None,
                 None,
@@ -245,8 +246,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
-    /// - [`Error::Io`] if the `.commitmeta` file is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), is not a regular
+    ///   file, or is a symlink.
+    /// - [`Error::InvalidFormat`] if `tmp` or `objects/<xx>` of the
+    ///   `.commitmeta` file is a symlink or is not a directory.
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
@@ -268,10 +272,8 @@ impl Repo {
         let checksum = *checksum;
         let metadata_key = metadata_key.to_owned();
         self.write_locked(move |repo| {
-            let tmp_fd = crate::staging::open_tmp_dir(repo.repo_fd(), repo_mode)?;
             crate::commit::prune_detached_signatures_blocking(
-                tmp_fd.as_fd(),
-                repo.objects_fd(),
+                repo.objects(),
                 &checksum,
                 &metadata_key,
                 &payload,

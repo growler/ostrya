@@ -164,6 +164,7 @@ fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
             .await
             .expect("create the repository");
         std::fs::remove_dir_all(&tmp).expect("remove tmp/");
+        let repo = Repo::open(&repo_path).await.expect("open the repository");
         repo.set_ref_immediate(&Ref::local("dir/one"), Some(&checksum))
             .await
             .expect("write the ref");

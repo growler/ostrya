@@ -792,6 +792,7 @@ fn ref_writes_place_no_temp_beside_the_target() {
 
         std::fs::remove_dir_all(root_dir.join("tmp")).unwrap();
         std::fs::write(root_dir.join("tmp"), b"").unwrap();
+        let repo = Repo::open(&root_dir).await.unwrap();
 
         let notdir = rustix::io::Errno::NOTDIR;
         assert_errno(
@@ -812,11 +813,10 @@ fn ref_writes_place_no_temp_beside_the_target() {
             "guarded ref write",
         );
         guard.finish().await.unwrap();
-        assert_errno(
-            repo.write_commit_detached_metadata(&a, None).await,
-            notdir,
-            "detached metadata write",
-        );
+        match repo.write_commit_detached_metadata(&a, None).await {
+            Err(Error::InvalidFormat(m)) => assert_eq!(m, "tmp is not a directory"),
+            other => panic!("detached metadata write: {other:?}"),
+        }
 
         assert!(
             !root_dir.join("refs/heads/dir").exists(),
@@ -832,8 +832,9 @@ fn ref_writes_place_no_temp_beside_the_target() {
 
 #[test]
 fn ref_writes_create_a_missing_tmp() {
-    // If a repository has no `tmp/`, a ref, alias, or detached-metadata write
-    // creates it and leaves it empty. A ref removal does not create it.
+    // If a repository has no `tmp/`, a ref or alias write creates it and leaves
+    // it empty. A detached-metadata write creates it with its child `cache`
+    // and leaves no other entry. A ref removal does not create it.
     let tmp = TmpDir::new("commit-missing-tmp");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -866,9 +867,10 @@ fn ref_writes_create_a_missing_tmp() {
         assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
 
         std::fs::remove_dir_all(&tmp_dir).unwrap();
+        let repo = Repo::open(&root_dir).await.unwrap();
         repo.write_commit_detached_metadata(&a, None).await.unwrap();
         assert!(tmp_dir.is_dir());
-        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+        assert_eq!(dir_names(&tmp_dir), ["cache"]);
 
         assert_eq!(
             repo.list_refs(None).await.unwrap(),
@@ -880,6 +882,83 @@ fn ref_writes_create_a_missing_tmp() {
             RepoMode::Archive,
         ));
         assert_eq!(std::fs::metadata(&meta).unwrap().len(), 0);
+    });
+}
+
+#[test]
+fn a_new_handle_writes_detached_metadata_after_tmp_is_removed() {
+    // A repository handle opens `tmp/` at its first use and keeps it. After
+    // another process removes `tmp/`, a direct detached-metadata write of
+    // that handle fails. A transaction of the handle makes `tmp/` again at
+    // its begin, so its commit writes the queued detached metadata. A direct
+    // write on a newly opened handle succeeds.
+    let tmp = TmpDir::new("commit-detached-tmp-removed");
+    let root_dir = tmp.path().join("repo");
+    let tmp_dir = root_dir.join("tmp");
+    let a = csum(COMMIT);
+    let mut builder = ostrya_core::DictBuilder::new();
+    builder.insert_bytes("test.note", b"note");
+    let meta = builder.build();
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.write_commit_detached_metadata(&a, None).await.unwrap();
+
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        assert!(
+            repo.write_commit_detached_metadata(&a, Some(&meta))
+                .await
+                .is_err(),
+            "a direct write of the live handle fails after the removal"
+        );
+        let txn = repo.transaction().await.unwrap();
+        txn.set_commit_detached_metadata(&a, meta.clone());
+        txn.commit().await.unwrap();
+        assert_eq!(
+            repo.read_commit_detached_metadata(&a).await.unwrap(),
+            Some(meta.clone())
+        );
+
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        let reopened = Repo::open(&root_dir).await.unwrap();
+        reopened
+            .write_commit_detached_metadata(&a, None)
+            .await
+            .unwrap();
+        assert_eq!(dir_names(&tmp_dir), ["cache"]);
+        assert_eq!(
+            reopened.read_commit_detached_metadata(&a).await.unwrap(),
+            None
+        );
+    });
+}
+
+#[test]
+fn a_detached_metadata_write_makes_a_missing_fanout() {
+    // The fan-out directory of the `.commitmeta` file is absent. The write
+    // makes it, writes the file, and leaves no temp file in `tmp/`.
+    let tmp = TmpDir::new("commit-detached-missing-fanout");
+    let root_dir = tmp.path().join("repo");
+    let a = csum(COMMIT);
+    let fanout = root_dir.join("objects").join(&COMMIT[..2]);
+    let mut builder = ostrya_core::DictBuilder::new();
+    builder.insert_bytes("test.note", b"note");
+    let meta = builder.build();
+    block_on(async {
+        let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        assert!(!fanout.exists(), "the fan-out directory starts absent");
+        repo.write_commit_detached_metadata(&a, Some(&meta))
+            .await
+            .unwrap();
+        assert!(std::fs::symlink_metadata(&fanout).unwrap().is_dir());
+        assert_eq!(
+            repo.read_commit_detached_metadata(&a).await.unwrap(),
+            Some(meta)
+        );
+        assert_eq!(dir_names(&root_dir.join("tmp")), ["cache"]);
     });
 }
 
@@ -915,9 +994,11 @@ fn a_ref_name_of_name_max_bytes_is_written() {
 
 #[test]
 fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
-    // If `tmp/` is on another file system, the rename of each temp entry fails
-    // with EXDEV. The write fails, ostrya removes the temp entry, and the target
-    // does not change.
+    // If `tmp/` is on another file system, the rename of each temp entry of a
+    // ref write fails with EXDEV. The write fails, ostrya removes the temp
+    // entry, and the target does not change. A detached-metadata write refuses
+    // a symlink at `tmp`, as
+    // `a_symlink_at_tmp_fails_each_detached_metadata_write` states.
     let tmp = TmpDir::new("commit-tmp-xdev");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -966,22 +1047,11 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
             xdev,
             "alias write",
         );
-        assert_errno(
-            repo.write_commit_detached_metadata(&a, None).await,
-            xdev,
-            "detached metadata write",
-        );
 
         assert_eq!(
             repo.list_refs(None).await.unwrap(),
             vec![("kept".to_owned(), a)]
         );
-        let meta = root_dir.join("objects").join(loose_path(
-            &a,
-            ObjectType::CommitMeta,
-            RepoMode::Archive,
-        ));
-        assert!(!meta.exists(), "no detached metadata is written");
         assert_eq!(dir_names(&other), Vec::<String>::new());
     });
     let _ = std::fs::remove_dir_all(&other);

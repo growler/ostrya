@@ -526,9 +526,9 @@ struct RepoInner {
     // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
     // The strict open mode of `Repo::open_at_strict`: the read of the
-    // composefs image, the read of `summary`, and the object copies of a
-    // local pull follow no symlink in any component of their path, do not
-    // block on a FIFO, and refuse a file that is not a regular file.
+    // composefs image and the read of `summary` follow no symlink in any
+    // component of their path, do not block on a FIFO, and refuse a file that
+    // is not a regular file.
     strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
@@ -541,6 +541,10 @@ struct RepoInner {
     // The anonymous read access of the implicit client groups. The first
     // use builds it from `config`, and all clones of this handle share it.
     implicit_reads: OnceLock<ReadAccess>,
+    // The result of the seal probe of `Repo::seals_objects` under
+    // `fsverity=maybe`. The first probe sets it, and all clones of this
+    // handle share it.
+    seal_probe: OnceLock<bool>,
 }
 
 impl RepoInner {
@@ -659,22 +663,14 @@ impl Repo {
     ///   refuse a file that is not a regular file. A symlink at any
     ///   component of the path, a FIFO, or a device fails the read and does
     ///   not block it.
-    /// - The link, the copy, and the clone of an object by a local pull from
-    ///   the handle follow no symlink at `objects/<xx>`. Before a hardlink,
-    ///   the pull opens `objects/<xx>` with `openat2`, `RESOLVE_BENEATH`, and
-    ///   `RESOLVE_NO_SYMLINKS`, and makes the link relative to it. The link refuses a source object that is
-    ///   not a regular file, except a symlink content object of a `bare`,
-    ///   `bare-user-only`, or `bare-split-xattrs` repository. It also refuses
-    ///   an object that changed between its check and its link. A copy of a
-    ///   metadata object and a clone of a payload open the object with
-    ///   `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-    ///   `O_NONBLOCK`, and refuse a file that is not a regular file. A
-    ///   symlink at the object path, a FIFO, or a device fails the copy and
-    ///   does not block it.
     ///
-    /// The open of `objects`, the read of `config`, and each read of an
-    /// object by the handle, also the copy of the bytes of a `.filez` file by
-    /// a local pull, are the same as in [`open_at`](Repo::open_at).
+    /// The open of `objects`, the read of `config`, each read of an object by
+    /// the handle, and the link, the copy, and the clone of an object by a
+    /// local pull from the handle are the same as in
+    /// [`open_at`](Repo::open_at). In each open mode, a local pull follows no
+    /// symlink at `objects/<xx>` or at the path of a source object, refuses a
+    /// source object that is not the type that the source mode stores, and
+    /// does not block on a FIFO.
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.
@@ -862,7 +858,10 @@ impl Repo {
     /// - `no` gives `false`.
     /// - `maybe` gives the result of a probe. The probe makes a temp file in
     ///   `tmp/`, writes one byte, and enables fs-verity on it. If the enable
-    ///   fails, the result is `false`. The probe removes the file.
+    ///   fails, the result is `false`. The probe removes the file. The
+    ///   handle runs the probe one time, and each later call on the handle or
+    ///   on a clone of it gives the same result. A transaction of the handle
+    ///   seals no object when the result is `false`.
     ///
     /// The result covers the objects that a write stages. An object that the
     /// repository holds from before, for example from a write with
@@ -876,6 +875,8 @@ impl Repo {
     /// # Errors
     ///
     /// - The errors of [`RepoConfig::fsverity`].
+    /// - [`Error::InvalidFormat`] if `tmp` is a symlink or is not a
+    ///   directory.
     /// - [`Error::Io`] if the probe cannot create `tmp/`, or cannot open or
     ///   write its temp file.
     pub async fn seals_objects(&self) -> Result<bool> {
@@ -883,12 +884,14 @@ impl Repo {
             Tristate::Yes => Ok(true),
             Tristate::No => Ok(false),
             Tristate::Maybe => {
+                if let Some(sealed) = self.inner.seal_probe.get() {
+                    return Ok(*sealed);
+                }
                 let repo = self.clone();
-                ostrya_rt::unblock(move || {
-                    let tmp = crate::staging::open_tmp_dir(repo.repo_fd(), repo.mode())?;
-                    crate::write::probe_seal_blocking(tmp.as_fd())
-                })
-                .await
+                let sealed =
+                    ostrya_rt::unblock(move || crate::write::probe_seal_blocking(repo.root_dir()))
+                        .await?;
+                Ok(*self.inner.seal_probe.get_or_init(|| sealed))
             }
         }
     }
@@ -1190,6 +1193,7 @@ impl Repo {
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
                 implicit_reads: OnceLock::new(),
+                seal_probe: OnceLock::new(),
             }),
         }
     }

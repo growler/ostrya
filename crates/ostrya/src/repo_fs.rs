@@ -33,7 +33,7 @@ mod write;
 
 pub(crate) use read::{verity_digest, xattr, xattrs};
 pub(crate) use temp::{TempFile, TempLink};
-pub(crate) use write::{clone_or_copy, link};
+pub(crate) use write::{Cloned, clone_or_copy, link, rename};
 
 /// The error of a file system operation in a repository.
 ///

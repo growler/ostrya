@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::io::Write;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
@@ -1590,11 +1590,8 @@ impl Repo {
             }
             let mode = self.mode();
             let repo = self.clone();
-            ostrya_rt::unblock(move || {
-                let tmp_fd = crate::staging::open_tmp_dir(repo.repo_fd(), mode)?;
-                write_tombstone(tmp_fd.as_fd(), repo.objects_fd(), &commit, mode, fsync)
-            })
-            .await?;
+            ostrya_rt::unblock(move || write_tombstone(repo.objects(), &commit, mode, fsync))
+                .await?;
             self.fsck_unlink_object(ObjectName::new(commit, ObjectType::Commit))
                 .await?;
             ctx.tombstoned.insert(commit);

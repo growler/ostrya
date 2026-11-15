@@ -264,7 +264,7 @@ fn a_transaction_reaps_aged_tmp_entries() {
     std::fs::write(tmp.join(".tmp-old"), b"o").unwrap();
     stamp(&tmp.join(".tmp-old"), OLD);
     // The temporary entries of a ref write and of a detached-metadata write.
-    for name in [".ostrya-ref-1-1-aBc123", ".ostrya-meta-1-1-aBc123"] {
+    for name in [".ostrya-ref-1-1-aBc123", ".ostrya-tmp-1-aBc123"] {
         std::fs::write(tmp.join(name), b"o").unwrap();
         stamp(&tmp.join(name), OLD);
     }
@@ -288,7 +288,7 @@ fn a_transaction_reaps_aged_tmp_entries() {
     // Entries that the reap keeps.
     std::fs::write(tmp.join("newfile"), b"n").unwrap();
     std::fs::write(tmp.join(".ostrya-ref-2-2-aBc123"), b"n").unwrap();
-    std::fs::write(tmp.join(".ostrya-meta-2-2-aBc123"), b"n").unwrap();
+    std::fs::write(tmp.join(".ostrya-tmp-2-aBc123"), b"n").unwrap();
     std::fs::create_dir(tmp.join("newdir")).unwrap();
     std::fs::write(tmp.join("newdir/oldkid"), b"o").unwrap();
     stamp(&tmp.join("newdir/oldkid"), OLD);
@@ -313,8 +313,8 @@ fn a_transaction_reaps_aged_tmp_entries() {
         assert_eq!(
             left,
             [
-                ".ostrya-meta-2-2-aBc123",
                 ".ostrya-ref-2-2-aBc123",
+                ".ostrya-tmp-2-aBc123",
                 "cache",
                 "newdir",
                 "newfile",

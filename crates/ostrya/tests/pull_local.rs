@@ -1539,6 +1539,70 @@ fn a_verity_destination_seals_every_imported_object() {
     });
 }
 
+/// A destination with `fsverity=maybe` copies each object where its seal
+/// probe succeeds, and hardlinks each object where the probe fails. The test
+/// runs once below the test directory and once on tmpfs at `/dev/shm`, and
+/// reads the result of the probe of each destination, so each file system
+/// gives a fixed expectation.
+#[test]
+fn a_maybe_destination_links_where_it_cannot_seal() {
+    let tmp = TmpDir::new("pull-verity-maybe");
+    let shm =
+        PathBuf::from("/dev/shm").join(format!("ostrya-pull-verity-maybe-{}", std::process::id()));
+    // Removes the directory below `/dev/shm` also when the test panics.
+    struct Cleanup {
+        inner: PathBuf,
+    }
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.inner);
+        }
+    }
+    let mut bases = vec![tmp.path().to_owned()];
+    let cleanup = if Path::new("/dev/shm").is_dir() {
+        let _ = std::fs::remove_dir_all(&shm);
+        std::fs::create_dir_all(&shm).unwrap();
+        bases.push(shm.clone());
+        Some(Cleanup { inner: shm })
+    } else {
+        eprintln!("no tmpfs at /dev/shm: the test runs below the test directory alone");
+        None
+    };
+    let results: Vec<_> = bases
+        .iter()
+        .map(|base| {
+            block_on(async {
+                let (src_dir, src, _c1, _c2) = source_repo(base, RepoMode::BareUser).await;
+                let (dst_dir, dst) = verity_repo(base, "dst", RepoMode::BareUser, "maybe").await;
+                let seals = dst.seals_objects().await.unwrap();
+                pull_main(&dst, &src, PullFlags::empty()).await;
+                let names = object_names(&dst_dir);
+                let shared: Vec<bool> = names
+                    .iter()
+                    .map(|flat| object_ino(&src_dir, flat) == object_ino(&dst_dir, flat))
+                    .collect();
+                (seals, names, shared)
+            })
+        })
+        .collect();
+    drop(cleanup);
+    for (base, (seals, names, shared)) in bases.iter().zip(results) {
+        assert!(
+            !names.is_empty(),
+            "{}: the pull imported nothing",
+            base.display()
+        );
+        for (flat, shared) in names.iter().zip(shared) {
+            assert_eq!(
+                shared,
+                !seals,
+                "{}: {flat} shares the source inode: {shared}, the probe seals: {seals}",
+                base.display()
+            );
+        }
+    }
+}
+
 #[test]
 fn a_bare_split_xattrs_destination_is_refused() {
     let tmp = TmpDir::new("pull-split-xattrs-dst");

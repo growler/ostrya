@@ -14,22 +14,18 @@
 //! - [`Repo::add_detached_related`] adds a build source to a commit.
 
 use std::collections::HashMap;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::io::Write;
 
 use ostrya_core::sizes::SizeEntry;
 use ostrya_core::{
     Checksum, Commit, DirTree, ObjectType, RepoMode, Type, Value, loose_path, to_bytes,
 };
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
-use crate::perm;
 use crate::related::{self, CommitRelated, RelatedField};
 use crate::repo::Repo;
-use crate::repo_fs::FsResultExt;
-use crate::staging::{META_TEMP_PREFIX, TempEntry, open_tmp_dir};
+use crate::repo_fs::{FsError, FsResultExt, Publish, RepoDir, TempFile};
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
 
@@ -793,6 +789,8 @@ impl Repo {
     ///   boolean, or if `[core] lock-timeout-secs` is not an integer.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
     ///   `-1`.
+    /// - [`Error::InvalidFormat`] if `tmp` or `objects/<xx>` of the
+    ///   `.commitmeta` file is a symlink or is not a directory.
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
@@ -815,15 +813,7 @@ impl Repo {
         let repo_mode = self.mode();
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
         self.write_locked(move |repo| {
-            let tmp_fd = open_tmp_dir(repo.repo_fd(), repo_mode)?;
-            write_detached_blocking(
-                tmp_fd.as_fd(),
-                repo.objects_fd(),
-                &dest,
-                &bytes,
-                fsync,
-                repo_mode,
-            )
+            write_detached_blocking(None, repo.objects(), &dest, &bytes, fsync)
         })
         .await
     }
@@ -883,8 +873,11 @@ impl Repo {
     ///   `a{sv}` dict.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
     ///   `-1`.
-    /// - [`Error::Io`] if the `.commitmeta` file is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::InvalidFormat`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), is not a regular
+    ///   file, or is a symlink.
+    /// - [`Error::InvalidFormat`] if `tmp` or `objects/<xx>` of the
+    ///   `.commitmeta` file is a symlink or is not a directory.
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
@@ -910,10 +903,9 @@ impl Repo {
                     ty: ObjectType::Commit,
                 });
             }
-            let tmp_fd = open_tmp_dir(repo.repo_fd(), repo_mode)?;
             merge_detached_blocking(
-                tmp_fd.as_fd(),
-                repo.objects_fd(),
+                None,
+                repo.objects(),
                 &checksum,
                 None,
                 None,
@@ -1006,11 +998,12 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// The read, the merge, and the write run as one step under
 /// [`DETACHED_MERGE`], for this edit only. Because the guard covers one edit,
 /// a caller can apply several edits in one call on the blocking pool. The
-/// caller holds the update lock.
+/// caller holds the update lock. `tmp` is the home of the temp file, as
+/// [`write_detached_blocking`] states.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn merge_detached_blocking(
-    tmp_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
+    tmp: Option<&RepoDir>,
+    objects: &RepoDir,
     checksum: &Checksum,
     replace: Option<Value>,
     merge: Option<(Vec<u8>, Vec<String>)>,
@@ -1020,7 +1013,7 @@ pub(crate) fn merge_detached_blocking(
     repo_mode: RepoMode,
 ) -> Result<()> {
     let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-    edit_detached_blocking(tmp_fd, objects_fd, &dest, fsync, repo_mode, |read| {
+    edit_detached_blocking(tmp, objects, &dest, fsync, |read| {
         let base = match replace {
             Some(dict) => Some(dict),
             None => read()?,
@@ -1053,10 +1046,8 @@ pub(crate) fn merge_detached_blocking(
 /// Returns the number of blobs removed. If the count is zero, the file stays
 /// as it is. If the removal empties the dict, the call writes the zero-length
 /// "no metadata" marker.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn prune_detached_signatures_blocking(
-    tmp_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
+    objects: &RepoDir,
     checksum: &Checksum,
     metadata_key: &str,
     payload: &[u8],
@@ -1065,7 +1056,7 @@ pub(crate) fn prune_detached_signatures_blocking(
     repo_mode: RepoMode,
 ) -> Result<usize> {
     let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-    edit_detached_blocking(tmp_fd, objects_fd, &dest, fsync, repo_mode, |read| {
+    edit_detached_blocking(None, objects, &dest, fsync, |read| {
         let Some(mut dict) = read()? else {
             return Ok((DetachedWrite::Keep, 0));
         };
@@ -1083,67 +1074,63 @@ pub(crate) fn prune_detached_signatures_blocking(
     })
 }
 
-/// Writes detached metadata to the file `name` in a staging directory.
+/// Writes detached metadata to the file `name` in the staging directory
+/// `staging`.
 ///
 /// [`install_detached_blocking`] moves the file into `objects/` at the
-/// transaction commit. The file gets the `0644` of each metadata object. If a
-/// file exists at `name`, the call replaces it. The call syncs nothing,
-/// because the transaction commit makes the file durable before the install.
-pub(crate) fn stage_detached_blocking(
-    staging_fd: BorrowedFd<'_>,
-    name: &str,
-    bytes: &[u8],
-) -> Result<()> {
-    use std::io::Write;
-
-    let fd = rustix::fs::openat(
-        staging_fd,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(COMMITMETA_MODE),
-    )?;
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes)?;
-    file.flush()?;
-    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(COMMITMETA_MODE))?;
+/// transaction commit. The file gets the `0644` of each metadata object. The
+/// call writes a named temp file `.ostrya-tmp-<pid>-XXXXXX` in `staging` with
+/// [`TempFile::create_named`], and moves it to `name` with one `renameat`, so
+/// it replaces a file that exists at `name`. The call syncs nothing, because
+/// the transaction commit makes the file durable before the install.
+pub(crate) fn stage_detached_blocking(staging: &RepoDir, name: &str, bytes: &[u8]) -> Result<()> {
+    let mut temp = TempFile::create_named(staging)?;
+    temp.file_mut().write_all(bytes)?;
+    temp.set_mode(COMMITMETA_MODE)?;
+    temp.publish(staging, name, Publish::Replace, false)?;
     Ok(())
 }
 
-/// Renames each staged file in `staged` over the `.commitmeta` loose path of
+/// Moves each staged file in `staged` over the `.commitmeta` loose path of
 /// its commit.
 ///
-/// The call runs under [`DETACHED_MERGE`]. It creates each fanout directory
-/// on demand, as [`write_detached_blocking`] does. If fsync is on, the call
-/// runs `fsync` once on each fanout directory that got a file, after the last
-/// rename. It also runs `fsync` once on `objects/` if it created a fanout
-/// directory.
+/// The call runs under [`DETACHED_MERGE`]. Each move is
+/// [`rename_into_fanout`](crate::write::rename_into_fanout) with
+/// [`Publish::Replace`], which makes a missing fan-out directory with no sync.
+/// A symlink at `objects/<xx>` and an entry there that is not a directory
+/// fail the call. If fsync is on, the call runs `fsync` once on each fan-out
+/// directory that got a file, after the last move. It then runs `fsync` once
+/// on `objects/` if it made a fan-out directory. `root` is the handle of the
+/// repository root.
 ///
 /// The caller holds the update lock. If fsync is on, the staged files are
 /// durable before the call.
 pub(crate) fn install_detached_blocking(
-    staging_fd: BorrowedFd<'_>,
+    root: &RepoDir,
+    staging: &RepoDir,
     staged: &[(&Checksum, &str)],
-    objects_fd: BorrowedFd<'_>,
+    objects: &RepoDir,
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
-    // Each fanout directory that got a file, and `true` if this call created
-    // it.
-    let mut fanouts = std::collections::BTreeMap::<String, bool>::new();
+    // Each fan-out directory that got a file.
+    let mut fanouts = std::collections::BTreeSet::<String>::new();
+    // `true` if the call made a fan-out directory.
+    let mut made_fanout = false;
     for (checksum, name) in staged {
         let dest = loose_path(checksum, ObjectType::CommitMeta, repo_mode);
-        let fanout = &dest[..2];
-        let created = create_fanout(objects_fd, fanout, repo_mode)?;
-        rustix::fs::renameat(staging_fd, *name, objects_fd, dest.as_str())?;
-        *fanouts.entry(fanout.to_owned()).or_default() |= created;
+        let (_, made) =
+            crate::write::rename_into_fanout(staging, name, objects, &dest, Publish::Replace)?;
+        made_fanout |= made;
+        fanouts.insert(dest[..2].to_owned());
     }
     if fsync {
-        for fanout in fanouts.keys() {
-            sync_fanout(objects_fd, fanout, false)?;
+        for fanout in &fanouts {
+            objects.sync_dir(fanout)?;
         }
-        if fanouts.values().any(|&created| created) {
-            rustix::fs::fsync(objects_fd)?;
+        if made_fanout {
+            root.sync_dir("objects")?;
         }
     }
     Ok(())
@@ -1182,24 +1169,21 @@ enum DetachedWrite {
 /// for the caller. The reader, `edit`, and the write all run inside the guard,
 /// so no other edit of this process occurs between them.
 fn edit_detached_blocking<T>(
-    tmp_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
+    tmp: Option<&RepoDir>,
+    objects: &RepoDir,
     dest: &str,
     fsync: bool,
-    repo_mode: RepoMode,
     edit: impl FnOnce(&dyn Fn() -> Result<Option<Value>>) -> Result<(DetachedWrite, T)>,
 ) -> Result<T> {
     let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
     let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
-    let (write, value) = edit(&|| read_detached_blocking(objects_fd, dest, &ty))?;
+    let (write, value) = edit(&|| read_detached_blocking(objects, dest, &ty))?;
     match write {
         DetachedWrite::Dict(dict) => {
             let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
-            write_detached_blocking(tmp_fd, objects_fd, dest, &bytes, fsync, repo_mode)?;
+            write_detached_blocking(tmp, objects, dest, &bytes, fsync)?;
         }
-        DetachedWrite::Marker => {
-            write_detached_blocking(tmp_fd, objects_fd, dest, &[], fsync, repo_mode)?
-        }
+        DetachedWrite::Marker => write_detached_blocking(tmp, objects, dest, &[], fsync)?,
         DetachedWrite::Keep => {}
     }
     Ok(value)
@@ -1208,18 +1192,17 @@ fn edit_detached_blocking<T>(
 /// Reads the `a{sv}` dict at a `.commitmeta` loose path.
 ///
 /// Returns `None` if the file is absent or is the zero-length "no metadata"
-/// marker.
-fn read_detached_blocking(
-    objects_fd: BorrowedFd<'_>,
-    dest: &str,
-    ty: &Type,
-) -> Result<Option<Value>> {
-    let bytes =
-        match crate::object::read_meta_object(objects_fd, dest, crate::object::MAX_METADATA_SIZE) {
-            Ok(bytes) => bytes,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(err) => return Err(Error::Io(err)),
-        };
+/// marker. The read is [`RepoDir::read_capped`] with the cap
+/// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE). A file over the cap, a
+/// symlink, and an entry that is not a regular file give
+/// [`Error::InvalidFormat`].
+fn read_detached_blocking(objects: &RepoDir, dest: &str, ty: &Type) -> Result<Option<Value>> {
+    let Some(bytes) = objects
+        .read_capped(dest, crate::object::MAX_METADATA_SIZE)
+        .optional()?
+    else {
+        return Ok(None);
+    };
     if bytes.is_empty() {
         return Ok(None);
     }
@@ -1231,81 +1214,72 @@ fn read_detached_blocking(
 /// Writes metadata bytes to a loose path atomically.
 ///
 /// The detached metadata writers use it for a `.commitmeta` file. The prune
-/// sweep uses it for a `.tombstone-commit` file. Both objects get the `0644`
-/// of each metadata object. `tmp_fd` is the open `tmp/` directory of the
-/// repository. The steps are:
+/// sweep and `fsck` use it for a `.tombstone-commit` file. Both objects get
+/// the `0644` of each metadata object. `tmp` is the `tmp/` handle of the
+/// staging directory of a transaction, for a write at the commit of the
+/// transaction. `None` is a write outside a transaction: the temp file goes
+/// in the temp home of `objects`, which is the `tmp/` handle that the
+/// repository handle opens at its first use and keeps. `objects` is the
+/// `objects/` handle of the repository, and `dest` is the loose path below
+/// it. The steps are:
 ///
-/// 1. The call creates the fanout directory if it is absent, with `0777`
-///    reduced by the umask. If the call creates it in a `bare-user-shared`
-///    repository, the mode is [`perm::SHARED_DIR_MODE`].
-/// 2. The call writes the bytes to a temp file in `tmp/` and runs `fchmod`
-///    0644. If fsync is on, it runs `fdatasync` on the file.
-/// 3. The call renames the temp file over the target. If `tmp/` is on another
-///    file system, the rename fails with `EXDEV` and the temp file is removed.
-/// 4. If fsync is on, the call runs `fsync` on the fanout directory, so the
-///    new name survives a crash. If the call created the fanout directory, it
-///    also runs `fsync` on `objects/`.
+/// 1. The call writes the bytes to a named temp file
+///    `.ostrya-tmp-<pid>-XXXXXX` with [`TempFile::create_named`], and runs
+///    `fchmod` 0644. If fsync is on, it runs `fsync` on the file. A failure
+///    of this step makes no fan-out directory.
+/// 2. The call moves the temp file over the target with one `renameat`. If
+///    `tmp/` is on another file system, the move fails with `EXDEV`, and the
+///    temp file is removed. If fsync is on, the call runs `fsync` on the
+///    fan-out directory, so the new name survives a crash.
+/// 3. If the move gives [`FsError::Absent`] for `objects/<xx>`, the fan-out
+///    directory of `dest`, the drop of the temp file removes it. The call
+///    makes the fan-out directory with [`RepoDir::ensure_dir`]: `0777`
+///    reduced by the umask, or the forced shared mode in a `bare-user-shared`
+///    repository. With fsync on, it syncs `objects/` after it makes the
+///    directory. The call then does steps 1 and 2 one more time with a new
+///    temp file.
+///
+/// A symlink at `objects/<xx>`, and an entry there that is not a directory,
+/// fail the call with [`Error::InvalidFormat`]. A symlink at the target is
+/// replaced, and its target stays.
 ///
 /// The object publication path gives the same durability.
 pub(crate) fn write_detached_blocking(
-    tmp_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
+    tmp: Option<&RepoDir>,
+    objects: &RepoDir,
     dest: &str,
     bytes: &[u8],
     fsync: bool,
-    repo_mode: RepoMode,
 ) -> Result<()> {
-    use std::io::Write;
-
     let fanout = &dest[..2];
-    let fanout_created = create_fanout(objects_fd, fanout, repo_mode)?;
-
-    let (temp, fd) = TempEntry::create_file(tmp_fd, META_TEMP_PREFIX, COMMITMETA_MODE)?;
-    let mut file = std::fs::File::from(fd);
-    file.write_all(bytes)?;
-    file.flush()?;
-    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(COMMITMETA_MODE))?;
-    if fsync {
-        rustix::fs::fdatasync(file.as_fd())?;
-    }
-    drop(file);
-    temp.rename_into(objects_fd, dest)?;
-    if fsync {
-        sync_fanout(objects_fd, fanout, fanout_created)?;
-    }
-    Ok(())
-}
-
-/// Creates the fanout directory `fanout` under `objects/` if it is absent.
-///
-/// The directory gets `0777` reduced by the umask. In a `bare-user-shared`
-/// repository, its mode is [`perm::SHARED_DIR_MODE`]. Returns `true` if this
-/// call created the directory.
-fn create_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<bool> {
-    match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
-        Ok(()) => {
-            perm::force_created_dir(objects_fd, fanout, repo_mode)?;
-            Ok(true)
+    let temp = detached_temp(tmp, objects, bytes, fsync)?;
+    match temp.publish(objects, dest, Publish::Replace, fsync) {
+        Err(FsError::Absent { path }) if path.strip_prefix("objects/") == Some(fanout) => {
+            objects.ensure_dir(fanout, fsync)?;
+            let temp = detached_temp(tmp, objects, bytes, fsync)?;
+            temp.publish(objects, dest, Publish::Replace, fsync)?;
         }
-        Err(Errno::EXIST) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Makes a directory entry renamed into `fanout` durable.
-///
-/// The call runs `fsync` on the fanout directory. If `created` is `true`, the
-/// fanout directory is new, and the call also runs `fsync` on `objects/`.
-fn sync_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, created: bool) -> Result<()> {
-    let dir = rustix::fs::openat(
-        objects_fd,
-        fanout,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    rustix::fs::fsync(&dir)?;
-    if created {
-        rustix::fs::fsync(objects_fd)?;
+        other => {
+            other?;
+        }
     }
     Ok(())
+}
+
+/// Makes the named temp file of [`write_detached_blocking`] with the bytes
+/// `bytes` and the mode `0644`, in `tmp` or in the temp home of `objects`.
+/// If fsync is on, it runs `fsync` on the file.
+fn detached_temp(
+    tmp: Option<&RepoDir>,
+    objects: &RepoDir,
+    bytes: &[u8],
+    fsync: bool,
+) -> Result<TempFile> {
+    let mut temp = TempFile::create_named(tmp.unwrap_or(objects))?;
+    temp.file_mut().write_all(bytes)?;
+    temp.set_mode(COMMITMETA_MODE)?;
+    if fsync {
+        temp.sync()?;
+    }
+    Ok(temp)
 }

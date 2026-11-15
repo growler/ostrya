@@ -21,10 +21,10 @@ use crate::error::{Error, Result};
 use crate::jobs::{Jobs, Tracked};
 use crate::lock::{LockGuard, UpdateLockHeld};
 use crate::repo::Repo;
-use crate::repo_fs::RepoDir;
+use crate::repo_fs::{RepoDir, TempFile};
 use crate::staging::StagingDir;
 use crate::write::{
-    Blocks, StageCtx, StageOutcome, TempKind, probe_fresh_owner, publish_blocking,
+    Blocks, StageCtx, StageOutcome, probe_fresh_owner, publish_blocking,
     stage_clone_content_blocking, stage_content_blocking, stage_import_blocking,
     stage_metadata_blocking, stage_symlink_blocking,
 };
@@ -253,8 +253,8 @@ struct DetachedQueue {
 /// A ref write, a detached-metadata write, and a tombstone write create a temp
 /// entry at the top level of `tmp/` and rename it over the target. The entry
 /// of a ref write is named `.ostrya-ref-<pid>-<n>-XXXXXX`. The entry of the
-/// other two writes is named `.ostrya-meta-<pid>-<n>-XXXXXX`. The age test
-/// applies to such an entry.
+/// other two writes is named `.ostrya-tmp-<pid>-XXXXXX`. The age test applies
+/// to such an entry.
 ///
 /// If `tmp-expiry-secs` is very small or negative, a transaction that begins
 /// can remove the entry before its rename. The write then fails with `ENOENT`,
@@ -487,10 +487,8 @@ impl Transaction {
         if let Some(owner) = self.fresh_owner.get() {
             return Ok(*owner);
         }
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let owner = self
-            .unblock(move || probe_fresh_owner(staging.as_fd()))
-            .await?;
+        let staging = self.staging_dir().clone();
+        let owner = self.unblock(move || probe_fresh_owner(&staging)).await?;
         Ok(*self.fresh_owner.get_or_init(|| owner))
     }
 
@@ -886,12 +884,10 @@ impl Transaction {
         bytes: Vec<u8>,
     ) -> Result<()> {
         let name = crate::write::flat_name(checksum, ObjectType::CommitMeta, self.repo.mode());
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let staging = self.staging_dir().clone();
         let staged = name.clone();
-        self.unblock(move || {
-            crate::commit::stage_detached_blocking(staging.as_fd(), &staged, &bytes)
-        })
-        .await?;
+        self.unblock(move || crate::commit::stage_detached_blocking(&staging, &staged, &bytes))
+            .await?;
         let mut queue = self.detached.lock().unwrap();
         let edit = Self::edit_for(&mut queue, checksum);
         edit.staged = Some(name);
@@ -1066,13 +1062,20 @@ impl Transaction {
             fsync,
             staged_durable: synced,
             repo_mode: self.repo.mode(),
-            objects_fd: self.repo.objects_fd().try_clone_to_owned()?,
-            staging_fd: self.staging_fd().try_clone_to_owned()?,
+            root: self.repo.root_dir().clone(),
+            objects: self.repo.objects().clone(),
+            staging: self.staging_dir().clone(),
+            tmp: self
+                .staging
+                .as_ref()
+                .expect("staging directory present during the transaction")
+                .tmp()
+                .clone(),
         })
     }
 
-    /// Stages a regular-file content object whose payload is in `file`
-    /// already.
+    /// Stages a regular-file content object whose payload is in the temp file
+    /// `temp` already.
     ///
     /// [`ContentWriter::finish`](crate::ContentWriter::finish) calls it. If
     /// `counted` is `true`, the payload adds to
@@ -1081,29 +1084,28 @@ impl Transaction {
         &self,
         checksum: Checksum,
         header: ostrya_core::FileHeader,
-        file: std::fs::File,
-        temp: TempKind,
+        temp: TempFile,
         unpacked: u64,
         counted: bool,
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.verity()?;
-        let objects = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let verity = self.verity().await?;
+        let objects = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
         let key = checksum;
         let outcome = self
             .unblock(move || {
                 let ctx = StageCtx {
-                    objects_fd: objects.as_fd(),
-                    staging_fd: staging.as_fd(),
+                    objects: &objects,
+                    staging: &staging,
                     mode,
                     fsync,
                     per_object_fsync,
                     sync_metadata: false,
                     verity,
                 };
-                stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
+                stage_content_blocking(&ctx, &key, &header, temp, unpacked)
             })
             .await?;
         self.record(checksum, ObjectType::File, mode, outcome, counted)
@@ -1119,15 +1121,15 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.verity()?;
-        let objects = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let verity = self.verity().await?;
+        let objects = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
         let key = checksum;
         let outcome = self
             .unblock(move || {
                 let ctx = StageCtx {
-                    objects_fd: objects.as_fd(),
-                    staging_fd: staging.as_fd(),
+                    objects: &objects,
+                    staging: &staging,
                     mode,
                     fsync,
                     per_object_fsync,
@@ -1167,12 +1169,12 @@ impl Transaction {
     ) -> Result<bool> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.verity()?;
+        let verity = self.verity().await?;
         // After `sync_staged` each metadata object is synced on its own, so the
         // `syncfs` that already ran still covers every staged object.
         let sync_metadata = fsync && self.staged.lock().unwrap().presynced.is_some();
-        let objects = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let objects = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
         let key = checksum;
         #[cfg(test)]
         let gate =
@@ -1182,8 +1184,8 @@ impl Transaction {
                 #[cfg(test)]
                 let _gate = crate::jobs::job_gate::pass(&gate, staging.as_fd())?;
                 let ctx = StageCtx {
-                    objects_fd: objects.as_fd(),
-                    staging_fd: staging.as_fd(),
+                    objects: &objects,
+                    staging: &staging,
                     mode,
                     fsync,
                     per_object_fsync,
@@ -1203,9 +1205,8 @@ impl Transaction {
     ///
     /// The two repositories must store the object in the same form. The source
     /// inode must have the ownership that a write here gives already.
-    /// [`stage_import_blocking`] states the rules. If `src` is a handle in the
-    /// strict open mode, the import follows the rules of a strict source of
-    /// that function. The local pull path calls this method.
+    /// [`stage_import_blocking`] states the rules, in each open mode of `src`.
+    /// The local pull path calls this method.
     ///
     /// Returns `true` if the object is staged. `false` is a content object
     /// whose link the call refused. The caller then imports it through the
@@ -1220,11 +1221,11 @@ impl Transaction {
     ) -> Result<bool> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.verity()?;
-        let objects = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let source = src.objects_fd().try_clone_to_owned()?;
-        let (src_mode, strict) = (src.mode(), src.is_strict());
+        let verity = self.verity().await?;
+        let objects = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
+        let source = src.objects().clone();
+        let src_mode = src.mode();
         // The ownership that a link must match. The call measures it only if it
         // tries a link. The measure creates and removes a staging temporary,
         // and a forced copy or a sealing repository never reads the result.
@@ -1236,23 +1237,15 @@ impl Transaction {
         let outcome = self
             .unblock(move || {
                 let ctx = StageCtx {
-                    objects_fd: objects.as_fd(),
-                    staging_fd: staging.as_fd(),
+                    objects: &objects,
+                    staging: &staging,
                     mode,
                     fsync,
                     per_object_fsync,
                     sync_metadata: false,
                     verity,
                 };
-                stage_import_blocking(
-                    &ctx,
-                    source.as_fd(),
-                    &checksum,
-                    ty,
-                    src_mode,
-                    strict,
-                    link_owner,
-                )
+                stage_import_blocking(&ctx, &source, &checksum, ty, src_mode, link_owner)
             })
             .await?;
         let Some(outcome) = outcome else {
@@ -1270,9 +1263,8 @@ impl Transaction {
     ///
     /// The call applies the inode policy of this repository from the logical
     /// header of the object. The two modes must store the payload in the same
-    /// form. [`stage_clone_content_blocking`] states the rules. If `src` is a
-    /// handle in the strict open mode, the clone follows the rules of a strict
-    /// source of that function. The local pull path calls this method.
+    /// form. [`stage_clone_content_blocking`] states the rules, in each open
+    /// mode of `src`. The local pull path calls this method.
     pub(crate) async fn stage_clone_content(
         &self,
         src: &Repo,
@@ -1282,31 +1274,23 @@ impl Transaction {
     ) -> Result<()> {
         let mode = self.repo.mode();
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.verity()?;
-        let objects = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let source = src.objects_fd().try_clone_to_owned()?;
-        let (src_mode, strict) = (src.mode(), src.is_strict());
+        let verity = self.verity().await?;
+        let objects = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
+        let source = src.objects().clone();
+        let src_mode = src.mode();
         let outcome = self
             .unblock(move || {
                 let ctx = StageCtx {
-                    objects_fd: objects.as_fd(),
-                    staging_fd: staging.as_fd(),
+                    objects: &objects,
+                    staging: &staging,
                     mode,
                     fsync,
                     per_object_fsync,
                     sync_metadata: false,
                     verity,
                 };
-                stage_clone_content_blocking(
-                    &ctx,
-                    source.as_fd(),
-                    &checksum,
-                    src_mode,
-                    strict,
-                    &header,
-                    unpacked,
-                )
+                stage_clone_content_blocking(&ctx, &source, &checksum, src_mode, &header, unpacked)
             })
             .await?;
         // An imported object has no size record. A pull writes no commit, so
@@ -1490,11 +1474,19 @@ impl Transaction {
         Ok((fsync, per_object))
     }
 
-    /// Returns the `[ex-integrity] fsverity` value of the repository config.
+    /// Returns the fs-verity setting that the stage of each regular-file
+    /// object applies.
     ///
-    /// The stage of each regular-file object applies it.
-    fn verity(&self) -> Result<Tristate> {
-        self.repo.config().fsverity()
+    /// It is the `[ex-integrity] fsverity` value of the repository config,
+    /// with one change: `maybe` gives [`Tristate::No`] if the probe of
+    /// [`Repo::seals_objects`] gives `false`. The repository handle runs that
+    /// probe one time, so a file system with no fs-verity costs no failed
+    /// seal for each object.
+    pub(crate) async fn verity(&self) -> Result<Tristate> {
+        match self.repo.config().fsverity()? {
+            Tristate::Maybe if !self.repo.seals_objects().await? => Ok(Tristate::No),
+            verity => Ok(verity),
+        }
     }
 
     /// Publishes the staged objects into `objects/` and writes the queued refs.
@@ -1514,8 +1506,10 @@ impl Transaction {
     /// 3. The call renames each staged object into `objects/<xx>/`, and then
     ///    each staged composefs image into
     ///    `extensions/ostrya/composefs/<xx>/`. So an image is in place only
-    ///    after each object of the transaction. The rename of an image
-    ///    replaces a stored image of the same commit.
+    ///    after each object of the transaction. The rename of an object keeps
+    ///    an object that `objects/` holds, for example from another writer
+    ///    after the stage. The rename of an image replaces a stored image of
+    ///    the same commit.
     /// 4. The call checks the queued refs against the ref store, as
     ///    [`set_ref`](Transaction::set_ref) states. It also compares each
     ///    entry of [`set_ref_expecting`](Transaction::set_ref_expecting) with
@@ -1569,7 +1563,8 @@ impl Transaction {
     ///
     /// - Before the renames of step 3, it runs `syncfs` on the repository.
     /// - After the renames of the objects, it runs `fsync` on each fanout
-    ///   directory that got an object, and on `objects/`.
+    ///   directory that got an object, and then on `objects/` if one or more
+    ///   fanout directories got an object.
     /// - After the renames of the images, it runs `fsync` on each
     ///   `extensions/ostrya/composefs/<xx>/` directory that got an image, and
     ///   on `extensions/ostrya/composefs/`. It syncs each directory that the
@@ -1625,6 +1620,9 @@ impl Transaction {
     ///   and writes nothing.
     /// - The errors of [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
     ///   if a writer recorded a commit.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of a staged object is a
+    ///   symlink or is not a directory. The objects that the call renamed
+    ///   before stay, and the call writes no detached metadata and no ref.
     /// - [`Error::InvalidFormat`] if a staged composefs image meets a
     ///   component of `extensions/ostrya/composefs/<xx>/` that is a symlink or
     ///   no directory. The objects and the images that the call renamed
@@ -1650,6 +1648,12 @@ impl Transaction {
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
     ///   `-1`, or if a signature entry of the stored detached metadata is not
     ///   an array.
+    /// - [`Error::InvalidFormat`] if a stored `.commitmeta` file that a queued
+    ///   edit reads is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), is not a regular
+    ///   file, or is a symlink, or if `tmp` or `objects/<xx>` of a
+    ///   `.commitmeta` file is a symlink or is not a directory. The published
+    ///   objects stay, and the call writes no ref.
     /// - [`Error::Io`] if the check of step 4 cannot read a queued ref path,
     ///   or cannot open or read the ref file of an entry of
     ///   [`set_ref_expecting`](Transaction::set_ref_expecting), for example
@@ -1739,7 +1743,7 @@ impl Transaction {
             test_tail::pass(repo_fd.as_fd());
             let tmp_fd = staging.tmp_fd();
             let written = crate::refs::check_resolved_refs_blocking(repo_fd.as_fd(), &refs)
-                .and_then(|()| detached.run(tmp_fd))
+                .and_then(|()| detached.run())
                 .and_then(|()| {
                     crate::refs::write_resolved_refs_blocking(
                         repo_fd.as_fd(),
@@ -1826,14 +1830,14 @@ impl Transaction {
         let (fsync, _) = self.fsync_flags()?;
         let syncfs = self.syncfs_at_publish(fsync);
         let repo_mode = self.repo.mode();
-        let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
-        let objects_fd = self.repo.objects_fd().try_clone_to_owned()?;
-        let staging_fd = self.staging_fd().try_clone_to_owned()?;
+        let root = self.repo.root_dir().clone();
+        let objects_dir = self.repo.objects().clone();
+        let staging = self.staging_dir().clone();
         ostrya_rt::unblock(move || {
             publish_blocking(
-                repo_fd.as_fd(),
-                objects_fd.as_fd(),
-                staging_fd.as_fd(),
+                &root,
+                &objects_dir,
+                &staging,
                 &objects,
                 &images,
                 syncfs,
@@ -1870,8 +1874,12 @@ struct DetachedJob {
     /// the publication step.
     staged_durable: bool,
     repo_mode: RepoMode,
-    objects_fd: std::os::fd::OwnedFd,
-    staging_fd: std::os::fd::OwnedFd,
+    root: RepoDir,
+    objects: RepoDir,
+    staging: RepoDir,
+    /// The `tmp/` handle that the staging directory of the transaction
+    /// opened. Each edit writes its temp file there.
+    tmp: RepoDir,
 }
 
 impl DetachedJob {
@@ -1886,9 +1894,9 @@ impl DetachedJob {
     /// fsync on it makes the edit durable first. Each edit takes the
     /// process-wide guard of detached-metadata edits for itself alone.
     ///
-    /// `tmp_fd` is the open `tmp/` of the repository, where each edit creates
-    /// its temp file. The caller holds the update lock.
-    fn run(self, tmp_fd: BorrowedFd<'_>) -> Result<()> {
+    /// Each edit creates its temp file in the `tmp/` that the staging
+    /// directory of the transaction opened. The caller holds the update lock.
+    fn run(self) -> Result<()> {
         let staged: Vec<(&Checksum, &str)> = self
             .queued
             .iter()
@@ -1896,12 +1904,13 @@ impl DetachedJob {
             .collect();
         if !staged.is_empty() {
             if self.fsync && !self.staged_durable {
-                rustix::fs::syncfs(self.staging_fd.as_fd())?;
+                rustix::fs::syncfs(self.staging.as_fd())?;
             }
             crate::commit::install_detached_blocking(
-                self.staging_fd.as_fd(),
+                &self.root,
+                &self.staging,
                 &staged,
-                self.objects_fd.as_fd(),
+                &self.objects,
                 self.fsync,
                 self.repo_mode,
             )?;
@@ -1916,8 +1925,8 @@ impl DetachedJob {
                 continue;
             }
             crate::commit::merge_detached_blocking(
-                tmp_fd,
-                self.objects_fd.as_fd(),
+                Some(&self.tmp),
+                &self.objects,
                 &checksum,
                 edit.replace,
                 edit.merge,
@@ -3240,6 +3249,29 @@ mod tests {
                 repo.resolve_ref_tip(&Ref::local("main")).await.unwrap(),
                 Some(commit)
             );
+            assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
+        });
+    }
+
+    /// The install of a staged `.commitmeta` whose fan-out directory is
+    /// missing makes the directory and moves the file into it.
+    #[test]
+    fn the_install_of_a_staged_file_makes_a_missing_fanout() {
+        let scratch = Scratch::new("staged-missing-fanout");
+        block_on(async {
+            let repo = no_wait_repo(&scratch).await;
+            let root = scratch.0.join("repo");
+            let commit = Checksum::from_bytes([0x38; 32]);
+            let fanout = root.join("objects").join("38");
+            let staged = crate::summary::serialize_signature_dict(&string_dict("a", "x")).unwrap();
+            let mut txn = repo.transaction().await.unwrap();
+            txn.set_fsync(true);
+            txn.stage_commit_detached_bytes(&commit, staged.clone())
+                .await
+                .unwrap();
+            assert!(!fanout.exists(), "the stage makes no fan-out directory");
+            txn.commit().await.unwrap();
+            assert!(std::fs::symlink_metadata(&fanout).unwrap().is_dir());
             assert_eq!(std::fs::read(commitmeta(&root, &commit)).unwrap(), staged);
         });
     }

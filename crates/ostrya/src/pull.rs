@@ -1486,6 +1486,11 @@ impl Repo {
     /// It writes each object again, with a reflink of the bytes if the file
     /// system supports it, and a copy if not.
     ///
+    /// To compare the owners, the pull links the source object into the
+    /// staging directory and reads the status of the link. If the owners
+    /// differ, the pull removes the link and then copies the object. The link
+    /// and its removal change the ctime of the source object.
+    ///
     /// The pull reads only the ownership of the source inode. It trusts that
     /// the permission bits and the xattrs match the header of the object, and
     /// does not check them. In `archive`, `bare-user`, and `bare-user-shared`
@@ -1513,6 +1518,13 @@ impl Repo {
     /// seals the copy of the source. An unsealed link breaks the rule of the
     /// destination that each object stored as a regular file is sealed. Such a
     /// destination copies each object and seals each copy.
+    ///
+    /// A destination with `[ex-integrity] fsverity=maybe` seals its objects
+    /// only if the probe of [`seals_objects`](Repo::seals_objects) gives
+    /// `true`. On a file system that cannot seal a file, the probe gives
+    /// `false`, and the pull hardlinks by the rules above. A linked object
+    /// shares the inode of the source, so a later change of that inode in
+    /// place is visible in this repository.
     ///
     /// This is a divergence from the `ostree` command, which hardlinks into a
     /// `fsverity=yes` repository and leaves the imported objects unsealed.
@@ -4317,9 +4329,9 @@ async fn check_timestamp(
 /// A metadata object has no header. The function copies it if its link is
 /// refused, so it is always staged.
 ///
-/// If `src` is a handle in the strict open mode, the link and the copy follow
-/// the rules of a strict source of
-/// [`stage_import_blocking`](crate::write::stage_import_blocking).
+/// The link and the copy follow the rules of the source paths of
+/// [`stage_import_blocking`](crate::write::stage_import_blocking), in each
+/// open mode of `src`.
 async fn link_import(
     txn: &Transaction,
     src: &Repo,
@@ -4881,14 +4893,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Returns the error of `result`, which must be [`Error::Io`].
-    fn io_error<T: std::fmt::Debug>(result: Result<T>) -> std::io::Error {
-        match result {
-            Err(Error::Io(e)) => e,
-            other => panic!("{other:?}"),
-        }
-    }
-
     /// The `.filez` copy follows no symlink at the fan-out directory
     /// `objects/<xx>`, from a handle of each open mode. A symlink that
     /// replaces `objects/<xx>` after the load fails the copy.
@@ -4973,12 +4977,36 @@ mod tests {
         }
     }
 
-    /// The link and the metadata copy from a handle in the strict open mode
-    /// open the fan-out directory `objects/<xx>` again, and follow no symlink
-    /// there. A symlink that replaces `objects/<xx>` after the load fails the
-    /// import with `ELOOP`.
+    /// Returns a handle of the source repository of `dir` in the default open
+    /// mode, beside the handle `strict` of the strict open mode.
+    fn both_modes(dir: &std::path::Path, strict: &Repo) -> [Repo; 2] {
+        let plain = ostrya_rt::block_on(Repo::open(&dir.join("src"))).unwrap();
+        [strict.clone(), plain]
+    }
+
+    /// Returns the text of the refusal of a symlink at the path of the
+    /// source object `name` of a repository of mode `mode`.
+    fn symlink_refusal(name: ObjectName, mode: RepoMode) -> String {
+        format!(
+            "objects/{} passes through a symlink; ostrya refuses a symlink in the repository",
+            name.loose_path(mode)
+        )
+    }
+
+    /// Returns the message of `result`, which must be
+    /// [`Error::InvalidFormat`].
+    fn invalid_format<T: std::fmt::Debug>(result: Result<T>) -> String {
+        match result {
+            Err(Error::InvalidFormat(m)) => m,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// The link and the metadata copy follow no symlink at the fan-out
+    /// directory `objects/<xx>`, from a handle of each open mode. A symlink
+    /// that replaces `objects/<xx>` after the load fails the import.
     #[test]
-    fn a_strict_link_refuses_a_fanout_symlinked_after_the_load() {
+    fn a_link_refuses_a_fanout_symlinked_after_the_load() {
         for (index, flags) in [
             (0, PullFlags::empty()),
             (1, PullFlags::empty()),
@@ -4992,26 +5020,29 @@ mod tests {
                 .join(name.loose_path(RepoMode::Archive));
             swap_in_symlink(object.parent().unwrap(), &dir.join("moved"));
 
-            let result = ostrya_rt::block_on(async {
-                let txn = dst.transaction().await.unwrap();
-                link_import(&txn, &strict, name, flags).await
+            let results = both_modes(&dir, &strict).map(|src| {
+                ostrya_rt::block_on(async {
+                    let txn = dst.transaction().await.unwrap();
+                    link_import(&txn, &src, name, flags).await
+                })
             });
             let _ = std::fs::remove_dir_all(&dir);
-            let e = io_error(result);
-            assert_eq!(
-                e.raw_os_error(),
-                Some(rustix::io::Errno::LOOP.raw_os_error()),
-                "{:?} {flags:?}: {e}",
-                name.ty
-            );
+            for result in results {
+                assert_eq!(
+                    invalid_format(result),
+                    symlink_refusal(name, RepoMode::Archive),
+                    "{:?} {flags:?}",
+                    name.ty
+                );
+            }
         }
     }
 
-    /// The payload clone from a handle in the strict open mode follows no
-    /// symlink at `objects/<xx>`. A symlink that replaces `objects/<xx>` after
-    /// the load fails the clone with `ELOOP`.
+    /// The payload clone follows no symlink at `objects/<xx>`, from a handle
+    /// of each open mode. A symlink that replaces `objects/<xx>` after the
+    /// load fails the clone.
     #[test]
-    fn a_strict_payload_clone_refuses_a_fanout_symlinked_after_the_load() {
+    fn a_payload_clone_refuses_a_fanout_symlinked_after_the_load() {
         let (dir, strict, [name, ..], meta, dst) =
             strict_fixture("clone-fanout", RepoMode::BareUser, RepoMode::BareUserOnly);
         let object = dir
@@ -5019,28 +5050,32 @@ mod tests {
             .join(name.loose_path(RepoMode::BareUser));
         swap_in_symlink(object.parent().unwrap(), &dir.join("moved"));
 
-        let result = ostrya_rt::block_on(async {
-            let txn = dst.transaction().await.unwrap();
-            txn.stage_clone_content(&strict, name.checksum, meta.regular_header(), 0)
-                .await
+        let results = both_modes(&dir, &strict).map(|src| {
+            ostrya_rt::block_on(async {
+                let txn = dst.transaction().await.unwrap();
+                txn.stage_clone_content(&src, name.checksum, meta.regular_header(), 0)
+                    .await
+            })
         });
         let _ = std::fs::remove_dir_all(&dir);
-        let e = io_error(result);
-        assert_eq!(
-            e.raw_os_error(),
-            Some(rustix::io::Errno::LOOP.raw_os_error()),
-            "{e}"
-        );
+        for result in results {
+            assert_eq!(
+                invalid_format(result),
+                symlink_refusal(name, RepoMode::BareUser)
+            );
+        }
     }
 
-    /// The metadata copy and the payload clone from a handle in the strict
-    /// open mode refuse a FIFO that replaces the object after the load, and
-    /// do not wait for a writer.
+    /// The metadata copy and the payload clone refuse a FIFO that replaces
+    /// the object after the load, from a handle of each open mode, and do not
+    /// wait for a writer.
     #[test]
-    fn a_strict_copy_refuses_a_fifo_swapped_in_after_the_load() {
-        for clone in [false, true] {
+    fn a_copy_refuses_a_fifo_swapped_in_after_the_load() {
+        for (clone, plain) in [(false, false), (false, true), (true, false), (true, true)] {
             let (dir, strict, [file, dirmeta, _], meta, dst) =
                 strict_fixture("copy-fifo", RepoMode::BareUser, RepoMode::BareUserOnly);
+            let [strict, plain_src] = both_modes(&dir, &strict);
+            let src = if plain { plain_src } else { strict };
             let name = if clone { file } else { dirmeta };
             let object = dir
                 .join("src/objects")
@@ -5052,10 +5087,10 @@ mod tests {
                 let result = ostrya_rt::block_on(async {
                     let txn = dst.transaction().await.unwrap();
                     if clone {
-                        txn.stage_clone_content(&strict, name.checksum, meta.regular_header(), 0)
+                        txn.stage_clone_content(&src, name.checksum, meta.regular_header(), 0)
                             .await
                     } else {
-                        link_import(&txn, &strict, name, PullFlags::FORCE_COPY)
+                        link_import(&txn, &src, name, PullFlags::FORCE_COPY)
                             .await
                             .map(drop)
                     }
@@ -5077,19 +5112,21 @@ mod tests {
                 }
             };
             let _ = std::fs::remove_dir_all(&dir);
-            let e = io_error(result);
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-            assert!(e.to_string().contains("not a regular file"), "{e}");
+            let expected = format!(
+                "objects/{} is not a regular file",
+                name.loose_path(RepoMode::BareUser)
+            );
+            assert_eq!(invalid_format(result), expected, "{:?} {plain}", name.ty);
         }
     }
 
-    /// Links `name` from `strict` into a transaction of `dst`. Returns the
+    /// Links `name` from `src` into a transaction of `dst`. Returns the
     /// result of the link, and `true` if the staging directory holds the
     /// object after it.
-    fn link_and_probe(strict: &Repo, dst: &Repo, name: ObjectName) -> (Result<bool>, bool) {
+    fn link_and_probe(src: &Repo, dst: &Repo, name: ObjectName) -> (Result<bool>, bool) {
         ostrya_rt::block_on(async {
             let txn = dst.transaction().await.unwrap();
-            let result = link_import(&txn, strict, name, PullFlags::empty()).await;
+            let result = link_import(&txn, src, name, PullFlags::empty()).await;
             let staging = crate::write::flat_name(&name.checksum, name.ty, dst.mode());
             let staged = rustix::fs::statat(
                 txn.staging_fd(),
@@ -5101,10 +5138,10 @@ mod tests {
         })
     }
 
-    /// The link from a handle in the strict open mode refuses a symlink that
-    /// replaces the object after the load with `ELOOP`, and stages nothing.
+    /// The link from a handle of each open mode refuses a symlink that
+    /// replaces the object after the load, and stages nothing.
     #[test]
-    fn a_strict_link_refuses_an_object_symlinked_after_the_load() {
+    fn a_link_refuses_an_object_symlinked_after_the_load() {
         for index in [0, 1] {
             let (dir, strict, names, _, dst) =
                 strict_fixture("link-object", RepoMode::Archive, RepoMode::Archive);
@@ -5114,23 +5151,24 @@ mod tests {
                 .join(name.loose_path(RepoMode::Archive));
             swap_in_symlink(&object, &dir.join("moved"));
 
-            let (result, staged) = link_and_probe(&strict, &dst, name);
+            let results = both_modes(&dir, &strict).map(|src| link_and_probe(&src, &dst, name));
             let _ = std::fs::remove_dir_all(&dir);
-            let e = io_error(result);
-            assert_eq!(
-                e.raw_os_error(),
-                Some(rustix::io::Errno::LOOP.raw_os_error()),
-                "{:?}: {e}",
-                name.ty
-            );
-            assert!(!staged, "{:?}", name.ty);
+            for (result, staged) in results {
+                assert_eq!(
+                    invalid_format(result),
+                    symlink_refusal(name, RepoMode::Archive),
+                    "{:?}",
+                    name.ty
+                );
+                assert!(!staged, "{:?}", name.ty);
+            }
         }
     }
 
-    /// The link from a handle in the strict open mode refuses a FIFO that
-    /// replaces the object after the load, and stages nothing.
+    /// The link from a handle of each open mode refuses a FIFO that replaces
+    /// the object after the load, and stages nothing.
     #[test]
-    fn a_strict_link_refuses_a_fifo_swapped_in_after_the_load() {
+    fn a_link_refuses_a_fifo_swapped_in_after_the_load() {
         for index in [0, 1] {
             let (dir, strict, names, _, dst) =
                 strict_fixture("link-fifo", RepoMode::Archive, RepoMode::Archive);
@@ -5140,28 +5178,34 @@ mod tests {
                     .join(name.loose_path(RepoMode::Archive)),
             );
 
-            let (result, staged) = link_and_probe(&strict, &dst, name);
+            let results = both_modes(&dir, &strict).map(|src| link_and_probe(&src, &dst, name));
             let _ = std::fs::remove_dir_all(&dir);
-            let e = io_error(result);
-            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-            assert!(e.to_string().contains("not a regular file"), "{e}");
-            assert!(!staged, "{:?}", name.ty);
+            let expected = format!(
+                "objects/{} is not a regular file",
+                name.loose_path(RepoMode::Archive)
+            );
+            for (result, staged) in results {
+                assert_eq!(invalid_format(result), expected, "{:?}", name.ty);
+                assert!(!staged, "{:?}", name.ty);
+            }
         }
     }
 
     /// A `bare-user-only` repository stores a symlink content object as a
-    /// symlink. The link from a handle in the strict open mode stages it.
+    /// symlink. The link from a handle of each open mode stages it.
     #[test]
-    fn a_strict_link_keeps_a_symlink_object_of_bare_user_only() {
+    fn a_link_keeps_a_symlink_object_of_bare_user_only() {
         let (dir, strict, [_, _, symlink], _, dst) = strict_fixture(
             "link-symlink",
             RepoMode::BareUserOnly,
             RepoMode::BareUserOnly,
         );
-        let (result, staged) = link_and_probe(&strict, &dst, symlink);
+        let results = both_modes(&dir, &strict).map(|src| link_and_probe(&src, &dst, symlink));
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(matches!(result, Ok(true)), "{result:?}");
-        assert!(staged);
+        for (result, staged) in results {
+            assert!(matches!(result, Ok(true)), "{result:?}");
+            assert!(staged);
+        }
     }
 
     /// An untrusted import stages the bytes that it hashes. The seam replaces

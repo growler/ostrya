@@ -141,6 +141,10 @@ It refuses each other object that is not a regular file, with the error \fB\%inv
 In a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository, a symbolic link at a \fB\%.file\fR object is a symbolic link object.
 The read of a FIFO does not wait for a writer.
 A listing of the objects, the device and inode cache of \fB\%ostrya commit \-\-link\-checkout\-speedup\fR, and the resolve of an abbreviated checksum refuse a symbolic link and an entry that is not a directory at \fB\%objects/<xx>\fR.
+Each write of an object, of a \fB\%.commitmeta\fR, and of a \fB\%.tombstone\-commit\fR refuses a symbolic link and an entry that is not a directory at \fB\%objects/<xx>\fR.
+The commit of a transaction keeps an object that \fB\%objects/\fR holds, also when another writer put it there after the transaction wrote the object.
+A transaction moves each object into \fB\%objects/<xx>\fR with \fB\%renameat2\fR and \fB\%RENAME_NOREPLACE\fR, or with a hard link where the file system refuses the flag.
+On a file system with no \fB\%RENAME_NOREPLACE\fR and no hard links, each object write fails.
 .TP
 \fB\%<repo>/refs/heads/<ref>\fR
 A local ref.
@@ -181,6 +185,12 @@ The read of the state of a commit refuses a symbolic link at \fB\%state\fR.
 The staging area.
 Each transaction makes a directory \fB\%tmp/staging\-<boot\-id>\-<6 characters>/\fR and a lock file with the same name and the suffix \fB\%\-lock\fR.
 A transaction writes its objects there and moves them into \fB\%objects/\fR when it commits.
+Where the file system has no \fB\%O_TMPFILE\fR, the temporary file of an object in a staging directory is \fB\%.ostrya\-tmp\-<pid>\-<6 characters>\fR.
+A symbolic link object of a \fB\%bare\fR or \fB\%bare\-user\-only\fR repository and a \fB\%.commitmeta\fR that a pull stages always use such a temporary name.
+A repository handle opens \fB\%tmp/\fR at its first use and keeps it.
+The open makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
+Each write of a \fB\%.commitmeta\fR outside a transaction and of a \fB\%.tombstone\-commit\fR, and the fs\-verity probe of \fB\%[ex\-integrity] fsverity=maybe\fR, make their temporary file in that \fB\%tmp/\fR.
+If another process removes \fB\%tmp/\fR, these writes of the handle fail, and the caller opens the repository again.
 Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 At the start of each transaction, ostrya removes each staging directory whose lock is free.
 It removes a staging directory with no lock file, and each other entry except a staging lock file, when the entry is older than \fB\%core.tmp\-expiry\-secs\fR.
@@ -265,8 +275,9 @@ When it exists, ostrya does not read the keyring of the remote in the remotes di
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
 .PP
-To change \fB\%config\fR, a ref, \fB\%summary\fR, or a file under \fB\%extensions/ostrya/summary/\fR, ostrya writes a temporary file and renames it over the target.
-The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-ref\-*\fR or \fB\%tmp/.ostrya\-meta\-*\fR below \fB\%tmp/\fR.
+To change \fB\%config\fR, a ref, \fB\%summary\fR, a file under \fB\%extensions/ostrya/summary/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file and renames it over the target.
+The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-ref\-*\fR or \fB\%tmp/.ostrya\-tmp\-*\fR below \fB\%tmp/\fR.
+A \fB\%.commitmeta\fR and a \fB\%.tombstone\-commit\fR use \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR.
 .SH STATIC DELTAS
 A static delta holds the objects that change between two commits, or all the objects of one commit.
 Its path uses a modified base64 form of the commit checksums: standard base64 with \fB\%/\fR changed to \fB\%_\fR and no trailing \fB\%=\fR, 43 characters in all.
@@ -506,7 +517,7 @@ the directory \fB\%extensions/ostrya/summary/\fR and its files;
 .IP \(bu 2
 the writer lock \fB\%extensions/ostrya/lock\fR, its probe \fB\%extensions/ostrya/lock\-probe\fR, and the markers \fB\%state/<checksum>.commitpartial\fR of a bucket repository;
 .IP \(bu 2
-the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
+the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-tmp\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2
 the config groups \fB\%[ex\-ostrya]\fR, \fB\%[ex\-ostrya server]\fR, \fB\%[ex\-ostrya client "NAME"]\fR, \fB\%[ex\-ostrya trust "NAME"]\fR, and \fB\%[ex\-ostrya key "NAME"]\fR;
 .IP \(bu 2

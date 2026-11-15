@@ -9,11 +9,10 @@
 //! - `fsck --add-tombstones` writes it for each commit whose parent commit
 //!   object is absent. The same step removes that commit object.
 
-use std::os::fd::BorrowedFd;
-
 use ostrya_core::{Checksum, DictBuilder, ObjectType, RepoMode, Type, loose_path, to_bytes};
 
 use crate::error::Result;
+use crate::repo_fs::RepoDir;
 
 /// The GVariant type that a `.tombstone-commit` object holds.
 const TOMBSTONE_SIGNATURE: &str = "a{sv}";
@@ -23,11 +22,13 @@ const TOMBSTONE_KEY: &str = "commit";
 /// Writes the `.tombstone-commit` marker that names `commit`.
 ///
 /// The object is an `a{sv}` with one key, `commit`. Its `ay` value is the
-/// commit checksum in lowercase hex, with a NUL terminator. `tmp_fd` is the
-/// open `tmp/` of the repository, where the write creates its temp file.
+/// commit checksum in lowercase hex, with a NUL terminator. `objects` is the
+/// `objects/` handle of the repository. The write is
+/// [`write_detached_blocking`](crate::commit::write_detached_blocking) with
+/// no `tmp`, so it creates its temp file in the `tmp/` handle that the
+/// repository handle keeps, and replaces an existing marker.
 pub(crate) fn write_tombstone(
-    tmp_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
+    objects: &RepoDir,
     commit: &Checksum,
     mode: RepoMode,
     fsync: bool,
@@ -39,5 +40,5 @@ pub(crate) fn write_tombstone(
     let ty = Type::parse(TOMBSTONE_SIGNATURE).map_err(ostrya_core::Error::from)?;
     let bytes = to_bytes(&ty, &builder.build()).map_err(ostrya_core::Error::from)?;
     let dest = loose_path(commit, ObjectType::TombstoneCommit, mode);
-    crate::commit::write_detached_blocking(tmp_fd, objects_fd, &dest, &bytes, fsync, mode)
+    crate::commit::write_detached_blocking(None, objects, &dest, &bytes, fsync)
 }

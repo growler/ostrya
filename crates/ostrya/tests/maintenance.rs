@@ -1404,6 +1404,62 @@ fn fsck_add_tombstones_replaces_the_commit() {
     }
 }
 
+/// A symlink at `tmp` fails each write of a `.commitmeta` and of a
+/// `.tombstone-commit` with `InvalidFormat`, on a handle that opens the
+/// repository after the change: the write of detached metadata, a signature,
+/// and the tombstone of `fsck --add-tombstones`. The stored `.commitmeta`
+/// stays as it was, and the target of the symlink gets no file.
+#[test]
+fn a_symlink_at_tmp_fails_each_detached_metadata_write() {
+    let tmp = TmpDir::new("maint-tmp-symlink");
+    block_on(async {
+        let base = tmp.path();
+        let mode = RepoMode::BareUser;
+        let (repo, c1, c2) = build_two_commit_repo(base, mode).await;
+        repo.write_commit_detached_metadata(&c2, None)
+            .await
+            .unwrap();
+        drop(repo);
+        let repo_dir = base.join("repo");
+        let objects = repo_dir.join("objects");
+        let meta = objects.join(ObjectName::new(c2, ObjectType::CommitMeta).loose_path(mode));
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::remove_dir_all(repo_dir.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(&outside, repo_dir.join("tmp")).unwrap();
+        std::fs::remove_file(
+            objects.join(ObjectName::new(c1, ObjectType::Commit).loose_path(mode)),
+        )
+        .unwrap();
+
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let dict = ostrya::Value::Array(Vec::new());
+        let results = [
+            repo.write_commit_detached_metadata(&c2, Some(&dict)).await,
+            repo.sign_commit(&c2, &ostrya::DummySigner::new(b"key".to_vec()))
+                .await,
+            repo.fsck(&FsckOptions {
+                add_tombstones: true,
+                ..FsckOptions::new()
+            })
+            .await
+            .map(drop),
+        ];
+        let expected = "tmp passes through a symlink; ostrya refuses a symlink in the repository";
+        for (index, result) in results.into_iter().enumerate() {
+            match result {
+                Err(ostrya::Error::InvalidFormat(m)) => assert_eq!(m, expected, "write {index}"),
+                other => panic!("write {index}: {other:?}"),
+            }
+        }
+        assert_eq!(std::fs::metadata(&meta).unwrap().len(), 0);
+        let tombstone =
+            objects.join(ObjectName::new(c2, ObjectType::TombstoneCommit).loose_path(mode));
+        assert!(!tombstone.exists(), "no tombstone is written");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    });
+}
+
 /// The tombstone step writes to the repository. If the walk found a corrupt
 /// object, the step runs under `all` or `delete` alone. An absent object leaves
 /// the walk sound for this purpose, so the step runs.

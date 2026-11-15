@@ -571,7 +571,7 @@ holds only `.filez` content objects and uncompressed metadata.
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
   tmp/.ostrya-ref-<pid>-<n>-XXXXXX  port temp entry of a ref or alias write
-  tmp/.ostrya-meta-<pid>-<n>-XXXXXX port temp file of a .commitmeta or .tombstone-commit
+  tmp/.ostrya-tmp-<pid>-XXXXXX    port temp file of a .commitmeta or .tombstone-commit
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -611,6 +611,28 @@ of `objects/` reads each entry whose name is two hexadecimal characters as a
 fan-out directory. A symlink there, or an entry that is not a directory,
 fails the listing of the objects, the device and inode cache of a commit
 with `--link-checkout-speedup`, and the resolve of an abbreviated checksum.
+
+The port writes each object relative to `objects/` by the same rule. A
+symlink at `objects/<xx>`, or an entry there that is not a directory, fails
+the check of the presence of an object before a write, with the message
+`objects/<xx>/<leaf> passes through a symlink; ostrya refuses a symlink in
+the repository` or `objects/<xx>/<leaf> is not a directory`. The publish of
+a transaction moves each staged object into `objects/<xx>/` with `renameat2`
+and `RENAME_NOREPLACE`. Where the file system refuses the flag, a `linkat`
+puts the object in place, and an `unlinkat` then removes the staged name.
+When the open of `objects/<xx>` for the move gives `ENOENT`, the publish
+makes the directory and moves the object one more time. The move fails at
+such an entry with the message `objects/<xx> passes through a symlink;
+ostrya refuses a symlink in the repository` or `objects/<xx> is not a
+directory`. An object that `objects/` holds at the move stays, also when
+another writer put it there after the check of the presence.
+
+The object writes of a transaction thus need `renameat2` with
+`RENAME_NOREPLACE` or `linkat` on the file system of the repository. The
+publish into `objects/<xx>/` uses one of the two, and so does the move of a
+named temp file or a temp symlink to its staging name ("Durability and
+staging"). On a file system with no `RENAME_NOREPLACE` and no hard links,
+each object write fails with the errno of the `linkat`.
 
 The port reads at most 134217728 bytes of a metadata object
 (`MAX_METADATA_SIZE`). A larger object fails the read with the message
@@ -1038,6 +1060,16 @@ that commits, aborts, or drops removes the pair itself. A process that ends
 without unwinding removes the pair of every transaction that it still holds
 immediately before the exit.
 
+A repository handle of the port opens `tmp/` at its first use and keeps it.
+The open makes `tmp/` and `tmp/cache/` if they are absent. Each clone of the
+handle uses the same `tmp/`. These writes of the handle make their temp
+files there: a `.commitmeta` and a `.tombstone-commit` outside a
+transaction, and the seal probe of `fsverity=maybe`. If another process
+removes `tmp/`, these writes of the handle fail, and the caller opens the
+repository again. The
+port itself does not remove `tmp/`. Each transaction begin makes `tmp/` and
+`tmp/cache/` again if they are absent, and opens `tmp/` for the transaction.
+
 ### The update lock
 
 The file `<repo>/.update.lock` holds the update lock of the port. The port takes
@@ -1158,7 +1190,7 @@ Each transaction creates a new staging directory, and the port reuses none.
 between the two reaps.
 
 The port writes a ref, an alias, a `.commitmeta`, and a `.tombstone-commit`
-through the temp entries `.ostrya-ref-*` and `.ostrya-meta-*`. These entries get
+through the temp entries `.ostrya-ref-*` and `.ostrya-tmp-*`. These entries get
 the age test like each other entry. With a very small or negative
 `tmp-expiry-secs`, the reap of another transaction can unlink such an entry
 before its rename. The write then fails with `ENOENT`, and the ref or the object
@@ -1529,6 +1561,19 @@ and `[core] per-object-fsync` set the syncs:
 `conformance/cli-behavior.md`, "The fsync vocabulary", gives the command
 switches of the two keys and the sync counts.
 
+The port makes the temp file of each object of a transaction in the staging
+directory. The temp file is an `O_TMPFILE` file, which the port links at its
+staging name with `linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`. Where
+the `O_TMPFILE` open gives `EOPNOTSUPP`, `EISDIR`, or `EINVAL`, the temp file
+is a named file `.ostrya-tmp-<pid>-XXXXXX`, where `XXXXXX` is six random
+characters from `[A-Za-z0-9]`, and the port moves it to its staging name with
+`renameat2` and `RENAME_NOREPLACE`. Each other error of the open fails the
+write. A symlink object of `bare` and `bare-user-only` is always a temp
+symlink `.ostrya-tmp-<pid>-XXXXXX`, which the port moves to its staging name
+in the same way. In `bare`, the temp symlink gets the owner and the xattrs
+before its move. An entry that the transaction staged under the name stays,
+and the new temp file is removed.
+
 The port always stages and then renames, and it applies these three rules to
 the syncs it issues. At ingest it does not sync an object that it hardlinks
 from another repository. It also does not sync a content object that it stores
@@ -1545,15 +1590,30 @@ A pull stages each `.commitmeta` that it copies as a file in the staging
 directory, with no sync of its own. At the step that writes detached metadata
 and refs, it renames the file into `objects/<xx>/`. When fsync is on, the
 `syncfs` that starts publication makes the staged file durable. Where
-publication runs no `syncfs`, the step runs one before the rename. After the
+publication runs no `syncfs`, the step runs one before the rename. When the
+open of `objects/<xx>` for the rename gives `ENOENT`, the step makes the
+directory and renames the file one more time. After the
 renames, the step syncs each fanout directory that gained a `.commitmeta` once,
 and `objects/` once if the step created a fanout directory.
 
 Every other `.commitmeta` write, and each `.tombstone-commit` write, creates a
-temp file in `tmp/` and renames it into `objects/<xx>/`
-(`conformance/cli-surface.md`, "Global conventions"). If `tmp/` is on a
-different filesystem from `objects/`, the rename fails with `EXDEV` and the
-write fails.
+named temp file `.ostrya-tmp-<pid>-XXXXXX` in `tmp/` and moves it over the
+target in `objects/<xx>/` with one `renameat`
+(`conformance/cli-surface.md`, "Global conventions"). The write needs no
+`/proc`. When fsync is on, the port runs `fsync` on the temp file before the
+move, and on `objects/<xx>` after the move. When the write makes
+`objects/<xx>`, it also runs `fsync` on `objects/`. If `tmp/` is on a
+different filesystem from `objects/`, the move fails with `EXDEV` and the
+write fails. The write first moves the temp file. When the open of
+`objects/<xx>` for the move gives `ENOENT`, the write makes the directory,
+writes a new temp file, and moves it one more time. A write outside a
+transaction uses the `tmp/` that the repository handle keeps ("Repository
+lock and staging"). A write at the commit of a transaction uses the `tmp/`
+that the transaction opened at its start. A symlink at `tmp`, at
+`tmp/cache`, or at `objects/<xx>`, and an entry there that is not a
+directory, fail the write. The port stages the `.commitmeta`
+of a pull in the same way: a named temp file in the staging directory, moved
+to its staging name with one `renameat`.
 
 The layout of the staging directory is transient and is not part of the
 on-disk format ("Repository lock and staging" gives its place).
@@ -1592,6 +1652,20 @@ filesystem without verity, `FS_IOC_ENABLE_VERITY` returns `ENOTTY`. Under
 `maybe`, a commit then completes with unsealed objects. Under `yes`, the write
 fails. The tool then reports that fs-verity is required and that the
 filesystem does not support it.
+
+Under `maybe`, the port probes the seal one time for each repository handle,
+and the clones of the handle share the result. The probe makes a temp file in
+`tmp/`, writes one byte, seals the file, and removes it. If the seal of the
+probe fails, the effective `fsverity` of each transaction of the handle is
+`no`: the transaction seals no object and makes no seal attempt. Else each
+object write tries the seal and keeps an object that the seal refuses. Under
+`yes`, each failure of the seal fails the write, also a failure of the
+read-only reopen through `/proc/self/fd`.
+
+A local pull into a repository with `maybe` whose probe fails thus links the
+objects of the source as a repository with `no` does. A linked object shares
+the inode of the source object, so a later change of that inode in place is
+visible in both repositories.
 
 `FS_IOC_ENABLE_VERITY` needs write permission on the inode, also through a
 read-only descriptor. Without it the kernel returns `EACCES`. A caller with

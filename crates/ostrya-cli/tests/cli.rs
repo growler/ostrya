@@ -3964,6 +3964,51 @@ fn sign_verify_ed25519() {
     }
 }
 
+/// `sign` writes the `.commitmeta` file through a named temp file in `tmp/`.
+/// With fsync on, it syncs the temp file with `fsync`, and then the fan-out
+/// directory that holds the `.commitmeta` file. It makes no `fdatasync` call.
+/// With `[core] fsync=false`, it makes no sync call.
+#[test]
+fn sign_syncs_the_commitmeta_with_fsync() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("sign-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    for fsync in [true, false] {
+        let dir = base.join(format!("fsync-{fsync}"));
+        std::fs::create_dir(&dir).unwrap();
+        let repo = commit_fixture(&dir);
+        if !fsync {
+            set_core_key(&repo, "fsync=false");
+        }
+        let repo_s = repo.to_str().unwrap();
+        let (run, calls) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &dir.join("trace"),
+            &["sign", "--repo", repo_s, COMMIT, ED25519_SECRET_B64],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        if !fsync {
+            assert!(calls.is_empty(), "fsync=false synced: {calls:?}");
+            continue;
+        }
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert_eq!(calls[0].0, "fsync", "{calls:?}");
+        assert!(calls[0].1.starts_with("tmp/.ostrya-tmp-"), "{calls:?}");
+        assert_eq!(
+            calls[1],
+            ("fsync", format!("objects/{}", &COMMIT[..2])),
+            "{calls:?}"
+        );
+    }
+}
+
 /// `sign -d` and `sign --delete` exit non-zero and write nothing: the
 /// detached metadata of the commit keeps its bytes.
 #[test]

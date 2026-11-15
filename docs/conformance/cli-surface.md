@@ -7331,6 +7331,31 @@ Observed by running the tool (2026.1).
   --commit-metadata-only`, `summary -u`, `prune --refs-only`, `config set`,
   and `config get` exit 0 with the output of a repository with no symlink.
   The tool writes the new objects through the symlink.
+  The port refuses the same symlink at each write below `objects/<xx>`, in
+  `commit`, `pull-local`, and `static-delta apply`. The check of the presence
+  of an object before its write fails with `invalid format:
+  objects/<xx>/<name> passes through a symlink; ostrya refuses a symlink in
+  the repository`. The publish of a transaction fails with `invalid format:
+  objects/<xx> passes through a symlink; ostrya refuses a symlink in the
+  repository`. `sign` and `fsck --add-tombstones` read the commit object
+  below `objects/<xx>` before they write its `.commitmeta` or its
+  `.tombstone-commit`. They fail at that read with `invalid format:
+  objects/<xx>/<name> passes through a symlink; ostrya refuses a symlink in
+  the repository`, where `<name>` is the commit object. `prune` fails at the
+  listing of the objects, with or without tombstones, with the `objects/<xx>`
+  text of the listing above. The library call
+  `Repo::write_commit_detached_metadata` reads no object first, and fails at
+  its write with `invalid format: objects/<xx> passes through a symlink;
+  ostrya refuses a symlink in the repository`. An entry `objects/<xx>` that
+  is not a directory fails these steps with `is not a directory` in place of
+  the symlink text. The target of the symlink gets no file.
+  `pull-local` refuses a symlink at `objects/<xx>` and at the path of an
+  object of the source repository, in each open mode of the source, at the
+  link and at the copy of the object. A symlink gives `invalid format:
+  objects/<xx>/<name> passes through a symlink; ostrya refuses a symlink in
+  the repository`. A FIFO, or another entry that is not a regular file where
+  the source mode stores one, gives `invalid format: objects/<xx>/<name> is
+  not a regular file`, and the copy does not wait for a writer.
   A symlink at the path of a metadata object, at a `.filez` object of an
   `archive` repository, or at a `.file` object of a `bare-user` repository
   fails each read of the object in the port, in each open mode, with
@@ -7382,6 +7407,21 @@ Observed by running the tool (2026.1).
   `tmp/cache`. A transaction makes `tmp` and `tmp/cache` if they are
   absent. With libostree 2026.4 on 2026-11-13, against a repository with an
   absolute symlink at `tmp`, the commands of the first list above exit 0.
+  A symlink at `tmp` or at `tmp/cache`, or an entry there that is not a
+  directory, also fails each write of a `.commitmeta` outside a transaction
+  and each write of a `.tombstone-commit` in the port. Examples are `sign`,
+  `fsck --add-tombstones`, and `prune` with tombstones. The error is
+  `invalid format: tmp passes through a symlink; ostrya refuses a symlink in
+  the repository`, the same text for `tmp/cache`, or `invalid format: tmp is
+  not a directory`. Each such write makes `tmp` and `tmp/cache` if they are
+  absent. With
+  libostree 2026.1 on 2026-11-14, `ostree sign` with an absolute symlink at
+  `tmp` exits 0 and writes the `.commitmeta`, in `bare-user` and in
+  `archive`. Its temp file is in `objects/<xx>`, and it writes no file in the
+  target of the symlink. With libostree 2026.4 on 2026-11-14, `ostree prune
+  --delete-commit` with `core.tombstone-commits=true` and the same symlink
+  exits 0 and writes the `.tombstone-commit`. Its temp file is in the target
+  of the symlink. A target on another file system was not observed.
 - The global option `--remotes-config-dir=PATH` and the key `[ex-ostrya]
   remotes-config-dir` are port extensions. The tool has no such option and
   ignores the key. The `ostrya` command selects the remotes directory of a
@@ -7460,8 +7500,30 @@ Observed by running the tool (2026.1).
   `refs/` in the tool (`commit_fsync_policy_controls_the_syscalls` in
   `crates/ostrya-cli/tests/cli.rs`). The port also creates the temp symlink
   of an alias write in `tmp/`. It writes each `.commitmeta` it does not
-  stage, and each `.tombstone-commit`, through a temp file in `tmp/`. No
-  published byte differs.
+  stage, and each `.tombstone-commit`, through a named temp file
+  `tmp/.ostrya-tmp-<pid>-XXXXXX`, and moves it over the target with one
+  `renameat`. No published byte differs.
+- The port syncs a `.commitmeta` that it does not stage, and a
+  `.tombstone-commit`, by `[core] fsync`. With fsync on, it runs `fsync` on
+  the temp file before the move, and on `objects/<xx>` after the move. When
+  the write makes `objects/<xx>`, it also runs `fsync` on `objects/`. With
+  `fsync=false`, it makes no sync call (`sign_syncs_the_commitmeta_with_fsync`
+  in `crates/ostrya-cli/tests/cli.rs`). The tool syncs these files by
+  another rule. The observations below come from `strace` of the tool on
+  2026-11-14, with the default config and with `core.fsync=false`, which
+  gave the same calls.
+  - `ostree sign` (libostree 2026.1, `bare-user` and `archive`) makes an
+    `O_TMPFILE` file in `objects/<xx>`. It links the file at
+    `objects/<xx>/tmp.XXXXXX` through `/proc/self/fd` and renames it over the
+    `.commitmeta`. It runs `fdatasync` on the temp file when a `.commitmeta`
+    exists, and no sync call when none exists. It runs `fsync` on no
+    directory.
+  - `ostree prune --delete-commit` and `ostree fsck --add-tombstones`
+    (libostree 2026.4, `bare-user`) make an `O_TMPFILE` file in `tmp/` and
+    link it at the `.tombstone-commit` name through `/proc/self/fd`, with no
+    rename. They make no sync call. When a `.tombstone-commit` exists, `prune`
+    writes no file, and the existing file keeps its content and its mode. The
+    port replaces the existing file with the 78-byte marker at `0644`.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

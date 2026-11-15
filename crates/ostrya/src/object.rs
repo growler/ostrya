@@ -1,20 +1,12 @@
-//! Blocking I/O functions for loose objects.
-//!
-//! These synchronous functions make the `openat`, `statat`, and `read` system
-//! calls of the read path. Each function takes a borrowed directory
-//! descriptor and a loose path that the caller computes. The async methods on
-//! [`Repo`](crate::Repo) run them on the blocking pool.
+//! The size caps of loose objects, and the blocking open of a file below a
+//! directory descriptor.
 //!
 //! A metadata read stops at the metadata cap of the format, 128 MiB
 //! ([`MAX_METADATA_SIZE`]), so a malformed object cannot use all memory.
 
-use std::io::Read;
 use std::os::fd::OwnedFd;
 
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
-use rustix::io::Errno;
-
-use crate::error::{Error, Result};
+use rustix::fs::{FileType, Mode, OFlags, ResolveFlags};
 
 pub use ostrya_core::MAX_METADATA_SIZE;
 
@@ -33,11 +25,6 @@ pub use ostrya_core::MAX_METADATA_SIZE;
 /// - The header length comes from the object stream.
 /// - The receive path holds one header buffer for each fetch in flight.
 pub(crate) const MAX_FILE_HEADER_SIZE: u64 = 1024 * 1024;
-
-/// Opens a loose object for reading, relative to a directory descriptor.
-pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
-    open_regular_file(dir, path, false)
-}
 
 /// Opens the file at `path` under `dir` for reading.
 ///
@@ -94,80 +81,4 @@ pub(crate) fn open_regular_file_nofollow(
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
         Mode::empty(),
     )?)
-}
-
-/// Opens the fan-out directory `fanout` under `objects_fd` as a path
-/// descriptor with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`.
-///
-/// A symlink there fails the open with `ELOOP`. A missing entry gives the
-/// kind `ErrorKind::NotFound`.
-pub(crate) fn open_fanout_beneath(
-    objects_fd: rustix::fd::BorrowedFd<'_>,
-    fanout: &str,
-) -> std::io::Result<OwnedFd> {
-    Ok(rustix::fs::openat2(
-        objects_fd,
-        fanout,
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-    )?)
-}
-
-/// Returns the error of a metadata read for an object larger than the size cap.
-///
-/// The buffered loader and the streaming reader both return this error, so the
-/// two paths refuse an oversized object in the same way.
-pub(crate) fn metadata_cap_exceeded() -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::InvalidData,
-        "object exceeds the metadata size cap",
-    )
-}
-
-/// Reads a whole metadata object into memory and refuses one larger than `cap`.
-///
-/// If the object does not exist, the error has the kind `ErrorKind::NotFound`.
-/// The async wrapper maps this kind to [`Error::ObjectNotFound`].
-pub(crate) fn read_meta_object(
-    dir: rustix::fd::BorrowedFd<'_>,
-    path: &str,
-    cap: u64,
-) -> std::io::Result<Vec<u8>> {
-    read_meta_fd(open_object(dir, path)?, cap)
-}
-
-/// Reads a whole metadata object from an open descriptor.
-///
-/// The cap rule is the same as in [`read_meta_object`]. If the descriptor is
-/// not a regular file, the error has the kind `ErrorKind::InvalidData`.
-pub(crate) fn read_meta_fd(fd: OwnedFd, cap: u64) -> std::io::Result<Vec<u8>> {
-    let stat = rustix::fs::fstat(&fd)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "object is not a regular file",
-        ));
-    }
-    let size = stat.st_size.max(0) as u64;
-    if size > cap {
-        return Err(metadata_cap_exceeded());
-    }
-    let file = std::fs::File::from(fd);
-    let mut buf = Vec::with_capacity(size as usize);
-    // `take` stops the read if the file grows between the `fstat` and the read.
-    file.take(cap + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > cap {
-        return Err(metadata_cap_exceeded());
-    }
-    Ok(buf)
-}
-
-/// Returns `true` if a loose object exists at `path` relative to `dir`.
-pub(crate) fn object_exists(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> Result<bool> {
-    match rustix::fs::statat(dir, path, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(_) => Ok(true),
-        Err(Errno::NOENT) => Ok(false),
-        Err(e) => Err(Error::Io(e.into())),
-    }
 }

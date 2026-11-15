@@ -162,7 +162,7 @@ impl TempFile {
     /// mode, and the errors are those of the named file of
     /// [`create`](TempFile::create). A publish with [`Publish::Replace`] then
     /// costs one `renameat`, with no link of the file at a temp name.
-    pub(super) fn create_named(dir: &RepoDir) -> Result<TempFile, FsError> {
+    pub(crate) fn create_named(dir: &RepoDir) -> Result<TempFile, FsError> {
         TempFile::create_named_in(temp_home(dir)?)
     }
 

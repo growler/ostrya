@@ -167,6 +167,8 @@ Each key takes \fB\%no\fR, \fB\%maybe\fR, or \fB\%yes\fR, and ostrya refuses any
 \fB\%fsverity\fR (default no)
 Seal each loose object that is a regular file with fs\-verity, in each mode.
 With \fB\%maybe\fR, a write continues if the file system cannot seal the object.
+With \fB\%maybe\fR, ostrya first seals a probe file in \fB\%tmp/\fR one time for each open of the repository.
+If the probe fails, the writes of that open seal no object.
 With \fB\%yes\fR, the write fails.
 If the key is absent and \fB\%composefs\fR is \fB\%maybe\fR or \fB\%yes\fR, the default is \fB\%maybe\fR.
 .TP

@@ -130,10 +130,6 @@ pub(crate) fn open_tmp_dir(repo_fd: BorrowedFd<'_>, repo_mode: RepoMode) -> io::
 /// The name prefix of the temp entry of a ref file or of an alias symlink.
 pub(crate) const REF_TEMP_PREFIX: &str = ".ostrya-ref-";
 
-/// The name prefix of the temp file of a `.commitmeta` or a
-/// `.tombstone-commit` object.
-pub(crate) const META_TEMP_PREFIX: &str = ".ostrya-meta-";
-
 /// A temp entry in `tmp/` that a write renames over its target.
 ///
 /// The name is `<prefix><pid>-<counter>-XXXXXX`. `XXXXXX` is a random suffix,
@@ -319,6 +315,12 @@ impl StagingDir {
     /// into `objects/`.
     pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
         self.dir.as_fd()
+    }
+
+    /// Returns the handle of the `tmp/` directory of the repository, which
+    /// holds the staging directory. [`create`](StagingDir::create) opened it.
+    pub(crate) fn tmp(&self) -> &RepoDir {
+        &self.tmp
     }
 
     /// Returns the descriptor of the `tmp/` directory of the repository, which

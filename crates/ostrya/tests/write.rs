@@ -860,6 +860,272 @@ fn bare_user_only_hashes_the_canonical_header() {
     });
 }
 
+/// Returns the bytes and the checksum of a dirmeta object of mode `mode`.
+fn dirmeta_object(mode: u32) -> (Vec<u8>, Checksum) {
+    let bytes = ostrya_core::DirMeta {
+        uid: 0,
+        gid: 0,
+        mode,
+        xattrs: ostrya_core::Xattrs::empty(),
+    }
+    .serialize()
+    .unwrap();
+    let checksum = Checksum::sha256(&bytes);
+    (bytes, checksum)
+}
+
+/// Returns the message of `result`, which must be [`Error::InvalidFormat`].
+fn invalid_format<T: std::fmt::Debug>(result: ostrya::Result<T>) -> String {
+    match result {
+        Err(Error::InvalidFormat(m)) => m,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Returns the text of the refusal of a symlink at the path `path`.
+fn symlink_refusal(path: &str) -> String {
+    format!("{path} passes through a symlink; ostrya refuses a symlink in the repository")
+}
+
+/// Moves the fan-out directory of the loose path `object` below `root/objects`
+/// to `moved`, and puts a symlink to the empty directory `target` there.
+fn symlink_fanout(root: &Path, object: &str, moved: &Path, target: &Path) {
+    let fanout = root.join("objects").join(&object[..2]);
+    std::fs::rename(&fanout, moved).unwrap();
+    std::fs::create_dir(target).unwrap();
+    std::os::unix::fs::symlink(target, &fanout).unwrap();
+}
+
+/// A symlink at `objects/<xx>` fails a write of an object below it with
+/// `InvalidFormat` and the object path. The target of the symlink gets no
+/// file.
+#[test]
+fn a_symlink_at_a_fanout_fails_a_write_below_it() {
+    let tmp = TmpDir::new("write-fanout-symlink");
+    let root = tmp.path().join("repo");
+    let mode = RepoMode::BareUser;
+    let (bytes, dirmeta) = dirmeta_object(0o040755);
+    let file_path = loose_path(&csum(HELLO_TXT), ObjectType::File, mode);
+    let meta_path = loose_path(&dirmeta, ObjectType::DirMeta, mode);
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(mode)).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        txn.write_regfile_inline(None, &reg(), HELLO).await.unwrap();
+        txn.write_metadata(ObjectType::DirMeta, None, &bytes)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    });
+    let targets = [
+        tmp.path().join("file-target"),
+        tmp.path().join("meta-target"),
+    ];
+    symlink_fanout(
+        &root,
+        &file_path,
+        &tmp.path().join("file-moved"),
+        &targets[0],
+    );
+    if meta_path[..2] != file_path[..2] {
+        symlink_fanout(
+            &root,
+            &meta_path,
+            &tmp.path().join("meta-moved"),
+            &targets[1],
+        );
+    }
+
+    let (file, meta) = block_on(async {
+        let repo = Repo::open(&root).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let file = txn.write_regfile_inline(None, &reg(), HELLO).await;
+        let meta = txn.write_metadata(ObjectType::DirMeta, None, &bytes).await;
+        txn.abort().await.unwrap();
+        (file, meta)
+    });
+    assert_eq!(
+        invalid_format(file),
+        symlink_refusal(&format!("objects/{file_path}"))
+    );
+    assert_eq!(
+        invalid_format(meta),
+        symlink_refusal(&format!("objects/{meta_path}"))
+    );
+    for target in targets.iter().filter(|t| t.exists()) {
+        assert_eq!(std::fs::read_dir(target).unwrap().count(), 0, "{target:?}");
+    }
+}
+
+/// The publish of a commit refuses a symlink at `objects/<xx>` that appears
+/// after the stage, and an entry there that is not a directory. The target of
+/// the symlink gets no file.
+#[test]
+fn the_publish_refuses_a_fanout_that_is_not_a_directory() {
+    let mode = RepoMode::BareUser;
+    let fanout = &loose_path(&csum(HELLO_TXT), ObjectType::File, mode)[..2];
+    for symlink in [true, false] {
+        let tmp = TmpDir::new("write-publish-fanout");
+        let root = tmp.path().join("repo");
+        let target = tmp.path().join("target");
+        let result = block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(mode)).await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.write_regfile_inline(None, &reg(), HELLO).await.unwrap();
+            let at = root.join("objects").join(fanout);
+            if symlink {
+                std::fs::create_dir(&target).unwrap();
+                std::os::unix::fs::symlink(&target, &at).unwrap();
+            } else {
+                std::fs::write(&at, b"").unwrap();
+            }
+            txn.commit().await
+        });
+        let expected = if symlink {
+            symlink_refusal(&format!("objects/{fanout}"))
+        } else {
+            format!("objects/{fanout} is not a directory")
+        };
+        assert_eq!(invalid_format(result), expected);
+        if symlink {
+            assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
+        }
+    }
+}
+
+/// The publish of a commit makes again a fan-out directory that was removed
+/// after the stage, and moves the object into it.
+#[test]
+fn the_publish_makes_a_missing_fanout_again() {
+    let tmp = TmpDir::new("write-publish-missing-fanout");
+    let root = tmp.path().join("repo");
+    let mode = RepoMode::BareUser;
+    let path = loose_path(&csum(HELLO_TXT), ObjectType::File, mode);
+    let fanout = root.join("objects").join(&path[..2]);
+    block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(mode)).await.unwrap();
+        let first = repo.transaction().await.unwrap();
+        first
+            .write_regfile_inline(None, &reg(), HELLO)
+            .await
+            .unwrap();
+        first.commit().await.unwrap();
+        std::fs::remove_dir_all(&fanout).unwrap();
+        let second = repo.transaction().await.unwrap();
+        second
+            .write_regfile_inline(None, &reg(), HELLO)
+            .await
+            .unwrap();
+        assert!(!fanout.exists(), "the stage makes no fan-out directory");
+        second.commit().await.unwrap();
+    });
+    assert!(std::fs::symlink_metadata(&fanout).unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(root.join("objects").join(&path)).unwrap(),
+        HELLO
+    );
+}
+
+/// Two transactions stage the same object. The first commit publishes it,
+/// and the second commit keeps the published inode. Both commits succeed.
+#[test]
+fn a_second_publish_of_an_object_keeps_the_first_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = TmpDir::new("write-keep-published");
+    let root = tmp.path().join("repo");
+    let mode = RepoMode::BareUser;
+    let object = root
+        .join("objects")
+        .join(loose_path(&csum(HELLO_TXT), ObjectType::File, mode));
+    let (first, second) = block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(mode)).await.unwrap();
+        let one = repo.transaction().await.unwrap();
+        let two = repo.transaction().await.unwrap();
+        one.write_regfile_inline(None, &reg(), HELLO).await.unwrap();
+        two.write_regfile_inline(None, &reg(), HELLO).await.unwrap();
+        one.commit().await.unwrap();
+        let first = std::fs::symlink_metadata(&object).unwrap().ino();
+        two.commit().await.unwrap();
+        let second = std::fs::symlink_metadata(&object).unwrap().ino();
+        (first, second)
+    });
+    assert_eq!(first, second, "the second publish keeps the first inode");
+    assert_eq!(std::fs::read(&object).unwrap().len(), HELLO.len());
+}
+
+/// Returns the name and the inode number of each entry of each staging
+/// directory of the repository at `root`, sorted by name.
+fn staged_entries(root: &Path) -> Vec<(String, u64)> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(root.join("tmp")).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_name().to_string_lossy().starts_with("staging-")
+            && entry.file_type().unwrap().is_dir()
+        {
+            for staged in std::fs::read_dir(entry.path()).unwrap() {
+                let staged = staged.unwrap();
+                let ino = std::fs::symlink_metadata(staged.path()).unwrap().ino();
+                entries.push((staged.file_name().to_string_lossy().into_owned(), ino));
+            }
+        }
+    }
+    entries.sort();
+    entries
+}
+
+/// One transaction writes the same metadata object and the same `bare`
+/// symlink object two times. The staging directory holds one entry of each
+/// and no temp file. The second write keeps the inode of each entry that the
+/// first write staged. The published symlink has the owner of the header.
+#[test]
+fn a_second_stage_of_an_object_keeps_the_staged_entry() {
+    use std::os::unix::fs::MetadataExt;
+
+    let tmp = TmpDir::new("write-keep-staged");
+    let root = tmp.path().join("repo");
+    let mode = RepoMode::Bare;
+    let (bytes, dirmeta) = dirmeta_object(0o040700);
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    let meta = FileMeta::regular(uid, gid, 0o777);
+    let (staged, link) = block_on(async {
+        let repo = Repo::create(&root, CreateOptions::new(mode)).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut link = None;
+        let mut staged = Vec::new();
+        for _ in 0..2 {
+            txn.write_metadata(ObjectType::DirMeta, None, &bytes)
+                .await
+                .unwrap();
+            link = Some(txn.write_symlink("target", &meta, None).await.unwrap());
+            staged.push(staged_entries(&root));
+        }
+        txn.commit().await.unwrap();
+        (staged, link.unwrap())
+    });
+    let mut expected = vec![
+        format!("{}.dirmeta", dirmeta.to_hex()),
+        format!("{}.file", link.to_hex()),
+    ];
+    expected.sort();
+    let names: Vec<String> = staged[0].iter().map(|(name, _)| name.clone()).collect();
+    assert_eq!(names, expected);
+    assert_eq!(
+        staged[1], staged[0],
+        "the second write keeps each staged inode"
+    );
+
+    let published = root
+        .join("objects")
+        .join(loose_path(&link, ObjectType::File, mode));
+    let stat = std::fs::symlink_metadata(&published).unwrap();
+    assert!(stat.file_type().is_symlink());
+    assert_eq!((stat.uid(), stat.gid()), (uid, gid));
+    assert_eq!(std::fs::read_link(&published).unwrap(), Path::new("target"));
+}
+
 fn run_ostree(args: &[&str]) {
     let status = Command::new("ostree")
         .args(args)

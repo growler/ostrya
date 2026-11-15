@@ -13,8 +13,9 @@
 //! write permission on the inode. In bare mode the logical xattrs go on after
 //! the seal, between the owner and the mode.
 
+use std::ffi::CString;
 use std::future::poll_fn;
-use std::io::{self, SeekFrom};
+use std::io::{self, SeekFrom, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,12 +28,16 @@ use ostrya_core::{
     loose_path,
 };
 use ostrya_rt::File as RtFile;
-use rustix::fs::{AtFlags, Gid, Mode, OFlags, Uid, XattrFlags};
+use rustix::fs::{FileType, Mode, OFlags, XattrFlags};
+use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 
 use crate::config::Tristate;
 use crate::error::{Error, Result};
-use crate::perm;
+use crate::read::object_path_error;
+use crate::repo_fs::{
+    self, Cloned, FsError, Publish, Published, Reason, RepoDir, Stat, TempFile, TempLink,
+};
 use crate::transaction::Transaction;
 
 /// The regular-file mode bit.
@@ -56,17 +61,6 @@ const FIXED_MODE: u32 = 0o644;
 /// [`Transaction::write_content`] copies in chunks of this size, and
 /// `Repo::fsck` hashes in them.
 pub(crate) const COPY_CHUNK: usize = 64 * 1024;
-/// The number of attempts to enable fs-verity before an `ETXTBSY` error is
-/// reported.
-///
-/// The kernel refuses to seal an inode while a writable descriptor to it is
-/// open. `fork` copies the file descriptor table, so a child process holds a
-/// copy of the writable staging descriptor until its `exec` closes it. The
-/// retries outlast this window between `fork` and `exec`. A refusal that stays
-/// still fails within 50 ms.
-const SEAL_ATTEMPTS: u32 = 50;
-/// The pause between fs-verity enable attempts.
-const SEAL_PAUSE: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// The logical metadata that a writer records for a content object.
 ///
@@ -182,7 +176,7 @@ fn canonical_dirmeta(meta: &DirMeta) -> DirMeta {
     }
 }
 
-/// How a staged temp file gets its final staging name.
+/// How a temp file of [`open_temp`] gets its final name.
 #[derive(Debug)]
 pub(crate) enum TempKind {
     /// An `O_TMPFILE` anonymous inode, linked into place through
@@ -190,41 +184,6 @@ pub(crate) enum TempKind {
     Anonymous,
     /// A named temp file, renamed into place.
     Named(String),
-}
-
-/// An ingestion temp file that is not staged yet.
-///
-/// A drop removes the temp. An anonymous inode goes away when its descriptor
-/// closes, and the drop unlinks a named temp.
-/// [`into_inner`](PendingTemp::into_inner) hands the temp on for staging.
-struct PendingTemp<'a> {
-    staging_fd: BorrowedFd<'a>,
-    temp: Option<TempKind>,
-}
-
-impl<'a> PendingTemp<'a> {
-    fn new(staging_fd: BorrowedFd<'a>, temp: TempKind) -> PendingTemp<'a> {
-        PendingTemp {
-            staging_fd,
-            temp: Some(temp),
-        }
-    }
-
-    /// Returns the temp and stops its removal on drop.
-    fn into_inner(mut self) -> TempKind {
-        self.temp
-            .take()
-            .expect("a pending temp holds its temp until handed on")
-    }
-}
-
-impl Drop for PendingTemp<'_> {
-    fn drop(&mut self) {
-        // One unlink of one name. A dedup hit costs the same.
-        if let Some(temp) = &self.temp {
-            cleanup_temp(self.staging_fd, temp);
-        }
-    }
 }
 
 /// A writer that streams the payload of one regular file into a transaction.
@@ -248,7 +207,10 @@ impl Drop for PendingTemp<'_> {
 ///
 /// - The payload goes into a temp file in the staging directory. If the file
 ///   system supports `O_TMPFILE`, the temp file is an unnamed inode that
-///   `linkat` gives a name. Otherwise it is a named temp file.
+///   `linkat` gives a name. Where the file system gives `EOPNOTSUPP`,
+///   `EISDIR`, or `EINVAL` for `O_TMPFILE`, it is a named temp file
+///   `.ostrya-tmp-<pid>-XXXXXX`, where `XXXXXX` is six random characters.
+///   Each other error of the create fails the write.
 /// - In the bare modes, the temp file receives the raw payload.
 /// - In archive mode, the bytes go through a raw-DEFLATE encoder at the level
 ///   of `[archive] zlib-level`, clamped to the range 1-9. The stored `.filez`
@@ -264,7 +226,9 @@ pub struct ContentWriter<'txn> {
     uncompressed: u64,
     header: FileHeader,
     expected: Option<Checksum>,
-    temp: PendingTemp<'txn>,
+    /// The temp file of the object. The sink writes through a second
+    /// descriptor of it.
+    temp: TempFile,
     sink: Sink,
     /// `true` if the payload adds to
     /// [`content_bytes_unpacked`](crate::TransactionStats::content_bytes_unpacked).
@@ -313,6 +277,8 @@ impl ContentWriter<'_> {
     ///   `[ex-integrity] composefs` in the repository config is malformed.
     /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
     ///   xattr name in the header is not valid UTF-8.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a write, a sync, or a syscall of the staging step
     ///   fails.
     pub async fn finish(self) -> Result<Checksum> {
@@ -355,16 +321,12 @@ impl ContentWriter<'_> {
             });
         }
 
-        let std_file = file.into_std().await;
-        txn.stage_regular(
-            checksum,
-            header,
-            std_file,
-            temp.into_inner(),
-            uncompressed,
-            counted,
-        )
-        .await
+        // The seal needs each writable descriptor of the file closed. The
+        // checked flush above leaves the file idle, so the drop closes the
+        // descriptor at once.
+        drop(file);
+        txn.stage_regular(checksum, header, temp, uncompressed, counted)
+            .await
     }
 }
 
@@ -456,10 +418,7 @@ impl Transaction {
         let mut hasher = Sha256::new();
         hasher.update(&framed);
 
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let (fd, temp) = self.unblock(move || open_temp(staging.as_fd())).await?;
-        let temp = PendingTemp::new(self.staging_fd(), temp);
-        let mut file = RtFile::from(fd);
+        let (temp, mut file) = self.object_temp().await?;
 
         let sink = if mode.is_archive() {
             // Reserve the region of the archive header. `finish` writes the
@@ -510,6 +469,8 @@ impl Transaction {
     ///   `[ex-integrity] composefs` in the repository config is malformed.
     /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
     ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a read from `reader` fails, or if a file system
     ///   operation fails.
     pub async fn write_content(
@@ -546,6 +507,8 @@ impl Transaction {
     ///   `[ex-integrity] composefs` in the repository config is malformed.
     /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
     ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_regfile_inline(
         &self,
@@ -599,25 +562,31 @@ impl Transaction {
             ));
         }
 
-        let staging = self.staging_fd().try_clone_to_owned()?;
-        let (fd, temp) = self.unblock(move || open_temp(staging.as_fd())).await?;
-        let temp = PendingTemp::new(self.staging_fd(), temp);
-        let mut file = RtFile::from(fd);
+        let (temp, mut file) = self.object_temp().await?;
         write_all(&mut file, framed_header).await?;
 
         feed_archive_payload(expected, header, declared, payload, buf, Some(&mut file)).await?;
 
         flush(&mut file).await?;
-        let std_file = file.into_std().await;
-        self.stage_regular(
-            *expected,
-            header.clone(),
-            std_file,
-            temp.into_inner(),
-            declared,
-            true,
-        )
-        .await
+        // The seal needs each writable descriptor of the file closed. The
+        // checked flush leaves the file idle, so the drop closes the
+        // descriptor at once.
+        drop(file);
+        self.stage_regular(*expected, header.clone(), temp, declared, true)
+            .await
+    }
+
+    /// Makes the temp file of a regular-file object in the staging directory,
+    /// and gives it and a second descriptor of it to stream the payload into.
+    ///
+    /// [`TempFile::create`] makes the file. The caller closes the second
+    /// descriptor before the stage, because the seal needs each writable
+    /// descriptor of the file closed.
+    async fn object_temp(&self) -> Result<(TempFile, RtFile)> {
+        let staging = self.staging_dir().clone();
+        let mut temp = self.unblock(move || TempFile::create(&staging)).await?;
+        let file = temp.file_mut().try_clone()?;
+        Ok((temp, RtFile::from(file)))
     }
 
     /// Writes a symlink content object and returns its checksum.
@@ -656,6 +625,8 @@ impl Transaction {
     ///   `[ex-integrity] composefs` in the repository config is malformed.
     /// - [`Error::InvalidFormat`] if the repository is in `bare` mode and an
     ///   xattr name in `meta` is not valid UTF-8.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_symlink(
         &self,
@@ -714,6 +685,8 @@ impl Transaction {
     ///   malformed.
     /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
     ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_dirmeta(&self, meta: &DirMeta) -> Result<Checksum> {
         let bytes = self.dirmeta_bytes(meta)?;
@@ -771,6 +744,8 @@ impl Transaction {
     ///   repository config is malformed.
     /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
     ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `objects/<xx>` of the object is a symlink
+    ///   or is not a directory.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_metadata(
         &self,
@@ -917,14 +892,14 @@ pub(crate) fn archive_level(zlib_level: i64) -> u8 {
     zlib_level.clamp(1, 9) as u8
 }
 
-/// Opens an ingestion temp file in the staging directory.
+/// Opens a temp file in the directory `dir_fd`.
 ///
 /// The function uses `O_TMPFILE` if the file system supports it, and a named
-/// temp file otherwise. The checkout copy path also uses this function, to
-/// open its temp files in the destination directory.
-pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
+/// temp file otherwise. The checkout copy path uses this function to open its
+/// temp files in the destination directory.
+pub(crate) fn open_temp(dir_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind)> {
     match rustix::fs::openat(
-        staging_fd,
+        dir_fd,
         ".",
         OFlags::WRONLY | OFlags::TMPFILE | OFlags::CLOEXEC,
         Mode::from_raw_mode(FIXED_MODE),
@@ -935,7 +910,7 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
         Err(_) => {
             let name = temp_name();
             let fd = rustix::fs::openat(
-                staging_fd,
+                dir_fd,
                 name.as_str(),
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
                 Mode::from_raw_mode(FIXED_MODE),
@@ -945,10 +920,11 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
     }
 }
 
-/// Returns the uid and gid that a newly staged object in `staging_fd` gets.
+/// Returns the uid and gid that a newly staged object in `staging` gets.
 ///
-/// The function creates a temp file there, as for each staged object, and
-/// reads its inode.
+/// The function creates a temp file there with [`TempFile::create`], as for
+/// each staged object, and reads its inode. The drop of the temp file removes
+/// it.
 ///
 /// The function measures the pair, because the rule has more than one input.
 /// If the directory is setgid, a created inode gets the group of the
@@ -958,15 +934,13 @@ pub(crate) fn open_temp(staging_fd: BorrowedFd<'_>) -> Result<(OwnedFd, TempKind
 ///
 /// One create costs the same syscalls as a read of the inputs of the rule. It
 /// also gives the answer for the file system that holds the staging directory.
-pub(crate) fn probe_fresh_owner(staging_fd: BorrowedFd<'_>) -> Result<(u32, u32)> {
-    let (fd, temp) = open_temp(staging_fd)?;
-    let stat = rustix::fs::fstat(&fd);
-    cleanup_temp(staging_fd, &temp);
-    let stat = stat?;
-    Ok((stat.st_uid, stat.st_gid))
+pub(crate) fn probe_fresh_owner(staging: &RepoDir) -> Result<(u32, u32)> {
+    let mut temp = TempFile::create(staging)?;
+    let stat = repo_fs::stat_fd(temp.file_mut().as_fd())?;
+    Ok((stat.uid, stat.gid))
 }
 
-/// Returns an ingestion temp file name that is unique in the process.
+/// Returns a temp file name of [`open_temp`] that is unique in the process.
 fn temp_name() -> String {
     format!(".ostrya-tmp-{}-{}", std::process::id(), unique())
 }
@@ -982,14 +956,13 @@ pub(crate) fn unique() -> u64 {
 }
 
 /// The shared context of the blocking staging helpers: the directory
-/// descriptors, the repository mode, and the durability settings.
+/// handles, the repository mode, and the durability settings.
 pub(crate) struct StageCtx<'a> {
-    /// The `objects/` directory of the repository, for the dedup check and
-    /// the fanout.
-    pub(crate) objects_fd: BorrowedFd<'a>,
+    /// The `objects/` directory of the repository, for the dedup check.
+    pub(crate) objects: &'a RepoDir,
     /// The staging directory of the transaction, where the helpers stage
     /// objects.
-    pub(crate) staging_fd: BorrowedFd<'a>,
+    pub(crate) staging: &'a RepoDir,
     /// The storage mode of the repository.
     pub(crate) mode: RepoMode,
     /// `true` if durability syncs run at all.
@@ -1071,65 +1044,50 @@ pub(crate) struct StageOutcome {
 /// Applies the per-mode metadata to a content object and links it under its
 /// flat loose name.
 ///
-/// The function runs synchronous syscalls, in this order:
+/// The function first checks `objects/` for the object. A symlink at
+/// `objects/<xx>` and an entry there that is not a directory fail the check.
+/// It then runs synchronous syscalls on the temp file `temp`, in this order:
 ///
-/// 1. The metadata that needs write permission on the inode goes on, on the
-///    writable descriptor.
-/// 2. The function seals the inode per `ctx.verity`.
-/// 3. The mode and the owner go on, on the descriptor that is linked. In bare
-///    mode the logical xattrs also go on, between the owner and the mode.
+/// 1. The metadata that needs write permission on the inode goes on.
+/// 2. The function seals the inode per `ctx.verity`, with
+///    [`TempFile::seal`]. The seal opens the file again read-only and closes
+///    the writable descriptor.
+/// 3. The mode and the owner go on. In bare mode the logical xattrs also go
+///    on, between the owner and the mode.
 /// 4. The per-object sync runs.
-/// 5. The function links the inode into the staging directory.
+/// 5. The function publishes the inode in the staging directory with
+///    [`Publish::KeepExisting`], so an entry that the transaction staged
+///    under the name stays.
 ///
-/// Until the link, the inode is an anonymous or staging temp, so no reader
-/// sees the intermediate mode. Each failure after the dedup check removes a
+/// Until the publish, the inode is an anonymous or named temp, so no reader
+/// sees the intermediate mode. The drop of `temp` after a failure removes a
 /// named temp.
 pub(crate) fn stage_content_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
     header: &FileHeader,
-    file: std::fs::File,
-    temp: TempKind,
+    mut temp: TempFile,
     unpacked: u64,
 ) -> Result<StageOutcome> {
     let dest = loose_path(checksum, ObjectType::File, ctx.mode);
-    if crate::object::object_exists(ctx.objects_fd, &dest)? {
-        cleanup_temp(ctx.staging_fd, &temp);
+    if ctx.objects.exists(&dest)? {
         return Ok(dedup(dest));
     }
 
     let staging_name = flat_name(checksum, ObjectType::File, ctx.mode);
-    let stage = |file: std::fs::File| -> Result<u64> {
-        // The size does not change with the mode, owner, or xattrs, so one
-        // stat gives the create mode and the on-disk size.
-        let stat = rustix::fs::fstat(file.as_fd())?;
-        apply_content_pre_seal(file.as_fd(), ctx.mode, ctx.verity, stat.st_mode, header)?;
-        let on_disk_size = stat.st_size.max(0) as u64;
-        // Seal with fs-verity while the inode is still anonymous. Then link
-        // it from the descriptor that owns it. With verity off, this is the
-        // writable descriptor. With verity on, it is a new read-only reopen
-        // after the writable descriptor closes. The mode and the owner, and in
-        // bare mode the xattrs, go on after the seal, on the linked
-        // descriptor.
-        let link_fd = if ctx.verity == Tristate::No {
-            OwnedFd::from(file)
-        } else {
-            let ro = reopen_ro(file.as_fd())?;
-            drop(file);
-            seal_regular(ro.as_fd(), ctx.verity)?;
-            ro
-        };
-        apply_content_post_seal(link_fd.as_fd(), ctx.mode, header)?;
-        if ctx.fsync && ctx.per_object_fsync {
-            rustix::fs::fsync(link_fd.as_fd())?;
-        }
-        materialize(ctx.staging_fd, link_fd.as_fd(), &temp, &staging_name)?;
-        Ok(on_disk_size)
-    };
-    let on_disk_size = stage(file).inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))?;
+    // The size does not change with the mode, owner, or xattrs, so one stat
+    // gives the create mode and the on-disk size.
+    let stat = repo_fs::stat_fd(temp.file_mut().as_fd())?;
+    apply_content_pre_seal(&mut temp, ctx.mode, ctx.verity, stat.mode, header)?;
+    seal_temp(&mut temp, ctx.verity)?;
+    apply_content_post_seal(&mut temp, ctx.mode, header)?;
+    if ctx.fsync && ctx.per_object_fsync {
+        temp.sync()?;
+    }
+    temp.publish(ctx.staging, &staging_name, Publish::KeepExisting, false)?;
     Ok(StageOutcome {
         deduped: false,
-        on_disk_size,
+        on_disk_size: stat.size,
         // The payload arrived in the temp file the caller opened. A caller that
         // filled it by reflink says so on the outcome it returns.
         blocks: Blocks::Written,
@@ -1141,18 +1099,23 @@ pub(crate) fn stage_content_blocking(
 
 /// Stages a symlink content object.
 ///
-/// - In `bare` and `bare-user-only`, the object is a symlink.
+/// - In `bare` and `bare-user-only`, the object is a symlink. The function
+///   makes a temp symlink `.ostrya-tmp-<pid>-XXXXXX` in the staging
+///   directory and moves it to its staging name. In `bare`, the temp symlink
+///   gets the owner and the xattrs before its publish.
 /// - In `bare-user` and `bare-user-shared`, it is a regular file that holds
 ///   the target and one NUL.
 /// - In archive mode, it is a framed archive header with no payload.
+///
+/// The publish in the staging directory keeps an entry that the transaction
+/// staged under the name.
 pub(crate) fn stage_symlink_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
     header: &FileHeader,
 ) -> Result<StageOutcome> {
-    let staging_fd = ctx.staging_fd;
     let dest = loose_path(checksum, ObjectType::File, ctx.mode);
-    if crate::object::object_exists(ctx.objects_fd, &dest)? {
+    if ctx.objects.exists(&dest)? {
         return Ok(dedup(dest));
     }
     let staging_name = flat_name(checksum, ObjectType::File, ctx.mode);
@@ -1161,24 +1124,21 @@ pub(crate) fn stage_symlink_blocking(
 
     let on_disk_size = match ctx.mode {
         RepoMode::Bare => {
-            // A concurrent writer of the same symlink can win the race. Its
-            // content is the same, so an existing entry is not an error.
-            if stage_symlink_inode(staging_fd, target, &staging_name)? {
-                rustix::fs::chownat(
-                    staging_fd,
-                    staging_name.as_str(),
-                    Some(uid(header.uid)),
-                    Some(gid(header.gid)),
-                    AtFlags::SYMLINK_NOFOLLOW,
-                )?;
-                for (name, value) in header.xattrs.iter() {
-                    set_link_xattr(staging_fd, &staging_name, name, value)?;
-                }
+            let link = TempLink::create(ctx.staging, target)?;
+            link.set_owner(header.uid, header.gid)?;
+            for (name, value) in header.xattrs.iter() {
+                link.set_xattr(&xattr_name(name)?, value)?;
             }
+            link.publish(ctx.staging, &staging_name, Publish::KeepExisting, false)?;
             target.len() as u64
         }
         RepoMode::BareUserOnly => {
-            stage_symlink_inode(staging_fd, target, &staging_name)?;
+            TempLink::create(ctx.staging, target)?.publish(
+                ctx.staging,
+                &staging_name,
+                Publish::KeepExisting,
+                false,
+            )?;
             target.len() as u64
         }
         RepoMode::BareUser | RepoMode::BareUserShared => {
@@ -1187,7 +1147,7 @@ pub(crate) fn stage_symlink_blocking(
             let mut content = target.clone().into_bytes();
             content.push(0);
             stage_named_regular(
-                staging_fd,
+                ctx.staging,
                 &staging_name,
                 &content,
                 FIXED_MODE,
@@ -1200,7 +1160,7 @@ pub(crate) fn stage_symlink_blocking(
             // A framed archive header with no payload.
             let body = frame(&header.serialize_archive(0)?)?;
             stage_named_regular(
-                staging_fd,
+                ctx.staging,
                 &staging_name,
                 &body,
                 FIXED_MODE,
@@ -1231,7 +1191,8 @@ pub(crate) fn stage_symlink_blocking(
 /// Stages a metadata object.
 ///
 /// The function writes the bytes to a temp file, sets the mode 0644 with
-/// `fchmod`, and renames the file to the flat loose name.
+/// `fchmod`, and publishes the file at the flat loose name, as
+/// [`stage_named_regular`] states.
 pub(crate) fn stage_metadata_blocking(
     ctx: &StageCtx<'_>,
     checksum: &Checksum,
@@ -1239,12 +1200,12 @@ pub(crate) fn stage_metadata_blocking(
     bytes: &[u8],
 ) -> Result<StageOutcome> {
     let dest = loose_path(checksum, ty, ctx.mode);
-    if crate::object::object_exists(ctx.objects_fd, &dest)? {
+    if ctx.objects.exists(&dest)? {
         return Ok(dedup(dest));
     }
     let staging_name = flat_name(checksum, ty, ctx.mode);
     let on_disk_size = stage_named_regular(
-        ctx.staging_fd,
+        ctx.staging,
         &staging_name,
         bytes,
         FIXED_MODE,
@@ -1270,13 +1231,10 @@ pub(crate) fn stage_metadata_blocking(
 /// under its staging name.
 ///
 /// [`write_image_temp_blocking`] makes it, and [`link_image_blocking`] links
-/// it.
+/// it. A drop of the image removes its temp file.
 pub(crate) struct ImageTemp {
-    /// The descriptor that links an anonymous temp. It is read-only if the
-    /// image is sealed.
-    pub(crate) fd: OwnedFd,
-    /// The temp file.
-    pub(crate) temp: TempKind,
+    /// The temp file. It is read-only if the image is sealed.
+    pub(crate) temp: TempFile,
     /// The fs-verity digest of the image bytes, which the writer computed as
     /// it wrote them.
     pub(crate) digest: [u8; 32],
@@ -1285,49 +1243,43 @@ pub(crate) struct ImageTemp {
 }
 
 /// Writes the composefs image of `dir` to a temp file in the staging
-/// directory.
+/// directory `staging`.
 ///
 /// The function runs these steps:
 ///
-/// 1. It opens a temp file, as [`open_temp`] does.
+/// 1. It makes a temp file with [`TempFile::create`].
 /// 2. It writes the image through a buffer of 128 KiB, and the writer
 ///    computes the fs-verity digest of the bytes that it writes. No step holds
 ///    the whole image.
 /// 3. It sets the mode 0644 with `fchmod`, so the umask does not change the
 ///    mode. A seal needs write permission on the inode, and the mode gives it.
 /// 4. If `do_fsync` is set, it runs `fsync` on the file.
-/// 5. If `verity` is not [`Tristate::No`], it closes the writable descriptor,
-///    seals the file through a read-only descriptor, and reads the digest of
-///    the seal from the kernel. If the kernel digest is not the digest of the
-///    writer, the function fails. Under [`Tristate::Maybe`], a file that the
-///    file system did not seal has no kernel digest.
+/// 5. If `verity` is not [`Tristate::No`], it seals the file with
+///    [`TempFile::seal`], which closes the writable descriptor. If the file
+///    is sealed, the function reads the digest of the seal from the kernel.
+///    If the kernel digest is not the digest of the writer, the function
+///    fails.
 ///
-/// On a failure, the function removes the temp file.
+/// On a failure, the drop of the temp file removes it.
 pub(crate) fn write_image_temp_blocking(
-    staging_fd: BorrowedFd<'_>,
+    staging: &RepoDir,
     dir: &ostrya_composefs::Directory,
     do_fsync: bool,
     verity: Tristate,
 ) -> Result<ImageTemp> {
-    let (fd, temp) = open_temp(staging_fd)?;
-    let pending = PendingTemp::new(staging_fd, temp);
+    let mut temp = TempFile::create(staging)?;
     let mut out =
-        std::io::BufWriter::with_capacity(crate::composefs::DIGEST_CHUNK, std::fs::File::from(fd));
+        std::io::BufWriter::with_capacity(crate::composefs::DIGEST_CHUNK, temp.file_mut());
     let digest =
         ostrya_composefs::write_image_to(dir, &mut out).map_err(crate::composefs::writer_error)?;
-    let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
+    out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+    temp.set_mode(FIXED_MODE)?;
     if do_fsync {
-        rustix::fs::fsync(file.as_fd())?;
+        temp.sync()?;
     }
-    let size = size_of(file.as_fd())?;
-    let fd = if verity == Tristate::No {
-        OwnedFd::from(file)
-    } else {
-        let ro = reopen_ro(file.as_fd())?;
-        drop(file);
-        seal_regular(ro.as_fd(), verity)?;
-        match ostrya_sys::measure_verity(ro.as_fd()) {
+    let size = repo_fs::stat_fd(temp.file_mut().as_fd())?.size;
+    if seal_temp(&mut temp, verity)? {
+        match ostrya_sys::measure_verity(temp.file_mut().as_fd()) {
             Ok(sealed) if sealed != digest => {
                 return Err(Error::InvalidFormat(format!(
                     "the fs-verity digest of the sealed composefs image is {}, and the \
@@ -1337,35 +1289,30 @@ pub(crate) fn write_image_temp_blocking(
                 )));
             }
             Ok(_) => {}
-            // `seal_regular` ignored the seal failure under `maybe`.
             Err(_) if verity == Tristate::Maybe => {}
             Err(e) => return Err(Error::Io(e.into())),
         }
-        ro
-    };
-    Ok(ImageTemp {
-        fd,
-        temp: pending.into_inner(),
-        digest,
-        size,
-    })
+    }
+    Ok(ImageTemp { temp, digest, size })
 }
 
-/// Links a composefs image temp into the staging directory as the image of
-/// `commit`, under the name `<checksum>.cfs`.
+/// Links a composefs image temp into the staging directory `staging` as the
+/// image of `commit`, under the name `<checksum>.cfs`.
 ///
+/// The publish keeps an image that the transaction staged under the name.
 /// The function returns the outcome for the record of the image. Its `dest`
 /// is the path of the image under `extensions/ostrya/composefs/`. The image
 /// is never a dedup hit: the caller decides if a stored image stays. On a
-/// failure, the function removes the temp file.
+/// failure, the drop of the temp file removes it.
 pub(crate) fn link_image_blocking(
-    staging_fd: BorrowedFd<'_>,
+    staging: &RepoDir,
     image: ImageTemp,
     commit: &Checksum,
 ) -> Result<StageOutcome> {
     let staging_name = crate::image_store::staging_name(commit);
-    materialize(staging_fd, image.fd.as_fd(), &image.temp, &staging_name)
-        .inspect_err(|_| cleanup_temp(staging_fd, &image.temp))?;
+    image
+        .temp
+        .publish(staging, &staging_name, Publish::KeepExisting, false)?;
     Ok(StageOutcome {
         deduped: false,
         on_disk_size: image.size,
@@ -1374,11 +1321,6 @@ pub(crate) fn link_image_blocking(
         staging_name,
         dest: crate::image_store::rel_path(commit),
     })
-}
-
-/// Removes the temp file of a composefs image that is not linked.
-pub(crate) fn discard_image_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
-    cleanup_temp(staging_fd, temp);
 }
 
 /// Imports one loose object of another repository into the staging directory.
@@ -1447,8 +1389,10 @@ pub(crate) fn discard_image_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
 ///
 /// # fs-verity
 ///
-/// The function makes a link only if `[ex-integrity] fsverity` is
-/// [`Tristate::No`]. The caller states this when it gives no `link_owner`.
+/// The function makes a link only if the repository seals no object: the
+/// value of `[ex-integrity] fsverity` is `no`, or it is `maybe` and the probe
+/// of [`Repo::seals_objects`](crate::Repo::seals_objects) gives `false`. The
+/// caller states this when it gives no `link_owner`.
 /// fs-verity is a property of the inode. So a seal of a hardlinked object also
 /// seals the copy in the source repository, and that copy becomes immutable
 /// there. An unsealed link breaks the rule of this repository that each object
@@ -1456,27 +1400,37 @@ pub(crate) fn discard_image_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
 /// seals its writes copies each object, and seals the copy as it seals each
 /// new write.
 ///
-/// # Strict source
+/// A repository with `maybe` on a file system that cannot seal a file thus
+/// links each object that the gate allows. The staged object shares the
+/// inode of the source object, so a later change of that inode in place is
+/// visible in this repository.
 ///
-/// If `strict` is set, the source is a handle in the strict open mode of
-/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). Before a link,
-/// the function opens the fan-out directory `objects/<xx>` of the source with
-/// [`open_fanout_beneath`](crate::object::open_fanout_beneath), and makes
-/// the stat and the link relative to it. The link refuses a source object
-/// that is not the type that the source mode stores, as [`check_leaf_type`]
-/// states. After the link, the function confirms that the staged entry is
-/// the inode of the stat, as [`confirm_linked`] states. The copy of a
-/// metadata object is the strict open of
-/// [`open_regular_file`](crate::object::open_regular_file) on the object
-/// path. A symlink at `objects/<xx>` fails the link and the copy with
-/// `ELOOP`.
+/// # Source paths
+///
+/// Each operation on the source is a call of [`repo_fs`] from `src`, the
+/// `objects/` handle of the source, in each open mode of the source. The
+/// function follows no symlink at `objects/<xx>`, and a symlink there fails
+/// the link and the copy. The function links the source object first, and
+/// then reads the status of the new staged entry one time, with no follow.
+/// The checks of the link run on that status, so they examine the inode
+/// that the publish moves. The link refuses a source object that is not the
+/// type that the source mode stores, as [`check_leaf_type`] states. An
+/// owner of the inode that this repository does not write makes the import
+/// fall back to the copy. In both cases the function removes the staged
+/// entry first. The link and its removal change the ctime of the source
+/// object, also when the import then copies the object. The size of the
+/// staged object is the size of that status.
+/// An entry that this transaction staged earlier under the name stays, with
+/// no check. The copy of a metadata object opens the source with
+/// [`RepoDir::open_regular`], so a symlink and a file that is not a regular
+/// file fail the copy, and a FIFO does not block it. An absent source object
+/// gives [`Error::ObjectNotFound`].
 pub(crate) fn stage_import_blocking(
     ctx: &StageCtx<'_>,
-    src_objects_fd: BorrowedFd<'_>,
+    src: &RepoDir,
     checksum: &Checksum,
     ty: ObjectType,
     src_mode: RepoMode,
-    strict: bool,
     link_owner: Option<(u32, u32)>,
 ) -> Result<Option<StageOutcome>> {
     // An import is a write like any other: a bare-split-xattrs destination needs
@@ -1488,97 +1442,49 @@ pub(crate) fn stage_import_blocking(
         ));
     }
     let dest = loose_path(checksum, ty, ctx.mode);
-    if crate::object::object_exists(ctx.objects_fd, &dest)? {
+    if ctx.objects.exists(&dest)? {
         return Ok(Some(dedup(dest)));
     }
     let src_path = loose_path(checksum, ty, src_mode);
     let staging_name = flat_name(checksum, ty, ctx.mode);
+    let object_error = |e: FsError| object_path_error(e, &src_path).into_object_error(checksum, ty);
 
     if let Some(fresh_owner) = link_owner {
-        // A strict source names the object relative to its fan-out directory,
-        // which the strict open gives.
-        let fanout_fd;
-        let (src_dir, src_name) = if strict {
-            let (fanout, leaf) = src_path
-                .split_once('/')
-                .expect("a loose path names its fan-out directory");
-            fanout_fd = match crate::object::open_fanout_beneath(src_objects_fd, fanout) {
-                Ok(fd) => fd,
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    return Err(Error::ObjectNotFound {
-                        checksum: *checksum,
-                        ty,
-                    });
+        let link = repo_fs::link(src, &src_path, ctx.staging.as_fd(), &staging_name, false);
+        let linked_size = match link {
+            Ok(Published::Created) => {
+                // A hardlink is the inode of the source, so the status of the
+                // staged entry gives the type, the owner, and the size.
+                let stat = ctx.staging.lstat(&staging_name)?;
+                let type_checked = check_leaf_type(&stat, ty, src_mode, &src_path);
+                let owned_as_written = (ty == ObjectType::File && ctx.mode == RepoMode::Bare)
+                    || (stat.uid, stat.gid) == fresh_owner;
+                if type_checked.is_ok() && owned_as_written {
+                    Some(stat.size)
+                } else {
+                    ctx.staging.remove_file(&staging_name, false)?;
+                    type_checked?;
+                    None
                 }
-                Err(e) => return Err(e.into()),
-            };
-            (fanout_fd.as_fd(), leaf)
-        } else {
-            (src_objects_fd, src_path.as_str())
-        };
-        // The stat of the source decides if the link is allowed. It also gives
-        // the size of the staged object, because a hardlink is the inode that
-        // it stats.
-        let stat = match rustix::fs::statat(src_dir, src_name, AtFlags::SYMLINK_NOFOLLOW) {
-            Ok(stat) => stat,
-            Err(rustix::io::Errno::NOENT) => {
-                return Err(Error::ObjectNotFound {
-                    checksum: *checksum,
-                    ty,
-                });
             }
-            Err(e) => return Err(e.into()),
-        };
-        if strict {
-            check_leaf_type(&stat, ty, src_mode, &src_path)?;
-        }
-        let owned_as_written = (ty == ObjectType::File && ctx.mode == RepoMode::Bare)
-            || (stat.st_uid, stat.st_gid) == fresh_owner;
-        if owned_as_written {
-            match rustix::fs::linkat(
-                src_dir,
-                src_name,
-                ctx.staging_fd,
-                staging_name.as_str(),
-                AtFlags::empty(),
-            ) {
-                // An entry already under this name is the same object staged
-                // earlier in this transaction. A strict source confirms only
-                // the new link.
-                linked @ (Ok(()) | Err(rustix::io::Errno::EXIST)) => {
-                    if strict && linked.is_ok() {
-                        confirm_linked(ctx.staging_fd, &staging_name, &stat, &src_path)?;
-                    }
-                    return Ok(Some(StageOutcome {
-                        deduped: false,
-                        on_disk_size: stat.st_size.max(0) as u64,
-                        blocks: Blocks::Linked,
-                        unpacked: 0,
-                        staging_name,
-                        dest,
-                    }));
-                }
-                Err(rustix::io::Errno::NOENT) => {
-                    return Err(Error::ObjectNotFound {
-                        checksum: *checksum,
-                        ty,
-                    });
-                }
-                // A refusal from the file system or the kernel leaves the
-                // object unstaged. The causes are the same as in the
-                // `# Return value` list of this function. The code after this
-                // match copies the object or reports it to the caller. Each
-                // other failure belongs to the import and carries its errno
-                // out. A copy fails the same way and reports a less specific
-                // cause.
-                Err(
-                    rustix::io::Errno::XDEV
-                    | rustix::io::Errno::MLINK
-                    | rustix::io::Errno::OPNOTSUPP
-                    | rustix::io::Errno::PERM,
-                ) => {}
-                Err(e) => return Err(e.into()),
+            // An entry already under this name is the same object staged
+            // earlier in this transaction. It passed the checks at its stage.
+            Ok(Published::Existed) => Some(ctx.staging.lstat(&staging_name)?.size),
+            Err(FsError::Io(e)) => {
+                link_refused(e, checksum, ty)?;
+                None
             }
+            Err(e) => return Err(object_error(e)),
+        };
+        if let Some(on_disk_size) = linked_size {
+            return Ok(Some(StageOutcome {
+                deduped: false,
+                on_disk_size,
+                blocks: Blocks::Linked,
+                unpacked: 0,
+                staging_name,
+                dest,
+            }));
         }
     }
 
@@ -1588,8 +1494,7 @@ pub(crate) fn stage_import_blocking(
         return Ok(None);
     }
 
-    let (on_disk_size, blocks) =
-        clone_metadata(ctx, src_objects_fd, &src_path, &staging_name, strict)?;
+    let (on_disk_size, blocks) = clone_metadata(ctx, src, &src_path, &staging_name, checksum, ty)?;
     Ok(Some(StageOutcome {
         deduped: false,
         on_disk_size,
@@ -1600,93 +1505,80 @@ pub(crate) fn stage_import_blocking(
     }))
 }
 
-/// Refuses a source object of a strict source whose file type is not the
-/// type that the source mode stores for it.
+/// Reads the I/O error `e` of the link of the source object `checksum` of
+/// type `ty`, and gives `false` if the link falls back to the copy.
+///
+/// `ENOENT` gives [`Error::ObjectNotFound`]. A refusal from the file system or
+/// the kernel (`EXDEV`, `EMLINK`, `EOPNOTSUPP`, `EPERM`) leaves the object
+/// unstaged and gives `false`. The causes are the same as in the
+/// `# Return value` list of [`stage_import_blocking`]. Each other failure
+/// belongs to the import and carries its errno out. A copy fails the same way
+/// and reports a less specific cause.
+fn link_refused(e: io::Error, checksum: &Checksum, ty: ObjectType) -> Result<bool> {
+    match Errno::from_io_error(&e) {
+        Some(Errno::NOENT) => Err(Error::ObjectNotFound {
+            checksum: *checksum,
+            ty,
+        }),
+        Some(Errno::XDEV | Errno::MLINK | Errno::OPNOTSUPP | Errno::PERM) => Ok(false),
+        _ => Err(Error::Io(e)),
+    }
+}
+
+/// Refuses a source object whose file type is not the type that the source
+/// mode stores for it.
 ///
 /// A loose object is a regular file. A symlink content object is a symlink
 /// in the modes `bare`, `bare-user-only`, and `bare-split-xattrs`. Each other
-/// symlink gives `ELOOP`. Each other file type gives an error of the kind
-/// `ErrorKind::InvalidData`.
-fn check_leaf_type(
-    stat: &rustix::fs::Stat,
-    ty: ObjectType,
-    src_mode: RepoMode,
-    path: &str,
-) -> Result<()> {
-    match rustix::fs::FileType::from_raw_mode(stat.st_mode) {
-        rustix::fs::FileType::RegularFile => Ok(()),
-        rustix::fs::FileType::Symlink
+/// symlink gives [`Error::InvalidFormat`] with the reason
+/// [`Reason::Symlink`]. Each other file type gives [`Error::InvalidFormat`]
+/// with the reason [`Reason::NotRegular`]. The path of the error is
+/// `objects/<path>`.
+fn check_leaf_type(stat: &Stat, ty: ObjectType, src_mode: RepoMode, path: &str) -> Result<()> {
+    let reason = match stat.file_type {
+        FileType::RegularFile => return Ok(()),
+        FileType::Symlink
             if ty == ObjectType::File
                 && matches!(
                     src_mode,
                     RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs
                 ) =>
         {
-            Ok(())
+            return Ok(());
         }
-        rustix::fs::FileType::Symlink => Err(rustix::io::Errno::LOOP.into()),
-        _ => Err(Error::Io(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{path} is not a regular file"),
-        ))),
+        FileType::Symlink => Reason::Symlink,
+        other => Reason::NotRegular(other),
+    };
+    Err(FsError::Invalid {
+        path: format!("objects/{path}"),
+        reason,
     }
-}
-
-/// Confirms that the entry `staging_name` of the staging directory is the
-/// inode of `stat`, the stat of the source object `path` before its link.
-///
-/// The source object can change between the stat and the link. If the entry
-/// has another device, another inode number, or another file type, the
-/// function removes the entry and returns an error of the kind
-/// `ErrorKind::InvalidData`.
-fn confirm_linked(
-    staging_fd: BorrowedFd<'_>,
-    staging_name: &str,
-    stat: &rustix::fs::Stat,
-    path: &str,
-) -> Result<()> {
-    let linked = rustix::fs::statat(staging_fd, staging_name, AtFlags::SYMLINK_NOFOLLOW)?;
-    let file_type = |st: &rustix::fs::Stat| rustix::fs::FileType::from_raw_mode(st.st_mode);
-    if (linked.st_dev, linked.st_ino, file_type(&linked))
-        == (stat.st_dev, stat.st_ino, file_type(stat))
-    {
-        return Ok(());
-    }
-    let _ = rustix::fs::unlinkat(staging_fd, staging_name, AtFlags::empty());
-    Err(Error::Io(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("{path} changed during the link"),
-    )))
+    .into())
 }
 
 /// Imports one regular-file content object between two modes of the bare
 /// family.
 ///
 /// Two modes of the bare family store the payload identically and the inode
-/// metadata differently. The function clones the payload: a `FICLONE` reflink
-/// if the file system supports one, and a byte copy otherwise. It applies the
-/// inode policy of the destination from the logical header of the object, so
-/// nothing of the source inode carries over.
+/// metadata differently. The function clones the payload, as [`clone_into`]
+/// states. It applies the inode policy of the destination from the logical
+/// header of the object, so nothing of the source inode carries over.
 ///
 /// The function does not read the payload into memory and does not hash it
 /// again. A caller that needs a checksum check hashes the staged object after
 /// the call.
 ///
-/// # Strict source
-///
-/// If `strict` is set, the source is a handle in the strict open mode of
-/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). The open of the
-/// source object is the strict open of
-/// [`open_regular_file`](crate::object::open_regular_file). A symlink at
-/// `objects/<xx>` or at the object path fails the clone with `ELOOP`. A
-/// source object that is not a regular file fails the clone, and a FIFO does
-/// not block it.
+/// The open of the source object is [`RepoDir::open_regular`] from `src`, the
+/// `objects/` handle of the source, in each open mode of the source. A
+/// symlink at `objects/<xx>` or at the object path, and a source object that
+/// is not a regular file, fail the clone with [`Error::InvalidFormat`]. A
+/// FIFO does not block it. An absent source object gives
+/// [`Error::ObjectNotFound`].
 pub(crate) fn stage_clone_content_blocking(
     ctx: &StageCtx<'_>,
-    src_objects_fd: BorrowedFd<'_>,
+    src: &RepoDir,
     checksum: &Checksum,
     src_mode: RepoMode,
-    strict: bool,
     header: &FileHeader,
     unpacked: u64,
 ) -> Result<StageOutcome> {
@@ -1701,121 +1593,87 @@ pub(crate) fn stage_clone_content_blocking(
         ));
     }
     let src_path = loose_path(checksum, ObjectType::File, src_mode);
-    let opened = crate::object::open_regular_file_nofollow(src_objects_fd, &src_path, strict);
-    let src = match opened {
-        Ok(src) => src,
-        // If the source object disappeared between the plan and the import,
-        // report it as a missing object, as the link path does.
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            return Err(Error::ObjectNotFound {
-                checksum: *checksum,
-                ty: ObjectType::File,
-            });
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let (file, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
-    let mut outcome = stage_content_blocking(ctx, checksum, header, file, temp, unpacked)?;
+    // If the source object disappeared between the plan and the import,
+    // report it as a missing object, as the link path does.
+    let opened = src
+        .open_regular(&src_path)
+        .map_err(|e| e.into_object_error(checksum, ObjectType::File))?;
+    let mut temp = TempFile::create(ctx.staging)?;
+    let blocks = clone_into(&opened.file, &mut temp)?;
+    drop(opened);
+    let mut outcome = stage_content_blocking(ctx, checksum, header, temp, unpacked)?;
     outcome.blocks = blocks;
     Ok(outcome)
 }
 
-/// Moves the bytes of a regular-file object into a new temp file in the
-/// staging directory, and applies no metadata.
+/// Fills the temp file `temp` with the bytes of the regular file `src`, and
+/// gives the way that moved them. The function applies no metadata.
 ///
-/// The function uses a `FICLONE` reflink if the file system supports one, and
-/// a byte copy otherwise. It returns the open temp file, the handle that the
-/// file is linked under, and the method that moved the bytes. If the copy
-/// fails, it removes the temp file.
+/// [`repo_fs::clone_or_copy`] moves the bytes: a `FICLONE` reflink if the
+/// file system supports one, and a byte copy where the reflink gives
+/// `EOPNOTSUPP`, `EXDEV`, or `EINVAL`. Each other error of the reflink fails
+/// the import.
 ///
-/// The byte copy is `std::io::copy`. On Linux, a `File` to `File` transfer
-/// uses `copy_file_range` and moves the payload in the kernel. If the kernel
-/// refuses that, the copy uses a fixed stack buffer.
-///
-/// In both cases the payload is never buffered, whatever its size. A file
-/// system without reflink still gets a copy in the kernel. The cost is that
-/// the transfer holds one thread of the blocking pool until it ends, and it
-/// cannot be cancelled. If the future that awaits it is dropped, the copy runs
-/// to completion and writes into a staging temp that the reaper collects.
-fn clone_payload(
-    staging_fd: BorrowedFd<'_>,
-    src: BorrowedFd<'_>,
-) -> Result<(std::fs::File, TempKind, Blocks)> {
-    let (fd, temp) = open_temp(staging_fd)?;
-    let mut dst = std::fs::File::from(fd);
-    // A reflink shares the source extents fully. If the reflink is refused
-    // (a file system without reflink, a source on another file system), it
-    // writes nothing. So the byte copy starts from an empty file.
-    let copy = |dst: &mut std::fs::File| -> Result<Blocks> {
-        if rustix::fs::ioctl_ficlone(dst.as_fd(), src).is_ok() {
-            return Ok(Blocks::Reflinked);
-        }
-        let mut reader = std::fs::File::from(src.try_clone_to_owned()?);
-        std::io::copy(&mut reader, dst)?;
-        Ok(Blocks::Written)
-    };
-    match copy(&mut dst) {
-        Ok(blocks) => Ok((dst, temp, blocks)),
-        Err(e) => {
-            cleanup_temp(staging_fd, &temp);
-            Err(e)
-        }
-    }
+/// In both cases the payload is never buffered, whatever its size. The cost
+/// is that the transfer holds one thread of the blocking pool until it ends,
+/// and it cannot be cancelled. If the future that awaits it is dropped, the
+/// copy runs to completion, and the drop of the temp file then removes it.
+fn clone_into(src: &std::fs::File, temp: &mut TempFile) -> Result<Blocks> {
+    Ok(match repo_fs::clone_or_copy(src, temp.file_mut())? {
+        Cloned::Reflinked => Blocks::Reflinked,
+        Cloned::Copied => Blocks::Written,
+    })
 }
 
 /// Copies one loose metadata object into the staging directory under
 /// `staging_name`.
 ///
-/// The bytes move by `FICLONE` reflink if the file system supports it, and
-/// byte by byte otherwise. The copy gets the inode of a metadata object that
-/// this repository writes, in each mode. That inode has the mode 0644, no
-/// xattrs, and the uid and gid of the writing process. The staging temp file has this uid and
-/// gid by construction. The function returns the size on disk and the method
-/// that moved the bytes.
+/// The bytes move as [`clone_into`] states. The copy gets the inode of a
+/// metadata object that this repository writes, in each mode. That inode has
+/// the mode 0644, no xattrs, and the uid and gid of the writing process. The
+/// staging temp file has this uid and gid by construction. The publish keeps
+/// an entry that the transaction staged under the name. The function returns
+/// the size on disk and the method that moved the bytes.
 ///
-/// # Strict source
-///
-/// If `strict` is set, the source is a handle in the strict open mode of
-/// [`Repo::open_at_strict`](crate::Repo::open_at_strict). The open of the
-/// source object is the strict open of
-/// [`open_regular_file`](crate::object::open_regular_file). A symlink at a
-/// component of `src_path` fails the copy with `ELOOP`. A source object that
-/// is not a regular file fails the copy, and a FIFO does not block it.
+/// The open of the source object is [`RepoDir::open_regular`] from `src`, the
+/// `objects/` handle of the source. A symlink at a component of `src_path`
+/// and a source object that is not a regular file fail the copy with
+/// [`Error::InvalidFormat`], and a FIFO does not block it. An absent source
+/// object gives [`Error::ObjectNotFound`].
 fn clone_metadata(
     ctx: &StageCtx<'_>,
-    src_dir: BorrowedFd<'_>,
+    src: &RepoDir,
     src_path: &str,
     staging_name: &str,
-    strict: bool,
+    checksum: &Checksum,
+    ty: ObjectType,
 ) -> Result<(u64, Blocks)> {
-    let src = crate::object::open_regular_file_nofollow(src_dir, src_path, strict)?;
-    let (dst, temp, blocks) = clone_payload(ctx.staging_fd, src.as_fd())?;
-    let apply = || -> Result<(u64, Blocks)> {
-        rustix::fs::fchmod(dst.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
-        // The `syncfs` at the start of publication makes a metadata object
-        // durable. The per-object sync covers content objects only.
-        let on_disk_size = size_of(dst.as_fd())?;
-        let link_fd = if ctx.verity == Tristate::No {
-            OwnedFd::from(dst)
-        } else {
-            let ro = reopen_ro(dst.as_fd())?;
-            drop(dst);
-            seal_regular(ro.as_fd(), ctx.verity)?;
-            ro
-        };
-        materialize(ctx.staging_fd, link_fd.as_fd(), &temp, staging_name)?;
-        Ok((on_disk_size, blocks))
-    };
-    apply().inspect_err(|_| cleanup_temp(ctx.staging_fd, &temp))
+    let opened = src
+        .open_regular(src_path)
+        .map_err(|e| e.into_object_error(checksum, ty))?;
+    let mut temp = TempFile::create(ctx.staging)?;
+    let blocks = clone_into(&opened.file, &mut temp)?;
+    temp.set_mode(FIXED_MODE)?;
+    // The `syncfs` at the start of publication makes a metadata object
+    // durable. The per-object sync covers content objects only.
+    seal_temp(&mut temp, ctx.verity)?;
+    temp.publish(ctx.staging, staging_name, Publish::KeepExisting, false)?;
+    Ok((opened.stat.size, blocks))
 }
 
 /// Publishes staged objects into `objects/`, and then staged composefs images
 /// into `extensions/ostrya/composefs/`, in the order of the durability rules.
 ///
 /// 1. If `syncfs` is set, the function runs `syncfs` on the repository.
-/// 2. It renames each object into `objects/<xx>/`.
-/// 3. If `fsync` is set, it runs `fsync` on each fanout directory that it
-///    changed, and on `objects/`.
+/// 2. It moves each object from `staging` into `objects/<xx>/` with
+///    [`rename_into_fanout`] and [`Publish::KeepExisting`]. A missing fan-out
+///    directory makes the move make it. An object that `objects/` holds
+///    stays, and the staged copy stays in the staging directory until its
+///    removal. A symlink at `objects/<xx>` and an entry there that is not a
+///    directory fail the publish.
+/// 3. If `fsync` is set, it runs `fsync` on each fan-out directory that got
+///    a new entry. Then, if one or more fan-out directories got a new entry,
+///    it runs `fsync` one time on `objects/`.
 /// 4. It renames each image into the store, as
 ///    [`image_store::publish_blocking`](crate::image_store::publish_blocking)
 ///    states, with the same `fsync`.
@@ -1824,56 +1682,62 @@ fn clone_metadata(
 /// of the last object and the last image already made them durable.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_blocking(
-    repo_fd: BorrowedFd<'_>,
-    objects_fd: BorrowedFd<'_>,
-    staging_fd: BorrowedFd<'_>,
-    objects: &[(String, String)],
+    root: &RepoDir,
+    objects: &RepoDir,
+    staging: &RepoDir,
+    staged: &[(String, String)],
     images: &[(String, String)],
     syncfs: bool,
     fsync: bool,
     repo_mode: RepoMode,
 ) -> Result<()> {
     if syncfs {
-        rustix::fs::syncfs(repo_fd)?;
+        root.syncfs()?;
     }
-    let mut fanouts: Vec<String> = Vec::new();
-    for (staging_name, dest) in objects {
+    // The fan-out directories that got a new entry, for the syncs.
+    let mut fanouts: Vec<&str> = Vec::new();
+    for (staging_name, dest) in staged {
         let fanout = &dest[..2];
-        ensure_fanout(objects_fd, fanout, repo_mode)?;
-        rustix::fs::renameat(staging_fd, staging_name.as_str(), objects_fd, dest.as_str())?;
-        if !fanouts.iter().any(|f| f == fanout) {
-            fanouts.push(fanout.to_owned());
+        let (placed, _) =
+            rename_into_fanout(staging, staging_name, objects, dest, Publish::KeepExisting)?;
+        if placed == Published::Created && !fanouts.contains(&fanout) {
+            fanouts.push(fanout);
         }
     }
-    if fsync {
+    if fsync && !fanouts.is_empty() {
         for fanout in &fanouts {
-            let dir = rustix::fs::openat(
-                objects_fd,
-                fanout.as_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )?;
-            rustix::fs::fsync(&dir)?;
+            objects.sync_dir(fanout)?;
         }
-        if !objects.is_empty() {
-            rustix::fs::fsync(objects_fd)?;
-        }
+        root.sync_dir("objects")?;
     }
-    crate::image_store::publish_blocking(repo_fd, staging_fd, images, fsync, repo_mode)
+    crate::image_store::publish_blocking(root.as_fd(), staging.as_fd(), images, fsync, repo_mode)
 }
 
-/// Creates the fanout directory `objects/<xx>/` if it does not exist.
+/// Moves the entry `src_path` of `src` to the loose path `dest` below
+/// `objects` by the rule `how`, with no sync. It gives the result of the move
+/// and `true` if the call made the fan-out directory of `dest`.
 ///
-/// If a race created the directory first, the function ignores the race. The
-/// requested mode is `0777`, reduced by the umask. In a `bare-user-shared`
-/// repository, a fanout that this call creates then gets
-/// [`perm::SHARED_DIR_MODE`]. So each member of the repository group can add
-/// an object to it. A fanout that exists keeps its mode and its group.
-fn ensure_fanout(objects_fd: BorrowedFd<'_>, fanout: &str, repo_mode: RepoMode) -> Result<()> {
-    match rustix::fs::mkdirat(objects_fd, fanout, Mode::from_raw_mode(0o777)) {
-        Ok(()) => Ok(perm::force_created_dir(objects_fd, fanout, repo_mode)?),
-        Err(rustix::io::Errno::EXIST) => Ok(()),
-        Err(e) => Err(e.into()),
+/// The call first runs [`repo_fs::rename`]. If the move gives
+/// [`FsError::Absent`] for the fan-out directory `objects/<xx>`, the call
+/// makes that directory with [`RepoDir::ensure_dir`], with no sync, and runs
+/// the move one more time. Each other error of the move fails the call. A
+/// symlink at `objects/<xx>` and an entry there that is not a directory thus
+/// fail the move.
+pub(crate) fn rename_into_fanout(
+    src: &RepoDir,
+    src_path: &str,
+    objects: &RepoDir,
+    dest: &str,
+    how: Publish,
+) -> std::result::Result<(Published, bool), FsError> {
+    let fanout = &dest[..2];
+    match repo_fs::rename(src, src_path, objects, dest, how, false) {
+        Err(FsError::Absent { path }) if path.strip_prefix("objects/") == Some(fanout) => {
+            objects.ensure_dir(fanout, false)?;
+            let placed = repo_fs::rename(src, src_path, objects, dest, how, false)?;
+            Ok((placed, true))
+        }
+        other => other.map(|placed| (placed, false)),
     }
 }
 
@@ -1902,7 +1766,7 @@ pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> 
 /// Applies the inode metadata of a regular-file content object that needs
 /// write permission on the inode.
 ///
-/// The function runs on the writable descriptor, before the seal.
+/// The function runs on the temp file before the seal.
 /// `FS_IOC_ENABLE_VERITY` and a `user.*` xattr both need write permission on
 /// the inode. `create_mode` is the inode mode of the temp file.
 ///
@@ -1913,7 +1777,7 @@ pub(crate) fn flat_name(checksum: &Checksum, ty: ObjectType, mode: RepoMode) -> 
 /// the xattrs. [`apply_content_post_seal`] sets the final mode, and in bare mode
 /// the xattrs.
 fn apply_content_pre_seal(
-    fd: BorrowedFd<'_>,
+    temp: &mut TempFile,
     mode: RepoMode,
     verity: Tristate,
     create_mode: u32,
@@ -1928,7 +1792,7 @@ fn apply_content_pre_seal(
     {
         // Owner write for the seal and the xattrs, owner read for the
         // read-only reopen. In bare mode the xattrs go on after the seal.
-        rustix::fs::fchmod(fd, Mode::from_raw_mode(0o600))?;
+        temp.set_mode(0o600)?;
     }
     match mode {
         RepoMode::Bare => {}
@@ -1937,15 +1801,15 @@ fn apply_content_pre_seal(
             // xattr against the write permission of the inode. The canonical
             // inode mode of this repository mode has no owner-write bit if the
             // logical mode has none (0444, 0555).
-            set_ostreemeta(fd, header)?;
+            set_ostreemeta(temp, header)?;
         }
         RepoMode::BareUserShared => {
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;
-            set_ostreemeta(fd, header)?;
+            temp.set_mode(FIXED_MODE)?;
+            set_ostreemeta(temp, header)?;
         }
         RepoMode::BareUserOnly => {}
         RepoMode::Archive => {
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(FIXED_MODE))?;
+            temp.set_mode(FIXED_MODE)?;
         }
         RepoMode::BareSplitXattrs => {
             return Err(Error::Unsupported(
@@ -1960,11 +1824,11 @@ fn apply_content_pre_seal(
 /// the seal.
 ///
 /// In bare mode, the function also applies the logical xattrs. It runs on the
-/// descriptor that is linked, which is the read-only descriptor if verity is
-/// on. The kernel checks the inode owner for `fchmod` and `fchown`, and the
-/// inode permission for an xattr. It does not check the access mode of the
-/// descriptor. A sealed inode accepts xattr changes.
-fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHeader) -> Result<()> {
+/// temp file, which holds the read-only descriptor after a seal. The kernel
+/// checks the inode owner for `fchmod` and `fchown`, and the inode permission
+/// for an xattr. It does not check the access mode of the descriptor. A
+/// sealed inode accepts xattr changes.
+fn apply_content_post_seal(temp: &mut TempFile, mode: RepoMode, header: &FileHeader) -> Result<()> {
     let perm = header.mode & PERM_MASK;
     match mode {
         RepoMode::Bare => {
@@ -1975,20 +1839,20 @@ fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHead
             // kernel checks a `user.*` xattr against the write permission of
             // the inode. A logical mode without an owner-write bit (0444,
             // 0555) does not give that permission.
-            rustix::fs::fchown(fd, Some(uid(header.uid)), Some(gid(header.gid)))?;
+            temp.set_owner(header.uid, header.gid)?;
             for (name, value) in header.xattrs.iter() {
-                set_inode_xattr(fd, name, value)?;
+                temp.set_xattr(&xattr_name(name)?, value)?;
             }
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm))?;
+            temp.set_mode(perm)?;
         }
         RepoMode::BareUser => {
-            rustix::fs::fchmod(fd, Mode::from_raw_mode((perm & 0o775) | 0o400))?;
+            temp.set_mode((perm & 0o775) | 0o400)?;
         }
         RepoMode::BareUserOnly => {
             // Canonical mode: the owner bits stay, and the group-write and
             // other-write bits are removed. Observed on the objects that the
             // `ostree` command writes.
-            rustix::fs::fchmod(fd, Mode::from_raw_mode(perm & 0o755))?;
+            temp.set_mode(perm & 0o755)?;
         }
         RepoMode::BareUserShared | RepoMode::Archive => {}
         RepoMode::BareSplitXattrs => {
@@ -2001,16 +1865,28 @@ fn apply_content_post_seal(fd: BorrowedFd<'_>, mode: RepoMode, header: &FileHead
 }
 
 /// Writes the `user.ostreemeta` xattr that holds the logical `(uuua(ayay))`.
-fn set_ostreemeta(fd: BorrowedFd<'_>, header: &FileHeader) -> Result<()> {
+fn set_ostreemeta(temp: &TempFile, header: &FileHeader) -> Result<()> {
     let meta = header.serialize_stat_metadata()?;
-    rustix::fs::fsetxattr(fd, "user.ostreemeta", &meta, XattrFlags::empty())?;
+    temp.set_xattr(c"user.ostreemeta", &meta)?;
     Ok(())
+}
+
+/// Returns the xattr name `name` of an object header, without its
+/// terminating NUL, as a C string.
+///
+/// A name that is not valid UTF-8 gives [`Error::InvalidFormat`]. A name with
+/// a NUL before its end gives [`Error::Io`] with `EINVAL`.
+fn xattr_name(name: &[u8]) -> Result<CString> {
+    let name = name.strip_suffix(&[0]).unwrap_or(name);
+    std::str::from_utf8(name)
+        .map_err(|_| Error::InvalidFormat("xattr name is not valid UTF-8".into()))?;
+    CString::new(name).map_err(|_| Error::Io(Errno::INVAL.into()))
 }
 
 /// Sets one inode xattr, without the terminating NUL of the stored name.
 ///
-/// The checkout copy path also uses this function, to apply the logical xattrs
-/// of a file object.
+/// The checkout copy path uses this function to apply the logical xattrs of
+/// a file object.
 pub(crate) fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> Result<()> {
     let name = name.strip_suffix(&[0]).unwrap_or(name);
     let name = std::str::from_utf8(name)
@@ -2019,13 +1895,13 @@ pub(crate) fn set_inode_xattr(fd: BorrowedFd<'_>, name: &[u8], value: &[u8]) -> 
     Ok(())
 }
 
-/// Sets one xattr on a staged symlink inode, without the terminating NUL of
-/// the stored name.
+/// Sets one xattr on a symlink inode of a checkout, without the terminating
+/// NUL of the stored name.
 ///
 /// A symlink cannot be opened for a descriptor. The function sets the
 /// attribute with no-follow, through the `/proc/self/fd` path of the
-/// directory. The checkout path also uses this function, to apply the link
-/// xattrs of a symlink object.
+/// directory. The checkout path uses this function to apply the link xattrs
+/// of a symlink object.
 pub(crate) fn set_link_xattr(
     dir: BorrowedFd<'_>,
     staging_name: &str,
@@ -2040,20 +1916,22 @@ pub(crate) fn set_link_xattr(
     Ok(())
 }
 
-/// Writes `content` into a new named temp file and renames it to
-/// `staging_name`.
+/// Writes `content` into a new temp file of the staging directory `staging`
+/// and publishes it at `staging_name`.
 ///
-/// Before the rename, the function does these steps:
+/// The temp file is the file of [`TempFile::create`]. Before the publish, the
+/// function does these steps:
 ///
 /// 1. It sets the mode `perm` with `fchmod`.
 /// 2. If `ostreemeta` is given, it sets `user.ostreemeta`.
 /// 3. If `do_fsync` is set, it runs `fsync` on the file.
 /// 4. It seals the file with fs-verity per `verity`.
 ///
+/// The publish keeps an entry that the transaction staged under the name.
 /// The function returns the size on disk. It is for small bodies that the
 /// caller holds: symlinks stored as regular files, and metadata objects.
 fn stage_named_regular(
-    staging_fd: BorrowedFd<'_>,
+    staging: &RepoDir,
     staging_name: &str,
     content: &[u8],
     perm: u32,
@@ -2061,194 +1939,58 @@ fn stage_named_regular(
     do_fsync: bool,
     verity: Tristate,
 ) -> Result<u64> {
-    use std::io::Write;
-
-    let tmp = temp_name();
-    let fd = rustix::fs::openat(
-        staging_fd,
-        tmp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(perm),
-    )?;
-    let mut file = std::fs::File::from(fd);
-    file.write_all(content)?;
-    file.flush()?;
-    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(perm))?;
+    let mut temp = TempFile::create(staging)?;
+    temp.file_mut().write_all(content)?;
+    temp.set_mode(perm)?;
     if let Some(meta) = ostreemeta {
-        rustix::fs::fsetxattr(file.as_fd(), "user.ostreemeta", meta, XattrFlags::empty())?;
+        temp.set_xattr(c"user.ostreemeta", meta)?;
     }
     if do_fsync {
-        rustix::fs::fsync(file.as_fd())?;
+        temp.sync()?;
     }
-    let size = size_of(file.as_fd())?;
-    // Seal with fs-verity before the rename, after the writable descriptor
-    // closes. On a failure, remove the named temp so that nothing stays
-    // behind.
-    if verity != Tristate::No {
-        let ro = match reopen_ro(file.as_fd()) {
-            Ok(ro) => ro,
-            Err(e) => {
-                let _ = rustix::fs::unlinkat(staging_fd, tmp.as_str(), AtFlags::empty());
-                return Err(e);
-            }
-        };
-        drop(file);
-        if let Err(e) = seal_regular(ro.as_fd(), verity) {
-            let _ = rustix::fs::unlinkat(staging_fd, tmp.as_str(), AtFlags::empty());
-            return Err(e);
-        }
-    } else {
-        drop(file);
-    }
-    match rustix::fs::renameat(staging_fd, tmp.as_str(), staging_fd, staging_name) {
-        Ok(()) => {}
-        Err(e) => {
-            let _ = rustix::fs::unlinkat(staging_fd, tmp.as_str(), AtFlags::empty());
-            return Err(e.into());
-        }
-    }
+    let size = content.len() as u64;
+    seal_temp(&mut temp, verity)?;
+    temp.publish(staging, staging_name, Publish::KeepExisting, false)?;
     Ok(size)
 }
 
-/// Reopens an open file read-only through `/proc/self/fd`.
+/// Seals the temp file `temp` with fs-verity per `verity`, with
+/// [`TempFile::seal`], and gives `true` if the file is sealed.
 ///
-/// Then the writable descriptor to the same inode can close before
-/// `FS_IOC_ENABLE_VERITY`. The kernel refuses that ioctl while a writable
-/// descriptor to the inode is open. The reopened descriptor also links an
-/// anonymous `O_TMPFILE` inode into place.
-fn reopen_ro(fd: BorrowedFd<'_>) -> Result<OwnedFd> {
-    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    Ok(rustix::fs::open(
-        proc_path.as_str(),
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)
-}
-
-/// Enables fs-verity on a read-only descriptor per the configured tri-state.
-///
-/// [`Tristate::Maybe`] is best effort and ignores each enable error. A file
-/// system without verity returns `ENOTTY`. With [`Tristate::Yes`], an enable
-/// error fails the write. The function is never called for [`Tristate::No`].
-/// It tries again after an `ETXTBSY` error, up to [`SEAL_ATTEMPTS`] attempts
-/// with a pause of [`SEAL_PAUSE`].
-fn seal_regular(fd: BorrowedFd<'_>, verity: Tristate) -> Result<()> {
-    let mut attempts = 0;
-    let err = loop {
-        attempts += 1;
-        match ostrya_sys::enable_verity(fd) {
-            Ok(()) => return Ok(()),
-            Err(rustix::io::Errno::TXTBSY) if attempts < SEAL_ATTEMPTS => {
-                std::thread::sleep(SEAL_PAUSE);
-            }
-            Err(e) => break e,
+/// [`Tristate::Maybe`] is best effort and ignores each enable error. With
+/// [`Tristate::Yes`], each I/O error of the seal, also of the read-only
+/// reopen through `/proc/self/fd`, gives [`Error::Unsupported`] with the
+/// errno in its text.
+fn seal_temp(temp: &mut TempFile, verity: Tristate) -> Result<bool> {
+    temp.seal(verity).map_err(|e| match e {
+        FsError::Io(e) if verity == Tristate::Yes => {
+            Error::Unsupported(format!("fsverity required but could not be enabled: {e}"))
         }
-    };
-    if verity == Tristate::Maybe {
-        return Ok(());
-    }
-    Err(Error::Unsupported(format!(
-        "fsverity required but could not be enabled: {err}"
-    )))
+        other => other.into(),
+    })
 }
 
-/// Returns `true` if the file system of `tmp_fd` accepts an fs-verity seal.
+/// Returns `true` if the file system of `tmp/` accepts an fs-verity seal.
 ///
-/// The function makes a temp file in `tmp_fd`, writes one byte, closes the
-/// writable descriptor, and calls [`seal_regular`] with [`Tristate::Yes`] on
-/// a read-only descriptor. So the probe uses the same `ETXTBSY` retry. An
-/// enable error that remains after the retries gives `false`. The function
-/// removes the temp file.
+/// The function makes a temp file with [`TempFile::create`] in the temp home
+/// of the root handle `root`, which is the `tmp/` handle that the repository
+/// handle opens at its first use and keeps. It writes one byte, and seals the
+/// file with [`TempFile::seal`] and [`Tristate::Yes`], with the same
+/// `ETXTBSY` retry. Each I/O error of the seal gives `false`. The drop of the
+/// temp file removes it.
 ///
 /// # Errors
 ///
-/// [`Error::Io`] if the open or the write of the temp file fails.
-pub(crate) fn probe_seal_blocking(tmp_fd: BorrowedFd<'_>) -> Result<bool> {
-    let (fd, temp) = open_temp(tmp_fd)?;
-    let sealed = rustix::io::write(&fd, &[0])
-        .map_err(Error::from)
-        .and_then(|_| reopen_ro(fd.as_fd()))
-        .map(|ro| {
-            drop(fd);
-            seal_regular(ro.as_fd(), Tristate::Yes).is_ok()
-        });
-    cleanup_temp(tmp_fd, &temp);
-    sealed
-}
-
-/// Links an ingestion temp file into the staging directory under
-/// `staging_name`.
-///
-/// For an anonymous inode, the function links it through `link_fd`. For a
-/// named temp, it renames the temp and does not use `link_fd`.
-fn materialize(
-    staging_fd: BorrowedFd<'_>,
-    link_fd: BorrowedFd<'_>,
-    temp: &TempKind,
-    staging_name: &str,
-) -> Result<()> {
-    match temp {
-        TempKind::Anonymous => {
-            let proc_path = format!("/proc/self/fd/{}", link_fd.as_raw_fd());
-            match rustix::fs::linkat(
-                rustix::fs::CWD,
-                proc_path.as_str(),
-                staging_fd,
-                staging_name,
-                AtFlags::SYMLINK_FOLLOW,
-            ) {
-                // A concurrent writer of the same object linked it first. The
-                // bytes are the same, so treat it as staged.
-                Ok(()) | Err(rustix::io::Errno::EXIST) => Ok(()),
-                Err(e) => Err(e.into()),
-            }
-        }
-        TempKind::Named(name) => {
-            rustix::fs::renameat(staging_fd, name.as_str(), staging_fd, staging_name)?;
-            Ok(())
-        }
-    }
-}
-
-/// Creates a symlink object in the staging directory.
-///
-/// The function returns `true` if it created the symlink. An existing entry
-/// comes from a concurrent writer of the same symlink. The content is the
-/// same, so the entry is not an error.
-fn stage_symlink_inode(
-    staging_fd: BorrowedFd<'_>,
-    target: &str,
-    staging_name: &str,
-) -> Result<bool> {
-    match rustix::fs::symlinkat(target, staging_fd, staging_name) {
-        Ok(()) => Ok(true),
-        Err(rustix::io::Errno::EXIST) => Ok(false),
+/// - [`Error::InvalidFormat`] if `tmp` is a symlink or not a directory.
+/// - [`Error::Io`] if the create or the write of the temp file fails.
+pub(crate) fn probe_seal_blocking(root: &RepoDir) -> Result<bool> {
+    let mut temp = TempFile::create(root)?;
+    temp.file_mut().write_all(&[0])?;
+    match temp.seal(Tristate::Yes) {
+        Ok(sealed) => Ok(sealed),
+        Err(FsError::Io(_)) => Ok(false),
         Err(e) => Err(e.into()),
     }
-}
-
-/// Removes an ingestion temp file after a dedup hit, or a temp file abandoned
-/// before staging.
-///
-/// An anonymous inode goes away when its descriptor closes. The function
-/// unlinks a named temp.
-fn cleanup_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
-    if let TempKind::Named(name) = temp {
-        let _ = rustix::fs::unlinkat(staging_fd, name.as_str(), AtFlags::empty());
-    }
-}
-
-/// Returns the size on disk of an open file.
-fn size_of(fd: BorrowedFd<'_>) -> Result<u64> {
-    Ok(rustix::fs::fstat(fd)?.st_size.max(0) as u64)
-}
-
-fn uid(value: u32) -> Uid {
-    Uid::from_raw(value)
-}
-
-fn gid(value: u32) -> Gid {
-    Gid::from_raw(value)
 }
 
 /// The write-side sink into which an archive pass-through inflates its
@@ -2476,101 +2218,5 @@ mod verity_tests {
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
-    }
-}
-
-#[cfg(test)]
-mod temp_tests {
-    use std::os::fd::{AsFd, OwnedFd};
-
-    use super::{PendingTemp, TempKind, unique};
-
-    /// A drop unlinks a named temp that is not staged, and a temp handed on
-    /// for staging stays for the stager.
-    ///
-    /// Each file system that the tests run on supports `O_TMPFILE`, so the
-    /// test makes the named form by hand.
-    #[test]
-    fn a_pending_named_temp_is_removed_on_drop() {
-        let dir = std::env::temp_dir().join(format!(
-            "ostrya-pending-temp-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_fd: OwnedFd = std::fs::File::open(&dir).unwrap().into();
-        for name in [".ostrya-tmp-dropped", ".ostrya-tmp-kept"] {
-            std::fs::write(dir.join(name), b"partial").unwrap();
-        }
-
-        drop(PendingTemp::new(
-            dir_fd.as_fd(),
-            TempKind::Named(".ostrya-tmp-dropped".to_owned()),
-        ));
-        assert!(!dir.join(".ostrya-tmp-dropped").exists());
-
-        let kept = PendingTemp::new(
-            dir_fd.as_fd(),
-            TempKind::Named(".ostrya-tmp-kept".to_owned()),
-        );
-        assert!(matches!(kept.into_inner(), TempKind::Named(_)));
-        assert!(dir.join(".ostrya-tmp-kept").exists());
-
-        // An anonymous temp names nothing, so its drop unlinks nothing.
-        drop(PendingTemp::new(dir_fd.as_fd(), TempKind::Anonymous));
-        assert!(dir.join(".ostrya-tmp-kept").exists());
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-}
-
-#[cfg(test)]
-mod link_tests {
-    use std::os::fd::{AsFd, OwnedFd};
-
-    use rustix::fs::AtFlags;
-
-    use super::{confirm_linked, unique};
-    use crate::error::Error;
-
-    /// A staged entry that is the inode of the source stat stays. A staged
-    /// entry that is another inode, or the same inode with another file type
-    /// in the stat, is removed, and the error names the source path.
-    #[test]
-    fn a_link_to_another_inode_is_removed() {
-        let dir = std::env::temp_dir().join(format!(
-            "ostrya-confirm-linked-{}-{}",
-            std::process::id(),
-            unique()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let dir_fd: OwnedFd = std::fs::File::open(&dir).unwrap().into();
-        std::fs::write(dir.join("source"), b"source").unwrap();
-        std::fs::write(dir.join("other"), b"other").unwrap();
-        std::fs::hard_link(dir.join("source"), dir.join("linked")).unwrap();
-        let stat = rustix::fs::statat(dir_fd.as_fd(), "source", AtFlags::SYMLINK_NOFOLLOW).unwrap();
-
-        confirm_linked(dir_fd.as_fd(), "linked", &stat, "ab/cd.dirmeta").unwrap();
-        assert!(dir.join("linked").exists());
-
-        // The same inode number with another file type is another object.
-        let mut fifo = stat;
-        fifo.st_mode = rustix::fs::FileType::Fifo.as_raw_mode() | (stat.st_mode & 0o7777);
-        let fifo_refused =
-            confirm_linked(dir_fd.as_fd(), "linked", &fifo, "ab/cd.dirmeta").is_err();
-        let linked_exists = dir.join("linked").exists();
-
-        let err = confirm_linked(dir_fd.as_fd(), "other", &stat, "ab/cd.dirmeta").unwrap_err();
-        let exists = dir.join("other").exists();
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert!(fifo_refused);
-        assert!(!linked_exists);
-        match err {
-            Error::Io(e) => {
-                assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
-                assert_eq!(e.to_string(), "ab/cd.dirmeta changed during the link");
-            }
-            other => panic!("{other:?}"),
-        }
-        assert!(!exists);
     }
 }

@@ -81,7 +81,7 @@ use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
-use crate::write::{ImageTemp, discard_image_temp, link_image_blocking, write_image_temp_blocking};
+use crate::write::{ImageTemp, link_image_blocking, write_image_temp_blocking};
 
 /// The empty top-level directories that the `ostree` command adds to each
 /// exported image.
@@ -305,19 +305,11 @@ impl StagedComposefsImage<'_> {
 }
 
 impl StagedComposefsImage<'_> {
-    /// Removes the image file on the blocking pool.
-    ///
-    /// If the call cannot hand the staging directory to the blocking pool, it
-    /// keeps the image file, and the drop removes it.
+    /// Removes the image file on the blocking pool: the drop of its temp file
+    /// runs there.
     async fn discard(mut self) {
-        let Some(image) = self.image.take() else {
-            return;
-        };
-        match self.txn.staging_fd().try_clone_to_owned() {
-            Ok(staging) => {
-                ostrya_rt::unblock(move || discard_image_temp(staging.as_fd(), &image.temp)).await;
-            }
-            Err(_) => self.image = Some(image),
+        if let Some(image) = self.image.take() {
+            ostrya_rt::unblock(move || drop(image)).await;
         }
     }
 }
@@ -327,14 +319,6 @@ impl std::fmt::Debug for StagedComposefsImage<'_> {
         f.debug_struct("StagedComposefsImage")
             .field("digest", &digest_hex(&self.digest))
             .finish_non_exhaustive()
-    }
-}
-
-impl Drop for StagedComposefsImage<'_> {
-    fn drop(&mut self) {
-        if let Some(image) = self.image.take() {
-            discard_image_temp(self.txn.staging_fd(), &image.temp);
-        }
     }
 }
 
@@ -474,7 +458,7 @@ impl Transaction {
             ));
         }
         let (fsync, per_object_fsync) = self.fsync_flags()?;
-        let verity = self.repo().config().fsverity()?;
+        let verity = self.verity().await?;
         let dir = composefs_model(
             ObjectSource::Staged(self),
             root,
@@ -482,10 +466,10 @@ impl Transaction {
             cache,
         )
         .await?;
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let staging = self.staging_dir().clone();
         let image = self
             .unblock(move || {
-                write_image_temp_blocking(staging.as_fd(), &dir, fsync && per_object_fsync, verity)
+                write_image_temp_blocking(&staging, &dir, fsync && per_object_fsync, verity)
             })
             .await?;
         Ok(StagedComposefsImage {
@@ -749,14 +733,14 @@ impl Transaction {
                 return Err(e);
             }
         };
-        let staging = self.staging_fd().try_clone_to_owned()?;
+        let staging = self.staging_dir().clone();
         let temp = image
             .image
             .take()
             .expect("a staged composefs image holds its file until attached");
         let key = *commit;
         let outcome = self
-            .unblock(move || link_image_blocking(staging.as_fd(), temp, &key))
+            .unblock(move || link_image_blocking(&staging, temp, &key))
             .await?;
         self.record_image(*commit, outcome)?;
         Ok(result)

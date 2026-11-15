@@ -16,26 +16,25 @@
 //! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::{Read, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(feature = "receive")]
 use std::sync::Arc;
 
-use ostrya_core::{Checksum, Ref, RefPattern, RefSelector, RepoMode};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, ResolveFlags};
+use ostrya_core::{Checksum, Ref, RefPattern, RefSelector};
+use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::access::{AccessRules, Namespace, ReadAccess};
-use crate::archive::{Walked, resolve_alias, walk};
+use crate::archive::resolve_alias;
 use crate::config::valid_remote_name;
 use crate::error::{Error, Result};
-use crate::perm;
 use crate::repo::Repo;
-use crate::repo_fs::{FsResultExt, RepoDir};
-use crate::staging::{REF_TEMP_PREFIX, TempEntry, open_tmp_dir};
+use crate::repo_fs::{
+    FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, TempFile, TempLink,
+};
 use crate::summary::SelectionFloor;
 use crate::transaction::Transaction;
-use crate::traverse::read_dir_names;
 
 /// One collection-qualified ref of a repository.
 ///
@@ -154,15 +153,16 @@ impl Transaction {
     ///   queued ref, and one of the two is a write. Examples are a write of
     ///   `a` and a write of `a/b`, or a removal of `a` and a write of `a/b`.
     ///
-    /// The check opens the directory of each queued path with `openat2`,
-    /// `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. The open has no
-    /// fallback. On a kernel without `openat2`, the commit fails with
-    /// [`Error::Io`].
+    /// The check opens each queued path with `openat2`, `RESOLVE_BENEATH`,
+    /// and `RESOLVE_NO_SYMLINKS`. The open has no fallback. On a kernel
+    /// without `openat2`, the commit fails with [`Error::Io`].
     ///
     /// The check reads the ref store as it is before the first write. The
-    /// writes resolve each path by name, so the check is the guard. A writer
-    /// that does not take the update lock can put a symlink above a queued
-    /// path after the check, and a write can then go through that symlink.
+    /// writes follow no symlink either: each write opens the directory of its
+    /// ref with no symlink followed, and renames or unlinks relative to it. A
+    /// writer that does not take the update lock can put a symlink above a
+    /// queued path after the check. The write of that path then fails with
+    /// [`Error::InvalidFormat`], and never goes through the symlink.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
     /// ref under it cannot be written or removed through this call. Remove
@@ -189,11 +189,11 @@ impl Transaction {
     ///   file that names `c`. If the path of the ref names a directory or
     ///   passes through a file or an alias, the commit fails with
     ///   [`Error::RefNotWritable`], also for `None`.
-    ///   [`Repo::resolve_ref_tip`] gives `None` for a path that names a
-    ///   directory or passes through a file, so a caller that gives back that
-    ///   `None` as `expected` gets this error. [`Repo::resolve_ref_tip`]
-    ///   follows an alias above the path, so an `expected` taken from it for
-    ///   such a path also gets this error.
+    ///   [`Repo::resolve_ref_tip`] gives `None` for a path that passes
+    ///   through a file, so a caller that gives back that `None` as
+    ///   `expected` gets this error. For a path that names a directory,
+    ///   [`Repo::resolve_ref_tip`] fails with [`Error::NotARef`], and for a
+    ///   path below an alias with [`Error::InvalidFormat`].
     /// - `new`: the commit to write. If `new` is `None`, the commit removes
     ///   the ref.
     ///
@@ -211,8 +211,8 @@ impl Transaction {
     ///   [`Error::RefMismatch`].
     /// - The path of the ref names an alias, or passes through an alias:
     ///   [`Error::RefNotWritable`].
-    /// - The ref file does not parse: [`Error::InvalidFormat`] or
-    ///   [`Error::Core`].
+    /// - The ref file does not parse, or is larger than 4096 bytes:
+    ///   [`Error::InvalidFormat`] or [`Error::Core`].
     pub fn set_ref_expecting(&self, r: &Ref, expected: Option<&Checksum>, new: Option<&Checksum>) {
         self.refs.lock().unwrap().push(RefWrite {
             target: r.clone(),
@@ -247,11 +247,11 @@ impl Transaction {
 /// blocking pool.
 ///
 /// The caller holds the update lock and calls this before the first write.
-/// The check opens the directory of each path with [`open_ref_parent`], so
-/// it follows no symlink above the ref. It reads the path of an entry with
-/// no expectation with `lstat` alone, and does not read the content of a ref
-/// file. It reads the path of a conditional entry with `lstat` and an
-/// `O_NOFOLLOW` open, and parses the ref file. It gives the first failure:
+/// The check reads each path with [`lstat_ref_state`], so it follows no
+/// symlink above the ref. It reads the path of an entry with no expectation
+/// with `lstat` alone, and does not read the content of a ref file. It reads
+/// the path of a conditional entry with [`ref_file_state`], and parses the
+/// ref file. It gives the first failure:
 ///
 /// 1. In queue order, a write or a removal whose path names a directory,
 ///    passes through a file or an alias, names a special file, or names an
@@ -266,10 +266,7 @@ impl Transaction {
 ///    other, and one of the two is a write: [`Error::RefNotWritable`]. The
 ///    error names the outer ref. Two removals pass, and so does one path
 ///    queued two times.
-pub(crate) fn check_resolved_refs_blocking(
-    repo_fd: BorrowedFd<'_>,
-    refs: &[ResolvedRef],
-) -> Result<()> {
+pub(crate) fn check_resolved_refs_blocking(root: &RepoDir, refs: &[ResolvedRef]) -> Result<()> {
     let not_writable = |r: &ResolvedRef, reason: String| Error::RefNotWritable {
         name: r.name.to_string(),
         reason,
@@ -278,7 +275,7 @@ pub(crate) fn check_resolved_refs_blocking(
     let mut removed: HashSet<&str> = HashSet::new();
     for r in refs {
         match r.expected {
-            None => match lstat_ref_state(repo_fd, &r.relpath)? {
+            None => match lstat_ref_state(root, &r.relpath)? {
                 Some(RefFileState::Alias) => {
                     return Err(not_writable(r, NAMES_AN_ALIAS.to_owned()));
                 }
@@ -292,7 +289,7 @@ pub(crate) fn check_resolved_refs_blocking(
                 _ => {}
             },
             Some(expected) => {
-                let current = match ref_file_state(repo_fd, &r.relpath)? {
+                let current = match ref_file_state(root, &r.relpath)? {
                     RefFileState::Absent => None,
                     RefFileState::Commit(c) => Some(c),
                     RefFileState::Alias => {
@@ -371,35 +368,36 @@ pub(crate) fn nested_ref_paths(entries: &[(&str, bool)]) -> Option<(usize, usize
 /// The call uses the fsync policy that the transaction resolved, so the
 /// object writes, the publication step, and the ref writes read one value.
 ///
-/// The durability invariant: with fsync on, each ref file is `fdatasync`-ed
-/// before its rename. After the last rename, each directory that gained or
-/// lost a name is `fsync`-ed once, deepest first, before the call returns.
+/// The durability invariant: with fsync on, each ref file is `fsync`-ed
+/// before its rename. Each directory that a write makes is synced into its
+/// parent when the write makes it. After the last rename, each directory
+/// that gained or lost a ref name is `fsync`-ed once, deepest first, before
+/// the call returns.
 ///
 /// Before the call, the caller made durable the objects and the detached
 /// metadata that the refs name. So no ref is durable before what it names. A
 /// write that fails still syncs the directories of the refs written before
 /// it.
 ///
-/// `tmp_fd` is the open `tmp/` of the repository. Each ref write creates its
-/// temp file there.
+/// `root` is the handle of the repository root. `tmp` is the `tmp/` handle
+/// of the transaction. Each ref write makes its temp file there.
 pub(crate) fn write_resolved_refs_blocking(
-    repo_fd: BorrowedFd<'_>,
-    tmp_fd: BorrowedFd<'_>,
+    root: &RepoDir,
+    tmp: &RepoDir,
     refs: &[ResolvedRef],
     fsync: bool,
-    repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
     let written = refs.iter().try_for_each(|r| match r.checksum {
-        Some(checksum) => put_ref_file_blocking(
-            repo_fd, tmp_fd, &r.relpath, checksum, fsync, repo_mode, &mut dirs,
-        ),
-        None => remove_ref_blocking(repo_fd, &r.relpath, fsync, &mut dirs),
+        Some(checksum) => {
+            put_ref_file_blocking(root, Some(tmp), &r.relpath, checksum, fsync, &mut dirs)
+        }
+        None => remove_ref_blocking(root, &r.relpath, fsync, &mut dirs),
     });
     if !fsync {
         return written;
     }
-    let synced = sync_ref_dirs(repo_fd, dirs);
+    let synced = sync_ref_dirs(root, dirs);
     written.and(synced)
 }
 
@@ -427,12 +425,11 @@ impl Repo {
     ///    `@ID:NAME`. It resolves to the commit that the ref names, read at
     ///    the path that [`resolve_ref_tip`](Repo::resolve_ref_tip) reads.
     ///    `@ID:NAME` reads `refs/mirrors/ID/NAME`, or `refs/heads/NAME` when
-    ///    `ID` is the `[core] collection-id` of the repository. A ref path
-    ///    that names a directory, or that passes through a file, fails with
-    ///    [`Error::Io`]. A ref path that names a FIFO, a socket, or a device
-    ///    file holds no ref. The call checks the type of the file after the
-    ///    open, and the open does not wait for a writer. An open that the
-    ///    permissions refuse fails with [`Error::Io`], also at a FIFO.
+    ///    `ID` is the `[core] collection-id` of the repository. The read
+    ///    rules of [`resolve_ref_tip`](Repo::resolve_ref_tip) apply: a ref
+    ///    path that passes through a ref file names no ref, and a ref path
+    ///    that names a directory, a FIFO, a socket, or a device file fails
+    ///    with [`Error::NotARef`]. An alias resolves by the alias rule.
     ///
     /// A checksum is in lowercase hex only. A 64-character name with an
     /// uppercase character is a refspec.
@@ -460,11 +457,14 @@ impl Repo {
     ///   parent.
     /// - [`Error::ObjectNotFound`] if a `^` step reads a commit that is not in
     ///   the repository.
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::NotARef`] if the ref path of the base names an entry that
+    ///   is not a ref, as [`resolve_ref_tip`](Repo::resolve_ref_tip) states.
+    ///   The error holds the base as text.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if the ref path passes through a symlink.
     /// - [`Error::Core`] if a ref file holds no checksum, or a commit object
     ///   does not parse.
-    /// - [`Error::Io`] if a read from the file system fails, or if the ref
-    ///   path of the base names a directory or passes through a file.
+    /// - [`Error::Io`] if a read from the file system fails.
     pub async fn resolve_rev(&self, rev: &str, allow_noent: bool) -> Result<Option<Checksum>> {
         Ok(self
             .resolve_rev_kind(rev, allow_noent)
@@ -530,7 +530,7 @@ impl Repo {
 
         let r: Ref = rev.parse()?;
         let relpath = ref_relpath(self.config().collection_id(), &r)?;
-        match self.resolve_relpath_tip(relpath).await? {
+        match self.resolve_named_tip(rev.to_owned(), relpath).await? {
             Some(checksum) => Ok(Some((checksum, RevKind::Ref))),
             None if allow_noent => Ok(None),
             None => Err(Error::RefNotFound(rev.to_owned())),
@@ -547,27 +547,38 @@ impl Repo {
     /// at the open.
     ///
     /// The call does not read the name as a checksum, as an abbreviated
-    /// checksum, or with a `^` suffix. If the ref is an alias, the call
-    /// follows the link. An alias whose target is absent reads as an absent
-    /// ref. A ref path that names a directory, or that passes through a
-    /// file, holds no ref. A ref path that names a FIFO, a socket, or a
-    /// device file holds no ref. The call checks the type of the file after
-    /// the open, and the open does not wait for a writer. An open that the
-    /// permissions refuse fails with [`Error::Io`], also at a FIFO. The
-    /// result is `None` if the store holds no such ref. A caller that needs
-    /// an error for an absent ref gives [`Error::RefNotFound`] with the text
-    /// of the ref.
+    /// checksum, or with a `^` suffix. The result is `None` if no entry is at
+    /// the path, or if the path passes through a ref file. A caller that
+    /// needs an error for an absent ref gives [`Error::RefNotFound`] with the
+    /// text of the ref.
+    ///
+    /// The read follows no symlink at a component of the path, from the
+    /// repository root down. It opens the ref file with `O_NONBLOCK`, and
+    /// then checks its type, so the open of a FIFO does not wait for a
+    /// writer. An open that the permissions refuse fails with [`Error::Io`],
+    /// also at a FIFO.
+    ///
+    /// If the ref is an alias, the call reads the ref that the alias names by
+    /// the alias rule:
+    ///
+    /// - The body of the alias is a relative path. It resolves against the
+    ///   directory of the alias to a path below `refs/`.
+    /// - The target is a ref file: a regular file. The call reads the type of
+    ///   the target before it opens it.
+    /// - No component of the target path is a symlink, and the target itself
+    ///   is not an alias.
+    ///
+    /// An alias whose target is absent, or whose target path passes through
+    /// a ref file, names no ref, and the result is `None`. An alias that
+    /// breaks the rule fails with [`Error::NotARef`]. So an alias to an
+    /// absolute path, to a path outside `refs/`, to another alias, or to
+    /// itself names no commit. The ref listings apply the same rule, and give
+    /// no ref for such an alias.
     ///
     /// Callers that hold a ref name and not a revision use this call. These
     /// are a media export and a media import for their refs, a summary for
     /// the metadata ref that it chains, and the CLI for its alias-target
     /// check. An alias records a name, so the CLI uses this call.
-    ///
-    /// A symlink that the port does not write can make the call and the ref
-    /// listing give different results. Examples are a symlink to a directory
-    /// in the mirror tree, an alias loop, and an absolute alias. The listing
-    /// does not follow a symlink to a directory, and it reads an alias by its
-    /// own rule. The call follows each link through the file system.
     ///
     /// The call takes no lock. It does not wait for an
     /// [`UpdateGuard`](crate::UpdateGuard) or for a transaction. A ref write
@@ -578,84 +589,78 @@ impl Repo {
     ///
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   error holds the text of the ref, and the call reads no file.
-    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::NotARef`] if the path names a directory, a FIFO, a socket,
+    ///   or a device file (reason `is not a regular file`), or an alias that
+    ///   breaks the alias rule. The error holds the text of the ref.
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if a component of the path, for example
+    ///   `refs/heads`, is a symlink.
     /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example on an alias loop or on
-    ///   a ref file that the process cannot read.
+    /// - [`Error::Io`] if the read fails, for example on a ref file that the
+    ///   process cannot read.
     pub async fn resolve_ref_tip(&self, r: &Ref) -> Result<Option<Checksum>> {
-        match self
-            .resolve_relpath_tip(ref_relpath(self.config().collection_id(), r)?)
-            .await
-        {
-            Err(Error::Io(e)) if is_not_a_ref_path(&e) => Ok(None),
-            other => other,
-        }
+        let relpath = ref_relpath(self.config().collection_id(), r)?;
+        self.resolve_named_tip(r.to_string(), relpath).await
     }
 
-    /// Returns the commit that the ref file at `relpath` names. The call
-    /// follows an alias. The result is `None` if no file is at the path. A
-    /// path that names a directory, or that passes through a file, fails
-    /// with [`Error::Io`]. A path that names a FIFO, a socket, or a device
-    /// file finds no ref. The call checks the type of the file after the
-    /// open, and the open does not wait for a writer. An open that the
-    /// permissions refuse fails with [`Error::Io`], also at a FIFO.
+    /// Returns the commit that the ref file at `relpath` names, by the read
+    /// rules of [`resolve_ref_tip`](Repo::resolve_ref_tip). An error that
+    /// names the ref names it as `relpath`.
     ///
     /// The read and the parse run in one call on the blocking pool.
     pub(crate) async fn resolve_relpath_tip(&self, relpath: String) -> Result<Option<Checksum>> {
+        self.resolve_named_tip(relpath.clone(), relpath).await
+    }
+
+    /// Returns the commit that the ref file at `relpath` names, by the read
+    /// rules of [`resolve_ref_tip`](Repo::resolve_ref_tip). An error that
+    /// names the ref names it as `name`.
+    async fn resolve_named_tip(&self, name: String, relpath: String) -> Result<Option<Checksum>> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || repo.resolve_relpath_tip_blocking(&relpath)).await
+        ostrya_rt::unblock(move || read_ref_tip(repo.root_dir(), &name, &relpath)).await
     }
 
     /// Runs [`resolve_relpath_tip`](Repo::resolve_relpath_tip) on the calling
     /// thread.
     pub(crate) fn resolve_relpath_tip_blocking(&self, relpath: &str) -> Result<Option<Checksum>> {
-        match read_ref_file(self.repo_fd(), relpath)? {
-            Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
-            None => Ok(None),
-        }
+        read_ref_tip(self.root_dir(), relpath, relpath)
     }
 
     /// Returns the commits of the ref files at several paths under `refs/`,
     /// each read as [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a
     /// refspec, in one pass on the blocking pool. The result holds one entry
-    /// for each path, in order. A ref path that names a directory, or that
-    /// passes through a file, holds no ref and reads as absent.
+    /// for each path, in order. A path that holds no ref by the read rules,
+    /// also one that gives [`Error::NotARef`], reads as absent.
     #[cfg(feature = "receive")]
     pub(crate) async fn resolve_relpath_tips(
         &self,
         relpaths: Arc<[String]>,
     ) -> Result<Vec<Option<Checksum>>> {
         let repo = self.clone();
-        let contents = ostrya_rt::unblock(move || {
+        ostrya_rt::unblock(move || {
             relpaths
                 .iter()
-                .map(|p| match read_ref_file(repo.repo_fd(), p) {
-                    Err(e) if is_not_a_ref_path(&e) => Ok(None),
+                .map(|p| match read_ref_tip(repo.root_dir(), p, p) {
+                    Err(Error::NotARef { .. }) => Ok(None),
                     other => other,
                 })
-                .collect::<std::io::Result<Vec<_>>>()
+                .collect()
         })
-        .await?;
-        contents
-            .into_iter()
-            .map(|bytes| bytes.map(|b| parse_ref_content(&b)).transpose())
-            .collect()
+        .await
     }
 
     /// Returns the state of the ref file at each of several paths under
     /// `refs/`, and the commit of the refspec `tip`, in one pass on the
     /// blocking pool. The result holds one state for each path, in order.
     ///
-    /// The call opens the directory of each ref path with
-    /// [`open_ref_parent`], and reads the last component with `lstat` first.
-    /// It then opens a regular file with `O_NOFOLLOW` and parses it. A ref
-    /// that does not parse fails the call.
+    /// The call reads each ref path with [`ref_file_state`]: the type of the
+    /// entry first, and then the content of a regular file, which it parses.
+    /// A ref that does not parse fails the call.
     ///
     /// If `tip` is given, the call reads it at the path where
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. A path that names
-    /// a directory, or that passes through a file, fails `tip` with
-    /// [`Error::Io`]. The result holds the failure of `tip` separately, so
-    /// the caller decides if it needs the value.
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it, by the same
+    /// rules. The result holds the failure of `tip` separately, so the caller
+    /// decides if it needs the value.
     #[cfg(feature = "receive")]
     #[allow(clippy::type_complexity)]
     pub(crate) async fn read_ref_states(
@@ -663,16 +668,17 @@ impl Repo {
         relpaths: Arc<[String]>,
         tip: Option<&str>,
     ) -> Result<(Vec<RefFileState>, Option<Result<Option<Checksum>>>)> {
-        let tip = tip.map(refspec_to_relpath);
+        let tip = tip.map(|refspec| refspec_to_relpath(refspec).map(|p| (refspec.to_owned(), p)));
         let repo = self.clone();
         ostrya_rt::unblock(move || {
+            let root = repo.root_dir();
             let states = relpaths
                 .iter()
-                .map(|p| ref_file_state(repo.repo_fd(), p))
+                .map(|p| ref_file_state(root, p))
                 .collect::<Result<Vec<_>>>()?;
-            let tip = tip.map(|relpath| match read_ref_file(repo.repo_fd(), &relpath?)? {
-                Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
-                None => Ok(None),
+            let tip = tip.map(|named| {
+                let (name, relpath) = named?;
+                read_ref_tip(root, &name, &relpath)
             });
             Ok((states, tip))
         })
@@ -682,28 +688,38 @@ impl Repo {
     /// Returns the local refs as `(name, commit)` pairs, sorted by name.
     ///
     /// The local refs are under `refs/heads`. If `prefix` is given, the result
-    /// holds only the ref named `prefix` and the refs below `prefix/`. The call
-    /// follows each alias. An alias whose target names no ref is not in the
-    /// result. A ref entry that is a FIFO, a socket, or a device file is not
-    /// in the result. The call does not open such an entry, so its permissions
-    /// have no effect on the call. An alias to such a file is not in the
-    /// result. The call checks the type of each file that it opens, and an
-    /// open does not wait for a writer. An open that the permissions refuse
-    /// fails the call, also at the target of an alias.
+    /// holds only the ref named `prefix` and the refs below `prefix/`.
+    ///
+    /// The call opens `refs/` and `refs/heads/` with no symlink followed, and
+    /// below them it opens each directory and each ref file with no symlink
+    /// followed. A symlink entry is an alias, and the walk never goes into
+    /// it. An alias resolves by the alias rule of
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip), and the call reads the
+    /// type of its target before it opens the target. An alias that breaks
+    /// the rule, and an alias whose target names no ref, are not in the
+    /// result.
+    ///
+    /// A ref entry that is a FIFO, a socket, or a device file is not in the
+    /// result. The call does not open such an entry, so its permissions have
+    /// no effect on the call. The call checks the type of each file that it
+    /// opens, and an open does not wait for a writer. An open that the
+    /// permissions refuse fails the call, also at the target of an alias.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if `refs` or `refs/heads` is a symlink.
     /// - [`Error::Core`] if a ref file holds no checksum.
-    /// - [`Error::Io`] if a read from the file system fails, for example for
-    ///   an alias that names a directory.
+    /// - [`Error::Io`] if a read from the file system fails.
     ///
     /// [`list_refs_where`](Repo::list_refs_where) lists the local refs and the
     /// collection refs that a predicate selects, and it reads no ref file
     /// that the predicate drops.
     pub async fn list_refs(&self, prefix: Option<&str>) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
-        let mut refs = ostrya_rt::unblock(move || collect_heads(&repo, &|_| true)).await?;
+        let mut refs =
+            ostrya_rt::unblock(move || collect_heads(&repo, open_refs(&repo)?.as_ref(), &|_| true))
+                .await?;
         if let Some(prefix) = prefix {
             refs.retain(|(name, _)| ref_prefixes(name).any(|part| part == prefix));
         }
@@ -725,18 +741,15 @@ impl Repo {
     /// it never reads a ref file that `keep` drops. It does not read
     /// `refs/mirrors/ID/` of the `[core] collection-id` of the repository,
     /// a directory under `refs/mirrors` whose name fails
-    /// [`is_valid_collection_id`](crate::is_valid_collection_id), or an entry
+    /// [`is_valid_collection_id`](crate::is_valid_collection_id), or a file
     /// directly under `refs/mirrors`, and it does not call `keep` for them.
     /// The result holds no remote ref.
     ///
-    /// The call follows each alias that `keep` selects, as
-    /// [`list_refs`](Repo::list_refs) does. An alias whose target names no
-    /// ref is not in the result. A ref entry that is a FIFO, a socket, or a
-    /// device file is not in the result. The call does not open such an
-    /// entry, so its permissions have no effect on the call. An alias to such
-    /// a file is not in the result. The call checks the type of each file
-    /// that it opens, and an open does not wait for a writer. An open that the
-    /// permissions refuse fails the call, also at the target of an alias.
+    /// The call reads each ref and each alias that `keep` selects by the rules
+    /// of [`list_refs`](Repo::list_refs), and opens `refs/mirrors/` with no
+    /// symlink followed. An alias that breaks the alias rule, an alias whose
+    /// target names no ref, and a ref entry that is a FIFO, a socket, or a
+    /// device file are not in the result.
     ///
     /// The local refs come first, sorted by name. The collection refs come
     /// after them, sorted by collection id and then by name. The sort is the
@@ -748,13 +761,15 @@ impl Repo {
     ///
     /// For a ref that `keep` selects:
     ///
-    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8 or is larger
+    ///   than 4096 bytes.
     /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if a read from the file system fails, for example for
-    ///   an alias that names a directory.
+    /// - [`Error::Io`] if a read from the file system fails.
     ///
-    /// Also [`Error::Io`] if the read of a directory under `refs/heads` or
-    /// `refs/mirrors` fails.
+    /// Also [`Error::InvalidFormat`] if `refs`, `refs/heads`, `refs/mirrors`,
+    /// or an entry directly under `refs/mirrors` is a symlink, whatever
+    /// `keep` selects, and [`Error::Io`] if the read of a directory under
+    /// `refs/heads` or `refs/mirrors` fails.
     pub async fn list_refs_where(
         &self,
         keep: impl Fn(&Ref) -> bool + Send + 'static,
@@ -762,7 +777,8 @@ impl Repo {
         let repo = self.clone();
         let own = self.config().collection_id().map(str::to_owned);
         ostrya_rt::unblock(move || {
-            let mut heads = collect_heads(&repo, &|name| keep(&Ref::local(name)))?;
+            let refs = open_refs(&repo)?;
+            let mut heads = collect_heads(&repo, refs.as_ref(), &|name| keep(&Ref::local(name)))?;
             heads.sort_by(|a, b| a.0.cmp(&b.0));
             // A directory directly under `refs/mirrors` is a collection. The
             // walk skips the own id and an id that is not valid.
@@ -775,7 +791,7 @@ impl Repo {
                 path.split_once('/')
                     .is_some_and(|(id, name)| keep(&Ref::collection(id, name)))
             };
-            let mut mirrors = collect_mirrors(&repo, &skip, &keep_mirror)?;
+            let mut mirrors = collect_mirrors(&repo, refs.as_ref(), &skip, &keep_mirror)?;
             mirrors.sort_unstable_by(|a, b| (&a.0, &a.1).cmp(&(&b.0, &b.1)));
             let mut out = Vec::with_capacity(heads.len() + mirrors.len());
             out.extend(heads.into_iter().map(|(name, c)| (Ref::local(name), c)));
@@ -822,16 +838,18 @@ impl Repo {
     /// checks the name before it reads the ref file, so a ref file that
     /// `access` does not read is never read. When `access` reads no local
     /// ref, or when a negative pattern of `refs` is `**`, the call does not
-    /// open `refs/heads/`. The call opens `refs/heads/` and `refs/mirrors/`
-    /// by their paths from the repository. Below these
-    /// two directories, it opens each ref file and each directory with no
-    /// symlink followed. An alias resolves by the rule of
-    /// the archive view: its body is relative, it names a regular file under
-    /// `refs/` by one link, and `access` reads the target path. The call
-    /// opens the target with no symlink followed. An alias that breaks one
-    /// of these rules, and an alias whose target names no regular file, are
-    /// not in the result. A ref entry that is a FIFO or a socket at the open
-    /// is not in the result, and its open does not wait for a writer.
+    /// open `refs/heads/`. The call opens `refs/`, `refs/heads/`, and
+    /// `refs/mirrors/` with no symlink followed. Below these directories, it
+    /// opens each ref file and each directory with no symlink followed. An
+    /// alias resolves by the alias rule of
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip), and only when `access`
+    /// reads the target path. The call reads the type of the target before
+    /// it opens the target. An alias that breaks the rule, and an alias
+    /// whose target names no regular file, are not in the result. The call
+    /// does not open a ref entry that is a FIFO, a socket, or a device file,
+    /// and such an entry is not in the result. An entry that changes into
+    /// such a file before its open is not in the result, and its open does
+    /// not wait for a writer.
     ///
     /// # Collection refs
     ///
@@ -841,7 +859,9 @@ impl Repo {
     /// group of the item in the namespace of `ID`. The call skips a
     /// collection whose group gives no `r` before it reads the directory. It
     /// also skips a name that is not UTF-8, and an entry that is no
-    /// directory. A directory whose name fails the collection-id rule goes to
+    /// directory. A symlink at the top level fails the call with
+    /// [`Error::InvalidFormat`]. A directory whose name fails the
+    /// collection-id rule goes to
     /// `invalid_dirs`, and the call reads no entry in it. The call skips the
     /// directory of an id that no positive pattern can reach, or that a
     /// negative pattern covers, before it reads the rights of the id. The
@@ -879,13 +899,26 @@ impl Repo {
         ostrya_rt::unblock(move || {
             let mut floor = SelectionFloor::new(cap);
             let mut selection = RefSelection::default();
-            collect_local_selected(&repo, &refs, &access, &mut floor, &mut selection)?;
+            let reads_local = !selects_no_name(&refs) && access.reads_local_refs();
+            let refs_dir = if reads_local || collections.is_some() {
+                open_refs(&repo)?
+            } else {
+                None
+            };
+            collect_local_selected(
+                &repo,
+                refs_dir.as_ref(),
+                &refs,
+                &access,
+                &mut floor,
+                &mut selection,
+            )?;
             if let Some(collections) = &collections
-                && let Some(mirrors) = open_refs_dir(&repo, MIRRORS_DIR)?
+                && let Some(mirrors) = open_top_in(refs_dir.as_ref(), MIRRORS_DIR)?
             {
                 collect_collections_selected(
                     &repo,
-                    mirrors.as_fd(),
+                    &mirrors,
                     collections,
                     &access,
                     &mut floor,
@@ -902,16 +935,17 @@ impl Repo {
     /// The remote refs are under `refs/remotes`. The first path component
     /// below `refs/remotes` is the remote name, so the refspec of each ref is
     /// `remote:name`. A file directly under `refs/remotes` names no remote,
-    /// and the result does not hold it. A ref entry that is a FIFO, a socket,
-    /// or a device file is not in the result. The call does not open such an
-    /// entry, so its permissions have no effect on the call. An alias to such
-    /// a file is not in the result. The call checks the type of each file that
-    /// it opens, and an open does not wait for a writer. An open that the
-    /// permissions refuse fails the call, also at the target of an alias.
+    /// and the result does not hold it. The call reads the refs
+    /// and the aliases by the rules of [`list_refs`](Repo::list_refs). An
+    /// alias that breaks the alias rule, an alias whose target names no ref,
+    /// and a ref entry that is a FIFO, a socket, or a device file are not in
+    /// the result.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if `refs`, `refs/remotes`, or an entry directly
+    ///   under `refs/remotes` is a symlink.
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_remote_refs(&self) -> Result<Vec<(String, Checksum)>> {
@@ -926,13 +960,11 @@ impl Repo {
     /// The mirror refs are under `refs/mirrors`. The first path component
     /// below `refs/mirrors` is the collection id. The rest of the path is the
     /// ref name, which can contain `/`. A file directly under `refs/mirrors`
-    /// has no collection id, and the result does not hold it. A ref entry
-    /// that is a FIFO, a socket, or a device file is not in the result. The
-    /// call does not open such an entry, so its permissions have no effect on
-    /// the call. An alias to such a file is not in the result. The call checks
-    /// the type of each file that it opens, and an open does not wait for a
-    /// writer. An open that the permissions refuse fails the call, also at the
-    /// target of an alias.
+    /// has no collection id, and the result does not hold it.
+    /// The call reads the refs and the aliases by the rules of
+    /// [`list_refs`](Repo::list_refs). An alias that breaks the alias rule,
+    /// an alias whose target names no ref, and a ref entry that is a FIFO, a
+    /// socket, or a device file are not in the result.
     ///
     /// The result holds the refs of `refs/mirrors/ID/` of the
     /// `[core] collection-id` of the repository. The ref resolve, the
@@ -942,12 +974,17 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if `refs`, `refs/mirrors`, or an entry directly
+    ///   under `refs/mirrors` is a symlink.
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_mirror_refs(&self) -> Result<Vec<(String, String, Checksum)>> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || collect_mirrors(&repo, &|_| false, &|_| true)).await
+        ostrya_rt::unblock(move || {
+            collect_mirrors(&repo, open_refs(&repo)?.as_ref(), &|_| false, &|_| true)
+        })
+        .await
     }
 
     /// Returns the collection-qualified refs, sorted by collection id and ref
@@ -975,12 +1012,10 @@ impl Repo {
     /// same pair. Among remotes with the same pair, the first remote in the
     /// byte order of the names wins.
     ///
-    /// A ref entry that is a FIFO, a socket, or a device file is not in the
-    /// result. The call does not open such an entry, so its permissions have
-    /// no effect on the call. An alias to such a file is not in the result.
-    /// The call checks the type of each file that it opens, and an open does
-    /// not wait for a writer. An open that the permissions refuse fails the
-    /// call, also at the target of an alias.
+    /// The call reads the refs and the aliases by the rules of
+    /// [`list_refs`](Repo::list_refs). An alias that breaks the alias rule,
+    /// an alias whose target names no ref, and a ref entry that is a FIFO, a
+    /// socket, or a device file are not in the result.
     ///
     /// [`list_collection_refs_in`](Repo::list_collection_refs_in) lists the
     /// refs of one collection that a selector selects. It does not read
@@ -988,7 +1023,10 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if `refs`, `refs/heads`, `refs/remotes`,
+    ///   `refs/mirrors`, an entry directly under `refs/mirrors`, or the
+    ///   directory `refs/remotes/R` of a remote of the result is a symlink.
     /// - [`Error::Core`] if a ref file holds no checksum.
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_collection_refs(&self) -> Result<Vec<CollectionRefEntry>> {
@@ -1056,21 +1094,22 @@ impl Repo {
     /// - Each other collection id lists the refs of `refs/mirrors/ID/` alone.
     ///   With no directory `refs/mirrors/ID/`, the result is an empty vector.
     ///
-    /// The call opens `refs/mirrors/ID` with no symlink followed. An entry
-    /// `ID` that is absent, a regular file, or a symlink is no directory
-    /// `refs/mirrors/ID/`, and so is each entry `ID` when `refs/mirrors` is
-    /// absent. When the call opens `refs/mirrors`, a `refs/mirrors` that is a
-    /// regular file gives an error. The call reads `[core] collection-id`
-    /// from the config that the handle read at the open.
+    /// The call opens `refs/`, `refs/mirrors`, and `refs/mirrors/ID` with no
+    /// symlink followed. An entry `ID` that is absent or a regular file is no
+    /// directory `refs/mirrors/ID/`, and so is each entry `ID` when
+    /// `refs/mirrors` is absent. A symlink at `ID` fails the call. When the
+    /// call opens `refs/mirrors`, a `refs/mirrors` that is a regular file
+    /// gives an error. The call reads `[core] collection-id` from the config
+    /// that the handle read at the open.
     ///
-    /// An alias resolves by the rule of the ref listing: its body is a
-    /// relative path, and it names a regular file under `refs/heads/` or
-    /// under `refs/mirrors/ID/` of a valid collection id other than `[core]
-    /// collection-id` with one link. The result holds the alias by its own
-    /// name, with the commit of the target. An alias whose target is absent,
-    /// is outside these directories, or is an alias is not in the result.
-    /// A ref entry that is a FIFO or a socket at the open is not in the
-    /// result, and its open does not wait for a writer.
+    /// An alias resolves by the alias rule of
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip), and it names a regular
+    /// file under `refs/heads/` or under `refs/mirrors/ID/` of a valid
+    /// collection id other than `[core] collection-id`. The result holds the
+    /// alias by its own name, with the commit of the target. An alias whose
+    /// target is absent, is outside these directories, or is an alias is not
+    /// in the result. The call does not open a ref entry that is a FIFO, a
+    /// socket, or a device file, and such an entry is not in the result.
     ///
     /// The call does not check a name that it finds against the ref-name
     /// rule. A wildcard of `refs` selects a name that the rule refuses.
@@ -1109,11 +1148,13 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if the collection id does not pass
     ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
     ///   bytes. The error holds the collection id. The call reads no file.
-    /// - [`Error::InvalidFormat`] if a selected ref file is not UTF-8.
+    /// - [`Error::InvalidFormat`] if a selected ref file is not UTF-8 or is
+    ///   larger than 4096 bytes, if `refs`, `refs/mirrors`, or
+    ///   `refs/mirrors/ID` that the call opens is a symlink, or if
+    ///   `refs/mirrors` is a regular file.
     /// - [`Error::Core`] if a selected ref file holds no checksum.
-    /// - [`Error::Io`] if a read fails, for example if `refs/mirrors` that
-    ///   the call opens is a regular file, or if a directory that the call
-    ///   reads gives no read permission.
+    /// - [`Error::Io`] if a read fails, for example if a directory that the
+    ///   call reads gives no read permission.
     pub async fn list_collection_refs_in(
         &self,
         collection_id: &str,
@@ -1157,14 +1198,14 @@ impl Repo {
             };
             // The walk opens `refs/mirrors/ID` by its name, so the call does
             // not read the names of `refs/mirrors`.
-            let Some(mirrors) = open_refs_dir(&repo, MIRRORS_DIR)? else {
+            let Some(mirrors) = open_ref_top(&repo, MIRRORS_DIR)? else {
                 return Ok(Vec::new());
             };
             let mut floor = SelectionFloor::new(None);
             let mut selection = RefSelection::default();
             collect_collection_selected(
                 &repo,
-                mirrors.as_fd(),
+                &mirrors,
                 &CollectionWalk::new(&collections),
                 &id,
                 rules,
@@ -1203,7 +1244,13 @@ impl Repo {
         let repo = self.clone();
         let skip = skip.map(str::to_owned);
         let mirrors = ostrya_rt::unblock(move || {
-            collect_mirrors(&repo, &|path| Some(path) == skip.as_deref(), &|_| true)
+            let refs = open_refs(&repo)?;
+            collect_mirrors(
+                &repo,
+                refs.as_ref(),
+                &|path| Some(path) == skip.as_deref(),
+                &|_| true,
+            )
         })
         .await?;
         for (collection, name, commit) in mirrors {
@@ -1227,6 +1274,8 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] if `refs`, `refs/heads`, `refs/remotes`, or
+    ///   an entry directly under `refs/remotes` is a symlink.
     /// - [`Error::Io`] if a read from the file system fails.
     pub async fn list_ref_aliases(&self) -> Result<Vec<RefAlias>> {
         let repo = self.clone();
@@ -1238,27 +1287,37 @@ impl Repo {
     /// Checks a path below `refs/` for a component that is not a directory.
     ///
     /// `relpath` is relative to `refs/`, as a listing prefix names it. The
-    /// call fails for one condition only: a component before the last one is
-    /// not a directory (`ENOTDIR`). This condition ends a listing.
+    /// call fails for two conditions: a component before the last one is not
+    /// a directory (`ENOTDIR`), or is a symlink. Each condition ends a
+    /// listing.
     ///
     /// If the path names nothing, the call returns `Ok(())`, because a prefix
     /// that matches no ref lists nothing. Each other failure of the check also
-    /// returns `Ok(())`, and the prefix then filters the listing. The call
-    /// does not follow the last component, so a path that names an alias is
-    /// the link itself.
+    /// returns `Ok(())`, and the prefix then filters the listing. The check
+    /// follows no symlink, and does not follow the last component, so a path
+    /// that names an alias is the link itself, and the call returns `Ok(())`.
     ///
     /// # Errors
     ///
     /// - [`Error::Io`] with `ENOTDIR` if a component before the last one is
     ///   not a directory.
+    /// - [`Error::InvalidFormat`] with the text `passes through a symlink` if
+    ///   `refs` or a component before the last one is a symlink.
     pub async fn check_refs_path(&self, relpath: &str) -> Result<()> {
         let path = format!("refs/{relpath}");
         let repo = self.clone();
-        ostrya_rt::unblock(move || {
-            match rustix::fs::statat(repo.repo_fd(), &path, AtFlags::SYMLINK_NOFOLLOW) {
-                Err(Errno::NOTDIR) => Err(Error::Io(Errno::NOTDIR.into())),
-                _ => Ok(()),
-            }
+        ostrya_rt::unblock(move || match repo.root_dir().exists(&path) {
+            Err(FsError::Invalid {
+                reason: Reason::NotDirectory,
+                ..
+            }) => Err(Error::Io(Errno::NOTDIR.into())),
+            Err(
+                e @ FsError::Invalid {
+                    reason: Reason::Symlink,
+                    ..
+                },
+            ) => Err(e.into()),
+            _ => Ok(()),
         })
         .await
     }
@@ -1288,46 +1347,55 @@ impl Repo {
     ///   the open.
     ///
     /// A ref can also be an alias: a relative symlink to the file of another
-    /// ref. A read follows the link and reads the checksum of the target ref.
-    /// The call does not write or remove an alias. To remove an alias, use
+    /// ref. A read resolves the link by the alias rule of
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip), and reads the checksum of
+    /// the target ref. The call does not write or remove an alias. To remove
+    /// an alias, use
     /// [`remove_ref_alias_immediate`](Repo::remove_ref_alias_immediate).
     /// [`Ref::validate`] checks each component of the ref against the
     /// ref-name rule, so a ref path stays inside `refs/`. If a directory of
     /// `refs/mirrors/` has a name that fails the rule, a ref under it cannot
     /// be written or removed through this call. Remove such a ref by hand.
     ///
-    /// A read also follows a symlink above the ref. A write or a removal
-    /// refuses a symlink above the ref, from the repository root down. Under
-    /// the update lock, before the write, the call opens the directory of the
-    /// ref with `openat2`, `RESOLVE_BENEATH`, and `RESOLVE_NO_SYMLINKS`. The
-    /// open has no fallback. On a kernel without `openat2`, the call fails
-    /// with [`Error::Io`]. The write itself resolves the path by name. A
-    /// writer that does not take the update lock can put a symlink above the
-    /// ref after the check, and the write can then go through that symlink.
+    /// A read, a write, and a removal follow no symlink above the ref, from
+    /// the repository root down. Each open of a path in the repository is one
+    /// `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. The open has
+    /// no fallback. On a kernel without `openat2`, the call fails with
+    /// [`Error::Io`]. Under the update lock, before the write, the call reads
+    /// the type of the entry at the path of the ref. The write itself opens
+    /// the directory of the ref with no symlink followed, and the rename of
+    /// the temp file is relative to that directory. So a symlink that a
+    /// writer puts above the ref after the check fails the write, and the
+    /// write never goes through it.
     ///
     /// The call creates the missing parent directories of a name with `/` in
     /// it. It requests mode `0777` for them, which the umask reduces. In a
     /// `bare-user-shared` repository, each directory that the call creates
-    /// gets mode `02770`.
+    /// gets mode `02770`. A file or a symlink at a component of the path
+    /// fails the write. If `refs/` is absent, the call makes it with the
+    /// directories `heads`, `remotes`, and `mirrors`, as the create of a
+    /// repository makes them.
     ///
     /// # Durability
     ///
-    /// The write is atomic. The call writes the content to a new temp file in
-    /// the `tmp/` directory of the repository. Then it renames the temp file
-    /// over the ref file. No temp entry is under `refs/`, so a listing never
-    /// reads one.
+    /// The write is atomic. The call writes the content to a new temp file
+    /// `.ostrya-tmp-<pid>-XXXXXX` in the `tmp/` directory of the repository.
+    /// Then it renames the temp file over the ref file. No temp entry is under
+    /// `refs/`, so a listing never reads one.
     ///
     /// If `tmp/` is on a different file system, the rename fails with
     /// `EXDEV`, and the call removes the temp file.
     ///
     /// If `[core] fsync` is on:
     ///
-    /// - The call runs `fdatasync` on the temp file before the rename.
+    /// - The call sets the mode of the temp file, and then runs `fsync` on it
+    ///   before the rename.
+    /// - When the call creates a parent directory, it runs `fsync` at once on
+    ///   the directory that holds the new directory. It creates the
+    ///   directories from the top down, so the full path of the name is
+    ///   durable, and not only the last entry.
     /// - After the rename, the call runs `fsync` on the directory that holds
     ///   the ref, so the name is durable together with the content.
-    /// - If the call created parent directories, it also runs `fsync` on the
-    ///   directory that holds each created directory, deepest first. So the
-    ///   full path of the name is durable, and not only the last entry.
     ///
     /// A removal and an alias write have no content of their own, so they sync
     /// directories only. A write that fails still syncs the directories that it
@@ -1351,12 +1419,16 @@ impl Repo {
     ///   error holds the text of the ref, and the call writes nothing.
     /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
     ///   call writes nothing, and the alias stays. The call gives the same
-    ///   error, with the reason `passes through an alias`, if a component
-    ///   above the ref is a symlink, also a dangling one. It then writes
-    ///   nothing through the symlink.
+    ///   error, with the reason `passes through an alias`, if `refs` or a
+    ///   component above the ref is a symlink, also a dangling one. It then
+    ///   writes nothing through the symlink.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
-    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`,
+    ///   if a file is at a directory component of the path, if a symlink is
+    ///   at `tmp`, or if a writer puts a symlink at a component of the path
+    ///   after the check of the path. The call then writes nothing through
+    ///   the symlink.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
@@ -1424,12 +1496,13 @@ impl Repo {
             .collect::<Result<Vec<_>>>()?;
         let fsync = self.config().fsync()?;
         self.write_locked(move |repo| {
-            check_resolved_refs_blocking(repo.repo_fd(), &resolved)?;
+            let root = repo.root_dir();
+            check_resolved_refs_blocking(root, &resolved)?;
             let mut dirs = Vec::new();
-            let removed = resolved.iter().try_for_each(|r| {
-                remove_ref_blocking(repo.repo_fd(), &r.relpath, fsync, &mut dirs)
-            });
-            removed.and(sync_ref_dirs(repo.repo_fd(), dirs))
+            let removed = resolved
+                .iter()
+                .try_for_each(|r| remove_ref_blocking(root, &r.relpath, fsync, &mut dirs));
+            removed.and(sync_ref_dirs(root, dirs))
         })
         .await
     }
@@ -1441,10 +1514,9 @@ impl Repo {
         checksum: Option<&Checksum>,
     ) -> Result<()> {
         let fsync = self.config().fsync()?;
-        let repo_mode = self.mode();
         let checksum = checksum.copied();
         self.write_locked(move |repo| {
-            write_ref_blocking(repo.repo_fd(), &name, &relpath, checksum, fsync, repo_mode)
+            write_ref_blocking(repo.root_dir(), &name, &relpath, checksum, fsync)
         })
         .await
     }
@@ -1457,34 +1529,52 @@ impl Repo {
     /// either ref to exist, because the link records a name and not a
     /// checksum.
     ///
-    /// The write is atomic: the call creates the link under a temp name in
-    /// `tmp/` and renames it over the ref path. If `[core] fsync` is on, the
-    /// call runs `fsync` on the directory that holds the link. It also runs
-    /// `fsync` on the directory that holds each parent directory that the
-    /// call created. The locks are those of
+    /// An alias names a ref file. Under the update lock, the call reads the
+    /// type of the entry at the path of `target` with no symlink followed,
+    /// and refuses an alias whose target is an alias. An absent target, and a
+    /// target whose path passes through a ref file, are allowed. The call
+    /// checks the new alias alone: an alias write over a ref file that other
+    /// aliases name makes these aliases name an alias, and they then name no
+    /// ref.
+    ///
+    /// The write is atomic: the call creates the link under a temp name
+    /// `.ostrya-tmp-<pid>-XXXXXX` in `tmp/` and renames it over the ref path.
+    /// The rules of the path and of the parent directories are those of
+    /// [`set_ref_immediate`](Repo::set_ref_immediate). If `[core] fsync` is
+    /// on, the call runs `fsync` on the directory that holds each parent
+    /// directory that it creates, at once, and on the directory that holds the
+    /// link. The locks are those of
     /// [`set_ref_immediate`](Repo::set_ref_immediate).
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
     ///   refspec.
-    /// - [`Error::RefNotWritable`] if a component above the path of
-    ///   `refspec` is a symlink, also a dangling one. The reason is `passes
-    ///   through an alias`, and the call writes nothing.
+    /// - [`Error::RefNotWritable`] if `refs` or a component above the path
+    ///   of `refspec` is a symlink, also a dangling one. The reason is
+    ///   `passes through an alias`, and the call writes nothing.
+    /// - [`Error::RefNotWritable`] for `refspec` if `target` names an alias,
+    ///   or names the path of `refspec` itself. The reason is `targets an
+    ///   alias`, and the call writes nothing. If `refs` or a component above
+    ///   the path of `target` is a symlink, the reason is `passes through an
+    ///   alias`.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
-    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`,
+    ///   if a file is at a directory component of the path, if a symlink is
+    ///   at `tmp`, or if a writer puts a symlink at a component of the path
+    ///   after the check of the path. The call then writes nothing through
+    ///   the symlink.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()> {
         let fsync = self.config().fsync()?;
-        let repo_mode = self.mode();
         let relpath = refspec_to_relpath(refspec)?;
-        let link = relative_link(&relpath, &refspec_to_relpath(target)?);
+        let target = refspec_to_relpath(target)?;
         let name = refspec.to_owned();
         self.write_locked(move |repo| {
-            write_alias_blocking(repo.repo_fd(), &name, &relpath, &link, fsync, repo_mode)
+            write_alias_blocking(repo.root_dir(), &name, &relpath, &target, fsync)
         })
         .await
     }
@@ -1514,9 +1604,10 @@ impl Repo {
         let relpath = refspec_to_relpath(refspec)?;
         let name = refspec.to_owned();
         self.write_locked(move |repo| {
+            let root = repo.root_dir();
             let mut dirs = Vec::new();
-            let removed = remove_alias_blocking(repo.repo_fd(), &name, &relpath, fsync, &mut dirs);
-            removed.and(sync_ref_dirs(repo.repo_fd(), dirs))
+            let removed = remove_alias_blocking(root, &name, &relpath, fsync, &mut dirs);
+            removed.and(sync_ref_dirs(root, dirs))
         })
         .await
     }
@@ -1669,16 +1760,23 @@ pub(crate) fn relative_link(from_relpath: &str, to_relpath: &str) -> String {
 }
 
 /// Collects each ref under `refs/heads` and its subdirectories whose name
-/// `keep` selects. The walk applies `keep` to the name before it reads the
-/// ref file.
-fn collect_heads(repo: &Repo, keep: &dyn Fn(&str) -> bool) -> Result<Vec<(String, Checksum)>> {
-    let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
+/// `keep` selects. `refs` is the handle of `refs/` that [`open_refs`] gives.
+/// The walk applies `keep` to the name before it reads the ref file.
+fn collect_heads(
+    repo: &Repo,
+    refs: Option<&RepoDir>,
+    keep: &dyn Fn(&str) -> bool,
+) -> Result<Vec<(String, Checksum)>> {
+    let Some(heads) = open_top_in(refs, HEADS_DIR)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    walk_ref_dir(heads.as_fd(), "", &mut |entry| {
-        if keep(entry.path) {
-            push_head(&mut out, &entry)?;
+    walk_ref_dir(&heads, "", &mut |entry| {
+        if !keep(entry.path) {
+            return Ok(());
+        }
+        if let Some((bytes, _)) = read_listed_ref(repo.root_dir(), HEADS_DIR, &entry, None)? {
+            out.push((entry.path.to_owned(), parse_ref_content(&bytes)?));
         }
         Ok(())
     })?;
@@ -1690,6 +1788,9 @@ pub(crate) const HEADS_DIR: &str = "refs/heads";
 
 /// The directory of the mirror refs, one subdirectory for each collection id.
 pub(crate) const MIRRORS_DIR: &str = "refs/mirrors";
+
+/// The directory of the remote refs, one subdirectory for each remote.
+pub(crate) const REMOTES_DIR: &str = "refs/remotes";
 
 /// The refs of one ref listing, which [`Repo::select_refs`] returns.
 #[derive(Default)]
@@ -1761,12 +1862,13 @@ impl RefSelection {
 }
 
 /// Returns the local refs that `selector` selects and `access` reads, sorted
-/// by name, each one time: the refs of `refs/heads`. When `access` reads no
-/// local ref, or when `selector` selects no name, the call does not open
-/// `refs/heads`. The call adds each ref to `floor`, and the refs and their
+/// by name, each one time: the refs of `refs/heads`. `refs` is the handle of
+/// `refs/` that [`open_refs`] gives. When `access` reads no local ref, or
+/// when `selector` selects no name, the call does not open `refs/heads`. The call adds each ref to `floor`, and the refs and their
 /// alias targets to `selection`.
 fn collect_local_selected(
     repo: &Repo,
+    refs: Option<&RepoDir>,
     selector: &RefSelector,
     access: &ReadAccess,
     floor: &mut SelectionFloor,
@@ -1776,16 +1878,9 @@ fn collect_local_selected(
         return Ok(());
     }
     let mut local = BTreeMap::new();
-    if let Some(heads) = open_refs_dir(repo, HEADS_DIR)? {
+    if let Some(heads) = open_top_in(refs, HEADS_DIR)? {
         collect_dir_selected(
-            repo,
-            HEADS_DIR,
-            heads.as_fd(),
-            selector,
-            access,
-            floor,
-            &mut local,
-            selection,
+            repo, HEADS_DIR, &heads, selector, access, floor, &mut local, selection,
         )?;
     }
     selection.local = local.into_iter().collect();
@@ -1805,7 +1900,7 @@ fn collect_local_selected(
 fn collect_dir_selected(
     repo: &Repo,
     root: &str,
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     selector: &RefSelector,
     access: &ReadAccess,
     floor: &mut SelectionFloor,
@@ -1822,7 +1917,8 @@ fn collect_dir_selected(
         {
             return Ok(());
         }
-        if let Some((bytes, target)) = read_listed_ref(repo, root, &entry, access)? {
+        if let Some((bytes, target)) = read_listed_ref(repo.root_dir(), root, &entry, Some(access))?
+        {
             let commit = parse_ref_content(&bytes)?;
             floor.add_ref(entry.path)?;
             out.insert(entry.path.to_owned(), commit);
@@ -1852,10 +1948,12 @@ fn collect_dir_selected(
 /// directory of each collection that a positive pattern can reach and whose
 /// group gives `r`, and no other directory. The own collection id is not a
 /// collection of the map. A name that is not UTF-8 and an entry at the top
-/// level that is no directory are skipped.
+/// level that is not a directory or a symlink are skipped. A symlink at the
+/// top level fails the call with [`Error::InvalidFormat`] and the text
+/// `passes through a symlink`.
 fn collect_collections_selected(
     repo: &Repo,
-    mirrors: BorrowedFd<'_>,
+    mirrors: &RepoDir,
     selector: &RefSelector,
     access: &ReadAccess,
     floor: &mut SelectionFloor,
@@ -1866,19 +1964,24 @@ fn collect_collections_selected(
     // The rules of each collection that the walk can reach and the client
     // can read, computed one time for the listing.
     let mut readable = BTreeMap::new();
-    for name in read_dir_names(mirrors)? {
-        if Some(name.as_str()) == own {
+    for entry in mirrors.list()? {
+        let Ok(name) = String::from_utf8(entry.name) else {
+            continue;
+        };
+        if entry.file_type == FileType::Symlink {
+            return Err(FsError::Invalid {
+                path: format!("{MIRRORS_DIR}/{name}"),
+                reason: Reason::Symlink,
+            }
+            .into());
+        }
+        if Some(name.as_str()) == own || entry.file_type != FileType::Directory {
             continue;
         }
         if !ostrya_core::is_valid_collection_id(&name) {
-            if ref_entry_type(mirrors, &name)? == Some(FileType::Directory) {
-                selection.invalid_dirs.push(name);
-            }
+            selection.invalid_dirs.push(name);
             continue;
         }
-        // The walk opens the directory of each id of `readable` with no
-        // symlink followed, and skips an entry that is no directory, so the
-        // loop reads no type of the entry.
         if !walk.reaches(&name) {
             continue;
         }
@@ -1901,6 +2004,7 @@ fn collect_collections_selected(
 /// target paths of their aliases. The call walks the directory `id` of
 /// `mirrors`, the open `refs/mirrors`, with [`CollectionWalk::walk`]. Except
 /// to read the target of an alias, it opens no other directory of `mirrors`.
+/// A symlink at `id` fails the call.
 /// It applies the negative patterns of the walk and `rules` to a name before
 /// it reads the ref file. An alias resolves only when `access` reads its
 /// target path. The call adds each ref to `floor`, and the collection when it
@@ -1908,7 +2012,7 @@ fn collect_collections_selected(
 #[allow(clippy::too_many_arguments)]
 fn collect_collection_selected(
     repo: &Repo,
-    mirrors: BorrowedFd<'_>,
+    mirrors: &RepoDir,
     walk: &CollectionWalk<'_>,
     id: &str,
     rules: &AccessRules,
@@ -1933,7 +2037,9 @@ fn collect_collection_selected(
         {
             return Ok(());
         }
-        if let Some((bytes, target)) = read_listed_ref(repo, MIRRORS_DIR, &entry, access)? {
+        if let Some((bytes, target)) =
+            read_listed_ref(repo.root_dir(), MIRRORS_DIR, &entry, Some(access))?
+        {
             let commit = parse_ref_content(&bytes)?;
             if names.is_empty() {
                 floor.add_collection(id)?;
@@ -1963,7 +2069,7 @@ fn collect_collection_selected(
 /// gets each entry. The walk does not read a directory that a negative
 /// pattern covers. `take` applies the negative patterns.
 fn walk_selected(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     selector: &RefSelector,
     take: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
@@ -1991,7 +2097,7 @@ fn walk_selected(
 /// directory that a deny item of `rules` covers, or for whose path `skip`
 /// returns `true`. `take` applies the rules.
 fn walk_readable(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     rules: &AccessRules,
     skip: &dyn Fn(&str) -> bool,
     take: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
@@ -2083,21 +2189,30 @@ impl<'a> CollectionWalk<'a> {
     /// [`walk_selected`] walks a directory, and gives `take` each entry as
     /// `id/NAME`. The walk does not read the top level of `mirrors`. With no
     /// positive pattern, it walks as [`walk_readable`] walks for `rules`, the
-    /// rules of the collection.
+    /// rules of the collection. An absent `id` and a file at `id` give no
+    /// entry, and a symlink at `id` fails the walk.
     fn walk(
         &self,
-        mirrors: BorrowedFd<'_>,
+        mirrors: &RepoDir,
         id: &str,
         rules: &AccessRules,
         take: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
     ) -> Result<()> {
         let skip = |dir: &str| dir_is_covered(&self.covers, dir);
-        let Some(sub) = open_ref_subdir(mirrors, id)? else {
-            return Ok(());
+        let sub = match mirrors.open_dir(id) {
+            Ok(sub) => sub,
+            Err(
+                FsError::Absent { .. }
+                | FsError::Invalid {
+                    reason: Reason::NotDirectory,
+                    ..
+                },
+            ) => return Ok(()),
+            Err(e) => return Err(e.into()),
         };
         if self.selector.positive().is_empty() {
             let skip = |dir: &str| skip(&format!("{id}/{dir}"));
-            return walk_readable(sub.as_fd(), rules, &skip, &mut |entry| {
+            return walk_readable(&sub, rules, &skip, &mut |entry| {
                 let path = format!("{id}/{}", entry.path);
                 take(RefEntry {
                     path: &path,
@@ -2113,7 +2228,7 @@ impl<'a> CollectionWalk<'a> {
             }
             match parts.split_first() {
                 Some((&"**", _)) => {
-                    walk_ref_dir_skipping(sub.as_fd(), id, &skip, &mut |entry| {
+                    walk_ref_dir_skipping(&sub, id, &skip, &mut |entry| {
                         if pattern.matches(entry.path) {
                             take(entry)
                         } else {
@@ -2125,7 +2240,7 @@ impl<'a> CollectionWalk<'a> {
                 None => {}
             }
         }
-        walk_ref_patterns(sub.as_fd(), id, &below, &skip, take)
+        walk_ref_patterns(&sub, id, &below, &skip, take)
     }
 }
 
@@ -2157,105 +2272,74 @@ fn negative_covers(selector: &RefSelector) -> Vec<Vec<&str>> {
 }
 
 /// Reads the ref of the entry `entry` of a ref-tree walk of the directory
-/// `root` under `refs/` for the listing of `access`, or returns `None`.
+/// `top` under `refs/`, or returns `None`. `root` is the handle of the
+/// repository root.
 ///
 /// The result holds the bytes of the ref file, and the target path of an
-/// alias. An alias goes to [`read_alias_ref`]. The call opens each other
-/// entry with [`walk`], so the open follows no symlink and does not wait for
-/// a writer. An entry that is an alias at the open goes to `read_alias_ref`,
-/// as the ref-tree walk sends an alias. An entry removed after the ref-tree
-/// walk read its type gives `None`. An entry that is a FIFO or a socket at
-/// the open gives `None`.
-fn read_listed_ref(
-    repo: &Repo,
-    root: &str,
-    entry: &RefEntry<'_>,
-    access: &ReadAccess,
-) -> Result<Option<(Vec<u8>, Option<String>)>> {
-    let alias = || -> Result<Option<(Vec<u8>, Option<String>)>> {
-        Ok(read_alias_ref(repo, root, entry, access)?.map(|(bytes, target)| (bytes, Some(target))))
-    };
-    if entry.file_type == FileType::Symlink {
-        return alias();
-    }
-    match walk(entry.dir, entry.name, false)? {
-        Walked::File(file, _) => {
-            let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
-            file.take(REF_READ_CAP).read_to_end(&mut buf)?;
-            Ok(Some((buf, None)))
-        }
-        Walked::NotFound => Ok(None),
-        Walked::Refused | Walked::Alias(_) => alias(),
-    }
-}
-
-/// Reads the ref that the alias `entry` of a walk of the directory `root`
-/// under `refs/` names, or returns `None`. The result holds the bytes of the
-/// ref file and the target path.
+/// alias. The call does not open an entry that is not a regular file or a
+/// symlink, so its open never waits on a FIFO. It reads a regular file with
+/// [`read_ref_entry`], which follows no symlink. An entry that is removed,
+/// or that is no regular file at the open, gives `None`.
 ///
-/// The body of the alias resolves by the rule of the archive view. The
-/// result is `None` when the body breaks that rule, when `access` does not
-/// read the target path, and when the target is no regular file. The path of
-/// the target gives its namespace. The read of the target follows no
-/// symlink.
-fn read_alias_ref(
-    repo: &Repo,
-    root: &str,
+/// A symlink entry is an alias. Its body resolves against the directory of
+/// the entry under `top`, with [`resolve_alias`], and the call reads the
+/// target with [`read_alias_target`]. With `access`, the alias resolves
+/// only when `access` reads the target path. An alias that breaks the alias
+/// rule, and an alias whose target names no ref, give `None`.
+///
+/// A ref file or an alias target larger than [`REF_READ_CAP`] fails the call
+/// with [`Error::InvalidFormat`].
+pub(crate) fn read_listed_ref(
+    root: &RepoDir,
+    top: &str,
     entry: &RefEntry<'_>,
-    access: &ReadAccess,
-) -> Result<Option<(Vec<u8>, String)>> {
-    let body = match rustix::fs::readlinkat(entry.dir, entry.name, Vec::new()) {
-        Ok(body) => body,
-        // The entry was removed after the walk read its type.
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(Error::Io(e.into())),
+    access: Option<&ReadAccess>,
+) -> Result<Option<(Vec<u8>, Option<String>)>> {
+    if !entry.can_hold_ref() {
+        return Ok(None);
+    }
+    let symlink = entry.file_type == FileType::Symlink;
+    let body = match read_ref_entry(entry.dir, entry.name, symlink) {
+        Ok(RefEntryRead::File(bytes)) => return Ok(Some((bytes, None))),
+        Ok(RefEntryRead::Alias(body)) => body,
+        // The entry is gone, or it changed into an entry that holds no ref.
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::NotRegular(_) | Reason::NotDirectory,
+                ..
+            },
+        ) => return Ok(None),
+        Err(e) => return Err(e.into()),
     };
     let link_dir = match entry.path.rsplit_once('/') {
-        Some((dir, _)) => format!("{root}/{dir}"),
-        None => root.to_owned(),
+        Some((dir, _)) => format!("{top}/{dir}"),
+        None => top.to_owned(),
     };
-    let Some(target) = resolve_alias(&link_dir, body.as_bytes()) else {
+    let Some(target) = resolve_alias(&link_dir, &body) else {
         return Ok(None);
     };
-    if !access.can_read_path(&target) {
+    if access.is_some_and(|access| !access.can_read_path(&target)) {
         return Ok(None);
     }
-    match walk(repo.repo_fd(), &target, false)? {
-        Walked::File(file, _) => {
-            let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
-            file.take(REF_READ_CAP).read_to_end(&mut buf)?;
-            Ok(Some((buf, target)))
-        }
-        Walked::NotFound | Walked::Refused | Walked::Alias(_) => Ok(None),
+    match read_alias_target(root, &target)? {
+        AliasTarget::Ref(bytes) => Ok(Some((bytes, Some(target)))),
+        AliasTarget::Absent | AliasTarget::Broken(_) => Ok(None),
     }
-}
-
-/// Reads the ref entry `entry` of a walk of `refs/heads` and adds it to
-/// `out`. An alias resolves to the commit of its target, and a dangling alias
-/// adds nothing.
-fn push_head(out: &mut Vec<(String, Checksum)>, entry: &RefEntry<'_>) -> Result<()> {
-    if !entry.can_hold_ref() {
-        return Ok(());
-    }
-    if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
-        out.push((entry.path.to_owned(), parse_ref_content(&bytes)?));
-    }
-    Ok(())
 }
 
 /// Collects each ref under `refs/remotes`, named by its `remote:name`
 /// refspec. The first path component is the remote, and the rest is the ref
-/// name.
+/// name. A symlink directly under `refs/remotes` fails the walk, as
+/// [`refuse_top_symlink`] states.
 fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
-    let Some(remotes) = open_refs_dir(repo, "refs/remotes")? else {
+    let Some(remotes) = open_ref_top(repo, REMOTES_DIR)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    walk_ref_dir(remotes.as_fd(), "", &mut |entry| {
-        if !entry.can_hold_ref() {
-            return Ok(());
-        }
-        let Some(bytes) = read_ref_file(entry.dir, entry.name)? else {
+    walk_ref_dir(&remotes, "", &mut |entry| {
+        refuse_top_symlink(REMOTES_DIR, &entry)?;
+        let Some((bytes, _)) = read_listed_ref(repo.root_dir(), REMOTES_DIR, &entry, None)? else {
             return Ok(());
         };
         let checksum = parse_ref_content(&bytes)?;
@@ -2272,25 +2356,23 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
 /// Collects each ref under `refs/remotes/R/` of each remote R of `remotes`,
 /// as `(remote, collection_id, ref_name, commit)` tuples. `remotes` maps a
 /// remote name to its collection id. The refs come in the order of the remotes in
-/// the map. A directory `R` that is absent, a regular file, or a symlink
-/// gives no ref.
+/// the map. A directory `R` that is absent or a regular file gives no ref.
+/// A symlink at `R` fails the call.
 fn collect_remote_collections(
     repo: &Repo,
     remotes: &BTreeMap<String, String>,
 ) -> Result<Vec<(String, String, String, Checksum)>> {
-    let Some(dir) = open_refs_dir(repo, "refs/remotes")? else {
+    let Some(dir) = open_ref_top(repo, REMOTES_DIR)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
     for (remote, collection) in remotes {
-        let Some(sub) = open_ref_subdir(dir.as_fd(), remote)? else {
+        let Some(sub) = open_named_ref_dir(&dir, remote)? else {
             continue;
         };
-        walk_ref_dir(sub.as_fd(), "", &mut |entry| {
-            if !entry.can_hold_ref() {
-                return Ok(());
-            }
-            if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
+        let top = format!("{REMOTES_DIR}/{remote}");
+        walk_ref_dir(&sub, "", &mut |entry| {
+            if let Some((bytes, _)) = read_listed_ref(repo.root_dir(), &top, &entry, None)? {
                 let checksum = parse_ref_content(&bytes)?;
                 out.push((
                     remote.clone(),
@@ -2306,12 +2388,15 @@ fn collect_remote_collections(
 }
 
 /// Collects the aliases under `refs/heads` and `refs/remotes`. Each alias
-/// gets the name that the listing of its directory gives a ref.
+/// gets the name that the listing of its directory gives a ref. A symlink
+/// directly under `refs/remotes` fails the call, as [`refuse_top_symlink`]
+/// states.
 fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
     let mut out = Vec::new();
-    if let Some(heads) = open_refs_dir(repo, "refs/heads")? {
-        walk_ref_dir(heads.as_fd(), "", &mut |entry| {
-            if let Some(target) = read_alias_target(&entry)? {
+    let refs = open_refs(repo)?;
+    if let Some(heads) = open_top_in(refs.as_ref(), HEADS_DIR)? {
+        walk_ref_dir(&heads, "", &mut |entry| {
+            if let Some(target) = read_alias_body(&entry)? {
                 out.push(RefAlias {
                     refspec: entry.path.to_owned(),
                     target,
@@ -2320,9 +2405,10 @@ fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
             Ok(())
         })?;
     }
-    if let Some(remotes) = open_refs_dir(repo, "refs/remotes")? {
-        walk_ref_dir(remotes.as_fd(), "", &mut |entry| {
-            if let Some(target) = read_alias_target(&entry)?
+    if let Some(remotes) = open_top_in(refs.as_ref(), REMOTES_DIR)? {
+        walk_ref_dir(&remotes, "", &mut |entry| {
+            refuse_top_symlink(REMOTES_DIR, &entry)?;
+            if let Some(target) = read_alias_body(&entry)?
                 && let Some((remote, ref_name)) = entry.path.split_once('/')
             {
                 out.push(RefAlias {
@@ -2336,38 +2422,74 @@ fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
     Ok(out)
 }
 
-/// Opens one directory under `refs/`. Returns `None` if it does not exist.
-fn open_refs_dir(repo: &Repo, relpath: &str) -> Result<Option<OwnedFd>> {
-    match rustix::fs::openat(
-        repo.repo_fd(),
-        relpath,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(Errno::NOENT) => Ok(None),
-        Err(e) => Err(Error::Io(e.into())),
+/// Opens the directory `top` under the repository root, for example
+/// `refs/heads`, with no symlink followed. `top` is a directory directly
+/// under `refs/`. Returns `None` if `refs/` or `top` is absent.
+///
+/// A symlink at `refs` or at `top` fails with [`Error::InvalidFormat`] and
+/// the text `passes through a symlink`. A file there fails with
+/// [`Error::InvalidFormat`] and the text `is not a directory`.
+pub(crate) fn open_ref_top(repo: &Repo, top: &str) -> Result<Option<RepoDir>> {
+    open_top_in(open_refs(repo)?.as_ref(), top)
+}
+
+/// Opens `refs/` under the repository root with no symlink followed, for a
+/// listing that reads more than one directory under it. Returns `None` if
+/// `refs/` is absent. The errors are those of [`open_ref_top`].
+pub(crate) fn open_refs(repo: &Repo) -> Result<Option<RepoDir>> {
+    Ok(repo.root_dir().open_layout(RepoLayout::Refs).optional()?)
+}
+
+/// Opens the directory `top`, for example `refs/heads`, in `refs`, the
+/// handle that [`open_refs`] gives, as [`open_ref_top`] opens it. Returns
+/// `None` if `refs` is `None` or `top` is absent.
+pub(crate) fn open_top_in(refs: Option<&RepoDir>, top: &str) -> Result<Option<RepoDir>> {
+    let Some(refs) = refs else {
+        return Ok(None);
+    };
+    let name = top.strip_prefix("refs/").unwrap_or(top);
+    Ok(refs.open_dir(name).optional()?)
+}
+
+/// Fails with [`Error::InvalidFormat`] and the text `passes through a
+/// symlink` if `entry`, an entry of a walk of the directory `top`, is a
+/// symlink directly under `top`. `top` is `refs/remotes` or `refs/mirrors`,
+/// where such an entry is a symlinked `refs/remotes/R` or `refs/mirrors/ID`.
+/// The walks of these directories call it for each entry before they read
+/// the entry, so a listing below such a symlink fails.
+pub(crate) fn refuse_top_symlink(top: &str, entry: &RefEntry<'_>) -> Result<()> {
+    if entry.file_type == FileType::Symlink && !entry.path.contains('/') {
+        return Err(FsError::Invalid {
+            path: format!("{top}/{}", entry.path),
+            reason: Reason::Symlink,
+        }
+        .into());
     }
+    Ok(())
 }
 
 /// Collects each ref under `refs/mirrors`, split into its collection id (the
-/// first path component) and its ref name (the rest of the path). The walk
-/// does not read a directory whose path below `refs/mirrors` `skip` selects,
-/// and it does not read an entry whose path `keep` drops.
+/// first path component) and its ref name (the rest of the path). `refs` is
+/// the handle of `refs/` that [`open_refs`] gives. The walk does not read a
+/// directory whose path below `refs/mirrors` `skip` selects, and it does not
+/// read an entry whose path `keep` drops. A symlink directly under
+/// `refs/mirrors` fails the walk, as [`refuse_top_symlink`] states.
 fn collect_mirrors(
     repo: &Repo,
+    refs: Option<&RepoDir>,
     skip: &dyn Fn(&str) -> bool,
     keep: &dyn Fn(&str) -> bool,
 ) -> Result<Vec<(String, String, Checksum)>> {
-    let Some(mirrors) = open_refs_dir(repo, "refs/mirrors")? else {
+    let Some(mirrors) = open_top_in(refs, MIRRORS_DIR)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    walk_ref_dir_skipping(mirrors.as_fd(), "", skip, &mut |entry| {
-        if !keep(entry.path) || !entry.can_hold_ref() {
+    walk_ref_dir_skipping(&mirrors, "", skip, &mut |entry| {
+        refuse_top_symlink(MIRRORS_DIR, &entry)?;
+        if !keep(entry.path) {
             return Ok(());
         }
-        let Some(bytes) = read_ref_file(entry.dir, entry.name)? else {
+        let Some((bytes, _)) = read_listed_ref(repo.root_dir(), MIRRORS_DIR, &entry, None)? else {
             return Ok(());
         };
         let checksum = parse_ref_content(&bytes)?;
@@ -2387,7 +2509,7 @@ fn collect_mirrors(
 /// One entry a ref-tree walk reports.
 pub(crate) struct RefEntry<'a> {
     /// The open directory holding the entry.
-    pub(crate) dir: BorrowedFd<'a>,
+    pub(crate) dir: &'a RepoDir,
     /// The name of the entry in that directory.
     pub(crate) name: &'a str,
     /// The path from the root of the walk to the entry.
@@ -2408,20 +2530,19 @@ impl RefEntry<'_> {
 /// Walks a directory under `refs/`. The walk descends into each subdirectory
 /// and reports each other entry to `visit`.
 ///
-/// The walk classifies entries with `SYMLINK_NOFOLLOW`, so it descends only
-/// into a real directory, and an alias has [`FileType::Symlink`] whatever it
-/// names. The walk reports a link that names a directory and does not
-/// descend into it. A caller that reads it as a ref fails the read with
-/// `EISDIR`, and a caller that reads it as an alias reads the link. The walk
-/// skips a name that is not UTF-8, and a name removed between the directory
-/// read and the classification.
+/// The type of each entry comes from the listing of its directory, read with
+/// no symlink followed, so the walk descends only into a real directory, and
+/// an alias has [`FileType::Symlink`] whatever it names. The walk reports a
+/// link that names a directory and does not descend into it. A caller reads
+/// it as an alias. The walk skips a name that is not UTF-8, and a name
+/// removed before the listing read its type.
 ///
 /// The walk opens a subdirectory with no symlink followed. When the entry is
 /// no directory at the open, the walk reads its type again and reports it
 /// with that type. When the entry is removed, or is a directory again, the
 /// walk skips it.
 pub(crate) fn walk_ref_dir(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     prefix: &str,
     visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
@@ -2431,17 +2552,16 @@ pub(crate) fn walk_ref_dir(
 /// Walks a directory as [`walk_ref_dir`] does, and does not read a
 /// subdirectory when `skip` returns `true` for its path below the top.
 fn walk_ref_dir_skipping(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     prefix: &str,
     skip: &dyn Fn(&str) -> bool,
     visit: &mut impl FnMut(RefEntry<'_>) -> Result<()>,
 ) -> Result<()> {
-    for name in read_dir_names(dir)? {
-        // A name removed between the directory read and the classification
-        // has no type.
-        let Some(mut file_type) = ref_entry_type(dir, &name)? else {
+    for entry in dir.list()? {
+        let Ok(name) = String::from_utf8(entry.name) else {
             continue;
         };
+        let mut file_type = entry.file_type;
         let path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -2451,13 +2571,13 @@ fn walk_ref_dir_skipping(
             if skip(&path) {
                 continue;
             }
-            if let Some(sub) = open_ref_subdir(dir, &name)? {
-                walk_ref_dir_skipping(sub.as_fd(), &path, skip, visit)?;
+            if let Some(sub) = open_walked_dir(dir, &name)? {
+                walk_ref_dir_skipping(&sub, &path, skip, visit)?;
                 continue;
             }
-            // The entry changed after its classification. It takes the type
-            // that it has now.
-            match ref_entry_type(dir, &name)? {
+            // The entry changed after the listing. It takes the type that it
+            // has now.
+            match entry_type(dir, &name)? {
                 Some(now) if now != FileType::Directory => file_type = now,
                 _ => continue,
             }
@@ -2483,7 +2603,7 @@ fn walk_ref_dir_skipping(
 /// patterns below it. Each pattern whose first part is `*` or `**` goes to
 /// `walk_ref_pattern`.
 fn walk_ref_patterns(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     prefix: &str,
     patterns: &[(&RefPattern, &[&str])],
     skip: &dyn Fn(&str) -> bool,
@@ -2503,7 +2623,7 @@ fn walk_ref_patterns(
     for (name, group) in literal {
         // A missing entry, or a name longer than a file name can be, has no
         // type.
-        let Some(file_type) = ref_entry_type(dir, name)? else {
+        let Some(file_type) = entry_type(dir, name)? else {
             continue;
         };
         let path = if prefix.is_empty() {
@@ -2520,9 +2640,9 @@ fn walk_ref_patterns(
             // with more parts.
             if !below.is_empty()
                 && !skip(&path)
-                && let Some(sub) = open_ref_subdir(dir, name)?
+                && let Some(sub) = open_walked_dir(dir, name)?
             {
-                walk_ref_patterns(sub.as_fd(), &path, &below, skip, visit)?;
+                walk_ref_patterns(&sub, &path, &below, skip, visit)?;
             }
         } else if group.iter().any(|(_, rest)| rest.is_empty()) {
             visit(RefEntry {
@@ -2543,8 +2663,8 @@ fn walk_ref_patterns(
 /// and no other entry. The call does not read a subdirectory when `skip`
 /// returns `true` for its path.
 ///
-/// The call classifies each entry with `SYMLINK_NOFOLLOW`, and opens a
-/// subdirectory with no symlink followed, as `walk_ref_dir` does, so it
+/// The call reads the type of each entry with no symlink followed, and opens
+/// a subdirectory with no symlink followed, as `walk_ref_dir` does, so it
 /// descends only into a real directory. It reads no ref file
 /// outside the literal leading parts of the pattern and the matches. A
 /// leading wildcard lists the directories at its level. For the first of
@@ -2555,12 +2675,13 @@ fn walk_ref_patterns(
 ///   follow, the entry must be a real directory, and the call goes down into
 ///   it. If the part is the last, the entry goes to `visit` unless it is a
 ///   directory. A symlink that names a directory is such an entry.
-/// - `*` reads `dir` and takes each entry as a literal part does.
+/// - `*` reads `dir` and takes each entry with its type from the listing, as
+///   a literal part does.
 /// - `**` walks `dir` with `walk_ref_dir`. If no part follows it, each entry
 ///   goes to `visit`. Otherwise `visit` gets each entry whose whole path the
 ///   pattern matches.
 fn walk_ref_pattern(
-    dir: BorrowedFd<'_>,
+    dir: &RepoDir,
     prefix: &str,
     parts: &[&str],
     pattern: &RefPattern,
@@ -2579,16 +2700,18 @@ fn walk_ref_pattern(
             }
         });
     }
-    let names = if *first == "*" {
-        read_dir_names(dir)?
+    let entries: Vec<(String, FileType)> = if *first == "*" {
+        dir.list()?
+            .into_iter()
+            .filter_map(|entry| Some((String::from_utf8(entry.name).ok()?, entry.file_type)))
+            .collect()
     } else {
-        vec![(*first).to_owned()]
+        entry_type(dir, first)?
+            .map(|file_type| ((*first).to_owned(), file_type))
+            .into_iter()
+            .collect()
     };
-    for name in names {
-        // A name removed after the directory read has no type.
-        let Some(file_type) = ref_entry_type(dir, &name)? else {
-            continue;
-        };
+    for (name, file_type) in entries {
         let path = if prefix.is_empty() {
             name.clone()
         } else {
@@ -2598,8 +2721,8 @@ fn walk_ref_pattern(
             (true, false) if !skip(&path) => {
                 // An entry that is no directory at the open matches no
                 // pattern with more parts.
-                if let Some(sub) = open_ref_subdir(dir, &name)? {
-                    walk_ref_pattern(sub.as_fd(), &path, rest, pattern, skip, visit)?;
+                if let Some(sub) = open_walked_dir(dir, &name)? {
+                    walk_ref_pattern(&sub, &path, rest, pattern, skip, visit)?;
                 }
             }
             (false, true) => visit(RefEntry {
@@ -2692,85 +2815,216 @@ fn uncovered_patterns(patterns: &[RefPattern]) -> Vec<&RefPattern> {
 ///
 /// A name longer than the file system permits (`ENAMETOOLONG`) names no
 /// entry, so it also gives `None`.
-fn ref_entry_type(dir: BorrowedFd<'_>, name: &str) -> Result<Option<FileType>> {
-    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) => Ok(Some(FileType::from_raw_mode(stat.st_mode))),
-        Err(Errno::NOENT | Errno::NAMETOOLONG) => Ok(None),
-        Err(e) => Err(Error::Io(e.into())),
+fn entry_type(dir: &RepoDir, name: &str) -> Result<Option<FileType>> {
+    match dir.lstat(name) {
+        Ok(stat) => Ok(Some(stat.file_type)),
+        Err(FsError::Absent { .. }) => Ok(None),
+        Err(FsError::Io(e)) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => {
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Opens the subdirectory `name` of `dir` in a ref-tree walk, with no
 /// symlink followed. Returns `None` if the entry is removed or is no
 /// directory, a symlink included.
-fn open_ref_subdir(dir: BorrowedFd<'_>, name: &str) -> Result<Option<OwnedFd>> {
-    match rustix::fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => Ok(None),
-        Err(e) => Err(Error::Io(e.into())),
+fn open_walked_dir(dir: &RepoDir, name: &str) -> Result<Option<RepoDir>> {
+    match dir.open_dir(name) {
+        Ok(sub) => Ok(Some(sub)),
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::Symlink | Reason::NotDirectory,
+                ..
+            },
+        ) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Opens the directory `name` of `dir` that a listing names, for example
+/// `refs/remotes/R`, with no symlink followed. Returns `None` if the entry
+/// is absent or is a file. A symlink at `name` fails with
+/// [`Error::InvalidFormat`].
+fn open_named_ref_dir(dir: &RepoDir, name: &str) -> Result<Option<RepoDir>> {
+    match dir.open_dir(name) {
+        Ok(sub) => Ok(Some(sub)),
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::NotDirectory,
+                ..
+            },
+        ) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
 /// Returns the symlink target of an alias entry, as stored. Returns `None`
 /// for an entry that is not a symlink and for a target that is not UTF-8.
-fn read_alias_target(entry: &RefEntry<'_>) -> Result<Option<String>> {
+fn read_alias_body(entry: &RefEntry<'_>) -> Result<Option<String>> {
     if entry.file_type != FileType::Symlink {
         return Ok(None);
     }
-    let target = rustix::fs::readlinkat(entry.dir, entry.name, Vec::new())
-        .map_err(|e| Error::Io(e.into()))?;
-    Ok(target.into_string().ok())
+    let body = entry.dir.read_link(entry.name, REF_READ_CAP)?;
+    Ok(String::from_utf8(body).ok())
 }
 
-/// Reads a ref file relative to `dir`, and follows alias symlinks. Returns
-/// `None` if the file does not exist.
+/// The content of a ref entry that [`read_ref_entry`] read.
+enum RefEntryRead {
+    /// The bytes of a ref file.
+    File(Vec<u8>),
+    /// The body of an alias.
+    Alias(Vec<u8>),
+}
+
+/// Reads the entry at `path` below `dir`: the bytes of a ref file, or the
+/// body of an alias. `symlink` is `true` when the caller read the type of
+/// the entry as a symlink.
 ///
-/// The call checks the type of the file after the open, and the open does
-/// not wait for a writer. A FIFO, a socket, or a device file at the path
-/// gives `None`. A path that names a directory gives `EISDIR`. An open that
-/// fails with an error other than `ENOENT` or `ENXIO`, for example `EACCES`,
-/// gives that error.
-pub(crate) fn read_ref_file(
-    dir: rustix::fd::BorrowedFd<'_>,
-    relpath: &str,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let fd = match rustix::fs::openat(
-        dir,
-        relpath,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        // The open of a socket fails with ENXIO.
-        Err(Errno::NOENT | Errno::NXIO) => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    match FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) {
-        FileType::RegularFile => {}
-        FileType::Directory => return Err(Errno::ISDIR.into()),
-        _ => return Ok(None),
+/// The read of a ref file is [`RepoDir::read_capped`] with the cap
+/// [`REF_READ_CAP`], so it follows no symlink, and its open does not wait on
+/// a FIFO. When it finds a symlink, the call reads the body of the symlink
+/// with [`RepoDir::read_link`]. A symlink at a component before the last one
+/// fails that read too, with [`Reason::Symlink`]. When the read of a body
+/// finds no symlink (`EINVAL`), a writer replaced the alias with a file, and
+/// the call starts again one time. The errors are those of the two reads.
+fn read_ref_entry(
+    dir: &RepoDir,
+    path: &str,
+    symlink: bool,
+) -> std::result::Result<RefEntryRead, FsError> {
+    let mut symlink = symlink;
+    let mut restarted = false;
+    loop {
+        if !symlink {
+            match dir.read_capped(path, REF_READ_CAP) {
+                Err(FsError::Invalid {
+                    reason: Reason::Symlink,
+                    ..
+                }) => {}
+                other => return other.map(RefEntryRead::File),
+            }
+        }
+        match dir.read_link(path, REF_READ_CAP) {
+            Err(FsError::Io(e))
+                if !restarted && e.raw_os_error() == Some(Errno::INVAL.raw_os_error()) =>
+            {
+                restarted = true;
+                symlink = false;
+            }
+            other => return other.map(RefEntryRead::Alias),
+        }
     }
-    // The buffer holds the whole cap before the read, so a ref file takes
-    // one read and the read that finds its end.
-    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
-    std::fs::File::from(fd)
-        .take(REF_READ_CAP)
-        .read_to_end(&mut buf)?;
-    Ok(Some(buf))
 }
 
-/// Returns `true` if `e` is the error of a read of a ref path that names a
-/// directory, or that passes through a file. Such a path holds no ref.
-fn is_not_a_ref_path(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::IsADirectory | std::io::ErrorKind::NotADirectory
-    )
+/// The target of an alias that [`read_alias_target`] read.
+enum AliasTarget {
+    /// The bytes of the ref file at the target.
+    Ref(Vec<u8>),
+    /// No entry is at the target, or the target path passes through a file.
+    Absent,
+    /// The alias breaks the alias rule. The payload is the reason that an
+    /// [`Error::NotARef`] of the alias gives.
+    Broken(&'static str),
+}
+
+/// Reads the ref file that an alias names, by the alias rule. `target` is
+/// the path of the target below the repository root `root`, as
+/// [`resolve_alias`] gives it, so it is a relative path inside `refs/`.
+///
+/// The rule: the target is a regular file, it is not an alias, and no
+/// component of its path is a symlink. One `lstat` with no symlink followed
+/// reads the type of the target before its open, so the call never opens a
+/// FIFO, a socket, or a device through an alias. The call then reads a
+/// regular file with [`RepoDir::read_capped`], which follows no symlink.
+///
+/// An absent target, and a target path that passes through a file, give
+/// [`AliasTarget::Absent`]. A target that breaks the rule gives
+/// [`AliasTarget::Broken`]. A target larger than [`REF_READ_CAP`] fails
+/// with [`Error::InvalidFormat`].
+fn read_alias_target(root: &RepoDir, target: &str) -> Result<AliasTarget> {
+    let stat = match root.lstat(target) {
+        Ok(stat) => stat,
+        Err(e) => return alias_target_error(e),
+    };
+    match stat.file_type {
+        FileType::RegularFile => {}
+        FileType::Symlink => return Ok(AliasTarget::Broken(ALIAS_TO_AN_ALIAS)),
+        _ => return Ok(AliasTarget::Broken(ALIAS_TO_NO_FILE)),
+    }
+    match root.read_capped(target, REF_READ_CAP) {
+        Ok(bytes) => Ok(AliasTarget::Ref(bytes)),
+        // The entry changed after the `lstat`.
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => Ok(AliasTarget::Broken(ALIAS_TO_NO_FILE)),
+        Err(e) => alias_target_error(e),
+    }
+}
+
+/// Returns the result of an error `e` of the read of the target of an alias,
+/// as [`read_alias_target`] states it.
+fn alias_target_error(e: FsError) -> Result<AliasTarget> {
+    match e {
+        FsError::Absent { .. }
+        | FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        } => Ok(AliasTarget::Absent),
+        FsError::Invalid {
+            reason: Reason::Symlink,
+            ..
+        } => Ok(AliasTarget::Broken(ALIAS_THROUGH_A_SYMLINK)),
+        e => Err(e.into()),
+    }
+}
+
+/// Reads the ref `name` at the path `relpath` below the repository root
+/// `root` for a direct read, and parses it. The rules are those of
+/// [`read_ref`].
+fn read_ref_tip(root: &RepoDir, name: &str, relpath: &str) -> Result<Option<Checksum>> {
+    match read_ref(root, name, relpath)? {
+        Some(bytes) => Ok(Some(parse_ref_content(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads the bytes of the ref `name` at the path `relpath` below the
+/// repository root `root`, for a direct read of a ref name.
+///
+/// The call reads the entry with [`read_ref_entry`]. It opens the path first,
+/// and checks the type of the entry after the open. The result is `None`
+/// for an absent entry and for a path that passes through a file. An entry
+/// that is not a regular file and not a symlink fails with
+/// [`Error::NotARef`] and the reason `is not a regular file`. A symlink at a
+/// component of the path fails with [`Error::InvalidFormat`].
+///
+/// An alias resolves by the alias rule: its body resolves with
+/// [`resolve_alias`] against the directory of the alias, and
+/// [`read_alias_target`] reads the target. An alias whose target is absent
+/// gives `None`. An alias that breaks the rule fails with
+/// [`Error::NotARef`] and the reason of the rule.
+fn read_ref(root: &RepoDir, name: &str, relpath: &str) -> Result<Option<Vec<u8>>> {
+    let body = match read_ref_entry(root, relpath, false).optional_ref(name)? {
+        None => return Ok(None),
+        Some(RefEntryRead::File(bytes)) => return Ok(Some(bytes)),
+        Some(RefEntryRead::Alias(body)) => body,
+    };
+    let broken = |reason: &str| Error::NotARef {
+        name: name.to_owned(),
+        reason: reason.to_owned(),
+    };
+    let Some(target) = resolve_alias(ref_parent(relpath), &body) else {
+        return Err(broken(ALIAS_OUTSIDE_REFS));
+    };
+    match read_alias_target(root, &target)? {
+        AliasTarget::Ref(bytes) => Ok(Some(bytes)),
+        AliasTarget::Absent => Ok(None),
+        AliasTarget::Broken(reason) => Err(broken(reason)),
+    }
 }
 
 /// The reason of [`RefFileState::NotARef`] for a path that passes through a
@@ -2793,77 +3047,44 @@ const NAMES_A_SPECIAL_FILE: &str = "names a special file";
 /// whose path names an alias.
 const NAMES_AN_ALIAS: &str = "names an alias";
 
-/// Opens the directory that holds the ref path `relpath`, relative to the
-/// repository root `dir`, for the reads of the last component.
-///
-/// The open is an `openat2` of a path descriptor with `RESOLVE_BENEATH` and
-/// `RESOLVE_NO_SYMLINKS`. So it follows no symlink at any component above the
-/// ref, from the repository root down, and `refs`, `refs/heads`, and
-/// `refs/remotes/R` are components too. The open has no fallback. On a kernel
-/// without `openat2`, the call fails.
-///
-/// `Err` holds the state of a path that the open cannot reach:
-///
-/// - A symlink above the ref (`ELOOP`), dangling or not, is
-///   [`RefFileState::NotARef`] with the reason [`PASSES_THROUGH_AN_ALIAS`].
-///   The walk stops at the first component that is not a directory, so a
-///   symlink there gives `ELOOP` before a file below it can give `ENOTDIR`.
-/// - A file or a special file above the ref (`ENOTDIR`) is
-///   [`RefFileState::NotARef`] with the reason [`PASSES_THROUGH_A_FILE`].
-/// - A missing directory above the ref (`ENOENT`) is
-///   [`RefFileState::Absent`].
-///
-/// Each other error of the open fails the call.
-fn open_ref_parent(
-    dir: BorrowedFd<'_>,
-    relpath: &str,
-) -> Result<std::result::Result<OwnedFd, RefFileState>> {
-    match rustix::fs::openat2(
-        dir,
-        ref_parent(relpath),
-        OFlags::PATH | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
-    ) {
-        Ok(fd) => Ok(Ok(fd)),
-        Err(Errno::LOOP) => Ok(Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS))),
-        Err(Errno::NOTDIR) => Ok(Err(RefFileState::NotARef(PASSES_THROUGH_A_FILE))),
-        Err(Errno::NOENT) => Ok(Err(RefFileState::Absent)),
-        Err(e) => Err(e.into()),
-    }
-}
+/// The reason of [`Error::RefNotWritable`] for an alias write whose target
+/// is an alias, or is the alias itself.
+const TARGETS_AN_ALIAS: &str = "targets an alias";
 
-/// Returns the last component of the ref path `relpath`: the name of the ref
-/// file in the directory that [`open_ref_parent`] opens.
-fn ref_file_name(relpath: &str) -> &str {
-    relpath.rsplit_once('/').map_or(relpath, |(_, name)| name)
-}
+/// The reason of [`Error::NotARef`] for an alias whose body is absolute, is
+/// not UTF-8, or resolves outside `refs/`.
+const ALIAS_OUTSIDE_REFS: &str = "is an alias whose target is not a relative path inside refs/";
+
+/// The reason of [`Error::NotARef`] for an alias whose target is an alias,
+/// or is the alias itself.
+const ALIAS_TO_AN_ALIAS: &str = "is an alias to an alias";
+
+/// The reason of [`Error::NotARef`] for an alias whose target path passes
+/// through a symlink.
+const ALIAS_THROUGH_A_SYMLINK: &str = "is an alias whose target passes through a symlink";
+
+/// The reason of [`Error::NotARef`] for an alias whose target is a
+/// directory, a FIFO, a socket, or a device file.
+const ALIAS_TO_NO_FILE: &str = "is an alias to an entry that is not a regular file";
 
 /// Returns the state of the ref path `relpath`, read with `lstat` alone.
 ///
-/// The call opens the directory of the ref with [`open_ref_parent`], and
-/// reads the last component relative to it. A path that the open cannot
-/// reach has the state that [`open_ref_parent`] gives.
+/// The `lstat` is relative to the repository root `root`, and follows no
+/// symlink at any component of the path, from the repository root down, so
+/// `refs`, `refs/heads`, and `refs/remotes/R` are components too. The open
+/// of the path has no fallback. On a kernel without `openat2`, the call
+/// fails.
 ///
 /// `None` is a regular file, whose content the caller reads. The call never
-/// returns [`RefFileState::Commit`]. Each other error of `lstat`, for example
-/// `EACCES`, fails the call.
-fn lstat_ref_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<Option<RefFileState>> {
-    match open_ref_parent(dir, relpath)? {
-        Ok(parent) => lstat_ref_entry(parent.as_fd(), ref_file_name(relpath)),
-        Err(state) => Ok(Some(state)),
-    }
-}
-
-/// Returns the state of the entry `name` of the open ref directory `parent`,
-/// read with `lstat` alone, as [`lstat_ref_state`] gives it.
-fn lstat_ref_entry(parent: BorrowedFd<'_>, name: &str) -> Result<Option<RefFileState>> {
-    let stat = match rustix::fs::statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+/// returns [`RefFileState::Commit`]. A path that the `lstat` cannot reach
+/// has the state that [`unreached_state`] gives. Each other error, for
+/// example `EACCES`, fails the call.
+fn lstat_ref_state(root: &RepoDir, relpath: &str) -> Result<Option<RefFileState>> {
+    let stat = match root.lstat(relpath) {
         Ok(stat) => stat,
-        Err(Errno::NOENT) => return Ok(Some(RefFileState::Absent)),
-        Err(e) => return Err(e.into()),
+        Err(e) => return unreached_state(e).map(Some),
     };
-    Ok(match FileType::from_raw_mode(stat.st_mode) {
+    Ok(match stat.file_type {
         FileType::RegularFile => None,
         FileType::Symlink => Some(RefFileState::Alias),
         FileType::Directory => Some(RefFileState::NotARef(NAMES_A_DIRECTORY)),
@@ -2871,53 +3092,63 @@ fn lstat_ref_entry(parent: BorrowedFd<'_>, name: &str) -> Result<Option<RefFileS
     })
 }
 
-/// Returns the state of the ref path `relpath`, read with `lstat` and then an
-/// `O_NOFOLLOW` open of a regular file. The call opens the directory of the
-/// ref one time, with [`open_ref_parent`], and reads the last component
-/// relative to it.
-fn ref_file_state(dir: BorrowedFd<'_>, relpath: &str) -> Result<RefFileState> {
-    let parent = match open_ref_parent(dir, relpath)? {
-        Ok(parent) => parent,
-        Err(state) => return Ok(state),
-    };
-    let name = ref_file_name(relpath);
-    if let Some(state) = lstat_ref_entry(parent.as_fd(), name)? {
-        return Ok(state);
+/// Returns the state of a ref path that an operation could not reach, from
+/// its error `e`:
+///
+/// - A symlink above the ref, dangling or not, is
+///   [`RefFileState::NotARef`] with the reason [`PASSES_THROUGH_AN_ALIAS`].
+///   The open stops at the first component that is not a directory, so a
+///   symlink there gives this state before a file below it can give the
+///   next one.
+/// - A file or a special file above the ref is [`RefFileState::NotARef`]
+///   with the reason [`PASSES_THROUGH_A_FILE`].
+/// - A missing entry is [`RefFileState::Absent`].
+///
+/// Each other error fails the call.
+fn unreached_state(e: FsError) -> Result<RefFileState> {
+    match e {
+        FsError::Absent { .. } => Ok(RefFileState::Absent),
+        FsError::Invalid {
+            reason: Reason::Symlink,
+            ..
+        } => Ok(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)),
+        FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        } => Ok(RefFileState::NotARef(PASSES_THROUGH_A_FILE)),
+        e => Err(e.into()),
     }
-    open_ref_entry(parent.as_fd(), name)
 }
 
-/// Returns the state of the entry `name` of the open ref directory `parent`,
-/// read with an `O_NOFOLLOW` open alone. [`ref_file_state`] calls it after
-/// `lstat` found a regular file.
+/// Returns the state of the ref path `relpath`, read with [`lstat_ref_state`]
+/// and then a read of a regular file with no symlink followed.
 ///
-/// The open does not wait for a writer. A directory, a FIFO, a socket, or a
-/// device file at the open gives the [`RefFileState::NotARef`] that
-/// [`lstat_ref_entry`] gives for it.
-fn open_ref_entry(parent: BorrowedFd<'_>, name: &str) -> Result<RefFileState> {
-    let fd = match rustix::fs::openat(
-        parent,
-        name,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(RefFileState::Absent),
-        Err(Errno::LOOP) => return Ok(RefFileState::Alias),
-        // The open of a socket fails with ENXIO.
-        Err(Errno::NXIO) => return Ok(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
-        Err(e) => return Err(e.into()),
-    };
-    match FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) {
-        FileType::RegularFile => {}
-        FileType::Directory => return Ok(RefFileState::NotARef(NAMES_A_DIRECTORY)),
-        _ => return Ok(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
+/// The read does not wait on a FIFO. A directory, a FIFO, a socket, or a
+/// device file at the read gives the [`RefFileState::NotARef`] that
+/// [`lstat_ref_state`] gives for it, and a symlink there gives
+/// [`RefFileState::Alias`]. A ref file larger than [`REF_READ_CAP`] fails
+/// with [`Error::InvalidFormat`].
+fn ref_file_state(root: &RepoDir, relpath: &str) -> Result<RefFileState> {
+    if let Some(state) = lstat_ref_state(root, relpath)? {
+        return Ok(state);
     }
-    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
-    std::fs::File::from(fd)
-        .take(REF_READ_CAP)
-        .read_to_end(&mut buf)?;
-    Ok(RefFileState::Commit(parse_ref_content(&buf)?))
+    match root.read_capped(relpath, REF_READ_CAP) {
+        Ok(bytes) => Ok(RefFileState::Commit(parse_ref_content(&bytes)?)),
+        // The entry changed after the `lstat`.
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(FileType::Directory),
+            ..
+        }) => Ok(RefFileState::NotARef(NAMES_A_DIRECTORY)),
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => Ok(RefFileState::NotARef(NAMES_A_SPECIAL_FILE)),
+        Err(FsError::Invalid {
+            reason: Reason::Symlink,
+            ..
+        }) => Ok(RefFileState::Alias),
+        Err(e) => unreached_state(e),
+    }
 }
 
 /// Parses the content of a ref file: a hex checksum with trailing white
@@ -3072,73 +3303,61 @@ pub(crate) fn refspec_ref(refspec: &str) -> Ref {
     }
 }
 
-/// The permission bits forced on a ref file, independent of the umask. The
-/// `ostree` command writes its ref files with mode `0644`.
-const REF_FILE_MODE: u32 = 0o644;
-/// The request mode for a created ref parent directory, reduced by the umask.
-/// The ref subdirectories of the `ostree` command are `0755` under a `022`
-/// umask. In a `bare-user-shared` repository, the write then forces a parent
-/// directory that it creates to [`perm::SHARED_DIR_MODE`]. So each member of
-/// the repository group can publish a ref under it.
-const REF_DIR_MODE: u32 = 0o777;
-
-/// Writes or removes one ref file relative to `repo_fd`, atomically.
+/// Writes or removes one ref file below the repository root `root`,
+/// atomically.
 ///
 /// For `Some(checksum)`, the call:
 ///
-/// 1. Opens `tmp/`, and creates it if it is missing.
-/// 2. Creates the missing parent directories of the target.
-/// 3. Writes the 65-byte `<hex>\n` content to a new temp file in `tmp/`.
-/// 4. Runs `fdatasync` on the temp file if `fsync` is set.
-/// 5. Renames the temp file over the target.
+/// 1. Makes a new temp file in `tmp/`.
+/// 2. Opens `refs/`, and makes it with its directories `heads`, `remotes`,
+///    and `mirrors` if it is absent.
+/// 3. Makes the missing parent directories of the target.
+/// 4. Writes the 65-byte `<hex>\n` content to the temp file, sets its mode
+///    `0644`, and runs `fsync` on it if `fsync` is set.
+/// 5. Renames the temp file over the target, relative to the parent
+///    directory of the target.
 ///
 /// If `tmp/` is on a different file system, the rename fails with `EXDEV`,
 /// and the call removes the temp file. `None` unlinks the ref and does not
 /// use `tmp/`. An absent file is success. A path that names an alias fails,
 /// as [`put_ref_blocking`] states.
 ///
-/// Under `fsync`, the call runs `fsync` on the directory that holds the ref
-/// after the rename or the unlink. So the name that the operation created or
-/// removed is durable, and not only the content of the file. The call also
-/// makes the name of each parent directory that it created durable, deepest
-/// first. A write that fails still syncs the directories that it changed
+/// Under `fsync`, step 3 syncs the parent of each directory that it makes at
+/// once, from the top down. The call runs `fsync` on the directory that
+/// holds the ref after the rename or the unlink. So the name that the
+/// operation created or removed is durable, and not only the content of the
+/// file. A write that fails still syncs the directories that it changed
 /// before the failure.
 fn write_ref_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     name: &str,
     relpath: &str,
     checksum: Option<Checksum>,
     fsync: bool,
-    repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = put_ref_blocking(
-        repo_fd, name, relpath, checksum, fsync, repo_mode, &mut dirs,
-    );
-    written.and(sync_ref_dirs(repo_fd, dirs))
+    let written = put_ref_blocking(root, name, relpath, checksum, fsync, &mut dirs);
+    written.and(sync_ref_dirs(root, dirs))
 }
 
-/// Runs the body of [`write_ref_blocking`], and leaves the directory syncs to
-/// the caller.
+/// Runs the body of [`write_ref_blocking`], and leaves the sync of the
+/// directory of the ref to the caller.
 ///
-/// Under `fsync`, the call adds each directory that gained or lost a name to
-/// `dirs`, for [`sync_ref_dirs`]. These are the directory that holds the ref,
-/// and the directory that holds each parent that this write created. The
-/// call adds a created parent when it creates it, so a write that fails after
-/// that step still adds it.
+/// Under `fsync`, the call adds the directory that holds the ref to `dirs`,
+/// for [`sync_ref_dirs`], after the rename or the unlink. The directories
+/// that the write makes are synced at once, and are not in `dirs`.
 ///
 /// If `relpath` names an alias, or passes through an alias, the call fails
 /// with [`Error::RefNotWritable`] for the ref `name`, and changes nothing.
 pub(crate) fn put_ref_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     name: &str,
     relpath: &str,
     checksum: Option<Checksum>,
     fsync: bool,
-    repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    let reason = match lstat_ref_state(repo_fd, relpath)? {
+    let reason = match lstat_ref_state(root, relpath)? {
         Some(RefFileState::Alias) => Some(NAMES_AN_ALIAS),
         Some(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) => Some(PASSES_THROUGH_AN_ALIAS),
         _ => None,
@@ -3150,65 +3369,83 @@ pub(crate) fn put_ref_blocking(
         });
     }
     match checksum {
-        Some(checksum) => {
-            let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
-            put_ref_file_blocking(
-                repo_fd,
-                tmp_fd.as_fd(),
-                relpath,
-                checksum,
-                fsync,
-                repo_mode,
-                dirs,
-            )
-        }
-        None => remove_ref_blocking(repo_fd, relpath, fsync, dirs),
+        Some(checksum) => put_ref_file_blocking(root, None, relpath, checksum, fsync, dirs),
+        None => remove_ref_blocking(root, relpath, fsync, dirs),
     }
 }
 
-/// Unlinks the ref file `relpath`. An absent file is success. Under `fsync`,
-/// the call adds the directory that holds the ref to `dirs`.
+/// Unlinks the ref file `relpath` below the repository root `root`. An
+/// absent file is success. The unlink is relative to the directory of the
+/// ref, which opens with no symlink followed. Under `fsync`, the call adds
+/// the directory that holds the ref to `dirs`.
 fn remove_ref_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     relpath: &str,
     fsync: bool,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    match rustix::fs::unlinkat(repo_fd, relpath, AtFlags::empty()) {
-        Ok(()) => {
-            if fsync {
-                dirs.push(ref_parent(relpath).to_owned());
-            }
-            Ok(())
-        }
-        Err(Errno::NOENT) => Ok(()),
-        Err(e) => Err(e.into()),
+    if root.remove_file(relpath, false)? && fsync {
+        dirs.push(ref_parent(relpath).to_owned());
     }
+    Ok(())
 }
 
-/// Writes the ref file `relpath` through a temp file in the open `tmp/` at
-/// `tmp_fd`, as [`put_ref_blocking`] writes a `Some` checksum.
+/// Opens the directory that holds the ref `relpath` for a write, and makes
+/// each missing directory on the way. Returns the handle of the directory
+/// and the name of the ref in it.
+///
+/// The call opens `refs/`. If `refs/` is absent, it makes `refs/` with its
+/// directories `heads`, `remotes`, and `mirrors`. It then makes the
+/// directories below `refs/` with [`RepoDir::ensure_dir`], with the mode of
+/// the kind below `refs/`. With `fsync`, each make syncs the parent of the
+/// new directory at once. A symlink or a file at a component fails with
+/// [`Error::InvalidFormat`].
+fn ensure_ref_parent<'p>(
+    root: &RepoDir,
+    relpath: &'p str,
+    fsync: bool,
+) -> Result<(RepoDir, &'p str)> {
+    let Some((parent, leaf)) = relpath
+        .strip_prefix("refs/")
+        .and_then(|rel| rel.rsplit_once('/'))
+    else {
+        return Err(Error::InvalidInput(format!("not a ref path: {relpath}")));
+    };
+    let refs = match root.open_layout(RepoLayout::Refs) {
+        Err(FsError::Absent { .. }) => root.ensure_layout(RepoLayout::Refs, fsync)?,
+        opened => opened?,
+    };
+    Ok((refs.ensure_dir(parent, fsync)?, leaf))
+}
+
+/// Writes the ref file `relpath` through a temp file, as
+/// [`put_ref_blocking`] writes a `Some` checksum.
+///
+/// The temp file is a named file `.ostrya-tmp-<pid>-XXXXXX` in the temp home
+/// of `tmp`, the `tmp/` handle of a transaction. With `None`, it is in the
+/// `tmp/` of the context of `root`. The call makes the temp file before it
+/// makes a parent directory, so a temp file that it cannot make changes
+/// nothing under `refs/`. The call sets the file mode of a ref file, `0644`,
+/// before the sync of the file, so the sync covers the mode.
 fn put_ref_file_blocking(
-    repo_fd: BorrowedFd<'_>,
-    tmp_fd: BorrowedFd<'_>,
+    root: &RepoDir,
+    tmp: Option<&RepoDir>,
     relpath: &str,
     checksum: Checksum,
     fsync: bool,
-    repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
-    let content = format!("{}\n", checksum.to_hex());
-    let (temp, fd) = TempEntry::create_file(tmp_fd, REF_TEMP_PREFIX, REF_FILE_MODE)?;
-    let mut file = std::fs::File::from(fd);
-    file.write_all(content.as_bytes())?;
-    file.flush()?;
-    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(REF_FILE_MODE))?;
-    if fsync {
-        rustix::fs::fdatasync(file.as_fd())?;
+    let mut temp = TempFile::create_named(tmp.unwrap_or(root))?;
+    let (parent, leaf) = ensure_ref_parent(root, relpath, fsync)?;
+    temp.file_mut()
+        .write_all(format!("{}\n", checksum.to_hex()).as_bytes())?;
+    if let Some(mode) = parent.file_mode() {
+        temp.set_mode(mode)?;
     }
-    drop(file);
-    temp.rename_into(repo_fd, relpath)?;
+    if fsync {
+        temp.sync()?;
+    }
+    temp.publish(&parent, leaf, Publish::Replace, false)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
     }
@@ -3218,7 +3455,7 @@ fn put_ref_file_blocking(
 /// Sorts `dirs` deepest first, then by name, and drops the repeats.
 fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
     let depth = |dir: &str| {
-        if dir == "." {
+        if dir == ROOT_DIR {
             0
         } else {
             dir.split('/').count()
@@ -3228,8 +3465,23 @@ fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
     dirs.dedup();
 }
 
+/// The name that a list of directories to sync gives the repository root.
+const ROOT_DIR: &str = ".";
+
+/// Runs `fsync` on the directory `dir` below the repository root `root`, or
+/// on the root itself for [`ROOT_DIR`]. The open of `dir` follows no
+/// symlink.
+fn sync_recorded_dir(root: &RepoDir, dir: &str) -> Result<()> {
+    if dir == ROOT_DIR {
+        root.sync()?;
+    } else {
+        root.sync_dir(dir)?;
+    }
+    Ok(())
+}
+
 /// Runs `fsync` once on each distinct directory of `dirs`, deepest first. The
-/// names are relative to the repository root.
+/// names are relative to the repository root `root`.
 ///
 /// The call syncs a deeper directory before the directory above it. The
 /// first sync records the name of the ref file. The next records the name of
@@ -3239,24 +3491,25 @@ fn sort_dirs_deepest_first(dirs: &mut Vec<String>) {
 /// So a crash part way through leaves a prefix of each path recorded. It
 /// never leaves a directory entry that names a directory with unrecorded
 /// contents.
-fn sync_ref_dirs(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
+fn sync_ref_dirs(root: &RepoDir, mut dirs: Vec<String>) -> Result<()> {
     sort_dirs_deepest_first(&mut dirs);
     for dir in &dirs {
-        sync_dir(repo_fd, dir)?;
+        sync_recorded_dir(root, dir)?;
     }
     Ok(())
 }
 
 /// Runs `fsync` once on each distinct directory of `dirs`, in the order of
 /// [`sync_ref_dirs`], and returns the first error. A failed sync does not stop
-/// the syncs after it.
-pub(crate) fn sync_dirs_all(repo_fd: BorrowedFd<'_>, mut dirs: Vec<String>) -> Result<()> {
+/// the syncs after it. `.` names the repository root, which the call syncs
+/// through its handle.
+pub(crate) fn sync_dirs_all(root: &RepoDir, mut dirs: Vec<String>) -> Result<()> {
     sort_dirs_deepest_first(&mut dirs);
     let mut first = Ok(());
     for dir in &dirs {
-        let synced = sync_dir(repo_fd, dir);
+        let synced = sync_recorded_dir(root, dir);
         #[cfg(test)]
-        test_syncs::record(repo_fd);
+        test_syncs::record(root.as_fd());
         if first.is_ok() {
             first = synced;
         }
@@ -3311,66 +3564,109 @@ pub(crate) mod test_syncs {
     }
 }
 
-/// Writes one alias symlink relative to `repo_fd`, atomically.
+/// Writes one alias symlink below the repository root `root`, atomically.
+/// `target` is the path of the ref that the alias names.
 ///
 /// The call:
 ///
-/// 1. Opens `tmp/`, and creates it if it is missing.
-/// 2. Creates the missing parent directories of the target.
-/// 3. Creates the link under a new temp name in `tmp/`.
-/// 4. Renames the link over the target.
+/// 1. Checks the path of the alias and the target, as [`put_alias_blocking`]
+///    states.
+/// 2. Creates the link under a new temp name in `tmp/`.
+/// 3. Makes the missing parent directories of the alias, as
+///    [`write_ref_blocking`] does.
+/// 4. Renames the link over the path of the alias, relative to its parent
+///    directory.
 ///
 /// So the call replaces an existing ref file or an existing alias in one
 /// step. A symlink has no content of its own to sync. So `fsync` reaches the
-/// directory that holds the link, and the directory that holds each parent
-/// that this write created.
+/// directory that holds each directory that the call makes, at once, and the
+/// directory that holds the link.
 ///
 /// A write that fails still syncs the directories that it changed before the
 /// failure.
 fn write_alias_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     name: &str,
     relpath: &str,
-    link: &str,
+    target: &str,
     fsync: bool,
-    repo_mode: RepoMode,
 ) -> Result<()> {
     let mut dirs = Vec::new();
-    let written = put_alias_blocking(repo_fd, name, relpath, link, fsync, repo_mode, &mut dirs);
-    written.and(sync_ref_dirs(repo_fd, dirs))
+    let written = put_alias_blocking(root, name, relpath, target, fsync, &mut dirs);
+    written.and(sync_ref_dirs(root, dirs))
 }
 
-/// Runs the body of [`write_alias_blocking`], and leaves the directory syncs
-/// to the caller. Under `fsync`, the call adds to `dirs` the directory that
-/// holds the link, and the directory that holds each parent that this write
-/// created. It adds each parent when it creates it.
+/// Runs the body of [`write_alias_blocking`], and leaves the sync of the
+/// directory of the link to the caller. Under `fsync`, the call adds to
+/// `dirs` the directory that holds the link.
 ///
-/// If `relpath` passes through an alias, the call fails with
-/// [`Error::RefNotWritable`] for the alias `name`, and changes nothing.
+/// The call fails with [`Error::RefNotWritable`] for the alias `name`, and
+/// changes nothing, in these cases:
+///
+/// - `relpath` passes through an alias. The reason is `passes through an
+///   alias`.
+/// - `target` is `relpath`, or names an alias. The reason is `targets an
+///   alias`. One `lstat` with no symlink followed reads the type of the
+///   target.
+/// - `target` passes through an alias. The reason is `passes through an
+///   alias`.
+///
+/// An absent target, and a target that passes through a file, are allowed.
 pub(crate) fn put_alias_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     name: &str,
     relpath: &str,
-    link: &str,
+    target: &str,
     fsync: bool,
-    repo_mode: RepoMode,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    if let Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) = open_ref_parent(repo_fd, relpath)?
-    {
-        return Err(Error::RefNotWritable {
+    let refuse = |reason: &str| {
+        Err(Error::RefNotWritable {
             name: name.to_owned(),
-            reason: PASSES_THROUGH_AN_ALIAS.to_owned(),
-        });
+            reason: reason.to_owned(),
+        })
+    };
+    if passes_through_an_alias(root, relpath)? {
+        return refuse(PASSES_THROUGH_AN_ALIAS);
     }
-    let tmp_fd = open_tmp_dir(repo_fd, repo_mode)?;
-    create_ref_parents(repo_fd, relpath, repo_mode, fsync, dirs)?;
-    TempEntry::create_symlink(tmp_fd.as_fd(), REF_TEMP_PREFIX, link)?
-        .rename_into(repo_fd, relpath)?;
+    if target == relpath {
+        return refuse(TARGETS_AN_ALIAS);
+    }
+    match lstat_ref_state(root, target)? {
+        Some(RefFileState::Alias) => return refuse(TARGETS_AN_ALIAS),
+        Some(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) => {
+            return refuse(PASSES_THROUGH_AN_ALIAS);
+        }
+        _ => {}
+    }
+    let link = TempLink::create(root, &relative_link(relpath, target))?;
+    let (parent, leaf) = ensure_ref_parent(root, relpath, fsync)?;
+    link.publish(&parent, leaf, Publish::Replace, false)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
     }
     Ok(())
+}
+
+/// Returns `true` if a symlink, dangling or not, is at a component of the
+/// ref path `relpath` before its last one, below the repository root `root`.
+///
+/// The check is one [`RepoDir::exists`], which follows no symlink. A symlink
+/// at the last component, an absent entry, and a path that passes through a
+/// file give `false`. Each other error fails the call.
+fn passes_through_an_alias(root: &RepoDir, relpath: &str) -> Result<bool> {
+    match root.exists(relpath) {
+        Ok(_)
+        | Err(FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        }) => Ok(false),
+        Err(FsError::Invalid {
+            reason: Reason::Symlink,
+            ..
+        }) => Ok(true),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Unlinks the alias `relpath`, and leaves the directory syncs to the caller.
@@ -3380,15 +3676,15 @@ pub(crate) fn put_alias_blocking(
 /// path that passes through a file or an alias fails with
 /// [`Error::RefNotWritable`] for the ref `name`.
 pub(crate) fn remove_alias_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     name: &str,
     relpath: &str,
     fsync: bool,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    let reason = match lstat_ref_state(repo_fd, relpath)? {
+    let reason = match lstat_ref_state(root, relpath)? {
         Some(RefFileState::Absent) => return Ok(()),
-        Some(RefFileState::Alias) => return remove_ref_blocking(repo_fd, relpath, fsync, dirs),
+        Some(RefFileState::Alias) => return remove_ref_blocking(root, relpath, fsync, dirs),
         Some(RefFileState::NotARef(reason)) => reason,
         None | Some(RefFileState::Commit(_)) => "names a ref file",
     };
@@ -3398,24 +3694,21 @@ pub(crate) fn remove_alias_blocking(
     })
 }
 
-/// Checks that no ref to delete passes through an alias, relative to
-/// `repo_fd`, and removes nothing.
+/// Checks that no ref to delete passes through an alias, below the
+/// repository root `root`, and removes nothing.
 ///
 /// The call maps each key to its path with `relpath`, as
-/// [`delete_matching_refs_blocking`] does. It opens the directory of each
-/// path one time with [`open_ref_parent`], and closes it before the next
-/// open. If a path passes through an alias, the call fails with
-/// [`Error::RefNotWritable`] for that key, reason `passes through an alias`.
-/// The other states of [`open_ref_parent`] pass the check.
+/// [`delete_matching_refs_blocking`] does. It checks each path one time with
+/// [`passes_through_an_alias`]. If a path passes through an alias, the call
+/// fails with [`Error::RefNotWritable`] for that key, reason `passes through
+/// an alias`. Each other path passes the check.
 pub(crate) fn check_refs_to_delete_blocking<K: std::fmt::Display>(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     refs: &[(K, Checksum)],
     relpath: impl Fn(&K) -> Result<String>,
 ) -> Result<()> {
     for (key, _) in refs {
-        if let Err(RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS)) =
-            open_ref_parent(repo_fd, &relpath(key)?)?
-        {
+        if passes_through_an_alias(root, &relpath(key)?)? {
             return Err(Error::RefNotWritable {
                 name: key.to_string(),
                 reason: PASSES_THROUGH_AN_ALIAS.to_owned(),
@@ -3426,7 +3719,7 @@ pub(crate) fn check_refs_to_delete_blocking<K: std::fmt::Display>(
 }
 
 /// Removes each ref that still names the checksum that the caller recorded
-/// for it, relative to `repo_fd`, in one blocking pass.
+/// for it, below the repository root `root`, in one blocking pass.
 ///
 /// The call maps each key to its path with `relpath`. The caller passes the
 /// path rule of the asynchronous writes, for example [`refspec_to_relpath`]
@@ -3436,20 +3729,23 @@ pub(crate) fn check_refs_to_delete_blocking<K: std::fmt::Display>(
 ///
 /// Before the first unlink, the call runs [`check_refs_to_delete_blocking`]
 /// on the whole batch. If a path passes through an alias, the call fails
-/// with its error and removes no ref. So no unlink goes through a symlink
-/// above a ref. The unlinks themselves resolve each path by name.
+/// with its error and removes no ref. Each unlink opens the directory of the
+/// ref with no symlink followed, so no unlink goes through a symlink above a
+/// ref.
 ///
-/// Each read comes immediately before its own unlink. The call leaves a ref
-/// that now names a different commit where it is. This covers a repository
-/// whose `[core] locking` is false, and a caller that moved the ref after it
-/// recorded the checksum.
+/// Each read comes immediately before its own unlink. The read is the direct
+/// read of [`Repo::resolve_ref_tip`]. The call leaves a ref that now names a
+/// different commit where it is. This covers a repository whose `[core]
+/// locking` is false, and a caller that moved the ref after it recorded the
+/// checksum.
 ///
-/// A read that finds no file unlinks all the same. The name that the caller
-/// recorded is gone or dangles. `unlinkat` removes a symlink and not the file
+/// A read that finds no ref unlinks all the same. The name that the caller
+/// recorded is gone or dangles. The unlink removes a symlink and not the file
 /// that it names, and an absent name is success. A FIFO, a socket, or a
-/// device file at the path is no ref, so the call unlinks it. The read checks
-/// the type of the file after the open, and the open does not wait for a
-/// writer. An open that the permissions refuse fails the call.
+/// device file at the path is no ref, and so is an alias that breaks the
+/// alias rule, so the call unlinks it. The read checks the type of the file
+/// after the open, and the open does not wait for a writer. An open that the
+/// permissions refuse fails the call.
 ///
 /// Under `fsync`, after the last unlink, the call runs `fsync` once on each
 /// directory from which an unlink removed a name. So each removed name is
@@ -3464,39 +3760,37 @@ pub(crate) fn check_refs_to_delete_blocking<K: std::fmt::Display>(
 ///
 /// Returns the keys that it removed, in the order that it got them.
 pub(crate) fn delete_matching_refs_blocking<K: std::fmt::Display>(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     refs: Vec<(K, Checksum)>,
     relpath: impl Fn(&K) -> Result<String>,
     fsync: bool,
 ) -> Result<Vec<K>> {
-    check_refs_to_delete_blocking(repo_fd, &refs, &relpath)?;
+    check_refs_to_delete_blocking(root, &refs, &relpath)?;
     let mut removed = Vec::with_capacity(refs.len());
     let mut parents: Vec<String> = Vec::new();
     let mut held: HashSet<String> = HashSet::new();
     for (key, target) in refs {
         let relpath = relpath(&key)?;
-        if let Some(bytes) = read_ref_file(repo_fd, &relpath)?
+        let current = match read_ref(root, &relpath, &relpath) {
+            Err(Error::NotARef { .. }) => None,
+            read => read?,
+        };
+        if let Some(bytes) = current
             && parse_ref_content(&bytes)? != target
         {
             continue;
         }
-        match rustix::fs::unlinkat(repo_fd, relpath.as_str(), AtFlags::empty()) {
-            Ok(()) => {
-                if fsync {
-                    let parent = ref_parent(&relpath);
-                    if !held.contains(parent) {
-                        held.insert(parent.to_owned());
-                        parents.push(parent.to_owned());
-                    }
-                }
+        if root.remove_file(&relpath, false)? && fsync {
+            let parent = ref_parent(&relpath);
+            if !held.contains(parent) {
+                held.insert(parent.to_owned());
+                parents.push(parent.to_owned());
             }
-            Err(Errno::NOENT) => {}
-            Err(e) => return Err(Error::Io(e.into())),
         }
         removed.push(key);
     }
     for parent in &parents {
-        sync_dir_present(repo_fd, parent)?;
+        root.sync_dir(parent).optional()?;
     }
     Ok(removed)
 }
@@ -3505,17 +3799,7 @@ pub(crate) fn delete_matching_refs_blocking<K: std::fmt::Display>(
 /// collection ref always map below `refs/`, so the path has a parent. For a
 /// bare name, the result is the repository root.
 fn ref_parent(relpath: &str) -> &str {
-    relpath.rsplit_once('/').map_or(".", |(dir, _)| dir)
-}
-
-/// Runs `fsync` on one directory, named relative to the repository root, if
-/// the directory still exists. A directory that is gone holds no entry to make
-/// durable, so its absence is success.
-fn sync_dir_present(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
-    match sync_dir(repo_fd, path) {
-        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        other => other,
-    }
+    relpath.rsplit_once('/').map_or(ROOT_DIR, |(dir, _)| dir)
 }
 
 /// Runs `fsync` on one directory, named relative to the repository root.
@@ -3530,54 +3814,10 @@ pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Creates the parent directories of a ref path, idempotently.
-///
-/// The call creates each component except the last, and leaves existing
-/// directories in place. Under `fsync`, the call adds the directory that holds
-/// each created directory to `dirs` when the `mkdirat` returns, before any
-/// step that can fail. So a write that fails later still leaves the new name
-/// to a sync.
-///
-/// A `mkdirat` adds a name to the directory that it is called in. So to make
-/// a created `refs/heads/deep/nest` durable, a caller syncs `refs/heads/deep`,
-/// which holds the `nest` entry: the [`ref_parent`] of the created path. A
-/// directory that was already in place needs no sync, because its name is
-/// already durable.
-///
-/// In a `bare-user-shared` repository, the call forces each directory that it
-/// creates to [`perm::SHARED_DIR_MODE`]. A directory that already exists
-/// keeps its mode and its group.
-fn create_ref_parents(
-    repo_fd: BorrowedFd<'_>,
-    relpath: &str,
-    repo_mode: RepoMode,
-    fsync: bool,
-    dirs: &mut Vec<String>,
-) -> Result<()> {
-    let mut acc = String::new();
-    let mut components: Vec<&str> = relpath.split('/').collect();
-    components.pop(); // the final component is the ref file itself
-    for component in components {
-        if !acc.is_empty() {
-            acc.push('/');
-        }
-        acc.push_str(component);
-        match rustix::fs::mkdirat(repo_fd, acc.as_str(), Mode::from_raw_mode(REF_DIR_MODE)) {
-            Ok(()) => {
-                if fsync {
-                    dirs.push(ref_parent(&acc).to_owned());
-                }
-                perm::force_created_dir(repo_fd, acc.as_str(), repo_mode)?;
-            }
-            Err(Errno::EXIST) => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    use ostrya_core::RepoMode;
+
     use super::*;
 
     #[test]
@@ -3863,7 +4103,6 @@ mod tests {
     /// drops.
     struct Root {
         dir: std::path::PathBuf,
-        fd: std::os::fd::OwnedFd,
     }
 
     impl Root {
@@ -3874,18 +4113,54 @@ mod tests {
                 crate::write::unique()
             ));
             std::fs::create_dir_all(dir.join("refs/heads")).unwrap();
-            let fd = std::fs::File::open(&dir).unwrap().into();
-            Root { dir, fd }
+            Root { dir }
         }
 
-        fn fd(&self) -> BorrowedFd<'_> {
-            self.fd.as_fd()
+        /// Opens a handle of the scratch directory as a repository root.
+        fn handle(&self) -> RepoDir {
+            RepoDir::open_root(rustix::fs::CWD, &self.dir).unwrap()
         }
     }
 
     impl Drop for Root {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    /// Returns the content of a ref file that names `commit`.
+    fn ref_text(commit: &Checksum) -> String {
+        format!("{}\n", commit.to_hex())
+    }
+
+    /// Makes a FIFO at `path`.
+    fn mkfifo(path: &std::path::Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+    }
+
+    /// Asserts that `result` is [`Error::NotARef`] with the reason `reason`.
+    fn assert_not_a_ref<T: std::fmt::Debug>(result: Result<T>, reason: &str, what: &str) {
+        match result {
+            Err(Error::NotARef { reason: r, .. }) => assert_eq!(r, reason, "{what}"),
+            other => panic!("{what}: {other:?}"),
+        }
+    }
+
+    /// Asserts that `result` is [`Error::InvalidFormat`] whose text holds
+    /// `text`.
+    fn assert_invalid<T: std::fmt::Debug>(result: Result<T>, text: &str, what: &str) {
+        match result {
+            Err(Error::InvalidFormat(message)) => {
+                assert!(message.contains(text), "{what}: {message}");
+            }
+            other => panic!("{what}: {other:?}"),
         }
     }
 
@@ -3899,16 +4174,17 @@ mod tests {
         std::fs::create_dir(heads.join("real")).unwrap();
         std::os::unix::fs::symlink("real", heads.join("link")).unwrap();
         std::fs::write(heads.join("file"), b"").unwrap();
-        let dir = std::fs::File::open(&heads).unwrap();
-        assert!(open_ref_subdir(dir.as_fd(), "real").unwrap().is_some());
+        let refs = root.handle().open_layout(RepoLayout::Refs).unwrap();
+        let dir = refs.open_dir("heads").unwrap();
+        assert!(open_walked_dir(&dir, "real").unwrap().is_some());
         for name in ["link", "file", "absent"] {
-            let sub = open_ref_subdir(dir.as_fd(), name).unwrap();
+            let sub = open_walked_dir(&dir, name).unwrap();
             assert!(sub.is_none(), "{name}");
         }
     }
 
-    /// The listing opens an entry that the walk found as a ref file with no
-    /// symlink followed. An entry that is an alias at the open takes the
+    /// The listing reads an entry that the walk found as a ref file with no
+    /// symlink followed. An entry that is an alias at the read takes the
     /// alias rule, so an alias to a ref that the client does not read gives
     /// no ref. The same entry gives the ref of its target to a client that
     /// reads the target.
@@ -3924,12 +4200,16 @@ mod tests {
             .unwrap();
             let commit = Checksum::from_bytes([7; 32]);
             let heads = root.dir.join("repo/refs/heads");
-            std::fs::write(heads.join("secret"), format!("{}\n", commit.to_hex())).unwrap();
+            std::fs::write(heads.join("secret"), ref_text(&commit)).unwrap();
             std::fs::create_dir(heads.join("pub")).unwrap();
             std::os::unix::fs::symlink("../secret", heads.join("pub/a")).unwrap();
-            let dir = std::fs::File::open(heads.join("pub")).unwrap();
+            let dir = open_ref_top(&repo, HEADS_DIR)
+                .unwrap()
+                .unwrap()
+                .open_dir("pub")
+                .unwrap();
             let entry = RefEntry {
-                dir: dir.as_fd(),
+                dir: &dir,
                 name: "a",
                 path: "pub/a",
                 file_type: FileType::RegularFile,
@@ -3947,82 +4227,66 @@ mod tests {
                     None,
                 )
             };
-            let hidden = read_listed_ref(&repo, HEADS_DIR, &entry, &reader("r:pub/**")).unwrap();
+            let root_dir = repo.root_dir();
+            let hidden =
+                read_listed_ref(root_dir, HEADS_DIR, &entry, Some(&reader("r:pub/**"))).unwrap();
             assert_eq!(hidden, None);
-            let (read, target) = read_listed_ref(&repo, HEADS_DIR, &entry, &reader("r:**"))
-                .unwrap()
-                .unwrap();
+            let (read, target) =
+                read_listed_ref(root_dir, HEADS_DIR, &entry, Some(&reader("r:**")))
+                    .unwrap()
+                    .unwrap();
             assert_eq!(parse_ref_content(&read).unwrap(), commit);
             assert_eq!(target.as_deref(), Some("refs/heads/secret"));
         });
     }
 
-    /// The listing gives no ref for an entry that is a FIFO at the open, and
-    /// the open does not wait for a writer. This holds when the walk read the
-    /// entry as a FIFO, and when the walk read a regular file that a FIFO
-    /// replaced.
+    /// The listing gives no ref for an entry that is a FIFO or a socket, and
+    /// does not wait on the FIFO. An entry that the walk typed as a FIFO or a
+    /// socket is never opened. An entry that the walk read as a regular file
+    /// and that a FIFO replaced opens with no wait.
     #[test]
-    fn a_listed_ref_entry_that_is_a_fifo_at_the_open_gives_no_ref() {
+    fn a_listed_ref_entry_that_is_a_fifo_or_a_socket_gives_no_ref() {
         let root = Root::new("listed-fifo");
-        let repo = ostrya_rt::block_on(Repo::create(
-            &root.dir.join("repo"),
-            crate::CreateOptions::new(RepoMode::Archive),
-        ))
-        .unwrap();
-        let heads = root.dir.join("repo/refs/heads");
-        let fifo = heads.join("fifo");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            FileType::Fifo,
-            Mode::from_raw_mode(0o644),
-            0,
-        )
-        .unwrap();
-        for file_type in [FileType::Fifo, FileType::RegularFile] {
-            let (tx, rx) = std::sync::mpsc::channel();
-            let (repo, heads) = (repo.clone(), heads.clone());
-            std::thread::spawn(move || {
-                let dir = std::fs::File::open(&heads).unwrap();
+        let (fifo, _socket) = special_ref_entries(&root);
+        for (name, file_type) in [
+            ("fifo", FileType::Fifo),
+            ("fifo", FileType::RegularFile),
+            ("sock", FileType::Socket),
+            ("sock", FileType::RegularFile),
+        ] {
+            let result = read_without_wait(&root.dir, &fifo, name, move |root| {
+                let dir = root
+                    .open_layout(RepoLayout::Refs)
+                    .unwrap()
+                    .open_dir("heads")
+                    .unwrap();
                 let entry = RefEntry {
-                    dir: dir.as_fd(),
-                    name: "fifo",
-                    path: "fifo",
+                    dir: &dir,
+                    name,
+                    path: name,
                     file_type,
                 };
-                let reads = repo.implicit_reads();
-                let _ =
-                    tx.send(read_listed_ref(&repo, HEADS_DIR, &entry, reads).map(|r| r.is_none()));
+                read_listed_ref(root, HEADS_DIR, &entry, None).map(|r| r.is_none())
             });
-            let timeout = std::time::Duration::from_secs(10);
-            let Ok(result) = rx.recv_timeout(timeout) else {
-                // A writer releases the blocked open, so the thread ends.
-                let _ = rustix::fs::open(
-                    &fifo,
-                    OFlags::WRONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-                    Mode::empty(),
-                );
-                let _ = rx.recv_timeout(timeout);
-                panic!("{file_type:?}: the open waits on the FIFO");
-            };
-            assert!(result.unwrap(), "{file_type:?}");
+            assert!(result.unwrap(), "{name} as {file_type:?}");
         }
     }
 
-    /// Runs `read` on a thread with a new descriptor of the directory `dir`,
-    /// and returns its result. If the call does not end in 10 seconds, a
-    /// writer opens `fifo`, so that a blocked open ends, and the test fails.
+    /// Runs `read` on a thread with a new handle of the repository root
+    /// `dir`, and returns its result. If the call does not end in 10 seconds,
+    /// a writer opens `fifo`, so that a blocked open ends, and the test
+    /// fails.
     fn read_without_wait<T: Send + 'static>(
         dir: &std::path::Path,
         fifo: &std::path::Path,
         what: &str,
-        read: impl FnOnce(BorrowedFd<'_>) -> T + Send + 'static,
+        read: impl FnOnce(&RepoDir) -> T + Send + 'static,
     ) -> T {
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = dir.to_owned();
         std::thread::spawn(move || {
-            let dir = std::fs::File::open(&dir).unwrap();
-            let _ = tx.send(read(dir.as_fd()));
+            let root = RepoDir::open_root(rustix::fs::CWD, &dir).unwrap();
+            let _ = tx.send(read(&root));
         });
         let timeout = std::time::Duration::from_secs(10);
         let Ok(result) = rx.recv_timeout(timeout) else {
@@ -4039,65 +4303,59 @@ mod tests {
     }
 
     /// Makes in `refs/heads` of `root` a FIFO `fifo`, an alias `to-fifo` to
-    /// it, a socket `sock`, an absolute alias `null` to `/dev/null`, a
-    /// directory `dir`, and an alias `to-dir` to it. Returns the path of the
-    /// FIFO and the socket, which lives while the caller holds it.
+    /// it, a socket `sock`, an alias `to-sock` to it, an absolute alias `null`
+    /// to `/dev/null`, a directory `dir`, and an alias `to-dir` to it.
+    /// Returns the path of the FIFO and the socket, which lives while the
+    /// caller holds it.
     fn special_ref_entries(root: &Root) -> (std::path::PathBuf, std::os::unix::net::UnixListener) {
         let heads = root.dir.join("refs/heads");
         let fifo = heads.join("fifo");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            FileType::Fifo,
-            Mode::from_raw_mode(0o644),
-            0,
-        )
-        .unwrap();
+        mkfifo(&fifo);
         std::os::unix::fs::symlink("fifo", heads.join("to-fifo")).unwrap();
         // The path of a socket has a short length limit, so the bind uses a
         // short path and a rename moves the socket into place.
         let short = root.dir.join("s");
         let socket = std::os::unix::net::UnixListener::bind(&short).unwrap();
         std::fs::rename(&short, heads.join("sock")).unwrap();
+        std::os::unix::fs::symlink("sock", heads.join("to-sock")).unwrap();
         std::os::unix::fs::symlink("/dev/null", heads.join("null")).unwrap();
         std::fs::create_dir(heads.join("dir")).unwrap();
         std::os::unix::fs::symlink("dir", heads.join("to-dir")).unwrap();
         (fifo, socket)
     }
 
-    /// The ref reader finds no ref at a FIFO, at a socket, and at a device
-    /// file, also through an alias, and its open does not wait for a writer.
-    /// A path that names a directory fails the read with `EISDIR`.
+    /// A direct read of a ref path that names a FIFO, a socket, or a
+    /// directory fails with "not a ref", and its open does not wait for a
+    /// writer. An alias to such an entry, and an absolute alias, fail with
+    /// the reason of the alias rule. A ref file reads.
     #[test]
-    fn a_ref_file_that_is_a_fifo_a_socket_or_a_device_reads_as_no_ref() {
+    fn a_direct_read_of_a_fifo_a_socket_or_a_directory_is_not_a_ref() {
         let root = Root::new("special");
         let (fifo, _socket) = special_ref_entries(&root);
-        for name in ["fifo", "to-fifo", "sock", "null"] {
+        for (name, reason) in [
+            ("fifo", "is not a regular file"),
+            ("sock", "is not a regular file"),
+            ("dir", "is not a regular file"),
+            ("to-fifo", ALIAS_TO_NO_FILE),
+            ("to-sock", ALIAS_TO_NO_FILE),
+            ("to-dir", ALIAS_TO_NO_FILE),
+            ("null", ALIAS_OUTSIDE_REFS),
+        ] {
             let relpath = format!("refs/heads/{name}");
-            let result = read_without_wait(&root.dir, &fifo, name, move |dir| {
-                read_ref_file(dir, &relpath)
+            let result = read_without_wait(&root.dir, &fifo, name, move |root| {
+                read_ref(root, name, &relpath)
             });
-            assert!(matches!(result, Ok(None)), "{name}: {result:?}");
-        }
-        for name in ["dir", "to-dir"] {
-            let err = read_ref_file(root.fd(), &format!("refs/heads/{name}")).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{name}");
+            assert_not_a_ref(result, reason, name);
         }
         let commit = Checksum::from_bytes([1; 32]);
-        std::fs::write(
-            root.dir.join("refs/heads/main"),
-            format!("{}\n", commit.to_hex()),
-        )
-        .unwrap();
-        let bytes = read_ref_file(root.fd(), "refs/heads/main")
-            .unwrap()
-            .unwrap();
-        assert_eq!(parse_ref_content(&bytes).unwrap(), commit);
+        std::fs::write(root.dir.join("refs/heads/main"), ref_text(&commit)).unwrap();
+        let read = read_ref_tip(&root.handle(), "main", "refs/heads/main").unwrap();
+        assert_eq!(read, Some(commit));
     }
 
     /// The state of a ref path that names a FIFO or a socket is a special
     /// file, and the state of a directory is a directory. This holds for
-    /// the `lstat` and for the open of the write-path check, and the open
+    /// the `lstat` and for the read of the write-path check, and the read
     /// does not wait for a writer.
     #[test]
     fn the_ref_state_of_a_fifo_a_socket_or_a_directory_is_no_ref() {
@@ -4109,15 +4367,15 @@ mod tests {
             ("dir", "names a directory"),
         ] {
             let relpath = format!("refs/heads/{name}");
-            let (checked, opened) = read_without_wait(&root.dir, &fifo, name, move |dir| {
-                let parent = open_ref_parent(dir, &relpath).unwrap().unwrap();
+            let (lstat, checked) = read_without_wait(&root.dir, &fifo, name, move |root| {
                 (
-                    ref_file_state(dir, &relpath),
-                    open_ref_entry(parent.as_fd(), name),
+                    lstat_ref_state(root, &relpath),
+                    ref_file_state(root, &relpath),
                 )
             });
-            assert_eq!(checked.unwrap(), RefFileState::NotARef(reason), "{name}");
-            assert_eq!(opened.unwrap(), RefFileState::NotARef(reason), "{name}");
+            let state = RefFileState::NotARef(reason);
+            assert_eq!(lstat.unwrap(), Some(state), "{name}");
+            assert_eq!(checked.unwrap(), state, "{name}");
         }
     }
 
@@ -4131,7 +4389,7 @@ mod tests {
 
         let root = Root::new("below-alias");
         let heads = root.dir.join("refs/heads");
-        let content = format!("{}\n", Checksum::from_bytes([1; 32]).to_hex());
+        let content = ref_text(&Checksum::from_bytes([1; 32]));
         std::fs::create_dir(heads.join("d0")).unwrap();
         std::fs::write(heads.join("d0/x"), &content).unwrap();
         std::fs::write(heads.join("file"), &content).unwrap();
@@ -4139,14 +4397,7 @@ mod tests {
         symlink("d0", heads.join("to-dir")).unwrap();
         symlink("file", heads.join("to-file")).unwrap();
         let fifo = heads.join("fifo");
-        rustix::fs::mknodat(
-            rustix::fs::CWD,
-            &fifo,
-            FileType::Fifo,
-            Mode::from_raw_mode(0o644),
-            0,
-        )
-        .unwrap();
+        mkfifo(&fifo);
         let alias = RefFileState::NotARef(PASSES_THROUGH_AN_ALIAS);
         let file = RefFileState::NotARef(PASSES_THROUGH_A_FILE);
         for (relpath, state) in [
@@ -4160,8 +4411,11 @@ mod tests {
             ("refs/heads/to-dir", RefFileState::Alias),
             ("refs/heads/nosuch/x", RefFileState::Absent),
         ] {
-            let (lstat, checked) = read_without_wait(&root.dir, &fifo, relpath, move |dir| {
-                (lstat_ref_state(dir, relpath), ref_file_state(dir, relpath))
+            let (lstat, checked) = read_without_wait(&root.dir, &fifo, relpath, move |root| {
+                (
+                    lstat_ref_state(root, relpath),
+                    ref_file_state(root, relpath),
+                )
             });
             assert_eq!(lstat.unwrap(), Some(state), "{relpath}");
             assert_eq!(checked.unwrap(), state, "{relpath}");
@@ -4179,19 +4433,366 @@ mod tests {
                 "real/main"
             };
             std::fs::write(root.dir.join(main), &content).unwrap();
+            let handle = root.handle();
             for relpath in ["refs/heads/main", "refs/heads/sub/x"] {
                 assert_eq!(
-                    lstat_ref_state(root.fd(), relpath).unwrap(),
+                    lstat_ref_state(&handle, relpath).unwrap(),
                     Some(alias),
                     "{top}: {relpath}"
                 );
                 assert_eq!(
-                    ref_file_state(root.fd(), relpath).unwrap(),
+                    ref_file_state(&handle, relpath).unwrap(),
                     alias,
                     "{top}: {relpath}"
                 );
             }
         }
+    }
+
+    /// Creates an archive repository at `path`.
+    async fn archive_repo(path: &std::path::Path) -> Repo {
+        Repo::create(path, crate::CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap()
+    }
+
+    /// An alias that breaks the alias rule names no ref. A direct read of it
+    /// fails with "not a ref" and the reason of the rule, and each listing
+    /// and the prune roots leave it out. The aliases are in `refs/heads`, in
+    /// `refs/remotes/o`, and in `refs/mirrors/ID`, and each names a ref file
+    /// that holds the commit: an absolute alias into `refs/`, an absolute
+    /// alias out of the repository, an alias to a file at the repository
+    /// root, an alias that leaves the repository, an alias through a
+    /// symlinked directory, an alias to an alias, and an alias to itself.
+    #[test]
+    fn an_alias_that_breaks_the_alias_rule_names_no_ref() {
+        use std::os::unix::fs::symlink;
+
+        let root = Root::new("alias-rule");
+        let path = root.dir.join("repo");
+        let repo = ostrya_rt::block_on(archive_repo(&path));
+        let commit = Checksum::from_bytes([3; 32]);
+        let outside = root.dir.join("outside-ref");
+        std::fs::write(&outside, ref_text(&commit)).unwrap();
+        std::fs::write(path.join("inrepo-ref"), ref_text(&commit)).unwrap();
+        let mirror = format!("{MIRRORS_DIR}/org.example.Other");
+        let dirs = [HEADS_DIR, "refs/remotes/o", mirror.as_str()];
+        for dir in dirs {
+            let dir = path.join(dir);
+            std::fs::create_dir_all(dir.join("real")).unwrap();
+            std::fs::write(dir.join("real/main"), ref_text(&commit)).unwrap();
+            symlink("real", dir.join("linked")).unwrap();
+            symlink("real/main", dir.join("good")).unwrap();
+            symlink(dir.join("real/main"), dir.join("absin")).unwrap();
+            symlink(&outside, dir.join("absout")).unwrap();
+            symlink("../../../inrepo-ref", dir.join("relroot")).unwrap();
+            symlink("../../../../outside-ref", dir.join("relout")).unwrap();
+            symlink("linked/main", dir.join("through")).unwrap();
+            symlink("good", dir.join("chain")).unwrap();
+            symlink("self", dir.join("self")).unwrap();
+        }
+        // The remote and the mirror directories are one level deeper, so a
+        // body that leaves `refs/` from there has one `..` more.
+        for dir in [&dirs[1], &dirs[2]] {
+            let dir = path.join(dir);
+            for name in ["relroot", "relout"] {
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            symlink("../../../../inrepo-ref", dir.join("relroot")).unwrap();
+            symlink("../../../../../outside-ref", dir.join("relout")).unwrap();
+        }
+        let broken = [
+            ("absin", ALIAS_OUTSIDE_REFS),
+            ("absout", ALIAS_OUTSIDE_REFS),
+            ("relroot", ALIAS_OUTSIDE_REFS),
+            ("relout", ALIAS_OUTSIDE_REFS),
+            ("through", ALIAS_THROUGH_A_SYMLINK),
+            ("chain", ALIAS_TO_AN_ALIAS),
+            ("self", ALIAS_TO_AN_ALIAS),
+        ];
+        ostrya_rt::block_on(async {
+            for (name, reason) in broken {
+                let result = repo.resolve_ref_tip(&Ref::local(name)).await;
+                assert_not_a_ref(result, reason, name);
+                let result = repo.resolve_rev(name, true).await;
+                assert_not_a_ref(result, reason, name);
+                let result = repo.resolve_ref_tip(&Ref::remote("o", name)).await;
+                assert_not_a_ref(result, reason, name);
+            }
+            assert_eq!(
+                repo.resolve_ref_tip(&Ref::local("good")).await.unwrap(),
+                Some(commit)
+            );
+            let names = |refs: Vec<(String, Checksum)>| -> Vec<String> {
+                refs.into_iter().map(|(name, _)| name).collect()
+            };
+            assert_eq!(
+                names(repo.list_refs(None).await.unwrap()),
+                ["good", "real/main"]
+            );
+            assert_eq!(
+                names(repo.list_remote_refs().await.unwrap()),
+                ["o:good", "o:real/main"]
+            );
+            let mut mirrors: Vec<String> = repo
+                .list_mirror_refs()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|(_, name, _)| name)
+                .collect();
+            mirrors.sort();
+            assert_eq!(mirrors, ["good", "real/main"]);
+            let selector = RefSelector::parse(["**"]).unwrap();
+            let selection = repo
+                .select_refs(&selector, Some(&selector), repo.implicit_reads(), None)
+                .await
+                .unwrap();
+            assert_eq!(names(selection.local), ["good", "real/main"]);
+            assert_eq!(
+                names(selection.collections["org.example.Other"].clone()),
+                ["good", "real/main"]
+            );
+            let mut all: Vec<String> = repo
+                .list_all_refs()
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|listed| listed.name)
+                .collect();
+            all.sort();
+            assert_eq!(
+                all,
+                [
+                    "good",
+                    "o:good",
+                    "o:real/main",
+                    "org.example.Other/good",
+                    "org.example.Other/real/main",
+                    "real/main",
+                ]
+            );
+        });
+    }
+
+    /// An alias whose target is absent, or whose target path passes through
+    /// a ref file, names no ref: a direct read gives `None`, and a listing
+    /// leaves it out.
+    #[test]
+    fn an_alias_to_an_absent_target_reads_as_absent() {
+        use std::os::unix::fs::symlink;
+
+        let root = Root::new("alias-absent");
+        let path = root.dir.join("repo");
+        let repo = ostrya_rt::block_on(archive_repo(&path));
+        let heads = path.join("refs/heads");
+        std::fs::write(heads.join("file"), ref_text(&Checksum::from_bytes([4; 32]))).unwrap();
+        symlink("nosuch", heads.join("gone")).unwrap();
+        symlink("file/below", heads.join("below")).unwrap();
+        ostrya_rt::block_on(async {
+            for name in ["gone", "below"] {
+                assert_eq!(
+                    repo.resolve_ref_tip(&Ref::local(name)).await.unwrap(),
+                    None,
+                    "{name}"
+                );
+                assert_eq!(repo.resolve_rev(name, true).await.unwrap(), None);
+                assert!(matches!(
+                    repo.resolve_rev(name, false).await,
+                    Err(Error::RefNotFound(_))
+                ));
+            }
+            assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
+        });
+    }
+
+    /// A ref file of 4096 bytes reads, in a direct read and in a listing. A
+    /// ref file of 4097 bytes fails each read with its cap, also as the
+    /// target of an alias.
+    #[test]
+    fn a_ref_file_over_its_cap_fails_the_read() {
+        let root = Root::new("ref-cap");
+        let path = root.dir.join("repo");
+        let repo = ostrya_rt::block_on(archive_repo(&path));
+        let commit = Checksum::from_bytes([5; 32]);
+        let heads = path.join("refs/heads");
+        let padded = |len: usize| {
+            let mut text = ref_text(&commit);
+            text.push_str(&" ".repeat(len - text.len()));
+            text
+        };
+        std::fs::write(heads.join("x"), padded(4096)).unwrap();
+        ostrya_rt::block_on(async {
+            assert_eq!(
+                repo.resolve_ref_tip(&Ref::local("x")).await.unwrap(),
+                Some(commit)
+            );
+            assert_eq!(
+                repo.list_refs(None).await.unwrap(),
+                [("x".to_owned(), commit)]
+            );
+            std::fs::write(heads.join("x"), padded(4097)).unwrap();
+            let cap = "refs/heads/x is larger than its cap of 4096 bytes";
+            assert_invalid(repo.resolve_ref_tip(&Ref::local("x")).await, cap, "tip");
+            assert_invalid(repo.resolve_rev("x", false).await, cap, "rev");
+            assert_invalid(repo.list_refs(None).await, cap, "list");
+            assert_invalid(repo.list_all_refs().await, cap, "all");
+            std::os::unix::fs::symlink("x", heads.join("al")).unwrap();
+            assert_invalid(repo.resolve_ref_tip(&Ref::local("al")).await, cap, "alias");
+        });
+    }
+
+    /// A symlink at `refs`, at `refs/heads`, at `refs/remotes/R`, or at
+    /// `refs/mirrors/ID` fails a resolve and each listing that reads the
+    /// directory with "passes through a symlink": the listings of the local,
+    /// remote, mirror, collection, and alias refs, the selection of the
+    /// summary, and the prune and fsck roots. A write below it gives
+    /// "passes through an alias".
+    #[test]
+    fn a_symlink_at_a_ref_directory_fails_the_read_and_the_write() {
+        use std::os::unix::fs::symlink;
+
+        let commit = Checksum::from_bytes([6; 32]);
+        let id = "org.example.Other";
+        for (dir, r) in [
+            ("refs", Ref::local("main")),
+            (HEADS_DIR, Ref::local("main")),
+            ("refs/remotes/o", Ref::remote("o", "main")),
+            (
+                "refs/mirrors/org.example.Other",
+                Ref::collection(id, "main"),
+            ),
+        ] {
+            let root = Root::new("ref-dir-link");
+            let path = root.dir.join("repo");
+            let repo = ostrya_rt::block_on(archive_repo(&path));
+            std::fs::create_dir_all(path.join(dir)).unwrap();
+            let rel = ref_relpath(None, &r).unwrap();
+            std::fs::create_dir_all(path.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(path.join(&rel), ref_text(&commit)).unwrap();
+            let real = root.dir.join("real");
+            std::fs::rename(path.join(dir), &real).unwrap();
+            symlink(&real, path.join(dir)).unwrap();
+            let symlinked = "passes through a symlink";
+            ostrya_rt::block_on(async {
+                assert_invalid(repo.resolve_ref_tip(&r).await, symlinked, dir);
+                assert_invalid(repo.list_all_refs().await, symlinked, dir);
+                let all = RefSelector::parse(["**"]).unwrap();
+                match dir {
+                    "refs" | HEADS_DIR => {
+                        assert_invalid(repo.list_refs(None).await, symlinked, dir);
+                        assert_invalid(repo.list_refs_where(|_| true).await, symlinked, dir);
+                        assert_invalid(repo.list_ref_aliases().await, symlinked, dir);
+                    }
+                    "refs/remotes/o" => {
+                        let remotes =
+                            BTreeMap::from([("o".to_owned(), "org.example.O".to_owned())]);
+                        assert_invalid(collect_remote_collections(&repo, &remotes), symlinked, dir);
+                        assert_invalid(repo.list_remote_refs().await, symlinked, dir);
+                        assert_invalid(repo.list_ref_aliases().await, symlinked, dir);
+                    }
+                    _ => {
+                        let listed = repo.list_collection_refs_in(id, &all).await;
+                        assert_invalid(listed, symlinked, dir);
+                        assert_invalid(repo.list_mirror_refs().await, symlinked, dir);
+                        assert_invalid(repo.list_collection_refs().await, symlinked, dir);
+                        assert_invalid(repo.list_refs_where(|_| true).await, symlinked, dir);
+                        // A `keep` that drops each ref does not hide the
+                        // symlink.
+                        assert_invalid(repo.list_refs_where(|_| false).await, symlinked, dir);
+                        let selected = repo
+                            .select_refs(&all, Some(&all), repo.implicit_reads(), None)
+                            .await;
+                        assert_invalid(selected.map(|_| ()), symlinked, dir);
+                    }
+                }
+                let written = repo.set_ref_immediate(&r, Some(&commit)).await;
+                match written {
+                    Err(Error::RefNotWritable { reason, .. }) => {
+                        assert_eq!(reason, PASSES_THROUGH_AN_ALIAS, "{dir}");
+                    }
+                    other => panic!("{dir}: {other:?}"),
+                }
+            });
+        }
+    }
+
+    /// An alias write refuses a target that is an alias, a target below an
+    /// alias, and a target that is the alias itself, and writes nothing. An
+    /// absent target is allowed.
+    #[test]
+    fn an_alias_write_refuses_a_target_that_is_an_alias() {
+        let root = Root::new("alias-write");
+        let path = root.dir.join("repo");
+        let repo = ostrya_rt::block_on(archive_repo(&path));
+        let heads = path.join("refs/heads");
+        ostrya_rt::block_on(async {
+            let commit = Checksum::from_bytes([8; 32]);
+            repo.set_ref_immediate(&Ref::local("main"), Some(&commit))
+                .await
+                .unwrap();
+            repo.set_ref_alias_immediate("al1", "main").await.unwrap();
+            std::fs::create_dir(heads.join("d")).unwrap();
+            std::os::unix::fs::symlink("d", heads.join("dl")).unwrap();
+            for (target, reason) in [
+                ("al1", TARGETS_AN_ALIAS),
+                ("al2", TARGETS_AN_ALIAS),
+                ("dl/x", PASSES_THROUGH_AN_ALIAS),
+            ] {
+                match repo.set_ref_alias_immediate("al2", target).await {
+                    Err(Error::RefNotWritable { name, reason: r }) => {
+                        assert_eq!((name.as_str(), r.as_str()), ("al2", reason), "{target}");
+                    }
+                    other => panic!("{target}: {other:?}"),
+                }
+                assert!(
+                    std::fs::symlink_metadata(heads.join("al2")).is_err(),
+                    "{target}"
+                );
+            }
+            repo.set_ref_alias_immediate("al3", "nosuch").await.unwrap();
+            assert_eq!(
+                std::fs::read_link(heads.join("al3")).unwrap(),
+                std::path::Path::new("nosuch")
+            );
+        });
+    }
+
+    /// Returns the number of temp entries in `tmp/` of the repository at
+    /// `root`.
+    fn temp_entries(root: &std::path::Path) -> usize {
+        std::fs::read_dir(root.join("tmp"))
+            .unwrap()
+            .filter(|entry| {
+                let name = entry.as_ref().unwrap().file_name();
+                name.to_string_lossy().starts_with(".ostrya-tmp-")
+            })
+            .count()
+    }
+
+    /// A ref write puts its temp file in `tmp/`, syncs the directories that
+    /// it makes at once, and records the directory of the ref for the batch
+    /// sync. A failed publish leaves no temp entry and records nothing.
+    #[test]
+    fn a_ref_write_puts_its_temp_file_in_tmp() {
+        let root = Root::new("temp-file");
+        let handle = root.handle();
+        let checksum = Some(Checksum::from_bytes([7; 32]));
+        let mut dirs = Vec::new();
+        put_ref_blocking(&handle, "a/x", "refs/heads/a/x", checksum, true, &mut dirs).unwrap();
+        assert_eq!(dirs, ["refs/heads/a"]);
+        assert_eq!(temp_entries(&root.dir), 0);
+
+        // A ref name of 256 bytes is longer than a file name can be. The temp
+        // file in `tmp/` is created, and the rename over the ref name fails.
+        let long = "r".repeat(256);
+        let name = format!("new/deep/{long}");
+        let mut dirs = Vec::new();
+        let relpath = format!("refs/heads/{name}");
+        put_ref_blocking(&handle, &name, &relpath, checksum, true, &mut dirs).unwrap_err();
+        assert!(dirs.is_empty(), "{dirs:?}");
+        assert!(root.dir.join("refs/heads/new/deep").is_dir());
+        assert_eq!(temp_entries(&root.dir), 0);
     }
 
     /// The ref listings leave out a FIFO entry that the walk found, and do
@@ -4278,10 +4879,15 @@ mod tests {
             }
         }
         let remotes = BTreeMap::from([("o".to_owned(), "org.example.O".to_owned())]);
-        let heads = collect_heads(&repo, &|_| true);
+        let heads = collect_heads(&repo, open_refs(&repo).unwrap().as_ref(), &|_| true);
         let remote_refs = collect_remotes(&repo);
         let remote_collections = collect_remote_collections(&repo, &remotes);
-        let mirrors = collect_mirrors(&repo, &|_| false, &|_| true);
+        let mirrors = collect_mirrors(
+            &repo,
+            open_refs(&repo).unwrap().as_ref(),
+            &|_| false,
+            &|_| true,
+        );
         let all = ostrya_rt::block_on(repo.list_all_refs());
         std::thread::sleep(std::time::Duration::from_millis(200));
         let ended = open_rx.try_iter().count();
@@ -4332,7 +4938,7 @@ mod tests {
         }
         let remotes = BTreeMap::from([("o".to_owned(), "org.example.O".to_owned())]);
         assert_eq!(
-            collect_heads(&repo, &|_| true).unwrap(),
+            collect_heads(&repo, open_refs(&repo).unwrap().as_ref(), &|_| true).unwrap(),
             [("main".to_owned(), commit)]
         );
         assert_eq!(
@@ -4349,7 +4955,13 @@ mod tests {
             )]
         );
         assert_eq!(
-            collect_mirrors(&repo, &|_| false, &|_| true).unwrap(),
+            collect_mirrors(
+                &repo,
+                open_refs(&repo).unwrap().as_ref(),
+                &|_| false,
+                &|_| true
+            )
+            .unwrap(),
             [("org.example.Other".to_owned(), "main".to_owned(), commit)]
         );
         let mut all: Vec<(String, Checksum)> = ostrya_rt::block_on(repo.list_all_refs())
@@ -4367,8 +4979,13 @@ mod tests {
             ]
         );
         for dir in dirs {
-            let err = read_ref_file(repo.repo_fd(), &format!("{dir}/locked")).unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{dir}");
+            let relpath = format!("{dir}/locked");
+            match read_ref(repo.root_dir(), "locked", &relpath) {
+                Err(Error::Io(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied, "{dir}");
+                }
+                other => panic!("{dir}: {other:?}"),
+            }
         }
     }
 
@@ -4451,58 +5068,50 @@ mod tests {
             "refs/heads/a".to_owned(),
         ];
         let before = test_syncs::count(&root.dir);
-        let err = sync_dirs_all(root.fd(), dirs).unwrap_err();
+        let err = sync_dirs_all(&root.handle(), dirs).unwrap_err();
         assert!(
-            matches!(&err, Error::Io(e) if e.raw_os_error() == Some(Errno::NOTDIR.raw_os_error())),
+            matches!(&err, Error::InvalidFormat(text) if text == "refs/heads/a/file is not a directory"),
             "{err:?}"
         );
         assert_eq!(test_syncs::count(&root.dir), before + 4);
     }
 
-    /// A write that fails after it created parent directories still records
-    /// the directories that hold them, and leaves no temp entry in `tmp/`.
+    /// A failed alias write leaves the directories that it made, and no temp
+    /// entry in `tmp/`. A write below a file fails before a temp entry.
     #[test]
-    fn a_failed_write_records_the_parents_it_created() {
-        let root = Root::new("created");
-        // A ref name of 256 bytes is longer than a file name can be. The temp
-        // file in `tmp/` is created, and the rename over the ref name fails.
-        let long = "r".repeat(256);
+    fn a_failed_alias_write_leaves_no_temp_entry() {
+        let root = Root::new("alias-failed");
+        let handle = root.handle();
+        std::fs::write(root.dir.join("refs/heads/file"), b"").unwrap();
         let mut dirs = Vec::new();
-        let name = format!("new/deep/{long}");
-        let relpath = format!("refs/heads/{name}");
-        let checksum = Some(Checksum::from_bytes([7; 32]));
-        put_ref_blocking(
-            root.fd(),
-            &name,
-            &relpath,
-            checksum,
+        let err = put_alias_blocking(
+            &handle,
+            "file/deep/alias",
+            "refs/heads/file/deep/alias",
+            "refs/heads/main",
             true,
-            RepoMode::BareUser,
             &mut dirs,
         )
         .unwrap_err();
-        dirs.sort();
-        assert_eq!(dirs, ["refs/heads", "refs/heads/new"]);
-        let tmp = root.dir.join("tmp");
-        assert!(tmp.is_dir());
-        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+        assert!(
+            matches!(&err, Error::InvalidFormat(text) if text.ends_with("is not a directory")),
+            "{err:?}"
+        );
+        assert!(dirs.is_empty());
 
-        // A link body longer than a path can be fails the `symlinkat`.
-        let mut dirs = Vec::new();
-        let link = "x".repeat(5000);
-        let relpath = "refs/heads/other/deep/alias";
-        put_alias_blocking(
-            root.fd(),
+        // An alias over a directory fails at the rename.
+        std::fs::create_dir_all(root.dir.join("refs/heads/other/deep/alias/x")).unwrap();
+        let err = put_alias_blocking(
+            &handle,
             "other/deep/alias",
-            relpath,
-            &link,
+            "refs/heads/other/deep/alias",
+            "refs/heads/main",
             true,
-            RepoMode::BareUser,
             &mut dirs,
         )
         .unwrap_err();
-        dirs.sort();
-        assert_eq!(dirs, ["refs/heads", "refs/heads/other"]);
-        assert_eq!(std::fs::read_dir(&tmp).unwrap().count(), 0);
+        assert!(matches!(&err, Error::Io(_)), "{err:?}");
+        assert!(dirs.is_empty());
+        assert_eq!(temp_entries(&root.dir), 0);
     }
 }

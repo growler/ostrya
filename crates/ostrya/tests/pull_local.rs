@@ -6971,11 +6971,12 @@ fn disable_verify_bindings_skips_the_ref_binding_alone_in_a_collection_delta_pul
     });
 }
 
-/// A collection ref path to a directory, or through a file, fails the read of
-/// the ref with [`Error::Io`], as the path of a plain operand does. This is
-/// also true for the path under `refs/heads` of a source whose collection id
-/// is the id of the operand: there, `refs/heads/app` is a ref file, and the
-/// name `app/a` goes through it.
+/// A collection ref path to a directory fails the read of the ref with
+/// [`Error::NotARef`]. A collection ref path through a file holds no ref, and
+/// the pull fails with [`Error::RefNotFound`]. This is also true for the path
+/// under `refs/heads` of a source whose collection id is the id of the
+/// operand: there, `refs/heads/app` is a ref file, and the name `app/a` goes
+/// through it.
 #[test]
 fn a_collection_ref_path_through_a_directory_or_a_file_fails_the_read() {
     let tmp = TmpDir::new("pull-collection-not-a-ref");
@@ -6985,16 +6986,14 @@ fn a_collection_ref_path_through_a_directory_or_a_file_fails_the_read() {
         set_ref(&src, COLLECTION, "main/sub", &c2).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        for (name, kind) in [
-            ("main", std::io::ErrorKind::IsADirectory),
-            ("main/sub/x", std::io::ErrorKind::NotADirectory),
-        ] {
+        for (name, directory) in [("main", true), ("main/sub/x", false)] {
             let err = dst
                 .pull_local(&src, collection_pull(&[name]))
                 .await
                 .unwrap_err();
             match err {
-                Error::Io(e) => assert_eq!(e.kind(), kind, "{name}"),
+                Error::NotARef { .. } if directory => {}
+                Error::RefNotFound(_) if !directory => {}
                 other => panic!("{name}: {other:?}"),
             }
             assert_nothing_left(&dst_dir, &dst, &c2).await;
@@ -7008,7 +7007,7 @@ fn a_collection_ref_path_through_a_directory_or_a_file_fails_the_read() {
             .await
             .unwrap_err();
         match err {
-            Error::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::NotADirectory),
+            Error::RefNotFound(_) => {}
             other => panic!("app/a: {other:?}"),
         }
         assert_nothing_left(&dst_dir, &dst, &app).await;

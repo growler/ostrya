@@ -414,7 +414,8 @@ fn a_repository_with_no_collection_id_lists_the_mirror_refs_alone() {
 }
 
 /// A collection with no directory gives an empty listing. An entry of the
-/// collection id that is a regular file or a symlink is no directory.
+/// collection id that is a regular file is no directory. A symlink at the
+/// entry fails the listing.
 #[test]
 fn an_absent_collection_gives_an_empty_listing() {
     let tmp = TmpDir::new("list-cref-in-absent");
@@ -430,7 +431,13 @@ fn an_absent_collection_gives_an_empty_listing() {
 
         let entry = path.join("refs/mirrors").join(OTHER);
         std::os::unix::fs::symlink(THIRD, &entry).unwrap();
-        assert!(list(&repo, OTHER, &[]).await.is_empty());
+        match repo.list_collection_refs_in(OTHER, &selector(&[])).await {
+            Err(Error::InvalidFormat(m)) => assert!(
+                m.starts_with(&format!("refs/mirrors/{OTHER} passes through a symlink")),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
         std::fs::remove_file(&entry).unwrap();
         std::fs::write(&entry, format!("{}\n", checksum(3))).unwrap();
         assert!(list(&repo, OTHER, &[]).await.is_empty());
@@ -464,7 +471,7 @@ fn a_mirror_directory_that_is_a_file_fails_the_listing() {
         std::fs::remove_dir(&mirrors).unwrap();
         std::fs::write(&mirrors, "").unwrap();
         match repo.list_collection_refs_in(OTHER, &selector(&[])).await {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::NotADirectory, "{e}"),
+            Err(Error::InvalidFormat(m)) => assert_eq!(m, "refs/mirrors is not a directory"),
             other => panic!("{other:?}"),
         }
         assert_eq!(list(&repo, OWN, &[]).await, pairs(&[("main", 1)]));

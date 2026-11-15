@@ -1850,11 +1850,8 @@ fn finish_returns_a_sync_error_and_releases_the_locks() {
 
         let err = guard.finish().await.unwrap_err();
         match &err {
-            Error::Io(e) => assert_eq!(
-                e.raw_os_error(),
-                Some(rustix::io::Errno::NOTDIR.raw_os_error())
-            ),
-            other => panic!("expected ENOTDIR, got {other:?}"),
+            Error::InvalidFormat(m) => assert_eq!(m, "refs/heads/deep is not a directory"),
+            other => panic!("expected InvalidFormat, got {other:?}"),
         }
         assert_locks_free(&path).await;
     });

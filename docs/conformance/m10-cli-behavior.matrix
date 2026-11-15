@@ -2466,7 +2466,8 @@ note: what the policy does, which no artifact this harness reads can show: the
  reaches the ref write and not the object writes alone. The syncing row is held
  to the target of every call -- each fanout under `objects/`, `objects/`
  itself, the repository for the `syncfs`, the ref's temp file for the
- `fdatasync`, and, for the port, the directory holding the ref -- and to the
+ `fdatasync` of the tool and the `fsync` of the port, and, for the port, the
+ directory holding the ref -- and to the
  total the table records, 11 for the tool and 12 for the port. The test asserts
  on a host carrying `strace` and returns without an assertion on one that does
  not, which is a gate beyond the tool's own presence.

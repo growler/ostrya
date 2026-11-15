@@ -980,13 +980,10 @@ fn a_ref_listing_selects_refs_by_pattern() {
 
         // A walk reports a symlink to a directory as one entry. The alias
         // names no regular file, so the listing leaves it out, as the archive
-        // view does not serve it. `list_refs` reads it as a ref and fails. A
+        // view does not serve it, and `list_refs` leaves it out too. A
         // pattern below it selects nothing.
         std::os::unix::fs::symlink("a", heads.join("ln")).unwrap();
-        assert!(matches!(
-            repo.list_refs(Some("ln")).await,
-            Err(ostrya::Error::Io(_))
-        ));
+        assert!(repo.list_refs(Some("ln")).await.unwrap().is_empty());
         for (entries, want) in [
             (&["ln"][..], vec![]),
             (&["a/**", "ln"][..], vec!["a/b", "a/bc", "a/c/d"]),
@@ -1433,7 +1430,10 @@ fn a_client_that_reads_no_local_ref_reads_no_entry_of_refs_heads() {
         let outcome = repo
             .build_ref_listing(&selector(&[]), None, &read_access(groups, "ssh:a"))
             .await;
-        assert!(matches!(outcome, Err(ostrya::Error::Io(_))), "{outcome:?}");
+        assert!(
+            matches!(&outcome, Err(ostrya::Error::InvalidFormat(m)) if m == "refs/heads is not a directory"),
+            "{outcome:?}"
+        );
     });
 }
 
@@ -2093,10 +2093,12 @@ fn the_collection_map_follows_the_items_of_each_namespace() {
 /// A directory under `refs/mirrors/` whose name fails the collection-id rule
 /// is left out of the listing, and its ref files are not read, so their
 /// content fails no listing. The listing names each such directory one time,
-/// sorted byte-wise, whatever its selector selects. A file or a symlink at
-/// the top level, and a name that is not UTF-8, are left out with no report,
-/// also when the name passes the collection-id rule. A listing with no
-/// selector of the collection refs reads none of them.
+/// sorted byte-wise, whatever its selector selects. A file at the top level,
+/// and a name that is not UTF-8, are left out with no report, also when the
+/// name passes the collection-id rule. A symlink at the top level fails each
+/// listing with a selector of the collection refs, whatever its selector
+/// selects and whatever the link names. A listing with no selector of the
+/// collection refs reads none of them.
 /// The archive view does not serve a ref of such a directory.
 #[test]
 fn a_listing_leaves_out_an_invalid_collection_directory() {
@@ -2117,14 +2119,12 @@ fn a_listing_leaves_out_an_invalid_collection_directory() {
             write_mirror_file(&repo_dir, path, "no checksum\n");
         }
         let mirrors = repo_dir.join("refs/mirrors");
-        std::os::unix::fs::symlink("bad", mirrors.join("link")).unwrap();
-        std::os::unix::fs::symlink("org.a", mirrors.join("org.link")).unwrap();
-        std::os::unix::fs::symlink("org.absent", mirrors.join("org.gone")).unwrap();
         let raw = mirrors.join(std::ffi::OsStr::from_bytes(b"\xff.b"));
         std::fs::create_dir(&raw).unwrap();
         std::fs::write(raw.join("main"), "no checksum\n").unwrap();
 
-        for collections in [&[][..], &["**"], &["org.a/**"], &["*/main"], &["!**"]] {
+        let selectors = [&[][..], &["**"], &["org.a/**"], &["*/main"], &["!**"]];
+        for collections in selectors {
             let listing = list_with(&repo, &[], Some(collections), &anyone()).await;
             assert_eq!(
                 listing.invalid_collection_dirs,
@@ -2156,6 +2156,28 @@ fn a_listing_leaves_out_an_invalid_collection_directory() {
                 ),
                 "{path}"
             );
+        }
+
+        for (name, target) in [
+            ("link", "bad"),
+            ("org.link", "org.a"),
+            ("org.gone", "org.absent"),
+        ] {
+            let link = mirrors.join(name);
+            std::os::unix::fs::symlink(target, &link).unwrap();
+            let refused = format!("refs/mirrors/{name} passes through a symlink");
+            for collections in selectors {
+                let outcome = repo
+                    .build_ref_listing(&selector(&[]), Some(&selector(collections)), &anyone())
+                    .await;
+                assert!(
+                    matches!(&outcome, Err(ostrya::Error::InvalidFormat(m)) if m.starts_with(&refused)),
+                    "{name} {collections:?}: {outcome:?}"
+                );
+            }
+            let listing = list_with(&repo, &[], None, &anyone()).await;
+            assert!(collection_names(&listing.bytes).is_empty(), "{name}");
+            std::fs::remove_file(&link).unwrap();
         }
     });
 }

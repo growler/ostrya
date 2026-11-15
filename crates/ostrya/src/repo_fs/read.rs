@@ -229,17 +229,30 @@ impl RepoDir {
     /// Reads the target of the symlink at `path` below this handle. The
     /// target has `cap` bytes at most.
     ///
-    /// One `openat2` with `O_PATH|O_NOFOLLOW` opens the symlink itself, and a
-    /// `readlinkat` on its descriptor reads the target into a stack buffer of
-    /// `cap + 1` bytes, or of 4096 bytes for a larger cap. A symlink target on
-    /// Linux has 4095 bytes at most, so the cap in effect is the smaller of
-    /// `cap` and 4095. A target over that cap gives [`Reason::TooLarge`]. An
-    /// entry that is not a symlink gives [`FsError::Io`] with `EINVAL`. The
-    /// path rules and the errors of the open are those of
+    /// A `path` of one component costs one `readlinkat` relative to this
+    /// handle. The path has no directory component to resolve, and the
+    /// `readlinkat` does not follow the leaf. An absent entry gives
+    /// [`FsError::Absent`], and each other errno maps by [`FsError::at`] with
+    /// `path`.
+    ///
+    /// For a longer `path`, one `openat2` with `O_PATH|O_NOFOLLOW` opens the
+    /// symlink itself, and a `readlinkat` on its descriptor reads the target.
+    /// The path rules and the errors of the open are those of
     /// [`open_dir`](RepoDir::open_dir). A symlink at a component before the
     /// leaf gives [`Reason::Symlink`].
+    ///
+    /// The `readlinkat` reads the target into a stack buffer of `cap + 1`
+    /// bytes, or of 4096 bytes for a larger cap. A symlink target on Linux
+    /// has 4095 bytes at most, so the cap in effect is the smaller of `cap`
+    /// and 4095. A target over that cap gives [`Reason::TooLarge`]. An entry
+    /// that is not a symlink gives [`FsError::Io`] with `EINVAL`.
     pub(crate) fn read_link(&self, path: &str, cap: u64) -> Result<Vec<u8>, FsError> {
         self.check_path(path)?;
+        if !path.contains('/') {
+            return self.read_link_at(self.as_fd(), path, path, cap, |e| {
+                FsError::at(e, self.err_path(path))
+            });
+        }
         let fd = self.open_link(path)?;
         self.read_link_fd(fd.as_fd(), path, cap)
     }
@@ -377,20 +390,37 @@ impl RepoDir {
     /// below this handle, for an error.
     ///
     /// `ENOENT` from the `readlinkat` means that the entry is not a symlink,
-    /// and gives `EINVAL`.
+    /// and gives `EINVAL`. The read is that of
+    /// [`read_link_at`](RepoDir::read_link_at).
+    fn read_link_fd(&self, fd: BorrowedFd<'_>, path: &str, cap: u64) -> Result<Vec<u8>, FsError> {
+        self.read_link_at(fd, c"", path, cap, |e| {
+            io_error(if e == Errno::NOENT { Errno::INVAL } else { e })
+        })
+    }
+
+    /// Reads the target of the symlink `name` relative to `dir` with one
+    /// `readlinkat`. The target has `cap` bytes at most. `path` is the path of
+    /// the symlink below this handle, for an error, and `map` converts the
+    /// errno of the `readlinkat`.
     ///
     /// The read goes into a stack buffer of `cap + 1` bytes, or of 4096 bytes
     /// for a larger cap, and the target then costs one allocation of its own
     /// size. A target that fills the buffer is over `cap`, or has 4096 bytes
     /// or more, and gives [`Reason::TooLarge`].
-    fn read_link_fd(&self, fd: BorrowedFd<'_>, path: &str, cap: u64) -> Result<Vec<u8>, FsError> {
-        let map = |e| io_error(if e == Errno::NOENT { Errno::INVAL } else { e });
+    fn read_link_at<P: rustix::path::Arg>(
+        &self,
+        dir: BorrowedFd<'_>,
+        name: P,
+        path: &str,
+        cap: u64,
+        map: impl FnOnce(Errno) -> FsError,
+    ) -> Result<Vec<u8>, FsError> {
         let mut stack = [MaybeUninit::<u8>::uninit(); LINK_STACK_LEN];
         let len = usize::try_from(cap)
             .ok()
             .filter(|&c| c < LINK_STACK_LEN)
             .map_or(LINK_STACK_LEN, |c| c + 1);
-        let (target, _) = rustix::fs::readlinkat_raw(fd, c"", &mut stack[..len]).map_err(map)?;
+        let (target, _) = rustix::fs::readlinkat_raw(dir, name, &mut stack[..len]).map_err(map)?;
         if target.len() == len {
             return Err(FsError::Invalid {
                 path: self.err_path(path),
@@ -889,6 +919,28 @@ mod tests {
         let (path, reason) = invalid(objects.read_link("cd/link", 64));
         assert_eq!(path, "objects/cd/link");
         assert!(matches!(reason, Reason::Symlink), "{reason:?}");
+    }
+
+    #[test]
+    fn read_link_of_one_component_reads_relative_to_the_handle() {
+        let dir = TestDir::new("read-link-one");
+        let objects = objects(&dir);
+        let base = dir.path().join("objects");
+        symlink("ab", base.join("link")).unwrap();
+        std::fs::write(base.join("file"), b"x").unwrap();
+        assert_eq!(objects.read_link("link", 64).unwrap(), b"ab");
+        let (path, reason) = invalid(objects.read_link("link", 1));
+        assert_eq!(path, "objects/link");
+        assert!(matches!(reason, Reason::TooLarge { cap: 1 }), "{reason:?}");
+        for path in ["file", "ab"] {
+            let err = io_err(objects.read_link(path, 64));
+            assert_eq!(
+                err.raw_os_error(),
+                Some(Errno::INVAL.raw_os_error()),
+                "{path}"
+            );
+        }
+        assert_eq!(absent(objects.read_link("none", 64)), "objects/none");
     }
 
     #[test]

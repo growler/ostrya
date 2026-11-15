@@ -221,15 +221,16 @@ fn an_unreached_weak_ref_is_deleted_and_its_objects_swept() {
 }
 
 /// `refs/heads` is a symlink to a directory that holds a weak ref that the
-/// walk does not reach. The run fails with `RefNotWritable` before it deletes
-/// anything, so the ref file behind the link and its commit stay.
+/// walk does not reach. The ref listing fails with `InvalidFormat` before the
+/// run deletes anything, so the ref file behind the link and its commit
+/// stay.
 #[test]
 fn a_weak_ref_below_an_alias_fails_the_prune() {
     prune_below_an_alias("weak-refs-below-alias", false);
 }
 
-/// A `no_prune` dry run checks the weak refs to delete as a real run does. It
-/// fails with the same error, and deletes nothing.
+/// A `no_prune` dry run lists the refs as a real run does. It fails with the
+/// same error, and deletes nothing.
 #[test]
 fn a_weak_ref_below_an_alias_fails_the_dry_run() {
     prune_below_an_alias("weak-refs-below-alias-dry", true);
@@ -237,8 +238,8 @@ fn a_weak_ref_below_an_alias_fails_the_dry_run() {
 
 /// Runs a prune with the given `no_prune` in a repository whose `refs/heads`
 /// is a symlink to a directory that holds the unreached weak ref `pool/a`.
-/// Asserts that the run fails with `RefNotWritable` for `pool/a`, and that the
-/// ref file behind the link and its commit stay.
+/// Asserts that the run fails with `InvalidFormat` for `refs/heads`, and that
+/// the ref file behind the link and its commit stay.
 fn prune_below_an_alias(name: &str, no_prune: bool) {
     let tmp = TmpDir::new(name);
     block_on(async {
@@ -256,11 +257,13 @@ fn prune_below_an_alias(name: &str, no_prune: bool) {
         let err = repo.prune(&opts).await.unwrap_err();
 
         match err {
-            Error::RefNotWritable { name, reason } => {
-                assert_eq!(name, "pool/a");
-                assert_eq!(reason, "passes through an alias");
+            Error::InvalidFormat(text) => {
+                assert!(
+                    text.starts_with("refs/heads passes through a symlink"),
+                    "{text}"
+                );
             }
-            other => panic!("expected RefNotWritable, got {other:?}"),
+            other => panic!("expected InvalidFormat, got {other:?}"),
         }
         assert!(
             base.join("real/pool/a").is_file(),

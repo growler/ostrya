@@ -357,11 +357,9 @@ For each other collection id, it reads `refs/mirrors/ID/NAME`. The read takes no
 `Repo::list_collection_refs_in` lists the refs of the collection `ID` by
 the same rule.
 
-A symlink that the port does not write can make the resolve and the ref
-listing give different results. Examples are a symlink to a directory in
-the mirror tree, an alias loop, and an absolute alias. The listing does not
-follow a symlink to a directory, and it reads an alias by its own rule. The
-resolve follows each link through the file system.
+The resolve and the ref listing read an alias by one rule, the alias rule
+of "Ref files". So an alias to a directory, an alias to an alias, and an
+absolute alias name no ref in both.
 
 The file `summary` at the repository root is the root summary. It holds
 each local ref and each collection ref, whatever the client groups, and it
@@ -570,8 +568,7 @@ holds only `.filez` content objects and uncompressed metadata.
   refs/mirrors/<collection>/<ref> collection refs (<collection>/ lazy)
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
-  tmp/.ostrya-ref-<pid>-<n>-XXXXXX  port temp entry of a ref or alias write
-  tmp/.ostrya-tmp-<pid>-XXXXXX    port temp file of a .commitmeta or .tombstone-commit
+  tmp/.ostrya-tmp-<pid>-XXXXXX    port temp entry of a ref, an alias, a .commitmeta, or a .tombstone-commit
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -651,15 +648,75 @@ The refspec `remote:ref` maps to `refs/remotes/remote/ref`, and a bare `ref`
 maps to `refs/heads/ref`. A NULL rev deletes the ref. An alias is a relative
 symlink.
 
-When the port reads a ref file, the open does not wait for a writer. The port
-checks the type of the file after the open. A FIFO, a socket, or a device file
-at a ref path is no ref, also through an alias. A ref listing does not hold
-it, and a resolve of its name finds no ref. A ref listing reads the type of
-each entry before the open, and it does not open a FIFO, a socket, or a device
-file. So the listing leaves out such an entry also when the permissions refuse
-its open. A read of one ref name opens the file, also at a FIFO. A listing
-opens each other entry and the target of each alias. When the permissions
-refuse one of these opens, the read fails with the error of the open.
+The port reads each ref path with one `openat2` relative to the repository
+root, with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`. So the
+open of a FIFO does not wait for a writer. One `statx` on the open file then
+checks the type. A symlink at a directory above the ref fails the read with
+the message `<path> passes through a symlink; ostrya refuses a symlink in the
+repository`, where `<path>` is the path of the ref. This includes a symlink
+at `refs`, `refs/heads`, `refs/remotes/R`, and `refs/mirrors/ID`. A listing
+of `refs/heads`, `refs/remotes`, or `refs/mirrors` fails in the same way when
+`refs` or the listed directory is a symlink, and so does a listing that opens
+`refs/remotes/R` or `refs/mirrors/ID` by its name. A listing of
+`refs/remotes` or `refs/mirrors` also fails when an entry directly in it is a
+symlink, with the message `refs/remotes/R passes through a symlink; ostrya
+refuses a symlink in the repository` or the same message for
+`refs/mirrors/ID`. This applies to each listing of these directories: the
+ref listings, `refs`, the summary, prune, and fsck. So a
+prune and an fsck fail, and the prune deletes nothing, when a ref is below
+such a symlink. Below that level, a listing reads a symlink entry as an
+alias, and never goes into it. A prefix of a listing whose path passes
+through a symlink fails with the message `<path> passes through a symlink;
+ostrya refuses a symlink in the repository`, where `<path>` is the path of
+the prefix below the repository.
+
+A ref file holds 4096 bytes at most. A larger file fails the read with the
+message `<path> is larger than its cap of 4096 bytes`, in a resolve, in a
+listing, and in the check of a ref write.
+
+A read of one ref name, for example `rev-parse` or `Repo::resolve_ref_tip`,
+gives no ref for an absent entry and for a path through a ref file. A
+directory, a FIFO, a socket, or a device file at the path fails the read with
+`not a ref: NAME: is not a regular file`. The read opens the path first, also
+at a FIFO, and checks the type after the open. A ref listing reads the type
+of each entry before the open, and it does not open a FIFO, a socket, or a
+device file. So the listing leaves out such an entry also when the
+permissions refuse its open. When the permissions refuse the open of a ref
+file or of an alias target, the read fails with the error of the open.
+
+An alias is a symlink in `refs/`. The port reads the body of the link with
+`readlinkat`, and never follows the link through the file system. The body
+resolves against the directory of the alias by name. The alias rule:
+
+- The body is a relative path. It resolves to a path below `refs/`. A `..`
+  that leaves `refs/`, an empty component, and a component that starts with
+  `.` break the rule.
+- No component of the target path is a symlink.
+- The target is a regular file. The port reads the type of the target with an
+  `lstat` before its open, so no read opens a FIFO, a socket, or a device
+  through an alias.
+- The target is not an alias. An alias to itself is an alias to an alias.
+
+An alias whose target is absent, or whose target path passes through a ref
+file, names no ref. An alias that breaks the rule also names no ref: the ref
+listings, `refs`, the summary, the archive view, prune, and fsck leave it out,
+and a read of its name fails with `not a ref: NAME: REASON`. The reasons are
+`is an alias whose target is not a relative path inside refs/`, `is an alias
+whose target passes through a symlink`, `is an alias to an entry that is not
+a regular file`, and `is an alias to an alias`. So an alias to a path outside
+the repository or outside `refs/` names no prune root and no fsck root, and a
+prune can delete a commit that only such an alias names. Only a write from
+outside the port makes such an alias. `conformance/cli-surface.md`, "Global
+conventions", records the divergences of the alias rule.
+
+An alias write (`Repo::set_ref_alias_immediate`, `UpdateGuard::set_ref_alias`,
+`refs -A --create`) reads the type of the target with one `lstat` under the
+update lock. It refuses an alias whose target is an alias, or is the alias
+itself, with `Error::RefNotWritable`, reason `targets an alias`. A symlink
+above the target gives the reason `passes through an alias`. An absent target
+is allowed. The check reads the new alias alone: an alias write over a ref
+file that other aliases name makes these aliases name an alias, and they then
+name no ref.
 
 A remote ref `refs/remotes/R/REF` belongs to the collection that the
 `collection-id` of the remote `R` names. The port lists it under that id in
@@ -973,11 +1030,17 @@ This includes the parent of the ref, `refs/heads`, and the repository root.
 ref name, with no sync. `refs --delete` runs `unlinkat` alone.
 
 The port creates the temp file of a ref write, and the symlink of an alias
-write, in `<repo>/tmp`. It creates `<repo>/tmp` if it is absent. It runs
-`fdatasync` on the temp file of a ref write, and renames the temp entry over the
-ref name. Then it runs `fsync` on the directory that holds the ref. A ref
-removal does not use `tmp/`, and the port runs the same directory `fsync` after
-it.
+write, in `<repo>/tmp`, with the name `.ostrya-tmp-<pid>-XXXXXX`. A
+transaction uses the `tmp/` that holds its staging directory. Each other
+write uses the `tmp/` that the repository handle opened at its first write,
+and the handle creates `<repo>/tmp` if it is absent. The port sets the mode
+`0644` of the temp file of a ref write, and then runs `fsync` on it, so the
+sync covers the mode. It opens the directory that holds the ref with
+no symlink followed, and renames the temp entry over the ref name relative to
+that directory. So the rename never goes through a symlink. Then it runs
+`fsync` on the directory that holds the ref. A ref removal does not use
+`tmp/`. It unlinks the ref relative to the directory that holds it, and the
+port runs the same directory `fsync` after it.
 
 A ref listing reads every entry under `refs/`, so the port keeps no temp entry
 there. If `<repo>/tmp` is on a different filesystem from the ref, the rename
@@ -987,15 +1050,18 @@ the ref stays unchanged.
 A ref name with a `/` can make the write create directories. A `mkdirat` records
 a name in the directory where it is called, so for a created
 `refs/heads/deep/nest` the directory to sync is `refs/heads/deep`. The port
-syncs the directory that holds the ref first. Then it runs `fsync` on the
-directory that holds each parent directory that the write created, deepest
-first. This is the child-before-parent order of the object fanout.
+creates the directories from the top down. When it creates a directory, it
+runs `fsync` at once on the directory that holds it. After the rename, it runs
+`fsync` on the directory that holds the ref. If `refs/` is absent, the write
+creates it with `heads`, `remotes`, and `mirrors`, and syncs the repository
+root and `refs/`. A file or a symlink at a component of the path fails the
+write.
 
-A crash part way through leaves a prefix of the path recorded. It never leaves a
-directory entry that names a directory whose own contents are not recorded.
-The write does not sync a directory that it found in place, unless that
-directory holds an entry that the write created. The name of a directory found
-in place is already durable.
+A crash part way through can leave an empty directory below `refs/`. It never
+leaves a directory entry that names a directory whose own entry is not
+recorded, and it loses no ref and changes no ref. The write does not sync a
+directory that it found in place, unless that directory holds an entry that
+the write created. The name of a directory found in place is already durable.
 
 A write whose parent directories all exist, such as a single-component
 local ref, creates no directory. The first ref of a remote creates
@@ -1005,9 +1071,11 @@ each directory that it created.
 
 A transaction that writes several refs renames every ref file first. Then,
 before its commit returns, it runs `fsync` once on each directory that gained or
-lost a name, deepest first. So two refs in one directory share one sync. Each
-ref file gets `fdatasync` before its rename. The objects and the detached
-metadata that the refs name are durable before the first rename. So the order
+lost a ref name, deepest first. So two refs in one directory share one sync.
+Each directory that a ref write creates gets the sync of its parent at once,
+so two new directories under one parent sync that parent two times. Each ref
+file gets `fsync` before its rename. The objects and the detached metadata
+that the refs name are durable before the first rename. So the order
 guarantee is the same as for one ref.
 
 `fsync=false` makes all of these syncs no-ops. The syscall sequence carries no
@@ -1219,7 +1287,7 @@ Each transaction creates a new staging directory, and the port reuses none.
 between the two reaps.
 
 The port writes a ref, an alias, a `.commitmeta`, and a `.tombstone-commit`
-through the temp entries `.ostrya-ref-*` and `.ostrya-tmp-*`. These entries get
+through the temp entries `.ostrya-tmp-*`. These entries get
 the age test like each other entry. With a very small or negative
 `tmp-expiry-secs`, the reap of another transaction can unlink such an entry
 before its rename. The write then fails with `ENOENT`, and the ref or the object
@@ -5070,16 +5138,20 @@ These rules apply to each ref of the two parts:
   that a deny item of the namespace covers.
 - An alias is in the listing under its own name, with the commit of its
   target, when the client reads its name and its target. The alias resolves
-  by the rules of "The archive view": the body is relative and stays inside
+  by the alias rule of "Ref files": the body is relative and stays inside
   `refs/`, and the server follows one link and no symlink on the path of the
+  target. The server reads the type of the target before it opens the
   target. The path of the target gives its namespace. These aliases are not
   in the listing: an alias that breaks one of these rules, an alias of an
   alias, an alias to a ref under `refs/remotes/`, and an alias whose target
   is no regular file, for example a directory.
 - An alias whose target is absent, and a ref file that a write removes during
   the walk, are not in the listing.
-- A ref entry that is a FIFO or a socket when the server opens it is not in
-  the listing. The open does not wait for a writer.
+- The server reads the type of each ref entry from the listing of its
+  directory, and does not open an entry that is a FIFO, a socket, or a
+  device file. Such an entry is not in the listing. An entry that changes
+  into such a file before its open is not in the listing either, and the open
+  does not wait for a writer.
 - These refs fail the whole listing when the client reads them, and the
   server leaves out no ref for these causes:
   - a ref file that is not UTF-8, or that holds no checksum;
@@ -5091,9 +5163,11 @@ With a list of the collection refs, the server reads the top level of
 `refs/mirrors/` one time, whatever the rights of the client. A directory
 whose name fails the collection-id rule is left out of the listing, and the
 server reads no file in it. The server writes a warning for each such
-directory. A name that is not UTF-8, and a file or a symlink at the top level,
-are left out with no warning. With no list of the collection refs, the server
-does not read `refs/mirrors/`.
+directory. A name that is not UTF-8, and an entry at the top level that is
+not a directory or a symlink, are left out with no warning. A symlink at the top level fails the listing with the
+message `refs/mirrors/ID passes through a symlink; ostrya refuses a symlink
+in the repository` ("Ref files"). With no list of the collection refs, the
+server does not read `refs/mirrors/`.
 
 The global metadata dict holds these entries, in this order:
 

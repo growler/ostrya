@@ -235,8 +235,9 @@ fn a_ref_that_only_a_remote_holds_is_not_found() {
     });
 }
 
-/// An operand that names a directory of the ref tree of the source, or a path
-/// under a ref file, is a ref that the source does not hold.
+/// An operand that names a directory of the ref tree of the source is not a
+/// ref. An operand that names a path under a ref file is a ref that the
+/// source does not hold.
 #[test]
 fn an_operand_that_names_a_ref_directory_is_not_found() {
     let tmp = TmpDir::new("media-ref-directory");
@@ -245,17 +246,25 @@ fn an_operand_that_names_a_ref_directory_is_not_found() {
         commit(&src, tmp.path(), "a", Some(&Ref::local(REF)), BOUND, &[]).await;
         let mount = mount_dir(tmp.path());
         let under = format!("{REF}/x");
-        for (operand, name) in [
-            (Ref::local("os"), "os"),
-            (Ref::collection(ID, "os"), "os"),
-            (Ref::local(&under), under.as_str()),
-            (Ref::collection(ID, &under), under.as_str()),
+        for (operand, name, directory) in [
+            (Ref::local("os"), "os", true),
+            (Ref::collection(ID, "os"), "os", true),
+            (Ref::local(&under), under.as_str(), false),
+            (Ref::collection(ID, &under), under.as_str(), false),
         ] {
             let err = export(&src, &mount, &[operand]).await.unwrap_err();
-            assert!(
-                matches!(&err, Error::RefNotFound(text) if *text == format!("@{ID}:{name}")),
-                "{err:?}"
-            );
+            let text = format!("@{ID}:{name}");
+            if directory {
+                assert!(
+                    matches!(&err, Error::NotARef { name, .. } if *name == text),
+                    "{err:?}"
+                );
+            } else {
+                assert!(
+                    matches!(&err, Error::RefNotFound(name) if *name == text),
+                    "{err:?}"
+                );
+            }
             assert_untouched(&mount);
         }
     });

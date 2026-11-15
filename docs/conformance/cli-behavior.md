@@ -1959,10 +1959,10 @@ corpus. It is a property of the writer.
 
 The port makes the same calls, and it adds the directory syncs of a ref write
 (`../format-reference.md`, "Ref durability"). Under `main` the ref write
-creates no directory. So the count of the port on the syncing row is 12 (10
-fsync, 1 fdatasync, 1 syncfs). Under `deep/nest/leaf` the write creates `deep`
-and `nest`. This gives three directory syncs and a count of 14 (12 fsync, 1
-fdatasync, 1 syncfs).
+creates no directory. The port syncs the temp file of the ref with `fsync`. So
+the count of the port on the syncing row is 12 (11 fsync, 1 syncfs). Under
+`deep/nest/leaf` the write creates `deep` and `nest`. This gives three
+directory syncs and a count of 14 (13 fsync, 1 syncfs).
 
 The three rows that sync nothing state the narrowing rule. The port also makes
 0 calls on each of these rows.

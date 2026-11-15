@@ -10,7 +10,9 @@
 //! extended attributes of a file object.
 
 use std::collections::{BTreeSet, HashMap};
-use std::os::fd::{AsFd, BorrowedFd};
+#[cfg(test)]
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -260,11 +262,10 @@ struct DetachedQueue {
 /// does not go into a mount: a mount point in the tree stops the removal of
 /// that tree, and the mount point and its content stay.
 ///
-/// A ref write, a detached-metadata write, and a tombstone write create a temp
-/// entry at the top level of `tmp/` and rename it over the target. The entry
-/// of a ref write is named `.ostrya-ref-<pid>-<n>-XXXXXX`. The entry of the
-/// other two writes is named `.ostrya-tmp-<pid>-XXXXXX`. The age test applies
-/// to such an entry.
+/// A ref write, an alias write, a detached-metadata write, and a tombstone
+/// write create a temp entry at the top level of `tmp/` and rename it over
+/// the target. The entry is named `.ostrya-tmp-<pid>-XXXXXX`. The age test
+/// applies to such an entry.
 ///
 /// If `tmp-expiry-secs` is very small or negative, a transaction that begins
 /// can remove the entry before its rename. The write then fails with `ENOENT`,
@@ -1579,7 +1580,9 @@ impl Transaction {
     ///   `extensions/ostrya/composefs/<xx>/` directory that got an image, and
     ///   on `extensions/ostrya/composefs/`. It syncs each directory that the
     ///   call creates into its parent.
-    /// - Before the rename of each ref, it runs `fdatasync` on the temp file.
+    /// - When a ref write makes a directory under `refs/`, it runs `fsync` at
+    ///   once on the directory that holds the new directory.
+    /// - Before the rename of each ref, it runs `fsync` on the temp file.
     /// - After the last ref rename, it runs `fsync` once on each directory that
     ///   gained or lost a ref name, deepest first.
     ///
@@ -1740,8 +1743,7 @@ impl Transaction {
     ) -> Result<TransactionStats> {
         let detached = self.detached_job(synced)?;
         let (fsync, _) = self.fsync_flags()?;
-        let repo_mode = self.repo.mode();
-        let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
+        let root = self.repo.root_dir().clone();
         let stats = self.staged.lock().unwrap().stats;
         let staging = self
             .staging
@@ -1750,18 +1752,11 @@ impl Transaction {
         let lock = self.lock;
         ostrya_rt::unblock(move || {
             #[cfg(test)]
-            test_tail::pass(repo_fd.as_fd());
-            let tmp_fd = staging.tmp_fd();
-            let written = crate::refs::check_resolved_refs_blocking(repo_fd.as_fd(), &refs)
+            test_tail::pass(root.as_fd());
+            let written = crate::refs::check_resolved_refs_blocking(&root, &refs)
                 .and_then(|()| detached.run())
                 .and_then(|()| {
-                    crate::refs::write_resolved_refs_blocking(
-                        repo_fd.as_fd(),
-                        tmp_fd,
-                        &refs,
-                        fsync,
-                        repo_mode,
-                    )
+                    crate::refs::write_resolved_refs_blocking(&root, staging.tmp(), &refs, fsync)
                 });
             drop(held);
             drop(staging);
@@ -3112,9 +3107,10 @@ mod tests {
         });
     }
 
-    /// A path that names a directory, or that passes through a file, reads
-    /// as an absent ref. A conditional entry that gives back this absent tip
-    /// fails, and the refs in the store keep their commits.
+    /// A path that passes through a file reads as an absent ref, and a path
+    /// that names a directory is not a ref. A conditional entry that expects
+    /// an absent ref at such a path fails, and the refs in the store keep
+    /// their commits.
     #[test]
     fn a_conditional_entry_on_the_absent_tip_of_a_path_that_is_not_a_ref_fails() {
         let scratch = Scratch::new("ref-cas-absent-tip");
@@ -3131,10 +3127,13 @@ mod tests {
                 ("app/x", "passes through a file"),
                 ("host", "names a directory"),
             ] {
-                let expected = tip(&repo, name).await;
-                assert_eq!(expected, None);
+                match repo.resolve_ref_tip(&Ref::local(name)).await {
+                    Ok(None) => assert_eq!(name, "app/x"),
+                    Err(Error::NotARef { .. }) => assert_eq!(name, "host"),
+                    other => panic!("{name}: {other:?}"),
+                }
                 let txn = repo.transaction().await.unwrap();
-                txn.set_ref_expecting(&Ref::local(name), expected.as_ref(), Some(&c));
+                txn.set_ref_expecting(&Ref::local(name), None, Some(&c));
                 let err = txn.commit().await.unwrap_err();
                 assert_not_writable(err, name, reason);
             }

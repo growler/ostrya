@@ -195,13 +195,13 @@ them are observed and deliberately not reproduced:
   `refs -A --create` refuses a target that is no ref, such as a directory or a
   dangling alias. No command of the port writes a link that names its own
   directory. Port writers make a link that names a directory in these ways:
-  - `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` do not
-    examine the target path, so each writes such a link in one step. With
-    the ref `deep/nest/ing`, `set_ref_alias_immediate("dal", "deep")` returns
-    `Ok`, and `Repo::list_refs` then fails with `Error::Io` of the kind
-    `IsADirectory`. On an empty repository, `set_ref_alias_immediate("a/b",
-    "a")` returns `Ok` and writes `refs/heads/a/b -> ../a`, a link that names
-    its own directory.
+  - `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` refuse
+    a target that is an alias, and accept a target of each other type, so
+    each writes such a link in one step. With the ref `deep/nest/ing`,
+    `set_ref_alias_immediate("dal", "deep")` returns `Ok`, and
+    `Repo::list_refs` then leaves the link out. On an empty repository,
+    `set_ref_alias_immediate("a/b", "a")` returns `Ok` and writes
+    `refs/heads/a/b -> ../a`, a link that names its own directory.
   - A writer removes the target ref of an alias and keeps the alias. Then a
     writer writes a ref below the target path. `refs --delete` of a remote
     ref keeps the alias. So after `refs -A --create=up9 origin:rb`, which
@@ -225,9 +225,12 @@ them are observed and deliberately not reproduced:
     These writers then write a ref below the target path: `commit -b`,
     `commit --tag`, `refs --create`, `pull`, `pull-local`, and a push.
     Each ref write, ref removal, and alias write of the port refuses a path
-    that has a symlink above the ref. The library and the `ostrya` commands
-    give `error: ref not writable: <name>: passes through an alias` at exit
-    1. A push that `ostrya receive` takes gets the ref-denied text `ref
+    that has a symlink above the ref. The library gives
+    `Error::RefNotWritable` with the reason `passes through an alias`. The
+    `ostrya` commands read the ref before the write, and that read of a path
+    below a symlink fails first: `error: invalid format: refs/heads/<name>
+    passes through a symlink; ostrya refuses a symlink in the repository` at
+    exit 1. A push that `ostrya receive` takes gets the ref-denied text `ref
     '<name>' names a directory or a path below a ref file or an alias, which
     a ref write cannot replace`. `commit --tag` gives `error: --tag
     specified but ref <name> already exists`. So no writer of the port
@@ -249,16 +252,16 @@ them are observed and deliberately not reproduced:
     removes them and exits 0. A `--delete` that names the link reports `error:
     Listing refs: opendir(lnk): Not a directory` and exits 1.
   - The port reads each symlink under `refs/` as an alias, and descends into a
-    real directory alone. So the read of the link fails with `EISDIR` wherever
-    an enumeration reaches it. The port reports `error: i/o error: Is a
-    directory (os error 21)` and exits 1 from each listing form other than
-    `-A`. It does the same from `--delete`, whatever the prefix matches, and
-    from `fsck` and `prune`. `ostrya push` with no refspec reads only the
-    ref files that `push-branches` selects and that the filter of
-    `--collection` keeps. So it reads at no step a link that the key does
-    not select or that the filter drops. A link that the key selects and
-    that the filter keeps gives the same error before the ssh client
-    starts. The listing of `ostrya push`
+    real directory alone. An alias whose target is a directory names no ref
+    (`../format-reference.md`, "Ref files", the alias rule). So each listing
+    form leaves the link out and exits 0, and so do `fsck` and `prune`. A
+    `--delete` removes the refs that its prefix matches and exits 0. A
+    `PREFIX` and a `--delete` that name the link match no ref and exit 0.
+    `ostrya push` with no refspec reads only the ref files that
+    `push-branches` selects and that the filter of `--collection` keeps. A
+    link that the key selects names no ref, so the key selects no ref
+    there, and the ssh client does not start for it. The listing of
+    `ostrya push`
     reads no entry under `refs/mirrors/ID/` of the own collection id or of
     an id that is not valid. `summary -u` leaves the link out of the summary
     and exits 0. Where `summary -u` writes the anchor commit and the link is
@@ -372,17 +375,22 @@ them are observed and deliberately not reproduced:
   condition has one message wherever a name reaches the library
   (`cli-behavior.md`, "CLI output formats", `refs`, "Listing and prefixes");
 - a `PREFIX` whose path under `refs/` runs through a ref file -- `plain/x` over
-  the ref `plain`, `origin:rr/x/y` over the ref `origin:rr/x`, `al/x` through an
-  alias symlink -- is refused by both, in every listing form and in `--delete`,
-  before the prefix matches anything. The tool reports `error: Listing refs:
-  fstatat(<path>): Not a directory`, naming the path below the repository, and the
-  port reports `error: i/o error: Not a directory (os error 20)`, the one message
-  it gives that condition. Both exit 1, print the same standard output, and leave
-  the same refs tree, so the two lines differ by the path and the syscall the
-  tool names. With `-c` the positional is a collection id and no path is read,
-  which is the collection-id divergence above;
+  the ref `plain`, `origin:rr/x/y` over the ref `origin:rr/x` -- is refused by
+  both, in every listing form and in `--delete`, before the prefix matches
+  anything. The tool reports `error: Listing refs: fstatat(<path>): Not a
+  directory`, naming the path below the repository, and the port reports
+  `error: i/o error: Not a directory (os error 20)`, the one message it gives
+  that condition. Both exit 1, print the same standard output, and leave the
+  same refs tree, so the two lines differ by the path and the syscall the tool
+  names. With `-c` the positional is a collection id and no path is read,
+  which is the collection-id divergence above. A `PREFIX` that reaches a ref
+  file through an alias symlink, `al/x`, gets the same refusal from the tool.
+  The port follows no symlink, and it refuses the path below the alias: each
+  listing form and `--delete` report `error: invalid format: refs/heads/al/x
+  passes through a symlink; ostrya refuses a symlink in the repository`, exit
+  1, and delete nothing;
 - a ref name that names a directory under `refs/` draws one message from the port,
-  `error: i/o error: Is a directory (os error 21)`, and three from the tool, two
+  `error: not a ref: <name>: is not a regular file`, and three from the tool, two
   of which carry a name the port cannot reproduce. Against `refs/heads/d`, a
   directory holding the ref `d/inner`, the tool reports `error: Conflict: inner
   exists under d when attempting write` for `refs --create=d`, naming one ref read
@@ -408,8 +416,9 @@ them are observed and deliberately not reproduced:
   Under `-A` a NEWREF naming a remote reaches no directory check in either
   implementation, the tool refusing at its remote-alias step and the port at the
   existence check ahead of it, so `refs -A --create=origin:rr plain` reports
-  `error: Cannot create alias to remote ref: origin` and `error: i/o error: Is a
-  directory (os error 21)`, both exiting 1 and writing nothing. A directory named
+  `error: Cannot create alias to remote ref: origin` and `error: not a ref:
+  origin:rr: is not a regular file`, both exiting 1 and writing nothing. A
+  directory named
   as an `-A --create` target names no ref in both implementations, so `refs -A
   --create=al deep` and `refs -A --create=al deep/nest` report the line of the
   existence check, `error: Cannot create alias to non-existent ref: <target>`,
@@ -429,10 +438,16 @@ them are observed and deliberately not reproduced:
   no path. As an `-A --create` target, both implementations report the target
   as a name no ref holds, `error: Cannot create alias to non-existent ref:
   plain/x`, the existence check standing ahead of the name at that one site.
-  The port reports `error: i/o error: Not a directory (os error 20)` for every
-  other site, the one message it gives that condition, which is also the
-  message the `PREFIX` form above draws. Both exit 1 and leave `refs/`
-  unchanged;
+  The port reads a path through a ref file as no ref: `rev-parse plain/x`,
+  `cat plain/x PATH`, and the positional revision of a plain `--create`
+  report `error: Refspec 'plain/x' not found`. A write of such a name reports
+  the file that the write cannot use as a directory, `error: invalid format:
+  refs/heads/plain is not a directory` for `refs --create=plain/x` and `refs
+  -A --create=plain/x`, and `error: invalid format: refs/remotes/origin/rr/x
+  is not a directory` for `refs --create=origin:rr/x/y`. A name below an
+  alias symlink, `al/x`, reports `error: invalid format: refs/heads/al/x
+  passes through a symlink; ostrya refuses a symlink in the repository` at
+  each site. Both exit 1 and leave `refs/` unchanged;
 - a revision resolving to a commit the store does not hold is refused in
   different words: the tool names the loose object file it looked for, `error: No
   such metadata object <checksum>.commit`, and the port names the object type the
@@ -901,9 +916,10 @@ link `refs/heads/lnk -> d0`, the tool writes `commit -b lnk/x` to
 `refs/heads/d0/x` through the link and exits 0. With a dangling `lnk`, the
 tool reports `error: open(O_TMPFILE): No such file or directory` and exits 1
 (`cli-behavior.md`, "Symlinks under refs"). The port refuses both with
-`error: ref not writable: lnk/x: passes through an alias` at exit 1, after
-it publishes the objects. It writes no ref, the link stays, and the objects
-stay until a prune.
+`error: invalid format: refs/heads/lnk/x passes through a symlink; ostrya
+refuses a symlink in the repository` at exit 1, at the read of the tip of
+the branch, before it writes an object. It writes no ref, and the link
+stays.
 
 `--related=NAME=CHECKSUM` of the port names one dependency of the commit in
 field 2 of the commit object (`../format-reference.md`, "Commit --
@@ -1369,6 +1385,8 @@ vocabulary", "Sync counts of a commit"). One commit with the branch `main`
 issues 11 sync calls in the tool and 12 in the port. The extra call is the
 `fsync` of `refs/heads` (`commit_fsync_policy_controls_the_syscalls` and
 `commit_syncs_every_created_ref_directory` in `crates/ostrya-cli/tests/cli.rs`).
+The tool syncs the temp file of the ref with `fdatasync`, and the port syncs it
+with `fsync`. This changes the kind of one call, and not the count.
 
 Under `[core] per-object-fsync=true`, one commit of corpus `C0` issues 15 sync
 calls in the tool and 16 in the port in `archive` and in `bare-user`. In `bare`
@@ -1378,8 +1396,13 @@ of `refs/heads` (`commit_per_object_fsync_syncs_content_objects_alone`).
 The port runs `fsync` on the directory that holds a ref after it renames a ref
 file or an alias link over the ref name, and after it removes a ref. A write
 that creates directories for a ref name with `/` also syncs the directory that
-holds each created directory, deepest first. The tool syncs no directory in a
-ref write, an alias write, or a ref removal. In the port, the name that a
+holds each created directory, at once, from the top down. So a commit of
+`a/b/c` into an empty `refs/heads` syncs `refs/heads`, then `refs/heads/a`, and
+after the rename `refs/heads/a/b`. One transaction that creates two
+directories under one parent syncs that parent two times: a `pull-local` of
+`x/1` and `y/1` into an empty `refs/heads` syncs `refs/heads` two times, and
+then `refs/heads/x` and `refs/heads/y`. The tool syncs no directory in a ref
+write, an alias write, or a ref removal. In the port, the name that a
 completed ref operation created or removed survives a crash, and so does the
 content of the file. No published byte differs, and `fsync=false` turns off
 these syncs in the port. `../format-reference.md`, "Ref durability", states the
@@ -7426,6 +7449,77 @@ Observed by running the tool (2026.1).
   no entry into a mount. A mount point in such a tree stops the removal of
   that tree, and the mount point and its content stay. The reap of `tmp/`
   below states the divergence.
+- A symlink at `refs` or at `refs/heads` fails the port, in each open mode.
+  A read of a ref below it fails with `invalid format: <path> passes through
+  a symlink; ostrya refuses a symlink in the repository`, where `<path>` is
+  the path of the ref. A listing of `refs/heads` fails with the same text for
+  `refs` or `refs/heads`. Examples are `refs`, `rev-parse`, `summary -u`,
+  `fsck`, `prune --refs-only`, and `commit`, which reads its branch first. A
+  ref write of the library below the symlink fails with `ref not writable:
+  <name>: passes through an alias`. With libostree 2026.4 on 2026-11-13,
+  against a repository with an absolute symlink at `refs` or at
+  `refs/heads`, `refs`, `rev-parse`, `ls`, `fsck`, `commit`, `checkout -U`,
+  `pull-local --commit-metadata-only`, `summary -u`, `prune --refs-only`,
+  `config set`, and `config get` exit 0 with the output of a repository with
+  no symlink. The tool writes the new ref through the symlink.
+  `../format-reference.md`, "Ref files", states the read of the port.
+- An alias in `refs/` that breaks the alias rule of
+  `../format-reference.md`, "Ref files", names no ref in the port. The rule
+  refuses an absolute body, also one into `refs/`, and a body that resolves
+  outside `refs/`. `refs`, `summary -u`, `fsck`, `prune`, and the other ref
+  listings leave such an alias out, and `rev-parse` of its name exits 1 with
+  `error: not a ref: <name>: is an alias whose target is not a relative path
+  inside refs/`. So such an alias names no prune root and no fsck root, and
+  `prune` can delete a commit that only such an alias names. `refs -A` lists
+  the link. With libostree 2026.4 on 2026-11-13, the tool follows each of
+  these four aliases in `refs/heads`: `absin -> <repo>/refs/heads/test/main`,
+  `absout -> /var/tmp/p1probe/outside-ref`, `relroot -> ../../inrepo-ref`, and
+  `relout -> ../../../outside-ref`. `refs` lists the four names, and
+  `rev-parse` and `ls` resolve each name to the commit, at exit 0. `refs -A`
+  prints an absolute body unchanged, and a relative body with no leading
+  `../` components. `summary -u` writes each name as a ref of the summary,
+  with the commit of its target. `pull-local` of each name exits 1 with the
+  binding check of the commit, `Commit has no requested ref ‘<name>’ in ref
+  binding metadata (‘test/main’)`. `refs --delete absout` removes the symlink
+  and keeps its target.
+- An alias whose target is an alias names no ref in the port, and the port
+  writes no such alias. `refs -A --create=al2 al1`, where `al1` is an alias,
+  exits 1 with `error: ref not writable: al2: targets an alias` and writes
+  nothing. `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias`
+  refuse the same alias. An alias to an alias that a write from outside the
+  port makes, and an alias to itself, are not in `refs`, in the summary of
+  `summary -u`, and in the roots of `prune` and `fsck`. `rev-parse` of the
+  name exits 1 with `error: not a ref: <name>: is an alias to an alias`, and
+  `refs -A` lists the link. With libostree 2026.4 on 2026-11-15, the tool gives these results:
+  - `refs -A --create=al2 al1` exits 0 and writes `al2 -> al1`.
+  - With `al1 -> test/main` and `al2 -> al1`, `refs` and `refs --list` list
+    `al1`, `al2`, and `test/main`. `rev-parse al2` and `ls al2 /` resolve
+    the chain to the commit of `test/main`, at exit 0. `summary -u` exits 0,
+    and the summary lists `al1`, `al2`, and `test/main`, each with that
+    commit. `pull-local` of `al2` exits 1 with `Commit has no requested ref
+    ‘al2’ in ref binding metadata (‘test/main’)`, as for `al1`. `prune
+    --refs-only` exits 0 and removes nothing.
+  - With `self -> self`, `refs`, `summary -u`, and `prune --refs-only` exit
+    1 with `error: Listing refs: openat(self): Too many levels of symbolic
+    links`, and `rev-parse self` exits 1 with `error:
+    openat(refs/heads/self): Too many levels of symbolic links`. `refs -A`
+    exits 0 and prints `self -> self`.
+- The port reads 4096 bytes of a ref file at most. A larger ref file fails
+  each read of it, and each listing that reads it, with `invalid format:
+  <path> is larger than its cap of 4096 bytes` at exit 1. Examples are
+  `rev-parse`, `refs`, `summary -u`, `fsck`, and `prune --refs-only`. A ref
+  file of exactly 4096 bytes reads. The cap bounds the memory of the read of
+  a ref (`../../CLAUDE.md`, "Working conventions"). With libostree 2026.4 on
+  2026-11-15, the tool reads a ref file of each size up to 16 MiB in reads of
+  4096 bytes to the end of the file, and drops the white space at the end.
+  So a ref file of 4097 bytes, or of 8192 bytes, that holds the 65-byte line
+  and then newlines or spaces gives the commit in `rev-parse`, `refs`,
+  `summary -u`, `fsck`, and `prune --refs-only`, at exit 0. A character other
+  than white space after the line, also after byte 4096, makes `rev-parse`
+  exit 1 with `error: Invalid rev <content>`, and `summary -u` and `fsck`
+  exit 1 with an error that holds the whole content. `refs` lists the name
+  and exits 0, and `prune --refs-only` exits 0 and reads no root from that
+  ref.
 - The port opens `.lock`, `.update.lock`, and each staging lock file
   `tmp/staging-<boot-id>-XXXXXX-lock` with no follow. A symlink, a FIFO, a
   socket, a device, or a directory at `.lock` or at `.update.lock` fails the
@@ -7560,12 +7654,14 @@ Observed by running the tool (2026.1).
     removes an aged entry with an ASCII name. It keeps a regular file with
     the name `\xffnew` that is not aged. A directory with such a name that
     is not aged was not observed.
-- The port creates the temp file of a ref write in `tmp/`, and the tool
-  creates it in the directory that holds the ref. The `fdatasync` of a ref
-  write therefore reaches a file under `tmp/` in the port and a file under
-  `refs/` in the tool (`commit_fsync_policy_controls_the_syscalls` in
+- The port creates the temp file of a ref write in `tmp/`, with the name
+  `.ostrya-tmp-<pid>-XXXXXX`, and the tool creates it in the directory that
+  holds the ref. The port syncs that file with `fsync`, and the tool with
+  `fdatasync`. The sync of a ref write therefore reaches a file under `tmp/`
+  in the port and a file under `refs/` in the tool
+  (`commit_fsync_policy_controls_the_syscalls` in
   `crates/ostrya-cli/tests/cli.rs`). The port also creates the temp symlink
-  of an alias write in `tmp/`. It writes each `.commitmeta` it does not
+  of an alias write in `tmp/`, with the same name form. It writes each `.commitmeta` it does not
   stage, and each `.tombstone-commit`, through a named temp file
   `tmp/.ostrya-tmp-<pid>-XXXXXX`, and moves it over the target with one
   `renameat`. No published byte differs.

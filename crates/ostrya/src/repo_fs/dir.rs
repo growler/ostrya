@@ -549,6 +549,12 @@ impl RepoDir {
         fsync_dir(fd.as_fd()).map_err(io_error)
     }
 
+    /// Syncs the directory of this handle with `fsync`. The call opens
+    /// nothing. An error of the `fsync` gives [`FsError::Io`].
+    pub(crate) fn sync(&self) -> Result<(), FsError> {
+        fsync_dir(self.as_fd()).map_err(io_error)
+    }
+
     /// Syncs the file system that holds the directory, with `syncfs`.
     pub(crate) fn syncfs(&self) -> Result<(), FsError> {
         rustix::fs::syncfs(self).map_err(io_error)
@@ -1513,6 +1519,21 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(take_synced().is_empty());
+    }
+
+    #[test]
+    fn sync_syncs_the_directory_of_the_handle() {
+        let dir = TestDir::new("sync-self");
+        std::fs::create_dir(dir.path().join("objects")).unwrap();
+        let repo = root(&dir);
+        let objects = repo.open_layout(RepoLayout::Objects).unwrap();
+        let _reset = record_syncs();
+        repo.sync().unwrap();
+        objects.sync().unwrap();
+        assert_eq!(
+            take_synced(),
+            [id_of(dir.path()), id_of(&dir.path().join("objects"))]
+        );
     }
 
     #[test]

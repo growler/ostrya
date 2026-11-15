@@ -159,21 +159,30 @@ On a file system with no \fB\%RENAME_NOREPLACE\fR and no hard links, each object
 A local ref.
 The file holds the 64 hexadecimal characters of a commit checksum and a newline.
 A \fB\%/\fR in the ref name makes a subdirectory.
+The file holds 4096 bytes at most, and a larger file fails each read with the error \fB\%invalid format: <path> is larger than its cap of 4096 bytes\fR.
 An alias is a relative symbolic link to another ref.
-Each write and removal of a ref or an alias refuses a symbolic link above the ref, at each directory from \fB\%refs/\fR down.
-The ostrya library and the \fB\%ostrya\fR commands give the error \fB\%ref not writable: <ref>: passes through an alias\fR.
+A read of an alias does not follow the link through the file system.
+The body of the link must resolve to a path below \fB\%refs/\fR, and the target must be a regular file that is not an alias, with no symbolic link on its path.
+An alias that breaks this rule, or whose target is absent, names no ref: the listings and \fB\%ostrya summary \-u\fR leave it out, and \fB\%ostrya prune\fR and \fB\%ostrya fsck\fR read no root from it.
+\fB\%ostrya refs \-A \-\-create\fR refuses a target that is an alias, with the error \fB\%ref not writable: <ref>: targets an alias\fR.
+A directory, a FIFO, a socket, or a device at the path of a ref is not a ref, and \fB\%ostrya rev\-parse\fR of its name gives the error \fB\%not a ref: <ref>: is not a regular file\fR.
+Each read, write, and removal of a ref refuses a symbolic link above the ref, at each directory from \fB\%refs/\fR down, also at \fB\%refs/\fR and \fB\%refs/heads/\fR.
+A read gives the error \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
+The ostrya library gives the error \fB\%ref not writable: <ref>: passes through an alias\fR for a write.
+The \fB\%ostrya\fR commands read the ref before they write it, so they give the error of the read.
 A push that \fB\%ostrya receive\fR takes gets the error \fB\%ref '<ref>' names a directory or a path below a ref file or an alias, which a ref write cannot replace\fR.
 \fB\%ostrya commit \-\-tag\fR gives \fB\%\-\-tag specified but ref <ref> already exists\fR.
-A read of a ref follows such a link.
 .TP
 \fB\%<repo>/refs/remotes/<remote>/<ref>\fR
 A ref that a pull from the remote \fB\%<remote>\fR wrote.
 The refspec \fB\%<remote>:<ref>\fR names it.
+A symbolic link at \fB\%refs/remotes/<remote>\fR fails each listing of \fB\%refs/remotes\fR, also in \fB\%ostrya prune\fR and \fB\%ostrya fsck\fR, with the error \fB\%invalid format: refs/remotes/<remote> passes through a symlink; ostrya refuses a symlink in the repository\fR, and \fB\%ostrya prune\fR then deletes nothing.
 .TP
 \fB\%<repo>/refs/mirrors/<collection\-id>/<ref>\fR
 A collection ref.
 The summary lists these refs in its collection map.
 A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
+A symbolic link at \fB\%refs/mirrors/<collection\-id>\fR fails each listing of \fB\%refs/mirrors\fR, also in \fB\%ostrya summary \-u\fR, \fB\%ostrya prune\fR, and \fB\%ostrya fsck\fR, with the error \fB\%invalid format: refs/mirrors/<collection\-id> passes through a symlink; ostrya refuses a symlink in the repository\fR, and \fB\%ostrya prune\fR then deletes nothing.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
 A pull with \fB\%\-\-collection\fR and \fB\%refs \-c \-\-create\fR write it by the same rule.
 A pull with \fB\%\-\-mirror\fR writes it by the same rule for each ref of the collection \fB\%<collection\-id>\fR that the summary of the remote states, and for each ref of the collection map of that summary.
@@ -292,8 +301,8 @@ A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\
 No command writes it.
 .PP
 To change \fB\%config\fR, a ref, \fB\%summary\fR, a file under \fB\%extensions/ostrya/summary/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file and renames it over the target.
-The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-ref\-*\fR or \fB\%tmp/.ostrya\-tmp\-*\fR below \fB\%tmp/\fR.
-A \fB\%.commitmeta\fR and a \fB\%.tombstone\-commit\fR use \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR.
+The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-tmp\-*\fR below \fB\%tmp/\fR.
+A ref, an alias, a \fB\%.commitmeta\fR, and a \fB\%.tombstone\-commit\fR use \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR.
 .SH STATIC DELTAS
 A static delta holds the objects that change between two commits, or all the objects of one commit.
 Its path uses a modified base64 form of the commit checksums: standard base64 with \fB\%/\fR changed to \fB\%_\fR and no trailing \fB\%=\fR, 43 characters in all.
@@ -533,7 +542,7 @@ the directory \fB\%extensions/ostrya/summary/\fR and its files;
 .IP \(bu 2
 the writer lock \fB\%extensions/ostrya/lock\fR, its probe \fB\%extensions/ostrya/lock\-probe\fR, and the markers \fB\%state/<checksum>.commitpartial\fR of a bucket repository;
 .IP \(bu 2
-the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-tmp\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
+the temporary names \fB\%tmp/.ostrya\-tmp\-*\fR and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2
 the config groups \fB\%[ex\-ostrya]\fR, \fB\%[ex\-ostrya server]\fR, \fB\%[ex\-ostrya client "NAME"]\fR, \fB\%[ex\-ostrya trust "NAME"]\fR, and \fB\%[ex\-ostrya key "NAME"]\fR;
 .IP \(bu 2

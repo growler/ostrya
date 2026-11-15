@@ -11,15 +11,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::BorrowedFd;
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Value};
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
-use crate::refs::walk_ref_dir;
+use crate::refs::{open_refs, open_top_in, read_listed_ref, refuse_top_symlink, walk_ref_dir};
 use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
 use crate::repo::Repo;
 use crate::repo_fs::{FsResultExt, RepoDir};
@@ -595,12 +593,18 @@ impl Repo {
 
     /// Returns each ref in `refs/heads`, `refs/remotes`, and `refs/mirrors`.
     ///
-    /// A ref entry that is a FIFO, a socket, or a device file is not in the
-    /// result. The call does not open such an entry, so its permissions have
-    /// no effect on the call. An alias to such a file is not in the result.
-    /// The call checks the type of each file that it opens, and an open does
-    /// not wait for a writer. An open that the permissions refuse fails the
-    /// call, also at the target of an alias.
+    /// The call reads the refs and the aliases by the rules of
+    /// [`Repo::list_refs`]. An alias that breaks the alias rule, an alias
+    /// whose target names no ref, and a ref entry that is a FIFO, a socket, or
+    /// a device file are not in the result. So such an alias names no prune
+    /// root and no fsck root. The call does not open a FIFO, a socket, or a
+    /// device file, so its permissions have no effect on the call. An open
+    /// that the permissions refuse fails the call, also at the target of an
+    /// alias. A symlink at `refs`, `refs/heads`, `refs/remotes`, or
+    /// `refs/mirrors`, and a symlink directly under `refs/remotes` or
+    /// `refs/mirrors`, fail the call with [`Error::InvalidFormat`]. So a ref
+    /// below a symlinked `refs/remotes/R` or `refs/mirrors/ID` fails the prune
+    /// and the fsck, and the prune deletes nothing.
     ///
     /// The name of each kind of ref:
     ///
@@ -619,12 +623,13 @@ impl Repo {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let mut out = Vec::new();
+            let refs = open_refs(&repo)?;
             for (space, top) in [
                 (RefSpace::Heads, "refs/heads"),
                 (RefSpace::Remotes, "refs/remotes"),
                 (RefSpace::Mirrors, "refs/mirrors"),
             ] {
-                collect_named_refs(repo.repo_fd(), space, top, &mut out)?;
+                collect_named_refs(&repo, refs.as_ref(), space, top, &mut out)?;
             }
             Ok(out)
         })
@@ -1429,32 +1434,32 @@ pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// Adds to `out` each ref file in the tree under `top`.
+/// Adds to `out` each ref file in the tree under `top`. `refs` is the handle
+/// of `refs/` that [`open_refs`] gives.
 ///
-/// The walk follows alias symlinks and skips a dangling symlink. A ref under
-/// `refs/remotes` takes its `<remote>:<name>` refspec as its name. A ref under
-/// `refs/heads` or `refs/mirrors` takes its path below `top`.
+/// The walk reads each ref and each alias by the rules of the ref listing
+/// ([`read_listed_ref`]). An alias that breaks the alias rule, and an alias
+/// whose target names no ref, give no ref. A symlink directly under
+/// `refs/remotes` or `refs/mirrors` fails the walk, as [`refuse_top_symlink`]
+/// states. A ref under `refs/remotes` takes its `<remote>:<name>` refspec as
+/// its name. A ref under `refs/heads` or `refs/mirrors` takes its path below
+/// `top`.
 fn collect_named_refs(
-    repo_fd: BorrowedFd<'_>,
+    repo: &Repo,
+    refs: Option<&RepoDir>,
     space: RefSpace,
     top: &str,
     out: &mut Vec<ListedRef>,
 ) -> Result<()> {
-    let dir = match rustix::fs::openat(
-        repo_fd,
-        top,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(()),
-        Err(e) => return Err(Error::Io(e.into())),
+    let Some(dir) = open_top_in(refs, top)? else {
+        return Ok(());
     };
-    walk_ref_dir(dir.as_fd(), "", &mut |entry| {
-        if !entry.can_hold_ref() {
-            return Ok(());
+    walk_ref_dir(&dir, "", &mut |entry| {
+        if space != RefSpace::Heads {
+            refuse_top_symlink(top, &entry)?;
         }
-        if let Some(checksum) = read_ref_target(entry.dir, entry.name)? {
+        if let Some((bytes, _)) = read_listed_ref(repo.root_dir(), top, &entry, None)? {
+            let checksum = crate::refs::parse_ref_content(&bytes)?;
             let name = match space {
                 RefSpace::Remotes => entry.path.replacen('/', ":", 1),
                 RefSpace::Heads | RefSpace::Mirrors => entry.path.to_owned(),
@@ -1472,17 +1477,6 @@ fn collect_named_refs(
         }
         Ok(())
     })
-}
-
-/// Returns the target checksum of the ref file `name` in `dir`.
-///
-/// The read follows alias symlinks. Returns `None` if the file is absent.
-/// The read checks the type of the file after the open, and the open does
-/// not wait for a writer. A FIFO, a socket, or a device file gives `None`.
-fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> {
-    crate::refs::read_ref_file(dir, name)?
-        .map(|bytes| crate::refs::parse_ref_content(&bytes))
-        .transpose()
 }
 
 #[cfg(test)]

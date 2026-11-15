@@ -94,6 +94,18 @@ fn assert_io(result: ostrya::Result<Option<Checksum>>, kind: ErrorKind) {
     }
 }
 
+/// Asserts that `result` is `Error::NotARef` for `name` with the reason `is
+/// not a regular file`.
+fn assert_not_a_ref(result: ostrya::Result<Option<Checksum>>, name: &str) {
+    match result {
+        Err(Error::NotARef { name: got, reason }) => {
+            assert_eq!(got, name);
+            assert_eq!(reason, "is not a regular file", "{name}");
+        }
+        other => panic!("{name}: {other:?}"),
+    }
+}
+
 #[test]
 fn a_mirror_ref_of_another_collection_resolves() {
     let tmp = TmpDir::new("ref-store-mirror");
@@ -333,31 +345,30 @@ fn the_own_collection_reads_a_local_ref_beside_a_mirror_ref_that_fails() {
     });
 }
 
+/// A path through a ref file holds no ref. A path that names a directory is
+/// not a ref, and the read fails with `NotARef`.
 #[test]
-fn a_directory_or_a_path_through_a_file_reads_as_no_ref() {
+fn a_directory_is_not_a_ref_and_a_path_through_a_file_reads_as_no_ref() {
     let tmp = TmpDir::new("ref-store-other-not-a-ref");
     let repo = open(&create(&tmp, Some(OWN)));
     block_on(async {
         put(&repo, OTHER, "a/b", &checksum(2)).await;
         put_local(&repo, "a", &checksum(1)).await;
-        assert_eq!(resolve(&repo, &Ref::collection(OTHER, "a")).await, None);
+        let cref = Ref::collection(OTHER, "a");
+        assert_not_a_ref(repo.resolve_ref_tip(&cref).await, &cref.to_string());
 
         put(&repo, OTHER, "f", &checksum(2)).await;
         put_local(&repo, "f/g", &checksum(1)).await;
         assert_eq!(resolve(&repo, &Ref::collection(OTHER, "f/g")).await, None);
 
         put_local(&repo, "d/e", &checksum(1)).await;
-        assert_eq!(resolve(&repo, &Ref::local("d")).await, None);
+        assert_not_a_ref(repo.resolve_ref_tip(&Ref::local("d")).await, "d");
 
-        // A revision keeps the error of the read.
-        assert_io(
-            repo.resolve_rev(&format!("@{OTHER}:a"), false).await,
-            ErrorKind::IsADirectory,
-        );
-        assert_io(
-            repo.resolve_rev(&format!("@{OTHER}:f/g"), false).await,
-            ErrorKind::NotADirectory,
-        );
+        // A revision gives the same results.
+        let rev = format!("@{OTHER}:a");
+        assert_not_a_ref(repo.resolve_rev(&rev, false).await, &rev);
+        let rev = format!("@{OTHER}:f/g");
+        assert_not_found(repo.resolve_rev(&rev, false).await, &rev);
     });
 }
 
@@ -697,12 +708,23 @@ fn put_file(path: &Path, rel: &str, checksum: &Checksum) {
     std::fs::write(file, format!("{}\n", checksum.to_hex())).unwrap();
 }
 
-/// Makes the symlink `rel` of the repository at `path`, which names its own
-/// directory.
-fn dir_link(path: &Path, rel: &str) {
-    let link = path.join(rel);
-    std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-    std::os::unix::fs::symlink(".", link).unwrap();
+/// Writes a ref file of 4097 bytes, one byte over the cap of a ref read, to
+/// the file `rel` of the repository at `path`. A read of it fails.
+fn put_oversize(path: &Path, rel: &str) {
+    let file = path.join(rel);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, vec![b'a'; 4097]).unwrap();
+}
+
+/// Asserts that `result` is `Error::InvalidFormat` for a ref file over its
+/// cap.
+fn assert_over_cap<T: std::fmt::Debug>(result: ostrya::Result<T>, what: &str) {
+    match result {
+        Err(Error::InvalidFormat(m)) => {
+            assert!(m.contains("is larger than its cap"), "{what}: {m}")
+        }
+        other => panic!("{what}: {other:?}"),
+    }
 }
 
 /// `list_refs_where` gives the local refs by name, then the refs of each
@@ -775,8 +797,8 @@ fn list_refs_where_gives_the_local_refs_then_the_collection_refs() {
 }
 
 /// `list_refs_where` applies `keep` to a name before it reads the ref file.
-/// An alias that names a directory and that `keep` drops is never read. A
-/// selected one fails the call with the error of `list_refs`.
+/// A ref file over the cap, whose read fails, gives no error when `keep`
+/// drops it. A selected one fails the call, as in `list_refs`.
 #[test]
 fn list_refs_where_does_not_read_an_entry_that_keep_drops() {
     let tmp = TmpDir::new("ref-store-where-keep");
@@ -785,10 +807,10 @@ fn list_refs_where_does_not_read_an_entry_that_keep_drops() {
     block_on(async {
         put_local(&repo, "main", &checksum(1)).await;
         put(&repo, OTHER, "x", &checksum(2)).await;
-        dir_link(&path, "refs/heads/lnk");
-        dir_link(&path, &format!("refs/mirrors/{OTHER}/lnk"));
+        put_oversize(&path, "refs/heads/big");
+        put_oversize(&path, &format!("refs/mirrors/{OTHER}/big"));
 
-        let refs = repo.list_refs_where(|r| r.name() != "lnk").await.unwrap();
+        let refs = repo.list_refs_where(|r| r.name() != "big").await.unwrap();
         assert_eq!(
             refs,
             vec![
@@ -797,23 +819,20 @@ fn list_refs_where_does_not_read_an_entry_that_keep_drops() {
             ]
         );
 
-        for name in [Ref::local("lnk"), Ref::collection(OTHER, "lnk")] {
+        for name in [Ref::local("big"), Ref::collection(OTHER, "big")] {
             let want = name.clone();
-            match repo.list_refs_where(move |r| *r == want).await {
-                Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
-                other => panic!("{name}: {other:?}"),
-            }
+            let refs = repo.list_refs_where(move |r| *r == want).await;
+            assert_over_cap(refs, &name.to_string());
         }
-        match repo.list_refs(None).await {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
-            other => panic!("list_refs: {other:?}"),
-        }
+        assert_over_cap(repo.list_refs(None).await, "list_refs");
     });
 }
 
 /// `list_refs_where` reads no entry of `refs/mirrors/OWN/`, of a directory
 /// whose name fails the collection-id rule, and directly under
-/// `refs/mirrors/`. `keep` is not called for them.
+/// `refs/mirrors/`. `keep` is not called for them. Each such entry is first
+/// a ref file over the cap, whose read fails. `list_mirror_refs` reads
+/// `refs/mirrors/OWN/` and the directory of the invalid name.
 #[test]
 fn list_refs_where_does_not_read_the_own_or_an_invalid_collection() {
     let tmp = TmpDir::new("ref-store-where-skip");
@@ -822,9 +841,11 @@ fn list_refs_where_does_not_read_the_own_or_an_invalid_collection() {
     block_on(async {
         put_local(&repo, "main", &checksum(1)).await;
         put(&repo, OTHER, "x", &checksum(2)).await;
-        dir_link(&path, &format!("refs/mirrors/{OWN}/lnk"));
-        dir_link(&path, "refs/mirrors/nodot/lnk");
-        dir_link(&path, "refs/mirrors/top");
+        let own = format!("refs/mirrors/{OWN}/r");
+        let entries = [own.as_str(), "refs/mirrors/nodot/r", "refs/mirrors/top"];
+        for rel in entries {
+            put_oversize(&path, rel);
+        }
 
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = seen.clone();
@@ -846,10 +867,20 @@ fn list_refs_where_does_not_read_the_own_or_an_invalid_collection() {
         seen.sort_by_key(|r| r.to_string());
         assert_eq!(seen, vec![Ref::collection(OTHER, "x"), Ref::local("main")]);
 
-        match repo.list_mirror_refs().await {
-            Err(Error::Io(e)) => assert_eq!(e.kind(), ErrorKind::IsADirectory, "{e}"),
-            other => panic!("list_mirror_refs: {other:?}"),
+        assert_over_cap(repo.list_mirror_refs().await, "list_mirror_refs");
+        for rel in entries {
+            put_file(&path, rel, &checksum(3));
         }
+        let mut mirrors = repo.list_mirror_refs().await.unwrap();
+        mirrors.sort();
+        assert_eq!(
+            mirrors,
+            vec![
+                ("nodot".to_owned(), "r".to_owned(), checksum(3)),
+                (OTHER.to_owned(), "x".to_owned(), checksum(2)),
+                (OWN.to_owned(), "r".to_owned(), checksum(3)),
+            ]
+        );
     });
 }
 
@@ -900,7 +931,7 @@ fn without_wait<T: Send + 'static>(
 }
 
 /// A ref entry that is a FIFO is no ref. The listings leave it out, a
-/// resolve finds no ref, and no read waits for a writer.
+/// resolve fails with `NotARef`, and no read waits for a writer.
 #[test]
 fn a_ref_entry_that_is_a_fifo_is_no_ref() {
     let tmp = TmpDir::new("ref-store-fifo");
@@ -964,12 +995,12 @@ fn a_ref_entry_that_is_a_fifo_is_no_ref() {
         let strict = without_wait(&repo, &fifos, rev, move |r| {
             block_on(r.resolve_rev(&owned, false))
         });
-        assert_not_found(strict, rev);
+        assert_not_a_ref(strict, rev);
         let owned = rev.to_owned();
         let lenient = without_wait(&repo, &fifos, rev, move |r| {
             block_on(r.resolve_rev(&owned, true))
         });
-        assert_eq!(lenient.unwrap(), None, "{rev}");
+        assert_not_a_ref(lenient, rev);
     }
     for r in [
         Ref::local("fifo"),
@@ -980,7 +1011,7 @@ fn a_ref_entry_that_is_a_fifo_is_no_ref() {
         let tip = without_wait(&repo, &fifos, &what, move |repo| {
             block_on(repo.resolve_ref_tip(&r))
         });
-        assert_eq!(tip.unwrap(), None, "{what}");
+        assert_not_a_ref(tip, &what);
     }
 }
 
@@ -999,7 +1030,8 @@ fn assert_through_alias<T: std::fmt::Debug>(result: ostrya::Result<T>, name: &st
 /// Each ref write and each removal refuses a path below an alias: a
 /// dangling alias, an alias to a directory of refs, and an alias that stands
 /// for `refs/remotes/R`. So is an alias write below an alias. Nothing is
-/// written through the alias, and a read still follows it.
+/// written through the alias, and a read below the alias fails with
+/// "passes through a symlink".
 #[test]
 fn a_ref_write_below_an_alias_is_refused() {
     let tmp = TmpDir::new("ref-store-below-alias");
@@ -1056,14 +1088,14 @@ fn a_ref_write_below_an_alias_is_refused() {
         );
         assert!(!heads.join("nosuch").exists());
         assert_eq!(ref_file(&path, "refs/heads/d0/y"), Some(checksum(1)));
-        assert_eq!(
-            resolve(&repo, &Ref::local("up2/y")).await,
-            Some(checksum(1))
-        );
-        assert_eq!(
-            resolve(&repo, &Ref::remote("origin", "y")).await,
-            Some(checksum(1))
-        );
+        for r in [Ref::local("up2/y"), Ref::remote("origin", "y")] {
+            match repo.resolve_ref_tip(&r).await {
+                Err(Error::InvalidFormat(m)) => {
+                    assert!(m.contains("passes through a symlink"), "{r}: {m}");
+                }
+                other => panic!("{r}: {other:?}"),
+            }
+        }
     });
 }
 

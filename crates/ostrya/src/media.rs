@@ -207,6 +207,9 @@ impl Repo {
     ///   one ref, for example `NAME` and `@OWN:NAME`.
     /// - [`Error::RefNotFound`] if the source does not hold a ref, with the
     ///   text `@ID:NAME`.
+    /// - [`Error::NotARef`] if the path of an operand names a directory or a
+    ///   special file, or an alias that breaks the alias rule, as
+    ///   [`resolve_ref_tip`](Repo::resolve_ref_tip) states.
     /// - [`Error::ObjectNotFound`] if the source does not hold a tip commit,
     ///   for example the commit of [`commit`](MediaExportOptions::commit).
     /// - [`Error::Pull`] if a binding check of a tip fails.
@@ -390,14 +393,16 @@ impl Repo {
     ///
     /// The import writes the ref `@ID:NAME` to `refs/mirrors/ID/NAME`, or to
     /// `refs/heads/NAME` when `ID` is the `[core] collection-id` of this
-    /// repository. The current ref of `@ID:NAME` is the ref at that place.
-    /// A directory at that place, or a path to that place through a file,
-    /// fails the read of the current ref with [`Error::Io`]. If this
-    /// repository has no ref at that place, and the `collection-id` of the
-    /// matched remote `R` is `ID`, the current ref is `refs/remotes/R/NAME`.
-    /// A remote ref whose commit this repository does not store gives no
-    /// current ref. Under the `[core] collection-id`, the import reads no
-    /// ref under `refs/remotes/`.
+    /// repository. The current ref of `@ID:NAME` is the ref at that place,
+    /// read as [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it. A path
+    /// to that place through a file holds no ref. A directory or a special
+    /// file at that place fails the read of the current ref with
+    /// [`Error::NotARef`]. If this repository has no ref at that place, and
+    /// the `collection-id` of the matched remote `R` is `ID`, the current ref
+    /// is `refs/remotes/R/NAME`, read by the same rules. A remote ref whose
+    /// commit this repository does not store gives no current ref. Under the
+    /// `[core] collection-id`, the import reads no ref under
+    /// `refs/remotes/`.
     ///
     /// The import does not pull a ref whose current ref holds the commit of
     /// the media. It makes one local pull from the media repository for each
@@ -610,7 +615,7 @@ impl Repo {
         // absent, it is the remote ref of the remote in `tracked`. A remote
         // ref whose commit this repository does not store is no current ref.
         // The ref that the pull writes is read with the reader of the pull,
-        // so a directory at that place fails the read.
+        // so a directory at that place fails the read with `NotARef`.
         let mut tips = Vec::with_capacity(selected.len());
         for &(id, ref name, _) in &selected {
             let mut check = TimestampCheck::CurrentRef;

@@ -1856,6 +1856,16 @@ fn commit_fsync_policy_controls_the_syscalls() {
                 "`{who}` wrote no ref in the `{tag}` row, so the ref write went unmeasured",
             );
             if expect_sync {
+                // ostrya creates the temp file of the ref in `tmp/` and syncs it
+                // with `fsync`. The `ostree` command creates it in the
+                // directory that holds the ref and syncs it with `fdatasync`.
+                let (ref_kind, ref_temp) = if *who == "port" {
+                    ("fsync", "tmp/.ostrya-tmp-")
+                } else {
+                    ("fdatasync", "refs/heads/")
+                };
+                let is_ref_sync =
+                    |kind: &str, path: &str| kind == ref_kind && path.starts_with(ref_temp);
                 // One `fsync` for each fanout that the commit wrote into, and
                 // one for `objects/`. ostrya also issues one for the directory
                 // that holds the ref, and the `ostree` command does not.
@@ -1867,7 +1877,7 @@ fn commit_fsync_policy_controls_the_syscalls() {
                 expected.sort();
                 let mut fsyncs: Vec<String> = calls
                     .iter()
-                    .filter(|(kind, _)| *kind == "fsync")
+                    .filter(|(kind, path)| *kind == "fsync" && !is_ref_sync(kind, path))
                     .map(|(_, path)| path.clone())
                     .collect();
                 fsyncs.sort();
@@ -1878,28 +1888,21 @@ fn commit_fsync_policy_controls_the_syscalls() {
 
                 let ref_syncs: Vec<&String> = calls
                     .iter()
-                    .filter(|(kind, _)| *kind == "fdatasync")
+                    .filter(|(kind, path)| is_ref_sync(kind, path))
                     .map(|(_, path)| path)
                     .collect();
                 assert_eq!(
                     ref_syncs.len(),
                     1,
-                    "`{who}` issued {} `fdatasync` calls in the `{tag}` row, where the \
-                     ref's temp file takes one: {calls:?}",
+                    "`{who}` issued {} `{ref_kind}` calls on the ref's temp file in the \
+                     `{tag}` row, where the temp file takes one: {calls:?}",
                     ref_syncs.len(),
                 );
-                // ostrya creates the temp file of the ref in `tmp/`. The
-                // `ostree` command creates it in the directory that holds the
-                // ref.
-                let ref_temp = if *who == "port" {
-                    "tmp/.ostrya-ref-"
-                } else {
-                    "refs/heads/"
-                };
                 assert!(
-                    ref_syncs[0].starts_with(ref_temp),
-                    "`{who}` did not `fdatasync` the ref's temp file in the `{tag}` row: {}",
-                    ref_syncs[0],
+                    calls
+                        .iter()
+                        .all(|(kind, path)| *kind != "fdatasync" || is_ref_sync(kind, path)),
+                    "`{who}` issued an `fdatasync` on another file in the `{tag}` row: {calls:?}",
                 );
 
                 let repo_syncs: Vec<&String> = calls
@@ -2003,10 +2006,10 @@ fn commit_per_object_fsync_syncs_content_objects_alone() {
                 String::from_utf8_lossy(&run.stderr),
             );
             assert_eq!(regular_content_objects(&repo), content, "{label}");
-            let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
-                ("tmp/.ostrya-ref-", &["refs/heads"], 12 + content)
+            let (ref_temp, extra, total): ((&str, &str), &[&str], usize) = if *who == "port" {
+                (("fsync", "tmp/.ostrya-tmp-"), &["refs/heads"], 12 + content)
             } else {
-                ("refs/heads/", &[], 11 + content)
+                (("fdatasync", "refs/heads/"), &[], 11 + content)
             };
             assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
         }
@@ -2051,10 +2054,11 @@ fn ref_dir_fsyncs(
 /// `deep/nest/branch` into a repository with neither directory creates
 /// `refs/heads/deep` and `refs/heads/deep/nest`. Each created name is in the
 /// directory one level up, so an `fsync` of that directory records the name.
-/// The calls run deepest first, in the order of the object fanout: the name of
-/// the ref file, then the name of the directory that holds it, then the next
-/// name up. A directory that already exists gets no sync, and `--fsync=false`
-/// reaches none of them.
+/// The write creates the directories from the top down, and syncs the
+/// directory that holds each new directory at once: `refs/heads`, then
+/// `refs/heads/deep`. After the rename, it syncs the directory that holds the
+/// ref file. A directory that already exists gets no sync, and
+/// `--fsync=false` reaches none of them.
 ///
 /// The `ostree` command issues no directory `fsync` for a ref. As a result,
 /// this test states a rule of ostrya alone, and no interop cell reads it. It
@@ -2096,7 +2100,7 @@ fn commit_syncs_every_created_ref_directory() {
 
     assert_eq!(
         commit("deep/nest/branch", "--fsync=true", "trace-created"),
-        ["refs/heads/deep/nest", "refs/heads/deep", "refs/heads"],
+        ["refs/heads", "refs/heads/deep", "refs/heads/deep/nest"],
         "a fresh multi-component ref must sync the holder of every name it created",
     );
 
@@ -9397,22 +9401,27 @@ fn stored_bytes(repo: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 /// - one `fsync` for each fanout directory under `objects/`
 /// - one `fsync` of `objects/`
 /// - one `fsync` of each directory in `extra_dirs`
-/// - one `fdatasync` of the temporary file of the ref, whose path starts with
-///   `ref_temp`
+/// - one call of the kind `ref_kind` (`fsync` or `fdatasync`) on the
+///   temporary file of the ref, whose path starts with `ref_temp`, and no
+///   other `fdatasync`
 /// - one `syncfs` of the repository
 /// - `total` calls in all
+#[allow(clippy::too_many_arguments)]
 fn assert_durability_syncs(
     label: &str,
     repo: &Path,
     calls: &[(&'static str, String)],
     per_object: usize,
-    ref_temp: &str,
+    (ref_kind, ref_temp): (&str, &str),
     extra_dirs: &[&str],
     total: usize,
 ) {
     let (staged, rest): (Vec<_>, Vec<_>) = calls
         .iter()
         .partition(|(_, path)| path.starts_with("tmp/staging-"));
+    let (ref_syncs, rest): (Vec<_>, Vec<_>) = rest
+        .into_iter()
+        .partition(|(kind, path)| *kind == ref_kind && path.starts_with(ref_temp));
     assert_eq!(
         staged.len(),
         per_object,
@@ -9431,14 +9440,19 @@ fn assert_durability_syncs(
         .collect();
     fsyncs.sort();
     assert_eq!(fsyncs, expected, "{label}: the directory syncs differ");
+    assert_eq!(
+        ref_syncs.len(),
+        1,
+        "{label}: the ref's temporary file at {ref_temp}* takes one `{ref_kind}`: {calls:?}",
+    );
     let datasyncs: Vec<&String> = rest
         .iter()
         .filter(|(kind, _)| *kind == "fdatasync")
         .map(|(_, path)| path)
         .collect();
     assert!(
-        datasyncs.len() == 1 && datasyncs[0].starts_with(ref_temp),
-        "{label}: the ref's temporary file at {ref_temp}* takes one `fdatasync`: {datasyncs:?}",
+        datasyncs.is_empty(),
+        "{label}: no other file takes an `fdatasync`: {datasyncs:?}"
     );
     let syncfs: Vec<&String> = rest
         .iter()
@@ -9551,14 +9565,15 @@ fn pull_fsync_switches_control_the_syscalls() {
                     } else {
                         0
                     };
-                    let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
+                    let (ref_temp, extra, total): ((&str, &str), &[&str], usize) = if *who == "port"
+                    {
                         (
-                            "tmp/.ostrya-ref-",
+                            ("fsync", "tmp/.ostrya-tmp-"),
                             &["refs/remotes", "refs/remotes/origin"],
                             13 + content,
                         )
                     } else {
-                        ("refs/remotes/origin/", &[], 11 + content)
+                        (("fdatasync", "refs/remotes/origin/"), &[], 11 + content)
                     };
                     assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
                     if per_object {
@@ -9780,10 +9795,11 @@ fn pull_local_fsync_switches_control_the_syscalls() {
                     } else {
                         0
                     };
-                    let (ref_temp, extra, total): (&str, &[&str], usize) = if *who == "port" {
-                        ("tmp/.ostrya-ref-", &["refs/heads"], 12 + content)
+                    let (ref_temp, extra, total): ((&str, &str), &[&str], usize) = if *who == "port"
+                    {
+                        (("fsync", "tmp/.ostrya-tmp-"), &["refs/heads"], 12 + content)
                     } else {
-                        ("refs/heads/", &[], 11 + content)
+                        (("fdatasync", "refs/heads/"), &[], 11 + content)
                     };
                     assert_durability_syncs(&label, &repo, &calls, content, ref_temp, extra, total);
                     if per_object && copied {
@@ -11096,7 +11112,6 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
         ("test/main/x", "refs/heads/test/main/x"),
         ("deep/nest/ing/x", "refs/heads/deep/nest/ing/x"),
         ("origin:rr/x/y", "refs/remotes/origin/rr/x/y"),
-        ("al/x", "refs/heads/al/x"),
     ] {
         for form in [
             vec!["refs"],
@@ -11109,6 +11124,38 @@ fn refs_refuses_a_prefix_through_a_ref_file() {
             args.push(prefix);
             refused(&repo, &repo, &args, path);
         }
+    }
+
+    // A prefix that reaches a ref file through an alias. The check of the
+    // port follows no symlink, and it refuses the path below the alias, so
+    // each form exits 1 and deletes nothing. The `ostree` command follows the
+    // alias and refuses the prefix with another message. This is a recorded
+    // divergence.
+    let below_alias = "error: invalid format: refs/heads/al/x passes through a symlink; ostrya \
+                       refuses a symlink in the repository\n";
+    for form in [
+        vec!["refs"],
+        vec!["refs", "--list"],
+        vec!["refs", "-r"],
+        vec!["refs", "-A"],
+        vec!["refs", "--delete"],
+    ] {
+        let mut args = form;
+        args.push("al/x");
+        let (port, tool) = run_both(&repo, &repo, &args);
+        assert_eq!(port.status.code(), Some(1), "{args:?}");
+        assert!(port.stdout.is_empty(), "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&port.stderr),
+            below_alias,
+            "{args:?}"
+        );
+        assert_eq!(tool.status.code(), Some(1), "{args:?}");
+        let stderr = String::from_utf8_lossy(&tool.stderr).into_owned();
+        assert!(
+            stderr.contains("error: Listing refs: fstatat(refs/heads/al/x): Not a directory"),
+            "{args:?}: {stderr}"
+        );
     }
 
     // A prefix that names nothing is not an error. As a result, the probe
@@ -11703,27 +11750,28 @@ fn refs_delete_alias_guard_matches_the_tool() {
     }
 
     // Without `-A`, the tool removes an alias outside the guard. The port
-    // refuses the alias before the first removal and removes no ref.
-    for (name, args, alias) in [
+    // refuses the alias before the first removal and removes no ref. An alias
+    // to an alias names no ref, so the port does not select `alal`, and the
+    // guard then refuses `test/al`.
+    for (name, args, alias, message) in [
         (
             "alias-nothing-names",
             vec!["refs", "--delete", "ral"],
             "ral",
+            "ref not writable: ral: names an alias",
         ),
         (
             "alias-then-its-target",
             vec!["refs", "--delete", "alal", "test/al"],
             "alal",
+            "Ref 'test/al' has an active alias: 'alal'",
         ),
     ] {
         let port = clone_repo(base, &repo, &format!("plain-port-{name}"));
         let tool = clone_repo(base, &repo, &format!("plain-tool-{name}"));
         let before = describe_refs(&port);
         let (port_run, tool_run) = run_both(&port, &tool, &args);
-        refused_with_message(
-            &port_run,
-            &format!("ref not writable: {alias}: names an alias"),
-        );
+        refused_with_message(&port_run, message);
         assert_eq!(describe_refs(&port), before, "the port removed a ref");
         assert_eq!(tool_run.status.code(), Some(0), "{name}");
         assert!(
@@ -13505,7 +13553,7 @@ fn invalid_refspec_matches_the_tool() {
         assert_eq!(refused.status.code(), Some(1));
         assert_eq!(
             String::from_utf8_lossy(&refused.stderr),
-            "error: i/o error: Is a directory (os error 21)\n"
+            "error: not a ref: deep: is not a regular file\n"
         );
         assert_eq!(conflicted.status.code(), Some(1));
         let stderr = String::from_utf8_lossy(&conflicted.stderr);
@@ -13544,7 +13592,7 @@ fn invalid_refspec_matches_the_tool() {
         (
             "port",
             &refused,
-            "error: i/o error: Is a directory (os error 21)\n",
+            "error: not a ref: origin:rr: is not a regular file\n",
         ),
         (
             "tool",
@@ -13567,7 +13615,7 @@ fn invalid_refspec_matches_the_tool() {
     assert_eq!(refused.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&refused.stderr),
-        "error: i/o error: Is a directory (os error 21)\n"
+        "error: not a ref: origin:rr: is not a regular file\n"
     );
     assert_eq!(
         describe_refs(&dir_port),
@@ -13600,7 +13648,7 @@ fn invalid_refspec_matches_the_tool() {
     assert_eq!(refused.status.code(), Some(1));
     assert_eq!(
         String::from_utf8_lossy(&refused.stderr),
-        "error: i/o error: Is a directory (os error 21)\n"
+        "error: not a ref: deep/nest: is not a regular file\n"
     );
     assert!(
         describe_refs(&dir_port).contains(&"heads/deep/nest/".to_owned()),
@@ -48748,8 +48796,9 @@ fn ref_writes_refuse_an_alias() {
 /// A ref write below an alias is refused, and nothing is written through the
 /// alias: `commit -b up2/y`, `refs --create=up2/z main`, and `refs -A
 /// --create=up2/al main` with the alias `up2 -> d0`, and the same with the
-/// dangling alias `up`. `commit --tag=up2/t` keeps the refusal of an existing
-/// tag.
+/// dangling alias `up`. Each command reads the ref first, and the read of a
+/// path below a symlink fails. `commit --tag=up2/t` keeps the refusal of an
+/// existing tag.
 #[test]
 fn ref_writes_refuse_a_path_below_an_alias() {
     let tmp = TmpDir::new("refs-write-below-alias");
@@ -48784,7 +48833,10 @@ fn ref_writes_refuse_a_path_below_an_alias() {
         ] {
             refused_with_message(
                 &run,
-                &format!("ref not writable: {name}: passes through an alias"),
+                &format!(
+                    "invalid format: refs/heads/{name} passes through a symlink; ostrya \
+                     refuses a symlink in the repository"
+                ),
             );
             assert_eq!(describe_refs(&repo), refs, "{name}");
             assert_eq!(std::fs::read_dir(heads.join("d0")).unwrap().count(), 0);

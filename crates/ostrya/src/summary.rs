@@ -1338,8 +1338,9 @@ impl Repo {
     /// names of these directories are in
     /// [`RefListing::invalid_collection_dirs`], so a server can write a
     /// warning. A name that is not UTF-8, and an entry at the top level that
-    /// is no directory, are left out with no report. With `None`, the call
-    /// does not read `refs/mirrors/`.
+    /// is not a directory or a symlink, are left out with no report. A symlink at the top level fails the call
+    /// with [`Error::InvalidFormat`] and the text `passes through a symlink`.
+    /// With `None`, the call does not read `refs/mirrors/`.
     ///
     /// # Access
     ///

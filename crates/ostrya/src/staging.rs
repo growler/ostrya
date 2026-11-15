@@ -20,9 +20,7 @@
 //! staging directory. With these handles, [`reap_owned`] removes each
 //! owned directory without a live [`StagingDir`]. A process that ends without
 //! its destructors calls it through
-//! [`reap_process_staging`](crate::reap_process_staging). A ref write, a
-//! detached-metadata write, and a tombstone write create a [`TempEntry`] at
-//! the top level of `tmp/`.
+//! [`reap_process_staging`](crate::reap_process_staging).
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -32,7 +30,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
 
 use ostrya_core::RepoMode;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::{FileType, Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
@@ -44,17 +42,6 @@ use crate::repo_fs::{self, FsError, RepoDir, RepoLayout};
 /// command requests. The process umask reduces it. In a `bare-user-shared`
 /// repository, an `fchmod` after the creation sets [`perm::SHARED_DIR_MODE`].
 const STAGING_DIR_MODE: u32 = 0o775;
-
-/// The character set of the random suffix of a staging name (the alphabet of
-/// `mkdtemp`).
-const SUFFIX_ALPHABET: &[u8; 62] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-
-/// The length of the random suffix of a staging name.
-const SUFFIX_LEN: usize = 6;
-
-/// The maximum number of attempts to find a unique name.
-const MKDTEMP_ATTEMPTS: u32 = 128;
 
 /// Returns the map of the staging directories that this process owns.
 ///
@@ -125,100 +112,6 @@ pub(crate) fn open_tmp_dir(repo_fd: BorrowedFd<'_>, repo_mode: RepoMode) -> io::
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
         Mode::empty(),
     )?)
-}
-
-/// The name prefix of the temp entry of a ref file or of an alias symlink.
-pub(crate) const REF_TEMP_PREFIX: &str = ".ostrya-ref-";
-
-/// A temp entry in `tmp/` that a write renames over its target.
-///
-/// The name is `<prefix><pid>-<counter>-XXXXXX`. `XXXXXX` is a random suffix,
-/// so a process in another PID namespace with the same pid and counter draws a
-/// different name. If the value drops before
-/// [`rename_into`](TempEntry::rename_into) succeeds, the drop unlinks the
-/// entry.
-pub(crate) struct TempEntry<'a> {
-    tmp_fd: BorrowedFd<'a>,
-    /// The name of the entry under `tmp_fd`. It is empty after the rename.
-    name: String,
-}
-
-impl<'a> TempEntry<'a> {
-    /// Creates a regular file with the permission bits `mode` and opens it for
-    /// writing.
-    ///
-    /// The umask reduces `mode`. The function returns the entry and the
-    /// descriptor.
-    pub(crate) fn create_file(
-        tmp_fd: BorrowedFd<'a>,
-        prefix: &str,
-        mode: u32,
-    ) -> io::Result<(TempEntry<'a>, OwnedFd)> {
-        Self::create(tmp_fd, prefix, |name| {
-            rustix::fs::openat(
-                tmp_fd,
-                name,
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-                Mode::from_raw_mode(mode),
-            )
-        })
-    }
-
-    /// Creates a symlink with the target `link`.
-    pub(crate) fn create_symlink(
-        tmp_fd: BorrowedFd<'a>,
-        prefix: &str,
-        link: &str,
-    ) -> io::Result<TempEntry<'a>> {
-        let (entry, ()) = Self::create(tmp_fd, prefix, |name| {
-            rustix::fs::symlinkat(link, tmp_fd, name)
-        })?;
-        Ok(entry)
-    }
-
-    /// Runs `make` with a new name, and draws a new name if the name is taken.
-    ///
-    /// It makes at most [`MKDTEMP_ATTEMPTS`] attempts.
-    fn create<T>(
-        tmp_fd: BorrowedFd<'a>,
-        prefix: &str,
-        mut make: impl FnMut(&str) -> rustix::io::Result<T>,
-    ) -> io::Result<(TempEntry<'a>, T)> {
-        for _ in 0..MKDTEMP_ATTEMPTS {
-            let name = format!(
-                "{prefix}{}-{}-{}",
-                std::process::id(),
-                crate::write::unique(),
-                random_suffix()
-            );
-            match make(&name) {
-                Ok(made) => return Ok((TempEntry { tmp_fd, name }, made)),
-                Err(Errno::EXIST) => continue,
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique temp name",
-        ))
-    }
-
-    /// Renames the entry over `dest` under `dir_fd`.
-    ///
-    /// If the rename fails, the entry stays for the drop, which unlinks it.
-    pub(crate) fn rename_into(mut self, dir_fd: BorrowedFd<'_>, dest: &str) -> io::Result<()> {
-        rustix::fs::renameat(self.tmp_fd, self.name.as_str(), dir_fd, dest)?;
-        self.name.clear();
-        Ok(())
-    }
-}
-
-impl Drop for TempEntry<'_> {
-    fn drop(&mut self) {
-        if !self.name.is_empty() {
-            let _ = rustix::fs::unlinkat(self.tmp_fd, self.name.as_str(), AtFlags::empty());
-        }
-    }
 }
 
 /// The staging area of a transaction: the directory, its held sibling lock,
@@ -319,12 +212,6 @@ impl StagingDir {
     pub(crate) fn tmp(&self) -> &RepoDir {
         &self.tmp
     }
-
-    /// Returns the descriptor of the `tmp/` directory of the repository, which
-    /// holds the staging directory.
-    pub(crate) fn tmp_fd(&self) -> BorrowedFd<'_> {
-        self.tmp.as_fd()
-    }
 }
 
 impl Drop for StagingDir {
@@ -390,39 +277,13 @@ fn boot_id() -> io::Result<&'static str> {
     Ok(BOOT_ID.get_or_init(|| id))
 }
 
-/// Returns a six-character `[A-Za-z0-9]` suffix from a seed of the time, the
-/// pid, and a per-process counter.
-///
-/// The name must be unique on the host only. A collision causes a new attempt.
-fn random_suffix() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut state =
-        nanos ^ (u64::from(std::process::id()) << 32) ^ counter.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-
-    let mut suffix = String::with_capacity(SUFFIX_LEN);
-    for _ in 0..SUFFIX_LEN {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        suffix.push(SUFFIX_ALPHABET[(state % 62) as usize] as char);
-    }
-    suffix
-}
-
 /// Removes the leftover entries at the top level of the `tmp/` handle `tmp`.
 ///
 /// [`reap_one`] gets each `staging-*` directory, and the reap of that directory
 /// also gets its `-lock` sibling. A `-lock` file with no directory stays. This
 /// function never touches `cache`, and it skips each name that is not UTF-8.
-/// [`reap_aged`] removes each other entry, a [`TempEntry`] in progress
-/// included, if it is older than `expiry_secs`.
+/// [`reap_aged`] removes each other entry, a temp entry of a write in
+/// progress included, if it is older than `expiry_secs`.
 ///
 /// The listing types an entry of unknown type with no follow. If the listing
 /// fails, the function reaps the names that it collected before the error.

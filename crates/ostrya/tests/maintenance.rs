@@ -872,27 +872,65 @@ fn fsck_passes_on_a_healthy_repo() {
 }
 
 #[test]
-fn fsck_refuses_a_ref_symlink_naming_a_directory() {
+fn fsck_and_prune_refuse_a_symlinked_remote_or_mirror_directory() {
+    // A ref below a symlinked `refs/remotes/R` or `refs/mirrors/ID` is a
+    // listing below a symlink. fsck and prune fail, and prune deletes
+    // nothing. The commit is named by the ref behind the link alone, so a
+    // prune that left the ref out would delete it.
+    for (link, rel) in [
+        ("refs/remotes/o", "../stash/o"),
+        ("refs/mirrors/org.example.X", "../stash/org.example.X"),
+    ] {
+        let tmp = TmpDir::new("maint-top-link");
+        block_on(async {
+            let (repo, commit) = build_library_repo(tmp.path()).await;
+            let objects = repo.list_objects().await.unwrap().len();
+            let dir = tmp.path().join("repo");
+            let parent = dir.join(link).parent().unwrap().to_owned();
+            let stashed = parent.join(rel);
+            std::fs::create_dir_all(&parent).unwrap();
+            std::fs::create_dir_all(&stashed).unwrap();
+            std::fs::rename(dir.join("refs/heads/main"), stashed.join("main")).unwrap();
+            std::os::unix::fs::symlink(rel, dir.join(link)).unwrap();
+            let expected = format!("{link} passes through a symlink");
+
+            let err = repo.fsck(&FsckOptions::new()).await.unwrap_err();
+            assert!(
+                matches!(&err, ostrya::Error::InvalidFormat(m) if m.starts_with(&expected)),
+                "{link}: fsck gave {err:?}"
+            );
+            for no_prune in [true, false] {
+                let mut opts = ostrya::PruneOptions::new();
+                opts.no_prune = no_prune;
+                let err = repo.prune(&opts).await.unwrap_err();
+                assert!(
+                    matches!(&err, ostrya::Error::InvalidFormat(m) if m.starts_with(&expected)),
+                    "{link}: prune gave {err:?}"
+                );
+            }
+            assert!(repo.load_commit(&commit).await.is_ok(), "{link}");
+            assert!(stashed.join("main").is_file(), "{link}");
+            assert_eq!(repo.list_objects().await.unwrap().len(), objects, "{link}");
+        });
+    }
+}
+
+#[test]
+fn fsck_and_prune_skip_a_ref_symlink_naming_a_directory() {
     // fsck and prune start from the refs. The ref walk reads a symlink as an
-    // alias and does not descend into it. If a link names a directory, the
-    // read fails with EISDIR. The `ostree` command gives the same refusal,
-    // `Listing refs: Is a directory`. Without this rule, a self-link recurses
-    // without end.
+    // alias and does not descend into it. An alias whose target is a
+    // directory names no ref, so the walks leave it out. Without this rule, a
+    // self-link recurses without end. The `ostree` command refuses the walk
+    // with `Listing refs: Is a directory`.
     let tmp = TmpDir::new("maint-fsck-dirlink");
     block_on(async {
-        let (repo, _commit) = build_library_repo(tmp.path()).await;
+        let (repo, commit) = build_library_repo(tmp.path()).await;
         let heads = tmp.path().join("repo/refs/heads");
         std::os::unix::fs::symlink(".", heads.join("selfdir")).unwrap();
-        let err = repo.fsck(&FsckOptions::new()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Is a directory"),
-            "fsck is refused, got {err}"
-        );
-        let err = repo.prune(&ostrya::PruneOptions::new()).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Is a directory"),
-            "prune is refused, got {err}"
-        );
+        let report = repo.fsck(&FsckOptions::new()).await.unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        repo.prune(&ostrya::PruneOptions::new()).await.unwrap();
+        assert!(repo.load_commit(&commit).await.is_ok());
     });
 }
 

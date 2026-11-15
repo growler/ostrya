@@ -593,7 +593,8 @@ fn remove_ref_alias_removes_an_alias_alone() {
 fn check_refs_path_reports_a_path_through_a_ref_file() {
     // The probe that a listing runs over the path that its PREFIX names. The
     // probe returns `ENOTDIR` if a component before the last one is not a
-    // directory. It returns `Ok` for a ref file, a directory, and a path that
+    // directory, and "passes through a symlink" if it is a symlink. It
+    // returns `Ok` for a ref file, a directory, an alias, and a path that
     // names nothing, because a prefix that matches no ref lists nothing.
     let tmp = TmpDir::new("commit-refs-path");
     let root_dir = tmp.path().join("repo");
@@ -632,19 +633,24 @@ fn check_refs_path_reports_a_path_through_a_ref_file() {
         // Paths through a ref file:
         // - the last component under a ref file
         // - an inner component under a ref file
-        // - a path through an alias symlink to a ref file
         // - the remote form
-        for path in [
-            "heads/plain/x",
-            "heads/plain/x/y",
-            "heads/al/x",
-            "remotes/origin/rr/x/y",
-        ] {
+        for path in ["heads/plain/x", "heads/plain/x/y", "remotes/origin/rr/x/y"] {
             let err = repo.check_refs_path(path).await.unwrap_err();
             assert!(
                 err.to_string().contains("Not a directory"),
                 "`{path}` was not refused with ENOTDIR, got {err}"
             );
+        }
+
+        // A path through an alias. The check follows no symlink.
+        for path in ["heads/al/x", "heads/al/x/y"] {
+            match repo.check_refs_path(path).await {
+                Err(Error::InvalidFormat(m)) => assert!(
+                    m.starts_with(&format!("refs/{path} passes through a symlink")),
+                    "`{path}`: {m}"
+                ),
+                other => panic!("`{path}`: {other:?}"),
+            }
         }
     });
 }
@@ -699,18 +705,14 @@ fn resolve_rev_reads_a_checksum_in_lowercase_hex_alone() {
 }
 
 #[test]
-fn list_refs_refuses_a_symlink_naming_a_directory() {
+fn list_refs_leaves_out_a_symlink_naming_a_directory() {
     // A symlink under refs/ is an alias, whatever its target, so the listing
-    // reads it as a ref and does not descend into it. As a result, a link to a
-    // directory fails the read with EISDIR. This is the `Listing refs: Is a
-    // directory` refusal of the `ostree` command. Without this rule, a self-link
-    // recurses without end. No command of the port writes a self-link.
-    // `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` do not
-    // examine the target path, so they write a link to a directory or a
-    // self-link in one step: `set_ref_alias_immediate("a/b", "a")` writes
-    // `refs/heads/a/b -> ../a`. Other port writers make a link to another
-    // directory in two steps: they remove the target ref of an alias, then
-    // write a ref below the target path.
+    // reads it as an alias and does not descend into it. An alias whose target
+    // is a directory names no ref, so the listing leaves it out. Without this
+    // rule, a self-link recurses without end. The `ostree` command refuses the
+    // listing with `Listing refs: Is a directory`. An alias write does not
+    // refuse a target that is a directory: `set_ref_alias_immediate("a/b",
+    // "a")` writes `refs/heads/a/b -> ../a`.
     let tmp = TmpDir::new("commit-refs-dirlink");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -726,20 +728,12 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
         let heads = root_dir.join("refs/heads");
         // A link to the directory that holds it: a walk that follows it has no end.
         std::os::unix::fs::symlink(".", heads.join("selfdir")).unwrap();
-        let err = repo.list_refs(None).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Is a directory"),
-            "a self-link is refused, got {err}"
-        );
+        assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
 
         // A link to another directory, which resolves but names no ref.
         std::fs::remove_file(heads.join("selfdir")).unwrap();
         std::os::unix::fs::symlink("deep", heads.join("dal")).unwrap();
-        let err = repo.list_refs(None).await.unwrap_err();
-        assert!(
-            err.to_string().contains("Is a directory"),
-            "a link naming a directory is refused, got {err}"
-        );
+        assert_eq!(repo.list_refs(None).await.unwrap().len(), 1);
 
         // The listing still reads an alias to a ref file through the link.
         std::fs::remove_file(heads.join("dal")).unwrap();
@@ -750,14 +744,6 @@ fn list_refs_refuses_a_symlink_naming_a_directory() {
             vec![("al".to_owned(), a), ("deep/nest/ing".to_owned(), a)]
         );
     });
-}
-
-/// Asserts that `result` failed with the OS error `errno`.
-fn assert_errno(result: ostrya::Result<()>, errno: rustix::io::Errno, what: &str) {
-    assert!(
-        matches!(&result, Err(ostrya::Error::Io(e)) if e.raw_os_error() == Some(errno.raw_os_error())),
-        "{what}: expected {errno:?}, got {result:?}"
-    );
 }
 
 /// Returns the sorted names in the directory `dir`, or none if `dir` is absent.
@@ -775,8 +761,8 @@ fn dir_names(dir: &Path) -> Vec<String> {
 #[test]
 fn ref_writes_place_no_temp_beside_the_target() {
     // A ref write, an alias write, and a detached-metadata write create their
-    // temp entry in `tmp/`. If `tmp/` is a regular file, each write fails before
-    // it touches `refs/` or `objects/`.
+    // temp entry in `tmp/`. If `tmp/` is a regular file, each write fails with
+    // `tmp is not a directory` before it touches `refs/` or `objects/`.
     let tmp = TmpDir::new("commit-temp-in-tmp");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -794,29 +780,29 @@ fn ref_writes_place_no_temp_beside_the_target() {
         std::fs::write(root_dir.join("tmp"), b"").unwrap();
         let repo = Repo::open(&root_dir).await.unwrap();
 
-        let notdir = rustix::io::Errno::NOTDIR;
-        assert_errno(
+        let not_a_directory = |result: ostrya::Result<()>, what: &str| match result {
+            Err(Error::InvalidFormat(m)) => assert_eq!(m, "tmp is not a directory", "{what}"),
+            other => panic!("{what}: {other:?}"),
+        };
+        not_a_directory(
             repo.set_ref_immediate(&Ref::local("dir/one"), Some(&a))
                 .await,
-            notdir,
             "immediate ref write",
         );
-        assert_errno(
+        not_a_directory(
             repo.set_ref_alias_immediate("dir/alias", "base").await,
-            notdir,
             "immediate alias write",
         );
         let guard = repo.begin_update().await.unwrap();
-        assert_errno(
+        not_a_directory(
             guard.set_ref(&Ref::local("dir/two"), Some(&a)).await,
-            notdir,
             "guarded ref write",
         );
         guard.finish().await.unwrap();
-        match repo.write_commit_detached_metadata(&a, None).await {
-            Err(Error::InvalidFormat(m)) => assert_eq!(m, "tmp is not a directory"),
-            other => panic!("detached metadata write: {other:?}"),
-        }
+        not_a_directory(
+            repo.write_commit_detached_metadata(&a, None).await,
+            "detached metadata write",
+        );
 
         assert!(
             !root_dir.join("refs/heads/dir").exists(),
@@ -832,9 +818,9 @@ fn ref_writes_place_no_temp_beside_the_target() {
 
 #[test]
 fn ref_writes_create_a_missing_tmp() {
-    // If a repository has no `tmp/`, a ref or alias write creates it and leaves
-    // it empty. A detached-metadata write creates it with its child `cache`
-    // and leaves no other entry. A ref removal does not create it.
+    // If a repository has no `tmp/`, a ref write, an alias write, and a
+    // detached-metadata write of a new handle create it with its child
+    // `cache` and leave no other entry. A ref removal does not create it.
     let tmp = TmpDir::new("commit-missing-tmp");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -853,18 +839,20 @@ fn ref_writes_create_a_missing_tmp() {
             .unwrap();
         assert!(!tmp_dir.exists(), "a ref removal does not create tmp/");
 
+        let repo = Repo::open(&root_dir).await.unwrap();
         repo.set_ref_immediate(&Ref::local("dir/one"), Some(&a))
             .await
             .unwrap();
         assert!(tmp_dir.is_dir());
-        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+        assert_eq!(dir_names(&tmp_dir), ["cache"]);
 
         std::fs::remove_dir_all(&tmp_dir).unwrap();
+        let repo = Repo::open(&root_dir).await.unwrap();
         repo.set_ref_alias_immediate("dir/alias", "dir/one")
             .await
             .unwrap();
         assert!(tmp_dir.is_dir());
-        assert_eq!(dir_names(&tmp_dir), Vec::<String>::new());
+        assert_eq!(dir_names(&tmp_dir), ["cache"]);
 
         std::fs::remove_dir_all(&tmp_dir).unwrap();
         let repo = Repo::open(&root_dir).await.unwrap();
@@ -965,7 +953,7 @@ fn a_detached_metadata_write_makes_a_missing_fanout() {
 #[test]
 fn a_ref_name_of_name_max_bytes_is_written() {
     // The temp entry in `tmp/` has a name of its own,
-    // `.ostrya-ref-<pid>-<n>-XXXXXX`, which does not contain the ref name. As a
+    // `.ostrya-tmp-<pid>-XXXXXX`, which does not contain the ref name. As a
     // result, a ref leaf of 255 bytes (the longest file name) can be written and
     // listed.
     let tmp = TmpDir::new("commit-name-max");
@@ -993,27 +981,19 @@ fn a_ref_name_of_name_max_bytes_is_written() {
 }
 
 #[test]
-fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
-    // If `tmp/` is on another file system, the rename of each temp entry of a
-    // ref write fails with EXDEV. The write fails, ostrya removes the temp
-    // entry, and the target does not change. A detached-metadata write refuses
-    // a symlink at `tmp`, as
+fn a_symlink_at_tmp_fails_each_ref_write() {
+    // A ref write makes its temp entry in `tmp/`, and the open of `tmp/`
+    // follows no symlink. A symlink at `tmp` fails each ref write and each
+    // alias write of a new handle with `tmp passes through a symlink`. The
+    // target does not change, and the target of the symlink gets no entry. A
+    // detached-metadata write refuses a symlink at `tmp` in the same way, as
     // `a_symlink_at_tmp_fails_each_detached_metadata_write` states.
-    let tmp = TmpDir::new("commit-tmp-xdev");
+    let tmp = TmpDir::new("commit-tmp-link");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
     let b = csum(CONTENT);
-
-    // The test needs a second file system. `/dev/shm` is one if the host has it.
-    // The test checks the device of `/dev/shm` only if the first write
-    // succeeds. A host with a second file system then fails the test, and it
-    // cannot pass by a skip.
-    let other = Path::new("/dev/shm").join(format!("ostrya-tmp-xdev-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&other);
-    if std::fs::create_dir_all(&other).is_err() {
-        eprintln!("skipped: /dev/shm is not writable, so no second filesystem is reachable");
-        return;
-    }
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
     block_on(async {
         let repo = Repo::create(&root_dir, CreateOptions::new(RepoMode::Archive))
             .await
@@ -1023,28 +1003,25 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
             .unwrap();
         std::fs::remove_dir_all(root_dir.join("tmp")).unwrap();
         std::os::unix::fs::symlink(&other, root_dir.join("tmp")).unwrap();
+        let repo = Repo::open(&root_dir).await.unwrap();
 
-        let first = repo.set_ref_immediate(&Ref::local("kept"), Some(&b)).await;
-        if first.is_ok() {
-            use std::os::unix::fs::MetadataExt;
-            let same_device = std::fs::metadata(&other).unwrap().dev()
-                == std::fs::metadata(&root_dir).unwrap().dev();
-            let _ = std::fs::remove_dir_all(&other);
-            assert!(same_device, "a ref was renamed across filesystems");
-            eprintln!("skipped: /dev/shm is the repository's own filesystem");
-            return;
-        }
-        let xdev = rustix::io::Errno::XDEV;
-        assert_errno(first, xdev, "ref write over an existing ref");
-        assert_errno(
+        let symlinked = |result: ostrya::Result<()>, what: &str| match result {
+            Err(Error::InvalidFormat(m)) => {
+                assert!(m.starts_with("tmp passes through a symlink"), "{what}: {m}");
+            }
+            other => panic!("{what}: {other:?}"),
+        };
+        symlinked(
+            repo.set_ref_immediate(&Ref::local("kept"), Some(&b)).await,
+            "ref write over an existing ref",
+        );
+        symlinked(
             repo.set_ref_immediate(&Ref::local("dir/new"), Some(&b))
                 .await,
-            xdev,
             "ref write of a new ref",
         );
-        assert_errno(
+        symlinked(
             repo.set_ref_alias_immediate("kept", "dir/new").await,
-            xdev,
             "alias write",
         );
 
@@ -1052,9 +1029,9 @@ fn writes_fail_with_exdev_when_tmp_is_on_another_filesystem() {
             repo.list_refs(None).await.unwrap(),
             vec![("kept".to_owned(), a)]
         );
+        assert!(!root_dir.join("refs/heads/dir").exists());
         assert_eq!(dir_names(&other), Vec::<String>::new());
     });
-    let _ = std::fs::remove_dir_all(&other);
 }
 
 #[test]

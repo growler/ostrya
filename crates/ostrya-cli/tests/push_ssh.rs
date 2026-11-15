@@ -1738,21 +1738,21 @@ mod cli {
         }
     }
 
-    /// A ref alias that names a directory and that `push-branches` selects
-    /// fails the push with the error of the read, before ssh starts.
+    /// A ref alias that names a directory names no ref, so `push-branches`
+    /// that selects it alone selects no ref, and ssh does not start.
     #[test]
-    fn push_branches_fails_on_a_selected_alias_that_names_a_directory() {
+    fn push_branches_skips_a_selected_alias_that_names_a_directory() {
         let setup = Setup::new("cli-push-branches-dirlink-selected", "archive");
         setup.commit("main", FILES, &[]);
         dir_link(&setup.client, "refs/heads/lnk");
         let dest = receiver(&setup.base, RepoMode::Archive);
         add_origin(&setup, &dest, "push-branches=lnk\n");
         let out = push_origin(&setup, &[]);
-        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
         assert_eq!(stdout(&out), "");
         assert_eq!(
             stderr(&out),
-            "error: i/o error: Is a directory (os error 21)\n"
+            "no ref matches [remote \"origin\"] push-branches\n"
         );
         assert!(!setup.ssh_started());
         assert_eq!(server_tip(&dest, "main"), None);

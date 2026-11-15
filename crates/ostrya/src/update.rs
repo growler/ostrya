@@ -21,8 +21,8 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
-    put_alias_blocking, put_ref_blocking, ref_relpath, refspec_to_relpath, relative_link,
-    remove_alias_blocking, sync_dirs_all,
+    put_alias_blocking, put_ref_blocking, ref_relpath, refspec_to_relpath, remove_alias_blocking,
+    sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config};
@@ -189,7 +189,7 @@ impl Held {
         }
         let dirs = std::mem::take(&mut writes.dirs);
         drop(writes);
-        let synced = sync_dirs_all(self.repo.repo_fd(), dirs.into_iter().collect());
+        let synced = sync_dirs_all(self.repo.root_dir(), dirs.into_iter().collect());
         self.release();
         synced
     }
@@ -209,7 +209,7 @@ impl Drop for Held {
     fn drop(&mut self) {
         let writes = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let dirs = std::mem::take(&mut writes.dirs);
-        let _ = sync_dirs_all(self.repo.repo_fd(), dirs.into_iter().collect());
+        let _ = sync_dirs_all(self.repo.root_dir(), dirs.into_iter().collect());
     }
 }
 
@@ -342,18 +342,21 @@ impl UpdateGuard {
     /// collection ref of the `[core] collection-id` of the repository, the
     /// call reads `refs/heads/NAME`, and it does not read
     /// `refs/mirrors/ID/`. If the store holds the ref as an alias, the call
-    /// follows the alias to the ref that it names. A ref path that names a
-    /// directory, or that passes through a file, holds no ref. The result is
-    /// `None` if the store holds no such ref.
+    /// reads the ref that the alias names, by the alias rule of
+    /// [`Repo::resolve_ref_tip`]. A ref path that passes through a file holds
+    /// no ref. The result is `None` if the store holds no such ref.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
     ///   call reads no file.
-    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8.
+    /// - [`Error::NotARef`] if the ref path names a directory, a FIFO, a
+    ///   socket, or a device file, or an alias that breaks the alias rule.
+    /// - [`Error::InvalidFormat`] if the ref file is not UTF-8 or is larger
+    ///   than 4096 bytes, or if a component of the ref path is a symlink.
     /// - [`Error::Core`] if the ref file holds no checksum.
-    /// - [`Error::Io`] if the read fails, for example on an alias loop or on
-    ///   a ref file that the process cannot read.
+    /// - [`Error::Io`] if the read fails, for example on a ref file that the
+    ///   process cannot read.
     pub async fn read_ref(&self, r: &Ref) -> Result<Option<Checksum>> {
         self.repo().resolve_ref_tip(r).await
     }
@@ -381,9 +384,13 @@ impl UpdateGuard {
     ///   call writes nothing.
     /// - [`Error::RefNotWritable`] if the path of the ref names an alias. The
     ///   call writes nothing, and the alias stays. The call gives the same
-    ///   error, with the reason `passes through an alias`, if a component
-    ///   above the ref is a symlink, also a dangling one. It then writes
-    ///   nothing through the symlink.
+    ///   error, with the reason `passes through an alias`, if `refs` or a
+    ///   component above the ref is a symlink, also a dangling one. It then
+    ///   writes nothing through the symlink.
+    /// - [`Error::InvalidFormat`] if a file is at a directory component of
+    ///   the path, if a symlink is at `tmp`, or if a writer puts a symlink at
+    ///   a component of the path after the check of the path. The call then
+    ///   writes nothing through the symlink.
     /// - [`Error::Io`] if a file system operation fails.
     ///
     /// If a directory of `refs/mirrors/` has a name that fails the rule, a
@@ -401,23 +408,31 @@ impl UpdateGuard {
     ///
     /// The alias is a relative symlink. It replaces the entry that `refspec`
     /// named before. The call checks both refspecs, and the two refs do not
-    /// have to exist.
+    /// have to exist. An alias whose target is an alias is refused, as
+    /// [`Repo::set_ref_alias_immediate`] states.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
     ///   refspec.
-    /// - [`Error::RefNotWritable`] if a component above the path of
-    ///   `refspec` is a symlink, also a dangling one. The reason is `passes
-    ///   through an alias`, and the call writes nothing.
+    /// - [`Error::RefNotWritable`] if `refs` or a component above the path
+    ///   of `refspec` is a symlink, also a dangling one. The reason is
+    ///   `passes through an alias`, and the call writes nothing.
+    /// - [`Error::RefNotWritable`] for `refspec` if `target` names an alias
+    ///   or the path of `refspec` itself (reason `targets an alias`), or if
+    ///   `refs` or a component above the path of `target` is a symlink
+    ///   (reason `passes through an alias`). The call writes nothing.
+    /// - [`Error::InvalidFormat`] if a file is at a directory component of
+    ///   the path, if a symlink is at `tmp`, or if a writer puts a symlink at
+    ///   a component of the path after the check of the path. The call then
+    ///   writes nothing through the symlink.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn set_ref_alias(&self, refspec: &str, target: &str) -> Result<()> {
         let relpath = refspec_to_relpath(refspec)?;
-        let link = relative_link(&relpath, &refspec_to_relpath(target)?);
-        let repo_mode = self.repo().mode();
+        let target = refspec_to_relpath(target)?;
         let name = refspec.to_owned();
         self.write(move |root, fsync, dirs| {
-            put_alias_blocking(root.as_fd(), &name, &relpath, &link, fsync, repo_mode, dirs)
+            put_alias_blocking(root, &name, &relpath, &target, fsync, dirs)
         })
         .await
     }
@@ -440,7 +455,7 @@ impl UpdateGuard {
         let relpath = refspec_to_relpath(refspec)?;
         let name = refspec.to_owned();
         self.write(move |root, fsync, dirs| {
-            remove_alias_blocking(root.as_fd(), &name, &relpath, fsync, dirs)
+            remove_alias_blocking(root, &name, &relpath, fsync, dirs)
         })
         .await
     }
@@ -865,17 +880,8 @@ impl UpdateGuard {
         checksum: Option<&Checksum>,
     ) -> Result<()> {
         let checksum = checksum.copied();
-        let repo_mode = self.repo().mode();
         self.write(move |root, fsync, dirs| {
-            put_ref_blocking(
-                root.as_fd(),
-                &name,
-                &relpath,
-                checksum,
-                fsync,
-                repo_mode,
-                dirs,
-            )
+            put_ref_blocking(root, &name, &relpath, checksum, fsync, dirs)
         })
         .await
     }
@@ -1244,12 +1250,11 @@ mod tests {
                 started_tx.send(()).unwrap();
                 go_rx.recv().unwrap();
                 let written = put_ref_blocking(
-                    root.as_fd(),
+                    root,
                     "late/one",
                     "refs/heads/late/one",
                     Some(checksum()),
                     fsync,
-                    RepoMode::BareUser,
                     dirs,
                 );
                 ended_in.store(true, Ordering::SeqCst);
@@ -1271,8 +1276,9 @@ mod tests {
             go_tx.send(()).unwrap();
             finish.await.unwrap();
             assert!(ended.load(Ordering::SeqCst), "the write ended first");
-            // refs/heads/late and refs/heads.
-            assert_eq!(test_syncs::count(&root), before + 2);
+            // refs/heads/late. The write synced refs/heads when it made
+            // refs/heads/late.
+            assert_eq!(test_syncs::count(&root), before + 1);
             assert_eq!(test_syncs::unlocked(&root), 0);
             assert!(!crate::lock::update_lock_held_in_process(repo.repo_fd()));
             let exclusive = repo.lock_repo(LockKind::Exclusive).await.unwrap();

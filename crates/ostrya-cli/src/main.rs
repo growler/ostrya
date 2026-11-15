@@ -12172,8 +12172,10 @@ fn own_local_name<'a>(text: &'a str, own: Option<&str>) -> &'a str {
 /// prefix with no ref in the ref store names no ref. An ambiguous prefix and
 /// a unique prefix are the same here, because neither names a ref.
 ///
-/// A name that is a directory, or a path through a ref file, names no ref.
-/// If another I/O error occurs on the ref file, the function returns it.
+/// A name that is a directory, a FIFO, a socket, or a device file, an alias
+/// that breaks the alias rule of [`Repo::resolve_ref_tip`], and a path through
+/// a ref file name no ref. If another error occurs on the ref file, the
+/// function returns it, for example for a path below a symlink.
 ///
 /// The lookup reads only the ref store ([`Repo::resolve_ref_tip`]), so no
 /// revision syntax applies here. An alias target is a refspec, so a name that
@@ -12186,7 +12188,10 @@ async fn resolve_ref_name(repo: &Repo, rev: &str) -> Result<Option<Checksum>> {
         return Ok(None);
     }
     match rev.parse::<Ref>() {
-        Ok(r) if !matches!(r, Ref::Collection { .. }) => repo.resolve_ref_tip(&r).await,
+        Ok(r) if !matches!(r, Ref::Collection { .. }) => match repo.resolve_ref_tip(&r).await {
+            Err(ostrya::Error::NotARef { .. }) => Ok(None),
+            other => other,
+        },
         _ => Ok(None),
     }
 }
@@ -12422,7 +12427,9 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
 /// Returns the aliases that one `-A --delete` prefix removes.
 ///
 /// This is the set that a `-A` listing prints for the prefix. The set is the
-/// ref that the prefix names exactly, alias or not, or the aliases under it.
+/// ref or the alias that the prefix names exactly, or the aliases under it. An
+/// alias that the prefix names exactly is in the set also when it names no
+/// ref, for example an alias to an alias.
 ///
 /// # Divergence
 ///
@@ -12437,7 +12444,8 @@ async fn select_aliases(
     prefix: Option<&str>,
 ) -> Result<Vec<String>> {
     if let Some(prefix) = prefix
-        && resolve_ref_name(repo, prefix).await?.is_some()
+        && (aliases.iter().any(|alias| alias == prefix)
+            || resolve_ref_name(repo, prefix).await?.is_some())
     {
         return Ok(vec![prefix.to_owned()]);
     }
@@ -12689,7 +12697,9 @@ fn prefixes(given: &[String]) -> Vec<Option<&str>> {
 /// The path probe reads the prefix under `refs/` as the directory that a
 /// listing enumerates. `ostree` reads the same path. `ENOTDIR` ends the
 /// command. ostrya gives one message for that condition, and `ostree` names the
-/// path and the syscall. This is a recorded divergence.
+/// path and the syscall. This is a recorded divergence. A symlink at a
+/// component before the last one also ends the command, with the message
+/// `<path> passes through a symlink`. `ostree` follows the symlink.
 ///
 /// A path that names nothing continues, because a prefix that matches no ref
 /// exits 0 in both commands. The probe is [`Repo::check_refs_path`], one

@@ -3242,11 +3242,14 @@ The rules of the classification:
   path of each key. One blocking hop and one set of `fsync` calls cover the
   refs under `refs/heads`, `refs/remotes`, and `refs/mirrors`, with one
   compare-and-delete guard.
-- Before the first unlink, the helper opens the directory of each ref to
-  delete one time with `openat2`, `RESOLVE_BENEATH`, and
+- The ref listing of the prune follows no symlink: a symlink at `refs` or
+  at `refs/heads`, `refs/remotes`, or `refs/mirrors` fails the listing with
+  `Error::InvalidFormat` before the run deletes anything, also in a
+  `no_prune` dry run. Before the first unlink, the helper reads the type of
+  each ref to delete one time with `openat2`, `RESOLVE_BENEATH`, and
   `RESOLVE_NO_SYMLINKS`. A ref whose path passes through an alias, for
-  example below a symlink `refs/heads`, fails the prune with
-  `Error::RefNotWritable`, reason `passes through an alias`. The ref
+  example after a symlink is put above it during the run, fails the prune
+  with `Error::RefNotWritable`, reason `passes through an alias`. The ref
   deletion comes before the commit deletion and the sweep, so the run then
   deletes no ref and no object. A `no_prune` dry run runs the same check
   and fails with the same error, and it deletes nothing. The open has no
@@ -4204,9 +4207,10 @@ the whole queue against the ref store before the first write. The rules:
   checks, the fast-forward walk, the parent of a server commit, and its
   reply need the current commit. It sends each refusal as a wire error
   before it publishes an object. The commit check then reads each queued
-  path again with one `openat2` of its directory and one `lstat`.
+  path again with one `lstat`.
 - The check reads each queued path of `Transaction::set_ref` with one
-  `openat2` of its directory and one `lstat`. A queued write or removal
+  `lstat`: one `openat2` of the path with `O_PATH|O_NOFOLLOW` and one
+  `statx` on the descriptor. A queued write or removal
   fails with `Error::RefNotWritable` if its path names an alias, names a
   directory, passes through a file or an alias, or names a special file: a
   FIFO, a socket, or a device file.
@@ -4223,8 +4227,8 @@ the whole queue against the ref store before the first write. The rules:
   a write of `a/b`. The error names the outer ref. Two removals pass this
   rule.
 - The check reads the ref store as it is before the first write. It opens
-  the directory of each queued path with `openat2`, `RESOLVE_BENEATH`, and
-  `RESOLVE_NO_SYMLINKS`, and reads the last component relative to it. So it
+  each queued path with `openat2`, `RESOLVE_BENEATH`, and
+  `RESOLVE_NO_SYMLINKS`, and with `O_NOFOLLOW` for the last component. So it
   follows no symlink at any component above the ref, from the repository
   root down, `refs` and `refs/heads` included. A queued write or removal
   whose path has a symlink above the ref fails with `Error::RefNotWritable`,
@@ -4240,14 +4244,19 @@ the whole queue against the ref store before the first write. The rules:
   directory writes its ref file in that directory, under a ref name that
   the caller did not give. A write through a dangling alias fails at the
   write, after the commit writes earlier refs.
-- The writes themselves resolve each path by name: the creation of the
-  parent directories, the rename, and the unlink. The check under the
-  update lock is the guard. A writer outside the update lock, for example
-  an out-of-band edit or a writer of a repository whose `[core] locking` is
-  false, can put a symlink above a ref path after the check. A write can
-  then go through that symlink.
-- The reads follow an alias above the path: the resolve, `rev-parse`, and
-  the ref listings.
+- The writes follow no symlink either. The creation of the parent
+  directories opens and makes each component relative to its parent with no
+  symlink followed. The rename and the unlink are relative to the directory
+  of the ref, which opens with no symlink followed. The check under the
+  update lock gives the reasons of a refusal. A writer outside the update
+  lock, for example an edit from outside the port or a writer of a
+  repository whose `[core] locking` is false, can put a symlink above a ref
+  path after the check. The write then fails with `Error::InvalidFormat`,
+  and never goes through that symlink.
+- The reads follow no symlink above the path: the resolve, `rev-parse`, and
+  the ref listings fail with `Error::InvalidFormat` for a path below a
+  symlink. They read an alias at the last component by the alias rule
+  (`format-reference.md`, "Ref files").
 - A queued write or removal whose path names an alias fails with
   `Error::RefNotWritable`, reason `names an alias`. This applies to an
   entry of `set_ref` and to an entry of `set_ref_expecting`.
@@ -4260,7 +4269,10 @@ the whole queue against the ref store before the first write. The rules:
   removal below an alias with `Error::RefNotWritable`, reason `passes
   through an alias`, under the update lock, before the rename or the
   unlink. `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias`
-  refuse a new alias below an alias with the same error. `Repo::prune`
+  refuse a new alias below an alias with the same error. They also refuse a
+  new alias whose target is an alias, or is the new alias itself, with the
+  reason `targets an alias`, and a new alias whose target is below an alias,
+  with the reason `passes through an alias`. `Repo::prune`
   refuses a weak ref to delete below an alias with the same error, before
   it deletes a ref ("The weak refs of a prune"). The receive path refuses a
   path below an alias with `ref-denied`.
@@ -4304,16 +4316,17 @@ ref. The rules of a conditional write:
 - A conditional entry whose path names a directory or passes through a file
   or an alias fails with `Error::RefNotWritable`, also for
   `expected = None`. `Repo::resolve_ref_tip` gives `None` for a path that
-  names a directory or passes through a file, so a caller that gives back
-  that `None` as `expected` gets this error. `Repo::resolve_ref_tip`
-  follows an alias above the path, so an `expected` taken from it for such
-  a path also gets this error.
+  passes through a file, so a caller that gives back that `None` as
+  `expected` gets this error. For a path that names a directory,
+  `Repo::resolve_ref_tip` fails with `Error::NotARef`, and for a path below
+  an alias with `Error::InvalidFormat`.
 - A conditional entry whose ref file does not parse fails with the error
   of the parse, because the compare needs the content.
-- An entry of `set_ref` costs one `openat2` of its directory and one
-  `lstat`. A conditional entry costs one `openat2` of its directory, one
-  `lstat`, and one `O_NOFOLLOW` open, with a read of at most 4096 bytes and
-  a parse.
+- An entry of `set_ref` costs one `lstat`: one `openat2` with
+  `O_PATH|O_NOFOLLOW` and one `statx`. A conditional entry costs one
+  `lstat` and one `openat2` of the ref file with `O_NOFOLLOW` and one
+  `statx`, with a read of at most 4096 bytes and a parse. A ref file larger
+  than 4096 bytes fails the check with `Error::InvalidFormat`.
 - `commit_under` runs the same compare. The receive path queues entries
   of `set_ref` alone. It compares each update with the current commit that
   it reads under the update lock, so it sends a mismatch as a wire error

@@ -632,9 +632,10 @@ fn a_mirror_ref_whose_commit_is_absent_refuses_the_ref() {
     });
 }
 
-/// A remote ref path of the matched remote that names a directory, or that
-/// passes through a remote ref file, holds no remote ref. The import writes
-/// the mirror ref.
+/// A remote ref path of the matched remote that passes through a remote ref
+/// file holds no remote ref, and the import writes the mirror ref. A remote
+/// ref path that names a directory is not a ref, and the import refuses the
+/// ref.
 #[test]
 fn a_remote_ref_path_with_no_ref_file_gives_no_current_ref() {
     let tmp = TmpDir::new("media-import-no-remote-ref-file");
@@ -653,10 +654,16 @@ fn a_remote_ref_path_with_no_ref_file_gives_no_current_ref() {
         let b_tip = commit(&c, dir, "b", &b, Some(X), 2000, Some(SECRET_B64)).await;
 
         let report = import(&c, &mount, &[], &[]).await.unwrap();
-        assert_eq!(report.written, [(Ref::collection(X, "a"), a), (bc_ref, bc)]);
+        assert_eq!(report.written, [(bc_ref, bc)]);
         assert!(report.unchanged.is_empty(), "{:?}", report.unchanged);
-        assert!(report.refused.is_empty(), "{:?}", report.refused);
-        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), Some(a));
+        assert_eq!(names(&report.refused), [format!("@{X}:a")]);
+        assert!(
+            matches!(&report.refused[0].1, Error::NotARef { name, .. } if name == "origin:a"),
+            "{:?}",
+            report.refused
+        );
+        assert!(!c.has_object(ObjectType::Commit, &a).await.unwrap());
+        assert_eq!(ref_file(&c, &format!("mirrors/{X}/a")), None);
         assert_eq!(ref_file(&c, &format!("mirrors/{X}/b/c")), Some(bc));
         assert_eq!(ref_file(&c, "remotes/origin/a/x"), Some(ax_tip));
         assert_eq!(ref_file(&c, "remotes/origin/b"), Some(b_tip));
@@ -699,7 +706,7 @@ fn a_directory_at_the_write_place_refuses_the_ref_before_the_pull() {
         );
         for (_, err) in &report.refused {
             assert!(
-                matches!(err, Error::Io(e) if e.kind() == std::io::ErrorKind::IsADirectory),
+                matches!(err, Error::NotARef { reason, .. } if reason == "is not a regular file"),
                 "{err:?}"
             );
         }

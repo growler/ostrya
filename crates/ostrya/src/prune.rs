@@ -913,12 +913,15 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if a value of
     ///   [`only_branch`](PruneOptions::only_branch) fails [`Ref::validate`],
     ///   for example `main^`.
+    /// - [`Error::InvalidFormat`] if `refs`, `refs/heads`, `refs/remotes`, or
+    ///   `refs/mirrors` is a symlink. The ref listing fails before the run
+    ///   deletes anything.
     /// - [`Error::RefNotWritable`] if the path of a weak ref to delete passes
-    ///   through an alias: a symlink at a component above the ref, for example
-    ///   `refs/heads`. The reason is `passes through an alias`. The run checks
-    ///   each weak ref to delete before the first unlink, so it then deletes
-    ///   no ref and no object. A [`no_prune`](PruneOptions::no_prune) dry run
-    ///   runs the same check.
+    ///   through an alias: a symlink at a component above the ref that a
+    ///   writer put there after the listing. The reason is `passes through an
+    ///   alias`. The run checks each weak ref to delete before the first
+    ///   unlink, so it then deletes no ref and no object. A
+    ///   [`no_prune`](PruneOptions::no_prune) dry run runs the same check.
     /// - An error of [`resolve_ref_tip`](Repo::resolve_ref_tip) if the read
     ///   of a value of [`only_branch`](PruneOptions::only_branch) fails. Each
     ///   run, a [`static_deltas_only`](PruneOptions::static_deltas_only) run
@@ -1200,7 +1203,7 @@ impl Repo {
         let mut deleted_refs: Vec<Ref> = if opts.no_prune {
             let repo = self.clone();
             let doomed_refs = ostrya_rt::unblock(move || {
-                crate::refs::check_refs_to_delete_blocking(repo.repo_fd(), &doomed_refs, |r| {
+                crate::refs::check_refs_to_delete_blocking(repo.root_dir(), &doomed_refs, |r| {
                     crate::refs::ref_relpath(None, r)
                 })
                 .map(|()| doomed_refs)
@@ -1212,7 +1215,7 @@ impl Repo {
             let fsync = sweep.fsync;
             ostrya_rt::unblock(move || {
                 crate::refs::delete_matching_refs_blocking(
-                    repo.repo_fd(),
+                    repo.root_dir(),
                     doomed_refs,
                     |r| crate::refs::ref_relpath(None, r),
                     fsync,

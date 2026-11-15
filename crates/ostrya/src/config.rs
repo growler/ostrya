@@ -16,7 +16,8 @@ use crate::error::{Error, Result};
 use crate::pattern::ReceiveSelector;
 use crate::remotes_dir;
 use crate::repo::{Repo, check_config_size};
-use crate::summary::{remove_root_file_blocking, write_root_file_blocking};
+use crate::repo_fs::{Publish, RootFile};
+use crate::summary::remove_root_file_blocking;
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
@@ -792,8 +793,9 @@ impl Repo {
     /// The call writes the file as the write path writes each file at the
     /// repository root:
     ///
-    /// 1. It writes a new temporary file at mode `0644`.
-    /// 2. If `[core] fsync` is on, it syncs the file with `fdatasync`.
+    /// 1. It writes a new named temp file `tmp/.ostrya-tmp-<pid>-XXXXXX` at
+    ///    mode `0644`. It makes `tmp/` if it does not exist.
+    /// 2. If `[core] fsync` is on, it syncs the file with `fsync`.
     /// 3. It renames the file over `config`.
     /// 4. If `[core] fsync` is on, it syncs the repository directory.
     ///
@@ -850,6 +852,8 @@ impl Repo {
     ///   regular file is at `.lock` or at `.update.lock`. The lock open
     ///   follows no symlink. If the process cannot open a FIFO, a socket, or
     ///   a device there for write, the error is [`Error::Io`].
+    /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory.
     /// - [`Error::Io`] if a lock file, the write, the rename, or a sync fails
     ///   on the file system.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
@@ -859,7 +863,9 @@ impl Repo {
         let names = remotes_dir::config_remote_names(keyfile);
         self.write_locked(move |repo| {
             remotes_dir::check_config_remotes(repo.repo_fd(), repo.remotes_dir(), &names)?;
-            write_root_file_blocking(repo.repo_fd(), CONFIG_FILE, &bytes, fsync)
+            repo.root_dir()
+                .write_root_file(RootFile::Config, &bytes, Publish::Replace, fsync)?;
+            Ok(())
         })
         .await
     }

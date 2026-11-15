@@ -28,14 +28,14 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use ostrya_core::{
     Checksum, Commit, DirMeta, ObjectType, Ref, RefSelector, RepoMode, Type, Value,
     choose_offset_size, from_bytes, to_bytes, tuple_field_from_bytes, write_offset,
 };
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
+use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess, SummaryFiles};
@@ -46,10 +46,12 @@ use crate::deltagen::{
 use crate::error::{Error, Result};
 use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
-use crate::perm;
 use crate::refs::RefSelection;
 use crate::remote::proto::MAX_REF_LISTING;
 use crate::repo::Repo;
+use crate::repo_fs::{
+    FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, RootFile, TempFile,
+};
 use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, verify_all};
 
 /// The GVariant type of the summary: `(refs, global_metadata)`.
@@ -87,9 +89,6 @@ const DELTA_MAP_SIGNATURE: &str = "a{sv}";
 pub(crate) const SUMMARY_FILE: &str = "summary";
 /// The name of the summary signature file at the repository root.
 pub(crate) const SUMMARY_SIG_FILE: &str = "summary.sig";
-/// The permission bits of each file that `put_root_file_blocking` writes.
-/// The `ostree` command gives `summary` and `summary.sig` the mode `0644`.
-const SUMMARY_MODE: u32 = 0o644;
 
 /// The ref of the anchor commit of a collection.
 pub(crate) const OSTREE_METADATA_REF: &str = "ostree-metadata";
@@ -751,24 +750,39 @@ impl Repo {
     ///    item, it writes the `.access` file.
     ///
     /// So while the `.access` file of an item holds a digest, the summary
-    /// next to it is a summary of that digest. Each file is written
-    /// atomically, with the mode `0644`. If `[core] fsync` is `true`, the
-    /// call syncs the data of each file and the repository root after the
+    /// next to it is a summary of that digest. An `.access` entry that is a
+    /// symlink, or that is not a regular file and not a directory, holds no
+    /// digest: step 1 removes it, and step 3 writes a regular file. A
+    /// directory at the name of the `.access` file fails step 1 with
+    /// [`Error::Io`], and the files of the item stay as they were.
+    ///
+    /// Each file is written atomically, with the mode `0644`: the call
+    /// writes a named temp file `tmp/.ostrya-tmp-<pid>-XXXXXX`, and renames
+    /// it over the file. A symlink at the name of the file is replaced. The
+    /// call makes `tmp/` if it does not exist. For each summary, the call
+    /// writes the temp files of the summary, of its signature file, and of
+    /// its `.access` file before it removes or renames a file of that
+    /// summary. So a failure in `tmp/` leaves each file of that summary as it
+    /// was. If `[core] fsync` is `true`, the call syncs each temp file with
+    /// `fsync` before its rename, and syncs the repository root after the
     /// write of the root summary. It also syncs the directory of the
-    /// `.access` file after the removal of step 1 and after the write of
-    /// step 3, and the directory of the summary before step 3.
+    /// `.access` file after the removal of step 1 and after the write of step
+    /// 3, and the directory of the summary before step 3.
     ///
     /// Then the call removes the files of each item that has no summary.
     /// Under `extensions/ostrya/summary/`, it removes each file
     /// `HEX`, `HEX.sig`, and `HEX.access` of no item with a summary, the
-    /// `.access` files first, and each temp file of these names that an
-    /// interrupted write left. It leaves each other entry.
+    /// `.access` files first. It also removes each temp file
+    /// `<name>.tmp-<pid>-<n>` of these names, which an interrupted write of an
+    /// older version of ostrya left there. It leaves each other entry. A temp
+    /// file of this form at the repository root stays.
     ///
     /// The call creates `extensions/`, `extensions/ostrya/`, and
     /// `extensions/ostrya/summary/` with the mode `0775`, less the
     /// file-creation mask. In a `bare-user-shared` repository, it forces the
-    /// mode `02770` on each directory that it creates. It opens each of these
-    /// directories with no symlink followed.
+    /// mode `02770` on each directory that it creates. It opens
+    /// `extensions` with one `openat2`, and then `ostrya/summary` below it
+    /// with one `openat2`, with no symlink followed.
     ///
     /// # Refs
     ///
@@ -911,9 +925,11 @@ impl Repo {
     ///   if a client group or the server group is malformed
     ///   ([`ClientAccess::from_config`]), if `[core] lock-timeout-secs` is
     ///   below `-1`, if a ref file is not UTF-8, if the system clock is
-    ///   before the Unix epoch, if a summary is larger than 64 MiB, or if
+    ///   before the Unix epoch, if a summary is larger than 64 MiB, if
     ///   `extensions`, `extensions/ostrya`, or `extensions/ostrya/summary` is
-    ///   not a directory.
+    ///   a symlink or is not a directory, or if `tmp` or `tmp/cache` is a
+    ///   symlink or is not a directory. The message names the path of the
+    ///   open: `extensions` or `extensions/ostrya/summary`.
     /// - [`Error::InvalidInput`] if [`SummaryOptions::auth_items_only`] and
     ///   [`SummaryOptions::root_summary_only`] are both `true`. The call then
     ///   writes nothing.
@@ -1080,13 +1096,29 @@ impl Repo {
                 .await
                 .map_err(write)?;
         }
+        // The one open of the summary directory, for the write of each item
+        // and for the removal of the files of the other items.
+        let dir = if items.is_empty() {
+            None
+        } else {
+            let repo = self.clone();
+            let dir = ostrya_rt::unblock(move || -> Result<RepoDir> {
+                Ok(repo
+                    .root_dir()
+                    .ensure_layout(RepoLayout::Extensions, fsync)?
+                    .ensure_dir(SUMMARY_SUBDIR, fsync)?)
+            })
+            .await
+            .map_err(write)?;
+            Some(dir)
+        };
         for (item, files) in &items {
             let bytes = self.item_summary(&run, item, opts).await.map_err(build)?;
             let signatures = sign(&bytes).await?;
-            let repo = self.clone();
+            let dir = dir.clone().expect("a run with items opens the directory");
             let files = files.clone();
             ostrya_rt::unblock(move || {
-                put_item_summary_blocking(&repo, &bytes, signatures, &files, fsync)
+                put_item_summary_blocking(&dir, &bytes, signatures, &files, fsync)
             })
             .await
             .map_err(write)?;
@@ -1094,9 +1126,18 @@ impl Repo {
         if !opts.root_summary_only {
             let kept: HashSet<String> = items.iter().map(|(_, files)| files.stem.clone()).collect();
             let repo = self.clone();
-            ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, fsync))
-                .await
-                .map_err(write)?;
+            ostrya_rt::unblock(move || -> Result<()> {
+                let dir = match dir {
+                    Some(dir) => Some(dir),
+                    None => open_summary_dir(repo.root_dir())?,
+                };
+                match dir {
+                    Some(dir) => remove_other_summaries_blocking(&dir, &kept, fsync),
+                    None => Ok(()),
+                }
+            })
+            .await
+            .map_err(write)?;
         }
         Ok(SummaryReport {
             invalid_collection_dirs: run.every.invalid_dirs,
@@ -1547,18 +1588,19 @@ impl Repo {
     /// Returns the bytes of `summary`, or `None` if the file does not exist.
     ///
     /// The call refuses a file larger than 64 MiB, the cap of a summary
-    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Size"). On a
-    /// handle of [`open_at_strict`](Repo::open_at_strict), the open of
-    /// `summary` does not block, and the call refuses a file that is not a
-    /// regular file.
+    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Size"). The
+    /// open of `summary` is one `openat2` with `RESOLVE_BENEATH`,
+    /// `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`. It follows no symlink and does
+    /// not block on a FIFO.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB.
-    /// - [`Error::Io`] if the read fails, for example if `summary` is a
-    ///   symlink, or if `summary` of a strict handle is not a regular file.
+    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB, if
+    ///   `summary` is a symlink, or if `summary` is not a regular file.
+    /// - [`Error::Io`] if the read fails.
     pub async fn read_summary(&self) -> Result<Option<Vec<u8>>> {
-        self.read_root_file(SUMMARY_FILE).await
+        let repo = self.clone();
+        ostrya_rt::unblock(move || read_root_file_blocking(repo.root_dir(), SUMMARY_FILE)).await
     }
 
     /// Returns the bytes of the summary of the auth item `item`, or `None` if
@@ -1568,26 +1610,27 @@ impl Repo {
     /// `extensions/ostrya/summary/HEX`, where `HEX` is the SHA-256 digest of
     /// the text of the item
     /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Files"). The call
-    /// opens each component with no symlink followed. It does not compare the
-    /// `.access` file of the item with the client groups. The call refuses a
-    /// file larger than 64 MiB, as [`read_summary`](Repo::read_summary) does.
+    /// opens `extensions`, then `ostrya/summary` below it, then the file, with
+    /// one `openat2` each and no symlink followed. The open of the file does
+    /// not block on a FIFO. It does not compare the `.access` file of the item
+    /// with the client groups. The call refuses a file larger than 64 MiB, as
+    /// [`read_summary`](Repo::read_summary) does.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if `extensions`, `extensions/ostrya`, or
-    ///   `extensions/ostrya/summary` is not a directory, or if the file is
-    ///   larger than 64 MiB.
-    /// - [`Error::Io`] if the read fails, for example if the file is a
-    ///   symlink.
+    ///   `extensions/ostrya/summary` is a symlink or is not a directory, if
+    ///   the file is a symlink or is not a regular file, or if the file is
+    ///   larger than 64 MiB. The message names the path of the open:
+    ///   `extensions`, `extensions/ostrya/summary`, or the path of the file.
+    /// - [`Error::Io`] if the read fails.
     pub async fn read_summary_of(&self, item: &AuthItem) -> Result<Option<Vec<u8>>> {
         let repo = self.clone();
         let name = summary_stem(item);
-        ostrya_rt::unblock(
-            move || match open_summary_dir(repo.repo_fd(), None, false)? {
-                Some(dir) => read_root_file_blocking(dir.as_fd(), &name),
-                None => Ok(None),
-            },
-        )
+        ostrya_rt::unblock(move || match open_summary_dir(repo.root_dir())? {
+            Some(dir) => read_root_file_blocking(&dir, &name),
+            None => Ok(None),
+        })
         .await
     }
 
@@ -1595,19 +1638,21 @@ impl Repo {
     /// not exist or is empty.
     ///
     /// The dict is an `a{sv}` with one entry for each signing engine. The call
-    /// refuses a file larger than 64 MiB. The read and the parse run in one
+    /// refuses a file larger than 64 MiB. The open is that of
+    /// [`read_summary`](Repo::read_summary). The read and the parse run in one
     /// call on the blocking pool.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB.
+    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB, if
+    ///   `summary.sig` is a symlink, or if `summary.sig` is not a regular
+    ///   file.
     /// - [`Error::Core`] if the file is not an `a{sv}` dict.
-    /// - [`Error::Io`] if the read fails, for example if `summary.sig` is a
-    ///   symlink.
+    /// - [`Error::Io`] if the read fails.
     pub async fn read_summary_signature(&self) -> Result<Option<Value>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            let Some(bytes) = read_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)? else {
+            let Some(bytes) = read_root_file_blocking(repo.root_dir(), SUMMARY_SIG_FILE)? else {
                 return Ok(None);
             };
             parse_signature_dict(&bytes)
@@ -1632,7 +1677,10 @@ impl Repo {
     /// The call appends the signature to the array of the engine of `signer`.
     /// If the dict or the array does not exist, the call creates it. The
     /// arrays of the other engines stay as they are. The call replaces
-    /// `summary.sig` atomically, with the mode `0644`.
+    /// `summary.sig` atomically, with the mode `0644`, through a named temp
+    /// file in `tmp/`. If `[core] fsync` is `true`, it syncs the temp file
+    /// with `fsync` before the rename, and the directory of `summary.sig`
+    /// after it.
     ///
     /// [`sign_summary_all`](Repo::sign_summary_all) signs with several signers
     /// in one write. It also states the locks that this call takes.
@@ -1642,9 +1690,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the repository has no summary, if
     ///   `[core] lock-timeout-secs` is below `-1`, if a summary or a signature
     ///   file is larger than 64 MiB, if the entry of the engine in a
-    ///   signature file is not an array, or if `extensions`,
-    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
-    ///   directory.
+    ///   signature file is not an array, if `extensions`,
+    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is a symlink or
+    ///   is not a directory, if a summary or a signature file is a symlink or
+    ///   is not a regular file, or if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse, or if a signature file is not an
     ///   `a{sv}` dict.
@@ -1691,9 +1741,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the repository has no summary, if
     ///   `[core] lock-timeout-secs` is below `-1`, if a summary or a signature
     ///   file is larger than 64 MiB, if the entry of the engine of a signer in
-    ///   a signature file is not an array, or if `extensions`,
-    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
-    ///   directory.
+    ///   a signature file is not an array, if `extensions`,
+    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is a symlink or
+    ///   is not a directory, if a summary or a signature file is a symlink or
+    ///   is not a regular file, or if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse, or if a signature file is not an
     ///   `a{sv}` dict.
@@ -1712,10 +1764,10 @@ impl Repo {
         // The one open of the summary directory, for each read and each
         // write of the call.
         let (dir, stems) = ostrya_rt::unblock(move || -> Result<_> {
-            match open_summary_dir(repo.repo_fd(), None, false)? {
+            match open_summary_dir(repo.root_dir())? {
                 Some(dir) => {
                     let stems = item_summary_stems(&dir)?;
-                    Ok((Some(Arc::new(dir)), stems))
+                    Ok((Some(dir), stems))
                 }
                 None => Ok((None, Vec::new())),
             }
@@ -1733,14 +1785,12 @@ impl Repo {
             let read = ostrya_rt::unblock(move || -> Result<Option<(Vec<u8>, Option<Value>)>> {
                 let (at, file, sig) = match &name {
                     Some(stem) => (
-                        dir.as_deref()
-                            .expect("each stem comes from the directory")
-                            .as_fd(),
+                        dir.as_ref().expect("each stem comes from the directory"),
                         stem.clone(),
                         format!("{stem}{SIG_SUFFIX}"),
                     ),
                     None => (
-                        repo.repo_fd(),
+                        repo.root_dir(),
                         SUMMARY_FILE.to_owned(),
                         SUMMARY_SIG_FILE.to_owned(),
                     ),
@@ -1785,12 +1835,17 @@ impl Repo {
         self.write_holding(locks, move |repo| {
             for (stem, bytes) in &written {
                 let Some(stem) = stem else {
-                    write_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, bytes, fsync)?;
+                    repo.root_dir().write_root_file(
+                        RootFile::SummarySig,
+                        bytes,
+                        Publish::Replace,
+                        fsync,
+                    )?;
                     continue;
                 };
-                let at = dir.as_deref().expect("each stem comes from the directory");
+                let at = dir.as_ref().expect("each stem comes from the directory");
                 let name = format!("{stem}{SIG_SUFFIX}");
-                write_root_file_blocking(at.as_fd(), &name, bytes, fsync)?;
+                at.write_atomic(&name, bytes, Publish::Replace, fsync)?;
             }
             Ok(())
         })
@@ -1935,17 +1990,6 @@ impl Repo {
             .await?;
         txn.set_ref(&Ref::local(OSTREE_METADATA_REF), Some(&commit));
         Ok(commit)
-    }
-
-    /// Reads a whole file at the repository root, or returns `None` if it does
-    /// not exist. The call refuses a file larger than [`SUMMARY_READ_CAP`].
-    /// On a strict handle, the open is the strict open of
-    /// [`read_root_file_with`].
-    pub(crate) async fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        let name = name.to_owned();
-        let strict = self.is_strict();
-        ostrya_rt::unblock(move || read_root_file_with(repo_fd.as_fd(), &name, strict)).await
     }
 }
 
@@ -2673,52 +2717,15 @@ pub(crate) fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
 /// passes each reader.
 pub(crate) const SUMMARY_READ_CAP: u64 = 64 * 1024 * 1024;
 
-/// Reads a whole file relative to `repo_fd`, or returns `None` if it does not
-/// exist.
+/// Reads the whole regular file at `path` below `dir`, or returns `None` if
+/// it does not exist.
 ///
-/// The read does not follow a symlink. It refuses a file larger than
-/// [`SUMMARY_READ_CAP`] with [`Error::InvalidFormat`], and reads at most one
-/// byte past the cap.
-pub(crate) fn read_root_file_blocking(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-) -> Result<Option<Vec<u8>>> {
-    read_root_file_with(repo_fd, name, false)
-}
-
-/// Reads a whole file relative to `repo_fd`, as [`read_root_file_blocking`]
-/// does, in the strict open mode of
-/// [`open_regular_file`](crate::object::open_regular_file) if `strict` is
-/// set. In that mode, the open does not block, and the call refuses a file
-/// that is not a regular file.
-pub(crate) fn read_root_file_with(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-    strict: bool,
-) -> Result<Option<Vec<u8>>> {
-    use std::io::Read;
-
-    let opened = crate::object::open_regular_file_nofollow(repo_fd, name, strict);
-    let fd = match opened {
-        Ok(fd) => fd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
-    };
-    let file = std::fs::File::from(fd);
-    // The buffer is sized from the file before the read, so the file lands in
-    // one allocation. Without the hint the buffer grows by doubling and the
-    // bytes already read are copied at every step of the ladder. The hint is
-    // clamped to the same bound the reader takes, so a file that states a
-    // hostile size allocates no more than that.
-    let hint = file.metadata()?.len().min(SUMMARY_READ_CAP) + 1;
-    let mut buf = Vec::with_capacity(hint as usize);
-    file.take(SUMMARY_READ_CAP + 1).read_to_end(&mut buf)?;
-    if buf.len() as u64 > SUMMARY_READ_CAP {
-        return Err(Error::InvalidFormat(format!(
-            "{name} is larger than its cap of {SUMMARY_READ_CAP} bytes"
-        )));
-    }
-    Ok(Some(buf))
+/// The read is [`RepoDir::read_capped`] with the cap [`SUMMARY_READ_CAP`]. It
+/// follows no symlink at any component of `path`, does not block on a FIFO,
+/// and refuses a file that is not a regular file or that is larger than the
+/// cap with [`Error::InvalidFormat`].
+pub(crate) fn read_root_file_blocking(dir: &RepoDir, path: &str) -> Result<Option<Vec<u8>>> {
+    Ok(dir.read_capped(path, SUMMARY_READ_CAP).optional()?)
 }
 
 /// Refuses a summary of `size` bytes, or of at least `size` bytes, when
@@ -2728,24 +2735,6 @@ pub(crate) fn check_summary_size(size: u64) -> Result<()> {
         return Err(Error::InvalidFormat(format!(
             "the summary is larger than its cap of {SUMMARY_READ_CAP} bytes"
         )));
-    }
-    Ok(())
-}
-
-/// Writes `bytes` to `name` at the repository root, atomically.
-///
-/// The call writes a new temp file (`fchmod` 0644, `fdatasync` if `fsync` is
-/// set) and renames it over the target. If `fsync` is set, it then syncs the
-/// root directory, so the rename survives a crash.
-pub(crate) fn write_root_file_blocking(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-    bytes: &[u8],
-    fsync: bool,
-) -> Result<()> {
-    put_root_file_blocking(repo_fd, name, bytes, fsync)?;
-    if fsync {
-        rustix::fs::fsync(repo_fd)?;
     }
     Ok(())
 }
@@ -2761,13 +2750,9 @@ pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> 
 }
 
 /// The directory of the summaries of the auth items, and of the `.access`
-/// file of each item with a summary.
-pub(crate) const SUMMARY_DIR: &str = "extensions/ostrya/summary";
-/// The components of [`SUMMARY_DIR`], from the repository root.
-const SUMMARY_DIR_PARTS: [&str; 3] = ["extensions", "ostrya", "summary"];
-/// The mode of each directory under `extensions/ostrya/` that a writer
-/// creates, before the file-creation mask.
-pub(crate) const EXTENSION_DIR_MODE: u32 = 0o775;
+/// file of each item with a summary: `extensions/ostrya/summary`. The value
+/// is its path below `extensions/`.
+const SUMMARY_SUBDIR: &str = "ostrya/summary";
 /// The suffix of the signature file of the summary of an item.
 pub(crate) const SIG_SUFFIX: &str = ".sig";
 /// The suffix of the file that holds the access digest of an item.
@@ -2784,95 +2769,19 @@ pub(crate) fn access_file_bytes(digest: &Checksum) -> Vec<u8> {
     format!("{}\n", digest.to_hex()).into_bytes()
 }
 
-/// Opens [`SUMMARY_DIR`] under `repo_fd`, as [`open_extension_dir`] does.
-fn open_summary_dir(
-    repo_fd: BorrowedFd<'_>,
-    create: Option<RepoMode>,
-    fsync: bool,
-) -> Result<Option<OwnedFd>> {
-    open_extension_dir(repo_fd, &SUMMARY_DIR_PARTS, create, fsync)
-}
-
-/// Opens the directory `parts` under `repo_fd`, one component at a time,
-/// with no symlink followed.
+/// Opens `extensions/ostrya/summary` below the repository root `root`, or
+/// returns `None` if `extensions` or a directory below it does not exist.
 ///
-/// With `create`, the mode of the repository, the call creates each
-/// component that does not exist, with [`EXTENSION_DIR_MODE`], and forces the
-/// shared mode on it in a `bare-user-shared` repository. With `fsync`, it
-/// then syncs the parent of each directory that it creates. Without
-/// `create`, a component that does not exist gives `None`.
-///
-/// A component that is a symlink, or that is no directory, gives
-/// [`Error::InvalidFormat`], as [`extension_entry_error`] states.
-pub(crate) fn open_extension_dir(
-    repo_fd: BorrowedFd<'_>,
-    parts: &[&str],
-    create: Option<RepoMode>,
-    fsync: bool,
-) -> Result<Option<OwnedFd>> {
-    let mut dir: Option<OwnedFd> = None;
-    let mut path = String::new();
-    for &part in parts {
-        let parent = dir.as_ref().map_or(repo_fd, AsFd::as_fd);
-        if !path.is_empty() {
-            path.push('/');
-        }
-        path.push_str(part);
-        let open = || {
-            rustix::fs::openat(
-                parent,
-                part,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-        };
-        let opened = match (open(), create) {
-            (Err(Errno::NOENT), None) => return Ok(None),
-            (Err(Errno::NOENT), Some(mode)) => {
-                match rustix::fs::mkdirat(parent, part, Mode::from_raw_mode(EXTENSION_DIR_MODE)) {
-                    Ok(()) => {
-                        perm::force_created_dir(parent, part, mode)?;
-                        if fsync {
-                            rustix::fs::fsync(parent)?;
-                        }
-                    }
-                    Err(Errno::EXIST) => {}
-                    Err(e) => return Err(e.into()),
-                }
-                open()
-            }
-            (opened, _) => opened,
-        };
-        dir = Some(match opened {
-            Ok(fd) => fd,
-            Err(Errno::NOTDIR | Errno::LOOP) => {
-                return Err(extension_entry_error(parent, part, &path));
-            }
-            Err(e) => return Err(e.into()),
-        });
-    }
-    Ok(dir)
-}
-
-/// Returns the error of the entry `part` of `parent`, at the path `path`
-/// relative to the root of the repository, which an open as a directory with
-/// no symlink followed refused.
-///
-/// A symlink gives [`Error::InvalidFormat`] with the text
-/// `{path} is a symlink; ostrya refuses a symlink in the repository`. Each
-/// other entry gives [`Error::InvalidFormat`] with the text
-/// `{path} is not a directory`. A stat of the entry that fails gives its
-/// errno.
-pub(crate) fn extension_entry_error(parent: BorrowedFd<'_>, part: &str, path: &str) -> Error {
-    match rustix::fs::statat(parent, part, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
-            Error::InvalidFormat(format!(
-                "{path} is a symlink; ostrya refuses a symlink in the repository"
-            ))
-        }
-        Ok(_) => Error::InvalidFormat(format!("{path} is not a directory")),
-        Err(e) => e.into(),
-    }
+/// The call opens `extensions` with one `openat2`, and then
+/// `ostrya/summary` below it with one `openat2`. A symlink at a component
+/// gives [`Error::InvalidFormat`] "passes through a symlink" with the path
+/// of the open, and an entry that is not a directory gives
+/// [`Error::InvalidFormat`] "is not a directory".
+pub(crate) fn open_summary_dir(root: &RepoDir) -> std::result::Result<Option<RepoDir>, FsError> {
+    let Some(extensions) = root.open_layout(RepoLayout::Extensions).optional()? else {
+        return Ok(None);
+    };
+    extensions.open_dir(SUMMARY_SUBDIR).optional()
 }
 
 /// Returns `true` if `name` is 64 lowercase hex digits.
@@ -2880,11 +2789,16 @@ fn is_stem(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// One file name under [`SUMMARY_DIR`] that the writer owns: `HEX`,
-/// `HEX.sig`, or `HEX.access`, or a temp file of one of these names.
+/// One file name under `extensions/ostrya/summary` that the writer owns:
+/// `HEX`, `HEX.sig`, or `HEX.access`, or a temp file `<name>.tmp-<pid>-<n>`
+/// of one of these names.
+///
+/// The writer makes its temp files in `tmp/`. A temp file of this form is
+/// the leftover of an interrupted write of an older version of ostrya, which
+/// made its temp files in the directory of the target.
 struct SummaryEntry<'a> {
     stem: &'a str,
-    /// `true` for a temp file of [`put_root_file_blocking`].
+    /// `true` for a temp file `<name>.tmp-<pid>-<n>`.
     temp: bool,
 }
 
@@ -2909,15 +2823,26 @@ fn summary_entry(name: &str) -> Option<SummaryEntry<'_>> {
     Some(SummaryEntry { stem, temp })
 }
 
-/// Returns the stem of each summary in `dir`, the open [`SUMMARY_DIR`],
-/// sorted: each file name that is 64 lowercase hex digits.
-fn item_summary_stems(dir: &OwnedFd) -> Result<Vec<String>> {
-    let mut stems: Vec<String> = crate::delta::dir_child_names(dir)?
+/// Returns the stem of each summary in `dir`, the open
+/// `extensions/ostrya/summary`, sorted: each file name that is 64 lowercase
+/// hex digits.
+fn item_summary_stems(dir: &RepoDir) -> Result<Vec<String>> {
+    let mut stems: Vec<String> = utf8_names(dir)?
         .into_iter()
         .filter(|name| is_stem(name))
         .collect();
     stems.sort();
     Ok(stems)
+}
+
+/// Returns the name of each entry of `dir` that is UTF-8. The call skips
+/// each other name, which names no file of the writer.
+fn utf8_names(dir: &RepoDir) -> Result<Vec<String>> {
+    Ok(dir
+        .list()?
+        .into_iter()
+        .filter_map(|entry| String::from_utf8(entry.name).ok())
+        .collect())
 }
 
 /// Returns the signature file of `bytes` with a signature of each signer of
@@ -2953,47 +2878,59 @@ fn put_root_summary_blocking(
     signatures: Option<Vec<u8>>,
     fsync: bool,
 ) -> Result<()> {
+    let root = repo.root_dir();
+    let summary = root.stage_root_file(&RootFile::Summary, bytes, fsync)?;
+    let signatures = signatures
+        .map(|signatures| root.stage_root_file(&RootFile::SummarySig, &signatures, fsync))
+        .transpose()?;
     put_summary_files_blocking(
-        repo.repo_fd(),
+        root,
         SUMMARY_FILE,
         SUMMARY_SIG_FILE,
-        bytes,
-        signatures,
+        (summary, signatures),
         fsync,
     )
 }
 
-/// Writes the summary `bytes` to `file` and the signature file `signatures`
-/// to `sig`, both under `at`, after it removes the old `sig`. With `fsync`,
-/// the call syncs `at` last.
+/// The temp files of a summary and of its signature file, in `tmp/`.
+type StagedSummary = (TempFile, Option<TempFile>);
+
+/// Puts the temp files `staged` of a summary and of its signature file at
+/// `file` and at `sig` in `dir`, after it removes the old `sig`. With
+/// `fsync`, the call syncs `dir` last.
+///
+/// The temp files are complete before the removal of the old `sig`. So a
+/// failure in `tmp/` keeps the old `file` and the old `sig`.
 fn put_summary_files_blocking(
-    at: BorrowedFd<'_>,
+    dir: &RepoDir,
     file: &str,
     sig: &str,
-    bytes: &[u8],
-    signatures: Option<Vec<u8>>,
+    staged: StagedSummary,
     fsync: bool,
 ) -> Result<()> {
+    let (summary, signatures) = staged;
     // The old signatures never pair with the new summary.
-    remove_root_file_blocking(at, sig)?;
-    put_root_file_blocking(at, file, bytes, fsync)?;
+    dir.remove_file(sig, false)?;
+    summary.publish(dir, file, Publish::Replace, false)?;
     if let Some(signatures) = signatures {
-        put_root_file_blocking(at, sig, &signatures, fsync)?;
+        signatures.publish(dir, sig, Publish::Replace, false)?;
     }
     if fsync {
-        rustix::fs::fsync(at)?;
+        dir.sync()?;
     }
     Ok(())
 }
 
 /// Writes the files of the summary of an item, whose access digest and file
-/// stem are `files`.
+/// stem are `files`, in `dir`, the open `extensions/ostrya/summary`.
 ///
-/// When the `.access` file of the item holds another digest, the call
-/// removes it first. Then it removes the old signature file, writes the
-/// summary `bytes` and the signature file `signatures`, and writes the
-/// `.access` file last, unless it holds the digest. So while the `.access`
-/// file holds a digest, the summary next to it is a summary of that digest.
+/// The call first writes the temp file of each file that it writes. So a
+/// failure in `tmp/` keeps each old file of the item. When the `.access`
+/// file of the item holds another digest, the call then removes it. Then it
+/// removes the old signature file, writes the summary `bytes` and the
+/// signature file `signatures`, and writes the `.access` file last, unless
+/// it holds the digest. So while the `.access` file holds a digest, the
+/// summary next to it is a summary of that digest.
 ///
 /// With `fsync`, the call syncs the directory of the `.access` file after
 /// its removal and after its write, and the directory of the summary before
@@ -3002,81 +2939,89 @@ fn put_summary_files_blocking(
 /// `.access` file are in one directory, the sync before the write of the
 /// `.access` file keeps the order of the two renames.
 fn put_item_summary_blocking(
-    repo: &Repo,
+    dir: &RepoDir,
     bytes: &[u8],
     signatures: Option<Vec<u8>>,
     files: &SummaryFiles,
     fsync: bool,
 ) -> Result<()> {
-    let dir = open_summary_dir(repo.repo_fd(), Some(repo.mode()), fsync)?
-        .expect("the call creates the directory");
     let access = format!("{}{ACCESS_SUFFIX}", files.stem);
     let want = access_file_bytes(&files.digest);
-    let held = holds_blocking(dir.as_fd(), &access, &want)?;
-    if held == Some(false) && remove_root_file_blocking(dir.as_fd(), &access)? && fsync {
-        rustix::fs::fsync(&dir)?;
+    let held = holds_blocking(dir, &access, &want)?;
+    let summary = dir.stage_atomic(bytes, fsync)?;
+    let signatures = signatures
+        .map(|signatures| dir.stage_atomic(&signatures, fsync))
+        .transpose()?;
+    // An `.access` file that holds the digest stays as it is.
+    let access_file = match held {
+        Some(true) => None,
+        _ => Some(dir.stage_atomic(&want, fsync)?),
+    };
+    if held == Some(false) {
+        dir.remove_file(&access, fsync)?;
     }
     put_summary_files_blocking(
-        dir.as_fd(),
+        dir,
         &files.stem,
         &format!("{}{SIG_SUFFIX}", files.stem),
-        bytes,
-        signatures,
+        (summary, signatures),
         fsync,
     )?;
-    // An `.access` file that holds the digest stays as it is.
-    if held != Some(true) {
-        put_root_file_blocking(dir.as_fd(), &access, &want, fsync)?;
+    if let Some(access_file) = access_file {
+        access_file.publish(dir, &access, Publish::Replace, false)?;
         if fsync {
-            rustix::fs::fsync(&dir)?;
+            dir.sync()?;
         }
     }
     Ok(())
 }
 
-/// Returns `None` if `name` under `dir` does not exist, else `true` if it
-/// is a file that holds exactly `want`.
+/// Returns `None` if `name` in `dir` does not exist, else `true` if it is a
+/// regular file that holds exactly `want`.
 ///
-/// The call follows no symlink, and a symlink gives `false`. The read stops
-/// one byte past the length of `want`.
-fn holds_blocking(dir: BorrowedFd<'_>, name: &str, want: &[u8]) -> Result<Option<bool>> {
-    match rustix::fs::openat(
-        dir,
-        name,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => Ok(Some(crate::archive::holds(&std::fs::File::from(fd), want)?)),
-        Err(Errno::NOENT) => Ok(None),
-        Err(Errno::LOOP) => Ok(Some(false)),
+/// The open follows no symlink and does not block on a FIFO. A symlink and
+/// an entry that is not a regular file give `false`, so the write removes
+/// the entry and writes the file again. The removal of a directory fails
+/// with `EISDIR`. The read stops one byte past the length of `want`.
+fn holds_blocking(dir: &RepoDir, name: &str, want: &[u8]) -> Result<Option<bool>> {
+    match dir.open_regular(name) {
+        Ok(opened) => Ok(Some(crate::archive::holds(&opened.file, want)?)),
+        Err(FsError::Absent { .. }) => Ok(None),
+        Err(FsError::Invalid {
+            reason: Reason::Symlink | Reason::NotRegular(_),
+            ..
+        }) => Ok(Some(false)),
         Err(e) => Err(e.into()),
     }
 }
 
 /// Removes the files of each item with no summary.
 ///
-/// `kept` holds the stem of each item with a summary. Under
-/// [`SUMMARY_DIR`], the call removes each [`SummaryEntry`] of a stem outside
-/// `kept`, the `.access` files first, and each temp file.
-fn remove_other_summaries_blocking(repo: &Repo, kept: &HashSet<String>, fsync: bool) -> Result<()> {
-    if let Some(dir) = open_summary_dir(repo.repo_fd(), None, false)? {
-        let mut gone: Vec<String> = crate::delta::dir_child_names(&dir)?
-            .into_iter()
-            .filter(|name| match summary_entry(name) {
-                None => false,
-                Some(entry) => entry.temp || !kept.contains(entry.stem),
-            })
-            .collect();
-        // The server stops serving a summary at the removal of its
-        // `.access` file, so that file goes first.
-        gone.sort_by_key(|name| !name.ends_with(ACCESS_SUFFIX));
-        let mut removed = false;
-        for name in &gone {
-            removed |= remove_root_file_blocking(dir.as_fd(), name)?;
-        }
-        if fsync && removed {
-            rustix::fs::fsync(&dir)?;
-        }
+/// `kept` holds the stem of each item with a summary. Under `dir`, the open
+/// `extensions/ostrya/summary`, the call removes each [`SummaryEntry`] of a
+/// stem outside `kept`, the `.access` files first, and each temp file of an
+/// older version of ostrya.
+fn remove_other_summaries_blocking(
+    dir: &RepoDir,
+    kept: &HashSet<String>,
+    fsync: bool,
+) -> Result<()> {
+    let mut gone: Vec<String> = utf8_names(dir)?
+        .into_iter()
+        .filter(|name| match summary_entry(name) {
+            None => false,
+            Some(entry) => entry.temp || !kept.contains(entry.stem),
+        })
+        .collect();
+    // The server stops serving a summary at the removal of its `.access`
+    // file, so that file goes first.
+    gone.sort_by_key(|name| !name.ends_with(ACCESS_SUFFIX));
+    let mut removed = false;
+    for name in &gone {
+        removed |= dir.remove_file(name, false)?;
+    }
+    if fsync && removed {
+        dir.sync()?;
     }
     Ok(())
 }
@@ -3105,44 +3050,6 @@ fn same_refs(a: &RefSelection, b: &RefSelection) -> bool {
             .iter()
             .zip(&b.collections)
             .all(|((a_id, a_refs), (b_id, b_refs))| a_id == b_id && same(a_refs, b_refs))
-}
-
-/// Writes a file as [`write_root_file_blocking`] does, with no sync of the
-/// root directory. The caller syncs the root directory.
-pub(crate) fn put_root_file_blocking(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-    bytes: &[u8],
-    fsync: bool,
-) -> Result<()> {
-    use std::io::Write;
-
-    let tmp = format!(
-        "{name}.tmp-{}-{}",
-        std::process::id(),
-        crate::write::unique()
-    );
-    let fd = rustix::fs::openat(
-        repo_fd,
-        tmp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::from_raw_mode(SUMMARY_MODE),
-    )?;
-    let write_and_rename = || -> Result<()> {
-        let mut file = std::fs::File::from(fd);
-        file.write_all(bytes)?;
-        file.flush()?;
-        rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(SUMMARY_MODE))?;
-        if fsync {
-            rustix::fs::fdatasync(file.as_fd())?;
-        }
-        drop(file);
-        rustix::fs::renameat(repo_fd, tmp.as_str(), repo_fd, name)?;
-        Ok(())
-    };
-    write_and_rename().inspect_err(|_| {
-        let _ = rustix::fs::unlinkat(repo_fd, tmp.as_str(), AtFlags::empty());
-    })
 }
 
 /// `SummaryOptions`, the parsed summary, its deltas, and a ref listing move
@@ -4376,40 +4283,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The read of `summary` on a strict handle refuses a FIFO at once, and
-    /// does not wait for a writer. The read on a strict handle gives the
+    /// The read of `summary` refuses a FIFO at once on a plain handle and on
+    /// a strict handle, and does not wait for a writer. Each handle gives the
     /// bytes of a regular file and `None` for a missing file.
     #[test]
-    fn a_strict_summary_read_refuses_a_fifo() {
+    fn a_summary_read_refuses_a_fifo_on_each_handle() {
+        use std::os::fd::AsFd;
+
         let dir = std::env::temp_dir().join(format!(
-            "ostrya-summary-strict-fifo-{}-{}",
+            "ostrya-summary-fifo-{}-{}",
             std::process::id(),
             crate::write::unique()
         ));
         let _ = std::fs::remove_dir_all(&dir);
         ostrya_rt::block_on(async {
-            repo_with_refs(&dir, &["main"]).await;
+            let plain = repo_with_refs(&dir, &["main"]).await;
             let root = std::fs::File::open(&dir).unwrap();
-            let repo = Repo::open_at_strict(root.as_fd(), std::path::Path::new("."))
+            let strict = Repo::open_at_strict(root.as_fd(), std::path::Path::new("."))
                 .await
                 .unwrap();
-            assert_eq!(repo.read_summary().await.unwrap(), None);
+            for repo in [&plain, &strict] {
+                assert_eq!(repo.read_summary().await.unwrap(), None);
+            }
             std::fs::write(dir.join(SUMMARY_FILE), b"bytes").unwrap();
-            assert_eq!(repo.read_summary().await.unwrap().unwrap(), b"bytes");
+            for repo in [&plain, &strict] {
+                assert_eq!(repo.read_summary().await.unwrap().unwrap(), b"bytes");
+            }
             std::fs::remove_file(dir.join(SUMMARY_FILE)).unwrap();
             rustix::fs::mknodat(
                 rustix::fs::CWD,
                 dir.join(SUMMARY_FILE),
-                FileType::Fifo,
-                Mode::from_raw_mode(0o644),
+                rustix::fs::FileType::Fifo,
+                rustix::fs::Mode::from_raw_mode(0o644),
                 0,
             )
             .unwrap();
-            let outcome = repo.read_summary().await;
-            assert!(
-                matches!(&outcome, Err(Error::Io(e)) if e.to_string().contains("regular file")),
-                "{outcome:?}"
-            );
+            for repo in [&plain, &strict] {
+                let outcome = repo.read_summary().await;
+                assert!(
+                    matches!(&outcome, Err(Error::InvalidFormat(m))
+                        if m == "summary is not a regular file"),
+                    "{outcome:?}"
+                );
+            }
         });
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -4418,6 +4334,8 @@ mod tests {
     /// that does not exist is no error.
     #[test]
     fn the_removal_of_a_root_file_reports_the_removal() {
+        use std::os::fd::AsFd;
+
         let dir = std::env::temp_dir().join(format!(
             "ostrya-remove-root-file-{}-{}",
             std::process::id(),
@@ -4432,10 +4350,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The plain read of a root file follows no symlink at the file. A
-    /// symlink to a regular file fails the read with `ELOOP`.
+    /// The read of a root file follows no symlink at the file. A symlink to a
+    /// regular file fails the read with [`Error::InvalidFormat`].
     #[test]
-    fn a_plain_summary_read_refuses_a_symlinked_summary() {
+    fn a_summary_read_refuses_a_symlinked_summary() {
         let dir = std::env::temp_dir().join(format!(
             "ostrya-summary-plain-symlink-{}-{}",
             std::process::id(),
@@ -4445,11 +4363,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("target"), b"bytes").unwrap();
         std::os::unix::fs::symlink("target", dir.join(SUMMARY_FILE)).unwrap();
-        let fd = std::fs::File::open(&dir).unwrap();
-        let outcome = read_root_file_blocking(fd.as_fd(), SUMMARY_FILE);
+        let root = RepoDir::open_root(rustix::fs::CWD, &dir).unwrap();
+        let outcome = read_root_file_blocking(&root, SUMMARY_FILE);
         assert!(
-            matches!(&outcome, Err(Error::Io(e))
-                if e.raw_os_error() == Some(Errno::LOOP.raw_os_error())),
+            matches!(&outcome, Err(Error::InvalidFormat(m))
+                if m == "summary passes through a symlink; ostrya refuses a symlink in the repository"),
             "{outcome:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -637,6 +637,10 @@ pub(crate) struct Stat {
     pub(crate) mtime_sec: i64,
     /// The nanoseconds of the modification time.
     pub(crate) mtime_nsec: u32,
+    /// The seconds of the status change time.
+    pub(crate) ctime_sec: i64,
+    /// The nanoseconds of the status change time.
+    pub(crate) ctime_nsec: u32,
     /// `true` if the inode is sealed with fs-verity.
     pub(crate) verity: bool,
 }
@@ -696,7 +700,8 @@ const STAT_FIELDS: StatxFlags = StatxFlags::TYPE
     .union(StatxFlags::GID)
     .union(StatxFlags::SIZE)
     .union(StatxFlags::INO)
-    .union(StatxFlags::MTIME);
+    .union(StatxFlags::MTIME)
+    .union(StatxFlags::CTIME);
 
 /// Returns the status of the inode open at `fd`, from one `statx` call.
 ///
@@ -726,6 +731,8 @@ fn stat_from_statx(stx: &Statx) -> Stat {
         ino: stx.stx_ino,
         mtime_sec: stx.stx_mtime.tv_sec,
         mtime_nsec: stx.stx_mtime.tv_nsec,
+        ctime_sec: stx.stx_ctime.tv_sec,
+        ctime_nsec: stx.stx_ctime.tv_nsec,
         verity: stx.stx_attributes.contains(StatxAttributes::VERITY),
     }
 }
@@ -1559,6 +1566,10 @@ mod tests {
         assert_eq!(stat.ino, meta.ino());
         assert_eq!(stat.mtime_sec, meta.mtime());
         assert_eq!(i64::from(stat.mtime_nsec), meta.mtime_nsec());
+        assert_eq!(
+            (stat.ctime_sec, i64::from(stat.ctime_nsec)),
+            (meta.ctime(), meta.ctime_nsec())
+        );
         assert!(!stat.verity);
     }
 

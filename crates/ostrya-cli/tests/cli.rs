@@ -4042,6 +4042,68 @@ fn sign_syncs_the_commitmeta_with_fsync() {
     }
 }
 
+/// `summary -u` writes each summary file through a named temp file in
+/// `tmp/`. It syncs each temp file with `fsync`, and then the directory that
+/// holds the file. It makes no `fdatasync` call. A second run, with each
+/// directory and each `.access` file in place, syncs the temp file of
+/// `summary`, the repository root, the temp file of the summary of the
+/// `anonymous` item, and `extensions/ostrya/summary`, in this order.
+#[test]
+fn summary_update_syncs_each_file_with_fsync() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("summary-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    for run_no in [1, 2] {
+        let (run, calls) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &base.join(format!("trace-{run_no}")),
+            &["summary", "--repo", repo_s, "-u"],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(
+            calls.iter().all(|(kind, _)| *kind == "fsync"),
+            "run {run_no}: {calls:?}"
+        );
+        let files: Vec<&String> = calls
+            .iter()
+            .map(|(_, path)| path)
+            .filter(|path| repo.join(path).is_file() || path.starts_with("tmp/"))
+            .collect();
+        assert!(
+            files
+                .iter()
+                .all(|path| path.starts_with("tmp/.ostrya-tmp-")),
+            "run {run_no}: {calls:?}"
+        );
+        if run_no == 2 {
+            let kinds: Vec<&str> = calls
+                .iter()
+                .map(|(_, path)| {
+                    if path.starts_with("tmp/.ostrya-tmp-") {
+                        "temp"
+                    } else {
+                        path.as_str()
+                    }
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                ["temp", ".", "temp", "extensions/ostrya/summary"],
+                "{calls:?}"
+            );
+        }
+    }
+}
+
 /// `sign -d` and `sign --delete` exit non-zero and write nothing: the
 /// detached metadata of the commit keeps its bytes.
 #[test]
@@ -9593,10 +9655,11 @@ fn pull_fsync_switches_control_the_syscalls() {
 }
 
 /// A `--mirror` pull of every ref copies the summary of the remote. By default,
-/// ostrya also syncs the summary file and the repository root. The `ostree`
-/// command does not sync them (over corpus `C0`, 11 calls for `ostree` and 14
-/// for ostrya). Under `--disable-fsync`, neither command makes a sync call, and
-/// both copy the same summary.
+/// ostrya also syncs the temp file of the summary in `tmp/` with `fsync`, and
+/// then the repository root. The `ostree` command does not sync them (over
+/// corpus `C0`, 11 calls for `ostree` and 14 for ostrya). Under
+/// `--disable-fsync`, neither command makes a sync call, and both copy the
+/// same summary.
 #[test]
 fn pull_mirror_disable_fsync_syncs_nothing() {
     if !strace_available() {
@@ -9644,9 +9707,16 @@ fn pull_mirror_disable_fsync_syncs_nothing() {
                 .filter(|(kind, path)| *kind == "fsync" && path == ".")
                 .count();
             if *who == "port" {
+                let last = &calls[calls.len().saturating_sub(2)..];
                 assert!(
-                    summary.len() == 1 && summary[0].0 == "fdatasync" && root_fsyncs == 1,
-                    "{label}: the port syncs the summary and the root: {calls:?}",
+                    summary.is_empty()
+                        && root_fsyncs == 1
+                        && last.len() == 2
+                        && last[0].0 == "fsync"
+                        && last[0].1.starts_with("tmp/.ostrya-tmp-")
+                        && last[1].0 == "fsync"
+                        && last[1].1 == ".",
+                    "{label}: the port syncs the temp file of the summary and the root: {calls:?}",
                 );
                 assert_eq!(calls.len(), 14, "{label}: {calls:?}");
             } else {
@@ -16820,10 +16890,11 @@ fn remote_delete_keeps_the_remote_when_the_config_write_fails() {
         before,
         "the failed write changed `config`"
     );
-    let leftovers: Vec<String> = std::fs::read_dir(&repo)
-        .unwrap()
+    let leftovers: Vec<String> = [repo.clone(), repo.join("tmp")]
+        .iter()
+        .flat_map(|dir| std::fs::read_dir(dir).unwrap())
         .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|name| name.starts_with("config.tmp-"))
+        .filter(|name| name.starts_with("config.tmp-") || name.starts_with(".ostrya-tmp-"))
         .collect();
     assert!(leftovers.is_empty(), "the failed write left {leftovers:?}");
 }

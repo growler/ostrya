@@ -6,13 +6,13 @@
 
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use ostrya_core::{Checksum, FileHeader, ObjectType, RepoMode, Xattrs, loose_path};
 use ostrya_rt::FileReader;
-use rustix::fs::{FileType, Statx, StatxAttributes};
+use rustix::fs::FileType;
 
 use crate::error::{Error, Result};
 use crate::inflate::{ArchiveDecoder, archive_decoder};
@@ -792,33 +792,6 @@ fn load_by_mode(
     }
 }
 
-/// Returns `true` if `statx` reports the inode as sealed with fs-verity. The
-/// kernel sets the attribute on every file with fs-verity enabled. The
-/// function does not read the attribute mask, because btrfs sets the
-/// attribute and leaves it out of the mask.
-pub(crate) fn is_sealed(stat: &Statx) -> bool {
-    stat.stx_attributes.contains(StatxAttributes::VERITY)
-}
-
-/// Returns the fs-verity digest that the kernel holds for the raw-payload
-/// object open at `fd`. The object must be sealed with SHA-256, 4096-byte
-/// blocks, no salt, and a data size of `size`. If `probe` is clear, the
-/// function issues no ioctl. Every error and every mismatch gives `None`.
-pub(crate) fn sealed_digest(fd: BorrowedFd<'_>, size: u64, probe: bool) -> Option<[u8; 32]> {
-    if !probe {
-        return None;
-    }
-    let desc = ostrya_sys::read_verity_descriptor(fd).ok()?;
-    if desc.hash_algorithm != 1
-        || desc.log_blocksize != 12
-        || desc.salt_size != 0
-        || desc.data_size != size
-    {
-        return None;
-    }
-    ostrya_sys::measure_verity(fd).ok()
-}
-
 /// Returns the fs-verity digest that the kernel holds for the raw-payload
 /// object `file` with the status `stat`, if `measure` is set and the status
 /// reports the object as sealed. Each other case gives `None`.
@@ -1284,7 +1257,8 @@ mod sealed_verity_tests {
     use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
 
-    use super::{FileKind, sealed_digest};
+    use super::FileKind;
+    use crate::repo_fs::verity_digest;
     use crate::{CreateOptions, FileMeta, Repo, Transaction};
     use ostrya_composefs::FsVerityHasher;
     use ostrya_core::{Checksum, ObjectType, RepoMode, loose_path};
@@ -1443,7 +1417,7 @@ mod sealed_verity_tests {
 
     /// `statx` reports a sealed object as sealed and an unsealed one as
     /// unsealed. An object reported as unsealed is never probed. The kernel
-    /// read of a sealed object gives none when the probe is clear.
+    /// read of a sealed object gives its digest for its own size alone.
     #[test]
     fn statx_gates_the_kernel_read() {
         let dir = scratch("gate");
@@ -1469,11 +1443,15 @@ mod sealed_verity_tests {
             let path = loose_path(&sealed_sum, ObjectType::File, RepoMode::BareUser);
             let size = payload().len() as u64;
             let opened = sealed_repo.objects().open_regular(&path).unwrap();
-            assert!(sealed_digest(opened.file.as_fd(), size, true).is_some());
+            assert!(opened.stat.verity);
             assert_eq!(
-                sealed_digest(opened.file.as_fd(), size, false),
+                verity_digest(opened.file.as_fd(), size),
+                Some(FsVerityHasher::hash(&payload()))
+            );
+            assert_eq!(
+                verity_digest(opened.file.as_fd(), size + 1),
                 None,
-                "a clear probe issues no ioctl"
+                "another size gives no digest"
             );
         });
         let _ = std::fs::remove_dir_all(&dir);

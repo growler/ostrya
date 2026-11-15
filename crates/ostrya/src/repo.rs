@@ -525,11 +525,6 @@ struct RepoInner {
     // The remotes directory that the open selected, or that the create took.
     // A value of the caller is stored as the caller gave it.
     remotes_dir: Option<RemotesDir>,
-    // The strict open mode of `Repo::open_at_strict`: the read of the
-    // composefs image and the read of `summary` follow no symlink in any
-    // component of their path, do not block on a FIFO, and refuse a file that
-    // is not a regular file.
-    strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
     // handle share one `.lock` descriptor and one in-process hold count.
@@ -582,7 +577,6 @@ struct Materials {
     objects: RepoDir,
     config: RepoConfig,
     remotes_dir: Option<RemotesDir>,
-    strict: bool,
 }
 
 impl Materials {
@@ -652,25 +646,23 @@ impl Repo {
     /// the strict open mode. A process that reads a repository of another
     /// user with more privileges than that user opens it in this mode.
     ///
-    /// The handle is the handle of [`open_at`](Repo::open_at), with these
-    /// changes:
+    /// The handle is the handle of [`open_at`](Repo::open_at), with one
+    /// change: the open reads no `[ex-ostrya] remotes-config-dir` key and no
+    /// remotes directory, so the handle has no remotes directory.
     ///
-    /// - The open reads no `[ex-ostrya] remotes-config-dir` key and no remotes
-    ///   directory, so the handle has no remotes directory.
-    /// - The reads of the stored composefs image and of `summary` by
-    ///   [`read_summary`](Repo::read_summary) open the file with `openat2`,
-    ///   `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, and
-    ///   refuse a file that is not a regular file. A symlink at any
-    ///   component of the path, a FIFO, or a device fails the read and does
-    ///   not block it.
-    ///
-    /// The open of `objects`, the read of `config`, each read of an object by
-    /// the handle, and the link, the copy, and the clone of an object by a
-    /// local pull from the handle are the same as in
-    /// [`open_at`](Repo::open_at). In each open mode, a local pull follows no
-    /// symlink at `objects/<xx>` or at the path of a source object, refuses a
-    /// source object that is not the type that the source mode stores, and
-    /// does not block on a FIFO.
+    /// Each read of the handle is the same as in [`open_at`](Repo::open_at).
+    /// In each open mode, a read of an object, of the stored composefs image,
+    /// or of a summary through [`read_summary`](Repo::read_summary),
+    /// [`read_summary_signature`](Repo::read_summary_signature), and
+    /// [`read_summary_of`](Repo::read_summary_of) opens the file with
+    /// `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`,
+    /// and refuses a file that is not a regular file. A symlink at any
+    /// component of the path, a FIFO, or a device fails the read and does not
+    /// block it. A local pull from the handle refuses a source object that is
+    /// not the type that the source mode stores. The local pull opens
+    /// `summary`, `summary.sig`, and the files of a static delta of the
+    /// handle with one `openat` with `O_NONBLOCK`, which follows a symlink,
+    /// and refuses a file that is not a regular file.
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.
@@ -692,14 +684,14 @@ impl Repo {
         Ok(Repo::assemble(materials, stored))
     }
 
-    /// Opens the repository whose root is the open directory `repo_fd` in the
-    /// strict open mode of [`open_at_strict`](Repo::open_at_strict). The
-    /// handle stores `path`. Blocks the calling thread.
-    pub(crate) fn open_strict_blocking(repo_fd: OwnedFd, path: PathBuf) -> Result<Repo> {
-        Ok(Repo::assemble(
-            materials_from_root(RepoDir::from_root_fd(repo_fd), true)?,
-            path,
-        ))
+    /// Opens the repository whose root handle is `root` in the strict open
+    /// mode of [`open_at_strict`](Repo::open_at_strict). The handle stores
+    /// `path`. Blocks the calling thread.
+    ///
+    /// `root` is a handle with no repository mode and no other clone, as
+    /// [`RepoDir::from_root_fd`] gives it.
+    pub(crate) fn open_strict_blocking(root: RepoDir, path: PathBuf) -> Result<Repo> {
+        Ok(Repo::assemble(materials_from_root(root)?, path))
     }
 
     /// Creates and opens a repository at `path`, relative to the working directory.
@@ -1157,12 +1149,6 @@ impl Repo {
         .await
     }
 
-    /// Returns `true` if the handle opened in the strict open mode of
-    /// [`open_at_strict`](Repo::open_at_strict).
-    pub(crate) fn is_strict(&self) -> bool {
-        self.inner.strict
-    }
-
     /// Returns the handle of the repository root.
     pub(crate) fn root_dir(&self) -> &RepoDir {
         &self.inner.root
@@ -1196,7 +1182,6 @@ impl Repo {
                 config: materials.config,
                 path,
                 remotes_dir: materials.remotes_dir,
-                strict: materials.strict,
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
                 implicit_reads: OnceLock::new(),
@@ -1266,7 +1251,7 @@ fn open_materials<Fd: AsFd>(
     strict: bool,
     opts: &OpenOptions,
 ) -> Result<Materials> {
-    let materials = materials_from_root(RepoDir::open_root(dir, path)?, strict)?;
+    let materials = materials_from_root(RepoDir::open_root(dir, path)?)?;
     if strict {
         return Ok(materials);
     }
@@ -1297,7 +1282,7 @@ fn create_materials<Fd: AsFd>(dir: Fd, path: &Path, opts: &CreateOptions) -> Res
         };
     }
     write_initial_config(&root, path, &config)?;
-    materials_from_root(root, false)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
+    materials_from_root(root)?.select_remotes_dir(opts.remotes_dir.as_ref(), None)
 }
 
 /// Reads and parses the config, and opens `objects/`, given the handle of the
@@ -1305,7 +1290,7 @@ fn create_materials<Fd: AsFd>(dir: Fd, path: &Path, opts: &CreateOptions) -> Res
 ///
 /// The open of `objects/` comes after the handle of the root takes the mode of
 /// the config, so the handle of `objects/` has that mode too.
-fn materials_from_root(root: RepoDir, strict: bool) -> Result<Materials> {
+fn materials_from_root(root: RepoDir) -> Result<Materials> {
     let config = read_config(&root)?;
     let root = root.with_repo_mode(config.mode());
     let objects = root.open_layout(RepoLayout::Objects)?;
@@ -1314,7 +1299,6 @@ fn materials_from_root(root: RepoDir, strict: bool) -> Result<Materials> {
         objects,
         config,
         remotes_dir: None,
-        strict,
     })
 }
 

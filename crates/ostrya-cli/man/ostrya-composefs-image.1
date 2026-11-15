@@ -16,7 +16,7 @@ The image of a commit is the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.c
 \fB\-\-add\fR \fIREV\fR
 Build and store the image of the commit REV.
 .IP
-The commit must carry \fB\%ostree.composefs.digest.v0\fR\&. The command builds the image of the tree, checks its digest against the key, and stores it. If a valid image is present already, the command does nothing. An image whose digest is not the key, or an image that does not read, is replaced. The command does not refuse a partial commit, and the build fails if an object of the tree is absent.
+The commit must carry \fB\%ostree.composefs.digest.v0\fR\&. The command builds the image of the tree, checks its digest against the key, and stores it. If a valid image is present already, the command does nothing. An image whose digest is not the key, or an image whose read fails with an \%I/O error, is replaced. A symlink on the path of the image, or an image that is not a regular file, fails the command. The command does not refuse a partial commit, and the build fails if an object of the tree is absent.
 .TP
 \fB\-\-get\-path\fR \fIREV\fR
 Print the absolute path of the image of the commit REV.

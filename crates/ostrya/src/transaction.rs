@@ -1834,7 +1834,6 @@ impl Transaction {
         }
         let (fsync, _) = self.fsync_flags()?;
         let syncfs = self.syncfs_at_publish(fsync);
-        let repo_mode = self.repo.mode();
         let root = self.repo.root_dir().clone();
         let objects_dir = self.repo.objects().clone();
         let staging = self.staging_dir().clone();
@@ -1847,7 +1846,6 @@ impl Transaction {
                 &images,
                 syncfs,
                 fsync,
-                repo_mode,
             )
         })
         .await?;

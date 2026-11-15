@@ -26,11 +26,7 @@ use crate::refs::{
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config};
-use crate::repo_fs::RepoDir;
-use crate::summary::put_root_file_blocking;
-
-/// The config file name at the repository root.
-const CONFIG_FILE: &str = "config";
+use crate::repo_fs::{Publish, RepoDir, RootFile};
 
 /// The directory that holds `config`: the repository root.
 const ROOT_DIR: &str = ".";
@@ -525,6 +521,9 @@ impl UpdateGuard {
     ///   the remotes directory. The call then writes nothing.
     /// - The errors of [`OpenOptions::open`](crate::OpenOptions::open) for the
     ///   remotes directory and its `.conf` files.
+    /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory. The write of `config` makes its temp file in
+    ///   `tmp/`.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
         let bytes = config_bytes(keyfile)?;
@@ -532,7 +531,7 @@ impl UpdateGuard {
         let dir = self.repo().remotes_dir().cloned();
         self.edit_config(move |root, fsync, dirs| {
             remotes_dir::check_config_remotes(root.as_fd(), dir.as_ref(), &names)?;
-            put_config_blocking(root.as_fd(), &bytes, fsync, dirs)
+            put_config_blocking(root, &bytes, fsync, dirs)
         })
         .await
     }
@@ -622,7 +621,7 @@ impl UpdateGuard {
                     writer.check_absent(&file)?;
                     writer.put(&file, keyfile.to_string().as_bytes(), None)
                 }
-                None => put_config_blocking(root.as_fd(), &config_bytes(&keyfile)?, fsync, dirs),
+                None => put_config_blocking(root, &config_bytes(&keyfile)?, fsync, dirs),
             }
         })
         .await
@@ -663,7 +662,7 @@ impl UpdateGuard {
                 return Ok(());
             }
             keyfile.set_string(&group, &key, &value)?;
-            source.put(root.as_fd(), fsync, dirs)
+            source.put(root, fsync, dirs)
         })
         .await
     }
@@ -697,7 +696,7 @@ impl UpdateGuard {
             if !source.keyfile_mut().remove_key(&group, &key) {
                 return Ok(false);
             }
-            source.put(root.as_fd(), fsync, dirs)?;
+            source.put(root, fsync, dirs)?;
             Ok(true)
         })
         .await
@@ -749,7 +748,7 @@ impl UpdateGuard {
                 check_key(key)?;
                 keyfile.set_string(&group, key, value)?;
             }
-            source.put(root.as_fd(), fsync, dirs)
+            source.put(root, fsync, dirs)
         })
         .await
     }
@@ -806,7 +805,13 @@ impl UpdateGuard {
                     keyfile.remove_group(&group);
                     let bytes = config_bytes(&keyfile)?;
                     let removed = remove_keyring_blocking(root.as_fd(), &keyring)?;
-                    let put = put_root_file_blocking(root.as_fd(), CONFIG_FILE, &bytes, fsync);
+                    let put = root
+                        .stage_root_file(&RootFile::Config, &bytes, fsync)
+                        .and_then(|temp| {
+                            temp.publish(root, RootFile::Config.name(), Publish::Replace, false)
+                        })
+                        .map(drop)
+                        .map_err(Error::from);
                     if fsync && (removed || put.is_ok()) {
                         dirs.push(ROOT_DIR.to_owned());
                     }
@@ -1014,10 +1019,10 @@ impl<'a> Source<'a> {
     /// [`UpdateGuard::finish`]. A write of a `.conf` file keeps the permission
     /// bits of the file, syncs before it returns, and refuses a file that is
     /// a symlink.
-    fn put(&self, repo_fd: BorrowedFd<'_>, fsync: bool, dirs: &mut Vec<String>) -> Result<()> {
+    fn put(&self, root: &RepoDir, fsync: bool, dirs: &mut Vec<String>) -> Result<()> {
         match self {
             Source::Config(keyfile) => {
-                put_config_blocking(repo_fd, &config_bytes(keyfile)?, fsync, dirs)
+                put_config_blocking(root, &config_bytes(keyfile)?, fsync, dirs)
             }
             Source::File {
                 writer,
@@ -1041,12 +1046,13 @@ fn config_bytes(keyfile: &KeyFile) -> Result<Vec<u8>> {
 
 /// Writes `bytes` to `config` atomically and records the repository root.
 fn put_config_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     bytes: &[u8],
     fsync: bool,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    put_root_file_blocking(repo_fd, CONFIG_FILE, bytes, fsync)?;
+    root.stage_root_file(&RootFile::Config, bytes, fsync)?
+        .publish(root, RootFile::Config.name(), Publish::Replace, false)?;
     if fsync {
         dirs.push(ROOT_DIR.to_owned());
     }

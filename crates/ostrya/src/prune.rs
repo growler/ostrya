@@ -1314,7 +1314,7 @@ impl Repo {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             let objects_fd = repo.objects_fd();
-            crate::image_store::unlink_blocking(repo.repo_fd(), [commit], sweep.fsync)?;
+            crate::image_store::unlink_blocking(repo.root_dir(), [commit], sweep.fsync)?;
             let mut touched = BTreeSet::new();
             remove_commit(repo.objects(), &sweep, &commit, true, &mut touched)?;
             if sweep.fsync {
@@ -1500,7 +1500,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
     // The image phase.
     if removes_commits {
         crate::image_store::unlink_blocking(
-            repo.repo_fd(),
+            repo.root_dir(),
             doomed_commits().map(|o| o.checksum),
             sweep.fsync,
         )?;

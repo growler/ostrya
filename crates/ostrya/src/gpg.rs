@@ -35,8 +35,8 @@ use crate::config::{remote_keyring_name, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::remotes_dir;
 use crate::repo::{RemotesDir, Repo};
+use crate::repo_fs::{Publish, RootFile};
 use crate::sign::read_key_source;
-use crate::summary::write_root_file_blocking;
 
 #[cfg(feature = "sign-gpg")]
 pub use ostrya_sign::GpgSigner;
@@ -497,6 +497,9 @@ impl Repo {
     ///   regular file is at `.lock` or at `.update.lock`. The lock open
     ///   follows no symlink. If the process cannot open a FIFO, a socket, or
     ///   a device there for write, the error is [`Error::Io`].
+    /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
+    ///   not a directory. The write of the keyring makes its temp file in
+    ///   `tmp/`.
     /// - [`Error::Io`] if a lock file, the write of the keyring, or the sync
     ///   of the repository directory fails.
     pub async fn gpg_import_keys(
@@ -536,7 +539,12 @@ impl Repo {
             let existing =
                 read_keyring_at(repo.repo_fd(), Path::new(&name), &subject)?.unwrap_or_default();
             let (imported, keyring) = gpg_merge_keyring(&existing, offered, &subject)?;
-            write_root_file_blocking(repo.repo_fd(), &name, &keyring, fsync)?;
+            repo.root_dir().write_root_file(
+                RootFile::Keyring(name),
+                &keyring,
+                Publish::Replace,
+                fsync,
+            )?;
             Ok(imported)
         })
         .await

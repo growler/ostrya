@@ -12,10 +12,11 @@
 //! - The image is the file of the store with the mode 0644, and `objects/`
 //!   holds no image. In a `bare-user-shared` repository, the directories of
 //!   the store get the shared mode.
-//! - A symlink at a component of the path of an image stops each read and
-//!   each write of the image. fsck and prune refuse a symlink or a file that
-//!   is no directory at a component of the store, and the message names the
-//!   path.
+//! - A symlink at a component of the path of an image, and an image that is
+//!   not a regular file, stop each read and each write of the image. No read
+//!   waits on a FIFO. fsck and prune refuse a symlink or a file that is no
+//!   directory at a component of the store, and the message names the path.
+//! - A write makes a missing `<xx>/` directory of the store.
 //! - A write refuses a commit without the key, a malformed key, and an image
 //!   of another tree, and stores nothing.
 //! - A changed image fails the check and fsck, and a second write replaces
@@ -861,14 +862,6 @@ fn a_required_seal_that_fails_stores_no_image() {
     });
 }
 
-/// Returns the error number of an `Error::Io`, or panics.
-fn io_errno(err: Error) -> i32 {
-    match err {
-        Error::Io(e) => e.raw_os_error().unwrap_or_else(|| panic!("{e}")),
-        other => panic!("{other}"),
-    }
-}
-
 /// In a `bare-user-shared` repository, the directories that the image write
 /// creates get the shared mode `02770`.
 #[test]
@@ -895,8 +888,9 @@ fn the_store_directories_take_the_shared_mode() {
 }
 
 /// A symlink at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/` stops the
-/// check, the checked open, and the presence test with `ELOOP`. A write of
-/// the image refuses the symlink and changes no file behind it.
+/// check, the checked open, the presence test, and the write of the image
+/// with `InvalidFormat`. The message of a read names the path of the image.
+/// The write changes no file behind the symlink.
 #[test]
 fn a_symlink_in_the_image_path_stops_each_read_and_write() {
     let scratch = TmpDir::new("cfs-symlink");
@@ -921,16 +915,20 @@ fn a_symlink_in_the_image_path_stops_each_read_and_write() {
             std::fs::rename(&path, &moved).unwrap();
             std::os::unix::fs::symlink(&moved, &path).unwrap();
 
-            let eloop = rustix::io::Errno::LOOP.raw_os_error();
+            let want = format!(
+                "invalid format: {} passes through a symlink; ostrya refuses a symlink in the \
+                 repository",
+                image.strip_prefix(&root).unwrap().display()
+            );
             let err = repo.check_composefs_image(&commit).await.unwrap_err();
-            assert_eq!(io_errno(err), eloop, "{part}");
+            assert_eq!(err.to_string(), want, "{part}");
             let err = repo
                 .open_composefs_image_checked(&commit)
                 .await
                 .unwrap_err();
-            assert_eq!(io_errno(err), eloop, "{part}");
+            assert_eq!(err.to_string(), want, "{part}");
             let err = repo.has_composefs_image(&commit).await.unwrap_err();
-            assert_eq!(io_errno(err), eloop, "{part}");
+            assert_eq!(err.to_string(), want, "{part}");
             let err = repo.add_composefs_image(&commit).await.unwrap_err();
             assert!(matches!(err, Error::InvalidFormat(_)), "{part}: {err}");
             assert_eq!(std::fs::read(&image).unwrap(), bytes, "{part}");
@@ -946,9 +944,11 @@ fn a_symlink_in_the_image_path_stops_each_read_and_write() {
 }
 
 /// A symlink at `extensions/`, `ostrya/`, or `composefs/` stops fsck and a
-/// prune that deletes a commit, and the message names the path and the
-/// symlink. A regular file in place of `composefs/` gives a message that
-/// names the path and no directory.
+/// prune that deletes a commit, and the message names the symlink and the
+/// path of the open: `extensions` for a symlink there, and
+/// `extensions/ostrya/composefs` for a symlink below it. A regular file in
+/// place of `composefs/` gives a message that names the path and no
+/// directory.
 #[test]
 fn a_symlink_in_extensions_names_the_path_in_fsck_and_prune() {
     let scratch = TmpDir::new("cfs-symlink-message");
@@ -973,8 +973,14 @@ fn a_symlink_in_extensions_names_the_path_in_fsck_and_prune() {
             std::fs::rename(&path, &moved).unwrap();
             std::os::unix::fs::symlink(&moved, &path).unwrap();
 
+            let opened = if part == "extensions" {
+                part
+            } else {
+                "extensions/ostrya/composefs"
+            };
             let want = format!(
-                "invalid format: {part} is a symlink; ostrya refuses a symlink in the repository"
+                "invalid format: {opened} passes through a symlink; ostrya refuses a symlink in \
+                 the repository"
             );
             let err = repo.fsck(&FsckOptions::default()).await.unwrap_err();
             assert_eq!(err.to_string(), want, "fsck");
@@ -993,6 +999,86 @@ fn a_symlink_in_extensions_names_the_path_in_fsck_and_prune() {
         assert_eq!(err.to_string(), want, "fsck");
         let err = repo.prune(&prune).await.unwrap_err();
         assert_eq!(err.to_string(), want, "prune");
+    });
+}
+
+/// A FIFO at the path of an image stops the check, the checked open, the
+/// presence test, and the write of the image with `InvalidFormat` on a
+/// handle of a plain open. No read waits for a writer of the FIFO. With the
+/// FIFO gone, a write stores the image again.
+#[test]
+fn a_fifo_at_the_image_path_stops_each_read_without_a_wait() {
+    let scratch = TmpDir::new("cfs-fifo");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let root = scratch.path().join("repo");
+    block_on(async {
+        let repo = new_repo(&root, RepoMode::BareUser, "").await;
+        let (commit, _) = commit_tree(&repo, &base, 1, true, None).await;
+        let image = repo.composefs_image_path(&commit);
+        std::fs::remove_file(&image).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &image,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+
+        let want = format!(
+            "invalid format: {} is not a regular file",
+            image.strip_prefix(&root).unwrap().display()
+        );
+        let err = repo.check_composefs_image(&commit).await.unwrap_err();
+        assert_eq!(err.to_string(), want);
+        let err = repo
+            .open_composefs_image_checked(&commit)
+            .await
+            .unwrap_err();
+        assert_eq!(err.to_string(), want);
+        let err = repo.has_composefs_image(&commit).await.unwrap_err();
+        assert_eq!(err.to_string(), want);
+        let err = repo.add_composefs_image(&commit).await.unwrap_err();
+        assert_eq!(err.to_string(), want);
+
+        std::fs::remove_file(&image).unwrap();
+        assert_eq!(
+            repo.add_composefs_image(&commit).await.unwrap(),
+            ComposefsImageAdd::Added
+        );
+        assert_eq!(
+            repo.check_composefs_image(&commit).await.unwrap(),
+            ComposefsImageState::Valid
+        );
+    });
+}
+
+/// A write of an image makes its `<xx>/` directory when the store exists and
+/// the directory does not.
+#[test]
+fn a_write_makes_a_missing_fan_out_directory() {
+    let scratch = TmpDir::new("cfs-fanout");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    block_on(async {
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
+        let (commit, _) = commit_tree(&repo, &base, 1, true, None).await;
+        let image = repo.composefs_image_path(&commit);
+        let fanout = image.parent().unwrap();
+        std::fs::remove_file(&image).unwrap();
+        std::fs::remove_dir(fanout).unwrap();
+        assert!(fanout.parent().unwrap().is_dir());
+
+        assert_eq!(
+            repo.add_composefs_image(&commit).await.unwrap(),
+            ComposefsImageAdd::Added
+        );
+        assert!(fanout.is_dir());
+        assert_eq!(
+            repo.check_composefs_image(&commit).await.unwrap(),
+            ComposefsImageState::Valid
+        );
     });
 }
 

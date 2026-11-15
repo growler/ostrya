@@ -2067,7 +2067,7 @@ A `--mirror` pull of each ref copies the summary of the remote. The tool makes
 
 - the 11 calls of the tool
 - one `fsync` of `refs/heads`
-- one `fdatasync` of the temp file of the summary
+- one `fsync` of the temp file of the summary in `tmp/`
 - one `fsync` of the repository root
 
 Under `--disable-fsync`, both make 0 calls.

@@ -165,17 +165,8 @@ fn a_stored_mount_needs_a_valid_image() {
     assert_empty(&target);
 }
 
-/// Returns `true` if `err` is a repository error with the error number
-/// `ELOOP`.
-fn is_eloop(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Repo(ostrya::Error::Io(e)) if e.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
-    )
-}
-
 /// Returns `true` if `err` is the refusal of a symlink on the path of an
-/// object.
+/// object or of a stored image.
 fn is_symlink_refusal(err: &Error) -> bool {
     matches!(
         err,
@@ -195,7 +186,8 @@ async fn with_symlink<F: std::future::Future<Output = ()>>(path: &Path, moved: &
 }
 
 /// A symlink at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/` of the
-/// path of a stored image stops a stored mount with `ELOOP`.
+/// path of a stored image stops a stored mount with the refusal of a symlink
+/// in the repository.
 #[test]
 fn a_symlink_in_the_image_path_stops_a_stored_mount() {
     let scratch = TmpDir::new("image-symlink");
@@ -220,7 +212,7 @@ fn a_symlink_in_the_image_path_stops_a_stored_mount() {
                     .mount_stored(&repo, &commit, &target, &MountOptions::default())
                     .await
                     .unwrap_err();
-                assert!(is_eloop(&err), "{part}: {err}");
+                assert!(is_symlink_refusal(&err), "{part}: {err}");
             })
             .await;
         }

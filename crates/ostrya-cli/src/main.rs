@@ -5244,9 +5244,11 @@ struct ComposefsImageArgs {
     /// The commit must carry `ostree.composefs.digest.v0`. The command builds
     /// the image of the tree, checks its digest against the key, and stores
     /// it. If a valid image is present already, the command does nothing. An
-    /// image whose digest is not the key, or an image that does not read, is
-    /// replaced. The command does not refuse a partial commit, and the build
-    /// fails if an object of the tree is absent.
+    /// image whose digest is not the key, or an image whose read fails with an
+    /// I/O error, is replaced. A symlink on the path of the image, or an image
+    /// that is not a regular file, fails the command. The command does not
+    /// refuse a partial commit, and the build fails if an object of the tree
+    /// is absent.
     #[arg(long, value_name = "REV")]
     add: Option<String>,
     /// Print the absolute path of the image of the commit REV.

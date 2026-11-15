@@ -46,10 +46,8 @@ use crate::refs::{HEADS_DIR, MIRRORS_DIR};
 use crate::related::{self, RelatedRule};
 use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
-use crate::summary::{
-    COLLECTION_ID_KEY, SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, collection_map_refs,
-    put_root_file_blocking,
-};
+use crate::repo_fs::{Publish, RootFile};
+use crate::summary::{COLLECTION_ID_KEY, Summary, collection_map_refs};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::verify::PullTrust;
@@ -1173,18 +1171,31 @@ impl Repo {
             // refs and the `.commitmeta` files. The pull then fails with those
             // files in place and the summary as it was.
             self.write_locked(move |repo| {
-                put_root_file_blocking(repo.repo_fd(), SUMMARY_FILE, &bytes, fsync)?;
+                let root = repo.root_dir();
+                let file = RootFile::Summary;
+                root.stage_root_file(&file, &bytes, fsync)?.publish(
+                    root,
+                    file.name(),
+                    Publish::Replace,
+                    false,
+                )?;
                 // The signature covers those bytes, so the pull copies it with
                 // them. A client that pulls from this repository with
                 // `gpg-verify-summary=true` reads the pair. If the remote holds
                 // no `summary.sig`, the file of this repository stays as it
                 // is. The `ostree` command does the same.
                 if let Some(sig) = signature {
-                    put_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, &sig, fsync)?;
+                    let file = RootFile::SummarySig;
+                    root.stage_root_file(&file, &sig, fsync)?.publish(
+                        root,
+                        file.name(),
+                        Publish::Replace,
+                        false,
+                    )?;
                 }
                 // One sync of the root directory makes both renames durable.
                 if fsync {
-                    rustix::fs::fsync(repo.repo_fd())?;
+                    root.sync()?;
                 }
                 Ok(())
             })

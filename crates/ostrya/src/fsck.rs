@@ -882,7 +882,7 @@ impl Repo {
         let commits = self.list_commits().await?;
         let repo = self.clone();
         let images =
-            ostrya_rt::unblock(move || crate::image_store::list_blocking(repo.repo_fd())).await?;
+            ostrya_rt::unblock(move || crate::image_store::list_blocking(repo.root_dir())).await?;
         if let Some(failure) = self
             .fsck_enumerate_commits(&commits, &ref_targets, &collection_refs, opts, &mut ctx)
             .await?
@@ -1625,7 +1625,7 @@ impl Repo {
         let repo = self.clone();
         let commit = *commit;
         ostrya_rt::unblock(move || {
-            crate::image_store::unlink_blocking(repo.repo_fd(), [commit], false)
+            crate::image_store::unlink_blocking(repo.root_dir(), [commit], false)
         })
         .await
     }

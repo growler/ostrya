@@ -3280,3 +3280,235 @@ fn an_access_file_that_holds_the_digest_is_not_written_again() {
         assert!(ref_names(&summary_of(&repo, "ssh:ci").await).is_empty());
     });
 }
+
+/// Returns the names of the entries of the directory `dir`.
+fn entry_names(dir: &Path) -> Vec<String> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect()
+}
+
+/// Makes a FIFO at `path`.
+fn make_fifo(path: &Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+}
+
+/// Each write of a summary makes its temp file in `tmp/`, and the open of
+/// `tmp/` follows no symlink. A symlink at `tmp` fails the write of the
+/// summaries, the write of the summaries of the items alone, and the signing
+/// of the summaries with `tmp passes through a symlink`. The failure comes
+/// before each change: each summary, each signature file, and each `.access`
+/// file keeps its bytes, also an `.access` file that holds another digest.
+/// The target of the symlink gets no entry.
+#[test]
+fn a_symlink_at_tmp_fails_each_summary_write() {
+    let (tmp, repo_dir) = writable_fixture("summary", "summary-tmp-link");
+    let other = tmp.path().join("other");
+    std::fs::create_dir(&other).unwrap();
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        let access = item_file(&repo_dir, "anonymous", ".access");
+        std::fs::write(&access, b"another digest\n").unwrap();
+        let files = [
+            repo_dir.join("summary"),
+            repo_dir.join("summary.sig"),
+            item_file(&repo_dir, "anonymous", ""),
+            item_file(&repo_dir, "anonymous", ".sig"),
+            access,
+        ];
+        let before: Vec<Vec<u8>> = files.iter().map(|f| std::fs::read(f).unwrap()).collect();
+        std::fs::remove_dir_all(repo_dir.join("tmp")).unwrap();
+        std::os::unix::fs::symlink(&other, repo_dir.join("tmp")).unwrap();
+        let repo = Repo::open(&repo_dir).await.unwrap();
+
+        let symlinked = |result: ostrya::Result<()>, what: &str| match result {
+            Err(ostrya::Error::InvalidFormat(m)) => {
+                assert!(m.starts_with("tmp passes through a symlink"), "{what}: {m}");
+            }
+            other => panic!("{what}: {other:?}"),
+        };
+        let later = SummaryOptions {
+            last_modified: Some(FIXED_EPOCH + 1),
+            ..SummaryOptions::default()
+        };
+        symlinked(
+            repo.regenerate_summaries(&later, &[&signer])
+                .await
+                .map(|_| ()),
+            "regenerate",
+        );
+        symlinked(
+            repo.regenerate_summaries(
+                &SummaryOptions {
+                    auth_items_only: true,
+                    ..later.clone()
+                },
+                &[&signer],
+            )
+            .await
+            .map(|_| ()),
+            "regenerate the items",
+        );
+        symlinked(repo.sign_summary_all(&[&signer]).await, "sign");
+        for (file, before) in files.iter().zip(&before) {
+            assert_eq!(&std::fs::read(file).unwrap(), before, "{file:?}");
+        }
+        assert!(entry_names(&other).is_empty(), "{:?}", entry_names(&other));
+    });
+}
+
+/// A write of the summaries and a signing leave no temp file: not at the
+/// repository root, not in `extensions/ostrya/summary`, and not in `tmp/`.
+#[test]
+fn a_summary_write_leaves_no_temp_file() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-no-temp");
+    block_on(async {
+        let groups = "[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:main\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        repo.sign_summary_all(&[&signer]).await.unwrap();
+        assert!(item_file(&repo_dir, "ssh:ci", ".sig").exists());
+        for dir in [
+            repo_dir.clone(),
+            repo_dir.join("extensions/ostrya/summary"),
+            repo_dir.join("tmp"),
+        ] {
+            let names = entry_names(&dir);
+            assert!(
+                !names.iter().any(|name| name.contains(".tmp-")),
+                "{dir:?}: {names:?}"
+            );
+        }
+    });
+}
+
+/// A read of a summary or of a signature file refuses a FIFO at once and a
+/// symlink, with `InvalidFormat` and the path of the file, on the handle of a
+/// plain open.
+#[test]
+fn a_summary_read_refuses_a_fifo_and_a_symlink() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-read-fifo");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let file = item_file(&repo_dir, "anonymous", "");
+        let rel = file.strip_prefix(&repo_dir).unwrap().display().to_string();
+
+        std::fs::remove_file(&file).unwrap();
+        make_fifo(&file);
+        let err = repo.read_summary_of(&item("anonymous")).await;
+        assert!(
+            matches!(&err, Err(ostrya::Error::InvalidFormat(m))
+                if *m == format!("{rel} is not a regular file")),
+            "{err:?}"
+        );
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("summary", &file).unwrap();
+        let err = repo.read_summary_of(&item("anonymous")).await;
+        assert!(
+            matches!(&err, Err(ostrya::Error::InvalidFormat(m))
+            if *m == format!(
+                "{rel} passes through a symlink; ostrya refuses a symlink in the repository"
+            )),
+            "{err:?}"
+        );
+
+        make_fifo(&repo_dir.join("summary.sig"));
+        let err = repo.read_summary_signature().await;
+        assert!(
+            matches!(&err, Err(ostrya::Error::InvalidFormat(m))
+                if m == "summary.sig is not a regular file"),
+            "{err:?}"
+        );
+        std::fs::remove_file(repo_dir.join("summary.sig")).unwrap();
+        std::fs::rename(repo_dir.join("summary"), repo_dir.join("moved")).unwrap();
+        std::os::unix::fs::symlink("moved", repo_dir.join("summary")).unwrap();
+        let err = repo.read_summary().await;
+        assert!(
+            matches!(&err, Err(ostrya::Error::InvalidFormat(m))
+                if m.starts_with("summary passes through a symlink")),
+            "{err:?}"
+        );
+    });
+}
+
+/// An `.access` file that is a symlink or a FIFO holds no digest: the write
+/// removes it and writes a regular file with the digest. The target of the
+/// symlink does not change.
+#[test]
+fn an_access_entry_that_is_no_regular_file_is_written_again() {
+    let (tmp, repo_dir) = writable_fixture("summary", "summary-access-entry");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let access = item_file(&repo_dir, "anonymous", ".access");
+        let want = std::fs::read(&access).unwrap();
+        let target = tmp.path().join("target");
+        std::fs::write(&target, &want).unwrap();
+
+        std::fs::remove_file(&access).unwrap();
+        std::os::unix::fs::symlink(&target, &access).unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        assert!(std::fs::symlink_metadata(&access).unwrap().is_file());
+        assert_eq!(std::fs::read(&access).unwrap(), want);
+        assert_eq!(std::fs::read(&target).unwrap(), want);
+
+        std::fs::remove_file(&access).unwrap();
+        make_fifo(&access);
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        assert!(std::fs::symlink_metadata(&access).unwrap().is_file());
+        assert_eq!(std::fs::read(&access).unwrap(), want);
+    });
+}
+
+/// In a `bare-user-shared` repository, the directories that the write of the
+/// summaries makes get the mode `02770`, and each summary file gets the mode
+/// `0644`.
+#[test]
+fn the_summary_files_take_the_shared_modes() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TmpDir::new("summary-shared");
+    let repo_dir = tmp.path().join("repo");
+    block_on(async {
+        let repo = Repo::create(
+            &repo_dir,
+            ostrya::CreateOptions::new(RepoMode::BareUserShared),
+        )
+        .await
+        .unwrap();
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        for dir in ["extensions/ostrya", "extensions/ostrya/summary"] {
+            assert_eq!(mode(&repo_dir.join(dir)), 0o2770, "{dir}");
+        }
+        let files = [
+            repo_dir.join("summary"),
+            repo_dir.join("summary.sig"),
+            item_file(&repo_dir, "anonymous", ""),
+            item_file(&repo_dir, "anonymous", ".sig"),
+            item_file(&repo_dir, "anonymous", ".access"),
+        ];
+        for file in &files {
+            assert_eq!(mode(file), 0o644, "{file:?}");
+        }
+    });
+}

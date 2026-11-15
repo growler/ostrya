@@ -15,7 +15,6 @@
 use std::fmt;
 use std::future::Future;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, ready};
@@ -25,7 +24,6 @@ use ostrya_core::{Checksum, DeflateReader, RepoMode};
 use ostrya_fetch::Priority;
 use ostrya_fetch::gate::{Acquire, Gate, Permit};
 use ostrya_rt::FileReader;
-use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxFlags};
 use rustix::io::Errno;
 
 use crate::access::{AuthItem, ReadAccess};
@@ -33,7 +31,8 @@ use crate::config::RepoConfig;
 use crate::error::Result;
 use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
-use crate::summary::{ACCESS_SUFFIX, SIG_SUFFIX, SUMMARY_DIR, access_file_bytes};
+use crate::repo_fs::{FsError, Opened, Reason, RepoDir, RootFile, Stat};
+use crate::summary::{ACCESS_SUFFIX, SIG_SUFFIX, access_file_bytes, open_summary_dir};
 use crate::write::archive_level;
 
 /// The maximum number of `.filez` objects that one view deflates at one time.
@@ -116,19 +115,26 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// the request, the view starts again, at most three times, and then
 /// answers not found.
 ///
-/// The view opens each component of these paths with no symlink followed,
-/// as for each stored file. A symlink on the path of the `.access` file or
-/// of the file is refused.
+/// The view opens these paths with no symlink followed, as for each stored
+/// file. A symlink on the path of the `.access` file or of the file is
+/// refused. The view opens `extensions/ostrya/summary` as a directory
+/// handle, so the process needs read permission on that directory.
 ///
 /// # File access
 ///
-/// The view opens a stored file one component at a time, with `openat` and
-/// `O_NOFOLLOW`. The walk starts at the descriptor of the repository or of
-/// `objects/`, so it needs no `openat2`. The repository handle opened these
-/// descriptors. The open of the handle refuses a symlink at `objects`.
+/// The view opens a stored file with one `openat2` with `RESOLVE_BENEATH`,
+/// `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, relative to the handle of the
+/// repository root or of `objects/`, and checks its type with one `statx`.
+/// A symlink at any component gives refused, except a ref alias. An entry
+/// that is not a regular file, such as a FIFO, a directory, or a socket, is
+/// not found, and its open does not block. The repository handle opened the
+/// root and `objects/`. The open of the handle refuses a symlink at
+/// `objects`. The open has no fallback: on a kernel without `openat2`, each
+/// read of a stored file fails.
 ///
 /// The view reads the repository `config` again if its inode number, size,
-/// modification time, or change time differs from the last parse. The next
+/// modification time, or change time differs from the last parse. One
+/// `statx` of `config` with no symlink followed reads these values. The next
 /// answer then shows the change. One request reads a changed file, and the
 /// requests that see the same change wait for its parse.
 pub struct ArchiveView {
@@ -324,7 +330,7 @@ impl ArchiveView {
             } => Ok(match self.stored(anchor, path, alias_ok, access).await? {
                 Walked::File(file, len) => ArchiveAnswer::Stream {
                     len: Some(len),
-                    body: Box::new(FileReader::with_len_hint(file, len)),
+                    body: Box::new(FileReader::with_len_hint(file.file, len)),
                 },
                 Walked::NotFound => ArchiveAnswer::NotFound,
                 Walked::Refused | Walked::Alias(_) => ArchiveAnswer::Refused,
@@ -332,7 +338,7 @@ impl ArchiveView {
             Route::Summary { sig } => Ok(match self.summary(sig, access).await? {
                 Summarized::Walked(Walked::File(file, len)) => ArchiveAnswer::Stream {
                     len: Some(len),
-                    body: Box::new(FileReader::with_len_hint(file, len)),
+                    body: Box::new(FileReader::with_len_hint(file.file, len)),
                 },
                 Summarized::Walked(Walked::NotFound) => ArchiveAnswer::NotFound,
                 Summarized::Walked(Walked::Refused | Walked::Alias(_)) => ArchiveAnswer::Refused,
@@ -422,7 +428,7 @@ impl ArchiveView {
     /// unchanged file reuses that parse.
     async fn current_config(&self) -> Result<Arc<RepoConfig>> {
         let repo = self.repo.clone();
-        let stat = ostrya_rt::unblock(move || config_statx(repo.repo_fd())).await?;
+        let stat = ostrya_rt::unblock(move || config_stat(repo.root_dir())).await?;
         self.config_for(&stat).await
     }
 
@@ -430,7 +436,7 @@ impl ArchiveView {
     ///
     /// One request reads a change of the file. The requests that wait at the
     /// same time take its parse if they saw the same change.
-    async fn config_for(&self, stat: &Statx) -> Result<Arc<RepoConfig>> {
+    async fn config_for(&self, stat: &Stat) -> Result<Arc<RepoConfig>> {
         let key = ConfigKey::of(stat);
         if let Some(config) = self.cached_config(key) {
             return Ok(config);
@@ -480,8 +486,8 @@ impl ArchiveView {
         let access = access.clone();
         let walked = ostrya_rt::unblock(move || {
             let root = match anchor {
-                Anchor::Repo => repo.repo_fd(),
-                Anchor::Objects => repo.objects_fd(),
+                Anchor::Repo => repo.root_dir(),
+                Anchor::Objects => repo.objects(),
             };
             match walk(root, &path, alias_ok)? {
                 Walked::Alias(body) => {
@@ -526,20 +532,21 @@ impl ArchiveView {
         let want = access_file_bytes(&files.digest);
         let repo = self.repo.clone();
         let summarized = ostrya_rt::unblock(move || -> io::Result<Summarized> {
-            // The one walk to the directory of the summary.
-            let dir = match walk_dir(repo.repo_fd(), SUMMARY_DIR)? {
-                WalkedDir::Dir(dir) => dir,
-                WalkedDir::Other(walked) => return Ok(Summarized::Walked(walked)),
+            // The one open of the directory of the summary.
+            let dir = match open_summary_dir(repo.root_dir()) {
+                Ok(Some(dir)) => dir,
+                Ok(None) => return Ok(Summarized::Walked(Walked::NotFound)),
+                Err(e) => return walk_error(e).map(Summarized::Walked),
             };
             for _ in 0..SUMMARY_TRIES {
-                let at = dir.as_fd();
+                let at = &dir;
                 // The file first, so a write between the two opens cannot
                 // pair a matching `.access` file with a later file.
                 let file = walk(at, &name, false)?;
                 let current = walk(at, &access_name, false)?;
                 let file = match (current, file) {
                     (Walked::File(current, _), file) => {
-                        if !holds(&current, &want)? {
+                        if !holds(&current.file, &want)? {
                             return Ok(Summarized::Stale);
                         }
                         file
@@ -573,7 +580,7 @@ impl ArchiveView {
         let fixed = self.level;
         let (stat, loaded) = ostrya_rt::unblock(move || {
             (
-                fixed.is_none().then(|| config_statx(repo.repo_fd())),
+                fixed.is_none().then(|| config_stat(repo.root_dir())),
                 repo.load_contained_blocking(&key),
             )
         })
@@ -650,26 +657,23 @@ pub(crate) fn holds(file: &std::fs::File, want: &[u8]) -> io::Result<bool> {
     Ok(buf == want)
 }
 
-/// Returns `true` if `name` under `dir` is the open file `file`, with no
+/// Returns `true` if `name` in `dir` is the open file `file`, with no
 /// symlink followed.
-fn names_file(dir: BorrowedFd<'_>, name: &str, file: &std::fs::File) -> io::Result<bool> {
-    let open = rustix::fs::fstat(file)?;
-    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(named) => Ok(named.st_dev == open.st_dev && named.st_ino == open.st_ino),
-        Err(Errno::NOENT) => Ok(false),
-        Err(e) => Err(e.into()),
+///
+/// The call compares the device and the inode of [`RepoDir::lstat`] of
+/// `name` with those of `file`. An absent `name` gives `false`.
+fn names_file(dir: &RepoDir, name: &str, file: &Opened) -> io::Result<bool> {
+    match dir.lstat(name) {
+        Ok(named) => Ok(named.dev == file.stat.dev && named.ino == file.stat.ino),
+        Err(FsError::Absent { .. }) => Ok(false),
+        Err(e) => Err(io_error(e)),
     }
 }
 
-/// Returns the `statx` of `config` under `repo_fd`, with the fields of a
-/// [`ConfigKey`].
-fn config_statx(repo_fd: BorrowedFd<'_>) -> io::Result<Statx> {
-    Ok(rustix::fs::statx(
-        repo_fd,
-        "config",
-        AtFlags::empty(),
-        StatxFlags::INO | StatxFlags::SIZE | StatxFlags::MTIME | StatxFlags::CTIME,
-    )?)
+/// Returns the status of `config` at the repository root `root`, with no
+/// symlink followed, for its [`ConfigKey`].
+fn config_stat(root: &RepoDir) -> io::Result<Stat> {
+    root.lstat(RootFile::Config.name()).map_err(io_error)
 }
 
 /// The parsed `config` and the key it was parsed under.
@@ -689,12 +693,12 @@ struct ConfigKey {
 }
 
 impl ConfigKey {
-    fn of(stat: &Statx) -> ConfigKey {
+    fn of(stat: &Stat) -> ConfigKey {
         ConfigKey {
-            ino: stat.stx_ino,
-            size: stat.stx_size,
-            mtime: (stat.stx_mtime.tv_sec, stat.stx_mtime.tv_nsec),
-            ctime: (stat.stx_ctime.tv_sec, stat.stx_ctime.tv_nsec),
+            ino: stat.ino,
+            size: stat.size,
+            mtime: (stat.mtime_sec, stat.mtime_nsec),
+            ctime: (stat.ctime_sec, stat.ctime_nsec),
         }
     }
 }
@@ -824,8 +828,8 @@ fn object_route(fanout: &str, name: &str, archive: bool) -> Route {
 
 /// The result of the safe walk.
 pub(crate) enum Walked {
-    /// A regular file and its size.
-    File(std::fs::File, u64),
+    /// A regular file, open, and its size.
+    File(Opened, u64),
     NotFound,
     Refused,
     /// A symlink at the last component of a walk that allows a ref alias,
@@ -833,109 +837,66 @@ pub(crate) enum Walked {
     Alias(Vec<u8>),
 }
 
-/// Opens the file at `path` under `root` and follows no symlink.
+/// The cap of the body of a ref alias, in bytes. A symlink body on Linux has
+/// 4095 bytes at most.
+const ALIAS_CAP: u64 = 4096;
+
+/// Opens the regular file at `path` below `dir` and follows no symlink.
 ///
-/// The walk takes the components of `path` one at a time. Each intermediate
-/// component opens with `O_PATH`, `O_DIRECTORY`, and `O_NOFOLLOW`. The last
-/// one opens with `O_RDONLY` and `O_NOFOLLOW`.
+/// The open is [`RepoDir::open_regular`]: one `openat2` with
+/// `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, then one `statx` of the open
+/// file. `O_NONBLOCK` keeps the open of a FIFO from a wait for a writer.
 ///
-/// `O_NONBLOCK` keeps the open of a FIFO from a wait for a writer. The
-/// `fstat` then gives not-found for anything but a regular file. The flag
-/// changes no read of a regular file.
-///
-/// With `alias_ok`, a symlink at the last component gives its body. A name
-/// longer than the kernel accepts is not found, and so is a path with nothing
-/// at it. A directory that the process cannot search fails the walk with its
-/// error.
-pub(crate) fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Result<Walked> {
-    let (dirs, last) = match path.rsplit_once('/') {
-        Some((dirs, last)) => (Some(dirs), last),
-        None => (None, path),
-    };
-    let held = match dirs.map(|dirs| walk_dir(root, dirs)).transpose()? {
-        Some(WalkedDir::Dir(fd)) => Some(fd),
-        Some(WalkedDir::Other(walked)) => return Ok(walked),
-        None => None,
-    };
-    let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
-    let fd = match rustix::fs::openat(
-        dir,
-        last,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT | Errno::NOTDIR | Errno::NXIO | Errno::NAMETOOLONG) => {
-            return Ok(Walked::NotFound);
+/// A symlink at a component gives refused. With `alias_ok`, a symlink at the
+/// last component gives its body, which [`RepoDir::read_link`] reads. An
+/// entry that is not a regular file, a component that is not a directory,
+/// a name longer than the kernel accepts, and a path with nothing at it are
+/// not found. A directory that the process cannot search fails the walk
+/// with its error.
+pub(crate) fn walk(dir: &RepoDir, path: &str, alias_ok: bool) -> io::Result<Walked> {
+    match dir.open_regular(path) {
+        Ok(opened) => {
+            let len = opened.stat.size;
+            Ok(Walked::File(opened, len))
         }
-        Err(Errno::LOOP) if alias_ok => {
-            let body = rustix::fs::readlinkat(dir, last, Vec::new())?;
-            return Ok(Walked::Alias(body.into_bytes()));
-        }
-        Err(Errno::LOOP) => return Ok(Walked::Refused),
-        Err(e) => return Err(e.into()),
-    };
-    let stat = rustix::fs::fstat(&fd)?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Ok(Walked::NotFound);
+        Err(FsError::Invalid {
+            reason: Reason::Symlink,
+            ..
+        }) if alias_ok => match dir.read_link(path, ALIAS_CAP) {
+            Ok(body) => Ok(Walked::Alias(body)),
+            Err(e) => walk_error(e),
+        },
+        Err(e) => walk_error(e),
     }
-    Ok(Walked::File(
-        std::fs::File::from(fd),
-        stat.st_size.max(0) as u64,
-    ))
 }
 
-/// The outcome of [`walk_dir`].
-enum WalkedDir {
-    /// The directory, opened with `O_PATH`.
-    Dir(OwnedFd),
-    /// [`Walked::NotFound`] or [`Walked::Refused`].
-    Other(Walked),
-}
-
-/// Opens the directory at `path` under `root` and follows no symlink.
+/// Returns the answer of the walk for the error `err` of an open.
 ///
-/// The walk takes the components of `path` one at a time, and opens each
-/// one with `O_PATH`, `O_DIRECTORY`, and `O_NOFOLLOW`, as [`walk`] opens
-/// the directories on its path. A symlink gives refused, and a component
-/// that does not exist or is no directory gives not found.
-fn walk_dir(root: BorrowedFd<'_>, path: &str) -> io::Result<WalkedDir> {
-    let mut held: Option<OwnedFd> = None;
-    for part in path.split('/') {
-        let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
-        match rustix::fs::openat(
-            dir,
-            part,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => held = Some(fd),
-            Err(Errno::NOENT | Errno::NAMETOOLONG) => {
-                return Ok(WalkedDir::Other(Walked::NotFound));
-            }
-            // A symlink gives `ENOTDIR` under `O_DIRECTORY`, and so does any
-            // other entry that is no directory.
-            Err(Errno::NOTDIR | Errno::LOOP) => {
-                return not_a_directory(dir, part).map(WalkedDir::Other);
-            }
-            Err(e) => return Err(e.into()),
+/// A symlink, a path that leaves the repository, and an alias body over its
+/// cap give refused. An absent entry, an entry that is not a regular file, a
+/// component that is not a directory, and a name longer than the kernel
+/// accepts give not found. Each other error fails the walk.
+fn walk_error(err: FsError) -> io::Result<Walked> {
+    match err {
+        FsError::Absent { .. }
+        | FsError::Invalid {
+            reason: Reason::NotDirectory | Reason::NotRegular(_),
+            ..
+        } => Ok(Walked::NotFound),
+        FsError::Invalid { .. } => Ok(Walked::Refused),
+        FsError::Io(e) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => {
+            Ok(Walked::NotFound)
         }
+        e => Err(io_error(e)),
     }
-    Ok(match held {
-        Some(fd) => WalkedDir::Dir(fd),
-        None => WalkedDir::Other(Walked::NotFound),
-    })
 }
 
-/// The answer for an intermediate component that did not open as a
-/// directory: refused for a symlink, not found for anything else.
-fn not_a_directory(dir: BorrowedFd<'_>, part: &str) -> io::Result<Walked> {
-    match rustix::fs::statat(dir, part, AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::Symlink => {
-            Ok(Walked::Refused)
-        }
-        Ok(_) | Err(Errno::NOENT) => Ok(Walked::NotFound),
-        Err(e) => Err(e.into()),
+/// Returns the [`io::Error`] of `err`, with the message of
+/// `From<FsError> for Error`.
+fn io_error(err: FsError) -> io::Error {
+    match err {
+        FsError::Io(e) => e,
+        e => io::Error::other(crate::Error::from(e)),
     }
 }
 
@@ -1200,6 +1161,7 @@ mod tests {
 
     use futures_lite::AsyncReadExt;
     use ostrya_core::ObjectType;
+    use rustix::fs::{FileType, Mode};
 
     use super::*;
     use crate::repo::CreateOptions;
@@ -1406,16 +1368,16 @@ mod tests {
     fn a_replaced_file_no_more_has_its_name() {
         let dir = scratch("names-file");
         std::fs::write(dir.join("summary"), b"old").unwrap();
-        let root = std::fs::File::open(&dir).unwrap();
-        let Walked::File(file, _) = walk(root.as_fd(), "summary", false).unwrap() else {
+        let root = RepoDir::open_root(rustix::fs::CWD, &dir).unwrap();
+        let Walked::File(file, _) = walk(&root, "summary", false).unwrap() else {
             panic!("the file exists");
         };
-        assert!(names_file(root.as_fd(), "summary", &file).unwrap());
+        assert!(names_file(&root, "summary", &file).unwrap());
         std::fs::write(dir.join("new"), b"new").unwrap();
         std::fs::rename(dir.join("new"), dir.join("summary")).unwrap();
-        assert!(!names_file(root.as_fd(), "summary", &file).unwrap());
+        assert!(!names_file(&root, "summary", &file).unwrap());
         std::fs::remove_file(dir.join("summary")).unwrap();
-        assert!(!names_file(root.as_fd(), "summary", &file).unwrap());
+        assert!(!names_file(&root, "summary", &file).unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

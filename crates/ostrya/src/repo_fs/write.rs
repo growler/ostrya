@@ -1,5 +1,6 @@
-//! The other write primitives: the atomic write of a file, the exclusive
-//! create of a file, the removal of a file, the hard link and the move of an
+//! The other write primitives: the atomic write of a file, the temp file
+//! of an atomic write that the caller publishes, the exclusive create of a
+//! file, the removal of a file, the hard link and the move of an
 //! entry, and the reflink or copy of file content.
 //!
 //! Each primitive that takes a path below a [`RepoDir`] opens the parent
@@ -49,8 +50,8 @@ impl RepoDir {
     ///
     /// For [`Publish::Replace`], the temp file is a named file
     /// `.ostrya-tmp-<pid>-XXXXXX` in the temp home, from
-    /// [`TempFile::create_named`]. The publish moves it with one `renameat`.
-    /// For [`Publish::KeepExisting`], the temp file is the file of
+    /// [`stage_atomic`](RepoDir::stage_atomic). The publish moves it with one
+    /// `renameat`. For [`Publish::KeepExisting`], the temp file is the file of
     /// [`TempFile::create`]: an anonymous `O_TMPFILE` file that the publish
     /// links into place, or a named file where the file system has no
     /// `O_TMPFILE`.
@@ -76,11 +77,43 @@ impl RepoDir {
         fsync: bool,
     ) -> Result<Published, FsError> {
         self.check_path(path)?;
-        let mode = require(
-            self.file_mode(),
-            "write_atomic needs a kind with a file mode",
-        )?;
-        self.write_temp(path, bytes, mode, how, fsync)
+        let temp = match how {
+            Publish::Replace => self.stage_atomic(bytes, fsync)?,
+            Publish::KeepExisting => {
+                let mode = self.kind_file_mode()?;
+                filled(TempFile::create(self)?, bytes, mode, fsync)?
+            }
+        };
+        temp.publish(self, path, how, fsync)
+    }
+
+    /// Writes `bytes` to a new named temp file for an atomic write below
+    /// this directory, and gives the file. The caller publishes the file.
+    ///
+    /// The temp file is a named file `.ostrya-tmp-<pid>-XXXXXX` in the temp
+    /// home, from [`TempFile::create_named`]. The function writes `bytes` to
+    /// it and sets the file mode of the kind of this directory with
+    /// `fchmod`. In a `bare-user-shared` repository the mode is the shared
+    /// file mode of the kind. With `fsync`, the function then syncs the file.
+    /// The function syncs no directory.
+    ///
+    /// The caller publishes the file with [`TempFile::publish`] and
+    /// [`Publish::Replace`], which costs one `renameat`. The bytes are in
+    /// place after the publish, with no sync of a directory. A caller that
+    /// publishes many files can publish each with no `fsync`, and then sync
+    /// the directory one time. The drop of the file before the publish
+    /// removes it.
+    ///
+    /// The caller holds all of `bytes` in memory, so the function is for
+    /// metadata whose size the format caps.
+    ///
+    /// The errors are those of [`TempFile::create_named`]. An error of the
+    /// write gives [`FsError::Io`]. A kind with no file mode is a defect of
+    /// the caller: it fails a debug assertion, and gives an `InvalidInput`
+    /// error in a release build.
+    pub(crate) fn stage_atomic(&self, bytes: &[u8], fsync: bool) -> Result<TempFile, FsError> {
+        let mode = self.kind_file_mode()?;
+        filled(TempFile::create_named(self)?, bytes, mode, fsync)
     }
 
     /// Writes `bytes` to the root file `file` in one atomic step, by the rule
@@ -88,7 +121,8 @@ impl RepoDir {
     ///
     /// The steps, the temp file of each [`Publish`] rule, the sync, and the
     /// errors are those of [`write_atomic`](RepoDir::write_atomic). The temp
-    /// file is in `tmp/`.
+    /// file is in `tmp/`. For [`Publish::Replace`], the temp file is from
+    /// [`stage_root_file`](RepoDir::stage_root_file).
     /// The mode is the mode of `file`, or its shared mode in a
     /// `bare-user-shared` repository.
     ///
@@ -112,30 +146,41 @@ impl RepoDir {
         how: Publish,
         fsync: bool,
     ) -> Result<Published, FsError> {
-        require(
-            (self.kind == RepoLayout::Root).then_some(()),
-            "write_root_file needs the root handle",
-        )?;
-        require(
-            (!matches!(file, RootFile::Lock | RootFile::UpdateLock)).then_some(()),
-            "write_root_file never writes a lock file",
-        )?;
-        if let RootFile::Keyring(name) = &file
-            && !is_component(name.as_bytes())
-        {
-            return Err(FsError::Invalid {
-                path: self.err_path(name),
-                reason: Reason::Escape,
-            });
-        }
-        let name = file.name();
-        self.check_path(name)?;
-        let mode = if self.ctx.is_shared() {
-            file.shared_file_mode()
-        } else {
-            file.file_mode()
+        let temp = match how {
+            Publish::Replace => self.stage_root_file(&file, bytes, fsync)?,
+            Publish::KeepExisting => {
+                let mode = self.checked_root_mode(&file)?;
+                filled(TempFile::create(self)?, bytes, mode, fsync)?
+            }
         };
-        self.write_temp(name, bytes, mode, how, fsync)
+        temp.publish(self, file.name(), how, fsync)
+    }
+
+    /// Writes `bytes` to a new named temp file for an atomic write of the
+    /// root file `file`, and gives the file. The call is on the root handle.
+    /// The caller publishes the file at the name of `file`.
+    ///
+    /// The temp file, the sync, and the publish are those of
+    /// [`stage_atomic`](RepoDir::stage_atomic). The temp file is in `tmp/`.
+    /// The mode is the mode of `file`, or its shared mode in a
+    /// `bare-user-shared` repository. The publish with [`Publish::Replace`]
+    /// puts a regular file at the name of `file`, and replaces a symlink at
+    /// the name.
+    ///
+    /// The checks of [`write_root_file`](RepoDir::write_root_file) come
+    /// before the temp file: a [`RootFile::Keyring`] name that is not one
+    /// path component gives [`Reason::Escape`], and a call on a handle other
+    /// than the root or for a lock file is a defect of the caller. The errors
+    /// of the temp file and of the write are those of
+    /// [`stage_atomic`](RepoDir::stage_atomic).
+    pub(crate) fn stage_root_file(
+        &self,
+        file: &RootFile,
+        bytes: &[u8],
+        fsync: bool,
+    ) -> Result<TempFile, FsError> {
+        let mode = self.checked_root_mode(file)?;
+        filled(TempFile::create_named(self)?, bytes, mode, fsync)
     }
 
     /// Creates a new regular file at `path` below this directory, and gives
@@ -234,32 +279,60 @@ impl RepoDir {
         }
     }
 
-    /// Writes `bytes` to a new temp file, sets the mode `mode`, and publishes
-    /// the file at `path` by the rule `how`. With `fsync`, the function syncs
-    /// the file before the publish. The caller checks `path`.
-    ///
-    /// [`Publish::Replace`] writes a named temp file, which the publish moves
-    /// with one `renameat`. [`Publish::KeepExisting`] writes the file of
-    /// [`TempFile::create`].
-    fn write_temp(
-        &self,
-        path: &str,
-        bytes: &[u8],
-        mode: u32,
-        how: Publish,
-        fsync: bool,
-    ) -> Result<Published, FsError> {
-        let mut temp = match how {
-            Publish::Replace => TempFile::create_named(self)?,
-            Publish::KeepExisting => TempFile::create(self)?,
-        };
-        temp.file_mut().write_all(bytes).map_err(FsError::Io)?;
-        temp.set_mode(mode)?;
-        if fsync {
-            temp.sync()?;
-        }
-        temp.publish(self, path, how, fsync)
+    /// Returns the file mode of the kind of this directory, or its shared
+    /// file mode in a `bare-user-shared` repository. A kind with no file mode
+    /// fails a debug assertion, and gives an `InvalidInput` error in a
+    /// release build.
+    fn kind_file_mode(&self) -> Result<u32, FsError> {
+        require(
+            self.file_mode(),
+            "write_atomic needs a kind with a file mode",
+        )
     }
+
+    /// Checks the root file `file` for a write on this handle, and returns
+    /// its mode: the mode of `file`, or its shared mode in a
+    /// `bare-user-shared` repository.
+    ///
+    /// A handle other than the root and a lock file fail a debug assertion,
+    /// and give an `InvalidInput` error in a release build. A
+    /// [`RootFile::Keyring`] name that is not one path component gives
+    /// [`Reason::Escape`].
+    fn checked_root_mode(&self, file: &RootFile) -> Result<u32, FsError> {
+        require(
+            (self.kind == RepoLayout::Root).then_some(()),
+            "write_root_file needs the root handle",
+        )?;
+        require(
+            (!matches!(file, RootFile::Lock | RootFile::UpdateLock)).then_some(()),
+            "write_root_file never writes a lock file",
+        )?;
+        if let RootFile::Keyring(name) = file
+            && !is_component(name.as_bytes())
+        {
+            return Err(FsError::Invalid {
+                path: self.err_path(name),
+                reason: Reason::Escape,
+            });
+        }
+        self.check_path(file.name())?;
+        Ok(if self.ctx.is_shared() {
+            file.shared_file_mode()
+        } else {
+            file.file_mode()
+        })
+    }
+}
+
+/// Writes `bytes` to the new temp file `temp`, sets the mode `mode` with
+/// `fchmod`, and gives the file. With `fsync`, the function syncs the file.
+fn filled(mut temp: TempFile, bytes: &[u8], mode: u32, fsync: bool) -> Result<TempFile, FsError> {
+    temp.file_mut().write_all(bytes).map_err(FsError::Io)?;
+    temp.set_mode(mode)?;
+    if fsync {
+        temp.sync()?;
+    }
+    Ok(temp)
 }
 
 /// Hard-links the entry at `src_path` below `src` to the name `dst_name` in
@@ -652,6 +725,103 @@ mod tests {
         assert!(take_synced().is_empty());
         assert_eq!(std::fs::read(&config).unwrap(), b"first");
         assert!(temp_names(&dir).is_empty());
+    }
+
+    #[test]
+    fn stage_atomic_gives_a_temp_file_in_tmp_with_the_mode_of_the_kind() {
+        for (mode, expected) in [
+            (RepoMode::BareUserShared, 0o640),
+            (RepoMode::BareUser, 0o644),
+        ] {
+            for fsync in [false, true] {
+                let dir = TestDir::new("stage-atomic");
+                let repo = root(&dir).with_repo_mode(mode);
+                let deltas = repo.ensure_layout(RepoLayout::Deltas, false).unwrap();
+                let _record = record_syncs();
+
+                let temp = deltas.stage_atomic(b"staged", fsync).unwrap();
+                let names = temp_names(&dir);
+                assert_eq!(names.len(), 1, "{mode:?} {fsync}: {names:?}");
+                let staged = dir.path().join("tmp").join(&names[0]);
+                assert_eq!(std::fs::read(&staged).unwrap(), b"staged");
+                assert_eq!(mode_of(&staged), expected, "{mode:?} {fsync}");
+                assert!(take_synced().is_empty(), "{mode:?} {fsync}");
+
+                // The publish with no `fsync` puts the bytes in place with no
+                // sync of a directory.
+                let result = temp.publish(&deltas, "superblock", Publish::Replace, false);
+                assert_eq!(result.unwrap(), Published::Created, "{mode:?} {fsync}");
+                assert!(take_synced().is_empty(), "{mode:?} {fsync}");
+                let path = dir.path().join("deltas/superblock");
+                assert_eq!(std::fs::read(&path).unwrap(), b"staged");
+                assert_eq!(mode_of(&path), expected, "{mode:?} {fsync}");
+                assert!(temp_names(&dir).is_empty(), "{mode:?} {fsync}");
+            }
+        }
+    }
+
+    #[test]
+    fn stage_root_file_gives_a_temp_file_in_tmp_with_the_mode_of_the_root_file() {
+        for mode in [RepoMode::BareUserShared, RepoMode::BareUser] {
+            for fsync in [false, true] {
+                let dir = TestDir::new("stage-root");
+                let repo = root(&dir).with_repo_mode(mode);
+                let summary = dir.path().join("summary");
+                std::fs::write(&summary, b"old").unwrap();
+                let _record = record_syncs();
+
+                let temp = repo
+                    .stage_root_file(&RootFile::Summary, b"new", fsync)
+                    .unwrap();
+                let names = temp_names(&dir);
+                assert_eq!(names.len(), 1, "{mode:?} {fsync}: {names:?}");
+                let staged = dir.path().join("tmp").join(&names[0]);
+                assert_eq!(std::fs::read(&staged).unwrap(), b"new");
+                assert_eq!(mode_of(&staged), 0o644, "{mode:?} {fsync}");
+                assert_eq!(std::fs::read(&summary).unwrap(), b"old");
+                assert!(take_synced().is_empty(), "{mode:?} {fsync}");
+
+                let result = temp.publish(&repo, "summary", Publish::Replace, false);
+                assert_eq!(result.unwrap(), Published::Created, "{mode:?} {fsync}");
+                assert!(take_synced().is_empty(), "{mode:?} {fsync}");
+                assert_eq!(std::fs::read(&summary).unwrap(), b"new");
+                assert_eq!(mode_of(&summary), 0o644, "{mode:?} {fsync}");
+                assert!(temp_names(&dir).is_empty(), "{mode:?} {fsync}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_drop_of_a_staged_file_removes_it() {
+        let dir = TestDir::new("stage-drop");
+        let refs = refs(&dir);
+        let repo = root(&dir);
+
+        let temp = refs.stage_atomic(b"a", false).unwrap();
+        assert_eq!(temp_names(&dir).len(), 1);
+        drop(temp);
+        assert!(temp_names(&dir).is_empty());
+
+        let temp = repo
+            .stage_root_file(&RootFile::Config, b"c", false)
+            .unwrap();
+        assert_eq!(temp_names(&dir).len(), 1);
+        drop(temp);
+        assert!(temp_names(&dir).is_empty());
+        assert!(is_gone(&dir.path().join("config")));
+    }
+
+    #[test]
+    fn stage_root_file_refuses_a_keyring_name_that_is_not_one_component() {
+        let dir = TestDir::new("stage-keyring-escape");
+        let repo = root(&dir);
+        for name in ["a/b", "..", ".", ""] {
+            let file = RootFile::Keyring(name.into());
+            let (err_path, reason) = invalid(repo.stage_root_file(&file, b"new", false));
+            assert_eq!(err_path, repo.err_path(name), "{name:?}");
+            assert!(matches!(reason, Reason::Escape), "{name:?}: {reason:?}");
+        }
+        assert!(is_gone(&dir.path().join("tmp")));
     }
 
     #[test]
@@ -1056,6 +1226,34 @@ mod tests {
             .ensure_layout(RepoLayout::Objects, false)
             .unwrap();
         let _ = objects.write_atomic("x", b"x", Publish::Replace, false);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "needs the root handle")]
+    fn stage_root_file_on_another_handle_fails_a_debug_assertion() {
+        let dir = TestDir::new("misuse-stage-root");
+        let refs = refs(&dir);
+        let _ = refs.stage_root_file(&RootFile::Config, b"x", false);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "never writes a lock file")]
+    fn stage_root_file_of_a_lock_fails_a_debug_assertion() {
+        let dir = TestDir::new("misuse-stage-lock");
+        let _ = root(&dir).stage_root_file(&RootFile::Lock, b"x", false);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "needs a kind with a file mode")]
+    fn stage_atomic_on_a_kind_with_no_file_mode_fails_a_debug_assertion() {
+        let dir = TestDir::new("misuse-stage");
+        let objects = root(&dir)
+            .ensure_layout(RepoLayout::Objects, false)
+            .unwrap();
+        let _ = objects.stage_atomic(b"x", false);
     }
 
     #[cfg(debug_assertions)]

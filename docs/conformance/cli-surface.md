@@ -4097,7 +4097,8 @@ both. Three differences stand:
 - syncs by default. The port syncs `refs/remotes/<remote>`, which holds the
   ref, and `refs/remotes`, where the ref write creates `refs/remotes/<remote>`.
   A later pull from the same remote syncs `refs/remotes/<remote>` alone. Under
-  `--mirror` the port also syncs the summary file and the repository root. The
+  `--mirror` the port also syncs the temp file of the summary in `tmp/` with
+  `fsync`, and the repository root. The
   tool makes none of these syncs. The count over corpus `C0` is 13 in the port
   and 11 in the tool, and 14 and 11 under `--mirror`. For a pulled commit that
   carries detached metadata, the port syncs the fanout directory of the
@@ -7445,6 +7446,16 @@ Observed by running the tool (2026.1).
   --delete-commit` with `core.tombstone-commits=true` and the same symlink
   exits 0 and writes the `.tombstone-commit`. Its temp file is in the target
   of the symlink. A target on another file system was not observed.
+  A symlink at `tmp` or at `tmp/cache`, or an entry there that is not a
+  directory, also fails each write of `config`, `summary`, `summary.sig`, a
+  keyring of a remote, and a file under `extensions/ostrya/summary/` in the
+  port, because each such write makes its temp file in `tmp/`. Examples are
+  `summary -u`, `summary` with a positional key or `--keys-file`, a
+  `--mirror` pull of each ref, `config set`, `remote add`, `remote delete`,
+  and `remote gpg-import`. The error is the error of the writes above. Each
+  such write makes `tmp` and `tmp/cache` if they are absent. With libostree
+  2026.4 on 2026-11-13, against a repository with an absolute symlink at
+  `tmp`, `summary -u` and `config set` exit 0.
   The port removes a staging directory and an aged directory of `tmp` with
   no entry into a mount. A mount point in such a tree stops the removal of
   that tree, and the mount point and its content stay. The reap of `tmp/`
@@ -7665,6 +7676,32 @@ Observed by running the tool (2026.1).
   stage, and each `.tombstone-commit`, through a named temp file
   `tmp/.ostrya-tmp-<pid>-XXXXXX`, and moves it over the target with one
   `renameat`. No published byte differs.
+- The port creates the temp file of `summary`, `summary.sig`, and each
+  file of an item summary in `tmp/`, with the name
+  `.ostrya-tmp-<pid>-XXXXXX`. It runs `fsync` on each temp file, moves it
+  to its name with one `renameat`, and runs `fsync` on the directory that
+  holds the files after the last move. `summary -u` and `pull --mirror`
+  write the files in this way (`summary_update_syncs_each_file_with_fsync`
+  and `pull_mirror_disable_fsync_syncs_nothing` in
+  `crates/ostrya-cli/tests/cli.rs`). In `summary -u`, the port writes and
+  syncs the temp files first, then removes `summary.sig`, and then moves
+  the files. The tool does these steps in another way. The
+  observations below come from `strace` of the tool, libostree 2026.4, on
+  2026-11-15. No published byte differs.
+  - `ostree summary -u`, with and without `--gpg-sign`, makes the staging
+    directory `tmp/summary-XXXXXX`. For each file, it makes an `O_TMPFILE`
+    file in that directory and runs `fdatasync` on it. It links the file at
+    `tmp.XXXXXX` through `/proc/self/fd` and renames it to `summary` or
+    `summary.sig` in the staging directory. Then it renames `summary` and
+    then `summary.sig` into the repository root, and removes the staging
+    directory. It runs `fsync` on no directory. Without a signature, it
+    removes `summary.sig` from the root after the move of `summary`.
+  - `ostree pull --mirror` makes an `O_TMPFILE` file in the repository
+    root for `summary` and then for `summary.sig`. It links each file at
+    `tmp.XXXXXX` in the root and renames it to its name. It runs no sync on
+    these files. It runs one `syncfs` on the root after the move of
+    `summary.sig`. It sets the mtime of each file to the `Last-Modified`
+    time of the remote.
 - The port syncs a `.commitmeta` that it does not stage, and a
   `.tombstone-commit`, by `[core] fsync`. With fsync on, it runs `fsync` on
   the temp file before the move, and on `objects/<xx>` after the move. When

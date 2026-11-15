@@ -568,7 +568,8 @@ holds only `.filez` content objects and uncompressed metadata.
   refs/mirrors/<collection>/<ref> collection refs (<collection>/ lazy)
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
-  tmp/.ostrya-tmp-<pid>-XXXXXX    port temp entry of a ref, an alias, a .commitmeta, or a .tombstone-commit
+  tmp/.ostrya-tmp-<pid>-XXXXXX    port temp entry of a ref, an alias, a .commitmeta, a .tombstone-commit,
+                                  config, summary, summary.sig, a keyring, or a file of the summary of an item
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -1433,7 +1434,13 @@ open. A FIFO does not block it. The tool follows a symlink at `config`
 (`conformance/cli-surface.md`, "Global conventions"). A new `config` gets the
 mode 0644 at each umask, as the tool gives it. The create of the port writes
 `config` to a temp file in `tmp/`, syncs it, and puts it at `config` only if
-no entry `config` exists.
+no entry `config` exists. Each later write of `config` by the port, for
+example by `ostrya config set` or by a remote command, writes a named temp
+file `.ostrya-tmp-<pid>-XXXXXX` in `tmp/` with the mode 0644, runs `fsync`
+on it when fsync is on, and moves it over `config` with one `renameat`. A
+symlink at `config` is replaced. The write makes `tmp/` if it is absent, and
+fails on a symlink or an entry that is not a directory at `tmp` or
+`tmp/cache`.
 
 `ostrya-config(1)` lists each key of `config`, its type, and its default. The
 list includes the keys of the port, the client groups, and the server group.
@@ -5772,11 +5779,12 @@ not a directory. It skips a candidate for these reasons:
 - The candidate has the device and the inode of the client repository.
 - The finder cannot read the candidate: the open of the directory, the read
   or the parse of its `summary`, or the open of the repository fails. The
-  finder reads `summary` in the strict open mode: the open follows no
-  symlink and does not block, and the finder refuses a file that is not a
-  regular file. It opens the repository only for a candidate whose summary
-  lists a collection ref. It opens it in the strict open mode
-  (`Repo::open_at_strict`), so the open reads no remotes directory.
+  finder reads `summary` as each read of a summary by the port reads it
+  ("The write of the summaries"): the open follows no symlink and does not
+  block, and the finder refuses a file that is not a regular file. It opens
+  the repository only for a candidate whose summary lists a collection ref.
+  It opens it in the strict open mode (`Repo::open_at_strict`), so the open
+  reads no remotes directory.
 - The summary lists no collection ref, or the candidate has no `summary`.
 
 A summary lists a collection ref when field 0 holds a ref other than
@@ -6070,6 +6078,17 @@ and makes each signature, removes the old `summary.sig`, writes `summary`,
 and writes the new `summary.sig` when a key signs. With
 `[core] fsync=true`, it then syncs the repository root.
 
+The command writes each file of a summary through a named temp file
+`.ostrya-tmp-<pid>-XXXXXX` in `tmp/`, with the mode 0644, and moves it over
+the file with one `renameat`. A symlink at the name of the file is
+replaced. With `[core] fsync=true`, it runs `fsync` on the temp file before
+the move. The command makes `tmp/` if it is absent. A symlink or an entry
+that is not a directory at `tmp` or `tmp/cache` fails the command before
+its first write. For each summary, the command writes the temp files of the
+summary, of its signature file, and of its `.access` file before it removes
+or moves a file of that summary. So a failure in `tmp/` leaves each file of
+that summary as it was.
+
 Then it writes the summary of each item that has a summary, one item at a
 time, in the order of the first group of each item in the config:
 
@@ -6083,7 +6102,12 @@ time, in the order of the first group of each item in the config:
    the item, it writes the `.access` file.
 
 So while the `.access` file of an item holds a digest, the summary next to
-it is a summary of that digest. With `[core] fsync=true`, the command syncs
+it is a summary of that digest. An `.access` entry that is a symlink, a
+FIFO, or another entry that is not a regular file and not a directory holds
+no digest: step 2 removes it, and step 4 writes a regular file. A directory
+at the name of the `.access` file fails step 2 with
+`error: i/o error: Is a directory (os error 21)`, and the files of the item
+stay as they were. With `[core] fsync=true`, the command syncs
 the directory of the `.access` file after the removal of step 2 and after
 the write of step 4, and the directory of the summary before step 4. A crash
 then cannot leave an `.access` file next to a summary of another digest.
@@ -6095,8 +6119,20 @@ keep their new files, and the summary of the refusal and the summaries after
 it keep their old files. The root summary comes first.
 
 Then it removes the files under `extensions/ostrya/summary/` of each item
-that has no summary, the `.access` files first. It removes the temp files of
-these names. It leaves each other entry of the directory.
+that has no summary, the `.access` files first. It also removes each temp
+file `<name>.tmp-<pid>-<n>` of these names. Such a file is the leftover of an
+interrupted write of an older version of the port, which wrote its temp
+files in the directory of the target. It leaves each other entry of the
+directory. A temp file of this form at the repository root stays.
+
+The command opens `extensions` with one `openat2`, and then
+`ostrya/summary` below it with one `openat2`, with `RESOLVE_BENEATH` and
+`RESOLVE_NO_SYMLINKS`. A symlink at `extensions`, `extensions/ostrya`, or
+`extensions/ostrya/summary` fails the command with
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`,
+and an entry that is not a directory fails it with
+`invalid format: PATH is not a directory`. `PATH` is the path of the open:
+`extensions` or `extensions/ostrya/summary`.
 
 `ostrya summary -u -c` writes the summaries of the items alone. It does not
 build, sign, or write the root summary, so `summary` and `summary.sig` stay
@@ -6113,7 +6149,25 @@ summary of an item again, as `ostrya summary -u` does. The key groups of `sign-s
 keys first. A one-way stream writes no summary.
 
 A mirror pull that writes `summary` writes no file under
-`extensions/ostrya/summary/`.
+`extensions/ostrya/summary/`. It writes `summary` and `summary.sig` through
+temp files in `tmp/`, as `ostrya summary -u` writes them, and syncs the
+repository root after the two moves.
+
+A read of a summary of the repository by the port, `summary`,
+`summary.sig`, or a file under `extensions/ostrya/summary/`, opens the file
+with one `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+`O_NONBLOCK`, in each open mode. The reads of `Repo`, of `ostrya serve`, and
+of the media finder are such reads. A symlink at a component of the path fails the read with
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
+A FIFO, a socket, a device, or a directory at the file fails the read with
+`invalid format: PATH is not a regular file`, and a FIFO does not block it.
+A file larger than 64 MiB fails the read with
+`invalid format: PATH is larger than its cap of 67108864 bytes`. `PATH` is
+relative to the repository root, for example
+`extensions/ostrya/summary/HEX`. A local pull reads `summary` and
+`summary.sig` of its source repository with one `openat` with
+`O_NONBLOCK`. That open follows a symlink, and the pull refuses a file that
+is not a regular file.
 
 ### The serve of a summary
 
@@ -6138,9 +6192,18 @@ file still names the file that it opened. When a write replaced the file
 during the request, the server starts again, at most three times, and then
 answers as for an absent path. Over HTTP, a 200 and a 404 of `summary` and
 `summary.sig` carry `Cache-Control: private`, because the body depends on
-the client. A 401 and a 403 do not. The server opens each component of the
-paths with no symlink followed. A request for a path under
+the client. A 401 and a 403 do not. A request for a path under
 `extensions/ostrya/` gets 404.
+
+The server opens `extensions` and then `ostrya/summary` below it as
+directories, with one `openat2` each, so the server needs read permission on
+`extensions/ostrya/summary`. It then opens the file and the `.access` file
+with one `openat2` each, relative to that directory. Each open has
+`RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, and the open of a file has
+`O_NONBLOCK`. A symlink at a component of a path gets the answer of a
+refused path. An absent component, a component that is not a directory, and
+a file that is not a regular file get the answer of an absent path. A FIFO
+does not block the request.
 
 ## The endpoints of `ostrya serve`
 
@@ -6194,8 +6257,10 @@ repository root in this way:
   sets it. Each value is as the repository config writes it. The
   view serves no other key and no other group. The view parses the
   repository config again when its inode number, size, modification time, or
-  change time differs from the last parse. The next answer then shows the
-  change.
+  change time differs from the last parse. One `statx` of `config` with no
+  symlink followed reads these values. The next answer then shows the
+  change. A symlink at `config` fails the read of the config, so the answer
+  is an error of the view.
 - The view serves these files as stored: the files under `refs/` and
   `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta`
   objects. In an `archive` repository, it also serves the `.filez` objects and
@@ -6231,8 +6296,13 @@ repository root in this way:
     a component that starts with `.`, other than `.` and `..`;
   - a symlink at another place on a path.
 
-  The walk starts at the `objects/` directory that the repository handle
-  opened. The open of the handle refuses a symlink at `objects`.
+  The view opens a stored file with one `openat2` with `RESOLVE_BENEATH`,
+  `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, relative to the repository root
+  or to the `objects/` directory that the repository handle opened, and
+  checks its type with one `statx`. The open of the handle refuses a symlink
+  at `objects`. A FIFO, a socket, a device, or a directory at a served path
+  is absent, and a FIFO does not block the request. The view reads the body
+  of an alias with `readlinkat` on a descriptor of the link itself.
 - The view refuses these paths:
   - `.lock` and `.update.lock`;
   - `tmp` and `state`, and each path under them;
@@ -6243,7 +6313,9 @@ repository root in this way:
 
   A refused path and an absent path get the same answer.
 - A directory on the path that the server cannot search, and a file that the
-  server cannot open, are errors of the view.
+  server cannot open, are errors of the view. For `summary` and
+  `summary.sig`, the view also needs read permission on
+  `extensions/ostrya/summary` ("The serve of a summary").
 
 Observed behavior: with no summary, a pull of an alias name succeeds when the
 commit has no ref binding.
@@ -7051,8 +7123,9 @@ The file:
   store the same bytes for the same tree.
 - The file has the mode `0644` in every mode, whatever the umask, and no
   extended attribute.
-- The write creates `extensions/ostrya/composefs/` and each `<xx>/` at the
-  first write into them, with the mode `0775` reduced by the umask. In a
+- The write creates `extensions/`, `extensions/ostrya/composefs/`, and each
+  `<xx>/` at the first write into them, with the mode `0775` reduced by the
+  umask. In a
   `bare-user-shared` repository each directory that the write creates gets
   `02770` ("bare-user-shared mode"). A directory that exists keeps its mode.
 
@@ -7065,8 +7138,10 @@ The key rule:
   of another form, and an image whose digest is not the value. It checks the
   digest before it installs the image.
 - A stored image whose digest is the value stays as it is. The write replaces
-  a stored image whose digest is not the value and a stored image that does
-  not read.
+  a stored image whose digest is not the value and a stored image whose read
+  fails with an I/O error. A symlink on the path of the stored image, and a
+  stored image that is not a regular file, fail the write with the error of
+  the read.
 
 The write:
 
@@ -7128,17 +7203,30 @@ The generation:
 The read:
 
 - Each read opens the image with one `openat2` of its path under the
-  repository root, with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. A symlink
-  at `extensions/`, `ostrya/`, `composefs/`, `<xx>/`, or the file fails the
-  read with `ELOOP`. Only `ENOENT` reads as an absent image. Each other error
-  of `openat2`, `ENOSYS` included, fails the read.
-- The write opens each directory of the path one component at a time with
-  `O_NOFOLLOW`, and refuses a component that is a symlink or no directory.
-  A symlink gives the error
-  `invalid format: PATH is a symlink; ostrya refuses a symlink in the repository`.
+  repository root, with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+  `O_NONBLOCK`, and checks its type with one `statx` of the open file, in
+  each open mode. A symlink at `extensions/`, `ostrya/`, `composefs/`,
+  `<xx>/`, or the file fails the read with
+  `invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
+  A FIFO, a socket, a device, or a directory at the file fails the read with
+  `invalid format: PATH is not a regular file`, and a FIFO does not block
+  it. `PATH` is the path of the image relative to the repository root. Only
+  `ENOENT` reads as an absent image. Each other error of `openat2`, `ENOSYS`
+  included, fails the read.
+- The write, the prune, and the fsck open `extensions` with one `openat2`,
+  and then `ostrya/composefs` below it with one `openat2`, with
+  `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. A symlink at a component gives
+  the error
+  `invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
   Each other entry that is no directory gives the error
-  `invalid format: PATH is not a directory`. `PATH` is the path of the
-  component relative to the repository root, for example `extensions/ostrya`.
+  `invalid format: PATH is not a directory`. `PATH` is the path of the open
+  relative to the repository root: `extensions` or
+  `extensions/ostrya/composefs`. The write opens each `<xx>/` directory of
+  its images one time with one `openat2`. When that open gives `ENOENT`, the
+  write makes the directory and opens it. It moves each image into its
+  `<xx>/` directory with one `renameat` relative to that descriptor. The
+  removal of images opens each `<xx>/` directory of its commits one time
+  with one `openat2`, and unlinks each image relative to it.
 
 No transfer carries the image. A pull, a push, a one-way stream, a static
 delta, the archive view, `ostrya serve`, and a bucket repository carry no

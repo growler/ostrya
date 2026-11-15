@@ -14,9 +14,10 @@ use super::MediaSkip;
 use super::mountinfo::{self, Mount};
 use crate::error::Result;
 use crate::repo::Repo;
+use crate::repo_fs::RepoDir;
 use crate::summary::{
     OSTREE_METADATA_REF, SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list,
-    read_root_file_with, summary_collection_id,
+    read_root_file_blocking, summary_collection_id,
 };
 
 /// The directory of the repository entries of the tool on a volume.
@@ -337,13 +338,14 @@ fn probe_candidate(
     if found.contains(&id) {
         return Ok(Probe::Found);
     }
-    let summary = read_root_file_with(candidate.as_fd(), SUMMARY_FILE, true)
+    let root = RepoDir::from_root_fd(candidate);
+    let summary = read_root_file_blocking(&root, SUMMARY_FILE)
         .map_err(MediaSkip::Unreadable)?
         .ok_or(MediaSkip::NoCollectionRef)?;
     if !lists_collection_ref(&summary).map_err(MediaSkip::Unreadable)? {
         return Err(MediaSkip::NoCollectionRef);
     }
-    let repo = Repo::open_strict_blocking(candidate, path).map_err(MediaSkip::Unreadable)?;
+    let repo = Repo::open_strict_blocking(root, path).map_err(MediaSkip::Unreadable)?;
     Ok(Probe::Media(id, repo, summary))
 }
 
@@ -588,7 +590,7 @@ mod tests {
             let found = one(choice.unwrap());
             assert_eq!(found.path, a.join(".ostree/repo"));
             assert_eq!(found.summary, media_summary());
-            assert!(found.repo.is_strict());
+            assert!(found.repo.remotes_dir().is_none());
             assert_eq!(found.repo.path(), a.join(".ostree/repo"));
             let choice = find_media(&client, table(&[(&b, "exfat"), (&a, "vfat")])).await;
             let MediaChoice::Many(paths) = choice.unwrap() else {

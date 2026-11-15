@@ -159,12 +159,17 @@ refuses it and does not give it that meaning. A caller with an absolute
 directory gives a `RemotesDir::Path` value. A create also refuses a path that
 is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
-The open of `objects`, the read of `config`, and each read of an object do
-not depend on the open mode. Each is one `openat2` with `RESOLVE_BENEATH` and
-`RESOLVE_NO_SYMLINKS`, with no fallback to `openat`. A symlink at `objects`
-or at `config` fails each open. A symlink at `objects/<xx>`, or at an object
+The open of `objects`, the read of `config`, each read of an object, each
+read of a summary of the repository by `Repo`, the server, and the media
+finder, and each read of a stored composefs image do not depend on the open
+mode. Each is one `openat2` with `RESOLVE_BENEATH` and
+`RESOLVE_NO_SYMLINKS`, with no fallback to `openat`. A local pull reads
+`summary`, `summary.sig`, and the files of a static delta of its source
+repository with one `openat` with `O_NONBLOCK`, which follows a symlink. A
+symlink at `objects` or at `config` fails each open. A symlink at `objects/<xx>`, or at an object
 that the repository mode stores as a regular file, fails each read of the
-object. `Repo::open_at_strict` reads no remotes directory. The open follows
+object. `Repo::open_at_strict` reads no remotes directory, and that is the
+one difference of the strict open mode. The open follows
 a symlink in the path of the root, because the caller names that path.
 
 ## The create of a repository
@@ -490,13 +495,18 @@ composefs images and of the summaries of the client groups refuses a symlink
 at `extensions/`, `extensions/ostrya/`, `extensions/ostrya/composefs/`, and
 `extensions/ostrya/summary/`. Each prune and fsck of the composefs images
 refuses the same symlinks. A symlink there makes a write or a removal reach
-a file outside the repository. The error names the path relative to the
-repository root:
-`invalid format: PATH is a symlink; ostrya refuses a symlink in the repository`.
-The read of a stored image is one `openat2` with `RESOLVE_NO_SYMLINKS`, so
-a symlink in its path fails the read with `ELOOP`. `ostrya serve` reads a
-summary with a walk that opens each component with `O_NOFOLLOW`. A symlink
-there gives no error, and the server answers 404, as for an absent summary.
+a file outside the repository. Each open of these paths is one `openat2`
+with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`: one for `extensions/`, one
+for the directory below it, and one for a file. The error names the path of
+the open, relative to the repository root:
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
+The read of a stored image and of a summary is one `openat2` of the path of
+the file, with `O_NONBLOCK`, and one `statx` of the open file, so a symlink
+in the path and a file that is not a regular file fail the read with
+`InvalidFormat`, and a FIFO does not block it. `ostrya serve` reads a
+summary with the same opens, relative to a handle of
+`extensions/ostrya/summary/`. A symlink there gives no error, and the
+server answers 404, as for an absent summary.
 
 ## The generation of the composefs image
 
@@ -601,12 +611,14 @@ namespace, and that it is not the initial user namespace. It does not check
 that the peer is a member of the namespaces that it sends. A client such as
 ostree-podman sends the namespaces of podman, which are not its own.
 
-The daemon opens the repository in the strict open mode. Each read of an
-object, of `config`, and of the stored image takes `openat2` with
-`RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so a symlink at any component of
-the path stops the read. The open has no fallback to `openat`: kernels older
-than 5.6 are not a target of the port, and `ENOSYS` is an error of the open,
-as each other errno is.
+The daemon opens the repository in the strict open mode, which reads no
+remotes directory. Each read of an object, of `config`, and of the stored
+image takes `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+`O_NONBLOCK` in each open mode, so a symlink at any component of the path
+stops the read, a FIFO does not block it, and a file that is not a regular
+file fails it. The open has no fallback to `openat`: kernels older than 5.6
+are not a target of the port, and `ENOSYS` is an error of the open, as each
+other errno is.
 
 The daemon reads the stored image as root, and the check of the `objects`
 directory does not cover its path. The access to the socket is the trust

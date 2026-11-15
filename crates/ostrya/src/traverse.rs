@@ -11,7 +11,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
-use std::os::fd::BorrowedFd;
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Value};
 
@@ -1401,37 +1400,6 @@ fn parse_object_entry(
     hex[2..].copy_from_slice(rest.as_bytes());
     let checksum = Checksum::from_hex(std::str::from_utf8(&hex).ok()?).ok()?;
     Some(ObjectName::new(checksum, ty))
-}
-
-/// Calls `f` with the name of each entry of an open directory, except `.` and
-/// `..`.
-///
-/// The name borrows the buffer of the reader.
-fn for_each_dir_name(dir: BorrowedFd<'_>, mut f: impl FnMut(&str) -> Result<()>) -> Result<()> {
-    let reader = rustix::fs::Dir::read_from(dir).map_err(|e| Error::Io(e.into()))?;
-    for entry in reader {
-        let entry = entry.map_err(|e| Error::Io(e.into()))?;
-        let bytes = entry.file_name().to_bytes();
-        if bytes == b"." || bytes == b".." {
-            continue;
-        }
-        // Object names and fanout names are ASCII, and a ref name is UTF-8.
-        // Any other name is not a loose object and not a ref.
-        if let Ok(name) = std::str::from_utf8(bytes) {
-            f(name)?;
-        }
-    }
-    Ok(())
-}
-
-/// Returns the entry names of an open directory, except `.` and `..`.
-pub(crate) fn read_dir_names(dir: BorrowedFd<'_>) -> Result<Vec<String>> {
-    let mut names = Vec::new();
-    for_each_dir_name(dir, |name| {
-        names.push(name.to_owned());
-        Ok(())
-    })?;
-    Ok(names)
 }
 
 /// Adds to `out` each ref file in the tree under `top`. `refs` is the handle

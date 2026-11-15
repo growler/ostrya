@@ -1680,7 +1680,6 @@ fn clone_metadata(
 ///
 /// A caller clears `syncfs` with fsync on only if a `syncfs` after the staging
 /// of the last object and the last image already made them durable.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn publish_blocking(
     root: &RepoDir,
     objects: &RepoDir,
@@ -1689,7 +1688,6 @@ pub(crate) fn publish_blocking(
     images: &[(String, String)],
     syncfs: bool,
     fsync: bool,
-    repo_mode: RepoMode,
 ) -> Result<()> {
     if syncfs {
         root.syncfs()?;
@@ -1710,7 +1708,7 @@ pub(crate) fn publish_blocking(
         }
         root.sync_dir("objects")?;
     }
-    crate::image_store::publish_blocking(root.as_fd(), staging.as_fd(), images, fsync, repo_mode)
+    crate::image_store::publish_blocking(root, staging, images, fsync)
 }
 
 /// Moves the entry `src_path` of `src` to the loose path `dest` below

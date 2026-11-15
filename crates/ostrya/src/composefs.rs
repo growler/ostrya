@@ -40,8 +40,10 @@
 //! Each write refuses a commit without the key and an image whose digest is
 //! not the key. A write never holds the whole image in memory. Each read
 //! opens the image with `openat2` under the root of the repository, with
-//! `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, so a symlink at any component
-//! of its path stops the read.
+//! `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`, so a symlink
+//! at any component of its path stops the read with
+//! [`Error::InvalidFormat`]. The read also refuses an image that is not a
+//! regular file with [`Error::InvalidFormat`], and does not wait on a FIFO.
 //!
 //! If `[ex-ostrya] generate-composefs` is `true`
 //! ([`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)),
@@ -254,7 +256,8 @@ pub enum ComposefsImageAdd {
     /// too.
     AlreadyValid,
     /// The repository holds an image of the commit, and its digest is not the
-    /// key of the commit or the image does not read. The write replaces it.
+    /// key of the commit or the read of the image fails with an I/O error.
+    /// The write replaces it.
     Replaced,
 }
 
@@ -493,8 +496,11 @@ impl Transaction {
     /// - With a stored image whose digest is the key, the call drops the image
     ///   and returns [`ComposefsImageAdd::AlreadyValid`].
     /// - With a stored image whose digest is not the key, or a stored image
-    ///   that does not read, the call stages the image and returns
-    ///   [`ComposefsImageAdd::Replaced`].
+    ///   whose read fails with [`Error::Io`], the call stages the image and
+    ///   returns [`ComposefsImageAdd::Replaced`].
+    /// - A symlink at a component of the path of the stored image, or a
+    ///   stored image that is not a regular file, fails the call with
+    ///   [`Error::InvalidFormat`].
     ///
     /// If the call does not stage the image, it removes the image file.
     ///
@@ -522,6 +528,8 @@ impl Transaction {
     /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
+    /// - [`Error::InvalidFormat`] if a symlink is at a component of the path
+    ///   of the stored image, or if the stored image is not a regular file.
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn attach_composefs_image(
         &self,
@@ -750,9 +758,10 @@ impl Transaction {
     /// `None` if the transaction staged an image of the commit or the
     /// repository holds a valid one, so the write changes nothing.
     ///
-    /// A stored image that does not read gives
+    /// A stored image whose read fails with [`Error::Io`] gives
     /// [`ComposefsImageAdd::Replaced`], so the rename of the publish replaces
-    /// it.
+    /// it. A symlink on the path of the stored image and a stored image that
+    /// is not a regular file give [`Error::InvalidFormat`].
     async fn image_state(
         &self,
         commit: &Checksum,
@@ -1192,9 +1201,11 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the open fails for a reason other than an absent
-    ///   file. A symlink at a component of the path fails the open with
-    ///   `ELOOP`.
+    /// - [`Error::InvalidFormat`] if a symlink is at a component of the path
+    ///   of the image, if a component before the image is not a directory, or
+    ///   if the image is not a regular file.
+    /// - [`Error::Io`] if the open fails for a reason other than an
+    ///   absent file.
     pub async fn has_composefs_image(&self, commit: &Checksum) -> Result<bool> {
         let repo = self.clone();
         let commit = *commit;
@@ -1219,6 +1230,8 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
+    /// - [`Error::InvalidFormat`] if a symlink is at a component of the path
+    ///   of the image, or if the image is not a regular file.
     /// - [`Error::Io`] if a read of the image or another file system operation
     ///   fails.
     pub async fn check_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageState> {
@@ -1243,10 +1256,12 @@ impl Repo {
     /// inode that the call checked.
     ///
     /// The call opens `extensions/ostrya/composefs/<xx>/<rest>.cfs` with one
-    /// `openat2` under the root of the repository, with `RESOLVE_BENEATH` and
-    /// `RESOLVE_NO_SYMLINKS`. A symlink at any component of the path fails the
-    /// open with `ELOOP`. The open has no fallback: an error of `openat2`,
-    /// `ENOSYS` included, fails the call.
+    /// `openat2` under the root of the repository, with `RESOLVE_BENEATH`,
+    /// `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`. A symlink at any component of
+    /// the path, and an image that is not a regular file, fail the call with
+    /// [`Error::InvalidFormat`]. The open has no fallback: an error of
+    /// `openat2`, `ENOSYS` included, fails the call. The returned file keeps
+    /// `O_NONBLOCK`, which changes no read of a regular file.
     ///
     /// If the image is sealed with fs-verity with SHA-256, 4096-byte blocks,
     /// no salt, and its full size, the call reads the digest from the kernel.
@@ -1272,6 +1287,8 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the commit object is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
+    /// - [`Error::InvalidFormat`] if a symlink is at a component of the path
+    ///   of the image, or if the image is not a regular file.
     /// - [`Error::Io`] if a read of the image or another file system operation
     ///   fails.
     pub async fn open_composefs_image_checked(
@@ -1294,7 +1311,10 @@ impl Repo {
             else {
                 return Err(Error::ComposefsImageNotFound { commit });
             };
-            let actual = match crate::file::sealed_digest(file.as_fd(), len, sealed) {
+            let kernel = sealed
+                .then(|| crate::repo_fs::verity_digest(file.as_fd(), len))
+                .flatten();
+            let actual = match kernel {
                 Some(digest) => digest,
                 None => {
                     let digest = image_file_digest(&mut file)?;
@@ -1336,24 +1356,17 @@ struct StoredImage {
     sealed: bool,
 }
 
-/// Opens the stored composefs image of `commit` in `repo` for reading, and
-/// reads its size and its fs-verity attribute with one `statx` of the open
-/// file. Returns `None` if the image is absent.
+/// Opens the stored composefs image of `commit` in `repo` for reading, with
+/// its size and its fs-verity attribute from the `statx` of the open. Returns
+/// `None` if the image is absent.
 fn open_stored_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<StoredImage>> {
-    let Some(file) = image_store::open_blocking(repo, commit)? else {
-        return Ok(None);
-    };
-    let stat = rustix::fs::statx(
-        &file,
-        "",
-        rustix::fs::AtFlags::EMPTY_PATH,
-        rustix::fs::StatxFlags::SIZE,
-    )?;
-    Ok(Some(StoredImage {
-        file,
-        len: stat.stx_size,
-        sealed: crate::file::is_sealed(&stat),
-    }))
+    Ok(
+        image_store::open_blocking(repo, commit)?.map(|opened| StoredImage {
+            file: opened.file,
+            len: opened.stat.size,
+            sealed: opened.stat.verity,
+        }),
+    )
 }
 
 /// Returns the fs-verity digest of the stored composefs image of `commit` in
@@ -1365,10 +1378,10 @@ pub(crate) fn stored_image_digest_blocking(
     repo: &Repo,
     commit: &Checksum,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(mut file) = image_store::open_blocking(repo, commit)? else {
+    let Some(mut opened) = image_store::open_blocking(repo, commit)? else {
         return Ok(None);
     };
-    Ok(Some(image_file_digest(&mut file)?))
+    Ok(Some(image_file_digest(&mut opened.file)?))
 }
 
 /// Returns the fs-verity digest of the bytes of `file` from its current

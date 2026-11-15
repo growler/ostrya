@@ -205,6 +205,7 @@ A symbolic link object of a \fB\%bare\fR or \fB\%bare\-user\-only\fR repository 
 A repository handle opens \fB\%tmp/\fR at its first use and keeps it.
 The open makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 Each write of a \fB\%.commitmeta\fR outside a transaction and of a \fB\%.tombstone\-commit\fR, and the fs\-verity probe of \fB\%[ex\-integrity] fsverity=maybe\fR, make their temporary file in that \fB\%tmp/\fR.
+Each write of \fB\%config\fR, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, and a file under \fB\%extensions/ostrya/summary/\fR also makes its temporary file there.
 If another process removes \fB\%tmp/\fR, these writes of the handle fail, and the caller opens the repository again.
 Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 The lock file of a staging directory opens by the rules of \fB\%.lock\fR.
@@ -224,11 +225,18 @@ Reserved.
 The repository holds no symbolic link.
 A ref alias and a symbolic link object of a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository are entries of the format, and the rule does not apply to them.
 The read of a symbolic link object reads its target and does not follow it.
-Each read and write of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, and these two directories.
-Each prune and fsck of the composefs images refuses the same symbolic links.
-The error names the path relative to the repository: \fB\%invalid format: <path> is a symlink; ostrya refuses a symlink in the repository\fR.
-A read of a composefs image refuses it with the error \fB\%ELOOP\fR, and the error names no path.
-A read of a summary by \fB\%ostrya serve\fR refuses it with no error, and the server answers 404, as for a summary that does not exist.
+Each read of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, these two directories, and each path below them.
+Each write and each removal of these files refuses a symbolic link at the same directories and at each directory below them.
+A write of a file under \fB\%extensions/ostrya/summary/\fR replaces a symbolic link at the file, and a removal removes a symbolic link at the file as the link.
+The target of the link stays.
+Each write of a composefs image reads the stored image first, so a symbolic link at the image fails the write.
+Each prune and fsck of the composefs images refuses the symbolic links at the same directories.
+The error names the path that ostrya opens, relative to the repository: \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
+For a directory, the path is \fB\%extensions\fR, \fB\%extensions/ostrya/summary\fR, or \fB\%extensions/ostrya/composefs\fR.
+For a read of a file, the path is the path of the file.
+A read of \fB\%summary\fR, \fB\%summary.sig\fR, a file under \fB\%extensions/ostrya/summary/\fR, or a composefs image also refuses a FIFO, a socket, a device, or a directory at the file, with the error \fB\%invalid format: <path> is not a regular file\fR, and a FIFO does not block it.
+A read of a summary by \fB\%ostrya serve\fR refuses a symbolic link with no error, and the server answers 404, as for a summary that does not exist.
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR open \fB\%extensions/ostrya/summary/\fR as a directory, so they need read permission on it.
 .TP
 \fB\%<repo>/extensions/ostrya/summary/\fR
 The summaries of the authentication items of the client groups.
@@ -258,7 +266,8 @@ With \fB\%[ex\-ostrya] generate\-composefs=true\fR, \fB\%ostrya commit\fR, \fB\%
 \fB\%ostrya prune\fR removes the images of the commits that it removes before the first commit, and keeps an image whose commit is absent.
 \fB\%ostrya fsck\fR checks it against the key of its commit, and notes an image whose commit is absent.
 With \fB\%generate\-composefs=true\fR, it also notes a complete commit with the key and no image.
-ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, and \fB\%RESOLVE_NO_SYMLINKS\fR, so a symbolic link in its path stops each read with the error \fB\%ELOOP\fR.
+ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, \fB\%RESOLVE_NO_SYMLINKS\fR, and \fB\%O_NONBLOCK\fR, so a symbolic link in its path stops each read and each write with the error \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
+An image that is not a regular file stops each read and each write with the error \fB\%invalid format: <path> is not a regular file\fR.
 No transfer carries it, and \fB\%ostrya serve\fR does not serve it.
 The \fB\%ostree\fR tool does not check, count, or remove it.
 .TP
@@ -297,9 +306,11 @@ When it exists, ostrya does not read the keyring of the remote in the remotes di
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
 .PP
-To change \fB\%config\fR, a ref, \fB\%summary\fR, a file under \fB\%extensions/ostrya/summary/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file and renames it over the target.
-The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-tmp\-*\fR below \fB\%tmp/\fR.
-A ref, an alias, a \fB\%.commitmeta\fR, and a \fB\%.tombstone\-commit\fR use \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR.
+To change \fB\%config\fR, a ref, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR and renames it over the target.
+A symbolic link at the target is replaced.
+With \fB\%core.fsync\fR on, ostrya syncs the temporary file with \fBfsync\fR(2) before the rename.
+\fB\%ostrya summary \-u\fR removes a file \fB\%<name>.tmp\-<pid>\-<n>\fR of a summary file under \fB\%extensions/ostrya/summary/\fR, which an interrupted write of an older version of ostrya left there.
+Such a file at the repository root stays.
 .SH STATIC DELTAS
 A static delta holds the objects that change between two commits, or all the objects of one commit.
 Its path uses a modified base64 form of the commit checksums: standard base64 with \fB\%/\fR changed to \fB\%_\fR and no trailing \fB\%=\fR, 43 characters in all.

@@ -846,6 +846,10 @@ impl Repo {
     ///   is less than `-1`.
     /// - [`Error::Core`] if `[core] fsync` or `[core] locking` of this handle
     ///   is not a boolean, or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock` or at `.update.lock`. The lock open
+    ///   follows no symlink. If the process cannot open a FIFO, a socket, or
+    ///   a device there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if a lock file, the write, the rename, or a sync fails
     ///   on the file system.
     pub async fn write_config(&self, keyfile: &KeyFile) -> Result<()> {
@@ -880,6 +884,10 @@ impl Repo {
     ///   is less than `-1`.
     /// - [`Error::Core`] if `[core] locking` of this handle is not a boolean,
     ///   or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock` or at `.update.lock`. The lock open
+    ///   follows no symlink. If the process cannot open a FIFO, a socket, or
+    ///   a device there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if a lock file or the removal fails on the file system.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
         if !valid_remote_name(remote) {

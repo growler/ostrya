@@ -1,8 +1,9 @@
 //! The repository lock and the process-global registry of lock files.
 //!
 //! [`LockKind`] holds the rules that a caller sees: the lock file, the
-//! in-process rules, and the wait. The record lock calls go through
-//! [`rustix::fs::fcntl_lock`]. The retry loop waits on [`ostrya_rt::Timer`].
+//! in-process rules, and the wait. The open of a lock file and the record lock
+//! calls go through the lock primitives of `repo_fs`. The retry loop waits on
+//! [`ostrya_rt::Timer`].
 //!
 //! A process-global registry maps the `(device, inode)` of each lock file to
 //! its lock. Each handle to one repository gets the same [`RepoLock`]: clones
@@ -21,29 +22,17 @@
 //! through two live descriptors.
 
 use std::collections::HashMap;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
-use ostrya_core::RepoMode;
-use rustix::fs::{AtFlags, FlockOperation, Mode, OFlags};
-use rustix::io::Errno;
-
 use crate::error::{Error, Result};
-use crate::perm;
+use crate::repo_fs::{self, FsError, RepoDir, RootFile};
 
 mod update;
 #[cfg(test)]
 pub(crate) use update::held_in_process as update_lock_held_in_process;
 pub(crate) use update::{UpdateLock, UpdateLockHeld, acquire_update};
-
-/// The repository lock file, relative to the repository root.
-const LOCK_FILE: &str = ".lock";
-
-/// The mode of a new lock file in the create call. The `ostree` command uses
-/// the same mode. The process umask reduces it. In a `bare-user-shared`
-/// repository, an `fchmod` after the create sets [`perm::SHARED_LOCK_MODE`].
-const LOCK_MODE: u32 = 0o660;
 
 /// The delay between two lock attempts while another holder has the lock.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -74,6 +63,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// creates to `0660` after the create. Each member of the repository group can
 /// then open the file for reading and writing. A file that another member
 /// created keeps its mode.
+///
+/// The open of the file follows no symlink. A symlink, a FIFO, a socket, a
+/// device, or a directory at `.lock` fails the lock, and the entry stays. The
+/// error is [`Error::InvalidFormat`], or [`Error::Io`] if the process cannot
+/// open a FIFO, a socket, or a device for write. The open of an existing file
+/// needs write access to it, also for a shared lock. If the file goes away
+/// between the create and the open, ostrya creates it again one time. The
+/// rules of a new file then apply to it, so a `bare-user-shared` repository
+/// gets the forced mode.
 ///
 /// If `.lock` and `.update.lock` are hard links to one inode, the repository
 /// lock and the update lock refuse each other. While the process has one of
@@ -230,13 +228,17 @@ fn registry() -> &'static Registry {
     })
 }
 
-/// Returns the registry entry for the file `name` under `repo_fd`.
+/// Returns the registry entry for the file `name` in the repository root
+/// `root`.
 ///
 /// The call does not open the file. The open and the close of a second
-/// descriptor to a lock file drop the live lock.
-fn probe<'r>(reg: &'r LockRegistry, repo_fd: BorrowedFd<'_>, name: &str) -> Option<&'r Entry> {
-    let stat = rustix::fs::statat(repo_fd, name, AtFlags::empty()).ok()?;
-    reg.get(&(stat.st_dev, stat.st_ino))
+/// descriptor to a lock file drop the live lock. The call reads the status of
+/// the entry with [`RepoDir::lstat`], which follows no symlink. A symlink at
+/// `name` thus gives the inode of the symlink, which the registry never holds.
+/// The call ignores each error of the read, and then gives `None`.
+fn probe<'r>(reg: &'r LockRegistry, root: &RepoDir, name: &str) -> Option<&'r Entry> {
+    let stat = root.lstat(name).ok()?;
+    reg.get(&(stat.dev, stat.ino))
 }
 
 /// What a registry entry holds for a lock of type `T`.
@@ -257,11 +259,17 @@ fn find<T>(entry: &Entry, view: fn(&Registered) -> Option<&Weak<T>>) -> Found<T>
     }
 }
 
-/// Returns the live lock of type `T` for the file `name` under `repo_fd`.
+/// Returns the live lock of type `T` for the root file `file` of the
+/// repository root `root`.
 ///
-/// If no live lock exists, the call opens the file by the rules of
-/// [`open_lock_file`]. It then registers the lock that `make` builds from the
-/// descriptor and the `(device, inode)`.
+/// If no live lock exists, the call opens the file with
+/// [`RepoDir::open_lock`]. That call creates an absent file with the mode of
+/// `file`, and forces the shared mode on a new file in a `bare-user-shared`
+/// repository. It follows no symlink, and refuses an entry that is not a
+/// regular file. A file that another member of the repository group created
+/// keeps its mode. The call then reads the `(device, inode)` of the open file,
+/// and registers the lock that `make` builds from the descriptor and the
+/// `(device, inode)`.
 ///
 /// Two rules keep one open descriptor for each lock inode in the process:
 ///
@@ -277,18 +285,18 @@ fn find<T>(entry: &Entry, view: fn(&Registered) -> Option<&Weak<T>>) -> Found<T>
 /// the inode between the probe and the insert. The first opens in the process
 /// therefore run one at a time.
 fn get_or_register<T>(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-    repo_mode: RepoMode,
+    root: &RepoDir,
+    file: RootFile,
     view: fn(&Registered) -> Option<&Weak<T>>,
     make: impl FnOnce(OwnedFd, (u64, u64)) -> (Arc<T>, Registered),
-) -> std::io::Result<Arc<T>> {
+) -> Result<Arc<T>> {
+    let name = file.name();
     let registry = registry();
     let mut reg = registry.map.lock().unwrap();
     loop {
-        match probe(&reg, repo_fd, name).map(|entry| find(entry, view)) {
+        match probe(&reg, root, name).map(|entry| find(entry, view)) {
             Some(Found::Live(existing)) => return Ok(existing),
-            Some(Found::Other) => return Err(shared_inode(name)),
+            Some(Found::Other) => return Err(Error::Io(shared_inode(name))),
             Some(Found::Dying) => {
                 reg = registry.gone.wait(reg).unwrap();
                 continue;
@@ -296,7 +304,9 @@ fn get_or_register<T>(
             None => {}
         }
 
-        let (fd, key) = open_lock_file(repo_fd, name, repo_mode)?;
+        let fd = root.open_lock(name)?;
+        let stat = repo_fs::stat_fd(fd.as_fd())?;
+        let key = (stat.dev, stat.ino);
         let Some(entry) = reg.get_mut(&key) else {
             let (lock, registered) = make(fd, key);
             reg.insert(
@@ -314,7 +324,7 @@ fn get_or_register<T>(
         entry.parked.push(fd);
         match found {
             Found::Live(existing) => return Ok(existing),
-            Found::Other => return Err(shared_inode(name)),
+            Found::Other => return Err(Error::Io(shared_inode(name))),
             Found::Dying => reg = registry.gone.wait(reg).unwrap(),
         }
     }
@@ -336,39 +346,6 @@ fn unregister(key: (u64, u64), fd: Option<OwnedFd>) {
     registry.gone.notify_all();
 }
 
-/// Opens the lock file `name` under `repo_fd` and returns the descriptor with
-/// the `(device, inode)` of the file.
-///
-/// If the file does not exist, the call creates it with [`LOCK_MODE`]. In a
-/// `bare-user-shared` repository, the call sets [`perm::SHARED_LOCK_MODE`] on
-/// a file that it creates. Each member of the repository group can then open
-/// the file `O_RDWR` and take the lock. The create attempt carries `O_EXCL` to
-/// tell the arm that made the file from the arm that found one. A file that
-/// another member owns keeps its mode.
-fn open_lock_file(
-    repo_fd: BorrowedFd<'_>,
-    name: &str,
-    repo_mode: RepoMode,
-) -> std::io::Result<(OwnedFd, (u64, u64))> {
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        name,
-        OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        Mode::from_raw_mode(LOCK_MODE),
-    ) {
-        Ok(fd) => {
-            perm::force_created_mode(&fd, repo_mode, perm::SHARED_LOCK_MODE)?;
-            fd
-        }
-        Err(Errno::EXIST) => {
-            rustix::fs::openat(repo_fd, name, OFlags::RDWR | OFlags::CLOEXEC, Mode::empty())?
-        }
-        Err(e) => return Err(e.into()),
-    };
-    let stat = rustix::fs::fstat(&fd)?;
-    Ok((fd, (stat.st_dev, stat.st_ino)))
-}
-
 /// Returns the error for a lock file whose inode the registry holds for
 /// another kind of lock.
 ///
@@ -382,35 +359,28 @@ fn shared_inode(name: &str) -> std::io::Error {
 }
 
 impl RepoLock {
-    /// Returns the [`RepoLock`] for the repository at `repo_fd`.
+    /// Returns the [`RepoLock`] for the repository of the root handle `root`.
     ///
-    /// The first use creates `<repo>/.lock` and registers the lock. The call
-    /// opens the file by the rules of [`open_lock_file`], through
-    /// [`get_or_register`]. It runs synchronous file system calls, so the
-    /// caller runs it on the blocking pool.
-    pub(crate) fn get_or_create(
-        repo_fd: BorrowedFd<'_>,
-        repo_mode: RepoMode,
-    ) -> std::io::Result<Arc<RepoLock>> {
-        get_or_register(
-            repo_fd,
-            LOCK_FILE,
-            repo_mode,
-            Registered::repo,
-            |fd, key| {
-                let lock = Arc::new(RepoLock {
-                    key,
-                    fd: Some(fd),
-                    state: Mutex::new(LockState {
-                        shared: 0,
-                        exclusive: 0,
-                        os: OsLock::Unlocked,
-                    }),
-                });
-                let registered = Registered::Repo(Arc::downgrade(&lock));
-                (lock, registered)
-            },
-        )
+    /// The first use creates `<repo>/.lock` if it is absent, and registers the
+    /// lock. The call opens the file through [`get_or_register`], which states
+    /// the rules of the open. A symlink or an entry that is not a regular file
+    /// at `.lock` gives [`Error::InvalidFormat`], or [`Error::Io`] if the
+    /// process cannot open the entry for write. The call runs synchronous
+    /// file system calls, so the caller runs it on the blocking pool.
+    pub(crate) fn get_or_create(root: &RepoDir) -> Result<Arc<RepoLock>> {
+        get_or_register(root, RootFile::Lock, Registered::repo, |fd, key| {
+            let lock = Arc::new(RepoLock {
+                key,
+                fd: Some(fd),
+                state: Mutex::new(LockState {
+                    shared: 0,
+                    exclusive: 0,
+                    os: OsLock::Unlocked,
+                }),
+            });
+            let registered = Registered::Repo(Arc::downgrade(&lock));
+            (lock, registered)
+        })
     }
 
     fn fd(&self) -> &OwnedFd {
@@ -425,7 +395,7 @@ impl RepoLock {
     /// keep one in-process holder from another. The hold counts do that. If a
     /// rule excludes the acquire, the call reports [`TryOutcome::WouldBlock`]
     /// and raises no count. The caller then goes into the retry loop.
-    fn try_acquire(&self, kind: LockKind) -> std::io::Result<TryOutcome> {
+    fn try_acquire(&self, kind: LockKind) -> std::result::Result<TryOutcome, FsError> {
         let mut st = self.state.lock().unwrap();
         match kind {
             LockKind::Shared => {
@@ -438,15 +408,12 @@ impl RepoLock {
                     st.shared += 1;
                     return Ok(TryOutcome::Acquired);
                 }
-                match rustix::fs::fcntl_lock(self.fd(), FlockOperation::NonBlockingLockShared) {
-                    Ok(()) => {
-                        st.os = OsLock::Shared;
-                        st.shared += 1;
-                        Ok(TryOutcome::Acquired)
-                    }
-                    Err(e) if would_block(e) => Ok(TryOutcome::WouldBlock),
-                    Err(e) => Err(e.into()),
+                if !repo_fs::try_lock(self.fd().as_fd(), LockKind::Shared)? {
+                    return Ok(TryOutcome::WouldBlock);
                 }
+                st.os = OsLock::Shared;
+                st.shared += 1;
+                Ok(TryOutcome::Acquired)
             }
             LockKind::Exclusive => {
                 // An exclusive acquire waits for every other holder, an
@@ -455,15 +422,12 @@ impl RepoLock {
                 if st.shared > 0 || st.exclusive > 0 {
                     return Ok(TryOutcome::WouldBlock);
                 }
-                match rustix::fs::fcntl_lock(self.fd(), FlockOperation::NonBlockingLockExclusive) {
-                    Ok(()) => {
-                        st.os = OsLock::Exclusive;
-                        st.exclusive += 1;
-                        Ok(TryOutcome::Acquired)
-                    }
-                    Err(e) if would_block(e) => Ok(TryOutcome::WouldBlock),
-                    Err(e) => Err(e.into()),
+                if !repo_fs::try_lock(self.fd().as_fd(), LockKind::Exclusive)? {
+                    return Ok(TryOutcome::WouldBlock);
                 }
+                st.os = OsLock::Exclusive;
+                st.exclusive += 1;
+                Ok(TryOutcome::Acquired)
             }
         }
     }
@@ -489,7 +453,7 @@ impl RepoLock {
         // A shared holder and an exclusive holder exclude each other, so one of
         // the two counts is zero, and the target here is `Unlocked`. The call
         // ignores errors, so a release never fails, also in a drop.
-        let _ = rustix::fs::fcntl_lock(self.fd(), FlockOperation::Unlock);
+        let _ = repo_fs::unlock(self.fd().as_fd());
         st.os = target;
     }
 }
@@ -499,11 +463,6 @@ impl Drop for RepoLock {
         // Closing the descriptor releases any residual record lock.
         unregister(self.key, self.fd.take());
     }
-}
-
-/// Returns `true` if a lock error means that another holder has the lock.
-fn would_block(e: Errno) -> bool {
-    e == Errno::AGAIN || e == Errno::ACCESS
 }
 
 /// A hold on the repository lock. The drop of the guard releases the hold.
@@ -581,12 +540,14 @@ pub(crate) async fn acquire(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::fd::{AsFd, AsRawFd};
+    use ostrya_core::RepoMode;
+    use std::os::fd::AsRawFd;
 
-    /// A repository root fd over a throwaway directory, for lock unit tests.
+    /// A repository root handle over a throwaway directory, for lock unit
+    /// tests.
     struct Scratch {
         _dir: std::path::PathBuf,
-        fd: OwnedFd,
+        root: RepoDir,
     }
 
     impl Scratch {
@@ -598,18 +559,18 @@ mod tests {
                 std::env::temp_dir().join(format!("ostrya-lock-{}-{tag}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
-            let fd = rustix::fs::openat(
-                rustix::fs::CWD,
-                &dir,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .unwrap();
-            Scratch { _dir: dir, fd }
+            let root = RepoDir::open_root(rustix::fs::CWD, &dir)
+                .unwrap()
+                .with_repo_mode(RepoMode::Bare);
+            Scratch { _dir: dir, root }
         }
 
-        fn repo_fd(&self) -> BorrowedFd<'_> {
-            self.fd.as_fd()
+        fn root(&self) -> &RepoDir {
+            &self.root
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self._dir
         }
     }
 
@@ -632,7 +593,7 @@ mod tests {
     #[test]
     fn shared_holders_share_one_descriptor_lock() {
         let scratch = Scratch::new("shared");
-        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let lock = RepoLock::get_or_create(scratch.root()).unwrap();
 
         assert!(matches!(
             lock.try_acquire(LockKind::Shared).unwrap(),
@@ -653,7 +614,7 @@ mod tests {
     #[test]
     fn exclusive_waits_for_a_shared_holder() {
         let scratch = Scratch::new("wait");
-        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let lock = RepoLock::get_or_create(scratch.root()).unwrap();
 
         lock.try_acquire(LockKind::Shared).unwrap();
         assert_eq!(os_lock(&lock), OsLock::Shared);
@@ -683,7 +644,7 @@ mod tests {
     #[test]
     fn shared_waits_for_an_exclusive_holder() {
         let scratch = Scratch::new("shared-waits");
-        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let lock = RepoLock::get_or_create(scratch.root()).unwrap();
 
         assert!(matches!(
             lock.try_acquire(LockKind::Exclusive).unwrap(),
@@ -718,7 +679,7 @@ mod tests {
     #[test]
     fn a_second_exclusive_waits_for_the_first() {
         let scratch = Scratch::new("exclusive-waits");
-        let lock = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let lock = RepoLock::get_or_create(scratch.root()).unwrap();
 
         assert!(matches!(
             lock.try_acquire(LockKind::Exclusive).unwrap(),
@@ -752,8 +713,8 @@ mod tests {
     #[test]
     fn one_repo_lock_is_shared_across_handles_and_reclaimed() {
         let scratch = Scratch::new("registry");
-        let a = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
-        let b = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+        let a = RepoLock::get_or_create(scratch.root()).unwrap();
+        let b = RepoLock::get_or_create(scratch.root()).unwrap();
         assert!(Arc::ptr_eq(&a, &b), "same repo yields one shared lock");
         let key = a.key;
 
@@ -788,7 +749,7 @@ mod tests {
     fn a_new_lock_survives_the_close_of_a_dropped_one() {
         for _ in 0..20 {
             let scratch = Scratch::new("redrop");
-            let old = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+            let old = RepoLock::get_or_create(scratch.root()).unwrap();
             let weak = Arc::downgrade(&old);
 
             // The held registry mutex stops the drop of `old` before it
@@ -800,7 +761,7 @@ mod tests {
                 std::thread::yield_now();
             }
             drop(reg);
-            let new = RepoLock::get_or_create(scratch.repo_fd(), RepoMode::Bare).unwrap();
+            let new = RepoLock::get_or_create(scratch.root()).unwrap();
             assert!(matches!(
                 new.try_acquire(LockKind::Exclusive).unwrap(),
                 TryOutcome::Acquired
@@ -810,5 +771,97 @@ mod tests {
             assert!(holds_write_lock(&new), "the close dropped the new lock");
             new.release(LockKind::Exclusive);
         }
+    }
+
+    /// Returns the error of the open of the lock file `name` in `root`.
+    /// `name` is `.lock` or `.update.lock`.
+    fn lock_error(root: &RepoDir, name: &str) -> Error {
+        if name == RootFile::Lock.name() {
+            RepoLock::get_or_create(root).map(drop).unwrap_err()
+        } else {
+            UpdateLock::get_or_create(root).map(drop).unwrap_err()
+        }
+    }
+
+    /// Runs [`lock_error`] in a new thread, and panics if it does not return
+    /// in 10 seconds. Before the panic, an open of the FIFO `fifo` for write
+    /// releases an open that waits for a writer.
+    fn lock_error_without_block(root: &RepoDir, name: &str, fifo: &std::path::Path) -> Error {
+        use std::sync::mpsc;
+
+        let (tx, rx) = mpsc::channel();
+        let (root, name) = (root.clone(), name.to_owned());
+        let worker = std::thread::spawn(move || {
+            let _ = tx.send(lock_error(&root, &name));
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(err) => {
+                worker.join().unwrap();
+                err
+            }
+            Err(_) => {
+                let _ = rustix::fs::open(
+                    fifo,
+                    rustix::fs::OFlags::WRONLY
+                        | rustix::fs::OFlags::NONBLOCK
+                        | rustix::fs::OFlags::CLOEXEC,
+                    rustix::fs::Mode::empty(),
+                );
+                panic!("the open of the FIFO {} blocked", fifo.display());
+            }
+        }
+    }
+
+    #[test]
+    fn a_lock_file_that_is_a_symlink_or_not_a_regular_file_is_refused() {
+        let outside = Scratch::new("refused-outside");
+        let target = outside.path().join("target");
+        std::fs::write(&target, b"outside bytes").unwrap();
+        let dangling = outside.path().join("absent");
+        let symlink_text = "passes through a symlink; ostrya refuses a symlink in the repository";
+        let not_regular_text = "is not a regular file";
+
+        for name in [RootFile::Lock.name(), RootFile::UpdateLock.name()] {
+            let cases = [
+                ("symlink", symlink_text),
+                ("dangling", symlink_text),
+                ("fifo", not_regular_text),
+                ("socket", not_regular_text),
+                ("directory", not_regular_text),
+            ];
+            for (label, text) in cases {
+                let scratch = Scratch::new("refused");
+                let at = scratch.path().join(name);
+                match label {
+                    "symlink" => std::os::unix::fs::symlink(&target, &at).unwrap(),
+                    "dangling" => std::os::unix::fs::symlink(&dangling, &at).unwrap(),
+                    "fifo" => rustix::fs::mknodat(
+                        rustix::fs::CWD,
+                        &at,
+                        rustix::fs::FileType::Fifo,
+                        rustix::fs::Mode::from_raw_mode(0o600),
+                        0,
+                    )
+                    .unwrap(),
+                    "socket" => drop(std::os::unix::net::UnixListener::bind(&at).unwrap()),
+                    _ => std::fs::create_dir(&at).unwrap(),
+                }
+                let err = lock_error_without_block(scratch.root(), name, &at);
+                let expected = format!("{name} {text}");
+                assert!(
+                    matches!(&err, Error::InvalidFormat(m) if *m == expected),
+                    "{name} as a {label}: {err:?}"
+                );
+                assert!(
+                    std::fs::symlink_metadata(&at).is_ok(),
+                    "{name} as a {label} stays"
+                );
+            }
+        }
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+        assert!(
+            std::fs::symlink_metadata(&dangling).is_err(),
+            "the target of a dangling symlink is not created"
+        );
     }
 }

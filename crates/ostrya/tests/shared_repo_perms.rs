@@ -160,7 +160,7 @@ fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
     let tmp = repo_path.join("tmp");
     let checksum = ostrya::Checksum::from_bytes([7; 32]);
     block_on(async {
-        let repo = Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserShared))
+        Repo::create(&repo_path, CreateOptions::new(RepoMode::BareUserShared))
             .await
             .expect("create the repository");
         std::fs::remove_dir_all(&tmp).expect("remove tmp/");

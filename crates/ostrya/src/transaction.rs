@@ -224,7 +224,10 @@ struct DetachedQueue {
 /// A transaction stages its objects in `tmp/staging-<boot-id>-XXXXXX`. It
 /// creates the directory when it begins and removes it when it ends. While the
 /// transaction lives, it holds an exclusive record lock on the sibling file
-/// `staging-<boot-id>-XXXXXX-lock`.
+/// `staging-<boot-id>-XXXXXX-lock`. The lock file opens by the rules of
+/// `.lock` ([`LockKind`](crate::LockKind)). A new lock file gets the mode
+/// `0600` in place of `0660`. In a `bare-user-shared` repository, ostrya sets
+/// the mode of a new lock file to `0660`, as for `.lock`.
 ///
 /// The transaction makes `tmp/` and `tmp/cache` if they are absent. It
 /// follows no symlink at `tmp` or at `tmp/cache`: a symlink there, or an
@@ -249,6 +252,13 @@ struct DetachedQueue {
 /// It never touches `tmp/cache`, and it never removes a staging directory that
 /// this process owns. A staging lock file has no age test, because a
 /// transaction can live longer than `tmp-expiry-secs` and still hold the lock.
+///
+/// The reap follows no symlink. It opens a staging lock file with no follow,
+/// and never creates it. A symlink, a FIFO, a socket, a device, or a
+/// directory at the lock name keeps the staging directory and the lock entry.
+/// It skips each entry whose name is not UTF-8. The removal of a directory
+/// does not go into a mount: a mount point in the tree stops the removal of
+/// that tree, and the mount point and its content stay.
 ///
 /// A ref write, a detached-metadata write, and a tombstone write create a temp
 /// entry at the top level of `tmp/` and rename it over the target. The entry
@@ -1782,8 +1792,8 @@ impl Transaction {
             let staged = self.staged.lock().unwrap();
             staged.objects.len() + staged.images.len()
         };
-        let repo_fd = self.repo.repo_fd().try_clone_to_owned()?;
-        ostrya_rt::unblock(move || rustix::fs::syncfs(repo_fd.as_fd())).await?;
+        let root = self.repo.root_dir().clone();
+        ostrya_rt::unblock(move || root.syncfs()).await?;
         self.staged.lock().unwrap().presynced = Some(count);
         Ok(())
     }
@@ -1904,7 +1914,7 @@ impl DetachedJob {
             .collect();
         if !staged.is_empty() {
             if self.fsync && !self.staged_durable {
-                rustix::fs::syncfs(self.staging.as_fd())?;
+                self.staging.syncfs()?;
             }
             crate::commit::install_detached_blocking(
                 &self.root,

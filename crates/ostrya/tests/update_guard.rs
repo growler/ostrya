@@ -178,6 +178,28 @@ fn an_existing_lock_file_keeps_its_mode() {
     assert_eq!(mode_of(&file), 0o600);
 }
 
+/// A symlink at `.update.lock` fails `begin_update`. The open follows no
+/// symlink, so the target keeps its bytes.
+#[test]
+fn a_symlink_at_the_lock_file_fails_begin_update() {
+    let tmp = TmpDir::new("guard-file-symlink");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    let target = tmp.path().join("outside");
+    std::fs::write(&target, b"outside bytes").unwrap();
+    std::os::unix::fs::symlink(&target, path.join(UPDATE_LOCK_FILE)).unwrap();
+
+    let repo = open(&path);
+    let err = block_on(repo.begin_update()).map(drop).unwrap_err();
+    let expected = format!(
+        "{UPDATE_LOCK_FILE} passes through a symlink; ostrya refuses a symlink in the repository"
+    );
+    assert!(
+        matches!(&err, Error::InvalidFormat(m) if *m == expected),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+}
+
 /// In a `bare-user-shared` repository, the lock file gets mode 0660 under a
 /// umask of 0077. The umask is a property of the process, so the check runs
 /// in a child process. The child is this test binary, which runs this test

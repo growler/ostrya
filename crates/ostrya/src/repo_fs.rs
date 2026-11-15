@@ -31,6 +31,7 @@ mod read;
 mod temp;
 mod write;
 
+pub(crate) use lock::{try_lock, unlock};
 pub(crate) use read::{verity_digest, xattr, xattrs};
 pub(crate) use temp::{TempFile, TempLink};
 pub(crate) use write::{Cloned, clone_or_copy, link, rename};

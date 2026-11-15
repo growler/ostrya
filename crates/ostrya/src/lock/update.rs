@@ -26,20 +26,18 @@
 //! The lock ignores `[core] locking` and always takes the record lock.
 
 use std::collections::VecDeque;
-use std::os::fd::{BorrowedFd, OwnedFd};
+#[cfg(test)]
+use std::os::fd::BorrowedFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
 use futures_lite::FutureExt;
-use ostrya_core::RepoMode;
-use rustix::fs::FlockOperation;
 
-use super::{POLL_INTERVAL, Registered, get_or_register, unregister, would_block};
+use super::{LockKind, POLL_INTERVAL, Registered, get_or_register, unregister};
 use crate::error::{Error, Result};
-
-/// The update lock file, relative to the repository root.
-const UPDATE_LOCK_FILE: &str = ".update.lock";
+use crate::repo_fs::{self, FsError, RepoDir, RootFile};
 
 /// The in-process state of an update lock: the hold and the queue of waiters.
 #[derive(Debug)]
@@ -65,38 +63,33 @@ pub(crate) struct UpdateLock {
 }
 
 impl UpdateLock {
-    /// Returns the [`UpdateLock`] of the repository at `repo_fd`.
+    /// Returns the [`UpdateLock`] of the repository of the root handle
+    /// `root`.
     ///
-    /// On first use, the call creates `<repo>/.update.lock` and registers the
-    /// lock. It makes synchronous file system calls, so run it on the blocking
-    /// pool.
+    /// On first use, the call creates `<repo>/.update.lock` if it is absent,
+    /// and registers the lock. It makes synchronous file system calls, so run
+    /// it on the blocking pool.
     ///
     /// The call opens the file by the rules of `.lock`, through the registry
-    /// helper that the repository lock uses. It refuses a file that shares its
-    /// inode with `.lock`.
-    pub(crate) fn get_or_create(
-        repo_fd: BorrowedFd<'_>,
-        repo_mode: RepoMode,
-    ) -> std::io::Result<Arc<UpdateLock>> {
-        get_or_register(
-            repo_fd,
-            UPDATE_LOCK_FILE,
-            repo_mode,
-            Registered::update,
-            |fd, key| {
-                let lock = Arc::new(UpdateLock {
-                    key,
-                    fd: Some(fd),
-                    state: Mutex::new(UpdateState {
-                        held: false,
-                        next_ticket: 0,
-                        queue: VecDeque::new(),
-                    }),
-                });
-                let registered = Registered::Update(Arc::downgrade(&lock));
-                (lock, registered)
-            },
-        )
+    /// helper that the repository lock uses. A symlink or an entry that is not
+    /// a regular file at `.update.lock` gives [`Error::InvalidFormat`], or
+    /// [`Error::Io`] if the process cannot open the entry for write. The
+    /// call refuses a file that shares its inode with `.lock` with
+    /// [`Error::Io`].
+    pub(crate) fn get_or_create(root: &RepoDir) -> Result<Arc<UpdateLock>> {
+        get_or_register(root, RootFile::UpdateLock, Registered::update, |fd, key| {
+            let lock = Arc::new(UpdateLock {
+                key,
+                fd: Some(fd),
+                state: Mutex::new(UpdateState {
+                    held: false,
+                    next_ticket: 0,
+                    queue: VecDeque::new(),
+                }),
+            });
+            let registered = Registered::Update(Arc::downgrade(&lock));
+            (lock, registered)
+        })
     }
 
     fn fd(&self) -> &OwnedFd {
@@ -138,7 +131,7 @@ impl Drop for UpdateLockHeld {
     fn drop(&mut self) {
         // The record lock goes first, because no waiter makes a request while
         // `held` is `true`. The release ignores errors, so it never fails.
-        let _ = rustix::fs::fcntl_lock(self.lock.fd(), FlockOperation::Unlock);
+        let _ = repo_fs::unlock(self.lock.fd().as_fd());
         let waker = match self.lock.state.lock() {
             Ok(mut st) => {
                 st.held = false;
@@ -195,22 +188,19 @@ impl Place {
     /// place the head, and returns `Poll::Pending`. The request and the grant
     /// happen under the state mutex in one poll, so a dropped wait cannot leave
     /// a hold that no guard releases.
-    fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<Turn>> {
+    fn poll_turn(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<Turn, FsError>> {
         let mut st = self.lock.state.lock().unwrap();
         let head = st.queue.front().map(|(ticket, _)| *ticket) == Some(self.ticket);
         if head && !st.held {
-            return match rustix::fs::fcntl_lock(
-                self.lock.fd(),
-                FlockOperation::NonBlockingLockExclusive,
-            ) {
-                Ok(()) => {
+            return match repo_fs::try_lock(self.lock.fd().as_fd(), LockKind::Exclusive) {
+                Ok(true) => {
                     st.held = true;
                     st.queue.pop_front();
                     self.granted = true;
                     Poll::Ready(Ok(Turn::Granted))
                 }
-                Err(e) if would_block(e) => Poll::Ready(Ok(Turn::Contended)),
-                Err(e) => Poll::Ready(Err(e.into())),
+                Ok(false) => Poll::Ready(Ok(Turn::Contended)),
+                Err(e) => Poll::Ready(Err(e)),
             };
         }
         if let Some((_, waker)) = st.queue.iter_mut().find(|(t, _)| *t == self.ticket) {
@@ -268,7 +258,7 @@ pub(crate) async fn acquire_update(
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 turn.or(async {
                     ostrya_rt::Timer::after(remaining).await;
-                    Ok::<_, std::io::Error>(Turn::TimedOut)
+                    Ok::<_, FsError>(Turn::TimedOut)
                 })
                 .await?
             }
@@ -305,9 +295,10 @@ pub(crate) async fn acquire_update(
 /// `false`.
 #[cfg(test)]
 pub(crate) fn held_in_process(repo_fd: BorrowedFd<'_>) -> bool {
+    let root = RepoDir::from_root_fd(repo_fd.try_clone_to_owned().unwrap());
     let found = {
         let reg = super::registry().map.lock().unwrap();
-        super::probe(&reg, repo_fd, UPDATE_LOCK_FILE)
+        super::probe(&reg, &root, RootFile::UpdateLock.name())
             .map(|entry| super::find(entry, Registered::update))
     };
     // The registry mutex is released before the lock can drop, because the
@@ -331,9 +322,9 @@ const _: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::LockKind;
     use crate::{CreateOptions, Repo};
     use futures_lite::future::poll_once;
+    use ostrya_core::RepoMode;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::pin::Pin;
@@ -344,6 +335,9 @@ mod tests {
 
     /// The environment variable that names the marker file of the umask child.
     const UMASK_ENV: &str = "OSTRYA_UPDATE_UMASK_CHILD";
+
+    /// The update lock file, relative to the repository root.
+    const UPDATE_LOCK_FILE: &str = ".update.lock";
 
     /// A scratch directory that holds a repository at `repo`. The drop removes
     /// the directory.
@@ -395,7 +389,7 @@ mod tests {
     /// Returns the lock of `repo` from the registry that holds the cached lock
     /// of the handle.
     fn lock_of(repo: &Repo) -> Arc<UpdateLock> {
-        UpdateLock::get_or_create(repo.repo_fd(), RepoMode::BareUser).unwrap()
+        UpdateLock::get_or_create(repo.root_dir()).unwrap()
     }
 
     /// Returns the number of waiters in the queue of `lock`.
@@ -814,6 +808,43 @@ mod tests {
             // that set the lock. It lists only the locks that this process set
             // through that descriptor. It is a consistent snapshot, and
             // `/proc/locks` gives no consistent snapshot.
+            let (lock, _) = guard.hold.as_ref().unwrap();
+            let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
+            let info = std::fs::read_to_string(path).unwrap();
+            let held = info.lines().any(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                fields.len() > 4
+                    && fields[0] == "lock:"
+                    && fields[2] == "POSIX"
+                    && fields[4] == "READ"
+            });
+            assert!(held, "the repository lock was dropped:\n{info}");
+        });
+    }
+
+    #[test]
+    fn a_lock_file_that_is_a_symlink_to_the_repository_lock_is_refused() {
+        use std::os::fd::AsRawFd;
+
+        let scratch = Scratch::new("symlinked");
+        let repo = scratch.create(RepoMode::BareUser);
+        ostrya_rt::block_on(async {
+            let guard = repo.lock_repo(LockKind::Shared).await.unwrap();
+            std::os::unix::fs::symlink(".lock", scratch.path().join(UPDATE_LOCK_FILE)).unwrap();
+
+            let err = repo.lock_update().await.unwrap_err();
+            let expected = format!(
+                "{UPDATE_LOCK_FILE} passes through a symlink; \
+                 ostrya refuses a symlink in the repository"
+            );
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if *m == expected),
+                "{err:?}"
+            );
+
+            // The kernel still records the shared lock of this process on the
+            // inode of `.lock`. The fdinfo of the descriptor that set the lock
+            // is a consistent snapshot of the locks set through it.
             let (lock, _) = guard.hold.as_ref().unwrap();
             let path = format!("/proc/self/fdinfo/{}", lock.fd().as_raw_fd());
             let info = std::fs::read_to_string(path).unwrap();

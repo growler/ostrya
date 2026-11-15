@@ -7422,6 +7422,44 @@ Observed by running the tool (2026.1).
   --delete-commit` with `core.tombstone-commits=true` and the same symlink
   exits 0 and writes the `.tombstone-commit`. Its temp file is in the target
   of the symlink. A target on another file system was not observed.
+  The port removes a staging directory and an aged directory of `tmp` with
+  no entry into a mount. A mount point in such a tree stops the removal of
+  that tree, and the mount point and its content stay. The reap of `tmp/`
+  below states the divergence.
+- The port opens `.lock`, `.update.lock`, and each staging lock file
+  `tmp/staging-<boot-id>-XXXXXX-lock` with no follow. A symlink, a FIFO, a
+  socket, a device, or a directory at `.lock` or at `.update.lock` fails the
+  command at exit 1, and the entry stays. The error is `invalid format:
+  <name> passes through a symlink; ostrya refuses a symlink in the
+  repository` for a symlink, and `invalid format: <name> is not a regular
+  file` for each other type. A FIFO, a socket, or a device that the process
+  cannot open for write gives the I/O error `Permission denied` in place of
+  `is not a regular file`, because the kernel checks the write access before
+  the type. `<name>` is `.lock` or `.update.lock`. Under
+  `[core] locking=false` the port does not open `.lock`, so an entry there
+  does not fail a command. `../format-reference.md`, "Repository lock and
+  staging", states the open. The test
+  `commit_refuses_a_symlink_at_the_repository_lock` in
+  `crates/ostrya-cli/tests/cli.rs` pins the error of `commit`. With libostree
+  2026.4 on 2026-11-15, `commit` and `prune --refs-only` open `.lock` with
+  one `openat` with `O_RDWR|O_CREAT|O_CLOEXEC` and the mode `0660`, with no
+  `O_NOFOLLOW`, no `O_NONBLOCK`, and no `O_EXCL`. They lock it with
+  `F_OFD_SETLK`. The results for each entry at `.lock` are:
+  - A symlink to an outside regular file: the tool follows it, locks the
+    target, and exits 0. The target keeps its bytes and its mtime.
+  - A dangling symlink: the tool follows it, creates the target as an empty
+    file with the mode `0660` reduced by the umask, locks it, and exits 0.
+  - A FIFO: the open does not wait, the lock succeeds, and the tool exits 0.
+    The FIFO stays.
+  - A directory: the tool exits 1 with `error: Opening lock file
+    <repo>/.lock failed: Is a directory`.
+  - A socket: the tool exits 1 with `error: Opening lock file <repo>/.lock
+    failed: No such device or address`.
+
+  The tool opens a staging lock file with
+  `O_RDWR|O_CREAT|O_NOCTTY|O_NOFOLLOW|O_CLOEXEC` and the mode `0600`, and
+  locks it with `F_OFD_SETLK` and `F_WRLCK`. The tool never opens
+  `.update.lock`.
 - The global option `--remotes-config-dir=PATH` and the key `[ex-ostrya]
   remotes-config-dir` are port extensions. The tool has no such option and
   ignores the key. The `ostrya` command selects the remotes directory of a
@@ -7477,7 +7515,7 @@ Observed by running the tool (2026.1).
   entries on both sides (`commit_reaps_aged_tmp_entries_as_the_tool_does` in
   `crates/ostrya-cli/tests/cli.rs`). No matrix cell states the comparison,
   because `tmp/` carries no published state and the oracles read `objects/`
-  and the refs tree. Three divergences stand:
+  and the refs tree. Six divergences stand:
   - The port exempts a `staging-*-lock` file from the age test, and it removes a
     staging directory with no lock file only once its age exceeds
     `tmp-expiry-secs`. The tool unlinks a held lock file that is older than
@@ -7494,6 +7532,34 @@ Observed by running the tool (2026.1).
     take. The port creates a new staging directory for each transaction and
     reuses none. "P2", in the signing divergences, records what each leaves
     in `tmp/` after a run.
+  - The port opens the lock file of a `staging-*` directory with no follow,
+    and never creates it in the reap. A symlink, a FIFO, a socket, a device,
+    or a directory at the lock name keeps the directory and the lock entry at
+    any age, and the transaction begins. With libostree 2026.4 on
+    2026-11-15, `commit` over a staging directory of the current boot, new
+    or two days old, gives these results:
+    - A symlink to an outside regular file at the lock name: the tool exits
+      1 with `error: Too many levels of symbolic links`, after the warning
+      `Failed to auto-cleanup OSTree transaction: tmpdir cleanup: Cleaning up
+      txn dir <name>: Too many levels of symbolic links`. The directory and
+      the symlink stay, and the target keeps its bytes.
+    - A FIFO at the lock name: the tool locks the FIFO, uses the directory
+      for the commit, and then removes the directory, its old content, and
+      the FIFO. It exits 0.
+    - A directory at the lock name: the tool uses the directory
+      `<name>-lock` as a staging directory with the lock file
+      `<name>-lock-lock`, and then removes both. The directory `<name>` and
+      its content stay. It exits 0.
+  - The removal of a tree in the port does not go into a mount. A mount
+    point in a staging directory or in an aged directory stops the removal
+    of that tree, and the mount point and its content stay. The tool was not
+    observed with a mount below `tmp/`.
+  - The port skips an entry of `tmp/` whose name is not valid UTF-8, at any
+    age. With libostree 2026.4 on 2026-11-15, `commit` removes an aged
+    regular file and an aged directory with the name `\xffold`, as it
+    removes an aged entry with an ASCII name. It keeps a regular file with
+    the name `\xffnew` that is not aged. A directory with such a name that
+    is not aged was not observed.
 - The port creates the temp file of a ref write in `tmp/`, and the tool
   creates it in the directory that holds the ref. The `fdatasync` of a ref
   write therefore reaches a file under `tmp/` in the port and a file under

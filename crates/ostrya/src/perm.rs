@@ -36,10 +36,6 @@ use rustix::path::Arg;
 /// repository.
 pub(crate) const SHARED_DIR_MODE: u32 = 0o2770;
 
-/// The mode forced on a lock file created inside a `bare-user-shared`
-/// repository.
-pub(crate) const SHARED_LOCK_MODE: u32 = 0o660;
-
 /// The mode forced on a regular file created inside a `bare-user-shared`
 /// repository outside the object store, such as a `.commitpartial` marker.
 pub(crate) const SHARED_FILE_MODE: u32 = 0o644;

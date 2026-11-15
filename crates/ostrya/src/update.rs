@@ -267,6 +267,10 @@ impl Repo {
     /// The `ostree` command never opens `.update.lock`, so the update lock
     /// excludes ostrya processes alone.
     ///
+    /// The lock file opens by the rules of `.lock`
+    /// ([`LockKind`](crate::LockKind), "Lock file"). The open follows no
+    /// symlink, and refuses an entry that is not a regular file.
+    ///
     /// # Waits
     ///
     /// Each of the two waits gets the whole of `[core] lock-timeout-secs`. If
@@ -306,6 +310,10 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock` or at `.update.lock`. The lock open
+    ///   follows no symlink. If the process cannot open a FIFO, a socket, or
+    ///   a device there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if the open of a lock file or a lock request fails.
     pub async fn begin_update(&self) -> Result<UpdateGuard> {
         let fsync = self.config().fsync()?;

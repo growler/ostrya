@@ -1040,6 +1040,24 @@ while the other side tried to take the lock. A record lock belongs to the
 process, so the port keeps one descriptor for each lock file in a process
 (`crates/ostrya/src/lock.rs`).
 
+The port opens `.lock`, `.update.lock`, and each staging lock file in two
+steps:
+
+1. It creates the file with one `openat2` with `O_CREAT|O_EXCL|O_NOFOLLOW` and
+   the mode of the file. An entry at the name, also a symlink, makes the
+   create give `EEXIST`.
+2. It opens the existing entry with one `openat2` with
+   `O_RDWR|O_NOFOLLOW|O_NONBLOCK|O_NOCTTY` and `RESOLVE_NO_SYMLINKS`, and reads
+   the file type with one `statx` on the descriptor.
+
+If the entry is gone before step 2, the port runs the two steps one more time.
+A symlink, a FIFO, a socket, a device, or a directory at the name fails the
+lock, and the entry stays. `O_NONBLOCK` keeps the open of a FIFO from a wait
+for a writer. The open of an existing file needs write access to it, also for a
+shared lock. Under `[core] locking=false` the port does not open `.lock`.
+`conformance/cli-surface.md`, "Global conventions", records how the tool opens
+these files.
+
 `[core] lock-timeout-secs` sets the limit of the wait for `.lock`. The port
 reads the value in this way:
 
@@ -1180,10 +1198,21 @@ read:
   - the removal of a symlink as the link.
 - It does not apply the age test to a staging lock file. The lock of a
   transaction that lives longer than `tmp-expiry-secs` is still held.
-- It removes a `staging-*` directory when it can take its lock.
+- It removes a `staging-*` directory when it can take its lock. It opens the
+  lock file with the open of step 2 in "Repository lock and staging", and
+  never creates it. A symlink, a FIFO, a socket, a device, or a directory at
+  the lock name keeps the staging directory and the lock entry.
 - It removes a staging directory with no lock file only when its age is more
   than `tmp-expiry-secs`. Another process can be between the directory create
   and the lock create.
+- It skips each entry whose name is not UTF-8, at any age.
+
+The reap of the port follows no symlink. The `lstat` of an entry does not
+follow it, and a listing types an entry of unknown type with no follow. The
+removal of a tree unlinks each symlink as the link. Each open of the removal of
+a tree uses `RESOLVE_NO_XDEV`, so the removal does not go into a mount. A mount
+point below a removed directory stops the removal of that tree. The mount point,
+its content, and the entries that the removal did not get to stay.
 
 Each transaction creates a new staging directory, and the port reuses none.
 `conformance/cli-surface.md`, "Global conventions", records the differences
@@ -7312,10 +7341,14 @@ keeps its mode and its group. This includes the repository root: the caller
 sets the group and the mode of a root that the port did not create. The port
 sets no group owner.
 
-A staging lock file and a `.commitpartial` marker have a second open after an
-exclusive create fails. Another process can remove the entry between the two
-opens. Then the second open creates the entry, and the port does not force
-its mode.
+A lock file has a second open after an exclusive create fails. If another
+process removes the file between the two opens, the port runs the exclusive
+create one more time, and forces the mode on the new file ("Repository lock
+and staging").
+
+A `.commitpartial` marker has a second open after an exclusive create fails.
+Another process can remove the entry between the two opens. Then the second
+open creates the entry, and the port does not force its mode.
 
 02770 gives no permission to others. The objects are 0644, which each user
 can read. So the directory permissions keep other users out of the

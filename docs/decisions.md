@@ -87,7 +87,9 @@ feature set and its graph.
 ## The repository lock
 
 The lock on `<repo>/.lock` is a classic `fcntl` record lock (`F_SETLK`,
-through `rustix::fs::fcntl_lock`). An OFD lock was rejected: `rustix` does
+through `rustix::fs::fcntl_lock`). The open of a lock file and each record
+lock call go through the lock primitives of `repo_fs`
+(`crates/ostrya/src/repo_fs/lock.rs`). An OFD lock was rejected: `rustix` does
 not expose the OFD commands, and a raw OFD call needs the `libc` crate and
 `unsafe` code.
 
@@ -99,8 +101,10 @@ tried to get the lock.
 A record lock belongs to the process, and the kernel releases it when the
 process closes any descriptor of the file. Thus a process-global registry,
 keyed by the `(device, inode)` of the lock file, keeps one descriptor and one
-reference count for each repository. `crates/ostrya/src/lock.rs` documents
-the registry.
+reference count for each repository. The probe of the registry reads the
+`(device, inode)` of the lock file with no follow, so a symlink at a lock file
+never matches a registered lock. `crates/ostrya/src/lock.rs` documents the
+registry.
 
 ## The options of an open and of a create
 

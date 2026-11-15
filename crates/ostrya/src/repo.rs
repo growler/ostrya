@@ -551,12 +551,12 @@ impl RepoInner {
     /// Returns the shared [`RepoLock`] of this repository. The first call
     /// creates and registers `<repo>/.lock`. Runs synchronous file system
     /// calls.
-    fn repo_lock(&self) -> std::io::Result<Arc<RepoLock>> {
+    fn repo_lock(&self) -> Result<Arc<RepoLock>> {
         let mut slot = self.lock.lock().unwrap();
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = RepoLock::get_or_create(self.root.as_fd(), self.config.mode())?;
+        let lock = RepoLock::get_or_create(&self.root)?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -564,12 +564,12 @@ impl RepoInner {
     /// Returns the shared [`UpdateLock`] of this repository. The first call
     /// creates and registers `<repo>/.update.lock`. Runs synchronous file
     /// system calls.
-    fn update_lock(&self) -> std::io::Result<Arc<UpdateLock>> {
+    fn update_lock(&self) -> Result<Arc<UpdateLock>> {
         let mut slot = self.update_lock.lock().unwrap();
         if let Some(existing) = slot.as_ref() {
             return Ok(existing.clone());
         }
-        let lock = UpdateLock::get_or_create(self.root.as_fd(), self.config.mode())?;
+        let lock = UpdateLock::get_or_create(&self.root)?;
         *slot = Some(lock.clone());
         Ok(lock)
     }
@@ -922,6 +922,11 @@ impl Repo {
     ///   `true` in an `archive` repository.
     /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
     ///   not a directory. The call makes each of them that is absent.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock`, when `[core] locking` is on, or at the
+    ///   lock file of the new staging directory. The lock open follows no
+    ///   symlink. If the process cannot open a FIFO, a socket, or a device
+    ///   there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction(&self) -> Result<Transaction> {
@@ -968,6 +973,11 @@ impl Repo {
     ///   `true` in an `archive` repository.
     /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
     ///   not a directory. The call makes each of them that is absent.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock`, when `[core] locking` is on, or at the
+    ///   lock file of the new staging directory. The lock open follows no
+    ///   symlink. If the process cannot open a FIFO, a socket, or a device
+    ///   there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if the call cannot create the lock file or the staging
     ///   directory, or cannot read the free space of the file system.
     pub async fn transaction_with_lock(&self, kind: LockKind) -> Result<Transaction> {
@@ -982,11 +992,8 @@ impl Repo {
         let guard = self.lock_repo(kind).await?;
 
         let repo = self.clone();
-        let staging = ostrya_rt::unblock(move || {
-            let mode = repo.inner.config.mode();
-            StagingDir::create(repo.root_dir(), expiry_secs, mode)
-        })
-        .await?;
+        let staging =
+            ostrya_rt::unblock(move || StagingDir::create(repo.root_dir(), expiry_secs)).await?;
 
         // The initial free-space budget: the available bytes less the reserve
         // of the config. Each staged object decreases it.

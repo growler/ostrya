@@ -1180,6 +1180,35 @@ fn commit_source_refusals_leave_no_staging_directory() {
     }
 }
 
+/// `commit` refuses a symlink at `.lock`. The run exits 1, names the entry, and
+/// leaves the target of the symlink with its bytes.
+#[test]
+fn commit_refuses_a_symlink_at_the_repository_lock() {
+    let tmp = TmpDir::new("commit-lock-symlink");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let target = base.join("outside");
+    std::fs::write(&target, b"outside bytes").unwrap();
+    std::os::unix::fs::symlink(&target, repo.join(".lock")).unwrap();
+    let repo_arg = format!("--repo={}", repo.display());
+    let src_arg = format!("--tree=dir={}", base.join("src").display());
+
+    let run = ostrya(
+        &[repo_arg.as_str(), "commit", "-b", "main", &src_arg],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr).trim_end(),
+        "error: invalid format: .lock passes through a symlink; \
+         ostrya refuses a symlink in the repository"
+    );
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+    assert_eq!(resolve(&repo, "main"), None, "the commit wrote no ref");
+}
+
 /// `commit --table-output` prints the seven-line block of the `ostree` command
 /// byte for byte. The test runs three repository modes and three commits in
 /// each mode. The first commit goes into an empty repository. The second

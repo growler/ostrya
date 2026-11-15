@@ -493,6 +493,10 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes
     ///   `[core] lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
+    ///   regular file is at `.lock` or at `.update.lock`. The lock open
+    ///   follows no symlink. If the process cannot open a FIFO, a socket, or
+    ///   a device there for write, the error is [`Error::Io`].
     /// - [`Error::Io`] if a lock file, the write of the keyring, or the sync
     ///   of the repository directory fails.
     pub async fn gpg_import_keys(

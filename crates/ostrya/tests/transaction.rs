@@ -12,6 +12,7 @@
 
 mod common;
 
+use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
@@ -196,19 +197,26 @@ fn concurrent_transactions_keep_their_staging_dirs() {
 
 #[test]
 fn a_transaction_reaps_a_stale_staging_dir() {
-    let (_dir, repo_path) = new_repo("txn-reap");
+    let (dir, repo_path) = new_repo("txn-reap");
     let tmp = repo_path.join("tmp");
 
     // Make a leftover staging directory with a sibling lock that no process
     // holds. A transaction that crashes leaves this pair. The directory is not
     // empty, so its reap tests the recursive removal.
-    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
-    let stale = format!("staging-{}-STALE0", boot.trim());
+    let stale = format!("staging-{}-STALE0", boot_id());
     let stale_dir = tmp.join(&stale);
     std::fs::create_dir_all(stale_dir.join("aa")).unwrap();
     std::fs::write(stale_dir.join("aa").join("leftover"), b"x").unwrap();
     let stale_lock = tmp.join(format!("{stale}-lock"));
     std::fs::write(&stale_lock, b"").unwrap();
+    // The removal unlinks a symlink in the tree as a link. Its target stays.
+    let outside = dir.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"k").unwrap();
+    let outside_file = dir.path().join("outside-file");
+    std::fs::write(&outside_file, b"f").unwrap();
+    std::os::unix::fs::symlink(&outside, stale_dir.join("aa").join("to-dir")).unwrap();
+    std::os::unix::fs::symlink(&outside_file, stale_dir.join("to-file")).unwrap();
 
     block_on(async {
         let repo = Repo::open(&repo_path).await.unwrap();
@@ -220,6 +228,170 @@ fn a_transaction_reaps_a_stale_staging_dir() {
         assert!(!stale_lock.exists(), "the stale staging lock is reaped too");
         txn.commit().await.unwrap();
     });
+    assert_eq!(std::fs::read(outside.join("keep")).unwrap(), b"k");
+    assert_eq!(std::fs::read(&outside_file).unwrap(), b"f");
+}
+
+/// Returns the boot id of the host.
+fn boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .unwrap()
+        .trim()
+        .to_owned()
+}
+
+/// Makes a FIFO at `path`.
+fn mkfifo(path: &Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .unwrap();
+}
+
+/// Runs `f` in a new thread and gives its result. A panic of `f` passes on.
+/// If `f` does not return in 10 seconds, the function opens the FIFO `fifo`
+/// for write with no wait, which releases an open that waits for a writer,
+/// and panics.
+fn without_block<T: Send + 'static>(fifo: &Path, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(value) => {
+            worker.join().unwrap();
+            value
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match worker.join() {
+            Err(panic) => std::panic::resume_unwind(panic),
+            Ok(()) => unreachable!("the worker sends a value before it ends"),
+        },
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let _ = rustix::fs::open(
+                fifo,
+                rustix::fs::OFlags::WRONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            );
+            panic!("an open of the FIFO {} blocked", fifo.display());
+        }
+    }
+}
+
+/// The kinds of entry that a test puts at a lock file name.
+const NOT_REGULAR: [&str; 4] = ["symlink", "fifo", "socket", "directory"];
+
+/// Makes an entry of the kind `kind` at `at`. A symlink points to the regular
+/// file `target`.
+///
+/// A socket binds at the short path `socket` next to `target`, because the
+/// path of a socket address has a limit of 107 bytes, and then moves to `at`.
+/// The function gives the listener of a socket, and the caller keeps it while
+/// the case runs.
+fn make_entry(kind: &str, at: &Path, target: &Path) -> Option<UnixListener> {
+    match kind {
+        "symlink" => std::os::unix::fs::symlink(target, at).unwrap(),
+        "fifo" => mkfifo(at),
+        "socket" => {
+            let bound = target.with_file_name("socket");
+            let listener = UnixListener::bind(&bound).unwrap();
+            std::fs::rename(&bound, at).unwrap();
+            return Some(listener);
+        }
+        "directory" => std::fs::create_dir(at).unwrap(),
+        other => unreachable!("no entry kind {other}"),
+    }
+    None
+}
+
+#[test]
+fn a_repository_lock_that_is_not_a_regular_file_fails_the_begin() {
+    for kind in NOT_REGULAR {
+        let (dir, repo_path) = new_repo("txn-lock-not-regular");
+        let target = dir.path().join("outside");
+        std::fs::write(&target, b"outside bytes").unwrap();
+        let lock = repo_path.join(".lock");
+        let _listener = make_entry(kind, &lock, &target);
+
+        let path = repo_path.clone();
+        let err = without_block(&lock, move || {
+            block_on(async {
+                let repo = Repo::open(&path).await.unwrap();
+                repo.transaction().await.map(drop).unwrap_err()
+            })
+        });
+        let expected = if kind == "symlink" {
+            ".lock passes through a symlink; ostrya refuses a symlink in the repository"
+        } else {
+            ".lock is not a regular file"
+        };
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == expected),
+            ".lock as a {kind}: {err:?}"
+        );
+        assert!(
+            staging_dirs(&repo_path).is_empty(),
+            ".lock as a {kind}: the begin made no staging dir"
+        );
+        let left: Vec<String> = listing(&repo_path.join("tmp"))
+            .into_iter()
+            .filter(|n| n.starts_with("staging-"))
+            .collect();
+        assert!(left.is_empty(), ".lock as a {kind}: {left:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+
+        // With `locking=false` the begin does not open `.lock`.
+        let config = repo_path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("locking=false\n");
+        std::fs::write(&config, text).unwrap();
+        let path = repo_path.clone();
+        without_block(&lock, move || {
+            block_on(async {
+                let repo = Repo::open(&path).await.unwrap();
+                repo.transaction().await.unwrap().commit().await.unwrap();
+            })
+        });
+    }
+}
+
+#[test]
+fn a_stale_staging_dir_whose_lock_is_not_a_regular_file_stays() {
+    for kind in NOT_REGULAR {
+        let (dir, repo_path) = new_repo("txn-reap-not-regular");
+        let tmp = repo_path.join("tmp");
+        let target = dir.path().join("outside");
+        std::fs::write(&target, b"outside bytes").unwrap();
+        let stale = format!("staging-{}-STALE1", boot_id());
+        let stale_dir = tmp.join(&stale);
+        std::fs::create_dir(&stale_dir).unwrap();
+        std::fs::write(stale_dir.join("leftover"), b"x").unwrap();
+        stamp(&stale_dir, OLD);
+        let stale_lock = tmp.join(format!("{stale}-lock"));
+        let _listener = make_entry(kind, &stale_lock, &target);
+
+        let path = repo_path.clone();
+        without_block(&stale_lock, move || {
+            block_on(async {
+                let repo = Repo::open(&path).await.unwrap();
+                repo.transaction().await.unwrap().commit().await.unwrap();
+            })
+        });
+        assert!(
+            stale_dir.join("leftover").exists(),
+            "a {kind} lock keeps the stale staging dir"
+        );
+        assert!(
+            std::fs::symlink_metadata(&stale_lock).is_ok(),
+            "the {kind} lock stays"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"outside bytes");
+    }
 }
 
 /// Sets the mtime of `path` to `epoch` seconds. On a symlink, it sets the mtime
@@ -333,6 +505,34 @@ fn a_transaction_reaps_aged_tmp_entries() {
         "a fresh directory is kept whole"
     );
     assert!(outside.join("keep").exists(), "the symlink target stays");
+}
+
+#[test]
+fn an_aged_temp_symlink_goes_as_a_link_and_a_name_that_is_not_utf8_stays() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let (dir, repo_path) = new_repo("txn-reap-names");
+    let tmp = repo_path.join("tmp");
+    let outside = dir.path().join("outside");
+    std::fs::write(&outside, b"outside bytes").unwrap();
+    let link = tmp.join(".ostrya-tmp-1-aBc123");
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    stamp(&link, OLD);
+    let raw = tmp.join(OsStr::from_bytes(b"\xffold"));
+    std::fs::write(&raw, b"o").unwrap();
+    stamp(&raw, OLD);
+
+    block_on(async {
+        let repo = Repo::open(&repo_path).await.unwrap();
+        repo.transaction().await.unwrap().commit().await.unwrap();
+    });
+    assert!(
+        std::fs::symlink_metadata(&link).is_err(),
+        "the aged temp symlink goes"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside bytes");
+    assert!(raw.exists(), "a name that is not UTF-8 stays");
 }
 
 #[test]

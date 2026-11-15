@@ -126,11 +126,17 @@ The repository lock.
 Each transaction takes a shared lock, so many commits and pulls can run at the same time.
 A prune takes an exclusive lock.
 The keys \fB\%core.locking\fR and \fB\%core.lock\-timeout\-secs\fR control it.
+The first lock makes the file with the mode 0660 if it is absent.
+The open follows no symbolic link and needs write access to the file.
+A symbolic link, a FIFO, a socket, a device, or a directory at \fB\%.lock\fR fails the lock with the error \fB\%invalid format: .lock passes through a symlink; ostrya refuses a symlink in the repository\fR or \fB\%invalid format: .lock is not a regular file\fR, and the entry stays.
+If the process cannot open a FIFO, a socket, or a device at \fB\%.lock\fR for write, the error is \fB\%Permission denied\fR in place of \fB\%is not a regular file\fR.
+When \fB\%core.locking\fR is false, ostrya does not open the file.
 .TP
 \fB\%<repo>/.update.lock\fR
 An ostrya extension.
 An exclusive lock that serializes each write of refs, \fB\%config\fR, keyrings, \fB\%summary\fR, \fB\%summary.sig\fR, and \fB\%.commitmeta\fR files.
 \fB\%ostrya\fR takes it also when \fB\%core.locking\fR is false.
+The file opens by the rules of \fB\%.lock\fR, and the errors name \fB\%.update.lock\fR.
 .TP
 \fB\%<repo>/objects/\fR
 The object store.
@@ -192,8 +198,15 @@ The open makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refus
 Each write of a \fB\%.commitmeta\fR outside a transaction and of a \fB\%.tombstone\-commit\fR, and the fs\-verity probe of \fB\%[ex\-integrity] fsverity=maybe\fR, make their temporary file in that \fB\%tmp/\fR.
 If another process removes \fB\%tmp/\fR, these writes of the handle fail, and the caller opens the repository again.
 Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
+The lock file of a staging directory opens by the rules of \fB\%.lock\fR.
+A new lock file gets the mode 0600 in place of 0660.
+In a \fB\%bare\-user\-shared\fR repository, ostrya sets the mode of a new lock file to 0660, as for \fB\%.lock\fR.
 At the start of each transaction, ostrya removes each staging directory whose lock is free.
 It removes a staging directory with no lock file, and each other entry except a staging lock file, when the entry is older than \fB\%core.tmp\-expiry\-secs\fR.
+A staging directory whose lock name holds a symbolic link, a FIFO, a socket, a device, or a directory stays, and its lock entry stays.
+An entry whose name is not valid UTF\-8 stays.
+The removal follows no symbolic link: it removes a symbolic link as the link, and the target stays.
+The removal of a directory does not go into a mount: a mount point in the tree stops the removal, and the mount point and its content stay.
 \fB\%tmp/cache/\fR is never removed.
 .TP
 \fB\%<repo>/extensions/\fR

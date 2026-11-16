@@ -461,7 +461,10 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
             .await
             .unwrap();
         guard.set_ref(&cref, Some(&checksum(3))).await.unwrap();
-        guard.set_ref_alias("current", "host/main").await.unwrap();
+        guard
+            .set_ref_alias(&Ref::local("current"), &Ref::local("host/main"))
+            .await
+            .unwrap();
 
         assert_eq!(
             other
@@ -492,7 +495,7 @@ fn the_writes_of_the_guard_are_visible_under_the_guard() {
         );
         let aliases = other.list_ref_aliases().await.unwrap();
         assert_eq!(aliases.len(), 1);
-        assert_eq!(aliases[0].refspec, "current");
+        assert_eq!(aliases[0].name, Ref::local("current"));
 
         assert_eq!(
             guard.read_ref(&Ref::local("current")).await.unwrap(),
@@ -547,7 +550,10 @@ fn the_guard_refuses_a_ref_write_over_an_alias() {
             .set_ref(&Ref::local("host/main"), Some(&checksum(1)))
             .await
             .unwrap();
-        guard.set_ref_alias("current", "host/main").await.unwrap();
+        guard
+            .set_ref_alias(&Ref::local("current"), &Ref::local("host/main"))
+            .await
+            .unwrap();
         for c in [Some(checksum(2)), None] {
             let err = guard
                 .set_ref(&Ref::local("current"), c.as_ref())
@@ -567,13 +573,19 @@ fn the_guard_refuses_a_ref_write_over_an_alias() {
                 Some(checksum(1))
             );
         }
-        guard.remove_ref_alias("current").await.unwrap();
+        guard
+            .remove_ref_alias(&Ref::local("current"))
+            .await
+            .unwrap();
         assert!(std::fs::symlink_metadata(&link).is_err());
         assert_eq!(
             guard.read_ref(&Ref::local("host/main")).await.unwrap(),
             Some(checksum(1))
         );
-        let err = guard.remove_ref_alias("host/main").await.unwrap_err();
+        let err = guard
+            .remove_ref_alias(&Ref::local("host/main"))
+            .await
+            .unwrap_err();
         assert!(
             matches!(
                 &err,

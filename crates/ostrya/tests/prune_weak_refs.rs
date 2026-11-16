@@ -661,13 +661,13 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
         // The test writes the target first, so a listing in creation order
         // reaches the target before the alias that names it.
         let first = commit(&repo, tmp.path(), "first", None, Some("pool/b")).await;
-        repo.set_ref_alias_immediate("pool/a", "pool/b")
+        repo.set_ref_alias_immediate(&Ref::local("pool/a"), &Ref::local("pool/b"))
             .await
             .unwrap();
 
         // The test writes the alias first, so the same listing reaches the
         // alias before the ref that it names.
-        repo.set_ref_alias_immediate("pool/x", "pool/y")
+        repo.set_ref_alias_immediate(&Ref::local("pool/x"), &Ref::local("pool/y"))
             .await
             .unwrap();
         let second = commit(&repo, tmp.path(), "second", None, Some("pool/y")).await;
@@ -1335,7 +1335,7 @@ fn a_strong_alias_over_a_weak_ref_keeps_both_refs() {
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let x = commit(&repo, tmp.path(), "target", None, Some("pool/target")).await;
         let x_root = commit_root(&repo, &x).await;
-        repo.set_ref_alias_immediate("keepalive", "pool/target")
+        repo.set_ref_alias_immediate(&Ref::local("keepalive"), &Ref::local("pool/target"))
             .await
             .unwrap();
 
@@ -1377,7 +1377,7 @@ fn a_weak_alias_over_a_strong_ref_survives() {
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
         let x = commit(&repo, tmp.path(), "head", None, Some("main")).await;
-        repo.set_ref_alias_immediate("pool/alias", "main")
+        repo.set_ref_alias_immediate(&Ref::local("pool/alias"), &Ref::local("main"))
             .await
             .unwrap();
 
@@ -1418,7 +1418,7 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
         commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
         // The test never writes `pool/missing`, so the link dangles.
-        repo.set_ref_alias_immediate("pool/dangle", "pool/missing")
+        repo.set_ref_alias_immediate(&Ref::local("pool/dangle"), &Ref::local("pool/missing"))
             .await
             .unwrap();
 
@@ -1702,12 +1702,18 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
         let target_root = commit_root(&repo, &target).await;
         // A local alias that names a remote ref, and a remote alias that names
         // the strong local ref.
-        repo.set_ref_alias_immediate("pool/into-remote", "origin:pool/target")
-            .await
-            .unwrap();
-        repo.set_ref_alias_immediate("origin:pool/into-heads", "main")
-            .await
-            .unwrap();
+        repo.set_ref_alias_immediate(
+            &Ref::local("pool/into-remote"),
+            &Ref::remote("origin", "pool/target"),
+        )
+        .await
+        .unwrap();
+        repo.set_ref_alias_immediate(
+            &Ref::remote("origin", "pool/into-heads"),
+            &Ref::local("main"),
+        )
+        .await
+        .unwrap();
 
         let (filter, seen) = recording_pool_is_weak();
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
@@ -1779,9 +1785,12 @@ fn a_weak_remote_alias_over_a_weak_remote_ref_leaves_no_ref_file() {
         )
         .await;
         let target_root = commit_root(&repo, &target).await;
-        repo.set_ref_alias_immediate("origin:pool/alias", "origin:pool/target")
-            .await
-            .unwrap();
+        repo.set_ref_alias_immediate(
+            &Ref::remote("origin", "pool/alias"),
+            &Ref::remote("origin", "pool/target"),
+        )
+        .await
+        .unwrap();
 
         let stats = repo.prune(&weak_options(any_pool_is_weak())).await.unwrap();
 

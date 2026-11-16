@@ -862,7 +862,9 @@ async fn add_prefix_refs(repo: &Repo) -> (Checksum, Checksum) {
             .await
             .unwrap();
     }
-    repo.set_ref_alias_immediate("x/al", "a/b").await.unwrap();
+    repo.set_ref_alias_immediate(&Ref::local("x/al"), &Ref::local("a/b"))
+        .await
+        .unwrap();
     (main, other)
 }
 
@@ -1611,10 +1613,10 @@ fn a_ref_listing_walks_the_directories_that_the_client_reads() {
                 .await
                 .unwrap();
         }
-        repo.set_ref_alias_immediate("pub/al", "main")
+        repo.set_ref_alias_immediate(&Ref::local("pub/al"), &Ref::local("main"))
             .await
             .unwrap();
-        repo.set_ref_alias_immediate("pub/hid", "priv/p")
+        repo.set_ref_alias_immediate(&Ref::local("pub/hid"), &Ref::local("priv/p"))
             .await
             .unwrap();
         for name in ["c/a", "c/b/c", "c/no/b", "z/x"] {

@@ -12158,7 +12158,10 @@ async fn refs_create(repo: &Repo, newref: &str, args: &RefsArgs) -> Result<()> {
                 "Cannot create alias to non-existent ref: {existing}"
             ));
         }
-        return repo.set_ref_alias_immediate(newref, existing).await;
+        // Both names parsed as refs at the checks above.
+        return repo
+            .set_ref_alias_immediate(&newref.parse::<Ref>()?, &existing.parse::<Ref>()?)
+            .await;
     }
     let commit = resolve(repo, existing).await?;
     repo.set_ref_immediate(&newref.parse::<Ref>()?, Some(&commit))
@@ -12306,6 +12309,12 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// alias with [`Repo::remove_ref_alias_immediate`], and each selected ref
 /// file as a ref.
 ///
+/// Without `-c`, the command reads the aliases with
+/// [`Repo::list_ref_aliases`] before the first prefix, and keeps the local and
+/// the remote aliases alone. That listing also reads `refs/mirrors/`. If it
+/// fails, for example on a symlink directly under `refs/mirrors`, the command
+/// fails and removes no ref.
+///
 /// # Collection refs
 ///
 /// Without `-c`, a prefix `@X:` selects each ref under `refs/mirrors/X/`, and
@@ -12329,7 +12338,8 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// an alias with [`Error::RefNotWritable`]. The prefix then removes no ref.
 /// The `ostree` command removes the alias. This is a recorded divergence. A
 /// prefix `@X:` or `@X:PREFIX` of another id selects an alias under
-/// `refs/mirrors/X/` only after an out-of-band write. The refs that an
+/// `refs/mirrors/X/` only after a write of the library or an out-of-band
+/// write. The `ostrya` command writes no such alias. The refs that an
 /// earlier prefix removed stay removed.
 ///
 /// If a prefix `@X:` or `@OWN:` with an empty rest selects one or more refs
@@ -12354,8 +12364,9 @@ async fn names_a_ref(repo: &Repo, rev: &str) -> Result<bool> {
 /// `refs/heads` or `refs/mirrors` is an alias, the command fails with
 /// [`Error::RefNotWritable`] before the first removal, and removes no ref.
 /// This applies also with `-A`.
-/// An alias under `refs/mirrors` comes from an out-of-band write alone. The
-/// `ostree` command removes both aliases. This is a recorded divergence.
+/// An alias under `refs/mirrors` comes from a write of the library or from an
+/// out-of-band write. The `ostrya` command writes none. The `ostree` command
+/// removes both aliases. This is a recorded divergence.
 async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
     if args.prefix.is_empty() {
         exit_error("At least one PREFIX is required when deleting refs");
@@ -12387,11 +12398,11 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
         // or mirror: only `-A --delete` removes an alias.
         return repo.remove_refs_immediate(&removed).await;
     }
-    let listed = repo.list_ref_aliases().await?;
+    let listed = listed_aliases(repo.list_ref_aliases().await?);
     let mut aliases = active_aliases(&listed);
     // All aliases, local and remote. A `-A` prefix filters this set, and a
     // `-A --delete` removes from it.
-    let mut alias_names: Vec<String> = listed.into_iter().map(|alias| alias.refspec).collect();
+    let mut alias_names: Vec<String> = listed.into_iter().map(|(name, _)| name).collect();
     let own = repo.config().collection_id();
     let mut all = if !args.alias && needs_all_refs(&args.prefix, own) {
         all_refs(repo).await?
@@ -12465,7 +12476,7 @@ async fn refs_delete(repo: &Repo, args: &RefsArgs) -> Result<()> {
                 // A `-A` prefix that names a ref file exactly removes that ref.
                 for (refspec, r) in selected.iter().zip(&removed) {
                     if alias_names.contains(refspec) {
-                        repo.remove_ref_alias_immediate(refspec).await?;
+                        repo.remove_ref_alias_immediate(r).await?;
                     } else {
                         repo.set_ref_immediate(r, None).await?;
                     }
@@ -12530,14 +12541,25 @@ async fn select_aliases(
 /// outside `refs/heads` also names the ref of the body with its leading `../`
 /// components removed: the body `../remotes/origin/x` names the local ref
 /// `remotes/origin/x`.
-fn active_aliases(listed: &[RefAlias]) -> Vec<(String, String)> {
+fn active_aliases(listed: &[(String, String)]) -> Vec<(String, String)> {
     listed
         .iter()
-        .filter(|alias| !alias.refspec.contains(':'))
-        .map(|alias| {
-            let named = alias_body_name(&alias.target).to_owned();
-            (alias.refspec.clone(), named)
-        })
+        .filter(|(refspec, _)| !refspec.contains(':'))
+        .map(|(refspec, body)| (refspec.clone(), alias_body_name(body).to_owned()))
+        .collect()
+}
+
+/// Returns the local and the remote aliases of a listing of
+/// [`Repo::list_ref_aliases`], sorted by alias refspec.
+///
+/// Each pair is `(alias refspec, link body)`. An alias under `refs/mirrors`
+/// is not in the result, so the `-A` listing and the `--delete` guard read
+/// the aliases under `refs/heads` and `refs/remotes` alone.
+fn listed_aliases(listed: Vec<RefAlias>) -> Vec<(String, String)> {
+    listed
+        .into_iter()
+        .filter(|alias| !matches!(alias.name, Ref::Collection { .. }))
+        .map(|alias| (alias.name.to_string(), alias.body))
         .collect()
 }
 
@@ -12588,7 +12610,7 @@ async fn refs_list(repo: &Repo, args: &RefsArgs) -> Result<()> {
 /// `@X:PREFIX` of an id X that is not the collection id of the repository.
 /// `@OWN:` selects each local alias.
 async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
-    let aliases = repo.list_ref_aliases().await?;
+    let aliases = listed_aliases(repo.list_ref_aliases().await?);
     let own = repo.config().collection_id();
     for given in prefixes(&args.prefix) {
         let (prefix, local_only) = own_prefix(given, own);
@@ -12600,15 +12622,9 @@ async fn refs_list_aliases(repo: &Repo, args: &RefsArgs) -> Result<()> {
             println!("{prefix} -> {}", commit.to_hex());
             continue;
         }
-        for alias in &aliases {
-            if (!local_only || !alias.refspec.contains(':'))
-                && nested_under_prefix(&alias.refspec, prefix)
-            {
-                println!(
-                    "{} -> {}",
-                    alias.refspec,
-                    alias_target(&alias.refspec, &alias.target)
-                );
+        for (refspec, body) in &aliases {
+            if (!local_only || !refspec.contains(':')) && nested_under_prefix(refspec, prefix) {
+                println!("{refspec} -> {}", alias_target(refspec, body));
             }
         }
     }

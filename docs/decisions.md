@@ -4486,14 +4486,59 @@ the whole queue against the ref store before the first write. The rules:
   refuses a weak ref to delete below an alias with the same error, before
   it deletes a ref ("The weak refs of a prune"). The receive path refuses a
   path below an alias with `ref-denied`.
-- `Repo::remove_ref_alias_immediate(refspec)` and
-  `UpdateGuard::remove_ref_alias(refspec)` remove an alias. They unlink the
+- `Repo::remove_ref_alias_immediate(alias)` and
+  `UpdateGuard::remove_ref_alias(alias)` remove an alias. They unlink the
   link, and the target ref stays. An absent path is success, as for the
   removal of an absent ref. A path that names a ref file fails with
   `Error::RefNotWritable`, reason `names a ref file`. A path that names a
   directory or a special file, or that passes through a file or an alias,
   fails with `Error::RefNotWritable` and the reason of the read. In the CLI,
   only `refs -A --delete` removes an alias.
+- The four alias calls take a `Ref` for the alias, and the two write calls
+  take a `Ref` for the target, as `Repo::set_ref_immediate` does. Each call
+  maps a ref to its path with the `[core] collection-id` that the open of
+  the handle read: a local ref to `refs/heads/NAME`, a remote ref to
+  `refs/remotes/R/NAME`, and a collection ref to `refs/mirrors/ID/NAME`, or
+  to `refs/heads/NAME` for the own id. So an alias and its target can be
+  any two valid refs, in one namespace or in two. An error names a ref by
+  the text of its canonical form, as `set_ref_immediate` does. The write
+  calls keep the alias rule. The readers apply their own rules to the
+  target: for example, the summary leaves out an alias to a ref under
+  `refs/remotes/`. The reason: a caller keeps aliases of mirror refs in the
+  directory of their collection, for example a set of default names for a
+  pool of refs. It writes these aliases, and it removes an alias whose
+  target is gone.
+- `Repo::list_ref_aliases` walks `refs/heads`, `refs/remotes`, and
+  `refs/mirrors`. It does not read the directory of the own collection id,
+  because the summaries ignore that directory. `RefAlias` holds the alias
+  as a `Ref` (`name`), the ref that the link body names (`target`), and the
+  body as stored (`body`). `target` is `None` when the body leaves `refs/`,
+  names a path that no `Ref` maps to, names a path under the directory of
+  the own id, or names a ref that fails `Ref::validate`. So a resolve of
+  `target` never fails with `Error::InvalidRefspec`, and a caller finds a
+  broken alias with a resolve of `target`. The listing does not check the
+  name, as it gives each link that is on disk: a name that fails the
+  ref-name rule, and a directory of `refs/mirrors/` whose name fails the
+  collection-id rule, are in the listing. The remove calls refuse such a
+  name, so the caller removes such a link by hand. The listing is sorted by
+  the text of the name, so the local and the remote aliases keep the order
+  of their refspecs. `RefAlias` is not `#[non_exhaustive]`, because its
+  three fields are fixed. Rejected: a `target` with no check, as `name`
+  has, because a resolve of it can then fail; and a listing that leaves out
+  a link whose name fails a rule, as the summary listing leaves out such a
+  directory, because the caller then does not find that link.
+- The `ostrya` command does not write or list an alias under
+  `refs/mirrors/`. `refs -A`, `refs -A --delete`, and the alias guard of
+  `refs --delete` read the local and the remote aliases of the listing
+  alone, so their output is the same. `refs -A --create` refuses a
+  collection ref. `refs -A` and `refs --delete` with no `-c` read
+  `refs/mirrors/` through the listing, so they fail on a damaged
+  `refs/mirrors/`: a symlink at `refs/mirrors` or directly under it, a
+  directory that cannot be read and that is not the directory of the
+  `[core] collection-id`, or a link body over the cap of a ref read.
+  This is a refusal of a damaged repository. Rejected: a second public
+  listing with no `refs/mirrors/` for the CLI, because it adds a public call
+  for one caller.
 - `Repo::remove_refs_immediate(refs)` removes a set of refs outside a
   transaction. It takes the update lock one time for the set. Under the
   lock, it applies the check of `Transaction::set_ref` to the whole set

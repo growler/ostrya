@@ -142,9 +142,21 @@ fn a_ref_write_refuses_a_name_outside_the_rule() {
             txn.set_ref(&cref, Some(&commit));
             assert_refused(txn.commit().await, name);
 
-            // The name fails as the alias and as the target of the alias.
-            assert_refused(repo.set_ref_alias_immediate(name, "main").await, name);
-            assert_refused(repo.set_ref_alias_immediate("al", name).await, name);
+            // The name fails as the alias and as the target of the alias, as
+            // a local or a remote ref and as a collection ref, in the calls
+            // of the repository and of the guard.
+            let main = Ref::local("main");
+            let al = Ref::local("al");
+            for r in [refspec(name), cref.clone()] {
+                assert_refused(repo.set_ref_alias_immediate(&r, &main).await, name);
+                assert_refused(repo.set_ref_alias_immediate(&al, &r).await, name);
+                assert_refused(repo.remove_ref_alias_immediate(&r).await, name);
+                let guard = repo.begin_update().await.unwrap();
+                assert_refused(guard.set_ref_alias(&r, &main).await, name);
+                assert_refused(guard.set_ref_alias(&al, &r).await, name);
+                assert_refused(guard.remove_ref_alias(&r).await, name);
+                guard.finish().await.unwrap();
+            }
 
             assert_eq!(ref_files(&repo_dir), before, "{name:?} wrote a ref");
         }

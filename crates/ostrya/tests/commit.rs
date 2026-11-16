@@ -461,7 +461,7 @@ fn ref_writes_run_under_both_fsync_settings() {
             );
 
             // An alias beside the nested ref, then the removal of both refs.
-            repo.set_ref_alias_immediate("branch/alias", "branch/one")
+            repo.set_ref_alias_immediate(&Ref::local("branch/alias"), &Ref::local("branch/one"))
                 .await
                 .unwrap();
             let alias = root_dir.join("refs/heads/branch/alias");
@@ -471,7 +471,7 @@ fn ref_writes_run_under_both_fsync_settings() {
                 Some(a)
             );
 
-            repo.remove_ref_alias_immediate("branch/alias")
+            repo.remove_ref_alias_immediate(&Ref::local("branch/alias"))
                 .await
                 .unwrap();
             repo.set_ref_immediate(&Ref::remote("origin", "branch/two"), None)
@@ -558,15 +558,21 @@ fn remove_ref_alias_removes_an_alias_alone() {
         repo.set_ref_immediate(&Ref::local("deep/nest"), Some(&a))
             .await
             .unwrap();
-        repo.set_ref_alias_immediate("al", "plain").await.unwrap();
+        repo.set_ref_alias_immediate(&Ref::local("al"), &Ref::local("plain"))
+            .await
+            .unwrap();
         let heads = root_dir.join("refs/heads");
 
-        repo.remove_ref_alias_immediate("al").await.unwrap();
+        repo.remove_ref_alias_immediate(&Ref::local("al"))
+            .await
+            .unwrap();
         assert!(std::fs::symlink_metadata(heads.join("al")).is_err());
         assert_eq!(repo.resolve_rev("plain", false).await.unwrap(), Some(a));
 
-        repo.remove_ref_alias_immediate("al").await.unwrap();
-        repo.remove_ref_alias_immediate("nosuch/deeper")
+        repo.remove_ref_alias_immediate(&Ref::local("al"))
+            .await
+            .unwrap();
+        repo.remove_ref_alias_immediate(&Ref::local("nosuch/deeper"))
             .await
             .unwrap();
 
@@ -575,7 +581,10 @@ fn remove_ref_alias_removes_an_alias_alone() {
             ("deep", "names a directory"),
             ("plain/x", "passes through a file"),
         ] {
-            let err = repo.remove_ref_alias_immediate(name).await.unwrap_err();
+            let err = repo
+                .remove_ref_alias_immediate(&Ref::local(name))
+                .await
+                .unwrap_err();
             assert!(
                 matches!(
                     &err,
@@ -612,7 +621,9 @@ fn check_refs_path_reports_a_path_through_a_ref_file() {
         repo.set_ref_immediate(&Ref::remote("origin", "rr/x"), Some(&a))
             .await
             .unwrap();
-        repo.set_ref_alias_immediate("al", "plain").await.unwrap();
+        repo.set_ref_alias_immediate(&Ref::local("al"), &Ref::local("plain"))
+            .await
+            .unwrap();
 
         for path in [
             "heads/plain",
@@ -711,8 +722,8 @@ fn list_refs_leaves_out_a_symlink_naming_a_directory() {
     // is a directory names no ref, so the listing leaves it out. Without this
     // rule, a self-link recurses without end. The `ostree` command refuses the
     // listing with `Listing refs: Is a directory`. An alias write does not
-    // refuse a target that is a directory: `set_ref_alias_immediate("a/b",
-    // "a")` writes `refs/heads/a/b -> ../a`.
+    // refuse a target that is a directory: an alias `a/b` of the ref `a`
+    // writes `refs/heads/a/b -> ../a`.
     let tmp = TmpDir::new("commit-refs-dirlink");
     let root_dir = tmp.path().join("repo");
     let a = csum(COMMIT);
@@ -790,7 +801,8 @@ fn ref_writes_place_no_temp_beside_the_target() {
             "immediate ref write",
         );
         not_a_directory(
-            repo.set_ref_alias_immediate("dir/alias", "base").await,
+            repo.set_ref_alias_immediate(&Ref::local("dir/alias"), &Ref::local("base"))
+                .await,
             "immediate alias write",
         );
         let guard = repo.begin_update().await.unwrap();
@@ -848,7 +860,7 @@ fn ref_writes_create_a_missing_tmp() {
 
         std::fs::remove_dir_all(&tmp_dir).unwrap();
         let repo = Repo::open(&root_dir).await.unwrap();
-        repo.set_ref_alias_immediate("dir/alias", "dir/one")
+        repo.set_ref_alias_immediate(&Ref::local("dir/alias"), &Ref::local("dir/one"))
             .await
             .unwrap();
         assert!(tmp_dir.is_dir());
@@ -970,7 +982,7 @@ fn a_ref_name_of_name_max_bytes_is_written() {
         repo.set_ref_immediate(&Ref::local(&name), Some(&a))
             .await
             .unwrap();
-        repo.set_ref_alias_immediate(&alias_name, &name)
+        repo.set_ref_alias_immediate(&Ref::local(&alias_name), &Ref::local(&name))
             .await
             .unwrap();
         assert_eq!(
@@ -1021,7 +1033,8 @@ fn a_symlink_at_tmp_fails_each_ref_write() {
             "ref write of a new ref",
         );
         symlinked(
-            repo.set_ref_alias_immediate("kept", "dir/new").await,
+            repo.set_ref_alias_immediate(&Ref::local("kept"), &Ref::local("dir/new"))
+                .await,
             "alias write",
         );
 

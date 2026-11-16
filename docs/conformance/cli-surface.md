@@ -85,7 +85,7 @@ Done, Phase 17b:
 - `cat` -- `COMMIT` and one or more `PATH`.
 
 Their output formats are recorded in `cli-behavior.md`, "CLI output
-formats", `refs`, `rev-parse`, and `cat`. Twenty-three tool behaviors around
+formats", `refs`, `rev-parse`, and `cat`. Twenty-four tool behaviors around
 them are observed and deliberately not reproduced:
 
 - the tool names an `-A` alias that lives under `refs/remotes/<remote>/` by its
@@ -175,8 +175,9 @@ them are observed and deliberately not reproduced:
     `refs/heads`, `refs/remotes`, or `refs/mirrors/<id>/`, and `refs -c
     --delete <id>`, where the id selects an alias under `refs/heads` or
     `refs/mirrors/<id>/`. Here `<id>` is not the `collection-id` of the
-    repository. Only an out-of-band write puts an alias under
-    `refs/mirrors/<id>/`. The tool removes the alias. The port refuses it
+    repository. The library writes an alias under `refs/mirrors/<id>/`,
+    and the `ostrya` command and the tool write none there. An out-of-band
+    write also puts one there. The tool removes the alias. The port refuses it
     before the prefix removes its first ref, after the alias guard where the
     guard runs. With `-c`, the port refuses it before the command removes its
     first ref. So with the ref `origin:rr/x` and the alias `origin:rr/remal`,
@@ -198,10 +199,12 @@ them are observed and deliberately not reproduced:
   - `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias` refuse
     a target that is an alias, and accept a target of each other type, so
     each writes such a link in one step. With the ref `deep/nest/ing`,
-    `set_ref_alias_immediate("dal", "deep")` returns `Ok`, and
-    `Repo::list_refs` then leaves the link out. On an empty repository,
-    `set_ref_alias_immediate("a/b", "a")` returns `Ok` and writes
-    `refs/heads/a/b -> ../a`, a link that names its own directory.
+    `set_ref_alias_immediate(&Ref::local("dal"), &Ref::local("deep"))`
+    returns `Ok`, and `Repo::list_refs` then leaves the link out. On an
+    empty repository,
+    `set_ref_alias_immediate(&Ref::local("a/b"), &Ref::local("a"))` returns
+    `Ok` and writes `refs/heads/a/b -> ../a`, a link that names its own
+    directory.
   - A writer removes the target ref of an alias and keeps the alias. Then a
     writer writes a ref below the target path. `refs --delete` of a remote
     ref keeps the alias. So after `refs -A --create=up9 origin:rb`, which
@@ -315,6 +318,18 @@ them are observed and deliberately not reproduced:
   other rows agree. `refs -c --create=<own id>:<ref>` writes
   `refs/heads/<ref>` in both, and `refs -c --delete <own id>` keeps the
   directory in both;
+- a damaged `refs/mirrors/`: a symlink at `refs/mirrors` or directly under
+  it, a directory under `refs/mirrors` that cannot be read and that is not
+  the directory of the `collection-id` of the repository, or an alias body
+  under `refs/mirrors` larger than 4096 bytes. In the tool, a link under
+  `refs/mirrors` reaches the `-c` listing alone (the dangling alias above).
+  `refs -A` and `refs --delete` with no `-c` of the port read the aliases of
+  the repository through `Repo::list_ref_aliases`, which also reads
+  `refs/mirrors/`. They print and remove no alias under `refs/mirrors/`, but
+  a damaged `refs/mirrors/` fails them at exit 1. A symlink gives `error:
+  invalid format: <path> passes through a symlink; ostrya refuses a symlink
+  in the repository`, where `<path>` is the path of the symlink, and `refs
+  --delete` then removes no ref. The port refuses a damaged repository here;
 - a ref under `refs/remotes/<remote>/` of a remote whose `collection-id` is
   the `collection-id` of the repository. The `-c` listing of the tool prints a
   `(<own id>, <name>)` row for it. For a name that `refs/heads` also holds,
@@ -516,7 +531,9 @@ tool. The port extension has these rules:
   matches no ref, the command exits 0. `refs --delete @ID:PREFIX` removes
   the refs that the prefix matches, and no local ref. The refusal of a ref
   that an alias names does not apply to a prefix `@ID:` or `@ID:PREFIX` of
-  another id. The port and the tool write no alias under `refs/mirrors/`.
+  another id. The `ostrya` command and the tool write no alias under
+  `refs/mirrors/`. The library writes one with
+  `Repo::set_ref_alias_immediate` and `UpdateGuard::set_ref_alias`.
 - A `PREFIX` `@OWN:PREFIX`, where `OWN` is the `[core] collection-id` of the
   repository and `PREFIX` is a local ref name, is the `PREFIX` `PREFIX`.
   `@OWN:` matches each local ref. A `PREFIX` `@OWN:REST`, where `REST` is
@@ -3843,7 +3860,8 @@ the link with a ref file that names the pulled commit. The port refuses the
 ref with `error: ref not writable: <ref>: names an alias` at exit 1, after it
 publishes the objects. It writes no ref, the link stays, and the objects stay
 until a prune. `pull-local` does the same. An alias under `refs/remotes` or
-`refs/mirrors` comes from an out-of-band write alone.
+`refs/mirrors` comes from a write of the library or from an out-of-band
+write. The `ostrya` command writes none.
 
 `pull` also fetches the dependencies that field 2 of each pulled commit
 names, each at depth 0 and with no ref, unless the pull is commit-only or has a

@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use common::TmpDir;
 use ostrya::{
-    Checksum, CommitOptions, CreateOptions, DirMeta, Error, MutableTree, Ref, Repo, RepoMode,
-    Xattrs,
+    Checksum, CommitOptions, CreateOptions, DirMeta, Error, MutableTree, Ref, RefSelector, Repo,
+    RepoMode, Summary, SummaryOptions, Xattrs,
 };
 use ostrya_rt::block_on;
 
@@ -207,7 +207,7 @@ fn an_alias_resolves_to_its_target() {
     let repo = open(&path);
     block_on(async {
         put_local(&repo, "main", &checksum(1)).await;
-        repo.set_ref_alias_immediate("current", "main")
+        repo.set_ref_alias_immediate(&Ref::local("current"), &Ref::local("main"))
             .await
             .unwrap();
         assert_eq!(
@@ -668,7 +668,9 @@ fn remove_refs_immediate_refuses_a_batch_with_a_mirror_alias() {
 
         put_local(&repo, "main", &checksum(2)).await;
         put_local(&repo, "other", &checksum(3)).await;
-        repo.set_ref_alias_immediate("al", "main").await.unwrap();
+        repo.set_ref_alias_immediate(&Ref::local("al"), &Ref::local("main"))
+            .await
+            .unwrap();
         let batch = [Ref::local("other"), Ref::local("al")];
         match repo.remove_refs_immediate(&batch).await {
             Err(Error::RefNotWritable { name, reason }) => {
@@ -805,7 +807,9 @@ fn list_refs_where_gives_the_local_refs_then_the_collection_refs() {
         put_local(&repo, "b", &checksum(1)).await;
         put_local(&repo, "a", &checksum(2)).await;
         put_local(&repo, "d/e", &checksum(3)).await;
-        repo.set_ref_alias_immediate("cur", "a").await.unwrap();
+        repo.set_ref_alias_immediate(&Ref::local("cur"), &Ref::local("a"))
+            .await
+            .unwrap();
         std::os::unix::fs::symlink("missing", path.join("refs/heads/gone")).unwrap();
         put(&repo, OTHER, "x", &checksum(4)).await;
         put(&repo, OTHER, "a/b", &checksum(5)).await;
@@ -1130,10 +1134,12 @@ fn a_ref_write_below_an_alias_is_refused() {
                 &name,
             );
         }
+        let target = Ref::local("d0/y");
         for refspec in ["up/al", "up2/al", "origin:al"] {
-            assert_through_alias(repo.set_ref_alias_immediate(refspec, "d0/y").await, refspec);
+            let alias: Ref = refspec.parse().unwrap();
+            assert_through_alias(repo.set_ref_alias_immediate(&alias, &target).await, refspec);
             let guard = repo.begin_update().await.unwrap();
-            assert_through_alias(guard.set_ref_alias(refspec, "d0/y").await, refspec);
+            assert_through_alias(guard.set_ref_alias(&alias, &target).await, refspec);
             guard.finish().await.unwrap();
         }
         assert_eq!(
@@ -1174,13 +1180,16 @@ fn an_alias_removal_below_an_alias_is_refused() {
     let heads = path.join("refs/heads");
     block_on(async {
         put_local(&repo, "d0/y", &checksum(1)).await;
-        repo.set_ref_alias_immediate("d0/al", "d0/y").await.unwrap();
+        repo.set_ref_alias_immediate(&Ref::local("d0/al"), &Ref::local("d0/y"))
+            .await
+            .unwrap();
         std::os::unix::fs::symlink("d0", heads.join("up2")).unwrap();
         std::os::unix::fs::symlink("nosuch", heads.join("up")).unwrap();
         for refspec in ["up2/al", "up/al"] {
-            assert_through_alias(repo.remove_ref_alias_immediate(refspec).await, refspec);
+            let alias = Ref::local(refspec);
+            assert_through_alias(repo.remove_ref_alias_immediate(&alias).await, refspec);
             let guard = repo.begin_update().await.unwrap();
-            assert_through_alias(guard.remove_ref_alias(refspec).await, refspec);
+            assert_through_alias(guard.remove_ref_alias(&alias).await, refspec);
             guard.finish().await.unwrap();
         }
         assert!(
@@ -1194,5 +1203,349 @@ fn an_alias_removal_below_an_alias_is_refused() {
             Some(checksum(1))
         );
         assert!(!heads.join("nosuch").exists());
+    });
+}
+
+/// Returns the body of the symlink at `rel` under `path`.
+fn link_body(path: &Path, rel: &str) -> String {
+    std::fs::read_link(path.join(rel))
+        .unwrap()
+        .into_os_string()
+        .into_string()
+        .unwrap()
+}
+
+/// Asserts that `result` is `Error::RefNotWritable` for `name`, with the
+/// reason `reason`.
+fn assert_not_writable<T: std::fmt::Debug>(result: ostrya::Result<T>, name: &str, reason: &str) {
+    match result {
+        Err(Error::RefNotWritable { name: n, reason: r }) => {
+            assert_eq!((n.as_str(), r.as_str()), (name, reason));
+        }
+        other => panic!("{name}: expected RefNotWritable, got {other:?}"),
+    }
+}
+
+/// An alias of a mirror ref, written in the directory of its collection, is
+/// a relative link to the ref. It resolves to the commit of the ref, and the
+/// collection listings and the collection map of the summary hold it.
+#[test]
+fn a_mirror_alias_resolves_to_its_target() {
+    let tmp = TmpDir::new("ref-store-mirror-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let rel = format!("refs/mirrors/{OTHER}/defpool/x");
+    block_on(async {
+        let commit = write_commit(&repo, "one", None).await;
+        put(&repo, OTHER, "pool/x", &commit).await;
+        let alias = Ref::collection(OTHER, "defpool/x");
+        repo.set_ref_alias_immediate(&alias, &Ref::collection(OTHER, "pool/x"))
+            .await
+            .unwrap();
+        assert_eq!(link_body(&path, &rel), "../pool/x");
+        assert_eq!(resolve(&repo, &alias).await, Some(commit));
+        let all = RefSelector::parse(["**"]).unwrap();
+        assert_eq!(
+            repo.list_collection_refs_in(OTHER, &all).await.unwrap(),
+            [
+                ("defpool/x".to_owned(), commit),
+                ("pool/x".to_owned(), commit),
+            ]
+        );
+        let listed = repo.list_refs_where(|_| true).await.unwrap();
+        assert!(listed.contains(&(alias, commit)), "{listed:?}");
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let summary = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        let map = summary.collection_map().unwrap();
+        let refs = map
+            .iter()
+            .find(|(id, _)| id == OTHER)
+            .map(|(_, refs)| refs)
+            .unwrap_or_else(|| panic!("no {OTHER} in {map:?}"));
+        let names: Vec<_> = refs.iter().map(|r| (r.name.as_str(), r.commit)).collect();
+        assert_eq!(names, [("defpool/x", commit), ("pool/x", commit)]);
+    });
+}
+
+/// The guard writes an alias of a mirror ref as the call of the repository
+/// writes it.
+#[test]
+fn the_guard_writes_a_mirror_alias() {
+    let tmp = TmpDir::new("ref-store-guard-mirror-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let rel = format!("refs/mirrors/{OTHER}/defpool/x");
+    block_on(async {
+        put(&repo, OTHER, "pool/x", &checksum(1)).await;
+        let alias = Ref::collection(OTHER, "defpool/x");
+        let guard = repo.begin_update().await.unwrap();
+        guard
+            .set_ref_alias(&alias, &Ref::collection(OTHER, "pool/x"))
+            .await
+            .unwrap();
+        guard.finish().await.unwrap();
+        assert_eq!(link_body(&path, &rel), "../pool/x");
+        assert_eq!(resolve(&repo, &alias).await, Some(checksum(1)));
+    });
+}
+
+/// An alias and its target can be in different namespaces: a collection
+/// alias of a local ref, a local alias of a collection ref, and an alias of
+/// a ref of another collection.
+#[test]
+fn an_alias_can_name_a_ref_of_another_namespace() {
+    let tmp = TmpDir::new("ref-store-alias-across");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        put(&repo, OTHER, "x", &checksum(2)).await;
+        let cases = [
+            (
+                Ref::collection(OTHER, "al"),
+                Ref::local("main"),
+                format!("refs/mirrors/{OTHER}/al"),
+                "../../heads/main".to_owned(),
+                checksum(1),
+            ),
+            (
+                Ref::local("lx"),
+                Ref::collection(OTHER, "x"),
+                "refs/heads/lx".to_owned(),
+                format!("../mirrors/{OTHER}/x"),
+                checksum(2),
+            ),
+            (
+                Ref::collection(FIRST, "y"),
+                Ref::collection(OTHER, "x"),
+                format!("refs/mirrors/{FIRST}/y"),
+                format!("../{OTHER}/x"),
+                checksum(2),
+            ),
+        ];
+        for (alias, target, rel, body, commit) in cases {
+            repo.set_ref_alias_immediate(&alias, &target).await.unwrap();
+            assert_eq!(link_body(&path, &rel), body, "{alias}");
+            assert_eq!(resolve(&repo, &alias).await, Some(commit), "{alias}");
+        }
+    });
+}
+
+/// An alias `@OWN:NAME` is the local alias `NAME`: the call writes
+/// `refs/heads/NAME`, and an error names the alias `NAME`.
+#[test]
+fn an_alias_of_the_own_collection_is_a_local_alias() {
+    let tmp = TmpDir::new("ref-store-own-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        let alias = Ref::collection(OWN, "al");
+        repo.set_ref_alias_immediate(&alias, &Ref::collection(OWN, "main"))
+            .await
+            .unwrap();
+        assert_eq!(link_body(&path, "refs/heads/al"), "main");
+        assert!(!path.join("refs/mirrors").join(OWN).exists());
+        assert_eq!(resolve(&repo, &Ref::local("al")).await, Some(checksum(1)));
+        assert_not_writable(
+            repo.set_ref_alias_immediate(&alias, &Ref::local("al"))
+                .await,
+            "al",
+            "targets an alias",
+        );
+        let guard = repo.begin_update().await.unwrap();
+        assert_not_writable(
+            guard.set_ref_alias(&alias, &alias).await,
+            "al",
+            "targets an alias",
+        );
+        guard.finish().await.unwrap();
+        assert_eq!(link_body(&path, "refs/heads/al"), "main");
+    });
+}
+
+/// An alias write refuses a mirror target that is an alias, and writes
+/// nothing.
+#[test]
+fn a_mirror_alias_of_an_alias_is_refused() {
+    let tmp = TmpDir::new("ref-store-mirror-alias-of-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let mirror = path.join("refs/mirrors").join(OTHER);
+    block_on(async {
+        put(&repo, OTHER, "pool/x", &checksum(1)).await;
+        repo.set_ref_alias_immediate(
+            &Ref::collection(OTHER, "a"),
+            &Ref::collection(OTHER, "pool/x"),
+        )
+        .await
+        .unwrap();
+        let alias = Ref::collection(OTHER, "c");
+        let target = Ref::collection(OTHER, "a");
+        let name = format!("@{OTHER}:c");
+        assert_not_writable(
+            repo.set_ref_alias_immediate(&alias, &target).await,
+            &name,
+            "targets an alias",
+        );
+        let guard = repo.begin_update().await.unwrap();
+        assert_not_writable(
+            guard.set_ref_alias(&alias, &target).await,
+            &name,
+            "targets an alias",
+        );
+        guard.finish().await.unwrap();
+        assert!(std::fs::symlink_metadata(mirror.join("c")).is_err());
+    });
+}
+
+/// The alias listing gives each alias under `refs/heads`, `refs/remotes`,
+/// and `refs/mirrors` with its name, the ref that its body names, and its
+/// body, sorted by the text of the name. It holds a broken alias, and an
+/// alias under a directory whose name fails the collection-id rule. It does
+/// not read the directory of the own collection id. A body that leaves
+/// `refs/`, names a path under the directory of the own collection id, or
+/// names a ref that fails the ref rule gives no target.
+#[test]
+fn the_alias_listing_gives_each_alias_with_its_target() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TmpDir::new("ref-store-alias-listing");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let mirrors = path.join("refs/mirrors");
+    block_on(async {
+        put_local(&repo, "main", &checksum(1)).await;
+        repo.set_ref_immediate(&Ref::remote("origin", "main"), Some(&checksum(2)))
+            .await
+            .unwrap();
+        put(&repo, OTHER, "pool/x", &checksum(3)).await;
+        repo.set_ref_alias_immediate(&Ref::local("al"), &Ref::local("main"))
+            .await
+            .unwrap();
+        repo.set_ref_alias_immediate(&Ref::remote("origin", "ra"), &Ref::remote("origin", "main"))
+            .await
+            .unwrap();
+        repo.set_ref_alias_immediate(
+            &Ref::collection(OTHER, "defpool/x"),
+            &Ref::collection(OTHER, "pool/x"),
+        )
+        .await
+        .unwrap();
+        repo.set_ref_alias_immediate(
+            &Ref::collection(OTHER, "broken"),
+            &Ref::collection(OTHER, "gone"),
+        )
+        .await
+        .unwrap();
+        let other = mirrors.join(OTHER);
+        symlink("../../../config", other.join("out")).unwrap();
+        symlink(format!("../{OWN}/x"), other.join("ownt")).unwrap();
+        symlink("../../heads/-a", other.join("bad")).unwrap();
+        symlink(format!("../mirrors/{OWN}/x"), path.join("refs/heads/ownl")).unwrap();
+        std::fs::create_dir_all(mirrors.join("nodots")).unwrap();
+        symlink(format!("../{OTHER}/pool/x"), mirrors.join("nodots/al")).unwrap();
+        put_own_mirror(&path, "x", &checksum(4));
+        symlink("x", mirrors.join(OWN).join("own")).unwrap();
+
+        let aliases = repo.list_ref_aliases().await.unwrap();
+        let got: Vec<(Ref, Option<Ref>, String)> = aliases
+            .into_iter()
+            .map(|a| (a.name, a.target, a.body))
+            .collect();
+        let mirror = |name: &str| Ref::collection(OTHER, name);
+        let want = [
+            (
+                Ref::collection("nodots", "al"),
+                Some(mirror("pool/x")),
+                format!("../{OTHER}/pool/x"),
+            ),
+            (mirror("bad"), None, "../../heads/-a".to_owned()),
+            (mirror("broken"), Some(mirror("gone")), "gone".to_owned()),
+            (
+                mirror("defpool/x"),
+                Some(mirror("pool/x")),
+                "../pool/x".to_owned(),
+            ),
+            (mirror("out"), None, "../../../config".to_owned()),
+            (mirror("ownt"), None, format!("../{OWN}/x")),
+            (
+                Ref::local("al"),
+                Some(Ref::local("main")),
+                "main".to_owned(),
+            ),
+            (
+                Ref::remote("origin", "ra"),
+                Some(Ref::remote("origin", "main")),
+                "main".to_owned(),
+            ),
+            (Ref::local("ownl"), None, format!("../mirrors/{OWN}/x")),
+        ];
+        assert_eq!(got, want);
+        assert_eq!(resolve(&repo, &mirror("gone")).await, None);
+        assert_eq!(resolve(&repo, &mirror("broken")).await, None);
+    });
+}
+
+/// A symlink directly under `refs/mirrors` fails the alias listing with
+/// "passes through a symlink".
+#[test]
+fn a_symlink_directly_under_refs_mirrors_fails_the_alias_listing() {
+    let tmp = TmpDir::new("ref-store-alias-listing-top-link");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    block_on(async {
+        put(&repo, OTHER, "x", &checksum(1)).await;
+        std::os::unix::fs::symlink(format!("{OTHER}/x"), path.join("refs/mirrors/al")).unwrap();
+        match repo.list_ref_aliases().await {
+            Err(Error::InvalidFormat(m)) => {
+                assert!(m.contains("passes through a symlink"), "{m}");
+            }
+            other => panic!("{other:?}"),
+        }
+    });
+}
+
+/// The remove calls remove an alias of a mirror ref and keep the ref. They
+/// refuse a mirror ref file, and keep it.
+#[test]
+fn the_remove_calls_remove_a_mirror_alias() {
+    let tmp = TmpDir::new("ref-store-remove-mirror-alias");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let mirror = path.join("refs/mirrors").join(OTHER);
+    let target = Ref::collection(OTHER, "pool/x");
+    let rel = format!("refs/mirrors/{OTHER}/pool/x");
+    block_on(async {
+        put(&repo, OTHER, "pool/x", &checksum(1)).await;
+        for by_guard in [false, true] {
+            let alias = Ref::collection(OTHER, "defpool/x");
+            repo.set_ref_alias_immediate(&alias, &target).await.unwrap();
+            if by_guard {
+                let guard = repo.begin_update().await.unwrap();
+                guard.remove_ref_alias(&alias).await.unwrap();
+                guard.finish().await.unwrap();
+            } else {
+                repo.remove_ref_alias_immediate(&alias).await.unwrap();
+            }
+            assert!(std::fs::symlink_metadata(mirror.join("defpool/x")).is_err());
+            assert_eq!(ref_file(&path, &rel), Some(checksum(1)));
+        }
+        let name = format!("@{OTHER}:pool/x");
+        assert_not_writable(
+            repo.remove_ref_alias_immediate(&target).await,
+            &name,
+            "names a ref file",
+        );
+        let guard = repo.begin_update().await.unwrap();
+        assert_not_writable(
+            guard.remove_ref_alias(&target).await,
+            &name,
+            "names a ref file",
+        );
+        guard.finish().await.unwrap();
+        assert_eq!(ref_file(&path, &rel), Some(checksum(1)));
     });
 }

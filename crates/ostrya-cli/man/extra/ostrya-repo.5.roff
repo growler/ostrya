@@ -158,6 +158,7 @@ The file holds the 64 hexadecimal characters of a commit checksum and a newline.
 A \fB\%/\fR in the ref name makes a subdirectory.
 The file holds 4096 bytes at most, and a larger file fails each read with the error \fB\%invalid format: <path> is larger than its cap of 4096 bytes\fR.
 An alias is a relative symbolic link to another ref.
+An alias can also be at \fB\%refs/remotes/<remote>/<ref>\fR or at \fB\%refs/mirrors/<collection\-id>/<ref>\fR, and its target can be a ref in each of these directories.
 A read of an alias does not follow the link through the file system.
 The body of the link must resolve to a path below \fB\%refs/\fR, and the target must be a regular file that is not an alias, with no symbolic link on its path.
 An alias that breaks this rule, or whose target is absent, names no ref: the listings and \fB\%ostrya summary \-u\fR leave it out, and \fB\%ostrya prune\fR and \fB\%ostrya fsck\fR read no root from it.
@@ -179,13 +180,18 @@ A symbolic link at \fB\%refs/remotes/<remote>\fR fails each listing of \fB\%refs
 A collection ref.
 The summary lists these refs in its collection map.
 A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
+The alias listing of the ostrya library gives each alias under such a directory.
 A symbolic link at \fB\%refs/mirrors/<collection\-id>\fR fails each listing of \fB\%refs/mirrors\fR, also in \fB\%ostrya summary \-u\fR, \fB\%ostrya prune\fR, and \fB\%ostrya fsck\fR, with the error \fB\%invalid format: refs/mirrors/<collection\-id> passes through a symlink; ostrya refuses a symlink in the repository\fR, and \fB\%ostrya prune\fR then deletes nothing.
+The ostrya library writes and removes an alias at \fB\%refs/mirrors/<collection\-id>/<ref>\fR.
+The \fB\%ostrya\fR command writes no alias here, and \fB\%ostrya refs \-A\fR does not list it.
+\fB\%ostrya refs \-A\fR and \fB\%ostrya refs \-\-delete\fR with no \fB\%\-c\fR read the aliases under \fB\%refs/mirrors\fR.
+A symbolic link at \fB\%refs/mirrors\fR or directly under it, a directory under \fB\%refs/mirrors\fR that cannot be read and that is not the directory of the own collection id, and a link body larger than 4096 bytes fail these two commands, and \fB\%ostrya refs \-\-delete\fR then removes nothing.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
 A pull with \fB\%\-\-collection\fR and \fB\%refs \-c \-\-create\fR write it by the same rule.
 A pull with \fB\%\-\-mirror\fR writes it by the same rule for each ref of the collection \fB\%<collection\-id>\fR that the summary of the remote states, and for each ref of the collection map of that summary.
 The refs of the own collection id are the local refs: each writer writes \fB\%refs/heads/<ref>\fR for that id.
 A directory \fB\%refs/mirrors/\fR of the own collection id comes from outside ostrya, for example from a hand edit or from the \fB\%ostree\fR command.
-The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the summary, the ref listing, and the archive view of \fB\%ostrya serve\fR and \fB\%ostrya send\fR, which serves no file in it.
+The readers of ostrya ignore it: the resolve, the listing of \fB\%refs \-c\fR, the alias listing, the summary, the ref listing, and the archive view of \fB\%ostrya serve\fR and \fB\%ostrya send\fR, which serves no file in it.
 \fB\%ostrya fsck\fR prints a line for each ref in it, and the line is not an error.
 \fB\%ostrya prune\fR keeps the commit of each ref in it, and never deletes such a ref.
 Remove such a ref by hand.

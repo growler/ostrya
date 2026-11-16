@@ -19,8 +19,8 @@ use futures_lite::AsyncReadExt;
 use futures_lite::io::{BufReader, Cursor};
 use ostrya::access::ReadAccess;
 use ostrya::{
-    ArchiveAnswer, ArchiveHead, ArchiveView, Checksum, CreateOptions, FileKind, ObjectType, Repo,
-    RepoMode, SummaryOptions, loose_path,
+    ArchiveAnswer, ArchiveHead, ArchiveView, Checksum, CreateOptions, FileKind, ObjectType, Ref,
+    Repo, RepoMode, SummaryOptions, loose_path,
 };
 use ostrya_core::{ContentHasher, DeflateReader, FileHeader, Xattrs};
 use ostrya_rt::block_on;
@@ -452,7 +452,9 @@ fn private_and_absent_paths_are_refused_or_not_found() {
     block_on(async {
         for mode in WRITABLE {
             let (path, repo, commit) = repo_of(tmp.path(), mode, &src).await;
-            repo.set_ref_alias_immediate("alias", "main").await.unwrap();
+            repo.set_ref_alias_immediate(&Ref::local("alias"), &Ref::local("main"))
+                .await
+                .unwrap();
             let heads = path.join("refs/heads");
             symlink("alias", heads.join("alias2")).unwrap();
             symlink("../../summary", heads.join("out")).unwrap();

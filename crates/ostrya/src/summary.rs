@@ -4113,10 +4113,10 @@ mod tests {
                     .await
                     .unwrap();
             }
-            repo.set_ref_alias_immediate("pub/link", "priv/p")
+            repo.set_ref_alias_immediate(&Ref::local("pub/link"), &Ref::local("priv/p"))
                 .await
                 .unwrap();
-            repo.set_ref_alias_immediate("pub/open", "main")
+            repo.set_ref_alias_immediate(&Ref::local("pub/open"), &Ref::local("main"))
                 .await
                 .unwrap();
             let own = "org.example.Own";

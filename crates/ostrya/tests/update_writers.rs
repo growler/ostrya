@@ -261,8 +261,14 @@ async fn run_writer(repo: &Repo, name: &str, commit: &Checksum) -> ostrya::Resul
             let cref = Ref::collection("org.example.C", "app/main");
             repo.set_ref_immediate(&cref, Some(commit)).await
         }
-        "set_ref_alias_immediate" => repo.set_ref_alias_immediate("current", "main").await,
-        "remove_ref_alias_immediate" => repo.remove_ref_alias_immediate("current").await,
+        "set_ref_alias_immediate" => {
+            repo.set_ref_alias_immediate(&Ref::local("current"), &Ref::local("main"))
+                .await
+        }
+        "remove_ref_alias_immediate" => {
+            repo.remove_ref_alias_immediate(&Ref::local("current"))
+                .await
+        }
         "write_config" => {
             let mut keyfile = repo.config().keyfile().clone();
             keyfile.set_value("ex-test", "written", "yes").unwrap();

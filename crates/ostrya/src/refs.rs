@@ -60,12 +60,36 @@ pub struct CollectionRefEntry {
 }
 
 /// A ref stored as an alias: a relative symlink to the file of another ref.
+///
+/// [`Repo::list_ref_aliases`] gives the aliases under `refs/heads`,
+/// `refs/remotes`, and `refs/mirrors`. It does not read the directory of the
+/// `[core] collection-id` under `refs/mirrors`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefAlias {
-    /// The refspec of the alias itself.
-    pub refspec: String,
-    /// The symlink target, as stored.
-    pub target: String,
+    /// The alias itself.
+    ///
+    /// A link under `refs/heads` is a [`Ref::Local`], a link under
+    /// `refs/remotes/R/` is a [`Ref::Remote`] of the remote `R`, and a link
+    /// under `refs/mirrors/ID/` is a [`Ref::Collection`] of the id `ID`. The
+    /// listing does not check the name, so it can be a ref that fails
+    /// [`Ref::validate`]. The remove calls refuse such a ref.
+    pub name: Ref,
+    /// The ref that the body of the link names, or `None`.
+    ///
+    /// The body resolves against the directory of the link, and the path
+    /// that it gives maps back to a ref, as the ref store maps a ref to a
+    /// path. The value is `None` when the body leaves `refs/`, when the path
+    /// names no ref, when the path is under the directory of the `[core]
+    /// collection-id` under `refs/mirrors`, or when the ref fails
+    /// [`Ref::validate`]. Thus `None` tells that the body names no ref path
+    /// that the store addresses by a [`Ref`]. It does not tell that the
+    /// alias resolves to no commit: the resolve of the alias follows a body
+    /// into the directory of the `[core] collection-id` and reads the file
+    /// there. The ref that a `Some` value names can be absent: a resolve of
+    /// it then gives no commit.
+    pub target: Option<Ref>,
+    /// The body of the link, as stored.
+    pub body: String,
 }
 
 /// The state of one ref path, as [`ref_file_state`] and [`lstat_ref_state`]
@@ -1274,21 +1298,32 @@ impl Repo {
         Ok(all)
     }
 
-    /// Returns the local and remote refs that are aliases, sorted by refspec.
+    /// Returns the refs that are aliases, sorted by the text of their name.
+    ///
+    /// The call reads the symlinks under `refs/heads`, `refs/remotes`, and
+    /// `refs/mirrors`. [`RefAlias`] states the name and the target of each
+    /// link. The text of the name is the text of [`Ref`], and the list is
+    /// sorted by that text in byte order. The call does not read the
+    /// directory of the `[core] collection-id` that the open of the handle
+    /// read, because the ref store reads `refs/heads` for that id.
     ///
     /// The result holds an alias whose target names no ref, because the call
-    /// reads the link and not the ref behind it. An alias whose target is not
-    /// UTF-8 is not in the result.
+    /// reads the link and not the ref behind it. [`RefAlias::target`] states
+    /// what its value tells about the ref behind the link. An alias whose
+    /// body is not UTF-8 is not in the result.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if `refs`, `refs/heads`, `refs/remotes`, or
-    ///   an entry directly under `refs/remotes` is a symlink.
-    /// - [`Error::Io`] if a read from the file system fails.
+    /// - [`Error::InvalidFormat`] if `refs`, `refs/heads`, `refs/remotes`,
+    ///   `refs/mirrors`, or an entry directly under `refs/remotes` or
+    ///   `refs/mirrors` is a symlink, or if the body of a link is larger than
+    ///   the cap of a ref read.
+    /// - [`Error::Io`] if a read from the file system fails, for example if
+    ///   a directory under `refs/` cannot be read.
     pub async fn list_ref_aliases(&self) -> Result<Vec<RefAlias>> {
         let repo = self.clone();
         let mut aliases = ostrya_rt::unblock(move || collect_aliases(&repo)).await?;
-        aliases.sort_by(|a, b| a.refspec.cmp(&b.refspec));
+        aliases.sort_by_cached_key(|alias| alias.name.to_string());
         Ok(aliases)
     }
 
@@ -1563,11 +1598,21 @@ impl Repo {
 
     /// Writes one ref as an alias of another ref, outside a transaction.
     ///
-    /// The alias is a relative symlink from the file of `refspec` to the file
-    /// of `target`. It replaces the ref or the alias that `refspec` named
-    /// before. The call checks both refspecs. The call does not require
-    /// either ref to exist, because the link records a name and not a
-    /// checksum.
+    /// The alias is a relative symlink from the file of `alias` to the file
+    /// of `target`. It replaces the ref or the alias that `alias` named
+    /// before. The call checks both refs. The call does not require either
+    /// ref to exist, because the link records a name and not a checksum.
+    ///
+    /// Each ref gives its path as
+    /// [`set_ref_immediate`](Repo::set_ref_immediate) states: a local ref is
+    /// under `refs/heads`, a remote ref under `refs/remotes/REMOTE/`, and a
+    /// collection ref under `refs/mirrors/ID/`. A collection ref of the
+    /// `[core] collection-id` is the local ref of the same name, under
+    /// `refs/heads`. The id is the one that the open of the handle read. The
+    /// alias and its target can be in different directories, for example a
+    /// collection alias of a local ref. An error names a ref by the text of
+    /// its canonical form, as [`Ref::canonical`] gives it: `@OWN:NAME` is
+    /// named `NAME`.
     ///
     /// An alias names a ref file. Under the update lock, the call reads the
     /// type of the entry at the path of `target` with no symlink followed,
@@ -1588,13 +1633,14 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
-    ///   refspec.
+    /// - [`Error::InvalidRefspec`] if `alias` or `target` fails
+    ///   [`Ref::validate`]. The call checks `alias` first, and the error
+    ///   holds the text of the ref that fails.
     /// - [`Error::RefNotWritable`] if `refs` or a component above the path
-    ///   of `refspec` is a symlink, also a dangling one. The reason is
+    ///   of `alias` is a symlink, also a dangling one. The reason is
     ///   `passes through an alias`, and the call writes nothing.
-    /// - [`Error::RefNotWritable`] for `refspec` if `target` names an alias,
-    ///   or names the path of `refspec` itself. The reason is `targets an
+    /// - [`Error::RefNotWritable`] for `alias` if `target` names an alias,
+    ///   or names the path of `alias` itself. The reason is `targets an
     ///   alias`, and the call writes nothing. If `refs` or a component above
     ///   the path of `target` is a symlink, the reason is `passes through an
     ///   alias`.
@@ -1608,41 +1654,51 @@ impl Repo {
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn set_ref_alias_immediate(&self, refspec: &str, target: &str) -> Result<()> {
+    pub async fn set_ref_alias_immediate(&self, alias: &Ref, target: &Ref) -> Result<()> {
         let fsync = self.config().fsync()?;
-        let relpath = refspec_to_relpath(refspec)?;
-        let target = refspec_to_relpath(target)?;
-        let name = refspec.to_owned();
+        let own = self.config().collection_id();
+        let relpath = ref_relpath(own, alias)?;
+        let target = ref_relpath(own, target)?;
+        let name = alias.clone().canonical(own).to_string();
         self.write_locked(move |repo| {
             write_alias_blocking(repo.root_dir(), &name, &relpath, &target, fsync)
         })
         .await
     }
 
-    /// Removes the alias `refspec`, outside a transaction.
+    /// Removes the alias `alias`, outside a transaction.
     ///
-    /// The call unlinks the symlink at the path of `refspec`. The ref that
-    /// the alias names stays. The removal of an absent path is not an error.
-    /// If `[core] fsync` is on, the call runs `fsync` on the directory that
-    /// held the link. The locks are those of
+    /// The call unlinks the symlink at the path of `alias`. The ref gives the
+    /// path as [`set_ref_alias_immediate`](Repo::set_ref_alias_immediate)
+    /// states, so the call removes an alias under `refs/heads`,
+    /// `refs/remotes/REMOTE/`, or `refs/mirrors/ID/`. The ref that the alias
+    /// names stays. The removal of an absent path is not an error. If `[core]
+    /// fsync` is on, the call runs `fsync` on the directory that held the
+    /// link. The locks are those of
     /// [`set_ref_immediate`](Repo::set_ref_immediate).
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
-    /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
+    /// - [`Error::InvalidRefspec`] if `alias` fails [`Ref::validate`]. The
+    ///   error holds the text of the ref. So an alias that
+    ///   [`list_ref_aliases`](Repo::list_ref_aliases) gives with a name that
+    ///   fails the check cannot be removed through this call. Remove such an
+    ///   alias by hand.
+    /// - [`Error::RefNotWritable`] if the path of `alias` names a ref file,
     ///   names a directory, passes through a file or an alias, or names a
-    ///   special file. The call removes nothing.
+    ///   special file. The error names the ref by the text of its canonical
+    ///   form, and the call removes nothing.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
     ///   lock-timeout-secs` does not parse.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is below `-1`.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn remove_ref_alias_immediate(&self, refspec: &str) -> Result<()> {
+    pub async fn remove_ref_alias_immediate(&self, alias: &Ref) -> Result<()> {
         let fsync = self.config().fsync()?;
-        let relpath = refspec_to_relpath(refspec)?;
-        let name = refspec.to_owned();
+        let own = self.config().collection_id();
+        let relpath = ref_relpath(own, alias)?;
+        let name = alias.clone().canonical(own).to_string();
         self.write_locked(move |repo| {
             let root = repo.root_dir();
             let mut dirs = Vec::new();
@@ -2413,39 +2469,96 @@ fn collect_remote_collections(
     Ok(out)
 }
 
-/// Collects the aliases under `refs/heads` and `refs/remotes`. Each alias
-/// gets the name that the listing of its directory gives a ref. A symlink
-/// directly under `refs/remotes` fails the call, as [`refuse_top_symlink`]
-/// states.
+/// Collects the aliases under `refs/heads`, `refs/remotes`, and
+/// `refs/mirrors`. Each alias gets the name that the listing of its
+/// directory gives a ref, and the target that [`listed_alias_target`] reads
+/// from its body. The walk of `refs/mirrors` does not read the directory of
+/// the `[core] collection-id`. A symlink directly under `refs/remotes` or
+/// `refs/mirrors` fails the call, as [`refuse_top_symlink`] states.
 fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
+    let own = repo.config().collection_id();
     let mut out = Vec::new();
     let refs = open_refs(repo)?;
+    // Gives the alias of one entry under `top`, or `None` for an entry that
+    // is not an alias.
+    let alias = |top: &str, entry: &RefEntry<'_>, name: Ref| -> Result<Option<RefAlias>> {
+        let Some(body) = read_alias_body(entry)? else {
+            return Ok(None);
+        };
+        let link_dir = match entry.path.rsplit_once('/') {
+            Some((dir, _)) => format!("{top}/{dir}"),
+            None => top.to_owned(),
+        };
+        let target = resolve_alias(&link_dir, body.as_bytes())
+            .and_then(|path| listed_alias_target(own, &path));
+        Ok(Some(RefAlias { name, target, body }))
+    };
     if let Some(heads) = open_top_in(refs.as_ref(), HEADS_DIR)? {
         walk_ref_dir(&heads, "", &mut |entry| {
-            if let Some(target) = read_alias_body(&entry)? {
-                out.push(RefAlias {
-                    refspec: entry.path.to_owned(),
-                    target,
-                });
+            if entry.file_type != FileType::Symlink {
+                return Ok(());
             }
+            let name = Ref::local(entry.path);
+            out.extend(alias(HEADS_DIR, &entry, name)?);
             Ok(())
         })?;
     }
     if let Some(remotes) = open_top_in(refs.as_ref(), REMOTES_DIR)? {
         walk_ref_dir(&remotes, "", &mut |entry| {
             refuse_top_symlink(REMOTES_DIR, entry.path, entry.file_type)?;
-            if let Some(target) = read_alias_body(&entry)?
-                && let Some((remote, ref_name)) = entry.path.split_once('/')
-            {
-                out.push(RefAlias {
-                    refspec: format!("{remote}:{ref_name}"),
-                    target,
-                });
+            if entry.file_type != FileType::Symlink {
+                return Ok(());
+            }
+            if let Some((remote, ref_name)) = entry.path.split_once('/') {
+                let name = Ref::remote(remote, ref_name);
+                out.extend(alias(REMOTES_DIR, &entry, name)?);
+            }
+            Ok(())
+        })?;
+    }
+    if let Some(mirrors) = open_top_in(refs.as_ref(), MIRRORS_DIR)? {
+        let skip = |path: &str| !path.contains('/') && Some(path) == own;
+        walk_ref_dir_skipping(&mirrors, "", &skip, &mut |entry| {
+            refuse_top_symlink(MIRRORS_DIR, entry.path, entry.file_type)?;
+            if entry.file_type != FileType::Symlink {
+                return Ok(());
+            }
+            // An entry directly under refs/mirrors names no collection, as
+            // in collect_mirrors.
+            if let Some((id, ref_name)) = entry.path.split_once('/') {
+                let name = Ref::collection(id, ref_name);
+                out.extend(alias(MIRRORS_DIR, &entry, name)?);
             }
             Ok(())
         })?;
     }
     Ok(out)
+}
+
+/// Maps the path `path` below the repository root, which [`resolve_alias`]
+/// gives for the body of an alias, to the ref that the ref store keeps at
+/// it, in a repository whose `[core] collection-id` is `own`.
+///
+/// `refs/heads/NAME` gives a local ref, `refs/remotes/R/NAME` a remote ref,
+/// and `refs/mirrors/ID/NAME` a collection ref. Each other path, a path
+/// under the directory of `own` under `refs/mirrors`, and a ref that fails
+/// [`Ref::validate`] give `None`.
+fn listed_alias_target(own: Option<&str>, path: &str) -> Option<Ref> {
+    let below = path.strip_prefix("refs/")?;
+    let r = if let Some(name) = below.strip_prefix("heads/") {
+        Ref::local(name)
+    } else if let Some(rest) = below.strip_prefix("remotes/") {
+        let (remote, name) = rest.split_once('/')?;
+        Ref::remote(remote, name)
+    } else {
+        let rest = below.strip_prefix("mirrors/")?;
+        let (id, name) = rest.split_once('/')?;
+        if Some(id) == own {
+            return None;
+        }
+        Ref::collection(id, name)
+    };
+    r.validate().is_ok().then_some(r)
 }
 
 /// Opens the directory `top` under the repository root, for example
@@ -2855,11 +2968,27 @@ fn entry_type(dir: &RepoDir, name: &str) -> Result<Option<FileType>> {
 
 /// Returns the symlink target of an alias entry, as stored. Returns `None`
 /// for an entry that is not a symlink and for a target that is not UTF-8.
+///
+/// The call reads the entry with [`read_ref_entry`]. An entry that is
+/// removed after the walk, or that is no symlink at the read, gives `None`,
+/// as in [`read_listed_ref`].
 fn read_alias_body(entry: &RefEntry<'_>) -> Result<Option<String>> {
     if entry.file_type != FileType::Symlink {
         return Ok(None);
     }
-    let body = entry.dir.read_link(entry.name, REF_READ_CAP)?;
+    let body = match read_ref_entry(entry.dir, entry.name, true) {
+        Ok(RefEntryRead::Alias(body)) => body,
+        Ok(RefEntryRead::File(_)) => return Ok(None),
+        // The entry is gone, or it changed into an entry that holds no ref.
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::NotRegular(_) | Reason::NotDirectory,
+                ..
+            },
+        ) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
     Ok(String::from_utf8(body).ok())
 }
 
@@ -3175,6 +3304,7 @@ pub fn validate_refspec(refspec: &str) -> Result<()> {
 
 /// Maps a refspec to its path under `refs/`. Refuses a refspec that
 /// [`validate_refspec`] refuses.
+#[cfg_attr(not(feature = "receive"), allow(dead_code))]
 pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
     validate_refspec(refspec)?;
     Ok(match refspec.split_once(':') {
@@ -4232,6 +4362,33 @@ mod tests {
         }
     }
 
+    /// The alias listing gives no alias for an entry that the walk found as
+    /// a symlink and that is removed, or that is no symlink, at the read of
+    /// its body. A concurrent writer removes or replaces an alias so.
+    #[test]
+    fn a_listed_alias_that_is_gone_or_no_symlink_at_the_read_gives_no_alias() {
+        let root = Root::new("listed-alias-gone");
+        let heads = root.dir.join("refs/heads");
+        let commit = Checksum::from_bytes([7; 32]);
+        std::fs::write(heads.join("file"), ref_text(&commit)).unwrap();
+        std::fs::create_dir(heads.join("dir")).unwrap();
+        let handle = root.handle();
+        let dir = handle
+            .open_layout(RepoLayout::Refs)
+            .unwrap()
+            .open_dir("heads")
+            .unwrap();
+        for name in ["gone", "file", "dir"] {
+            let entry = RefEntry {
+                dir: &dir,
+                name,
+                path: name,
+                file_type: FileType::Symlink,
+            };
+            assert_eq!(read_alias_body(&entry).unwrap(), None, "{name}");
+        }
+    }
+
     /// Runs `read` on a thread with a new handle of the repository root
     /// `dir`, and returns its result. If the call does not end in 10 seconds,
     /// a writer opens `fifo`, so that a blocked open ends, and the test
@@ -4664,6 +4821,7 @@ mod tests {
                             .select_refs(&all, Some(&all), repo.implicit_reads(), None)
                             .await;
                         assert_invalid(selected.map(|_| ()), symlinked, dir);
+                        assert_invalid(repo.list_ref_aliases().await, symlinked, dir);
                     }
                 }
                 let written = repo.set_ref_immediate(&r, Some(&commit)).await;
@@ -4691,7 +4849,9 @@ mod tests {
             repo.set_ref_immediate(&Ref::local("main"), Some(&commit))
                 .await
                 .unwrap();
-            repo.set_ref_alias_immediate("al1", "main").await.unwrap();
+            repo.set_ref_alias_immediate(&Ref::local("al1"), &Ref::local("main"))
+                .await
+                .unwrap();
             std::fs::create_dir(heads.join("d")).unwrap();
             std::os::unix::fs::symlink("d", heads.join("dl")).unwrap();
             for (target, reason) in [
@@ -4699,7 +4859,10 @@ mod tests {
                 ("al2", TARGETS_AN_ALIAS),
                 ("dl/x", PASSES_THROUGH_AN_ALIAS),
             ] {
-                match repo.set_ref_alias_immediate("al2", target).await {
+                match repo
+                    .set_ref_alias_immediate(&Ref::local("al2"), &Ref::local(target))
+                    .await
+                {
                     Err(Error::RefNotWritable { name, reason: r }) => {
                         assert_eq!((name.as_str(), r.as_str()), ("al2", reason), "{target}");
                     }
@@ -4710,7 +4873,9 @@ mod tests {
                     "{target}"
                 );
             }
-            repo.set_ref_alias_immediate("al3", "nosuch").await.unwrap();
+            repo.set_ref_alias_immediate(&Ref::local("al3"), &Ref::local("nosuch"))
+                .await
+                .unwrap();
             assert_eq!(
                 std::fs::read_link(heads.join("al3")).unwrap(),
                 std::path::Path::new("nosuch")

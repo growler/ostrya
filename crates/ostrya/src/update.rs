@@ -20,8 +20,7 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::lock::UpdateLocks;
 use crate::refs::{
-    put_alias_blocking, put_ref_blocking, ref_relpath, refspec_to_relpath, remove_alias_blocking,
-    sync_dirs_all,
+    put_alias_blocking, put_ref_blocking, ref_relpath, remove_alias_blocking, sync_dirs_all,
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config};
@@ -399,23 +398,31 @@ impl UpdateGuard {
         self.set_relpath(name, relpath, checksum).await
     }
 
-    /// Writes `refspec` as an alias of `target`, as
+    /// Writes `alias` as an alias of `target`, as
     /// [`Repo::set_ref_alias_immediate`] writes it.
     ///
-    /// The alias is a relative symlink. It replaces the entry that `refspec`
-    /// named before. The call checks both refspecs, and the two refs do not
-    /// have to exist. An alias whose target is an alias is refused, as
+    /// The alias is a relative symlink. It replaces the entry that `alias`
+    /// named before. The call checks both refs, and the two refs do not have
+    /// to exist. An alias whose target is an alias is refused, as
     /// [`Repo::set_ref_alias_immediate`] states.
+    ///
+    /// Each ref gives its path as [`set_ref`](UpdateGuard::set_ref) states:
+    /// `refs/heads/NAME` for a collection ref of the `[core] collection-id`,
+    /// and `refs/mirrors/ID/NAME` for a collection ref of each other id. The
+    /// id is the one that the open of the handle read, also after
+    /// [`write_config`](UpdateGuard::write_config) sets a new id. An error
+    /// names a ref by the text of its canonical form, as [`Ref::canonical`]
+    /// gives it.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` or `target` is not a valid
-    ///   refspec.
+    /// - [`Error::InvalidRefspec`] if `alias` or `target` fails
+    ///   [`Ref::validate`]. The call checks `alias` first.
     /// - [`Error::RefNotWritable`] if `refs` or a component above the path
-    ///   of `refspec` is a symlink, also a dangling one. The reason is
+    ///   of `alias` is a symlink, also a dangling one. The reason is
     ///   `passes through an alias`, and the call writes nothing.
-    /// - [`Error::RefNotWritable`] for `refspec` if `target` names an alias
-    ///   or the path of `refspec` itself (reason `targets an alias`), or if
+    /// - [`Error::RefNotWritable`] for `alias` if `target` names an alias
+    ///   or the path of `alias` itself (reason `targets an alias`), or if
     ///   `refs` or a component above the path of `target` is a symlink
     ///   (reason `passes through an alias`). The call writes nothing.
     /// - [`Error::InvalidFormat`] if a file is at a directory component of
@@ -423,33 +430,36 @@ impl UpdateGuard {
     ///   a component of the path after the check of the path. The call then
     ///   writes nothing through the symlink.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn set_ref_alias(&self, refspec: &str, target: &str) -> Result<()> {
-        let relpath = refspec_to_relpath(refspec)?;
-        let target = refspec_to_relpath(target)?;
-        let name = refspec.to_owned();
+    pub async fn set_ref_alias(&self, alias: &Ref, target: &Ref) -> Result<()> {
+        let own = self.repo().config().collection_id();
+        let relpath = ref_relpath(own, alias)?;
+        let target = ref_relpath(own, target)?;
+        let name = alias.clone().canonical(own).to_string();
         self.write(move |root, fsync, dirs| {
             put_alias_blocking(root, &name, &relpath, &target, fsync, dirs)
         })
         .await
     }
 
-    /// Removes the alias `refspec`, as [`Repo::remove_ref_alias_immediate`]
+    /// Removes the alias `alias`, as [`Repo::remove_ref_alias_immediate`]
     /// removes it.
     ///
-    /// The ref that the alias names stays. The removal of an absent path is
-    /// not an error. The sync of the directory that held the link waits for
-    /// [`finish`](UpdateGuard::finish).
+    /// The ref gives the path as [`set_ref_alias`](UpdateGuard::set_ref_alias)
+    /// states. The ref that the alias names stays. The removal of an absent
+    /// path is not an error. The sync of the directory that held the link
+    /// waits for [`finish`](UpdateGuard::finish).
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRefspec`] if `refspec` is not a valid refspec.
-    /// - [`Error::RefNotWritable`] if the path of `refspec` names a ref file,
+    /// - [`Error::InvalidRefspec`] if `alias` fails [`Ref::validate`].
+    /// - [`Error::RefNotWritable`] if the path of `alias` names a ref file,
     ///   names a directory, passes through a file or an alias, or names a
     ///   special file. The call removes nothing.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn remove_ref_alias(&self, refspec: &str) -> Result<()> {
-        let relpath = refspec_to_relpath(refspec)?;
-        let name = refspec.to_owned();
+    pub async fn remove_ref_alias(&self, alias: &Ref) -> Result<()> {
+        let own = self.repo().config().collection_id();
+        let relpath = ref_relpath(own, alias)?;
+        let name = alias.clone().canonical(own).to_string();
         self.write(move |root, fsync, dirs| {
             remove_alias_blocking(root, &name, &relpath, fsync, dirs)
         })

@@ -506,7 +506,7 @@ fn an_alias_lists_the_commit_of_its_target() {
         );
 
         put_local(&repo, "main", &checksum(3)).await;
-        repo.set_ref_alias_immediate("latest", "main")
+        repo.set_ref_alias_immediate(&Ref::local("latest"), &Ref::local("main"))
             .await
             .unwrap();
         put_local(&repo, "gone", &checksum(4)).await;

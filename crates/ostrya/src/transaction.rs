@@ -2716,7 +2716,9 @@ mod tests {
                     .await
                     .unwrap();
             }
-            repo.set_ref_alias_immediate("al", "x").await.unwrap();
+            repo.set_ref_alias_immediate(&Ref::local("al"), &Ref::local("x"))
+                .await
+                .unwrap();
             let txn = repo.transaction().await.unwrap();
             txn.set_ref(&Ref::local("main"), Some(&c));
             txn.set_ref(&Ref::local("x"), None);
@@ -2781,7 +2783,7 @@ mod tests {
             repo.set_ref_immediate(&Ref::local("target"), Some(&a))
                 .await
                 .unwrap();
-            repo.set_ref_alias_immediate("alias", "target")
+            repo.set_ref_alias_immediate(&Ref::local("alias"), &Ref::local("target"))
                 .await
                 .unwrap();
             for checksum in [Some(&c), None] {
@@ -2958,7 +2960,7 @@ mod tests {
             repo.set_ref_immediate(&Ref::local("target"), Some(&a))
                 .await
                 .unwrap();
-            repo.set_ref_alias_immediate("alias", "target")
+            repo.set_ref_alias_immediate(&Ref::local("alias"), &Ref::local("target"))
                 .await
                 .unwrap();
             let txn = repo.transaction().await.unwrap();

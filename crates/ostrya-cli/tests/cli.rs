@@ -49491,6 +49491,55 @@ fn refs_alias_refuses_a_collection_ref() {
     );
 }
 
+/// `refs -A` does not list an alias under `refs/mirrors/X/`, and `refs -A
+/// --delete` does not remove it. The local alias `loc` is listed and removed
+/// as before, and the mirror alias and its target stay.
+#[test]
+fn refs_alias_does_not_list_a_mirror_alias() {
+    let tmp = TmpDir::new("refs-alias-mirror-alias");
+    let (repo, main) = own_repo_with_main(tmp.path());
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+    ostrya_at(&repo, &["refs", "-A", "--create=loc", "main"]).ok();
+    let mirror = repo.join("refs/mirrors/org.example.X");
+    std::os::unix::fs::symlink("a", mirror.join("al")).unwrap();
+
+    assert_eq!(
+        ostrya_at(&repo, &["refs", "-A"]).ok().stdout_trimmed(),
+        "loc -> main"
+    );
+    ostrya_at(&repo, &["refs", "-A", "--delete", "loc"]).ok();
+    assert!(repo.join("refs/heads/loc").symlink_metadata().is_err());
+    assert_eq!(ostrya_at(&repo, &["refs", "-A"]).ok().stdout_trimmed(), "");
+    assert_eq!(
+        std::fs::read_link(mirror.join("al")).unwrap(),
+        Path::new("a")
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.X/a").as_ref(),
+        Some(&main)
+    );
+}
+
+/// A symlink directly under `refs/mirrors` fails `refs -A` and `refs
+/// --delete` with no `-c`, which read the aliases of the repository. The
+/// deletion removes no ref.
+#[test]
+fn refs_alias_listing_refuses_a_symlink_directly_under_refs_mirrors() {
+    let tmp = TmpDir::new("refs-alias-mirror-top-link");
+    let (repo, main) = own_repo_with_main(tmp.path());
+    ostrya_at(&repo, &["refs", "--create=@org.example.X:a", "main"]).ok();
+    ostrya_at(&repo, &["refs", "--create=zz", "main"]).ok();
+    std::os::unix::fs::symlink("org.example.X/a", repo.join("refs/mirrors/al")).unwrap();
+    let refs = describe_refs(&repo);
+    let message = "invalid format: refs/mirrors/al passes through a symlink; ostrya refuses a \
+                   symlink in the repository";
+
+    refused_with_message(&ostrya_at(&repo, &["refs", "-A"]), message);
+    refused_with_message(&ostrya_at(&repo, &["refs", "--delete", "zz"]), message);
+    assert_eq!(describe_refs(&repo), refs);
+    assert_eq!(ref_file(&repo, "refs/heads/zz").as_ref(), Some(&main));
+}
+
 /// A ref write or a ref removal at the path of an alias is refused, and the
 /// link and its target stay: `refs --create=al --force main`, `commit -b al`,
 /// `refs --delete al`, and `refs -c --delete OWN`. `refs --delete origin:rr`

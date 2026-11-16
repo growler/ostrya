@@ -4208,7 +4208,7 @@ mod tests {
                      [ex-ostrya client \"c\"]\nauth=anonymous\nallow={allow}\n"
                 );
                 let config = crate::RepoConfig::parse(&text).unwrap();
-                let access = crate::access::ClientAccess::from_config(&config, &root.dir).unwrap();
+                let access = crate::access::ClientAccess::from_config(&config).unwrap();
                 ReadAccess::new(
                     std::sync::Arc::new(access),
                     crate::access::AuthItem::Anonymous,

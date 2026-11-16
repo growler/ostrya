@@ -14,14 +14,15 @@ use super::rights::{
     AccessModes, AccessRules, AllowItem, NamespaceRules, parse_allow_item, parse_deny_item,
 };
 use super::{
-    ClientAccess, ClientGroup, ForwardedHeader, ServerSettings, SummaryFiles, is_header_name,
+    ClientAccess, ClientGroup, ForwardedHeader, ServerFile, ServerSettings, SummaryFiles,
+    is_header_name,
 };
-use crate::config::RepoConfig;
+use crate::config::{RepoConfig, relative_with_parent};
 use crate::error::{Error, Result};
 use crate::summary::summary_stem;
 
 /// The name of the server group.
-const SERVER_GROUP: &str = "ex-ostrya server";
+pub(super) const SERVER_GROUP: &str = "ex-ostrya server";
 /// The name prefix of a client group, before the quoted name.
 const CLIENT_PREFIX: &str = "ex-ostrya client \"";
 /// The name prefix of a trust group, before the quoted name.
@@ -89,7 +90,7 @@ struct Names<'a> {
 }
 
 /// Reads the client groups and the server group of `config`.
-pub(super) fn read(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess> {
+pub(super) fn read(config: &RepoConfig) -> Result<ClientAccess> {
     let keyfile = config.keyfile();
     let own_id = config.collection_id();
     let mut server = None;
@@ -113,7 +114,7 @@ pub(super) fn read(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess>
     }
 
     let server = match server {
-        Some(group) => parse_server(keyfile, group, &names, repo_dir)?,
+        Some(group) => parse_server(keyfile, group, &names)?,
         None => ServerSettings::default(),
     };
     let mut groups = Vec::with_capacity(clients.len());
@@ -508,12 +509,7 @@ fn check_overlap(groups: &[ClientGroup], by_item: &HashMap<AuthItem, Vec<usize>>
 }
 
 /// Reads the server group `group`.
-fn parse_server(
-    keyfile: &KeyFile,
-    group: &str,
-    names: &Names<'_>,
-    repo_dir: &Path,
-) -> Result<ServerSettings> {
+fn parse_server(keyfile: &KeyFile, group: &str, names: &Names<'_>) -> Result<ServerSettings> {
     check_keys(keyfile, group, SERVER_KEYS)?;
 
     let listen = match keyfile.get_string_list(group, "listen")? {
@@ -581,9 +577,9 @@ fn parse_server(
 
     Ok(ServerSettings {
         listen,
-        tls_cert: path(keyfile, group, "tls-cert", repo_dir)?,
-        tls_key: path(keyfile, group, "tls-key", repo_dir)?,
-        tls_client_ca: path(keyfile, group, "tls-client-ca", repo_dir)?,
+        tls_cert: path(keyfile, group, "tls-cert")?,
+        tls_key: path(keyfile, group, "tls-key")?,
+        tls_client_ca: path(keyfile, group, "tls-client-ca")?,
         trusted_proxy,
         trusted_proxy_header,
         trusted_proxy_client_cert,
@@ -600,15 +596,30 @@ fn parse_server(
 
 /// Reads the path key `key` of `group`.
 ///
-/// A relative path is joined onto `repo_dir`. An empty value is refused.
-fn path(keyfile: &KeyFile, group: &str, key: &str, repo_dir: &Path) -> Result<Option<PathBuf>> {
+/// The value is a [`ServerFile::Config`] path. An empty value is refused,
+/// and so is a relative path with a `..` component.
+fn path(keyfile: &KeyFile, group: &str, key: &str) -> Result<Option<ServerFile>> {
     match keyfile.get_string(group, key)? {
         None => Ok(None),
         Some(value) if value.is_empty() => Err(Error::InvalidFormat(format!(
             "[{group}] {key} is empty; remove the key or name a file"
         ))),
-        Some(value) => Ok(Some(repo_dir.join(value))),
+        Some(value) if relative_with_parent(Path::new(&value)) => {
+            Err(parent_component(group, key, Path::new(&value)))
+        }
+        Some(value) => Ok(Some(ServerFile::Config(PathBuf::from(value)))),
     }
+}
+
+/// Returns the [`Error::InvalidFormat`] of `value`, a relative path of the
+/// key `key` of `group` with a `..` component. The message names the group,
+/// the key, and the path.
+pub(super) fn parent_component(group: &str, key: &str, value: &Path) -> Error {
+    Error::InvalidFormat(format!(
+        "[{group}] {key} {} has a `..` component, which a relative path in a config \
+         cannot have",
+        value.display()
+    ))
 }
 
 /// Reads the integer key `key` of `group`, which must be from 1 to `max`.
@@ -639,7 +650,7 @@ mod tests {
 
     fn try_access(text: &str) -> Result<ClientAccess> {
         let config = RepoConfig::parse(&format!("{CORE}{text}"))?;
-        read(&config, Path::new("/srv/repo"))
+        read(&config)
     }
 
     fn access(text: &str) -> ClientAccess {
@@ -902,7 +913,7 @@ mod tests {
              deny=@own.id:a/secret\n"
         ))
         .unwrap();
-        let access = read(&config, Path::new("/r")).unwrap();
+        let access = read(&config).unwrap();
         let rules = access.groups()[0].rules();
         assert!(rules.collections.is_empty());
         let allow: Vec<String> = rules.local.allow.iter().map(ToString::to_string).collect();
@@ -1194,7 +1205,7 @@ mod tests {
             config("one", rules)
         ))
         .unwrap();
-        let own = read(&with_id, Path::new("/r")).unwrap();
+        let own = read(&with_id).unwrap();
         assert_ne!(
             own.summary_digest(&AuthItem::parse("ssh:u").unwrap()),
             Some(base)
@@ -1211,16 +1222,14 @@ mod tests {
                  [ex-ostrya client \"c\"]\nauth=anonymous\nallow={allow}\nsummary=true\n"
             ))
             .unwrap();
-            read(&config, Path::new("/r"))
-                .unwrap()
-                .summary_digest(&AuthItem::Anonymous)
+            read(&config).unwrap().summary_digest(&AuthItem::Anonymous)
         };
         assert_eq!(digest_of("r:@own.id:a"), digest_of("r:a"));
         assert_ne!(digest_of("r:@a.b:a"), digest_of("r:a"));
     }
 
-    /// The server keys parse to their values, and a relative path is joined
-    /// onto the repository directory.
+    /// The server keys parse to their values, and a path is a config path
+    /// as the key gives it.
     #[test]
     fn the_server_keys_parse() {
         let settings = server(
@@ -1250,15 +1259,15 @@ mod tests {
         );
         assert_eq!(
             settings.tls_cert,
-            Some(PathBuf::from("/srv/repo/certs/server.pem"))
+            Some(ServerFile::Config("certs/server.pem".into()))
         );
         assert_eq!(
             settings.tls_key,
-            Some(PathBuf::from("/etc/ostrya/server.key"))
+            Some(ServerFile::Config("/etc/ostrya/server.key".into()))
         );
         assert_eq!(
             settings.tls_client_ca,
-            Some(PathBuf::from("/srv/repo/~/ca.pem"))
+            Some(ServerFile::Config("~/ca.pem".into()))
         );
         let proxies = settings.trusted_proxy.as_ref().unwrap();
         assert_eq!(proxies.len(), 2);
@@ -1326,6 +1335,25 @@ mod tests {
         for key in ["listen", "trusted-proxy", "sign-summary"] {
             let message = refused(server(&format!("{key}=\n"), ""));
             assert!(message.contains(&format!("{key} is empty")), "{message}");
+        }
+        for key in ["tls-cert", "tls-key", "tls-client-ca"] {
+            for value in ["../c.pem", "certs/../c.pem", ".."] {
+                let message = refused(server(&format!("{key}={value}\n"), ""));
+                assert_eq!(
+                    message,
+                    format!(
+                        "[ex-ostrya server] {key} {value} has a `..` component, which a \
+                         relative path in a config cannot have"
+                    )
+                );
+            }
+            let settings = server(&format!("{key}=/etc/../c.pem\n"), "").unwrap();
+            let file = match key {
+                "tls-cert" => settings.tls_cert,
+                "tls-key" => settings.tls_key,
+                _ => settings.tls_client_ca,
+            };
+            assert_eq!(file, Some(ServerFile::Config("/etc/../c.pem".into())));
         }
         for keys in [
             "session-timeout=+5\n",

@@ -486,7 +486,7 @@ where
 /// The read rights of an anonymous client under the client groups of the
 /// config that `repo` read.
 fn anyone(repo: &Repo) -> ReadAccess {
-    let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let access = ClientAccess::from_config(repo.config()).unwrap();
     ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)
 }
 

@@ -1766,7 +1766,7 @@ fn collection_access(groups: &str, item: &str) -> ostrya::access::ReadAccess {
     let text =
         format!("[core]\nrepo_version=1\nmode=archive-z2\ncollection-id={COLLECTION_ID}\n{groups}");
     let config = ostrya::RepoConfig::parse(&text).unwrap();
-    let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(&config).unwrap();
     let item = ostrya::access::AuthItem::parse(item).unwrap();
     ostrya::access::ReadAccess::new(std::sync::Arc::new(access), item, None)
 }
@@ -2074,7 +2074,7 @@ fn the_collection_map_follows_the_items_of_each_namespace() {
              allow=r:main;r:@org.a:main;r:@org.b:main;r:@org.c:main\n",
         )
         .unwrap();
-        let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+        let access = ostrya::access::ClientAccess::from_config(&config).unwrap();
         let claims = ostrya::access::Claims::parse(["ostrya:ref:r:@org.a:x/**"]).unwrap();
         let access = ostrya::access::ReadAccess::new(
             std::sync::Arc::new(access),
@@ -2484,7 +2484,7 @@ fn each_item_gets_the_summary_of_its_groups() {
         );
         assert!(!item_file(&repo_dir, "ssh:ops", ".access").exists());
 
-        let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+        let access = ostrya::access::ClientAccess::from_config(repo.config()).unwrap();
         for text in ["anonymous", "ssh:ci"] {
             let digest = access.summary_digest(&item(text)).unwrap();
             assert_eq!(
@@ -2899,7 +2899,7 @@ fn the_summaries_of_the_auth_items_alone_leave_the_root_summary() {
         for file in &ops {
             assert!(!file.exists(), "{file:?}");
         }
-        let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+        let access = ostrya::access::ClientAccess::from_config(repo.config()).unwrap();
         for text in ["anonymous", "ssh:ci"] {
             let digest = access.summary_digest(&item(text)).unwrap();
             assert_eq!(

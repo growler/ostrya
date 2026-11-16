@@ -933,7 +933,10 @@ fn the_served_summary_of_a_bare_repository_names_no_delta() {
 ///   `--read-only`, and `--client-ca`, which it does not take,
 /// - `[ex-ostrya receive]` in the config,
 /// - a key group whose key it cannot read,
-/// - a TLS file that it cannot use, or that is larger than the size cap,
+/// - a TLS file that it cannot use, that is larger than 1 MiB, or that is
+///   not a regular file, from an option or from a key. A FIFO does not
+///   block the read,
+/// - a relative path with a `..` component in a TLS key,
 /// - a TLS file with no partner, from an option or from a key,
 /// - a key of the server group with a bad value, also when an option
 ///   replaces the key,
@@ -985,6 +988,10 @@ fn serve_refuses_what_it_cannot_serve() {
     let ca_key = server(
         "ca-key",
         &format!("tls-client-ca={}\n", fixture("ca.pem").display()),
+    );
+    let parent_key = server(
+        "parent-key",
+        "tls-cert=../server.pem\ntls-key=server.key.pem\n",
     );
     let listen_key = server("listen-key", "listen=localhost:8080\n");
     let session_key = server("session-key", "session-timeout=0\n");
@@ -1050,7 +1057,11 @@ fn serve_refuses_what_it_cannot_serve() {
             "tls-key is set, and tls-cert is not",
         ),
         (&[&repo, "serve", listen, &enc_cert, &enc_key], "passphrase"),
-        (&[&repo, "serve", listen, &big_cert, &key], "size cap"),
+        (&[&repo, "serve", listen, &big_cert, &key], "is over 1 MiB"),
+        (
+            &[&parent_key, "serve", listen],
+            "[ex-ostrya server] tls-cert ../server.pem has a `..` component",
+        ),
         (&[&cert_key, "serve", listen], tls_pair),
         (
             &[&ca_key, "serve", listen, &key],
@@ -1133,6 +1144,95 @@ fn serve_refuses_what_it_cannot_serve() {
     let out = run(ostrya(), &[&repo, "serve", listen, &cert, &absent]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("absent"));
+
+    // A FIFO at the path of a key and at the path of an option is refused
+    // with no wait for a writer.
+    let fifo_key = server("fifo-key", "tls-cert=server.pem\ntls-key=fifo.pem\n");
+    let fifo_repo = tmp.path().join("fifo-key");
+    std::fs::copy(fixture("server.pem"), fifo_repo.join("server.pem")).unwrap();
+    let fifo_opt = tmp.path().join("fifo-opt");
+    for fifo in [fifo_repo.join("fifo.pem"), fifo_opt.clone()] {
+        let made = Command::new("mkfifo").arg(&fifo).status().unwrap();
+        assert!(made.success());
+    }
+    let fifo_flag = format!("--tls-key={}", fifo_opt.display());
+    let fifo_cases: &[(&[&str], String)] = &[
+        (
+            &[&fifo_key, "serve", listen],
+            "tls-key 'fifo.pem' is not a regular file".to_owned(),
+        ),
+        (
+            &[&repo, "serve", listen, &cert, &fifo_flag],
+            format!("tls-key '{}' is not a regular file", fifo_opt.display()),
+        ),
+    ];
+    for (args, message) in fifo_cases {
+        let out = run_in_time(ostrya(), args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(out.stdout.is_empty(), "{args:?}");
+        assert!(stderr.contains(message.as_str()), "{args:?}: {stderr}");
+    }
+}
+
+/// Runs `program` with `args`, and returns its output. A run that does not
+/// end in 10 seconds is killed, and the test fails.
+fn run_in_time(program: &str, args: &[&str]) -> Output {
+    use std::time::{Duration, Instant};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{args:?} ran for more than 10 seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    child.wait_with_output().unwrap()
+}
+
+/// `ostrya summary -u` reads `[ex-ostrya server]`, and refuses a relative
+/// TLS path with a `..` component, as `serve` does. It reads no TLS file, so
+/// an absent file at a path of a key does not fail it.
+#[test]
+fn summary_update_refuses_a_parent_component_in_a_tls_key() {
+    let tmp = TmpDir::new("summary-parent");
+    let path = tmp.path().join("repo");
+    let repo = format!("--repo={}", path.display());
+    ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    let config = path.join("config");
+    let base = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        format!("{base}[ex-ostrya server]\ntls-cert=../c.pem\ntls-key=k.pem\n"),
+    )
+    .unwrap();
+    let out = run(ostrya(), &[&repo, "summary", "-u"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains(
+            "[ex-ostrya server] tls-cert ../c.pem has a `..` component, which a relative \
+             path in a config cannot have"
+        ),
+        "{stderr}"
+    );
+    assert!(!path.join("summary").exists());
+    std::fs::write(
+        &config,
+        format!("{base}[ex-ostrya server]\ntls-cert=c.pem\ntls-key=k.pem\n"),
+    )
+    .unwrap();
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    assert!(path.join("summary").exists());
 }
 
 /// Returns a request that opens a push session of the ref `name`, with no
@@ -1174,7 +1274,10 @@ fn session_request_with(name: &str, headers: &str) -> Vec<u8> {
 ///   `tls:*` item and no option, serve HTTPS. A relative path in a key is
 ///   relative to the repository directory, also when the command runs in
 ///   another directory.
-/// - A relative path in an option is relative to the current directory.
+/// - A relative path in an option is relative to the current directory,
+///   also with a `..` component.
+/// - The command follows a symlink at the path of a key to a file outside
+///   the repository.
 /// - An option replaces the path of a key, and the command does not read
 ///   the file of the key. `tls-cert` from a key and `--tls-key` go together.
 /// - A `listen` key with two addresses gives two listeners, and `--listen`
@@ -1228,6 +1331,37 @@ fn serve_takes_its_settings_from_the_server_group() {
             ])
             .current_dir(fixture("")),
     );
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    drop(server);
+    let pems = tmp.path().join("pems");
+    let sub = tmp.path().join("sub");
+    std::fs::create_dir(&pems).unwrap();
+    std::fs::create_dir(&sub).unwrap();
+    for name in ["server.pem", "server.key.pem"] {
+        std::fs::copy(fixture(name), pems.join(name)).unwrap();
+    }
+    let server = Serving::spawn(
+        serve_command(&flags)
+            .args([
+                listen,
+                "--tls-cert=../pems/server.pem",
+                "--tls-key=../pems/server.key.pem",
+            ])
+            .current_dir(&sub),
+    );
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    drop(server);
+
+    let linked = with_config(
+        "linked",
+        "[ex-ostrya server]
+tls-cert=server.pem
+tls-key=key-link.pem
+",
+    );
+    std::fs::copy(fixture("server.pem"), linked.join("server.pem")).unwrap();
+    std::os::unix::fs::symlink(pems.join("server.key.pem"), linked.join("key-link.pem")).unwrap();
+    let server = Serving::spawn(serve_command(&linked).arg(listen).current_dir(&sub));
     assert!(server.url.starts_with("https://"), "{}", server.url);
     drop(server);
 

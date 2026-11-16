@@ -51,7 +51,7 @@ use super::{
 ///     "[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=com.example.own\n\
 ///      [ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n",
 /// )?;
-/// let access = Arc::new(ClientAccess::from_config(&config, "/srv/repo".as_ref())?);
+/// let access = Arc::new(ClientAccess::from_config(&config)?);
 /// let read = ReadAccess::new(access, AuthItem::Anonymous, None);
 /// assert!(read.can_read_path("refs/heads/pub/main"));
 /// assert!(!read.can_read_path("refs/mirrors/com.example.own/pub/main"));
@@ -255,8 +255,6 @@ pub(crate) fn reads(rules: &AccessRules, name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
     use crate::config::RepoConfig;
 
@@ -266,7 +264,7 @@ mod tests {
 
     fn access(text: &str) -> Arc<ClientAccess> {
         let config = RepoConfig::parse(&format!("{CORE}{text}")).unwrap();
-        Arc::new(ClientAccess::from_config(&config, Path::new("/srv/repo")).unwrap())
+        Arc::new(ClientAccess::from_config(&config).unwrap())
     }
 
     fn reader(text: &str, item: &str, claims: Option<&[&str]>) -> ReadAccess {

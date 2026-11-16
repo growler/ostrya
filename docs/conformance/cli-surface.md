@@ -6668,10 +6668,15 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   (`ostrya-config(1)`, "Server keys"). Each option of the command has the
   name of a key, and the option replaces the key. A `--listen` option
   replaces the whole `listen` list. The command has no option for
-  `sign-summary`, because `ostrya receive` reads it too. A relative path in
-  a key is relative to the repository directory, and a relative path in an
-  option is relative to the current directory. A bad key value ends the
-  command at exit 1, also when an option replaces the key.
+  `sign-summary`, because `ostrya receive` reads it too. A path in
+  `tls-cert`, `tls-key`, or `tls-client-ca` follows "Paths in keys" in
+  `../format-reference.md`: a relative path is relative to the repository
+  root, and a relative path with a `..` component is refused. A relative
+  path in an option is relative to the current directory: the command makes
+  each `--tls-*` option absolute before the library reads it, a `..`
+  component stays in the path, and the command does not refuse the option.
+  A bad key value ends the command at exit 1, also when an option replaces
+  the key.
 - `--trusted-proxy` takes a network, `ADDR/LEN` or a bare `ADDR`, once for
   each network, and the options replace the whole `trusted-proxy` key. A
   network with host bits set is refused at exit 1. `--trusted-proxy-header`
@@ -6784,9 +6789,15 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 - A `HEAD` gets the status and the `Content-Length` of a `GET`, and no
   body. For a `.filez` built on request it reads no xattr and no byte of
   the object.
-- The command reads each TLS file once at start, up to 1 MiB. A file it
-  cannot read, a larger file, or TLS material that gives no server
-  configuration ends the command with `error: MESSAGE` at exit 1.
+- The command reads each TLS file once at start, up to 1 MiB. The read
+  follows a symlink, and does not wait for the writer of a FIFO. A file it
+  cannot read, a file that is not a regular file, a larger file, or TLS
+  material that gives no server configuration ends the command with
+  `error: MESSAGE` at exit 1. The message names the key and the path:
+  `KEY 'PATH': ERROR`, `KEY 'PATH' is not a regular file`, or
+  `KEY 'PATH' is over 1 MiB`. `KEY` is `tls-cert`, `tls-key`, or
+  `tls-client-ca`, also for an option, and the path of an option is
+  absolute.
 - When every listener is bound, the command writes one line for each to
   standard output, `http://ADDR:PORT/` or `https://ADDR:PORT/`, in the order
   of the addresses, and serves until the process ends. Standard output carries

@@ -50,7 +50,7 @@ enum KeySpec {
 /// receive policy of each group, in the order of the groups.
 pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePolicy>>)> {
     let config = repo.config();
-    let access = ClientAccess::from_config(config, repo.path())?;
+    let access = ClientAccess::from_config(config)?;
     let keyfile = config.keyfile();
 
     // The first pass checks each key group, then each trust group. The

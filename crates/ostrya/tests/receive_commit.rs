@@ -3919,7 +3919,7 @@ fn the_session_writes_the_summary_of_each_item() {
         signatures(&sig, ED25519_KEY),
         vec![ed25519_signature(SERVER_SECRET_B64, &bytes)]
     );
-    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(repo.config()).unwrap();
     let digest = access.summary_digest(&ci).unwrap();
     assert_eq!(
         std::fs::read(dir.join(format!("{stem}.access"))).unwrap(),

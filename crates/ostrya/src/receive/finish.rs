@@ -2301,7 +2301,7 @@ async fn write_summary(
         step,
         message: format!("{what}: {e}"),
     };
-    let access = ClientAccess::from_config(repo.config(), repo.path())
+    let access = ClientAccess::from_config(repo.config())
         .map_err(|e| warning(ReceiveStep::SummaryBuild, "the summary build", e))?;
     let is_gpg = |s: &&Arc<ServerSigner>| s.signer().metadata_key() == GPG_KEY;
     let ordered: Vec<&dyn Signer> = signers

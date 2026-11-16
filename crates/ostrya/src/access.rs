@@ -15,6 +15,9 @@
 //!   one namespace, and gives the effective rights of a ref as
 //!   [`AccessModes`]. [`NamespaceRules`] holds the rules of each namespace.
 //! - [`ServerSettings`] holds the keys of `[ex-ostrya server]`.
+//!   [`ServerFile`] is the path of a PEM file of a server, and
+//!   [`ServerSettings::read_tls_files`] reads these files as
+//!   [`ServerTlsFiles`].
 //! - [`Claims`] holds the claims of a client certificate, and
 //!   [`Claims::rules`] gives their rules for one namespace.
 //! - [`ForwardedHeader`] is a value of `trusted-proxy-header`, and
@@ -76,6 +79,8 @@
 //! in these cases:
 //!
 //! - Two groups carry the same item.
+//! - A value of `tls-cert`, `tls-key`, or `tls-client-ca` is a relative path
+//!   with a `..` component.
 //! - The collection id of an item fails the collection-id rule.
 //! - A network has host bits set.
 //! - A group sets `tls-accept-claim=true` and `summary=true`.
@@ -172,7 +177,7 @@
 //!     "[core]\nrepo_version=1\nmode=archive-z2\n\
 //!      [ex-ostrya client \"developer\"]\nauth=ssh:user\nallow=cd:devel/user/**\n",
 //! )?;
-//! let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+//! let access = ClientAccess::from_config(&config)?;
 //! let item = AuthItem::parse("ssh:user")?;
 //! let group = access.select(&item).unwrap();
 //! assert_eq!(group.name(), "developer");
@@ -192,7 +197,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub use claim::{Claim, ClaimError, ClaimRule, Claims, MAX_CLAIMS};
 pub use item::{AuthItem, IpNet};
@@ -204,8 +209,10 @@ pub use rights::{AccessModes, AccessRules, AllowItem, NamespaceRules};
 
 use ostrya_core::Checksum;
 
-use crate::config::RepoConfig;
+use crate::config::{KeyOrigin, KeyPath, RepoConfig, relative_with_parent};
+use crate::endpoint::{caller_path, read_pem_file};
 use crate::error::{Error, Result};
+use crate::repo::Repo;
 
 /// The namespace of a request: the local refs or the refs of one
 /// collection.
@@ -412,25 +419,79 @@ pub fn is_header_name(name: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// The path of a PEM file of a server: a value of `tls-cert`, `tls-key`, or
+/// `tls-client-ca`, or the path of a caller for one of these keys.
+///
+/// The source of the path sets the base of a relative path.
+/// [`ServerSettings::read_tls_files`] reads the file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ServerFile {
+    /// A value of `[ex-ostrya server]` in the repository config. The path is
+    /// absolute, or relative to the repository root.
+    /// [`ClientAccess::from_config`] gives each value of a key in this form,
+    /// and refuses a relative value with a `..` component.
+    Config(PathBuf),
+    /// A path of the caller, for example the value of a command-line option.
+    /// The path is absolute, or relative to the working directory.
+    /// [`ServerSettings::read_tls_files`] refuses a relative path with a `..`
+    /// component.
+    Caller(PathBuf),
+}
+
+/// The content of the PEM files of [`ServerSettings`], as
+/// [`ServerSettings::read_tls_files`] gives it.
+///
+/// Each field is `None` when its field of [`ServerSettings`] is `None`. The
+/// `Debug` output gives the size of the key and no byte of it.
+#[derive(Clone, Default)]
+pub struct ServerTlsFiles {
+    /// The bytes of the file of `tls-cert`: the PEM certificate chain.
+    pub cert: Option<Vec<u8>>,
+    /// The bytes of the file of `tls-key`: the PEM private key.
+    pub key: Option<Vec<u8>>,
+    /// The bytes of the file of `tls-client-ca`: the PEM CA certificates.
+    pub client_ca: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for ServerTlsFiles {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerTlsFiles")
+            .field("cert", &self.cert)
+            .field(
+                "key",
+                &self
+                    .key
+                    .as_ref()
+                    .map(|key| format!("<{} bytes redacted>", key.len())),
+            )
+            .field("client_ca", &self.client_ca)
+            .finish()
+    }
+}
+
 /// The keys of `[ex-ostrya server]`.
 ///
 /// Each field is `None` when the key is absent. The server takes its default
 /// for an absent key. A caller can build the struct with
 /// `..Default::default()`.
+///
+/// `tls_cert`, `tls_key`, and `tls_client_ca` name PEM files as
+/// [`ServerFile`] values. [`ClientAccess::from_config`] reads no file, and
+/// [`read_tls_files`](ServerSettings::read_tls_files) reads the files.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServerSettings {
     /// `listen`: the addresses to listen on, each `ADDR:PORT`. A host name is
     /// refused, and so is an empty value.
     pub listen: Option<Vec<SocketAddr>>,
     /// `tls-cert`: the PEM certificate chain.
-    pub tls_cert: Option<PathBuf>,
+    pub tls_cert: Option<ServerFile>,
     /// `tls-key`: the PEM private key of `tls-cert`.
-    pub tls_key: Option<PathBuf>,
+    pub tls_key: Option<ServerFile>,
     /// `tls-client-ca`: the PEM CA certificates that verify a client
     /// certificate. A server with no `tls-cert` and no
     /// `trusted-proxy-client-cert` ignores the key (see
     /// [`overridden_by`](ServerSettings::overridden_by)).
-    pub tls_client_ca: Option<PathBuf>,
+    pub tls_client_ca: Option<ServerFile>,
     /// `trusted-proxy`: the networks of the peers whose forwarding data the
     /// server reads. An empty value is refused.
     pub trusted_proxy: Option<Vec<IpNet>>,
@@ -548,6 +609,86 @@ impl ServerSettings {
         }
         merged
     }
+
+    /// Reads the PEM files of `tls_cert`, `tls_key`, and `tls_client_ca`.
+    ///
+    /// The call first checks the path of each field that is set. If a check
+    /// fails, the call opens no file and starts no job. It then reads each
+    /// field that is set, in the order `tls_cert`, `tls_key`, and
+    /// `tls_client_ca`, in one job on the blocking pool. It reads one file at
+    /// a time, and the first error stops the read. It opens no file for a
+    /// field that is `None`, and starts no job if no field is set.
+    ///
+    /// A [`ServerFile::Config`] path resolves against the root of `repo`, and
+    /// a [`ServerFile::Caller`] path against the working directory. The read
+    /// follows a symlink at each component of the path, also to a path
+    /// outside the repository. It opens the file with `O_NONBLOCK`, and then
+    /// refuses each file that is not a regular file, so a FIFO, a device, a
+    /// socket, or a directory at the path fails the read. It reads at most
+    /// 1 MiB and one byte of a file, and does not check the PEM syntax.
+    ///
+    /// # Errors
+    ///
+    /// No message holds a byte of a file.
+    ///
+    /// - [`Error::InvalidInput`] if a [`ServerFile::Caller`] path is relative
+    ///   and has a `..` component. The message names the key, `tls-cert`,
+    ///   `tls-key`, or `tls-client-ca`, and the path.
+    /// - [`Error::InvalidFormat`] if a [`ServerFile::Config`] path is
+    ///   relative and has a `..` component. The message names the group
+    ///   `[ex-ostrya server]`, the key, and the path, as
+    ///   [`ClientAccess::from_config`] does.
+    /// - [`Error::Io`] if a file cannot be opened or read. The message names
+    ///   the key and the path. An absent file gives the kind
+    ///   [`NotFound`](std::io::ErrorKind::NotFound).
+    /// - [`Error::InvalidInput`] if a file is not a regular file, or is
+    ///   larger than 1 MiB. The message names the key and the path.
+    pub async fn read_tls_files(&self, repo: &Repo) -> Result<ServerTlsFiles> {
+        let [cert, key, client_ca] = [
+            tls_path("tls-cert", &self.tls_cert)?,
+            tls_path("tls-key", &self.tls_key)?,
+            tls_path("tls-client-ca", &self.tls_client_ca)?,
+        ];
+        if cert.is_none() && key.is_none() && client_ca.is_none() {
+            return Ok(ServerTlsFiles::default());
+        }
+        let repo = repo.clone();
+        ostrya_rt::unblock(move || {
+            let read = |key: &str, path: Option<KeyPath>| -> Result<Option<Vec<u8>>> {
+                path.map(|path| read_pem_file(key, &path, Some(&repo)))
+                    .transpose()
+            };
+            Ok(ServerTlsFiles {
+                cert: read("tls-cert", cert)?,
+                key: read("tls-key", key)?,
+                client_ca: read("tls-client-ca", client_ca)?,
+            })
+        })
+        .await
+    }
+}
+
+/// Returns `file`, the path of the key `key`, as a [`KeyPath`]. The call
+/// opens no file.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if a [`ServerFile::Caller`] path is relative
+///   and has a `..` component.
+/// - [`Error::InvalidFormat`] if a [`ServerFile::Config`] path is relative
+///   and has a `..` component.
+fn tls_path(key: &str, file: &Option<ServerFile>) -> Result<Option<KeyPath>> {
+    match file {
+        None => Ok(None),
+        Some(ServerFile::Config(value)) if relative_with_parent(value) => {
+            Err(reader::parent_component(reader::SERVER_GROUP, key, value))
+        }
+        Some(ServerFile::Config(value)) => Ok(Some(KeyPath {
+            value: value.clone(),
+            origin: KeyOrigin::Config,
+        })),
+        Some(ServerFile::Caller(value)) => caller_path(key, Some(value.clone())),
+    }
 }
 
 /// The client groups and the server settings of a repository config.
@@ -581,11 +722,11 @@ impl ClientAccess {
     /// Reads `[ex-ostrya server]` and each `[ex-ostrya client "NAME"]` of
     /// `config`.
     ///
-    /// A relative path in `tls-cert`, `tls-key`, or `tls-client-ca` is joined
-    /// onto `repo_dir`. The call reads no file. It records the names of the
-    /// `[ex-ostrya trust "NAME"]` and `[ex-ostrya key "NAME"]` groups, for
-    /// the checks of `verify`, `sign`, and `sign-summary`, and reads no key
-    /// of these groups.
+    /// The call gives a value of `tls-cert`, `tls-key`, or `tls-client-ca`
+    /// as a [`ServerFile::Config`] path, and reads no file. It records the
+    /// names of the `[ex-ostrya trust "NAME"]` and `[ex-ostrya key "NAME"]`
+    /// groups, for the checks of `verify`, `sign`, and `sign-summary`, and
+    /// reads no key of these groups.
     ///
     /// # Errors
     ///
@@ -594,8 +735,8 @@ impl ClientAccess {
     ///   and the key.
     /// - [`Error::Core`] if a boolean or an integer value does not parse, or
     ///   if a value holds a malformed escape sequence.
-    pub fn from_config(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess> {
-        reader::read(config, repo_dir)
+    pub fn from_config(config: &RepoConfig) -> Result<ClientAccess> {
+        reader::read(config)
     }
 
     /// Returns the implicit group of a config with no client group, with the
@@ -674,7 +815,7 @@ impl ClientAccess {
     ///      [ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\nsummary=true\n\
     ///      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\n",
     /// )?;
-    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// let access = ClientAccess::from_config(&config)?;
     /// assert!(access.summary_digest(&AuthItem::Anonymous).is_some());
     /// assert!(access.summary_digest(&AuthItem::parse("ssh:ci")?).is_none());
     /// # Ok::<(), ostrya::Error>(())
@@ -738,7 +879,7 @@ impl ClientAccess {
     /// let config = RepoConfig::parse(
     ///     "[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=com.example.own\n",
     /// )?;
-    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// let access = ClientAccess::from_config(&config)?;
     /// let claims = Claims::parse([
     ///     "ostrya:ref:w:main",
     ///     "ostrya:ref:!@com.example.own:secret",
@@ -781,7 +922,7 @@ impl ClientAccess {
     ///      [ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\n\
     ///      allow=r:**;r:@com.example.os:**\n",
     /// )?;
-    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// let access = ClientAccess::from_config(&config)?;
     /// let group = access.select(&AuthItem::TlsAny).unwrap();
     /// let claims = Claims::parse(["ostrya:ref:w:main"]).unwrap();
     /// let rules = access.effective_rules(group, Some(&claims));
@@ -925,6 +1066,8 @@ const _: fn() = || {
     assert_send_sync::<ClientAccess>();
     assert_send_sync::<ClientGroup>();
     assert_send_sync::<ServerSettings>();
+    assert_send_sync::<ServerFile>();
+    assert_send_sync::<ServerTlsFiles>();
     assert_send_sync::<Namespace>();
     assert_send_sync::<NamespaceRules>();
     assert_send_sync::<AuthItem>();
@@ -953,7 +1096,7 @@ mod tests {
 
     fn try_access(text: &str) -> Result<ClientAccess> {
         let config = RepoConfig::parse(&format!("{CORE}{text}"))?;
-        ClientAccess::from_config(&config, Path::new("/srv/repo"))
+        ClientAccess::from_config(&config)
     }
 
     fn item(text: &str) -> AuthItem {
@@ -1179,7 +1322,7 @@ secret-key-file=/etc/ostrya/release.secret
         let groups = "[ex-ostrya client \"c\"]\nauth=ssh:u\n\
                       allow=r:a;w:@own.id:b\ndeny=@own.id:a/secret\n";
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n{groups}")).unwrap();
-        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let access = ClientAccess::from_config(&config).unwrap();
         let rules = access.select(&item("ssh:u")).unwrap().rules();
         assert_eq!(allow_texts(&rules.local), ["r:a", "w:b"]);
         assert_eq!(rules.local.deny.len(), 1);
@@ -1217,7 +1360,7 @@ secret-key-file=/etc/ostrya/release.secret
              [ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n"
         ))
         .unwrap();
-        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let access = ClientAccess::from_config(&config).unwrap();
         assert_eq!(access.namespace(Some("own.id")), Namespace::Local);
         assert_eq!(access.namespace(None), Namespace::Local);
         assert_eq!(access.namespace(Some("a.b")), collection("a.b"));
@@ -1245,7 +1388,7 @@ secret-key-file=/etc/ostrya/release.secret
     #[test]
     fn the_claim_rules_hold_the_claims_of_one_namespace() {
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
-        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let access = ClientAccess::from_config(&config).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:main",
             "ostrya:ref:t:@a.b:os/**",
@@ -1293,7 +1436,7 @@ secret-key-file=/etc/ostrya/release.secret
     #[test]
     fn the_rules_of_the_claims_are_the_claim_rules() {
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
-        let with_own = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let with_own = ClientAccess::from_config(&config).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:main",
             "ostrya:ref:t:@a.b:os/**",
@@ -1323,7 +1466,7 @@ secret-key-file=/etc/ostrya/release.secret
     #[test]
     fn the_own_collection_id_gives_the_claim_rules_of_the_local_refs() {
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
-        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let access = ClientAccess::from_config(&config).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:main",
             "ostrya:ref:d:@own.id:devel/**",
@@ -1353,7 +1496,7 @@ secret-key-file=/etc/ostrya/release.secret
                       allow=r:group/**;r:@a.b:group/**;r:@c.d:group/**\n\
                       [ex-ostrya client \"names\"]\nauth=tls:n\nallow=r:group/**\n";
         let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n{groups}")).unwrap();
-        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let access = ClientAccess::from_config(&config).unwrap();
         let certs = access.select(&AuthItem::TlsAny).unwrap();
         let claims = Claims::parse([
             "ostrya:ref:w:@a.b:claim/**",
@@ -1447,11 +1590,21 @@ secret-key-file=/etc/ostrya/release.secret
         assert!(try_access(text).is_err());
     }
 
+    /// Returns the config path `path` of a server file.
+    fn config(path: &str) -> Option<ServerFile> {
+        Some(ServerFile::Config(path.into()))
+    }
+
+    /// Returns the caller path `path` of a server file.
+    fn caller(path: &str) -> Option<ServerFile> {
+        Some(ServerFile::Caller(path.into()))
+    }
+
     fn settings() -> ServerSettings {
         ServerSettings {
-            tls_cert: Some("/c.pem".into()),
-            tls_key: Some("/k.pem".into()),
-            tls_client_ca: Some("/ca.pem".into()),
+            tls_cert: config("/c.pem"),
+            tls_key: config("/k.pem"),
+            tls_client_ca: config("/ca.pem"),
             ..ServerSettings::default()
         }
     }
@@ -1496,7 +1649,7 @@ secret-key-file=/etc/ostrya/release.secret
             trusted_proxy_client_cert: Some("X-Client-Cert".into()),
             trusted_proxy: proxy,
             trusted_proxy_header: Some(ForwardedHeader::XForwardedFor),
-            tls_client_ca: Some("/ca.pem".into()),
+            tls_client_ca: config("/ca.pem"),
             ..ServerSettings::default()
         };
         access.check_server(&merged).unwrap();
@@ -1508,7 +1661,7 @@ secret-key-file=/etc/ostrya/release.secret
         let anonymous = access("[ex-ostrya client \"c\"]\nauth=anonymous\n");
         let merged = ServerSettings {
             trusted_proxy_client_cert: Some("X-Client-Cert".into()),
-            tls_client_ca: Some("/ca.pem".into()),
+            tls_client_ca: config("/ca.pem"),
             ..ServerSettings::default()
         };
         let message = check(&anonymous, &merged);
@@ -1608,9 +1761,9 @@ secret-key-file=/etc/ostrya/release.secret
                 "127.0.0.1:1".parse().unwrap(),
                 "127.0.0.1:2".parse().unwrap(),
             ]),
-            tls_cert: Some("/key/c.pem".into()),
-            tls_key: Some("/key/k.pem".into()),
-            tls_client_ca: Some("/key/ca.pem".into()),
+            tls_cert: config("/key/c.pem"),
+            tls_key: config("/key/k.pem"),
+            tls_client_ca: config("/key/ca.pem"),
             trusted_proxy: Some(vec![net("10.0.0.0/8"), net("10.1.0.0/16")]),
             trusted_proxy_header: Some(ForwardedHeader::Forwarded),
             trusted_proxy_client_cert: Some("X-Key".into()),
@@ -1624,9 +1777,9 @@ secret-key-file=/etc/ostrya/release.secret
         };
         let flags = ServerSettings {
             listen: Some(vec!["127.0.0.1:3".parse().unwrap()]),
-            tls_cert: Some("flag/c.pem".into()),
-            tls_key: Some("flag/k.pem".into()),
-            tls_client_ca: Some("flag/ca.pem".into()),
+            tls_cert: caller("flag/c.pem"),
+            tls_key: caller("flag/k.pem"),
+            tls_client_ca: caller("flag/ca.pem"),
             trusted_proxy: Some(vec![net("192.0.2.0/24")]),
             trusted_proxy_header: Some(ForwardedHeader::XRealIp),
             trusted_proxy_client_cert: Some("X-Flag".into()),
@@ -1661,29 +1814,29 @@ secret-key-file=/etc/ostrya/release.secret
     /// the key goes, and the flag stays, so that `check_server` refuses it.
     #[test]
     fn a_plain_server_ignores_the_client_ca_key() {
-        let ca = |path: &str| ServerSettings {
-            tls_client_ca: Some(path.into()),
+        let ca = |file: Option<ServerFile>| ServerSettings {
+            tls_client_ca: file,
             ..ServerSettings::default()
         };
-        let merged = ca("/key/ca.pem").overridden_by(&ServerSettings::default());
+        let merged = ca(config("/key/ca.pem")).overridden_by(&ServerSettings::default());
         assert_eq!(merged, ServerSettings::default());
         access("").check_server(&merged).unwrap();
-        let merged = ca("/key/ca.pem").overridden_by(&ca("flag/ca.pem"));
-        assert_eq!(merged, ca("flag/ca.pem"));
+        let merged = ca(config("/key/ca.pem")).overridden_by(&ca(caller("flag/ca.pem")));
+        assert_eq!(merged, ca(caller("flag/ca.pem")));
         assert!(check(&access(""), &merged).contains("tls-client-ca"));
         let flags = ServerSettings {
-            tls_cert: Some("flag/c.pem".into()),
-            tls_key: Some("flag/k.pem".into()),
+            tls_cert: caller("flag/c.pem"),
+            tls_key: caller("flag/k.pem"),
             ..ServerSettings::default()
         };
-        let merged = ca("/key/ca.pem").overridden_by(&flags);
-        assert_eq!(merged.tls_client_ca, Some("/key/ca.pem".into()));
+        let merged = ca(config("/key/ca.pem")).overridden_by(&flags);
+        assert_eq!(merged.tls_client_ca, config("/key/ca.pem"));
         let keys = ServerSettings {
             trusted_proxy_client_cert: Some("X-Key".into()),
-            ..ca("/key/ca.pem")
+            ..ca(config("/key/ca.pem"))
         };
         let merged = keys.overridden_by(&ServerSettings::default());
-        assert_eq!(merged.tls_client_ca, Some("/key/ca.pem".into()));
+        assert_eq!(merged.tls_client_ca, config("/key/ca.pem"));
     }
 
     /// `tls-cert` and `tls-key` go together, and `tls-client-ca` needs
@@ -1702,7 +1855,7 @@ secret-key-file=/etc/ostrya/release.secret
         };
         assert!(check(&access, &merged).contains("tls-cert"));
         let merged = ServerSettings {
-            tls_client_ca: Some("/ca.pem".into()),
+            tls_client_ca: config("/ca.pem"),
             ..ServerSettings::default()
         };
         assert!(check(&access, &merged).contains("tls-client-ca"));
@@ -1711,5 +1864,232 @@ secret-key-file=/etc/ostrya/release.secret
             ..settings()
         };
         access.check_server(&merged).unwrap();
+    }
+
+    /// A temp directory with a repository at `repo`, which the drop removes.
+    struct TlsDir {
+        dir: crate::repo_fs::TestDir,
+        repo: Repo,
+    }
+
+    impl TlsDir {
+        fn new() -> TlsDir {
+            let dir = crate::repo_fs::TestDir::new("tls-files");
+            let root = dir.path().join("repo");
+            let repo = ostrya_rt::block_on(async {
+                Repo::create(
+                    &root,
+                    crate::CreateOptions::new(ostrya_core::RepoMode::Archive),
+                )
+                .await
+                .unwrap()
+            });
+            TlsDir { dir, repo }
+        }
+
+        /// Returns the path of the directory joined with `name`.
+        fn path(&self, name: &str) -> PathBuf {
+            self.dir.path().join(name)
+        }
+
+        /// Reads the files of `settings` against the repository.
+        fn read(&self, settings: &ServerSettings) -> Result<ServerTlsFiles> {
+            ostrya_rt::block_on(settings.read_tls_files(&self.repo))
+        }
+    }
+
+    /// Returns the message of an [`Error::InvalidInput`].
+    fn invalid_input(result: Result<ServerTlsFiles>) -> String {
+        match result {
+            Err(Error::InvalidInput(message)) => message,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A relative config path resolves against the repository root, and not
+    /// against the working directory. An absolute caller path opens, and so
+    /// does an absolute config path with a `..` component. The read follows
+    /// a symlink to a file outside the repository.
+    #[test]
+    fn the_tls_files_resolve_against_the_base_of_their_source() {
+        let dir = TlsDir::new();
+        let root = dir.repo.path().to_owned();
+        std::fs::create_dir(root.join("certs")).unwrap();
+        std::fs::write(root.join("certs/c.pem"), b"CERT").unwrap();
+        std::fs::write(dir.path("k.pem"), b"KEY").unwrap();
+        std::fs::write(dir.path("ca.pem"), b"CA").unwrap();
+        std::os::unix::fs::symlink(dir.path("ca.pem"), root.join("ca-link.pem")).unwrap();
+        assert!(!std::path::Path::new("certs/c.pem").exists());
+        let settings = ServerSettings {
+            tls_cert: config("certs/c.pem"),
+            tls_key: Some(ServerFile::Caller(dir.path("k.pem"))),
+            tls_client_ca: config("ca-link.pem"),
+            ..ServerSettings::default()
+        };
+        let files = dir.read(&settings).unwrap();
+        assert_eq!(files.cert.as_deref(), Some(&b"CERT"[..]));
+        assert_eq!(files.key.as_deref(), Some(&b"KEY"[..]));
+        assert_eq!(files.client_ca.as_deref(), Some(&b"CA"[..]));
+
+        let parent = root.join("certs/../certs/c.pem");
+        let settings = ServerSettings {
+            tls_cert: Some(ServerFile::Config(parent.clone())),
+            tls_key: Some(ServerFile::Caller(parent)),
+            ..ServerSettings::default()
+        };
+        let files = dir.read(&settings).unwrap();
+        assert_eq!(files.cert.as_deref(), Some(&b"CERT"[..]));
+        assert_eq!(files.key.as_deref(), Some(&b"CERT"[..]));
+        assert_eq!(files.client_ca, None);
+    }
+
+    /// A relative path with a `..` component is refused: a caller path with
+    /// [`Error::InvalidInput`], and a config path with
+    /// [`Error::InvalidFormat`] that names the key. A refused path of a later
+    /// field stops the read before the call opens the file of an earlier
+    /// field.
+    #[test]
+    fn a_relative_tls_path_with_a_parent_component_is_refused() {
+        let dir = TlsDir::new();
+        let settings = ServerSettings {
+            tls_key: caller("../k.pem"),
+            ..ServerSettings::default()
+        };
+        assert_eq!(
+            invalid_input(dir.read(&settings)),
+            "tls-key ../k.pem is a relative path with a `..` component"
+        );
+        let settings = ServerSettings {
+            tls_cert: config("absent.pem"),
+            tls_client_ca: config("certs/../../ca.pem"),
+            ..ServerSettings::default()
+        };
+        match dir.read(&settings) {
+            Err(Error::InvalidFormat(message)) => assert_eq!(
+                message,
+                "[ex-ostrya server] tls-client-ca certs/../../ca.pem has a `..` component, \
+                 which a relative path in a config cannot have"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A FIFO, a directory, and a device at a TLS path fail the read as a
+    /// file that is not a regular file, and the FIFO does not block it.
+    #[test]
+    fn a_tls_path_that_is_not_a_regular_file_is_refused() {
+        let dir = TlsDir::new();
+        let fifo = dir.path("fifo.pem");
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &fifo,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let dir = std::sync::Arc::new(dir);
+        for path in [fifo, dir.path(""), PathBuf::from("/dev/null")] {
+            let settings = ServerSettings {
+                tls_cert: Some(ServerFile::Caller(path.clone())),
+                ..ServerSettings::default()
+            };
+            let worker = {
+                let dir = dir.clone();
+                std::thread::spawn(move || dir.read(&settings))
+            };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !worker.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(worker.is_finished(), "the read does not end in 10 seconds");
+            assert_eq!(
+                invalid_input(worker.join().unwrap()),
+                format!("tls-cert '{}' is not a regular file", path.display())
+            );
+        }
+    }
+
+    /// A file of 1 MiB is read, and a file of 1 MiB and one byte is refused.
+    #[test]
+    fn a_tls_file_over_1_mib_is_refused() {
+        let dir = TlsDir::new();
+        let root = dir.repo.path().to_owned();
+        std::fs::write(root.join("cap.pem"), vec![b'a'; 1 << 20]).unwrap();
+        std::fs::write(root.join("over.pem"), vec![b'a'; (1 << 20) + 1]).unwrap();
+        let settings = ServerSettings {
+            tls_client_ca: config("cap.pem"),
+            ..ServerSettings::default()
+        };
+        let files = dir.read(&settings).unwrap();
+        assert_eq!(files.client_ca.map(|ca| ca.len()), Some(1 << 20));
+        let settings = ServerSettings {
+            tls_client_ca: config("over.pem"),
+            ..ServerSettings::default()
+        };
+        assert_eq!(
+            invalid_input(dir.read(&settings)),
+            "tls-client-ca 'over.pem' is over 1 MiB"
+        );
+    }
+
+    /// The read stops at the first error, in the order cert, key, and client
+    /// CA, and a field that is `None` gives `None`.
+    #[test]
+    fn the_tls_read_stops_at_the_first_error() {
+        let dir = TlsDir::new();
+        let root = dir.repo.path().to_owned();
+        std::fs::write(root.join("k.pem"), b"KEY").unwrap();
+        assert_eq!(
+            format!("{:?}", dir.read(&ServerSettings::default()).unwrap()),
+            "ServerTlsFiles { cert: None, key: None, client_ca: None }"
+        );
+        let settings = ServerSettings {
+            tls_cert: config("absent.pem"),
+            tls_key: config("k.pem"),
+            tls_client_ca: config("/"),
+            ..ServerSettings::default()
+        };
+        let err = dir.read(&settings).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::NotFound
+                && e.to_string().starts_with("tls-cert 'absent.pem': ")),
+            "{err:?}"
+        );
+        let settings = ServerSettings {
+            tls_cert: None,
+            ..settings
+        };
+        assert_eq!(
+            invalid_input(dir.read(&settings)),
+            "tls-client-ca '/' is not a regular file"
+        );
+        let settings = ServerSettings {
+            tls_client_ca: None,
+            ..settings
+        };
+        let files = dir.read(&settings).unwrap();
+        assert_eq!(files.cert, None);
+        assert_eq!(files.key.as_deref(), Some(&b"KEY"[..]));
+        assert_eq!(files.client_ca, None);
+    }
+
+    /// The `Debug` output of the files gives the size of the key and no byte
+    /// of it.
+    #[test]
+    fn the_debug_output_hides_the_key() {
+        let files = ServerTlsFiles {
+            cert: Some(b"C".to_vec()),
+            key: Some(b"SECRET".to_vec()),
+            client_ca: None,
+        };
+        let text = format!("{files:?}");
+        assert!(!text.contains("83, 69, 67"), "{text}");
+        assert!(!text.contains("SECRET"), "{text}");
+        assert_eq!(
+            text,
+            "ServerTlsFiles { cert: Some([67]), key: Some(\"<6 bytes redacted>\"), \
+             client_ca: None }"
+        );
     }
 }

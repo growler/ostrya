@@ -7,7 +7,8 @@
 //! and the keyring files of a repository: the trait [`FromOstreeKeyrings`],
 //! [`Repo::gpg_import_keys`], and [`Repo::gpg_list_keys`]. The trait builds a
 //! verifier from the keyrings of a repository handle, from the bytes of a
-//! keyring, or from the global trusted keyrings.
+//! keyring, from the `gpgkeys.gpg` keyring of a repository, or from the
+//! global trusted keyrings.
 //!
 //! The `sign-gpg` feature adds `GpgSigner`, which signs with
 //! `gpg --detach-sign`. This feature also turns on `verify-gpg`. `GpgSigner` is
@@ -49,6 +50,10 @@ const GLOBAL_TRUSTED_GPG_D: &str = "/usr/share/ostree/trusted.gpg.d";
 /// The environment variable that overrides the global trusted-keyring
 /// directory. The `ostree` command reads the same variable.
 const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
+/// The name of the keyring of a repository that names no remote.
+const REPO_KEYRING: &str = "gpgkeys.gpg";
+/// The name of [`REPO_KEYRING`] in a refusal.
+const REPO_KEYRING_SUBJECT: &str = "the keyring 'gpgkeys.gpg'";
 
 /// A GPG verifier that loads the keyrings that ostree trusts.
 ///
@@ -63,6 +68,8 @@ const OSTREE_GPG_HOME_ENV: &str = "OSTREE_GPG_HOME";
 /// of that remote.
 /// [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings) takes the
 /// bytes of that keyring from the caller.
+/// [`for_repo_in`](FromOstreeKeyrings::for_repo_in) reads the `gpgkeys.gpg`
+/// keyring of a repository, which names no remote.
 /// [`from_system_trust`](FromOstreeKeyrings::from_system_trust) reads the
 /// global trusted keyrings alone.
 pub trait FromOstreeKeyrings: Sized {
@@ -219,6 +226,30 @@ pub trait FromOstreeKeyrings: Sized {
         keypath: &[PathBuf],
     ) -> Result<Self>;
 
+    /// Creates a verifier from the `gpgkeys.gpg` keyring of the repository
+    /// of the handle `repo`.
+    ///
+    /// The keyring is the file `gpgkeys.gpg` at the repository root. If no
+    /// file is at that name, the verifier trusts no key. A file exists if its
+    /// open does not give "No such file or directory", so a symlink to no
+    /// file is no keyring. The read follows a symlink at the name, also to a
+    /// path outside the repository. It opens the file with `O_NONBLOCK`, and
+    /// then checks its type, so a FIFO does not block the read. The keyring
+    /// is a binary OpenPGP packet stream or armor, as
+    /// [`add_keyring`](GpgVerifier::add_keyring) reads it. No keyring of a
+    /// remote and no global trusted set take part. The call blocks the
+    /// calling thread while it reads the keyring.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if the keyring cannot be opened for a reason
+    ///   other than its absence, is not a regular file, cannot be read, or is
+    ///   over [`MAX_KEYRING`]. The message names the keyring as `the keyring
+    ///   'gpgkeys.gpg'`.
+    /// - The errors of [`add_keyring`](GpgVerifier::add_keyring), with the
+    ///   subject `the keyring 'gpgkeys.gpg'`.
+    fn for_repo_in(repo: &Repo) -> Result<Self>;
+
     /// Creates a verifier from the global trusted keyrings only.
     ///
     /// The global trusted set is the keyrings in the directory that the
@@ -284,6 +315,15 @@ impl FromOstreeKeyrings for GpgVerifier {
         let keypath: Vec<KeyPath> = keypath.iter().map(KeyPath::caller).collect();
         let keyring = repo_keyring.map(|bytes| RemoteKeyring::in_repo(bytes, remote));
         remote_keyrings(keyring, remote, None, &keypath, true)
+    }
+
+    fn for_repo_in(repo: &Repo) -> Result<GpgVerifier> {
+        let mut verifier = GpgVerifier::default();
+        if let Some(bytes) = read_root_keyring(repo.root_dir(), REPO_KEYRING, REPO_KEYRING_SUBJECT)?
+        {
+            verifier.add_keyring(&bytes, REPO_KEYRING_SUBJECT)?;
+        }
+        Ok(verifier)
     }
 
     fn from_system_trust() -> Result<GpgVerifier> {
@@ -2078,6 +2118,126 @@ pub(crate) mod tests {
             matches!(&result, Err(Error::Signature(m)) if *m == expected),
             "{:?}",
             result.err().map(|e| e.to_string())
+        );
+    }
+
+    /// Creates a repository at `root` and opens it.
+    fn new_repo(root: &Path) -> Repo {
+        use crate::{CreateOptions, RepoMode};
+
+        ostrya_rt::block_on(async {
+            Repo::create(root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap()
+        })
+    }
+
+    /// The `gpgkeys.gpg` keyring of a repository gives the keys of a binary
+    /// and of an armored keyring, also through a symlink to a file outside
+    /// the repository. With no file at the name, and with a symlink to no
+    /// file, the verifier trusts no key.
+    #[test]
+    fn the_repository_gpgkeys_keyring_loads() {
+        use ostrya_sign::Verifier as _;
+
+        if !gpg_available() {
+            assert!(
+                std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+                "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+            );
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let key = KeyFixture::new("Repo keyring <gpgkeys@ostrya.example>");
+        let payload = b"gpgkeys payload";
+        let signature = key.sign(payload);
+        let dir = scratch_dir();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = new_repo(&root);
+        let keyring = root.join("gpgkeys.gpg");
+        let outside = dir.join("outside.gpg");
+        let verify = |repo: &Repo| {
+            GpgVerifier::for_repo_in(repo)
+                .unwrap()
+                .verify(payload, std::slice::from_ref(&signature))
+                .unwrap()
+                .valid
+        };
+        let absent = GpgVerifier::for_repo_in(&repo).unwrap().is_empty();
+        std::os::unix::fs::symlink(&outside, &keyring).unwrap();
+        let dangling = GpgVerifier::for_repo_in(&repo).unwrap().is_empty();
+        std::fs::write(&outside, key.export(false)).unwrap();
+        let linked = verify(&repo);
+        std::fs::remove_file(&keyring).unwrap();
+        std::fs::write(&keyring, key.export(false)).unwrap();
+        let binary = verify(&repo);
+        std::fs::write(&keyring, key.export(true)).unwrap();
+        let armored = verify(&repo);
+        drop(repo);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(absent);
+        assert!(dangling);
+        assert!(linked);
+        assert!(binary);
+        assert!(armored);
+    }
+
+    /// A directory and a FIFO at `gpgkeys.gpg` are refused by name as files
+    /// that are not regular files, and the FIFO does not block the read. A
+    /// keyring over [`MAX_KEYRING`] is refused by name.
+    #[cfg(unix)]
+    #[test]
+    fn a_gpgkeys_keyring_that_is_not_a_regular_file_is_refused() {
+        let dir = scratch_dir();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = new_repo(&root);
+        let keyring = root.join("gpgkeys.gpg");
+        let mut results = Vec::new();
+        std::fs::create_dir(&keyring).unwrap();
+        results.push(GpgVerifier::for_repo_in(&repo).map(|_| ()));
+        std::fs::remove_dir(&keyring).unwrap();
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            &keyring,
+            FileType::Fifo,
+            Mode::from_raw_mode(0o600),
+            0,
+        )
+        .unwrap();
+        let worker = {
+            let repo = repo.clone();
+            std::thread::spawn(move || GpgVerifier::for_repo_in(&repo).map(|_| ()))
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let finished = worker.is_finished();
+        if finished {
+            results.push(worker.join().unwrap());
+        }
+        std::fs::remove_file(&keyring).unwrap();
+        std::fs::File::create(&keyring)
+            .unwrap()
+            .set_len(MAX_KEYRING + 1)
+            .unwrap();
+        let over = GpgVerifier::for_repo_in(&repo).map(|_| ());
+        drop(repo);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(finished, "the read does not end in 10 seconds");
+        for result in results {
+            assert!(
+                matches!(&result, Err(Error::Signature(m))
+                    if m == "the keyring 'gpgkeys.gpg' is not a regular file"),
+                "{result:?}"
+            );
+        }
+        assert!(
+            matches!(&over, Err(Error::Signature(m))
+                if *m == format!("the keyring 'gpgkeys.gpg' is over the {MAX_KEYRING}-byte ceiling")),
+            "{over:?}"
         );
     }
 

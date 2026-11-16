@@ -250,26 +250,28 @@ A later remote of the same name trusts that keyring while no file is at \fB\%<re
 \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.
 .SS "Paths in keys"
 The keys \fB\%gpgkeypath\fR, \fB\%verification\-ENGINE\-file\fR, \fB\%tls\-ca\-path\fR, \fB\%tls\-client\-cert\-path\fR, \fB\%tls\-client\-key\-path\fR, and \fB\%push\-token\-file\fR name files.
+The keys \fB\%tls\-cert\fR, \fB\%tls\-key\fR, and \fB\%tls\-client\-ca\fR of \fB\%[ex\-ostrya server]\fR also name files, and these rules apply to them.
 A path is absolute, or relative to a base:
 .IP \(bu 2
 A relative path in \fB\%config\fR is relative to the repository root.
-This also applies to a trust group and to \fB\%secret\-key\-file\fR of a key group.
+This also applies to a trust group, to \fB\%secret\-key\-file\fR of a key group, and to the server group.
 .IP \(bu 2
 A relative path in a \fB\%.conf\fR file of the remotes directory is relative to the remotes directory.
 A message names the file as the path of the remotes directory joined with the value.
 When a program gives the remotes directory as a descriptor, the message names the file as the value alone.
-An empty value names no file, as an empty value in \fB\%config\fR does.
+An empty value names no file, as an empty value of a key of a remote in \fB\%config\fR does.
 .IP \(bu 2
 A relative path in an option of the command, for example \fB\%\-\-tls\-ca\-path\fR, is relative to the current directory.
 .PP
 ostrya refuses a relative path with a \fB\%..\fR component when it reads the key, and the command fails.
 It accepts an absolute path with a \fB\%..\fR component.
+It refuses an empty value of \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR of the server group, and the command fails.
 \fB\%ostrya config set\fR writes a relative path with a \fB\%..\fR component with no check.
 ostrya does not expand \fB\%~\fR.
 A read follows a symlink at each component of the path, also to a path outside the repository.
 It opens the file with \fB\%O_NONBLOCK\fR, and refuses each file that is not a regular file.
 So a FIFO, a device, or a socket at the path fails the read, and the read does not wait for a writer of a FIFO.
-The \fB\%ostree\fR tool resolves a relative path of these keys against its current directory, and accepts a \fB\%..\fR component.
+The \fB\%ostree\fR tool resolves a relative path of the keys of a remote against its current directory, and accepts a \fB\%..\fR component.
 .SS "Address"
 .TP
 \fB\%url\fR (string)
@@ -730,7 +732,11 @@ With client groups and no group that holds that item, it writes an error line an
 .SS "Server keys"
 The keys of \fB\%[ex\-ostrya server]\fR.
 An option of \fB\%ostrya serve\fR with the name of a key has precedence over the key.
-A relative path in a key is relative to the repository directory, and a relative path in an option is relative to the current directory.
+A path in \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR follows "Paths in keys" of REMOTE KEYS.
+A relative path is relative to the repository root, and a relative path with a \fB\%..\fR component is refused.
+The read follows a symlink at each component of the path, and refuses a FIFO, a device, a socket, or a directory at the path with no wait for a writer.
+A relative path in an option of \fB\%ostrya serve\fR is relative to the current directory.
+\fB\%ostrya serve\fR reads each file one time, at start, and refuses a file larger than 1 MiB.
 An empty value of \fB\%listen\fR, \fB\%trusted\-proxy\fR, \fB\%sign\-summary\fR, \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR is refused.
 To get the default, remove the key.
 .TP
@@ -1076,6 +1082,8 @@ An ssh session of \fB\%ostrya receive\fR uses no \fB\%anonymous\fR item.
 ostrya refuses the config in these cases:
 .IP \(bu 2
 Two groups carry the same item.
+.IP \(bu 2
+A value of \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR is a relative path with a \fB\%..\fR component.
 .IP \(bu 2
 A group has the key \fB\%collection\fR.
 .IP \(bu 2

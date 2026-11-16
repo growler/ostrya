@@ -114,7 +114,7 @@ async fn repo(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
 /// The read rights of an anonymous client under the client groups of the
 /// config that `repo` read.
 fn anyone(repo: &Repo) -> ReadAccess {
-    let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let access = ClientAccess::from_config(repo.config()).unwrap();
     ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)
 }
 
@@ -1842,7 +1842,7 @@ fn the_collection_refs_follow_the_group_of_the_item() {
         ),
     );
     let access = |digest: &str| {
-        let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+        let access = ClientAccess::from_config(repo.config()).unwrap();
         let item = AuthItem::parse(&format!("token-sha256:{digest}")).unwrap();
         ReadAccess::new(Arc::new(access), item, None)
     };

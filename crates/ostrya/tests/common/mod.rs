@@ -33,7 +33,7 @@ pub fn anyone() -> ostrya::access::ReadAccess {
 pub fn read_access(groups: &str, item: &str) -> ostrya::access::ReadAccess {
     let text = format!("[core]\nrepo_version=1\nmode=archive-z2\n{groups}");
     let config = ostrya::RepoConfig::parse(&text).unwrap();
-    let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(&config).unwrap();
     let item = ostrya::access::AuthItem::parse(item).unwrap();
     ostrya::access::ReadAccess::new(Arc::new(access), item, None)
 }
@@ -41,7 +41,7 @@ pub fn read_access(groups: &str, item: &str) -> ostrya::access::ReadAccess {
 /// Returns the read rights of the client with the auth item `item` under
 /// the client groups of the config of `repo`.
 pub fn repo_access(repo: &ostrya::Repo, item: &str) -> ostrya::access::ReadAccess {
-    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(repo.config()).unwrap();
     let item = ostrya::access::AuthItem::parse(item).unwrap();
     ostrya::access::ReadAccess::new(Arc::new(access), item, None)
 }

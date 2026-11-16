@@ -41,7 +41,7 @@ mod walk;
 
 pub use crate::access::{
     AccessModes, AccessRules, AllowItem, AuthItem, ClientAccess, ClientGroup, IpNet, Namespace,
-    NamespaceRules, ServerSettings,
+    NamespaceRules, ServerFile, ServerSettings, ServerTlsFiles,
 };
 pub use crate::pattern::ReceivePattern;
 pub use crate::verify::TrustedKeys;

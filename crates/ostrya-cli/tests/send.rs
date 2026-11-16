@@ -310,7 +310,7 @@ fn send_serves_a_repository_its_user_cannot_write() {
         let mut expected = Vec::new();
         block_on(async {
             let handle = Repo::open(&repo).await.unwrap();
-            let access = ClientAccess::from_config(handle.config(), handle.path()).unwrap();
+            let access = ClientAccess::from_config(handle.config()).unwrap();
             let access = ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None);
             handle
                 .send(&input[..], &mut expected, &access)

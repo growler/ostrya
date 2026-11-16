@@ -16008,8 +16008,8 @@ fn log_forms_match_the_tool() {
 /// The report of `log` for each commit verifies GPG signatures against the
 /// `gpgkeys.gpg` file of the repository. The working directory of the process
 /// has no effect. The test runs with no `cwd` override, so the two directories
-/// differ. A `log` that passes `.` as the repository path fails this test. It
-/// must use the path that `show` also receives from `resolve_repo`.
+/// differ. The read of the keyring resolves its name against the repository
+/// root.
 #[cfg(feature = "gpg")]
 #[test]
 fn log_verifies_signatures_against_the_repo_not_the_cwd() {
@@ -16153,11 +16153,16 @@ fn show_and_log_open_each_file_once() {
                 "{command}: the opens of {commit}.commitmeta"
             );
         }
-        assert_eq!(
-            opens("/gpgkeys.gpg"),
-            1,
-            "{command}: the opens of the keyring"
-        );
+        // The count holds each open of the keyring: by its name relative to
+        // a descriptor, and by a path that ends with its name.
+        let keyring_opens = text
+            .lines()
+            .filter(|line| {
+                is_read_open(line)
+                    && (line.contains("\"gpgkeys.gpg\"") || line.contains("/gpgkeys.gpg\""))
+            })
+            .count();
+        assert_eq!(keyring_opens, 1, "{command}: the opens of the keyring");
     }
 }
 
@@ -19192,6 +19197,63 @@ fn show_reads_a_relative_gpgkeypath_from_the_repository_root() {
         stderr.contains("gpgkeypath entry 'keys/cwd.gpg' cannot be read: "),
         "{stderr}"
     );
+}
+
+/// `show` refuses a directory and a FIFO at `gpgkeys.gpg` by the name of the
+/// keyring, and the FIFO does not block the read.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_refuses_a_gpgkeys_keyring_that_is_not_a_regular_file() {
+    use std::time::{Duration, Instant};
+
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("show-gpgkeys-special");
+    let (repo, _home, commit) = signed_show_repo(
+        tmp.path(),
+        "Special Keyring <special-keyring@ostrya.example>",
+    );
+    let repo_arg = format!("--repo={}", repo.display());
+    let show = || {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+            .env("OSTREE_GPG_HOME", empty_gpg_home())
+            .args([repo_arg.as_str(), "show", &commit])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("show ran for more than 10 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        child.wait_with_output().unwrap()
+    };
+    let keyring = repo.join("gpgkeys.gpg");
+    std::fs::create_dir(&keyring).unwrap();
+    let directory = show();
+    std::fs::remove_dir(&keyring).unwrap();
+    mkfifo_at(&keyring);
+    let fifo = show();
+    for out in [directory, fifo] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{stderr}");
+        assert!(
+            stderr.contains("the keyring 'gpgkeys.gpg' is not a regular file"),
+            "{stderr}"
+        );
+    }
 }
 
 /// A signed commit in an archive repository under `base`, and the GnuPG home

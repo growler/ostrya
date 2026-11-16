@@ -332,9 +332,14 @@ A symbolic link to an absent file is no keyring.
 \fB\%ostrya remote delete\fR removes a symbolic link as the link, and the target stays.
 .TP
 \fB\%<repo>/gpgkeys.gpg\fR
-A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
+A keyring that \fB\%ostrya show\fR and \fB\%ostrya log\fR read to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
+The keyring is a binary or an armored OpenPGP keyring of at most 4 MiB.
+When no file is at the name, ostrya trusts no key of this keyring.
 It can be a symbolic link, also to a file outside the repository.
+A read follows the link, opens the file with \fB\%O_NONBLOCK\fR, and then checks that it is a regular file, so a FIFO does not block it.
+ostrya refuses a file that is not a regular file with the error \fB\%the keyring 'gpgkeys.gpg' is not a regular file\fR.
+A symbolic link to an absent file is no keyring.
 .PP
 To change \fB\%config\fR, a ref, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, a file in \fB\%deltas/\fR or \fB\%delta\-indexes/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR and renames it over the target.
 A symbolic link at the target is replaced.
@@ -683,8 +688,10 @@ ostrya does not write these files.
 .TP
 \fB\%tls\-cert\fR, \fB\%tls\-key\fR, \fB\%tls\-client\-ca\fR
 The PEM certificate chain of the server, its private key, and the CA certificates that verify a client certificate.
-A relative path in a key is relative to the repository directory.
+A relative path in a key is relative to the repository root, and ostrya refuses a relative path with a \fB\%..\fR component.
 An option of \fB\%ostrya serve\fR with the name of a key replaces the key, and a relative path in an option is relative to the current directory.
+The read follows a symbolic link at each component of the path, also to a file outside the repository.
+It opens the file with \fB\%O_NONBLOCK\fR, and refuses each file that is not a regular file, so a FIFO does not block it.
 \fB\%ostrya serve\fR reads each file one time, at start, and refuses a file larger than 1 MiB.
 .SH SEE ALSO
 \fBostrya\fR(1),

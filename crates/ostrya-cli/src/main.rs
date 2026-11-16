@@ -4559,16 +4559,19 @@ struct ServeArgs {
     /// Serve HTTPS with the certificate chain in FILE, in PEM.
     ///
     /// The certificate needs a key, from --tls-key or from the `tls-key`
-    /// key. ALPN selects HTTP/2 or HTTP/1.1. The command reads FILE once, at
-    /// start, and refuses a file larger than 1 MiB.
+    /// key. ALPN selects HTTP/2 or HTTP/1.1. A relative FILE is relative to
+    /// the working directory. The command reads FILE once, at start. It
+    /// refuses a file that is not a regular file, and a file larger than
+    /// 1 MiB.
     #[arg(long, value_name = "FILE")]
     tls_cert: Option<PathBuf>,
     /// The private key of the server certificate, in PEM.
     ///
     /// The key needs a certificate, from --tls-cert or from the `tls-cert`
     /// key. The command refuses an encrypted key, because it has no option
-    /// for a passphrase. It reads FILE once, at start, and refuses a file
-    /// larger than 1 MiB.
+    /// for a passphrase. A relative FILE is relative to the working
+    /// directory. The command reads FILE once, at start. It refuses a file
+    /// that is not a regular file, and a file larger than 1 MiB.
     #[arg(long, value_name = "FILE")]
     tls_key: Option<PathBuf>,
     /// Verify client certificates against the CA certificates in FILE, in PEM.
@@ -4582,8 +4585,10 @@ struct ServeArgs {
     /// client that presents no certificate completes the handshake, and the
     /// other auth items identify it. A client certificate
     /// that the CA signed can match a `tls:*`, `tls:NAME`, or
-    /// `tls-sha256:HEX` item of a client group. The command reads FILE once,
-    /// at start, and refuses a file larger than 1 MiB.
+    /// `tls-sha256:HEX` item of a client group. A relative FILE is relative
+    /// to the working directory. The command reads FILE once, at start. It
+    /// refuses a file that is not a regular file, and a file larger than
+    /// 1 MiB.
     #[arg(long, value_name = "FILE")]
     tls_client_ca: Option<PathBuf>,
     /// Read the forwarding headers of a peer in the network CIDR.
@@ -4701,12 +4706,21 @@ struct ServeArgs {
 impl ServeArgs {
     /// Returns the options as the server settings that they replace. An
     /// option that is not given is `None`.
+    ///
+    /// The path of a TLS option is a caller path, made absolute against the
+    /// current directory. If the current directory cannot be read, the
+    /// process ends with an error at exit 1.
     fn settings(self) -> ostrya::access::ServerSettings {
+        use ostrya::access::ServerFile;
+
+        let file = |option: &str, path: Option<PathBuf>| {
+            absolute_option(option, path).map(ServerFile::Caller)
+        };
         ostrya::access::ServerSettings {
             listen: (!self.listen.is_empty()).then_some(self.listen),
-            tls_cert: self.tls_cert,
-            tls_key: self.tls_key,
-            tls_client_ca: self.tls_client_ca,
+            tls_cert: file("--tls-cert", self.tls_cert),
+            tls_key: file("--tls-key", self.tls_key),
+            tls_client_ca: file("--tls-client-ca", self.tls_client_ca),
             trusted_proxy: (!self.trusted_proxy.is_empty()).then_some(self.trusted_proxy),
             trusted_proxy_header: self.trusted_proxy_header,
             trusted_proxy_client_cert: self.trusted_proxy_client_cert,
@@ -5753,12 +5767,12 @@ async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> 
             cat(repo, name, args).await
         }
         Command::Show(args) => {
-            let (repo, path) = resolve_repo(repo, verbose, name).await;
-            show(repo, path, name, args).await
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            show(repo, name, args).await
         }
         Command::Log(args) => {
-            let (repo, path) = resolve_repo(repo, verbose, name).await;
-            log(repo, path, name, args).await
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            log(repo, name, args).await
         }
         Command::Ls(args) => {
             let (repo, _) = resolve_repo(repo, verbose, name).await;
@@ -5954,12 +5968,6 @@ async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> 
     }
 }
 
-/// The maximum size in bytes of a file that `serve` reads.
-///
-/// The files are the PEM files.
-#[cfg(feature = "serve")]
-const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
-
 /// Serves the repository with the options of `args` until the process ends.
 ///
 /// When all listeners are bound, the URL of each listener goes to standard
@@ -5968,9 +5976,13 @@ const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 /// `serve` reads and checks the client groups, the server group, the trust
 /// groups, and the key groups of the repository config at start. Each option
 /// of `args` replaces the key of `[ex-ostrya server]` with its name, and the
-/// checks run on the result. The receive endpoint identifies each client by
-/// the client groups. For each session that commits, each warning of its
-/// report goes to standard error as one line.
+/// checks run on the result. Then `serve` reads the TLS files of the result
+/// one time, with
+/// [`read_tls_files`](ostrya::access::ServerSettings::read_tls_files). A
+/// relative path of a key is relative to the repository root, and a relative
+/// path of an option to the working directory. The receive endpoint
+/// identifies each client by the client groups. For each session that
+/// commits, each warning of its report goes to standard error as one line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
@@ -5979,6 +5991,7 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     let policies = Arc::new(ostrya::ReceivePolicies::from_config(&repo).await?);
     let settings = policies.access().server().overridden_by(&args.settings());
     policies.access().check_server(&settings)?;
+    let files = settings.read_tls_files(&repo).await?;
     let mut opts = ostrya_server::ServeOptions::default();
     if let Some(listen) = settings.listen {
         opts.listen = listen;
@@ -5998,14 +6011,14 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     if let Some(n) = settings.parallel_uploads {
         opts.parallel_uploads = n;
     }
-    if let (Some(cert), Some(key)) = (&settings.tls_cert, &settings.tls_key) {
+    if let (Some(cert_chain_pem), Some(key_pem)) = (files.cert, files.key) {
         opts.tls = Some(ostrya_server::ServerTls {
-            cert_chain_pem: read_serve_file(cert),
-            key_pem: read_serve_file(key),
+            cert_chain_pem,
+            key_pem,
             key_passphrase: None,
         });
     }
-    opts.client_ca_pem = settings.tls_client_ca.as_deref().map(read_serve_file);
+    opts.client_ca_pem = files.client_ca;
     opts.trusted_proxies = settings.trusted_proxy.unwrap_or_default();
     opts.trusted_proxy_header = settings.trusted_proxy_header;
     opts.trusted_proxy_client_cert = settings.trusted_proxy_client_cert;
@@ -6046,34 +6059,6 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         exit_process(1);
     }
     Ok(())
-}
-
-/// Reads a file of `serve` that has at most [`MAX_SERVE_FILE_SIZE`] bytes.
-///
-/// If the file cannot be read, or is larger, the process ends with an error.
-#[cfg(feature = "serve")]
-fn read_serve_file(path: &Path) -> Vec<u8> {
-    use std::io::Read;
-
-    let read = std::fs::File::open(path).and_then(|file| {
-        let mut bytes = Vec::new();
-        file.take(MAX_SERVE_FILE_SIZE + 1).read_to_end(&mut bytes)?;
-        Ok(bytes)
-    });
-    match read {
-        Ok(bytes) if bytes.len() as u64 <= MAX_SERVE_FILE_SIZE => bytes,
-        Ok(_) => {
-            eprintln!(
-                "error: {}: the file exceeds the {MAX_SERVE_FILE_SIZE}-byte size cap",
-                path.display()
-            );
-            exit_process(1);
-        }
-        Err(err) => {
-            eprintln!("error: {}: {err}", path.display());
-            exit_process(1);
-        }
-    }
 }
 
 /// Runs one push session of the client `client` over standard input and
@@ -6257,7 +6242,7 @@ fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
 async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
 
-    let access = ClientAccess::from_config(repo.config(), repo.path())?;
+    let access = ClientAccess::from_config(repo.config())?;
     let item = if !access.has_client_groups() {
         AuthItem::Anonymous
     } else if access.groups_of(&client).next().is_none() {
@@ -6661,7 +6646,7 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
 ///
 /// A relative value is relative to the current directory. If the current
 /// directory cannot be read, the process ends with an error at exit 1.
-#[cfg(feature = "push")]
+#[cfg(any(feature = "push", feature = "serve"))]
 fn absolute_option(option: &str, path: Option<PathBuf>) -> Option<PathBuf> {
     let path = path?;
     match std::path::absolute(&path) {
@@ -13234,7 +13219,7 @@ fn variant_text(ty: &Type, value: &Value) -> Result<String> {
 /// 6. the variant file
 /// 7. the sizes
 /// 8. the report of the object itself
-async fn show(repo: Repo, repo_path: PathBuf, name: &str, args: ShowArgs) -> Result<()> {
+async fn show(repo: Repo, name: &str, args: ShowArgs) -> Result<()> {
     let Some(object) = args.object.as_deref() else {
         exit_with_error(name, "An object argument is required");
     };
@@ -13259,7 +13244,7 @@ async fn show(repo: Repo, repo_path: PathBuf, name: &str, args: ShowArgs) -> Res
     if args.print_sizes {
         return show_sizes(&repo, object).await;
     }
-    show_object(&repo, &repo_path, object, &args).await
+    show_object(&repo, object, &args).await
 }
 
 /// Returns the commit metadata dict of the revision that `object` names.
@@ -13478,7 +13463,7 @@ async fn show_sizes(repo: &Repo, object: &str) -> Result<()> {
 /// in this order: commit, dirtree, dirmeta, and a file object. If no object of
 /// that checksum is present, the failure for the absent file object is
 /// reported.
-async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArgs) -> Result<()> {
+async fn show_object(repo: &Repo, object: &str, args: &ShowArgs) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     for ty in [ObjectType::Commit, ObjectType::DirTree, ObjectType::DirMeta] {
         if !repo.has_object(ty, &checksum).await? {
@@ -13494,7 +13479,7 @@ async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArg
         // `--raw` alone reports the variant and stops. `-B` reports the variant
         // and then gives the report of the commit itself.
         if ty == ObjectType::Commit && (!args.raw || args.no_byteswap) {
-            report_commit(repo, repo_path, &checksum, args, &mut None).await?;
+            report_commit(repo, &checksum, args, &mut None).await?;
         }
         return Ok(());
     }
@@ -13563,7 +13548,6 @@ type ReportVerifier = Option<std::convert::Infallible>;
 /// the report builds it from the keyrings of `args`.
 async fn report_commit(
     repo: &Repo,
-    repo_path: &Path,
     checksum: &Checksum,
     args: &ShowArgs,
     verifier: &mut ReportVerifier,
@@ -13596,7 +13580,7 @@ async fn report_commit(
         print_indented(&commit.body);
     }
     println!();
-    report_commit_signatures(repo, repo_path, checksum, &data, args, verifier).await?;
+    report_commit_signatures(repo, checksum, &data, args, verifier).await?;
     Ok(commit.parent)
 }
 
@@ -13615,7 +13599,6 @@ fn print_indented(text: &str) {
 #[cfg(feature = "gpg")]
 async fn report_commit_signatures(
     repo: &Repo,
-    repo_path: &Path,
     checksum: &Checksum,
     data: &[u8],
     args: &ShowArgs,
@@ -13627,7 +13610,7 @@ async fn report_commit_signatures(
     }
     let verifier = match verifier {
         Some(verifier) => verifier,
-        None => verifier.insert(show_gpg_verifier(repo, repo_path, args).await?),
+        None => verifier.insert(show_gpg_verifier(repo, args).await?),
     };
     let outcome = verifier.verify(data, &signatures)?;
     println!();
@@ -13664,7 +13647,6 @@ async fn report_commit_signatures(
 #[cfg(not(feature = "gpg"))]
 async fn report_commit_signatures(
     _: &Repo,
-    _: &Path,
     _: &Checksum,
     _: &[u8],
     _: &ShowArgs,
@@ -13685,8 +13667,9 @@ async fn report_commit_signatures(
 ///   Each of its files must be a binary OpenPGP packet stream.
 /// - Each `gpgkeypath` entry of the remote.
 ///
-/// Otherwise, the keyrings are the `gpgkeys.gpg` of the repository and each
-/// `*.gpg` file in a `--gpg-homedir`.
+/// Otherwise, the keyrings are the `gpgkeys.gpg` of the repository, which
+/// [`FromOstreeKeyrings::for_repo_in`] reads, and each `*.gpg` file in a
+/// `--gpg-homedir`.
 ///
 /// Under `--gpg-verify-remote`, the call refuses a name that
 /// [`valid_remote_name`] refuses with [`Error::InvalidInput`]. If the config
@@ -13694,7 +13677,7 @@ async fn report_commit_signatures(
 /// `ostree` command. A `gpgkeypath` entry that cannot be read gives
 /// [`Error::Signature`].
 #[cfg(feature = "gpg")]
-async fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
+async fn show_gpg_verifier(repo: &Repo, args: &ShowArgs) -> Result<GpgVerifier> {
     if let Some(remote) = args.gpg_verify_remote.as_deref() {
         if !valid_remote_name(remote) {
             return Err(Error::InvalidInput(format!(
@@ -13706,10 +13689,10 @@ async fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Re
         let remote = remote.to_owned();
         return ostrya_rt::unblock(move || GpgVerifier::for_remote_in(&repo, &remote)).await;
     }
-    let keyring = repo_path.join("gpgkeys.gpg");
+    let repo = repo.clone();
     let homedir = args.gpg_homedir.clone();
     ostrya_rt::unblock(move || {
-        let mut paths = vec![keyring];
+        let mut verifier = GpgVerifier::for_repo_in(&repo)?;
         if let Some(homedir) = homedir {
             let mut found: Vec<PathBuf> = std::fs::read_dir(&homedir)
                 .map_err(Error::Io)?
@@ -13719,9 +13702,9 @@ async fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Re
                 })
                 .collect();
             found.sort();
-            paths.extend(found);
+            verifier.add_keyring_files(found)?;
         }
-        Ok(GpgVerifier::from_keyring_files(paths)?)
+        Ok(verifier)
     })
     .await
 }
@@ -13798,7 +13781,7 @@ fn xattrs_text(xattrs: &Xattrs) -> Result<String> {
 /// The start revision obeys the stricter rule of each other read command. A
 /// checksum that names no commit is refused, and does not count as an empty
 /// history.
-async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Result<()> {
+async fn log(repo: Repo, name: &str, args: LogArgs) -> Result<()> {
     let Some(rev) = args.rev.as_deref() else {
         exit_with_error(name, "A rev argument is required");
     };
@@ -13830,7 +13813,7 @@ async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Resul
             println!("{}", variant_text(&ty, &value.byteswapped())?);
             commit.parent
         } else {
-            report_commit(&repo, &repo_path, &checksum, &show, &mut verifier).await?
+            report_commit(&repo, &checksum, &show, &mut verifier).await?
         };
     }
     Ok(())
@@ -16141,7 +16124,7 @@ fn summary_auth_item(
             "needs a read option: -v, --raw, --list-metadata-keys, or --print-metadata-key",
         );
     }
-    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?;
+    let access = ostrya::access::ClientAccess::from_config(repo.config())?;
     let Some(group) = access.groups().iter().find(|group| group.name() == name) else {
         return refuse(&format!("names no client group '{name}'"));
     };

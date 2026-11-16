@@ -982,7 +982,7 @@ impl Repo {
         }
         // The client groups give the items. A malformed group is refused
         // before the anchor advances.
-        let access = Arc::new(ClientAccess::from_config(self.config(), self.path())?);
+        let access = Arc::new(ClientAccess::from_config(self.config())?);
         self.config().fsync()?;
 
         // The repository lock comes before the update lock. The anchor
@@ -3062,8 +3062,7 @@ mod tests {
     /// The rights of an anonymous client under the implicit group.
     fn anyone() -> ReadAccess {
         let config = crate::RepoConfig::parse("[core]\nrepo_version=1\nmode=archive-z2\n").unwrap();
-        let access =
-            crate::access::ClientAccess::from_config(&config, std::path::Path::new("/")).unwrap();
+        let access = crate::access::ClientAccess::from_config(&config).unwrap();
         ReadAccess::new(
             std::sync::Arc::new(access),
             crate::access::AuthItem::Anonymous,
@@ -3325,7 +3324,7 @@ mod tests {
                 .await
                 .unwrap();
             assert!(anchor.is_some(), "the regeneration wrote the anchor");
-            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let access = Arc::new(ClientAccess::from_config(repo.config()).unwrap());
             let run = repo.summary_run(access, &opts).await.unwrap();
             let built = repo
                 .item_summary(&run, &AuthItem::Anonymous, &opts)
@@ -3386,7 +3385,7 @@ mod tests {
                 last_modified: Some(1_700_000_000),
                 ..SummaryOptions::default()
             };
-            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let access = Arc::new(ClientAccess::from_config(repo.config()).unwrap());
             let run = repo.summary_run(access, &opts).await.unwrap();
             let local = repo
                 .selection_summary(&run, &run.every, SummaryKind::Root, &opts)
@@ -4162,7 +4161,7 @@ mod tests {
                 last_modified: Some(1_700_000_000),
                 ..SummaryOptions::default()
             };
-            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let access = Arc::new(ClientAccess::from_config(repo.config()).unwrap());
             let run = repo.summary_run(access.clone(), &opts).await.unwrap();
             let all = all_refs();
             for text in ["anonymous", "ssh:ci", "ssh:admin", "ssh:none"] {

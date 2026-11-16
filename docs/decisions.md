@@ -304,11 +304,14 @@ A key of a remote that names a file has a base for a relative path. The
 keys are `verification-<type>-file`, `gpgkeypath`, `tls-ca-path`,
 `tls-client-cert-path`, `tls-client-key-path`, and `push-token-file`. A
 relative path in `config` is relative to the repository root, also in a trust
-group, and so is `secret-key-file` of a key group. A relative path in a
+group, and so are `secret-key-file` of a key group and `tls-cert`, `tls-key`,
+and `tls-client-ca` of `[ex-ostrya server]`. A relative path in a
 `.conf` file is relative to the remotes directory, for each form of the
 directory. A path of a caller is relative to the working directory. A
 relative path with a `..` component is refused, and the check reads the text
-of the path alone. Each reader gets the source of the value with the value,
+of the path alone. The `ostrya` command makes a path of an option absolute
+against the working directory before the library reads it, so a `..`
+component stays in the path, and the command does not refuse the option. Each reader gets the source of the value with the value,
 and opens the file from the descriptor of its base. The open follows a
 symlink at each component, uses `O_NONBLOCK`, and refuses each file that is
 not a regular file, so a FIFO does not block it.
@@ -982,7 +985,9 @@ that take the path of a repository were rejected. A path does not give the
 remotes directory of the handle. When the keyring of a remote is only in that
 directory, such a constructor trusts the global trusted set, and a pull trusts
 the keyring of the directory. The two trusted sets of one remote are then
-different, with no message.
+different, with no message. `for_repo_in` reads `gpgkeys.gpg` of the
+repository through the handle. `ostrya show` and `ostrya log` use it. No
+constructor takes the path of this keyring.
 
 `GpgSigner::export_public` gives the minimal public certificate of a signing
 key, for a trust store such as the trust files of a sealed boot image. It runs

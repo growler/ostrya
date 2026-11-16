@@ -1846,7 +1846,7 @@ fn path_or_key(
 ///
 /// [`Error::InvalidInput`] if `path` is a relative path with a `..`
 /// component.
-fn caller_path(key: &str, path: Option<PathBuf>) -> Result<Option<KeyPath>> {
+pub(crate) fn caller_path(key: &str, path: Option<PathBuf>) -> Result<Option<KeyPath>> {
     match path {
         Some(path) if relative_with_parent(&path) => Err(Error::InvalidInput(format!(
             "{key} {} is a relative path with a `..` component",
@@ -1958,12 +1958,13 @@ fn read_token_file(path: &KeyPath, repo: Option<&Repo>) -> Result<String> {
     token_of(line).map_err(|why| Error::InvalidInput(format!("{KEY} '{}': {why}", shown.display())))
 }
 
-/// Returns the bytes of the PEM file at `path`, which the remote key `key`
-/// names. The path resolves as [`KeyPath::locate`] states with `repo`.
+/// Returns the bytes of the PEM file at `path`, which the key `key` of a
+/// remote or of the server names. The path resolves as [`KeyPath::locate`]
+/// states with `repo`.
 ///
 /// The function reads at most 1 MiB and one byte of the file. It does not
-/// check the PEM syntax. The fetcher reads the bytes. The call blocks the
-/// calling thread.
+/// check the PEM syntax. The fetcher or the server reads the bytes. The call
+/// blocks the calling thread.
 ///
 /// # Errors
 ///
@@ -1972,7 +1973,7 @@ fn read_token_file(path: &KeyPath, repo: Option<&Repo>) -> Result<String> {
 ///   the path, and holds no byte of the file.
 /// - [`Error::InvalidInput`] if the file is larger than 1 MiB. The message
 ///   names `key` and the path.
-fn read_pem_file(key: &str, path: &KeyPath, repo: Option<&Repo>) -> Result<Vec<u8>> {
+pub(crate) fn read_pem_file(key: &str, path: &KeyPath, repo: Option<&Repo>) -> Result<Vec<u8>> {
     let (file, shown) = open_key_file(key, path, repo)?;
     // The read stops one byte over the cap, so a file over the cap is
     // refused with no read of the rest.

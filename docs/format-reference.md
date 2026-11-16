@@ -3513,8 +3513,9 @@ at a remote with no `url`.
 These keys name a file: `gpgkeypath`, `verification-ENGINE-file`,
 `tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`, and
 `push-token-file` of a remote, `gpgkeypath` and `verification-ENGINE-file` of
-a trust group, and `secret-key-file` of a key group. A path is absolute, or
-relative to a base:
+a trust group, `secret-key-file` of a key group, and `tls-cert`, `tls-key`,
+and `tls-client-ca` of `[ex-ostrya server]`. A path is absolute, or relative
+to a base:
 
 - A relative path in `<repo>/config` is relative to the repository root.
 - A relative path in a `.conf` file of the remotes directory is relative to
@@ -3522,10 +3523,13 @@ relative to a base:
   value of the directory. A message names such a file as the path of the
   directory joined with the value. For a descriptor value, the message
   names the file as the value alone. An empty value names no file, as an
-  empty value in `<repo>/config` does.
+  empty value of a key of a remote in `<repo>/config` does.
 - A path of a caller, for example the option `--tls-ca-path` of
-  `ostrya push`, is relative to the working directory. The `ostrya` command
-  gives each such option to the library as an absolute path.
+  `ostrya push` or the option `--tls-cert` of `ostrya serve`, is relative to
+  the working directory. The `ostrya` command makes each such option
+  absolute against the working directory before the library reads it. A
+  `..` component stays in the path, and the command does not refuse the
+  option.
 
 The port refuses a relative path with a `..` component. The check reads the
 text of the path alone. An absolute path with a `..` component is accepted.
@@ -3536,10 +3540,10 @@ path fails the read and does not block it. A directory entry of `gpgkeypath`
 is the exception ("GPG" in "Signing details"). `ostrya-config(1)`, "Paths in
 keys", states the rules and the refusals.
 
-The `ostree` tool resolves a relative path of these keys against its working
-directory, and accepts a `..` component (`conformance/cli-behavior.md`,
-"Paths of the remote keys"). `conformance/cli-surface.md` records the
-divergence.
+The `ostree` tool resolves a relative path of the keys of a remote against
+its working directory, and accepts a `..` component
+(`conformance/cli-behavior.md`, "Paths of the remote keys").
+`conformance/cli-surface.md` records the divergence.
 
 ## Related commits
 

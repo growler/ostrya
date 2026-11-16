@@ -941,7 +941,7 @@ mod tests {
                 .unwrap();
             let config =
                 crate::RepoConfig::parse("[core]\nrepo_version=1\nmode=bare-user\n").unwrap();
-            let access = crate::access::ClientAccess::from_config(&config, &dir).unwrap();
+            let access = crate::access::ClientAccess::from_config(&config).unwrap();
             let access = ReadAccess::new(
                 std::sync::Arc::new(access),
                 crate::access::AuthItem::Anonymous,

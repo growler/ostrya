@@ -27,17 +27,17 @@ Give the option once for each address. The options replace the whole \fB\%listen
 \fB\-\-tls\-cert\fR \fIFILE\fR
 Serve HTTPS with the certificate chain in FILE, in PEM.
 .IP
-The certificate needs a key, from \%\-\-tls\-key or from the \fB\%tls\-key\fR key. ALPN selects \%HTTP/2 or \%HTTP/1.1. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The certificate needs a key, from \%\-\-tls\-key or from the \fB\%tls\-key\fR key. ALPN selects \%HTTP/2 or \%HTTP/1.1. A relative FILE is relative to the working directory. The command reads FILE once, at start. It refuses a file that is not a regular file, and a file larger than \%1 MiB.
 .TP
 \fB\-\-tls\-key\fR \fIFILE\fR
 The private key of the server certificate, in PEM.
 .IP
-The key needs a certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key. The command refuses an encrypted key, because it has no option for a passphrase. It reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The key needs a certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key. The command refuses an encrypted key, because it has no option for a passphrase. A relative FILE is relative to the working directory. The command reads FILE once, at start. It refuses a file that is not a regular file, and a file larger than \%1 MiB.
 .TP
 \fB\-\-tls\-client\-ca\fR \fIFILE\fR
 Verify client certificates against the CA certificates in FILE, in PEM.
 .IP
-The CA needs a server certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key, or a header of a forwarded certificate, from \%\-\-trusted\-proxy\-client\-cert or from the \fB\%trusted\-proxy\-client\-cert\fR key. The CA verifies the certificate of the TLS handshake and the certificate that a trusted proxy forwards. A client that presents a certificate in the handshake must present one that the CA signed. A client that presents no certificate completes the handshake, and the other auth items identify it. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The CA needs a server certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key, or a header of a forwarded certificate, from \%\-\-trusted\-proxy\-client\-cert or from the \fB\%trusted\-proxy\-client\-cert\fR key. The CA verifies the certificate of the TLS handshake and the certificate that a trusted proxy forwards. A client that presents a certificate in the handshake must present one that the CA signed. A client that presents no certificate completes the handshake, and the other auth items identify it. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. A relative FILE is relative to the working directory. The command reads FILE once, at start. It refuses a file that is not a regular file, and a file larger than \%1 MiB.
 .TP
 \fB\-\-trusted\-proxy\fR \fICIDR\fR
 Read the forwarding headers of a peer in the network CIDR.

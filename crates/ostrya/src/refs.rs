@@ -2015,13 +2015,7 @@ fn collect_collections_selected(
         let Ok(name) = String::from_utf8(entry.name) else {
             continue;
         };
-        if entry.file_type == FileType::Symlink {
-            return Err(FsError::Invalid {
-                path: format!("{MIRRORS_DIR}/{name}"),
-                reason: Reason::Symlink,
-            }
-            .into());
-        }
+        refuse_top_symlink(MIRRORS_DIR, &name, entry.file_type)?;
         if Some(name.as_str()) == own || entry.file_type != FileType::Directory {
             continue;
         }
@@ -2385,7 +2379,7 @@ fn collect_remotes(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     };
     let mut out = Vec::new();
     walk_ref_dir(&remotes, "", &mut |entry| {
-        refuse_top_symlink(REMOTES_DIR, &entry)?;
+        refuse_top_symlink(REMOTES_DIR, entry.path, entry.file_type)?;
         let Some((bytes, _)) = read_listed_ref(repo.root_dir(), REMOTES_DIR, &entry, None)? else {
             return Ok(());
         };
@@ -2454,7 +2448,7 @@ fn collect_aliases(repo: &Repo) -> Result<Vec<RefAlias>> {
     }
     if let Some(remotes) = open_top_in(refs.as_ref(), REMOTES_DIR)? {
         walk_ref_dir(&remotes, "", &mut |entry| {
-            refuse_top_symlink(REMOTES_DIR, &entry)?;
+            refuse_top_symlink(REMOTES_DIR, entry.path, entry.file_type)?;
             if let Some(target) = read_alias_body(&entry)?
                 && let Some((remote, ref_name)) = entry.path.split_once('/')
             {
@@ -2499,15 +2493,16 @@ pub(crate) fn open_top_in(refs: Option<&RepoDir>, top: &str) -> Result<Option<Re
 }
 
 /// Fails with [`Error::InvalidFormat`] and the text `passes through a
-/// symlink` if `entry`, an entry of a walk of the directory `top`, is a
-/// symlink directly under `top`. `top` is `refs/remotes` or `refs/mirrors`,
-/// where such an entry is a symlinked `refs/remotes/R` or `refs/mirrors/ID`.
-/// The walks of these directories call it for each entry before they read
-/// the entry, so a listing below such a symlink fails.
-pub(crate) fn refuse_top_symlink(top: &str, entry: &RefEntry<'_>) -> Result<()> {
-    if entry.file_type == FileType::Symlink && !entry.path.contains('/') {
+/// symlink` if the entry at `path`, relative to the directory `top`, is a
+/// symlink directly under `top`. `file_type` is the type of the entry, read
+/// with no symlink followed. `top` is `refs/remotes` or `refs/mirrors`, where
+/// such an entry is a symlinked `refs/remotes/R` or `refs/mirrors/ID`. The
+/// walks and the listings of these directories call it for each entry before
+/// they read the entry, so a listing below such a symlink fails.
+pub(crate) fn refuse_top_symlink(top: &str, path: &str, file_type: FileType) -> Result<()> {
+    if file_type == FileType::Symlink && !path.contains('/') {
         return Err(FsError::Invalid {
-            path: format!("{top}/{}", entry.path),
+            path: format!("{top}/{path}"),
             reason: Reason::Symlink,
         }
         .into());
@@ -2532,7 +2527,7 @@ fn collect_mirrors(
     };
     let mut out = Vec::new();
     walk_ref_dir_skipping(&mirrors, "", skip, &mut |entry| {
-        refuse_top_symlink(MIRRORS_DIR, &entry)?;
+        refuse_top_symlink(MIRRORS_DIR, entry.path, entry.file_type)?;
         if !keep(entry.path) {
             return Ok(());
         }

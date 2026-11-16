@@ -2454,7 +2454,7 @@ impl Repo {
             return Ok(None);
         }
         for (position, src) in sources.iter().enumerate() {
-            if let Some(size) = source_size(src, name.ty, &name.checksum).await? {
+            if let Some(size) = src.held_object_size(name.ty, &name.checksum).await? {
                 self.import_from(txn, src, name, flags, verify_buf).await?;
                 return Ok(Some((position, size)));
             }
@@ -3281,10 +3281,12 @@ async fn check_commit_signatures(
             let (dict, detached) = parse_detached(detached).await;
             (dict?, Some(detached))
         }
-        None => match repo.load_object_bytes(ObjectType::CommitMeta, commit).await {
-            Ok(held) => (parse_detached(held).await.0?, None),
-            Err(Error::ObjectNotFound { .. }) => (None, None),
-            Err(e) => return Err(e),
+        None => match repo
+            .held_object_bytes(ObjectType::CommitMeta, commit)
+            .await?
+        {
+            Some(held) => (parse_detached(held).await.0?, None),
+            None => (None, None),
         },
     };
     verification
@@ -3327,12 +3329,11 @@ async fn check_local_commit_signatures(
             };
             return Ok((read, dict));
         }
-        let read = CheckedDetached::Absent;
-        match repo.load_object_bytes_blocking(ObjectType::CommitMeta, &key) {
-            Ok(held) => Ok((read, crate::summary::parse_signature_dict(&held)?)),
-            Err(Error::ObjectNotFound { .. }) => Ok((read, None)),
-            Err(e) => Err(e),
-        }
+        let dict = match repo.held_object_bytes_blocking(ObjectType::CommitMeta, &key)? {
+            Some(held) => crate::summary::parse_signature_dict(&held)?,
+            None => None,
+        };
+        Ok((CheckedDetached::Absent, dict))
     })
     .await?;
     verification
@@ -3571,16 +3572,6 @@ fn count_fetched(counters: &PullCounters, ty: ObjectType, size: u64) {
     counters.add_transferred(size);
 }
 
-/// Returns the stored size of a loose object in `repo`, or `None` if `repo`
-/// does not hold it.
-async fn source_size(repo: &Repo, ty: ObjectType, checksum: &Checksum) -> Result<Option<u64>> {
-    match repo.loose_object_size(ty, checksum).await {
-        Ok(size) => Ok(Some(size)),
-        Err(Error::ObjectNotFound { .. }) => Ok(None),
-        Err(e) => Err(e),
-    }
-}
-
 /// A commit that a local pull read: its bytes, the commit parsed from them,
 /// and the result of the format check of field 2.
 struct LoadedCommit {
@@ -3693,16 +3684,12 @@ fn load_dependencies_blocking(
     for (at, checksum) in wanted.iter().enumerate() {
         let mut bytes = None;
         for (position, held) in holders.iter().enumerate() {
-            match held.load_object_bytes_blocking(ObjectType::Commit, checksum) {
-                Ok(read) => {
-                    if untrusted && position + 1 < holders.len() {
-                        check_hash(checksum, &read)?;
-                    }
-                    bytes = Some(read);
-                    break;
+            if let Some(read) = held.held_object_bytes_blocking(ObjectType::Commit, checksum)? {
+                if untrusted && position + 1 < holders.len() {
+                    check_hash(checksum, &read)?;
                 }
-                Err(Error::ObjectNotFound { .. }) => continue,
-                Err(e) => return Err(e),
+                bytes = Some(read);
+                break;
             }
         }
         let Some(bytes) = bytes else {
@@ -3747,10 +3734,8 @@ fn detached_bytes_from_blocking(
     commit: &Checksum,
 ) -> Result<Option<(usize, Vec<u8>)>> {
     for (at, src) in sources.iter().enumerate() {
-        match src.load_object_bytes_blocking(ObjectType::CommitMeta, commit) {
-            Ok(bytes) => return Ok(Some((at, bytes))),
-            Err(Error::ObjectNotFound { .. }) => continue,
-            Err(e) => return Err(e),
+        if let Some(bytes) = src.held_object_bytes_blocking(ObjectType::CommitMeta, commit)? {
+            return Ok(Some((at, bytes)));
         }
     }
     Ok(None)

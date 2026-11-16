@@ -19,7 +19,7 @@ use crate::inflate::{ArchiveDecoder, archive_decoder};
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::object_path_error;
 use crate::repo::Repo;
-use crate::repo_fs::{self, FsError, ObjectEntry, Opened, Reason, RepoDir, Stat};
+use crate::repo_fs::{self, FsError, FsResultExt, ObjectEntry, Opened, Reason, RepoDir, Stat};
 use crate::write::FileMeta;
 
 /// The largest symlink target that a load reads from a `bare-user` object.
@@ -1141,11 +1141,10 @@ fn missing_xattrs_link() -> LoadError {
 /// a symlink at its path fails the read, and a FIFO there does not block it.
 fn load_split_xattrs(dir: &RepoDir, file_path: &str) -> std::result::Result<Xattrs, LoadError> {
     let path = format!("{file_path}-xattrs-link");
-    let bytes = match dir.read_capped(&path, MAX_METADATA_SIZE) {
-        Ok(bytes) => bytes,
-        Err(FsError::Absent { .. }) => return Err(missing_xattrs_link()),
-        Err(e) => return Err(e.into()),
-    };
+    let bytes = dir
+        .read_capped(&path, MAX_METADATA_SIZE)
+        .optional()?
+        .ok_or_else(missing_xattrs_link)?;
     Ok(Xattrs::from_gvariant(&bytes)?)
 }
 
@@ -1155,11 +1154,10 @@ fn load_split_xattrs(dir: &RepoDir, file_path: &str) -> std::result::Result<Xatt
 /// [`load_split_xattrs`] gives.
 fn probe_split_xattrs_link(dir: &RepoDir, file_path: &str) -> std::result::Result<(), LoadError> {
     let path = format!("{file_path}-xattrs-link");
-    match dir.open_regular(&path) {
-        Ok(_) => Ok(()),
-        Err(FsError::Absent { .. }) => Err(missing_xattrs_link()),
-        Err(e) => Err(e.into()),
-    }
+    dir.open_regular(&path)
+        .optional()?
+        .map(drop)
+        .ok_or_else(missing_xattrs_link)
 }
 
 /// An async reader over the payload of a file object.

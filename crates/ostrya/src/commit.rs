@@ -661,10 +661,8 @@ impl Repo {
         &self,
         checksum: &Checksum,
     ) -> Result<Option<Value>> {
-        let bytes = match self.load_object_bytes_blocking(ObjectType::CommitMeta, checksum) {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+        let Some(bytes) = self.held_object_bytes_blocking(ObjectType::CommitMeta, checksum)? else {
+            return Ok(None);
         };
         parse_detached_metadata(&bytes)
     }
@@ -691,10 +689,8 @@ impl Repo {
         &self,
         checksum: &Checksum,
     ) -> Result<Option<Value>> {
-        let bytes = match self.load_object_bytes_blocking(ObjectType::CommitMeta, checksum) {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+        let Some(bytes) = self.held_object_bytes_blocking(ObjectType::CommitMeta, checksum)? else {
+            return Ok(None);
         };
         parse_build_source_dict(&bytes)
     }

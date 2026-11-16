@@ -910,11 +910,9 @@ impl Repo {
         }
         let repo = self.clone();
         let key = *checksum;
-        let (local, field) = ostrya_rt::unblock(move || {
-            let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &key) {
-                Ok(bytes) => bytes,
-                Err(Error::ObjectNotFound { .. }) => return Ok((Local::Absent, None)),
-                Err(e) => return Err(e),
+        let (local, field) = ostrya_rt::unblock(move || -> Result<_> {
+            let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &key)? else {
+                return Ok((Local::Absent, None));
             };
             Ok(match repo.commit_state_blocking(&key)? {
                 CommitState::Normal => {

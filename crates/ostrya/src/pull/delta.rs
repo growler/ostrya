@@ -113,7 +113,7 @@ use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
     CheckedDetached, CheckedMeta, TipChecks, check_commit_signatures_filtered,
-    check_local_commit_signatures, check_tip_refs, count_fetched, source_size,
+    check_local_commit_signatures, check_tip_refs, count_fetched,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -1584,7 +1584,7 @@ async fn discover_chain(
                 Some(CheckedDetached::Read { at: 0, len, .. }) => Some(*len),
                 Some(CheckedDetached::Absent | CheckedDetached::Read { .. }) => None,
                 Some(CheckedDetached::Unchecked) | None => {
-                    source_size(src, ObjectType::CommitMeta, commit).await?
+                    src.held_object_size(ObjectType::CommitMeta, commit).await?
                 }
             };
             if let Some(size) = size {

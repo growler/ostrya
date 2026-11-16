@@ -31,7 +31,7 @@ use crate::config::RepoConfig;
 use crate::error::Result;
 use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
-use crate::repo_fs::{FsError, Opened, Reason, RepoDir, RootFile, Stat};
+use crate::repo_fs::{FsError, FsResultExt, Opened, Reason, RepoDir, RootFile, Stat};
 use crate::summary::{ACCESS_SUFFIX, SIG_SUFFIX, access_file_bytes, open_summary_dir};
 use crate::write::archive_level;
 
@@ -663,11 +663,8 @@ pub(crate) fn holds(file: &std::fs::File, want: &[u8]) -> io::Result<bool> {
 /// The call compares the device and the inode of [`RepoDir::lstat`] of
 /// `name` with those of `file`. An absent `name` gives `false`.
 fn names_file(dir: &RepoDir, name: &str, file: &Opened) -> io::Result<bool> {
-    match dir.lstat(name) {
-        Ok(named) => Ok(named.dev == file.stat.dev && named.ino == file.stat.ino),
-        Err(FsError::Absent { .. }) => Ok(false),
-        Err(e) => Err(io_error(e)),
-    }
+    let named = dir.lstat(name).optional().map_err(io_error)?;
+    Ok(named.is_some_and(|n| n.dev == file.stat.dev && n.ino == file.stat.ino))
 }
 
 /// Returns the status of `config` at the repository root `root`, with no

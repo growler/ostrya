@@ -335,10 +335,8 @@ fn held_entries(repo: &Repo, relpath: &str) -> Result<Option<HashMap<String, Che
     let Some(tip) = repo.resolve_relpath_tip_blocking(relpath)? else {
         return Ok(None);
     };
-    let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &tip) {
-        Ok(bytes) => bytes,
-        Err(Error::ObjectNotFound { .. }) => return Ok(None),
-        Err(e) => return Err(e),
+    let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &tip)? else {
+        return Ok(None);
     };
     let Ok(entries) = related::parse_dependencies(&bytes).and_then(|entries| {
         related::checked_entries(RelatedField::Dependencies, Some(tip), entries)

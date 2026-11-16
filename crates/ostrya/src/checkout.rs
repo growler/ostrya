@@ -1365,7 +1365,7 @@ async fn hash_destination_file(
             .clamp(1, HASH_CHUNK)
     ];
     loop {
-        let n = file.read(&mut buf).await.map_err(Error::Io)?;
+        let n = file.read(&mut buf).await?;
         if n == 0 {
             break;
         }
@@ -1556,10 +1556,8 @@ async fn copy_object(
         None => obj.reader().await?,
     };
     let mut writer = RtFile::from(temp.as_fd().try_clone_to_owned()?);
-    crate::write::copy_stream(reader, &mut writer)
-        .await
-        .map_err(Error::Io)?;
-    crate::write::flush(&mut writer).await.map_err(Error::Io)?;
+    crate::write::copy_stream(reader, &mut writer).await?;
+    crate::write::flush(&mut writer).await?;
     Ok(())
 }
 

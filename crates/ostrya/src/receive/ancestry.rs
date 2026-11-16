@@ -190,10 +190,8 @@ impl Chain {
 async fn stored_parent(txn: &Transaction, commit: Checksum) -> Result<Option<Option<Checksum>>> {
     let repo = txn.repo().clone();
     ostrya_rt::unblock(move || {
-        let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &commit) {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(None),
-            Err(e) => return Err(e),
+        let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &commit)? else {
+            return Ok(None);
         };
         let commit = Commit::parse(&bytes)
             .map_err(|e| Error::InvalidFormat(format!("commit {commit} does not parse: {e}")))?;

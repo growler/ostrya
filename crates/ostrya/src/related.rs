@@ -744,10 +744,9 @@ pub(crate) fn held_dependency_blocking<T>(
             let flat = crate::write::flat_name(checksum, ObjectType::Commit, repo.mode());
             staging.read_capped(&flat, crate::object::MAX_METADATA_SIZE)?
         }
-        None => match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(HeldDependency::Absent),
-            Err(e) => return Err(e),
+        None => match repo.held_object_bytes_blocking(ObjectType::Commit, checksum)? {
+            Some(bytes) => bytes,
+            None => return Ok(HeldDependency::Absent),
         },
     };
     let nested = has_dependencies(&bytes)?;

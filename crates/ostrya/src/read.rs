@@ -36,7 +36,7 @@ use ostrya_rt::FileReader;
 use crate::error::{Error, Result};
 use crate::object::MAX_METADATA_SIZE;
 use crate::repo::Repo;
-use crate::repo_fs::{FsError, Opened};
+use crate::repo_fs::{FsError, FsResultExt, Opened, Reason};
 
 /// The object totals that the `ostree.sizes` metadata of a commit states.
 ///
@@ -125,10 +125,36 @@ impl Repo {
         ty: ObjectType,
         checksum: &Checksum,
     ) -> Result<Vec<u8>> {
+        let checksum = *checksum;
+        self.held_object_bytes_blocking(ty, &checksum)?
+            .ok_or(Error::ObjectNotFound { checksum, ty })
+    }
+
+    /// Loads the bytes of a metadata object as
+    /// [`load_object_bytes`](Repo::load_object_bytes) does, or returns `None`
+    /// when the object store does not hold the object.
+    pub(crate) async fn held_object_bytes(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<Option<Vec<u8>>> {
+        let repo = self.clone();
+        let key = *checksum;
+        ostrya_rt::unblock(move || repo.held_object_bytes_blocking(ty, &key)).await
+    }
+
+    /// Runs [`held_object_bytes`](Repo::held_object_bytes) on the calling
+    /// thread.
+    pub(crate) fn held_object_bytes_blocking(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<Option<Vec<u8>>> {
         let path = loose_path(checksum, ty, self.mode());
-        self.objects()
+        Ok(self
+            .objects()
             .read_capped(&path, MAX_METADATA_SIZE)
-            .map_err(|e| e.into_object_error(checksum, ty))
+            .optional()?)
     }
 
     /// Opens a streaming reader over the bytes of a metadata object.
@@ -172,7 +198,7 @@ impl Repo {
             // as the errors of the open give it.
             let path = format!("objects/{path}");
             if stat.size > MAX_METADATA_SIZE {
-                return Err(Error::InvalidFormat(cap_text(&path)));
+                return Err(Error::InvalidFormat(format!("{path} {CAP_REASON}")));
             }
             Ok(MetadataReader {
                 file: FileReader::with_len_hint(file, stat.size),
@@ -367,14 +393,28 @@ impl Repo {
         ty: ObjectType,
         checksum: &Checksum,
     ) -> Result<u64> {
+        let checksum = *checksum;
+        self.held_object_size(ty, &checksum)
+            .await?
+            .ok_or(Error::ObjectNotFound { checksum, ty })
+    }
+
+    /// Returns the on-disk size of a loose object as
+    /// [`loose_object_size`](Repo::loose_object_size) does, or `None` when the
+    /// object store does not hold the object.
+    pub(crate) async fn held_object_size(
+        &self,
+        ty: ObjectType,
+        checksum: &Checksum,
+    ) -> Result<Option<u64>> {
         let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
-        let key = *checksum;
         ostrya_rt::unblock(move || {
-            repo.objects()
+            Ok(repo
+                .objects()
                 .lstat(&path)
-                .map(|stat| stat.size)
-                .map_err(|e| e.into_object_error(&key, ty))
+                .optional()?
+                .map(|stat| stat.size))
         })
         .await
     }
@@ -442,11 +482,10 @@ impl Repo {
     }
 }
 
-/// Returns the text of the refusal of the metadata object at `path` for its
-/// size. It is the text of the cap error of a capped read.
-fn cap_text(path: &str) -> String {
-    format!("{path} is larger than its cap of {MAX_METADATA_SIZE} bytes")
-}
+/// The reason of the refusal of a metadata object larger than its cap.
+const CAP_REASON: Reason = Reason::TooLarge {
+    cap: MAX_METADATA_SIZE,
+};
 
 /// Gives the error `err` of an operation on the loose object at `path`,
 /// relative to `objects/`, with the path of the object.
@@ -521,7 +560,10 @@ pub struct MetadataReader {
 impl MetadataReader {
     /// Returns the error of a read past the cap.
     fn cap_exceeded(&self) -> io::Error {
-        io::Error::new(io::ErrorKind::InvalidData, cap_text(&self.path))
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} {CAP_REASON}", self.path),
+        )
     }
 
     /// Runs the read step that both trait implementations call.

@@ -26,8 +26,8 @@ use crate::config::{
 use crate::error::{Error, Result};
 use crate::repo::{MAX_CONFIG_SIZE, RemotesDir};
 use crate::repo_fs::{
-    FsError, Named, Publish, Published, Reason, ensure_named_dir, list_fd, open_named, put_named,
-    remove_named,
+    FsError, FsResultExt, Named, Publish, Published, Reason, ensure_named_dir, list_fd, open_named,
+    put_named, remove_named,
 };
 
 /// The name suffix of a file that the read takes.
@@ -240,11 +240,9 @@ pub(crate) fn entry<'a>(
 /// it is absent.
 fn open_dir(repo_fd: BorrowedFd<'_>, dir: &RemotesDir) -> Result<Option<OwnedFd>> {
     let (base, at) = locate(repo_fd, dir);
-    match open_named(base, at, Named::Dir) {
-        Ok(fd) => Ok(Some(fd)),
-        Err(FsError::Absent { .. }) => Ok(None),
-        Err(err) => Err(fs_error(at, err)),
-    }
+    open_named(base, at, Named::Dir)
+        .optional()
+        .map_err(|err| fs_error(at, err))
 }
 
 /// Reads the `.conf` files of the open directory `dir_fd` of `dir`.

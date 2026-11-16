@@ -1031,16 +1031,12 @@ impl Repo {
         fsync: bool,
         ctx: &mut Ctx,
     ) -> Result<std::result::Result<Option<Vec<u8>>, FsckFailure>> {
-        let bytes = match self.load_object_bytes(ObjectType::Commit, &commit).await {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => {
-                return Ok(Err(FsckFailure::RefTarget {
-                    ref_name: display.to_owned(),
-                    commit,
-                    removed: false,
-                }));
-            }
-            Err(e) => return Err(e),
+        let Some(bytes) = self.held_object_bytes(ObjectType::Commit, &commit).await? else {
+            return Ok(Err(FsckFailure::RefTarget {
+                ref_name: display.to_owned(),
+                commit,
+                removed: false,
+            }));
         };
         let actual = Checksum::sha256(&bytes);
         if actual == commit {
@@ -1855,10 +1851,11 @@ fn walk_subtree<'a, S: WalkSink + Send>(
         if !walked.insert(dirtree) {
             return Ok(Ok(()));
         }
-        let bytes = match repo.load_object_bytes(ObjectType::DirTree, &dirtree).await {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return Ok(Err(dirtree)),
-            Err(e) => return Err(e),
+        let Some(bytes) = repo
+            .held_object_bytes(ObjectType::DirTree, &dirtree)
+            .await?
+        else {
+            return Ok(Err(dirtree));
         };
         let Ok(parsed) = DirTree::parse(&bytes) else {
             return Ok(Ok(()));

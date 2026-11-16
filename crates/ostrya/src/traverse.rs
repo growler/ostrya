@@ -716,11 +716,7 @@ pub(crate) trait MetadataSource: Sync {
 
 impl MetadataSource for Repo {
     async fn load_metadata(&self, ty: ObjectType, checksum: Checksum) -> Result<Option<Vec<u8>>> {
-        match self.load_object_bytes(ty, &checksum).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(Error::ObjectNotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
+        self.held_object_bytes(ty, &checksum).await
     }
 
     async fn load_build_source_dict(&self, commit: Checksum) -> Result<Option<Value>> {
@@ -1424,7 +1420,7 @@ fn collect_named_refs(
     };
     walk_ref_dir(&dir, "", &mut |entry| {
         if space != RefSpace::Heads {
-            refuse_top_symlink(top, &entry)?;
+            refuse_top_symlink(top, entry.path, entry.file_type)?;
         }
         if let Some((bytes, _)) = read_listed_ref(repo.root_dir(), top, &entry, None)? {
             let checksum = crate::refs::parse_ref_content(&bytes)?;

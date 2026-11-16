@@ -3433,10 +3433,11 @@ pub(super) async fn fetch_remote_detached(
 /// that holds it.
 async fn cached_detached_metadata(sources: &[Repo], commit: &Checksum) -> Result<Option<Vec<u8>>> {
     for src in sources {
-        match src.load_object_bytes(ObjectType::CommitMeta, commit).await {
-            Ok(bytes) => return Ok(Some(bytes)),
-            Err(Error::ObjectNotFound { .. }) => continue,
-            Err(e) => return Err(e),
+        if let Some(bytes) = src
+            .held_object_bytes(ObjectType::CommitMeta, commit)
+            .await?
+        {
+            return Ok(Some(bytes));
         }
     }
     Ok(None)

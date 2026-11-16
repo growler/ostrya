@@ -139,11 +139,9 @@ impl Walk<'_> {
                         Some((checksum, true, Some(DirTree::parse(&bytes))))
                     }
                     Some((checksum, TreeSource::Stored)) => {
-                        match repo.load_object_bytes_blocking(ObjectType::DirTree, &checksum) {
-                            Ok(bytes) => Some((checksum, false, Some(DirTree::parse(&bytes)))),
-                            Err(Error::ObjectNotFound { .. }) => Some((checksum, false, None)),
-                            Err(e) => return Err(e),
-                        }
+                        let bytes =
+                            repo.held_object_bytes_blocking(ObjectType::DirTree, &checksum)?;
+                        Some((checksum, false, bytes.map(|b| DirTree::parse(&b))))
                     }
                 };
                 Ok((probes, present, read))

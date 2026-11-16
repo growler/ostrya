@@ -1043,10 +1043,9 @@ async fn read_commits(
                     let name = flat_name(&checksum, ObjectType::Commit, mode);
                     staging.read_capped(&name, MAX_METADATA_SIZE)?
                 } else {
-                    match repo.load_object_bytes_blocking(ObjectType::Commit, &checksum) {
-                        Ok(bytes) => bytes,
-                        Err(Error::ObjectNotFound { .. }) => return Ok(ReadCommit::Absent),
-                        Err(e) => return Err(e),
+                    match repo.held_object_bytes_blocking(ObjectType::Commit, &checksum)? {
+                        Some(bytes) => bytes,
+                        None => return Ok(ReadCommit::Absent),
                     }
                 };
                 Ok(match Commit::parse(&bytes) {
@@ -1411,14 +1410,10 @@ async fn read_stored(repo: &Repo, commits: Vec<Checksum>) -> Checked<Vec<Option<
     ostrya_rt::unblock(move || {
         commits
             .iter()
-            .map(
-                |commit| match repo.load_object_bytes_blocking(ObjectType::CommitMeta, commit) {
-                    Ok(bytes) if bytes.is_empty() => Ok(None),
-                    Ok(bytes) => Ok(Some(Arc::new(bytes))),
-                    Err(Error::ObjectNotFound { .. }) => Ok(None),
-                    Err(e) => Err(e),
-                },
-            )
+            .map(|commit| {
+                let bytes = repo.held_object_bytes_blocking(ObjectType::CommitMeta, commit)?;
+                Ok(bytes.filter(|b| !b.is_empty()).map(Arc::new))
+            })
             .collect::<Result<Vec<_>>>()
     })
     .await

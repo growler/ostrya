@@ -219,6 +219,7 @@ use crate::perm;
 use crate::refs::{ref_relpath, refspec_ref};
 use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
+use crate::repo_fs::{FsError, FsResultExt, RootFile};
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
@@ -3990,28 +3991,28 @@ async fn take_static_deltas(opts: &mut PullOptions) -> Result<Option<chain::Edge
 /// Reads the `summary` of the local repository `src`, and checks it if
 /// `verification` checks the summary.
 ///
-/// The function opens `summary` if `verification` checks the summary or if
-/// `needed` is `true`. It opens `summary.sig` only if `verification` checks
+/// The function reads `summary` if `verification` checks the summary or if
+/// `needed` is `true`. It reads `summary.sig` only if `verification` checks
 /// the summary and `summary` exists. It reads each file under
-/// [`SUMMARY_READ_CAP`](crate::summary::SUMMARY_READ_CAP), and refuses a file
-/// that is not a regular file. If `verification` checks the summary, the
+/// [`SUMMARY_READ_CAP`](crate::summary::SUMMARY_READ_CAP) with one `openat2`
+/// that follows no symlink, and refuses a file that is not a regular file. A
+/// FIFO does not block the open. If `verification` checks the summary, the
 /// function gives the two files to
 /// [`Verification::check_summary`](verify::Verification::check_summary).
 ///
-/// Under the summary verification, a missing file stops the call before it
-/// reads the other file: with no `summary`, the call does not open
-/// `summary.sig`, and with no `summary.sig`, it does not read `summary`. So
+/// Under the summary verification, with no `summary` the call does not read
+/// `summary.sig`, and a missing file stops the call before the check. So
 /// under the summary verification, a call that succeeds returns `Some`.
 ///
 /// Without the summary verification, returns `None` if `src` has no
-/// `summary`, or if the function does not open it.
+/// `summary`, or if the function does not read it.
 ///
 /// # Errors
 ///
 /// - [`Error::Signature`] if `verification` checks the summary and `src` has
 ///   no `summary` or no `summary.sig`, or if the summary fails the policy.
-/// - [`Error::InvalidFormat`] if a file that the function opens is not a
-///   regular file, or is longer than the cap.
+/// - [`Error::InvalidFormat`] if a file that the function reads is a symlink
+///   or is not a regular file, or is longer than the cap.
 /// - [`Error::Io`] if a file cannot be opened or read.
 /// - The other errors of
 ///   [`Verification::check_summary`](verify::Verification::check_summary).
@@ -4021,31 +4022,26 @@ async fn read_checked_local_summary(
     needed: bool,
 ) -> Result<Option<Arc<Vec<u8>>>> {
     let checks_summary = verification.checks_summary();
-    let summary_file = if checks_summary || needed {
-        delta::open_local(src, crate::summary::SUMMARY_FILE).await?
-    } else {
-        None
-    };
-    let signature_file = if checks_summary && summary_file.is_some() {
-        delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
-    } else {
-        None
-    };
-    verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
-    let summary = delta::read_opened(
-        summary_file,
-        crate::summary::SUMMARY_FILE,
-        crate::summary::SUMMARY_READ_CAP,
-    )
-    .await?
-    .map(Arc::new);
+    let root = src.root_dir().clone();
+    let (summary, signature) = ostrya_rt::unblock(move || {
+        let cap = crate::summary::SUMMARY_READ_CAP;
+        let summary = if checks_summary || needed {
+            root.read_capped(RootFile::Summary.name(), cap).optional()?
+        } else {
+            None
+        };
+        let signature = if checks_summary && summary.is_some() {
+            root.read_capped(RootFile::SummarySig.name(), cap)
+                .optional()?
+        } else {
+            None
+        };
+        Ok::<_, FsError>((summary, signature))
+    })
+    .await?;
+    verification.check_summary_files(summary.is_some(), signature.is_some())?;
+    let summary = summary.map(Arc::new);
     if checks_summary {
-        let signature = delta::read_opened(
-            signature_file,
-            crate::summary::SUMMARY_SIG_FILE,
-            crate::summary::SUMMARY_READ_CAP,
-        )
-        .await?;
         verification
             .check_summary(summary.as_ref(), signature)
             .await?;
@@ -5129,7 +5125,7 @@ mod tests {
             let result = link_import(&txn, src, name, PullFlags::empty()).await;
             let staging = crate::write::flat_name(&name.checksum, name.ty, dst.mode());
             let staged = rustix::fs::statat(
-                txn.staging_fd(),
+                txn.staging_dir(),
                 staging.as_str(),
                 AtFlags::SYMLINK_NOFOLLOW,
             )
@@ -5287,7 +5283,7 @@ mod tests {
                         .await;
                     let staged = crate::write::flat_name(&name.checksum, name.ty, dst_mode);
                     let staged = rustix::fs::openat(
-                        txn.staging_fd(),
+                        txn.staging_dir(),
                         staged.as_str(),
                         OFlags::RDONLY | OFlags::CLOEXEC,
                         Mode::empty(),

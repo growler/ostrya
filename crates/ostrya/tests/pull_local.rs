@@ -3498,14 +3498,15 @@ fn a_local_pull_checks_the_source_summary_when_asked() {
 }
 
 /// Under the summary verification, a missing `summary` or `summary.sig` stops
-/// the pull before it reads the other file:
+/// the pull:
 ///
 /// - With no `summary`, the pull does not open `summary.sig`. A directory
 ///   there would fail the open as a file that is not a regular file.
-/// - With no `summary.sig`, the pull does not read `summary`. A sparse
-///   `summary` one byte past the read cap of 64 MiB would fail the read.
+/// - With no `summary.sig`, the pull refuses the source. The pull reads
+///   `summary` before `summary.sig`, so a sparse `summary` one byte past the
+///   read cap of 64 MiB fails the read first.
 #[test]
-fn a_summary_check_refuses_a_missing_file_before_it_reads_the_other() {
+fn a_summary_check_refuses_a_missing_file() {
     let tmp = TmpDir::new("pull-local-verify-summary-missing");
     let base = tmp.path();
     block_on(async {
@@ -3531,6 +3532,13 @@ fn a_summary_check_refuses_a_missing_file_before_it_reads_the_other() {
         let summary = std::fs::File::create(src_path.join("summary")).unwrap();
         summary.set_len((64 << 20) + 1).unwrap();
         drop(summary);
+        let err = pull_main_with(&dst, &src, asked.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m == "summary is larger than its cap of 67108864 bytes"),
+            "{err}"
+        );
+        std::fs::write(src_path.join("summary"), b"").unwrap();
         let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains("no summary.sig is published")),
@@ -5362,6 +5370,61 @@ fn a_required_delta_pull_refuses_a_summary_that_is_not_a_regular_file() {
             .unwrap_err();
         assert!(err.to_string().contains("not a regular file"), "{err}");
         assert_nothing_left(&dst_dir, &dst, &c2).await;
+    });
+}
+
+/// The pull reads the files of the source with no symlink followed. A FIFO
+/// or a symlink at `summary`, at a superblock, at an index file, or at a part
+/// file fails the pull with no wait for a writer, and the pull publishes
+/// nothing.
+#[test]
+fn a_required_delta_pull_refuses_a_fifo_or_a_symlink_in_the_source() {
+    let tmp = TmpDir::new("pull-delta-source-special");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2, dir) = delta_source(base).await;
+        let b64 = c2.to_base64_modified();
+        let index = src_dir
+            .join("delta-indexes")
+            .join(&b64[..2])
+            .join(format!("{}.index", &b64[2..]));
+        let files = [
+            src_dir.join("summary"),
+            dir.join("superblock"),
+            index,
+            dir.join("0"),
+        ];
+        for (i, file) in files.iter().enumerate() {
+            let saved = base.join(format!("saved-{i}"));
+            std::fs::rename(file, &saved).unwrap();
+            for special in ["fifo", "symlink"] {
+                match special {
+                    "fifo" => {
+                        let status = Command::new("mkfifo").arg(file).status().unwrap();
+                        assert!(status.success());
+                    }
+                    _ => std::os::unix::fs::symlink(&saved, file).unwrap(),
+                }
+                let (dst_dir, dst) =
+                    make_repo(base, &format!("dst-{i}-{special}"), RepoMode::BareUser).await;
+                let err = dst
+                    .pull_local(&src, required(PullFlags::empty()))
+                    .await
+                    .unwrap_err();
+                let expected = match special {
+                    "fifo" => "is not a regular file",
+                    _ => "passes through a symlink",
+                };
+                assert!(
+                    matches!(&err, Error::InvalidFormat(m) if m.contains(expected)),
+                    "{} {special}: {err}",
+                    file.display()
+                );
+                assert_nothing_left(&dst_dir, &dst, &c2).await;
+                std::fs::remove_file(file).unwrap();
+            }
+            std::fs::rename(&saved, file).unwrap();
+        }
     });
 }
 

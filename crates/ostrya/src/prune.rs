@@ -995,9 +995,10 @@ impl Repo {
                 .count_objects(move |ty| counted(ty, commit_only))
                 .await?;
             if !opts.no_prune {
-                let repo = self.clone();
+                let fsync = self.config().fsync()?;
+                let root = self.root_dir().clone();
                 ostrya_rt::unblock(move || {
-                    crate::delta::prune_delta_dirs(repo.repo_fd(), |to| *to == delta_target)
+                    crate::delta::prune_delta_dirs(&root, fsync, |to| *to == delta_target)
                 })
                 .await?;
             }
@@ -1251,6 +1252,7 @@ impl Repo {
         drop(all_objects);
         drop(keep);
 
+        let fsync = sweep.fsync;
         let repo = self.clone();
         let (pruned_objects, freed_bytes) =
             ostrya_rt::unblock(move || sweep_blocking(&repo, &sweep, &doomed)).await?;
@@ -1267,7 +1269,9 @@ impl Repo {
             let repo = self.clone();
             ostrya_rt::unblock(move || {
                 let repo_fd = repo.repo_fd();
-                crate::delta::prune_delta_dirs(repo_fd, |to| !present_commits.contains(to))?;
+                crate::delta::prune_delta_dirs(repo.root_dir(), fsync, |to| {
+                    !present_commits.contains(to)
+                })?;
                 sweep_orphan_markers_blocking(repo_fd, &present_commits)
             })
             .await?;

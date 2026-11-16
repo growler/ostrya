@@ -1610,7 +1610,7 @@ type Refs = (ListedRefs, Option<Arc<Vec<u8>>>);
 /// If `verification` checks the summary, the refs come from the `summary`
 /// of `src`, after the check of the summary and its `summary.sig`, as from a
 /// remote. [`read_checked_local_summary`] reads these files under the size
-/// cap of a summary. The probe drops the bytes of the summary after the parse
+/// cap of a summary, with no symlink followed. The probe drops the bytes of the summary after the parse
 /// of the refs.
 ///
 /// Otherwise the refs come from the ref files of `src`, through

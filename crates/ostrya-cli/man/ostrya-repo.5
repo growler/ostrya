@@ -208,7 +208,7 @@ A symbolic link object of a \fB\%bare\fR or \fB\%bare\-user\-only\fR repository 
 A repository handle opens \fB\%tmp/\fR at its first use and keeps it.
 The open makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 Each write of a \fB\%.commitmeta\fR outside a transaction and of a \fB\%.tombstone\-commit\fR, and the fs\-verity probe of \fB\%[ex\-integrity] fsverity=maybe\fR, make their temporary file in that \fB\%tmp/\fR.
-Each write of \fB\%config\fR, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, and a file under \fB\%extensions/ostrya/summary/\fR also makes its temporary file there.
+Each write of \fB\%config\fR, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, and a file in \fB\%deltas/\fR or \fB\%delta\-indexes/\fR also makes its temporary file there.
 If another process removes \fB\%tmp/\fR, these writes of the handle fail, and the caller opens the repository again.
 Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 The lock file of a staging directory opens by the rules of \fB\%.lock\fR.
@@ -283,12 +283,24 @@ The section STATIC DELTAS gives the layout.
 The index of the static deltas that end at the commit \fB\%<to>\fR.
 \fB\%ostrya static\-delta reindex\fR writes it.
 Each entry maps a delta name to the SHA\-256 checksum of its superblock.
+.PP
+ostrya opens each path in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, and \fB\%RESOLVE_NO_SYMLINKS\fR, and opens each file with \fB\%O_NONBLOCK\fR.
+A symbolic link at \fB\%deltas\fR or at \fB\%delta\-indexes\fR, also a dangling one, stops each command that reads or writes there, also \fB\%ostrya summary \-u\fR and \fB\%ostrya prune\fR, with the error \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
+A symbolic link at a fanout directory that a command names stops the command with the same error.
+A symbolic link at a delta directory that a command names also stops the command, but \fB\%ostrya static\-delta delete\fR removes the link and keeps its target.
+A symbolic link at a \fB\%superblock\fR stops each read and each listing of the delta, and \fB\%ostrya static\-delta generate \-n\fR, with the same error.
+\fB\%ostrya static\-delta generate\fR replaces a symbolic link at \fB\%superblock\fR with a regular file.
+The listings skip a symbolic link at a fanout directory or at a delta directory.
+A file at \fB\%deltas\fR stops each command with the error \fB\%invalid format: deltas is not a directory\fR.
+A local pull reads the superblocks, the index files, and the part files of its source repository by the same rules, and a FIFO there stops the pull with the error \fB\%invalid format: <path> is not a regular file\fR.
+The temporary files of a write are in \fB\%tmp/\fR, so \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them must be on the file system of \fB\%tmp/\fR.
 .TP
 \fB\%<repo>/summary\fR
 The root summary: each ref and its commit, the static deltas, and the repository metadata.
 It holds each local ref and each collection ref, whatever the client groups, and states the mode of the repository.
 \fB\%ostrya summary \-u\fR writes it, and \fB\%ostrya summary \-u \-c\fR leaves it as it is.
 \fB\%ostrya summary \-v\fR and a local pull read it.
+A local pull reads \fB\%summary\fR and \fB\%summary.sig\fR of its source repository with no symbolic link followed, and refuses a file that is not a regular file.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR never serve it.
 A web server that serves the repository directory as files serves it, and with it the name of each ref.
 A summary is at most 64 MiB: \fB\%ostrya summary \-u\fR refuses a larger summary, and ostrya refuses to read a larger file.
@@ -309,11 +321,12 @@ When it exists, ostrya does not read the keyring of the remote in the remotes di
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
 .PP
-To change \fB\%config\fR, a ref, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR and renames it over the target.
+To change \fB\%config\fR, a ref, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, a file in \fB\%deltas/\fR or \fB\%delta\-indexes/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR and renames it over the target.
 A symbolic link at the target is replaced.
 With \fB\%core.fsync\fR on, ostrya syncs the temporary file with \fBfsync\fR(2) before the rename.
 \fB\%ostrya summary \-u\fR removes a file \fB\%<name>.tmp\-<pid>\-<n>\fR of a summary file under \fB\%extensions/ostrya/summary/\fR, which an interrupted write of an older version of ostrya left there.
 Such a file at the repository root stays.
+\fB\%ostrya static\-delta generate\fR removes a file \fB\%.<name>.tmp\-<pid>\-<n>\fR from a delta directory when it is one hour old or older, which an interrupted write of an older version of ostrya left there.
 .SH STATIC DELTAS
 A static delta holds the objects that change between two commits, or all the objects of one commit.
 Its path uses a modified base64 form of the commit checksums: standard base64 with \fB\%/\fR changed to \fB\%_\fR and no trailing \fB\%=\fR, 43 characters in all.
@@ -338,13 +351,12 @@ In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory wit
 An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
 It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
 .PP
-In every mode, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
-In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of their parent directory.
+In each mode other than \fB\%bare\-user\-shared\fR, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
 .PP
 In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
 .TP
 Directories: 02770
-The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, \fB\%extensions/ostrya/composefs/\fR, and each directory below it.
+The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, \fB\%extensions/ostrya/composefs/\fR, and each directory below it, and \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them.
 The setgid bit makes each new entry take the group of its directory.
 .TP
 Lock files: 0660
@@ -359,10 +371,13 @@ Each \fB\%state/<checksum>.commitpartial\fR.
 .TP
 Summaries: 0644
 \fB\%summary\fR, \fB\%summary.sig\fR, and each file in \fB\%extensions/ostrya/summary/\fR.
+.TP
+Static deltas: 0640
+Each \fB\%superblock\fR, each part file, and each index file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR.
+A file that ostrya replaces gets this mode.
 .PP
 An entry that exists keeps its mode and its group.
 ostrya sets no group owner.
-\fB\%deltas/\fR and \fB\%delta\-indexes/\fR take the modes of the other repository modes and the setgid bit of their parent directory.
 .SH SERVED FILES
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR read the repository through an archive view.
 The view serves these paths:

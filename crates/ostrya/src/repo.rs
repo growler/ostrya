@@ -659,10 +659,10 @@ impl Repo {
     /// and refuses a file that is not a regular file. A symlink at any
     /// component of the path, a FIFO, or a device fails the read and does not
     /// block it. A local pull from the handle refuses a source object that is
-    /// not the type that the source mode stores. The local pull opens
+    /// not the type that the source mode stores. The local pull reads
     /// `summary`, `summary.sig`, and the files of a static delta of the
-    /// handle with one `openat` with `O_NONBLOCK`, which follows a symlink,
-    /// and refuses a file that is not a regular file.
+    /// handle by the same rule: a symlink, a FIFO, or a device fails the
+    /// pull and does not block it.
     ///
     /// The open of `openat2` has no fallback. On a kernel without the call,
     /// each of these reads fails.

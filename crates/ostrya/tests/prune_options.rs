@@ -1208,7 +1208,7 @@ fn static_delta_sweep_follows_no_symlink_at_the_fanout() {
 }
 
 #[test]
-fn static_delta_sweep_follows_a_symlink_at_deltas() {
+fn static_delta_sweep_refuses_a_symlink_at_deltas() {
     let tmp = TmpDir::new("prune-deltas-symlink");
     block_on(async {
         let repo = Repo::create(
@@ -1227,18 +1227,30 @@ fn static_delta_sweep_follows_a_symlink_at_deltas() {
         let _ = std::fs::remove_dir_all(&deltas);
         std::os::unix::fs::symlink(&outside, &deltas).unwrap();
 
-        repo.prune(&PruneOptions {
-            delete_commit: Some(main[2]),
-            static_deltas_only: true,
-            ..PruneOptions::default()
-        })
-        .await
-        .unwrap();
-        assert!(
-            !outside.join(rel).exists(),
-            "the sweep follows a symlink at `deltas`"
+        let refused = |err: Error| {
+            assert!(
+                matches!(&err, Error::InvalidFormat(m)
+                    if m == "deltas passes through a symlink; ostrya refuses a symlink in the \
+                             repository"),
+                "{err:?}"
+            );
+        };
+        // A run of the deltas alone, then a full run. The full run fails after
+        // its object sweep, at the sweep of the deltas.
+        refused(
+            repo.prune(&PruneOptions {
+                delete_commit: Some(main[2]),
+                static_deltas_only: true,
+                ..PruneOptions::default()
+            })
+            .await
+            .unwrap_err(),
         );
-        assert!(outside.join(rel).parent().unwrap().is_dir());
+        refused(repo.prune(&PruneOptions::default()).await.unwrap_err());
+        assert!(
+            outside.join(rel).join("superblock").is_file(),
+            "the sweep follows no symlink at `deltas`"
+        );
         assert!(deltas.symlink_metadata().unwrap().is_symlink());
     });
 }

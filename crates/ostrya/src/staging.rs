@@ -26,22 +26,15 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io;
 use std::ops::ControlFlow;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::sync::{Mutex, OnceLock};
 
-use ostrya_core::RepoMode;
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::lock::LockKind;
-use crate::perm;
 use crate::repo_fs::{self, FsError, RepoDir, RepoLayout};
-
-/// The requested mode of a staging directory, the same mode that the `ostree`
-/// command requests. The process umask reduces it. In a `bare-user-shared`
-/// repository, an `fchmod` after the creation sets [`perm::SHARED_DIR_MODE`].
-const STAGING_DIR_MODE: u32 = 0o775;
 
 /// Returns the map of the staging directories that this process owns.
 ///
@@ -91,27 +84,6 @@ pub(crate) fn reap_owned() {
 fn remove_staging(tmp: &RepoDir, name: &str) {
     let _ = tmp.remove_tree(OsStr::new(name), false);
     let _ = tmp.remove_file(&format!("{name}-lock"), false);
-}
-
-/// Opens the `tmp/` directory of the repository at `repo_fd`, and creates it
-/// if it is absent.
-///
-/// A new `tmp/` gets [`STAGING_DIR_MODE`], reduced by the umask. In a
-/// `bare-user-shared` repository, this function forces the mode of a new
-/// `tmp/` to [`perm::SHARED_DIR_MODE`]. If `tmp/` is a symlink, the open
-/// follows it.
-pub(crate) fn open_tmp_dir(repo_fd: BorrowedFd<'_>, repo_mode: RepoMode) -> io::Result<OwnedFd> {
-    match rustix::fs::mkdirat(repo_fd, "tmp", Mode::from_raw_mode(STAGING_DIR_MODE)) {
-        Ok(()) => perm::force_created_dir(repo_fd, "tmp", repo_mode)?,
-        Err(Errno::EXIST) => {}
-        Err(e) => return Err(e.into()),
-    }
-    Ok(rustix::fs::openat(
-        repo_fd,
-        "tmp",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)
 }
 
 /// The staging area of a transaction: the directory, its held sibling lock,
@@ -197,14 +169,6 @@ impl StagingDir {
     /// [`Staging`](crate::repo_fs::RepoLayout::Staging).
     pub(crate) fn dir(&self) -> &RepoDir {
         &self.dir
-    }
-
-    /// Returns the descriptor of the staging directory.
-    ///
-    /// The write path ingests objects here. The transaction commit renames them
-    /// into `objects/`.
-    pub(crate) fn dir_fd(&self) -> BorrowedFd<'_> {
-        self.dir.as_fd()
     }
 
     /// Returns the handle of the `tmp/` directory of the repository, which

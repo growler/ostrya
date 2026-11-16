@@ -161,12 +161,12 @@ is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
 
 The open of `objects`, the read of `config`, each read of an object, each
 read of a summary of the repository by `Repo`, the server, and the media
-finder, and each read of a stored composefs image do not depend on the open
-mode. Each is one `openat2` with `RESOLVE_BENEATH` and
-`RESOLVE_NO_SYMLINKS`, with no fallback to `openat`. A local pull reads
-`summary`, `summary.sig`, and the files of a static delta of its source
-repository with one `openat` with `O_NONBLOCK`, which follows a symlink. A
-symlink at `objects` or at `config` fails each open. A symlink at `objects/<xx>`, or at an object
+finder, each read of a stored composefs image, and each read and write of a
+static delta and of a delta index file do not depend on the open mode. Each
+is one `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, with no
+fallback to `openat`. A local pull reads `summary`, `summary.sig`, and the
+files of a static delta of its source repository by the same rule, with
+`O_NONBLOCK`. A symlink at `objects` or at `config` fails each open. A symlink at `objects/<xx>`, or at an object
 that the repository mode stores as a regular file, fails each read of the
 object. `Repo::open_at_strict` reads no remotes directory, and that is the
 one difference of the strict open mode. The open follows

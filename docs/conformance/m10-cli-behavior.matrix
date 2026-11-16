@@ -10178,7 +10178,8 @@ note: with `--delete-commit` the run removes the static deltas the named commit
  ref names is accepted here, where a plain `--delete-commit` refuses it. Needs
  two deltas. The second cited test states that the sweep follows no symlink at
  a fanout or at a delta path and skips a regular file directly under
- `deltas/`, at exit 0 in both.
+ `deltas/`, at exit 0 in both. A symlink at `deltas` is the divergence
+ `cli-surface.md`, "P2", `prune`, records.
 
 family: M10
 subcommand: prune
@@ -12800,14 +12801,15 @@ evidence: ostrya_cli::cli::static_delta_list_matches_the_tool,
 spec: cli-behavior.md#static-delta
 note: an entry is listed when its fanout and its delta path are directories
  and its `superblock` resolves. The first cited test states that both skip an
- empty directory, a directory with a part alone, a regular file, and a
- directory whose `superblock` is a dangling symlink, beside two deltas the tool
- generated. The second states that both follow no symlink at a fanout or at a
- delta path, skip a regular file directly under `deltas/` and a symlink loop
- at a fanout or at a delta path, and refuse a `superblock` that is a symlink
- loop at exit 1, for `list`, `reindex`, and `summary -u`. A name that does not
- decode is the divergence `cli-surface.md`, "P2", records. The cell stays
- full: every name the cited tests list decodes.
+ empty directory, a directory with a part alone, and a regular file, beside two
+ deltas the tool generated. The second states that both follow no symlink at a
+ fanout or at a delta path, skip a regular file directly under `deltas/` and a
+ symlink loop at a fanout or at a delta path, and refuse a `superblock` that is
+ a symlink loop at exit 1, for `list`, `reindex`, and `summary -u`. A name that
+ does not decode, a dangling symlink at a `superblock`, and a symlink at
+ `deltas` are the divergences `cli-surface.md`, "P2" and "Global
+ conventions", record. The cell stays full: every name the cited tests list
+ decodes.
 
 family: M10
 subcommand: static-delta

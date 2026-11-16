@@ -569,7 +569,8 @@ holds only `.filez` content objects and uncompressed metadata.
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
   tmp/.ostrya-tmp-<pid>-XXXXXX    port temp entry of a ref, an alias, a .commitmeta, a .tombstone-commit,
-                                  config, summary, summary.sig, a keyring, or a file of the summary of an item
+                                  config, summary, summary.sig, a keyring, a file of the summary of an item,
+                                  a file of a static delta, or a delta index file
   tmp/cache/summaries/            summary cache
   extensions/                     reserved, created empty
   deltas/                         static deltas (lazy)
@@ -1287,12 +1288,12 @@ Each transaction creates a new staging directory, and the port reuses none.
 `conformance/cli-surface.md`, "Global conventions", records the differences
 between the two reaps.
 
-The port writes a ref, an alias, a `.commitmeta`, and a `.tombstone-commit`
-through the temp entries `.ostrya-tmp-*`. These entries get
-the age test like each other entry. With a very small or negative
+The port writes a ref, an alias, a `.commitmeta`, a `.tombstone-commit`, a
+file of a static delta, and a delta index file through the temp entries
+`.ostrya-tmp-*`. These entries get the age test like each other entry. With a very small or negative
 `tmp-expiry-secs`, the reap of another transaction can unlink such an entry
-before its rename. The write then fails with `ENOENT`, and the ref or the object
-stays unchanged.
+before its rename. The write then fails with `ENOENT`, and the ref, the object,
+or the delta file stays unchanged.
 
 ### Prune removal order
 
@@ -1392,10 +1393,75 @@ else. This holds for a from-scratch delta, a from->to delta, a four-part delta
 (`--min-fallback-size=1`). A fallback object adds no file here ("Object
 delivery").
 
-The `superblock`, each part file, and each index file have mode 0644 at any
-umask. This applies at the repository location and in a `--filename` directory,
-and to `reindex` with and without `--to`. The directories that the writer
-creates get mode 0755, reduced by the umask.
+Outside a `bare-user-shared` repository, the `superblock`, each part file,
+and each index file have mode 0644 at any umask. This applies at the
+repository location and in a `--filename` directory, and to `reindex` with and
+without `--to`. The directories that the port creates get mode 0755, reduced
+by the umask. The tool requests 0775 for each new directory (`mkdirat`,
+observed on ostree 2026.4). In a `bare-user-shared` repository, the port gives
+02770 to `deltas/`, to `delta-indexes/`, and to each new directory below them,
+and 0640 to each file in them ("bare-user-shared mode"). A file in a
+`--filename` or `--output-dir` directory has mode 0644 in each repository
+mode.
+
+The port reads and writes the deltas of the repository below the handles of
+`deltas/` and of `delta-indexes/`. Each open is one `openat2` with
+`RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, and each open of a file adds
+`O_NONBLOCK`. A symlink at `deltas`, at `delta-indexes`, at a fanout
+directory that a command names, or at an index file or a part file that a
+read names fails the call with
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in
+the repository`. A dangling symlink fails in the same way. A symlink at a
+delta directory that a command names fails each command other than
+`static-delta delete` in the same way. A symlink at a `superblock` fails each
+read and each listing of the delta, and `static-delta generate -n`, in the
+same way. `static-delta generate` replaces a symlink at `superblock` with a
+regular file. `static-delta reindex --to` reads only the superblocks of its
+target, so a symlink at a `superblock` of another target does not fail it. A
+file at `deltas` or at a fanout directory that a command names fails with
+`invalid format: PATH is not a directory`. A listing of the deltas and a
+listing of the index files skip a symlink at a fanout directory or at a delta
+directory. A listing counts each entry at `superblock` as a superblock, a
+directory and an empty file included, and refuses a symlink there. The index
+walk of a summary update counts a symlink at an index file or at its fanout as
+no index file. A superblock and an index file are read under 128 MiB. A
+larger file fails with
+`invalid format: PATH is larger than its cap of 134217728 bytes`. `PATH` is relative
+to the repository root.
+
+`static-delta delete` removes the entry at the delta path with no symlink
+followed. A directory goes with its tree, and each other entry, a symlink
+included, is unlinked. A dangling symlink at the delta path is removed.
+
+The port writes each part, each superblock, and each index file at the
+repository location to a temp file `tmp/.ostrya-tmp-<pid>-XXXXXX`. It streams
+a part into its temp file and sets the mode of the file. With `[core] fsync`,
+it syncs the file with `fsync`, renames it into place, and syncs the
+directory that holds it. Without `[core] fsync`, the write syncs nothing. The
+port also syncs, with `[core] fsync`, the parent of each directory that it
+makes under `deltas/` or `delta-indexes/`, the delta directory after the
+removal of an old superblock, the delta directory after the cleanup of old
+part files, each fanout directory after the removal of a delta by a delete or
+a prune, and each fanout directory of `delta-indexes/` after the removal of
+an index file. A rename does not cross a file system, so `deltas/`,
+`delta-indexes/`, and each directory below them must be on the file system of
+`tmp/`. A directory below them on another mount fails each write with
+`EXDEV`. `static-delta generate` compares the device of the delta directory
+with the device of `tmp/` before it removes or writes a file in the delta
+directory. A delta directory on another file system fails with `EXDEV`
+before that removal, and the previous delta stays. A bind mount of the file
+system of `tmp/` has the same device, so a delta directory on such a mount
+still fails with `EXDEV` at the first rename, after the removal of the old
+superblock.
+
+The cleanup after a generation removes the part files of a longer previous
+delta. It also removes each name `.<name>.tmp-<pid>-<n>` that is one hour old
+or older from the delta directory.
+
+In a `--filename` or `--output-dir` directory, the port writes each file
+through a temp name `.<name>.tmp-<pid>-<n>` in that directory, and with
+`[core] fsync` it syncs the file with `fdatasync` and the directory after the
+rename.
 
 ### Static delta index files
 
@@ -6165,9 +6231,10 @@ A file larger than 64 MiB fails the read with
 `invalid format: PATH is larger than its cap of 67108864 bytes`. `PATH` is
 relative to the repository root, for example
 `extensions/ostrya/summary/HEX`. A local pull reads `summary` and
-`summary.sig` of its source repository with one `openat` with
-`O_NONBLOCK`. That open follows a symlink, and the pull refuses a file that
-is not a regular file.
+`summary.sig` of its source repository, and the superblocks, the index files,
+and the part files of its static deltas, by the same rule. A symlink, a
+FIFO, or a file over the cap fails the pull, and the pull publishes nothing.
+The pull reads `summary` before `summary.sig`.
 
 ### The serve of a summary
 
@@ -7483,6 +7550,7 @@ the file-creation mask of the process has no effect:
   - the `objects/<xx>` fanout directories;
   - `extensions/ostrya/composefs/` and its `<xx>/` directories;
   - the parent directories under `refs/`;
+  - `deltas/`, `delta-indexes/`, and each directory below them;
   - `tmp/`, and each staging directory of a transaction.
 
   So each member of the repository group can read, deduplicate, and write
@@ -7497,6 +7565,10 @@ the file-creation mask of the process has no effect:
   get 0660. So each group member can open them `O_RDWR`, take the repository
   lock and the update lock, and remove a staging tree whose owner is dead.
 - The `state/<commit>.commitpartial` marker gets 0644.
+- Each `superblock`, part file, and index file that the port writes under
+  `deltas/` or `delta-indexes/` gets 0640. It starts as a temp file in
+  `tmp/`, so it gets the group of `tmp/`. A file that the port replaces gets
+  the new mode.
 
 The port forces a mode only on an entry that it creates. An entry that exists
 keeps its mode and its group. This includes the repository root: the caller
@@ -7515,11 +7587,6 @@ open creates the entry, and the port does not force its mode.
 02770 gives no permission to others. The objects are 0644, which each user
 can read. So the directory permissions keep other users out of the
 repository.
-
-The directories and the files under `deltas/` and `delta-indexes/` are outside
-this rule. They get the modes of each other mode ("Object store layout"). The
-directories get 0755 reduced by the umask. The files get 0644, whatever the
-umask is.
 
 The mode string is `[core] mode=bare-user-shared`. The separate string keeps
 the tool out of the repository. Observed behavior: the tool refuses a

@@ -1085,8 +1085,7 @@ fn list_static_deltas_lists_only_a_directory_holding_a_superblock() {
         write_flat_delta(&delta_entry(base, None, &c2));
 
         // An empty directory, a directory that holds a part and no superblock,
-        // a regular file, and a directory whose superblock is a dangling
-        // symlink.
+        // and a regular file.
         std::fs::create_dir_all(delta_entry(base, Some(&c1), &c2)).unwrap();
         let part_only = delta_entry(base, None, &c1);
         std::fs::create_dir_all(&part_only).unwrap();
@@ -1094,9 +1093,6 @@ fn list_static_deltas_lists_only_a_directory_holding_a_superblock() {
         let file = delta_entry(base, None, &c3);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"file").unwrap();
-        let dangling = delta_entry(base, Some(&c1), &c3);
-        std::fs::create_dir_all(&dangling).unwrap();
-        std::os::unix::fs::symlink("nowhere", dangling.join("superblock")).unwrap();
 
         assert_eq!(repo.list_static_deltas().await.unwrap(), vec![c2.to_hex()]);
     });
@@ -1136,56 +1132,203 @@ fn list_static_deltas_follows_no_symlink_and_skips_a_file_in_the_tree() {
     });
 }
 
+/// Asserts that `result` is the refusal of a symlink at `path`.
+fn assert_symlink_refusal<T: std::fmt::Debug>(result: ostrya::Result<T>, path: &str) {
+    let err = result.unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidFormat(m) if m.starts_with(path)
+            && m.contains("passes through a symlink")),
+        "{path}: {err:?}"
+    );
+}
+
 #[test]
-fn list_and_delete_follow_a_symlink_at_deltas() {
+fn a_symlink_at_deltas_or_delta_indexes_fails_each_call() {
     let tmp = TmpDir::new("delta-deltas-symlink");
     let base = tmp.path();
     let (c1, c2) = removal_checksums();
     block_on(async {
         let repo = removal_repo(base).await;
         let deltas = base.join("repo/deltas");
-        let pair = delta_entry(base, Some(&c1), &c2);
-        write_flat_delta(&delta_entry(base, None, &c1));
-        write_flat_delta(&pair);
-        let rel = pair.strip_prefix(&deltas).unwrap().to_owned();
+        let indexes = base.join("repo/delta-indexes");
+        let outside = base.join("outside");
+        write_flat_delta(
+            &outside.join("deltas").join(
+                delta_entry(base, Some(&c1), &c2)
+                    .strip_prefix(&deltas)
+                    .unwrap(),
+            ),
+        );
+        let b64 = c2.to_base64_modified();
+        let index_dir = outside.join("delta-indexes").join(&b64[..2]);
+        std::fs::create_dir_all(&index_dir).unwrap();
+        std::fs::write(index_dir.join(format!("{}.index", &b64[2..])), b"x").unwrap();
+        let snapshot = || {
+            let mut names: Vec<_> = walk(&outside);
+            names.sort();
+            names
+        };
+        let before = snapshot();
 
-        // A target outside the repository, and one inside it.
-        for target in [base.join("outside"), base.join("repo/tmp/dd")] {
-            std::fs::rename(&deltas, &target).unwrap();
+        // A symlink to a directory, and a dangling symlink.
+        for target in [outside.join("deltas"), base.join("nowhere")] {
             std::os::unix::fs::symlink(&target, &deltas).unwrap();
-            assert_eq!(
-                repo.list_static_deltas().await.unwrap(),
-                vec![c1.to_hex(), format!("{}-{}", c1.to_hex(), c2.to_hex())],
-                "{target:?}"
-            );
-            repo.delete_static_delta(Some(&c1), &c2).await.unwrap();
-            assert!(!target.join(&rel).exists(), "{target:?}");
-            assert!(deltas.symlink_metadata().unwrap().is_symlink());
-            assert_eq!(repo.list_static_deltas().await.unwrap(), vec![c1.to_hex()]);
+            assert_symlink_refusal(repo.list_static_deltas().await, "deltas");
+            assert_symlink_refusal(repo.delete_static_delta(Some(&c1), &c2).await, "deltas");
+            assert_symlink_refusal(repo.read_static_delta(Some(&c1), &c2).await, "deltas");
+            assert_symlink_refusal(repo.has_static_delta(Some(&c1), &c2).await, "deltas");
+            assert_symlink_refusal(repo.reindex_static_deltas().await, "deltas");
+            assert_symlink_refusal(repo.reindex_static_deltas_to(&c2).await, "deltas");
             std::fs::remove_file(&deltas).unwrap();
-            std::fs::rename(&target, &deltas).unwrap();
-            write_flat_delta(&pair);
         }
+        for target in [outside.join("delta-indexes"), base.join("nowhere")] {
+            std::os::unix::fs::symlink(&target, &indexes).unwrap();
+            assert_symlink_refusal(repo.list_static_delta_indexes().await, "delta-indexes");
+            assert_symlink_refusal(repo.reindex_static_deltas().await, "delta-indexes");
+            assert_symlink_refusal(repo.reindex_static_deltas_to(&c2).await, "delta-indexes");
+            std::fs::remove_file(&indexes).unwrap();
+        }
+        assert_eq!(snapshot(), before, "the targets stay as they were");
 
-        // A dangling symlink at `deltas` holds no delta.
-        std::fs::remove_dir_all(&deltas).unwrap();
-        std::os::unix::fs::symlink(base.join("nowhere"), &deltas).unwrap();
-        assert!(repo.list_static_deltas().await.unwrap().is_empty());
+        // A file at `deltas` is not a directory.
+        std::fs::write(&deltas, b"file").unwrap();
+        let err = repo.list_static_deltas().await.unwrap_err();
+        assert_eq!(err.to_string(), "invalid format: deltas is not a directory");
     });
 }
 
+/// Returns the path of each entry below `dir`, relative to `dir`.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_owned()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).unwrap() {
+            let path = entry.unwrap().path();
+            out.push(path.strip_prefix(dir).unwrap().to_owned());
+            if path.symlink_metadata().unwrap().is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out
+}
+
 #[test]
-fn list_static_deltas_refuses_a_superblock_symlink_loop() {
+fn a_symlink_at_superblock_fails_the_listing_and_the_reads() {
     let tmp = TmpDir::new("delta-list-superblock-loop");
     let base = tmp.path();
-    let (_, c2) = removal_checksums();
+    let (c1, c2) = removal_checksums();
     block_on(async {
         let repo = removal_repo(base).await;
         let dir = delta_entry(base, None, &c2);
         std::fs::create_dir_all(&dir).unwrap();
-        std::os::unix::fs::symlink("superblock", dir.join("superblock")).unwrap();
-        let err = repo.list_static_deltas().await.unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        let outside = base.join("outside");
+        std::fs::write(&outside, b"superblock").unwrap();
+        let shown = format!("{}/superblock", static_delta_relative_dir(None, &c2));
+        // A symlink to a file, a dangling symlink, and a symlink loop.
+        for target in [
+            outside.as_path(),
+            Path::new("nowhere"),
+            Path::new("superblock"),
+        ] {
+            std::os::unix::fs::symlink(target, dir.join("superblock")).unwrap();
+            assert_symlink_refusal(repo.list_static_deltas().await, &shown);
+            assert_symlink_refusal(repo.has_static_delta(None, &c2).await, &shown);
+            assert_symlink_refusal(repo.read_static_delta(None, &c2).await, &shown);
+            assert_symlink_refusal(repo.reindex_static_deltas().await, &shown);
+            assert_symlink_refusal(repo.reindex_static_deltas_to(&c2).await, &shown);
+            // A pass over another target does not read this superblock.
+            repo.reindex_static_deltas_to(&c1).await.unwrap();
+            std::fs::remove_file(dir.join("superblock")).unwrap();
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"superblock");
+    });
+}
+
+#[test]
+fn a_named_symlinked_fanout_or_delta_dir_fails_and_a_listing_skips_it() {
+    let tmp = TmpDir::new("delta-named-fanout-symlink");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let outside = base.join("outside");
+        let pair = delta_entry(base, Some(&c1), &c2);
+        let fanout = pair.parent().unwrap().to_owned();
+        let leaf = pair.file_name().unwrap().to_owned();
+        write_flat_delta(&outside.join(&leaf));
+        std::fs::create_dir_all(base.join("repo/deltas")).unwrap();
+        let shown_fanout = static_delta_relative_dir(Some(&c1), &c2)
+            .rsplit_once('/')
+            .unwrap()
+            .0
+            .to_owned();
+        let shown_leaf = static_delta_relative_dir(Some(&c1), &c2);
+
+        // A symlinked fanout, then a symlinked delta directory.
+        std::os::unix::fs::symlink(&outside, &fanout).unwrap();
+        assert!(repo.list_static_deltas().await.unwrap().is_empty());
+        assert_symlink_refusal(
+            repo.delete_static_delta(Some(&c1), &c2).await,
+            &format!("{shown_fanout} passes"),
+        );
+        assert_symlink_refusal(repo.read_static_delta(Some(&c1), &c2).await, &shown_fanout);
+        assert_symlink_refusal(repo.has_static_delta(Some(&c1), &c2).await, &shown_fanout);
+        std::fs::remove_file(&fanout).unwrap();
+        std::fs::create_dir(&fanout).unwrap();
+        std::os::unix::fs::symlink(outside.join(&leaf), &pair).unwrap();
+        assert!(repo.list_static_deltas().await.unwrap().is_empty());
+        assert_symlink_refusal(repo.read_static_delta(Some(&c1), &c2).await, &shown_leaf);
+        assert_symlink_refusal(repo.has_static_delta(Some(&c1), &c2).await, &shown_leaf);
+        assert!(outside.join(&leaf).join("superblock").is_file());
+        assert!(outside.join(&leaf).join("0").is_file());
+    });
+}
+
+#[test]
+fn a_full_reindex_refuses_a_symlinked_index_fanout_and_unlinks_nothing_behind_it() {
+    let tmp = TmpDir::new("delta-index-fanout-symlink");
+    let base = tmp.path();
+    let (_, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let b64 = c2.to_base64_modified();
+        let stale = outside.join(format!("{}.index", &b64[2..]));
+        std::fs::write(&stale, b"stale").unwrap();
+        let indexes = base.join("repo/delta-indexes");
+        std::fs::create_dir(&indexes).unwrap();
+        std::os::unix::fs::symlink(&outside, indexes.join(&b64[..2])).unwrap();
+
+        // No delta is left, so the pass would remove each index file.
+        assert!(repo.list_static_delta_indexes().await.unwrap().is_empty());
+        assert_symlink_refusal(
+            repo.reindex_static_deltas().await,
+            &format!("delta-indexes/{}", &b64[..2]),
+        );
+        assert_eq!(std::fs::read(&stale).unwrap(), b"stale");
+    });
+}
+
+#[test]
+fn has_static_delta_follows_the_listing_rule() {
+    let tmp = TmpDir::new("delta-has");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        assert!(!repo.has_static_delta(None, &c2).await.unwrap());
+        let dir = delta_entry(base, None, &c2);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!repo.has_static_delta(None, &c2).await.unwrap());
+        // An empty file and a directory at `superblock` count, as in a listing.
+        std::fs::write(dir.join("superblock"), b"").unwrap();
+        assert!(repo.has_static_delta(None, &c2).await.unwrap());
+        std::fs::remove_file(dir.join("superblock")).unwrap();
+        std::fs::create_dir(dir.join("superblock")).unwrap();
+        assert!(repo.has_static_delta(None, &c2).await.unwrap());
+        assert!(!repo.has_static_delta(Some(&c1), &c2).await.unwrap());
     });
 }
 
@@ -1200,6 +1343,8 @@ fn list_static_deltas_skips_a_malformed_name_without_a_superblock() {
             repo.list_static_deltas().await.unwrap(),
             Vec::<String>::new()
         );
+        let (_, c2) = removal_checksums();
+        repo.reindex_static_deltas_to(&c2).await.unwrap();
     });
 }
 
@@ -1211,6 +1356,10 @@ fn list_static_deltas_refuses_a_malformed_name_with_a_superblock() {
         let repo = removal_repo(base).await;
         write_flat_delta(&base.join("repo/deltas/zz/garbage"));
         let err = repo.list_static_deltas().await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "{err:?}");
+        // The name names no target, so a pass over one target also fails.
+        let (_, c2) = removal_checksums();
+        let err = repo.reindex_static_deltas_to(&c2).await.unwrap_err();
         assert!(matches!(err, Error::Core(_)), "{err:?}");
     });
 }
@@ -1299,7 +1448,7 @@ fn delete_static_delta_removes_a_file_or_a_link_at_the_path() {
         let entry = delta_entry(base, None, &c2);
         std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
 
-        let cases: [(&str, &dyn Fn()); 4] = [
+        let cases: [(&str, &dyn Fn()); 6] = [
             ("a regular file", &|| {
                 std::fs::write(&entry, b"file").unwrap()
             }),
@@ -1311,6 +1460,12 @@ fn delete_static_delta_removes_a_file_or_a_link_at_the_path() {
             }),
             ("a symlink to a file", &|| {
                 std::os::unix::fs::symlink(outside.join("file"), &entry).unwrap()
+            }),
+            ("a dangling symlink", &|| {
+                std::os::unix::fs::symlink("nowhere", &entry).unwrap()
+            }),
+            ("a symlink loop", &|| {
+                std::os::unix::fs::symlink(entry.file_name().unwrap(), &entry).unwrap()
             }),
         ];
         for (case, make) in cases {
@@ -1328,6 +1483,33 @@ fn delete_static_delta_removes_a_file_or_a_link_at_the_path() {
                 "{case}: the link target stays"
             );
         }
+    });
+}
+
+#[test]
+fn delete_static_delta_refuses_a_file_at_the_fanout() {
+    let tmp = TmpDir::new("delta-delete-fanout-file");
+    let base = tmp.path();
+    let (c1, c2) = removal_checksums();
+    block_on(async {
+        let repo = removal_repo(base).await;
+        let fanout = delta_entry(base, Some(&c1), &c2)
+            .parent()
+            .unwrap()
+            .to_owned();
+        std::fs::create_dir_all(fanout.parent().unwrap()).unwrap();
+        std::fs::write(&fanout, b"x").unwrap();
+        let shown = static_delta_relative_dir(Some(&c1), &c2)
+            .rsplit_once('/')
+            .unwrap()
+            .0
+            .to_owned();
+        let err = repo.delete_static_delta(Some(&c1), &c2).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            format!("invalid format: {shown} is not a directory")
+        );
+        assert_eq!(std::fs::read(&fanout).unwrap(), b"x");
     });
 }
 
@@ -1368,18 +1550,10 @@ fn delete_static_delta_reports_an_absent_delta() {
             Some(c1),
         );
 
-        // A dangling symlink at the path is an absent delta, and it stays.
+        // A fanout with no entry at the path.
         let entry = delta_entry(base, None, &c2);
         std::fs::create_dir_all(entry.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("nowhere", &entry).unwrap();
         absent(repo.delete_static_delta(None, &c2).await.unwrap_err(), None);
-        assert!(std::fs::symlink_metadata(&entry).is_ok(), "the link stays");
-        std::fs::remove_file(&entry).unwrap();
-
-        // A symlink loop fails the existence check with its own errno.
-        std::os::unix::fs::symlink(entry.file_name().unwrap(), &entry).unwrap();
-        let err = repo.delete_static_delta(None, &c2).await.unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "{err:?}");
     });
 }
 

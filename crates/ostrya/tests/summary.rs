@@ -1225,7 +1225,11 @@ fn a_ref_listing_names_deltas_in_archive_mode_alone() {
             std::fs::write(path.join("delta-indexes"), b"").unwrap();
             let listing = list(&repo, &[]).await;
             if mode == RepoMode::Archive {
-                assert!(matches!(listing, Err(ostrya::Error::Io(_))), "{listing:?}");
+                assert!(
+                    matches!(&listing, Err(ostrya::Error::InvalidFormat(m))
+                        if m == "delta-indexes is not a directory"),
+                    "{listing:?}"
+                );
             } else {
                 let listing = Summary::parse(&listing.unwrap()).unwrap();
                 assert_eq!(metadata_keys(&listing), ["ostree.summary.mode"]);

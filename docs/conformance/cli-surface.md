@@ -2628,9 +2628,13 @@ is not a directory, a symlink or a regular file, stays in both, and so do the
 deltas behind a symlinked fanout. A regular file directly under `deltas/` is
 skipped, and the run exits 0 in both. A delta directory that holds no
 `superblock` is not a delta, so it stays in both, also where its commit is the
-one the prune deletes. A symlink at `deltas` itself is followed in both, and
-the deltas behind it that the sweep selects are removed. A dangling symlink at
-`deltas` holds no delta, and the run exits 0 in both.
+one the prune deletes. The tool follows a symlink at `deltas` itself and
+removes the deltas behind it that the sweep selects, and a dangling symlink
+at `deltas` holds no delta. The port refuses each symlink at `deltas` at
+exit 1, and the target stays. A full `prune` of the port fails after its
+object sweep. A symlink at the `superblock` of a delta that the sweep selects
+also fails the port ("Global conventions"). With `[core] fsync`, the port
+runs `fsync` on each fanout directory from which the sweep removes a delta.
 
 The port's prune also removes, on every run without `--no-prune` and without
 `--static-deltas-only`, each static delta whose target commit is absent from
@@ -3220,13 +3224,15 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-nine differences stand on `show`,
+details", "spki"). Fifty-two differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
   `show`, `verify`, and `apply-offline`, and a pull refuses the fetched
   superblock, with `error: i/o error: static delta file <path> exceeds the
-  size ceiling` or the fetcher's size refusal. The tool has no such ceiling:
+  size ceiling` or the fetcher's size refusal. For a delta name, `show` and
+  `verify` write `error: invalid format: deltas/<fanout>/<rest>/superblock is
+  larger than its cap of 134217728 bytes`. The tool has no such ceiling:
   it writes a 140,007,544-byte superblock with `--inline` and applies it
   offline at exit 0. Only an inline delta whose parts add up to more than 128
   MiB reaches the ceiling. The ceiling is the bound the port holds for
@@ -3300,21 +3306,38 @@ details", "spki"). Forty-nine differences stand on `show`,
 - the wording of an `indexes` read failure. The tool writes `error: opendirat:
   Not a directory` and `error: opendir(<fanout>): Permission denied`, and the
   port writes the library's `error: i/o error:` sentence. For a
-  `delta-indexes` that is a regular file, the port writes `error: i/o error:
-  Not a directory (os error 20)`. Both exit 1;
+  `delta-indexes` that is a regular file, the port writes `error: invalid
+  format: delta-indexes is not a directory`. Both exit 1;
 - the wording of a `list` read failure. For a `superblock` that is a symlink
   loop, the tool writes `error: fstatat(<rest>/superblock): Too many levels of
   symbolic links`. For an entry that cannot be searched, it writes `error:
   fstatat(<rest>/superblock): Permission denied`. For a `deltas` that is a
   regular file, it writes `error: opendirat: Not a directory`. The port writes
-  the library's `error: i/o error:` sentence, with `Too many levels of
-  symbolic links (os error 40)`, `Permission denied (os error 13)`, and `Not a
-  directory (os error 20)`, and both exit 1;
+  `error: invalid format: deltas/<fanout>/<rest>/superblock passes through a
+  symlink; ostrya refuses a symlink in the repository`, the library's `error:
+  i/o error:` sentence with `Permission denied (os error 13)`, and `error:
+  invalid format: deltas is not a directory`, and both exit 1;
 - the wording of a `delete` failure other than an absent delta. The tool
   writes `error: fstatat(<path>): <reason>`, `error: open(<path>): <reason>`,
   and `error: Removing <path>: unlinkat(<name>): <reason>`, and the port writes
-  the library's `error: i/o error:` sentence. Both exit 1, and both leave the
+  the library's `error: i/o error:` sentence, or `error: invalid format:`
+  for a file at `deltas` or at the fanout. Both exit 1, and both leave the
   entries the removal did not reach;
+- a dangling symlink or a symlink loop at the delta path under `delete`. The
+  tool follows the link: it reports `error: Can't find delta <name>` for a
+  dangling link and a `Too many levels of symbolic links` error for a loop,
+  at exit 1, and the link stays. The port removes the link at exit 0;
+- a symlink at `deltas`, at `delta-indexes`, at a `superblock`, or at a
+  fanout or a delta directory that a command names, in the cases that
+  "Global conventions" lists. The port refuses it at exit 1, and the tool
+  follows it;
+- a directory or a FIFO at the `superblock` or at a part file of a delta
+  name under `show`, and at the `superblock` of a delta name under `verify`.
+  The port writes `error: invalid format: deltas/<fanout>/<rest>/<file> is
+  not a regular file` at exit 1, where `<file>` is `superblock` or the
+  number of the part. The read does not wait on a FIFO. For a path that
+  names a directory, both write `error: Is a directory` at exit 1
+  (`cli-behavior.md`, `static-delta`, "The arguments");
 - an extra positional argument. The tool ignores it on `show`, `delete`,
   `list`, `indexes`, and `reindex`, and `clap` refuses it with
   `error: unexpected argument '<value>' found` at exit 1. For `delete` the port
@@ -3343,8 +3366,13 @@ details", "spki"). Forty-nine differences stand on `show`,
   port reports the same line in the full pass. For a target with no delta, a
   regular file at the fanout or at `delta-indexes`,
   or a symlink at the fanout to a regular file, makes the tool report `error:
-  unlink(<index>): Not a directory`, and the port reports `error: i/o error:
-  Not a directory (os error 20)`. Both exit 1 and leave no temp file;
+  unlink(<index>): Not a directory`. The port reports `error: invalid format:
+  delta-indexes/<fanout> is not a directory`, `error: invalid format:
+  delta-indexes is not a directory`, and `error: invalid format:
+  delta-indexes/<fanout> passes through a symlink; ostrya refuses a symlink
+  in the repository`. Both exit 1 and leave no temp file. For a dangling
+  symlink at the fanout, the tool exits 0, and the port refuses the symlink
+  at exit 1;
 - `Endianness:` for a superblock with no `ostree.endianness` key, or a byte
   other than `l` and `B`. The port prints `little` and reads the size fields as
   little-endian in all three cases. With the key absent over a delta whose
@@ -7531,6 +7559,66 @@ Observed by running the tool (2026.1).
   exit 1 with an error that holds the whole content. `refs` lists the name
   and exits 0, and `prune --refs-only` exits 0 and reads no root from that
   ref.
+- The port follows no symlink in `deltas/` and in `delta-indexes/`
+  (`../format-reference.md`, "Static delta directories"). Each case below
+  fails the port at exit 1 with `invalid format: <path> passes through a
+  symlink; ostrya refuses a symlink in the repository`, where `<path>` is
+  relative to the repository root:
+  - A symlink at `deltas` or at `delta-indexes`, also a dangling one. This
+    fails `static-delta list`, `reindex`, `reindex --to`, `indexes`,
+    `generate`, `generate -n`, `delete`, `show` and `verify` of a delta
+    name, `summary -u`, and the sweep of the deltas in `prune`. A full
+    `prune` fails after its object sweep.
+  - A symlink at the `superblock` of a delta, also a dangling one or a loop.
+    This fails `list`, `reindex`, `summary -u`, the sweep of `prune`,
+    `show` and `verify` of the name, and `generate -n`. It fails
+    `reindex --to` only for a delta to the target of the call.
+  - A symlink at the fanout directory that a command names: `delete`,
+    `generate`, `generate -n`, and `show` and `verify` of the name.
+    `reindex --to` fails for a symlink at the fanout directory of its index
+    file.
+  - A symlink at the delta directory that a command names: `generate`,
+    `generate -n`, and `show` and `verify` of the name.
+  - A symlink at a fanout directory of `delta-indexes/` in a full
+    `reindex`. The port unlinks no file behind it.
+
+  A file at `deltas` fails with `invalid format: deltas is not a
+  directory`. The listings of the deltas and of the index files skip a
+  symlink at a fanout directory or at a delta directory, as the tool does.
+  `delete` removes a symlink at the delta path as the link, also a dangling
+  one or a loop, keeps its target, and exits 0. `generate` replaces a
+  symlink at `superblock` with a regular file and exits 0, as the tool does.
+  The tool follows a symlink at `deltas`, and at the
+  `superblock` and the fanout of a delta that a command names
+  (`cli-behavior.md`, `static-delta`, "Delta selection" and `delete`). For a
+  dangling symlink or a loop at the delta path, `delete` of the tool exits 1
+  and keeps the link. These facts come from the tool, ostree 2026.4, on
+  2026-11-15:
+  - With a symlink at the fanout of a delta, `list` prints `(No static
+    deltas)`. `show` exits 0 and `verify` reads the superblock, each through
+    the link. `generate` writes the new part and superblock behind the link,
+    and the link stays. `delete` removes the delta behind the link and keeps
+    the link. `reindex --to` exits 0 and removes the index file of the
+    target, because its scan finds no delta.
+  - With a symlink to a regular file at `superblock`, `list` lists the
+    delta, and `show` and `verify` read through the link. `generate`
+    replaces the link with a regular file with `renameat`, and the target
+    of the link does not change. `reindex --to` keeps the index file.
+    `delete` unlinks the link, keeps its target, and removes the delta
+    directory.
+  - With a dangling symlink at `superblock`, `list` prints `(No static
+    deltas)`. `show` exits 1 with `error:
+    openat(deltas/<fanout>/<rest>/superblock): No such file or directory`.
+    `verify` prints `Verification fails` and the same error at exit 1.
+    `generate` replaces the link with a regular file, and writes nothing at
+    the target of the link. `reindex --to` removes the index file, and the
+    fanout stays empty. `delete` removes the delta directory with the link.
+  - With a symlink at a fanout directory of `delta-indexes/`, to a directory
+    that holds the index file of a delta and an index file of no delta,
+    `indexes` prints `(No static deltas indexes)`. A full `reindex` exits 0.
+    It reads the index file behind the link, writes nothing because the
+    content is equal, and unlinks no file behind the link. In a fanout that
+    is a directory, `reindex` unlinks each index file of no delta.
 - The port opens `.lock`, `.update.lock`, and each staging lock file
   `tmp/staging-<boot-id>-XXXXXX-lock` with no follow. A symlink, a FIFO, a
   socket, a device, or a directory at `.lock` or at `.update.lock` fails the
@@ -7702,6 +7790,37 @@ Observed by running the tool (2026.1).
     these files. It runs one `syncfs` on the root after the move of
     `summary.sig`. It sets the mtime of each file to the `Last-Modified`
     time of the remote.
+- The port creates the temp file of each part, `superblock`, and index file
+  of the repository location in `tmp/`, with the name
+  `.ostrya-tmp-<pid>-XXXXXX`. It sets the mode of the file, moves it to its
+  name with one `renameat`, and, with `[core] fsync`, runs `fsync` on the
+  file before the move and on the directory that holds it after the move.
+  It also runs `fsync`, with `[core] fsync`, on the parent of each directory
+  that it makes under `deltas/` and `delta-indexes/`, and on each directory
+  from which it removes a delta file or an index file
+  (`../format-reference.md`, "Static delta directories"). The tool writes
+  these files in another way. The observations below come from `strace` of
+  the tool, ostree 2026.4, on 2026-11-15, with no `[core] fsync` key in the
+  config. No published byte differs.
+  - `static-delta generate` takes no lock. It makes `deltas`, the fanout,
+    and the delta directory with `mkdirat` and the mode 0775. For each part
+    and then for the superblock, it opens an `O_TMPFILE` file with the mode
+    0600 in the delta directory, writes it, sets the mode 0644, links it at
+    `tmp.XXXXXX` in the delta directory through `/proc/self/fd`, and renames
+    it to its name. It runs no `fdatasync`, no `fsync`, and no `syncfs`, on
+    a file or on a directory. Over an existing delta, it unlinks no old
+    file. A `generate` that fails on an absent source commit leaves an empty
+    delta directory. The scratch files of the diff are `O_TMPFILE` files in
+    `/var/tmp`.
+  - `static-delta reindex` takes the repository lock shared. It makes
+    `delta-indexes` and each fanout with `mkdirat` and the mode 0775. For
+    each index file, it opens an `O_TMPFILE` file in the fanout, writes it,
+    sets the mode 0644, links it at `tmp.XXXXXX` in the fanout through
+    `/proc/self/fd`, and renames it to its name. It runs `fdatasync` on the
+    temp file only when a file with the name of the index file exists. It
+    writes no file for an index file whose content does not change. It
+    unlinks the index file of a target with no delta, and keeps the empty
+    fanout. It runs `fsync` on no directory and runs no `syncfs`.
 - The port syncs a `.commitmeta` that it does not stage, and a
   `.tombstone-commit`, by `[core] fsync`. With fsync on, it runs `fsync` on
   the temp file before the move, and on `objects/<xx>` after the move. When

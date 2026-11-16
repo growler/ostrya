@@ -22,6 +22,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::SeekFrom;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+
+use rustix::fs::FileType;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,14 +44,16 @@ use crate::delta::{
     Blob, COMMIT_SIG, COMPRESSION_XZ, DeltaEndianness, ENDIANNESS_BIG, ENDIANNESS_KEY,
     ENDIANNESS_LITTLE, IO_CHUNK, MAX_SUPERBLOCK, MAX_TABLE_BYTES, MMAP_THRESHOLD, OP_BSPATCH,
     OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE, OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE, OP_WRITE,
-    SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, dir_child_names, open_rw_temp, read_capped,
-    spill_to_blob,
+    SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, read_capped, spill_to_blob,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::hashing::HashingWriter;
 use crate::object::MAX_METADATA_SIZE;
 use crate::repo::Repo;
+use crate::repo_fs::{
+    FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, TempFile, stat_fd,
+};
 use crate::rollsum::{self, Run};
 use crate::sign::{Signer, append_signature};
 use crate::summary::{AdvertisedDelta, check_delta_map_type, parse_delta_map};
@@ -283,10 +287,29 @@ impl Repo {
     /// is signed before it is written, so a failure of a signer writes no
     /// superblock.
     ///
-    /// Each file is written under a temp name. Only the rename that puts the
-    /// file in place keeps the temp file. If a generation fails or is
-    /// cancelled, the temp file is unlinked, so no partial file stays in the
-    /// directory.
+    /// Each file is written to a temp file, and a rename puts it in place. If
+    /// a generation fails or is cancelled, the temp file is unlinked, so no
+    /// partial file stays in the directory.
+    ///
+    /// At the default location, the temp file of each part, and of the
+    /// superblock, is a file `.ostrya-tmp-<pid>-XXXXXX` in `tmp/` of the
+    /// repository. The rename moves it into the delta directory, so
+    /// `deltas/`, the fanout directory, and the delta directory must be on
+    /// the file system of `tmp/`. A part streams into its temp file. If
+    /// `[core] fsync` is `true`, the generation syncs each file before its
+    /// rename and syncs the delta directory after it. It also syncs the
+    /// parent of each directory that it makes, and the delta directory after
+    /// the removal of the old superblock and after the cleanup.
+    ///
+    /// In a directory that the caller names, the temp file of each file is
+    /// `.<name>.tmp-<pid>-<n>` in that directory.
+    ///
+    /// The generation follows no symlink in the repository: a symlink at
+    /// `deltas`, at the fanout directory, at the delta directory, or at
+    /// `tmp` fails the call. A new directory under `deltas/` gets mode 0755,
+    /// which the umask reduces. In a `bare-user-shared` repository it gets
+    /// 02770, and each file gets 0640. A directory that exists keeps its
+    /// mode.
     ///
     /// The new parts overwrite the parts of a delta at the same location. For
     /// this reason, the generation unlinks the old superblock before it writes
@@ -305,8 +328,9 @@ impl Repo {
     ///
     /// - the part files of a longer previous delta, or each numbered part file
     ///   if the new delta carries its parts inline
-    /// - the temp files of a generation that was killed mid-write, when they
-    ///   are one hour old or older
+    /// - the temp files `.<name>.tmp-<pid>-<n>` that a generation of an older
+    ///   version of this crate left in the delta directory, when they are one
+    ///   hour old or older
     ///
     /// This pass covers the `deltas/` tree of the repository only. A directory
     /// named through [`DeltaOptions::output_dir`] or
@@ -412,6 +436,13 @@ impl Repo {
     ///   [`Error::InvalidFormat`] or [`Error::Core`].
     /// - [`Error::InvalidFormat`] if a metadata object is larger than 128 MiB
     ///   or is not a regular file, or if a symlink is on its path.
+    /// - [`Error::InvalidFormat`] if `deltas`, the fanout directory, the delta
+    ///   directory, or `tmp` is a symlink or is not a directory.
+    /// - [`Error::Io`] with `EXDEV` if the delta directory is on another file
+    ///   system than `tmp/`. The call then removes and writes no file in the
+    ///   delta directory. A delta directory on a bind mount of the file
+    ///   system of `tmp/` fails with `EXDEV` at the first rename, after the
+    ///   removal of the old superblock.
     /// - [`Error::Io`] if a read, a write, or an unlink on the file system
     ///   fails.
     pub async fn generate_static_delta(
@@ -478,15 +509,18 @@ impl Repo {
         };
 
         let mut selection = self.select_objects(from, to, opts).await?;
-        let (dir_path, dir_fd, superblock_name) = match superblock_target {
-            Some(target) => target,
+        let fsync = self.config().fsync()?;
+        let (dir_path, dest, superblock_name) = match superblock_target {
+            Some((path, fd, name)) => (path, DeltaDest::Dir(fd), name),
             None => {
-                let (path, fd) = self.open_delta_dir(from, to, opts).await?;
-                (path, fd, SUPERBLOCK_FILE.to_owned())
+                let (path, dest) = self.open_delta_dir(from, to, opts, fsync).await?;
+                (path, dest, SUPERBLOCK_FILE.to_owned())
             }
         };
-        let tmp_fd = self.open_tmp_dir().await?;
-        let fsync = self.config().fsync()?;
+        let tmp = {
+            let root = self.root_dir().clone();
+            ostrya_rt::unblock(move || root.tmp_dir(false)).await?
+        };
 
         // The new parts overwrite the old parts in place, so the superblock of
         // the previous delta at this location goes before the first part. A
@@ -495,8 +529,30 @@ impl Repo {
         // inline generation overwrites no part file. The previous superblock
         // stays until the rename replaces it, and a failed generation leaves
         // the previous delta whole.
-        if opts.superblock_file.is_none() && !opts.inline {
-            remove_superblock(&dir_fd).await?;
+        //
+        // At the repository location, each file goes into place by a rename
+        // from `tmp/`, and a rename does not cross a file system. A delta
+        // directory on another file system than `tmp/` fails before the
+        // removal and before each write into it.
+        match &dest {
+            DeltaDest::Repo(dir) => {
+                let (dir, tmp, remove) = (dir.clone(), tmp.clone(), !opts.inline);
+                ostrya_rt::unblock(move || -> Result<()> {
+                    if stat_fd(dir.as_fd())?.dev != stat_fd(tmp.as_fd())?.dev {
+                        return Err(Error::Io(rustix::io::Errno::XDEV.into()));
+                    }
+                    if remove {
+                        dir.remove_file(SUPERBLOCK_FILE, fsync)?;
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            DeltaDest::Dir(fd) => {
+                if opts.superblock_file.is_none() && !opts.inline {
+                    remove_superblock(fd).await?;
+                }
+            }
         }
 
         // The generation holds inline parts until it serializes the
@@ -520,7 +576,10 @@ impl Repo {
                     .saturating_sub(fixed),
             }
         } else {
-            PartTarget::File(&dir_fd)
+            match &dest {
+                DeltaDest::Repo(dir) => PartTarget::Repo(dir),
+                DeltaDest::Dir(fd) => PartTarget::Dir(fd),
+            }
         };
         let mut entries: Vec<PartEntry> = Vec::new();
         let mut part = Part::default();
@@ -537,8 +596,7 @@ impl Repo {
                 entries.push(write_part(&mut target, entries.len(), part, fsync).await?);
                 part = Part::default();
             }
-            self.add_object(&mut part, item, opts, tmp_fd.as_fd())
-                .await?;
+            self.add_object(&mut part, item, opts, &tmp).await?;
         }
         if !part.is_empty() {
             entries.push(write_part(&mut target, entries.len(), part, fsync).await?);
@@ -552,12 +610,23 @@ impl Repo {
             let signers: Vec<&dyn Signer> = opts.signers.iter().map(|s| s.as_ref()).collect();
             superblock = sign_superblock(superblock, Value::Array(Vec::new()), &signers).await?;
         }
-        write_delta_file(&dir_fd, &superblock_name, &superblock, fsync).await?;
+        match &dest {
+            DeltaDest::Repo(dir) => {
+                let dir = dir.clone();
+                ostrya_rt::unblock(move || {
+                    dir.write_atomic(SUPERBLOCK_FILE, &superblock, Publish::Replace, fsync)
+                })
+                .await?;
+            }
+            DeltaDest::Dir(fd) => {
+                write_delta_file(fd, &superblock_name, &superblock, fsync).await?
+            }
+        }
         // The sweep finds what it removes by name. This is safe only where
         // this code wrote each entry. An output directory of the caller can
         // hold files with the names of delta files.
-        if opts.output_dir.is_none() && opts.superblock_file.is_none() {
-            clean_delta_dir(&dir_fd, part_files).await?;
+        if let DeltaDest::Repo(dir) = &dest {
+            clean_delta_dir(dir, part_files, fsync).await?;
         }
         Ok(dir_path)
     }
@@ -612,34 +681,38 @@ impl Repo {
     /// a stale entry cannot advertise a delta that is gone. The fanout
     /// directory that this removal empties stays, as it does for the `ostree`
     /// command. The pass skips a delta with no superblock, so a half-written
-    /// delta does not fail the pass.
+    /// delta does not fail the pass. The scan of `deltas/` is the scan of
+    /// [`list_static_deltas`](Repo::list_static_deltas).
+    ///
+    /// The pass follows no symlink in the repository. It writes each index
+    /// file to a temp file in `tmp/`, and a rename puts it in place. It makes
+    /// `delta-indexes/` only if a delta exists. A new directory gets mode
+    /// 0755, which the umask reduces, and 02770 in a `bare-user-shared`
+    /// repository, where each index file gets 0640. If `[core] fsync` is
+    /// `true`, the pass syncs each index file and its fanout directory, the
+    /// parent of each directory that it makes, and each fanout directory that
+    /// it removes a file from.
     ///
     /// # Errors
     ///
     /// - [`Error::Core`] if a delta directory that holds a superblock has a
     ///   name that does not decode to a checksum.
     /// - [`Error::Core`] if `[core] fsync` in the config is not a boolean.
-    /// - [`Error::Io`] if a superblock is larger than 128 MiB.
-    /// - [`Error::Io`] if an entry of `delta-indexes/` is not a directory.
+    /// - [`Error::InvalidFormat`] if a superblock is larger than 128 MiB or is
+    ///   not a regular file.
+    /// - [`Error::InvalidFormat`] if `deltas`, `delta-indexes`, `tmp`, a
+    ///   `superblock`, or a fanout directory of `delta-indexes/` is a symlink.
+    ///   The pass unlinks no file behind a symlinked fanout.
+    /// - [`Error::InvalidFormat`] if `deltas`, `delta-indexes`, or an entry of
+    ///   `delta-indexes/` that is a regular file is not a directory.
+    /// - [`Error::Io`] with `EXDEV` if `delta-indexes/` is on another file
+    ///   system than `tmp/`.
     /// - [`Error::Io`] if a scan, a read, a write, or an unlink on the file
     ///   system fails.
     pub async fn reindex_static_deltas(&self) -> Result<()> {
-        let mut by_target: BTreeMap<Checksum, BTreeMap<String, Checksum>> = BTreeMap::new();
-        for entry in self.static_delta_digests().await? {
-            by_target
-                .entry(entry.to)
-                .or_default()
-                .insert(entry.name, entry.digest);
-        }
-
         let fsync = self.config().fsync()?;
-        let mut written: BTreeSet<String> = BTreeSet::new();
-        for (to, deltas) in &by_target {
-            self.write_delta_index(to, deltas, fsync).await?;
-            let (fanout, name) = delta_index_parts(to);
-            written.insert(format!("{fanout}/{name}"));
-        }
-        self.prune_delta_indexes(written).await
+        let root = self.root_dir().clone();
+        ostrya_rt::unblock(move || reindex_blocking(&root, fsync)).await
     }
 
     /// Rewrites the index file of the target commit `to` alone.
@@ -652,7 +725,10 @@ impl Repo {
     /// If no delta for `to` exists, the call removes the index file. An absent
     /// file, fanout directory, or `delta-indexes/` is no error, and the call
     /// creates no directory for it. The fanout directory that the removal
-    /// empties stays.
+    /// empties stays. If `[core] fsync` is `true`, the call syncs the fanout
+    /// directory after the removal. The write, the modes, and the syncs of
+    /// the index file are those of
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas).
     ///
     /// The index files of other targets stay as they are, stale files
     /// included. The call does not check that `to` names a commit object, so a
@@ -660,48 +736,43 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::Io`] if the fanout or `delta-indexes` is not a directory, a
-    ///   regular file for example.
+    /// - [`Error::InvalidFormat`] if the fanout or `delta-indexes` is not a
+    ///   directory, a regular file for example.
+    /// - [`Error::InvalidFormat`] if `deltas`, `delta-indexes`, `tmp`, the
+    ///   fanout directory of the index file, or a `superblock` of `to` is a
+    ///   symlink, also a dangling one. A symlink at a `superblock` of another
+    ///   target is no error.
     /// - [`Error::Io`] if a directory is at the path of the index file.
-    /// - [`Error::Io`] if a superblock of `to` is larger than 128 MiB.
+    /// - [`Error::InvalidFormat`] if a superblock of `to` is larger than
+    ///   128 MiB or is not a regular file.
     /// - [`Error::Core`] if a delta directory that holds a superblock has a
     ///   name that does not decode to a checksum.
     /// - [`Error::Core`] if `[core] fsync` in the config is not a boolean.
     /// - [`Error::Io`] if a scan, a read, a write, or an unlink on the file
     ///   system fails.
     pub async fn reindex_static_deltas_to(&self, to: &Checksum) -> Result<()> {
-        let deltas: BTreeMap<String, Checksum> = self
-            .static_delta_digests_of(Some(to))
-            .await?
-            .into_iter()
-            .map(|entry| (entry.name, entry.digest))
-            .collect();
-        if deltas.is_empty() {
-            let repo = self.clone();
-            let relative = delta_index_relative_path(to);
-            return ostrya_rt::unblock(move || {
-                remove_delta_index_blocking(repo.repo_fd(), &relative)
-            })
-            .await;
-        }
         let fsync = self.config().fsync()?;
-        self.write_delta_index(to, &deltas, fsync).await
-    }
-
-    /// Writes the index file of the target commit `to` from its delta map, and
-    /// creates the fanout directory and its parents.
-    async fn write_delta_index(
-        &self,
-        to: &Checksum,
-        deltas: &BTreeMap<String, Checksum>,
-        fsync: bool,
-    ) -> Result<()> {
-        let (fanout, name) = delta_index_parts(to);
-        let dir_fd = self
-            .open_repo_subdir(&format!("{DELTA_INDEXES_DIR}/{fanout}"))
-            .await?;
-        let index = index_value(deltas)?;
-        write_delta_file(&dir_fd, &name, &index, fsync).await
+        let root = self.root_dir().clone();
+        let to = *to;
+        ostrya_rt::unblock(move || {
+            let deltas: BTreeMap<String, Checksum> = delta_digests_blocking(&root, Some(&to))?
+                .into_iter()
+                .map(|entry| (entry.name, entry.digest))
+                .collect();
+            let (fanout, name) = delta_index_parts(&to);
+            if deltas.is_empty() {
+                if let Some(indexes) = root.open_layout(RepoLayout::DeltaIndexes).optional()? {
+                    indexes.remove_file(&format!("{fanout}/{name}"), fsync)?;
+                }
+                return Ok(());
+            }
+            let index = index_value(&deltas)?;
+            open_delta_indexes(&root, fsync)?
+                .ensure_dir(&fanout, fsync)?
+                .write_atomic(&name, &index, Publish::Replace, fsync)?;
+            Ok(())
+        })
+        .await
     }
 
     /// Returns each delta under `deltas/`, sorted by delta name, with the
@@ -713,39 +784,8 @@ impl Repo {
     /// stays unadvertised. If a superblock goes away between the scan and the
     /// read, the call skips it and does not fail.
     pub(crate) async fn static_delta_digests(&self) -> Result<Vec<DeltaDigest>> {
-        self.static_delta_digests_of(None).await
-    }
-
-    /// Returns the deltas of [`static_delta_digests`](Repo::static_delta_digests),
-    /// limited to the target commit `to` if it is given.
-    ///
-    /// The limit applies before a superblock is read, so a pass over one
-    /// target reads only the superblocks of that target.
-    async fn static_delta_digests_of(&self, to: Option<&Checksum>) -> Result<Vec<DeltaDigest>> {
-        let mut out = Vec::new();
-        for (from, target) in self.list_static_delta_targets().await? {
-            if to.is_some_and(|to| *to != target) {
-                continue;
-            }
-            let relative = format!(
-                "{}/{SUPERBLOCK_FILE}",
-                delta_relative_dir(from.as_ref(), &target)
-            );
-            let Some(bytes) = self.read_repo_file(&relative).await? else {
-                continue;
-            };
-            out.push(DeltaDigest {
-                name: delta_name(from.as_ref(), &target),
-                to: target,
-                digest: Checksum::sha256(&bytes),
-            });
-        }
-        // The `ostree` command writes the index files and the summary map in
-        // hash-table order, and ostrya does not reproduce that order. A sort by
-        // name gives both one order, whatever order the file system returns
-        // for the `deltas/` tree.
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(out)
+        let root = self.root_dir().clone();
+        ostrya_rt::unblock(move || delta_digests_blocking(&root, None)).await
     }
 
     /// Returns the target commits of the index files in `delta-indexes/`, sorted.
@@ -757,15 +797,17 @@ impl Repo {
     ///
     /// The call reads no delta directory, so it lists a target also if no
     /// delta for it exists. A repository with no `delta-indexes/` lists
-    /// nothing.
+    /// nothing. The call follows no symlink.
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] if `delta-indexes` is a symlink, also a
+    ///   dangling one, or is not a directory.
     /// - [`Error::Io`] if `delta-indexes/` or a fanout directory cannot be
     ///   opened or read.
     pub async fn list_static_delta_indexes(&self) -> Result<Vec<Checksum>> {
-        let repo = self.clone();
-        ostrya_rt::unblock(move || list_delta_indexes_blocking(repo.repo_fd())).await
+        let root = self.root_dir().clone();
+        ostrya_rt::unblock(move || list_delta_indexes_blocking(&root)).await
     }
 
     /// Returns the deltas that the index files advertise on the paths back
@@ -792,28 +834,18 @@ impl Repo {
     ///   holds no `ostree.static-deltas` map, if the map fails the rules of
     ///   [`Summary::static_deltas`], or if an entry names a delta to another
     ///   commit. The message names the index file.
-    /// - [`Error::Io`] if `delta-indexes/` is not a directory, or if an open
-    ///   or a read fails.
+    /// - [`Error::InvalidFormat`] if `delta-indexes` is a symlink or is not a
+    ///   directory.
+    /// - [`Error::Io`] if an open or a read fails.
     ///
     /// [`Summary::static_deltas`]: crate::Summary::static_deltas
     pub(crate) async fn walk_delta_indexes(
         &self,
         commits: impl IntoIterator<Item = Checksum>,
     ) -> Result<Vec<AdvertisedDelta>> {
-        let repo = self.clone();
+        let root = self.root_dir().clone();
         let commits: Vec<Checksum> = commits.into_iter().collect();
-        ostrya_rt::unblock(move || walk_delta_indexes_blocking(repo.repo_fd(), commits)).await
-    }
-
-    /// Removes the index files under `delta-indexes/` that this pass did not
-    /// write.
-    ///
-    /// `written` holds the `<fanout>/<rest>.index` names that the pass wrote.
-    /// The call leaves each name that does not end in [`INDEX_SUFFIX`], so a
-    /// temp file of a concurrent write stays.
-    async fn prune_delta_indexes(&self, written: BTreeSet<String>) -> Result<()> {
-        let repo = self.clone();
-        ostrya_rt::unblock(move || prune_delta_indexes_blocking(repo.repo_fd(), &written)).await
+        ostrya_rt::unblock(move || walk_delta_indexes_blocking(&root, commits)).await
     }
 
     /// Splits the objects that the delta delivers into packed objects and
@@ -945,7 +977,7 @@ impl Repo {
         part: &mut Part,
         item: &mut PackItem,
         opts: &DeltaOptions,
-        tmp: BorrowedFd<'_>,
+        tmp: &RepoDir,
     ) -> Result<()> {
         // Only a content object carries a loaded file object. A metadata
         // object is spliced from its serialized bytes.
@@ -1073,10 +1105,9 @@ impl Repo {
     ///
     /// A small payload loads on the heap. A large payload loads in a read-only
     /// mapping of a temp file.
-    async fn load_content_blob(&self, file: &FileObject, tmp: BorrowedFd<'_>) -> Result<Blob> {
+    async fn load_content_blob(&self, file: &FileObject, tmp: &RepoDir) -> Result<Blob> {
         let reader = file.reader().await?;
-        let owned = tmp.try_clone_to_owned()?;
-        spill_to_blob(reader, &owned, None).await
+        spill_to_blob(reader, tmp, None).await
     }
 
     /// Builds the superblock GVariant.
@@ -1196,85 +1227,38 @@ impl Repo {
         Ok(bytes)
     }
 
-    /// Returns the `(from, to)` pair of each delta under `deltas/`.
-    async fn list_static_delta_targets(&self) -> Result<Vec<(Option<Checksum>, Checksum)>> {
-        let repo = self.clone();
-        ostrya_rt::unblock(move || crate::delta::list_delta_targets(repo.repo_fd())).await
-    }
-
-    /// Reads a file under the repository root, or returns `None` if it is
-    /// absent.
-    ///
-    /// The metadata ceiling bounds the read, so it serves superblocks and index
-    /// files, and no object payloads. A file past the ceiling is an error, as
-    /// for [`read_capped`]. A prefix of a superblock gives an index digest that
-    /// covers only part of the superblock.
-    async fn read_repo_file(&self, relative: &str) -> Result<Option<Vec<u8>>> {
-        use std::io::Read;
-
-        let repo = self.clone();
-        let relative = relative.to_owned();
-        ostrya_rt::unblock(move || {
-            let fd = match rustix::fs::openat(
-                repo.repo_fd(),
-                relative.as_str(),
-                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            ) {
-                Ok(fd) => fd,
-                Err(rustix::io::Errno::NOENT) => return Ok(None),
-                Err(e) => return Err(Error::Io(e.into())),
-            };
-            let mut file = std::fs::File::from(fd);
-            if file.metadata().map_err(Error::Io)?.len() > MAX_SUPERBLOCK {
-                return Err(Error::Io(std::io::Error::other(format!(
-                    "static delta file {relative} exceeds the size ceiling"
-                ))));
-            }
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes).map_err(Error::Io)?;
-            Ok(Some(bytes))
-        })
-        .await
-    }
-
-    /// Opens a directory under the repository root, and creates it and its
-    /// parents if they are absent.
-    async fn open_repo_subdir(&self, relative: &str) -> Result<OwnedFd> {
-        let repo = self.clone();
-        let relative = relative.to_owned();
-        ostrya_rt::unblock(move || open_subdir_blocking(repo.repo_fd(), &relative)).await
-    }
-
-    /// Opens the `tmp/` directory of the repository, which holds the spill
-    /// files. [`crate::staging::open_tmp_dir`] creates it if it is absent.
-    pub(crate) async fn open_tmp_dir(&self) -> Result<OwnedFd> {
-        let repo = self.clone();
-        ostrya_rt::unblock(move || {
-            crate::staging::open_tmp_dir(repo.repo_fd(), repo.mode()).map_err(Error::Io)
-        })
-        .await
-    }
-
     /// Creates and opens the directory for the files of the delta, and returns
-    /// its path with the descriptor.
+    /// its path with the destination.
+    ///
+    /// In the repository, the call makes `deltas/`, the fanout directory, and
+    /// the delta directory where they are absent, with no symlink followed.
+    /// With `fsync`, it syncs the parent of each directory that it makes.
     async fn open_delta_dir(
         &self,
         from: Option<&Checksum>,
         to: &Checksum,
         opts: &DeltaOptions,
-    ) -> Result<(PathBuf, OwnedFd)> {
+        fsync: bool,
+    ) -> Result<(PathBuf, DeltaDest)> {
         match &opts.output_dir {
             Some(dir) => {
                 let path = dir.clone();
                 let target = path.clone();
                 let fd = ostrya_rt::unblock(move || create_dir_path_blocking(&target)).await?;
-                Ok((path, fd))
+                Ok((path, DeltaDest::Dir(fd)))
             }
             None => {
-                let relative = delta_relative_dir(from, to);
-                let fd = self.open_repo_subdir(&relative).await?;
-                Ok((PathBuf::from(relative), fd))
+                let root = self.root_dir().clone();
+                let rel = delta_subdir(from, to);
+                let dir = ostrya_rt::unblock(move || {
+                    root.ensure_layout(RepoLayout::Deltas, fsync)?
+                        .ensure_dir(&rel, fsync)
+                })
+                .await?;
+                Ok((
+                    PathBuf::from(delta_relative_dir(from, to)),
+                    DeltaDest::Repo(dir),
+                ))
             }
         }
     }
@@ -1332,10 +1316,20 @@ struct PartEntry {
     inline: Option<(u8, Vec<u8>)>,
 }
 
+/// The directory that takes the files of a delta.
+enum DeltaDest {
+    /// The delta directory under `deltas/` of the repository.
+    Repo(RepoDir),
+    /// A directory that the caller names.
+    Dir(OwnedFd),
+}
+
 /// The destination of the bytes of a part in [`write_part`].
 enum PartTarget<'a> {
-    /// The numbered part file in this delta directory.
-    File(&'a OwnedFd),
+    /// The numbered part file in this delta directory of the repository.
+    Repo(&'a RepoDir),
+    /// The numbered part file in this directory that the caller names.
+    Dir(&'a OwnedFd),
     /// A buffer that the superblock carries inline. `budget` is the space that
     /// the superblock ceiling leaves for the parts not yet written.
     Inline { budget: usize },
@@ -1435,7 +1429,7 @@ impl Spill {
     }
 
     /// Appends `bytes` and returns the offset at which they were written.
-    async fn append(&mut self, bytes: &[u8], tmp: BorrowedFd<'_>) -> Result<u64> {
+    async fn append(&mut self, bytes: &[u8], tmp: &RepoDir) -> Result<u64> {
         let offset = self.len();
         if let Spill::Ram(buf) = self
             && buf.len() + bytes.len() > MMAP_THRESHOLD
@@ -1460,7 +1454,7 @@ impl Spill {
     async fn append_reader<R: futures_io::AsyncRead + Unpin>(
         &mut self,
         mut reader: R,
-        tmp: BorrowedFd<'_>,
+        tmp: &RepoDir,
     ) -> Result<(u64, u64)> {
         use futures_lite::AsyncReadExt;
 
@@ -1479,13 +1473,13 @@ impl Spill {
     }
 
     /// Moves an in-memory buffer into a temp file.
-    async fn spill(&mut self, tmp: BorrowedFd<'_>) -> Result<()> {
+    async fn spill(&mut self, tmp: &RepoDir) -> Result<()> {
         let Spill::Ram(buf) = self else {
             return Ok(());
         };
-        let owned = tmp.try_clone_to_owned()?;
-        let fd = ostrya_rt::unblock(move || open_rw_temp(owned.as_fd())).await?;
-        let mut file = RtFile::from(fd);
+        let dir = tmp.clone();
+        let file = ostrya_rt::unblock(move || TempFile::create(&dir)?.into_file()).await?;
+        let mut file = RtFile::from(file);
         file.write_all(buf).await.map_err(Error::Io)?;
         let len = buf.len() as u64;
         *self = Spill::File { file, len };
@@ -1609,7 +1603,39 @@ async fn write_part(
     write_offset(&mut offsets, modes.len(), width);
 
     let dir_fd = match target {
-        PartTarget::File(dir_fd) => *dir_fd,
+        PartTarget::Repo(dir) => {
+            let dir = (*dir).clone();
+            let name = index.to_string();
+            // The spill buffer gives a blocking handle, so the payload, its
+            // compression, the file write, and the publish all run on one
+            // blocking-pool thread. The temp file is in `tmp/`, and the
+            // publish replaces a part of the same name with one rename.
+            let blob = part.blob.into_blocking().await?;
+            let ops = part.ops;
+            let (checksum, size) = ostrya_rt::unblock(move || {
+                let mut temp = TempFile::create_named(&dir)?;
+                let written =
+                    compress_part(temp.file_mut(), &modes, &xattrs, blob, &ops, &offsets)?;
+                let mode = dir
+                    .file_mode()
+                    .expect("the kind of a delta directory has a file mode");
+                temp.set_mode(mode)?;
+                if fsync {
+                    temp.sync()?;
+                }
+                temp.publish(&dir, &name, Publish::Replace, fsync)?;
+                Ok::<_, Error>(written)
+            })
+            .await?;
+            return Ok(PartEntry {
+                checksum,
+                size,
+                uncompressed_size: part.uncompressed_size,
+                objects: part.objects,
+                inline: None,
+            });
+        }
+        PartTarget::Dir(dir_fd) => *dir_fd,
         PartTarget::Inline { budget } => {
             let limit = *budget;
             let blob = part.blob.into_blocking().await?;
@@ -1635,7 +1661,7 @@ async fn write_part(
     };
 
     let name = index.to_string();
-    let temp = TempFile::create(dir_fd, &name);
+    let temp = TempGuard::create(dir_fd, &name);
     let fd = {
         let owned = dir_fd.try_clone()?;
         let temp = temp.name().to_owned();
@@ -2136,16 +2162,22 @@ pub fn static_delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> Stri
 /// is added here. The `ostree` command was observed to request these paths with
 /// `+` unencoded.
 pub(crate) fn delta_relative_dir(from: Option<&Checksum>, to: &Checksum) -> String {
+    format!("{DELTAS_DIR}/{}", delta_subdir(from, to))
+}
+
+/// Returns the directory of a delta, relative to `deltas/`: `<fanout>/<rest>`,
+/// by the rule of [`static_delta_relative_dir`].
+pub(crate) fn delta_subdir(from: Option<&Checksum>, to: &Checksum) -> String {
     let to_b64 = to.to_base64_modified();
     match from {
         Some(from) => {
             let from_b64 = from.to_base64_modified();
             let (fanout, rest) = from_b64.split_at(2);
-            format!("{DELTAS_DIR}/{fanout}/{rest}-{to_b64}")
+            format!("{fanout}/{rest}-{to_b64}")
         }
         None => {
             let (fanout, rest) = to_b64.split_at(2);
-            format!("{DELTAS_DIR}/{fanout}/{rest}")
+            format!("{fanout}/{rest}")
         }
     }
 }
@@ -2160,7 +2192,7 @@ fn resolve_timestamp(explicit: Option<u64>) -> Result<u64> {
 
 /// Writes a whole file into a delta directory atomically.
 async fn write_delta_file(dir_fd: &OwnedFd, name: &str, bytes: &[u8], fsync: bool) -> Result<()> {
-    let temp = TempFile::create(dir_fd, name);
+    let temp = TempGuard::create(dir_fd, name);
     let fd = {
         let owned = dir_fd.try_clone()?;
         let temp = temp.name().to_owned();
@@ -2181,15 +2213,15 @@ async fn write_delta_file(dir_fd: &OwnedFd, name: &str, bytes: &[u8], fsync: boo
 /// disarms the guard. Each code path from the creation of the temp file to its
 /// rename holds a guard. A failed or cancelled write then leaves only the
 /// finished files in the directory.
-struct TempFile<'a> {
+struct TempGuard<'a> {
     dir: &'a OwnedFd,
     name: String,
     armed: bool,
 }
 
-impl<'a> TempFile<'a> {
-    fn create(dir: &'a OwnedFd, name: &str) -> TempFile<'a> {
-        TempFile {
+impl<'a> TempGuard<'a> {
+    fn create(dir: &'a OwnedFd, name: &str) -> TempGuard<'a> {
+        TempGuard {
             dir,
             name: temp_name(name),
             armed: true,
@@ -2206,7 +2238,7 @@ impl<'a> TempFile<'a> {
     }
 }
 
-impl Drop for TempFile<'_> {
+impl Drop for TempGuard<'_> {
     /// The unlink runs on the thread that drops the guard, which can be an
     /// executor thread. It is one `unlinkat` on an open directory descriptor, a
     /// syscall that the write path also does inline.
@@ -2289,22 +2321,37 @@ async fn remove_superblock(dir_fd: &OwnedFd) -> Result<()> {
 /// repository, where this code wrote each entry. An output directory of the
 /// caller can hold any file. A file there named `0` or `.x.tmp-1-2` does not
 /// belong to this delta.
-async fn clean_delta_dir(dir_fd: &OwnedFd, count: usize) -> Result<()> {
-    let owned = dir_fd.try_clone()?;
+///
+/// A generation of the repository writes its temp files in `tmp/`. The temp
+/// names in a delta directory are leftovers of the writes in place of older
+/// versions. A file whose status cannot be read stays. With `fsync`, the pass
+/// syncs the delta directory one time if it removed a file.
+async fn clean_delta_dir(dir: &RepoDir, count: usize, fsync: bool) -> Result<()> {
+    let dir = dir.clone();
     let now = unix_seconds()?;
     ostrya_rt::unblock(move || {
-        for name in dir_child_names(&owned)? {
+        let mut removed = false;
+        for entry in dir.list()? {
+            let Ok(name) = String::from_utf8(entry.name) else {
+                continue;
+            };
             let remove = match name.parse::<usize>() {
                 Ok(index) => index >= count,
-                Err(_) => is_temp_name(&name) && temp_is_stale(owned.as_fd(), &name, now),
+                Err(_) => {
+                    is_temp_name(&name)
+                        && dir
+                            .lstat(&name)
+                            .ok()
+                            .and_then(|stat| u64::try_from(stat.mtime_sec).ok())
+                            .is_some_and(|mtime| now.saturating_sub(mtime) >= TEMP_STALE_SECS)
+                }
             };
-            if !remove {
-                continue;
+            if remove {
+                removed |= dir.remove_file(&name, false)?;
             }
-            match rustix::fs::unlinkat(owned.as_fd(), name.as_str(), rustix::fs::AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => {}
-                Err(e) => return Err(Error::Io(e.into())),
-            }
+        }
+        if removed && fsync {
+            dir.sync()?;
         }
         Ok(())
     })
@@ -2325,18 +2372,6 @@ async fn clean_delta_dir(dir_fd: &OwnedFd, count: usize) -> Result<()> {
 /// before its rename: a 200 MB part compresses in about ninety seconds. The
 /// sweep then touches no file in progress.
 const TEMP_STALE_SECS: u64 = 60 * 60;
-
-/// Returns `true` if a temp file is old enough to be a leftover, and not a
-/// write in progress. A file whose metadata cannot be read stays in place.
-fn temp_is_stale(dir: BorrowedFd<'_>, name: &str, now: u64) -> bool {
-    let Ok(stat) = rustix::fs::statat(dir, name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW) else {
-        return false;
-    };
-    let Ok(mtime) = u64::try_from(stat.st_mtime) else {
-        return false;
-    };
-    now.saturating_sub(mtime) >= TEMP_STALE_SECS
-}
 
 /// Returns the current time in seconds since the Unix epoch.
 fn unix_seconds() -> Result<u64> {
@@ -2373,88 +2408,230 @@ fn check_table_size(len: usize) -> Result<()> {
     Ok(())
 }
 
-/// Walks `delta-indexes/<fanout>/` and unlinks each index file whose
-/// `<fanout>/<name>` is not in `written`.
+/// Rebuilds the `delta-indexes/` cache, by the rule of
+/// [`Repo::reindex_static_deltas`].
 ///
-/// A repository with no `delta-indexes/` needs no work.
-fn prune_delta_indexes_blocking(repo_fd: BorrowedFd<'_>, written: &BTreeSet<String>) -> Result<()> {
-    use rustix::fs::{AtFlags, Mode, OFlags, openat, unlinkat};
-
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let indexes = match openat(repo_fd, DELTA_INDEXES_DIR, flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(()),
-        Err(e) => return Err(Error::Io(e.into())),
+/// The pass opens `delta-indexes/` one time, and makes it only if a delta
+/// exists. For each target, it makes the fanout directory where it is absent
+/// and writes the index file in one atomic step. It then removes the index
+/// files that it did not write.
+fn reindex_blocking(root: &RepoDir, fsync: bool) -> Result<()> {
+    let mut by_target: BTreeMap<Checksum, BTreeMap<String, Checksum>> = BTreeMap::new();
+    for entry in delta_digests_blocking(root, None)? {
+        by_target
+            .entry(entry.to)
+            .or_default()
+            .insert(entry.name, entry.digest);
+    }
+    let indexes = if by_target.is_empty() {
+        root.open_layout(RepoLayout::DeltaIndexes).optional()?
+    } else {
+        Some(open_delta_indexes(root, fsync)?)
     };
+    let Some(indexes) = indexes else {
+        return Ok(());
+    };
+    let mut written: BTreeSet<String> = BTreeSet::new();
+    for (to, deltas) in &by_target {
+        let (fanout, name) = delta_index_parts(to);
+        let index = index_value(deltas)?;
+        indexes
+            .ensure_dir(&fanout, fsync)?
+            .write_atomic(&name, &index, Publish::Replace, fsync)?;
+        written.insert(format!("{fanout}/{name}"));
+    }
+    prune_delta_indexes(&indexes, &written, fsync)
+}
 
-    for fanout in dir_child_names(&indexes)? {
-        let fan_fd = openat(&indexes, fanout.as_str(), flags, Mode::empty())
-            .map_err(|e| Error::Io(e.into()))?;
-        for name in dir_child_names(&fan_fd)? {
+/// Opens `delta-indexes/`, and makes it if it is absent. A symlink or a file
+/// at `delta-indexes` is an error.
+fn open_delta_indexes(root: &RepoDir, fsync: bool) -> Result<RepoDir> {
+    Ok(root.ensure_layout(RepoLayout::DeltaIndexes, fsync)?)
+}
+
+/// Returns each delta under `deltas/`, sorted by delta name, with the SHA-256
+/// of its superblock, by the rule of [`Repo::static_delta_digests`]. With
+/// `to`, the call lists the deltas to `to` alone.
+///
+/// The limit applies before a superblock is opened, so a pass over one
+/// target reads only the superblocks of that target. A delta directory whose
+/// name does not decode names no target. With `to`, one no-follow `statx`
+/// decides if such a directory holds a superblock, and only then does it
+/// fail the pass. The walk holds the handle of `deltas/` and one fanout
+/// handle at a time, and reads each superblock below the fanout handle with
+/// no symlink followed. A superblock that is gone at the read is skipped. A
+/// superblock over the metadata limit, or that is not a regular file, gives
+/// [`Error::InvalidFormat`].
+fn delta_digests_blocking(root: &RepoDir, to: Option<&Checksum>) -> Result<Vec<DeltaDigest>> {
+    let mut out = Vec::new();
+    crate::delta::walk_deltas(root, |fan, fanout, leaves| {
+        for leaf in leaves {
+            let superblock = format!("{leaf}/{SUPERBLOCK_FILE}");
+            let shown = || format!("{DELTAS_DIR}/{fanout}/{superblock}");
+            let parsed = crate::delta::parse_delta_dir(fanout, leaf);
+            if let Some(to) = to {
+                match &parsed {
+                    Ok((_, target)) if target != to => continue,
+                    Ok(_) => {}
+                    // A name that does not decode fails the pass only where
+                    // the directory holds a superblock, as in a full pass.
+                    Err(_) => {
+                        if crate::delta::has_superblock(fan, &superblock, shown)? {
+                            parsed?;
+                        }
+                        continue;
+                    }
+                }
+            }
+            let Some(digest) = superblock_digest(fan, &superblock, shown)? else {
+                continue;
+            };
+            let (from, target) = parsed?;
+            out.push(DeltaDigest {
+                name: delta_name(from.as_ref(), &target),
+                to: target,
+                digest,
+            });
+        }
+        Ok(())
+    })?;
+    // The `ostree` command writes the index files and the summary map in
+    // hash-table order, and ostrya does not reproduce that order. A sort by
+    // name gives both one order, whatever order the file system returns for
+    // the `deltas/` tree.
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
+/// Returns the SHA-256 of the superblock at `path` below the fanout handle
+/// `fan`, or `None` if no superblock is there. `shown` gives the path
+/// relative to the repository root.
+///
+/// The open is one `openat2` with no symlink followed. An absent entry, and a
+/// file in place of the delta directory, give `None`. A symlink, and an entry
+/// that is not a regular file, give [`Error::InvalidFormat`]. A file over
+/// [`MAX_SUPERBLOCK`] gives [`Error::InvalidFormat`], also if it grows past
+/// the limit during the read. The hash reads the file in [`IO_CHUNK`]
+/// pieces, so the call holds one piece in memory.
+fn superblock_digest(
+    fan: &RepoDir,
+    path: &str,
+    shown: impl Fn() -> String,
+) -> Result<Option<Checksum>> {
+    use std::io::Read;
+
+    let opened = match fan.open_regular(path) {
+        Ok(opened) => opened,
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::NotDirectory,
+                ..
+            },
+        ) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let too_large = || -> Error {
+        FsError::Invalid {
+            path: shown(),
+            reason: Reason::TooLarge {
+                cap: MAX_SUPERBLOCK,
+            },
+        }
+        .into()
+    };
+    if opened.stat.size > MAX_SUPERBLOCK {
+        return Err(too_large());
+    }
+    let mut reader = (&opened.file).take(MAX_SUPERBLOCK + 1);
+    let mut hasher = Sha256::new();
+    let mut chunk = vec![0u8; IO_CHUNK];
+    let mut total = 0u64;
+    loop {
+        let n = match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::Io(e)),
+        };
+        total += n as u64;
+        hasher.update(&chunk[..n]);
+    }
+    if total > MAX_SUPERBLOCK {
+        return Err(too_large());
+    }
+    Ok(Some(Checksum::from_bytes(hasher.finalize().into())))
+}
+
+/// Removes the index files under `delta-indexes/` that this pass did not
+/// write.
+///
+/// `written` holds the `<fanout>/<rest>.index` names that the pass wrote. The
+/// call leaves each name that does not end in [`INDEX_SUFFIX`]. A symlink or
+/// a regular file at a fanout fails the pass, so the pass unlinks nothing
+/// outside `delta-indexes/`. The pass skips an entry of each other type that
+/// is not a directory. An entry with an index name that is not a directory
+/// is unlinked, a symlink as the link, and a directory there fails the pass.
+/// With `fsync`, the pass syncs each fanout directory that it removed a file
+/// from, one time.
+fn prune_delta_indexes(indexes: &RepoDir, written: &BTreeSet<String>, fsync: bool) -> Result<()> {
+    for entry in indexes.list()? {
+        if !matches!(
+            entry.file_type,
+            FileType::Directory | FileType::Symlink | FileType::RegularFile
+        ) {
+            continue;
+        }
+        let Ok(fanout) = String::from_utf8(entry.name) else {
+            continue;
+        };
+        let fan = indexes.open_dir(&fanout)?;
+        let mut removed = false;
+        for entry in fan.list()? {
+            let Ok(name) = String::from_utf8(entry.name) else {
+                continue;
+            };
             if !name.ends_with(INDEX_SUFFIX) || written.contains(&format!("{fanout}/{name}")) {
                 continue;
             }
-            unlinkat(&fan_fd, name.as_str(), AtFlags::empty()).map_err(|e| Error::Io(e.into()))?;
+            removed |= fan.remove_file(&name, false)?;
+        }
+        if removed && fsync {
+            fan.sync()?;
         }
     }
     Ok(())
 }
 
-/// Unlinks the index file at `relative` under the repository root.
-///
-/// An absent file, fanout directory, or `delta-indexes/` is no error. A
-/// dangling symlink on the path also counts as absent. Each other failure is an
-/// error, as it is for the `ostree` command. This includes a directory at the
-/// path. It also includes a path component that is not a directory, such as a
-/// regular file at the fanout or at `delta-indexes`.
-fn remove_delta_index_blocking(repo_fd: BorrowedFd<'_>, relative: &str) -> Result<()> {
-    use rustix::fs::{AtFlags, unlinkat};
-
-    match unlinkat(repo_fd, relative, AtFlags::empty()) {
-        Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-        Err(e) => Err(Error::Io(e.into())),
-    }
-}
-
 /// Walks `delta-indexes/<fanout>/` and collects the target of each index file,
 /// by the rule of [`Repo::list_static_delta_indexes`].
-fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>> {
-    use rustix::fs::{Dir, FileType, Mode, OFlags, openat};
-
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let indexes = match openat(repo_fd, DELTA_INDEXES_DIR, flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Io(e.into())),
+fn list_delta_indexes_blocking(root: &RepoDir) -> Result<Vec<Checksum>> {
+    let Some(indexes) = root.open_layout(RepoLayout::DeltaIndexes).optional()? else {
+        return Ok(Vec::new());
     };
-    let mut indexes = Dir::new(indexes).map_err(|e| Error::Io(e.into()))?;
-
     let mut out = Vec::new();
-    for fanout in entries_of_type(&mut indexes, FileType::Directory)? {
-        if fanout.len() != 2 {
+    for fanout in indexes.list()? {
+        if fanout.file_type != FileType::Directory || fanout.name.len() != 2 {
             continue;
         }
-        let fan_fd = openat(
-            indexes.fd().map_err(|e| Error::Io(e.into()))?,
-            fanout.as_slice(),
-            flags | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::Io(e.into()))?;
-        let mut fan_dir = Dir::new(fan_fd).map_err(|e| Error::Io(e.into()))?;
-        for name in entries_of_type(&mut fan_dir, FileType::RegularFile)? {
-            let Some(rest) = name.strip_suffix(INDEX_SUFFIX.as_bytes()) else {
+        let Ok(fanout) = String::from_utf8(fanout.name) else {
+            continue;
+        };
+        let fan = indexes.open_dir(&fanout)?;
+        for entry in fan.list()? {
+            if entry.file_type != FileType::RegularFile {
+                continue;
+            }
+            let Some(rest) = entry.name.strip_suffix(INDEX_SUFFIX.as_bytes()) else {
                 continue;
             };
             if rest.len() != 41 {
                 continue;
             }
-            let mut b64 = fanout.clone();
-            b64.extend_from_slice(rest);
-            let Ok(b64) = std::str::from_utf8(&b64) else {
+            let Ok(rest) = std::str::from_utf8(rest) else {
                 continue;
             };
-            if let Ok(to) = Checksum::from_base64_modified(b64) {
+            if let Ok(to) = Checksum::from_base64_modified(&format!("{fanout}{rest}")) {
                 out.push(to);
             }
         }
@@ -2466,16 +2643,11 @@ fn list_delta_indexes_blocking(repo_fd: BorrowedFd<'_>) -> Result<Vec<Checksum>>
 /// Walks the index files back from `commits`, by the rule of
 /// [`Repo::walk_delta_indexes`].
 fn walk_delta_indexes_blocking(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     commits: Vec<Checksum>,
 ) -> Result<Vec<AdvertisedDelta>> {
-    use rustix::fs::{Mode, OFlags, openat};
-
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let indexes = match openat(repo_fd, DELTA_INDEXES_DIR, flags, Mode::empty()) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(Vec::new()),
-        Err(e) => return Err(Error::Io(e.into())),
+    let Some(indexes) = root.open_layout(RepoLayout::DeltaIndexes).optional()? else {
+        return Ok(Vec::new());
     };
     let mut seen: HashSet<Checksum> = HashSet::new();
     let mut queue: VecDeque<Checksum> = commits
@@ -2484,7 +2656,7 @@ fn walk_delta_indexes_blocking(
         .collect();
     let mut found: BTreeMap<String, AdvertisedDelta> = BTreeMap::new();
     while let Some(to) = queue.pop_front() {
-        let Some(bytes) = read_delta_index_blocking(indexes.as_fd(), &to)? else {
+        let Some(bytes) = read_delta_index_blocking(&indexes, &to)? else {
             continue;
         };
         let path = delta_index_relative_path(&to);
@@ -2520,104 +2692,28 @@ fn walk_delta_indexes_blocking(
     Ok(found.into_values().collect())
 }
 
-/// Reads the index file of the target commit `to` in the open
-/// `delta-indexes/` directory `indexes`, or returns `None` if the repository
-/// holds no index file for it.
+/// Reads the index file of the target commit `to` in the `delta-indexes/`
+/// handle `indexes`, or returns `None` if the repository holds no index file
+/// for it.
 ///
-/// The rule is the rule of [`list_delta_indexes_blocking`]. The call follows
-/// no symlink. A fanout that is not a directory, and an index path that is
-/// not a regular file, count as no index file. The call reads the type of the
-/// index path before the open, so it opens no socket, FIFO, or device node.
-/// The open does not block. A second type check after the open gives `None`
-/// for a file that another process puts at the path after the first check.
-fn read_delta_index_blocking(indexes: BorrowedFd<'_>, to: &Checksum) -> Result<Option<Vec<u8>>> {
-    use std::io::Read;
-
-    use rustix::fs::{AtFlags, FileType, Mode, OFlags, fstat, openat, statat};
-    use rustix::io::Errno;
-
+/// The rule is the rule of [`list_delta_indexes_blocking`]. The read follows
+/// no symlink. A symlink at the fanout or at the index file, a fanout that is
+/// not a directory, and an index path that is not a regular file count as no
+/// index file. The open does not block, so a FIFO at the path gives `None`.
+/// An index file over [`MAX_METADATA_SIZE`] gives [`Error::InvalidFormat`].
+fn read_delta_index_blocking(indexes: &RepoDir, to: &Checksum) -> Result<Option<Vec<u8>>> {
     let (fanout, name) = delta_index_parts(to);
-    let fan_fd = match openat(
-        indexes,
-        fanout.as_str(),
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => return Ok(None),
-        Err(e) => return Err(Error::Io(e.into())),
-    };
-    match statat(&fan_fd, name.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
-        Ok(_) | Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(Error::Io(e.into())),
-    }
-    let fd = match openat(
-        &fan_fd,
-        name.as_str(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT | Errno::LOOP) => return Ok(None),
-        Err(e) => return Err(Error::Io(e.into())),
-    };
-    let stat = fstat(&fd).map_err(|e| Error::Io(e.into()))?;
-    if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile {
-        return Ok(None);
-    }
-    let too_large = || {
-        Error::InvalidFormat(format!(
-            "{} is larger than the {MAX_METADATA_SIZE}-byte metadata ceiling",
-            delta_index_relative_path(to)
-        ))
-    };
-    let len = stat.st_size.max(0) as u64;
-    if len > MAX_METADATA_SIZE {
-        return Err(too_large());
-    }
-    let mut bytes = Vec::with_capacity(len as usize + 1);
-    std::fs::File::from(fd)
-        .take(MAX_METADATA_SIZE + 1)
-        .read_to_end(&mut bytes)
-        .map_err(Error::Io)?;
-    if bytes.len() as u64 > MAX_METADATA_SIZE {
-        return Err(too_large());
-    }
-    Ok(Some(bytes))
-}
-
-/// Returns the names of the entries of type `ty` in an open directory, with no
-/// symlink followed.
-///
-/// If the directory reports no type for an entry, a `statat` reads the type.
-fn entries_of_type(dir: &mut rustix::fs::Dir, ty: rustix::fs::FileType) -> Result<Vec<Vec<u8>>> {
-    use rustix::fs::{AtFlags, FileType, statat};
-
-    let mut out = Vec::new();
-    while let Some(entry) = dir.next() {
-        let entry = entry.map_err(|e| Error::Io(e.into()))?;
-        let name = entry.file_name();
-        if matches!(name.to_bytes(), b"." | b"..") {
-            continue;
-        }
-        let entry_ty = match entry.file_type() {
-            FileType::Unknown => match statat(
-                dir.fd().map_err(|e| Error::Io(e.into()))?,
-                name,
-                AtFlags::SYMLINK_NOFOLLOW,
-            ) {
-                Ok(stat) => FileType::from_raw_mode(stat.st_mode),
-                Err(rustix::io::Errno::NOENT) => continue,
-                Err(e) => return Err(Error::Io(e.into())),
+    match indexes.read_capped(&format!("{fanout}/{name}"), MAX_METADATA_SIZE) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(
+            FsError::Absent { .. }
+            | FsError::Invalid {
+                reason: Reason::Symlink | Reason::NotDirectory | Reason::NotRegular(_),
+                ..
             },
-            known => known,
-        };
-        if entry_ty == ty {
-            out.push(name.to_bytes().to_vec());
-        }
+        ) => Ok(None),
+        Err(e) => Err(e.into()),
     }
-    Ok(out)
 }
 
 /// Returns the temp name under which a delta file is written before its rename
@@ -2652,32 +2748,6 @@ fn create_file_blocking(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
     .map_err(|e| Error::Io(e.into()))?;
     fchmod(&fd, Mode::from_raw_mode(DELTA_FILE_MODE)).map_err(|e| Error::Io(e.into()))?;
     Ok(fd)
-}
-
-/// Opens a directory relative to `base`, and creates each component that is
-/// absent.
-fn open_subdir_blocking(base: BorrowedFd<'_>, relative: &str) -> Result<OwnedFd> {
-    use rustix::fs::{Mode, OFlags, mkdirat, openat};
-
-    let mut current = base.try_clone_to_owned()?;
-    for component in relative.split('/').filter(|part| !part.is_empty()) {
-        match mkdirat(
-            current.as_fd(),
-            component,
-            Mode::from_raw_mode(DELTA_DIR_MODE),
-        ) {
-            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-            Err(e) => return Err(Error::Io(e.into())),
-        }
-        current = openat(
-            current.as_fd(),
-            component,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::Io(e.into()))?;
-    }
-    Ok(current)
 }
 
 /// Creates a directory and its parents at an absolute or relative path, and
@@ -2973,16 +3043,14 @@ mod tests {
         // async file writes on a background task, so `write_all` accepts the
         // bytes, and the error comes at the flush.
         let file = std::fs::File::open(&path).unwrap();
-        let spill_dir = std::fs::File::open(&dir).unwrap();
+        let spill_dir = RepoDir::from_root_fd(open_dir_blocking(&dir).unwrap());
 
         let outcome = ostrya_rt::block_on(async {
             let mut spill = Spill::File {
                 file: RtFile::from(file),
                 len: 0,
             };
-            spill
-                .append(b"data source bytes", spill_dir.as_fd())
-                .await?;
+            spill.append(b"data source bytes", &spill_dir).await?;
             spill.into_blocking().await.map(|_| ())
         });
         let _ = std::fs::remove_dir_all(&dir);
@@ -3041,9 +3109,9 @@ mod tests {
                 ..Part::default()
             };
             part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 9);
-            write_part(&mut PartTarget::File(&dir_fd), 0, part, false).await
+            write_part(&mut PartTarget::Dir(&dir_fd), 0, part, false).await
         });
-        let leftovers = dir_child_names(&dir_fd).unwrap();
+        let leftovers = child_names(&dir);
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(outcome.is_err(), "a short data source must fail the part");
@@ -3051,6 +3119,49 @@ mod tests {
             leftovers.is_empty(),
             "the failed part left files behind: {leftovers:?}"
         );
+    }
+
+    /// A part of the repository whose write fails leaves no file in the delta
+    /// directory and no temp file in `tmp/`.
+    #[test]
+    fn a_failed_part_write_in_the_repository_leaves_no_temp_file_behind() {
+        let root = scratch("repo-part-temp-leak");
+        let path = root.join("source");
+        std::fs::write(&path, b"seven!!").unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let repo = empty_repo(&root).await;
+            let dir = repo
+                .root_dir()
+                .ensure_layout(RepoLayout::Deltas, false)
+                .unwrap()
+                .ensure_dir("ab/cd", false)
+                .unwrap();
+            let mut part = Part {
+                blob: Spill::File {
+                    file: RtFile::from(std::fs::File::open(&path).unwrap()),
+                    len: 9,
+                },
+                ..Part::default()
+            };
+            part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 9);
+            write_part(&mut PartTarget::Repo(&dir), 0, part, false).await
+        });
+        let leftovers = child_names(&root.join("repo/deltas/ab/cd"));
+        let mut tmp = child_names(&root.join("repo/tmp"));
+        tmp.retain(|name| name != "cache");
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(outcome.is_err(), "a short data source must fail the part");
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+        assert!(tmp.is_empty(), "{tmp:?}");
+    }
+
+    /// Returns the names in the directory at `dir`.
+    fn child_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect()
     }
 
     /// Returns `(repo, commit)` for a repository at `root/repo` with one
@@ -3126,7 +3237,7 @@ mod tests {
                 .await
                 .unwrap();
             let delta = root.join("repo").join(&relative);
-            let before = dir_child_names(&open_dir_blocking(&delta).unwrap()).unwrap();
+            let before = child_names(&delta);
             let superblock = std::fs::read(delta.join(SUPERBLOCK_FILE)).unwrap();
             let listed = repo.list_static_deltas().await.unwrap();
             assert_eq!(listed.len(), 1);
@@ -3143,7 +3254,7 @@ mod tests {
                 panic!("the ceiling refusal is an invalid-format error: {err}");
             };
             assert!(message.contains("superblock ceiling"), "{message}");
-            let mut after = dir_child_names(&open_dir_blocking(&delta).unwrap()).unwrap();
+            let mut after = child_names(&delta);
             let mut before = before;
             before.sort();
             after.sort();
@@ -3167,7 +3278,7 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
-            dir_child_names(&open_dir_blocking(&out).unwrap()).unwrap()
+            child_names(&out)
         });
         let _ = std::fs::remove_dir_all(&root);
         assert!(outcome.is_empty(), "{outcome:?}");
@@ -3190,10 +3301,10 @@ mod tests {
         assert_eq!(capped.into_parts(), (b'a', b"bcd".to_vec()));
 
         let root = scratch("capped-part");
-        let tmp = open_dir_blocking(&root).unwrap();
+        let tmp = RepoDir::from_root_fd(open_dir_blocking(&root).unwrap());
         let outcome = ostrya_rt::block_on(async {
             let mut part = Part::default();
-            part.blob.append(&[7u8; 4096], tmp.as_fd()).await?;
+            part.blob.append(&[7u8; 4096], &tmp).await?;
             part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 4096);
             write_part(&mut PartTarget::Inline { budget: 16 }, 0, part, false).await
         });
@@ -3205,7 +3316,7 @@ mod tests {
         let mut budget = PartTarget::Inline { budget: 1 << 20 };
         let entry = ostrya_rt::block_on(async {
             let mut part = Part::default();
-            part.blob.append(&[7u8; 4096], tmp.as_fd()).await?;
+            part.blob.append(&[7u8; 4096], &tmp).await?;
             part.finish_object(ObjectType::File, Checksum::sha256(b"x"), 4096);
             write_part(&mut budget, 0, part, false).await
         })
@@ -3582,5 +3693,59 @@ mod tests {
         assert!(is_temp_name(&temp_name(SUPERBLOCK_FILE)));
         assert!(!is_temp_name("0"));
         assert!(!is_temp_name(SUPERBLOCK_FILE));
+    }
+
+    /// The digest of a superblock is the SHA-256 of its bytes, read in
+    /// pieces. The read follows no symlink and refuses a file over the cap.
+    #[test]
+    fn a_superblock_digest_hashes_the_file_and_refuses_what_the_read_refuses() {
+        let root = scratch("superblock-digest");
+        let leaf = root.join("deltas/ab/leaf");
+        std::fs::create_dir_all(&leaf).unwrap();
+        let repo = RepoDir::from_root_fd(open_dir_blocking(&root).unwrap());
+        let fan = repo
+            .open_layout(RepoLayout::Deltas)
+            .unwrap()
+            .open_dir("ab")
+            .unwrap();
+        let shown = || "deltas/ab/leaf/superblock".to_owned();
+        let digest = || superblock_digest(&fan, "leaf/superblock", shown);
+        let file = leaf.join(SUPERBLOCK_FILE);
+
+        assert!(digest().unwrap().is_none());
+        let bytes: Vec<u8> = (0..2 * IO_CHUNK + 5).map(|i| i as u8).collect();
+        std::fs::write(&file, &bytes).unwrap();
+        assert_eq!(digest().unwrap(), Some(Checksum::sha256(&bytes)));
+        std::fs::write(&file, b"").unwrap();
+        assert_eq!(digest().unwrap(), Some(Checksum::sha256(b"")));
+
+        let sparse = std::fs::File::create(&file).unwrap();
+        sparse.set_len(MAX_SUPERBLOCK + 1).unwrap();
+        drop(sparse);
+        assert_eq!(
+            digest().unwrap_err().to_string(),
+            "invalid format: deltas/ab/leaf/superblock is larger than its cap of \
+             134217728 bytes"
+        );
+
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("elsewhere", &file).unwrap();
+        let err = digest().unwrap_err().to_string();
+        assert!(
+            err.starts_with("invalid format: deltas/ab/leaf/superblock passes through a symlink"),
+            "{err}"
+        );
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert_eq!(
+            digest().unwrap_err().to_string(),
+            "invalid format: deltas/ab/leaf/superblock is not a regular file"
+        );
+
+        // A file in place of the delta directory holds no superblock.
+        std::fs::remove_dir_all(&leaf).unwrap();
+        std::fs::write(&leaf, b"x").unwrap();
+        assert!(digest().unwrap().is_none());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -79,19 +79,15 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, RepoMode, Value};
 use ostrya_rt::FileReader;
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::delta::{
     Blob, DeltaFallback, DeltaPart, DeltaSuperblock, MAX_SUPERBLOCK, apply_part, check_inline_part,
-    concat_to_blob, decode_inline_part, decode_part_stream, inline_part_at, open_rw_temp,
-    verify_inline_part,
+    concat_to_blob, decode_inline_part, decode_part_stream, inline_part_at, verify_inline_part,
 };
 use crate::deltagen::{
     STATIC_DELTAS_KEY, SUPERBLOCK_FILE, delta_index_relative_path, delta_name, delta_relative_dir,
@@ -105,6 +101,7 @@ use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, RefPlace};
 use crate::read::CommitState;
 use crate::related::{self, RelatedField, RelatedRule};
 use crate::repo::Repo;
+use crate::repo_fs::{FsResultExt, RepoDir, RepoLayout, TempFile};
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
 use crate::transaction::Transaction;
 
@@ -615,9 +612,9 @@ impl RecordStore {
         if let Some(file) = &self.file {
             return Ok(Arc::clone(file));
         }
-        let tmp = self.repo.open_tmp_dir().await?;
-        let fd = ostrya_rt::unblock(move || open_rw_temp(tmp.as_fd())).await?;
-        let file = Arc::new(std::fs::File::from(fd));
+        let root = self.repo.root_dir().clone();
+        let file =
+            Arc::new(ostrya_rt::unblock(move || TempFile::create(&root)?.into_file()).await?);
         self.file = Some(Arc::clone(&file));
         Ok(file)
     }
@@ -628,8 +625,7 @@ impl RecordStore {
         if let Some(file) = &self.file {
             return Ok(Arc::clone(file));
         }
-        let tmp = crate::staging::open_tmp_dir(self.repo.repo_fd(), self.repo.mode())?;
-        let file = Arc::new(std::fs::File::from(open_rw_temp(tmp.as_fd())?));
+        let file = Arc::new(TempFile::create(self.repo.root_dir())?.into_file()?);
         self.file = Some(Arc::clone(&file));
         Ok(file)
     }
@@ -2067,7 +2063,7 @@ async fn read_local_superblock(
         "{}/{SUPERBLOCK_FILE}",
         delta_relative_dir(from.as_ref(), &to)
     );
-    let bytes = read_local(src, &path, MAX_SUPERBLOCK)
+    let bytes = read_local(src, path, MAX_SUPERBLOCK)
         .await?
         .ok_or_else(|| {
             Error::InvalidFormat(format!(
@@ -2138,7 +2134,7 @@ impl DeltaSource<'_> {
         match self {
             DeltaSource::Remote(source) => source.read_optional(path, Priority::High, cap).await,
             DeltaSource::Local(repo) => {
-                let bytes = read_local(repo, path, cap).await?;
+                let bytes = read_local(repo, path.to_owned(), cap).await?;
                 if let Some(bytes) = &bytes {
                     progress.add_transferred(bytes.len() as u64);
                 }
@@ -2148,95 +2144,35 @@ impl DeltaSource<'_> {
     }
 }
 
-/// Opens the regular file at `path` under `repo_fd`, with its length, or
+/// Reads the whole regular file at `path` in the source repository `repo`, or
 /// `None` if it is absent.
 ///
-/// The open does not block, so an open of a FIFO does not wait for a writer.
-/// The function then refuses each file that is not a regular file, a FIFO
-/// included, with [`Error::InvalidFormat`]. As a result, no read waits for a
-/// writer.
-fn open_local_blocking(
-    repo_fd: BorrowedFd<'_>,
-    path: &str,
-) -> Result<Option<(std::fs::File, u64)>> {
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(Error::from(e)),
-    };
-    let file = std::fs::File::from(fd);
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(Error::InvalidFormat(format!(
-            "{path} in the source repository is not a regular file"
-        )));
-    }
-    Ok(Some((file, meta.len())))
-}
-
-/// Opens the regular file at `path` under the directory of `repo`.
-///
-/// The open runs on the blocking pool. [`open_local_blocking`] states the
-/// rules.
-pub(crate) async fn open_local(repo: &Repo, path: &str) -> Result<Option<(std::fs::File, u64)>> {
-    let repo_fd = repo.repo_fd().try_clone_to_owned()?;
-    let path = path.to_owned();
-    ostrya_rt::unblock(move || open_local_blocking(repo_fd.as_fd(), &path)).await
-}
-
-/// Reads the whole regular file at `path` under `repo`, or `None` if it is
-/// absent.
-///
-/// If the file is longer than `cap`, the function reads `cap` bytes and one
-/// more, then refuses the file with [`Error::InvalidFormat`]. A file that is
-/// not a regular file fails as [`open_local_blocking`] states.
-pub(crate) async fn read_local(repo: &Repo, path: &str, cap: u64) -> Result<Option<Vec<u8>>> {
-    let repo_fd = repo.repo_fd().try_clone_to_owned()?;
-    let path = path.to_owned();
+/// `path` is relative to the root of `repo`, and starts with `deltas/` or
+/// `delta-indexes/`. The call opens the directory of that kind, and reads the
+/// rest of the path below it with no symlink followed. A FIFO at the path
+/// does not block the open. A file that is not a regular file, a symlink at a
+/// component, and a file of more than `cap` bytes give
+/// [`Error::InvalidFormat`].
+async fn read_local(repo: &Repo, path: String, cap: u64) -> Result<Option<Vec<u8>>> {
+    let root = repo.root_dir().clone();
     ostrya_rt::unblock(move || {
-        let Some((file, len)) = open_local_blocking(repo_fd.as_fd(), &path)? else {
+        let (kind, rest) = if let Some(rest) = path.strip_prefix("deltas/") {
+            (RepoLayout::Deltas, rest)
+        } else if let Some(rest) = path.strip_prefix("delta-indexes/") {
+            (RepoLayout::DeltaIndexes, rest)
+        } else {
+            debug_assert!(false, "a local delta read names {path}");
+            return Err(Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "a local delta read names a path outside deltas/ and delta-indexes/",
+            )));
+        };
+        let Some(dir) = root.open_layout(kind).optional()? else {
             return Ok(None);
         };
-        read_capped(file, len, &path, cap).map(Some)
+        Ok(dir.read_capped(rest, cap).optional()?)
     })
     .await
-}
-
-/// Reads the whole file that [`open_local`] opened at `path`, or `None` if
-/// `opened` is `None`.
-///
-/// The read runs on the blocking pool, under the cap rules of [`read_local`].
-pub(crate) async fn read_opened(
-    opened: Option<(std::fs::File, u64)>,
-    path: &str,
-    cap: u64,
-) -> Result<Option<Vec<u8>>> {
-    let Some((file, len)) = opened else {
-        return Ok(None);
-    };
-    let path = path.to_owned();
-    ostrya_rt::unblock(move || read_capped(file, len, &path, cap).map(Some)).await
-}
-
-/// Reads `file`, of length `len`, whole. If it is longer than `cap`, the
-/// function reads `cap` bytes and one more, then refuses the file at `path`
-/// with [`Error::InvalidFormat`].
-fn read_capped(file: std::fs::File, len: u64, path: &str, cap: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let hint = len.min(cap) + 1;
-    let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
-    file.take(cap + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > cap {
-        return Err(Error::InvalidFormat(format!(
-            "{path} in the source repository exceeds the size ceiling of {cap} bytes"
-        )));
-    }
-    Ok(bytes)
 }
 
 /// Returns the error of a pull that requires static deltas from a source with
@@ -2834,8 +2770,7 @@ async fn take_inline_parts(
     if bodies.is_empty() {
         return Ok((inline, Blob::Ram(Vec::new())));
     }
-    let tmp = repo.open_tmp_dir().await?;
-    Ok((inline, concat_to_blob(&bodies, &tmp).await?))
+    Ok((inline, concat_to_blob(&bodies, repo.root_dir()).await?))
 }
 
 /// Verifies the detached signatures of a fetched delta over the raw superblock
@@ -2994,13 +2929,13 @@ pub(crate) async fn apply_job_part(
         ))
     })?;
     if let Some(Some(part)) = job.inline.get(index) {
-        let staging = txn.staging_fd().try_clone_to_owned()?;
+        let staging = txn.staging_dir().clone();
         let body = &job.inline_bodies.as_slice()[part.start..part.start + part.len];
         let payload = decode_inline_part(part.compression, body, &staging).await?;
         return apply_part(txn, payload.as_slice(), &entry.objects, &staging, checks).await;
     }
     let path = format!("{}/{index}", job.dir);
-    let staging = txn.staging_fd().try_clone_to_owned()?;
+    let staging = txn.staging_dir().clone();
     let blob = match source {
         DeltaSource::Remote(remote) => match remote.transfer() {
             Transfer::Http(fetcher) => fetch_part_blob(fetcher, &path, entry, &staging).await?,
@@ -3018,12 +2953,26 @@ pub(crate) async fn apply_job_part(
             }
         },
         DeltaSource::Local(repo) => {
-            let (file, len) = open_local(repo, &path).await?.ok_or_else(|| {
-                Error::InvalidFormat(format!(
-                    "static delta {}: the source repository holds no part {index}",
-                    job.name
-                ))
-            })?;
+            let root = repo.root_dir().clone();
+            let rest = path
+                .strip_prefix("deltas/")
+                .expect("a delta directory is below deltas/")
+                .to_owned();
+            let opened = ostrya_rt::unblock(move || {
+                let Some(deltas) = root.open_layout(RepoLayout::Deltas).optional()? else {
+                    return Ok(None);
+                };
+                deltas.open_regular(&rest).optional()
+            })
+            .await?;
+            let (file, len) = opened
+                .map(|opened| (opened.file, opened.stat.size))
+                .ok_or_else(|| {
+                    Error::InvalidFormat(format!(
+                        "static delta {}: the source repository holds no part {index}",
+                        job.name
+                    ))
+                })?;
             // If the part file is longer than the declared size, the pull
             // refuses it before any read. The async reader reads ahead of the
             // bytes that the declared-size limit lets it write.
@@ -3049,7 +2998,7 @@ async fn fetch_part_blob(
     fetcher: &Fetcher,
     path: &str,
     entry: &DeltaPart,
-    staging: &OwnedFd,
+    staging: &RepoDir,
 ) -> Result<Blob> {
     // The superblock states the size of the part file, so the fetcher refuses
     // a larger `Content-Length` before the body arrives. It also stops a body

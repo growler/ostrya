@@ -25564,6 +25564,274 @@ fn composefs_image_mode_does_not_follow_the_umask() {
     assert_eq!(mode(&path), 0o644);
 }
 
+/// In a `bare-user-shared` repository, `static-delta generate` and
+/// `static-delta reindex` give each new directory under `deltas/` and
+/// `delta-indexes/` mode 02770, and each file mode 0640, under umask 077 and
+/// under umask 022. A directory that exists keeps its mode.
+#[test]
+fn shared_repo_delta_modes_do_not_follow_the_umask() {
+    let tmp = TmpDir::new("delta-shared-umask");
+    let bin = env!("CARGO_BIN_EXE_ostrya");
+    let mode = |path: &Path| std::fs::symlink_metadata(path).unwrap().mode() & 0o7777;
+    for mask in ["077", "022"] {
+        let base = tmp.path().join(mask);
+        std::fs::create_dir_all(&base).unwrap();
+        build_fixture_source(&base);
+        let repo = create_repo(&base, RepoMode::BareUserShared);
+        let repo_arg = format!("--repo={}", repo.display());
+        let src = base.join("src");
+        let commit = program_with_umask(
+            bin,
+            mask,
+            &[
+                "commit",
+                &repo_arg,
+                "-b",
+                "m",
+                FIXED_TIMESTAMP,
+                src.to_str().unwrap(),
+            ],
+        )
+        .ok()
+        .stdout_trimmed();
+        // A `delta-indexes/` that exists keeps its mode.
+        std::fs::create_dir(repo.join("delta-indexes")).unwrap();
+        std::fs::set_permissions(
+            repo.join("delta-indexes"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+        program_with_umask(
+            bin,
+            mask,
+            &[
+                "static-delta",
+                &repo_arg,
+                "generate",
+                "--empty",
+                "--to",
+                &commit,
+            ],
+        )
+        .ok();
+        program_with_umask(bin, mask, &["static-delta", &repo_arg, "reindex"]).ok();
+
+        let to = Checksum::from_hex(&commit).unwrap();
+        let delta = repo.join(ostrya::static_delta_relative_dir(None, &to));
+        for dir in [
+            repo.join("deltas"),
+            delta.parent().unwrap().to_owned(),
+            delta.clone(),
+        ] {
+            assert_eq!(mode(&dir), 0o2770, "{mask}: {}", dir.display());
+        }
+        for file in ["superblock", "0"] {
+            assert_eq!(mode(&delta.join(file)), 0o640, "{mask}: {file}");
+        }
+        let b64 = to.to_base64_modified();
+        let fanout = repo.join("delta-indexes").join(&b64[..2]);
+        assert_eq!(mode(&repo.join("delta-indexes")), 0o750, "{mask}");
+        assert_eq!(mode(&fanout), 0o2770, "{mask}");
+        let index = fanout.join(format!("{}.index", &b64[2..]));
+        assert_eq!(mode(&index), 0o640, "{mask}");
+        // The temp files are in `tmp/`, so no temp name is in the directories.
+        for dir in [&delta, &fanout] {
+            let names: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .map(|e| e.unwrap().file_name().into_string().unwrap())
+                .filter(|name| name.starts_with('.'))
+                .collect();
+            assert!(names.is_empty(), "{mask}: {names:?}");
+        }
+    }
+}
+
+/// A symlink at `tmp` fails `static-delta generate` and `static-delta
+/// reindex` with the refusal of the symlink, and the generation writes no
+/// part file.
+#[test]
+fn a_symlink_at_tmp_fails_the_delta_writes() {
+    let tmp = TmpDir::new("delta-tmp-symlink");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    let commit = ostrya(
+        &[
+            "commit",
+            &repo_arg,
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    std::fs::rename(repo.join("tmp"), base.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(base.join("elsewhere"), repo.join("tmp")).unwrap();
+    let refused = |run: &Run| {
+        assert_eq!(run.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "error: invalid format: tmp passes through a symlink; ostrya refuses a symlink in \
+             the repository\n"
+        );
+    };
+    refused(&ostrya(
+        &[
+            "static-delta",
+            &repo_arg,
+            "generate",
+            "--empty",
+            "--to",
+            &commit,
+        ],
+        None,
+        &[],
+    ));
+    let to = Checksum::from_hex(&commit).unwrap();
+    let delta = repo.join(ostrya::static_delta_relative_dir(None, &to));
+    assert!(!delta.join("0").exists());
+    assert!(!delta.join("superblock").exists());
+
+    // A delta from another run, for the reindex.
+    std::fs::remove_file(repo.join("tmp")).unwrap();
+    std::fs::rename(base.join("elsewhere"), repo.join("tmp")).unwrap();
+    ostrya(
+        &[
+            "static-delta",
+            &repo_arg,
+            "generate",
+            "--empty",
+            "--to",
+            &commit,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    std::fs::rename(repo.join("tmp"), base.join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(base.join("elsewhere"), repo.join("tmp")).unwrap();
+    refused(&ostrya(&["static-delta", &repo_arg, "reindex"], None, &[]));
+    assert!(std::fs::read_dir(base.join("elsewhere")).unwrap().all(|e| {
+        let name = e.unwrap().file_name();
+        name == "cache"
+    }));
+}
+
+/// A delta named in the repository is read with no symlink followed:
+///
+/// - `show` and `verify` of an absent delta keep the text of the `ostree`
+///   command, `openat(<path>): No such file or directory`.
+/// - A symlink at `deltas`, at the named fanout, or at `superblock` fails
+///   `show`, `verify`, `generate`, and `generate -n` at exit 1, and the
+///   target of the symlink does not change.
+#[test]
+fn a_named_delta_refuses_a_symlink_in_the_repository() {
+    let tmp = TmpDir::new("delta-named-symlink");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    let commit = ostrya(
+        &[
+            "commit",
+            &repo_arg,
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    let to = Checksum::from_hex(&commit).unwrap();
+    let relative = ostrya::static_delta_relative_dir(None, &to);
+    let show = || ostrya(&["static-delta", &repo_arg, "show", &commit], None, &[]);
+    let verify = || {
+        ostrya(
+            &[
+                "static-delta",
+                &repo_arg,
+                "verify",
+                "--sign-type=ed25519",
+                &commit,
+                ED25519_PUBLIC_B64,
+            ],
+            None,
+            &[],
+        )
+    };
+    let generate = |extra: &[&str]| {
+        let mut args = vec!["static-delta", repo_arg.as_str(), "generate", "--empty"];
+        args.extend_from_slice(extra);
+        args.extend_from_slice(&["--to", commit.as_str()]);
+        ostrya(&args, None, &[])
+    };
+
+    let absent = format!("error: openat({relative}/superblock): No such file or directory\n");
+    let run = show();
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stderr), absent);
+    let run = verify();
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "Verification fails\n");
+    assert_eq!(String::from_utf8_lossy(&run.stderr), absent);
+
+    generate(&[]).ok();
+    let delta = repo.join(&relative);
+    let outside = base.join("outside");
+    std::fs::rename(repo.join("deltas"), &outside).unwrap();
+    let fanout_rel = relative.rsplit_once('/').unwrap().0.to_owned();
+    let fanout_name = Path::new(&fanout_rel).file_name().unwrap().to_owned();
+    let snapshot = || describe_tree(&outside);
+    let before = snapshot();
+    let refused = |run: Run, shown: &str| {
+        assert_eq!(run.status.code(), Some(1), "{shown}");
+        let err = String::from_utf8_lossy(&run.stderr);
+        assert!(
+            err.contains(&format!("invalid format: {shown}"))
+                && err.contains(
+                    "passes through a symlink; ostrya refuses a symlink in the repository"
+                ),
+            "{shown}: {err}"
+        );
+    };
+
+    // A symlink at `deltas`, then at the fanout.
+    std::os::unix::fs::symlink(&outside, repo.join("deltas")).unwrap();
+    for shown in ["deltas", fanout_rel.as_str()] {
+        if shown != "deltas" {
+            std::fs::remove_file(repo.join("deltas")).unwrap();
+            std::fs::create_dir(repo.join("deltas")).unwrap();
+            std::os::unix::fs::symlink(outside.join(&fanout_name), repo.join(&fanout_rel)).unwrap();
+        }
+        refused(show(), shown);
+        refused(verify(), shown);
+        refused(generate(&[]), shown);
+        refused(generate(&["-n"]), shown);
+        assert_eq!(snapshot(), before, "{shown}");
+    }
+
+    // A symlink at `superblock`.
+    std::fs::remove_file(repo.join(&fanout_rel)).unwrap();
+    std::fs::remove_dir(repo.join("deltas")).unwrap();
+    std::fs::rename(&outside, repo.join("deltas")).unwrap();
+    std::fs::rename(delta.join("superblock"), base.join("superblock")).unwrap();
+    std::os::unix::fs::symlink(base.join("superblock"), delta.join("superblock")).unwrap();
+    let shown = format!("{relative}/superblock");
+    refused(show(), &shown);
+    refused(verify(), &shown);
+    refused(generate(&["-n"]), &shown);
+}
+
 /// Builds the two overlay sources of the composition cases. `t1` and `t2`
 /// share `f.txt` and `common/`, and each one has a directory that the other
 /// does not have. Returns the parent directory of both.
@@ -40718,9 +40986,6 @@ fn static_delta_list_matches_the_tool() {
     std::fs::create_dir(&part_only).unwrap();
     std::fs::write(part_only.join("0"), b"part").unwrap();
     std::fs::write(entry(Some(&to1), &to1), b"file").unwrap();
-    let dangling = entry(Some(&to2), &to2);
-    std::fs::create_dir(&dangling).unwrap();
-    std::os::unix::fs::symlink("nowhere", dangling.join("superblock")).unwrap();
 
     let lines = |run: &Run| {
         String::from_utf8_lossy(&run.stdout)
@@ -40737,6 +41002,22 @@ fn static_delta_list_matches_the_tool() {
     let mut expected = vec![c1.clone(), format!("{c1}-{c2}")];
     expected.sort();
     assert_eq!(lines(&port), expected);
+
+    // A dangling symlink at a superblock: the `ostree` command skips the
+    // entry. ostrya refuses the symlink at exit 1.
+    let dangling = entry(Some(&to2), &to2);
+    std::fs::create_dir(&dangling).unwrap();
+    std::os::unix::fs::symlink("nowhere", dangling.join("superblock")).unwrap();
+    let (port, tool) = both();
+    assert!(tool.status.success() && tool.stderr.is_empty());
+    assert_eq!(lines(&tool).len(), 2);
+    assert_eq!(port.status.code(), Some(1));
+    assert!(port.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&port.stderr).contains("superblock passes through a symlink"),
+        "{}",
+        String::from_utf8_lossy(&port.stderr)
+    );
 }
 
 /// The recorded `list` divergences do not change. The `ostree` command lists
@@ -40888,11 +41169,12 @@ fn summary_delta_entries(repo: &Path) -> Vec<String> {
 ///   commands do not list, index, or advertise the deltas behind it.
 /// - The scan skips a regular file directly under `deltas/`, and a symlink
 ///   loop at a delta path or used as a fanout.
-/// - The scan follows a symlink at `deltas` itself. The commands list, index,
-///   and advertise the deltas behind it.
-/// - A dangling symlink at `deltas` holds no delta.
 /// - A `superblock` that is a symlink loop and a regular file at `deltas`
 ///   cause a refusal of all three commands at exit 1.
+///
+/// A symlink at `deltas` itself is a divergence. The `ostree` command follows
+/// it, and a dangling symlink there holds no delta. ostrya refuses each
+/// symlink at `deltas` with all three commands at exit 1.
 ///
 /// The test carries `static-delta/list-skips-dir-without-superblock`.
 #[test]
@@ -40939,6 +41221,26 @@ fn static_delta_scan_follows_no_symlink_like_the_tool() {
             tool_args.extend_from_slice(&args[1..]);
             (ostrya(&port_args, None, &[]), ostree(&tool_args))
         };
+        if matches!(
+            case,
+            DeltaTreeCase::DeltasSymlink | DeltaTreeCase::DeltasDangling
+        ) {
+            for args in [
+                &["static-delta", "list"][..],
+                &["static-delta", "reindex"],
+                &["summary", "-u"],
+            ] {
+                let (port, tool) = run(args);
+                assert!(tool.status.success(), "{case:?} {args:?}");
+                assert_eq!(port.status.code(), Some(1), "{case:?} {args:?}");
+                assert!(
+                    String::from_utf8_lossy(&port.stderr)
+                        .contains("deltas passes through a symlink"),
+                    "{case:?} {args:?}"
+                );
+            }
+            continue;
+        }
         let (port, tool) = run(&["static-delta", "list"]);
         assert_eq!(port.status.code(), tool.status.code(), "{case:?} list");
         assert_eq!(lines(&port), lines(&tool), "{case:?} list");
@@ -40972,7 +41274,7 @@ fn static_delta_scan_follows_no_symlink_like_the_tool() {
         );
         let advertised = match case {
             DeltaTreeCase::LeafSymlink => 1,
-            DeltaTreeCase::FanoutSymlink | DeltaTreeCase::DeltasDangling => 0,
+            DeltaTreeCase::FanoutSymlink => 0,
             _ => 2,
         };
         assert_eq!(entries.len(), advertised, "{case:?} summary");
@@ -40985,9 +41287,11 @@ fn static_delta_scan_follows_no_symlink_like_the_tool() {
 /// - The sweep follows no symlink at a delta path or at a fanout, and it skips
 ///   a regular file directly under `deltas/`. The deltas behind a symlink
 ///   stay, and the run exits 0.
-/// - The sweep follows a symlink at `deltas` itself and removes the delta
-///   behind it.
-/// - A dangling symlink at `deltas` holds no delta, and the run exits 0.
+///
+/// A symlink at `deltas` itself is a divergence. The `ostree` command follows
+/// it and removes the delta behind it, and a dangling symlink there holds no
+/// delta. ostrya refuses each symlink at `deltas` at exit 1, and the target
+/// stays.
 #[test]
 fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
     if !ostree_available() {
@@ -41018,6 +41322,22 @@ fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
         let args = |repo_arg| ["prune", repo_arg, "--static-deltas-only", delete.as_str()];
         let port = ostrya(&args(port_arg.as_str()), None, &PRUNE_ENV);
         let tool = ostree_env(&args(tool_arg.as_str()), &PRUNE_ENV);
+        if matches!(
+            case,
+            DeltaTreeCase::DeltasSymlink | DeltaTreeCase::DeltasDangling
+        ) {
+            assert!(tool.status.success(), "{case:?}");
+            assert_eq!(port.status.code(), Some(1), "{case:?}");
+            assert!(
+                String::from_utf8_lossy(&port.stderr).contains("deltas passes through a symlink"),
+                "{case:?}"
+            );
+            if matches!(case, DeltaTreeCase::DeltasSymlink) {
+                let outside = port_repo.parent().unwrap().join("outside/deltas");
+                assert!(outside.join(pair_dir(&c1, &c2)).join("superblock").exists());
+            }
+            continue;
+        }
         assert_runs_agree(&port, &tool, &format!("prune ({case:?})"));
         port.ok();
         for dir in ["repo/deltas", "outside"] {
@@ -41029,11 +41349,6 @@ fn prune_static_delta_sweep_follows_no_symlink_like_the_tool() {
                 }
             };
             assert_eq!(at(&port_repo), at(&tool_repo), "{case:?} {dir}");
-        }
-        if matches!(case, DeltaTreeCase::DeltasSymlink) {
-            let deltas = port_repo.join("deltas");
-            assert!(deltas.join(scratch_dir(&c1)).join("superblock").exists());
-            assert!(!deltas.join(pair_dir(&c1, &c2)).exists());
         }
     }
 }
@@ -41053,11 +41368,12 @@ fn pair_dir(from: &str, to: &str) -> PathBuf {
     PathBuf::from(dir.strip_prefix("deltas/").unwrap())
 }
 
-/// `delete` agrees if `deltas` is a symlink. The command follows a symlink at
-/// `deltas`, removes the delta behind it, and keeps the link. A dangling
-/// symlink at `deltas` holds no delta, and both commands refuse at exit 1.
+/// A symlink at `deltas` is a divergence of `delete`. The `ostree` command
+/// follows it, removes the delta behind it, and keeps the link. A dangling
+/// symlink at `deltas` holds no delta, and it refuses at exit 1. ostrya
+/// refuses each symlink at `deltas` at exit 1, and the target stays.
 #[test]
-fn static_delta_delete_follows_a_deltas_symlink_like_the_tool() {
+fn static_delta_delete_refuses_a_deltas_symlink() {
     if !ostree_available() {
         return;
     }
@@ -41073,16 +41389,21 @@ fn static_delta_delete_follows_a_deltas_symlink_like_the_tool() {
     for case in [DeltaTreeCase::DeltasSymlink, DeltaTreeCase::DeltasDangling] {
         let port_repo = lay_delta_tree(base, &repo, &format!("{case:?}-port"), case, &c1, &c2);
         let tool_repo = lay_delta_tree(base, &repo, &format!("{case:?}-tool"), case, &c1, &c2);
-        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&name]);
-        assert_eq!(port.status.code(), tool.status.code(), "{case:?}");
         let outside = |repo: &Path| describe_tree(&repo.parent().unwrap().join("outside"));
-        assert_eq!(outside(&port_repo), outside(&tool_repo), "{case:?}");
+        let before = outside(&port_repo);
+        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&name]);
+        assert_eq!(port.status.code(), Some(1), "{case:?}");
+        assert!(
+            String::from_utf8_lossy(&port.stderr).contains("deltas passes through a symlink"),
+            "{case:?}"
+        );
+        assert_eq!(outside(&port_repo), before, "{case:?}");
         for repo in [&port_repo, &tool_repo] {
             assert!(repo.join("deltas").symlink_metadata().unwrap().is_symlink());
         }
         if matches!(case, DeltaTreeCase::DeltasSymlink) {
-            port.ok();
-            let deltas = port_repo.join("deltas");
+            tool.ok();
+            let deltas = tool_repo.join("deltas");
             assert!(deltas.join(scratch_dir(&c1)).join("superblock").exists());
             assert!(!deltas.join(pair_dir(&c1, &c2)).exists());
         } else {
@@ -41226,10 +41547,10 @@ fn static_delta_delete_matches_the_tool() {
 /// - no argument
 /// - a name that the parser refuses
 /// - a path
-/// - an absent delta, which includes a dangling symlink at the delta path and
-///   a missing `deltas/`
+/// - an absent delta, which includes a missing `deltas/`
 ///
-/// An extra positional and a symlink loop are the recorded divergences.
+/// An extra positional, a dangling symlink, and a symlink loop at the delta
+/// path are the recorded divergences: ostrya removes the symlink and exits 0.
 /// The test carries `static-delta/delete-absent`.
 #[test]
 fn static_delta_delete_refusals_match_the_tool() {
@@ -41285,44 +41606,23 @@ fn static_delta_delete_refusals_match_the_tool() {
     let port = agree(&[&c2]);
     assert_eq!(String::from_utf8_lossy(&port.stderr), not_found);
 
-    // A dangling symlink at the delta path is an absent delta, and the symlink
-    // stays.
+    // A dangling symlink and a symlink loop at the delta path: the `ostree`
+    // command follows the link, finds no delta or fails, and keeps the link.
+    // ostrya removes the link and exits 0.
     let scratch2 = ostrya::static_delta_relative_dir(None, &to2);
-    for repo in [&port_repo, &tool_repo] {
-        let link = repo.join(&scratch2);
-        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink("nowhere", &link).unwrap();
-    }
-    let port = agree(&[&c2]);
-    assert_eq!(String::from_utf8_lossy(&port.stderr), not_found);
-    for repo in [&port_repo, &tool_repo] {
-        assert!(std::fs::symlink_metadata(repo.join(&scratch2)).is_ok());
-        std::fs::remove_file(repo.join(&scratch2)).unwrap();
-    }
-
-    // A symlink loop at the delta path fails in both commands, with different
-    // messages.
     let leaf = Path::new(&scratch2).file_name().unwrap().to_owned();
-    for repo in [&port_repo, &tool_repo] {
-        std::os::unix::fs::symlink(&leaf, repo.join(&scratch2)).unwrap();
-    }
-    let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&c2]);
-    for run in [&port, &tool] {
-        assert_eq!(run.status.code(), Some(1));
-        assert!(run.stdout.is_empty());
-    }
-    assert!(
-        String::from_utf8_lossy(&tool.stderr).contains("Too many levels of symbolic links"),
-        "{}",
-        String::from_utf8_lossy(&tool.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&port.stderr).starts_with("error: i/o error: "),
-        "{}",
-        String::from_utf8_lossy(&port.stderr)
-    );
-    for repo in [&port_repo, &tool_repo] {
-        std::fs::remove_file(repo.join(&scratch2)).unwrap();
+    for target in [Path::new("nowhere"), Path::new(&leaf)] {
+        for repo in [&port_repo, &tool_repo] {
+            let link = repo.join(&scratch2);
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(target, &link).unwrap();
+        }
+        let (port, tool) = run_delta_delete(&port_repo, &tool_repo, &[&c2]);
+        port.ok();
+        assert_eq!(tool.status.code(), Some(1), "{target:?}");
+        assert!(std::fs::symlink_metadata(port_repo.join(&scratch2)).is_err());
+        assert!(std::fs::symlink_metadata(tool_repo.join(&scratch2)).is_ok());
+        std::fs::remove_file(tool_repo.join(&scratch2)).unwrap();
     }
 
     // An extra positional: the `ostree` command ignores it and removes the
@@ -44416,7 +44716,9 @@ fn static_delta_reindex_to_matches_the_tool() {
 ///
 /// Both commands exit 1 with different messages for a `--to` with no value.
 /// This is also true for a directory at the index path, of a target with a
-/// delta and of a target with none.
+/// delta and of a target with none, and for a file or a symlink to a file at
+/// the fanout. A dangling symlink at the fanout is a divergence: the `ostree`
+/// command exits 0, and ostrya refuses the symlink at exit 1.
 #[test]
 fn static_delta_reindex_to_refusals_match_the_tool() {
     if !ostree_available() {
@@ -44531,15 +44833,18 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
     // - a symlink to a regular file at the fanout
     // - a regular file at `delta-indexes`
     // Both commands refuse at exit 1 with different messages. A dangling
-    // symlink at the fanout counts as an absent file, and both exit 0.
+    // symlink at the fanout counts as an absent file in the `ostree` command,
+    // which exits 0. ostrya refuses each symlink in the repository at exit 1.
     let to_arg = format!("--to={c1}");
     let fanout_rel = format!("delta-indexes/{}", &index_rel(c1)[..2]);
     type Setup = fn(&Path, &str);
-    let cases: [(&str, Setup, bool); 4] = [
+    let refused = "passes through a symlink; ostrya refuses a symlink in the repository";
+    let cases: [(&str, Setup, bool, &str); 4] = [
         (
             "a file at the fanout",
             |side, fanout| std::fs::write(side.join(fanout), b"x").unwrap(),
             false,
+            "is not a directory",
         ),
         (
             "a symlink to a file at the fanout",
@@ -44548,11 +44853,13 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
                 std::os::unix::fs::symlink("../regular", side.join(fanout)).unwrap();
             },
             false,
+            refused,
         ),
         (
             "a dangling symlink at the fanout",
             |side, fanout| std::os::unix::fs::symlink("../absent", side.join(fanout)).unwrap(),
             true,
+            refused,
         ),
         (
             "a file at delta-indexes",
@@ -44561,9 +44868,10 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
                 std::fs::write(side.join("delta-indexes"), b"x").unwrap();
             },
             false,
+            "error: invalid format: delta-indexes is not a directory",
         ),
     ];
-    for (label, setup, succeeds) in cases {
+    for (label, setup, tool_succeeds, port_text) in cases {
         for side in [&port, &tool] {
             let fanout = side.join(&fanout_rel);
             match std::fs::symlink_metadata(&fanout) {
@@ -44575,23 +44883,19 @@ fn static_delta_reindex_to_refusals_match_the_tool() {
             setup(side, &fanout_rel);
         }
         let (port_run, tool_run) = run_reindex_both(&port, &tool, &["reindex", &to_arg]);
-        if succeeds {
-            assert_runs_agree(&port_run, &tool_run, label);
-            assert!(port_run.status.success(), "{label}: the port failed");
+        assert_eq!(port_run.status.code(), Some(1), "{label}");
+        let port_err = String::from_utf8_lossy(&port_run.stderr);
+        assert!(port_err.contains(port_text), "{label}: {port_err}");
+        if tool_succeeds {
+            assert!(tool_run.status.success(), "{label}: the tool failed");
             continue;
         }
-        assert_eq!(
-            (port_run.status.code(), tool_run.status.code()),
-            (Some(1), Some(1)),
-            "{label}"
-        );
+        assert_eq!(tool_run.status.code(), Some(1), "{label}");
         let tool_err = String::from_utf8_lossy(&tool_run.stderr);
         assert!(
             tool_err.starts_with("error: unlink(") && tool_err.contains("Not a directory"),
             "{label}: {tool_err}"
         );
-        let port_err = String::from_utf8_lossy(&port_run.stderr);
-        assert!(port_err.contains("Not a directory"), "{label}: {port_err}");
     }
 }
 

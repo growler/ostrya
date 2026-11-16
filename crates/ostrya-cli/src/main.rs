@@ -60,16 +60,16 @@ use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionPullOptions, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
     ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions,
-    DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide, Ed25519Signer,
-    Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult, FsckBindingError,
-    FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, KeyFile,
-    MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref, RefAlias, RefNamespace,
-    RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode, RepoTree, Result, Signer,
-    Summary, SummaryOptions, TarExportOptions, TarImportOptions, TimestampCheck, Transaction,
-    TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome, VerityPolicy, WeakRefFilter,
-    Xattrs, from_bytes, load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated,
-    validate_refspec,
+    DeltaPartStats, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
+    FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions,
+    PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref,
+    RefAlias, RefNamespace, RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode,
+    RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions, TarImportOptions,
+    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
+    VerityPolicy, WeakRefFilter, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
+    to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -5848,8 +5848,8 @@ async fn run(repo: RepoArgs<'_>, verbose: bool, command: Command) -> Result<()> 
             let Some(sub) = args.command else {
                 exit_with_error(name, "No command specified");
             };
-            let (repo, path) = resolve_repo(repo, verbose, name).await;
-            static_delta(repo, path, sub).await
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            static_delta(repo, sub).await
         }
         Command::Pull(args) => {
             // The low-speed values are read with the options, so the error for
@@ -8126,7 +8126,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
 /// - delete one delta
 /// - list the index cache
 /// - verify the signatures of one delta
-async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaCommand) -> Result<()> {
+async fn static_delta(repo: Repo, command: StaticDeltaCommand) -> Result<()> {
     match command {
         StaticDeltaCommand::List => {
             let names = repo.list_static_deltas().await?;
@@ -8139,7 +8139,7 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
             Ok(())
         }
         StaticDeltaCommand::ApplyOffline(apply) => delta_apply_offline(&repo, apply).await,
-        StaticDeltaCommand::Generate(generate) => delta_generate(&repo, &repo_path, generate).await,
+        StaticDeltaCommand::Generate(generate) => delta_generate(&repo, generate).await,
         StaticDeltaCommand::Reindex(args) => match args.to {
             None => repo.reindex_static_deltas().await,
             Some(rev) => {
@@ -8147,7 +8147,7 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
                 repo.reindex_static_deltas_to(&to).await
             }
         },
-        StaticDeltaCommand::Show { delta } => delta_show(&repo_path, delta).await,
+        StaticDeltaCommand::Show { delta } => delta_show(&repo, delta).await,
         StaticDeltaCommand::Delete { delta } => delta_delete(&repo, delta).await,
         StaticDeltaCommand::Indexes => {
             let indexes = repo.list_static_delta_indexes().await?;
@@ -8159,7 +8159,7 @@ async fn static_delta(repo: Repo, repo_path: PathBuf, command: StaticDeltaComman
             }
             Ok(())
         }
-        StaticDeltaCommand::Verify(args) => delta_verify(&repo_path, args).await,
+        StaticDeltaCommand::Verify(args) => delta_verify(&repo, args).await,
     }
 }
 
@@ -8192,7 +8192,8 @@ fn parse_delta_name(arg: &str) -> std::result::Result<(Option<Checksum>, Checksu
     }
 }
 
-/// The files of a `static-delta` argument, and their names in the refusals.
+/// The files of a `static-delta` argument that is a path, and their names in
+/// the refusals.
 struct DeltaFiles {
     superblock: PathBuf,
     superblock_shown: String,
@@ -8200,13 +8201,70 @@ struct DeltaFiles {
     parts_shown: String,
 }
 
-/// Resolves a `static-delta` argument to its files.
+/// A `static-delta` argument: the path of a superblock file, or the name of a
+/// delta in the `deltas/` tree of the repository.
+enum DeltaArg {
+    /// A superblock file and the directory of its parts.
+    Path(DeltaFiles),
+    /// A delta of the repository. `shown` is its directory, relative to the
+    /// repository root.
+    Name {
+        from: Option<Checksum>,
+        to: Checksum,
+        shown: String,
+    },
+}
+
+impl DeltaArg {
+    /// Returns the name of the superblock file in a refusal.
+    fn superblock_shown(&self) -> String {
+        match self {
+            DeltaArg::Path(files) => files.superblock_shown.clone(),
+            DeltaArg::Name { shown, .. } => format!("{shown}/superblock"),
+        }
+    }
+
+    /// Returns the name of the file of part `index` in a refusal.
+    fn part_shown(&self, index: usize) -> String {
+        match self {
+            DeltaArg::Path(files) => format!("{}/{index}", files.parts_shown),
+            DeltaArg::Name { shown, .. } => format!("{shown}/{index}"),
+        }
+    }
+
+    /// Reads and parses the superblock. A delta of the repository is read
+    /// with no symlink followed.
+    async fn read(&self, repo: &Repo) -> Result<DeltaSuperblock> {
+        match self {
+            DeltaArg::Path(files) => DeltaSuperblock::read(&files.superblock).await,
+            DeltaArg::Name { from, to, .. } => repo.read_static_delta(from.as_ref(), to).await,
+        }
+    }
+
+    /// Reads the statistics of part `index` of the superblock `sb`.
+    async fn part_stats(
+        &self,
+        repo: &Repo,
+        sb: &DeltaSuperblock,
+        index: usize,
+    ) -> Result<DeltaPartStats> {
+        match self {
+            DeltaArg::Path(files) => sb.part_stats(index, &files.parts).await,
+            DeltaArg::Name { from, to, .. } => {
+                repo.static_delta_part_stats(from.as_ref(), to, sb, index)
+                    .await
+            }
+        }
+    }
+}
+
+/// Resolves a `static-delta` argument.
 ///
 /// An argument that holds `/` is the path of a superblock file. Its parts are
 /// read from the directory that holds it. Any other argument is a delta name,
 /// read under the `deltas/` tree of the repository. If the parser refuses a
 /// name, the result is `Err` with the text of the parser.
-fn resolve_delta_arg(repo_path: &Path, arg: &str) -> std::result::Result<DeltaFiles, String> {
+fn resolve_delta_arg(arg: &str) -> std::result::Result<DeltaArg, String> {
     if arg.contains('/') {
         let superblock = PathBuf::from(arg);
         let parts = superblock
@@ -8214,28 +8272,25 @@ fn resolve_delta_arg(repo_path: &Path, arg: &str) -> std::result::Result<DeltaFi
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or(Path::new("."))
             .to_owned();
-        return Ok(DeltaFiles {
+        return Ok(DeltaArg::Path(DeltaFiles {
             superblock_shown: arg.to_owned(),
             parts_shown: parts.display().to_string(),
             superblock,
             parts,
-        });
+        }));
     }
     let (from, to) = parse_delta_name(arg)?;
-    let relative = ostrya::static_delta_relative_dir(from.as_ref(), &to);
-    Ok(DeltaFiles {
-        superblock: repo_path.join(&relative).join("superblock"),
-        superblock_shown: format!("{relative}/superblock"),
-        parts: repo_path.join(&relative),
-        parts_shown: relative,
-    })
+    let shown = ostrya::static_delta_relative_dir(from.as_ref(), &to);
+    Ok(DeltaArg::Name { from, to, shown })
 }
 
 /// Returns the words of the `ostree` command for a failed delta file read.
 ///
 /// For a system error, the text is `Is a directory` for a directory, and
-/// `openat(<path>): <reason>` for every other system error. For any other
-/// error, the result is `None`.
+/// `openat(<path>): <reason>` for every other system error. An absent file of
+/// a delta of the repository, which the library gives with no errno, gives
+/// `openat(<path>): No such file or directory`. For any other error, the
+/// result is `None`.
 fn delta_read_text(err: &Error, shown: &str) -> Option<String> {
     match err {
         Error::Io(io) if io.kind() == std::io::ErrorKind::IsADirectory => {
@@ -8243,6 +8298,9 @@ fn delta_read_text(err: &Error, shown: &str) -> Option<String> {
         }
         Error::Io(io) if io.raw_os_error().is_some() => {
             Some(format!("openat({shown}): {}", io_reason(io)))
+        }
+        Error::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("openat({shown}): No such file or directory"))
         }
         _ => None,
     }
@@ -8275,14 +8333,15 @@ async fn delta_delete(repo: &Repo, delta: Option<String>) -> Result<()> {
 ///
 /// The command prints one line at a time, so the lines before a refusal reach
 /// standard output.
-async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
+async fn delta_show(repo: &Repo, delta: Option<String>) -> Result<()> {
     let Some(arg) = delta else {
         exit_error("DELTA must be specified");
     };
-    let files = resolve_delta_arg(repo_path, &arg).unwrap_or_else(|text| exit_error(&text));
-    let sb = DeltaSuperblock::read(&files.superblock)
+    let files = resolve_delta_arg(&arg).unwrap_or_else(|text| exit_error(&text));
+    let sb = files
+        .read(repo)
         .await
-        .map_err(|err| delta_read_error(err, &files.superblock_shown))?;
+        .map_err(|err| delta_read_error(err, &files.superblock_shown()))?;
 
     println!("Delta: {arg}");
     println!("Signed: {}", if sb.is_signed() { "yes" } else { "no" });
@@ -8319,10 +8378,10 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
             part.size(),
             part.uncompressed_size()
         );
-        let stats = sb
-            .part_stats(i, &files.parts)
+        let stats = files
+            .part_stats(repo, &sb, i)
             .await
-            .map_err(|err| delta_read_error(err, &format!("{}/{i}", files.parts_shown)))?;
+            .map_err(|err| delta_read_error(err, &files.part_shown(i)))?;
         println!(
             "PartPayload{i}: nmodes={} nxattrs={} blobsize={} opsize={}",
             stats.modes, stats.xattrs, stats.blob_size, stats.ops_size
@@ -8414,7 +8473,7 @@ fn verification_fails(text: &str) -> ! {
 /// Every failure from step 4 on prints `Verification fails` first. The first
 /// engine that fails gives the failure line. If each engine passes, the
 /// command prints `Verification OK` one time.
-async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
+async fn delta_verify(repo: &Repo, args: DeltaVerifyArgs) -> Result<()> {
     let Some(arg) = args.delta else {
         exit_error("DELTA must be specified");
     };
@@ -8434,10 +8493,10 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
         summary: false,
         gpg: false,
     })?;
-    let files = resolve_delta_arg(repo_path, &arg).unwrap_or_else(|text| verification_fails(&text));
-    let sb = match DeltaSuperblock::read(&files.superblock).await {
+    let files = resolve_delta_arg(&arg).unwrap_or_else(|text| verification_fails(&text));
+    let sb = match files.read(repo).await {
         Ok(sb) => sb,
-        Err(err) => match delta_read_text(&err, &files.superblock_shown) {
+        Err(err) => match delta_read_text(&err, &files.superblock_shown()) {
             Some(text) => verification_fails(&text),
             None => {
                 println!("Verification fails");
@@ -9060,7 +9119,7 @@ fn format_delta_size(n: u64) -> String {
 ///
 /// If signing keys are given, the delta is signed. The `--sign-type` values
 /// are read first.
-async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) -> Result<()> {
+async fn delta_generate(repo: &Repo, args: DeltaGenerateArgs) -> Result<()> {
     let engines = match args.key_types.engines(sign_type_from_name, false) {
         Ok(engines) => engines,
         Err(message) => exit_error(&message),
@@ -9090,18 +9149,13 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
 
     // The `ostree` command reads the superblock of the delta in the
     // repository, at any output location of the run.
-    if args.if_not_exists {
-        let superblock = repo_path
-            .join(ostrya::static_delta_relative_dir(from.as_ref(), &to))
-            .join("superblock");
-        if superblock.try_exists().map_err(Error::Io)? {
-            let name = match &from {
-                Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
-                None => to.to_hex(),
-            };
-            println!("Delta {name} already exists.");
-            return Ok(());
-        }
+    if args.if_not_exists && repo.has_static_delta(from.as_ref(), &to).await? {
+        let name = match &from {
+            Some(from) => format!("{}-{}", from.to_hex(), to.to_hex()),
+            None => to.to_hex(),
+        };
+        println!("Delta {name} already exists.");
+        return Ok(());
     }
 
     // The byte order starts from the host order, as the byte order of the

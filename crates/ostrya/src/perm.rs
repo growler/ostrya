@@ -21,47 +21,18 @@
 //! entry that exists before the call can belong to another uid, and then
 //! `fchmod` returns `EPERM`.
 //!
-//! [`force_created_dir`] opens the entry and calls `fchmod` on the descriptor.
-//! Linux does not support `AT_SYMLINK_NOFOLLOW` in `fchmodat`, so a chmod by
-//! path has a symlink-swap race. An `openat` with `O_NOFOLLOW` and then an
-//! `fchmod` on the descriptor has no such race.
+//! [`force_created_mode`] calls `fchmod` on an open descriptor. Linux does not
+//! support `AT_SYMLINK_NOFOLLOW` in `fchmodat`, so a chmod by path has a
+//! symlink-swap race. An `fchmod` on the descriptor has no such race.
 
 use std::os::fd::AsFd;
 
 use ostrya_core::RepoMode;
-use rustix::fs::{Mode, OFlags};
-use rustix::path::Arg;
-
-/// The mode forced on a directory created inside a `bare-user-shared`
-/// repository.
-pub(crate) const SHARED_DIR_MODE: u32 = 0o2770;
+use rustix::fs::Mode;
 
 /// The mode forced on a regular file created inside a `bare-user-shared`
 /// repository outside the object store, such as a `.commitpartial` marker.
 pub(crate) const SHARED_FILE_MODE: u32 = 0o644;
-
-/// Forces [`SHARED_DIR_MODE`] on the directory that the calling code created
-/// at `path` under `dir`.
-///
-/// Call this on the arm of the create that made the directory. In all other
-/// repository modes, the function returns at once.
-pub(crate) fn force_created_dir<Fd: AsFd, P: Arg>(
-    dir: Fd,
-    path: P,
-    repo_mode: RepoMode,
-) -> std::io::Result<()> {
-    if repo_mode != RepoMode::BareUserShared {
-        return Ok(());
-    }
-    let fd = rustix::fs::openat(
-        dir,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    rustix::fs::fchmod(&fd, Mode::from_raw_mode(SHARED_DIR_MODE))?;
-    Ok(())
-}
 
 /// Forces `bits` on an open descriptor of an entry that the calling code
 /// created.

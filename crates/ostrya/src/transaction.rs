@@ -12,7 +12,6 @@
 use std::collections::{BTreeSet, HashMap};
 #[cfg(test)]
 use std::os::fd::AsFd;
-use std::os::fd::BorrowedFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -440,14 +439,6 @@ impl Transaction {
             .as_ref()
             .expect("staging directory present during the transaction")
             .dir()
-    }
-
-    /// Returns the descriptor of the staging directory, where the objects go.
-    pub(crate) fn staging_fd(&self) -> BorrowedFd<'_> {
-        self.staging
-            .as_ref()
-            .expect("staging directory present during the transaction")
-            .dir_fd()
     }
 
     /// Runs `f` on the blocking pool as a job of this transaction, and

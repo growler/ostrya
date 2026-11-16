@@ -897,7 +897,10 @@ fn reindexing_one_target_refuses_a_file_at_the_fanout() {
         std::fs::create_dir_all(fanout.parent().unwrap()).unwrap();
         std::fs::write(&fanout, b"x").unwrap();
         let err = repo.reindex_static_deltas_to(&commit).await.unwrap_err();
-        assert!(matches!(err, Error::Io(_)), "unexpected error: {err:?}");
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m.ends_with("is not a directory")),
+            "unexpected error: {err:?}"
+        );
         fanout
     });
     assert_eq!(
@@ -1020,7 +1023,8 @@ fn reindexing_refuses_an_oversized_superblock() {
             .await
             .expect_err("an oversized superblock must fail the index pass");
         assert!(
-            err.to_string().contains("exceeds the size ceiling"),
+            matches!(&err, Error::InvalidFormat(m)
+                if m.ends_with("superblock is larger than its cap of 134217728 bytes")),
             "unexpected error for an oversized superblock: {err}"
         );
     });
@@ -3568,4 +3572,109 @@ fn a_delta_of_commits_without_an_image_keeps_its_bytes() {
         );
         assert_eq!(parts, &want_parts, "a part payload of {name} changed");
     }
+}
+
+/// The environment variable that marks the child of
+/// [`generate_on_another_file_system_fails_before_it_removes_a_file`]. Its
+/// value is the scratch directory of the parent.
+const XDEV_CHILD: &str = "OSTRYA_DELTA_XDEV_CHILD";
+
+/// Returns each file of the delta directory `dir`, sorted, with its bytes.
+fn delta_files(dir: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            (name, std::fs::read(entry.path()).unwrap())
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A delta directory on another file system than `tmp/` fails the
+/// generation with `EXDEV` before the removal of the old superblock, so the
+/// previous delta stays whole.
+///
+/// The child half runs in a new user and mount namespace, with a `tmpfs` on
+/// `deltas/` that holds a copy of the previous delta. The test skips if the
+/// host grants no such namespace or no `tmpfs` mount.
+#[test]
+fn generate_on_another_file_system_fails_before_it_removes_a_file() {
+    if let Some(base) = std::env::var_os(XDEV_CHILD) {
+        let base = PathBuf::from(base);
+        let src = base.join("src");
+        let to = std::fs::read_to_string(base.join("commit")).unwrap();
+        let to = Checksum::from_hex(&to).unwrap();
+        let dir = src.join(static_delta_relative_dir(None, &to));
+        let before = delta_files(&dir);
+        assert!(before.iter().any(|(name, _)| name == "superblock"));
+        block_on(async {
+            let repo = Repo::open(&src).await.unwrap();
+            let err = repo
+                .generate_static_delta(None, &to, &DeltaOptions::default())
+                .await
+                .unwrap_err();
+            // 18 is `EXDEV`.
+            assert!(
+                matches!(&err, Error::Io(e) if e.raw_os_error() == Some(18)),
+                "{err:?}"
+            );
+            assert_eq!(repo.list_static_deltas().await.unwrap(), [to.to_hex()]);
+        });
+        assert_eq!(delta_files(&dir), before);
+        std::fs::write(base.join("ran"), b"").unwrap();
+        return;
+    }
+
+    let probe = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "true"])
+        .output();
+    if !probe.is_ok_and(|out| out.status.success()) {
+        eprintln!("skipped: the host grants no user and mount namespace");
+        return;
+    }
+    let tmp = TmpDir::new("gen-xdev");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a.txt"), b"one\n").unwrap();
+    let src = base.join("src");
+    block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let commit = commit_tree(&repo, &tree, None).await;
+        repo.generate_static_delta(None, &commit, &DeltaOptions::default())
+            .await
+            .unwrap();
+        std::fs::write(base.join("commit"), commit.to_hex()).unwrap();
+    });
+
+    let script = "cp -a \"$1/src/deltas\" \"$1/saved\" || exit 1; \
+                  mount -t tmpfs tmpfs \"$1/src/deltas\" || exit 77; \
+                  cp -a \"$1/saved/.\" \"$1/src/deltas/\" || exit 1; \
+                  exec \"$2\" --exact \"$3\" --test-threads=1";
+    let output = Command::new("unshare")
+        .args(["--user", "--map-root-user", "--mount", "--", "sh", "-c"])
+        .arg(script)
+        .arg("sh")
+        .arg(base)
+        .arg(std::env::current_exe().unwrap())
+        .arg("generate_on_another_file_system_fails_before_it_removes_a_file")
+        .env(XDEV_CHILD, base)
+        .output()
+        .unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if output.status.code() == Some(77) {
+        eprintln!("skipped: no tmpfs mount in the namespace:\n{log}");
+        return;
+    }
+    assert!(output.status.success(), "the child failed: {log}");
+    assert!(base.join("ran").is_file(), "the child ran no test:\n{log}");
 }

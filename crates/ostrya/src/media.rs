@@ -32,6 +32,7 @@ use crate::pull::{
 use crate::refs::ref_relpath;
 use crate::related::RelatedRule;
 use crate::repo::{CreateOptions, Repo};
+use crate::repo_fs;
 use crate::summary::{OSTREE_METADATA_REF, SummaryOptions};
 use crate::verify::PullTrust;
 
@@ -757,7 +758,8 @@ impl Repo {
 /// repository `source`, and creates the directory `.ostree` in `mount` if
 /// it does not exist, with the mode `0777` less the file-creation mask.
 fn make_media_dir_blocking(source: &Repo, mount: &Path) -> Result<()> {
-    let own = find::identity(source.repo_fd())?;
+    let stat = repo_fs::stat_fd(source.repo_fd())?;
+    let own = (stat.dev, stat.ino);
     let fd = rustix::fs::open(
         mount,
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,

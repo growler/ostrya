@@ -1321,6 +1321,38 @@ impl Repo {
         .await
     }
 
+    /// Returns `true` if an entry stands at the ref path of `r`, or above it.
+    ///
+    /// The path is the path where [`resolve_ref_tip`](Repo::resolve_ref_tip)
+    /// reads the ref. The call reads the type of the entry with one `lstat`
+    /// relative to the repository root, and follows no symlink at any
+    /// component of the path. It reads no content, and does not check the
+    /// alias rule.
+    ///
+    /// The result is `true` for a ref file, an alias (also a dangling one), a
+    /// directory, or a special file at the path. It is also `true` for a file,
+    /// a special file, or a symlink at a component above the path, for
+    /// example a symlink at `refs/heads`. The result is `false` if a
+    /// component of the path is absent.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if the ref fails [`Ref::validate`]. The
+    ///   call reads no file.
+    /// - [`Error::Io`] if the `lstat` fails for a reason other than an absent
+    ///   entry, for example on a directory that the process cannot search.
+    pub async fn ref_path_has_entry(&self, r: &Ref) -> Result<bool> {
+        let relpath = ref_relpath(self.config().collection_id(), r)?;
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            Ok(!matches!(
+                lstat_ref_state(repo.root_dir(), &relpath)?,
+                Some(RefFileState::Absent)
+            ))
+        })
+        .await
+    }
+
     /// Writes one ref outside a transaction.
     ///
     /// If `checksum` is `None`, the call removes the ref file. The removal of

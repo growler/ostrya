@@ -116,6 +116,7 @@ impl RepoDir {
     /// A call on a handle other than the root is a defect of the caller: it
     /// fails a debug assertion, and gives an `InvalidInput` error in a release
     /// build.
+    #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
     pub(crate) fn open_root_file(&self, file: RootFile) -> Result<Opened, FsError> {
         require(
             (self.kind == RepoLayout::Root).then_some(()),

@@ -246,8 +246,9 @@ OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
 
 The module `repo_fs` of `ostrya` is `crates/ostrya/src/repo_fs.rs` and the
 files in `crates/ostrya/src/repo_fs/`. It holds the primitives for the
-low-level file operations on a repository. Each primitive applies the same
-rules for symlinks, FIFOs, file types, size caps, errors, modes, and sync.
+low-level file operations on a repository, on the paths that a config names,
+and on the remotes directory. Each primitive applies the same rules for
+symlinks, FIFOs, file types, size caps, errors, modes, and sync.
 
 All access to the repository content must go through the API of `repo_fs`.
 This applies to each file operation of non-test code on a path in scope. No
@@ -261,10 +262,20 @@ The paths in scope are:
   a local pull reads;
 - the paths that a config names, the remotes directory, and the files in it.
 
-These paths are outside the scope: the target tree of a checkout, the source
-tree of a commit or an ingest, the files that a caller names by a path or a
-descriptor, `gpg-homedir` of `[ex-ostrya key]`, and the mount scan of
-`media/find.rs`.
+These paths and crates are outside the scope:
+
+- the target tree of a checkout, and the source tree of a commit or an
+  ingest;
+- the files that a caller names by a path or a descriptor;
+- `gpg-homedir` of `[ex-ostrya key]`;
+- the mount scan of `media/find.rs`;
+- the repository resolution of the `ostrya` command: `find_repo` and
+  `is_system_repo` in `crates/ostrya-cli/src/main.rs`;
+- the worker of `ostrya-mount`: its opens of the repository root and of
+  `objects`, which it gives to `open_tree` as the sources of a mount, and
+  its mount checks on these descriptors (`fstatfs`, the mount id of
+  `statx`, and `fstat`);
+- `ostrya-conformance`, a black-box harness that does not link `ostrya`.
 
 Each change to `repo_fs` needs the explicit confirmation of the maintainer
 before the edit. This rule applies to each change to the files of the

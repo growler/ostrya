@@ -12,8 +12,6 @@
 //! conversions: [`FsResultExt::optional_ref`] and
 //! [`FsError::into_object_error`].
 
-#![allow(dead_code)]
-
 use std::fmt;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::sync::{Arc, OnceLock};
@@ -274,11 +272,8 @@ pub(crate) enum TempHome {
 /// the umask has no effect.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LayoutRules {
-    /// The path relative to `base`, or `None` for a directory with no fixed
-    /// name.
+    /// The path, or `None` for a directory with no fixed name.
     pub(crate) path: Option<&'static str>,
-    /// The kind of the parent directory, or `None` for the root.
-    pub(crate) base: Option<RepoLayout>,
     /// The mode of the directory itself.
     pub(crate) dir_mode: u32,
     /// The mode of each directory that a later write makes below the
@@ -299,6 +294,7 @@ pub(crate) struct LayoutRules {
     /// directory.
     pub(crate) init_children: &'static [&'static str],
     /// `true` if the create of the repository makes the directory.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) created_at_init: bool,
 }
 
@@ -308,7 +304,6 @@ impl RepoLayout {
         match self {
             RepoLayout::Root => LayoutRules {
                 path: None,
-                base: None,
                 dir_mode: 0o775,
                 below_mode: None,
                 file_mode: None,
@@ -320,7 +315,6 @@ impl RepoLayout {
             },
             RepoLayout::Objects => LayoutRules {
                 path: Some("objects"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o775,
                 below_mode: Some(0o777),
                 file_mode: None,
@@ -332,7 +326,6 @@ impl RepoLayout {
             },
             RepoLayout::Staging => LayoutRules {
                 path: None,
-                base: Some(RepoLayout::Tmp),
                 dir_mode: 0o775,
                 below_mode: None,
                 file_mode: None,
@@ -344,7 +337,6 @@ impl RepoLayout {
             },
             RepoLayout::Tmp => LayoutRules {
                 path: Some("tmp"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o775,
                 below_mode: Some(0o775),
                 file_mode: Some(0o600),
@@ -356,7 +348,6 @@ impl RepoLayout {
             },
             RepoLayout::Refs => LayoutRules {
                 path: Some("refs"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o775,
                 below_mode: Some(0o777),
                 file_mode: Some(0o644),
@@ -368,7 +359,6 @@ impl RepoLayout {
             },
             RepoLayout::State => LayoutRules {
                 path: Some("state"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o775,
                 below_mode: None,
                 file_mode: Some(0o644),
@@ -380,7 +370,6 @@ impl RepoLayout {
             },
             RepoLayout::Extensions => LayoutRules {
                 path: Some("extensions"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o775,
                 below_mode: Some(0o775),
                 file_mode: Some(0o644),
@@ -392,7 +381,6 @@ impl RepoLayout {
             },
             RepoLayout::Deltas => LayoutRules {
                 path: Some("deltas"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o755,
                 below_mode: Some(0o755),
                 file_mode: Some(0o644),
@@ -404,7 +392,6 @@ impl RepoLayout {
             },
             RepoLayout::DeltaIndexes => LayoutRules {
                 path: Some("delta-indexes"),
-                base: Some(RepoLayout::Root),
                 dir_mode: 0o755,
                 below_mode: Some(0o755),
                 file_mode: Some(0o644),
@@ -433,6 +420,7 @@ pub(crate) enum RootFile {
     UpdateLock,
     /// A keyring file, such as `<remote>.trustedkeys.gpg` or `gpgkeys.gpg`.
     /// The payload is the file name, which is one path component.
+    #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
     Keyring(String),
 }
 
@@ -473,12 +461,6 @@ impl RootFile {
                 0o644
             }
         }
-    }
-
-    /// Returns `true` if a read of the file follows a symlink at the file
-    /// name. A keyring file can be a symlink. Each other root file cannot.
-    pub(crate) fn follows_leaf_symlink(&self) -> bool {
-        matches!(self, RootFile::Keyring(_))
     }
 }
 
@@ -583,6 +565,7 @@ impl RepoDir {
 
     /// Returns the mode of the repository, or `None` if the handle has no
     /// mode.
+    #[cfg(test)]
     pub(crate) fn repo_mode(&self) -> Option<RepoMode> {
         self.ctx.mode
     }
@@ -713,6 +696,21 @@ pub(crate) fn stat_fd(fd: BorrowedFd<'_>) -> Result<Stat, FsError> {
     let stx = rustix::fs::statx(fd, "", AtFlags::EMPTY_PATH, STAT_FIELDS)
         .map_err(|errno| FsError::Io(errno.into()))?;
     Ok(stat_from_statx(&stx))
+}
+
+/// Returns the space of the file system that holds the inode open at `fd`,
+/// from one `fstatvfs` call, as `(available, total)` in bytes.
+///
+/// `available` is the space that a process with no privilege can use
+/// (`f_bavail` blocks), and `total` is the size of the file system
+/// (`f_blocks` blocks). Each count is in blocks of `f_frsize` bytes. A
+/// product that overflows `u64` gives `u64::MAX`.
+pub(crate) fn fs_space(fd: BorrowedFd<'_>) -> Result<(u64, u64), FsError> {
+    let stat = rustix::fs::fstatvfs(fd).map_err(|errno| FsError::Io(errno.into()))?;
+    Ok((
+        stat.f_bavail.saturating_mul(stat.f_frsize),
+        stat.f_blocks.saturating_mul(stat.f_frsize),
+    ))
 }
 
 /// Returns the [`Stat`] of the result `stx` of a `statx` call with the fields
@@ -1184,30 +1182,20 @@ mod tests {
     }
 
     #[test]
-    fn layout_paths_and_bases() {
-        let expected: [(RepoLayout, Option<&str>, Option<RepoLayout>); 9] = [
-            (RepoLayout::Root, None, None),
-            (RepoLayout::Objects, Some("objects"), Some(RepoLayout::Root)),
-            (RepoLayout::Staging, None, Some(RepoLayout::Tmp)),
-            (RepoLayout::Tmp, Some("tmp"), Some(RepoLayout::Root)),
-            (RepoLayout::Refs, Some("refs"), Some(RepoLayout::Root)),
-            (RepoLayout::State, Some("state"), Some(RepoLayout::Root)),
-            (
-                RepoLayout::Extensions,
-                Some("extensions"),
-                Some(RepoLayout::Root),
-            ),
-            (RepoLayout::Deltas, Some("deltas"), Some(RepoLayout::Root)),
-            (
-                RepoLayout::DeltaIndexes,
-                Some("delta-indexes"),
-                Some(RepoLayout::Root),
-            ),
+    fn layout_paths() {
+        let expected: [(RepoLayout, Option<&str>); 9] = [
+            (RepoLayout::Root, None),
+            (RepoLayout::Objects, Some("objects")),
+            (RepoLayout::Staging, None),
+            (RepoLayout::Tmp, Some("tmp")),
+            (RepoLayout::Refs, Some("refs")),
+            (RepoLayout::State, Some("state")),
+            (RepoLayout::Extensions, Some("extensions")),
+            (RepoLayout::Deltas, Some("deltas")),
+            (RepoLayout::DeltaIndexes, Some("delta-indexes")),
         ];
-        for (kind, path, base) in expected {
-            let rules = kind.rules();
-            assert_eq!(rules.path, path, "path of {kind:?}");
-            assert_eq!(rules.base, base, "base of {kind:?}");
+        for (kind, path) in expected {
+            assert_eq!(kind.rules().path, path, "path of {kind:?}");
         }
     }
 
@@ -1284,37 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn root_files_have_their_names_modes_and_symlink_rule() {
-        let expected: [(RootFile, &str, u32, u32, bool); 7] = [
-            (RootFile::Config, "config", 0o644, 0o644, false),
-            (RootFile::Summary, "summary", 0o644, 0o644, false),
-            (RootFile::SummarySig, "summary.sig", 0o644, 0o644, false),
-            (RootFile::Lock, ".lock", 0o660, 0o660, false),
-            (RootFile::UpdateLock, ".update.lock", 0o660, 0o660, false),
+    fn root_files_have_their_names_and_modes() {
+        let expected: [(RootFile, &str, u32, u32); 7] = [
+            (RootFile::Config, "config", 0o644, 0o644),
+            (RootFile::Summary, "summary", 0o644, 0o644),
+            (RootFile::SummarySig, "summary.sig", 0o644, 0o644),
+            (RootFile::Lock, ".lock", 0o660, 0o660),
+            (RootFile::UpdateLock, ".update.lock", 0o660, 0o660),
             (
                 RootFile::Keyring("origin.trustedkeys.gpg".into()),
                 "origin.trustedkeys.gpg",
                 0o644,
                 0o644,
-                true,
             ),
             (
                 RootFile::Keyring("gpgkeys.gpg".into()),
                 "gpgkeys.gpg",
                 0o644,
                 0o644,
-                true,
             ),
         ];
-        for (file, name, mode, shared, follows) in expected {
+        for (file, name, mode, shared) in expected {
             assert_eq!(file.name(), name);
             assert_eq!(file.file_mode(), mode, "mode of {name}");
             assert_eq!(file.shared_file_mode(), shared, "shared mode of {name}");
-            assert_eq!(
-                file.follows_leaf_symlink(),
-                follows,
-                "symlink rule of {name}"
-            );
         }
     }
 
@@ -1598,6 +1579,15 @@ mod tests {
         .unwrap();
         let stat = stat_fd(fd.as_fd()).unwrap();
         assert_eq!(stat.file_type, FileType::Symlink);
+    }
+
+    #[test]
+    fn fs_space_reads_the_space_of_the_file_system() {
+        let dir = TestDir::new("fs-space");
+        let (available, total) = fs_space(dir.fd()).unwrap();
+        let stat = rustix::fs::fstatvfs(dir.fd()).unwrap();
+        assert_eq!(total, stat.f_blocks * stat.f_frsize);
+        assert!(available <= total);
     }
 
     #[test]

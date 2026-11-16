@@ -72,10 +72,6 @@ for it.
 - `ostrya serve` reads the key groups before `check_server` runs, so a start
   that a check refuses reads the key files first. A fix needs a second read
   of the client groups or a new constructor of `ReceivePolicies`.
-- `ostrya commit --tag` checks in the CLI that the ref is absent, before the
-  lock and again before the commit. The library has no API for this check. A
-  ref that another writer makes during the publish step is replaced.
-  `conformance/cli-surface.md` states this.
 - The armored repository keyring in `remote gpg-import` and `remote
   gpg-list-keys`. These commands read an armored `<remote>.trustedkeys.gpg`,
   and a verification refuses it. The answer of the `ostree` command to such a

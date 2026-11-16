@@ -893,9 +893,10 @@ repository lock. The last item also gives the checks after that point:
   `refs/mirrors/ID`: a ref, an alias (also a dangling one), a directory, or a
   special file. A path below a ref file, a special file, or an alias is
   refused too. The message is `error: --tag specified but ref <name> already
-  exists`. The port refuses a symbolic link at `refs`, `refs/heads`, or
-  `refs/mirrors/ID` after it publishes the objects, with the same message,
-  and the new objects stay until a prune. The port reads the path again
+  exists`. A symbolic link at `refs`, `refs/heads`, `refs/mirrors`, or
+  `refs/mirrors/ID` is above the path, and the port refuses it with the
+  same message, also when the target of the link holds no entry for the
+  value. The port reads the path again
   before it publishes the objects, and refuses an entry that came after the
   first read. After the second read, another writer can create a ref, an
   alias, a directory, or a special file at the path. It can also create a
@@ -7395,6 +7396,34 @@ Observed by running the tool (2026.1).
   `config is larger than its cap of 1048576 bytes`. The tool reads a `config`
   of any size. The cap bounds the memory of a read of `config`
   (`../../CLAUDE.md`, "Working conventions").
+- Each path inside a repository resolves in the port by one rule
+  (`../decisions.md`, "The resolve rule of a repository path"), so the port
+  gives one set of error texts for these paths. A text names the path
+  relative to the repository root, or the path as the caller gives it:
+  - An absent entry gives `i/o error: <path> does not exist`. The error is
+    `Error::Io` of kind `NotFound`, with no raw errno. `ostrya
+    --repo=/nonexistent-xyz refs` exits 1 with `error: opening repo: i/o
+    error: /nonexistent-xyz does not exist`, and `ostrya --repo=/proc/self
+    refs` exits 1 with `error: opening repo: i/o error: config does not
+    exist`.
+  - An entry that the rule refuses gives `Error::InvalidFormat` with one of
+    these texts: `invalid format: <path> passes through a symlink; ostrya
+    refuses a symlink in the repository`, `invalid format: <path> resolves
+    outside the repository`, `invalid format: <path> is not a directory`,
+    `invalid format: <path> is not a regular file`, or `invalid format:
+    <path> is larger than its cap of <N> bytes`.
+  - A directory at the path of a ref gives `Error::NotARef` with the text
+    `not a ref: <name>: is not a regular file`. `rev-parse` of the name exits
+    1 with this text.
+  - An absent object gives `Error::ObjectNotFound`. A file of a static delta
+    that is larger than its cap gives `Error::InvalidFormat`.
+
+  The tool gives the text of the system call that failed. Examples are
+  `error: opening repo: opendir(<path>): No such file or directory` for an
+  absent repository with `--repo`, and `openat(config)` and
+  `opendir(objects)` in the text of `ostree init` (the items above and
+  below). The wording of a diagnostic is outside the scope of compatibility
+  ("Scope of CLI compatibility").
 - A symlink at `objects` or at `config` fails the command in the port, in
   each open mode. The open of a repository fails with `invalid format:
   objects passes through a symlink; ostrya refuses a symlink in the
@@ -7579,6 +7608,33 @@ Observed by running the tool (2026.1).
   `pull-local --commit-metadata-only`, `summary -u`, `prune --refs-only`,
   `config set`, and `config get` exit 0 with the output of a repository with
   no symlink. The tool writes the new ref through the symlink.
+  A symlink at `refs/remotes/R` or at `refs/mirrors/ID` also fails the port,
+  in each open mode, with the same text for the path of the ref or of the
+  directory. The port writes nothing in the target of the symlink. With an
+  absolute symlink at `refs/remotes/origin`, `refs`, `refs origin:`, `refs
+  --list`, `rev-parse origin:main`, `fsck`, `prune --refs-only`, `refs
+  --create=origin:new`, and `pull-local --commit-metadata-only` of
+  `origin:main` exit 1. `summary -u` exits 0, because a summary lists no
+  remote ref. With an absolute symlink at `refs/mirrors/ID`, `refs -c`,
+  `rev-parse @ID:main`, `summary -u`, `fsck`, `prune --refs-only`, `refs
+  --create=@ID:new`, and `pull-local --commit-metadata-only` of `@ID:main`
+  exit 1. `refs -c --create=ID:new` exits 1 with `error: ref not writable:
+  @ID:new: passes through an alias`. `refs` with no `-c` lists the local
+  refs and exits 0. With libostree 2026.4 on 2026-11-16, against a
+  repository with an absolute symlink at `refs/remotes/origin` that holds
+  `main`, `refs` lists `test/main`, `refs origin:` lists `origin:main`,
+  `refs --list` lists `test/main` alone, and `rev-parse origin:main` gives
+  the commit, at exit 0. `summary -u`, `fsck`, and `prune --refs-only
+  --depth=0` exit 0, and the prune deletes no object. `refs
+  --create=origin:new` exits 0 and writes the new ref through the symlink.
+  Against a repository with the collection id `org.example.Own` and an
+  absolute symlink at `refs/mirrors/org.example.C` that holds `main`, `refs
+  -c` lists `(org.example.Own, test/main)` alone, and does not list the
+  mirror ref `(org.example.C, main)`. `summary -u`, `fsck`, and `prune
+  --refs-only --depth=0` exit 0, and the prune deletes no object. `refs -c
+  --create=org.example.C:new` exits 0 and writes the new ref through the
+  symlink. `ostree pull-local` takes no `REMOTE:NAME` form and no `ID:NAME`
+  form, so the probe gives no result for it.
   `../format-reference.md`, "Ref files", states the read of the port.
 - An alias in `refs/` that breaks the alias rule of
   `../format-reference.md`, "Ref files", names no ref in the port. The rule

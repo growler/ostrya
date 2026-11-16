@@ -1049,16 +1049,16 @@ struct CommitArgs {
     /// path below another of these refs. The command refuses a NAME that has
     /// an entry at its path: a ref, an alias (also a dangling one), a
     /// directory, or a special file. It also refuses a NAME below a ref file,
-    /// a special file, or an alias. A NAME refused before the publish gives no
-    /// new object and no ref. The command refuses a symbolic link at `refs`,
-    /// `refs/heads`, or `refs/mirrors/ID` after the publish, with the same
-    /// error, and the new objects stay until a prune. The command reads the
-    /// path of each NAME again before it publishes the objects. After this
-    /// read, another writer can create such an entry at the path, or a ref
-    /// file, a special file, or an alias above it. The command then refuses
-    /// NAME with the same error and writes no ref. The published objects stay
-    /// until a prune. The option conflicts with --no-bindings and
-    /// --skip-if-unchanged.
+    /// a special file, or an alias. A symbolic link at `refs`, `refs/heads`,
+    /// `refs/mirrors`, or `refs/mirrors/ID` is above the path of NAME, and the
+    /// command refuses NAME with the same error, also when the target of the
+    /// link holds no entry for NAME. A NAME refused before the publish gives
+    /// no new object and no ref. The command reads the path of each NAME
+    /// again before it publishes the objects. After this read, another writer
+    /// can create such an entry at the path, or a ref file, a special file,
+    /// or an alias above it. The command then refuses NAME with the same
+    /// error and writes no ref. The published objects stay until a prune. The
+    /// option conflicts with --no-bindings and --skip-if-unchanged.
     #[arg(
         long = "tag",
         value_name = "NAME",
@@ -9359,7 +9359,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         exit_error(&message);
     }
     for tag in &args.tags {
-        if let Some(message) = existing_tag_refusal(repo.path(), tag, own) {
+        if let Some(message) = existing_tag_refusal(&repo, tag).await {
             exit_error(&message);
         }
     }
@@ -9744,13 +9744,14 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // Each tag is queued with the expectation of no ref. So `txn.commit` also
     // refuses an entry that another writer creates during the commit, with
     // the same text. At the path of the tag, this entry is a ref, an alias, a
-    // directory, or a special file. Above the path, it is a ref file or a
-    // special file. The objects of the refused commit are then published and
-    // stay until a prune. The branch does not move, because `txn.commit`
-    // refuses such an entry when it checks the whole ref queue, before it
-    // writes a ref.
+    // directory, or a special file. Above the path, it is a ref file, a
+    // special file, or a symbolic link, also a symbolic link at `refs`,
+    // `refs/heads`, `refs/mirrors`, or `refs/mirrors/ID`. The objects of the
+    // refused commit are then published and stay until a prune. The branch
+    // does not move, because `txn.commit` refuses such an entry when it
+    // checks the whole ref queue, before it writes a ref.
     for tag in &args.tags {
-        if let Some(message) = existing_tag_refusal(repo.path(), tag, own) {
+        if let Some(message) = existing_tag_refusal(&repo, tag).await {
             txn.abort().await?;
             exit_error(&message);
         }
@@ -9919,34 +9920,21 @@ fn refused_tag<'a>(err: &Error, tags: &'a [String], own: Option<&str>) -> Option
 /// Returns the refusal of a `--tag` name that has an entry at its ref path,
 /// or `None` if the path is absent.
 ///
-/// The path is `refs/mirrors/X/<name>` in the repository at `repo_path` for a
-/// tag `@X:<name>` whose X is not `own`, the `[core] collection-id` of the
-/// repository, and `refs/heads/<name>` for each other tag. The lookup reads
-/// each component with no symlink follow. Each component before the last must
-/// be a directory. The check refuses a regular file, a symlink (also a
-/// dangling one), and a directory at the last component. It also refuses a
-/// component before the last that is not a directory. Only a component that
-/// is absent gives `None`. A lookup error other than an absent entry is also
-/// a refusal.
-fn existing_tag_refusal(repo_path: &Path, tag: &str, own: Option<&str>) -> Option<String> {
-    let exists = || tag_exists_refusal(tag);
-    let (dir, name) = match commit_ref(tag, own) {
-        Some(Ref::Collection { id, name }) => (format!("refs/mirrors/{id}"), name),
-        Some(r) => ("refs/heads".to_owned(), r.name().to_owned()),
-        None => ("refs/heads".to_owned(), tag.to_owned()),
+/// The check is [`Repo::ref_path_has_entry`]. It refuses a ref file, an alias
+/// (also a dangling one), a directory, or a special file at the path, and a
+/// file, a special file, or a symlink at a component above the path, for
+/// example at `refs/heads` or `refs/mirrors/X`. A check error is also a
+/// refusal. The caller checks the names with [`tag_name_refusal`] first.
+async fn existing_tag_refusal(repo: &Repo, tag: &str) -> Option<String> {
+    let r = match tag.parse::<Ref>() {
+        Ok(r) => r,
+        Err(err) => return Some(format!("Cannot read ref {tag}: {err}")),
     };
-    let mut path = repo_path.join(dir);
-    let mut components = name.split('/').peekable();
-    while let Some(component) = components.next() {
-        path.push(component);
-        match std::fs::symlink_metadata(&path) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(err) => return Some(format!("Cannot read ref {tag}: {err}")),
-            Ok(meta) if meta.is_dir() && components.peek().is_some() => {}
-            Ok(_) => return Some(exists()),
-        }
+    match repo.ref_path_has_entry(&r).await {
+        Ok(false) => None,
+        Ok(true) => Some(tag_exists_refusal(tag)),
+        Err(err) => Some(format!("Cannot read ref {tag}: {err}")),
     }
-    Some(exists())
 }
 
 /// Returns the refusal of `--canonical-permissions` with a non-zero owner id.

@@ -18,7 +18,7 @@ use crate::config::{EX_OSTRYA, MinFreeSpace, REMOTES_CONFIG_DIR, RepoConfig, Tri
 use crate::error::{Error, Result};
 use crate::lock::{self, LockGuard, LockKind, RepoLock, UpdateLock, UpdateLockHeld, UpdateLocks};
 use crate::remotes_dir;
-use crate::repo_fs::{Publish, Published, RepoDir, RepoLayout, RootFile};
+use crate::repo_fs::{self, Publish, Published, RepoDir, RepoLayout, RootFile};
 use crate::staging::StagingDir;
 use crate::transaction::Transaction;
 
@@ -1268,11 +1268,9 @@ fn lock_timeout(secs: i64) -> Option<Duration> {
 
 /// Computes the initial free-space budget of a transaction: the bytes
 /// available on the file system of the repository, less the `min-free-space`
-/// reserve of the config. Runs a synchronous `fstatvfs`.
+/// reserve of the config. Runs a synchronous [`repo_fs::fs_space`].
 fn free_budget(repo_fd: BorrowedFd<'_>, min_free: MinFreeSpace) -> Result<u64> {
-    let stat = rustix::fs::fstatvfs(repo_fd)?;
-    let available = stat.f_bavail.saturating_mul(stat.f_frsize);
-    let total = stat.f_blocks.saturating_mul(stat.f_frsize);
+    let (available, total) = repo_fs::fs_space(repo_fd)?;
     let reserved = match min_free {
         MinFreeSpace::Percent(percent) => ((u128::from(total) * u128::from(percent)) / 100) as u64,
         MinFreeSpace::Size(spec) => spec.bytes(),

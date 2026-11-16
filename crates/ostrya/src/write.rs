@@ -1256,9 +1256,11 @@ pub(crate) struct ImageTemp {
 /// 4. If `do_fsync` is set, it runs `fsync` on the file.
 /// 5. If `verity` is not [`Tristate::No`], it seals the file with
 ///    [`TempFile::seal`], which closes the writable descriptor. If the file
-///    is sealed, the function reads the digest of the seal from the kernel.
-///    If the kernel digest is not the digest of the writer, the function
-///    fails.
+///    is sealed, the function reads the digest of the seal from the kernel
+///    with [`repo_fs::verity_digest`]. If the kernel digest is not the digest
+///    of the writer, the function fails with [`Error::InvalidFormat`]. If the
+///    digest cannot be read, the function fails with [`Error::Unsupported`]
+///    under [`Tristate::Yes`], and continues under [`Tristate::Maybe`].
 ///
 /// On a failure, the drop of the temp file removes it.
 pub(crate) fn write_image_temp_blocking(
@@ -1279,8 +1281,8 @@ pub(crate) fn write_image_temp_blocking(
     }
     let size = repo_fs::stat_fd(temp.file_mut().as_fd())?.size;
     if seal_temp(&mut temp, verity)? {
-        match ostrya_sys::measure_verity(temp.file_mut().as_fd()) {
-            Ok(sealed) if sealed != digest => {
+        match repo_fs::verity_digest(temp.file_mut().as_fd(), size) {
+            Some(sealed) if sealed != digest => {
                 return Err(Error::InvalidFormat(format!(
                     "the fs-verity digest of the sealed composefs image is {}, and the \
                      writer computed {}",
@@ -1288,9 +1290,13 @@ pub(crate) fn write_image_temp_blocking(
                     crate::composefs::digest_hex(&digest)
                 )));
             }
-            Ok(_) => {}
-            Err(_) if verity == Tristate::Maybe => {}
-            Err(e) => return Err(Error::Io(e.into())),
+            Some(_) => {}
+            None if verity == Tristate::Maybe => {}
+            None => {
+                return Err(Error::Unsupported(
+                    "the fs-verity digest of the sealed composefs image cannot be read".into(),
+                ));
+            }
         }
     }
     Ok(ImageTemp { temp, digest, size })

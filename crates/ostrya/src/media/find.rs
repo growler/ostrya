@@ -14,7 +14,7 @@ use super::MediaSkip;
 use super::mountinfo::{self, Mount};
 use crate::error::Result;
 use crate::repo::Repo;
-use crate::repo_fs::RepoDir;
+use crate::repo_fs::{self, RepoDir};
 use crate::summary::{
     OSTREE_METADATA_REF, SUMMARY_FILE, Summary, collection_map_has_ref, parse_ref_list,
     read_root_file_blocking, summary_collection_id,
@@ -198,7 +198,8 @@ impl Scan {
     /// Starts a scan for the client repository `client`.
     async fn new(client: &Repo) -> Result<Scan> {
         let repo = client.clone();
-        let client = ostrya_rt::unblock(move || identity(repo.repo_fd())).await?;
+        let stat = ostrya_rt::unblock(move || repo_fs::stat_fd(repo.repo_fd())).await?;
+        let client = (stat.dev, stat.ino);
         Ok(Scan {
             client,
             skipped: Vec::new(),

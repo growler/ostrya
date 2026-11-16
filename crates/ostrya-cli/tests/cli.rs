@@ -22083,6 +22083,65 @@ fn commit_tag_refuses_an_existing_ref_and_writes_nothing() {
     }
 }
 
+/// `commit --tag` refuses a tag whose ref path passes through a symlink at
+/// `refs/heads` or at `refs/mirrors/X`, also when the target of the symlink
+/// holds no entry for the tag. The refusal comes before the repository lock,
+/// so it writes no object and no ref, and nothing in the target.
+#[test]
+fn commit_tag_refuses_a_symlink_above_the_ref_path_and_writes_nothing() {
+    let tmp = TmpDir::new("commit-tag-symlink-above");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let changed = base.join("changed");
+    build_fixture_source(&changed);
+    std::fs::write(changed.join("src/extra.txt"), b"extra\n").unwrap();
+    let changed = changed.join("src");
+    let cases: [(&str, &str, &str, &str); 2] = [
+        ("heads", "refs/heads", "new", "t"),
+        (
+            "mirrors",
+            "refs/mirrors/org.example.X",
+            "@org.example.X:new",
+            "@org.example.X:t",
+        ),
+    ];
+    for (label, link, branch, tag) in cases {
+        let case = base.join(label);
+        std::fs::create_dir(&case).unwrap();
+        let repo = create_repo(&case, RepoMode::Archive);
+        commit_no_parent(&repo, &["-b", "held"], &base.join("src")).ok();
+        let outside = case.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let link = repo.join(link);
+        if link.symlink_metadata().is_ok() {
+            std::fs::rename(&link, case.join("moved")).unwrap();
+        } else {
+            std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        }
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        let objects = loose_objects(&repo);
+        let refs = describe_tree_with_content(&repo.join("refs"));
+        let run = commit_no_parent(&repo, &["-b", branch, &format!("--tag={tag}")], &changed);
+        assert_eq!(run.status.code(), Some(1), "--tag={tag} was not refused");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            format!("error: --tag specified but ref {tag} already exists"),
+        );
+        assert_eq!(loose_objects(&repo), objects, "--tag={tag} wrote an object");
+        assert_eq!(
+            describe_tree_with_content(&repo.join("refs")),
+            refs,
+            "--tag={tag} changed a ref"
+        );
+        assert_eq!(
+            std::fs::read_dir(&outside).unwrap().count(),
+            0,
+            "--tag={tag} wrote through the symlink"
+        );
+    }
+}
+
 /// `commit --tag` checks the ref path of each tag again before the
 /// transaction publishes. The editor runs after the first check, so a ref
 /// that the editor creates reaches the second check. The refusal writes no

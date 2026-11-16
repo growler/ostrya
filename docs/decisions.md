@@ -106,6 +106,117 @@ reference count for each repository. The probe of the registry reads the
 never matches a registered lock. `crates/ostrya/src/lock.rs` documents the
 registry.
 
+## The resolve rule of a repository path
+
+Each file operation on a path inside a repository is a primitive of the
+module `repo_fs` of `ostrya` (`crates/ostrya/src/repo_fs.rs`). Each open of
+a path below a `RepoDir` is one `openat2` with
+`RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS`, relative to the descriptor of the
+`RepoDir`. The opens of a tree removal also have `RESOLVE_NO_XDEV`, so the
+open of a mount point gives `EXDEV`, and the removal does not go into a
+mount. The tree removal goes up one level with an `openat` of `..`. It then
+compares the device and the inode of that directory with the directory that
+it left. A listing opens `.` of its directory with `openat`, and an anonymous
+temp file is an `openat` of `.` with `O_TMPFILE`.
+
+The calls that have no `openat2` form follow no symlink in the repository:
+
+- `unlinkat`, `renameat`, `renameat2`, `mkdirat`, and `linkat` act on the
+  leaf in its parent directory. One `openat2` opens the parent. A path of one
+  component has the `RepoDir` as its parent. The source of a publish is a
+  temp name in the temp home. `unlinkat`, `renameat`, and `renameat2` act on
+  a symlink at the leaf itself. `linkat` has no `AT_SYMLINK_FOLLOW`, so it
+  links a symlink as the symlink itself.
+- The link of an anonymous temp file is one `linkat` with
+  `AT_SYMLINK_FOLLOW`. Its source is the path of the file descriptor in
+  `/proc/self/fd`, and its destination is the leaf in the parent directory.
+- `statx` and `readlinkat` of a path of one component are one call relative
+  to the `RepoDir`. `statx` has `AT_SYMLINK_NOFOLLOW`, and `readlinkat`
+  reads the symlink at the leaf.
+- `RepoDir::lstat` and `RepoDir::read_link` of a path of more than one
+  component, and each read of a symlink object, open the leaf itself. The
+  open is one `openat2` with `O_PATH|O_NOFOLLOW`. Then one `statx` with
+  `AT_EMPTY_PATH`, or one `readlinkat` with an empty path, acts on that
+  descriptor.
+- Each other `statx` acts on an open descriptor with `AT_EMPTY_PATH`, or on
+  one name with `AT_SYMLINK_NOFOLLOW`, relative to the directory that holds
+  the name.
+- `symlinkat` and `fchownat` act on a temp name of one component in the temp
+  home of the kind, which is `tmp/` or the directory of the kind. `fchownat`
+  has `AT_SYMLINK_NOFOLLOW`.
+- `llistxattr`, `lgetxattr`, and `lsetxattr` read and write the xattrs of a
+  symlink through the path `/proc/self/fd/<dir>/<leaf>`. `<dir>` is the
+  descriptor of the parent directory or of the temp home.
+
+A primitive refuses a `..`, `.`, or empty component, and an absolute path,
+from the text of the path, before the call. The primitives have no fallback
+to `openat`. `ENOSYS` and an `EPERM` from a seccomp filter fail the call. A
+kernel older than Linux 5.6 is not a target.
+
+A symlink in a repository can be at these locations alone:
+
+- a ref alias in `refs/`;
+- a symlink object in `objects/<xx>/` of the modes `bare`, `bare-user-only`,
+  and `bare-split-xattrs`;
+- the staged copies of these entries in `tmp/`.
+
+The port reads such a symlink with `readlinkat`, and the kernel never
+follows it. An alias resolves by the alias rule of `format-reference.md`,
+"Ref files". Each other symlink fails the operation. This includes a
+symlink at a fixed name of the layout, for example `objects`, `refs/heads`,
+`tmp`, `deltas`, or `config`.
+
+These paths follow a symlink:
+
+- The path of the repository root. The caller names it, and
+  `RepoDir::open_root` follows a symlink at each component.
+- A keyring file at the root. Its open follows a symlink at the file name.
+- The paths that a config names, and the remotes directory. Each follows a
+  symlink at each component. "The read of the remotes directory" states the
+  rule.
+
+A `RepoDir` holds a descriptor that it opens with
+`O_RDONLY|O_DIRECTORY|O_CLOEXEC`, its kind, its path relative to the root,
+and the context of the repository. No caller keeps the descriptor of a
+fan-out directory between calls.
+
+The rule has a cost. An `lstat` of a path of more than one component is one
+`openat2` with `O_PATH|O_NOFOLLOW`, one `statx` with `AT_EMPTY_PATH`, and one
+`close`. An `exists` of such a path is one `openat2` with
+`O_PATH|O_NOFOLLOW` and one `close`. A path of one component costs one
+`statx` with `AT_SYMLINK_NOFOLLOW`. On btrfs with a warm cache, an `exists`
+of an object takes 793-871 ns for a present entry and 398-469 ns for an
+absent entry. One `statat` of the same path, with no resolve rule, takes
+514-557 ns and 246-321 ns.
+
+These alternatives were rejected:
+
+- A walk of opens with `O_PATH|O_NOFOLLOW`, one for each component. It takes
+  one open and one close for each component, and each caller must apply the
+  `..` rule.
+- A follow at the fixed names of the layout. A symlink at `objects`,
+  `refs/heads`, `tmp`, `deltas`, or `config` then takes writes and removals
+  outside the repository. For example, a prune of the delta indexes unlinks
+  files in the target of a symlinked fan-out directory. The `ostree` command
+  follows such names (`conformance/cli-surface.md`, "Global conventions").
+- A fallback to `openat` with `O_NOFOLLOW`. It gives two rules, and it
+  cannot refuse a symlink at a component before the last.
+- The rule in the strict open mode alone. It gives two rules for one path.
+- Kept descriptors of the fan-out directories, as a table for each walk,
+  each load, or each batch. Many transactions in one process can then use
+  all the descriptors of the process.
+- One `statx` of `xx/leaf` relative to `objects/` with
+  `AT_SYMLINK_NOFOLLOW`. `statx` has no `RESOLVE_*` flags, and it follows a
+  symlink at the fan-out directory.
+- A follow of an alias by the kernel at a read. It reads an absolute target,
+  a target outside `refs/`, and a chain of aliases.
+- `getxattrat` and `setxattrat` (Linux 6.13) for the xattrs of a symlink.
+  Kernels from Linux 5.6 are a target, so the module reads and writes these
+  xattrs through `/proc/self/fd/<parent>/<leaf>`.
+
+The last paragraph of "The options of an open and of a create" states the
+open of `objects` and the reads that do not depend on the open mode.
+
 ## The options of an open and of a create
 
 `OpenOptions` holds the options of an open, in the form of
@@ -4454,11 +4565,14 @@ ref. The rules of a conditional write:
 `ostrya commit --tag` gives one text for a set of entries: `--tag specified
 but ref NAME already exists`, at exit 1. At the path of the tag, the set
 holds a ref, an alias (also a dangling one), a directory, and a special
-file. Above the path, the set holds a ref file and a special file. The
-command gives this text at the two checks before the publish and at the
-transaction commit. Each tag is queued with `set_ref_expecting` and
-`expected = None`. At the transaction commit, `Error::RefMismatch` is a ref
-at the path. `Error::RefNotWritable` is each other entry of the set.
+file. Above the path, the set holds a ref file, a special file, and a
+symbolic link, also a symbolic link at `refs`, `refs/heads`, `refs/mirrors`,
+or `refs/mirrors/ID`. The command gives this text at the two checks before
+the publish, which call `Repo::ref_path_has_entry`, and at the transaction
+commit. Each tag is queued with `set_ref_expecting` and `expected = None`.
+At the transaction commit, `Error::RefMismatch` is a ref at the path.
+`Error::RefNotWritable` is each other entry of the set. For a symbolic link
+above the path, its reason is `passes through an alias`.
 
 These alternatives were rejected:
 

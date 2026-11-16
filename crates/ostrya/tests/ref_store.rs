@@ -2,8 +2,8 @@
 //! case and each collection id reads and writes, the read of
 //! `refs/heads/NAME` under the collection id of the repository, aliases,
 //! absent refs, the read errors, the read while another handle holds the
-//! update lock, the revisions `@ID:NAME` and `@ID:NAME^`, and the removal of
-//! a set of refs.
+//! update lock, the revisions `@ID:NAME` and `@ID:NAME^`, the removal of a
+//! set of refs, and the check for an entry at a ref path.
 
 mod common;
 
@@ -369,6 +369,70 @@ fn a_directory_is_not_a_ref_and_a_path_through_a_file_reads_as_no_ref() {
         assert_not_a_ref(repo.resolve_rev(&rev, false).await, &rev);
         let rev = format!("@{OTHER}:f/g");
         assert_not_found(repo.resolve_rev(&rev, false).await, &rev);
+    });
+}
+
+/// `ref_path_has_entry` gives `false` for an absent path alone. An entry of
+/// each type at the path, and a file or a symlink above it, give `true`.
+#[test]
+fn ref_path_has_entry_reads_each_state_of_a_ref_path() {
+    let tmp = TmpDir::new("ref-store-has-entry");
+    let path = create(&tmp, Some(OWN));
+    let repo = open(&path);
+    let heads = path.join("refs/heads");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    block_on(async {
+        let has = |r: Ref| {
+            let repo = repo.clone();
+            async move { repo.ref_path_has_entry(&r).await.unwrap() }
+        };
+        assert!(!has(Ref::local("absent")).await);
+        assert!(!has(Ref::local("absent/below")).await);
+        assert!(!has(Ref::collection(OTHER, "absent")).await);
+
+        put_local(&repo, "file", &checksum(1)).await;
+        assert!(has(Ref::local("file")).await);
+        // The ref of the own collection id is the local ref.
+        assert!(has(Ref::collection(OWN, "file")).await);
+        // A path below a ref file passes through a file.
+        assert!(has(Ref::local("file/below")).await);
+
+        std::os::unix::fs::symlink("file", heads.join("alias")).unwrap();
+        assert!(has(Ref::local("alias")).await);
+        std::os::unix::fs::symlink("nowhere", heads.join("dangling")).unwrap();
+        assert!(has(Ref::local("dangling")).await);
+        assert!(has(Ref::local("dangling/below")).await);
+
+        std::fs::create_dir(heads.join("dir")).unwrap();
+        assert!(has(Ref::local("dir")).await);
+        assert!(!has(Ref::local("dir/absent")).await);
+
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(heads.join("fifo"))
+            .status()
+            .unwrap();
+        assert!(fifo.success(), "mkfifo failed");
+        assert!(has(Ref::local("fifo")).await);
+        assert!(has(Ref::local("fifo/below")).await);
+
+        // A symlink at `refs/mirrors/ID` stands above each ref of the
+        // collection, also above a ref that its target does not hold.
+        std::fs::create_dir_all(path.join("refs/mirrors")).unwrap();
+        std::os::unix::fs::symlink(&outside, path.join("refs/mirrors").join(OTHER)).unwrap();
+        assert!(has(Ref::collection(OTHER, "absent")).await);
+
+        // A symlink at `refs/heads` stands above each local ref.
+        std::fs::rename(&heads, path.join("refs/heads.real")).unwrap();
+        std::os::unix::fs::symlink(&outside, &heads).unwrap();
+        assert!(has(Ref::local("absent")).await);
+        assert!(has(Ref::collection(OWN, "absent")).await);
+
+        let err = repo
+            .ref_path_has_entry(&Ref::local("a/../b"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRefspec(_)), "{err:?}");
     });
 }
 

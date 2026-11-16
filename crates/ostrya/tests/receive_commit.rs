@@ -3491,6 +3491,47 @@ fn a_ref_path_below_an_alias_is_ref_denied() {
     }
 }
 
+/// A ref path below a `refs/heads` that is a symlink to another directory of
+/// `refs/` reads as absent at `Hello`, and is `ref-denied` under the lock.
+/// The session writes nothing through the symlink.
+#[test]
+fn a_symlinked_refs_heads_is_ref_denied() {
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let new = Some(commit.checksum);
+    let tmp = TmpDir::new("recv-symlinked-heads");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let refs = repo.path().join("refs");
+    std::fs::create_dir(refs.join("other")).unwrap();
+    std::fs::remove_dir(refs.join("heads")).unwrap();
+    std::os::unix::fs::symlink("other", refs.join("heads")).unwrap();
+    let before = snapshot(&repo);
+    let (result, (hello, reply)) = session(&repo, &policy(), |mut c| async move {
+        let hello = c.hello_reply(&["main"]).await;
+        for o in &objects {
+            c.object(o.ty, o.checksum, o.encoding, &o.bytes)
+                .await
+                .unwrap();
+        }
+        c.objects_end().await;
+        c.commit(vec![update("main", Expected::Absent, new)], false)
+            .await
+            .unwrap();
+        (hello, c.commit_reply().await)
+    });
+    let current: Vec<_> = hello.refs.iter().map(|r| r.commit).collect();
+    assert_eq!(current, vec![None]);
+    let error = refused((result, reply), ErrorCode::RefDenied);
+    assert_eq!(
+        error.message,
+        "ref 'main' names a directory or a path below a ref file or an alias, \
+         which a ref write cannot replace"
+    );
+    assert_unchanged(&repo, &before);
+    assert!(!refs.join("other/main").exists());
+}
+
 // ---------------------------------------------------------------------------
 // Faults of the server.
 // ---------------------------------------------------------------------------

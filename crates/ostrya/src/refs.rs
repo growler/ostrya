@@ -626,10 +626,18 @@ impl Repo {
     }
 
     /// Returns the commits of the ref files at several paths under `refs/`,
-    /// each read as [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a
-    /// refspec, in one pass on the blocking pool. The result holds one entry
-    /// for each path, in order. A path that holds no ref by the read rules,
-    /// also one that gives [`Error::NotARef`], reads as absent.
+    /// in one pass on the blocking pool. The result holds one entry for each
+    /// path, in order.
+    ///
+    /// The call first reads the type of the entry at each path, and follows
+    /// no symlink. These paths read as absent: an absent entry, a directory,
+    /// a FIFO, a socket, a device, a path that passes through a file, and a
+    /// path with a symlink at a component before the last one. A regular
+    /// file and a symlink at the last component, an alias, are then read as
+    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a refspec. An alias
+    /// that gives [`Error::NotARef`] reads as absent. Each other error fails
+    /// the call. The check under the update lock refuses a write or a delete
+    /// at each path that reads as absent, except at an absent entry.
     #[cfg(feature = "receive")]
     pub(crate) async fn resolve_relpath_tips(
         &self,
@@ -637,11 +645,19 @@ impl Repo {
     ) -> Result<Vec<Option<Checksum>>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
+            let root = repo.root_dir();
             relpaths
                 .iter()
-                .map(|p| match read_ref_tip(repo.root_dir(), p, p) {
-                    Err(Error::NotARef { .. }) => Ok(None),
-                    other => other,
+                .map(|p| {
+                    if let Some(RefFileState::Absent | RefFileState::NotARef(_)) =
+                        lstat_ref_state(root, p)?
+                    {
+                        return Ok(None);
+                    }
+                    match read_ref_tip(root, p, p) {
+                        Err(Error::NotARef { .. }) => Ok(None),
+                        other => other,
+                    }
                 })
                 .collect()
         })

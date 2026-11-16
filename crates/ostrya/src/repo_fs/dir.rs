@@ -622,7 +622,7 @@ impl RepoDir {
     /// Returns the path of an error at `rel`, relative to this directory, as
     /// a path relative to the repository root. An empty `rel` gives the path
     /// of this directory. The root itself shows as `.`.
-    pub(super) fn err_path(&self, rel: &str) -> String {
+    pub(crate) fn err_path(&self, rel: &str) -> String {
         let (base, mid) = match &self.path {
             DirPath::Fixed(base) => (*base, ""),
             DirPath::Nested { base, rel } => (*base, &**rel),

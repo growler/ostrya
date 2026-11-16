@@ -2233,16 +2233,8 @@ impl<'a> CollectionWalk<'a> {
         take: &mut dyn FnMut(RefEntry<'_>) -> Result<()>,
     ) -> Result<()> {
         let skip = |dir: &str| dir_is_covered(&self.covers, dir);
-        let sub = match mirrors.open_dir(id) {
-            Ok(sub) => sub,
-            Err(
-                FsError::Absent { .. }
-                | FsError::Invalid {
-                    reason: Reason::NotDirectory,
-                    ..
-                },
-            ) => return Ok(()),
-            Err(e) => return Err(e.into()),
+        let Some(sub) = mirrors.open_dir(id).optional_dir()? else {
+            return Ok(());
         };
         if self.selector.positive().is_empty() {
             let skip = |dir: &str| skip(&format!("{id}/{dir}"));
@@ -2401,7 +2393,7 @@ fn collect_remote_collections(
     };
     let mut out = Vec::new();
     for (remote, collection) in remotes {
-        let Some(sub) = open_named_ref_dir(&dir, remote)? else {
+        let Some(sub) = dir.open_dir(remote).optional_dir()? else {
             continue;
         };
         let top = format!("{REMOTES_DIR}/{remote}");
@@ -2606,7 +2598,7 @@ fn walk_ref_dir_skipping(
             if skip(&path) {
                 continue;
             }
-            if let Some(sub) = open_walked_dir(dir, &name)? {
+            if let Some(sub) = dir.open_dir(&name).optional_walked_dir()? {
                 walk_ref_dir_skipping(&sub, &path, skip, visit)?;
                 continue;
             }
@@ -2675,7 +2667,7 @@ fn walk_ref_patterns(
             // with more parts.
             if !below.is_empty()
                 && !skip(&path)
-                && let Some(sub) = open_walked_dir(dir, name)?
+                && let Some(sub) = dir.open_dir(name).optional_walked_dir()?
             {
                 walk_ref_patterns(&sub, &path, &below, skip, visit)?;
             }
@@ -2756,7 +2748,7 @@ fn walk_ref_pattern(
             (true, false) if !skip(&path) => {
                 // An entry that is no directory at the open matches no
                 // pattern with more parts.
-                if let Some(sub) = open_walked_dir(dir, &name)? {
+                if let Some(sub) = dir.open_dir(&name).optional_walked_dir()? {
                     walk_ref_pattern(&sub, &path, rest, pattern, skip, visit)?;
                 }
             }
@@ -2857,41 +2849,6 @@ fn entry_type(dir: &RepoDir, name: &str) -> Result<Option<FileType>> {
         Err(FsError::Io(e)) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => {
             Ok(None)
         }
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Opens the subdirectory `name` of `dir` in a ref-tree walk, with no
-/// symlink followed. Returns `None` if the entry is removed or is no
-/// directory, a symlink included.
-fn open_walked_dir(dir: &RepoDir, name: &str) -> Result<Option<RepoDir>> {
-    match dir.open_dir(name) {
-        Ok(sub) => Ok(Some(sub)),
-        Err(
-            FsError::Absent { .. }
-            | FsError::Invalid {
-                reason: Reason::Symlink | Reason::NotDirectory,
-                ..
-            },
-        ) => Ok(None),
-        Err(e) => Err(e.into()),
-    }
-}
-
-/// Opens the directory `name` of `dir` that a listing names, for example
-/// `refs/remotes/R`, with no symlink followed. Returns `None` if the entry
-/// is absent or is a file. A symlink at `name` fails with
-/// [`Error::InvalidFormat`].
-fn open_named_ref_dir(dir: &RepoDir, name: &str) -> Result<Option<RepoDir>> {
-    match dir.open_dir(name) {
-        Ok(sub) => Ok(Some(sub)),
-        Err(
-            FsError::Absent { .. }
-            | FsError::Invalid {
-                reason: Reason::NotDirectory,
-                ..
-            },
-        ) => Ok(None),
         Err(e) => Err(e.into()),
     }
 }
@@ -4183,25 +4140,6 @@ mod tests {
                 assert!(message.contains(text), "{what}: {message}");
             }
             other => panic!("{what}: {other:?}"),
-        }
-    }
-
-    /// A ref-tree walk opens a subdirectory with no symlink followed: a
-    /// symlink to a directory, a regular file, and an absent entry give no
-    /// directory.
-    #[test]
-    fn a_ref_subdirectory_opens_with_no_symlink_followed() {
-        let root = Root::new("subdir-nofollow");
-        let heads = root.dir.join("refs/heads");
-        std::fs::create_dir(heads.join("real")).unwrap();
-        std::os::unix::fs::symlink("real", heads.join("link")).unwrap();
-        std::fs::write(heads.join("file"), b"").unwrap();
-        let refs = root.handle().open_layout(RepoLayout::Refs).unwrap();
-        let dir = refs.open_dir("heads").unwrap();
-        assert!(open_walked_dir(&dir, "real").unwrap().is_some());
-        for name in ["link", "file", "absent"] {
-            let sub = open_walked_dir(&dir, name).unwrap();
-            assert!(sub.is_none(), "{name}");
         }
     }
 

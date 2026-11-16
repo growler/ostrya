@@ -717,9 +717,7 @@ impl Repo {
             let Some(deltas) = root.open_layout(RepoLayout::Deltas).optional()? else {
                 return Ok(false);
             };
-            has_superblock(&deltas, &format!("{rel}/{SUPERBLOCK_FILE}"), || {
-                format!("deltas/{rel}/{SUPERBLOCK_FILE}")
-            })
+            has_superblock(&deltas, &format!("{rel}/{SUPERBLOCK_FILE}"))
         })
         .await
     }
@@ -839,11 +837,7 @@ pub(crate) fn prune_delta_dirs(
             let Ok((_, to)) = parse_delta_dir(fanout, leaf) else {
                 continue;
             };
-            if !remove(&to)
-                || !has_superblock(fan, &superblock_path(leaf), || {
-                    format!("deltas/{fanout}/{}", superblock_path(leaf))
-                })?
-            {
+            if !remove(&to) || !has_superblock(fan, &superblock_path(leaf))? {
                 continue;
             }
             // A leaf that became a symlink before the superblock check fails
@@ -883,9 +877,7 @@ fn scan_deltas<T>(root: &RepoDir, parse: impl Fn(&str, &str) -> Result<T>) -> Re
     let mut out = Vec::new();
     walk_deltas(root, |fan, fanout, leaves| {
         for leaf in leaves {
-            if has_superblock(fan, &superblock_path(leaf), || {
-                format!("deltas/{fanout}/{}", superblock_path(leaf))
-            })? {
+            if has_superblock(fan, &superblock_path(leaf))? {
                 out.push(parse(fanout, leaf)?);
             }
         }
@@ -924,16 +916,8 @@ pub(crate) fn walk_deltas(
         };
         // A fanout that became a symlink or a file since the read is skipped
         // too.
-        let fan = match deltas.open_dir(&fanout) {
-            Ok(fan) => fan,
-            Err(
-                FsError::Absent { .. }
-                | FsError::Invalid {
-                    reason: Reason::Symlink | Reason::NotDirectory,
-                    ..
-                },
-            ) => continue,
-            Err(e) => return Err(e.into()),
+        let Some(fan) = deltas.open_dir(&fanout).optional_walked_dir()? else {
+            continue;
         };
         let leaves: Vec<String> = fan
             .list()?
@@ -954,33 +938,20 @@ fn superblock_path(leaf: &str) -> String {
 
 /// Returns `true` if an entry is at `path` below `dir`, the superblock of a
 /// delta. An entry of each type counts, as in the rule of the `ostree`
-/// command for a delta. `shown` gives the path relative to the repository
-/// root for the error of a symlink.
+/// command for a delta.
 ///
 /// The check is one `statx` with no follow. An absent entry and a file at a
 /// directory component give `false`. A symlink at `superblock` gives
 /// [`Error::InvalidFormat`], and a symlink at a component before it gives
 /// the same error.
-pub(crate) fn has_superblock(
-    dir: &RepoDir,
-    path: &str,
-    shown: impl FnOnce() -> String,
-) -> Result<bool> {
-    match dir.lstat(path) {
-        Ok(stat) if stat.file_type == FileType::Symlink => Err(FsError::Invalid {
-            path: shown(),
+pub(crate) fn has_superblock(dir: &RepoDir, path: &str) -> Result<bool> {
+    match dir.lstat(path).optional_dir()? {
+        Some(stat) if stat.file_type == FileType::Symlink => Err(FsError::Invalid {
+            path: dir.err_path(path),
             reason: Reason::Symlink,
         }
         .into()),
-        Ok(_) => Ok(true),
-        Err(
-            FsError::Absent { .. }
-            | FsError::Invalid {
-                reason: Reason::NotDirectory,
-                ..
-            },
-        ) => Ok(false),
-        Err(e) => Err(e.into()),
+        found => Ok(found.is_some()),
     }
 }
 

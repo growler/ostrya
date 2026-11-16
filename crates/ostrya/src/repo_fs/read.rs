@@ -8,22 +8,24 @@
 //! [`open_root_file`](RepoDir::open_root_file) is a plain `openat` that
 //! follows a symlink. [`link_xattrs`](RepoDir::link_xattrs) opens the parent
 //! directory with `openat2`, and then reaches the leaf through
-//! `/proc/self/fd`. The path rules of the directory primitives apply. A
-//! regular file opens with `O_NONBLOCK`, so the open of a FIFO does not wait
-//! for a writer. One `statx` on the open descriptor then refuses each entry
-//! that is not a regular file.
+//! `/proc/self/fd`. The path rules of the directory primitives apply.
+//! [`link_xattrs_at`] reads an entry of a tree outside the repository below a
+//! plain descriptor, with no path rule. A regular file opens with
+//! `O_NONBLOCK`, so the open of a FIFO does not wait for a writer. One `statx`
+//! on the open descriptor then refuses each entry that is not a regular file.
 //!
 //! Each read has a cap. A read of file content has the cap of the caller, and
 //! a symlink target has the cap of the caller or a fixed cap. For
-//! [`xattrs`] and [`link_xattrs`](RepoDir::link_xattrs), the cap applies to
-//! the list of names and to each value, and not to their sum. It is the limit
-//! of the kernel for each of them, 64 KiB.
+//! [`xattrs`], [`link_xattrs`](RepoDir::link_xattrs), and [`link_xattrs_at`],
+//! the cap applies to the list of names and to each value, and not to their
+//! sum. It is the limit of the kernel for each of them, 64 KiB.
 
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::path::{Path, PathBuf};
 
 use ostrya_core::Xattrs;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, StatxFlags};
@@ -335,18 +337,7 @@ impl RepoDir {
         };
         let dir = parent.as_ref().map_or(self.as_fd(), AsFd::as_fd);
         let link = format!("/proc/self/fd/{}/{leaf}", dir.as_raw_fd());
-        let map = |e| self.link_error(e, dir, leaf, path);
-        let mut list = Vec::new();
-        let len = match read_grown(&mut list, |buf| rustix::fs::llistxattr(link.as_str(), buf)) {
-            Ok(len) => len,
-            Err(Errno::NOTSUP) => return Ok(Xattrs::empty()),
-            Err(e) => return Err(map(e)),
-        };
-        collect_xattrs(
-            &list[..len],
-            |name, buf| read_grown(buf, |b| rustix::fs::lgetxattr(link.as_str(), name, b)),
-            map,
-        )
+        proc_xattrs(Path::new(&link), |e| self.link_error(e, dir, leaf, path))
     }
 
     /// Returns the error of `errno` from an xattr call on the leaf `leaf` of
@@ -367,15 +358,7 @@ impl RepoDir {
                 path: self.err_path(path),
             },
             Err(e) => io_error(e),
-            Ok(_) => FsError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "the xattr read of {} through /proc/self/fd gives ENOENT, but \
-                     the entry exists: /proc is not mounted or is of another PID \
-                     namespace",
-                    self.err_path(path)
-                ),
-            )),
+            Ok(_) => proc_hidden(self.err_path(path)),
         }
     }
 
@@ -540,6 +523,60 @@ pub(crate) fn xattr(fd: BorrowedFd<'_>, name: &str) -> Result<Option<Vec<u8>>, F
         Err(Errno::NODATA | Errno::NOTSUP) => Ok(None),
         Err(e) => Err(io_error(e)),
     }
+}
+
+/// Returns the extended attributes of the entry `name` below the directory
+/// open at `dir`, in a tree outside the repository, for example the source
+/// tree of a commit. A symlink at the leaf gives the attributes of the
+/// symlink itself.
+///
+/// The reads are those of [`link_xattrs`](RepoDir::link_xattrs), through
+/// `/proc/self/fd/<dir>/<name>`, with no path rule. `name` can have more than
+/// one component, and the kernel follows a symlink at a component before the
+/// leaf. For an `ENOENT` of the reads, one `statx` of the leaf with
+/// `AT_SYMLINK_NOFOLLOW` checks the leaf. A leaf that exists gives
+/// [`FsError::Io`] with a message that names `/proc/self/fd`. Each other
+/// error, also an absent leaf, gives [`FsError::Io`] with the errno of the
+/// xattr call. The rules of [`xattrs`] for the size and the names apply.
+pub(crate) fn link_xattrs_at(dir: BorrowedFd<'_>, name: &Path) -> Result<Xattrs, FsError> {
+    let mut link = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    link.push(name);
+    let found = || rustix::fs::statx(dir, name, AtFlags::SYMLINK_NOFOLLOW, StatxFlags::TYPE);
+    proc_xattrs(&link, |e| match e {
+        Errno::NOENT if found().is_ok() => proc_hidden(name.display()),
+        e => io_error(e),
+    })
+}
+
+/// Returns the extended attributes of the entry at `link`, a path through
+/// `/proc/self/fd`, with `llistxattr` and `lgetxattr`. A file system with no
+/// xattr support gives an empty set. `map` gives the error of each other
+/// errno of the two calls.
+fn proc_xattrs(link: &Path, map: impl Fn(Errno) -> FsError) -> Result<Xattrs, FsError> {
+    let mut list = Vec::new();
+    let len = match read_grown(&mut list, |buf| rustix::fs::llistxattr(link, buf)) {
+        Ok(len) => len,
+        Err(Errno::NOTSUP) => return Ok(Xattrs::empty()),
+        Err(e) => return Err(map(e)),
+    };
+    collect_xattrs(
+        &list[..len],
+        |name, buf| read_grown(buf, |b| rustix::fs::lgetxattr(link, name, b)),
+        map,
+    )
+}
+
+/// Returns the error of an xattr read of `path` through `/proc/self/fd` that
+/// gives `ENOENT` for an entry that exists.
+fn proc_hidden(path: impl std::fmt::Display) -> FsError {
+    FsError::Io(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "the xattr read of {path} through /proc/self/fd gives ENOENT, but \
+             the entry exists: /proc is not mounted or is of another PID \
+             namespace"
+        ),
+    ))
 }
 
 /// Returns the fs-verity digest that the kernel holds for the file open at
@@ -1325,6 +1362,13 @@ mod tests {
         let (path, reason) = invalid(objects.link_xattrs("cd/file"));
         assert_eq!(path, "objects/cd");
         assert!(matches!(reason, Reason::Symlink), "{reason:?}");
+
+        let at = |name: &str| link_xattrs_at(objects.as_fd(), Path::new(name));
+        assert!(has_demo(&at("ab/file").unwrap()));
+        assert!(!has_demo(&at("ab/link").unwrap()));
+        assert!(has_demo(&at("cd/file").unwrap()));
+        let err = io_err(at("ab/none"));
+        assert_eq!(err.raw_os_error(), Some(Errno::NOENT.raw_os_error()));
     }
 
     #[test]

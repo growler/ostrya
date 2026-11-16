@@ -2461,7 +2461,6 @@ fn delta_digests_blocking(root: &RepoDir, to: Option<&Checksum>) -> Result<Vec<D
     crate::delta::walk_deltas(root, |fan, fanout, leaves| {
         for leaf in leaves {
             let superblock = format!("{leaf}/{SUPERBLOCK_FILE}");
-            let shown = || format!("{DELTAS_DIR}/{fanout}/{superblock}");
             let parsed = crate::delta::parse_delta_dir(fanout, leaf);
             if let Some(to) = to {
                 match &parsed {
@@ -2470,14 +2469,14 @@ fn delta_digests_blocking(root: &RepoDir, to: Option<&Checksum>) -> Result<Vec<D
                     // A name that does not decode fails the pass only where
                     // the directory holds a superblock, as in a full pass.
                     Err(_) => {
-                        if crate::delta::has_superblock(fan, &superblock, shown)? {
+                        if crate::delta::has_superblock(fan, &superblock)? {
                             parsed?;
                         }
                         continue;
                     }
                 }
             }
-            let Some(digest) = superblock_digest(fan, &superblock, shown)? else {
+            let Some(digest) = superblock_digest(fan, &superblock)? else {
                 continue;
             };
             let (from, target) = parsed?;
@@ -2498,8 +2497,7 @@ fn delta_digests_blocking(root: &RepoDir, to: Option<&Checksum>) -> Result<Vec<D
 }
 
 /// Returns the SHA-256 of the superblock at `path` below the fanout handle
-/// `fan`, or `None` if no superblock is there. `shown` gives the path
-/// relative to the repository root.
+/// `fan`, or `None` if no superblock is there.
 ///
 /// The open is one `openat2` with no symlink followed. An absent entry, and a
 /// file in place of the delta directory, give `None`. A symlink, and an entry
@@ -2507,27 +2505,15 @@ fn delta_digests_blocking(root: &RepoDir, to: Option<&Checksum>) -> Result<Vec<D
 /// [`MAX_SUPERBLOCK`] gives [`Error::InvalidFormat`], also if it grows past
 /// the limit during the read. The hash reads the file in [`IO_CHUNK`]
 /// pieces, so the call holds one piece in memory.
-fn superblock_digest(
-    fan: &RepoDir,
-    path: &str,
-    shown: impl Fn() -> String,
-) -> Result<Option<Checksum>> {
+fn superblock_digest(fan: &RepoDir, path: &str) -> Result<Option<Checksum>> {
     use std::io::Read;
 
-    let opened = match fan.open_regular(path) {
-        Ok(opened) => opened,
-        Err(
-            FsError::Absent { .. }
-            | FsError::Invalid {
-                reason: Reason::NotDirectory,
-                ..
-            },
-        ) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let Some(opened) = fan.open_regular(path).optional_dir()? else {
+        return Ok(None);
     };
     let too_large = || -> Error {
         FsError::Invalid {
-            path: shown(),
+            path: fan.err_path(path),
             reason: Reason::TooLarge {
                 cap: MAX_SUPERBLOCK,
             },
@@ -3702,8 +3688,7 @@ mod tests {
             .unwrap()
             .open_dir("ab")
             .unwrap();
-        let shown = || "deltas/ab/leaf/superblock".to_owned();
-        let digest = || superblock_digest(&fan, "leaf/superblock", shown);
+        let digest = || superblock_digest(&fan, "leaf/superblock");
         let file = leaf.join(SUPERBLOCK_FILE);
 
         assert!(digest().unwrap().is_none());

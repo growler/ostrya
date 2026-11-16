@@ -29,6 +29,7 @@ use crate::error::{Error, Result};
 use crate::ingest::{adjust_meta, to_dirmeta};
 use crate::modifier::{CommitModifierFlags, Owner};
 use crate::repo::Repo;
+use crate::repo_fs::{FsError, link_xattrs_at};
 use crate::write::FileMeta;
 
 /// The size of the payload chunk that hashes a local file. A file of any size
@@ -347,8 +348,6 @@ impl Repo {
     ///   repository does not hold, or if a dirtree that the walk reads is
     ///   absent.
     /// - [`Error::Core`] if a commit or a dirtree does not parse.
-    /// - [`Error::InvalidFormat`] if the name of an extended attribute on a
-    ///   directory side is not valid UTF-8.
     /// - [`Error::InvalidFormat`] if a commit or a dirtree is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path, as
@@ -1119,11 +1118,10 @@ fn read_xattrs(
 ) -> Result<HashMap<usize, Xattrs>> {
     let mut out = HashMap::with_capacity(asked.len());
     for (at, name) in asked {
-        let xattrs =
-            crate::ingest::read_link_xattrs(root, rel.join(&name)).map_err(|err| match err {
-                Error::Io(io) => path_error_io("getxattr", &path.join(&name), &io),
-                other => other,
-            })?;
+        let xattrs = link_xattrs_at(root, &rel.join(&name)).map_err(|err| match err {
+            FsError::Io(io) => path_error_io("getxattr", &path.join(&name), &io),
+            other => other.into(),
+        })?;
         out.insert(at, xattrs);
     }
     Ok(out)

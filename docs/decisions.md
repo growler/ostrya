@@ -149,9 +149,13 @@ The calls that have no `openat2` form follow no symlink in the repository:
   descriptor of the parent directory or of the temp home.
 
 A primitive refuses a `..`, `.`, or empty component, and an absolute path,
-from the text of the path, before the call. The primitives have no fallback
-to `openat`. `ENOSYS` and an `EPERM` from a seccomp filter fail the call. A
-kernel older than Linux 5.6 is not a target.
+from the text of a path below a `RepoDir`, before the call. The primitives
+have no fallback to `openat`. `ENOSYS` and an `EPERM` from a seccomp filter
+fail the call. A kernel older than Linux 5.6 is not a target.
+
+`link_xattrs_at` reads the xattrs of an entry in a tree outside the
+repository below a plain descriptor, for example the source tree of a commit.
+It reads through the path `/proc/self/fd/<dir>/<name>` with no path rule.
 
 A symlink in a repository can be at these locations alone:
 

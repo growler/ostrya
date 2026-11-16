@@ -23,7 +23,7 @@ use ostrya_core::Checksum;
 
 use crate::error::Result;
 use crate::repo::Repo;
-use crate::repo_fs::{self, FsError, FsResultExt, Opened, Publish, Reason, RepoDir, RepoLayout};
+use crate::repo_fs::{self, FsError, FsResultExt, Opened, Publish, RepoDir, RepoLayout};
 
 /// The directory of the images, relative to the root of the repository.
 pub(crate) const IMAGE_DIR: &str = "extensions/ostrya/composefs";
@@ -104,16 +104,8 @@ pub(crate) fn list_blocking(root: &RepoDir) -> Result<Vec<Checksum>> {
         if !is_lower_hex(fanout, 2) {
             continue;
         }
-        let sub = match store.open_dir(fanout) {
-            Ok(sub) => sub,
-            Err(
-                FsError::Absent { .. }
-                | FsError::Invalid {
-                    reason: Reason::Symlink | Reason::NotDirectory,
-                    ..
-                },
-            ) => continue,
-            Err(e) => return Err(e.into()),
+        let Some(sub) = store.open_dir(fanout).optional_walked_dir()? else {
+            continue;
         };
         for entry in sub.list()? {
             let Some(rest) = std::str::from_utf8(&entry.name)

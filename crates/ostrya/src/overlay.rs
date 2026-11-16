@@ -19,9 +19,10 @@ use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags};
 
 use crate::error::{Error, Result};
-use crate::ingest::{adjust_meta, finalize_meta, join_path, to_dirmeta};
+use crate::ingest::{adjust_meta, finalize_meta, join_path, to_dirmeta, utf8_names};
 use crate::modifier::{CommitModifier, CommitModifierFlags, FilterResult, Owner};
 use crate::mtree::MutableTree;
+use crate::repo_fs::link_xattrs_at;
 use crate::transaction::Transaction;
 use crate::write::FileMeta;
 
@@ -414,7 +415,7 @@ fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &OverlayKind) -> Res
     let oflags = match kind {
         OverlayKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         OverlayKind::Dir => OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        OverlayKind::Symlink(_) => return crate::ingest::read_link_xattrs(dir, name),
+        OverlayKind::Symlink(_) => return utf8_names(link_xattrs_at(dir, Path::new(name))?),
         OverlayKind::Whiteout => return Ok(Xattrs::empty()),
     };
     let fd = rustix::fs::openat(dir, name, oflags, Mode::empty())?;

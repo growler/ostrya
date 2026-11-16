@@ -32,7 +32,7 @@ mod write;
 pub(crate) use dir::list_fd;
 pub(crate) use lock::{try_lock, unlock};
 pub(crate) use named::{Named, ensure_named_dir, open_named, put_named, remove_named};
-pub(crate) use read::{verity_digest, xattr, xattrs};
+pub(crate) use read::{link_xattrs_at, verity_digest, xattr, xattrs};
 pub(crate) use temp::{TempFile, TempLink};
 pub(crate) use write::{Cloned, clone_or_copy, link, rename};
 
@@ -170,6 +170,15 @@ pub(crate) trait FsResultExt<T> {
     /// `Ok(Some(value))` for `Ok(value)`. Each other error stays the same.
     fn optional(self) -> Result<Option<T>, FsError>;
 
+    /// Gives `Ok(None)` for an [`Absent`](FsError::Absent) entry and for
+    /// [`Reason::NotDirectory`]: an entry below a file, or a file at the name.
+    /// Each other error stays the same, also [`Reason::Symlink`].
+    fn optional_dir(self) -> Result<Option<T>, FsError>;
+
+    /// Gives the result of [`optional_dir`](FsResultExt::optional_dir), and
+    /// also `Ok(None)` for [`Reason::Symlink`].
+    fn optional_walked_dir(self) -> Result<Option<T>, FsError>;
+
     /// Converts the result of an operation on the ref file of the ref `name`.
     /// `name` is the ref as text, as the caller gives it.
     ///
@@ -196,6 +205,26 @@ impl<T> FsResultExt<T> for Result<T, FsError> {
             Ok(value) => Ok(Some(value)),
             Err(FsError::Absent { .. }) => Ok(None),
             Err(err) => Err(err),
+        }
+    }
+
+    fn optional_dir(self) -> Result<Option<T>, FsError> {
+        match self {
+            Err(FsError::Invalid {
+                reason: Reason::NotDirectory,
+                ..
+            }) => Ok(None),
+            other => other.optional(),
+        }
+    }
+
+    fn optional_walked_dir(self) -> Result<Option<T>, FsError> {
+        match self {
+            Err(FsError::Invalid {
+                reason: Reason::Symlink,
+                ..
+            }) => Ok(None),
+            other => other.optional_dir(),
         }
     }
 
@@ -1361,6 +1390,26 @@ mod tests {
             Err(FsError::Io(e)) => assert_eq!(e.raw_os_error(), Some(Errno::ACCESS.raw_os_error())),
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn optional_dir_gives_none_for_an_entry_that_is_no_directory() {
+        let dir = TestDir::new("optional-dir");
+        let refs = refs(&dir);
+        let top = dir.path().join("refs");
+        std::fs::create_dir(top.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", top.join("link")).unwrap();
+        std::fs::write(top.join("file"), b"").unwrap();
+        let open = |name: &str| refs.open_dir(name);
+        assert!(open("real").optional_dir().unwrap().is_some());
+        assert!(open("real").optional_walked_dir().unwrap().is_some());
+        for name in ["file", "file/below", "absent"] {
+            assert!(open(name).optional_dir().unwrap().is_none(), "{name}");
+        }
+        assert!(open("link").optional_walked_dir().unwrap().is_none());
+        let (path, reason) = super::invalid(open("link").optional_dir());
+        assert_eq!(path, "refs/link");
+        assert!(matches!(reason, Reason::Symlink), "{reason:?}");
     }
 
     #[test]

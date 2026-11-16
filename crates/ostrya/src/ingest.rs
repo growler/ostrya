@@ -6,7 +6,7 @@
 //! The object writers are in `write.rs`.
 
 use std::future::Future;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::pin::Pin;
@@ -21,6 +21,7 @@ use crate::modifier::{
     CommitModifier, CommitModifierFlags, FilterResult, Owner, with_selinux, without_selinux,
 };
 use crate::mtree::MutableTree;
+use crate::repo_fs::link_xattrs_at;
 use crate::transaction::Transaction;
 use crate::write::FileMeta;
 
@@ -944,7 +945,7 @@ fn read_entry_xattrs(dir: BorrowedFd<'_>, name: &str, kind: &EntryKind) -> Resul
     let oflags = match kind {
         EntryKind::Regular => OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         EntryKind::Dir => OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        EntryKind::Symlink(_) => return read_link_xattrs(dir, name),
+        EntryKind::Symlink(_) => return utf8_names(link_xattrs_at(dir, Path::new(name))?),
     };
     let fd = rustix::fs::openat(dir, name, oflags, Mode::empty())?;
     read_all_xattrs(fd.as_fd())
@@ -1108,13 +1109,18 @@ pub(crate) fn join_path(parent: &str, name: &str) -> String {
 
 /// Reads all extended attributes of an open descriptor into an [`Xattrs`] set.
 ///
-/// The function reads with [`repo_fs::xattrs`](crate::repo_fs::xattrs). The
-/// set is canonical. Each name keeps its terminating NUL, as in the on-disk
-/// form. A name that is not valid UTF-8 gives [`Error::InvalidFormat`]. A list
-/// or a value over 64 KiB gives [`Error::Io`] with `E2BIG`. A set that
-/// [`Xattrs::new`] refuses gives [`Error::Io`] with the kind `InvalidData`.
+/// The function reads with [`repo_fs::xattrs`](crate::repo_fs::xattrs), and
+/// then checks the names with [`utf8_names`]. The set is canonical. Each name
+/// keeps its terminating NUL, as in the on-disk form. A list or a value over
+/// 64 KiB gives [`Error::Io`] with `E2BIG`. A set that [`Xattrs::new`]
+/// refuses gives [`Error::Io`] with the kind `InvalidData`.
 pub(crate) fn read_all_xattrs(fd: BorrowedFd<'_>) -> Result<Xattrs> {
-    let xattrs = crate::repo_fs::xattrs(fd)?;
+    utf8_names(crate::repo_fs::xattrs(fd)?)
+}
+
+/// Gives `xattrs` back if each name is valid UTF-8. A name that is not valid
+/// UTF-8 gives [`Error::InvalidFormat`].
+pub(crate) fn utf8_names(xattrs: Xattrs) -> Result<Xattrs> {
     if xattrs
         .iter()
         .any(|(name, _)| std::str::from_utf8(name).is_err())
@@ -1124,159 +1130,11 @@ pub(crate) fn read_all_xattrs(fd: BorrowedFd<'_>) -> Result<Xattrs> {
     Ok(xattrs)
 }
 
-/// Reads the extended attributes of an entry relative to a directory descriptor.
-///
-/// If the entry is a symlink, the function reads the attributes of the symlink
-/// itself. `name` can name an entry several directories below `dir`.
-///
-/// A symlink cannot be opened for a descriptor, so [`read_all_xattrs`] cannot
-/// read it. This function addresses the entry through `/proc/self/fd` with
-/// no-follow. It reads the entry with the path-based `l` xattr calls.
-pub(crate) fn read_link_xattrs(
-    dir: rustix::fd::BorrowedFd<'_>,
-    name: impl AsRef<std::ffi::OsStr>,
-) -> Result<Xattrs> {
-    let link = proc_fd_path(dir, name.as_ref());
-    let mut names_buf = vec![0u8; 256];
-    let names = loop {
-        match rustix::fs::llistxattr(&link, &mut names_buf[..]) {
-            Ok(n) => break &names_buf[..n],
-            Err(Errno::RANGE) => {
-                let grown = names_buf.len().saturating_mul(2).max(512);
-                names_buf.resize(grown, 0);
-            }
-            Err(Errno::NOTSUP) => return Ok(Xattrs::empty()),
-            Err(e) => return Err(Error::Io(e.into())),
-        }
-    };
-    collect_xattrs(names, |xname| read_link_xattr(&link, xname))
-}
-
-/// Reads one extended attribute of the entry at a `/proc/self/fd` path.
-///
-/// The read does not follow a symlink. If the attribute does not exist, the
-/// function returns `None`. The function reads one value with the path-based
-/// `lgetxattr` call.
-fn read_link_xattr(link: &std::path::Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = vec![0u8; 256];
-    loop {
-        match rustix::fs::lgetxattr(link, name, &mut buf[..]) {
-            Ok(n) => {
-                buf.truncate(n);
-                return Ok(Some(buf));
-            }
-            Err(Errno::RANGE) => {
-                let grown = buf.len().saturating_mul(2).max(512);
-                buf.resize(grown, 0);
-            }
-            Err(Errno::NODATA) | Err(Errno::NOTSUP) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
-/// Builds a canonical [`Xattrs`] set from a list of names and a value reader.
-///
-/// `names` is a NUL-separated list of attribute names. `read_value` reads the
-/// value of one name. The set stores each name with one terminating NUL, as in
-/// the on-disk form.
-///
-/// If an attribute disappears between the list call and the read of its value,
-/// the function skips it.
-fn collect_xattrs(
-    names: &[u8],
-    mut read_value: impl FnMut(&str) -> std::io::Result<Option<Vec<u8>>>,
-) -> Result<Xattrs> {
-    let mut pairs = Vec::new();
-    for raw_name in names.split(|&b| b == 0) {
-        if raw_name.is_empty() {
-            continue;
-        }
-        let name = std::str::from_utf8(raw_name)
-            .map_err(|_| Error::InvalidFormat("xattr name is not valid UTF-8".into()))?;
-        let Some(value) = read_value(name).map_err(Error::Io)? else {
-            continue;
-        };
-        let mut stored = raw_name.to_vec();
-        stored.push(0);
-        pairs.push((stored, value));
-    }
-    Ok(Xattrs::new(pairs)?)
-}
-
-/// Returns the `/proc/self/fd` path of `name` relative to a directory descriptor.
-///
-/// The path has the form `/proc/self/fd/<dirfd>/<name>`. The path-based
-/// no-follow xattr calls use it to reach a symlink, because a symlink cannot be
-/// opened for a descriptor. They also use it to reach an entry of another kind
-/// with no open call.
-fn proc_fd_path(dir: rustix::fd::BorrowedFd<'_>, name: &std::ffi::OsStr) -> std::path::PathBuf {
-    let mut path = std::path::PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
-    path.push(name);
-    path
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{CreateOptions, Repo};
     use ostrya_rt::block_on;
-
-    /// Checks that `read_link_xattrs` reads the symlink itself, with no-follow.
-    ///
-    /// The test makes a symlink to a regular file that has an xattr. The
-    /// function returns the xattr set of the symlink. The set of the target
-    /// does not show through the symlink.
-    ///
-    /// An xattr on a symlink needs a privileged namespace. The VFS refuses
-    /// `user.*` on a symlink. The other namespaces need `CAP_SYS_ADMIN` or the
-    /// permission of an LSM. An unprivileged test cannot put an xattr on the
-    /// symlink, so the test checks only the no-follow rule.
-    #[test]
-    fn read_link_xattrs_does_not_follow_to_the_target() {
-        let dir = std::env::temp_dir().join(format!("ostrya-linkxattr-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-
-        std::fs::write(dir.join("target"), b"payload").unwrap();
-        rustix::fs::setxattr(
-            dir.join("target"),
-            "user.demo",
-            b"value",
-            rustix::fs::XattrFlags::empty(),
-        )
-        .unwrap();
-        std::os::unix::fs::symlink("target", dir.join("link")).unwrap();
-
-        let dfd = std::fs::File::open(&dir).unwrap();
-
-        // The target has the xattr when the test reads it through its descriptor.
-        let tfd = rustix::fs::openat(
-            dfd.as_fd(),
-            "target",
-            OFlags::RDONLY | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .unwrap();
-        let target_xattrs = read_all_xattrs(tfd.as_fd()).unwrap();
-        assert!(
-            target_xattrs
-                .iter()
-                .any(|(n, v)| n == b"user.demo\0" && v == b"value"),
-            "the target file carries user.demo"
-        );
-
-        // The link, read with no-follow, has an empty xattr set. The xattr of
-        // the target does not show through the link.
-        let link_xattrs = read_link_xattrs(dfd.as_fd(), "link").unwrap();
-        assert_eq!(
-            link_xattrs.iter().count(),
-            0,
-            "the symlink's own xattr set is empty, not the target's: {link_xattrs:?}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     /// A temporary directory that the drop removes.
     struct Scratch(std::path::PathBuf);

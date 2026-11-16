@@ -1180,26 +1180,16 @@ impl Repo {
             // files in place and the summary as it was.
             self.write_locked(move |repo| {
                 let root = repo.root_dir();
-                let file = RootFile::Summary;
-                root.stage_root_file(&file, &bytes, fsync)?.publish(
-                    root,
-                    file.name(),
-                    Publish::Replace,
-                    false,
-                )?;
+                let temp = root.stage_root_file(&RootFile::Summary, &bytes, fsync)?;
+                temp.publish(root, RootFile::Summary.name(), Publish::Replace, false)?;
                 // The signature covers those bytes, so the pull copies it with
                 // them. A client that pulls from this repository with
                 // `gpg-verify-summary=true` reads the pair. If the remote holds
                 // no `summary.sig`, the file of this repository stays as it
                 // is. The `ostree` command does the same.
                 if let Some(sig) = signature {
-                    let file = RootFile::SummarySig;
-                    root.stage_root_file(&file, &sig, fsync)?.publish(
-                        root,
-                        file.name(),
-                        Publish::Replace,
-                        false,
-                    )?;
+                    let temp = root.stage_root_file(&RootFile::SummarySig, &sig, fsync)?;
+                    temp.publish(root, RootFile::SummarySig.name(), Publish::Replace, false)?;
                 }
                 // One sync of the root directory makes both renames durable.
                 if fsync {

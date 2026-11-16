@@ -1113,6 +1113,79 @@ The page `ostree.repo-config(5)` states a wider rule: "If this variable is
 set, any certificate will be accepted." The measurement shows that the host
 name check stays. `cli-surface.md`, "P2", `pull`, records the port side.
 
+#### Paths of the remote keys
+
+The keys `tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`,
+`gpgkeypath`, and `verification-ed25519-file` of a remote name files. The
+TLS keys and `gpgkeypath` were observed with libostree 2026.4 on Debian, and
+`verification-ed25519-file` with libostree 2026.1 with `sign-ed25519`. Each
+command names its repository with `--repo`, and runs from a set working
+directory. `strace` shows the open of each path.
+
+The TLS keys are set in `<repo>/config` with `remote add --set`. A pull of
+`test/main` from `https://localhost:PORT/src` reads them:
+
+- `tls-ca-path=certs/ca.pem`, with the file under the repository root alone:
+  the pull fails at exit 1 with `[77] Problem with the SSL CA cert (path?
+  access rights?)`. The tool opens `certs/ca.pem` relative to the working
+  directory, and the open gives `ENOENT`.
+- The same value, with the file under the working directory alone: the pull
+  succeeds. The tool opens `certs/ca.pem` relative to the working directory
+  four times in one pull.
+- `tls-ca-path=../cadir/ca.pem`, with the file at `<cwd>/../cadir/ca.pem`
+  alone: the pull succeeds. With the file at `<repo>/../cadir2/ca.pem` alone
+  and the value `../cadir2/ca.pem`, the pull fails with `[77]`.
+- `tls-client-cert-path=certs/cli.pem` and
+  `tls-client-key-path=certs/cli.key`, against a server that requires a
+  client certificate: the same results. The files under the repository root
+  alone fail the pull with `[58] Problem with the local SSL certificate`. The
+  files under the working directory alone serve. A value with `..` resolves
+  against the working directory.
+- A FIFO at the absolute path of each of the three keys, with no writer: the
+  pull does not end in 20 seconds. With a writer that writes the file one
+  time into the FIFO, the pull does not end in 20 seconds either.
+- `tls-ca-path=/dev/null`: the pull fails at exit 1 with `[77]`.
+- An absolute `tls-ca-path` serves. No `tls-ca-path` fails with `[60] SSL
+  peer certificate or SSH remote key was not OK`. No client certificate
+  against a server that requires one fails with `[56] Failure when receiving
+  data from the peer`. An absolute client certificate and key serve.
+
+A pull from a `file://` URL of a commit that GPG signed reads `gpgkeypath`:
+
+- For each entry, the tool first opens the path relative to the working
+  directory with `O_DIRECTORY`, `O_NOFOLLOW`, and `O_NONBLOCK`. For a file,
+  this open gives `ENOTDIR`, and the tool then opens the file with
+  `O_RDONLY` and no `O_NONBLOCK`.
+- A FIFO at a file entry, with no writer: the pull does not end in 20
+  seconds. The tool waits in the open of the FIFO. With a writer that writes
+  the keyring one time into the FIFO, the pull reads the keyring from the
+  FIFO and ends at exit 0.
+- `gpgkeypath=../keys/k.gpg`, with the file at `<cwd>/../keys/k.gpg` alone:
+  the pull succeeds. With the file at `<repo>/../keys/k.gpg` alone, the pull
+  fails at exit 1 with `error: Commit <hex>: opendir(../keys/k.gpg): No such
+  file or directory`.
+- A directory entry: the tool lists the directory, and opens each member
+  that the listing gives as a regular file. It does not open a FIFO member,
+  and the pull does not wait for it. It does not read a symlink member. A
+  symlink at a file entry is followed.
+
+A pull from a `file://` URL with `gpg-verify=false`, `sign-verify=true`, and
+a commit that `ostree sign` signed reads `verification-ed25519-file`:
+
+- The tool reads the status of the path with a stat that follows a symlink,
+  and then opens a regular file. A symlink at the path is followed.
+- A FIFO at the path, with or without a writer: the pull ends at once at
+  exit 1 with `error: Failed loading 'ed25519' keys from '<path>`, with no
+  closing quote. The tool does not open the FIFO.
+- `verification-ed25519-file=../keys/pub.ed25519`, with the file at
+  `<cwd>/../keys/pub.ed25519` alone: the pull succeeds. With the file at
+  `<repo>/../keys/pub.ed25519` alone, the pull fails at exit 1 with
+  `error: Failed loading 'ed25519' keys from '../keys/pub.ed25519`.
+
+Not observed: `push-token-file`, which the tool does not read, and a value
+in a `.conf` file of a remotes directory that a repository names, which the
+tool does not read.
+
 #### Ref list and mirror pulls
 
 The tool resolves an empty ref list by the kind of pull:

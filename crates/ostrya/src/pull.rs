@@ -714,9 +714,12 @@ pub struct PullOptions {
     /// of [`EndpointOverrides`](crate::endpoint::EndpointOverrides).
     ///
     /// [`Repo::pull`] gives them to
-    /// [`resolve_pull`](crate::endpoint::resolve_pull) with the config of this
-    /// repository and the name of the remote. A value of the caller wins over
-    /// its remote key. `resolve_pull` refuses the push fields `push_token_file`
+    /// [`resolve_pull`](crate::endpoint::resolve_pull) with this repository
+    /// and the name of the remote. A value of the caller wins over its remote
+    /// key. A relative path of the caller is relative to the working
+    /// directory, and a relative path of a remote key is relative to the
+    /// repository root or to the remotes directory, as
+    /// [`Remote`](crate::config::Remote#paths) states. `resolve_pull` refuses the push fields `push_token_file`
     /// and `push_user` with [`Error::InvalidInput`]. The default value
     /// overrides nothing, and the pull defaults then apply: 5 retries, 8
     /// requests in flight, and a low speed limit of 1000 bytes per second for

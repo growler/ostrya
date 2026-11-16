@@ -19,15 +19,18 @@
 // configuration section of a remote, or a trust group.
 // The pull and the receive path share this build.
 
+use std::os::fd::BorrowedFd;
+use std::path::Path;
 use std::sync::Arc;
 
 use ostrya_core::{Value, base64};
-use rustix::fs::{Mode, OFlags};
+use rustix::io::Errno;
 
-use crate::config::{Remote, SignVerify, valid_remote_name};
+use crate::config::{KeyPath, Remote, SignVerify, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::pull::PullVerify;
 use crate::repo::Repo;
+use crate::repo_fs::{FsError, Named, Reason, open_named};
 use crate::sign::{
     Ed25519Verifier, MAX_KEY_FILE, SignKeys, Verifier, key_text, load_sign_keys, read_key_source,
     signatures_for,
@@ -1113,14 +1116,16 @@ impl KeySource<'_> {
         }
     }
 
-    /// Returns the path of a file of trusted keys for one sign-api engine.
-    fn verification_file(&self, engine: &str) -> Result<Option<String>> {
+    /// Returns the path of a file of trusted keys for one sign-api engine,
+    /// with the source of the section.
+    fn verification_file(&self, engine: &str) -> Result<Option<KeyPath>> {
+        let key = format!("verification-{engine}-file");
         match self {
             KeySource::Remote { section, .. } => match section {
-                Some(section) => section.verification_file(engine),
+                Some(section) => section.key_path(&key),
                 None => Ok(None),
             },
-            KeySource::Trust { section, .. } => section.verification_file(engine),
+            KeySource::Trust { section, .. } => section.key_path(&key),
         }
     }
 
@@ -1169,13 +1174,14 @@ impl Verifiers {
     /// `None` means that the engine has no key to verify with.
     async fn sign(
         &mut self,
+        repo: &Repo,
         engine: &str,
         source: &KeySource<'_>,
     ) -> Result<Option<Arc<dyn Verifier>>> {
         if let Some((_, verifier)) = self.sign.iter().find(|(name, _)| name == engine) {
             return Ok(verifier.clone());
         }
-        let verifier = sign_verifier(engine, source).await?;
+        let verifier = sign_verifier(repo, engine, source).await?;
         self.sign.push((engine.to_owned(), verifier.clone()));
         Ok(verifier)
     }
@@ -1213,7 +1219,7 @@ pub(crate) async fn build_policy(
     if !names.is_empty() {
         let mut verifiers: Vec<Arc<dyn Verifier>> = Vec::with_capacity(names.len());
         for name in &names {
-            match cache.sign(name, source).await? {
+            match cache.sign(repo, name, source).await? {
                 Some(verifier) => verifiers.push(verifier),
                 None if required => {
                     return Err(Error::Signature(format!(
@@ -1282,7 +1288,7 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             system_keys,
         } => {
             let keypath = match section {
-                Some(section) => section.gpgkeypath()?,
+                Some(section) => section.gpgkeypath_paths()?,
                 None => Vec::new(),
             };
             let repo = repo.clone();
@@ -1298,7 +1304,7 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
                 } else {
                     None
                 };
-                crate::gpg::remote_keyrings(keyring, &remote, &keypath, global)
+                crate::gpg::remote_keyrings(keyring, &remote, Some(&repo), &keypath, global)
             })
             .await?;
             if !global && verifier.is_empty() {
@@ -1310,9 +1316,10 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             verifier
         }
         KeySource::Trust { name, section } => {
-            let keypath = section.gpgkeypath()?;
+            let keypath = section.gpgkeypath_paths()?;
             let key = format!("[ex-ostrya trust \"{name}\"] gpgkeypath");
-            ostrya_rt::unblock(move || crate::gpg::from_keypath(&key, &keypath)).await?
+            let repo = repo.clone();
+            ostrya_rt::unblock(move || crate::gpg::from_keypath(&key, &repo, &keypath)).await?
         }
     };
     Ok(Arc::new(verifier))
@@ -1354,7 +1361,11 @@ enum Engine {
 /// `None` means that the engine has no key to verify with. The policy decides
 /// the result. It refuses an engine that it names by hand. It skips an engine
 /// that it reached through a value that names every engine.
-async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Arc<dyn Verifier>>> {
+async fn sign_verifier(
+    repo: &Repo,
+    engine: &str,
+    source: &KeySource<'_>,
+) -> Result<Option<Arc<dyn Verifier>>> {
     let kind = match engine {
         "ed25519" => Engine::Ed25519,
         #[cfg(feature = "sign-spki")]
@@ -1365,7 +1376,7 @@ async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Ar
             )));
         }
     };
-    let Some(keys) = sign_keys(engine, source).await? else {
+    let Some(keys) = sign_keys(repo, engine, source).await? else {
         return Ok(None);
     };
     build_verifier(kind, keys)
@@ -1403,15 +1414,17 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
 ///
 /// This function reads the configuration. The blocking pool reads the paths
 /// that the configuration names, so a slow path holds a pool thread and cannot
-/// hold an executor thread.
+/// hold an executor thread. A relative path of the key file resolves against
+/// the base that its source and `repo` give, as [`KeyPath::locate`] states.
 ///
 /// `None` means that no source holds a key for the engine.
-async fn sign_keys(engine: &str, source: &KeySource<'_>) -> Result<Option<SignKeys>> {
+async fn sign_keys(repo: &Repo, engine: &str, source: &KeySource<'_>) -> Result<Option<SignKeys>> {
     let inline = source.verification_key(engine)?;
     let path = source.verification_file(engine)?;
     let system = source.system_store();
     let engine = engine.to_owned();
-    ostrya_rt::unblock(move || read_sign_keys(&engine, inline, path, system)).await
+    let repo = repo.clone();
+    ostrya_rt::unblock(move || read_sign_keys(&engine, inline, path, Some(&repo), system)).await
 }
 
 /// Runs the blocking half of [`sign_keys`].
@@ -1428,7 +1441,8 @@ async fn sign_keys(engine: &str, source: &KeySource<'_>) -> Result<Option<SignKe
 fn read_sign_keys(
     engine: &str,
     inline: Option<String>,
-    path: Option<String>,
+    path: Option<KeyPath>,
+    repo: Option<&Repo>,
     system: bool,
 ) -> Result<Option<SignKeys>> {
     let mut keys = SignKeys::default();
@@ -1439,7 +1453,9 @@ fn read_sign_keys(
         keys.trusted.push(base64::decode(inline.trim())?);
     }
     if let Some(path) = path {
-        keys.trusted.extend(read_verification_file(engine, &path)?);
+        let (base, at, shown) = path.locate(repo);
+        keys.trusted
+            .extend(read_verification_file(engine, base, &at, &shown)?);
     }
     if system {
         let store = load_sign_keys(engine)?;
@@ -1452,29 +1468,47 @@ fn read_sign_keys(
     Ok(Some(keys))
 }
 
-/// Reads the keys of one `verification-<engine>-file`, up to [`MAX_KEY_FILE`]
-/// bytes, under the rule that [`read_key_source`] states.
+/// Reads the keys of one `verification-<engine>-file` at `at` relative to
+/// `base`, up to [`MAX_KEY_FILE`] bytes, under the rule that
+/// [`read_key_source`] states. `shown` names the file in a message.
 ///
-/// The function opens the path once and reads it through the ceiling, so the
-/// keys come from the bytes that the ceiling admits. It refuses a file of
-/// another kind, a file over the ceiling, and a file that it cannot read. Each
-/// error names the file, so an operator can find the entry that names it.
+/// The function opens the path once with `O_NONBLOCK`, and follows a symlink
+/// at each component. It refuses a file of another kind after the open, so a
+/// FIFO does not block the open. It reads the file through the ceiling, so
+/// the keys come from the bytes that the ceiling admits. It refuses a file
+/// over the ceiling, and a file that it cannot read. Each error names the
+/// file, so an operator can find the entry that names it.
 ///
 /// A file of the spki engine holds PEM `PUBLIC KEY` blocks, which
 /// `spki_public_keys` reads. An empty file adds no keys. A file of another
 /// engine holds one base64 key on each line, and the function skips a line of
 /// white space only.
-fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
-    let subject = format!("the '{engine}' key file '{path}'");
-    // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
-    // waits for a writer. On a regular file, the flag has no effect on the
-    // later read.
-    let fd = rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
+fn read_verification_file(
+    engine: &str,
+    base: BorrowedFd<'_>,
+    at: &Path,
+    shown: &Path,
+) -> Result<Vec<Vec<u8>>> {
+    let subject = format!("the '{engine}' key file '{}'", shown.display());
+    let fd = match open_named(base, at, Named::File) {
+        Ok(fd) => fd,
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
+        Err(err) => {
+            let e: std::io::Error = match err {
+                FsError::Io(e) => e,
+                FsError::Absent { .. } => Errno::NOENT.into(),
+                FsError::Invalid {
+                    reason: Reason::NotDirectory,
+                    ..
+                } => Errno::NOTDIR.into(),
+                other => return Err(other.into()),
+            };
+            return Err(Error::Signature(format!("{subject} cannot be read: {e}")));
+        }
+    };
     let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
     #[cfg(feature = "sign-spki")]
     if engine == "spki" {
@@ -1492,9 +1526,34 @@ fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
 
 #[cfg(test)]
 mod tests {
-    use rustix::fs::FileType;
+    use rustix::fs::{FileType, Mode};
 
     use super::*;
+
+    /// Runs `f` with the handle of a new repository in a temp directory, and
+    /// removes the directory after.
+    fn with_repo<T>(f: impl AsyncFnOnce(&Repo) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-repo-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let outcome = ostrya_rt::block_on(async {
+            let repo = Repo::create(&root, crate::CreateOptions::new(crate::RepoMode::Archive))
+                .await
+                .unwrap();
+            f(&repo).await
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        outcome
+    }
+
+    /// Reads the keys of the key file at the caller path `path`.
+    fn key_file(engine: &str, path: &Path) -> Result<Vec<Vec<u8>>> {
+        read_verification_file(engine, rustix::fs::CWD, path, path)
+    }
 
     /// A remote that the configuration does not describe.
     const NO_SECTION: KeySource<'static> = KeySource::Remote {
@@ -1773,8 +1832,8 @@ mod tests {
     /// policy reads that report to refuse an engine that it names by hand.
     #[test]
     fn unknown_engines_and_empty_key_sets_are_told_apart() {
-        ostrya_rt::block_on(async {
-            let Err(err) = sign_verifier("nosuchengine", &NO_SECTION).await else {
+        with_repo(async |repo| {
+            let Err(err) = sign_verifier(repo, "nosuchengine", &NO_SECTION).await else {
                 panic!("an engine this build has no verifier for is refused");
             };
             assert!(
@@ -1785,7 +1844,7 @@ mod tests {
             // own, the engine has no key at all.
             if load_sign_keys("ed25519").unwrap().trusted.is_empty() {
                 assert!(
-                    sign_verifier("ed25519", &NO_SECTION)
+                    sign_verifier(repo, "ed25519", &NO_SECTION)
                         .await
                         .unwrap()
                         .is_none()
@@ -1799,8 +1858,8 @@ mod tests {
     /// verified against it passes a verification that reads no key.
     #[test]
     fn the_dummy_engine_is_refused_by_name() {
-        ostrya_rt::block_on(async {
-            let Err(err) = sign_verifier("dummy", &NO_SECTION).await else {
+        with_repo(async |repo| {
+            let Err(err) = sign_verifier(repo, "dummy", &NO_SECTION).await else {
                 panic!("a configuration naming the dummy engine is refused");
             };
             assert!(
@@ -1906,7 +1965,7 @@ mod tests {
         ))
         .unwrap();
         let section = config.remote("origin");
-        ostrya_rt::block_on(async {
+        with_repo(async |repo| {
             let source = KeySource::Remote {
                 name: "origin",
                 section: section.as_ref(),
@@ -1914,8 +1973,8 @@ mod tests {
                 system_keys: true,
             };
             let mut cache = Verifiers::default();
-            let first = cache.sign("ed25519", &source).await.unwrap();
-            let second = cache.sign("ed25519", &source).await.unwrap();
+            let first = cache.sign(repo, "ed25519", &source).await.unwrap();
+            let second = cache.sign(repo, "ed25519", &source).await.unwrap();
             let (Some(first), Some(second)) = (first, second) else {
                 panic!("the configured key builds a verifier");
             };
@@ -1980,6 +2039,41 @@ mod tests {
         assert!(err.to_string().contains("is from a trusted key"), "{err}");
     }
 
+    /// A relative `verification-ed25519-file` in `config` is relative to the
+    /// repository root, and not to the working directory.
+    #[test]
+    fn a_relative_key_file_is_relative_to_the_repository_root() {
+        let keyfile = ostrya_core::KeyFile::parse(
+            "[remote \"o\"]\nverification-ed25519-file=keys/o.ed25519\n",
+        )
+        .unwrap();
+        let section = Remote::view(&keyfile, "remote \"o\"".to_owned());
+        let source = KeySource::Remote {
+            name: "o",
+            section: Some(&section),
+            repo_keyring: false,
+            system_keys: false,
+        };
+        let (absent, present) = with_repo(async |repo| {
+            let absent = sign_keys(repo, "ed25519", &source).await;
+            std::fs::create_dir(repo.path().join("keys")).unwrap();
+            std::fs::write(
+                repo.path().join("keys/o.ed25519"),
+                format!("{PUBLIC_B64}\n"),
+            )
+            .unwrap();
+            (absent, sign_keys(repo, "ed25519", &source).await)
+        });
+        assert!(
+            matches!(&absent, Err(Error::Signature(m))
+                if m.starts_with("the 'ed25519' key file 'keys/o.ed25519' cannot be read: ")),
+            "{:?}",
+            absent.err()
+        );
+        let keys = present.unwrap().expect("the key file holds a key");
+        assert_eq!(keys.trusted, [base64::decode(PUBLIC_B64).unwrap()]);
+    }
+
     /// `read_verification_file` refuses a key file over the ceiling by its own
     /// name, so the size of the file cannot decide an allocation.
     #[test]
@@ -1995,7 +2089,7 @@ mod tests {
             .unwrap()
             .set_len(MAX_KEY_FILE + 1)
             .unwrap();
-        let outcome = read_verification_file("ed25519", &path.display().to_string());
+        let outcome = key_file("ed25519", &path);
         std::fs::remove_dir_all(&dir).unwrap();
         let err = outcome.expect_err("a key file over the ceiling has to be refused");
         assert!(
@@ -2101,7 +2195,7 @@ mod tests {
             0,
         )
         .unwrap();
-        let outcome = read_verification_file("ed25519", &path.display().to_string());
+        let outcome = key_file("ed25519", &path);
         std::fs::remove_dir_all(&dir).unwrap();
         let err = outcome.expect_err("a fifo at a key file's name has to be refused");
         assert!(
@@ -2109,6 +2203,49 @@ mod tests {
                 && m.contains("regular file")),
             "{err}"
         );
+    }
+
+    /// An empty `verification-ed25519-file` in a `.conf` file names no file,
+    /// as the same value in `config` does, so the read gives the same refusal
+    /// of an absent file. The case runs for each form of the remotes
+    /// directory.
+    #[test]
+    fn an_empty_key_file_of_a_remotes_file_is_absent_as_in_config() {
+        use crate::config::tests::repos_with_remotes_file;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-emptyfile-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let section = |name: &str| {
+            format!("[remote \"{name}\"]\nurl=http://h/\nverification-ed25519-file=\n")
+        };
+        let repos = repos_with_remotes_file(&dir.join("repo"), &section("c"), &section("o"));
+        let mut results = Vec::new();
+        for repo in &repos {
+            let read = |name: &str| {
+                let remote = repo.config().remote(name).unwrap();
+                let path = remote.key_path("verification-ed25519-file").unwrap();
+                read_sign_keys("ed25519", None, path, Some(repo), false).map(|_| ())
+            };
+            results.push((read("c"), read("o"), repo.remotes_dir().cloned()));
+        }
+        drop(repos);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let expected = "the 'ed25519' key file '' cannot be read: No such file or directory";
+        for (in_config, in_file, remotes_dir) in results {
+            assert!(
+                matches!(&in_config, Err(Error::Signature(m)) if m.starts_with(expected)),
+                "{in_config:?}"
+            );
+            assert_eq!(
+                in_file.map_err(|e| e.to_string()),
+                in_config.map_err(|e| e.to_string()),
+                "{remotes_dir:?}"
+            );
+        }
     }
 
     /// A `verification-spki-file` holds PEM `PUBLIC KEY` blocks. A file of
@@ -2140,7 +2277,8 @@ mod tests {
         );
         let lines = write("lines", &format!("{SPKI_B64}\n"));
         let empty = write("empty", "");
-        let read = |path: &str| read_sign_keys("spki", None, Some(path.to_owned()), false);
+        let read =
+            |path: &str| read_sign_keys("spki", None, Some(KeyPath::caller(path)), None, false);
         let by_pem = read(&pem);
         let by_lines = read(&lines);
         let by_empty = read(&empty);
@@ -2192,7 +2330,8 @@ mod tests {
         let read = read_sign_keys(
             "spki",
             Some(base64::encode(&inline.public_key_der())),
-            Some(path.display().to_string()),
+            Some(KeyPath::caller(&path)),
+            None,
             false,
         );
         std::fs::remove_dir_all(&dir).unwrap();
@@ -2230,7 +2369,7 @@ mod tests {
             format!("{head}\r\n{tail}\r\n"),
             format!(" {head}\t{tail} "),
         ] {
-            let keys = read_sign_keys("spki", Some(inline), None, false)
+            let keys = read_sign_keys("spki", Some(inline), None, None, false)
                 .unwrap()
                 .expect("the inline key is a key");
             assert_eq!(keys.trusted, std::slice::from_ref(&der));
@@ -2241,7 +2380,7 @@ mod tests {
         let point = der[der.len() - 65..].to_vec();
         let secret = base64::decode(SPKI_SECRET_A).unwrap();
         for bytes in [point, pem.into_bytes(), secret] {
-            let keys = read_sign_keys("spki", Some(base64::encode(&bytes)), None, false)
+            let keys = read_sign_keys("spki", Some(base64::encode(&bytes)), None, None, false)
                 .unwrap()
                 .expect("the inline key decodes");
             match build_verifier(Engine::Spki, keys) {
@@ -2256,7 +2395,7 @@ mod tests {
         // An ed25519 inline key keeps its strict decode, with no white space
         // inside the key.
         let (a, b) = PUBLIC_B64.split_at(20);
-        assert!(read_sign_keys("ed25519", Some(format!("{a}\n{b}")), None, false).is_err());
+        assert!(read_sign_keys("ed25519", Some(format!("{a}\n{b}")), None, None, false).is_err());
     }
 
     /// The trust source reads the `verification-*` keys of its group. The
@@ -2280,8 +2419,11 @@ mod tests {
             Some("INLINE")
         );
         assert_eq!(
-            source.verification_file("ed25519").unwrap().as_deref(),
-            Some("/keys.ed25519")
+            source.verification_file("ed25519").unwrap(),
+            Some(KeyPath {
+                value: "/keys.ed25519".into(),
+                origin: crate::config::KeyOrigin::Config,
+            })
         );
         assert_eq!(source.verification_key("spki").unwrap(), None);
         assert!(!source.system_store());

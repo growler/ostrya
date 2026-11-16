@@ -555,6 +555,9 @@ pub(crate) fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
                  no check reads it"
             )));
         }
+        if key.ends_with("-file") {
+            Remote::view(keyfile, group.to_owned()).verification_file(engine)?;
+        }
     }
     if gpg {
         if cfg!(not(feature = "verify-gpg")) {
@@ -1333,5 +1336,23 @@ pub(crate) mod tests {
         assert_eq!(verification_engine("verification-spki-file"), Some("spki"));
         assert_eq!(verification_engine("verification-x-y"), None);
         assert_eq!(verification_engine("gpgkeypath"), None);
+    }
+
+    /// The check of a trust group refuses a relative key file with a `..`
+    /// component before the build reads a key source.
+    #[test]
+    fn the_check_refuses_a_key_file_with_a_parent_component() {
+        let group = "ex-ostrya trust \"t\"";
+        let keyfile = KeyFile::parse(&format!(
+            "[{group}]\nsign-verify=ed25519\nverification-ed25519-file=../k.ed25519\n"
+        ))
+        .unwrap();
+        let err = check_trust(&keyfile, group).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == "[ex-ostrya trust \"t\"] \
+                verification-ed25519-file ../k.ed25519 has a `..` component, which a relative \
+                path in a config cannot have"),
+            "{err:?}"
+        );
     }
 }

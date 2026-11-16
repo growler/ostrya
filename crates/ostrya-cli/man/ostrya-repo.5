@@ -631,6 +631,14 @@ A repository with no remotes directory reads no such file.
 A signature check and \fB\%ostrya remote gpg\-list\-keys\fR read it.
 A signature check takes it only as a binary OpenPGP keyring, as it takes \fB\%<remote>.trustedkeys.gpg\fR in the repository, and refuses an armored keyring by its path.
 .TP
+\fB\%<path in a key>\fR
+The keys \fB\%gpgkeypath\fR, \fB\%verification\-ENGINE\-file\fR, \fB\%tls\-ca\-path\fR, \fB\%tls\-client\-cert\-path\fR, \fB\%tls\-client\-key\-path\fR, and \fB\%push\-token\-file\fR of a remote, \fB\%gpgkeypath\fR and \fB\%verification\-ENGINE\-file\fR of a trust group, and \fB\%secret\-key\-file\fR of a key group name files.
+A relative path in \fB\%config\fR is relative to the repository root, and a relative path in a \fB\%.conf\fR file is relative to the remotes directory.
+A relative path with a \fB\%..\fR component is refused.
+A read follows a symbolic link at each component of the path, also to a file outside the repository, and refuses each file that is not a regular file.
+ostrya never writes these files.
+\fB\%ostrya\-config\fR(1), "Paths in keys", gives the rules.
+.TP
 \fB\%/usr/share/ostree/trusted.gpg.d/*.gpg\fR
 The global trusted GPG keyrings.
 If \fB\%OSTREE_GPG_HOME\fR is set and is not empty, ostrya reads the keyrings in that directory in place of this one.

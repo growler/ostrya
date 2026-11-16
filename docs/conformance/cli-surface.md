@@ -687,7 +687,11 @@ observed and deliberately not reproduced:
   tool writes `error: opendir(ENTRY): No such file or directory`, and
   `error: opendir(): No such file or directory` for an empty entry. The
   port writes `error: signature: gpgkeypath entry 'ENTRY' cannot be read: No
-  such file or directory (os error 2)`;
+  such file or directory (os error 2)`. For a remote of a `.conf` file,
+  ENTRY is the path of the remotes directory joined with the entry, and
+  ENTRY is empty for an empty entry. A relative entry resolves against the
+  repository root in the port, and against the working directory in the
+  tool ("Global conventions");
 - a `gpgkeypath` file over 4 MiB, or with more than 256 certificates, parts
   the two. The port refuses the file by its path, and the report exits 1
   after the commit report. Two `gpgkeypath` directories give `Good signature
@@ -3959,7 +3963,12 @@ the files before the fetcher refuses a `file://` address. A file larger than
 1 MiB is refused at exit 1
 before any request, and the message names the key and the path: `error:
 invalid input: tls-ca-path 'PATH' is over 1 MiB`. A file that cannot be read
-is refused with a message that names the key and the path too.
+is refused with a message that names the key and the path too. A relative
+path resolves against the repository root, or against the remotes directory
+for a key of a `.conf` file. A relative path with a `..` component, and a
+FIFO, a device, or a socket at the path, are refused ("Global conventions").
+The tool resolves a relative path against its working directory, and a FIFO
+at the path blocks its pull.
 
 `tls-permissive=true` takes the certificate chain as the server presents it,
 and keeps the host name check. The tool was measured on two terms of the key
@@ -7760,6 +7769,32 @@ Observed by running the tool (2026.1).
   `/ostree/repo` as the third source, with the current directory at
   `/ostree/repo`, and with `OSTREE_REPO=/ostree/repo`. `ostree init` with no
   `--repo` reports the same error.
+- A relative path of a key that names a file resolves against the
+  repository root in the port, and against the remotes directory for a key
+  of a `.conf` file. The keys are `gpgkeypath`, `verification-ENGINE-file`,
+  `tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`, and
+  `push-token-file` of a remote, `gpgkeypath` and `verification-ENGINE-file`
+  of a trust group, and `secret-key-file` of a key group. The port refuses a
+  relative path with a `..` component at the read of the key, with ``invalid
+  format: [GROUP] KEY VALUE has a `..` component, which a relative path in a
+  config cannot have``. It opens an absolute path with a `..` component. It
+  opens each file with `O_NONBLOCK`, and a FIFO, a device, or a socket at the
+  path fails the read with `is not a regular file` in the message. The read
+  does not wait for a writer. A member of a `gpgkeypath` directory that the
+  listing gives as a FIFO, a socket, a device, a symlink, or a directory is
+  skipped with no open, as in the tool. The tool resolves a relative path of
+  the TLS keys, of `gpgkeypath`, and of `verification-ed25519-file` against
+  its working directory, and accepts a `..` component. A FIFO at a TLS path
+  or at a `gpgkeypath` file entry blocks the pull of the tool, and with a
+  writer the tool reads the keyring of `gpgkeypath` from the FIFO. A FIFO at
+  `verification-ed25519-file` fails the pull of the tool at once
+  (`cli-behavior.md`, "HTTP pull surface", "Paths of the remote keys"). The
+  tool reads no `push-token-file`, no `secret-key-file`, and no remotes
+  directory that a repository names. The options `--push-token-file`,
+  `--tls-ca-path`, `--tls-client-cert-path`, and `--tls-client-key-path` of
+  `ostrya push` and `ostrya push-tree` are relative to the current directory:
+  the command makes each one absolute before the library reads it, and a
+  `..` component stays in the path.
 - Every subcommand that opens a transaction reaps `tmp/`, in the port and in
   the tool. Both skip `cache`, and both remove an entry that is not a staging
   entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole

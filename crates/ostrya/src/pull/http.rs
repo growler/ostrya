@@ -838,7 +838,7 @@ impl Repo {
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
         let overrides = std::mem::take(&mut opts.overrides);
-        let endpoint = resolve_pull(Some(self.config()), remote, overrides).await?;
+        let endpoint = resolve_pull(Some(self), remote, overrides).await?;
         // The trust comes before the session, so a refused policy starts no
         // fetcher and no ssh client.
         let mut group = opts.trust_group.as_deref().map(FieldGroup::new);
@@ -1596,7 +1596,7 @@ impl Repo {
         remote: &str,
         overrides: EndpointOverrides,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let endpoint = resolve_pull(Some(self.config()), remote, overrides).await?;
+        let endpoint = resolve_pull(Some(self), remote, overrides).await?;
         let connection = connect(endpoint, StreamSessionOptions::default()).await?;
         let source = RemoteSource::new(connection, Vec::new());
         let read = source.summary_files().await;

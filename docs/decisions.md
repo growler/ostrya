@@ -300,14 +300,31 @@ group, as the tool does. The trust groups stay in `config` alone. The open
 refuses a remote name that two sources define, as the tool does, because a
 choice of one of the two sources reinterprets the configuration.
 
-The keys `verification-<type>-key`, `verification-<type>-file`, and
-`gpgkeypath` of a remote of a `.conf` file work as in `config`. A relative
-path in `verification-<type>-file` or in `gpgkeypath` is relative to the
-working directory of the process, as in `config` and as the tool does. So a
-remote keeps its meaning when it moves between `config` and a `.conf` file,
-and no reader of a path needs the source of the remote. A path relative to
-the `.conf` file or to the remotes directory was rejected: the same text
-would name another file when the remote moves between the two sources.
+A key of a remote that names a file has a base for a relative path. The
+keys are `verification-<type>-file`, `gpgkeypath`, `tls-ca-path`,
+`tls-client-cert-path`, `tls-client-key-path`, and `push-token-file`. A
+relative path in `config` is relative to the repository root, also in a trust
+group, and so is `secret-key-file` of a key group. A relative path in a
+`.conf` file is relative to the remotes directory, for each form of the
+directory. A path of a caller is relative to the working directory. A
+relative path with a `..` component is refused, and the check reads the text
+of the path alone. Each reader gets the source of the value with the value,
+and opens the file from the descriptor of its base. The open follows a
+symlink at each component, uses `O_NONBLOCK`, and refuses each file that is
+not a regular file, so a FIFO does not block it.
+
+The working directory of the process as the base of a key was rejected,
+although the tool resolves a relative path in this way. A config names its
+files for the repository, and the working directory of a process that reads
+the repository is not part of the repository. So the same config names
+another file in each working directory. The base of the remotes directory
+keeps the files of a `.conf` file beside it, so a directory of `.conf` files
+and their keys moves as one tree. The refusal of `..` keeps a relative path
+below its base. A FIFO, a device, or a socket at a path fails the read,
+because a FIFO blocks the read until a writer comes, and its writer can
+supply a trusted set of its own. A member of a `gpgkeypath` directory is
+read only when the listing gives it as a regular file, as the tool does, so
+the listing opens no FIFO and no device.
 
 A create refuses a collection id with a line break. The create writes the id
 into `config` as text, so a line break would add groups to `config`, such as

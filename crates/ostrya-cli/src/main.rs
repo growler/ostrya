@@ -6392,7 +6392,7 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         return push_onto(repo, verbose, args).await;
     }
     let overrides = push_overrides(&mut args);
-    let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
+    let endpoint = ostrya::endpoint::resolve_push(Some(&repo), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
     let opts = push_options(args, progress)?;
     let outcome = match endpoint {
@@ -6539,7 +6539,7 @@ async fn push_onto(repo: Repo, verbose: bool, mut args: PushArgs) -> Result<()> 
         parse_timestamp(text).unwrap_or_else(|| exit_error(&format!("Could not parse '{text}'")))
     });
     let overrides = push_overrides(&mut args);
-    let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
+    let endpoint = ostrya::endpoint::resolve_push(Some(&repo), remote, overrides).await?;
     let onto = onto.parse::<Ref>()?;
     let tags = parse_refs(&args.tags)?;
     let (progress, bar) = PushBar::start();
@@ -6632,7 +6632,10 @@ fn push_overrides(args: &mut PushArgs) -> ostrya::endpoint::EndpointOverrides {
 /// The options are `--ssh-command`, `--receive-command`, and the HTTP options.
 /// Each option goes in the field of its name, so the resolver refuses an
 /// option of the other transport. The ssh command is split at ASCII
-/// whitespace.
+/// whitespace. Each file option goes to the library as an absolute path: a
+/// relative path is relative to the current directory, and a `..` component
+/// stays in the path. If the current directory cannot be read, the process
+/// ends with an error at exit 1.
 #[cfg(feature = "push")]
 fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides {
     let ssh_command = args.ssh_command.map(|command| {
@@ -6644,13 +6647,26 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
     ostrya::endpoint::EndpointOverrides {
         ssh_command,
         remote_command: args.receive_command,
-        push_token_file: args.push_token_file,
+        push_token_file: absolute_option("--push-token-file", args.push_token_file),
         push_user: args.push_user,
-        tls_ca_path: args.tls_ca_path,
-        tls_client_cert_path: args.tls_client_cert_path,
-        tls_client_key_path: args.tls_client_key_path,
+        tls_ca_path: absolute_option("--tls-ca-path", args.tls_ca_path),
+        tls_client_cert_path: absolute_option("--tls-client-cert-path", args.tls_client_cert_path),
+        tls_client_key_path: absolute_option("--tls-client-key-path", args.tls_client_key_path),
         allow_cleartext_credentials: args.allow_cleartext_credentials,
         ..Default::default()
+    }
+}
+
+/// Returns the absolute form of `path`, the value of the option `option`.
+///
+/// A relative value is relative to the current directory. If the current
+/// directory cannot be read, the process ends with an error at exit 1.
+#[cfg(feature = "push")]
+fn absolute_option(option: &str, path: Option<PathBuf>) -> Option<PathBuf> {
+    let path = path?;
+    match std::path::absolute(&path) {
+        Ok(absolute) => Some(absolute),
+        Err(err) => exit_error(&format!("{option} {}: {err}", path.display())),
     }
 }
 
@@ -6758,7 +6774,7 @@ async fn push_tree(
         let (repo, _) = resolve_repo(repo, verbose, name).await;
         #[cfg(feature = "s3")]
         refuse_s3_options(remote, push_destination_is_s3(&repo, remote), &s3_set);
-        ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?
+        ostrya::endpoint::resolve_push(Some(&repo), remote, overrides).await?
     };
     let target = match endpoint {
         #[cfg(feature = "s3")]
@@ -13685,11 +13701,10 @@ async fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Re
                 "invalid remote name: {remote}"
             )));
         }
-        let keypath = remote_section(repo, remote).gpgkeypath()?;
+        require_remote(repo, remote);
         let repo = repo.clone();
         let remote = remote.to_owned();
-        return ostrya_rt::unblock(move || GpgVerifier::for_remote_in(&repo, &remote, &keypath))
-            .await;
+        return ostrya_rt::unblock(move || GpgVerifier::for_remote_in(&repo, &remote)).await;
     }
     let keyring = repo_path.join("gpgkeys.gpg");
     let homedir = args.gpg_homedir.clone();
@@ -14534,9 +14549,7 @@ fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
 #[cfg(feature = "s3")]
 async fn remote_init(repo: Option<&Repo>, nested: &str, args: RemoteInitArgs) -> Result<()> {
     let target = remote_operand(nested, args.name.as_deref());
-    let config = repo.map(Repo::config);
-    let endpoint =
-        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let endpoint = ostrya::endpoint::resolve_bucket(repo, target, args.s3.into_overrides()).await?;
     let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
     let broken = bucket
         .init(
@@ -14563,9 +14576,7 @@ async fn remote_init(repo: Option<&Repo>, nested: &str, args: RemoteInitArgs) ->
 async fn remote_fsck(repo: Option<&Repo>, nested: &str, args: RemoteFsckArgs) -> Result<()> {
     use std::io::Write;
     let target = remote_operand(nested, args.name.as_deref());
-    let config = repo.map(Repo::config);
-    let endpoint =
-        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let endpoint = ostrya::endpoint::resolve_bucket(repo, target, args.s3.into_overrides()).await?;
     let mut opts = ostrya::bucket::BucketFsckOptions::default();
     opts.delete = args.delete;
     opts.break_lock = args.break_lock;
@@ -14626,9 +14637,7 @@ async fn remote_prune(repo: Option<&Repo>, nested: &str, args: RemotePruneArgs) 
         },
         None => None,
     };
-    let config = repo.map(Repo::config);
-    let endpoint =
-        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let endpoint = ostrya::endpoint::resolve_bucket(repo, target, args.s3.into_overrides()).await?;
     let opts = PruneOptions {
         refs_only: args.refs_only,
         depth: args.depth,
@@ -14907,9 +14916,7 @@ async fn remote_summary_update(
         remote: true,
     })
     .await?;
-    let config = repo.map(Repo::config);
-    let endpoint =
-        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let endpoint = ostrya::endpoint::resolve_bucket(repo, target, args.s3.into_overrides()).await?;
     let mut opts = ostrya::bucket::BucketSummaryOptions::default();
     opts.summary_signers = signers.into_iter().map(Arc::from).collect();
     opts.last_modified = args.last_modified;
@@ -19062,6 +19069,27 @@ mod tests {
             opened.unwrap().remotes_dir(),
             Some(RemotesDir::Path(p)) if *p == expected
         ));
+    }
+
+    /// The four file options of a push reach the library as absolute paths,
+    /// relative to the current directory. A `..` component stays in the
+    /// path.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_file_options_of_a_push_reach_the_library_as_absolute_paths() {
+        let args = PushConnectArgs {
+            push_token_file: Some("../token".into()),
+            tls_ca_path: Some("ca.pem".into()),
+            tls_client_cert_path: Some("/abs/cert.pem".into()),
+            tls_client_key_path: Some("keys/key.pem".into()),
+            ..PushConnectArgs::default()
+        };
+        let o = connect_overrides(args);
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(o.push_token_file, Some(cwd.join("../token")));
+        assert_eq!(o.tls_ca_path, Some(cwd.join("ca.pem")));
+        assert_eq!(o.tls_client_cert_path, Some(PathBuf::from("/abs/cert.pem")));
+        assert_eq!(o.tls_client_key_path, Some(cwd.join("keys/key.pem")));
     }
 
     /// Without `--remotes-config-dir`, the system repository takes the key

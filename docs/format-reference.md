@@ -2789,8 +2789,16 @@ removes one empty entry at the end of the value and keeps each other empty
 entry. An empty entry names no file, so it fails the read: `gpgkeypath=`,
 `gpgkeypath=;`, `gpgkeypath=;<k>`, and
 `gpgkeypath=<k>;;<k>` fail, and `gpgkeypath=<k>;` reads `<k>`. A
-`gpgkeypath` entry is a keyring file or a directory.
-The remote trusts each regular file of the directory, with any name. The read
+`gpgkeypath` entry is a keyring file or a directory. A relative entry
+resolves by the rules of "Paths in keys" in "Configuration keys of the
+port". The read opens an entry as a file first, and lists it if it is a
+directory. The remote trusts each member of the directory that the listing
+gives as a regular file, with any name. The type in the listing decides
+which members the read opens, so the read follows a member that changes to
+a symlink after the listing. The read skips a symlink, a
+subdirectory, a FIFO, a socket, and a device of the directory, and opens none
+of them. It also skips a member that is absent or is not a regular file at
+its open. The read
 skips a file that does not hold the bytes `-----BEGIN PGP` and that is a GnuPG
 keybox or is not a whole OpenPGP packet stream. Each other file that the read
 cannot read whole as a keyring fails the read, and the refusal names the path
@@ -3499,6 +3507,39 @@ unsigned commit with `trust=grp`, with and without the group
 treat a remote with `pull-url` and no `url`, and an ssh address in `url`.
 `conformance/cli-behavior.md`, "`remote`", states how `remote list -u` stops
 at a remote with no `url`.
+
+### Paths in keys
+
+These keys name a file: `gpgkeypath`, `verification-ENGINE-file`,
+`tls-ca-path`, `tls-client-cert-path`, `tls-client-key-path`, and
+`push-token-file` of a remote, `gpgkeypath` and `verification-ENGINE-file` of
+a trust group, and `secret-key-file` of a key group. A path is absolute, or
+relative to a base:
+
+- A relative path in `<repo>/config` is relative to the repository root.
+- A relative path in a `.conf` file of the remotes directory is relative to
+  that directory, for a path value, an in-repository value, and a descriptor
+  value of the directory. A message names such a file as the path of the
+  directory joined with the value. For a descriptor value, the message
+  names the file as the value alone. An empty value names no file, as an
+  empty value in `<repo>/config` does.
+- A path of a caller, for example the option `--tls-ca-path` of
+  `ostrya push`, is relative to the working directory. The `ostrya` command
+  gives each such option to the library as an absolute path.
+
+The port refuses a relative path with a `..` component. The check reads the
+text of the path alone. An absolute path with a `..` component is accepted.
+The read follows a symlink at each component of the path, also to a path
+outside the repository. It opens a file with `O_NONBLOCK`, and then refuses
+each file that is not a regular file, so a FIFO, a device, or a socket at the
+path fails the read and does not block it. A directory entry of `gpgkeypath`
+is the exception ("GPG" in "Signing details"). `ostrya-config(1)`, "Paths in
+keys", states the rules and the refusals.
+
+The `ostree` tool resolves a relative path of these keys against its working
+directory, and accepts a `..` component (`conformance/cli-behavior.md`,
+"Paths of the remote keys"). `conformance/cli-surface.md` records the
+divergence.
 
 ## Related commits
 
@@ -7099,6 +7140,8 @@ line of the file:
 - The push ignores the bytes after the first LF.
 - No message of the push holds the token. The push checks no permission of
   the file.
+- The path resolves by the rules of "Paths in keys" in "Configuration keys
+  of the port". A FIFO, a device, or a socket at the path fails the push.
 
 ## Stream transports
 

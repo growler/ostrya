@@ -248,6 +248,28 @@ A later remote of the same name trusts that keyring while no file is at \fB\%<re
 .PP
 \fB\%ostrya config get\fR, \fB\%ostrya config set\fR, and \fB\%ostrya config unset\fR read and write \fB\%config\fR alone.
 \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR refuse a key of the group \fB\%[remote "NAME"]\fR when NAME is a remote of the directory, and write nothing.
+.SS "Paths in keys"
+The keys \fB\%gpgkeypath\fR, \fB\%verification\-ENGINE\-file\fR, \fB\%tls\-ca\-path\fR, \fB\%tls\-client\-cert\-path\fR, \fB\%tls\-client\-key\-path\fR, and \fB\%push\-token\-file\fR name files.
+A path is absolute, or relative to a base:
+.IP \(bu 2
+A relative path in \fB\%config\fR is relative to the repository root.
+This also applies to a trust group and to \fB\%secret\-key\-file\fR of a key group.
+.IP \(bu 2
+A relative path in a \fB\%.conf\fR file of the remotes directory is relative to the remotes directory.
+A message names the file as the path of the remotes directory joined with the value.
+When a program gives the remotes directory as a descriptor, the message names the file as the value alone.
+An empty value names no file, as an empty value in \fB\%config\fR does.
+.IP \(bu 2
+A relative path in an option of the command, for example \fB\%\-\-tls\-ca\-path\fR, is relative to the current directory.
+.PP
+ostrya refuses a relative path with a \fB\%..\fR component when it reads the key, and the command fails.
+It accepts an absolute path with a \fB\%..\fR component.
+\fB\%ostrya config set\fR writes a relative path with a \fB\%..\fR component with no check.
+ostrya does not expand \fB\%~\fR.
+A read follows a symlink at each component of the path, also to a path outside the repository.
+It opens the file with \fB\%O_NONBLOCK\fR, and refuses each file that is not a regular file.
+So a FIFO, a device, or a socket at the path fails the read, and the read does not wait for a writer of a FIFO.
+The \fB\%ostree\fR tool resolves a relative path of these keys against its current directory, and accepts a \fB\%..\fR component.
 .SS "Address"
 .TP
 \fB\%url\fR (string)
@@ -306,10 +328,14 @@ A \fB\%;\fR separates the entries.
 ostrya reads the raw value and decodes no escape sequence, so \fB\%k\esspace.gpg\fR names the file with that name.
 One \fB\%;\fR at the end of the value gives no entry.
 Each other empty entry fails the pull, and so does an empty value.
-ostrya reads each regular file of a directory as a keyring, with any name.
-It does not read a subdirectory or a symlink of the directory.
+Each entry is a path by the rules of "Paths in keys".
+ostrya opens an entry as a file first, and lists it when it is a directory.
+ostrya reads each file that the listing of a directory gives as a regular file, with any name.
+The type in the listing decides which files ostrya opens, so ostrya follows a file that changes to a symlink after the listing.
+It does not open a subdirectory, a symlink, a FIFO, a socket, or a device of the directory.
+It also skips a file of the directory that is absent or is not a regular file when ostrya opens it.
 ostrya skips a file that does not hold the bytes \fB\%\-\-\-\-\-BEGIN PGP\fR and that is a GnuPG keybox or is not a whole OpenPGP packet stream, and the file adds no key.
-An entry that does not exist fails the pull.
+An entry that does not exist fails the pull, and so does an entry that is a FIFO, a device, or a socket.
 Each other file that ostrya cannot read whole as a keyring also fails the pull.
 Examples are a file that ostrya cannot open, a file larger than 4 MiB, a keyring with more than 256 certificates, armor that does not decode to a keyring, and a packet stream that the parser refuses.
 \fB\%ostrya show \-\-gpg\-verify\-remote=NAME\fR also trusts these entries, and an entry that does not exist or is empty fails its signature report.
@@ -333,7 +359,7 @@ The base64 of an \fB\%spki\fR key can hold line breaks, written as the escape \f
 ostrya refuses an \fB\%spki\fR key that is the base64 of a raw SEC1 point, of the full PEM text, or of a secret key.
 .TP
 \fB\%verification\-ENGINE\-file\fR (string)
-A file of trusted public keys of the engine \fB\%ENGINE\fR.
+A file of trusted public keys of the engine \fB\%ENGINE\fR, a path by the rules of "Paths in keys".
 An \fB\%ed25519\fR file holds one base64 key on each line.
 An \fB\%spki\fR file holds PEM \fB\%PUBLIC KEY\fR blocks, and ostrya ignores the text outside the blocks.
 ostrya refuses an \fB\%spki\fR file with a block of another label, a block that does not decode, or no block.
@@ -358,8 +384,7 @@ A switch that turns off a check of the commits turns off that check of the group
 \fB\%ostrya remote fsck NAME\fR checks the group and the keys beside this key, and reads no key of the group.
 The key is an extension of ostrya, and the \fB\%ostree\fR tool keeps it and ignores it.
 .SS "TLS and proxy"
-A relative path is relative to the current directory of the command.
-ostrya does not expand \fB\%~\fR.
+A TLS file is a path by the rules of "Paths in keys".
 ostrya refuses a TLS file that is larger than 1 MiB.
 .TP
 \fB\%tls\-ca\-path\fR (string)
@@ -488,8 +513,7 @@ A pull that names the remote does not read this key.
 \fB\%ostrya remote add \-\-mirrored\-collection\-id\fR writes the key.
 .TP
 \fB\%push\-token\-file\fR (string)
-A file whose first line is the token of a push over HTTP.
-A relative path is relative to the current directory of the command, and ostrya does not expand \fB\%~\fR.
+A file whose first line is the token of a push over HTTP, a path by the rules of "Paths in keys".
 The token is token68: letters, digits, \fB\%\-\fR, \fB\%.\fR, \fB\%_\fR, \fB\%~\fR, \fB\%+\fR, and \fB\%/\fR, then zero or more \fB\%=\fR.
 A push to an \fB\%http://\fR address refuses to send it, unless the command has \fB\%\-\-allow\-cleartext\-credentials\fR.
 A push to an \fB\%s3://\fR address refuses it.
@@ -1078,6 +1102,7 @@ It runs these checks after each option replaces the key of its name:
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
 A \fB\%verification\-ENGINE\-key\fR and a \fB\%verification\-ENGINE\-file\fR have the form of the remote keys.
+A path of \fB\%gpgkeypath\fR and of \fB\%verification\-ENGINE\-file\fR follows "Paths in keys" of REMOTE KEYS: a relative path is relative to the repository root.
 An \fB\%spki\fR key is the base64 of a SubjectPublicKeyInfo DER, and it can hold line breaks.
 A \fB\%verification\-ENGINE\-file\fR holds base64 lines for \fB\%ed25519\fR, and PEM \fB\%PUBLIC KEY\fR blocks for \fB\%spki\fR.
 It trusts the keys that it names, and no system key store or keyring.
@@ -1087,6 +1112,7 @@ ostrya reads \fB\%gpgkeypath\fR as it reads the remote key: it reads the raw val
 One \fB\%;\fR at the end of the value gives no entry.
 Each other empty entry of \fB\%gpgkeypath\fR is refused when the config is read, and so is an empty value.
 An entry of \fB\%gpgkeypath\fR that names neither a file nor a directory is refused, and so are keyrings that hold no certificate.
+A relative path of \fB\%gpgkeypath\fR or of \fB\%verification\-ENGINE\-file\fR with a \fB\%..\fR component is refused when the config is read.
 A \fB\%verification\-ENGINE\-key\fR or \fB\%verification\-ENGINE\-file\fR key of an engine that \fB\%sign\-verify\fR does not select is refused.
 \fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a trust group sets a commit policy alone.
 A trust group checks the new commits of a push that a client group with \fB\%verify=trust:NAME\fR accepts, the commits of a pull from a remote with \fB\%trust=NAME\fR, and the commits of \fB\%ostrya pull\-local \-\-trust=NAME\fR.
@@ -1105,6 +1131,8 @@ The key is necessary.
 .TP
 \fB\%secret\-key\-file\fR (string)
 For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB.
+A relative path is relative to the repository root, and a relative path with a \fB\%..\fR component is refused when the config is read.
+The read follows a symlink, and a FIFO, a device, or a socket at the path is refused.
 For \fB\%ed25519\fR, the file holds exactly one line that is not blank, the base64 of the 64\-byte seed and public key.
 For \fB\%spki\fR, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a PKCS#8 DER of a P\-256, a P\-384, an Ed25519, or an RSA key, as \fB\%ostrya sign \-\-keys\-file\fR takes them.
 Each block gives one signing key, in the order of the file.

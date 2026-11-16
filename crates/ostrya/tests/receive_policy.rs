@@ -1112,3 +1112,64 @@ fn the_policies_are_send_and_sync() {
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
 }
+
+/// A relative `secret-key-file` is relative to the repository root, and not
+/// to the working directory. A relative path with a `..` component is
+/// refused as malformed before a key file is read, and a FIFO at the path is
+/// refused with no hang.
+#[test]
+fn a_relative_secret_key_file_is_relative_to_the_repository_root() {
+    let dir = TmpDir::new("receive-policy-relative-key");
+    let groups =
+        format!("{CLIENT_C}sign=k\n[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=keys/k\n");
+    let repo = repo_with(dir.path(), "", &groups);
+    let err = block_on(ReceivePolicies::from_config(&repo)).unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m == "[ex-ostrya key \"k\"]: the secret key file 'keys/k' does not exist"),
+        "{err}"
+    );
+    std::fs::create_dir(repo.path().join("keys")).unwrap();
+    secret_file(&repo.path().join("keys"));
+    std::fs::rename(
+        repo.path().join("keys/secret.ed25519"),
+        repo.path().join("keys/k"),
+    )
+    .unwrap();
+    let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
+    assert_eq!(group(&policies, "c").signers.len(), 1);
+
+    let fifo = repo.path().join("keys/fifo");
+    if rustix::fs::mknodat(
+        rustix::fs::CWD,
+        &fifo,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o600),
+        0,
+    )
+    .is_ok()
+    {
+        let dir = TmpDir::new("receive-policy-fifo-key");
+        let groups = format!(
+            "{CLIENT_C}sign=k\n[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file={}\n",
+            fifo.display()
+        );
+        let repo = repo_with(dir.path(), "", &groups);
+        let read = std::thread::spawn(move || block_on(ReceivePolicies::from_config(&repo)));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !read.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(read.is_finished(), "the read of a FIFO does not block");
+        let err = read.join().unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.ends_with("is not a regular file")),
+            "{err}"
+        );
+    }
+
+    assert_malformed(
+        &format!("{CLIENT_C}sign=k\n[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=../k\n"),
+        "[ex-ostrya key \"k\"] secret-key-file ../k has a `..` component",
+    );
+}

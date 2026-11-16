@@ -635,7 +635,7 @@ mod repo_push {
             ssh_command: Some(standin(status)),
             ..EndpointOverrides::default()
         };
-        block_on(resolve_push(Some(local.config()), "origin", overrides)).unwrap()
+        block_on(resolve_push(Some(local), "origin", overrides)).unwrap()
     }
 
     /// The options of a push of `refspecs`.

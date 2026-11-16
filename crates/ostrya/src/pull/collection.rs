@@ -1314,7 +1314,7 @@ async fn resolve_candidate<'a>(
     let address = match local_pull_path(repo.config(), name, &opts.overrides)? {
         Some(path) => Address::Local(path),
         None => Address::Endpoint(Box::new(
-            resolve_pull(Some(repo.config()), name, opts.overrides.clone()).await?,
+            resolve_pull(Some(repo), name, opts.overrides.clone()).await?,
         )),
     };
     let trust = match trust {

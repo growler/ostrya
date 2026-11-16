@@ -28,9 +28,17 @@
 //! [`PullSession`](crate::remote::PullSession) and calls
 //! [`Repo::pull_with_session`](crate::Repo::pull_with_session).
 //!
-//! [`read_token_file`] and [`read_pem_file`] read a token file and a PEM file.
-//! [`read_pem_file`] reads at most 1 MiB and one byte. [`read_token_file`]
-//! stops at the first LF, and reads at most 1 MiB and one byte. Each error
+//! A resolver reads the token file and the PEM files of one endpoint in one
+//! job on the blocking pool. A path of a key in `config` is absolute, or
+//! relative to the repository root. A path of a key in a `.conf` file of the
+//! remotes directory is absolute, or relative to that directory. A path of
+//! the caller is absolute, or relative to the working directory. A relative
+//! path with a `..` component is refused. The read follows a symlink at each
+//! component, opens the file with `O_NONBLOCK`, and refuses each file that is
+//! not a regular file, so a FIFO does not block the read.
+//! [`Remote`](crate::config::Remote#paths) states the rules of a key. The read
+//! of a PEM file takes at most 1 MiB and one byte. The read of a token file
+//! stops at the first LF, and takes at most 1 MiB and one byte. Each error
 //! names the key and the path.
 //!
 //! The trust policy of the remote keys is in the resolvers. [`resolve_pull`]
@@ -46,12 +54,16 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::config::{Remote, RepoConfig};
+use rustix::io::Errno;
+
+use crate::config::{KeyPath, Remote, RepoConfig, relative_with_parent};
 use crate::error::{Error, Result};
 #[cfg(feature = "push")]
 use crate::fetch::{BasicAuth, BearerToken};
 use crate::fetch::{ClientIdentity, FetcherOptions, LowSpeed, Proxy, TrustRoots};
 use crate::remote::{self, Endpoint, SshAddress, SshOptions};
+use crate::repo::Repo;
+use crate::repo_fs::{FsError, Named, Reason, open_named};
 
 /// The largest first line of a token file, and the largest PEM file: 1 MiB.
 const FILE_CAP: u64 = 1 << 20;
@@ -75,6 +87,11 @@ const DEFAULT_LOW_SPEED_TIME: Duration = Duration::from_secs(30);
 /// A resolver refuses a field that applies to the other direction or to the
 /// other transport. The refusal names the field by its remote key, or by the
 /// option of the `ostrya` command that sets it.
+///
+/// A path field is a path of the caller. A relative path is relative to the
+/// working directory of the process, and a resolver refuses a relative path
+/// with a `..` component. The paths of the remote keys have other bases, as
+/// [`Remote`](crate::config::Remote#paths) states.
 ///
 /// The [`Debug`] output shows `url` and `s3_endpoint` without their
 /// userinfo, and shows `<redacted>` in place of each header value.
@@ -222,7 +239,11 @@ pub(crate) type S3Environment = remote::s3::Environment;
 #[cfg(not(feature = "s3"))]
 pub(crate) type S3Environment = ();
 
-/// Resolves the remote `remote` to the endpoint of a pull.
+/// Resolves the remote `remote` of the config of `repo` to the endpoint of a
+/// pull.
+///
+/// With no `repo`, no remote has a section, and the values of the caller
+/// apply alone.
 ///
 /// # Address
 ///
@@ -343,15 +364,22 @@ pub(crate) type S3Environment = ();
 ///   The signature of each request would go to the server in cleartext. The
 ///   check comes after the read of the shared AWS files, because the
 ///   endpoint can come from them.
-/// - The errors of [`read_pem_file`].
+/// - [`Error::InvalidInput`] if a TLS path of the caller is a relative path
+///   with a `..` component.
+/// - [`Error::InvalidFormat`] if a TLS key is a relative path with a `..`
+///   component.
+/// - The errors of the read of a PEM file: [`Error::Io`] if the file cannot
+///   be opened or read, and [`Error::InvalidInput`] if it is not a regular
+///   file or is larger than 1 MiB. The message names the key and the path,
+///   and holds no byte of the file.
 /// - [`Error::Core`] if a key that the function reads holds a malformed
 ///   escape sequence, or if `tls-permissive` is not a boolean.
 pub async fn resolve_pull(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     remote: &str,
     overrides: EndpointOverrides,
 ) -> Result<Endpoint> {
-    resolve_pull_in(config, remote, overrides, &S3Environment::default()).await
+    resolve_pull_in(repo, remote, overrides, &S3Environment::default()).await
 }
 
 /// Resolves the remote `remote` to the endpoint of a pull, as
@@ -359,13 +387,13 @@ pub async fn resolve_pull(
 /// address.
 #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
 pub(crate) async fn resolve_pull_in(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     remote: &str,
     overrides: EndpointOverrides,
     env: &S3Environment,
 ) -> Result<Endpoint> {
     let mut o = overrides;
-    let section = config.and_then(|config| config.remote(remote));
+    let section = repo.and_then(|repo| repo.config().remote(remote));
     if let Some(name) = push_field(&o) {
         return Err(Error::InvalidInput(format!(
             "{name} applies to a push, and this is a pull"
@@ -377,7 +405,7 @@ pub(crate) async fn resolve_pull_in(
         PullAddress::Endpoint(endpoint) => endpoint,
         PullAddress::S3(address) => {
             #[cfg(feature = "s3")]
-            return Box::pin(pull_s3(remote, section.as_ref(), &address, o, env)).await;
+            return Box::pin(pull_s3(remote, section.as_ref(), &address, o, env, repo)).await;
             #[cfg(not(feature = "s3"))]
             return Err(Error::Unsupported(format!(
                 "the pull address '{}' is an s3:// address, and this build of ostrya has no S3 \
@@ -387,7 +415,7 @@ pub(crate) async fn resolve_pull_in(
         }
     };
     match endpoint {
-        Endpoint::Http(http) => pull_http(remote, section.as_ref(), http, o).await,
+        Endpoint::Http(http) => pull_http(remote, section.as_ref(), http, o, repo).await,
         Endpoint::Ssh { address, .. } => {
             if let Some(name) = s3_field(&o) {
                 return Err(Error::InvalidInput(format!(
@@ -698,12 +726,13 @@ fn s3_field(o: &EndpointOverrides) -> Option<&'static str> {
 }
 
 /// Completes `http`, the options of an HTTP pull of `remote`, from `o` and
-/// the keys of `section`.
+/// the keys of `section`, a section of the config of `repo`.
 async fn pull_http(
     remote: &str,
     section: Option<&Remote<'_>>,
     mut http: FetcherOptions,
     o: EndpointOverrides,
+    repo: Option<&Repo>,
 ) -> Result<Endpoint> {
     if let Some(name) = ssh_field(&o, "send-command") {
         return Err(Error::InvalidInput(format!(
@@ -715,12 +744,15 @@ async fn pull_http(
             "{name} applies to a pull from an s3:// address, and this pull runs over HTTP"
         )));
     }
-    PullHttp::read(remote, section, o)?.apply(&mut http).await?;
+    PullHttp::read(remote, section, o)?
+        .apply(&mut http, repo)
+        .await?;
     Ok(Endpoint::Http(http))
 }
 
 /// Completes the endpoint of a pull of `remote` from the `s3://` address
-/// `address`, from `o`, the keys of `section`, and `env`.
+/// `address`, from `o`, the keys of `section`, a section of the config of
+/// `repo`, and `env`.
 #[cfg(feature = "s3")]
 async fn pull_s3(
     remote: &str,
@@ -728,6 +760,7 @@ async fn pull_s3(
     address: &str,
     o: EndpointOverrides,
     env: &S3Environment,
+    repo: Option<&Repo>,
 ) -> Result<Endpoint> {
     if let Some(name) = ssh_field(&o, "send-command") {
         return Err(Error::InvalidInput(format!(
@@ -739,7 +772,7 @@ async fn pull_s3(
         remote: Error::Pull,
     };
     let (settings, http) = s3_settings(remote, section, o, refusals)?;
-    s3_resolve(address, &settings, http, env, refusals).await
+    s3_resolve(address, &settings, http, env, refusals, repo).await
 }
 
 /// The errors of the refusals of [`s3_settings`] and [`s3_resolve`].
@@ -800,6 +833,7 @@ fn s3_settings(
     };
     let http = PullHttp::read(remote, section, o).map_err(|e| match e {
         Error::Pull(msg) => (refusals.remote)(msg),
+        Error::InvalidInput(msg) => (refusals.invalid)(msg),
         other => other,
     })?;
     Ok((settings, http))
@@ -808,8 +842,9 @@ fn s3_settings(
 /// Completes the S3 endpoint of the `s3://` address `address` from
 /// `settings`, `http`, and `env`.
 ///
-/// The call reads the shared AWS files and the PEM files. It refuses an
-/// `http://` endpoint with no `allow_cleartext_credentials`.
+/// The call reads the shared AWS files and the PEM files. A relative path of
+/// a PEM file resolves as [`KeyPath::locate`] states with `repo`. It refuses
+/// an `http://` endpoint with no `allow_cleartext_credentials`.
 #[cfg(feature = "s3")]
 async fn s3_resolve(
     address: &str,
@@ -817,6 +852,7 @@ async fn s3_resolve(
     http: PullHttp,
     env: &S3Environment,
     refusals: S3Refusals,
+    repo: Option<&Repo>,
 ) -> Result<Endpoint> {
     use remote::s3::S3Endpoint;
 
@@ -833,7 +869,7 @@ async fn s3_resolve(
              travel in cleartext: use https, or set allow-cleartext-credentials"
         )));
     }
-    http.apply(&mut endpoint.http).await?;
+    http.apply(&mut endpoint.http, repo).await?;
     Ok(Endpoint::S3(endpoint))
 }
 
@@ -861,9 +897,9 @@ struct PullHttp {
     /// no CA path.
     any_chain: bool,
     /// The PEM file of the trust anchors.
-    ca_path: Option<PathBuf>,
+    ca_path: Option<KeyPath>,
     /// The PEM files of the client certificate chain and of its key.
-    client_files: Option<(PathBuf, PathBuf)>,
+    client_files: Option<(KeyPath, KeyPath)>,
     proxy: Proxy,
     headers: Vec<(String, String)>,
     allow_cleartext_credentials: bool,
@@ -876,14 +912,11 @@ impl PullHttp {
     /// Reads the HTTP fields of `o` and the HTTP keys of `section`, the
     /// section of `remote`.
     ///
-    /// The call reads no file. It refuses a client certificate with no key, a
-    /// key with no certificate, and a key `proxy` with white space at its
-    /// start or its end.
-    fn read(
-        remote: &str,
-        section: Option<&Remote<'_>>,
-        mut o: EndpointOverrides,
-    ) -> Result<PullHttp> {
+    /// The call reads no file. It refuses a path of the caller or of a key
+    /// that is a relative path with a `..` component, a client certificate
+    /// with no key, a key with no certificate, and a key `proxy` with white
+    /// space at its start or its end.
+    fn read(remote: &str, section: Option<&Remote<'_>>, o: EndpointOverrides) -> Result<PullHttp> {
         // `tls-permissive` keeps the host name check and ignores
         // `tls-ca-path`. Both facts are observed on the `ostree` command: a
         // CA that signed nothing in the chain works, and a path that names an
@@ -897,24 +930,18 @@ impl PullHttp {
         // verification that ignores the CA path is libcurl peer verification
         // turned off, and that setting also drops the validity dates.
         let mut any_chain = false;
-        let ca_path = match (o.tls_ca_path, section) {
+        let ca_path = match (caller_path("tls-ca-path", o.tls_ca_path)?, section) {
             (Some(path), _) => Some(path),
             (None, Some(section)) if section.tls_permissive()? => {
                 any_chain = true;
                 None
             }
-            (None, Some(section)) => section.tls_ca_path()?.map(PathBuf::from),
+            (None, Some(section)) => section.key_path("tls-ca-path")?,
             (None, None) => None,
         };
-        if let Some(section) = section {
-            if o.tls_client_cert_path.is_none() {
-                o.tls_client_cert_path = section.tls_client_cert_path()?.map(PathBuf::from);
-            }
-            if o.tls_client_key_path.is_none() {
-                o.tls_client_key_path = section.tls_client_key_path()?.map(PathBuf::from);
-            }
-        }
-        let client_files = match (o.tls_client_cert_path, o.tls_client_key_path) {
+        let cert = path_or_key("tls-client-cert-path", o.tls_client_cert_path, section)?;
+        let key = path_or_key("tls-client-key-path", o.tls_client_key_path, section)?;
+        let client_files = match (cert, key) {
             (Some(cert), Some(key)) => Some((cert, key)),
             (None, None) => None,
             _ => {
@@ -942,17 +969,24 @@ impl PullHttp {
     }
 
     /// Reads the PEM files, and sets the options in `http`.
-    async fn apply(self, http: &mut FetcherOptions) -> Result<()> {
+    ///
+    /// A relative path of a key resolves as [`KeyPath::locate`] states with
+    /// `repo`.
+    async fn apply(self, http: &mut FetcherOptions, repo: Option<&Repo>) -> Result<()> {
         if self.any_chain {
             http.tls.roots = TrustRoots::DangerousAcceptAnyChain;
         }
-        if let Some(path) = self.ca_path {
-            http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", &path).await?);
+        let files = EndpointFiles {
+            token: None,
+            ca: self.ca_path,
+            client: self.client_files,
         }
-        http.tls.client_identity = match self.client_files {
-            Some((cert, key)) => Some(client_identity(&cert, &key).await?),
-            None => None,
-        };
+        .read(repo)
+        .await?;
+        if let Some(pem) = files.ca {
+            http.tls.roots = TrustRoots::Pem(pem);
+        }
+        http.tls.client_identity = files.client;
         http.headers = self.headers;
         http.allow_cleartext_credentials = self.allow_cleartext_credentials;
         http.proxy = self.proxy;
@@ -971,8 +1005,8 @@ impl PullHttp {
 /// [`is_push_address`](crate::is_push_address). An address that starts with
 /// `s3://` is the address of a bucket repository. [`Endpoint::parse`] reads
 /// each other address. The function reads no configuration for an address.
-/// Each other value is the name of a remote section of `config`. The address
-/// of the section is its key `push-url`. If `push-url` is absent, a key `url`
+/// Each other value is the name of a remote section of the config of `repo`.
+/// The address of the section is its key `push-url`. If `push-url` is absent, a key `url`
 /// that starts with `http://` or `https://` is the address. The function
 /// reads `url` only if `push-url` is absent. The key `url` cannot hold an
 /// `s3://` address, because the `ostree` command also reads it.
@@ -988,8 +1022,9 @@ impl PullHttp {
 ///
 /// - The keys `push-token-file`, `push-user`, `tls-ca-path`,
 ///   `tls-client-cert-path`, and `tls-client-key-path` fill each field of
-///   `overrides` that is `None`. A relative path stays relative to the
-///   current directory of the process.
+///   `overrides` that is `None`. A relative path of a key resolves by the
+///   rules of [`Remote`](crate::config::Remote#paths), and a relative path of
+///   the caller is relative to the working directory.
 /// - The token of the token file and a `push_user` give
 ///   [`basic_auth`](FetcherOptions::basic_auth). The token alone gives
 ///   [`bearer_token`](FetcherOptions::bearer_token).
@@ -1047,8 +1082,9 @@ impl PullHttp {
 /// [`InvalidInput`](crate::remote::Error::InvalidInput):
 ///
 /// - The caller sets `url`.
-/// - `config` holds no section for the name, or the section has no push
-///   address. The message shows a `url` that is no push address without the
+/// - A path of the caller is a relative path with a `..` component.
+/// - The config of `repo` holds no section for the name, or the section has
+///   no push address. The message shows a `url` that is no push address without the
 ///   text up to its last `@`. A `url` that holds an `s3://` address is no
 ///   push address.
 /// - The section sets an S3 key, and neither `pull-url` nor `push-url` holds
@@ -1092,17 +1128,30 @@ impl PullHttp {
 ///   `s3` feature. The message names the feature.
 /// - [`Error::Io`] for an `s3://` address if a shared AWS file exists and
 ///   cannot be read.
-/// - The errors of [`read_token_file`] and [`read_pem_file`].
+/// - [`Error::InvalidFormat`] if a key that names a file is a relative path
+///   with a `..` component.
+/// - The errors of the read of the token file: [`Error::Io`] if the file
+///   cannot be opened or read, and [`Error::InvalidInput`] if it is not a
+///   regular file, or if its first line is longer than 1 MiB, is empty,
+///   holds a CR, is not UTF-8, or is not token68. The token has the token68
+///   syntax: one or more ASCII letters, digits, `-`, `.`, `_`, `~`, `+`, or
+///   `/`, then zero or more `=`. No error holds a part of the token, and the
+///   read checks no permission of the file.
+/// - The errors of the read of a PEM file: [`Error::Io`] if the file cannot
+///   be opened or read, and [`Error::InvalidInput`] if it is not a regular
+///   file or is larger than 1 MiB.
 /// - [`Error::Core`] if a key that the function reads holds a malformed
 ///   escape sequence, or if `tls-permissive` is not a boolean.
+///
+/// Each error of a read names the key and the path.
 #[cfg(feature = "push")]
 pub async fn resolve_push(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     remote_or_address: &str,
     overrides: EndpointOverrides,
 ) -> Result<Endpoint> {
     resolve_push_in(
-        config,
+        repo,
         remote_or_address,
         overrides,
         &S3Environment::default(),
@@ -1116,14 +1165,14 @@ pub async fn resolve_push(
 #[cfg(feature = "push")]
 #[cfg_attr(not(feature = "s3"), allow(unused_variables))]
 pub(crate) async fn resolve_push_in(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     remote_or_address: &str,
     overrides: EndpointOverrides,
     env: &S3Environment,
 ) -> Result<Endpoint> {
-    match checked_push(config, remote_or_address, overrides)? {
+    match checked_push(repo.map(Repo::config), remote_or_address, overrides)? {
         CheckedPush::Ssh(address, options) => Ok(Endpoint::Ssh { address, options }),
-        CheckedPush::Http(push) => push.read_files().await,
+        CheckedPush::Http(push) => push.read_files(repo).await,
         #[cfg(feature = "s3")]
         CheckedPush::S3(push) => {
             Box::pin(s3_resolve(
@@ -1132,6 +1181,7 @@ pub(crate) async fn resolve_push_in(
                 push.http,
                 env,
                 push.refusals,
+                repo,
             ))
             .await
         }
@@ -1176,7 +1226,8 @@ pub enum PushKind {
 /// to the push, for example when the push selects no ref.
 ///
 /// The function does not make the refusals that come after a file read.
-/// These are the errors of [`read_token_file`] and [`read_pem_file`], and,
+/// These are the errors of the reads of the token file and of the PEM files,
+/// and,
 /// for an `s3://` address, the other refusals of `S3Endpoint::resolve`, the
 /// refusal of an `http://` S3 endpoint with no
 /// `allow_cleartext_credentials`, and the refusal of the proxy by the HTTP
@@ -1404,6 +1455,8 @@ fn check_push_s3(
 /// Resolves a remote name or an `s3://` address to the endpoint of a writer
 /// of a bucket repository other than a push.
 ///
+/// A remote name is the name of a section of the config of `repo`.
+///
 /// [`BucketRepo::init`](crate::bucket::BucketRepo::init) is such a writer.
 /// `resolve_push` gives the endpoint of a push.
 ///
@@ -1432,6 +1485,7 @@ fn check_push_s3(
 /// [`InvalidInput`](crate::remote::Error::InvalidInput):
 ///
 /// - The caller sets `url`.
+/// - A TLS path of the caller is a relative path with a `..` component.
 /// - The value holds a `:` or a `/`, and does not start with `s3://`.
 /// - `config` holds no section for the name, or neither `push-url` nor
 ///   `pull-url` of the section holds an `s3://` address.
@@ -1452,22 +1506,18 @@ fn check_push_s3(
 /// - [`Error::Unsupported`] if the key `proxy` has white space at its start
 ///   or its end.
 /// - [`Error::Io`] if a shared AWS file exists and cannot be read.
-/// - The errors of [`read_pem_file`].
+/// - [`Error::InvalidFormat`] if a TLS key is a relative path with a `..`
+///   component.
+/// - The errors of the read of a PEM file, as [`resolve_pull`] states them.
 /// - [`Error::Core`] if a key that the function reads holds a malformed
 ///   escape sequence, or if `tls-permissive` is not a boolean.
 #[cfg(feature = "s3")]
 pub async fn resolve_bucket(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     name_or_address: &str,
     overrides: EndpointOverrides,
 ) -> Result<remote::s3::S3Endpoint> {
-    resolve_bucket_in(
-        config,
-        name_or_address,
-        overrides,
-        &S3Environment::default(),
-    )
-    .await
+    resolve_bucket_in(repo, name_or_address, overrides, &S3Environment::default()).await
 }
 
 /// Resolves `name_or_address` to the endpoint of a writer of a bucket
@@ -1475,7 +1525,7 @@ pub async fn resolve_bucket(
 /// the `s3://` address.
 #[cfg(feature = "s3")]
 pub(crate) async fn resolve_bucket_in(
-    config: Option<&RepoConfig>,
+    repo: Option<&Repo>,
     name_or_address: &str,
     overrides: EndpointOverrides,
     env: &S3Environment,
@@ -1494,8 +1544,8 @@ pub(crate) async fn resolve_bucket_in(
             remote::without_userinfo(value)
         )));
     } else {
-        let section = config
-            .and_then(|config| config.remote(value))
+        let section = repo
+            .and_then(|repo| repo.config().remote(value))
             .ok_or_else(|| push_invalid(format!("no remote '{value}' is configured")))?;
         let s3 = |address: Option<String>| address.filter(|address| is_s3(address));
         let address = match s3(section.push_url()?) {
@@ -1521,6 +1571,7 @@ pub(crate) async fn resolve_bucket_in(
         push.http,
         env,
         push.refusals,
+        repo,
     ))
     .await?;
     let Endpoint::S3(endpoint) = endpoint else {
@@ -1535,13 +1586,13 @@ struct HttpPush {
     /// The options of the push, with each value that needs no file.
     http: FetcherOptions,
     /// The token file of the push.
-    token_file: Option<PathBuf>,
+    token_file: Option<KeyPath>,
     /// The user of a Basic credential.
     user: Option<String>,
     /// The PEM file of the trust anchors.
-    ca_path: Option<PathBuf>,
+    ca_path: Option<KeyPath>,
     /// The PEM files of the client certificate chain and of its key.
-    client_files: Option<(PathBuf, PathBuf)>,
+    client_files: Option<(KeyPath, KeyPath)>,
     /// `true` for an `http://` address.
     cleartext: bool,
 }
@@ -1554,7 +1605,7 @@ fn check_push_http(
     section: Option<&Remote<'_>>,
     address: &str,
     mut http: FetcherOptions,
-    mut o: EndpointOverrides,
+    o: EndpointOverrides,
 ) -> Result<HttpPush> {
     if let Some(section) = section
         && address.starts_with("https://")
@@ -1570,25 +1621,22 @@ fn check_push_http(
             "{name} applies to an ssh address, and '{address}' is an HTTP address"
         )));
     }
-    if let Some(section) = section {
-        let path = |key: Option<String>| key.map(PathBuf::from);
-        if o.push_token_file.is_none() {
-            o.push_token_file = path(section.push_token_file()?);
-        }
-        if o.push_user.is_none() {
-            o.push_user = section.push_user()?;
-        }
-        if o.tls_ca_path.is_none() {
-            o.tls_ca_path = path(section.tls_ca_path()?);
-        }
-        if o.tls_client_cert_path.is_none() {
-            o.tls_client_cert_path = path(section.tls_client_cert_path()?);
-        }
-        if o.tls_client_key_path.is_none() {
-            o.tls_client_key_path = path(section.tls_client_key_path()?);
-        }
-    }
-    let client_files = match (o.tls_client_cert_path.take(), o.tls_client_key_path.take()) {
+    let pick = |key: &str, path: Option<PathBuf>| {
+        path_or_key(key, path, section).map_err(|e| match e {
+            Error::InvalidInput(msg) => push_invalid(msg),
+            other => other,
+        })
+    };
+    let token_file = pick("push-token-file", o.push_token_file)?;
+    let push_user = match (o.push_user, section) {
+        (Some(user), _) => Some(user),
+        (None, Some(section)) => section.push_user()?,
+        (None, None) => None,
+    };
+    let ca_path = pick("tls-ca-path", o.tls_ca_path)?;
+    let cert = pick("tls-client-cert-path", o.tls_client_cert_path)?;
+    let key = pick("tls-client-key-path", o.tls_client_key_path)?;
+    let client_files = match (cert, key) {
         (Some(cert), Some(key)) => Some((cert, key)),
         (None, None) => None,
         _ => {
@@ -1597,7 +1645,7 @@ fn check_push_http(
             ));
         }
     };
-    match (&o.push_user, &o.push_token_file) {
+    match (&push_user, &token_file) {
         (Some(_), None) => {
             return Err(push_invalid("push-user needs push-token-file"));
         }
@@ -1611,7 +1659,7 @@ fn check_push_http(
     let cleartext = address
         .get(..7)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
-    if o.push_token_file.is_some() && cleartext && !o.allow_cleartext_credentials {
+    if token_file.is_some() && cleartext && !o.allow_cleartext_credentials {
         return Err(push_invalid(format!(
             "the push address '{address}' is http://, so the token would travel in cleartext: \
              use https, or set allow-cleartext-credentials"
@@ -1631,9 +1679,9 @@ fn check_push_http(
     }
     Ok(HttpPush {
         http,
-        token_file: o.push_token_file,
-        user: o.push_user,
-        ca_path: o.tls_ca_path,
+        token_file,
+        user: push_user,
+        ca_path,
         client_files,
         cleartext,
     })
@@ -1642,7 +1690,10 @@ fn check_push_http(
 #[cfg(feature = "push")]
 impl HttpPush {
     /// Reads the token file and the PEM files, and completes the endpoint.
-    async fn read_files(self) -> Result<Endpoint> {
+    ///
+    /// A relative path of a key resolves as [`KeyPath::locate`] states with
+    /// `repo`.
+    async fn read_files(self, repo: Option<&Repo>) -> Result<Endpoint> {
         let HttpPush {
             mut http,
             token_file,
@@ -1651,8 +1702,16 @@ impl HttpPush {
             client_files,
             cleartext,
         } = self;
-        if let Some(path) = &token_file {
-            let token = read_token_file(path).await?;
+        // The HTTP client of a push session follows no redirect, so an
+        // `http://` address uses no TLS, and the push reads no TLS file.
+        let files = EndpointFiles {
+            token: token_file,
+            ca: ca_path.filter(|_| !cleartext),
+            client: client_files.filter(|_| !cleartext),
+        }
+        .read(repo)
+        .await?;
+        if let Some(token) = files.token {
             match user {
                 Some(user) => {
                     http.basic_auth = Some(BasicAuth {
@@ -1663,13 +1722,11 @@ impl HttpPush {
                 None => http.bearer_token = Some(BearerToken { token }),
             }
         }
-        // The HTTP client of a push session follows no redirect, so an
-        // `http://` address uses no TLS, and the push reads no TLS file.
-        if !cleartext && let Some(path) = &ca_path {
-            http.tls.roots = TrustRoots::Pem(read_pem_file("tls-ca-path", path).await?);
+        if let Some(pem) = files.ca {
+            http.tls.roots = TrustRoots::Pem(pem);
         }
-        if !cleartext && let Some((cert, key)) = client_files {
-            http.tls.client_identity = Some(client_identity(&cert, &key).await?);
+        if files.client.is_some() {
+            http.tls.client_identity = files.client;
         }
         Ok(Endpoint::Http(http))
     }
@@ -1762,18 +1819,107 @@ fn remote_proxy(remote: &str, section: &Remote<'_>) -> Result<Proxy> {
     })
 }
 
-/// Reads the client certificate chain at `cert` and the client key at `key`.
-async fn client_identity(cert: &Path, key: &Path) -> Result<ClientIdentity> {
-    Ok(ClientIdentity {
-        cert_chain_pem: read_pem_file("tls-client-cert-path", cert).await?,
-        key_pem: read_pem_file("tls-client-key-path", key).await?,
-        // A remote has no config key for a passphrase, so the key must need
-        // no passphrase.
-        key_passphrase: None,
-    })
+/// Returns the path of the caller `path` for the field of the key `key`, or
+/// else the path of the key `key` of `section`.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] if `path` is a relative path with a `..`
+///   component.
+/// - The errors of [`Remote::key_path`].
+fn path_or_key(
+    key: &str,
+    path: Option<PathBuf>,
+    section: Option<&Remote<'_>>,
+) -> Result<Option<KeyPath>> {
+    match (caller_path(key, path)?, section) {
+        (Some(path), _) => Ok(Some(path)),
+        (None, Some(section)) => section.key_path(key),
+        (None, None) => Ok(None),
+    }
 }
 
-/// Returns the token of the token file at `path`.
+/// Returns `path`, the path of the caller for the field of the key `key`, as
+/// a [`KeyPath`] of the caller.
+///
+/// # Errors
+///
+/// [`Error::InvalidInput`] if `path` is a relative path with a `..`
+/// component.
+fn caller_path(key: &str, path: Option<PathBuf>) -> Result<Option<KeyPath>> {
+    match path {
+        Some(path) if relative_with_parent(&path) => Err(Error::InvalidInput(format!(
+            "{key} {} is a relative path with a `..` component",
+            path.display()
+        ))),
+        path => Ok(path.map(KeyPath::caller)),
+    }
+}
+
+/// The files of one endpoint that a resolver reads.
+struct EndpointFiles {
+    /// The token file of a push.
+    token: Option<KeyPath>,
+    /// The PEM file of the trust anchors.
+    ca: Option<KeyPath>,
+    /// The PEM files of the client certificate chain and of its key.
+    client: Option<(KeyPath, KeyPath)>,
+}
+
+/// The content of the files of [`EndpointFiles`].
+struct ReadFiles {
+    // A pull reads no token file, so a build without a push reads no token.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    token: Option<String>,
+    ca: Option<Vec<u8>>,
+    client: Option<ClientIdentity>,
+}
+
+impl EndpointFiles {
+    /// Reads the files in one job on the blocking pool: the token file, the
+    /// PEM file of the trust anchors, the client certificate chain, and the
+    /// client key, in this order. The first error stops the read.
+    ///
+    /// A relative path resolves as [`KeyPath::locate`] states with `repo`.
+    /// The call reads one file at a time, and starts no job if no file is
+    /// set.
+    async fn read(self, repo: Option<&Repo>) -> Result<ReadFiles> {
+        if self.token.is_none() && self.ca.is_none() && self.client.is_none() {
+            return Ok(ReadFiles {
+                token: None,
+                ca: None,
+                client: None,
+            });
+        }
+        let repo = repo.cloned();
+        ostrya_rt::unblock(move || {
+            let repo = repo.as_ref();
+            let token = match &self.token {
+                Some(path) => Some(read_token_file(path, repo)?),
+                None => None,
+            };
+            let ca = match &self.ca {
+                Some(path) => Some(read_pem_file("tls-ca-path", path, repo)?),
+                None => None,
+            };
+            let client = match &self.client {
+                Some((cert, key)) => Some(ClientIdentity {
+                    cert_chain_pem: read_pem_file("tls-client-cert-path", cert, repo)?,
+                    key_pem: read_pem_file("tls-client-key-path", key, repo)?,
+                    // A remote has no config key for a passphrase, so the key
+                    // must need no passphrase.
+                    key_passphrase: None,
+                }),
+                None => None,
+            };
+            Ok(ReadFiles { token, ca, client })
+        })
+        .await
+    }
+}
+
+/// Returns the token of the token file at `path`, which resolves as
+/// [`KeyPath::locate`] states with `repo`.
 ///
 /// The token is the first line of the file: the bytes up to the first LF, or
 /// the whole file if it holds no LF. The function stops at the first LF, and
@@ -1782,78 +1928,108 @@ async fn client_identity(cert: &Path, key: &Path) -> Result<ClientIdentity> {
 /// `.`, `_`, `~`, `+`, or `/`, then zero or more `=`.
 ///
 /// No error holds a part of the token. The function checks no permission of
-/// the file.
+/// the file. The call blocks the calling thread.
 ///
 /// # Errors
 ///
+/// - The errors of [`open_key_file`] for the key `push-token-file`.
 /// - [`Error::Io`] if the file cannot be read. The message names the key
 ///   `push-token-file` and the path.
 /// - [`Error::InvalidInput`] if the first line is longer than 1 MiB, or if it
 ///   is empty, holds a CR, is not UTF-8, or is not token68. The message names
 ///   the key `push-token-file` and the path.
-pub async fn read_token_file(path: &Path) -> Result<String> {
-    let owned = path.to_owned();
-    let read = ostrya_rt::unblock(move || {
-        let mut bytes = Vec::new();
-        let file = std::fs::File::open(&owned)?;
-        BufReader::new(file.take(FILE_CAP + 1)).read_until(b'\n', &mut bytes)?;
-        Ok::<_, std::io::Error>(bytes)
-    })
-    .await;
-    let bytes = read.map_err(|e| io_error("push-token-file", path, e))?;
+fn read_token_file(path: &KeyPath, repo: Option<&Repo>) -> Result<String> {
+    const KEY: &str = "push-token-file";
+    let (file, shown) = open_key_file(KEY, path, repo)?;
+    let mut bytes = Vec::new();
+    BufReader::new(file.take(FILE_CAP + 1))
+        .read_until(b'\n', &mut bytes)
+        .map_err(|e| io_error(KEY, &shown, e))?;
     let line = match bytes.split_last() {
         Some((b'\n', line)) => line,
         _ if bytes.len() as u64 > FILE_CAP => {
             return Err(Error::InvalidInput(format!(
-                "the first line of push-token-file '{}' is over 1 MiB",
-                path.display()
+                "the first line of {KEY} '{}' is over 1 MiB",
+                shown.display()
             )));
         }
         _ => &bytes[..],
     };
-    token_of(line)
-        .map_err(|why| Error::InvalidInput(format!("push-token-file '{}': {why}", path.display())))
+    token_of(line).map_err(|why| Error::InvalidInput(format!("{KEY} '{}': {why}", shown.display())))
 }
 
 /// Returns the bytes of the PEM file at `path`, which the remote key `key`
-/// names.
+/// names. The path resolves as [`KeyPath::locate`] states with `repo`.
 ///
 /// The function reads at most 1 MiB and one byte of the file. It does not
-/// check the PEM syntax. The fetcher reads the bytes.
+/// check the PEM syntax. The fetcher reads the bytes. The call blocks the
+/// calling thread.
 ///
 /// # Errors
 ///
+/// - The errors of [`open_key_file`].
 /// - [`Error::Io`] if the file cannot be read. The message names `key` and
 ///   the path, and holds no byte of the file.
 /// - [`Error::InvalidInput`] if the file is larger than 1 MiB. The message
 ///   names `key` and the path.
-pub async fn read_pem_file(key: &str, path: &Path) -> Result<Vec<u8>> {
-    let bytes = read_capped(path, key).await?;
+fn read_pem_file(key: &str, path: &KeyPath, repo: Option<&Repo>) -> Result<Vec<u8>> {
+    let (file, shown) = open_key_file(key, path, repo)?;
+    // The read stops one byte over the cap, so a file over the cap is
+    // refused with no read of the rest.
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    file.take(FILE_CAP + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| io_error(key, &shown, e))?;
     if bytes.len() as u64 > FILE_CAP {
         return Err(Error::InvalidInput(format!(
             "{key} '{}' is over 1 MiB",
-            path.display()
+            shown.display()
         )));
     }
     Ok(bytes)
 }
 
-/// Reads at most [`FILE_CAP`] + 1 bytes of the file at `path`, on the
-/// blocking pool.
+/// Opens the file at `path`, which the key `key` names, and returns it with
+/// the path that names it in a message.
 ///
-/// The key `key` names the file. A failure is an [`Error::Io`] that names
-/// the key and the path, and holds no byte of the file.
-async fn read_capped(path: &Path, key: &str) -> Result<Vec<u8>> {
-    let owned = path.to_owned();
-    let read = ostrya_rt::unblock(move || {
-        let mut bytes = Vec::new();
-        std::fs::File::open(&owned)?
-            .take(FILE_CAP + 1)
-            .read_to_end(&mut bytes)?;
-        Ok::<_, std::io::Error>(bytes)
-    })
-    .await;
-    read.map_err(|e| io_error(key, path, e))
+/// The path resolves as [`KeyPath::locate`] states with `repo`. The open
+/// follows a symlink at each component, and uses `O_NONBLOCK`, so the open of
+/// a FIFO does not wait for a writer. The type check after the open refuses
+/// each file that is not a regular file.
+///
+/// # Errors
+///
+/// - [`Error::Io`] if the file cannot be opened. The message names `key` and
+///   the path. An absent file gives the kind
+///   [`NotFound`](std::io::ErrorKind::NotFound).
+/// - [`Error::InvalidInput`] if the file is not a regular file. The message
+///   names `key` and the path.
+fn open_key_file(
+    key: &str,
+    path: &KeyPath,
+    repo: Option<&Repo>,
+) -> Result<(std::fs::File, PathBuf)> {
+    let (base, at, shown) = path.locate(repo);
+    let e: std::io::Error = match open_named(base, &at, Named::File) {
+        Ok(fd) => return Ok((std::fs::File::from(fd), shown)),
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => {
+            return Err(Error::InvalidInput(format!(
+                "{key} '{}' is not a regular file",
+                shown.display()
+            )));
+        }
+        Err(FsError::Io(e)) => e,
+        Err(FsError::Absent { .. }) => Errno::NOENT.into(),
+        Err(FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        }) => Errno::NOTDIR.into(),
+        Err(other) => return Err(other.into()),
+    };
+    Err(io_error(key, &shown, e))
 }
 
 /// Returns the [`Error::Io`] of the failure `e` to read the file at `path`,
@@ -1941,16 +2117,49 @@ mod tests {
         }
     }
 
-    /// Returns the config of the remote sections `sections`.
-    fn config(sections: &str) -> RepoConfig {
-        RepoConfig::parse(&format!(
-            "[core]\nrepo_version=1\nmode=archive-z2\n\n{sections}"
-        ))
-        .unwrap()
+    /// A repository in a temp directory, which the drop removes.
+    struct TestRepo {
+        repo: Repo,
+        _dir: Dir,
     }
 
-    fn pull(config: Option<&RepoConfig>, remote: &str, o: EndpointOverrides) -> Result<Endpoint> {
-        ostrya_rt::block_on(resolve_pull(config, remote, o))
+    impl std::ops::Deref for TestRepo {
+        type Target = Repo;
+
+        fn deref(&self) -> &Repo {
+            &self.repo
+        }
+    }
+
+    /// Returns the handle of a new repository whose config holds the remote
+    /// sections `sections`.
+    fn config(sections: &str) -> TestRepo {
+        let dir = Dir::new();
+        let root = dir.0.join("repo");
+        let repo = ostrya_rt::block_on(async {
+            Repo::create(
+                &root,
+                crate::CreateOptions::new(ostrya_core::RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            std::fs::write(
+                root.join("config"),
+                format!("[core]\nrepo_version=1\nmode=archive-z2\n\n{sections}"),
+            )
+            .unwrap();
+            Repo::open(&root).await.unwrap()
+        });
+        TestRepo { repo, _dir: dir }
+    }
+
+    /// Returns the handle of `repo`.
+    fn handle(repo: Option<&TestRepo>) -> Option<&Repo> {
+        repo.map(|repo| &repo.repo)
+    }
+
+    fn pull(repo: Option<&TestRepo>, remote: &str, o: EndpointOverrides) -> Result<Endpoint> {
+        ostrya_rt::block_on(resolve_pull(handle(repo), remote, o))
     }
 
     fn http_of(endpoint: Result<Endpoint>) -> FetcherOptions {
@@ -1993,11 +2202,11 @@ mod tests {
     }
 
     fn token(path: &Path) -> Result<String> {
-        ostrya_rt::block_on(read_token_file(path))
+        read_token_file(&KeyPath::caller(path), None)
     }
 
     fn pem(key: &str, path: &Path) -> Result<Vec<u8>> {
-        ostrya_rt::block_on(read_pem_file(key, path))
+        read_pem_file(key, &KeyPath::caller(path), None)
     }
 
     /// The token is the first line of the file. A file with no line end holds
@@ -2087,6 +2296,51 @@ mod tests {
                 m.starts_with(&format!("{key} '{}': ", absent.display())),
                 "{m}"
             );
+        }
+    }
+
+    /// An empty path of a key in a `.conf` file names no file, as the same
+    /// value in `config` does, so the read gives the same refusal of an
+    /// absent file. The case runs for each form of the remotes directory.
+    #[test]
+    fn an_empty_key_path_of_a_remotes_file_is_absent_as_in_config() {
+        use crate::config::tests::repos_with_remotes_file;
+
+        const KEYS: [&str; 4] = [
+            "push-token-file",
+            "tls-ca-path",
+            "tls-client-cert-path",
+            "tls-client-key-path",
+        ];
+        let dir = Dir::new();
+        let section = |name: &str| {
+            let mut text = format!("[remote \"{name}\"]\nurl=https://h/\n");
+            for key in KEYS {
+                text.push_str(&format!("{key}=\n"));
+            }
+            text
+        };
+        let root = dir.0.join("repo");
+        for repo in repos_with_remotes_file(&root, &section("c"), &section("o")) {
+            for key in KEYS {
+                let messages: Vec<String> = ["c", "o"]
+                    .into_iter()
+                    .map(|name| {
+                        let remote = repo.config().remote(name).unwrap();
+                        let path = remote.key_path(key).unwrap().unwrap();
+                        let result = match key {
+                            "push-token-file" => read_token_file(&path, Some(&repo)).map(|_| ()),
+                            _ => read_pem_file(key, &path, Some(&repo)).map(|_| ()),
+                        };
+                        not_found(result)
+                    })
+                    .collect();
+                assert!(
+                    messages[0].starts_with(&format!("{key} '': No such file or directory")),
+                    "{messages:?}"
+                );
+                assert_eq!(messages[0], messages[1], "{:?}", repo.remotes_dir());
+            }
         }
     }
 
@@ -2380,7 +2634,7 @@ mod tests {
 
     /// Returns the PEM files of a CA and of a client, and a config whose
     /// remote `keys` names them.
-    fn tls_keys(dir: &Dir, url: &str) -> RepoConfig {
+    fn tls_keys(dir: &Dir, url: &str) -> TestRepo {
         let ca = dir.file("key-ca.pem", b"KEY-CA");
         let cert = dir.file("key-cert.pem", b"KEY-CERT");
         let key = dir.file("key-key.pem", b"KEY-KEY");
@@ -2834,7 +3088,7 @@ mod tests {
                                   [remote \"none\"]\ngpg-verify=false\n";
 
     fn local(remote: &str, o: &EndpointOverrides) -> Result<Option<PathBuf>> {
-        local_pull_path(&config(LOCAL_SECTIONS), remote, o)
+        local_pull_path(config(LOCAL_SECTIONS).config(), remote, o)
     }
 
     /// A `file:` address of a pull, in either case of the scheme, gives the
@@ -2878,7 +3132,11 @@ mod tests {
             ("file:///srv/a#b", "holds '%', '?', or '#'"),
         ] {
             let config = config(&format!("[remote \"r\"]\nurl={address}\n"));
-            let msg = pull_error(local_pull_path(&config, "r", &EndpointOverrides::default()));
+            let msg = pull_error(local_pull_path(
+                config.config(),
+                "r",
+                &EndpointOverrides::default(),
+            ));
             assert!(!msg.contains("QXZ"), "{msg}");
             assert!(
                 msg.starts_with("remote 'r': the file address '")
@@ -2938,6 +3196,105 @@ mod tests {
         );
     }
 
+    /// Runs `f` on a thread, and fails the test if it does not end in 10
+    /// seconds. A read that blocks on a FIFO so fails the test with no hang.
+    fn in_time<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let worker = std::thread::spawn(f);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !worker.is_finished() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker.is_finished(), "the read does not end in 10 seconds");
+        worker.join().unwrap()
+    }
+
+    /// Makes a FIFO at `path`. Returns `false` if the file system refuses it.
+    fn make_fifo(path: &Path) -> bool {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
+            path,
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o600),
+            0,
+        )
+        .is_ok()
+    }
+
+    /// A relative TLS key in `config` is relative to the repository root,
+    /// and not to the working directory. The read follows a symlink, and an
+    /// absolute path with a `..` component opens. A relative key with a `..`
+    /// component is refused at the read of the key, and a relative path of
+    /// the caller with a `..` component is refused before a file is read.
+    #[test]
+    fn a_relative_tls_key_is_relative_to_the_repository_root() {
+        let repo = config(
+            "[remote \"rel\"]\nurl=https://ex.com/repo\ntls-ca-path=certs/ca.pem\n\
+             tls-client-cert-path=certs/link.pem\ntls-client-key-path=certs/key.pem\n\
+             [remote \"up\"]\nurl=https://ex.com/repo\ntls-ca-path=../ca.pem\n",
+        );
+        let certs = repo.path().join("certs");
+        std::fs::create_dir(&certs).unwrap();
+        // Before the files exist at the root, the pull fails, so no file of
+        // the working directory serves it.
+        let m = not_found(pull(Some(&repo), "rel", EndpointOverrides::default()));
+        assert!(m.starts_with("tls-ca-path 'certs/ca.pem': "), "{m}");
+        std::fs::write(certs.join("ca.pem"), b"ROOT-CA").unwrap();
+        std::fs::write(certs.join("cert.pem"), b"ROOT-CERT").unwrap();
+        std::fs::write(certs.join("key.pem"), b"ROOT-KEY").unwrap();
+        std::os::unix::fs::symlink(certs.join("cert.pem"), certs.join("link.pem")).unwrap();
+        let http = http_of(pull(Some(&repo), "rel", EndpointOverrides::default()));
+        assert_eq!(http.tls.roots, TrustRoots::Pem(b"ROOT-CA".to_vec()));
+        assert_eq!(
+            identity(&http),
+            (b"ROOT-CERT".to_vec(), b"ROOT-KEY".to_vec())
+        );
+
+        let err = pull(Some(&repo), "up", EndpointOverrides::default()).unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m == "[remote \"up\"] tls-ca-path \
+                ../ca.pem has a `..` component, which a relative path in a config cannot have"),
+            "{err:?}"
+        );
+        let o = EndpointOverrides {
+            tls_ca_path: Some("../ca.pem".into()),
+            ..EndpointOverrides::default()
+        };
+        assert_eq!(
+            invalid_input(pull(Some(&repo), "rel", o)),
+            "tls-ca-path ../ca.pem is a relative path with a `..` component"
+        );
+        let o = EndpointOverrides {
+            tls_ca_path: Some(certs.join("../certs/ca.pem")),
+            ..EndpointOverrides::default()
+        };
+        let http = http_of(pull(Some(&repo), "rel", o));
+        assert_eq!(http.tls.roots, TrustRoots::Pem(b"ROOT-CA".to_vec()));
+    }
+
+    /// A FIFO, a directory, and a device at a TLS path fail the pull as a
+    /// file that is not a regular file, and the FIFO does not block it.
+    #[test]
+    fn a_tls_path_that_is_not_a_regular_file_fails_the_pull() {
+        let dir = Dir::new();
+        let fifo = dir.absent("fifo.pem");
+        let mut paths = vec![dir.0.clone(), PathBuf::from("/dev/null")];
+        if make_fifo(&fifo) {
+            paths.push(fifo);
+        }
+        for path in paths {
+            let o = EndpointOverrides {
+                url: Some("https://ex.com/repo".into()),
+                tls_ca_path: Some(path.clone()),
+                ..EndpointOverrides::default()
+            };
+            let result = in_time(move || pull(None, "r", o));
+            assert_eq!(
+                invalid_input(result),
+                format!("tls-ca-path '{}' is not a regular file", path.display())
+            );
+        }
+    }
+
     #[cfg(feature = "push")]
     mod push {
         use super::*;
@@ -2975,12 +3332,8 @@ mod tests {
                               [remote \"bad-url\"]\nurl=a\\zb\n\
                               push-url=ssh://h/p\n";
 
-        fn push(
-            config: Option<&RepoConfig>,
-            remote: &str,
-            o: EndpointOverrides,
-        ) -> Result<Endpoint> {
-            ostrya_rt::block_on(resolve_push(config, remote, o))
+        fn push(repo: Option<&TestRepo>, remote: &str, o: EndpointOverrides) -> Result<Endpoint> {
+            ostrya_rt::block_on(resolve_push(handle(repo), remote, o))
         }
 
         fn push_named(name: &str) -> Result<Endpoint> {
@@ -3054,7 +3407,14 @@ mod tests {
             assert_eq!(address(push_named("file-push")), parsed("host:srv/repo"));
             // The keyfile cannot read the escape `\z` of this url, and the
             // push does not read it.
-            assert!(config(CONFIG).remote("bad-url").unwrap().url().is_err());
+            assert!(
+                config(CONFIG)
+                    .config()
+                    .remote("bad-url")
+                    .unwrap()
+                    .url()
+                    .is_err()
+            );
             assert_eq!(address(push_named("bad-url")), parsed("ssh://h/p"));
         }
 
@@ -3217,6 +3577,59 @@ mod tests {
             let http = http_of(push_named("https"));
             assert_eq!(http.bearer_token, None);
             assert_eq!(http.basic_auth, None);
+        }
+
+        /// A relative `push-token-file` in `config` is relative to the
+        /// repository root. A relative key with a `..` component and a
+        /// relative path of the caller with a `..` component are refused. A
+        /// FIFO at the path fails the push with no hang.
+        #[test]
+        fn a_relative_push_token_file_is_relative_to_the_repository_root() {
+            let cfg = config(
+                "[remote \"rel\"]\npush-url=https://ex.com/r\npush-token-file=t/token\n\
+                 [remote \"up\"]\npush-url=https://ex.com/r\npush-token-file=../token\n\
+                 [remote \"fifo\"]\npush-url=https://ex.com/r\npush-token-file=t/fifo\n",
+            );
+            std::fs::create_dir(cfg.path().join("t")).unwrap();
+            let m = not_found(push(Some(&cfg), "rel", EndpointOverrides::default()));
+            assert!(m.starts_with("push-token-file 't/token': "), "{m}");
+            std::fs::write(cfg.path().join("t/token"), b"r00t==\n").unwrap();
+            let http = http_of(push(Some(&cfg), "rel", EndpointOverrides::default()));
+            assert_eq!(
+                http.bearer_token,
+                Some(BearerToken {
+                    token: "r00t==".into()
+                })
+            );
+            let err = push(Some(&cfg), "up", EndpointOverrides::default()).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m)
+                    if m.starts_with("[remote \"up\"] push-token-file ../token has a `..`")),
+                "{err:?}"
+            );
+            let o = EndpointOverrides {
+                push_token_file: Some("../token".into()),
+                ..EndpointOverrides::default()
+            };
+            assert_eq!(
+                refused(push(Some(&cfg), "rel", o)),
+                "push-token-file ../token is a relative path with a `..` component"
+            );
+            if make_fifo(&cfg.path().join("t/fifo")) {
+                let root = cfg.path().to_owned();
+                let result = in_time(move || {
+                    let repo = ostrya_rt::block_on(Repo::open(&root)).unwrap();
+                    ostrya_rt::block_on(resolve_push(
+                        Some(&repo),
+                        "fifo",
+                        EndpointOverrides::default(),
+                    ))
+                });
+                assert_eq!(
+                    invalid_input(result),
+                    "push-token-file 't/fifo' is not a regular file"
+                );
+            }
         }
 
         /// An override wins over each key of the push on its own.
@@ -3554,7 +3967,7 @@ mod tests {
                 "[remote \"bad-ssh\"]\nurl=https://ex.com/repo\n\
                  ssh-command=a\\zb\nreceive-command=a\\zb\n",
             );
-            let section = cfg.remote("bad-ssh").unwrap();
+            let section = cfg.config().remote("bad-ssh").unwrap();
             assert!(section.ssh_command().is_err());
             assert!(section.receive_command().is_err());
             assert_eq!(
@@ -3783,7 +4196,7 @@ mod tests {
                 ),
             ];
             for (name, o) in cases {
-                let checked = check_push(Some(&config), name, o.clone());
+                let checked = check_push(Some(config.config()), name, o.clone());
                 let resolved = push(Some(&config), name, o);
                 assert!(checked.is_err(), "{name}: {checked:?}");
                 assert_eq!(
@@ -3870,7 +4283,7 @@ mod tests {
                 let prepared = ostrya_rt::block_on(remote::PushSession::prepare(endpoint))
                     .map(drop)
                     .map_err(Error::Remote);
-                let checked = check_push(Some(&config), name, o);
+                let checked = check_push(Some(config.config()), name, o);
                 assert!(
                     matches!(checked, Err(Error::Remote(remote::Error::Fetch(_)))),
                     "{checked:?}"
@@ -3878,7 +4291,7 @@ mod tests {
                 assert_eq!(format!("{checked:?}"), format!("{prepared:?}"), "{name}");
             }
             assert_eq!(
-                check_push(Some(&config), "plain", d()).unwrap(),
+                check_push(Some(config.config()), "plain", d()).unwrap(),
                 PushKind::Session
             );
             // The token file is absent, so a read of it would fail the check.
@@ -3887,7 +4300,7 @@ mod tests {
                 ..d()
             };
             assert!(matches!(
-                check_push(Some(&config), "proxied", o),
+                check_push(Some(config.config()), "proxied", o),
                 Err(Error::Remote(remote::Error::Fetch(_)))
             ));
         }
@@ -3961,7 +4374,7 @@ mod tests {
     #[test]
     fn the_s3_test_of_a_pull_address_follows_the_order_of_the_pull() {
         let config = config(S3_SECTIONS);
-        let is_s3 = |remote, url| pull_address_is_s3(Some(&config), remote, url);
+        let is_s3 = |remote, url| pull_address_is_s3(Some(config.config()), remote, url);
         assert_eq!(is_s3("pull", None), Some(true));
         assert_eq!(is_s3("push", None), Some(false));
         assert_eq!(is_s3("s3-url", None), None);
@@ -4153,12 +4566,12 @@ mod tests {
         }
 
         fn pull_in(
-            config: Option<&RepoConfig>,
+            repo: Option<&TestRepo>,
             remote: &str,
             o: EndpointOverrides,
             env: &Environment,
         ) -> Result<Endpoint> {
-            ostrya_rt::block_on(resolve_pull_in(config, remote, o, env))
+            ostrya_rt::block_on(resolve_pull_in(handle(repo), remote, o, env))
         }
 
         fn s3_of(endpoint: Result<Endpoint>) -> S3Endpoint {
@@ -4453,12 +4866,12 @@ mod tests {
 
         #[cfg(feature = "push")]
         fn push_in(
-            config: Option<&RepoConfig>,
+            repo: Option<&TestRepo>,
             remote: &str,
             o: EndpointOverrides,
             env: &Environment,
         ) -> Result<Endpoint> {
-            ostrya_rt::block_on(resolve_push_in(config, remote, o, env))
+            ostrya_rt::block_on(resolve_push_in(handle(repo), remote, o, env))
         }
 
         #[cfg(feature = "push")]
@@ -4490,7 +4903,7 @@ mod tests {
             let d = EndpointOverrides::default;
             assert!(push_in(Some(&config), "push", d(), &no_keys).is_err());
             assert_eq!(
-                check_push(Some(&config), "push", d()).unwrap(),
+                check_push(Some(config.config()), "push", d()).unwrap(),
                 PushKind::Bucket
             );
             assert_eq!(
@@ -4515,7 +4928,7 @@ mod tests {
                     ..d()
                 },
             ] {
-                let checked = check_push(Some(&config), "push", o.clone());
+                let checked = check_push(Some(config.config()), "push", o.clone());
                 let resolved = push_in(Some(&config), "push", o, &env(&dir, &[]));
                 assert_eq!(push_refused(checked), push_refused(resolved));
             }
@@ -4696,12 +5109,12 @@ mod tests {
         }
 
         fn bucket_in(
-            config: Option<&RepoConfig>,
+            repo: Option<&TestRepo>,
             value: &str,
             o: EndpointOverrides,
             env: &Environment,
         ) -> Result<S3Endpoint> {
-            ostrya_rt::block_on(resolve_bucket_in(config, value, o, env))
+            ostrya_rt::block_on(resolve_bucket_in(handle(repo), value, o, env))
         }
 
         fn bucket_refused(result: Result<S3Endpoint>) -> String {

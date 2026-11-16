@@ -1412,6 +1412,79 @@ mod cli {
         assert!(!refs.lines().any(|l| l == "o3"), "{refs}");
     }
 
+    /// A relative `push-token-file` and `tls-ca-path` in the config of the
+    /// client are relative to the repository root, and not to the working
+    /// directory. A relative option is relative to the working directory, and
+    /// a `..` component of the option stays in its path. A FIFO at the token
+    /// path fails the push with no hang.
+    #[test]
+    fn push_reads_relative_key_paths_from_the_repository_root() {
+        let setup = Setup::new("cli-relative-keys");
+        let src = tree(setup.tmp.path(), "tree", 3, 1000);
+        let (client, commit) = setup.client(&src);
+        let server = setup.init("server", "archive");
+        add_credential_group(&server);
+        let serving = Serving::start(&server, &strs(&server_tls_args()));
+        std::fs::create_dir(client.join("keys")).unwrap();
+        std::fs::copy(fixture("ca.pem"), client.join("keys/ca.pem")).unwrap();
+        std::fs::copy(&setup.alice, client.join("keys/token")).unwrap();
+        let fifo = client.join("keys/fifo");
+        let fifo_made = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .is_ok_and(|status| status.success());
+        add_config(
+            &client,
+            &format!(
+                "[remote \"origin\"]\nurl={url}\ntls-ca-path=keys/ca.pem\n\
+                 push-token-file=keys/token\n\n\
+                 [remote \"fifo\"]\nurl={url}\ntls-ca-path=keys/ca.pem\n\
+                 push-token-file=keys/fifo\n",
+                url = serving.url,
+            ),
+        );
+        // The working directory holds no `keys` directory, so the push reads
+        // each key from the repository root.
+        let work = setup.path("work");
+        std::fs::create_dir(&work).unwrap();
+        let push_command = |args: &[&str]| {
+            let mut push = command(ostrya_bin());
+            push.current_dir(&work)
+                .args([&format!("--repo={}", client.display()), "push"])
+                .args(args)
+                .env_remove("OSTREE_REPO");
+            push
+        };
+        let push_in = |args: &[&str]| push_command(args).output().unwrap();
+        let out = push_in(&["origin", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
+        // The option `../alice` is relative to the working directory.
+        let out = push_in(&["--push-token-file=../alice", "origin", "main:opt"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(rev_parse(&server, "opt"), commit);
+        if fifo_made {
+            // The read of the FIFO does not wait for a writer. A push that
+            // runs past the limit is killed, and the test fails.
+            let mut child = push_command(&["fifo", "main:f"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while child.try_wait().unwrap().is_none() {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("the push with a FIFO token file ran for more than 10 seconds");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let out = child.wait_with_output().unwrap();
+            assert_refused(&out, "push-token-file 'keys/fifo' is not a regular file");
+        }
+    }
+
     /// `ostrya push` to `ostrya serve` sends the dependency that field 2 of
     /// the pushed commit names. The server holds the dependency complete,
     /// and writes no ref for it.

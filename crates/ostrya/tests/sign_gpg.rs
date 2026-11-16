@@ -434,7 +434,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .await
             .unwrap();
         assert_eq!(count, 1);
-        let verifier = GpgVerifier::for_remote_in(&repo, "origin", &[]).unwrap();
+        let verifier = GpgVerifier::for_remote_in(&repo, "origin").unwrap();
         let outcome = repo
             .verify_commit(&commit, &[Arc::new(verifier)])
             .await
@@ -450,7 +450,7 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .await
             .unwrap();
         assert_eq!(count, 0);
-        let verifier = GpgVerifier::for_remote_in(&repo, "origin", &[]).unwrap();
+        let verifier = GpgVerifier::for_remote_in(&repo, "origin").unwrap();
         let outcome = repo
             .verify_commit(&commit, &[Arc::new(verifier)])
             .await

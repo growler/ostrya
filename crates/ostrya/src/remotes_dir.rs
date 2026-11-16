@@ -212,19 +212,27 @@ fn display_base(dir: &RemotesDir) -> &Path {
     }
 }
 
-/// Returns the descriptor and the path that open the entry `name` of `dir`,
-/// and the path that names the entry in an error message.
+/// Returns the descriptor and the path that open the path `name` relative to
+/// `dir`, and the path that names it in an error message.
 ///
-/// The error path is the path of a [`Path`](RemotesDir::Path) value as
-/// given, or of an [`InRepo`](RemotesDir::InRepo) value, joined with `name`.
-/// For a [`Fd`](RemotesDir::Fd) value, it is `name` alone.
-#[cfg(feature = "verify-gpg")]
+/// `name` is a file name of the directory, or a path that a `.conf` file of
+/// the directory names. An absolute `name` ignores `dir`. The error path is
+/// the path of a [`Path`](RemotesDir::Path) value as given, or of an
+/// [`InRepo`](RemotesDir::InRepo) value, joined with `name`. For a
+/// [`Fd`](RemotesDir::Fd) value, it is `name` alone.
+///
+/// An empty `name` gives the empty path to open and to show, and does not
+/// name `dir`. The open of the empty path gives "No such file or directory",
+/// as the open of an empty value of `config` does.
 pub(crate) fn entry<'a>(
     repo_fd: BorrowedFd<'a>,
     dir: &'a RemotesDir,
-    name: &str,
+    name: &Path,
 ) -> (BorrowedFd<'a>, PathBuf, PathBuf) {
     let (base, at) = locate(repo_fd, dir);
+    if name.as_os_str().is_empty() {
+        return (base, PathBuf::new(), PathBuf::new());
+    }
     (base, at.join(name), display_base(dir).join(name))
 }
 

@@ -48,10 +48,10 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// [`GpgVerifier::default`], which trusts no certificate.
 /// [`add_keyring`](GpgVerifier::add_keyring) and
 /// [`add_keyring_files`](GpgVerifier::add_keyring_files) then add each source.
-/// [`add_keyring_files_skipping`](GpgVerifier::add_keyring_files_skipping)
-/// adds the files of a source that can hold files of other kinds, as a
-/// `gpgkeypath` entry can. It skips a file with no armor that is a GnuPG
-/// keybox or that is not a whole OpenPGP packet stream.
+/// [`add_keyring_skipping`](GpgVerifier::add_keyring_skipping) adds one
+/// keyring of a source that can hold files of other kinds, as a `gpgkeypath`
+/// entry can. It skips a keyring with no armor that is a GnuPG keybox or that
+/// is not a whole OpenPGP packet stream.
 /// [`add_binary_keyring`](GpgVerifier::add_binary_keyring) and
 /// [`add_binary_keyring_files`](GpgVerifier::add_binary_keyring_files) add
 /// a source that must be a binary packet stream. They refuse armor.
@@ -186,9 +186,9 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// the parser refuses a keyring, the load fails. If the packet stream of a
 /// keyring does not frame to its end, the load also fails. So each
 /// verification uses a trusted set that was read whole.
-/// [`add_keyring_files_skipping`](GpgVerifier::add_keyring_files_skipping)
-/// skips a file with no armor that is a keybox or that does not frame to its
-/// end, and adds no certificate from it. It refuses each other file that it
+/// [`add_keyring_skipping`](GpgVerifier::add_keyring_skipping) skips a
+/// keyring with no armor that is a keybox or that does not frame to its end,
+/// and adds no certificate from it. It refuses each other keyring that it
 /// cannot read whole.
 ///
 /// The parse runs under `catch_unwind`, so a panic in the parser gives
@@ -317,70 +317,52 @@ impl GpgVerifier {
         Ok(())
     }
 
-    /// Adds each keyring that `paths` names to the trusted set, in the given
-    /// order, and skips each file that is not an OpenPGP packet stream. If a
-    /// path names no file, the load skips it.
+    /// Adds one keyring to the trusted set, and skips it if it is not an
+    /// OpenPGP packet stream.
     ///
-    /// The call skips a file only if the file does not hold the bytes
+    /// The call is for a source that can hold files of other kinds, as a
+    /// `gpgkeypath` entry of ostree can. The caller reads the file and gives
+    /// its bytes. `subject` names the source in a refusal, for example
+    /// `the keyring '<path>'`.
+    ///
+    /// The call skips the keyring only if `bytes` does not hold the bytes
     /// `-----BEGIN PGP`, and one of these conditions applies:
     ///
-    /// - The file is a GnuPG keybox.
-    /// - The file does not frame as a whole OpenPGP packet stream. Text,
+    /// - The keyring is a GnuPG keybox.
+    /// - The keyring does not frame as a whole OpenPGP packet stream. Text,
     ///   random bytes, a truncated keyring, and a keyring with bytes after its
     ///   last packet are examples.
     ///
-    /// A skipped file adds no certificate and gives no message. The call reads
-    /// a file whole, so a file that holds a keyring and then other bytes adds
-    /// no certificate. An empty file gives no certificate.
+    /// A skipped keyring adds no certificate and gives no message. The call
+    /// reads `bytes` whole, so a keyring with other bytes after it adds no
+    /// certificate. An empty keyring gives no certificate.
     ///
-    /// The call refuses each other file that it cannot read whole as a
-    /// keyring. A file that holds the bytes `-----BEGIN PGP` is armored, and
-    /// the call refuses it if its armor does not decode to a keyring. Armor
-    /// after other bytes, an armor line that does not start a line, an armor
-    /// header that is not valid UTF-8, a block that is not valid base64 after
-    /// a valid block, and armor of bytes that are not a whole packet stream
-    /// are examples. Another tool can read a key or a revocation from such a
-    /// file, so a skip could trust a key that the file revokes. The call also
-    /// refuses a whole packet stream if the parser refuses or panics on a
-    /// certificate of it.
+    /// The call refuses each other keyring that it cannot read whole. Bytes
+    /// that hold `-----BEGIN PGP` are armored, and the call refuses them if
+    /// their armor does not decode to a keyring. Armor after other bytes, an
+    /// armor line that does not start a line, an armor header that is not
+    /// valid UTF-8, a block that is not valid base64 after a valid block, and
+    /// armor of bytes that are not a whole packet stream are examples. Another
+    /// tool can read a key or a revocation from such a file, so a skip could
+    /// trust a key that the file revokes. The call also refuses a whole
+    /// packet stream if the parser refuses or panics on a certificate of it.
+    /// It refuses a keyring over 4 MiB, and a keyring with more than 256
+    /// certificates.
     ///
-    /// The other read rules of
-    /// [`from_keyring_files`](GpgVerifier::from_keyring_files) apply. So a
-    /// file that cannot be opened or read, a path that names a file that is
-    /// not a regular file, a file over 4 MiB, and a keyring with more than 256
-    /// certificates are refused. Each refusal names the path, as
-    /// `the keyring '<path>'`.
-    ///
-    /// The call reads and parses each keyring before it adds a certificate.
-    /// So the trusted set gets either all keyrings or none of them.
+    /// The extend has the rules of [`add_keyring`](GpgVerifier::add_keyring).
     ///
     /// # Errors
     ///
-    /// - [`Error::Signature`] if a path cannot be opened for a reason other
-    ///   than a missing file, or a read of the file fails.
-    /// - [`Error::Signature`] if a path names a file that is not a regular
-    ///   file, for example a directory or a fifo.
-    /// - [`Error::Signature`] if a file is over 4 MiB, or holds more than 256
+    /// - [`Error::Signature`] if `bytes` is over 4 MiB, or holds more than 256
     ///   certificates.
-    /// - [`Error::Signature`] if a file holds the bytes `-----BEGIN PGP` and
-    ///   its armor does not decode to a keyring that the parser reads.
+    /// - [`Error::Signature`] if `bytes` holds `-----BEGIN PGP` and its armor
+    ///   does not decode to a keyring that the parser reads.
     /// - [`Error::Signature`] if the parser refuses a certificate of a whole
     ///   packet stream, or panics.
     ///
-    /// On an error, the verifier is unchanged.
-    pub fn add_keyring_files_skipping<I, P>(&mut self, paths: I) -> Result<()>
-    where
-        I: IntoIterator<Item = P>,
-        P: AsRef<Path>,
-    {
-        let mut certs = Vec::new();
-        for path in paths {
-            let path = path.as_ref();
-            let subject = format!("the keyring '{}'", path.display());
-            if let Some(bytes) = read_key_file(path, &subject, MAX_KEYRING)? {
-                certs.extend(skippable_keyring_certs(&bytes, &subject)?);
-            }
-        }
+    /// Each message holds `subject`. On an error, the verifier is unchanged.
+    pub fn add_keyring_skipping(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
+        let certs = skippable_keyring_certs(bytes, subject)?;
         self.trust(certs);
         Ok(())
     }
@@ -546,8 +528,8 @@ impl From<KeyringRefusal> for Error {
 /// The bytes that start an armor header line.
 const ARMOR_BEGIN: &[u8] = b"-----BEGIN PGP";
 
-/// Returns the certificates of one file of a `gpgkeypath` entry, as
-/// [`GpgVerifier::add_keyring_files_skipping`] reads it.
+/// Returns the certificates of one keyring of a `gpgkeypath` entry, as
+/// [`GpgVerifier::add_keyring_skipping`] reads it.
 ///
 /// Returns no certificate for a file to skip: a file that does not hold
 /// [`ARMOR_BEGIN`] and that is a GnuPG keybox or does not frame to its end.
@@ -2346,11 +2328,31 @@ IHdvcmxk\n\
         assert_eq!(verifier.certs.len(), 1);
     }
 
-    /// The skipping load skips each file with no armor that is a GnuPG
+    /// Adds the keyring files `paths` with
+    /// [`add_keyring_skipping`](GpgVerifier::add_keyring_skipping), in order,
+    /// as the reader of a `gpgkeypath` entry does. Each file is named
+    /// `the keyring '<path>'`, and a path that names no file adds nothing. On
+    /// an error, the verifier is unchanged.
+    fn add_files_skipping<P: AsRef<Path>>(
+        verifier: &mut GpgVerifier,
+        paths: impl IntoIterator<Item = P>,
+    ) -> Result<()> {
+        let mut staged = verifier.clone();
+        for path in paths {
+            let path = path.as_ref();
+            let subject = format!("the keyring '{}'", path.display());
+            if let Some(bytes) = read_key_file(path, &subject, MAX_KEYRING)? {
+                staged.add_keyring_skipping(&bytes, &subject)?;
+            }
+        }
+        *verifier = staged;
+        Ok(())
+    }
+
+    /// The skipping load skips each keyring with no armor that is a GnuPG
     /// keybox or that does not frame as a whole OpenPGP packet stream, and
-    /// gives no error. It adds the certificates of each keyring file, binary
-    /// or armored. A path that names no file is also skipped. An empty file
-    /// gives no certificate.
+    /// gives no error. It adds the certificates of each keyring, binary or
+    /// armored. An empty keyring gives no certificate.
     #[test]
     fn the_skipping_load_skips_a_file_that_is_not_a_keyring() {
         if !gpg_or_skip() {
@@ -2393,72 +2395,48 @@ IHdvcmxk\n\
         let empty = dir.join("empty.gpg");
         std::fs::write(&empty, b"").unwrap();
         let mut verifier = GpgVerifier::default();
-        verifier.add_keyring_files_skipping([&empty]).unwrap();
+        verifier
+            .add_keyring_skipping(b"", "the keyring 'empty'")
+            .unwrap();
         assert!(verifier.is_empty());
         paths.push(empty);
         paths.push(dir.join("absent.gpg"));
-        verifier.add_keyring_files_skipping(&paths).unwrap();
+        add_files_skipping(&mut verifier, &paths).unwrap();
         assert_eq!(verifier.certs.len(), 2);
         let alone = GpgVerifier::from_keyring_files([dir.join("binary.gpg")]).unwrap();
         assert_eq!(verifier.certs[0], alone.certs[0]);
         assert_eq!(verifier.certs[1], alone.certs[0]);
     }
 
-    /// The skipping load refuses a file over a limit of the port, a file that
-    /// is not a regular file, and a file that cannot be opened, by the path of
-    /// the file. On each refusal, the verifier is unchanged.
-    #[cfg(unix)]
+    /// The skipping load refuses a keyring over a limit of the port by its
+    /// subject. On each refusal, the verifier is unchanged.
     #[test]
-    fn the_skipping_load_refuses_a_limit_and_a_file_it_cannot_read() {
-        use std::os::unix::fs::PermissionsExt;
-
+    fn the_skipping_load_refuses_a_keyring_over_a_limit() {
         if !gpg_or_skip() {
             return;
         }
         let home = KeyFixture::new("Limit <limit@ostrya.example>");
-        let dir = home.dir.join("keys");
-        std::fs::create_dir(&dir).unwrap();
         let one = home.export(false);
-        let good = dir.join("good.gpg");
-        std::fs::write(&good, &one).unwrap();
-        let oversized = dir.join("oversized.gpg");
-        std::fs::write(&oversized, vec![0u8; MAX_KEYRING as usize + 1]).unwrap();
-        let many = dir.join("many.gpg");
-        std::fs::write(&many, one.repeat(MAX_KEYRING_CERTS + 1)).unwrap();
         // The certificates come before bytes that do not frame. The count
         // reaches the limit before the walk reaches these bytes.
-        let many_tailed = dir.join("many-tailed.gpg");
         let mut tailed = one.repeat(MAX_KEYRING_CERTS + 1);
         tailed.extend_from_slice(b"This file holds the trusted keys.\n");
-        std::fs::write(&many_tailed, tailed).unwrap();
-        let mut refused = vec![
-            (oversized, "ceiling"),
-            (many, "256 certificates"),
-            (many_tailed, "256 certificates"),
-            (dir.clone(), "is not a regular file"),
+        let refused = [
+            ("oversized", vec![0u8; MAX_KEYRING as usize + 1], "ceiling"),
+            (
+                "many",
+                one.repeat(MAX_KEYRING_CERTS + 1),
+                "256 certificates",
+            ),
+            ("many-tailed", tailed, "256 certificates"),
         ];
-        let fifo = dir.join("fifo.gpg");
-        match std::process::Command::new("mkfifo").arg(&fifo).status() {
-            Ok(status) if status.success() => refused.push((fifo, "is not a regular file")),
-            other => eprintln!("skipping the fifo arm: mkfifo did not create a fifo: {other:?}"),
-        }
-        let unreadable = dir.join("unreadable.gpg");
-        std::fs::write(&unreadable, &one).unwrap();
-        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
-        // A process that holds the override of file permissions, as root
-        // does, opens the file. The arm then has no refusal to observe.
-        if std::fs::File::open(&unreadable).is_ok() {
-            eprintln!("skipping the unreadable arm: the file opens with mode 000");
-        } else {
-            refused.push((unreadable, "cannot be opened"));
-        }
         let mut verifier = GpgVerifier::default();
-        verifier.add_keyring_files_skipping([&good]).unwrap();
-        for (path, reason) in &refused {
-            let err = verifier
-                .add_keyring_files_skipping([good.as_path(), path.as_path()])
-                .unwrap_err();
-            let named = format!("the keyring '{}'", path.display());
+        verifier
+            .add_keyring_skipping(&one, "the keyring 'good'")
+            .unwrap();
+        for (name, bytes, reason) in &refused {
+            let named = format!("the keyring '{name}'");
+            let err = verifier.add_keyring_skipping(bytes, &named).unwrap_err();
             assert!(
                 matches!(&err, Error::Signature(m) if m.contains(&named) && m.contains(reason)),
                 "{err}"
@@ -2477,12 +2455,10 @@ IHdvcmxk\n\
     /// after a load of `good`, and leaves the verifier unchanged.
     fn skipping_load_refuses(good: &Path, paths: &[PathBuf]) {
         let mut verifier = GpgVerifier::default();
-        verifier.add_keyring_files_skipping([good]).unwrap();
+        add_files_skipping(&mut verifier, [good]).unwrap();
         let before = verifier.certs.len();
         for path in paths {
-            let err = verifier
-                .add_keyring_files_skipping([good, path.as_path()])
-                .unwrap_err();
+            let err = add_files_skipping(&mut verifier, [good, path.as_path()]).unwrap_err();
             let named = format!("the keyring '{}'", path.display());
             assert!(
                 matches!(&err, Error::Signature(m) if m.contains(&named)),
@@ -2568,9 +2544,7 @@ IHdvcmxk\n\
         skipping_load_refuses(&good, &refused);
         // The same armor with no text before it adds the key.
         let mut verifier = GpgVerifier::default();
-        verifier
-            .add_keyring_files_skipping([write_file(dir.join("plain.asc"), &armored)])
-            .unwrap();
+        add_files_skipping(&mut verifier, [write_file(dir.join("plain.asc"), &armored)]).unwrap();
         assert_eq!(verifier.certs.len(), 1);
     }
 
@@ -2594,7 +2568,7 @@ IHdvcmxk\n\
             let path = write_file(dir.join(format!("{index}.gpg")), stream);
             assert!(matches!(certificate_chunks(stream), Chunks::Framed(_)));
             let mut verifier = GpgVerifier::default();
-            results.push((path.clone(), verifier.add_keyring_files_skipping([&path])));
+            results.push((path.clone(), add_files_skipping(&mut verifier, [&path])));
         }
         std::fs::remove_dir_all(&dir).unwrap();
         for (path, result) in results {
@@ -2630,7 +2604,7 @@ IHdvcmxk\n\
         let dir = scratch_dir();
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_file(dir.join("empty-keys.gpg"), &full);
-        let result = GpgVerifier::default().add_keyring_files_skipping([&path]);
+        let result = add_files_skipping(&mut GpgVerifier::default(), [&path]);
         std::fs::remove_dir_all(&dir).unwrap();
         let named = format!("the keyring '{}'", path.display());
         assert!(

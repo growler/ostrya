@@ -10,15 +10,19 @@
 //! shared handles to these objects.
 
 use std::collections::HashMap;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::path::Path;
 use std::sync::Arc;
 
 use ostrya_core::KeyFile;
+use rustix::io::Errno;
 
 use crate::access::{ClientAccess, Group, classify};
+use crate::config::relative_with_parent;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
+use crate::repo_fs::{FsError, Named, Reason, open_named};
+use crate::sign::{MAX_KEY_FILE, key_text, read_key_source};
 use crate::verify::trust::{check_trust, unknown_key};
 
 use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
@@ -76,7 +80,7 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
     for (build, _) in builds {
         match build {
             Group::Key(name) => {
-                let built = build_signers(name, &keys[name]).await?;
+                let built = build_signers(repo, name, &keys[name]).await?;
                 signers.insert(name, built.into_iter().map(Arc::new).collect());
             }
             Group::Trust(name) => {
@@ -142,6 +146,18 @@ fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
             _ => Err(Error::InvalidFormat(format!("[{group}] needs {key}"))),
         }
     };
+    // A relative path of the secret key file is relative to the repository
+    // root, and cannot leave it through a `..` component.
+    let key_file = || -> Result<String> {
+        let value = required("secret-key-file")?;
+        if relative_with_parent(Path::new(&value)) {
+            return Err(Error::InvalidFormat(format!(
+                "[{group}] secret-key-file {value} has a `..` component, which a relative \
+                 path in a config cannot have"
+            )));
+        }
+        Ok(value)
+    };
     let Some(kind) = keyfile.get_string(group, "type")? else {
         return Err(Error::InvalidFormat(format!(
             "[{group}] needs type: ed25519, spki, or gpg"
@@ -150,13 +166,11 @@ fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
     match kind.as_str() {
         "ed25519" => {
             foreign(&kind, &["gpg-key", "gpg-homedir"])?;
-            Ok(KeySpec::Ed25519 {
-                file: required("secret-key-file")?,
-            })
+            Ok(KeySpec::Ed25519 { file: key_file()? })
         }
         "spki" => {
             foreign(&kind, &["gpg-key", "gpg-homedir"])?;
-            spki_key(group, required("secret-key-file")?)
+            spki_key(group, key_file()?)
         }
         "gpg" => {
             foreign(&kind, &["secret-key-file"])?;
@@ -215,8 +229,9 @@ fn gpg_key(group: &str, _key: String, _homedir: Option<String>) -> Result<KeySpe
 ///
 /// An ed25519 or GPG key group gives one signer. An spki key group gives one
 /// signer for each `PRIVATE KEY` block of its secret key file, in the order of
-/// the file.
-async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> {
+/// the file. A relative path of the secret key file is relative to the root of
+/// `repo`.
+async fn build_signers(repo: &Repo, name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> {
     let label = format!("[{KEY_PREFIX}{name}\"]");
     let in_group = |e: Error| match e {
         Error::Signature(message) => Error::Signature(format!("{label}: {message}")),
@@ -224,13 +239,13 @@ async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> 
     };
     match spec {
         KeySpec::Ed25519 { file } => {
-            let line = secret_key_line(file).await.map_err(in_group)?;
+            let line = secret_key_line(repo, file).await.map_err(in_group)?;
             let signer =
                 ServerSigner::ed25519(&ostrya_core::base64::decode(&line)?).map_err(in_group)?;
             Ok(vec![signer])
         }
         #[cfg(feature = "sign-spki")]
-        KeySpec::Spki { file } => secret_key_blocks(file)
+        KeySpec::Spki { file } => secret_key_blocks(repo, file)
             .await
             .map_err(in_group)?
             .into_iter()
@@ -248,25 +263,24 @@ async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> 
 }
 
 /// Returns the one secret key that the file at `path` holds, as its base64
-/// line.
+/// line. A relative `path` is relative to the root of `repo`.
 ///
 /// The read runs on the blocking pool.
-async fn secret_key_line(path: &str) -> Result<String> {
+async fn secret_key_line(repo: &Repo, path: &str) -> Result<String> {
+    let repo = repo.clone();
     let path = path.to_owned();
-    ostrya_rt::unblock(move || read_secret_key_line(&path)).await
+    ostrya_rt::unblock(move || read_secret_key_line(repo.root_dir().as_fd(), &path)).await
 }
 
-/// Reads the one secret key line of the file at `path`, the blocking half of
-/// `secret_key_line`.
+/// Reads the one secret key line of the file at `path` relative to `root`,
+/// the blocking half of `secret_key_line`.
 ///
 /// The read obeys the rule of every key source: a regular file alone, of at
 /// most [`MAX_KEY_FILE`] bytes. The function skips blank lines. The file must
 /// hold exactly one other line.
-fn read_secret_key_line(path: &str) -> Result<String> {
+fn read_secret_key_line(root: BorrowedFd<'_>, path: &str) -> Result<String> {
     let subject = format!("the secret key file '{path}'");
-    let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {
-        return Err(Error::Signature(format!("{subject} does not exist")));
-    };
+    let bytes = read_secret_key_file(root, path, &subject)?;
     let text = key_text(bytes, &subject)?;
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     match (lines.next(), lines.next()) {
@@ -279,26 +293,66 @@ fn read_secret_key_line(path: &str) -> Result<String> {
 }
 
 /// Returns the signers of the spki secret key file at `path`, one for each
-/// `PRIVATE KEY` block, in the order of the file.
+/// `PRIVATE KEY` block, in the order of the file. A relative `path` is
+/// relative to the root of `repo`.
 ///
 /// The read runs on the blocking pool.
 #[cfg(feature = "sign-spki")]
-async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
+async fn secret_key_blocks(repo: &Repo, path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
+    let repo = repo.clone();
     let path = path.to_owned();
-    ostrya_rt::unblock(move || read_secret_key_blocks(&path)).await
+    ostrya_rt::unblock(move || read_secret_key_blocks(repo.root_dir().as_fd(), &path)).await
 }
 
-/// Reads the signers of the spki secret key file at `path`, the blocking half
-/// of `secret_key_blocks`.
+/// Reads the signers of the spki secret key file at `path` relative to
+/// `root`, the blocking half of `secret_key_blocks`.
 ///
 /// The read obeys the rule of every key source: a regular file alone, of at
 /// most [`MAX_KEY_FILE`] bytes. `spki_secret_keys` reads the blocks and states
 /// the rules of the file.
 #[cfg(feature = "sign-spki")]
-fn read_secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
+fn read_secret_key_blocks(
+    root: BorrowedFd<'_>,
+    path: &str,
+) -> Result<Vec<crate::spki::SpkiSigner>> {
     let subject = format!("the secret key file '{path}'");
-    let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {
-        return Err(Error::Signature(format!("{subject} does not exist")));
-    };
+    let bytes = read_secret_key_file(root, path, &subject)?;
     Ok(crate::spki::spki_secret_keys(bytes, &subject)?)
+}
+
+/// Reads the whole secret key file at `path` relative to `root`, up to
+/// [`MAX_KEY_FILE`] bytes. `subject` names the file in a refusal.
+///
+/// The open follows a symlink at each component of the path, and uses
+/// `O_NONBLOCK`. The type check after the open refuses each file that is not
+/// a regular file, so a FIFO does not block the read.
+fn read_secret_key_file(root: BorrowedFd<'_>, path: &str, subject: &str) -> Result<Vec<u8>> {
+    let fd = match open_named(root, Path::new(path), Named::File) {
+        Ok(fd) => fd,
+        Err(FsError::Absent { .. }) => {
+            return Err(Error::Signature(format!("{subject} does not exist")));
+        }
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
+        Err(FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        }) => {
+            return Err(Error::Signature(format!(
+                "{subject} cannot be opened: {}",
+                std::io::Error::from(Errno::NOTDIR)
+            )));
+        }
+        Err(FsError::Io(e)) => {
+            return Err(Error::Signature(format!("{subject} cannot be opened: {e}")));
+        }
+        Err(other) => return Err(other.into()),
+    };
+    Ok(read_key_source(
+        std::fs::File::from(fd),
+        subject,
+        MAX_KEY_FILE,
+    )?)
 }

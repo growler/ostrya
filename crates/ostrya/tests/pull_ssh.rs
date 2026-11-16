@@ -575,7 +575,7 @@ fn the_resolution_of_an_http_address_refuses_the_ssh_commands() {
                 url: Some("http://127.0.0.1:1/".to_owned()),
                 ..o
             };
-            match resolve_pull(Some(dest.config()), "origin", o).await {
+            match resolve_pull(Some(&dest), "origin", o).await {
                 Err(Error::InvalidInput(msg)) => assert!(msg.contains(key), "{msg}"),
                 other => panic!("{other:?}"),
             }

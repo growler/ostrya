@@ -8,7 +8,8 @@
 //! - [`valid_remote_name`] checks a remote name.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::os::fd::{AsFd, BorrowedFd};
+use std::path::{Component, Path, PathBuf};
 
 use ostrya_core::{KeyFile, RepoMode};
 
@@ -96,6 +97,79 @@ pub enum RemoteSource<'a> {
     /// A `.conf` file of the remotes directory, by its name in that
     /// directory, for example `origin.conf`.
     File(&'a str),
+}
+
+/// The source of a path that a key or a caller names. The source sets the
+/// base of a relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeyOrigin {
+    /// A path of a caller. A relative path resolves against the working
+    /// directory.
+    Caller,
+    /// A value of `<repo>/config`. A relative path resolves against the
+    /// repository root.
+    Config,
+    /// A value of a `.conf` file of the remotes directory. A relative path
+    /// resolves against that directory.
+    RemotesFile,
+}
+
+/// A path that a key or a caller names, with its source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeyPath {
+    /// The path as the key or the caller gives it.
+    pub(crate) value: PathBuf,
+    /// The source of the path.
+    pub(crate) origin: KeyOrigin,
+}
+
+impl KeyPath {
+    /// Returns the path `value` of a caller.
+    pub(crate) fn caller(value: impl Into<PathBuf>) -> KeyPath {
+        KeyPath {
+            value: value.into(),
+            origin: KeyOrigin::Caller,
+        }
+    }
+
+    /// Returns the descriptor that the path resolves against, the path to
+    /// open from that descriptor, and the path that names the file in a
+    /// message.
+    ///
+    /// A path of a caller resolves against the working directory. A value of
+    /// `config` resolves against the root of `repo`, and the message shows
+    /// the value. A value of a `.conf` file resolves against the remotes
+    /// directory of `repo`, and the message shows the path of that directory
+    /// joined with the value, as [`remotes_dir::entry`] gives it. An empty
+    /// value of a `.conf` file names no file, as an empty value of `config`
+    /// does. An absolute path ignores the descriptor.
+    ///
+    /// A value of a key comes from the config of `repo`, so it always has a
+    /// repository handle. A value with no handle resolves against the
+    /// working directory.
+    pub(crate) fn locate<'a>(
+        &'a self,
+        repo: Option<&'a Repo>,
+    ) -> (BorrowedFd<'a>, PathBuf, PathBuf) {
+        match (self.origin, repo) {
+            (KeyOrigin::Config, Some(repo)) => (
+                repo.root_dir().as_fd(),
+                self.value.clone(),
+                self.value.clone(),
+            ),
+            (KeyOrigin::RemotesFile, Some(repo)) => match repo.remotes_dir() {
+                Some(dir) => remotes_dir::entry(repo.root_dir().as_fd(), dir, &self.value),
+                None => (rustix::fs::CWD, self.value.clone(), self.value.clone()),
+            },
+            _ => (rustix::fs::CWD, self.value.clone(), self.value.clone()),
+        }
+    }
+}
+
+/// Returns `true` if `path` is relative and has a `..` component. A path of
+/// a key or of a caller cannot have such a component.
+pub(crate) fn relative_with_parent(path: &Path) -> bool {
+    path.is_relative() && path.components().any(|c| c == Component::ParentDir)
 }
 
 /// The minimum free space that a write must leave.
@@ -925,6 +999,26 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 /// section. A pull from a remote with the key [`trust`](Remote::trust), a pull
 /// with [`PullOptions::trust_group`](crate::PullOptions::trust_group), and the
 /// receive side read a trust group through this type.
+///
+/// # Paths
+///
+/// The keys `gpgkeypath`, `verification-ENGINE-file`, `tls-ca-path`,
+/// `tls-client-cert-path`, `tls-client-key-path`, and `push-token-file` name
+/// files. A path is absolute, or relative to a base:
+///
+/// - A relative path in `config` is relative to the repository root. This
+///   applies to a remote and to a trust group.
+/// - A relative path in a `.conf` file of the remotes directory is relative
+///   to that directory.
+///
+/// The accessor of each of these keys refuses a relative path with a `..`
+/// component. An absolute path with a `..` component is not refused. The
+/// readers do not expand `~`. A read follows a symlink at each component of
+/// the path, also to a path outside the repository. It opens the file with
+/// `O_NONBLOCK`, and then refuses each file that is not a regular file, so
+/// a FIFO, a device, or a socket at the path fails the read. A directory
+/// entry of `gpgkeypath` is the exception, as
+/// [`gpgkeypath`](Remote::gpgkeypath) states.
 #[derive(Debug, Clone)]
 pub struct Remote<'a> {
     keyfile: &'a KeyFile,
@@ -1023,16 +1117,22 @@ impl Remote<'_> {
     /// empty entry, so an empty value gives one empty entry. If the key is
     /// absent, the list is empty.
     ///
-    /// Each entry is a keyring file or a directory of keyring files. The GPG
-    /// verifier refuses an empty entry, because it cannot read it. It reads
-    /// each regular file of a directory. It skips a file that does not hold
-    /// the bytes `-----BEGIN PGP` and that is a GnuPG keybox or is not a whole
-    /// OpenPGP packet stream. It refuses each other file that it cannot read
-    /// whole as a keyring.
+    /// Each entry is a keyring file or a directory of keyring files, by the
+    /// rules of [`Remote#paths`]. The GPG verifier refuses an empty entry,
+    /// because it cannot read it. It opens an entry as a file first, and lists
+    /// the entry if it is a directory. In a directory, it reads each member
+    /// that the listing gives as a regular file. It skips a symlink, a
+    /// subdirectory, a FIFO, a socket, and a device, and opens no such
+    /// member. It also skips a member that is absent or is not a regular file
+    /// at its open. It skips a file that does not hold the bytes
+    /// `-----BEGIN PGP` and that is a GnuPG keybox or is not a whole OpenPGP
+    /// packet stream. It refuses each other file that it cannot read whole as
+    /// a keyring.
     ///
     /// # Errors
     ///
-    /// The call gives no error.
+    /// [`Error::InvalidFormat`] if an entry is a relative path with a `..`
+    /// component.
     pub fn gpgkeypath(&self) -> Result<Vec<String>> {
         let Some(raw) = self.get("gpgkeypath") else {
             return Ok(Vec::new());
@@ -1041,7 +1141,40 @@ impl Remote<'_> {
         if entries.len() > 1 && entries.last().is_some_and(String::is_empty) {
             entries.pop();
         }
+        for entry in &entries {
+            self.check_path("gpgkeypath", entry)?;
+        }
         Ok(entries)
+    }
+
+    /// Returns the `gpgkeypath` entries of [`gpgkeypath`](Remote::gpgkeypath)
+    /// as paths with the source of the section.
+    #[cfg(feature = "verify-gpg")]
+    pub(crate) fn gpgkeypath_paths(&self) -> Result<Vec<KeyPath>> {
+        Ok(self
+            .gpgkeypath()?
+            .into_iter()
+            .map(|entry| self.key_path_of(entry))
+            .collect())
+    }
+
+    /// Returns the path that the key `key` names, with the source of the
+    /// section, or `None` if the key is absent. The call refuses a value as
+    /// [`path_string`](Remote::path_string) does.
+    pub(crate) fn key_path(&self, key: &str) -> Result<Option<KeyPath>> {
+        Ok(self.path_string(key)?.map(|value| self.key_path_of(value)))
+    }
+
+    /// Returns `value`, a path of a key of this section, with the source of
+    /// the section.
+    fn key_path_of(&self, value: String) -> KeyPath {
+        KeyPath {
+            value: PathBuf::from(value),
+            origin: match self.source {
+                RemoteSource::Config => KeyOrigin::Config,
+                RemoteSource::File(_) => KeyOrigin::RemotesFile,
+            },
+        }
     }
 
     /// Returns the sign-api engines that verify the commits of this remote.
@@ -1089,11 +1222,16 @@ impl Remote<'_> {
     /// - `ed25519`: the file holds one base64 key on each line.
     /// - `spki`: the file holds PEM `PUBLIC KEY` blocks.
     ///
+    /// A pull and the receive side read the path by the rules of
+    /// [`Remote#paths`].
+    ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - [`Error::InvalidFormat`] if the value is a relative path with a `..`
+    ///   component.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn verification_file(&self, engine: &str) -> Result<Option<String>> {
-        self.string(&format!("verification-{engine}-file"))
+        self.path_string(&format!("verification-{engine}-file"))
     }
 
     /// Returns the `trust` key: the name of the trust group
@@ -1213,41 +1351,46 @@ impl Remote<'_> {
     /// Returns the `tls-ca-path` key: a PEM file of trust anchors for TLS.
     ///
     /// The anchors replace the trust store of the host. A pull and a push read
-    /// a relative path from the current directory of the process. They do not
-    /// expand `~`.
+    /// the path by the rules of [`Remote#paths`].
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - [`Error::InvalidFormat`] if the value is a relative path with a `..`
+    ///   component.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_ca_path(&self) -> Result<Option<String>> {
-        self.string("tls-ca-path")
+        self.path_string("tls-ca-path")
     }
 
     /// Returns the `tls-client-cert-path` key: the PEM client certificate
     /// chain.
     ///
-    /// The client presents this chain to the remote. A relative path is read as
-    /// [`tls_ca_path`](Remote::tls_ca_path) states.
+    /// The client presents this chain to the remote. A pull and a push read
+    /// the path by the rules of [`Remote#paths`].
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - [`Error::InvalidFormat`] if the value is a relative path with a `..`
+    ///   component.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_client_cert_path(&self) -> Result<Option<String>> {
-        self.string("tls-client-cert-path")
+        self.path_string("tls-client-cert-path")
     }
 
     /// Returns the `tls-client-key-path` key: the PEM private key of the
     /// client.
     ///
     /// The key belongs to the chain of
-    /// [`tls_client_cert_path`](Remote::tls_client_cert_path). A relative path
-    /// is read as [`tls_ca_path`](Remote::tls_ca_path) states.
+    /// [`tls_client_cert_path`](Remote::tls_client_cert_path). A pull and a
+    /// push read the path by the rules of [`Remote#paths`].
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - [`Error::InvalidFormat`] if the value is a relative path with a `..`
+    ///   component.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn tls_client_key_path(&self) -> Result<Option<String>> {
-        self.string("tls-client-key-path")
+        self.path_string("tls-client-key-path")
     }
 
     /// Returns `true` if `tls-permissive` turns off the TLS chain verification.
@@ -1342,14 +1485,15 @@ impl Remote<'_> {
     /// Returns the `push-token-file` key: the token file of an HTTP push.
     ///
     /// The first line of the file is the token of an HTTP push to this remote.
-    /// The push reads a relative path from the current directory of the
-    /// process, as a pull reads the TLS keys. It does not expand `~`.
+    /// The push reads the path by the rules of [`Remote#paths`].
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// - [`Error::InvalidFormat`] if the value is a relative path with a `..`
+    ///   component.
+    /// - [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn push_token_file(&self) -> Result<Option<String>> {
-        self.string("push-token-file")
+        self.path_string("push-token-file")
     }
 
     /// Returns the `push-user` key: the Basic credential name of an HTTP push.
@@ -1476,6 +1620,30 @@ impl Remote<'_> {
         self.keyfile
             .get_string(&self.group, key)
             .map_err(Error::from)
+    }
+
+    /// Returns the value of the key `key`, which names a path. The call
+    /// refuses a relative path with a `..` component with
+    /// [`Error::InvalidFormat`].
+    fn path_string(&self, key: &str) -> Result<Option<String>> {
+        let value = self.string(key)?;
+        if let Some(value) = &value {
+            self.check_path(key, value)?;
+        }
+        Ok(value)
+    }
+
+    /// Refuses `value`, a path of the key `key`, if it is a relative path with
+    /// a `..` component.
+    fn check_path(&self, key: &str, value: &str) -> Result<()> {
+        if relative_with_parent(Path::new(value)) {
+            return Err(Error::InvalidFormat(format!(
+                "[{}] {key} {value} has a `..` component, which a relative path in a config \
+                 cannot have",
+                self.group
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -1613,7 +1781,7 @@ fn parse_size(raw: &str) -> Option<SizeSpec> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use ostrya_core::Ref;
 
@@ -2440,5 +2608,149 @@ mod tests {
                 "{keys:?}"
             );
         }
+    }
+
+    /// Reads the file that `path` names from the base of
+    /// [`KeyPath::locate`] with `repo`, and gives its text and the path of a
+    /// message.
+    fn read_located(path: &KeyPath, repo: Option<&Repo>) -> (String, PathBuf) {
+        use std::io::Read as _;
+
+        let (base, at, shown) = path.locate(repo);
+        let fd = crate::repo_fs::open_named(base, &at, crate::repo_fs::Named::File).unwrap();
+        let mut text = String::new();
+        std::fs::File::from(fd).read_to_string(&mut text).unwrap();
+        (text, shown)
+    }
+
+    /// A relative path of a key in `config` resolves against the repository
+    /// root, and a relative path of a key in a `.conf` file against the
+    /// remotes directory, for each form of the directory. No relative path
+    /// resolves against the working directory. An absolute path with a `..`
+    /// component opens, and a relative path with a `..` component is
+    /// refused at the read of the key.
+    #[test]
+    fn a_relative_key_path_resolves_against_the_base_of_its_source() {
+        use std::sync::Arc;
+
+        use crate::repo::RemotesDir;
+        use crate::repo_fs::TestDir;
+        use crate::{CreateOptions, OpenOptions};
+
+        let dir = TestDir::new("key-path");
+        let root = dir.path().join("repo");
+        let remotes = dir.path().join("remotes.d");
+        let conf = "[remote \"o\"]\nurl=http://h/\ntls-ca-path=k.pem\n";
+        let repo = ostrya_rt::block_on(async {
+            Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap()
+        });
+        drop(repo);
+        let mut text = std::fs::read_to_string(root.join("config")).unwrap();
+        text.push_str(&format!(
+            "[remote \"c\"]\nurl=http://h/\ntls-ca-path=k.pem\n\
+             [remote \"a\"]\nurl=http://h/\ntls-ca-path={}\n\
+             [remote \"p\"]\nurl=http://h/\ntls-ca-path=../k.pem\n",
+            root.join("in.d/../k.pem").display()
+        ));
+        std::fs::write(root.join("config"), text).unwrap();
+        std::fs::create_dir(root.join("in.d")).unwrap();
+        std::fs::create_dir(&remotes).unwrap();
+        std::fs::write(root.join("k.pem"), "root").unwrap();
+        std::fs::write(root.join("in.d/k.pem"), "in-repo").unwrap();
+        std::fs::write(root.join("in.d/o.conf"), conf).unwrap();
+        std::fs::write(remotes.join("k.pem"), "path").unwrap();
+        std::fs::write(remotes.join("o.conf"), conf).unwrap();
+        let open = |dir: RemotesDir| {
+            ostrya_rt::block_on(OpenOptions::new().remotes_dir(dir).open(&root)).unwrap()
+        };
+        let fd = rustix::fs::open(
+            &remotes,
+            rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+            rustix::fs::Mode::empty(),
+        )
+        .unwrap();
+        let cases = [
+            (RemotesDir::path(&remotes), "path", remotes.join("k.pem")),
+            (
+                RemotesDir::InRepo("in.d".into()),
+                "in-repo",
+                PathBuf::from("in.d/k.pem"),
+            ),
+            (RemotesDir::Fd(Arc::new(fd)), "path", PathBuf::from("k.pem")),
+        ];
+        for (remotes_dir, text, shown) in cases {
+            let repo = open(remotes_dir);
+            let path = repo
+                .config()
+                .remote("o")
+                .unwrap()
+                .key_path("tls-ca-path")
+                .unwrap()
+                .unwrap();
+            assert_eq!(path.origin, KeyOrigin::RemotesFile);
+            assert_eq!(read_located(&path, Some(&repo)), (text.to_owned(), shown));
+            let path = repo
+                .config()
+                .remote("c")
+                .unwrap()
+                .key_path("tls-ca-path")
+                .unwrap()
+                .unwrap();
+            assert_eq!(path.origin, KeyOrigin::Config);
+            assert_eq!(
+                read_located(&path, Some(&repo)),
+                ("root".to_owned(), PathBuf::from("k.pem"))
+            );
+        }
+        let repo = open(RemotesDir::path(&remotes));
+        let absolute = repo.config().remote("a").unwrap();
+        let path = absolute.key_path("tls-ca-path").unwrap().unwrap();
+        assert_eq!(read_located(&path, Some(&repo)).0, "root");
+        let caller = KeyPath::caller(root.join("in.d/k.pem"));
+        assert_eq!(read_located(&caller, Some(&repo)).0, "in-repo");
+        let parent = repo.config().remote("p").unwrap();
+        for result in [
+            parent.tls_ca_path(),
+            parent.key_path("tls-ca-path").map(|_| None),
+        ] {
+            assert!(
+                matches!(&result, Err(Error::InvalidFormat(m)) if m == "[remote \"p\"] tls-ca-path \
+                    ../k.pem has a `..` component, which a relative path in a config cannot have"),
+                "{result:?}"
+            );
+        }
+    }
+
+    /// Creates a repository at `root`. Its `config` ends with `sections`, and
+    /// its remotes directory `remotes.d` holds the file `o.conf` with the
+    /// text `conf`. Returns a handle of the repository for each form of the
+    /// remotes directory: a path, a path relative to the repository, and a
+    /// descriptor.
+    pub(crate) fn repos_with_remotes_file(root: &Path, sections: &str, conf: &str) -> Vec<Repo> {
+        use crate::repo::RemotesDir;
+        use crate::{CreateOptions, OpenOptions};
+
+        ostrya_rt::block_on(async {
+            Repo::create(root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+        });
+        let mut text = std::fs::read_to_string(root.join("config")).unwrap();
+        text.push_str(sections);
+        std::fs::write(root.join("config"), text).unwrap();
+        let remotes = root.join("remotes.d");
+        std::fs::create_dir(&remotes).unwrap();
+        std::fs::write(remotes.join("o.conf"), conf).unwrap();
+        let fd = std::os::fd::OwnedFd::from(std::fs::File::open(&remotes).unwrap());
+        [
+            RemotesDir::path(&remotes),
+            RemotesDir::InRepo(PathBuf::from("remotes.d")),
+            RemotesDir::from(fd),
+        ]
+        .into_iter()
+        .map(|dir| ostrya_rt::block_on(OpenOptions::new().remotes_dir(dir).open(root)).unwrap())
+        .collect()
     }
 }

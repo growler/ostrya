@@ -19143,6 +19143,57 @@ fn show_refuses_an_invalid_gpg_verify_remote_name() {
     );
 }
 
+/// `show --gpg-verify-remote` reads a relative `gpgkeypath` entry relative
+/// to the repository root, and not to the working directory. A keyring at
+/// the same relative path under the working directory is not read.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_reads_a_relative_gpgkeypath_from_the_repository_root() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("show-relative-keypath");
+    let base = tmp.path();
+    let (repo, home, commit) =
+        signed_show_repo(base, "Relative Keypath <relative-keypath@ostrya.example>");
+    let repo_arg = format!("--repo={}", repo.display());
+    std::fs::create_dir(repo.join("keys")).unwrap();
+    std::fs::create_dir(base.join("keys")).unwrap();
+    home.export_to(&repo.join("keys/root.gpg"));
+    home.export_to(&base.join("keys/cwd.gpg"));
+    configure_remote(
+        &repo,
+        "https://example.invalid/r",
+        "gpgkeypath=keys/root.gpg\n",
+    );
+    let args = [
+        repo_arg.as_str(),
+        "show",
+        "--gpg-verify-remote=origin",
+        &commit,
+    ];
+    let out = ostrya_in(Some(base), &args, None, &[]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{stdout}");
+    assert!(stdout.contains("Good signature from"), "{stdout}");
+
+    let config = repo.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("keys/root.gpg", "keys/cwd.gpg")).unwrap();
+    let out = ostrya_in(Some(base), &args, None, &[]);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("gpgkeypath entry 'keys/cwd.gpg' cannot be read: "),
+        "{stderr}"
+    );
+}
+
 /// A signed commit in an archive repository under `base`, and the GnuPG home
 /// of the key that signed it. The function returns the repository path, the
 /// home, and the commit checksum.

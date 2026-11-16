@@ -1303,15 +1303,14 @@ impl Repo {
         ostrya_rt::unblock(move || {
             use std::io::{Seek, SeekFrom};
 
-            let Some(StoredImage {
-                mut file,
-                len,
-                sealed,
-            }) = open_stored_image_blocking(&repo, &commit)?
+            let Some(crate::repo_fs::Opened { mut file, stat }) =
+                image_store::open_blocking(&repo, &commit)?
             else {
                 return Err(Error::ComposefsImageNotFound { commit });
             };
-            let kernel = sealed
+            let len = stat.size;
+            let kernel = stat
+                .verity
                 .then(|| crate::repo_fs::verity_digest(file.as_fd(), len))
                 .flatten();
             let actual = match kernel {
@@ -1344,29 +1343,6 @@ impl Repo {
         let commit = *commit;
         ostrya_rt::unblock(move || stored_image_digest_blocking(&repo, &commit)).await
     }
-}
-
-/// A stored composefs image, open for reading.
-struct StoredImage {
-    /// The open image.
-    file: std::fs::File,
-    /// The size of the image in bytes.
-    len: u64,
-    /// The image is sealed with fs-verity.
-    sealed: bool,
-}
-
-/// Opens the stored composefs image of `commit` in `repo` for reading, with
-/// its size and its fs-verity attribute from the `statx` of the open. Returns
-/// `None` if the image is absent.
-fn open_stored_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<StoredImage>> {
-    Ok(
-        image_store::open_blocking(repo, commit)?.map(|opened| StoredImage {
-            file: opened.file,
-            len: opened.stat.size,
-            sealed: opened.stat.verity,
-        }),
-    )
 }
 
 /// Returns the fs-verity digest of the stored composefs image of `commit` in

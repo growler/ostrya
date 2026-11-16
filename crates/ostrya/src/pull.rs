@@ -2660,7 +2660,7 @@ impl Repo {
         }
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            let state = open_or_make_state(repo.root_dir(), fsync)?;
+            let state = repo.root_dir().ensure_layout(RepoLayout::State, fsync)?;
             for commit in &commits {
                 create_partial_marker(&state, commit, content, fsync)?;
             }
@@ -2690,7 +2690,7 @@ impl Repo {
         ostrya_rt::unblock_task(move || {
             #[cfg(test)]
             let _gate = crate::jobs::job_gate::pass(&gate, repo.repo_fd())?;
-            let state = open_or_make_state(repo.root_dir(), fsync)?;
+            let state = repo.root_dir().ensure_layout(RepoLayout::State, fsync)?;
             create_partial_marker(&state, &commit, &[], fsync)
         })
     }
@@ -2799,17 +2799,6 @@ pub(crate) fn partial_path(commit: &Checksum) -> String {
 /// Returns the name of the partial marker of a commit in `state/`.
 pub(crate) fn partial_name(commit: &Checksum) -> String {
     format!("{}.commitpartial", commit.to_hex())
-}
-
-/// Opens `state/` on the root handle `root` for the create of a marker, and
-/// makes it if it is absent. With `fsync`, the make of `state/` syncs the
-/// root. A symlink or an entry that is not a directory at `state` gives
-/// [`Error::InvalidFormat`].
-fn open_or_make_state(root: &RepoDir, fsync: bool) -> Result<RepoDir> {
-    Ok(match root.open_layout(RepoLayout::State).optional()? {
-        Some(state) => state,
-        None => root.ensure_layout(RepoLayout::State, fsync)?,
-    })
 }
 
 /// Creates the marker of `commit` in `state` with `O_EXCL`, and writes
@@ -4111,19 +4100,17 @@ async fn read_checked_local_summary(
     let checks_summary = verification.checks_summary();
     let root = src.root_dir().clone();
     let (summary, signature) = ostrya_rt::unblock(move || {
-        let cap = crate::summary::SUMMARY_READ_CAP;
         let summary = if checks_summary || needed {
-            root.read_capped(RootFile::Summary.name(), cap).optional()?
+            crate::summary::read_root_file_blocking(&root, RootFile::Summary.name())?
         } else {
             None
         };
         let signature = if checks_summary && summary.is_some() {
-            root.read_capped(RootFile::SummarySig.name(), cap)
-                .optional()?
+            crate::summary::read_root_file_blocking(&root, RootFile::SummarySig.name())?
         } else {
             None
         };
-        Ok::<_, FsError>((summary, signature))
+        Ok::<_, Error>((summary, signature))
     })
     .await?;
     verification.check_summary_files(summary.is_some(), signature.is_some())?;

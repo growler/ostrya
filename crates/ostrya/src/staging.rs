@@ -321,8 +321,7 @@ fn reap_one(tmp: &RepoDir, name: &str, expiry_secs: i64) {
                 repo_fs::try_lock(lock_fd.as_fd(), LockKind::Exclusive),
                 Ok(true)
             ) {
-                let _ = tmp.remove_tree(OsStr::new(name), false);
-                let _ = tmp.remove_file(&lock_name, false);
+                remove_staging(tmp, name);
             }
         }
         Err(FsError::Absent { .. }) => {

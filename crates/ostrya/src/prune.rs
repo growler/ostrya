@@ -1231,7 +1231,7 @@ impl Repo {
         let (state, mut deleted_refs): (Option<RepoDir>, Vec<Ref>) = if opts.no_prune {
             let repo = self.clone();
             let (state, doomed_refs) = ostrya_rt::unblock(move || {
-                let state = open_state(&repo)?;
+                let state = repo.root_dir().open_layout(RepoLayout::State).optional()?;
                 crate::refs::check_refs_to_delete_blocking(repo.root_dir(), &doomed_refs, |r| {
                     crate::refs::ref_relpath(None, r)
                 })?;
@@ -1243,7 +1243,7 @@ impl Repo {
             let repo = self.clone();
             let fsync = sweep.fsync;
             ostrya_rt::unblock(move || {
-                let state = open_state(&repo)?;
+                let state = repo.root_dir().open_layout(RepoLayout::State).optional()?;
                 let deleted = crate::refs::delete_matching_refs_blocking(
                     repo.root_dir(),
                     doomed_refs,
@@ -1364,13 +1364,6 @@ impl Repo {
     }
 }
 
-/// Opens `state/` for a prune, or gives `None` if the repository has no
-/// `state/`. A symlink or an entry that is not a directory at `state` gives
-/// [`Error::InvalidFormat`].
-fn open_state(repo: &Repo) -> Result<Option<RepoDir>> {
-    Ok(repo.root_dir().open_layout(RepoLayout::State).optional()?)
-}
-
 /// Removes each `state/<commit>.commitpartial` marker whose commit is not in
 /// `present`. `state` is the `state/` handle that the run opened, or `None`
 /// if the repository has no `state/`, and then nothing is to remove.
@@ -1485,16 +1478,6 @@ fn sync_dirs(objects: &RepoDir, fanouts: &BTreeSet<u8>) -> Result<()> {
         objects.sync_dir(&format!("{fanout:02x}"))?;
     }
     Ok(())
-}
-
-/// Returns the on-disk size of a loose object, or `None` if it is absent.
-/// `path` is the loose path of the object, relative to `objects`, the
-/// `objects/` handle. A dry run reads the size with this function.
-///
-/// An absent object was taken by a concurrent removal, or was never present.
-/// Nothing is then to free.
-fn object_size(objects: &RepoDir, path: &str) -> Result<Option<u64>> {
-    Ok(objects.lstat(path).optional()?.map(|stat| stat.size))
 }
 
 /// Opens the `objects/<xx>` directory of the loose object at `path`, relative
@@ -1619,7 +1602,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
     for name in doomed_commits() {
         let path = name.loose_path(sweep.mode);
         let size = if sweep.no_prune {
-            object_size(objects, &path)?
+            objects.lstat(&path).optional()?.map(|stat| stat.size)
         } else {
             let Some(fanout) = open_fanout(objects, &path)? else {
                 continue;
@@ -1653,7 +1636,10 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         .filter(|o| o.ty.is_commit_sidecar() && !removed_commits.contains(&o.checksum))
     {
         let size = if sweep.no_prune {
-            object_size(objects, &name.loose_path(sweep.mode))?
+            objects
+                .lstat(&name.loose_path(sweep.mode))
+                .optional()?
+                .map(|stat| stat.size)
         } else {
             remove_object(objects, sweep, name, &mut touched)?
         };
@@ -1672,7 +1658,10 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
         .filter(|o| o.ty != ObjectType::Commit && !o.ty.is_commit_sidecar())
     {
         let size = if sweep.no_prune {
-            object_size(objects, &name.loose_path(sweep.mode))?
+            objects
+                .lstat(&name.loose_path(sweep.mode))
+                .optional()?
+                .map(|stat| stat.size)
         } else {
             remove_object(objects, sweep, name, &mut touched)?
         };

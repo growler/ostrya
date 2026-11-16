@@ -29,8 +29,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, ObjectType, Value, base64};
-use rustix::fs::{Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::repo::Repo;
 
@@ -668,7 +666,7 @@ fn collect_keys(
 /// of [`read_key_source`]. A missing file is not an error.
 fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
     let subject = format!("the key file '{}'", path.display());
-    let Some(bytes) = read_key_path(path, &subject, MAX_KEY_FILE)? else {
+    let Some(bytes) = read_key_file(path, &subject, MAX_KEY_FILE)? else {
         return Ok(());
     };
     #[cfg(feature = "sign-spki")]
@@ -686,39 +684,6 @@ fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crat
         out.push(base64::decode(line)?);
     }
     Ok(())
-}
-
-/// Returns the whole key source at `path`, up to `ceiling` bytes, or `None` if
-/// no file is there.
-///
-/// Each error names the source by `subject`, so an operator can find the entry
-/// that named the source.
-pub(crate) fn read_key_path(
-    path: &Path,
-    subject: &str,
-    ceiling: u64,
-) -> crate::Result<Option<Vec<u8>>> {
-    // With `NONBLOCK`, the open of a fifo returns at once. Without the flag,
-    // the open waits for a writer. On a regular file, the flag has no effect
-    // on the read that follows.
-    let fd = match rustix::fs::open(
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => {
-            return Err(crate::Error::Signature(format!(
-                "{subject} cannot be opened: {e}"
-            )));
-        }
-    };
-    Ok(Some(read_key_source(
-        std::fs::File::from(fd),
-        subject,
-        ceiling,
-    )?))
 }
 
 #[cfg(test)]

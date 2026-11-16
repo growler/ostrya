@@ -767,7 +767,7 @@ impl Repo {
                 return Ok(());
             }
             let index = index_value(&deltas)?;
-            open_delta_indexes(&root, fsync)?
+            root.ensure_layout(RepoLayout::DeltaIndexes, fsync)?
                 .ensure_dir(&fanout, fsync)?
                 .write_atomic(&name, &index, Publish::Replace, fsync)?;
             Ok(())
@@ -2426,7 +2426,7 @@ fn reindex_blocking(root: &RepoDir, fsync: bool) -> Result<()> {
     let indexes = if by_target.is_empty() {
         root.open_layout(RepoLayout::DeltaIndexes).optional()?
     } else {
-        Some(open_delta_indexes(root, fsync)?)
+        Some(root.ensure_layout(RepoLayout::DeltaIndexes, fsync)?)
     };
     let Some(indexes) = indexes else {
         return Ok(());
@@ -2441,12 +2441,6 @@ fn reindex_blocking(root: &RepoDir, fsync: bool) -> Result<()> {
         written.insert(format!("{fanout}/{name}"));
     }
     prune_delta_indexes(&indexes, &written, fsync)
-}
-
-/// Opens `delta-indexes/`, and makes it if it is absent. A symlink or a file
-/// at `delta-indexes` is an error.
-fn open_delta_indexes(root: &RepoDir, fsync: bool) -> Result<RepoDir> {
-    Ok(root.ensure_layout(RepoLayout::DeltaIndexes, fsync)?)
 }
 
 /// Returns each delta under `deltas/`, sorted by delta name, with the SHA-256

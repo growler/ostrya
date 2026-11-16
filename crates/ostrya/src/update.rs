@@ -802,14 +802,8 @@ impl UpdateGuard {
                     keyfile.remove_group(&group);
                     let bytes = config_bytes(&keyfile)?;
                     let removed = remove_keyring_blocking(root, &keyring)?;
-                    let put = root
-                        .stage_root_file(&RootFile::Config, &bytes, fsync)
-                        .and_then(|temp| {
-                            temp.publish(root, RootFile::Config.name(), Publish::Replace, false)
-                        })
-                        .map(drop)
-                        .map_err(Error::from);
-                    if fsync && (removed || put.is_ok()) {
+                    let put = put_config_blocking(root, &bytes, fsync, dirs);
+                    if fsync && removed && put.is_err() {
                         dirs.push(ROOT_DIR.to_owned());
                     }
                     put

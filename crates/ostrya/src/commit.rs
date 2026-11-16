@@ -1084,9 +1084,7 @@ pub(crate) fn prune_detached_signatures_blocking(
 /// it replaces a file that exists at `name`. The call syncs nothing, because
 /// the transaction commit makes the file durable before the install.
 pub(crate) fn stage_detached_blocking(staging: &RepoDir, name: &str, bytes: &[u8]) -> Result<()> {
-    let mut temp = TempFile::create_named(staging)?;
-    temp.file_mut().write_all(bytes)?;
-    temp.set_mode(COMMITMETA_MODE)?;
+    let temp = detached_temp(Some(staging), staging, bytes, false)?;
     temp.publish(staging, name, Publish::Replace, false)?;
     Ok(())
 }
@@ -1177,7 +1175,7 @@ fn edit_detached_blocking<T>(
 ) -> Result<T> {
     let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
     let _guard = DETACHED_MERGE.lock().unwrap_or_else(|err| err.into_inner());
-    let (write, value) = edit(&|| read_detached_blocking(objects, dest, &ty))?;
+    let (write, value) = edit(&|| read_detached_blocking(objects, dest))?;
     match write {
         DetachedWrite::Dict(dict) => {
             let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
@@ -1196,19 +1194,14 @@ fn edit_detached_blocking<T>(
 /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE). A file over the cap, a
 /// symlink, and an entry that is not a regular file give
 /// [`Error::InvalidFormat`].
-fn read_detached_blocking(objects: &RepoDir, dest: &str, ty: &Type) -> Result<Option<Value>> {
+fn read_detached_blocking(objects: &RepoDir, dest: &str) -> Result<Option<Value>> {
     let Some(bytes) = objects
         .read_capped(dest, crate::object::MAX_METADATA_SIZE)
         .optional()?
     else {
         return Ok(None);
     };
-    if bytes.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(
-        ostrya_core::from_bytes(ty, &bytes).map_err(ostrya_core::Error::from)?,
-    ))
+    parse_detached_metadata(&bytes)
 }
 
 /// Writes metadata bytes to a loose path atomically.
@@ -1266,9 +1259,9 @@ pub(crate) fn write_detached_blocking(
     Ok(())
 }
 
-/// Makes the named temp file of [`write_detached_blocking`] with the bytes
-/// `bytes` and the mode `0644`, in `tmp` or in the temp home of `objects`.
-/// If fsync is on, it runs `fsync` on the file.
+/// Makes a named temp file that holds the bytes `bytes` of a metadata object,
+/// a `.commitmeta` or a `.tombstone-commit`, with the mode `0644`, in `tmp` or
+/// in the temp home of `objects`. If fsync is on, it runs `fsync` on the file.
 fn detached_temp(
     tmp: Option<&RepoDir>,
     objects: &RepoDir,

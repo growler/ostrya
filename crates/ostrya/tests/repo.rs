@@ -504,6 +504,26 @@ fn remove_remote_keyring_refuses_an_invalid_remote_name() {
     assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
 
+/// `Repo::remove_remote_keyring` removes a symlink at the keyring, and the
+/// target of the link keeps its bytes.
+#[test]
+fn remove_remote_keyring_removes_a_symlink_and_keeps_its_target() {
+    let tmp = TmpDir::new("remove-keyring-link");
+    let target = tmp.path().join("target.gpg");
+    std::fs::write(&target, b"target bytes").unwrap();
+    let repo = block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .expect("create");
+    let keyring = tmp.path().join("repo").join("origin.trustedkeys.gpg");
+    std::os::unix::fs::symlink(&target, &keyring).unwrap();
+
+    block_on(repo.remove_remote_keyring("origin")).expect("remove keyring");
+    assert!(std::fs::symlink_metadata(&keyring).is_err());
+    assert_eq!(std::fs::read(&target).unwrap(), b"target bytes");
+}
+
 /// Creates a `bare-user` repository `repo` under `tmp` and returns a
 /// descriptor of `tmp`.
 fn strict_fixture(tmp: &TmpDir) -> std::fs::File {
@@ -1364,7 +1384,6 @@ fn open_keeps_the_remotes_dir_of_the_options() {
     ))
     .expect("create");
     let values = [
-        RemotesDir::path("remotes.d"),
         RemotesDir::path(tmp.path().join("remotes.d")),
         RemotesDir::InRepo(PathBuf::from("remotes.d")),
         RemotesDir::from(scratch_dir_fd(&tmp, "scratch")),
@@ -1389,13 +1408,14 @@ fn open_selects_remotes_dir_before_the_default() {
     let tmp = TmpDir::new("rdorder");
     let path = tmp.path().join("repo");
     block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).expect("create");
-    let chosen = RemotesDir::path("chosen.d");
+    let chosen = RemotesDir::path(tmp.path().join("chosen.d"));
+    let default = RemotesDir::path(tmp.path().join("default.d"));
     for opts in [
         OpenOptions::new()
             .remotes_dir(chosen.clone())
-            .default_remotes_dir(RemotesDir::path("default.d")),
+            .default_remotes_dir(default.clone()),
         OpenOptions::new()
-            .default_remotes_dir(RemotesDir::path("default.d"))
+            .default_remotes_dir(default.clone())
             .remotes_dir(chosen.clone()),
     ] {
         let opened = block_on(opts.open(&path)).expect("open");
@@ -1436,7 +1456,7 @@ fn open_takes_an_absent_remotes_dir_and_creates_nothing() {
     for value in [
         RemotesDir::path(&absent),
         RemotesDir::InRepo(PathBuf::from("absent.d")),
-        RemotesDir::path(OsStr::from_bytes(b"\xff")),
+        RemotesDir::path(tmp.path().join(OsStr::from_bytes(b"\xff"))),
     ] {
         let opened = block_on(OpenOptions::new().remotes_dir(value.clone()).open(&path))
             .expect("open with an absent remotes directory");
@@ -1448,19 +1468,25 @@ fn open_takes_an_absent_remotes_dir_and_creates_nothing() {
 }
 
 /// The values that an open and a create refuse: an empty path, a path that
-/// holds a NUL byte, and an absolute in-repository path.
-fn refused_values() -> [RemotesDir; 5] {
+/// holds a NUL byte, a relative path, an absolute in-repository path, and an
+/// in-repository path with a `..` component.
+fn refused_values() -> [RemotesDir; 8] {
     [
         RemotesDir::path(""),
         RemotesDir::InRepo(PathBuf::new()),
-        RemotesDir::path("remotes\0.d"),
+        RemotesDir::path("/remotes\0.d"),
         RemotesDir::InRepo(PathBuf::from("remotes\0.d")),
         RemotesDir::InRepo(PathBuf::from("/abs/remotes.d")),
+        RemotesDir::path("rel.d"),
+        RemotesDir::InRepo(PathBuf::from("../x")),
+        RemotesDir::InRepo(PathBuf::from("a/../b")),
     ]
 }
 
-/// An open refuses an empty path, a path that holds a NUL byte, and an
-/// absolute in-repository path in each setter, with `Error::InvalidInput`.
+/// An open refuses an empty path, a path that holds a NUL byte, a relative
+/// path, an absolute in-repository path, and an in-repository path with a
+/// `..` component in each setter, with `Error::InvalidInput`. An absolute
+/// path with a `..` component opens.
 #[test]
 fn open_refuses_an_empty_nul_or_absolute_in_repo_remotes_dir() {
     let tmp = TmpDir::new("rdrefopen");
@@ -1472,7 +1498,7 @@ fn open_refuses_an_empty_nul_or_absolute_in_repo_remotes_dir() {
             OpenOptions::new().remotes_dir(value.clone()),
             OpenOptions::new().default_remotes_dir(value.clone()),
             OpenOptions::new()
-                .remotes_dir(RemotesDir::path("ok.d"))
+                .remotes_dir(RemotesDir::path(tmp.path().join("ok.d")))
                 .default_remotes_dir(value.clone()),
         ] {
             let err = block_on(opts.open(&path)).expect_err("open refuses");
@@ -1482,6 +1508,10 @@ fn open_refuses_an_empty_nul_or_absolute_in_repo_remotes_dir() {
             assert!(matches!(err, Error::InvalidInput(_)), "{value:?}: {err}");
         }
     }
+    let dotted = RemotesDir::path(tmp.path().join("repo").join("..").join("dotted.d"));
+    let opened = block_on(OpenOptions::new().remotes_dir(dotted.clone()).open(&path))
+        .expect("an absolute path with `..` opens");
+    assert_same_dir(opened.remotes_dir(), &dotted);
 }
 
 /// A create refuses an empty path, a path that holds a NUL byte, an absolute
@@ -1508,7 +1538,8 @@ fn create_refuses_a_bad_remotes_dir_and_writes_nothing() {
 }
 
 /// A create writes `[ex-ostrya] remotes-config-dir` in the form of the value,
-/// and the handle holds the value as given.
+/// and the handle holds the value as given. A create refuses a relative
+/// path, and writes nothing.
 #[test]
 fn create_writes_the_remotes_config_dir_key() {
     let tmp = TmpDir::new("rdkey");
@@ -1521,11 +1552,6 @@ fn create_writes_the_remotes_config_dir_key() {
             "abs",
             RemotesDir::path(&absolute),
             Some(absolute.to_str().unwrap().to_owned()),
-        ),
-        (
-            "rel",
-            RemotesDir::path(&relative),
-            Some(cwd.join(&relative).to_str().unwrap().to_owned()),
         ),
         (
             "inrepo",
@@ -1553,6 +1579,10 @@ fn create_writes_the_remotes_config_dir_key() {
             "{at}"
         );
     }
+    let opts = CreateOptions::new(RepoMode::Archive).remotes_dir(RemotesDir::path(&relative));
+    let err = block_on(opts.create(&tmp.path().join("rel"))).expect_err("create refuses");
+    assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+    assert!(!tmp.path().join("rel").exists());
     assert!(
         !cwd.join(&relative).exists(),
         "the create writes no remotes directory"
@@ -1726,6 +1756,54 @@ fn open_refuses_an_empty_key() {
     );
 }
 
+/// The open refuses a relative value of the key with a `..` component, with
+/// `Error::InvalidFormat`, also when an option comes before the key. An
+/// absolute value with a `..` component opens.
+#[test]
+fn open_refuses_a_dot_dot_in_the_key() {
+    let tmp = TmpDir::new("rdkeydotdot");
+    for (name, value) in [("up", "../remotes.d"), ("inner", "a/../b")] {
+        let path = tmp.path().join(name);
+        create_with_key(&path, value);
+        assert_invalid_format(block_on(Repo::open(&path)), "has a `..` component");
+        assert_invalid_format(
+            block_on(
+                OpenOptions::new()
+                    .remotes_dir(RemotesDir::path(tmp.path().join("r.d")))
+                    .open(&path),
+            ),
+            "has a `..` component",
+        );
+    }
+    let path = tmp.path().join("abs");
+    let dir = tmp.path().join("abs").join("..").join("abs.d");
+    write_conf(&dir, "a.conf", &remote_text("abs"));
+    create_with_key(&path, dir.to_str().unwrap());
+    let opened = block_on(Repo::open(&path)).expect("open");
+    assert_eq!(remote_names(&opened), ["abs"]);
+}
+
+/// The open follows a symlink at an in-repository remotes directory and at a
+/// component of its path, also to a directory outside the repository.
+#[test]
+fn open_follows_a_symlinked_in_repo_remotes_dir() {
+    let tmp = TmpDir::new("rdinrepolink");
+    let outside = tmp.path().join("outside.d");
+    write_conf(&outside, "o.conf", &remote_text("outside"));
+    let path = tmp.path().join("leaf");
+    create_with_key(&path, "remotes.d");
+    std::os::unix::fs::symlink(&outside, path.join("remotes.d")).unwrap();
+    let opened = block_on(Repo::open(&path)).expect("open");
+    assert_eq!(remote_names(&opened), ["outside"]);
+
+    let path = tmp.path().join("component");
+    create_with_key(&path, "etc/remotes.d");
+    std::os::unix::fs::symlink(tmp.path(), path.join("etc")).unwrap();
+    std::fs::rename(&outside, tmp.path().join("remotes.d")).unwrap();
+    let opened = block_on(Repo::open(&path)).expect("open");
+    assert_eq!(remote_names(&opened), ["outside"]);
+}
+
 /// The strict open reads no key and no remotes directory.
 #[test]
 fn the_strict_open_reads_no_key() {
@@ -1799,7 +1877,8 @@ fn open_lists_remotes_in_source_order() {
 
 /// The open skips each entry whose name does not end in `.conf` and each
 /// entry that is not a regular file after a symlink, and reads no
-/// subdirectory.
+/// subdirectory. A symlink to a FIFO and a symlink to a socket are skipped
+/// with no block.
 #[test]
 fn open_skips_entries_that_are_not_conf_files() {
     let tmp = TmpDir::new("rdskip");
@@ -1826,6 +1905,8 @@ fn open_skips_entries_that_are_not_conf_files() {
     let short = tmp.path().join("s");
     let _socket = std::os::unix::net::UnixListener::bind(&short).unwrap();
     std::fs::rename(&short, dir.join("s.conf")).unwrap();
+    std::os::unix::fs::symlink("f.conf", dir.join("linkfifo.conf")).unwrap();
+    std::os::unix::fs::symlink("s.conf", dir.join("linksocket.conf")).unwrap();
     write_conf(&tmp.path().join("real"), "target", &remote_text("linked"));
     std::os::unix::fs::symlink("../real/target", dir.join("link.conf")).unwrap();
     write_conf(&dir, ".conf", &remote_text("bare"));
@@ -1854,6 +1935,28 @@ fn open_refuses_a_conf_symlink_loop() {
         std::io::Error::from_raw_os_error(eloop()).kind(),
         "{err}"
     );
+}
+
+/// The open fails with `Error::Io` of the kind `NotADirectory` on a `.conf`
+/// symlink whose target passes through a regular file, and the message
+/// names the `.conf` file.
+#[test]
+fn open_refuses_a_conf_symlink_through_a_file() {
+    let tmp = TmpDir::new("rdnotdir");
+    let dir = tmp.path().join("remotes.d");
+    let path = tmp.path().join("repo");
+    create_with_key(&path, dir.to_str().unwrap());
+    let file = tmp.path().join("file");
+    std::fs::write(&file, b"").unwrap();
+    std::fs::create_dir(&dir).unwrap();
+    std::os::unix::fs::symlink(file.join("sub"), dir.join("x.conf")).unwrap();
+    let err = io_error(block_on(Repo::open(&path)));
+    assert!(
+        err.to_string()
+            .starts_with(&format!("{}: ", dir.join("x.conf").display())),
+        "{err}"
+    );
+    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err}");
 }
 
 /// A `.conf` file of 1 MiB opens, and a larger file fails the open.
@@ -1923,7 +2026,8 @@ fn open_refuses_conf_content_that_is_not_utf8() {
     }
 }
 
-/// The open refuses a remotes directory path that is not a directory.
+/// The open refuses a remotes directory path that is not a directory with
+/// `Error::InvalidFormat` and the message `<path> is not a directory`.
 #[test]
 fn open_refuses_a_remotes_dir_that_is_not_a_directory() {
     let tmp = TmpDir::new("rdnotdir");
@@ -1931,13 +2035,13 @@ fn open_refuses_a_remotes_dir_that_is_not_a_directory() {
     std::fs::write(&file, "x").unwrap();
     let path = tmp.path().join("repo");
     create_with_key(&path, file.to_str().unwrap());
-    let err = io_error(block_on(Repo::open(&path)));
-    assert_eq!(err.kind(), std::io::ErrorKind::NotADirectory, "{err}");
-    assert!(
-        err.to_string()
-            .starts_with(&format!("{}: ", file.display())),
-        "{err}"
-    );
+    match block_on(Repo::open(&path)) {
+        Err(Error::InvalidFormat(m)) => {
+            assert_eq!(m, format!("{} is not a directory", file.display()));
+        }
+        Err(other) => panic!("{other}"),
+        Ok(_) => panic!("the open succeeds"),
+    }
 }
 
 /// The open fails on a remotes directory or a `.conf` file that it cannot

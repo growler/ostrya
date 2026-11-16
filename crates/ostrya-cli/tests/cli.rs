@@ -17610,6 +17610,85 @@ fn the_remotes_config_dir_option_comes_before_the_key() {
     assert_eq!(config_text(&repo), before, "a command wrote `config`");
 }
 
+/// `remote add` into a remotes directory writes `<name>.conf` through a temp
+/// file in that directory. With fsync on, it syncs the temp file with
+/// `fsync`, and then the remotes directory. `remote delete` of the remote
+/// syncs the remotes directory after the unlink of the file, and the
+/// repository root after the removal of the keyring of the remote. Each call
+/// is an `fsync`. With `[core] fsync=false`, neither command makes a sync
+/// call.
+#[test]
+fn remote_add_into_the_remotes_dir_syncs_with_fsync() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("remote-dir-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    for fsync in [true, false] {
+        let dir = base.join(format!("fsync-{fsync}"));
+        std::fs::create_dir(&dir).unwrap();
+        let repo = create_repo(&dir, RepoMode::Archive);
+        if !fsync {
+            set_core_key(&repo, "fsync=false");
+        }
+        let remotes = dir.join("remotes.d");
+        std::fs::create_dir(&remotes).unwrap();
+        let repo_arg = format!("--repo={}", repo.display());
+        let dir_arg = format!("--remotes-config-dir={}", remotes.display());
+        let (run, added) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &dir.join("trace-add"),
+            &[
+                &repo_arg,
+                &dir_arg,
+                "remote",
+                "add",
+                "x",
+                "https://example.invalid/x",
+            ],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(remotes.join("x.conf").is_file());
+        std::fs::write(repo.join("x.trustedkeys.gpg"), b"keys").unwrap();
+        let (run, deleted) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &dir.join("trace-delete"),
+            &[&repo_arg, &dir_arg, "remote", "delete", "x"],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!remotes.join("x.conf").exists());
+        assert!(!repo.join("x.trustedkeys.gpg").exists());
+        if !fsync {
+            assert!(added.is_empty(), "fsync=false synced: {added:?}");
+            assert!(deleted.is_empty(), "fsync=false synced: {deleted:?}");
+            continue;
+        }
+        let remotes_s = remotes.to_str().unwrap().to_owned();
+        assert_eq!(added.len(), 2, "{added:?}");
+        assert_eq!(added[0].0, "fsync", "{added:?}");
+        assert!(
+            added[0].1.starts_with(&format!("{remotes_s}/.ostrya-tmp-")),
+            "{added:?}"
+        );
+        assert_eq!(added[1], ("fsync", remotes_s.clone()), "{added:?}");
+        assert_eq!(
+            deleted,
+            [("fsync", remotes_s), ("fsync", ".".to_owned())],
+            "{deleted:?}"
+        );
+    }
+}
+
 /// With no option and no key, a repository that is not the system
 /// repository has no remotes directory. `remote add` writes into `config`
 /// with `[core] add-remotes-config-dir=true`, and creates no directory.

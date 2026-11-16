@@ -17,7 +17,6 @@ use crate::pattern::ReceiveSelector;
 use crate::remotes_dir;
 use crate::repo::{Repo, check_config_size};
 use crate::repo_fs::{Publish, RootFile};
-use crate::summary::remove_root_file_blocking;
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
@@ -873,8 +872,11 @@ impl Repo {
     /// Removes the trusted GPG keyring of a remote at the repository root.
     ///
     /// The file is `<remote>.trustedkeys.gpg`. If the keyring is absent, the
-    /// call succeeds. The keyring belongs to the config section of the remote,
-    /// so a deletion of the section also deletes this file.
+    /// call succeeds. For a symlink, the call removes the link, and the
+    /// target stays. The keyring belongs to the config section of the remote,
+    /// so a deletion of the section also deletes this file. With `[core]
+    /// fsync` on, the call syncs the repository directory with `fsync` after
+    /// the removal.
     ///
     /// The call takes the same locks as [`write_config`](Repo::write_config)
     /// and waits for them in the same way.
@@ -884,6 +886,7 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
     ///   The call refuses the name before it takes a lock, and removes no
     ///   file.
+    /// - [`Error::Core`] if `[core] fsync` of this handle is not a boolean.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` of this handle
@@ -902,8 +905,12 @@ impl Repo {
             )));
         }
         let name = remote_keyring_name(remote);
-        self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name).map(drop))
-            .await
+        let fsync = self.config().fsync()?;
+        self.write_locked(move |repo| {
+            repo.root_dir().remove_file(&name, fsync)?;
+            Ok(())
+        })
+        .await
     }
 }
 

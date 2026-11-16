@@ -232,6 +232,7 @@ Reserved.
 \fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored, except \fB\%extensions/ostrya/\fR.
 The repository holds no symbolic link.
 A ref alias and a symbolic link object of a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository are entries of the format, and the rule does not apply to them.
+The rule also does not apply to these entries: \fB\%<repo>/<remote>.trustedkeys.gpg\fR and \fB\%<repo>/gpgkeys.gpg\fR, which can be symbolic links, and a remotes directory in the repository, each component of its path, and each entry in it.
 The read of a symbolic link object reads its target and does not follow it.
 Each read of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, these two directories, and each path below them.
 Each write and each removal of these files refuses a symbolic link at the same directories and at each directory below them.
@@ -321,10 +322,19 @@ The trusted GPG keyring of the remote \fB\%<remote>\fR.
 \fB\%ostrya remote gpg\-import\fR writes it, and \fB\%ostrya remote delete\fR removes it.
 A signature check takes it only as a binary OpenPGP keyring, and refuses an armored keyring by its name.
 When it exists, ostrya does not read the keyring of the remote in the remotes directory.
+The keyring can be a symbolic link, also to a file outside the repository.
+A read follows the link, opens the file with \fB\%O_NONBLOCK\fR, and then checks that it is a regular file.
+A read of a device at the name, also through a symbolic link, opens the device before the type check, and the open of a device with a driver can have side effects.
+ostrya refuses such a keyring as a file that is not a regular file if the open succeeds or if the device has no driver.
+Each other error of the open, for example \fBEACCES\fR for a device on a \fB\%nodev\fR mount, gives the error \fB\%the keyring '<remote>.trustedkeys.gpg' cannot be opened\fR.
+A symbolic link to an absent file is no keyring.
+\fB\%ostrya remote gpg\-import\fR replaces a symbolic link with a regular file, and the target keeps its content.
+\fB\%ostrya remote delete\fR removes a symbolic link as the link, and the target stays.
 .TP
 \fB\%<repo>/gpgkeys.gpg\fR
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
+It can be a symbolic link, also to a file outside the repository.
 .PP
 To change \fB\%config\fR, a ref, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, a file in \fB\%deltas/\fR or \fB\%delta\-indexes/\fR, a \fB\%.commitmeta\fR, or a \fB\%.tombstone\-commit\fR, ostrya writes a temporary file \fB\%tmp/.ostrya\-tmp\-<pid>\-<6 characters>\fR and renames it over the target.
 A symbolic link at the target is replaced.
@@ -588,13 +598,21 @@ ostrya also reads these files outside the repository, and writes the files of th
 \fB\%<remotes\-dir>/*.conf\fR
 The remotes of the remotes directory of the repository.
 The \fB\%ostrya\fR command selects the directory in this order: the option \fB\%\-\-remotes\-config\-dir\fR, the key \fB\%remotes\-config\-dir\fR of \fB\%[ex\-ostrya]\fR in \fB\%config\fR, then \fB\%/etc/ostree/remotes.d\fR for the system repository.
-A relative value of the key names a directory in the repository directory.
+A relative value of the key names a directory in the repository directory, and a relative value with a \fB\%..\fR component is refused.
+A relative value of \fB\%\-\-remotes\-config\-dir\fR is relative to the current directory.
 A program gives the directory through the ostrya library, and the library detects no system repository.
+ostrya follows a symbolic link at each component of the path of the directory.
+A read also follows a symbolic link at each entry in the directory.
+A write replaces a symbolic link at an entry with a regular file, and a removal removes the link, and the target of the link stays.
 Each open of the repository reads each file, and refuses a file larger than 1 MiB.
 \fB\%ostrya remote add\fR writes a new remote into the file \fB\%<remote>.conf\fR, at mode 0666 with the umask applied.
 It creates an absent directory and each absent parent at mode 0777 with the umask applied.
-ostrya writes each file through a temporary file \fB\%.ostrya\-tmp\-<pid>\-<n>\fR in the directory and a rename.
-A rewrite of a file keeps its permission bits, and does not keep its owner.
+In a \fB\%bare\-user\-shared\fR repository, each directory that it creates for a relative value of the key gets mode 02770.
+ostrya writes each file through a temporary file \fB\%.ostrya\-tmp\-<pid>\-<6 characters>\fR in the directory and a rename.
+With \fB\%core.fsync\fR on, ostrya syncs the temporary file and the directory with \fBfsync\fR(2).
+A rewrite of a regular file keeps its permission bits, and does not keep its owner.
+A rewrite of a symbolic link replaces the link with a regular file at mode 0666 with the umask applied, and the target keeps its content.
+ostrya makes the temporary file in the remotes directory, outside \fB\%tmp/\fR.
 A crash can leave a temporary file, and ostrya does not remove it.
 The update lock of the repository covers each write.
 Two repositories that share one remotes directory do not exclude each other.

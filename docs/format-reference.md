@@ -1612,11 +1612,14 @@ remote `NAME` writes the file `<dir>/NAME.conf` with the one group
 keys follow in the order of `remote add` (`conformance/cli-behavior.md`,
 "`remote add`"). The file mode is `0666` with the umask applied. An add
 creates an absent directory and each absent parent at mode `0777` with the
-umask applied. An add writes into the directory when `[core]
-add-remotes-config-dir` of `config` is not `false`, and into `config` when it
-is `false`. The key has no effect in a `.conf` file. A rewrite of a file
-writes the groups in the layout of `config`, with one blank line between two
-groups.
+umask applied. In a `bare-user-shared` repository, each directory that an add
+creates for a relative value of `remotes-config-dir` gets mode `02770`. A
+rewrite of a regular file keeps its mode, and a rewrite of a symlink replaces
+the link with a regular file at the mode of a new file. An add writes into
+the directory when `[core] add-remotes-config-dir` of `config` is not
+`false`, and into `config` when it is `false`. The key has no effect in a
+`.conf` file. A rewrite of a file writes the groups in the layout of
+`config`, with one blank line between two groups.
 
 `RepoConfig::auto_update_summary` reads `auto-update-summary` and
 `commit-update-summary` together. Its caller in the port is the reader of the
@@ -2767,9 +2770,10 @@ directory, as the keyring of the repo does. An import of the port writes the
 keyring of the repo alone, and that keyring then hides the file of the remotes
 directory. The import reads `<remote>.trustedkeys.gpg` of the repo as a
 verification does: the read follows a symlink, and a symlink to no file is no
-keyring. The import writes a temp file and renames it at that path, so a
-symlink there becomes a regular file, and the target of the symlink does not
-change. These are the rules of the port.
+keyring. The read opens the file with `O_NONBLOCK`, and then refuses a file
+that is not a regular file. The import writes a temp file and renames it at
+that path, so a symlink there becomes a regular file, and the target of the
+symlink does not change. These are the rules of the port.
 
 The `<remote>.trustedkeys.gpg` keyring and each file of the global
 directory must be a binary OpenPGP packet stream. If such a keyring holds
@@ -3399,24 +3403,28 @@ The key `[ex-ostrya] remotes-config-dir` names the remotes directory of the
 repository: a directory of `.conf` files that hold remotes. A library create
 with a remotes directory writes the key into the new `config`:
 
-- A path value gives the absolute form of the path, from
-  `std::path::absolute`. That call resolves no symlink.
-- An in-repository value gives its relative path as given.
+- A path value is absolute, and gives its path as given. The library
+  refuses a relative path value.
+- An in-repository value gives its relative path as given. The library
+  refuses an in-repository value with a `..` component.
 - A descriptor value gives no key.
 
 `ostrya init --remotes-config-dir=PATH` writes the key with the absolute form
-of PATH.
+of PATH. The command makes a relative PATH absolute against its working
+directory with `std::path::absolute`, which resolves no symlink.
 
 Each open of the repository reads the key, except an open in the strict open
 mode. The open selects the remotes directory in this order: the directory that
 the program gives through the library, the key, the default directory that the
 program gives, and no directory. An absolute value names a path. A relative
 value names a path relative to the repository directory. The open refuses an
-empty value, also when the program gives a directory. The open reads the key at
-the open alone, so a change of the key takes effect at the next open. The
-`ostrya` command gives `--remotes-config-dir` as the directory of the program,
-and `/etc/ostree/remotes.d` as the default directory for the system repository
-("Config file (`<repo>/config`, GKeyFile / INI)").
+empty value and a relative value with a `..` component, also when the program
+gives a directory. An absolute value with a `..` component is accepted. The
+open reads the key at the open alone, so a change of the key takes effect at
+the next open. The `ostrya` command gives `--remotes-config-dir` as the
+directory of the program, and `/etc/ostree/remotes.d` as the default
+directory for the system repository ("Config file (`<repo>/config`,
+GKeyFile / INI)").
 
 The open reads the `.conf` files of the selected directory, by the rules of
 `ostrya-config(1)`, "Remotes directory". `RepoConfig::remotes` gives the

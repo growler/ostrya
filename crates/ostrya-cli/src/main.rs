@@ -5656,9 +5656,10 @@ fn main() -> std::process::ExitCode {
     let Some(command) = cli.command else {
         exit_no_command();
     };
+    let remotes_dir = absolute_remotes_dir(cli.remotes_config_dir.as_deref());
     let repo = RepoArgs {
         path: cli.repo.as_deref(),
-        remotes_dir: cli.remotes_config_dir.as_deref(),
+        remotes_dir: remotes_dir.as_deref(),
     };
     match ostrya_rt::block_on(run(repo, cli.verbose, command)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
@@ -5666,6 +5667,19 @@ fn main() -> std::process::ExitCode {
             eprintln!("error: {}", error_line(&err));
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+/// Returns the absolute form of `dir`, the value of `--remotes-config-dir`.
+///
+/// A relative value is relative to the current directory. The library takes
+/// an absolute remotes directory path alone. If the current directory cannot
+/// be read, the process ends with an error at exit 1.
+fn absolute_remotes_dir(dir: Option<&Path>) -> Option<PathBuf> {
+    let dir = dir?;
+    match std::path::absolute(dir) {
+        Ok(absolute) => Some(absolute),
+        Err(err) => exit_error(&format!("--remotes-config-dir {}: {err}", dir.display())),
     }
 }
 
@@ -19025,6 +19039,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         assert!(matches!(with.remotes_dir(), Some(RemotesDir::Path(p)) if *p == dir));
         assert!(without.remotes_dir().is_none());
+    }
+
+    /// A relative `--remotes-config-dir` reaches the open as an absolute path,
+    /// relative to the current directory.
+    #[test]
+    fn a_relative_remotes_config_dir_reaches_the_open_as_an_absolute_path() {
+        let root =
+            std::env::temp_dir().join(format!("ostrya-cli-relative-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("repo");
+        ostrya_rt::block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).unwrap();
+        let cli = parse_cli(["ostrya", "--remotes-config-dir=rel.d", "remote", "list"]).unwrap();
+
+        let dir = absolute_remotes_dir(cli.remotes_config_dir.as_deref()).unwrap();
+        let opened = ostrya_rt::block_on(open_options(&path, Some(&dir), &path).open(&path));
+        let _ = std::fs::remove_dir_all(&root);
+        let expected = std::env::current_dir().unwrap().join("rel.d");
+        assert_eq!(dir, expected);
+        assert!(matches!(
+            opened.unwrap().remotes_dir(),
+            Some(RemotesDir::Path(p)) if *p == expected
+        ));
     }
 
     /// Without `--remotes-config-dir`, the system repository takes the key

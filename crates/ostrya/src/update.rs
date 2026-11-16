@@ -7,11 +7,10 @@
 //! guard.
 
 use std::collections::BTreeSet;
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::AsFd;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use ostrya_core::{Checksum, KeyFile, Ref};
-use rustix::fs::AtFlags;
 use rustix::io::Errno;
 
 use crate::config::{
@@ -26,7 +25,7 @@ use crate::refs::{
 };
 use crate::remotes_dir::{self, DirWriter};
 use crate::repo::{RemotesDir, Repo, check_config_size, read_config};
-use crate::repo_fs::{Publish, RepoDir, RootFile};
+use crate::repo_fs::{FsError, Publish, RepoDir, RootFile};
 
 /// The directory that holds `config`: the repository root.
 const ROOT_DIR: &str = ".";
@@ -72,13 +71,14 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// again. A `.conf` file that an open refuses, and that comes into the
 /// directory after the open, makes each of these calls fail.
 ///
-/// A write of a `.conf` file is atomic: the guard writes a temporary file in
-/// the directory, whose name does not end in `.conf`, and renames it over the
-/// file. With `[core] fsync` on, the write syncs the file and the directory
-/// before the call returns. A rewrite of a file keeps its permission bits,
-/// and does not keep its owner. The guard refuses a rewrite of a `.conf` file
-/// that is a symlink, because the rename replaces the link with a regular
-/// file.
+/// A write of a `.conf` file is atomic: the guard writes a temp file
+/// `.ostrya-tmp-<pid>-XXXXXX` in the directory, whose name does not end in
+/// `.conf`, and renames it over the file. With `[core] fsync` on, the write
+/// syncs the file and the directory with `fsync` before the call returns. A
+/// rewrite of a regular file keeps its permission bits, and does not keep
+/// its owner. A rewrite of a `.conf` file that is a symlink replaces the link
+/// with a regular file at the mode of a new file, and does not write through
+/// the link: the target keeps its content.
 ///
 /// The update lock is the lock of one repository. Two repositories that
 /// share one remotes directory do not exclude each other. Each write changes
@@ -543,8 +543,13 @@ impl UpdateGuard {
     /// the file `<name>.conf` into the directory. The file holds the one
     /// group `[remote "<name>"]`. Its mode is `0666` with the umask applied.
     /// If the directory is absent, the call creates it and each absent
-    /// parent, at mode `0777` with the umask applied. The call refuses the
-    /// name if the directory holds an entry `<name>.conf` of any type.
+    /// parent, at mode `0777` with the umask applied. In a
+    /// `bare-user-shared` repository, each directory that the call creates
+    /// for an [`InRepo`](crate::RemotesDir::InRepo) value gets the mode
+    /// `02770`. The call refuses the name if the directory holds an entry
+    /// `<name>.conf` of any type, also a symlink. The check and the write are
+    /// one step: the move of the temp file to `<name>.conf` does not replace
+    /// an entry.
     ///
     /// Else the `[remote "<name>"]` group goes at the end of `config`. The
     /// call does not touch a trusted keyring of the name. A refusal writes
@@ -618,8 +623,7 @@ impl UpdateGuard {
             match writer {
                 Some(writer) => {
                     let file = remote_file_name(&name);
-                    writer.check_absent(&file)?;
-                    writer.put(&file, keyfile.to_string().as_bytes(), None)
+                    writer.put(&file, keyfile.to_string().as_bytes(), Publish::KeepExisting)
                 }
                 None => put_config_blocking(root, &config_bytes(&keyfile)?, fsync, dirs),
             }
@@ -643,8 +647,6 @@ impl UpdateGuard {
     ///
     /// - [`Error::RemoteNotFound`] if no source holds the remote.
     /// - [`Error::InvalidInput`] if a key file cannot hold the key name.
-    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
-    ///   symlink.
     /// - The errors of [`read_config`](UpdateGuard::read_config).
     /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
@@ -681,8 +683,6 @@ impl UpdateGuard {
     ///
     /// - [`Error::RemoteNotFound`] if no source holds the remote. The call
     ///   then writes nothing.
-    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
-    ///   symlink.
     /// - The errors of [`read_config`](UpdateGuard::read_config).
     /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
@@ -719,8 +719,6 @@ impl UpdateGuard {
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `name`, if
     ///   `keys` is empty, or if a key file cannot hold a key name of `keys`.
     /// - [`Error::RemoteNotFound`] if no source holds the remote.
-    /// - [`Error::InvalidFormat`] if the `.conf` file of the remote is a
-    ///   symlink.
     /// - The errors of [`read_config`](UpdateGuard::read_config).
     /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if a file system operation fails.
@@ -757,7 +755,8 @@ impl UpdateGuard {
     /// its repository keyring.
     ///
     /// The call removes the trusted keyring `<name>.trustedkeys.gpg` at the
-    /// repository root, and then the group of the remote from its file. An
+    /// repository root, and then the group of the remote from its file. For a
+    /// symlink at the keyring, it removes the link, and the target stays. An
     /// absent keyring is not an error. A keyring name that is too long for the
     /// file system is not an error, because no file can have that name. The
     /// call does not remove a keyring of the remotes directory.
@@ -785,8 +784,6 @@ impl UpdateGuard {
     ///
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `name`.
     /// - [`Error::RemoteNotFound`] if no source holds the remote.
-    /// - [`Error::InvalidFormat`] if the call writes back a `.conf` file that
-    ///   is a symlink.
     /// - The errors of [`read_config`](UpdateGuard::read_config).
     /// - [`Error::InvalidFormat`] if the new file is larger than 1 MiB.
     /// - [`Error::Io`] if the removal of the keyring or the write of the file
@@ -804,7 +801,7 @@ impl UpdateGuard {
                 Source::Config(mut keyfile) => {
                     keyfile.remove_group(&group);
                     let bytes = config_bytes(&keyfile)?;
-                    let removed = remove_keyring_blocking(root.as_fd(), &keyring)?;
+                    let removed = remove_keyring_blocking(root, &keyring)?;
                     let put = root
                         .stage_root_file(&RootFile::Config, &bytes, fsync)
                         .and_then(|temp| {
@@ -827,15 +824,15 @@ impl UpdateGuard {
                     let rewrite = if keyfile.groups().any(|g| remote_group_name(g).is_some()) {
                         let bytes = keyfile.to_string().into_bytes();
                         writer.check_size(&file, &bytes)?;
-                        Some((writer.mode_of(&file)?, bytes))
+                        Some(bytes)
                     } else {
                         None
                     };
-                    if remove_keyring_blocking(root.as_fd(), &keyring)? && fsync {
+                    if remove_keyring_blocking(root, &keyring)? && fsync {
                         dirs.push(ROOT_DIR.to_owned());
                     }
                     match rewrite {
-                        Some((mode, bytes)) => writer.put(&file, &bytes, Some(mode)),
+                        Some(bytes) => writer.put(&file, &bytes, Publish::Replace),
                         None => writer.remove(&file),
                     }
                 }
@@ -1017,8 +1014,8 @@ impl<'a> Source<'a> {
     ///
     /// A write of `config` records the repository root for the sync of
     /// [`UpdateGuard::finish`]. A write of a `.conf` file keeps the permission
-    /// bits of the file, syncs before it returns, and refuses a file that is
-    /// a symlink.
+    /// bits of a regular file, replaces a symlink with a regular file, and
+    /// syncs before it returns.
     fn put(&self, root: &RepoDir, fsync: bool, dirs: &mut Vec<String>) -> Result<()> {
         match self {
             Source::Config(keyfile) => {
@@ -1028,10 +1025,7 @@ impl<'a> Source<'a> {
                 writer,
                 file,
                 keyfile,
-            } => {
-                let mode = writer.mode_of(file)?;
-                writer.put(file, keyfile.to_string().as_bytes(), Some(mode))
-            }
+            } => writer.put(file, keyfile.to_string().as_bytes(), Publish::Replace),
         }
     }
 }
@@ -1060,13 +1054,17 @@ fn put_config_blocking(
 }
 
 /// Removes the trusted keyring `name` at the repository root, and returns
-/// `true` if a file was removed. An absent file is not an error. A name that
-/// is too long for the file system is not an error, because no file can have
-/// that name.
-fn remove_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<bool> {
-    match rustix::fs::unlinkat(repo_fd, name, AtFlags::empty()) {
-        Ok(()) => Ok(true),
-        Err(Errno::NOENT | Errno::NAMETOOLONG) => Ok(false),
+/// `true` if a file was removed. For a symlink, the call removes the link,
+/// and the target stays. An absent file is not an error. A name that is too
+/// long for the file system is not an error, because no file can have that
+/// name. The call syncs nothing: the caller records the root for the sync of
+/// [`UpdateGuard::finish`].
+fn remove_keyring_blocking(root: &RepoDir, name: &str) -> Result<bool> {
+    match root.remove_file(name, false) {
+        Ok(removed) => Ok(removed),
+        Err(FsError::Io(e)) if e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error()) => {
+            Ok(false)
+        }
         Err(e) => Err(e.into()),
     }
 }

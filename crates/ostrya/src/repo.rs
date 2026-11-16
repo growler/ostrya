@@ -7,7 +7,7 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
@@ -45,21 +45,32 @@ const INIT_KINDS: [RepoLayout; 5] = [
 /// The remote calls of an [`UpdateGuard`](crate::UpdateGuard) write the
 /// `.conf` files of the directory. An add creates the directory of a
 /// [`Path`](RemotesDir::Path) or an [`InRepo`](RemotesDir::InRepo) value if
-/// it is absent.
+/// it is absent. In a `bare-user-shared` repository, each directory that an
+/// add creates for an [`InRepo`](RemotesDir::InRepo) value gets the mode
+/// `02770`. A directory of a [`Path`](RemotesDir::Path) value gets the mode
+/// `0777` with the umask applied.
+///
+/// Each access follows a symlink at each component of the path of the
+/// directory, also to a directory outside the repository. A read follows a
+/// symlink at each name in the directory. A write replaces a symlink at a
+/// name with a regular file, and the target of the symlink keeps its
+/// content. A remove unlinks a symlink at a name, and the target stays.
 ///
 /// A clone of a [`Fd`](RemotesDir::Fd) value shares one descriptor.
 #[derive(Debug, Clone)]
 pub enum RemotesDir {
-    /// A path. A relative path is relative to the working directory of the
-    /// process at each access.
+    /// An absolute path. An open and a create refuse a relative path. A
+    /// caller with a relative path makes it absolute first, for example with
+    /// [`std::path::absolute`].
     Path(PathBuf),
     /// A descriptor of the directory. Each access uses it with `openat`.
     ///
     /// The value owns the descriptor. A caller that keeps its descriptor
     /// gives a duplicate.
     Fd(Arc<OwnedFd>),
-    /// A path relative to the repository directory. Each access resolves it
-    /// with `openat` on the descriptor of the repository directory.
+    /// A path relative to the repository directory, with no `..` component.
+    /// Each access resolves it with `openat` on the descriptor of the
+    /// repository directory.
     InRepo(PathBuf),
 }
 
@@ -70,8 +81,9 @@ impl RemotesDir {
     }
 
     /// Refuses a value that an open and a create do not take: an empty path,
-    /// a path that holds a NUL byte, and an absolute
-    /// [`InRepo`](RemotesDir::InRepo) path.
+    /// a path that holds a NUL byte, a relative [`Path`](RemotesDir::Path)
+    /// path, and an [`InRepo`](RemotesDir::InRepo) path that is absolute or
+    /// has a `..` component.
     fn check(&self) -> Result<()> {
         match self {
             RemotesDir::Path(path) | RemotesDir::InRepo(path)
@@ -88,10 +100,20 @@ impl RemotesDir {
             RemotesDir::InRepo(path) if path.as_os_str().is_empty() => Err(Error::InvalidInput(
                 "the in-repository remotes directory path is empty".into(),
             )),
+            RemotesDir::Path(path) if path.is_relative() => Err(Error::InvalidInput(format!(
+                "the remotes directory path {} is relative",
+                path.display()
+            ))),
             RemotesDir::InRepo(path) if path.is_absolute() => Err(Error::InvalidInput(format!(
                 "the in-repository remotes directory path {} is absolute",
                 path.display()
             ))),
+            RemotesDir::InRepo(path) if path.components().any(|c| c == Component::ParentDir) => {
+                Err(Error::InvalidInput(format!(
+                    "the in-repository remotes directory path {} has a `..` component",
+                    path.display()
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -127,8 +149,8 @@ impl From<OwnedFd> for RemotesDir {
 /// No option turns off the key. An absolute value of the key gives a
 /// [`Path`](RemotesDir::Path) value. A relative value gives an
 /// [`InRepo`](RemotesDir::InRepo) value, relative to the repository
-/// directory. The open refuses an empty value, also when an option comes
-/// before the key.
+/// directory. The open refuses an empty value and a relative value with a
+/// `..` component, also when an option comes before the key.
 ///
 /// [`Repo::remotes_dir`] gives the selected value.
 ///
@@ -143,10 +165,18 @@ impl From<OwnedFd> for RemotesDir {
 ///
 /// - It reads each entry whose name ends in `.conf`, in the byte order of the
 ///   names. The match is case-sensitive. A name that starts with `.` is read.
-/// - It follows a symlink. It skips each entry that is not a regular file
-///   after the symlink, and it does not read a subdirectory. A symlink to an
-///   absent file is skipped. Each other failure of the symlink, such as a
-///   loop, fails the open.
+/// - It skips a subdirectory, a FIFO, a socket, and a device by the type of
+///   the listing, and opens no such entry.
+/// - It opens a regular file and a symlink with `O_NONBLOCK`, and follows the
+///   symlink. It then checks the type of the open file, and skips each entry
+///   that is not a regular file. A symlink to an absent file is skipped. Each
+///   other failure of the symlink, such as a loop, fails the open.
+/// - The open of a symlink to a device opens the device before the type
+///   check, and the open of a device with a driver can have side effects.
+///   The read skips the entry if the open succeeds or if the device has no
+///   driver. Each other error of the open fails the open of the repository,
+///   for example `EACCES` for a device that the user cannot open or for a
+///   device on a `nodev` mount.
 /// - It takes the `[remote "<name>"]` groups of each file and ignores each
 ///   other group.
 /// - An absent directory, or an absent parent of it, gives no remotes.
@@ -209,9 +239,10 @@ impl OpenOptions {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if a remotes directory value is an empty
-    ///   path, a path that holds a NUL byte, or an absolute
-    ///   [`InRepo`](RemotesDir::InRepo) path. The call checks the values
-    ///   before it opens a file.
+    ///   path, a path that holds a NUL byte, a relative
+    ///   [`Path`](RemotesDir::Path) path, or an [`InRepo`](RemotesDir::InRepo)
+    ///   path that is absolute or has a `..` component. The call checks the
+    ///   values before it opens a file.
     /// - [`Error::Io`] of kind `NotFound` if a component of `path` does not
     ///   exist, if a symlink in `path` has no target, or if `objects` or
     ///   `config` does not exist. The message is `<path> does not exist`,
@@ -232,11 +263,15 @@ impl OpenOptions {
     /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
     ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
     /// - [`Error::InvalidFormat`] if `[ex-ostrya] remotes-config-dir` is
-    ///   empty or holds a NUL byte, and [`Error::Core`] if it holds a
-    ///   malformed escape sequence.
-    /// - [`Error::Io`] if the remotes directory is not a directory, or if it
-    ///   or one of its `.conf` files cannot be read. The message starts with
-    ///   the path of the directory or of the file. A
+    ///   empty, holds a NUL byte, or is a relative path with a `..`
+    ///   component, and [`Error::Core`] if it holds a malformed escape
+    ///   sequence.
+    /// - [`Error::InvalidFormat`] if the remotes directory or a component of
+    ///   its path is not a directory. The message is
+    ///   `<path> is not a directory`.
+    /// - [`Error::Io`] if the remotes directory or one of its `.conf` files
+    ///   cannot be read. The message starts with the path of the directory or
+    ///   of the file. In the messages of the remotes directory, a
     ///   [`Path`](RemotesDir::Path) value gives the path as given, and an
     ///   [`InRepo`](RemotesDir::InRepo) value the path relative to the
     ///   repository. A [`Fd`](RemotesDir::Fd) value gives the name of a file,
@@ -264,9 +299,10 @@ impl OpenOptions {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if a remotes directory value is an empty
-    ///   path, a path that holds a NUL byte, or an absolute
-    ///   [`InRepo`](RemotesDir::InRepo) path. The call checks the values
-    ///   before it opens a file.
+    ///   path, a path that holds a NUL byte, a relative
+    ///   [`Path`](RemotesDir::Path) path, or an [`InRepo`](RemotesDir::InRepo)
+    ///   path that is absolute or has a `..` component. The call checks the
+    ///   values before it opens a file.
     /// - [`Error::Io`] if the call cannot duplicate `dir`.
     /// - [`Error::Io`] of kind `NotFound` if a component of `path` does not
     ///   exist, if a symlink in `path` has no target, or if `objects` or
@@ -288,11 +324,15 @@ impl OpenOptions {
     /// - [`Error::Core`] if `config` is not a valid key file, or if a `[core]`
     ///   value that [`RepoConfig::from_keyfile`] reads does not parse.
     /// - [`Error::InvalidFormat`] if `[ex-ostrya] remotes-config-dir` is
-    ///   empty or holds a NUL byte, and [`Error::Core`] if it holds a
-    ///   malformed escape sequence.
-    /// - [`Error::Io`] if the remotes directory is not a directory, or if it
-    ///   or one of its `.conf` files cannot be read. The message starts with
-    ///   the path of the directory or of the file. A
+    ///   empty, holds a NUL byte, or is a relative path with a `..`
+    ///   component, and [`Error::Core`] if it holds a malformed escape
+    ///   sequence.
+    /// - [`Error::InvalidFormat`] if the remotes directory or a component of
+    ///   its path is not a directory. The message is
+    ///   `<path> is not a directory`.
+    /// - [`Error::Io`] if the remotes directory or one of its `.conf` files
+    ///   cannot be read. The message starts with the path of the directory or
+    ///   of the file. In the messages of the remotes directory, a
     ///   [`Path`](RemotesDir::Path) value gives the path as given, and an
     ///   [`InRepo`](RemotesDir::InRepo) value the path relative to the
     ///   repository. A [`Fd`](RemotesDir::Fd) value gives the name of a file,
@@ -372,9 +412,8 @@ impl CreateOptions {
     /// The create writes nothing into the directory. It writes the key
     /// `[ex-ostrya] remotes-config-dir` into the new `config`:
     ///
-    /// - A [`Path`](RemotesDir::Path) value writes the absolute form of the
-    ///   path, from [`std::path::absolute`]. That call needs no existing
-    ///   directory and resolves no symlink.
+    /// - A [`Path`](RemotesDir::Path) value, which is absolute, writes its
+    ///   path as given.
     /// - An [`InRepo`](RemotesDir::InRepo) value writes its path as given.
     /// - A [`Fd`](RemotesDir::Fd) value writes no key.
     ///
@@ -400,13 +439,12 @@ impl CreateOptions {
     ///   and before the call puts its own `config` in place, the call gives
     ///   the same error, and the layout directories that it wrote stay.
     /// - [`Error::InvalidInput`] if the remotes directory value is an empty
-    ///   path, a path that holds a NUL byte, or an absolute
-    ///   [`InRepo`](RemotesDir::InRepo) path, or if the value of the key is
-    ///   not valid UTF-8. The call checks the value before it writes.
+    ///   path, a path that holds a NUL byte, a relative
+    ///   [`Path`](RemotesDir::Path) path, or an [`InRepo`](RemotesDir::InRepo)
+    ///   path that is absolute or has a `..` component, or if the value of the
+    ///   key is not valid UTF-8. The call checks the value before it writes.
     /// - [`Error::InvalidInput`] if the collection id holds a line break. The
     ///   call checks the id before it writes.
-    /// - [`Error::Io`] if the call cannot make the absolute form of a
-    ///   [`Path`](RemotesDir::Path) value.
     /// - [`Error::Io`] of kind `NotFound` if a component of `path` above the
     ///   last does not exist, or if a symlink in `path` has no target. The
     ///   message is `<path> does not exist`, with `path` as given.
@@ -1322,9 +1360,6 @@ fn write_initial_config(root: &RepoDir, path: &Path, text: &str) -> Result<()> {
 }
 
 /// Returns the exact config bytes of a new repository.
-///
-/// The call reads the working directory for the absolute form of a
-/// [`RemotesDir::Path`] value, so it runs off the async task.
 fn initial_config_text(opts: &CreateOptions) -> Result<String> {
     let mut text = String::from("[core]\nrepo_version=1\nmode=");
     text.push_str(opts.mode.as_mode_str());
@@ -1356,18 +1391,12 @@ fn utf8_key_value(path: &Path) -> Result<&str> {
 /// Returns the `[ex-ostrya]` group that names `dir` in a new `config`, or
 /// `None` if the create writes no key.
 ///
-/// A [`RemotesDir::Path`] value gives its absolute form, and a
-/// [`RemotesDir::InRepo`] value its path as given. A [`RemotesDir::Fd`] value
-/// has no path, so it gives no key. The absolute form of a relative path is
-/// not valid UTF-8 if the working directory is not, and the call refuses it.
+/// A [`RemotesDir::Path`] value and a [`RemotesDir::InRepo`] value give
+/// their path as given. A [`RemotesDir::Fd`] value has no path, so it gives
+/// no key.
 fn remotes_dir_group(dir: Option<&RemotesDir>) -> Result<Option<String>> {
-    let absolute;
     let value = match dir {
-        Some(RemotesDir::Path(path)) => {
-            absolute = std::path::absolute(path)?;
-            &absolute
-        }
-        Some(RemotesDir::InRepo(path)) => path,
+        Some(RemotesDir::Path(path) | RemotesDir::InRepo(path)) => path,
         Some(RemotesDir::Fd(_)) | None => return Ok(None),
     };
     let value = utf8_key_value(value)?;

@@ -28,15 +28,12 @@
 
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::os::fd::BorrowedFd;
 use std::sync::Arc;
 
 use ostrya_core::{
     Checksum, Commit, DirMeta, ObjectType, Ref, RefSelector, RepoMode, Type, Value,
     choose_offset_size, from_bytes, to_bytes, tuple_field_from_bytes, write_offset,
 };
-use rustix::fs::AtFlags;
-use rustix::io::Errno;
 
 use crate::access::{AuthItem, ClientAccess, ReadAccess, SummaryFiles};
 use crate::commit::{CommitOptions, append_dict_entry};
@@ -2739,16 +2736,6 @@ pub(crate) fn check_summary_size(size: u64) -> Result<()> {
     Ok(())
 }
 
-/// Removes `name` at the repository root, and returns `true` if it removed
-/// a file. If the file does not exist, the call succeeds with `false`.
-pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<bool> {
-    match rustix::fs::unlinkat(repo_fd, name, AtFlags::empty()) {
-        Ok(()) => Ok(true),
-        Err(Errno::NOENT) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
 /// The directory of the summaries of the auth items, and of the `.access`
 /// file of each item with a summary: `extensions/ostrya/summary`. The value
 /// is its path below `extensions/`.
@@ -4327,26 +4314,6 @@ mod tests {
                 );
             }
         });
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The removal of a root file reports whether it removed a file. A file
-    /// that does not exist is no error.
-    #[test]
-    fn the_removal_of_a_root_file_reports_the_removal() {
-        use std::os::fd::AsFd;
-
-        let dir = std::env::temp_dir().join(format!(
-            "ostrya-remove-root-file-{}-{}",
-            std::process::id(),
-            crate::write::unique()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("file"), b"x").unwrap();
-        let fd = std::fs::File::open(&dir).unwrap();
-        assert!(remove_root_file_blocking(fd.as_fd(), "file").unwrap());
-        assert!(!dir.join("file").exists());
-        assert!(!remove_root_file_blocking(fd.as_fd(), "file").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1294,7 +1294,7 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             // pool thread and cannot hold an executor thread.
             let verifier = ostrya_rt::unblock(move || {
                 let keyring = if read_keyring {
-                    crate::gpg::read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), &remote)?
+                    crate::gpg::read_remote_keyring(repo.root_dir(), repo.remotes_dir(), &remote)?
                 } else {
                     None
                 };

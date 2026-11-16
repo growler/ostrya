@@ -4970,7 +4970,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `cli-behavior.md`, "`remote`",
-records. Eighteen divergences stand:
+records. Seventeen divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -5364,13 +5364,40 @@ records. Eighteen divergences stand:
   no remote group, both remove the file, and for a symlink both remove the
   link and keep the target;
 - a rewrite of a `.conf` file that is a symlink, by `remote add --force` or
-  by a `remote delete` that writes the file back. The port refuses it with
-  `error: invalid format: <dir>/<name>.conf is a symlink, and a write would
-  replace it with a regular file` at exit 1, writes nothing, and keeps the
-  keyring of the remote. Not observed: the answer of the tool;
-- the mode of a rewritten `.conf` file. The port keeps the permission bits
-  of the old file, and the owner of the new file is the user of the command.
-  Not observed: the mode that the tool gives a rewritten file.
+  by a `remote delete` that writes the file back. The port replaces the link
+  with a regular file at mode `0666` with the umask applied, and does not
+  write through the link: the target keeps its content and its mode. The port
+  keeps the other groups of the file, as for each `.conf` file. With
+  libostree 2026.1 on 2026-11-16, under a umask of `0022`, `remote add
+  --force a URL`, where `<dir>/ab.conf` is a symlink to a regular file at mode
+  `0640` outside the directory that holds the remotes `a` and `b`, writes
+  through the link. `ab.conf` stays a symlink, the target stays a regular file
+  at mode `0640`, and the target then holds the new group of `a` alone, so the
+  remote `b` is lost. The tool tries an open of `ab.conf` with
+  `O_WRONLY|O_CREAT|O_EXCL`, which gives `EEXIST`, and with `O_NOFOLLOW`,
+  which gives `ELOOP`. It then opens the link with `O_WRONLY|O_CREAT`, writes
+  the file, and runs `fsync` on it. It makes no temp file, no rename, and no
+  `fchmod`, and syncs no directory. Over the same layout and under the same
+  umask, the port writes a regular file `ab.conf` at mode `0644` that holds
+  the group `b` and the new group `a`, and the target keeps its bytes and the
+  mode `0640`.
+
+A rewrite of a `.conf` file that is a regular file keeps the mode of the old
+file in both. The port keeps the permission bits of the old file, and the
+owner of the new file is the user of the command. With libostree 2026.1 on
+2026-11-16, `remote add --force d URL`, where `<dir>/d.conf` is a regular
+file at mode `0600`, writes the temp file `.goutputstream-XXXXXX` in the
+remotes directory with `O_WRONLY|O_CREAT|O_EXCL` and the mode `0666`, sets
+the mode `0600` of the old file with `fchmod`, and runs `fsync` on the temp
+file. `d.conf` keeps the mode `0600`. The trace does not show the call that
+moves the temp file to `d.conf`. The tool syncs no directory.
+
+`remote delete` of a remote whose `<repo>/<name>.trustedkeys.gpg` is a
+symlink removes the link and keeps the target with its bytes in both. With
+libostree 2026.1 on 2026-11-16, the tool unlinks
+`/etc/ostree/remotes.d/<name>.conf` and then `<name>.trustedkeys.gpg`
+relative to the descriptor of the repository, and makes no sync call. The
+port removes the keyring first, and then edits or removes the `.conf` file.
 
 Three messages the port words for itself, each reporting a condition the tool
 reports through gpgme: `remote gpg-import` with no `--keyring` and no `--stdin`
@@ -7693,9 +7720,12 @@ Observed by running the tool (2026.1).
   so a symlink to it and a bind mount of it also match. This is the rule of
   the tool (`cli-behavior.md`, `remote`, "The remotes directory"), so with no
   option and no key the port and the tool read one remotes directory. A
-  relative PATH is relative to the current directory, and a relative value of
-  the key is relative to the repository directory. `ostrya init
-  --remotes-config-dir=PATH` writes the key with the absolute form of PATH.
+  relative PATH is relative to the current directory: the command makes it
+  absolute before the open. A relative value of the key is relative to the
+  repository directory, and the port refuses a relative value with a `..`
+  component at each open. An absolute value with a `..` component opens.
+  `ostrya init --remotes-config-dir=PATH` writes the key with the absolute
+  form of PATH.
   The port refuses an empty PATH at exit 1 when it parses the command line.
   The option has no environment variable.
 - `--remotes-config-dir` applies to the repository of the command alone. The
@@ -7911,6 +7941,29 @@ Observed by running the tool (2026.1).
     deletes, it unlinks `state/<checksum>.commitpartial` with
     `unlinkat(repo, ...)`, which gives `ENOENT` for an absent marker, then
     the `.commitmeta`, and then the commit object.
+- The port syncs each write of the remotes directory by `[core] fsync`. With
+  fsync on, a write of a `.conf` file runs `fsync` on the temp file
+  `<dir>/.ostrya-tmp-<pid>-XXXXXX` before the move, and on the remotes
+  directory after the move. A removal of a `.conf` file runs `fsync` on the
+  remotes directory after the unlink. The create of an absent remotes
+  directory runs `fsync` on the parent of each directory that it makes. The
+  port runs no `fdatasync` on these files. With `fsync=false`, it makes no
+  sync call (`remote_add_into_the_remotes_dir_syncs_with_fsync` in
+  `crates/ostrya-cli/tests/cli.rs`). The observations below come from
+  `strace` of the tool, libostree 2026.1, on 2026-11-16, with the default
+  config.
+  - `remote add --force` of a remote of a regular `.conf` file runs `fsync`
+    on the temp file, and syncs no directory.
+  - `remote add --force` of a remote of a `.conf` file that is a symlink
+    runs `fsync` on the target that it writes through the link, and syncs no
+    directory.
+  - `remote add` into an absent `/etc/ostree/remotes.d` makes
+    `/etc/ostree` and `/etc/ostree/remotes.d` with `mkdir` and the mode
+    `0777`, and creates the new `.conf` file in place with `O_CREAT|O_EXCL`
+    and the mode `0666`. It runs no `fsync`, no `fdatasync`, and no
+    `syncfs`.
+  - `remote delete` unlinks the `.conf` file and the keyring of the
+    repository, and makes no sync call.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

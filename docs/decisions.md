@@ -141,23 +141,42 @@ form, and a new option is a new method, which is additive. A struct
 expression of `CreateOptions` and an assignment to its fields do not compile
 outside the crate.
 
-A create with a `RemotesDir::Path` value writes the value of
-`std::path::absolute` of the path into `[ex-ostrya] remotes-config-dir`. A
-relative `Path` value is relative to the working directory of the process,
-which does not name a directory for another process. `std::path::absolute`
-needs no existing directory and resolves no symlink, so the key names the
-directory that the create took. A create with a `RemotesDir::InRepo` value
-writes its path as given, and a `RemotesDir::Fd` value writes no key.
+A `RemotesDir::Path` value is an absolute path. A create with a
+`RemotesDir::Path` value writes its path as given into
+`[ex-ostrya] remotes-config-dir`, so the key names the directory that the
+create took. A create with a `RemotesDir::InRepo` value writes its path as
+given, and a `RemotesDir::Fd` value writes no key. The `ostrya` command
+resolves a relative `--remotes-config-dir` against its working directory
+with `std::path::absolute`, and gives the absolute path. That call needs no
+existing directory and resolves no symlink.
 
-An open and a create refuse an empty path, a path that holds a NUL byte, and
-an absolute `InRepo` path with `Error::InvalidInput`, before they open or
-write a file. An empty path names no directory. A path with a NUL byte names
-no file for a system call, and a create would write the NUL byte into
-`config`, which the `ostree` tool then does not open. An `openat` call with an absolute path ignores the directory
-descriptor, so an absolute `InRepo` value acts as a `Path` value. The port
-refuses it and does not give it that meaning. A caller with an absolute
-directory gives a `RemotesDir::Path` value. A create also refuses a path that
-is not valid UTF-8, because `config` is UTF-8. An open takes such a path.
+An open and a create refuse these values with `Error::InvalidInput`, before
+they open or write a file:
+
+- An empty path. It names no directory.
+- A path that holds a NUL byte. It names no file for a system call, and a
+  create would write the NUL byte into `config`, which the `ostree` tool then
+  does not open.
+- A relative `Path` value.
+- An absolute `InRepo` value. An `openat` call with an absolute path ignores
+  the directory descriptor, so an absolute `InRepo` value acts as a `Path`
+  value. The port refuses it and does not give it that meaning. A caller
+  with an absolute directory gives a `RemotesDir::Path` value.
+- An `InRepo` value with a `..` component. The check reads the text of the
+  path alone. A relative value of `[ex-ostrya] remotes-config-dir` with a
+  `..` component gives `Error::InvalidFormat` for the same rule. An absolute
+  path with a `..` component is accepted.
+
+A create also refuses a path that is not valid UTF-8, because `config` is
+UTF-8. An open takes such a path.
+
+A relative `Path` value that the library resolves against the working
+directory of the process was rejected. The working directory is a property of
+the process, so one value names a different directory in each process and
+after each `chdir`. In that form, a create writes the absolute form into the
+key, so the key and the handle can name two directories. The command line
+is the one place where a path relative to the working directory is the
+expected form, so the command resolves it.
 
 The open of `objects`, the read of `config`, each read of an object, each
 read of a summary of the repository by `Repo`, the server, and the media
@@ -258,6 +277,24 @@ absent file, as the tool does, and fails on each other failure of a symlink,
 such as a loop: the tool result for these is not observed, and a skip would
 hide an error of the administrator.
 
+The open of the directory follows a symlink at each component of its path,
+also for an `InRepo` value: the remotes directory is not a directory of the
+repository layout, and an administrator can link it to a shared directory.
+The read skips a directory, a FIFO, a socket, and a device by the type that
+the listing gives, with no open. It opens a regular file and a symlink with
+`O_NONBLOCK`, and follows the symlink. It then reads the type of the open
+file, and skips the entry if it is not a regular file. One open and one
+`statx` on the descriptor give the type of the file that the read reads, so
+a FIFO that comes in after the listing does not block the read. A `stat` of
+the name before the open was rejected: an entry can change between the two
+calls.
+
+The read thus opens the device of a symlink to a device before the type
+check, and the open of a device with a driver can have side effects. The
+read skips the entry if the open succeeds or if the device has no driver.
+Each other error of the open fails the read, for example `EACCES` for a
+device that the user cannot open or for a device on a `nodev` mount.
+
 The read takes the `[remote "NAME"]` groups of a file and ignores each other
 group, as the tool does. The trust groups stay in `config` alone. The open
 refuses a remote name that two sources define, as the tool does, because a
@@ -286,23 +323,34 @@ is the documented default of the tool for a system repository. The key stays
 in `[core]`, where the tool reads it.
 
 The add writes `<dir>/<name>.conf` with the one group of the remote, through
-a temporary file in the directory and a rename. The name of the temporary
-file starts with `.` and does not end in `.conf`, so an open, which takes no
-lock, never reads a partial file. The name is `.ostrya-tmp-<pid>-<n>`, and its
-length does not depend on the name of the remote, so the write takes each
-name whose `<name>.conf` fits in a file name. The tool creates the file in
-place with `O_EXCL`, and the result on disk is the same. The file mode is
-`0666` with the umask applied, and an absent directory and its absent parents
-get `0777` with the umask applied, as the tool gives them.
+a temp file in the directory and a move. The name of the temp file starts
+with `.` and does not end in `.conf`, so an open, which takes no lock, never
+reads a partial file. The name is `.ostrya-tmp-<pid>-XXXXXX`, with six random
+characters, and its length does not depend on the name of the remote, so the
+write takes each name whose `<name>.conf` fits in a file name. The temp file
+stays in the remotes directory, which is outside `tmp/`, so the reaper of
+`tmp/` does not remove a temp file that a crash leaves. The tool creates the
+file in place with `O_EXCL`, and the result on disk is the same. The file
+mode is `0666` with the umask applied, and an absent directory and its absent
+parents get `0777` with the umask applied, as the tool gives them. In a
+`bare-user-shared` repository, each directory that the add creates for an
+`InRepo` value gets `02770`, as each other directory of that repository gets
+it, so each member of the group can write the remotes. A directory of a
+`Path` value or of an `Fd` value is outside the repository, and gets no
+forced mode.
 
 The add refuses a name when the directory holds an entry `<name>.conf` of any
-type and no source holds the remote. The check is a `stat` that does not
-follow a symlink, then a plain rename. The tool replaces such a file, and the
+type and no source holds the remote. The tool replaces such a file, and the
 remotes in it are lost. The rule "refuse rather than reinterpret" applies: the
-entry can hold remotes of the administrator, or a symlink that a rename would
-replace. The add uses a plain rename after the check: the update lock
-excludes each other writer of the repository, and `RENAME_NOREPLACE` is
-specific to Linux.
+entry can hold remotes of the administrator. The move of the temp file to
+`<name>.conf` is the check: `renameat2` with `RENAME_NOREPLACE` gives `EEXIST`
+for an existing entry of any type, also a symlink, and the entry stays. A
+file system that does not support `RENAME_NOREPLACE` gives `EINVAL`, and the
+add then makes a hard link from the temp name to `<name>.conf` and unlinks
+the temp name. The link gives `EEXIST` in the same way. A `stat` of the name
+before a plain rename was rejected: the update lock excludes the writers of
+one repository alone, and two repositories can share one remotes directory,
+so an entry can come in between the `stat` and the rename.
 
 `set_remote_key`, `unset_remote_key`, `delete_remote`, and
 `UpdateGuard::replace_remote` edit the file that holds the remote: `config` or
@@ -318,27 +366,40 @@ and keeps `<dir>/<name>.trustedkeys.gpg`, as the tool does. A later remote of
 the same name trusts the keys of the directory while the repository holds no
 keyring of that name.
 
-A rewrite of a `.conf` file keeps the permission bits of the old file, so a
-file that the administrator made private stays private. The owner is not
-kept, because a change of the owner needs a privilege that the writer can
-lack. The port refuses a rewrite of a `.conf` file that is a symlink: a
-rename replaces the link with a regular file, and the target, which holds the
-remote, keeps the old text. A delete of a file that is a symlink removes the
-link, as the tool does.
+A rewrite of a regular `.conf` file keeps the permission bits of the old
+file, so a file that the administrator made private stays private. The owner
+is not kept, because a change of the owner needs a privilege that the writer
+can lack. A rewrite of a `.conf` file that is a symlink replaces the link with
+a regular file at the mode of a new file, `0666` with the umask applied. The
+target of the link keeps its content. A delete of a file that is a symlink
+removes the link, as the tool does. These rejected alternatives apply:
 
-With `[core] fsync` on, each write of the directory syncs the file and the
-directory before the call returns. The directory is outside the repository,
-so the syncs of `UpdateGuard::finish`, which name directories relative to the
-repository, cannot hold it.
+- A write through the link, as the tool makes it. The target can be outside
+  the remotes directory, for example a file that a package owns, and a write
+  through the link changes that file.
+- A refusal of the rewrite. The user cannot then edit a remote of a linked
+  file with the remote calls.
+
+A delete of a remote also removes `<repo>/<name>.trustedkeys.gpg` when it is a
+symlink: the unlink removes the link, and the target stays, as the tool does.
+
+With `[core] fsync` on, each write of the directory syncs the temp file and
+the directory with `fsync` before the call returns, and the create of an
+absent directory syncs the parent of each new directory. The directory is
+outside the repository, so the syncs of `UpdateGuard::finish`, which name
+directories relative to the repository, cannot hold it. The remotes directory
+follows the sync rule of the repository files: each file sync is `fsync`.
 
 The update lock covers the writes of the directory. It is the lock of one
 repository, so two repositories that share one directory do not exclude each
 other. Each write changes one entry with one rename or one unlink, so a race
 of the two loses at most the edit of one file. A lock in the directory was
-rejected for this reason. Each guard call reads `config` and the directory
-again under the lock, so a `.conf` file that fails the open and that comes in
-after the open fails each edit. The edit then reports the file that the
-administrator must correct.
+rejected for this reason. If another process removes a `.conf` file between
+the read and the write of an edit of that file, the write creates the file
+again with the groups of the read, so a removed remote comes back. Each guard
+call reads `config` and the directory again under the lock, so a `.conf` file
+that fails the open and that comes in after the open fails each edit. The
+edit then reports the file that the administrator must correct.
 
 `UpdateGuard::write_config` and `Repo::write_config` refuse a document with a
 `[remote "NAME"]` group when a `.conf` file defines `NAME`, with

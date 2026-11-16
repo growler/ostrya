@@ -24,18 +24,16 @@
 //! The private key stays with GnuPG and its agent. It never goes through this
 //! crate.
 
-use std::os::fd::BorrowedFd;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 
 use ostrya_sign::{gpg_keyring_keys, gpg_merge_keyring, gpg_offered_keys};
-use rustix::fs::{AtFlags, FileType, Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::config::{remote_keyring_name, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::remotes_dir;
 use crate::repo::{RemotesDir, Repo};
-use crate::repo_fs::{Publish, RootFile};
+use crate::repo_fs::{FsError, Named, Publish, Reason, RepoDir, RootFile, open_named};
 use crate::sign::read_key_source;
 
 #[cfg(feature = "sign-gpg")]
@@ -88,7 +86,15 @@ pub trait FromOstreeKeyrings: Sized {
     /// A file exists if its open does not give "No such file or directory".
     /// So an empty repository keyring hides the keyring of the remotes
     /// directory and stops the read of the global trusted directory. A
-    /// symlink to no file is no keyring. The rules of
+    /// symlink to no file is no keyring. The read follows a symlink, opens
+    /// the file with `O_NONBLOCK`, and then checks its type, so a FIFO does
+    /// not block the read. The read of a device, also through a symlink,
+    /// opens the device before the type check, and the open of a device with
+    /// a driver can have side effects. The read refuses the device as a file
+    /// that is not a regular file if the open succeeds or if the device has
+    /// no driver. Each other error of the open, for example `EACCES` for a
+    /// device on a `nodev` mount, gives the error "cannot be opened". The
+    /// rules of
     /// [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings) apply
     /// to each source. The call blocks the calling thread while it reads the
     /// keyrings.
@@ -114,7 +120,7 @@ pub trait FromOstreeKeyrings: Sized {
     /// - The errors of
     ///   [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings).
     fn for_remote_in(repo: &Repo, remote: &str, keypath: &[String]) -> Result<Self> {
-        let keyring = read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), remote)?;
+        let keyring = read_remote_keyring(repo.root_dir(), repo.remotes_dir(), remote)?;
         Self::for_remote_keyrings(keyring.map(|keyring| keyring.bytes), remote, keypath)
     }
 
@@ -219,7 +225,7 @@ pub trait FromOstreeKeyrings: Sized {
 
 impl FromOstreeKeyrings for GpgVerifier {
     fn for_remote_in(repo: &Repo, remote: &str, keypath: &[String]) -> Result<GpgVerifier> {
-        let keyring = read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), remote)?;
+        let keyring = read_remote_keyring(repo.root_dir(), repo.remotes_dir(), remote)?;
         remote_keyrings(keyring, remote, keypath, true)
     }
 
@@ -258,16 +264,26 @@ impl RemoteKeyring {
     }
 }
 
-/// Reads the keyring of `remote` for the repository at `repo_fd`, with the
-/// remotes directory `dir`.
+/// Reads the keyring of `remote` for the repository of the root handle
+/// `root`, with the remotes directory `dir`.
 ///
 /// The keyring is `<remote>.trustedkeys.gpg` of the repository. Only when no
 /// file is at that name, the keyring is the file of that name in `dir`. If
 /// `dir` is `None`, or neither file exists, the result is `None`. A file
 /// exists if its open does not give "No such file or directory", so a
 /// symlink to no file is no keyring, and an absent directory or an absent
-/// parent of it holds no keyring. The read follows a symlink. The `ostree`
-/// command was observed to follow a symlink at the repository keyring too.
+/// parent of it holds no keyring. The read follows a symlink at the
+/// repository keyring, and at each component of the path of the keyring of
+/// `dir`. The `ostree` command was observed to follow a symlink at the
+/// repository keyring too.
+///
+/// The read opens the file with `O_NONBLOCK`, and then checks its type, so a
+/// FIFO does not block the read. The read of a device, also through a
+/// symlink, opens the device before the type check, and the open of a device
+/// with a driver can have side effects. The read refuses the device as a
+/// file that is not a regular file if the open succeeds or if the device has
+/// no driver. Each other error of the open, for example `EACCES` for a
+/// device on a `nodev` mount, gives the error "cannot be opened".
 ///
 /// The read refuses a remote name that [`valid_remote_name`] refuses with
 /// [`Error::InvalidInput`], before it opens a file. Each other refusal is
@@ -276,7 +292,7 @@ impl RemoteKeyring {
 /// file, a file that cannot be read, and a file over [`MAX_KEYRING`]. The
 /// call blocks the calling thread.
 pub(crate) fn read_remote_keyring(
-    repo_fd: BorrowedFd<'_>,
+    root: &RepoDir,
     dir: Option<&RemotesDir>,
     remote: &str,
 ) -> Result<Option<RemoteKeyring>> {
@@ -287,7 +303,7 @@ pub(crate) fn read_remote_keyring(
     }
     let name = remote_keyring_name(remote);
     let repo_subject = format!("the keyring '{name}'");
-    if let Some(bytes) = read_keyring_at(repo_fd, Path::new(&name), &repo_subject)? {
+    if let Some(bytes) = read_root_keyring(root, &name, &repo_subject)? {
         return Ok(Some(RemoteKeyring {
             bytes,
             subject: repo_subject,
@@ -296,12 +312,13 @@ pub(crate) fn read_remote_keyring(
     let Some(dir) = dir else {
         return Ok(None);
     };
-    let (base, at, display) = remotes_dir::entry(repo_fd, dir, &name);
+    let (base, at, display) = remotes_dir::entry(root.as_fd(), dir, &name);
     let subject = format!(
         "the keyring '{}' of the remotes directory",
         display.display()
     );
-    Ok(read_keyring_at(base, &at, &subject)?.map(|bytes| RemoteKeyring { bytes, subject }))
+    let opened = open_named(base, &at, Named::File).map(std::fs::File::from);
+    Ok(read_keyring(opened, &subject)?.map(|bytes| RemoteKeyring { bytes, subject }))
 }
 
 /// Creates a verifier from the keyrings of a remote, as
@@ -414,7 +431,8 @@ impl Repo {
     /// # Import rules
     ///
     /// The call replaces the keyring atomically. The read of the keyring
-    /// follows a symlink, and a symlink to no file is no keyring. The write
+    /// follows a symlink, and a symlink to no file is no keyring. The read
+    /// opens the file with `O_NONBLOCK`, and then checks its type. The write
     /// puts a regular file at the path of the symlink, and does not change the
     /// target. The keyring keeps the packet stream that it already held. The
     /// packets of each added certificate follow, as `keys` wrote them, with no
@@ -536,8 +554,7 @@ impl Repo {
             .await
         };
         self.write_locked(move |repo| {
-            let existing =
-                read_keyring_at(repo.repo_fd(), Path::new(&name), &subject)?.unwrap_or_default();
+            let existing = read_root_keyring(repo.root_dir(), &name, &subject)?.unwrap_or_default();
             let (imported, keyring) = gpg_merge_keyring(&existing, offered, &subject)?;
             repo.root_dir().write_root_file(
                 RootFile::Keyring(name),
@@ -588,7 +605,7 @@ impl Repo {
         // The read resolves the names through descriptors, and the parse is
         // CPU work, so both run in one job on the blocking pool.
         ostrya_rt::unblock(move || {
-            let Some(keyring) = read_remote_keyring(repo.repo_fd(), repo.remotes_dir(), &remote)?
+            let Some(keyring) = read_remote_keyring(repo.root_dir(), repo.remotes_dir(), &remote)?
             else {
                 return Ok(Vec::new());
             };
@@ -718,49 +735,47 @@ fn keypath_refusal(key: &str, entry: &str, e: &std::io::Error) -> Error {
     Error::Signature(format!("{key} entry '{entry}' cannot be read: {e}"))
 }
 
-/// Reads the keyring at `path`, resolved against `base`, through
+/// Reads the keyring `name` at the root of the repository of the root handle
+/// `root`, as [`read_keyring`] reads it. The open follows a symlink at
+/// `name`.
+fn read_root_keyring(root: &RepoDir, name: &str, subject: &str) -> Result<Option<Vec<u8>>> {
+    let opened = root
+        .open_root_file(RootFile::Keyring(name.to_owned()))
+        .map(|opened| opened.file);
+    read_keyring(opened, subject)
+}
+
+/// Reads the keyring file of the result `opened` through
 /// [`read_key_source`], the reader of each key source.
 ///
-/// Returns `None` if no file is at `path`. If a symlink is at `path`, the
-/// read follows it. The reader accepts only a regular file, up to
-/// [`MAX_KEYRING`]. A refusal names `subject`, so an operator can find the
-/// keyring.
-///
-/// The call checks the type before it opens the file, so it opens no device
-/// and no socket. It opens the file with `O_NONBLOCK`, and the reader checks
-/// the type again, so a fifo that replaces the file after the check does not
-/// block the read.
+/// Returns `None` if no file was at the path of the open. The open uses
+/// `O_NONBLOCK`, so a FIFO does not block it, and the type check of the
+/// open refuses each entry that is not a regular file. The reader accepts
+/// only a regular file, up to [`MAX_KEYRING`]. A refusal names `subject`,
+/// so an operator can find the keyring.
 ///
 /// A keyring has its own limit, because it holds certificates and no base64
 /// lines. The call refuses a keyring over the limit by name, and does not read
 /// the part under the limit. `gpgkeypath` applies the same rule to an entry
 /// that names nothing.
-fn read_keyring_at(base: BorrowedFd<'_>, path: &Path, subject: &str) -> Result<Option<Vec<u8>>> {
-    let refuse_open = |e: Errno| Error::Signature(format!("{subject} cannot be opened: {e}"));
-    match rustix::fs::statat(base, path, AtFlags::empty()) {
-        Ok(stat) if FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile => {}
-        Ok(_) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(refuse_open(e)),
-    }
-    // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
-    // waits for a writer. On a regular file, the flag has no effect on the
-    // read that the reader makes.
-    let fd = match rustix::fs::openat(
-        base,
-        path,
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOCTTY | OFlags::CLOEXEC,
-        Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(refuse_open(e)),
+fn read_keyring(
+    opened: std::result::Result<std::fs::File, FsError>,
+    subject: &str,
+) -> Result<Option<Vec<u8>>> {
+    let reason = match opened {
+        Ok(file) => return Ok(Some(read_key_source(file, subject, MAX_KEYRING)?)),
+        Err(FsError::Absent { .. }) => return Ok(None),
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
+        Err(FsError::Io(e)) => e.to_string(),
+        Err(FsError::Invalid { path, reason }) => format!("{path} {reason}"),
+        Err(other) => Error::from(other).to_string(),
     };
-    Ok(Some(read_key_source(
-        std::fs::File::from(fd),
-        subject,
-        MAX_KEYRING,
-    )?))
+    Err(Error::Signature(format!(
+        "{subject} cannot be opened: {reason}"
+    )))
 }
 
 /// Returns a scratch directory path for one test fixture, unique in the
@@ -805,7 +820,9 @@ fn remove_home_sockets(dir: &Path) {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::os::fd::{AsFd, OwnedFd};
+    use std::os::fd::OwnedFd;
+
+    use rustix::fs::{FileType, Mode};
 
     use super::*;
 
@@ -996,7 +1013,7 @@ pub(crate) mod tests {
         dir: Option<&RemotesDir>,
         remote: &str,
     ) -> Result<Option<RemoteKeyring>> {
-        read_remote_keyring(open_dir(repo).as_fd(), dir, remote)
+        read_remote_keyring(&RepoDir::from_root_fd(open_dir(repo)), dir, remote)
     }
 
     /// Reads the keyring of `remote` as [`read_in`] does, and builds a
@@ -1143,13 +1160,14 @@ pub(crate) mod tests {
 
     /// A fifo and a character device 0:0 at the name of the repository
     /// keyring, and a symlink to each, are refused as files that are not
-    /// regular files. The read checks the type before the open, so it does
-    /// not open the device: an open of a device 0:0 gives an error, and the
-    /// refusal would then be one of the open. A process needs no capability
-    /// to create a character device 0:0.
+    /// regular files. The read opens the file with `O_NONBLOCK` and then
+    /// checks its type, so the open of the fifo does not block. The open of a
+    /// device 0:0 gives `ENXIO`, and a `statx` that follows the symlink then
+    /// reads the type. A process needs no capability to create a character
+    /// device 0:0.
     #[cfg(unix)]
     #[test]
-    fn a_fifo_and_a_device_at_the_repository_keyring_are_refused_before_an_open() {
+    fn a_fifo_and_a_device_at_the_repository_keyring_are_refused_as_not_regular_files() {
         let dir = scratch_dir();
         let repo = dir.join("repo");
         let remote = "ostrya-special-test";
@@ -1180,13 +1198,45 @@ pub(crate) mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
         let expected = format!("the keyring '{name}' is not a regular file");
-        for result in results {
+        // A `nodev` mount refuses the open of a device with `EACCES`, so
+        // there the device is refused as a file that cannot be opened.
+        let denied = format!("the keyring '{name}' cannot be opened: Permission denied");
+        for (index, result) in results.into_iter().enumerate() {
+            let message = match &result {
+                Err(Error::Signature(m)) => m.as_str(),
+                Err(other) => panic!("{other}"),
+                Ok(_) => panic!("the read succeeds"),
+            };
+            if message == expected {
+                continue;
+            }
+            let nodev = rustix::fs::statvfs(std::env::temp_dir())
+                .is_ok_and(|vfs| vfs.f_flag.contains(rustix::fs::StatVfsMountFlags::NODEV));
             assert!(
-                matches!(&result, Err(Error::Signature(m)) if *m == expected),
-                "{:?}",
-                result.err().map(|e| e.to_string())
+                index >= 2 && nodev && message.starts_with(&denied),
+                "{message}"
             );
         }
+    }
+
+    /// The read follows a symlink at the repository keyring to a file outside
+    /// the repository, and reads the bytes of the target.
+    #[cfg(unix)]
+    #[test]
+    fn the_repository_keyring_is_read_through_a_symlink_outside_the_repository() {
+        let dir = scratch_dir();
+        let repo = dir.join("repo");
+        let remote = "ostrya-link-test";
+        let name = remote_keyring_name(remote);
+        std::fs::create_dir_all(&repo).unwrap();
+        let target = dir.join("outside.gpg");
+        std::fs::write(&target, b"outside bytes").unwrap();
+        std::os::unix::fs::symlink(&target, repo.join(&name)).unwrap();
+        let read = read_in(&repo, None, remote);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let keyring = read.unwrap().unwrap();
+        assert_eq!(keyring.bytes, b"outside bytes");
+        assert_eq!(keyring.subject, format!("the keyring '{name}'"));
     }
 
     /// The read takes the keyring of the remotes directory when no file is at

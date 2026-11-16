@@ -1144,14 +1144,6 @@ fn write_conf(dir: &Path, name: &str, text: &str) {
     std::fs::write(dir.join(name), text).unwrap();
 }
 
-/// Returns the message of an `Error::InvalidFormat` result.
-fn invalid_format<T: std::fmt::Debug>(result: ostrya::Result<T>) -> String {
-    match result {
-        Err(Error::InvalidFormat(message)) => message,
-        other => panic!("expected InvalidFormat, got {other:?}"),
-    }
-}
-
 /// An add into a remotes directory writes `<name>.conf` with the one group
 /// of the remote, at mode 0666 with the umask applied, and leaves `config` as
 /// it was. The add creates the absent directory and its absent parent at
@@ -1702,45 +1694,106 @@ fn delete_remote_keeps_the_keyring_of_the_remotes_directory() {
     assert_eq!(fingerprints, [fingerprint.as_str()]);
 }
 
-/// A set, an unset, a replace, and a delete that writes the file back refuse
-/// a `.conf` file that is a symlink, with `InvalidFormat` that names the
-/// link. The link and its target stay, and the delete keeps the keyring.
+/// A set, an unset, a replace, and a delete that writes the file back each
+/// replace a `.conf` file that is a symlink with a regular file. The new file
+/// holds the new text, and gets the mode of a new file: 0666 with the umask
+/// applied. The target of the link keeps its bytes and its mode. The delete
+/// removes the keyring of the repository.
 #[test]
-fn the_writes_refuse_a_conf_symlink() {
+fn the_writes_replace_a_conf_symlink_and_keep_its_target() {
     let tmp = TmpDir::new("guard-dir-symlink");
     let path = create(&tmp, RepoMode::BareUser, "");
     let dir = tmp.path().join("remotes.d");
     std::fs::create_dir(&dir).unwrap();
-    let target = tmp.path().join("real.conf");
-    std::fs::write(
-        &target,
-        "[remote \"s1\"]\nurl=https://example.invalid/s1\n\n\
-         [remote \"s2\"]\nurl=https://example.invalid/s2\n",
-    )
-    .unwrap();
-    let link = dir.join("ln.conf");
-    std::os::unix::fs::symlink(&target, &link).unwrap();
-    let keyring = path.join("s1.trustedkeys.gpg");
-    std::fs::write(&keyring, b"keys").unwrap();
-    let before = file_state(&target);
-    let repo = open_with_dir(&path, RemotesDir::path(&dir));
-    let messages = guarded(&repo, async |guard| {
-        vec![
-            invalid_format(guard.set_remote_key("s1", "url", "u").await),
-            invalid_format(guard.unset_remote_key("s1", "url").await),
-            invalid_format(guard.replace_remote("s1", &[("url", "u")]).await),
-            invalid_format(guard.delete_remote("s1").await),
-        ]
-    });
-    for message in messages {
-        assert!(
-            message.starts_with(&link.display().to_string()),
-            "{message}"
-        );
+    let mut targets = Vec::new();
+    for prefix in ["a", "b", "c", "d"] {
+        let target = tmp.path().join(format!("{prefix}-real.conf"));
+        std::fs::write(
+            &target,
+            format!(
+                "[remote \"{prefix}1\"]\nurl=https://example.invalid/{prefix}1\n\n\
+                 [remote \"{prefix}2\"]\nurl=https://example.invalid/{prefix}2\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, dir.join(format!("{prefix}.conf"))).unwrap();
+        targets.push((target.clone(), file_state(&target)));
     }
-    assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
-    assert_eq!(file_state(&target), before);
-    assert_eq!(std::fs::read(&keyring).unwrap(), b"keys");
+    let keyring = path.join("d1.trustedkeys.gpg");
+    std::fs::write(&keyring, b"keys").unwrap();
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard.set_remote_key("a1", "url", "u").await.unwrap();
+        assert!(guard.unset_remote_key("b1", "url").await.unwrap());
+        guard.replace_remote("c1", &[("url", "u")]).await.unwrap();
+        guard.delete_remote("d1").await.unwrap();
+    });
+    let expected = [
+        (
+            "a",
+            "[remote \"a1\"]\nurl=u\n\n[remote \"a2\"]\nurl=https://example.invalid/a2\n",
+        ),
+        (
+            "b",
+            "[remote \"b1\"]\n\n[remote \"b2\"]\nurl=https://example.invalid/b2\n",
+        ),
+        (
+            "c",
+            "[remote \"c2\"]\nurl=https://example.invalid/c2\n\n[remote \"c1\"]\nurl=u\n",
+        ),
+        ("d", "[remote \"d2\"]\nurl=https://example.invalid/d2\n"),
+    ];
+    let new_mode = masked_mode(&dir, 0o666);
+    for (prefix, text) in expected {
+        let file = dir.join(format!("{prefix}.conf"));
+        assert!(
+            std::fs::symlink_metadata(&file).unwrap().is_file(),
+            "{prefix}"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), text, "{prefix}");
+        assert_eq!(mode_of(&file), new_mode, "{prefix}");
+    }
+    for (target, before) in &targets {
+        assert_eq!(&file_state(target), before);
+        assert_eq!(mode_of(target), 0o640);
+    }
+    assert!(!keyring.exists());
+    assert_eq!(entry_names(&dir), ["a.conf", "b.conf", "c.conf", "d.conf"]);
+}
+
+/// A delete removes a keyring of the repository that is a symlink: the link
+/// goes, and its target keeps its bytes. This holds for a remote of `config`
+/// and for a remote of a `.conf` file.
+#[test]
+fn delete_remote_removes_a_keyring_symlink_and_keeps_its_target() {
+    let tmp = TmpDir::new("guard-keyring-symlink");
+    let path = create(&tmp, RepoMode::BareUser, "");
+    add_remote(&path, "c", &[("url", "https://example.invalid/c")]);
+    let dir = tmp.path().join("remotes.d");
+    write_conf(
+        &dir,
+        "f.conf",
+        "[remote \"f\"]\nurl=https://example.invalid/f\n",
+    );
+    let mut links = Vec::new();
+    for name in ["c", "f"] {
+        let target = tmp.path().join(format!("{name}-target.gpg"));
+        std::fs::write(&target, b"target keys").unwrap();
+        let link = path.join(format!("{name}.trustedkeys.gpg"));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        links.push((link, target));
+    }
+    let repo = open_with_dir(&path, RemotesDir::path(&dir));
+    guarded(&repo, async |guard| {
+        guard.delete_remote("c").await.unwrap();
+        guard.delete_remote("f").await.unwrap();
+    });
+    for (link, target) in links {
+        assert!(std::fs::symlink_metadata(&link).is_err(), "{link:?}");
+        assert_eq!(std::fs::read(&target).unwrap(), b"target keys");
+    }
+    assert!(entry_names(&dir).is_empty());
 }
 
 /// A set of the held value on a remote of a `.conf` symlink writes nothing

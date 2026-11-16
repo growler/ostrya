@@ -23,7 +23,7 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use common::TmpDir;
-use ostrya::{CreateOptions, FileMeta, Ref, Repo, RepoMode};
+use ostrya::{CreateOptions, FileMeta, OpenOptions, Ref, RemotesDir, Repo, RepoMode};
 use ostrya_core::{ObjectType, loose_path};
 use ostrya_rt::block_on;
 
@@ -185,6 +185,86 @@ fn shared_repo_forces_the_mode_of_a_tmp_a_ref_write_creates() {
             "the .commitmeta file"
         );
     });
+}
+
+/// An add of a remote into an absent in-repository remotes directory of a
+/// `bare-user-shared` repository forces `02770` on each directory that it
+/// creates. An existing in-repository directory keeps its mode, and a new
+/// directory of an absolute path gets the masked mode. The `.conf` file
+/// gets `0666` with the umask applied in each case.
+#[test]
+fn shared_repo_forces_the_mode_of_an_in_repo_remotes_dir() {
+    let dir = TmpDir::new("shared-remotes-dir");
+    let repo_path = dir.path().join("repo");
+    let masked = |mode: u32, tag: &str| {
+        let probe = dir.path().join(format!("probe-{tag}"));
+        std::fs::DirBuilder::new()
+            .mode(mode)
+            .create(&probe)
+            .expect("create the probe directory");
+        mode_of(&probe)
+    };
+    let masked_dir = masked(0o777, "dir");
+    let masked_file = {
+        let probe = dir.path().join("probe-file");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o666)
+            .open(&probe)
+            .expect("create the probe file");
+        mode_of(&probe)
+    };
+    block_on(Repo::create(
+        &repo_path,
+        CreateOptions::new(RepoMode::BareUserShared),
+    ))
+    .expect("create the repository");
+    std::fs::DirBuilder::new()
+        .mode(0o777)
+        .create(repo_path.join("pre.d"))
+        .expect("create the existing directory");
+    // The directory takes the setgid bit of the root, so the test reads its
+    // mode before the add.
+    let pre_mode = mode_of(&repo_path.join("pre.d"));
+    let absolute = dir.path().join("abs").join("remotes.d");
+    let cases = [
+        ("new", RemotesDir::InRepo(PathBuf::from("etc/remotes.d"))),
+        ("pre", RemotesDir::InRepo(PathBuf::from("pre.d"))),
+        ("abs", RemotesDir::path(&absolute)),
+    ];
+    for (name, remotes) in cases {
+        block_on(async {
+            let repo = OpenOptions::new()
+                .remotes_dir(remotes)
+                .open(&repo_path)
+                .await
+                .expect("open the repository");
+            let guard = repo.begin_update().await.expect("begin an update");
+            guard
+                .add_remote(name, &[("url", "https://example.invalid/r")])
+                .await
+                .expect("add the remote");
+            guard.finish().await.expect("finish the update");
+        });
+    }
+
+    assert_eq!(mode_of(&repo_path.join("etc")), 0o2770, "etc");
+    assert_eq!(
+        mode_of(&repo_path.join("etc/remotes.d")),
+        0o2770,
+        "etc/remotes.d"
+    );
+    assert_eq!(mode_of(&repo_path.join("pre.d")), pre_mode, "pre.d");
+    assert_eq!(mode_of(&dir.path().join("abs")), masked_dir, "abs");
+    assert_eq!(mode_of(&absolute), masked_dir, "abs/remotes.d");
+    for file in [
+        repo_path.join("etc/remotes.d/new.conf"),
+        repo_path.join("pre.d/pre.conf"),
+        absolute.join("abs.conf"),
+    ] {
+        assert_eq!(mode_of(&file), masked_file, "{}", file.display());
+    }
 }
 
 /// The control: a `bare-user` repository keeps the masked modes. This test

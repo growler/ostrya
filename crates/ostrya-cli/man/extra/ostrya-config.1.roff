@@ -172,8 +172,14 @@ Each open of the repository reads the directory.
 ostrya reads each entry whose name ends in \fB\%.conf\fR, in the byte order of the names.
 The match is case-sensitive.
 A name that starts with \fB\%.\fR is read.
-ostrya follows a symlink.
-It skips each entry that is not a regular file after the symlink: a directory, a symlink to an absent file, a FIFO, a socket, or a device.
+The open of the directory follows a symlink at each component of its path.
+ostrya skips a directory, a FIFO, a socket, and a device by the type that the listing gives, and opens no such entry.
+It opens a regular file and a symlink with \fB\%O_NONBLOCK\fR, and follows the symlink.
+It then checks the type of the open file, and skips each entry that is not a regular file: a symlink to a directory, a FIFO, or a socket.
+A symlink to a device opens the device before the type check, and the open of a device with a driver can have side effects.
+ostrya skips the entry if the open succeeds or if the device has no driver.
+Each other error of the open fails the open of the repository, for example \fBEACCES\fR for a device that the user cannot open or for a device on a \fB\%nodev\fR mount.
+A symlink to an absent file is skipped.
 Each other failure of the symlink, such as a loop or a path through a file, fails the open.
 It does not read subdirectories.
 An absent directory gives no remotes.
@@ -191,6 +197,8 @@ The \fB\%ostree\fR tool reads a larger file, and fails on a value that is not va
 Else it writes the group into \fB\%config\fR.
 The add writes the file \fB\%NAME.conf\fR with the one group \fB\%[remote "NAME"]\fR, at mode 0666 with the umask applied.
 If the directory is absent, the add creates it and each absent parent, at mode 0777 with the umask applied.
+In a \fB\%bare\-user\-shared\fR repository, each directory that the add creates for a relative value of \fB\%remotes\-config\-dir\fR gets mode 02770.
+A directory of an absolute path gets no forced mode.
 The add needs search permission on each parent that exists, as \fB\%mkdir \-p\fR does.
 With \fB\%fsync\fR on, it also needs read permission on the parent of each directory that it creates, because it syncs that parent.
 The add refuses NAME when a source holds the remote, and when the directory holds an entry \fB\%NAME.conf\fR of any type.
@@ -205,14 +213,17 @@ For a symlink, the delete removes the link, and the target stays.
 The \fB\%ostree\fR tool writes a \fB\%.conf\fR file again with the new group alone, and removes the whole file of a deleted remote, with each other remote in it.
 .PP
 A write of a \fB\%.conf\fR file drops its comment lines and its blank lines, and keeps its groups and keys in their order.
-ostrya writes a temporary file in the directory, whose name does not end in \fB\%.conf\fR, and renames it over the file.
-A rewrite keeps the permission bits of the file, and does not keep its owner.
-ostrya refuses to write a \fB\%.conf\fR file that is a symlink, because the rename replaces the link with a regular file.
-With \fB\%fsync\fR on, the write syncs the file and the directory before the command completes.
+ostrya writes a temporary file \fB\%.ostrya\-tmp\-PID\-XXXXXX\fR in the directory, whose name does not end in \fB\%.conf\fR, and renames it over the file.
+A rewrite of a regular file keeps its permission bits, and does not keep its owner.
+A rewrite of a \fB\%.conf\fR file that is a symlink replaces the link with a regular file at mode 0666 with the umask applied.
+The target of the link keeps its content.
+The \fB\%ostree\fR tool writes through the link.
+With \fB\%fsync\fR on, the write syncs the file and the directory with \fBfsync\fR(2) before the command completes.
 .PP
 The update lock of the repository covers each write.
 It is the lock of one repository, so two repositories that share one remotes directory do not exclude each other.
 Each write changes one entry of the directory, so a race of the two loses at most the edit of one file.
+If another process removes a \fB\%.conf\fR file between the read and the write of an edit of that file, the write creates the file again with the groups that ostrya read, so a removed remote comes back.
 .PP
 Each command that edits a remote or \fB\%config\fR reads the directory again under the update lock.
 So a \fB\%.conf\fR file that fails the open, and that comes into the directory after the open, makes the edit fail.
@@ -633,7 +644,7 @@ In the \fB\%config\fR of a bucket repository, \fB\%ostrya push\fR to an \fB\%s3:
 \fB\%remotes\-config\-dir\fR (string)
 The remotes directory of the repository: a directory of \fB\%.conf\fR files that hold remotes.
 A create of a repository through the ostrya library with a remotes directory writes the key into the new \fB\%config\fR.
-A path value gives the absolute form of the path, with no symlink resolution.
+A path value, which is absolute, gives its path as given.
 An in-repository value gives its relative path as given.
 A descriptor value gives no key.
 \fB\%ostrya init \-\-remotes\-config\-dir=PATH\fR writes the key with the absolute form of PATH.
@@ -642,8 +653,9 @@ The option \fB\%\-\-remotes\-config\-dir\fR of the \fB\%ostrya\fR command comes 
 A remotes directory that a program gives through the ostrya library comes before the key, and a default of the program comes after it.
 An absolute value is a path.
 A relative value is relative to the repository directory.
-ostrya refuses an empty value at each open, also when a program gives a remotes directory.
-\fB\%ostrya config set\fR writes an empty value with no check.
+ostrya refuses an empty value and a relative value with a \fB\%..\fR component at each open, also when a program gives a remotes directory.
+An absolute value with a \fB\%..\fR component is accepted.
+\fB\%ostrya config set\fR writes an empty value and a relative value with a \fB\%..\fR component with no check.
 The repository then does not open, so no \fB\%ostrya\fR command can change the value, \fB\%ostrya config set\fR and \fB\%ostrya config unset\fR included.
 Edit \fB\%config\fR by hand to correct the value.
 A change of the key takes effect at the next open.

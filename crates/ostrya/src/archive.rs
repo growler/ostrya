@@ -428,7 +428,8 @@ impl ArchiveView {
     /// unchanged file reuses that parse.
     async fn current_config(&self) -> Result<Arc<RepoConfig>> {
         let repo = self.repo.clone();
-        let stat = ostrya_rt::unblock(move || config_stat(repo.root_dir())).await?;
+        let stat =
+            ostrya_rt::unblock(move || repo.root_dir().lstat(RootFile::Config.name())).await?;
         self.config_for(&stat).await
     }
 
@@ -580,7 +581,9 @@ impl ArchiveView {
         let fixed = self.level;
         let (stat, loaded) = ostrya_rt::unblock(move || {
             (
-                fixed.is_none().then(|| config_stat(repo.root_dir())),
+                fixed
+                    .is_none()
+                    .then(|| repo.root_dir().lstat(RootFile::Config.name())),
                 repo.load_contained_blocking(&key),
             )
         })
@@ -665,12 +668,6 @@ pub(crate) fn holds(file: &std::fs::File, want: &[u8]) -> io::Result<bool> {
 fn names_file(dir: &RepoDir, name: &str, file: &Opened) -> io::Result<bool> {
     let named = dir.lstat(name).optional().map_err(io_error)?;
     Ok(named.is_some_and(|n| n.dev == file.stat.dev && n.ino == file.stat.ino))
-}
-
-/// Returns the status of `config` at the repository root `root`, with no
-/// symlink followed, for its [`ConfigKey`].
-fn config_stat(root: &RepoDir) -> io::Result<Stat> {
-    root.lstat(RootFile::Config.name()).map_err(io_error)
 }
 
 /// The parsed `config` and the key it was parsed under.
@@ -888,13 +885,10 @@ fn walk_error(err: FsError) -> io::Result<Walked> {
     }
 }
 
-/// Returns the [`io::Error`] of `err`, with the message of
-/// `From<FsError> for Error`.
+/// Returns the [`io::Error`] of `err`, through `From<FsError> for Error`
+/// and then `From<Error> for io::Error`.
 fn io_error(err: FsError) -> io::Error {
-    match err {
-        FsError::Io(e) => e,
-        e => io::Error::other(crate::Error::from(e)),
-    }
+    crate::Error::from(err).into()
 }
 
 /// Resolves the body of a ref alias in the directory `link_dir`, which

@@ -1032,17 +1032,17 @@ This includes the parent of the ref, `refs/heads`, and the repository root.
 ref name, with no sync. `refs --delete` runs `unlinkat` alone.
 
 The port creates the temp file of a ref write, and the symlink of an alias
-write, in `<repo>/tmp`, with the name `.ostrya-tmp-<pid>-XXXXXX`. A
-transaction uses the `tmp/` that holds its staging directory. Each other
-write uses the `tmp/` that the repository handle opened at its first write,
-and the handle creates `<repo>/tmp` if it is absent. The port sets the mode
-`0644` of the temp file of a ref write, and then runs `fsync` on it, so the
-sync covers the mode. It opens the directory that holds the ref with
-no symlink followed, and renames the temp entry over the ref name relative to
-that directory. So the rename never goes through a symlink. Then it runs
-`fsync` on the directory that holds the ref. A ref removal does not use
-`tmp/`. It unlinks the ref relative to the directory that holds it, and the
-port runs the same directory `fsync` after it.
+write, in `<repo>/tmp`, with the name `.ostrya-tmp-<pid>-XXXXXX`. Each of
+these writes, also a ref write at the commit of a transaction, uses the `tmp/`
+that the repository handle opened at its first write, and the handle creates
+`<repo>/tmp` if it is absent. The port sets the mode `0644` of the temp file
+of a ref write, and then runs `fsync` on it, so the sync covers the mode. It
+opens the directory that holds the ref with no symlink followed, and renames
+the temp entry over the ref name relative to that directory. So the rename
+never goes through a symlink. Then it runs `fsync` on the directory that holds
+the ref. A ref removal does not use `tmp/`. It unlinks the ref relative to the
+directory that holds it, and the port runs the same directory `fsync` after
+it.
 
 A ref listing reads every entry under `refs/`, so the port keeps no temp entry
 there. If `<repo>/tmp` is on a different filesystem from the ref, the rename
@@ -1150,13 +1150,14 @@ immediately before the exit.
 
 A repository handle of the port opens `tmp/` at its first use and keeps it.
 The open makes `tmp/` and `tmp/cache/` if they are absent. Each clone of the
-handle uses the same `tmp/`. These writes of the handle make their temp
-files there: a `.commitmeta` and a `.tombstone-commit` outside a
+handle uses the same `tmp/`. These writes of the handle make their temp files
+there: each ref write and each alias write, also the ref writes at the commit
+of a transaction, a `.commitmeta` and a `.tombstone-commit` outside a
 transaction, and the seal probe of `fsverity=maybe`. If another process
 removes `tmp/`, these writes of the handle fail, and the caller opens the
-repository again. The
-port itself does not remove `tmp/`. Each transaction begin makes `tmp/` and
-`tmp/cache/` again if they are absent, and opens `tmp/` for the transaction.
+repository again. The port itself does not remove `tmp/`. Each transaction
+begin makes `tmp/` and `tmp/cache/` again if they are absent, and opens `tmp/`
+for the transaction.
 
 ### The update lock
 

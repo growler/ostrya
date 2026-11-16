@@ -1746,9 +1746,7 @@ impl Transaction {
             test_tail::pass(root.as_fd());
             let written = crate::refs::check_resolved_refs_blocking(&root, &refs)
                 .and_then(|()| detached.run())
-                .and_then(|()| {
-                    crate::refs::write_resolved_refs_blocking(&root, staging.tmp(), &refs, fsync)
-                });
+                .and_then(|()| crate::refs::write_resolved_refs_blocking(&root, &refs, fsync));
             drop(held);
             drop(staging);
             drop(lock);

@@ -16,7 +16,6 @@
 //! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::io::Write;
 #[cfg(feature = "receive")]
 use std::sync::Arc;
 
@@ -29,9 +28,7 @@ use crate::archive::resolve_alias;
 use crate::config::valid_remote_name;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::repo_fs::{
-    FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, TempFile, TempLink,
-};
+use crate::repo_fs::{FsError, FsResultExt, Publish, Reason, RepoDir, RepoLayout, TempLink};
 use crate::summary::SelectionFloor;
 use crate::transaction::Transaction;
 
@@ -378,19 +375,15 @@ pub(crate) fn nested_ref_paths(entries: &[(&str, bool)]) -> Option<(usize, usize
 /// write that fails still syncs the directories of the refs written before
 /// it.
 ///
-/// `root` is the handle of the repository root. `tmp` is the `tmp/` handle
-/// of the transaction. Each ref write makes its temp file there.
+/// `root` is the handle of the repository root.
 pub(crate) fn write_resolved_refs_blocking(
     root: &RepoDir,
-    tmp: &RepoDir,
     refs: &[ResolvedRef],
     fsync: bool,
 ) -> Result<()> {
     let mut dirs = Vec::new();
     let written = refs.iter().try_for_each(|r| match r.checksum {
-        Some(checksum) => {
-            put_ref_file_blocking(root, Some(tmp), &r.relpath, checksum, fsync, &mut dirs)
-        }
+        Some(checksum) => put_ref_file_blocking(root, &r.relpath, checksum, fsync, &mut dirs),
         None => remove_ref_blocking(root, &r.relpath, fsync, &mut dirs),
     });
     if !fsync {
@@ -3350,13 +3343,12 @@ pub(crate) fn refspec_ref(refspec: &str) -> Ref {
 ///
 /// For `Some(checksum)`, the call:
 ///
-/// 1. Makes a new temp file in `tmp/`.
-/// 2. Opens `refs/`, and makes it with its directories `heads`, `remotes`,
+/// 1. Opens `refs/`, and makes it with its directories `heads`, `remotes`,
 ///    and `mirrors` if it is absent.
+/// 2. Writes the 65-byte `<hex>\n` content to a new temp file in `tmp/`,
+///    sets its mode `0644`, and runs `fsync` on it if `fsync` is set.
 /// 3. Makes the missing parent directories of the target.
-/// 4. Writes the 65-byte `<hex>\n` content to the temp file, sets its mode
-///    `0644`, and runs `fsync` on it if `fsync` is set.
-/// 5. Renames the temp file over the target, relative to the parent
+/// 4. Renames the temp file over the target, relative to the parent
 ///    directory of the target.
 ///
 /// If `tmp/` is on a different file system, the rename fails with `EXDEV`,
@@ -3411,7 +3403,7 @@ pub(crate) fn put_ref_blocking(
         });
     }
     match checksum {
-        Some(checksum) => put_ref_file_blocking(root, None, relpath, checksum, fsync, dirs),
+        Some(checksum) => put_ref_file_blocking(root, relpath, checksum, fsync, dirs),
         None => remove_ref_blocking(root, relpath, fsync, dirs),
     }
 }
@@ -3432,18 +3424,26 @@ fn remove_ref_blocking(
     Ok(())
 }
 
-/// Opens the directory that holds the ref `relpath` for a write, and makes
-/// each missing directory on the way. Returns the handle of the directory
-/// and the name of the ref in it.
+/// Opens `refs/` below the repository root `root` for a write. If `refs/` is
+/// absent, the call makes it with its directories `heads`, `remotes`, and
+/// `mirrors`.
+fn open_refs_for_write(root: &RepoDir, fsync: bool) -> Result<RepoDir> {
+    match root.open_layout(RepoLayout::Refs) {
+        Err(FsError::Absent { .. }) => Ok(root.ensure_layout(RepoLayout::Refs, fsync)?),
+        opened => Ok(opened?),
+    }
+}
+
+/// Opens the directory that holds the ref `relpath` below the `refs/`
+/// handle `refs` for a write, and makes each missing directory on the way.
+/// Returns the handle of the directory and the name of the ref in it.
 ///
-/// The call opens `refs/`. If `refs/` is absent, it makes `refs/` with its
-/// directories `heads`, `remotes`, and `mirrors`. It then makes the
-/// directories below `refs/` with [`RepoDir::ensure_dir`], with the mode of
-/// the kind below `refs/`. With `fsync`, each make syncs the parent of the
-/// new directory at once. A symlink or a file at a component fails with
-/// [`Error::InvalidFormat`].
+/// The call makes the directories below `refs/` with
+/// [`RepoDir::ensure_dir`], with the mode of the kind below `refs/`. With
+/// `fsync`, each make syncs the parent of the new directory at once. A
+/// symlink or a file at a component fails with [`Error::InvalidFormat`].
 fn ensure_ref_parent<'p>(
-    root: &RepoDir,
+    refs: &RepoDir,
     relpath: &'p str,
     fsync: bool,
 ) -> Result<(RepoDir, &'p str)> {
@@ -3453,40 +3453,31 @@ fn ensure_ref_parent<'p>(
     else {
         return Err(Error::InvalidInput(format!("not a ref path: {relpath}")));
     };
-    let refs = match root.open_layout(RepoLayout::Refs) {
-        Err(FsError::Absent { .. }) => root.ensure_layout(RepoLayout::Refs, fsync)?,
-        opened => opened?,
-    };
     Ok((refs.ensure_dir(parent, fsync)?, leaf))
 }
 
 /// Writes the ref file `relpath` through a temp file, as
 /// [`put_ref_blocking`] writes a `Some` checksum.
 ///
-/// The temp file is a named file `.ostrya-tmp-<pid>-XXXXXX` in the temp home
-/// of `tmp`, the `tmp/` handle of a transaction. With `None`, it is in the
-/// `tmp/` of the context of `root`. The call makes the temp file before it
-/// makes a parent directory, so a temp file that it cannot make changes
-/// nothing under `refs/`. The call sets the file mode of a ref file, `0644`,
-/// before the sync of the file, so the sync covers the mode.
+/// The call opens `refs/` with [`open_refs_for_write`], and then makes the
+/// temp file with [`RepoDir::stage_atomic`] on the `refs/` handle: a named
+/// file `.ostrya-tmp-<pid>-XXXXXX` in the `tmp/` of the context of `root`.
+/// The temp file holds the content, has the file mode of a ref file, and is
+/// synced under `fsync`. The call makes the temp file before each directory
+/// below `refs/` that [`RepoDir::ensure_dir`] makes, so a temp file that it
+/// cannot make adds no such directory. If `refs/` is absent,
+/// [`open_refs_for_write`] makes `refs/` and its directories `heads`,
+/// `remotes`, and `mirrors` before the temp file.
 fn put_ref_file_blocking(
     root: &RepoDir,
-    tmp: Option<&RepoDir>,
     relpath: &str,
     checksum: Checksum,
     fsync: bool,
     dirs: &mut Vec<String>,
 ) -> Result<()> {
-    let mut temp = TempFile::create_named(tmp.unwrap_or(root))?;
-    let (parent, leaf) = ensure_ref_parent(root, relpath, fsync)?;
-    temp.file_mut()
-        .write_all(format!("{}\n", checksum.to_hex()).as_bytes())?;
-    if let Some(mode) = parent.file_mode() {
-        temp.set_mode(mode)?;
-    }
-    if fsync {
-        temp.sync()?;
-    }
+    let refs = open_refs_for_write(root, fsync)?;
+    let temp = refs.stage_atomic(format!("{}\n", checksum.to_hex()).as_bytes(), fsync)?;
+    let (parent, leaf) = ensure_ref_parent(&refs, relpath, fsync)?;
     temp.publish(&parent, leaf, Publish::Replace, false)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());
@@ -3682,7 +3673,7 @@ pub(crate) fn put_alias_blocking(
         _ => {}
     }
     let link = TempLink::create(root, &relative_link(relpath, target))?;
-    let (parent, leaf) = ensure_ref_parent(root, relpath, fsync)?;
+    let (parent, leaf) = ensure_ref_parent(&open_refs_for_write(root, fsync)?, relpath, fsync)?;
     link.publish(&parent, leaf, Publish::Replace, false)?;
     if fsync {
         dirs.push(ref_parent(relpath).to_owned());

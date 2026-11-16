@@ -12,12 +12,13 @@ use std::os::fd::{AsFd, BorrowedFd};
 use std::path::{Component, Path, PathBuf};
 
 use ostrya_core::{KeyFile, RepoMode};
+use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::pattern::ReceiveSelector;
 use crate::remotes_dir;
 use crate::repo::{Repo, check_config_size};
-use crate::repo_fs::{Publish, RootFile};
+use crate::repo_fs::{FsError, Publish, Reason, RootFile};
 
 const CORE: &str = "core";
 const ARCHIVE: &str = "archive";
@@ -163,6 +164,23 @@ impl KeyPath {
             },
             _ => (rustix::fs::CWD, self.value.clone(), self.value.clone()),
         }
+    }
+}
+
+/// Returns the I/O error of `err`, an error of the open of a [`KeyPath`]
+/// file, with the text of its errno.
+///
+/// [`FsError::Absent`] gives `ENOENT`, and [`Reason::NotDirectory`] gives
+/// `ENOTDIR`. Each other [`FsError::Invalid`] gives an error with its text.
+pub(crate) fn io_of(err: FsError) -> std::io::Error {
+    match err {
+        FsError::Io(e) => e,
+        FsError::Absent { .. } => Errno::NOENT.into(),
+        FsError::Invalid {
+            reason: Reason::NotDirectory,
+            ..
+        } => Errno::NOTDIR.into(),
+        other => std::io::Error::other(Error::from(other).to_string()),
     }
 }
 

@@ -1106,49 +1106,22 @@ pub(crate) fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
-/// Reads the value of one extended attribute from an open descriptor.
-///
-/// If the attribute does not exist, the function returns `None`.
-pub(crate) fn read_xattr(
-    fd: rustix::fd::BorrowedFd<'_>,
-    name: &str,
-) -> std::io::Result<Option<Vec<u8>>> {
-    let mut buf = vec![0u8; 256];
-    loop {
-        match rustix::fs::fgetxattr(fd, name, &mut buf[..]) {
-            Ok(n) => {
-                buf.truncate(n);
-                return Ok(Some(buf));
-            }
-            Err(Errno::RANGE) => {
-                let grown = buf.len().saturating_mul(2).max(512);
-                buf.resize(grown, 0);
-            }
-            // The attribute does not exist, or the file system has no xattr support.
-            Err(Errno::NODATA) | Err(Errno::NOTSUP) => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
-    }
-}
-
 /// Reads all extended attributes of an open descriptor into an [`Xattrs`] set.
 ///
-/// The set is canonical. Each name keeps its terminating NUL, as in the on-disk
-/// form.
-pub(crate) fn read_all_xattrs(fd: rustix::fd::BorrowedFd<'_>) -> Result<Xattrs> {
-    let mut names_buf = vec![0u8; 256];
-    let names = loop {
-        match rustix::fs::flistxattr(fd, &mut names_buf[..]) {
-            Ok(n) => break &names_buf[..n],
-            Err(Errno::RANGE) => {
-                let grown = names_buf.len().saturating_mul(2).max(512);
-                names_buf.resize(grown, 0);
-            }
-            Err(Errno::NOTSUP) => return Ok(Xattrs::empty()),
-            Err(e) => return Err(Error::Io(e.into())),
-        }
-    };
-    collect_xattrs(names, |name| read_xattr(fd, name))
+/// The function reads with [`repo_fs::xattrs`](crate::repo_fs::xattrs). The
+/// set is canonical. Each name keeps its terminating NUL, as in the on-disk
+/// form. A name that is not valid UTF-8 gives [`Error::InvalidFormat`]. A list
+/// or a value over 64 KiB gives [`Error::Io`] with `E2BIG`. A set that
+/// [`Xattrs::new`] refuses gives [`Error::Io`] with the kind `InvalidData`.
+pub(crate) fn read_all_xattrs(fd: BorrowedFd<'_>) -> Result<Xattrs> {
+    let xattrs = crate::repo_fs::xattrs(fd)?;
+    if xattrs
+        .iter()
+        .any(|(name, _)| std::str::from_utf8(name).is_err())
+    {
+        return Err(Error::InvalidFormat("xattr name is not valid UTF-8".into()));
+    }
+    Ok(xattrs)
 }
 
 /// Reads the extended attributes of an entry relative to a directory descriptor.
@@ -1182,7 +1155,7 @@ pub(crate) fn read_link_xattrs(
 /// Reads one extended attribute of the entry at a `/proc/self/fd` path.
 ///
 /// The read does not follow a symlink. If the attribute does not exist, the
-/// function returns `None`. The function is [`read_xattr`] with the path-based
+/// function returns `None`. The function reads one value with the path-based
 /// `lgetxattr` call.
 fn read_link_xattr(link: &std::path::Path, name: &str) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = vec![0u8; 256];

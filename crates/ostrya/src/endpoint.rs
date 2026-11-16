@@ -54,9 +54,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rustix::io::Errno;
-
-use crate::config::{KeyPath, Remote, RepoConfig, relative_with_parent};
+use crate::config::{KeyPath, Remote, RepoConfig, io_of, relative_with_parent};
 use crate::error::{Error, Result};
 #[cfg(feature = "push")]
 use crate::fetch::{BasicAuth, BearerToken};
@@ -2011,26 +2009,17 @@ fn open_key_file(
     repo: Option<&Repo>,
 ) -> Result<(std::fs::File, PathBuf)> {
     let (base, at, shown) = path.locate(repo);
-    let e: std::io::Error = match open_named(base, &at, Named::File) {
-        Ok(fd) => return Ok((std::fs::File::from(fd), shown)),
+    match open_named(base, &at, Named::File) {
+        Ok(fd) => Ok((std::fs::File::from(fd), shown)),
         Err(FsError::Invalid {
             reason: Reason::NotRegular(_),
             ..
-        }) => {
-            return Err(Error::InvalidInput(format!(
-                "{key} '{}' is not a regular file",
-                shown.display()
-            )));
-        }
-        Err(FsError::Io(e)) => e,
-        Err(FsError::Absent { .. }) => Errno::NOENT.into(),
-        Err(FsError::Invalid {
-            reason: Reason::NotDirectory,
-            ..
-        }) => Errno::NOTDIR.into(),
-        Err(other) => return Err(other.into()),
-    };
-    Err(io_error(key, &shown, e))
+        }) => Err(Error::InvalidInput(format!(
+            "{key} '{}' is not a regular file",
+            shown.display()
+        ))),
+        Err(err) => Err(io_error(key, &shown, io_of(err))),
+    }
 }
 
 /// Returns the [`Error::Io`] of the failure `e` to read the file at `path`,

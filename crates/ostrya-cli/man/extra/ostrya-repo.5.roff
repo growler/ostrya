@@ -211,6 +211,7 @@ A repository handle opens \fB\%tmp/\fR at its first use and keeps it.
 The open makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 Each write of a \fB\%.commitmeta\fR outside a transaction and of a \fB\%.tombstone\-commit\fR, and the fs\-verity probe of \fB\%[ex\-integrity] fsverity=maybe\fR, make their temporary file in that \fB\%tmp/\fR.
 Each write of \fB\%config\fR, \fB\%summary\fR, \fB\%summary.sig\fR, a keyring of a remote, a file under \fB\%extensions/ostrya/summary/\fR, and a file in \fB\%deltas/\fR or \fB\%delta\-indexes/\fR also makes its temporary file there.
+Each ref write, also a ref write at the commit of a transaction, makes its temporary file there too, and each alias write makes its temporary symbolic link there.
 If another process removes \fB\%tmp/\fR, these writes of the handle fail, and the caller opens the repository again.
 Each transaction makes \fB\%tmp/\fR and \fB\%tmp/cache/\fR if they are absent, and refuses a symbolic link and an entry that is not a directory at each of them.
 The lock file of a staging directory opens by the rules of \fB\%.lock\fR.

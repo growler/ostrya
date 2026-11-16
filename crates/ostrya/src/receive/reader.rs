@@ -15,14 +15,13 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ostrya_core::KeyFile;
-use rustix::io::Errno;
 
 use crate::access::{ClientAccess, Group, classify};
 use crate::config::relative_with_parent;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::repo_fs::{FsError, Named, Reason, open_named};
-use crate::sign::{MAX_KEY_FILE, key_text, read_key_source};
+use crate::sign::key_text;
+use crate::verify::read_key_file_at;
 use crate::verify::trust::{check_trust, unknown_key};
 
 use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
@@ -276,11 +275,11 @@ async fn secret_key_line(repo: &Repo, path: &str) -> Result<String> {
 /// the blocking half of `secret_key_line`.
 ///
 /// The read obeys the rule of every key source: a regular file alone, of at
-/// most [`MAX_KEY_FILE`] bytes. The function skips blank lines. The file must
-/// hold exactly one other line.
+/// most [`MAX_KEY_FILE`](crate::sign::MAX_KEY_FILE) bytes. The function
+/// skips blank lines. The file must hold exactly one other line.
 fn read_secret_key_line(root: BorrowedFd<'_>, path: &str) -> Result<String> {
     let subject = format!("the secret key file '{path}'");
-    let bytes = read_secret_key_file(root, path, &subject)?;
+    let bytes = read_key_file_at(root, Path::new(path), &subject)?;
     let text = key_text(bytes, &subject)?;
     let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
     match (lines.next(), lines.next()) {
@@ -308,51 +307,14 @@ async fn secret_key_blocks(repo: &Repo, path: &str) -> Result<Vec<crate::spki::S
 /// `root`, the blocking half of `secret_key_blocks`.
 ///
 /// The read obeys the rule of every key source: a regular file alone, of at
-/// most [`MAX_KEY_FILE`] bytes. `spki_secret_keys` reads the blocks and states
-/// the rules of the file.
+/// most [`MAX_KEY_FILE`](crate::sign::MAX_KEY_FILE) bytes.
+/// `spki_secret_keys` reads the blocks and states the rules of the file.
 #[cfg(feature = "sign-spki")]
 fn read_secret_key_blocks(
     root: BorrowedFd<'_>,
     path: &str,
 ) -> Result<Vec<crate::spki::SpkiSigner>> {
     let subject = format!("the secret key file '{path}'");
-    let bytes = read_secret_key_file(root, path, &subject)?;
+    let bytes = read_key_file_at(root, Path::new(path), &subject)?;
     Ok(crate::spki::spki_secret_keys(bytes, &subject)?)
-}
-
-/// Reads the whole secret key file at `path` relative to `root`, up to
-/// [`MAX_KEY_FILE`] bytes. `subject` names the file in a refusal.
-///
-/// The open follows a symlink at each component of the path, and uses
-/// `O_NONBLOCK`. The type check after the open refuses each file that is not
-/// a regular file, so a FIFO does not block the read.
-fn read_secret_key_file(root: BorrowedFd<'_>, path: &str, subject: &str) -> Result<Vec<u8>> {
-    let fd = match open_named(root, Path::new(path), Named::File) {
-        Ok(fd) => fd,
-        Err(FsError::Absent { .. }) => {
-            return Err(Error::Signature(format!("{subject} does not exist")));
-        }
-        Err(FsError::Invalid {
-            reason: Reason::NotRegular(_),
-            ..
-        }) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
-        Err(FsError::Invalid {
-            reason: Reason::NotDirectory,
-            ..
-        }) => {
-            return Err(Error::Signature(format!(
-                "{subject} cannot be opened: {}",
-                std::io::Error::from(Errno::NOTDIR)
-            )));
-        }
-        Err(FsError::Io(e)) => {
-            return Err(Error::Signature(format!("{subject} cannot be opened: {e}")));
-        }
-        Err(other) => return Err(other.into()),
-    };
-    Ok(read_key_source(
-        std::fs::File::from(fd),
-        subject,
-        MAX_KEY_FILE,
-    )?)
 }

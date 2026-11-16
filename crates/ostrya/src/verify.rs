@@ -24,9 +24,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use ostrya_core::{Value, base64};
-use rustix::io::Errno;
 
-use crate::config::{KeyPath, Remote, SignVerify, valid_remote_name};
+use crate::config::{KeyPath, Remote, SignVerify, io_of, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::pull::PullVerify;
 use crate::repo::Repo;
@@ -1468,16 +1467,43 @@ fn read_sign_keys(
     Ok(Some(keys))
 }
 
-/// Reads the keys of one `verification-<engine>-file` at `at` relative to
-/// `base`, up to [`MAX_KEY_FILE`] bytes, under the rule that
-/// [`read_key_source`] states. `shown` names the file in a message.
+/// Reads the whole key file at `at` relative to `base`, up to
+/// [`MAX_KEY_FILE`] bytes, under the rule that [`read_key_source`] states.
+/// `subject` names the file in a refusal.
 ///
-/// The function opens the path once with `O_NONBLOCK`, and follows a symlink
-/// at each component. It refuses a file of another kind after the open, so a
-/// FIFO does not block the open. It reads the file through the ceiling, so
-/// the keys come from the bytes that the ceiling admits. It refuses a file
-/// over the ceiling, and a file that it cannot read. Each error names the
-/// file, so an operator can find the entry that names it.
+/// The open follows a symlink at each component of the path, and uses
+/// `O_NONBLOCK`. The type check after the open refuses each file that is not
+/// a regular file, so a FIFO does not block the read.
+pub(crate) fn read_key_file_at(base: BorrowedFd<'_>, at: &Path, subject: &str) -> Result<Vec<u8>> {
+    let refuse = |what: String| Err(Error::Signature(format!("{subject} {what}")));
+    let fd = match open_named(base, at, Named::File) {
+        Ok(fd) => fd,
+        Err(FsError::Absent { .. }) => return refuse("does not exist".into()),
+        Err(FsError::Invalid {
+            reason: Reason::NotRegular(_),
+            ..
+        }) => return refuse("is not a regular file".into()),
+        Err(
+            err @ (FsError::Io(_)
+            | FsError::Invalid {
+                reason: Reason::NotDirectory,
+                ..
+            }),
+        ) => return refuse(format!("cannot be opened: {}", io_of(err))),
+        Err(other) => return Err(other.into()),
+    };
+    Ok(read_key_source(
+        std::fs::File::from(fd),
+        subject,
+        MAX_KEY_FILE,
+    )?)
+}
+
+/// Reads the keys of one `verification-<engine>-file` at `at` relative to
+/// `base`, with [`read_key_file_at`]. `shown` names the file in a message.
+///
+/// Each error names the file, so an operator can find the entry that names
+/// it.
 ///
 /// A file of the spki engine holds PEM `PUBLIC KEY` blocks, which
 /// `spki_public_keys` reads. An empty file adds no keys. A file of another
@@ -1490,26 +1516,7 @@ fn read_verification_file(
     shown: &Path,
 ) -> Result<Vec<Vec<u8>>> {
     let subject = format!("the '{engine}' key file '{}'", shown.display());
-    let fd = match open_named(base, at, Named::File) {
-        Ok(fd) => fd,
-        Err(FsError::Invalid {
-            reason: Reason::NotRegular(_),
-            ..
-        }) => return Err(Error::Signature(format!("{subject} is not a regular file"))),
-        Err(err) => {
-            let e: std::io::Error = match err {
-                FsError::Io(e) => e,
-                FsError::Absent { .. } => Errno::NOENT.into(),
-                FsError::Invalid {
-                    reason: Reason::NotDirectory,
-                    ..
-                } => Errno::NOTDIR.into(),
-                other => return Err(other.into()),
-            };
-            return Err(Error::Signature(format!("{subject} cannot be read: {e}")));
-        }
-    };
-    let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
+    let bytes = read_key_file_at(base, at, &subject)?;
     #[cfg(feature = "sign-spki")]
     if engine == "spki" {
         return Ok(crate::spki::spki_public_keys(&bytes, &subject)?);
@@ -2066,7 +2073,7 @@ mod tests {
         });
         assert!(
             matches!(&absent, Err(Error::Signature(m))
-                if m.starts_with("the 'ed25519' key file 'keys/o.ed25519' cannot be read: ")),
+                if m.starts_with("the 'ed25519' key file 'keys/o.ed25519' does not exist")),
             "{:?}",
             absent.err()
         );
@@ -2234,7 +2241,7 @@ mod tests {
         }
         drop(repos);
         std::fs::remove_dir_all(&dir).unwrap();
-        let expected = "the 'ed25519' key file '' cannot be read: No such file or directory";
+        let expected = "the 'ed25519' key file '' does not exist";
         for (in_config, in_file, remotes_dir) in results {
             assert!(
                 matches!(&in_config, Err(Error::Signature(m)) if m.starts_with(expected)),

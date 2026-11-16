@@ -32,9 +32,8 @@ use std::path::{Path, PathBuf};
 
 use ostrya_sign::{gpg_keyring_keys, gpg_merge_keyring, gpg_offered_keys};
 use rustix::fs::FileType;
-use rustix::io::Errno;
 
-use crate::config::{KeyPath, relative_with_parent, remote_keyring_name, valid_remote_name};
+use crate::config::{KeyPath, io_of, relative_with_parent, remote_keyring_name, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::remotes_dir;
 use crate::repo::{RemotesDir, Repo};
@@ -874,23 +873,6 @@ fn add_keyring_fd(verifier: &mut GpgVerifier, fd: OwnedFd, subject: &str) -> Res
     let bytes = read_key_source(std::fs::File::from(fd), subject, MAX_KEYRING)?;
     verifier.add_keyring_skipping(&bytes, subject)?;
     Ok(())
-}
-
-/// Returns the I/O error of `err`, an error of the open of a keyring path
-/// entry, with the text of its errno.
-///
-/// [`FsError::Absent`] gives `ENOENT`, and [`Reason::NotDirectory`] gives
-/// `ENOTDIR`. Each other [`FsError::Invalid`] gives an error with its text.
-fn io_of(err: FsError) -> std::io::Error {
-    match err {
-        FsError::Io(e) => e,
-        FsError::Absent { .. } => Errno::NOENT.into(),
-        FsError::Invalid {
-            reason: Reason::NotDirectory,
-            ..
-        } => Errno::NOTDIR.into(),
-        other => std::io::Error::other(Error::from(other).to_string()),
-    }
 }
 
 /// Returns the refusal of the keyring path entry `entry`, which cannot be

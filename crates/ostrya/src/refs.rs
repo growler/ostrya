@@ -17,12 +17,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
-use std::os::fd::{AsFd, BorrowedFd};
 #[cfg(feature = "receive")]
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, Ref, RefPattern, RefSelector};
-use rustix::fs::{FileType, Mode, OFlags};
+use rustix::fs::FileType;
 use rustix::io::Errno;
 
 use crate::access::{AccessRules, Namespace, ReadAccess};
@@ -3509,7 +3508,7 @@ pub(crate) fn sync_dirs_all(root: &RepoDir, mut dirs: Vec<String>) -> Result<()>
     for dir in &dirs {
         let synced = sync_recorded_dir(root, dir);
         #[cfg(test)]
-        test_syncs::record(root.as_fd());
+        test_syncs::record(std::os::fd::AsFd::as_fd(root));
         if first.is_ok() {
             first = synced;
         }
@@ -3802,21 +3801,10 @@ fn ref_parent(relpath: &str) -> &str {
     relpath.rsplit_once('/').map_or(ROOT_DIR, |(dir, _)| dir)
 }
 
-/// Runs `fsync` on one directory, named relative to the repository root.
-pub(crate) fn sync_dir(repo_fd: BorrowedFd<'_>, path: &str) -> Result<()> {
-    let dir = rustix::fs::openat(
-        repo_fd,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?;
-    rustix::fs::fsync(dir.as_fd())?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use ostrya_core::RepoMode;
+    use rustix::fs::{Mode, OFlags};
 
     use super::*;
 

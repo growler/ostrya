@@ -2043,9 +2043,9 @@ an `archive` destination and in a `bare-user` destination:
 
 ```
 switch or [core] key                         tool   port
-(none)                                        11     13
---per-object-fsync                            15     17
-per-object-fsync=true                         15     17
+(none)                                        11     15
+--per-object-fsync                            15     19
+per-object-fsync=true                         15     19
 --disable-fsync                                0      0
 --per-object-fsync --disable-fsync             0      0
 fsync=false with --per-object-fsync            0      0
@@ -2062,11 +2062,16 @@ the ref, and `refs/remotes`, which holds the created `origin` entry. A later
 pull from the same remote finds `refs/remotes/origin` in place, and the port
 syncs that directory alone.
 
+The port also syncs `state/` two times for the `.commitpartial` marker of
+the pulled commit: one time after the create of the marker, and one time
+after its removal (`../format-reference.md`, "Commit-state markers").
+
 A `--mirror` pull of each ref copies the summary of the remote. The tool makes
-11 calls and syncs no summary file. The port makes 14 calls:
+11 calls and syncs no summary file. The port makes 16 calls:
 
 - the 11 calls of the tool
 - one `fsync` of `refs/heads`
+- two `fsync` calls of `state/` for the `.commitpartial` marker
 - one `fsync` of the temp file of the summary in `tmp/`
 - one `fsync` of the repository root
 
@@ -2075,8 +2080,8 @@ Under `--disable-fsync`, both make 0 calls.
 A pulled commit with detached metadata adds a `.commitmeta` file to the pull.
 The tool makes no sync call for this file. The input is `C0` committed with
 `--add-detached-metadata-string`, pulled into `archive`. The tool makes 11
-calls on `pull-local`, on `pull`, and on a `--mirror` pull. The port makes 13,
-14, and 15 calls. Under `--disable-fsync`, both make 0 calls.
+calls on `pull-local`, on `pull`, and on a `--mirror` pull. The port makes 15,
+16, and 17 calls. Under `--disable-fsync`, both make 0 calls.
 
 `../format-reference.md`, "Durability and staging", states how the port makes a
 pulled `.commitmeta` durable.
@@ -2093,9 +2098,9 @@ The input is a `pull-local` of the same commit from an `archive` source:
 ```
 switch or [core] key                  archive dest    bare-user dest
                                       tool   port     tool   port
-(none)                                 11     12       11     12
---per-object-fsync                     11     12       15     16
-per-object-fsync=true                  11     12       15     16
+(none)                                 11     14       11     14
+--per-object-fsync                     11     14       15     18
+per-object-fsync=true                  11     14       15     18
 --disable-fsync                         0      0        0      0
 fsync=false with --per-object-fsync     0      0        0      0
 ```
@@ -2104,10 +2109,12 @@ Into `archive`, the pull hardlinks each object from the source, so no row syncs
 an object. Into `bare-user`, the pull ingests the content objects again and
 hardlinks the metadata objects. So the per-object rows add one sync for each
 content object. The port adds one `fsync` of `refs/heads`, the directory that
-holds the ref (`../format-reference.md`, "Ref durability").
+holds the ref (`../format-reference.md`, "Ref durability"). It also adds two
+`fsync` calls of `state/` for the `.commitpartial` marker, as a pull does
+("Sync counts of a pull").
 
 The port extension `--force-copy` changes the count. Under `--force-copy
---per-object-fsync` into `archive`, the port copies each object and makes 16
+--per-object-fsync` into `archive`, the port copies each object and makes 18
 calls. It syncs the 4 content objects, and it does not sync the 4 metadata
 objects.
 

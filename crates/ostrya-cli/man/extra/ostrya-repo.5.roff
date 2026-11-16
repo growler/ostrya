@@ -194,7 +194,12 @@ Remove such a ref by hand.
 A marker of a commit that the repository does not hold in full.
 A pull writes it before it fetches the objects of the commit, and removes it when the pull completes.
 A pull with \fB\%\-\-subpath\fR or \fB\%\-\-commit\-metadata\-only\fR keeps it.
-The read of the state of a commit refuses a symbolic link at \fB\%state\fR.
+A pull writes it empty.
+\fB\%ostrya fsck\fR writes it with the one byte \fBf\fR when it finds a commit that misses an object.
+Each writer makes \fB\%state/\fR if it is absent, creates the marker with \fB\%O_EXCL\fR and the mode 0644, and keeps an entry of any type that is at the name.
+With \fB\%[core] fsync\fR, each writer syncs \fB\%state/\fR after the create, and each removal of markers by a pull, a receive, or \fB\%ostrya prune\fR syncs it one time.
+\fB\%ostrya prune\fR removes each marker whose commit is absent, also a symbolic link or a FIFO at the name, and keeps a directory.
+Each read, write, and removal of a marker refuses a symbolic link at \fB\%state\fR and an entry there that is not a directory.
 .TP
 \fB\%<repo>/tmp/\fR
 The staging area.

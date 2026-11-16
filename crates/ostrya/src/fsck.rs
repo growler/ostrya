@@ -5,20 +5,14 @@
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::io::Write;
-use std::os::fd::BorrowedFd;
 use std::pin::Pin;
 
 use futures_lite::AsyncReadExt;
 use ostrya_core::{
     Checksum, Commit, ContentHasher, DirMetaRef, DirTree, DirTreeRef, ObjectName, ObjectType,
-    RepoMode,
 };
-use rustix::fs::{AtFlags, Mode, OFlags};
-use rustix::io::Errno;
 
 use crate::error::{Error, Result};
-use crate::perm;
 use crate::refs::CollectionRefEntry;
 use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
 use crate::repo::Repo;
@@ -39,6 +33,13 @@ pub struct FsckOptions {
     /// the `ostree` command writes it. The default is `true`. The value `false`
     /// is an ostrya extension, which the `ostrya fsck` command spells
     /// `--no-mark-partial`.
+    ///
+    /// The run creates the marker with `O_EXCL` and writes the one byte `f`
+    /// into it. An entry that is present at the name of the marker, of any
+    /// type, stays as it is, and the run writes nothing into it. The run
+    /// makes `state/` if it is absent. If `[core] fsync` is `true`, the run
+    /// syncs `state/` after the create of each marker. It does not sync the
+    /// content of a marker.
     ///
     /// If [`mark_dependencies`](FsckOptions::mark_dependencies) is also
     /// `true`, the switch marks each commit that has an
@@ -68,9 +69,14 @@ pub struct FsckOptions {
     /// The option of the `ostree fsck` command is `--delete`.
     ///
     /// The run also marks each commit that reaches a deleted object as
-    /// partial. If the bytes of a metadata object do not parse as the type of
-    /// its name, the run reports the object and does not unlink it. Such an
-    /// object marks no commit as partial.
+    /// partial. The run writes these markers first, and unlinks the objects
+    /// after them. If the bytes of a metadata object do not parse as the type
+    /// of its name, the run reports the object and does not unlink it. Such
+    /// an object marks no commit as partial.
+    ///
+    /// The unlink follows no symlink at `objects/<xx>`. If `[core] fsync` is
+    /// `true`, the run syncs the `objects/<xx>` directory after the unlink of
+    /// each object.
     ///
     /// If this field is `false`, a checksum mismatch marks no commit, as with
     /// the `ostree` command. A commit stays complete while the wrong object is
@@ -94,6 +100,11 @@ pub struct FsckOptions {
     ///
     /// The step writes a `.tombstone-commit` object that names each deleted
     /// commit. [`Repo::fsck`] states when the step runs.
+    ///
+    /// The unlink of a commit follows no symlink at `objects/<xx>`. If
+    /// `[core] fsync` is `true`, the step syncs the `objects/<xx>` directory
+    /// after the unlink of each commit, and the directory of the composefs
+    /// image of the commit after the removal of the image.
     pub add_tombstones: bool,
     /// The switch that checks that the commit of each ref is bound to the ref.
     ///
@@ -847,7 +858,10 @@ impl Repo {
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is
     ///   not a regular file, or if a symlink is on its path. The listing of
     ///   the objects also gives this error for a symlink or an entry that is
-    ///   not a directory at `objects/<xx>`.
+    ///   not a directory at `objects/<xx>`, and so does the unlink of an
+    ///   object.
+    /// - [`Error::InvalidFormat`] if `state` is a symlink or is not a
+    ///   directory.
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport> {
         let note = self.config().generate_composefs()?;
         let mut ctx = Ctx::default();
@@ -979,9 +993,13 @@ impl Repo {
         opts: &FsckOptions,
         ctx: &mut Ctx,
     ) -> Result<Option<FsckFailure>> {
+        let fsync = opts.delete && self.config().fsync()?;
         for (name, commit) in targets {
             let commit = *commit;
-            let bytes = match self.fsck_check_ref_target(name, commit, opts, ctx).await? {
+            let bytes = match self
+                .fsck_check_ref_target(name, commit, opts, fsync, ctx)
+                .await?
+            {
                 Err(failure) => return Ok(Some(failure)),
                 Ok(bytes) => bytes,
             };
@@ -1003,12 +1021,14 @@ impl Repo {
     ///
     /// `Err` ends the run. `Ok(None)` records a finding and leaves the commit
     /// unread. The caller decides if the run continues after it. `display` is
-    /// the ref as a message names it.
+    /// the ref as a message names it. `fsync` is the value of `[core] fsync`
+    /// for the unlink of a `delete` run.
     async fn fsck_check_ref_target(
         &self,
         display: &str,
         commit: Checksum,
         opts: &FsckOptions,
+        fsync: bool,
         ctx: &mut Ctx,
     ) -> Result<std::result::Result<Option<Vec<u8>>, FsckFailure>> {
         let bytes = match self.load_object_bytes(ObjectType::Commit, &commit).await {
@@ -1029,7 +1049,7 @@ impl Repo {
         let object = ObjectName::new(commit, ObjectType::Commit);
         ctx.record(object, FsckErrorKind::ChecksumMismatch { actual });
         if opts.delete {
-            self.fsck_unlink_object(object).await?;
+            self.fsck_unlink_object(object, fsync).await?;
             ctx.deleted.insert(object);
             return Ok(Err(FsckFailure::RefTarget {
                 ref_name: display.to_owned(),
@@ -1052,6 +1072,7 @@ impl Repo {
         opts: &FsckOptions,
         ctx: &mut Ctx,
     ) -> Result<Option<FsckFailure>> {
+        let fsync = opts.delete && self.config().fsync()?;
         for entry in entries {
             let bytes = if entry.local {
                 self.load_object_bytes(ObjectType::Commit, &entry.commit)
@@ -1060,7 +1081,7 @@ impl Repo {
             } else {
                 let display = format!("({}, {})", entry.collection, entry.name);
                 match self
-                    .fsck_check_ref_target(&display, entry.commit, opts, ctx)
+                    .fsck_check_ref_target(&display, entry.commit, opts, fsync, ctx)
                     .await?
                 {
                     Err(failure) => return Ok(Some(failure)),
@@ -1366,7 +1387,9 @@ impl Repo {
 
     /// Acts on the findings. If `delete` is set, the function unlinks each
     /// faulty object. It marks each commit that reaches a deleted or an
-    /// absent object as partial.
+    /// absent object as partial. The markers go first, and the unlinks
+    /// follow. If `[core] fsync` is on, the sync of `state/` after each
+    /// marker comes before the first unlink.
     ///
     /// A checksum mismatch alone marks no commit, as with the `ostree`
     /// command. The commits of an object that is present and wrong stay
@@ -1388,17 +1411,18 @@ impl Repo {
                 }
             }
         }
+        let fsync = self.config().fsync()?;
+        // The markers go first, so a commit whose object goes is partial
+        // before the object goes.
+        if opts.mark_partial {
+            ctx.marked_partial.extend(incomplete.iter().copied());
+            self.mark_commits_partial(incomplete, fsync).await?;
+        }
         for object in doomed {
             if !ctx.deleted.insert(object) {
                 continue;
             }
-            self.fsck_unlink_object(object).await?;
-        }
-        if opts.mark_partial {
-            for commit in incomplete {
-                self.mark_commit_partial(&commit).await?;
-                ctx.marked_partial.insert(commit);
-            }
+            self.fsck_unlink_object(object, fsync).await?;
         }
         Ok(())
     }
@@ -1445,6 +1469,7 @@ impl Repo {
         }
         if opts.mark_partial && opts.mark_dependencies {
             let mut marked = HashSet::new();
+            let mut to_mark = Vec::new();
             for finding in &findings {
                 let commit = finding.commit;
                 if matches!(finding.kind, FsckDependencyErrorKind::Defective(_))
@@ -1453,8 +1478,12 @@ impl Repo {
                 {
                     continue;
                 }
-                self.mark_commit_partial(&commit).await?;
-                ctx.marked_partial.insert(commit);
+                to_mark.push(commit);
+            }
+            if !to_mark.is_empty() {
+                let fsync = self.config().fsync()?;
+                ctx.marked_partial.extend(to_mark.iter().copied());
+                self.mark_commits_partial(to_mark, fsync).await?;
             }
         }
         ctx.dependency_errors = findings;
@@ -1480,6 +1509,7 @@ impl Repo {
         if images.is_empty() {
             return Ok(());
         }
+        let fsync = opts.delete && self.config().fsync()?;
         let removed = |c: &Checksum| {
             ctx.deleted
                 .contains(&ObjectName::new(*c, ObjectType::Commit))
@@ -1515,7 +1545,7 @@ impl Repo {
             let commit_fault = matches!(kind, FsckImageErrorKind::CommitUnreadable(_));
             ctx.image_errors.push(FsckImageError { commit, kind });
             if opts.delete && !commit_fault {
-                self.fsck_unlink_image(&commit).await?;
+                self.fsck_unlink_image(&commit, fsync).await?;
             }
         }
         Ok(())
@@ -1592,49 +1622,67 @@ impl Repo {
             let repo = self.clone();
             ostrya_rt::unblock(move || write_tombstone(repo.objects(), &commit, mode, fsync))
                 .await?;
-            self.fsck_unlink_object(ObjectName::new(commit, ObjectType::Commit))
+            self.fsck_unlink_object(ObjectName::new(commit, ObjectType::Commit), fsync)
                 .await?;
             ctx.tombstoned.insert(commit);
         }
         Ok(())
     }
 
-    /// Unlinks one loose object. An absent file counts as a success.
+    /// Unlinks one loose object. An absent file counts as a success. With
+    /// `fsync`, the call syncs the `objects/<xx>` directory of the object
+    /// after the unlink.
     ///
     /// Before it unlinks a commit object, the call removes the composefs
     /// image of the commit, as [`fsck_unlink_image`](Repo::fsck_unlink_image)
     /// does. So the run leaves no image whose commit it removed.
-    async fn fsck_unlink_object(&self, name: ObjectName) -> Result<()> {
+    ///
+    /// The unlink follows no symlink at `objects/<xx>`. Such a symlink gives
+    /// [`Error::InvalidFormat`], and the run stops.
+    async fn fsck_unlink_object(&self, name: ObjectName, fsync: bool) -> Result<()> {
         if name.ty == ObjectType::Commit {
-            self.fsck_unlink_image(&name.checksum).await?;
+            self.fsck_unlink_image(&name.checksum, fsync).await?;
         }
         let repo = self.clone();
         let path = name.loose_path(repo.mode());
         ostrya_rt::unblock(move || {
-            match rustix::fs::unlinkat(repo.objects_fd(), path.as_str(), AtFlags::empty()) {
-                Ok(()) | Err(Errno::NOENT) => Ok(()),
-                Err(e) => Err(Error::Io(e.into())),
-            }
+            repo.objects()
+                .remove_file(&path, fsync)
+                .map(drop)
+                .map_err(|e| crate::read::object_path_error(e, &path).into())
         })
         .await
     }
 
     /// Removes the composefs image of `commit`. An absent image counts as a
-    /// success.
-    async fn fsck_unlink_image(&self, commit: &Checksum) -> Result<()> {
+    /// success. With `fsync`, the call syncs the directory of the image after
+    /// the removal.
+    async fn fsck_unlink_image(&self, commit: &Checksum, fsync: bool) -> Result<()> {
         let repo = self.clone();
         let commit = *commit;
         ostrya_rt::unblock(move || {
-            crate::image_store::unlink_blocking(repo.root_dir(), [commit], false)
+            crate::image_store::unlink_blocking(repo.root_dir(), [commit], fsync)
         })
         .await
     }
 
-    /// Writes the `state/<commit>.commitpartial` marker of a commit.
-    async fn mark_commit_partial(&self, commit: &Checksum) -> Result<()> {
-        let path = crate::pull::partial_path(commit);
-        let repo = self.clone();
-        ostrya_rt::unblock(move || write_partial_marker(repo.repo_fd(), &path, repo.mode())).await
+    /// Writes the `state/<commit>.commitpartial` marker of each of
+    /// `commits`, which holds the one state byte of the `ostree` command, in
+    /// one trip to the blocking pool.
+    ///
+    /// The call opens `state/` one time, and makes it if it is absent. It
+    /// creates each marker with `O_EXCL` and writes the byte into the new
+    /// file. An entry that is present at the name of a marker, of any type,
+    /// stays as it is, and the call writes nothing into it. A symlink at the
+    /// name is such an entry, so the call does not write through it. With
+    /// `fsync`, the call syncs `state/` after the create of each marker. It
+    /// does not sync the content of a marker.
+    ///
+    /// A symlink or an entry that is not a directory at `state` gives
+    /// [`Error::InvalidFormat`].
+    async fn mark_commits_partial(&self, commits: Vec<Checksum>, fsync: bool) -> Result<()> {
+        self.create_partial_markers(commits, &[PARTIAL_STATE_BYTE], fsync)
+            .await
     }
 }
 
@@ -1828,39 +1876,151 @@ fn walk_subtree<'a, S: WalkSink + Send>(
     })
 }
 
-/// Creates or truncates a `.commitpartial` marker that holds the one state
-/// byte of the `ostree` command.
-///
-/// In a `bare-user-shared` repository, a marker that this call creates gets
-/// the mode [`perm::SHARED_FILE_MODE`]. For this reason the create attempt
-/// has `O_EXCL`, which separates the arm that made the file from the arm that
-/// found one. A marker that another member of the repository group owns keeps
-/// its mode, and the call truncates it in place.
-///
-/// The second open also has `O_CREAT`. A concurrent pull or prune removes the
-/// marker of a commit that it completes or deletes, and the name can be free
-/// again when this call reaches it.
-fn write_partial_marker(repo_fd: BorrowedFd<'_>, path: &str, repo_mode: RepoMode) -> Result<()> {
-    let mode = Mode::from_raw_mode(crate::pull::PARTIAL_MARKER_MODE);
-    let fd = match rustix::fs::openat(
-        repo_fd,
-        path,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-        mode,
-    ) {
-        Ok(fd) => {
-            perm::force_created_mode(&fd, repo_mode, perm::SHARED_FILE_MODE)?;
-            fd
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, symlink};
+    use std::path::{Path, PathBuf};
+
+    use ostrya_core::RepoMode;
+
+    use super::*;
+
+    /// A temp directory that the drop removes.
+    struct Scratch {
+        path: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let path = std::env::temp_dir().join(format!(
+                "ostrya-fsck-{tag}-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Scratch { path }
         }
-        Err(Errno::EXIST) => rustix::fs::openat(
-            repo_fd,
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    /// Creates an `archive` repository at `repo` below `base`.
+    fn repo_in(base: &Path) -> Repo {
+        ostrya_rt::block_on(Repo::create(
+            &base.join("repo"),
+            crate::CreateOptions::new(RepoMode::Archive),
+        ))
+        .unwrap()
+    }
+
+    /// Returns the path of the marker of `commit` in the repository at
+    /// `repo` below `base`.
+    fn marker_of(base: &Path, commit: &Checksum) -> PathBuf {
+        base.join("repo/state")
+            .join(crate::pull::partial_name(commit))
+    }
+
+    /// Makes a FIFO at `path`.
+    fn mkfifo(path: &Path) {
+        rustix::fs::mknodat(
+            rustix::fs::CWD,
             path,
-            OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::CLOEXEC,
-            mode,
-        )?,
-        Err(e) => return Err(e.into()),
-    };
-    std::fs::File::from(fd)
-        .write_all(&[PARTIAL_STATE_BYTE])
-        .map_err(Error::Io)
+            rustix::fs::FileType::Fifo,
+            rustix::fs::Mode::from_raw_mode(0o644),
+            0,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_marker_holds_the_state_byte_with_the_mode_of_a_new_file() {
+        let scratch = Scratch::new("marker-new");
+        let repo = repo_in(&scratch.path);
+        let commit = Checksum::sha256(b"commit");
+        let _ = std::fs::remove_dir_all(scratch.path.join("repo/state"));
+
+        ostrya_rt::block_on(repo.mark_commits_partial(vec![commit], true)).unwrap();
+        let marker = marker_of(&scratch.path, &commit);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"f");
+        let reference = scratch.path.join("repo/state/reference");
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&reference)
+            .unwrap();
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
+        assert_eq!(mode(&marker), mode(&reference));
+    }
+
+    /// An entry at the name of the marker stays as it is, and the marking
+    /// succeeds with no write. A symlink is not followed, and a FIFO is not
+    /// opened.
+    #[test]
+    fn an_entry_at_the_marker_name_stays_and_the_marking_succeeds() {
+        for case in ["empty", "symlink", "dangling", "fifo", "directory"] {
+            let scratch = Scratch::new("marker-entry");
+            let repo = repo_in(&scratch.path);
+            let commit = Checksum::sha256(b"commit");
+            let marker = marker_of(&scratch.path, &commit);
+            std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+            let target = scratch.path.join("target");
+            std::fs::write(&target, b"target").unwrap();
+            match case {
+                "empty" => std::fs::write(&marker, b"").unwrap(),
+                "symlink" => symlink(&target, &marker).unwrap(),
+                "dangling" => symlink(scratch.path.join("missing"), &marker).unwrap(),
+                "fifo" => mkfifo(&marker),
+                _ => std::fs::create_dir(&marker).unwrap(),
+            }
+            let before = std::fs::symlink_metadata(&marker).unwrap();
+
+            ostrya_rt::block_on(repo.mark_commits_partial(vec![commit], true)).unwrap();
+            let after = std::fs::symlink_metadata(&marker).unwrap();
+            assert_eq!(after.ino(), before.ino(), "{case}");
+            assert_eq!(after.file_type(), before.file_type(), "{case}");
+            assert_eq!(after.len(), before.len(), "{case}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"target", "{case}");
+            assert!(!scratch.path.join("missing").exists(), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_symlink_at_state_fails_the_marking() {
+        let scratch = Scratch::new("marker-state-link");
+        let repo = repo_in(&scratch.path);
+        let commit = Checksum::sha256(b"commit");
+        let outside = scratch.path.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let state = scratch.path.join("repo/state");
+        let _ = std::fs::remove_dir_all(&state);
+        symlink(&outside, &state).unwrap();
+
+        let err = ostrya_rt::block_on(repo.mark_commits_partial(vec![commit], false)).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn the_unlink_of_an_object_refuses_a_symlinked_fanout() {
+        let scratch = Scratch::new("unlink-fanout-link");
+        let repo = repo_in(&scratch.path);
+        let name = ObjectName::new(Checksum::sha256(b"object"), ObjectType::File);
+        let path = name.loose_path(RepoMode::Archive);
+        let (fanout, leaf) = path.split_once('/').unwrap();
+        let outside = scratch.path.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join(leaf), b"object").unwrap();
+        let link = scratch.path.join("repo/objects").join(fanout);
+        let _ = std::fs::remove_dir_all(&link);
+        symlink(&outside, &link).unwrap();
+
+        let err = ostrya_rt::block_on(repo.fsck_unlink_object(name, true)).unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        assert_eq!(std::fs::read(outside.join(leaf)).unwrap(), b"object");
+    }
 }

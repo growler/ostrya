@@ -2641,9 +2641,13 @@ The port's prune also removes, on every run without `--no-prune` and without
 the store and each `state/<commit>.commitpartial` marker whose commit is
 absent. These are the leftovers of a run that stopped part way through. Every
 prune skips a delta name that does not decode and leaves that entry in place.
-This is a port behavior. The tool's handling of the two leftovers is not
-observed. `../format-reference.md`, "Prune removal order", states the rule
-and the order in which the port's prune removes a commit and its content.
+The marker sweep unlinks a symlink and a FIFO at the name of such a marker,
+and keeps a directory. With `[core] fsync`, it runs `fsync` on `state/` one
+time after its last unlink. This is a port behavior. The tool's handling of
+the two leftovers is not observed. The tool unlinks the marker of each commit
+that it deletes, before the commit object. `../format-reference.md`, "Prune
+removal order", states the rule and the order in which the port's prune
+removes a commit and its content.
 
 Both implementations hold the repository lock for the whole of a prune, and
 both take it exclusive. Measured against `ostree` 2026.1 on an archive
@@ -4126,12 +4130,14 @@ both. Three differences stand:
   ref, and `refs/remotes`, where the ref write creates `refs/remotes/<remote>`.
   A later pull from the same remote syncs `refs/remotes/<remote>` alone. Under
   `--mirror` the port also syncs the temp file of the summary in `tmp/` with
-  `fsync`, and the repository root. The
-  tool makes none of these syncs. The count over corpus `C0` is 13 in the port
-  and 11 in the tool, and 14 and 11 under `--mirror`. For a pulled commit that
+  `fsync`, and the repository root. The port syncs `state/` after the create
+  of each `.commitpartial` marker, and one time after the removal of the
+  markers. The
+  tool makes none of these syncs. The count over corpus `C0` is 15 in the port
+  and 11 in the tool, and 16 and 11 under `--mirror`. For a pulled commit that
   carries detached metadata, the port syncs the fanout directory of the
   `.commitmeta` file after the rename into `objects/`, which the tool does not,
-  and neither syncs the file itself: 14 in the port and 11 in the tool, and 15
+  and neither syncs the file itself: 16 in the port and 11 in the tool, and 17
   and 11 under `--mirror`. `--disable-fsync` turns every one of them off;
 - a value given to either switch. The tool reads and discards an `=VALUE`
   suffix, so `--disable-fsync=false` disables fsync and
@@ -4364,10 +4370,11 @@ refuses each of these seven options with `error: Unknown option <option>` at exi
 object hardlinked from the source is not synced, in both, so from `archive`
 into `archive` `--per-object-fsync` adds no call. The same three differences
 stand, with `refs/heads` in place of `refs/remotes/<remote>` and no summary:
-the count over corpus `C0` is 12 in the port and 11 in the tool, and 13 and 11
-for a commit that carries detached metadata. `pull-local` takes neither
-`--subpath` nor `--http-trusted` in either: the tool reports `error: Unknown
-option <option>` at exit 1, and `clap` refuses the option at exit 1. The
+the count over corpus `C0` is 14 in the port and 11 in the tool, and 15 and 11
+for a commit that carries detached metadata. The two syncs of `state/` for
+the `.commitpartial` marker are in the count of the port. `pull-local` takes
+neither `--subpath` nor `--http-trusted` in either: the tool reports `error:
+Unknown option <option>` at exit 1, and `clap` refuses the option at exit 1. The
 library's local pull refuses a subpath with `unsupported: a local pull takes no
 subpath`. A `--depth` below `-1` is refused in both, as on `pull`: the tool
 ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
@@ -7452,6 +7459,30 @@ Observed by running the tool (2026.1).
   repository with an absolute symlink at `state`, the commands of the first
   list above exit 0, and `pull-local --commit-metadata-only` writes
   `state/<checksum>.commitpartial` through the symlink.
+  A symlink at `state`, or an entry there that is not a directory, also
+  fails each write and each removal of a marker in the port. `pull` and
+  `pull-local` fail at the write of the first marker, before they stage an
+  object of that commit, with `invalid format: state passes through a
+  symlink; ostrya refuses a symlink in the repository` or `invalid format:
+  state is not a directory`. `fsck` fails at the read of the first commit
+  state, before it writes a marker. `prune` fails with the same text after
+  its walk and before it removes a ref or an object, and a `--no-prune` run
+  fails in the same way. The removal of the markers after a receive gives one
+  warning with the text. A pull and `fsck` make `state` if it is absent. With
+  libostree 2026.4 on 2026-11-16, against a repository with an absolute
+  symlink at `state` to a directory outside the repository, `fsck` writes the
+  marker in the target of the symlink and exits 0.
+  The port does not follow a symlink at the name of a marker and does not
+  open a FIFO there. A pull and `fsck` keep each entry of any type at the
+  name of a marker, and write nothing into it. The removal of a marker by a
+  pull, a receive, and `prune` unlinks a symlink and a FIFO, and the target
+  of a symlink stays. A directory at the name of a marker fails a pull with
+  `Is a directory`, gives a warning in a receive, and stays in a prune. With
+  libostree 2026.4 on 2026-11-16, `fsck` of the tool skips a commit whose
+  marker opens for read, also through a symlink, so it writes over no
+  marker. A dangling symlink at the name of the marker makes its
+  `O_CREAT|O_EXCL` create fail with `EEXIST`, and the tool writes nothing and
+  reports no error.
   A symlink at `tmp` or at `tmp/cache`, or an entry that is not a directory
   there, fails the begin of each transaction in the port, for example in
   `commit` and `pull-local`, with `invalid format: tmp passes through a
@@ -7842,6 +7873,44 @@ Observed by running the tool (2026.1).
     rename. They make no sync call. When a `.tombstone-commit` exists, `prune`
     writes no file, and the existing file keeps its content and its mode. The
     port replaces the existing file with the 78-byte marker at `0644`.
+- The port syncs the `.commitpartial` markers, and the directories of the
+  removals of `prune` and of `fsck --delete`, by `[core] fsync` or by the
+  `fsync` switch of the transaction of a pull. `--disable-fsync` and
+  `[core] fsync=false` turn each of these syncs off
+  (`../format-reference.md`, "Commit-state markers" and "Prune removal
+  order").
+  - `pull`, `pull-local`, and `fsck` run `fsync` on `state/` after the
+    create of each marker. They sync no marker content.
+  - `pull`, `pull-local`, and a receive run `fsync` on `state/` one time
+    after the removal of their markers. Over corpus `C0`, a pull of one
+    commit therefore makes two more sync calls in the port
+    (`pull_fsync_switches_control_the_syscalls` and
+    `pull_local_fsync_switches_control_the_syscalls` in
+    `crates/ostrya-cli/tests/cli.rs`).
+  - `prune` runs `fsync` one time on each `objects/<xx>` from which the
+    content phase removed an object, at the end of that phase, and one time
+    on `state/` after the leftover sweep unlinks a marker.
+  - `fsck --delete` runs `fsync` on `objects/<xx>` after the unlink of each
+    object, and on the directory of each composefs image that it removes.
+    It writes the markers of the run before it unlinks the objects.
+    `fsck --add-tombstones` runs `fsync` on `objects/<xx>` after the unlink
+    of each commit that it deletes, and on the directory of the composefs
+    image of the commit after the removal of the image.
+  The observations below come from `strace` of the tool, libostree 2026.4,
+  on 2026-11-16.
+  - `fsck` creates the marker with `openat(repo,
+    "state/<checksum>.commitpartial",
+    O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0644)` and writes the byte
+    `f`. It makes no `state/` and runs no `fsync`, `fdatasync`, or `syncfs`
+    on the marker, on `state/`, or on the root.
+  - `fsck --delete` unlinks the corrupt object with `unlinkat(objects,
+    "<xx>/<name>")` first, and then creates and writes the marker. It syncs
+    no `objects/<xx>` and no `state/`.
+  - `prune --refs-only` with no `[core] fsync` key runs no `fsync`,
+    `fdatasync`, `syncfs`, or `sync_file_range`. For each commit that it
+    deletes, it unlinks `state/<checksum>.commitpartial` with
+    `unlinkat(repo, ...)`, which gives `ENOENT` for an absent marker, then
+    the `.commitmeta`, and then the commit object.
 - `init --mode=<mode>` rejects a mode it does not recognize with `error:
   Invalid mode '<mode>' in repository configuration` and exits 1, before
   writing anything to the target directory. Confirmed for an unknown string

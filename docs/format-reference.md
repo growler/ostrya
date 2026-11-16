@@ -1201,14 +1201,59 @@ marker is local state and does not enter any checksum.
 `conformance/cli-surface.md`, "P2", `pull`, records the markers that a failed
 pull leaves.
 
-No writer syncs a marker or the `state/` directory. A local pull creates every
-marker before its first stage. A pull from a remote creates the marker of a
-commit in the step that fetches that commit. Each marker exists before the
-transaction commits. So the `syncfs` at the start of publication makes the
-marker durable before the first object rename. The removal
-is the last operation of the pull, and no barrier follows it. So a crash
-immediately after a successful pull can restore the marker of a complete commit.
-`fsck` writes its marker with no barrier, and a new `fsck` run writes it again.
+The port writes and removes each marker relative to a handle of `state/`. The
+open of `state/` follows no symlink. A symlink or an entry that is not a
+directory at `state` fails the operation with an `InvalidFormat` error:
+
+- A pull fails at the write of its first marker, before it stages an object
+  of that commit.
+- `fsck` fails at the check of the first commit state, before it writes a
+  marker.
+- A prune fails after its walk and before it removes a ref or an object. A
+  `--no-prune` run fails in the same way.
+- The removal of the markers after a receive gives one warning.
+
+A writer that finds no `state/` makes it. Each port writer creates a marker
+with `O_CREAT|O_EXCL|O_NOFOLLOW` and the mode 0644, which the umask reduces.
+In a `bare-user-shared` repository, the port forces the mode 0644 on a marker
+that it creates.
+An entry of any type at the name of a marker stays as it is. A symlink at the
+name is such an entry, so no writer writes through it, and no writer opens a
+FIFO at the name. A pull then keeps the entry and reads the commit as partial.
+`fsck` writes the byte `0x66` into a marker that it creates, and writes
+nothing into an entry that is present. Each removal of a marker is one
+`unlinkat` in `state/`. It unlinks a symlink and keeps its target. A directory
+at the name of a marker gives `EISDIR`: a pull fails with it, a receive gives
+a warning, and the leftover sweep of a prune keeps the directory.
+
+The port syncs the markers under `[core] fsync`, or under the `fsync` switch of
+the transaction of a pull. With `fsync`, each writer syncs `state/` after the
+create of each marker, and syncs no marker content. A pull and a receive sync
+`state/` one time after the removal of their markers, if they removed an
+entry. The leftover sweep of a prune does the same. With no `fsync`, no
+writer syncs a marker or `state/`.
+
+A local pull creates every marker before its first stage. A pull from a
+remote creates the marker of a commit in the step that fetches that commit.
+Each marker exists before the transaction commits. So the `syncfs` at the
+start of publication makes the marker durable before the first object
+rename, also with no `fsync`. The removal is the last operation of the pull.
+With no `fsync`, no barrier follows it, so a crash immediately after a
+successful pull can restore the marker of a complete commit. `fsck --delete`
+writes its markers before it unlinks the objects. With `fsync`, each marker
+is durable before the first unlink.
+
+The tool writes a marker with no `O_NOFOLLOW`. As observed, `fsck` of the tool
+writes the marker with
+`openat(repo, "state/<checksum>.commitpartial", O_WRONLY|O_CREAT|O_EXCL|O_NOCTTY|O_CLOEXEC, 0644)`
+and then writes the byte `f`. It makes no `state/`. With `state` a symlink to
+a directory outside the repository, it writes the marker in the target of the
+symlink, and gives no error. A dangling symlink at the name of the marker
+makes the create fail with `EEXIST`: the tool writes nothing and reports no
+error. The tool skips a commit whose marker opens for read, also through a
+symlink, so it never writes over a marker. `fsck --delete` of the tool unlinks
+the object first, and then writes the marker.
+
 The tool `pull-local` runs these syscalls in this order:
 
 1. `openat(state/<checksum>.commitpartial, O_WRONLY|O_CREAT|O_EXCL, 0644)`;
@@ -1219,7 +1264,8 @@ The tool `pull-local` runs these syscalls in this order:
 6. the `unlinkat` of the marker, as its last syscall.
 
 The tool `fsck` runs no `fsync`, `fdatasync`, or `syncfs` in a run that writes a
-marker.
+marker, also with `--delete`: it syncs no `objects/<xx>`, no `state/`, and not
+the root.
 
 ### Old entries in `tmp/`
 
@@ -1315,8 +1361,11 @@ such a commit is damage that no reader reports.
    each directory. If `[core] fsync` is false, a crash gives no guarantee of
    the order in which the removals reach the disk.
 4. The content phase. The port removes each other doomed object, in any
-   order.
-5. The leftover sweep. See below.
+   order. If `[core] fsync` is true, it then syncs each `objects/` fanout
+   directory in which the content phase removed an entry, one time for each
+   directory.
+5. The leftover sweep. See below. If `[core] fsync` is true, the sweep syncs
+   `state/` one time after the last unlink of a marker, if it unlinked one.
 
 Each image goes before its commit. If `[core] fsync` is true, each image
 removal is durable before the port unlinks the first commit object. A stop or
@@ -1359,7 +1408,18 @@ removes them after the content phase:
   whose source commit is absent and whose target commit is present stays. A
   delta name that does not decode names no commit, and its entry stays.
 - each `state/<commit>.commitpartial` marker whose commit is absent from the
-  store. A name that is not a marker name in lowercase hex stays.
+  store. The sweep lists `state/` one time. It unlinks a symlink at the name
+  of such a marker and keeps its target, and it unlinks a FIFO. A directory,
+  a name that is not UTF-8, and a name that is not a marker name in lowercase
+  hex stay.
+
+Each prune, a `--no-prune` run included, opens `state/` after the walk and
+before its first removal, the removal of a weak ref included. The leftover
+sweep reads `state/` through this handle. A symlink or an entry that is not a
+directory at `state` fails the run before it removes anything. A repository
+with no `state/` has no marker to remove. Each unlink of an object follows no
+symlink at `objects/<xx>`. Such a symlink fails the run with an
+`InvalidFormat` error.
 
 The prune of a bucket repository deletes its keys in the same order
 ("The prune of a bucket repository").
@@ -1379,7 +1439,11 @@ after the prune lists the store.
 
 The leftover sweep is a port behavior. The tool's handling of a static delta
 whose target commit is absent, and of a marker whose commit is absent, is not
-observed.
+observed. As observed, the prune of the tool unlinks the marker of each commit
+that it deletes, with `unlinkat(repo, "state/<checksum>.commitpartial")`, and
+then the `.commitmeta` and the commit object. The tool gets `ENOENT` for an
+absent marker. A `--refs-only` prune of the tool with `[core] fsync` unset
+runs no `fsync`, `fdatasync`, `syncfs`, or `sync_file_range`.
 
 ### Static delta directories
 
@@ -4952,7 +5016,8 @@ that a receive uses. A receive uses them in this order:
 4. The server commits the transaction. The transaction releases the
    repository lock at the end of this step.
 5. The server removes `state/<commit>.commitpartial` of each commit of the
-   session.
+   session. With `[core] fsync`, it syncs `state/` one time after the last
+   unlink ("Commit-state markers").
 6. If the policy regenerates the summary and a ref changed, the server builds
    the summary. It signs the summary with each key of `sign-summary` of
    `[ex-ostrya server]`, GPG keys first. Then it removes
@@ -7580,9 +7645,8 @@ process removes the file between the two opens, the port runs the exclusive
 create one more time, and forces the mode on the new file ("Repository lock
 and staging").
 
-A `.commitpartial` marker has a second open after an exclusive create fails.
-Another process can remove the entry between the two opens. Then the second
-open creates the entry, and the port does not force its mode.
+A `.commitpartial` marker has one exclusive create. An entry that exists at
+its name stays as it is, and keeps its mode.
 
 02770 gives no permission to others. The objects are 0644, which each user
 can read. So the directory permissions keep other users out of the

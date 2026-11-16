@@ -36,9 +36,11 @@
 //! - a pull from a remote with [`subpaths`](PullOptions::subpaths), which
 //!   fetched part of the content.
 //!
-//! The pull does not write over a marker that is present. So the one-byte
-//! state that fsck writes stays after a pull over the commit that it
-//! marked.
+//! The pull does not write over an entry that is present at the name of a
+//! marker. So the one-byte state that fsck writes stays after a pull over
+//! the commit that it marked. The pull makes `state/` if it is absent. A
+//! symlink or an entry that is not a directory at `state` fails the pull
+//! with [`Error::InvalidFormat`] before it stages an object of the commit.
 //!
 //! If a pull returns an error, it removes the markers that it wrote for
 //! commits that this repository does not hold. Its transaction published
@@ -49,24 +51,32 @@
 //!
 //! # Marker durability
 //!
-//! The pull does not fsync a marker or `state/`, as the `ostree` command
-//! does. The markers stay unsynced under each option.
+//! The markers follow the `fsync` rule of the transaction of the pull:
+//! `[core] fsync`, or `false` with
+//! [`disable_fsync`](PullOptions::disable_fsync). With `fsync`, the pull
+//! syncs `state/` after the create of each marker, and syncs `state/` one
+//! time after the removal of its markers. It syncs no marker content,
+//! because a marker of a pull has no content.
 //!
 //! The pull writes each marker before [`Transaction::commit`]. So the
 //! `syncfs` at the start of publication makes the marker durable before the
-//! first object rename. A staged object enters `objects/` in that rename,
-//! so no staged object is reachable before the marker that guards it is
-//! durable.
+//! first object rename, also with no `fsync`. A staged object enters
+//! `objects/` in that rename, so no staged object is reachable before the
+//! marker that guards it is durable.
 //!
 //! A local pull writes all its markers before the first import. A pull
 //! from a remote writes the marker of each commit in the step that fetched
 //! that commit.
 //!
-//! The removal of the markers is the last operation of the pull, and no
-//! barrier follows it. So a crash right after a successful pull can leave a
-//! marker on a complete commit. This costs availability, and the
-//! integrity of the repository stays. Checkout refuses the commit until
-//! the next pull of it, or a prune of it, clears the marker.
+//! The removal of the markers is the last operation of the pull. The pull
+//! removes all its markers in one pass, also when the removal of one marker
+//! fails, and then returns the first error. The removal unlinks a symlink
+//! or a FIFO at the name of a marker, and the target of a symlink stays. A
+//! directory at the name of a marker gives [`Error::Io`] with `EISDIR`.
+//! With no `fsync`, a crash right after a successful pull can leave a marker
+//! on a complete commit. This costs availability, and the integrity of the
+//! repository stays. Checkout refuses the commit until the next pull of it,
+//! or a prune of it, clears the marker.
 //!
 //! # Concurrency
 //!
@@ -203,6 +213,7 @@
 //! [`Fetcher`]: crate::fetch::Fetcher
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -211,15 +222,13 @@ use futures_lite::AsyncReadExt;
 use ostrya_core::{
     Checksum, Commit, ContentHasher, DirTree, ObjectName, ObjectType, Ref, RepoMode, Value,
 };
-use rustix::fs::{AtFlags, Mode, OFlags};
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
-use crate::perm;
 use crate::refs::{ref_relpath, refspec_ref};
 use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
-use crate::repo_fs::{FsError, FsResultExt, RootFile};
+use crate::repo_fs::{FsError, FsResultExt, RepoDir, RepoLayout, RootFile};
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
@@ -244,11 +253,6 @@ pub use collection::{
 
 /// The chunk size of a streamed read of the payload of a content object.
 const READ_CHUNK: usize = 128 * 1024;
-
-/// The mode that a `state/<commit>.commitpartial` marker is created with,
-/// before the process umask. In a `bare-user-shared` repository an `fchmod`
-/// after the create sets [`perm::SHARED_FILE_MODE`].
-pub(crate) const PARTIAL_MARKER_MODE: u32 = 0o644;
 
 /// The flags of a pull.
 ///
@@ -1812,6 +1816,11 @@ impl Repo {
     ///   file, that is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or that has a
     ///   symlink on its path.
+    /// - [`Error::InvalidFormat`] if `state` is a symlink or is not a
+    ///   directory. The pull fails at the write of its first marker, before
+    ///   it imports an object.
+    /// - [`Error::Io`] with `EISDIR` if a directory is at the name of a
+    ///   marker that the pull removes after its transaction commits.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read. Also if the read of a ref file of
     ///   `src` fails, for example with `EACCES`, or if the path of a requested
@@ -2137,6 +2146,8 @@ impl Repo {
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, &opts);
+        // The markers follow the `fsync` rule of the transaction.
+        let marker_fsync = txn.fsync_flags()?.0;
 
         // The markers that the pull writes. The list is outside the span that
         // writes them, so a failure in that span clears the markers that it
@@ -2148,19 +2159,22 @@ impl Repo {
             // failure must not demote a complete commit. The plan of the tree
             // reads the same answer and plans nothing for a complete commit.
             // The intermediate commits of the chains come first, with one
-            // batched check. `marked` takes each commit before the write of
-            // its marker, so the cleanup also sees a marker that a failed
-            // write created.
+            // batched check and one batched write. `marked` takes each commit
+            // before the write of its marker, so the cleanup also sees a
+            // marker that a failed write created.
             let level_commits: Vec<Checksum> = deltas.levels().iter().flatten().copied().collect();
             let mut held_levels: HashSet<Checksum> = HashSet::new();
+            let mut to_mark = Vec::new();
             for (commit, held) in chain::check_complete(self, &level_commits).await? {
                 if held {
                     held_levels.insert(commit);
                 } else {
-                    marked.push(commit);
-                    self.write_partial_marker(&commit).await?;
+                    to_mark.push(commit);
                 }
             }
+            marked.extend_from_slice(&to_mark);
+            self.create_partial_markers(to_mark, &[], marker_fsync)
+                .await?;
             // The other commits follow, with one batched check.
             let walked: Vec<Checksum> = commits
                 .iter()
@@ -2171,13 +2185,16 @@ impl Repo {
             let walked = commits
                 .iter_mut()
                 .filter(|commit| !done.contains(&commit.checksum));
+            let mut to_mark = Vec::new();
             for (commit, (_, held)) in walked.zip(states) {
                 commit.held = held;
                 if !held {
-                    marked.push(commit.checksum);
-                    self.write_partial_marker(&commit.checksum).await?;
+                    to_mark.push(commit.checksum);
                 }
             }
+            marked.extend_from_slice(&to_mark);
+            self.create_partial_markers(to_mark, &[], marker_fsync)
+                .await?;
 
             let checks = ModeChecks::new(flags, self.mode());
             let delta_source = delta::DeltaSource::Local(src);
@@ -2352,7 +2369,8 @@ impl Repo {
         let stats = match published {
             Ok(stats) => stats,
             Err(e) => {
-                self.clear_markers_for_absent_commits(&marked).await;
+                self.clear_markers_for_absent_commits(&marked, marker_fsync)
+                    .await;
                 return Err(e);
             }
         };
@@ -2360,9 +2378,8 @@ impl Repo {
         // The content that a marker guarded is published. A commit-only pull
         // keeps its markers, because it did not walk the trees.
         if completes_marked(&opts) {
-            for commit in &marked {
-                self.remove_partial_marker(commit).await?;
-            }
+            self.clear_markers(std::mem::take(&mut marked), marker_fsync)
+                .await?;
         }
 
         Ok(PullStats {
@@ -2609,32 +2626,60 @@ impl Repo {
         Ok(())
     }
 
-    /// Writes the zero-length `state/<commit>.commitpartial` marker of a
-    /// commit, which a pull keeps while the objects of the commit are in
-    /// flight.
+    /// Creates the `state/<commit>.commitpartial` marker of each of
+    /// `commits` in one trip to the blocking pool, and writes `content` into
+    /// each marker that the call creates.
     ///
-    /// The call does not write over a marker that is present, so the one-byte
-    /// state that fsck writes stays. The `ostree` command does the same: its
-    /// `pull-local` opens a marker that is present read-only, and creates a
-    /// marker with `O_EXCL`.
+    /// A pull writes zero-length markers, which it keeps while the objects of
+    /// the commits are in flight. fsck writes the one state byte of the
+    /// `ostree` command.
     ///
-    /// The module [`pull`](self) states the durability of the markers.
+    /// An empty list does nothing. The call opens `state/` one time, and makes
+    /// it if it is absent. It creates each marker with `O_EXCL`. With
+    /// `fsync`, it syncs `state/` after the create of each marker. It does not
+    /// sync the content of a marker.
     ///
-    /// In a `bare-user-shared` repository, a marker that this call creates gets
-    /// [`perm::SHARED_FILE_MODE`]. A marker that is present keeps its mode.
-    async fn write_partial_marker(&self, commit: &Checksum) -> Result<()> {
-        self.partial_marker_job(commit).await
+    /// The call does not write over an entry that is present at the name of
+    /// a marker, of any type, so the one-byte state that fsck writes stays.
+    /// The `ostree` command does the same: its `pull-local` opens a marker
+    /// that is present read-only, and creates a marker with `O_EXCL`.
+    ///
+    /// The module [`pull`](self) states the durability of the markers and the
+    /// errors. The call stops at the first error.
+    pub(crate) async fn create_partial_markers(
+        &self,
+        commits: Vec<Checksum>,
+        content: &'static [u8],
+        fsync: bool,
+    ) -> Result<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let repo = self.clone();
+        ostrya_rt::unblock(move || {
+            let state = open_or_make_state(repo.root_dir(), fsync)?;
+            for commit in &commits {
+                create_partial_marker(&state, commit, content, fsync)?;
+            }
+            Ok(())
+        })
+        .await
     }
 
-    /// Starts the write of the marker of `commit` on the blocking pool, as
-    /// [`write_partial_marker`](Repo::write_partial_marker) states it, and
-    /// returns the handle of the job.
+    /// Starts the create of the zero-length marker of `commit` on the
+    /// blocking pool, as
+    /// [`create_partial_markers`](Repo::create_partial_markers) creates one,
+    /// and returns the handle of the job.
     ///
     /// The job continues if the handle drops. A pull from a remote gives the
     /// handle to its transaction, so that a failed run waits for the job
     /// before its cleanup.
-    fn partial_marker_job(&self, commit: &Checksum) -> ostrya_rt::JoinHandle<Result<()>> {
-        let path = partial_path(commit);
+    fn partial_marker_job(
+        &self,
+        commit: &Checksum,
+        fsync: bool,
+    ) -> ostrya_rt::JoinHandle<Result<()>> {
+        let commit = *commit;
         let repo = self.clone();
         #[cfg(test)]
         let gate =
@@ -2642,65 +2687,67 @@ impl Repo {
         ostrya_rt::unblock_task(move || {
             #[cfg(test)]
             let _gate = crate::jobs::job_gate::pass(&gate, repo.repo_fd())?;
-            match rustix::fs::openat(
-                repo.repo_fd(),
-                path.as_str(),
-                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::CLOEXEC,
-                Mode::from_raw_mode(PARTIAL_MARKER_MODE),
-            ) {
-                Ok(fd) => {
-                    perm::force_created_mode(&fd, repo.mode(), perm::SHARED_FILE_MODE)?;
-                    Ok(())
-                }
-                Err(rustix::io::Errno::EXIST) => Ok(()),
-                Err(e) => Err(Error::from(e)),
-            }
+            let state = open_or_make_state(repo.root_dir(), fsync)?;
+            create_partial_marker(&state, &commit, &[], fsync)
         })
-    }
-
-    /// Removes the `.commitpartial` marker of a commit.
-    ///
-    /// An absent marker is a success. This is the last operation of a pull,
-    /// and no barrier follows it, as in the `ostree` command. If a crash occurs
-    /// before the unlink gets to the disk, the marker stays on a complete
-    /// commit. The next pull of that commit, or a prune of it, clears it.
-    async fn remove_partial_marker(&self, commit: &Checksum) -> Result<()> {
-        let path = partial_path(commit);
-        let repo = self.clone();
-        ostrya_rt::unblock(move || {
-            match rustix::fs::unlinkat(repo.repo_fd(), path.as_str(), AtFlags::empty()) {
-                Ok(()) | Err(rustix::io::Errno::NOENT) => Ok(()),
-                Err(e) => Err(Error::from(e)),
-            }
-        })
-        .await
     }
 
     /// Removes the `.commitpartial` marker of each of `commits` in one trip to
-    /// the blocking pool, as [`remove_partial_marker`](Repo::remove_partial_marker)
-    /// removes one.
+    /// the blocking pool.
+    ///
+    /// An empty list does nothing. An absent marker and an absent `state/` are
+    /// a success. The call
+    /// unlinks a symlink at the name of a marker, and its target stays. A
+    /// directory at the name of a marker gives `EISDIR` for that commit. With
+    /// `fsync`, the call syncs `state/` one time after the last unlink, if
+    /// it unlinked an entry.
+    ///
+    /// The removal is the last operation of a pull, and no barrier follows it
+    /// other than this sync. If a crash occurs before the unlink gets to the
+    /// disk, the marker stays on a complete commit. The next pull of that
+    /// commit, or a prune of it, clears it.
     ///
     /// Returns each commit whose marker stays, with the error, in the order of
-    /// `commits`.
-    #[cfg(feature = "receive")]
+    /// `commits`. The call tries each commit. The open of `state/` and its
+    /// sync give the outer error.
     pub(crate) async fn remove_partial_markers(
         &self,
         commits: Vec<Checksum>,
-    ) -> Vec<(Checksum, Error)> {
+        fsync: bool,
+    ) -> Result<Vec<(Checksum, Error)>> {
+        if commits.is_empty() {
+            return Ok(Vec::new());
+        }
         let repo = self.clone();
         ostrya_rt::unblock(move || {
-            commits
-                .into_iter()
-                .filter_map(|commit| {
-                    let path = partial_path(&commit);
-                    match rustix::fs::unlinkat(repo.repo_fd(), path.as_str(), AtFlags::empty()) {
-                        Ok(()) | Err(rustix::io::Errno::NOENT) => None,
-                        Err(e) => Some((commit, Error::from(e))),
-                    }
-                })
-                .collect()
+            let Some(state) = repo.root_dir().open_layout(RepoLayout::State).optional()? else {
+                return Ok(Vec::new());
+            };
+            let mut removed = false;
+            let mut failed = Vec::new();
+            for commit in commits {
+                match state.remove_file(&partial_name(&commit), false) {
+                    Ok(unlinked) => removed |= unlinked,
+                    Err(e) => failed.push((commit, Error::from(e))),
+                }
+            }
+            if removed && fsync {
+                state.sync()?;
+            }
+            Ok(failed)
         })
         .await
+    }
+
+    /// Removes the markers of `marked` after the transaction of a pull
+    /// published, and gives the outer error, or else the first error of a
+    /// commit after the call tries each commit.
+    async fn clear_markers(&self, marked: Vec<Checksum>, fsync: bool) -> Result<()> {
+        let failed = self.remove_partial_markers(marked, fsync).await?;
+        match failed.into_iter().next() {
+            Some((_, e)) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Removes the markers that a failed pull wrote for commits that this
@@ -2712,14 +2759,18 @@ impl Repo {
     /// commit partial and kept the marker, so the state byte that fsck writes
     /// is in it.
     ///
-    /// This function runs on the error path. It leaves a marker that it cannot
-    /// remove, so the pull reports the error that ended it.
-    async fn clear_markers_for_absent_commits(&self, marked: &[Checksum]) {
+    /// This function runs on the error path. It removes the markers in one
+    /// call of [`remove_partial_markers`](Repo::remove_partial_markers) with
+    /// `fsync`. It leaves a marker that it cannot remove, so the pull reports
+    /// the error that ended it.
+    async fn clear_markers_for_absent_commits(&self, marked: &[Checksum], fsync: bool) {
+        let mut absent = Vec::new();
         for commit in marked {
             if matches!(self.has_object(ObjectType::Commit, commit).await, Ok(false)) {
-                let _ = self.remove_partial_marker(commit).await;
+                absent.push(*commit);
             }
         }
+        let _ = self.remove_partial_markers(absent, fsync).await;
         #[cfg(test)]
         crate::jobs::job_gate::release(self.repo_fd());
     }
@@ -2740,6 +2791,39 @@ pub(crate) fn completes_marked(opts: &PullOptions) -> bool {
 /// the repository directory.
 pub(crate) fn partial_path(commit: &Checksum) -> String {
     format!("state/{}.commitpartial", commit.to_hex())
+}
+
+/// Returns the name of the partial marker of a commit in `state/`.
+pub(crate) fn partial_name(commit: &Checksum) -> String {
+    format!("{}.commitpartial", commit.to_hex())
+}
+
+/// Opens `state/` on the root handle `root` for the create of a marker, and
+/// makes it if it is absent. With `fsync`, the make of `state/` syncs the
+/// root. A symlink or an entry that is not a directory at `state` gives
+/// [`Error::InvalidFormat`].
+fn open_or_make_state(root: &RepoDir, fsync: bool) -> Result<RepoDir> {
+    Ok(match root.open_layout(RepoLayout::State).optional()? {
+        Some(state) => state,
+        None => root.ensure_layout(RepoLayout::State, fsync)?,
+    })
+}
+
+/// Creates the marker of `commit` in `state` with `O_EXCL`, and writes
+/// `content` into the new file. An entry that is present at the name of the
+/// marker stays as it is, and the call gives `Ok`. With `fsync`, the create
+/// syncs `state/`.
+fn create_partial_marker(
+    state: &RepoDir,
+    commit: &Checksum,
+    content: &[u8],
+    fsync: bool,
+) -> Result<()> {
+    match state.create_exclusive(&partial_name(commit), fsync) {
+        Ok(mut file) => file.write_all(content).map_err(Error::Io),
+        Err(FsError::Exists) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// The place of the refs of a pull.
@@ -4649,6 +4733,8 @@ pub(crate) mod import_seam {
 
 #[cfg(test)]
 mod tests {
+    use rustix::fs::{AtFlags, Mode, OFlags};
+
     use super::*;
 
     #[test]

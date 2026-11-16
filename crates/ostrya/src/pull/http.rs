@@ -779,6 +779,11 @@ impl Repo {
     ///   repository fails.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
     ///   update lock passes `[core] lock-timeout-secs`.
+    /// - [`Error::InvalidFormat`] if `state` is a symlink or is not a
+    ///   directory. The pull fails at the write of the marker of the first
+    ///   commit that it fetches, before it stages that commit.
+    /// - [`Error::Io`] with `EISDIR` if a directory is at the name of a
+    ///   marker that the pull removes after its transaction commits.
     /// - [`Error::Io`] for an I/O error of the file system.
     ///
     /// # Examples
@@ -1091,9 +1096,11 @@ impl Repo {
             },
         };
 
-        // The markers that the pull writes. They stay outside the span that
-        // writes them, so a failure in that span clears the markers it left.
+        // The markers that the pull writes, and the `fsync` rule of the
+        // transaction for them. They stay outside the span that writes them,
+        // so a failure in that span clears the markers it left.
         let mut marked = Vec::new();
+        let mut marker_fsync = false;
         let fetched = self
             .fetch_from(
                 &source,
@@ -1106,6 +1113,7 @@ impl Repo {
                 edges,
                 counters,
                 &mut marked,
+                &mut marker_fsync,
             )
             .await;
         // The source ends before the transaction commits. The stream source
@@ -1138,7 +1146,8 @@ impl Repo {
         let (stats, summary_bytes, signature) = match published {
             Ok(published) => published,
             Err(e) => {
-                self.clear_markers_for_absent_commits(&marked).await;
+                self.clear_markers_for_absent_commits(&marked, marker_fsync)
+                    .await;
                 return Err(e);
             }
         };
@@ -1147,9 +1156,8 @@ impl Repo {
         // keeps its markers, because it fetched no tree. A pull with subpaths
         // keeps them too, because it fetched part of each tree.
         if completes_marked(opts) {
-            for commit in &marked {
-                self.remove_partial_marker(commit).await?;
-            }
+            self.clear_markers(std::mem::take(&mut marked), marker_fsync)
+                .await?;
         }
 
         // A mirror pull of every ref holds all that the remote publishes, so
@@ -1222,7 +1230,8 @@ impl Repo {
     /// pull that follows dependencies then looks for the deltas of the
     /// dependencies that no run reached, and runs the plan one more time for
     /// them. The commits whose `.commitpartial` marker the pull wrote go into
-    /// `marked`.
+    /// `marked`. The `fsync` rule of the transaction for the markers goes
+    /// into `marker_fsync` when the transaction starts.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_from(
         &self,
@@ -1236,6 +1245,7 @@ impl Repo {
         edges: Option<Edges>,
         counters: &PullCounters,
         marked: &mut Vec<Checksum>,
+        marker_fsync: &mut bool,
     ) -> Result<FetchedPull> {
         let mut root;
         // The probe of a collection pull read this summary and checked it
@@ -1362,6 +1372,7 @@ impl Repo {
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, opts);
+        *marker_fsync = txn.fsync_flags()?.0;
         // A part of a later step of a chain can patch against an object that
         // an earlier step wrote. So the run of each level of intermediate
         // commits ends before the next run starts. The jobs of a level live
@@ -1396,6 +1407,7 @@ impl Repo {
                 counters,
                 &mut carry,
                 marked,
+                *marker_fsync,
             )
             .await?;
             drop(jobs);
@@ -1433,6 +1445,7 @@ impl Repo {
             counters,
             &mut carry,
             marked,
+            *marker_fsync,
         )
         .await?;
         drop(jobs);
@@ -1506,6 +1519,7 @@ impl Repo {
                 counters,
                 &mut carry,
                 marked,
+                *marker_fsync,
             )
             .await?;
         }
@@ -1777,6 +1791,9 @@ impl Repo {
     ///
     /// `marked` is an argument, so the caller holds the written markers when a
     /// step fails.
+    ///
+    /// `marker_fsync` is the `fsync` rule of the transaction for the markers,
+    /// which the caller reads one time.
     #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
@@ -1791,6 +1808,7 @@ impl Repo {
         progress: &PullCounters,
         carry: &mut Carry,
         marked: &mut Vec<Checksum>,
+        marker_fsync: bool,
     ) -> Result<()> {
         // A commit-only pull and a pull with subpaths take part of each commit.
         // They follow no dependency.
@@ -1812,6 +1830,7 @@ impl Repo {
             dependencies: whole,
             dependency_run: phase.dependency_run,
             marking: Mutex::new(Vec::new()),
+            marker_fsync,
             progress,
         };
         let mut plan = Plan::new(phase.subpaths);
@@ -2135,7 +2154,9 @@ impl Repo {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(checksum);
-            ctx.txn.track(self.partial_marker_job(&checksum)).await?;
+            ctx.txn
+                .track(self.partial_marker_job(&checksum, ctx.marker_fsync))
+                .await?;
         }
         // The pull stages the commit here, after its marker and before its
         // tree. The write hashes the bytes that the checks read and compares
@@ -2729,6 +2750,9 @@ struct StepCtx<'a> {
     /// hands each marker that it wrote to the cleanup, also the marker of a
     /// step that failed or that the run dropped in flight.
     marking: Mutex<Vec<Checksum>>,
+    /// The `fsync` rule of the transaction for the markers that a step
+    /// writes.
+    marker_fsync: bool,
     /// The live counters of the pull.
     progress: &'a PullCounters,
 }

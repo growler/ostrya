@@ -91,7 +91,8 @@ pub enum ReceiveStep {
     SummaryWrite,
     /// The removal of the partial marker of one commit of the session.
     ///
-    /// Each commit whose marker stays gets one warning.
+    /// Each commit whose marker stays gets one warning. A failure of the open
+    /// or of the sync of `state/` gives one warning for the whole removal.
     PartialMarker,
     /// The send of `CommitReply` to the client.
     ReplyNotDelivered,

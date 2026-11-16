@@ -410,3 +410,132 @@ fn a_delete_commit_run_removes_the_marker_of_the_named_commit() {
         );
     });
 }
+
+/// Makes a FIFO at `path`.
+fn mkfifo(path: &Path) {
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        path,
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+}
+
+/// A symlink or a file at `state` fails a prune, and a dry run, after the walk
+/// and before the run deletes a ref or an object.
+#[test]
+fn a_symlink_or_a_file_at_state_fails_the_prune_before_it_deletes_anything() {
+    for (case, no_prune) in [
+        ("symlink", false),
+        ("symlink", true),
+        ("file", false),
+        ("file", true),
+    ] {
+        let tmp = TmpDir::new("prune-state-entry");
+        let base = tmp.path();
+        block_on(async {
+            let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            commit(&repo, base, "kept", None, Some("main")).await;
+            let x = commit(&repo, base, "doomed", None, None).await;
+            let state = base.join("repo/state");
+            let _ = std::fs::remove_dir_all(&state);
+            let outside = base.join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            let outside_marker = outside.join(format!("{}.commitpartial", x.to_hex()));
+            std::fs::write(&outside_marker, b"").unwrap();
+            if case == "symlink" {
+                std::os::unix::fs::symlink(&outside, &state).unwrap();
+            } else {
+                std::fs::write(&state, b"").unwrap();
+            }
+            let before = repo.list_objects().await.unwrap();
+
+            let result = repo
+                .prune(&PruneOptions {
+                    refs_only: true,
+                    no_prune,
+                    ..PruneOptions::default()
+                })
+                .await;
+            assert!(
+                matches!(result, Err(ostrya::Error::InvalidFormat(_))),
+                "{case}, dry run {no_prune}: {result:?}"
+            );
+            assert_eq!(repo.list_objects().await.unwrap(), before, "{case}");
+            assert!(repo.has_object(ObjectType::Commit, &x).await.unwrap());
+            assert!(outside_marker.exists(), "{case}: the target stays");
+        });
+    }
+}
+
+#[test]
+fn a_prune_with_no_state_directory_removes_the_doomed_commit() {
+    let tmp = TmpDir::new("prune-no-state");
+    let base = tmp.path();
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        commit(&repo, base, "kept", None, Some("main")).await;
+        let x = commit(&repo, base, "doomed", None, None).await;
+        let _ = std::fs::remove_dir_all(base.join("repo/state"));
+
+        repo.prune(&PruneOptions {
+            refs_only: true,
+            ..PruneOptions::default()
+        })
+        .await
+        .unwrap();
+        assert!(!repo.has_object(ObjectType::Commit, &x).await.unwrap());
+        assert!(!base.join("repo/state").exists());
+    });
+}
+
+/// The leftover sweep unlinks a symlink and a FIFO at the name of a marker
+/// whose commit is absent, with no follow and no wait. A directory at such a
+/// name stays, and so does each name that is not a marker name in lowercase
+/// hex.
+#[test]
+fn the_marker_sweep_unlinks_a_symlink_and_a_fifo_and_keeps_a_directory_and_other_names() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TmpDir::new("prune-marker-types");
+    let base = tmp.path();
+    block_on(async {
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        commit(&repo, base, "kept", None, Some("main")).await;
+        let [link, fifo, dir] = [b"link", b"fifo", b"dir!"].map(|seed| Checksum::sha256(seed));
+        let state = base.join("repo/state");
+        std::fs::create_dir_all(&state).unwrap();
+        let target = base.join("target");
+        std::fs::write(&target, b"target").unwrap();
+        std::os::unix::fs::symlink(&target, marker(base, &link)).unwrap();
+        mkfifo(&marker(base, &fifo));
+        std::fs::create_dir(marker(base, &dir)).unwrap();
+        let upper = state.join(format!(
+            "{}.commitpartial",
+            Checksum::sha256(b"upper").to_hex().to_uppercase()
+        ));
+        std::fs::write(&upper, b"").unwrap();
+        let other = state.join("notes.txt");
+        std::fs::write(&other, b"").unwrap();
+        let not_utf8 = state.join(OsStr::from_bytes(b"\xff.commitpartial"));
+        std::fs::write(&not_utf8, b"").unwrap();
+
+        repo.prune(&PruneOptions::default()).await.unwrap();
+        assert!(std::fs::symlink_metadata(marker(base, &link)).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        assert!(std::fs::symlink_metadata(marker(base, &fifo)).is_err());
+        assert!(marker(base, &dir).is_dir());
+        for kept in [&upper, &other, &not_utf8] {
+            assert!(kept.exists(), "{}", kept.display());
+        }
+    });
+}

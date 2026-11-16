@@ -587,9 +587,10 @@ fn hook_updates(names: &[&Ref], updates: &[RefUpdate]) -> Vec<ReceiveRefUpdate> 
 /// anchor is `internal`, and nothing is published.
 ///
 /// After the transaction commit, the call removes the partial marker of each
-/// commit of `session_commits`. If the policy regenerates the summary and a
-/// ref changed, it writes each summary. A failure of these two steps is a
-/// warning. Then the call releases the update lock.
+/// commit of `session_commits`, with the `fsync` rule of the transaction. If
+/// the policy regenerates the summary and a ref changed, it writes each
+/// summary. A failure of these two steps is a warning. Then the call releases
+/// the update lock.
 pub(super) async fn publish(
     repo: &Repo,
     policy: &dyn SessionPolicy,
@@ -609,16 +610,24 @@ pub(super) async fn publish(
             .await
             .map_err(Failure::Internal)?;
     }
+    let marker_fsync = txn.fsync_flags().map_err(Failure::Internal)?.0;
     let stats = txn.commit_under(&held).await.map_err(Failure::Internal)?;
-    let mut warnings: Vec<ReceiveWarning> = repo
-        .remove_partial_markers(session_commits)
+    let mut warnings: Vec<ReceiveWarning> = match repo
+        .remove_partial_markers(session_commits, marker_fsync)
         .await
-        .into_iter()
-        .map(|(commit, e)| ReceiveWarning {
+    {
+        Ok(failed) => failed
+            .into_iter()
+            .map(|(commit, e)| ReceiveWarning {
+                step: ReceiveStep::PartialMarker,
+                message: format!("the partial marker of commit {commit}: {e}"),
+            })
+            .collect(),
+        Err(e) => vec![ReceiveWarning {
             step: ReceiveStep::PartialMarker,
-            message: format!("the partial marker of commit {commit}: {e}"),
-        })
-        .collect();
+            message: format!("the partial markers: {e}"),
+        }],
+    };
     if summary && let Err(warning) = write_summary(repo, policy.summary_keys()).await {
         warnings.push(warning);
     }

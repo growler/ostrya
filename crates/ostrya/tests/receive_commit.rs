@@ -667,6 +667,48 @@ fn a_marker_that_stays_is_a_warning() {
     );
 }
 
+/// A symlink at `state` fails the open of `state/` for the removal of the
+/// partial markers. The report holds one warning for the whole removal, and
+/// the refs stay written. The target of the symlink stays as it is.
+#[test]
+fn a_symlink_at_state_gives_one_marker_warning() {
+    let tmp = TmpDir::new("recv-state-symlink");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    let marker = outside.join(format!("{COMMIT}.commitpartial"));
+    std::fs::write(&marker, b"").unwrap();
+    let state = repo.path().join("state");
+    let _ = std::fs::remove_dir_all(&state);
+    std::os::unix::fs::symlink(&outside, &state).unwrap();
+    let report = committed(push(
+        &repo,
+        &policy(),
+        &fixture_objects(Encoding::Raw),
+        &[],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert_eq!(report.warnings[0].step, ReceiveStep::PartialMarker);
+    assert!(
+        report.warnings[0]
+            .message
+            .starts_with("the partial markers: "),
+        "{:?}",
+        report.warnings
+    );
+    assert!(marker.exists());
+    assert_eq!(
+        ref_file(&repo, "refs/heads/test/main"),
+        Some(format!("{COMMIT}\n"))
+    );
+}
+
 /// If the client does not read `CommitReply`, the report holds a warning, and
 /// the call returns `Ok`.
 #[test]

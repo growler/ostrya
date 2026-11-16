@@ -4042,6 +4042,126 @@ fn sign_syncs_the_commitmeta_with_fsync() {
     }
 }
 
+/// `prune --refs-only` of a commit whose ref is gone removes the commit, its
+/// content, and its `.commitpartial` marker. With fsync on, it syncs the
+/// `objects/<xx>` directory of the commit, then one time each `objects/<xx>`
+/// directory from which it removed a content object, in order, and then
+/// `state/` after the unlink of the marker. Each call is an `fsync`. With
+/// `[core] fsync=false`, it makes no sync call.
+#[test]
+fn prune_syncs_the_fanouts_and_state_with_fsync() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("prune-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    for fsync in [true, false] {
+        let dir = base.join(format!("fsync-{fsync}"));
+        std::fs::create_dir(&dir).unwrap();
+        let repo = commit_fixture(&dir);
+        if !fsync {
+            set_core_key(&repo, "fsync=false");
+        }
+        std::fs::remove_file(repo.join("refs/heads").join(BRANCH)).unwrap();
+        let marker = repo.join(format!("state/{COMMIT}.commitpartial"));
+        std::fs::write(&marker, b"").unwrap();
+        let mut content: Vec<String> = files_under(&repo.join("objects"))
+            .into_iter()
+            .filter(|path| path.extension().and_then(|e| e.to_str()) != Some("commit"))
+            .map(|path| format!("objects/{}", path.parent().unwrap().display()))
+            .collect();
+        content.dedup();
+        assert!(!content.is_empty(), "the commit has content objects");
+
+        let repo_s = repo.to_str().unwrap();
+        let (run, calls) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &dir.join("trace"),
+            &["prune", "--repo", repo_s, "--refs-only"],
+        );
+        assert!(
+            run.status.success(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert!(!marker.exists(), "the prune removes the marker");
+        assert!(
+            files_under(&repo.join("objects")).is_empty(),
+            "the prune removes each object"
+        );
+        if !fsync {
+            assert!(calls.is_empty(), "fsync=false synced: {calls:?}");
+            continue;
+        }
+        let mut expected = vec![("fsync", format!("objects/{}", &COMMIT[..2]))];
+        expected.extend(content.into_iter().map(|dir| ("fsync", dir)));
+        expected.push(("fsync", "state".to_owned()));
+        assert_eq!(calls, expected);
+    }
+}
+
+/// `fsck --delete` of a repository with one corrupt content object writes the
+/// `.commitpartial` marker of the commit, and then unlinks the object. With
+/// fsync on, it syncs `state/` after the create of the marker, and then the
+/// `objects/<xx>` directory of the object after its unlink. Each call is an
+/// `fsync`. With `[core] fsync=false`, it makes no sync call.
+#[test]
+fn fsck_delete_syncs_state_and_the_fanout_with_fsync() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("fsck-delete-fsync");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    for fsync in [true, false] {
+        let dir = base.join(format!("fsync-{fsync}"));
+        std::fs::create_dir(&dir).unwrap();
+        let repo = commit_fixture(&dir);
+        if !fsync {
+            set_core_key(&repo, "fsync=false");
+        }
+        let objects = repo.join("objects");
+        let files: Vec<PathBuf> = files_under(&objects)
+            .into_iter()
+            .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("filez"))
+            .collect();
+        assert!(files.len() >= 2, "the commit has two content objects");
+        let corrupt = objects.join(&files[0]);
+        let bytes = std::fs::read(objects.join(&files[1])).unwrap();
+        std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&corrupt, bytes).unwrap();
+
+        let repo_s = repo.to_str().unwrap();
+        let (run, calls) = sync_calls(
+            env!("CARGO_BIN_EXE_ostrya"),
+            &repo,
+            &dir.join("trace"),
+            &["fsck", "--repo", repo_s, "--delete"],
+        );
+        assert!(
+            !corrupt.exists(),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        let marker = repo.join(format!("state/{COMMIT}.commitpartial"));
+        assert_eq!(std::fs::read(&marker).unwrap(), b"f");
+        if !fsync {
+            assert!(calls.is_empty(), "fsync=false synced: {calls:?}");
+            continue;
+        }
+        assert_eq!(
+            calls,
+            [
+                ("fsync", "state".to_owned()),
+                (
+                    "fsync",
+                    format!("objects/{}", files[0].parent().unwrap().display())
+                ),
+            ]
+        );
+    }
+}
+
 /// `summary -u` writes each summary file through a named temp file in
 /// `tmp/`. It syncs each temp file with `fsync`, and then the directory that
 /// holds the file. It makes no `fdatasync` call. A second run, with each
@@ -9582,11 +9702,12 @@ fn durability_binaries() -> Vec<(&'static str, String)> {
 /// sync for each content object and none for a metadata object.
 ///
 /// The test checks the syncing rows against the full call inventory, which
-/// includes the totals (11 and 15 for the `ostree` command, 13 and 17 for
+/// includes the totals (11 and 15 for the `ostree` command, 15 and 19 for
 /// ostrya). ostrya also syncs `refs/remotes/origin`, which holds the ref, and
-/// `refs/remotes`, where the ref write creates `origin`. `ostree` does not sync
-/// these directories. Every row of both binaries exits 0 and stores the same
-/// bytes.
+/// `refs/remotes`, where the ref write creates `origin`. It syncs `state/`
+/// after the create of the `.commitpartial` marker and again after its
+/// removal. `ostree` does not sync these directories. Every row of both
+/// binaries exits 0 and stores the same bytes.
 #[test]
 fn pull_fsync_switches_control_the_syscalls() {
     if !strace_available() {
@@ -9631,8 +9752,8 @@ fn pull_fsync_switches_control_the_syscalls() {
                     {
                         (
                             ("fsync", "tmp/.ostrya-tmp-"),
-                            &["refs/remotes", "refs/remotes/origin"],
-                            13 + content,
+                            &["refs/remotes", "refs/remotes/origin", "state", "state"],
+                            15 + content,
                         )
                     } else {
                         (("fdatasync", "refs/remotes/origin/"), &[], 11 + content)
@@ -9657,7 +9778,8 @@ fn pull_fsync_switches_control_the_syscalls() {
 /// A `--mirror` pull of every ref copies the summary of the remote. By default,
 /// ostrya also syncs the temp file of the summary in `tmp/` with `fsync`, and
 /// then the repository root. The `ostree` command does not sync them (over
-/// corpus `C0`, 11 calls for `ostree` and 14 for ostrya). Under
+/// corpus `C0`, 11 calls for `ostree` and 16 for ostrya, with the two syncs of
+/// `state/` for the `.commitpartial` marker). Under
 /// `--disable-fsync`, neither command makes a sync call, and both copy the
 /// same summary.
 #[test]
@@ -9718,7 +9840,7 @@ fn pull_mirror_disable_fsync_syncs_nothing() {
                         && last[1].1 == ".",
                     "{label}: the port syncs the temp file of the summary and the root: {calls:?}",
                 );
-                assert_eq!(calls.len(), 14, "{label}: {calls:?}");
+                assert_eq!(calls.len(), 16, "{label}: {calls:?}");
             } else {
                 assert!(
                     summary.is_empty() && root_fsyncs == 0,
@@ -9739,7 +9861,8 @@ fn pull_mirror_disable_fsync_syncs_nothing() {
 /// each pull). ostrya makes no sync call on the file that it stages, because
 /// the `syncfs` of the publication step makes its data durable. ostrya makes
 /// one more `fsync`, of the fanout directory of the file after the rename into
-/// `objects/` (13, 14, and 15 calls).
+/// `objects/`, and two of `state/` for the `.commitpartial` marker (15, 16, and
+/// 17 calls).
 #[test]
 fn pull_disable_fsync_syncs_no_detached_metadata() {
     if !strace_available() {
@@ -9759,9 +9882,9 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
     assert_eq!(commitmeta(&remote), 1, "the source holds detached metadata");
     // (tag, command, the default call count of ostrya)
     let pulls: [(&str, &[&str], usize); 3] = [
-        ("pull-local", &["pull-local", src, "main"], 13),
-        ("pull", &["pull", "origin", "main"], 14),
-        ("mirror", &["pull", "--mirror", "origin"], 15),
+        ("pull-local", &["pull-local", src, "main"], 15),
+        ("pull", &["pull", "origin", "main"], 16),
+        ("mirror", &["pull", "--mirror", "origin"], 17),
     ];
     for (who, binary) in &durability_binaries() {
         for (tag, command, port_total) in pulls {
@@ -9807,11 +9930,12 @@ fn pull_disable_fsync_syncs_no_detached_metadata() {
 /// `--disable-fsync` and `--per-object-fsync` on `pull-local`, with the rows of
 /// the HTTP test, from an `archive` source. Into an `archive` destination,
 /// every object is hardlinked, so no row syncs an object (11 calls for the
-/// `ostree` command, 12 for ostrya). Into a `bare-user` destination, the
+/// `ostree` command, 14 for ostrya). Into a `bare-user` destination, the
 /// content is ingested again, and the per-object rows sync each content object
-/// (15 for `ostree`, 16 for ostrya).
+/// (15 for `ostree`, 18 for ostrya).
 ///
-/// ostrya also syncs `refs/heads`, and `ostree` does not. One row for ostrya
+/// ostrya also syncs `refs/heads`, and `state/` after the create and after the
+/// removal of the `.commitpartial` marker. `ostree` does not. One row for ostrya
 /// alone copies into `archive` under `--force-copy --per-object-fsync`. In that
 /// row, the content objects are synced and the copied metadata objects are not.
 #[test]
@@ -9867,7 +9991,11 @@ fn pull_local_fsync_switches_control_the_syscalls() {
                     };
                     let (ref_temp, extra, total): ((&str, &str), &[&str], usize) = if *who == "port"
                     {
-                        (("fsync", "tmp/.ostrya-tmp-"), &["refs/heads"], 12 + content)
+                        (
+                            ("fsync", "tmp/.ostrya-tmp-"),
+                            &["refs/heads", "state", "state"],
+                            14 + content,
+                        )
                     } else {
                         (("fdatasync", "refs/heads/"), &[], 11 + content)
                     };

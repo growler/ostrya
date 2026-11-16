@@ -100,7 +100,6 @@ pub mod mtree;
 mod object;
 mod overlay;
 mod pattern;
-mod perm;
 pub mod prune;
 pub mod pull;
 #[cfg(feature = "push")]

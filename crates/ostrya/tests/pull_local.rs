@@ -1934,6 +1934,81 @@ fn a_pull_leaves_an_fsck_marker_as_it_found_it() {
     });
 }
 
+/// A symlink at `state` fails the pull. The pull publishes no object and
+/// writes no ref, and it writes nothing into the target of the symlink.
+#[test]
+fn a_symlink_at_state_fails_the_pull_before_it_publishes_an_object() {
+    let tmp = TmpDir::new("pull-state-symlink");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let _ = std::fs::remove_dir_all(dst_dir.join("state"));
+        symlink(&outside, dst_dir.join("state")).unwrap();
+
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        assert!(dst.list_objects().await.unwrap().is_empty());
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+    });
+}
+
+/// A symlink and a FIFO at the name of a marker are entries that the pull
+/// finds in place. The pull does not follow or open them, and its removal of
+/// the markers unlinks them. The target of the symlink stays.
+#[test]
+fn a_pull_unlinks_a_symlink_or_a_fifo_at_a_marker_name() {
+    for case in ["symlink", "fifo"] {
+        let tmp = TmpDir::new("pull-marker-entry");
+        block_on(async {
+            let base = tmp.path();
+            let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+            let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+            std::fs::create_dir_all(dst_dir.join("state")).unwrap();
+            let marker = dst_dir
+                .join("state")
+                .join(format!("{}.commitpartial", c2.to_hex()));
+            let target = base.join("target");
+            std::fs::write(&target, b"target").unwrap();
+            if case == "symlink" {
+                symlink(&target, &marker).unwrap();
+            } else {
+                let status = Command::new("mkfifo").arg(&marker).status().unwrap();
+                assert!(status.success());
+            }
+
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(std::fs::symlink_metadata(&marker).is_err(), "{case}");
+            assert_eq!(std::fs::read(&target).unwrap(), b"target", "{case}");
+            assert_eq!(
+                dst.commit_state(&c2).await.unwrap(),
+                CommitState::Normal,
+                "{case}"
+            );
+        });
+    }
+}
+
 // --- trust and checks ----------------------------------------------------
 
 #[test]

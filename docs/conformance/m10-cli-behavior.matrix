@@ -13806,7 +13806,7 @@ evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
 spec: cli-behavior.md#the-fsync-vocabulary
 note: under `--disable-fsync` an HTTP pull of corpus C0 into an `archive` and a
  `bare-user` destination makes no `fsync`, `fdatasync`, or `syncfs` call, in
- both implementations. By default the tool makes 11 and the port 13.
+ both implementations. By default the tool makes 11 and the port 15.
 
 family: M10
 subcommand: pull
@@ -13819,7 +13819,7 @@ spec: cli-behavior.md#the-fsync-vocabulary
 note: `--per-object-fsync`, and `[core] per-object-fsync=true` with no switch,
  each add one sync per content object the pull stages and none per metadata
  object: four calls over corpus C0, on the staged files under `tmp/`. The tool
- makes 15 and the port 17.
+ makes 15 and the port 19.
 
 family: M10
 subcommand: pull
@@ -13854,14 +13854,15 @@ severity: interop
 loss: syncs by default that the tool does not make. The port syncs
  `refs/remotes/<remote>`, which holds the ref, and `refs/remotes`, where the
  ref write creates `refs/remotes/<remote>`; a later pull from the same remote
- syncs `refs/remotes/<remote>` alone. Under `--mirror` it syncs the summary
- file and the repository root, which the tool does not (`cli-behavior.md`,
- "The fsync vocabulary"). No byte differs, and
+ syncs `refs/remotes/<remote>` alone. It syncs `state/` two times, after the
+ create and after the removal of the `.commitpartial` marker. Under
+ `--mirror` it syncs the summary file and the repository root, which the tool
+ does not (`cli-behavior.md`, "The fsync vocabulary"). No byte differs, and
  `--disable-fsync` turns every one of them off.
 evidence: ostrya_cli::cli::pull_fsync_switches_control_the_syscalls
 spec: cli-behavior.md#the-fsync-vocabulary
 note: `ostrya_cli::cli::pull_mirror_disable_fsync_syncs_nothing` holds the
- mirror half: tool 11 calls and port 14 by default, 0 in both under
+ mirror half: tool 11 calls and port 16 by default, 0 in both under
  `--disable-fsync`, and one summary in both.
 
 family: M10
@@ -14031,11 +14032,11 @@ severity: interop
 evidence: ostrya_cli::cli::pull_local_fsync_switches_control_the_syscalls
 spec: cli-behavior.md#the-fsync-vocabulary
 note: from `archive` into `archive` every object is hardlinked, so no row syncs
- an object: tool 11 calls and port 12 by default and under either
+ an object: tool 11 calls and port 14 by default and under either
  per-object form. Into `bare-user` the per-object forms add four, one per
- content object: tool 15 and port 16. `--disable-fsync` and `[core]
- fsync=false` make 0 in both. The port also syncs `refs/heads`, which the tool
- does not.
+ content object: tool 15 and port 18. `--disable-fsync` and `[core]
+ fsync=false` make 0 in both. The port also syncs `refs/heads`, and `state/`
+ two times for the `.commitpartial` marker, which the tool does not.
 
 # ---------------------------------------------------------------------------
 # pull -- scope and trust (Phase 17f). The harness serves no remote, so each

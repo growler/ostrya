@@ -1,8 +1,52 @@
-ostrya (0.12.0) UNRELEASED; urgency=medium
+ostrya (0.12.0) unstable; urgency=medium
 
-  * New upstream release.
+  * Each read and each write of a repository file applies one set of
+    rules. A symlink, a FIFO, a socket, or a device at the place of a
+    repository file or directory stops the command with an error, and
+    no open waits on a FIFO. The rules apply to config, objects/ and
+    each object, tmp/, state/, the lock files, the refs, the summary
+    and its signature, the static deltas and their indexes, and the
+    composefs images. init refuses a symlink or a file that is not a
+    directory at each directory of the layout.
+  * A read of a ref refuses a symlink above the ref and a ref file
+    larger than 4096 bytes. An alias resolves to a regular ref file
+    inside refs/ alone. A listing skips a broken alias, and a read of
+    the alias reports it. A symlink at refs/remotes/REMOTE or at
+    refs/mirrors/ID stops each listing, prune, and fsck.
+  * commit --tag refuses a symlink at refs, refs/heads, refs/mirrors,
+    or refs/mirrors/ID before it takes the lock, and writes no object.
+  * refs -A and refs --delete with no -c also read the aliases under
+    refs/mirrors/, and fail when refs/mirrors/ is damaged. Their output
+    does not change.
+  * A relative path in config resolves against the root of the
+    repository, and a relative path in a .conf file of the remotes
+    directory resolves against that directory. A relative path with a
+    .. component is refused. Each such path must name a regular file.
+    A gpgkeypath directory gives its regular files alone. serve reads
+    its TLS files by the same rules, with a cap of 1 MiB for each file,
+    and makes each --tls-* path absolute.
+  * A read of the remotes directory skips a directory, a FIFO, a
+    socket, and a device. A write of a .conf file replaces a symlink
+    with a regular file. remote add never replaces an entry that is
+    there. A new remotes directory in a bare-user-shared repository
+    gets the mode 02770. Under [core] fsync, a .conf write syncs the
+    file and the directory.
+  * A symlink or a file that is not a directory at state/ stops a pull
+    before it stages an object, and a prune before it removes anything.
+    fsck writes its markers before it deletes objects.
+  * static-delta generate checks that tmp/ and the delta directory are
+    on one file system before it removes an old superblock.
+  * Each write of a summary, of config, and of a keyring puts a temp
+    file in tmp/ and syncs it with fsync. A summary write does this
+    before it removes the old signature.
+  * A push to receive or to serve that names a ref below a symlink
+    reads the ref as absent at Hello, and the commit is refused with
+    ref-denied. The session ended with an internal error before.
+  * A verification key file that is absent gives "does not exist", and
+    an open error gives "cannot be opened".
+  * diff accepts an xattr name that is not UTF-8.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 13 Nov 2026 18:36:42 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 17 Nov 2026 07:31:57 +0100
 
 ostrya (0.11.2) unstable; urgency=medium
 

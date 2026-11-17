@@ -2016,8 +2016,11 @@ fn an_absent_or_a_partial_attachment_is_an_attachment_error() {
     });
 }
 
+/// A defective entry is an `Attachment` error. A commit that names a
+/// complete attachment with attachments of its own gets no finding, and a
+/// commit that names a commit with a defective entry gets no finding.
 #[test]
-fn a_defective_entry_and_a_nested_attachment_are_attachment_errors() {
+fn a_defective_entry_is_an_attachment_error_and_does_not_propagate() {
     block_on(async {
         let f = Fixture::new(None).await;
         let (tip, att) = attachment_fixture(&f).await;
@@ -2025,11 +2028,13 @@ fn a_defective_entry_and_a_nested_attachment_are_attachment_errors() {
             common::store_with_field2(&f.local, &att, &[("", att.as_bytes()), ("lib/a", &[7; 31])])
                 .await;
         let nested = common::store_with_field2(&f.local, &att, &[("lib/b", tip.as_bytes())]).await;
+        let above =
+            common::store_with_field2(&f.local, &att, &[("lib/c", defective.as_bytes())]).await;
         f.copy("objects");
         let report = f.fsck().await;
         let found = attachment_findings(&report);
         let defect = |reason: &str| FsckAttachmentErrorKind::Defective(reason.to_owned());
-        let mut expected = vec![
+        let expected = vec![
             (
                 defective,
                 "",
@@ -2042,20 +2047,111 @@ fn a_defective_entry_and_a_nested_attachment_are_attachment_errors() {
                 None,
                 defect("entry 1 (lib/a) has a checksum of 31 bytes, not 32"),
             ),
-            (
-                nested,
-                "lib/b",
-                Some(tip),
-                defect(&format!(
-                    "attachment lib/b names commit {tip}, which has attachments of its own"
-                )),
-            ),
         ];
-        expected.sort_by_key(|(commit, ..)| *commit);
         assert_eq!(found.len(), expected.len(), "{:#?}", report.findings);
         for (found, (commit, name, attachment, kind)) in found.into_iter().zip(expected) {
             assert_attachment(found, commit, name, attachment, kind);
         }
+        for commit in [nested, above] {
+            let key = object_path(ObjectType::Commit, &commit);
+            assert!(
+                report.findings.iter().all(|finding| finding.key != key),
+                "{:#?}",
+                report.findings
+            );
+        }
+    });
+}
+
+/// Writes the chain R -> C -> D into the local repository of the fixture,
+/// copies the objects, and points `refs/heads/chain` at R.
+async fn chain_fixture(f: &Fixture) -> common::Chain {
+    let chain = common::write_chain(&f.local, f.tmp.path(), "chain").await;
+    f.copy("objects");
+    f.put_ref("refs/heads/chain", &chain.r);
+    chain
+}
+
+/// An absent commit at the bottom of the chain R -> C -> D gives an `Absent`
+/// error on C and a `Partial` error on R. The repair gives the same findings
+/// and writes and deletes no key for them.
+#[test]
+fn an_absent_attachment_at_the_bottom_of_a_chain_makes_each_commit_above_partial() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let common::Chain { r, c, d } = chain_fixture(&f).await;
+        f.remove(ObjectType::Commit, &d);
+        let mut expected = vec![
+            (c, common::CHAIN_D, FsckAttachmentErrorKind::Absent),
+            (r, common::CHAIN_C, FsckAttachmentErrorKind::Partial),
+        ];
+        expected.sort_by_key(|(commit, ..)| object_path(ObjectType::Commit, commit));
+        let check = |report: &BucketFsckReport| {
+            let found = attachment_findings(report);
+            assert_eq!(found.len(), expected.len(), "{:#?}", report.findings);
+            for (found, (commit, name, kind)) in found.into_iter().zip(expected.clone()) {
+                let attachment = if commit == c { d } else { c };
+                assert_attachment(found, commit, name, Some(attachment), kind);
+            }
+            assert!(report.has_errors());
+        };
+
+        let report = f.fsck().await;
+        check(&report);
+        let top = attachment_findings(&report)
+            .into_iter()
+            .find(|found| found.object.unwrap().checksum == r)
+            .unwrap();
+        assert!(
+            top.detail
+                .ends_with(&format!("names commit {c}, which is partial")),
+            "{top}"
+        );
+
+        f.server.state().requests.clear();
+        let report = f.repair().await.unwrap();
+        check(&report);
+        assert!(report.marked_partial.is_empty());
+        assert!(report.deleted.is_empty());
+        let writes: Vec<(String, String)> = f
+            .requests()
+            .into_iter()
+            .filter(|(method, _)| method != "GET")
+            .collect();
+        assert_eq!(
+            writes,
+            [
+                ("PUT".to_owned(), PROBE_KEY.to_owned()),
+                ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),
+                ("DELETE".to_owned(), "extensions/ostrya/lock".to_owned()),
+            ]
+        );
+    });
+}
+
+/// A commit with a partial-commit marker at the bottom of the chain gives a
+/// `Partial` error on C and on R.
+#[test]
+fn a_partial_attachment_at_the_bottom_of_a_chain_makes_each_commit_above_partial() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let common::Chain { r, c, d } = chain_fixture(&f).await;
+        f.put(&format!("state/{}.commitpartial", d.to_hex()), &[0x66]);
+        let report = f.fsck().await;
+        let mut expected = vec![(c, common::CHAIN_D, d), (r, common::CHAIN_C, c)];
+        expected.sort_by_key(|(commit, ..)| object_path(ObjectType::Commit, commit));
+        let found = attachment_findings(&report);
+        assert_eq!(found.len(), expected.len(), "{:#?}", report.findings);
+        for (found, (commit, name, attachment)) in found.into_iter().zip(expected) {
+            assert_attachment(
+                found,
+                commit,
+                name,
+                Some(attachment),
+                FsckAttachmentErrorKind::Partial,
+            );
+        }
+        assert!(report.has_errors());
     });
 }
 
@@ -2318,6 +2414,140 @@ fn an_attachment_that_a_writer_adds_during_the_run_is_a_note() {
             Some(&FsckAttachmentErrorKind::Absent)
         );
     });
+}
+
+/// A writer puts the absent bottom commit of a chain back after the
+/// listing. The `Absent` error on C becomes a note, and R has no finding.
+#[test]
+fn an_attachment_that_a_writer_adds_below_a_chain_during_the_run_leaves_no_error() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let common::Chain { r, c, d } = chain_fixture(&f).await;
+        let key = object_path(ObjectType::Commit, &d);
+        let bytes = f.object(ObjectType::Commit, &d);
+        f.remove(ObjectType::Commit, &d);
+        // A writer puts the commit back after the listing, at the read of R.
+        let stored = format!("repo/{key}");
+        f.server.state().before_key = Some((
+            "GET",
+            format!("repo/{}", object_path(ObjectType::Commit, &r)),
+            Box::new(move |objects| {
+                objects.insert(
+                    stored,
+                    common::s3::Stored {
+                        bytes,
+                        etag: "\"back\"".into(),
+                    },
+                );
+            }),
+        ));
+        let report = f.fsck().await;
+        assert!(!report.has_errors(), "{:#?}", report.findings);
+        let found = attachment_findings(&report);
+        assert_eq!(found.len(), 1, "{:#?}", report.findings);
+        assert!(!found[0].error);
+        assert_eq!(found[0].object.unwrap().checksum, c);
+        assert_eq!(
+            found[0].attachment.as_ref().map(|error| &error.kind),
+            Some(&FsckAttachmentErrorKind::Absent)
+        );
+    });
+}
+
+/// Removes the commit object `commit` from the bucket, and puts it back at
+/// the read of the commit `at`, after the listing, as a writer does.
+fn put_back_at_read(f: &Fixture, commit: &Checksum, at: &Checksum) {
+    let bytes = f.object(ObjectType::Commit, commit);
+    f.remove(ObjectType::Commit, commit);
+    let stored = format!("repo/{}", object_path(ObjectType::Commit, commit));
+    f.server.state().before_key = Some((
+        "GET",
+        format!("repo/{}", object_path(ObjectType::Commit, at)),
+        Box::new(move |objects| {
+            objects.insert(
+                stored,
+                common::s3::Stored {
+                    bytes,
+                    etag: "\"back\"".into(),
+                },
+            );
+        }),
+    ));
+}
+
+/// A writer puts the absent bottom commit of the chain T -> R -> C -> D back
+/// after the listing. The `Absent` error on C becomes a note, and R and T
+/// have no finding.
+#[test]
+fn an_attachment_that_a_writer_adds_below_a_chain_of_depth_three_leaves_no_error() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let common::Chain { r, c, d } = common::write_chain(&f.local, f.tmp.path(), "chain").await;
+        let t = common::store_with_field2(&f.local, &r, &[("rootfs", r.as_bytes())]).await;
+        f.copy("objects");
+        f.put_ref("refs/heads/top", &t);
+        put_back_at_read(&f, &d, &t);
+        let report = f.fsck().await;
+        assert!(!report.has_errors(), "{:#?}", report.findings);
+        let found = attachment_findings(&report);
+        assert_eq!(found.len(), 1, "{:#?}", report.findings);
+        assert!(!found[0].error);
+        assert_eq!(found[0].object.unwrap().checksum, c);
+        assert_eq!(
+            found[0].attachment.as_ref().map(|error| &error.kind),
+            Some(&FsckAttachmentErrorKind::Absent)
+        );
+    });
+}
+
+/// R names C1 and C2, and C1 names D1. A writer puts the absent D1 back
+/// after the listing. If `marker` is set, C2 has a partial-commit marker.
+/// Else C2 names D2, which stays absent. The run drops the `Partial` error
+/// of R on C1, and keeps the `Partial` error of R on C2.
+async fn a_partial_attachment_keeps_its_error_next_to_one_that_a_writer_adds(marker: bool) {
+    let f = Fixture::new(None).await;
+    let one = common::write_chain(&f.local, f.tmp.path(), "one").await;
+    let two = common::write_chain(&f.local, f.tmp.path(), "two").await;
+    let (c1, c2) = (one.c, two.c);
+    let r = common::store_with_field2(
+        &f.local,
+        &one.r,
+        &[("lib/c1", c1.as_bytes()), ("lib/c2", c2.as_bytes())],
+    )
+    .await;
+    f.copy("objects");
+    f.put_ref("refs/heads/top", &r);
+    if marker {
+        f.put(&format!("state/{}.commitpartial", c2.to_hex()), &[0x66]);
+    } else {
+        f.remove(ObjectType::Commit, &two.d);
+    }
+    put_back_at_read(&f, &one.d, &r);
+    let report = f.fsck().await;
+    assert!(report.has_errors(), "{:#?}", report.findings);
+    let on = |attachment: Checksum| {
+        attachment_findings(&report).into_iter().find(|found| {
+            found.object.unwrap().checksum == r
+                && found.attachment.as_ref().unwrap().attachment == Some(attachment)
+        })
+    };
+    assert!(on(c1).is_none(), "{:#?}", report.findings);
+    let kept = on(c2).unwrap();
+    assert!(kept.error, "{kept}");
+    assert_eq!(
+        kept.attachment.as_ref().map(|error| &error.kind),
+        Some(&FsckAttachmentErrorKind::Partial)
+    );
+}
+
+#[test]
+fn a_marked_attachment_keeps_its_error_next_to_one_that_a_writer_adds() {
+    block_on(a_partial_attachment_keeps_its_error_next_to_one_that_a_writer_adds(true));
+}
+
+#[test]
+fn an_attachment_above_an_absent_one_keeps_its_error_next_to_one_that_a_writer_adds() {
+    block_on(a_partial_attachment_keeps_its_error_next_to_one_that_a_writer_adds(false));
 }
 
 #[test]

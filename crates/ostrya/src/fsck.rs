@@ -44,8 +44,10 @@ pub struct FsckOptions {
     /// If [`mark_attachments`](FsckOptions::mark_attachments) is also
     /// `true`, the switch marks each commit that has an
     /// [`Absent`](FsckAttachmentErrorKind::Absent) or a
-    /// [`Partial`](FsckAttachmentErrorKind::Partial) attachment, so a later
-    /// pull of the commit fetches its attachments. A
+    /// [`Partial`](FsckAttachmentErrorKind::Partial) attachment. An
+    /// attachment is partial if an attachment below it is absent or partial,
+    /// so the marks reach each commit above a broken attachment. A later pull
+    /// of the top commit then fetches the full set of its attachments. A
     /// [`Defective`](FsckAttachmentErrorKind::Defective) entry marks no
     /// commit, because a pull cannot repair it.
     pub mark_partial: bool,
@@ -57,6 +59,9 @@ pub struct FsckOptions {
     /// [`mark_partial`](FsckOptions::mark_partial) is `true`. The default is
     /// `true`. The value `false` is an ostrya extension, which the
     /// `ostrya fsck` command spells `--no-mark-attachments`.
+    ///
+    /// With the value `true`, the marks reach each commit above a broken
+    /// attachment, at each depth.
     ///
     /// With the value `false`, the run reports each finding in
     /// [`FsckReport::attachment_errors`] and marks no commit for an
@@ -363,11 +368,11 @@ pub enum FsckAttachmentErrorKind {
     /// The repository does not hold the commit object of the attachment.
     Absent,
     /// The commit of the attachment is partial: it has a `.commitpartial`
-    /// marker, or its tree is not complete.
+    /// marker, or its tree is not complete, or an attachment of the commit is
+    /// absent or partial.
     Partial,
-    /// The entry has an empty name or a checksum that is not 32 bytes, or
-    /// the commit of the attachment has attachments of its own. The payload
-    /// is the reason.
+    /// The entry has an empty name or a checksum that is not 32 bytes. The
+    /// payload is the reason.
     Defective(String),
 }
 
@@ -397,37 +402,91 @@ impl std::fmt::Display for FsckAttachmentError {
     }
 }
 
-/// Returns the finding on each entry of `entries`, the field 2 of `commit`,
-/// in the stored order.
+/// Returns the findings on the field 2 of each commit of `attachments`.
 ///
-/// `absent` and `partial` tell the state of an attachment. `nested` tells if
-/// the field 2 of an attachment is not empty.
+/// `attachments` holds each commit whose field 2 is not empty, with the
+/// entries of its field 2, sorted by commit. `checked` tells if a commit gets
+/// a check. `absent` and `partial` tell the state of an attachment.
+///
+/// The first rule that applies gives the finding of an entry: a defect of
+/// the entry, an absent attachment, or a partial attachment. An entry with
+/// no such finding gets a `Partial` finding if its attachment is in
+/// `attachments` and has an `Absent` or a `Partial` finding of its own. The
+/// function applies this rule again until no finding changes. A `Defective`
+/// finding does not make the commit above it partial.
+///
+/// The findings are sorted by the naming commit, then by the stored order of
+/// its field 2.
 pub(crate) fn attachment_findings(
-    commit: Checksum,
-    entries: &[RelatedEntry],
+    attachments: &[(Checksum, Vec<RelatedEntry>)],
+    checked: impl Fn(&Checksum) -> bool,
     absent: impl Fn(&Checksum) -> bool,
     partial: impl Fn(&Checksum) -> bool,
-    nested: impl Fn(&Checksum) -> bool,
 ) -> Vec<FsckAttachmentError> {
+    let finding = |commit: usize, index: usize, kind| {
+        let (naming, entries) = &attachments[commit];
+        let entry = &entries[index];
+        (
+            (commit, index),
+            FsckAttachmentError {
+                commit: *naming,
+                name: entry.name.clone(),
+                attachment: entry.checksum.ok(),
+                kind,
+            },
+        )
+    };
     let mut findings = Vec::new();
-    for (index, entry) in entries.iter().enumerate() {
-        let kind = match (entry.defect(index), entry.checksum) {
-            (Some(reason), _) => FsckAttachmentErrorKind::Defective(reason),
-            (None, Ok(attachment)) if absent(&attachment) => FsckAttachmentErrorKind::Absent,
-            (None, Ok(attachment)) if partial(&attachment) => FsckAttachmentErrorKind::Partial,
-            (None, Ok(attachment)) if nested(&attachment) => FsckAttachmentErrorKind::Defective(
-                related::attachment_reason(&entry.name, &attachment, related::NESTED_REASON),
-            ),
-            (None, _) => continue,
-        };
-        findings.push(FsckAttachmentError {
-            commit,
-            name: entry.name.clone(),
-            attachment: entry.checksum.ok(),
-            kind,
-        });
+    // `broken` holds each commit with an `Absent` or a `Partial` finding.
+    // `queue` holds each such commit whose naming entries are not checked
+    // yet.
+    let mut broken = vec![false; attachments.len()];
+    let mut queue = Vec::new();
+    // Each edge `(attachment, commit, index)` is an entry with no finding
+    // whose attachment is in `attachments`.
+    let mut edges = Vec::new();
+    for (commit, (naming, entries)) in attachments.iter().enumerate() {
+        if !checked(naming) {
+            continue;
+        }
+        for (index, entry) in entries.iter().enumerate() {
+            let kind = match (entry.defect(index), entry.checksum) {
+                (Some(reason), _) => FsckAttachmentErrorKind::Defective(reason),
+                (None, Ok(attachment)) if absent(&attachment) => FsckAttachmentErrorKind::Absent,
+                (None, Ok(attachment)) if partial(&attachment) => FsckAttachmentErrorKind::Partial,
+                (None, Ok(attachment)) => {
+                    if let Ok(below) =
+                        attachments.binary_search_by_key(&attachment, |(naming, _)| *naming)
+                    {
+                        edges.push((below, commit, index));
+                    }
+                    continue;
+                }
+                (None, Err(_)) => continue,
+            };
+            if !matches!(kind, FsckAttachmentErrorKind::Defective(_)) && !broken[commit] {
+                broken[commit] = true;
+                queue.push(commit);
+            }
+            findings.push(finding(commit, index, kind));
+        }
     }
-    findings
+    edges.sort_unstable();
+    while let Some(below) = queue.pop() {
+        let start = edges.partition_point(|&(attachment, _, _)| attachment < below);
+        for &(_, commit, index) in edges[start..]
+            .iter()
+            .take_while(|&&(attachment, _, _)| attachment == below)
+        {
+            findings.push(finding(commit, index, FsckAttachmentErrorKind::Partial));
+            if !broken[commit] {
+                broken[commit] = true;
+                queue.push(commit);
+            }
+        }
+    }
+    findings.sort_unstable_by_key(|(position, _)| *position);
+    findings.into_iter().map(|(_, finding)| finding).collect()
 }
 
 /// The condition that ended a run before the end of its last phase.
@@ -518,6 +577,13 @@ pub struct FsckReport {
     pub missing_images: Vec<Checksum>,
     /// The attachments that are absent, partial, or defective, sorted by
     /// the commit that names them, then in the stored order of its field 2.
+    ///
+    /// An attachment with an `Absent` or a `Partial` finding of its own makes
+    /// each entry that names it [`Partial`](FsckAttachmentErrorKind::Partial).
+    /// Each such finding names the attachment one level below, and the
+    /// finding on that attachment names the next level. The first rule that
+    /// applies gives the finding of an entry, so an entry with an empty name
+    /// gives [`Defective`](FsckAttachmentErrorKind::Defective).
     ///
     /// [`Repo::fsck`] states the check under "Attachments".
     pub attachment_errors: Vec<FsckAttachmentError>,
@@ -736,18 +802,25 @@ impl Repo {
     ///   it.
     /// - [`Partial`](FsckAttachmentErrorKind::Partial) if the commit has a
     ///   `.commitpartial` marker at the start of the run, or if it reaches an
-    ///   absent or a deleted object.
-    /// - [`Defective`](FsckAttachmentErrorKind::Defective) if the field 2 of
-    ///   the commit is not empty.
+    ///   absent or a deleted object. The run does not read field 2 of a
+    ///   commit with a marker, and this rule gives the finding of each entry
+    ///   that names it.
+    /// - [`Partial`](FsckAttachmentErrorKind::Partial) if the commit has an
+    ///   `Absent` or a `Partial` finding on an entry of its own field 2. The
+    ///   run applies this rule again until no finding changes, so the rule
+    ///   reaches each commit above a broken attachment.
     ///
     /// The first rule that applies gives the finding of an entry. An entry
-    /// that no rule applies to gives no finding. A checksum that field 2
-    /// names under two names gives two findings. Two entries with one name,
-    /// and names that are not sorted, give no finding. If
+    /// that no rule applies to gives no finding. A `Defective` finding does
+    /// not make the commit above it partial. A checksum that field 2 names
+    /// under two names gives two findings. Two entries with one name, and
+    /// names that are not sorted, give no finding. If
     /// [`mark_partial`](FsckOptions::mark_partial) and
     /// [`mark_attachments`](FsckOptions::mark_attachments) are set, the run
     /// marks each commit with an `Absent` or a `Partial` finding as partial.
-    /// Such a mark does not change the other findings of the run.
+    /// The marks reach each commit above a broken attachment, so a later pull
+    /// of the top commit fetches the full set of its attachments. Such a mark
+    /// does not change the other findings of the run.
     ///
     /// A run that ends early does not reach this check.
     ///
@@ -1429,8 +1502,9 @@ impl Repo {
     ///
     /// `all` is the commit listing of the start of the run. `attachments`
     /// holds each verified commit whose field 2 is not empty, with its
-    /// entries, sorted by commit. An attachment in that list has attachments
-    /// of its own. The function reads no object.
+    /// entries, sorted by commit. An attachment is also partial if it has an
+    /// absent or a partial attachment of its own, at each depth. The function
+    /// reads no object.
     async fn fsck_check_attachments(
         &self,
         all: &[Checksum],
@@ -1442,27 +1516,15 @@ impl Repo {
             ctx.deleted
                 .contains(&ObjectName::new(*commit, ObjectType::Commit))
         };
-        let nested = |commit: &Checksum| {
-            attachments
-                .binary_search_by_key(commit, |(naming, _)| *naming)
-                .is_ok()
-        };
-        let mut findings = Vec::new();
-        for (commit, entries) in attachments {
-            if deleted(commit) {
-                continue;
-            }
-            findings.extend(attachment_findings(
-                *commit,
-                entries,
-                |attachment| all.binary_search(attachment).is_err() || deleted(attachment),
-                |attachment| {
-                    ctx.verified.binary_search(attachment).is_err()
-                        || ctx.incomplete.contains(attachment)
-                },
-                nested,
-            ));
-        }
+        let findings = attachment_findings(
+            attachments,
+            |commit| !deleted(commit),
+            |attachment| all.binary_search(attachment).is_err() || deleted(attachment),
+            |attachment| {
+                ctx.verified.binary_search(attachment).is_err()
+                    || ctx.incomplete.contains(attachment)
+            },
+        );
         if opts.mark_partial && opts.mark_attachments {
             let mut marked = HashSet::new();
             let mut to_mark = Vec::new();
@@ -2019,5 +2081,201 @@ mod tests {
         let err = ostrya_rt::block_on(repo.fsck_unlink_object(name, true)).unwrap_err();
         assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
         assert_eq!(std::fs::read(outside.join(leaf)).unwrap(), b"object");
+    }
+
+    /// One finding of [`attachment_findings`]: the naming commit, the name
+    /// of the entry, and the kind.
+    type Found = (Checksum, String, FsckAttachmentErrorKind);
+
+    /// Returns an entry of field 2 with `name` that names `commit`.
+    fn entry(name: &str, commit: Checksum) -> RelatedEntry {
+        RelatedEntry {
+            name: name.to_owned(),
+            checksum: Ok(commit),
+        }
+    }
+
+    /// Runs [`attachment_findings`] over `graph`, after a sort by commit.
+    /// Each commit gets a check except those in `skipped`. `absent` and
+    /// `partial` give the state of an attachment.
+    fn run(
+        mut graph: Vec<(Checksum, Vec<RelatedEntry>)>,
+        skipped: &[Checksum],
+        absent: &[Checksum],
+        partial: &[Checksum],
+    ) -> Vec<Found> {
+        graph.sort_by_key(|(commit, _)| *commit);
+        attachment_findings(
+            &graph,
+            |commit| !skipped.contains(commit),
+            |commit| absent.contains(commit),
+            |commit| partial.contains(commit),
+        )
+        .into_iter()
+        .map(|finding| (finding.commit, finding.name, finding.kind))
+        .collect()
+    }
+
+    /// Sorts `expected` by the naming commit, and keeps the order of the
+    /// entries of one commit.
+    fn by_commit(mut expected: Vec<Found>) -> Vec<Found> {
+        expected.sort_by_key(|(commit, _, _)| *commit);
+        expected
+    }
+
+    #[test]
+    fn an_absent_commit_at_depth_four_makes_each_commit_above_partial() {
+        let [a, b, c, d, e] = ["a", "b", "c", "d", "e"].map(|s| Checksum::sha256(s.as_bytes()));
+        let graph = vec![
+            (a, vec![entry("b", b)]),
+            (b, vec![entry("c", c)]),
+            (c, vec![entry("d", d)]),
+            (d, vec![entry("e", e)]),
+        ];
+
+        let found = run(graph, &[], &[e], &[]);
+
+        use FsckAttachmentErrorKind::{Absent, Partial};
+        assert_eq!(
+            found,
+            by_commit(vec![
+                (a, "b".to_owned(), Partial),
+                (b, "c".to_owned(), Partial),
+                (c, "d".to_owned(), Partial),
+                (d, "e".to_owned(), Absent),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_partial_commit_below_a_diamond_gives_one_finding_for_each_entry() {
+        let [r, a, b, d] = ["r", "a", "b", "d"].map(|s| Checksum::sha256(s.as_bytes()));
+        let graph = vec![
+            (r, vec![entry("lib/a", a), entry("lib/b", b)]),
+            (a, vec![entry("d", d)]),
+            (b, vec![entry("d", d)]),
+        ];
+
+        let found = run(graph, &[], &[], &[d]);
+
+        use FsckAttachmentErrorKind::Partial;
+        assert_eq!(
+            found,
+            by_commit(vec![
+                (r, "lib/a".to_owned(), Partial),
+                (r, "lib/b".to_owned(), Partial),
+                (a, "d".to_owned(), Partial),
+                (b, "d".to_owned(), Partial),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_defective_entry_does_not_make_the_commit_above_it_partial() {
+        let [r, c] = ["r", "c"].map(|s| Checksum::sha256(s.as_bytes()));
+        let graph = vec![
+            (r, vec![entry("c", c)]),
+            (
+                c,
+                vec![RelatedEntry {
+                    name: "d".to_owned(),
+                    checksum: Err(20),
+                }],
+            ),
+        ];
+
+        let found = run(graph, &[], &[], &[]);
+
+        assert_eq!(
+            found,
+            vec![(
+                c,
+                "d".to_owned(),
+                FsckAttachmentErrorKind::Defective(
+                    "entry 0 (d) has a checksum of 20 bytes, not 32".to_owned()
+                ),
+            )]
+        );
+    }
+
+    #[test]
+    fn a_skipped_commit_gets_no_finding_and_gives_none_to_the_commit_above_it() {
+        let [r, c, d] = ["r", "c", "d"].map(|s| Checksum::sha256(s.as_bytes()));
+        let graph = vec![(r, vec![entry("c", c)]), (c, vec![entry("d", d)])];
+
+        // The run deleted `c`: it gets no check, and the entry that names it
+        // is absent.
+        assert_eq!(
+            run(graph.clone(), &[c], &[c, d], &[]),
+            vec![(r, "c".to_owned(), FsckAttachmentErrorKind::Absent)]
+        );
+        // A skipped commit that is not absent makes no commit above it
+        // partial.
+        assert_eq!(run(graph, &[c], &[d], &[]), Vec::<Found>::new());
+    }
+
+    #[test]
+    fn a_direct_and_a_propagated_finding_keep_the_stored_order() {
+        let [r, c, d, x, y] = ["r", "c", "d", "x", "y"].map(|s| Checksum::sha256(s.as_bytes()));
+        let graph = vec![
+            (
+                r,
+                vec![
+                    entry("a/first", c),
+                    entry("b/second", x),
+                    entry("c/third", c),
+                    entry("d/fourth", y),
+                ],
+            ),
+            (c, vec![entry("d", d)]),
+        ];
+
+        let found = run(graph, &[], &[d, x], &[y]);
+
+        use FsckAttachmentErrorKind::{Absent, Partial};
+        assert_eq!(
+            found,
+            by_commit(vec![
+                (r, "a/first".to_owned(), Partial),
+                (r, "b/second".to_owned(), Absent),
+                (r, "c/third".to_owned(), Partial),
+                (r, "d/fourth".to_owned(), Partial),
+                (c, "d".to_owned(), Absent),
+            ])
+        );
+    }
+
+    #[test]
+    fn the_order_of_the_commits_does_not_change_the_findings() {
+        use FsckAttachmentErrorKind::{Absent, Partial};
+        // Each seed gives other checksums, so the commits sort, and the
+        // queue takes them, in another order.
+        for seed in 0..32 {
+            let [t, r, a, b, c, d] = ["t", "r", "a", "b", "c", "d"]
+                .map(|s| Checksum::sha256(format!("{seed}-{s}").as_bytes()));
+            let graph = vec![
+                (t, vec![entry("r", r), entry("c", c)]),
+                (r, vec![entry("a", a), entry("b", b)]),
+                (a, vec![entry("c", c)]),
+                (b, vec![entry("d", d)]),
+                (c, vec![entry("d", d)]),
+            ];
+
+            let found = run(graph, &[], &[d], &[]);
+
+            assert_eq!(
+                found,
+                by_commit(vec![
+                    (t, "r".to_owned(), Partial),
+                    (t, "c".to_owned(), Partial),
+                    (r, "a".to_owned(), Partial),
+                    (r, "b".to_owned(), Partial),
+                    (a, "c".to_owned(), Partial),
+                    (b, "d".to_owned(), Absent),
+                    (c, "d".to_owned(), Absent),
+                ]),
+                "seed {seed}"
+            );
+        }
     }
 }

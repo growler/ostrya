@@ -2088,8 +2088,10 @@ fn fsck_reports_a_partial_attachment() {
     });
 }
 
-/// A defective entry and a nested attachment each give one `Defective`
-/// finding and no marker.
+/// A defective entry gives one `Defective` finding and no marker. A commit
+/// that names a complete attachment with attachments of its own gets no
+/// finding, and a commit that names a commit with a defective entry gets no
+/// finding.
 #[test]
 fn fsck_reports_defective_attachments_without_a_marker() {
     let tmp = TmpDir::new("maint-fsck-dep-defective");
@@ -2102,10 +2104,12 @@ fn fsck_reports_defective_attachments_without_a_marker() {
         // `tip` names `att`, so a commit that names `tip` names a nested
         // attachment.
         let nested = common::store_with_field2(&repo, &att, &[("lib/b", tip.as_bytes())]).await;
+        let above =
+            common::store_with_field2(&repo, &att, &[("lib/c", defective.as_bytes())]).await;
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
         let kind = |reason: &str| ostrya::FsckAttachmentErrorKind::Defective(reason.to_owned());
-        let mut expected = vec![
+        let expected = vec![
             attachment_finding(defective, "", Some(att), kind("entry 0 has an empty name")),
             attachment_finding(
                 defective,
@@ -2113,26 +2117,216 @@ fn fsck_reports_defective_attachments_without_a_marker() {
                 None,
                 kind("entry 1 (lib/a) has a checksum of 31 bytes, not 32"),
             ),
-            attachment_finding(
-                nested,
-                "lib/b",
-                Some(tip),
-                kind(&format!(
-                    "attachment lib/b names commit {tip}, which has attachments of its own"
-                )),
-            ),
         ];
-        expected.sort_by_key(|error| error.commit);
         assert_eq!(report.attachment_errors, expected);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.marked_partial.is_empty());
         assert!(!report.is_ok());
-        for commit in [defective, nested] {
+        for commit in [defective, nested, above] {
             assert_eq!(
                 repo.commit_state(&commit).await.unwrap(),
                 ostrya::CommitState::Normal
             );
         }
+    });
+}
+
+/// Creates an archive repository under `base/repo` and writes the chain of
+/// [`common::write_chain`] into it, with R on the branch `chain`.
+async fn build_chain_repo(base: &Path) -> (Repo, common::Chain) {
+    let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let chain = common::write_chain(&repo, base, "chain").await;
+    (repo, chain)
+}
+
+/// Returns `commits`, sorted.
+fn sorted(commits: &[Checksum]) -> Vec<Checksum> {
+    let mut commits = commits.to_vec();
+    commits.sort();
+    commits
+}
+
+/// Asserts that each commit of `commits` has the state `state` in `repo`.
+async fn assert_states(repo: &Repo, commits: &[Checksum], state: ostrya::CommitState) {
+    for commit in commits {
+        assert_eq!(repo.commit_state(commit).await.unwrap(), state, "{commit}");
+    }
+}
+
+/// An absent commit at the bottom of the chain R -> C -> D gives an `Absent`
+/// finding on C and a `Partial` finding on R. One run marks both commits.
+#[test]
+fn fsck_marks_each_commit_above_an_absent_attachment_in_a_chain() {
+    use ostrya::FsckAttachmentErrorKind::{Absent, Partial};
+    let tmp = TmpDir::new("maint-fsck-att-chain");
+    block_on(async {
+        let (repo, common::Chain { r, c, d }) = build_chain_repo(tmp.path()).await;
+        remove_object(&repo, ObjectName::new(d, ObjectType::Commit));
+
+        let report = repo.fsck(&FsckOptions::new()).await.unwrap();
+        let top = attachment_finding(r, common::CHAIN_C, Some(c), Partial);
+        let mut expected = vec![
+            attachment_finding(c, common::CHAIN_D, Some(d), Absent),
+            top.clone(),
+        ];
+        expected.sort_by_key(|error| error.commit);
+        assert_eq!(report.attachment_errors, expected);
+        assert!(
+            top.to_string()
+                .ends_with(&format!("names commit {c}, which is partial")),
+            "{top}"
+        );
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.commits_checked, 2);
+        assert_eq!(report.marked_partial, sorted(&[c, r]));
+        assert_states(&repo, &[c, r], ostrya::CommitState::Partial).await;
+    });
+}
+
+/// With `mark_attachments` off, each run gives both findings of the chain
+/// and marks no commit.
+#[test]
+fn fsck_without_attachment_marks_reports_the_chain_and_marks_nothing() {
+    use ostrya::FsckAttachmentErrorKind::{Absent, Partial};
+    let tmp = TmpDir::new("maint-fsck-att-chain-nomark");
+    block_on(async {
+        let (repo, common::Chain { r, c, d }) = build_chain_repo(tmp.path()).await;
+        remove_object(&repo, ObjectName::new(d, ObjectType::Commit));
+        let opts = FsckOptions {
+            mark_attachments: false,
+            ..FsckOptions::new()
+        };
+        let mut expected = vec![
+            attachment_finding(c, common::CHAIN_D, Some(d), Absent),
+            attachment_finding(r, common::CHAIN_C, Some(c), Partial),
+        ];
+        expected.sort_by_key(|error| error.commit);
+
+        for _ in 0..2 {
+            let report = repo.fsck(&opts).await.unwrap();
+            assert_eq!(report.attachment_errors, expected);
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(report.marked_partial.is_empty());
+            assert!(!report.is_ok());
+            assert_states(&repo, &[c, r], ostrya::CommitState::Normal).await;
+        }
+    });
+}
+
+/// An absent commit at the bottom of a diamond gives an `Absent` finding on
+/// A and on B, and a `Partial` finding on each entry of R. One run marks A,
+/// B, and R.
+#[test]
+fn fsck_marks_each_commit_above_an_absent_attachment_in_a_diamond() {
+    use ostrya::FsckAttachmentErrorKind::{Absent, Partial};
+    let tmp = TmpDir::new("maint-fsck-att-diamond");
+    block_on(async {
+        let base = tmp.path();
+        let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let common::Diamond { r, a, b, d } = common::write_diamond(&repo, base, "diamond").await;
+        remove_object(&repo, ObjectName::new(d, ObjectType::Commit));
+
+        let report = repo.fsck(&FsckOptions::new()).await.unwrap();
+        let mut expected = vec![
+            attachment_finding(a, common::DIAMOND_D, Some(d), Absent),
+            attachment_finding(b, common::DIAMOND_D, Some(d), Absent),
+            attachment_finding(r, common::DIAMOND_A, Some(a), Partial),
+            attachment_finding(r, common::DIAMOND_B, Some(b), Partial),
+        ];
+        expected.sort_by_key(|error| error.commit);
+        assert_eq!(report.attachment_errors, expected);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.marked_partial, sorted(&[a, b, r]));
+        assert_states(&repo, &[a, b, r], ostrya::CommitState::Partial).await;
+    });
+}
+
+/// A commit T that names R of the chain R -> C -> D gets a `Partial` finding
+/// when D is absent. One run marks C, R, and T.
+#[test]
+fn fsck_marks_each_commit_above_an_absent_attachment_at_depth_three() {
+    use ostrya::FsckAttachmentErrorKind::{Absent, Partial};
+    let tmp = TmpDir::new("maint-fsck-att-depth3");
+    block_on(async {
+        let base = tmp.path();
+        let (repo, common::Chain { r, c, d }) = build_chain_repo(base).await;
+        write_tree(&base.join("top"), "top.txt", b"top\n");
+        let t = attachment_commit(&repo, base, "top", Some("top"), &[("rootfs", r)]).await;
+        remove_object(&repo, ObjectName::new(d, ObjectType::Commit));
+
+        let report = repo.fsck(&FsckOptions::new()).await.unwrap();
+        let mut expected = vec![
+            attachment_finding(c, common::CHAIN_D, Some(d), Absent),
+            attachment_finding(r, common::CHAIN_C, Some(c), Partial),
+            attachment_finding(t, "rootfs", Some(r), Partial),
+        ];
+        expected.sort_by_key(|error| error.commit);
+        assert_eq!(report.attachment_errors, expected);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.marked_partial, sorted(&[c, r, t]));
+        assert_states(&repo, &[c, r, t], ostrya::CommitState::Partial).await;
+    });
+}
+
+/// After the run marks each commit of the chain above an absent D, a pull of
+/// the top commit fetches D again, and the next run is clean.
+#[test]
+fn fsck_marks_the_chain_above_an_absent_attachment_and_a_pull_of_the_top_repairs_it() {
+    let tmp = TmpDir::new("maint-fsck-att-chain-pull");
+    block_on(async {
+        let base = tmp.path();
+        let src = Repo::create(&base.join("src"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let common::Chain { r, c, d } = common::write_chain(&src, base, "chain").await;
+        let dst = Repo::create(&base.join("dst"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let chain = || ostrya::PullOptions {
+            refs: vec!["chain".to_owned()],
+            ..ostrya::PullOptions::default()
+        };
+        dst.pull_local(&src, chain()).await.unwrap();
+        remove_object(&dst, ObjectName::new(d, ObjectType::Commit));
+
+        let report = dst.fsck(&FsckOptions::new()).await.unwrap();
+        assert_eq!(report.attachment_errors.len(), 2, "{report:?}");
+        assert_eq!(report.marked_partial, sorted(&[c, r]));
+
+        dst.pull_local(&src, chain()).await.unwrap();
+        assert!(dst.has_object(ObjectType::Commit, &d).await.unwrap());
+        assert_states(&dst, &[r, c, d], ostrya::CommitState::Normal).await;
+        let again = dst.fsck(&FsckOptions::new()).await.unwrap();
+        assert!(again.is_ok(), "{again:?}");
+    });
+}
+
+/// A partial commit at the bottom of the chain gives a `Partial` finding on
+/// C and on R. One run marks both commits.
+#[test]
+fn fsck_marks_each_commit_above_a_partial_attachment_in_a_chain() {
+    use ostrya::FsckAttachmentErrorKind::Partial;
+    let tmp = TmpDir::new("maint-fsck-att-chain-partial");
+    block_on(async {
+        let (repo, common::Chain { r, c, d }) = build_chain_repo(tmp.path()).await;
+        common::mark_partial(&repo, &d);
+
+        let report = repo.fsck(&FsckOptions::new()).await.unwrap();
+        let mut expected = vec![
+            attachment_finding(c, common::CHAIN_D, Some(d), Partial),
+            attachment_finding(r, common::CHAIN_C, Some(c), Partial),
+        ];
+        expected.sort_by_key(|error| error.commit);
+        assert_eq!(report.attachment_errors, expected);
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.commits_checked, 2);
+        assert_eq!(report.commits_partial, 1);
+        assert_eq!(report.marked_partial, sorted(&[c, r]));
+        assert_states(&repo, &[c, r], ostrya::CommitState::Partial).await;
     });
 }
 

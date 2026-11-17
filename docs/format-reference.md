@@ -4109,21 +4109,31 @@ stored order, and the first rule that applies gives the kind:
 - `Absent`: the repository does not hold the commit object at the start of
   the run, or the run deletes it.
 - `Partial`: the commit has a partial-commit marker at the start of the run,
-  or its tree reaches an object that is absent or that the run deletes.
-- `Defective`: the field 2 of the commit is not empty.
+  or its tree reaches an object that is absent or that the run deletes. The
+  run does not read field 2 of a commit with a marker.
+- `Partial`: the commit has an `Absent` or a `Partial` finding on an entry
+  of its own field 2. The run applies this rule again until no finding
+  changes, so it reaches each commit above a broken attachment, at each
+  depth. In R -> C -> D with D absent, one run gives `Absent` on the entry
+  D of C and `Partial` on the entry C of R. The rule reads only the data
+  and the findings that the run already holds.
 
-An entry that no rule applies to gives no finding. A checksum that field 2
-names under two names gives two findings. Two entries with one name, and
-names that are not sorted, give no finding. The text of a finding is the
+A `Defective` finding does not make the commit above it partial: the
+checksum of the attachment covers its field 2, so a pull gives the same
+entry again. An entry that no rule applies to gives no finding. A checksum
+that field 2 names under two names gives two findings. Two entries with one
+name, and names that are not sorted, give no finding. The text of a finding is the
 text of `Error::InvalidRelations` for field 2: `related commits in field 2 of
 commit C: attachment N names commit D, which the repository does not hold`,
-`..., which is partial`, `..., which has attachments of its own`, or the
-defect of the entry.
+`..., which is partial`, or the defect of the entry. Each `Partial` finding
+names the attachment one level below, and the finding on that attachment
+names the next level.
 
 With the default `mark_partial` and `mark_attachments`, the run writes the
 marker `state/<commit>.commitpartial` of each commit with an `Absent` or a
-`Partial` finding. A later pull of that commit fetches it again with its
-attachments. A `Defective` finding gets no marker, because a pull cannot
+`Partial` finding. The markers reach each commit above a broken attachment,
+so a later pull of the top commit fetches the full set of its attachments
+again. A `Defective` finding gets no marker, because a pull cannot
 repair it. With `mark_attachments` false, or with
 `ostrya fsck --no-mark-attachments`, the run reports each finding and writes
 no marker for it. The markers for absent and deleted objects do not change.
@@ -8524,7 +8534,9 @@ The steps of the fsck are:
    that parses, the commits with a partial-commit marker included, as
    "Attachments in the fsck" states. The listing must hold the commit of
    each attachment, and `state/` must hold no marker
-   `state/<checksum>.commitpartial` of it. This check reads no object.
+   `state/<checksum>.commitpartial` of it. An attachment with an `Absent`
+   or a `Partial` finding of its own is `Partial`, at each depth. This
+   check reads no object.
 6. The walk of the tree of each commit that parses, also of a commit whose
    bytes do not match its name. The run reads each dirtree and each dirmeta
    once, and checks its checksum and its parse. A dirtree that does not
@@ -8612,7 +8624,12 @@ Each finding has one kind, and is an error or a note:
   the state after the repair (step 10). The repair writes and deletes no
   key for it.
 - `attachment`, a note: without the repair, an `Absent` attachment whose
-  commit the read again finds.
+  commit the read again finds. The run then drops each `Partial` finding
+  that an attachment below it gives, when no `Absent` or `Partial`
+  attachment error stays on that attachment, and repeats until it drops no finding. In a run without the
+  repair, a `Partial` finding whose attachment has no marker comes from an
+  attachment below it. This step uses the findings alone and sends no
+  request.
 - `marker`, a note: without the repair, the partial-commit marker of a
   commit that the run walked, whose tree has no `missing`, `mismatch`, or
   `corrupt` finding, and whose own object has none.

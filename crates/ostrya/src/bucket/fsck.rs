@@ -177,7 +177,8 @@ pub struct BucketFinding {
     ///
     /// Its fields are the fields of the finding of the local fsck. An
     /// attachment is [`Partial`](FsckAttachmentErrorKind::Partial) if the
-    /// bucket holds its marker `state/<checksum>.commitpartial`. A run with
+    /// bucket holds its marker `state/<checksum>.commitpartial`, or if an
+    /// attachment of its own is absent or partial, at each depth. A run with
     /// [`delete`](BucketFsckOptions::delete) reads the markers and the
     /// commit objects after its repair.
     pub attachment: Option<FsckAttachmentError>,
@@ -227,9 +228,10 @@ pub enum BucketFindingKind {
     /// its declared size.
     Corrupt,
     /// An attachment in field 2 of a commit that is absent, partial, or
-    /// defective. [`BucketFinding::attachment`] holds it. A run with
-    /// [`delete`](BucketFsckOptions::delete) writes and deletes no key for
-    /// it.
+    /// defective. An attachment is also partial if an attachment of its own
+    /// is absent or partial. [`BucketFinding::attachment`] holds it. A run
+    /// with [`delete`](BucketFsckOptions::delete) writes and deletes no key
+    /// for it.
     Attachment,
     /// A partial-commit marker of a commit whose tree the run finds whole. A
     /// run with [`delete`](BucketFsckOptions::delete) deletes such a marker.
@@ -347,10 +349,11 @@ impl Run {
     /// of `attachments` that is absent, partial, or defective.
     ///
     /// `attachments` holds each commit that parses and whose field 2 is not
-    /// empty, sorted by commit. An attachment in that list has attachments
-    /// of its own. `partial` holds the commits with a partial-commit marker.
-    /// `deleted` holds the commit objects that the repair deletes, sorted:
-    /// such an attachment is absent, and such a commit gets no check.
+    /// empty, sorted by commit. `partial` holds the commits with a
+    /// partial-commit marker. `deleted` holds the commit objects that the
+    /// repair deletes, sorted: such an attachment is absent, and such a
+    /// commit gets no check. An attachment is also partial if it has an
+    /// absent or a partial attachment of its own, at each depth.
     fn attachments(
         &mut self,
         listing: &ObjectListing,
@@ -358,44 +361,33 @@ impl Run {
         deleted: &[ObjectName],
         attachments: &[(Checksum, Vec<RelatedEntry>)],
     ) {
-        let nested = |commit: &Checksum| {
-            attachments
-                .binary_search_by_key(commit, |(naming, _)| *naming)
-                .is_ok()
-        };
         let deleted = |commit: &Checksum| {
             deleted
                 .binary_search_by_key(commit, |name| name.checksum)
                 .is_ok()
         };
-        for (commit, entries) in attachments {
-            if deleted(commit) {
-                continue;
-            }
-            let name = ObjectName::new(*commit, ObjectType::Commit);
-            let found = attachment_findings(
-                *commit,
-                entries,
-                |attachment| {
-                    !listing
-                        .objects
-                        .contains_key(&ObjectName::new(*attachment, ObjectType::Commit))
-                        || deleted(attachment)
-                },
-                |attachment| partial.contains(attachment),
-                nested,
-            );
-            for error in found {
-                self.findings.push(BucketFinding {
-                    kind: Attachment,
-                    error: true,
-                    key: object_key(&name),
-                    object: Some(name),
-                    commits: Vec::new(),
-                    detail: error.reason(),
-                    attachment: Some(error),
-                });
-            }
+        let found = attachment_findings(
+            attachments,
+            |commit| !deleted(commit),
+            |attachment| {
+                !listing
+                    .objects
+                    .contains_key(&ObjectName::new(*attachment, ObjectType::Commit))
+                    || deleted(attachment)
+            },
+            |attachment| partial.contains(attachment),
+        );
+        for error in found {
+            let name = ObjectName::new(error.commit, ObjectType::Commit);
+            self.findings.push(BucketFinding {
+                kind: Attachment,
+                error: true,
+                key: object_key(&name),
+                object: Some(name),
+                commits: Vec::new(),
+                detail: error.reason(),
+                attachment: Some(error),
+            });
         }
     }
 
@@ -543,13 +535,17 @@ impl BucketRepo {
     ///    finding again, and drops the commits that are gone. If no commit
     ///    stays, the run records no finding. The same read covers each
     ///    absent attachment of an `Attachment` finding, one time for each
-    ///    commit. If the key holds an object, the finding is a note.
+    ///    commit. If the key holds an object, the finding is a note. Then the
+    ///    run drops each `Partial` attachment error that an attachment below
+    ///    it gives, if no `Absent` or `Partial` attachment error stays on
+    ///    that attachment.
     /// 8. With `delete`: the check of the attachments of step 5, against
     ///    the state after the repair. An attachment is partial if it holds a
-    ///    marker that the repair does not delete, or gets a marker from the
-    ///    repair. An attachment whose commit object the repair deletes is
-    ///    absent, and a commit whose own object the repair deletes gets no
-    ///    check. Then a check of the lock, a marker
+    ///    marker that the repair does not delete, if it gets a marker from
+    ///    the repair, or if an attachment of its own is absent or partial,
+    ///    at each depth. An attachment whose commit object the repair
+    ///    deletes is absent, and a commit whose own object the repair
+    ///    deletes gets no check. Then a check of the lock, a marker
     ///    `state/<checksum>.commitpartial` for each commit that reaches a
     ///    tree object of a `Missing`, a `Mismatch`, or a `Corrupt` finding,
     ///    the delete of the marker of each commit whose tree the run finds
@@ -759,7 +755,7 @@ impl BucketRepo {
         drop(files);
         self.fsck_attribute(run, &listing, &roots).await?;
         if lock.is_none() {
-            self.fsck_recheck(run).await?;
+            self.fsck_recheck(run, &partial).await?;
         }
         let whole = whole_marked(&run.findings, &roots, &partial);
         match lock {
@@ -1631,7 +1627,13 @@ impl BucketRepo {
     /// makes its finding a note. A finding whose commits are all gone is
     /// dropped. Each read asks for the first byte of the object alone, so
     /// its connection serves the next read.
-    async fn fsck_recheck(&self, run: &mut Run) -> Result<()> {
+    ///
+    /// `partial` holds the commits with a partial-commit marker. After an
+    /// `Attachment` finding becomes a note, the function drops each
+    /// `Partial` attachment error whose attachment has no marker and no
+    /// `Absent` or `Partial` attachment error of its own. It repeats this
+    /// until it drops no finding. This step sends no request.
+    async fn fsck_recheck(&self, run: &mut Run, partial: &BTreeSet<Checksum>) -> Result<()> {
         let absent: HashSet<ObjectName> = run
             .findings
             .iter()
@@ -1666,12 +1668,14 @@ impl BucketRepo {
             )
             .await?;
         let unlisted = &run.unlisted;
+        let mut noted = false;
         run.findings.retain_mut(|finding| {
             if let Some(error) = &finding.attachment
                 && error.kind == FsckAttachmentErrorKind::Absent
                 && let Some(attachment) = error.attachment
                 && present.contains(&ObjectName::new(attachment, ObjectType::Commit))
             {
+                noted = true;
                 finding.error = false;
                 finding.detail = related::attachment_reason(
                     &error.name,
@@ -1701,6 +1705,60 @@ impl BucketRepo {
                 .commits
                 .retain(|commit| held.contains(&ObjectName::new(*commit, ObjectType::Commit)));
             !finding.commits.is_empty()
+        });
+        // In a run with no lock, a `Partial` attachment error whose
+        // attachment has no marker comes from an attachment below it. Such
+        // an error stays only while that attachment has an error of its own.
+        // `candidates` holds such errors by attachment, and `errors` counts
+        // the `Absent` and `Partial` errors of each naming commit. A commit
+        // whose count gets to zero goes to `queue` one time.
+        if !noted {
+            return Ok(());
+        }
+        let mut candidates: Vec<(Checksum, usize, Checksum)> = Vec::new();
+        let mut errors: HashMap<Checksum, usize> = HashMap::new();
+        for (index, finding) in run.findings.iter().enumerate() {
+            let Some(error) = finding.attachment.as_ref().filter(|_| finding.error) else {
+                continue;
+            };
+            match error.kind {
+                FsckAttachmentErrorKind::Absent => {}
+                FsckAttachmentErrorKind::Partial => {
+                    if let Some(attachment) = error.attachment
+                        && !partial.contains(&attachment)
+                    {
+                        candidates.push((attachment, index, error.commit));
+                    }
+                }
+                _ => continue,
+            }
+            *errors.entry(error.commit).or_default() += 1;
+        }
+        candidates.sort_unstable();
+        let mut queue: Vec<Checksum> = candidates
+            .iter()
+            .map(|&(attachment, _, _)| attachment)
+            .filter(|attachment| !errors.contains_key(attachment))
+            .collect();
+        queue.dedup();
+        let mut dropped = vec![false; run.findings.len()];
+        while let Some(attachment) = queue.pop() {
+            let start = candidates.partition_point(|&(other, _, _)| other < attachment);
+            let end = candidates.partition_point(|&(other, _, _)| other <= attachment);
+            for &(_, index, commit) in &candidates[start..end] {
+                dropped[index] = true;
+                if let Some(count) = errors.get_mut(&commit) {
+                    *count -= 1;
+                    if *count == 0 {
+                        queue.push(commit);
+                    }
+                }
+            }
+        }
+        let mut index = 0;
+        run.findings.retain(|_| {
+            index += 1;
+            !dropped[index - 1]
         });
         Ok(())
     }

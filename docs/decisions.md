@@ -3273,8 +3273,8 @@ the rules.
   continues. The warning names the commit, the field, and the reason. The
   defective value or entry roots nothing, and the other entries of the field
   root as usual. `PruneStats::warnings` carries the warnings, and
-  `ostrya prune` writes each one to standard error and exits 0. For the
-  prune, a nested attachment is not defective.
+  `ostrya prune` writes each one to standard error and exits 0. A nested
+  attachment is not defective.
 - The local prune parses a `.commitmeta` only if its bytes hold the key
   `ostrya.related` and its terminating NUL. In a serialized `a{sv}` dict, the
   key of each entry is a NUL-terminated string at contiguous bytes. So a file
@@ -3476,16 +3476,31 @@ the rules.
   trust.
 - The fsck (`Repo::fsck` and `ostrya fsck`) reports each attachment of a
   commit that it checks that is absent, partial, or defective, in
-  `FsckReport::attachment_errors`. A nested attachment is defective. The run
-  reads field 2 from the read of its object walk, and classifies each entry
-  against the state after its own findings: an attachment that the run
-  deletes is absent, and an attachment whose tree the run finds incomplete is
-  partial. Under `mark_partial` and `mark_attachments`, the run marks the
-  commit of an absent or a partial attachment as partial, so a later pull
-  fetches the commit again with its attachments. A pull cannot repair a
-  defective entry, so it gets no marker. `mark_attachments` is a separate
-  switch, because a caller can accept a commit whose attachments are
-  absent and still need the marks of absent objects. A pull walks the tree
+  `FsckReport::attachment_errors`. The run reads field 2 from the read of
+  its object walk, and classifies each entry against the state after its
+  own findings: an attachment that the run deletes is absent, and an
+  attachment whose tree the run finds incomplete is partial. An attachment
+  can have attachments of its own. The run also classifies an attachment as
+  partial if the attachment has an absent or a partial finding of its own,
+  and repeats this classification until no finding changes. In R -> C -> D
+  with D absent, one run gives `Absent` on the entry D of C and `Partial` on
+  the entry C of R. Each finding names the attachment one level below, and
+  the finding on that attachment names the next level. The rule reads only
+  the data and the findings that the run already holds. A `Defective`
+  finding does not make the commit above it partial: the checksum of the
+  attachment covers its field 2, so a pull gives the same entry again.
+  Under `mark_partial` and `mark_attachments`, the run marks the commit of
+  an absent or a partial attachment as partial. The marks reach each commit
+  above a broken attachment, so a later pull of the top commit repairs the
+  full set. A pull cannot repair a defective entry, so it gets no marker. A
+  new finding kind that names the bottom commit was rejected:
+  `FsckAttachmentErrorKind` is not `#[non_exhaustive]`, so a new variant
+  breaks each exhaustive `match`, a diamond can reach more than one bottom
+  commit, and the kind needs a new text and a new path in the bucket fsck.
+  One level for each run was rejected: a chain of depth n then needs n runs
+  before a pull of the top commit repairs it. `mark_attachments` is a
+  separate switch, because a caller can accept a commit whose attachments
+  are absent and still need the marks of absent objects. A pull walks the tree
   of a commit only when the commit is marked partial. One enum in place of
   `mark_partial` was rejected: it removes the field `mark_partial`, so it
   breaks each caller that sets the field, also a caller that starts from
@@ -3495,11 +3510,16 @@ the rules.
   cannot filter the findings first. The marks of this check do not change
   the other findings of the run. The bucket fsck gives the same findings as
   `attachment` findings, reads an attachment as partial if the bucket holds
-  its partial-commit marker, and writes no key for them in a repair. A run
-  with the repair classifies each entry against the markers and the commit
-  objects after the repair, as the local run does, so its findings describe
-  the bucket that the run leaves. A run with no lock reads
-  each absent attachment again, as it reads a missing object again. The
+  its partial-commit marker, applies the same rule to an attachment with an
+  absent or a partial finding of its own, and writes no key for them in a
+  repair. A run with the repair classifies each entry against the markers
+  and the commit objects after the repair, as the local run does, so its
+  findings describe the bucket that the run leaves. A run with no lock reads
+  each absent attachment again, as it reads a missing object again. If the
+  read makes an `Absent` finding a note, the run drops each `Partial`
+  finding that an attachment below it gives, when no `Absent` or `Partial`
+  attachment error stays on that attachment, and repeats until it drops no finding. It uses the findings
+  alone and sends no new request. The
   tool reports no finding for field 2 and exits 0, so the exit status of
   `ostrya fsck` over such a repository is a divergence. To pass a commit
   whose attachment is absent was rejected: the commit is not complete, and

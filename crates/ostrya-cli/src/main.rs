@@ -366,10 +366,11 @@ enum Command {
     ///
     /// After the walk, the command checks the attachments in field 2 of each
     /// commit that it verified. It writes one line on standard error for each
-    /// attachment that is absent, partial, or defective, and exits 1. It marks
-    /// a commit with an absent or a partial attachment as partial, so a later
-    /// pull fetches the attachment. --no-mark-partial and
-    /// --no-mark-attachments each stop these marks.
+    /// attachment that is absent, partial, or defective, and exits 1. An
+    /// attachment is also partial if one of its own attachments is absent or
+    /// partial, at each depth. The command marks a commit with an absent or a
+    /// partial attachment as partial, so a later pull fetches the attachment.
+    /// --no-mark-partial and --no-mark-attachments each stop these marks.
     ///
     /// After the walk, the command checks each composefs image in
     /// `extensions/ostrya/composefs/` against the key
@@ -1992,7 +1993,9 @@ enum RemoteCommand {
     ///
     /// The command checks the attachments in field 2 of each commit. An
     /// attachment that is absent, partial, or defective gives an `attachment`
-    /// error on the key of the commit that names it. With --delete, the
+    /// error on the key of the commit that names it. An attachment is also
+    /// partial if one of its own attachments is absent or partial, at each
+    /// depth. With --delete, the
     /// command checks the attachments against the bucket after the repair,
     /// and writes and deletes no key for such an error.
     ///

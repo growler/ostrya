@@ -131,8 +131,9 @@
 //! - The attachments in field 2 of each commit that parses, the commits
 //!   with a partial-commit marker included. Each entry must have a name that
 //!   is not empty and a checksum of 32 bytes. The listing must hold the
-//!   commit of each attachment, the bucket must hold no partial-commit marker
-//!   of it, and its field 2 must be empty. Each fault is an `Attachment`
+//!   commit of each attachment, and the bucket must hold no partial-commit
+//!   marker of it. An attachment with an absent or a partial attachment of
+//!   its own is partial, at each depth. Each fault is an `Attachment`
 //!   finding. With `delete`, the check reads the state after the repair.
 //! - The partial-commit markers of the commits whose trees are whole, the
 //!   incomplete multipart uploads, and a writer lock at the start or at the
@@ -145,7 +146,9 @@
 //! commits of the object. An object that is in the bucket now is a note, and
 //! an object whose commits are all gone is no finding. The run also reads
 //! again the commit of each attachment that the listing does not hold, and
-//! a commit that is in the bucket now makes its finding a note.
+//! a commit that is in the bucket now makes its finding a note. The run then
+//! drops each partial finding that an attachment below it gives, if no
+//! `Absent` or `Partial` attachment error stays on that attachment.
 //!
 //! With `delete`, the run takes the writer lock with the operation `fsck`.
 //! It writes the marker `state/<checksum>.commitpartial`, with the one byte

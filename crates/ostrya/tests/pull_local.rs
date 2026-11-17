@@ -14,15 +14,16 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{
-    TmpDir, attachment_error, file_inventory, ostree_available, store_with_field2,
-    wait_for_commit_under_guard, within,
+    CHAIN_C, CHAIN_D, GUARD_HOLD, TmpDir, attachment_error, file_inventory, mark_partial,
+    ostree_available, store_with_field2, wait_for_commit_under_guard, within, write_chain,
+    write_diamond,
 };
 use futures_lite::future::poll_once;
 use ostrya::{
     AdvertisedDelta, Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitState,
-    CreateOptions, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error, FsckOptions, MutableTree,
-    ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Ref, RefSelector, Repo,
-    RepoMode, Signer, SummaryOptions, TimestampCheck, Type, Value,
+    CreateOptions, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error, FsckOptions, LockKind,
+    MutableTree, ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Ref,
+    RefSelector, Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -8569,21 +8570,6 @@ fn signed_remote() -> String {
     format!("gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n")
 }
 
-/// Asserts that `err` is `Error::ObjectNotFound` for the commit object of
-/// `commit`.
-fn assert_commit_not_found(err: &Error, commit: &Checksum) {
-    assert!(
-        matches!(
-            err,
-            Error::ObjectNotFound {
-                checksum,
-                ty: ObjectType::Commit,
-            } if checksum == commit
-        ),
-        "{err:?}"
-    );
-}
-
 /// Returns the options of a pull of `main` that applies an empty list of
 /// static deltas, so the fetch counters count each read from the source.
 fn counted_pull() -> PullOptions {
@@ -9110,20 +9096,29 @@ fn a_local_attachment_that_is_also_a_parent_is_checked() {
 }
 
 /// An attachment that neither the source nor the destination holds fails the
-/// pull with `Error::ObjectNotFound`, and the pull leaves nothing.
+/// pull with `Error::InvalidRelations`. The error names the commit that names
+/// the attachment, and the pull leaves nothing.
 #[test]
 fn a_missing_local_attachment_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-missing");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, _tip, att) = build_attachment_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         remove_commit_object(&src_dir, &att);
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let err = pull_main_with(&dst, &src, PullOptions::default())
             .await
             .unwrap_err();
-        assert_commit_not_found(&err, &att);
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(tip),
+                format!(
+                    "attachment boot/uki names commit {att}, which neither a source nor this repository holds"
+                )
+            )
+        );
         assert_left_nothing(&dst).await;
     });
 }
@@ -9158,12 +9153,11 @@ fn a_defective_local_attachment_entry_fails_the_pull() {
     });
 }
 
-/// An attachment that names attachments of its own fails the pull with
-/// `Error::InvalidRelations`, also if the walk takes that commit as a target.
-/// The error names the commit that names the nested attachment. The pull
-/// leaves nothing.
+/// An attachment that names attachments of its own brings them in, also if
+/// the walk takes that commit as a target. Each commit ends complete, and the
+/// pull writes the requested refs alone.
 #[test]
-fn a_nested_local_attachment_fails_the_pull() {
+fn a_nested_local_attachment_is_imported_with_its_attachments() {
     let tmp = TmpDir::new("pull-local-dependency-nested");
     block_on(async {
         let base = tmp.path();
@@ -9176,37 +9170,40 @@ fn a_nested_local_attachment_fails_the_pull() {
         let head = store_with_field2(&src, &tip, &[("lib/b", nested.as_bytes())]).await;
         move_ref(&src, "other", &nested).await;
         move_ref(&src, "main", &head).await;
-        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        let reason =
-            format!("attachment lib/b names commit {nested}, which has attachments of its own");
-        for refs in [&["main"][..], &["main", "other"]] {
-            let err = dst
-                .pull_local(
-                    &src,
-                    PullOptions {
-                        refs: refs.iter().map(|r| (*r).to_owned()).collect(),
-                        ..PullOptions::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(
-                attachment_error(err),
-                (Some(head), reason.clone()),
-                "{refs:?}"
-            );
-            assert_left_nothing(&dst).await;
+        for (at, refs) in [&["main"][..], &["main", "other"]].into_iter().enumerate() {
+            let (dst_dir, dst) = make_repo(base, &format!("dst-{at}"), RepoMode::Archive).await;
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for commit in [head, nested, att] {
+                assert_complete(&src, &dst, &dst_dir, &commit).await;
+            }
+            assert_no_markers(&dst_dir);
+            let expected: Vec<(String, Checksum)> = [("main", head), ("other", nested)]
+                .into_iter()
+                .take(refs.len())
+                .map(|(name, commit)| (name.to_owned(), commit))
+                .collect();
+            assert_eq!(dst.list_refs(None).await.unwrap(), expected, "{refs:?}");
         }
     });
 }
 
-/// One tip names an absent commit and a commit that names attachments of its
-/// own. The pull reads the attachments in the order of field 2 and fails at
-/// the first defect. A first entry that names the parent of the tip needs no
-/// read. The pull leaves nothing.
+/// One tip names an absent commit and a commit `upper` whose own attachment
+/// is absent too. The walk reads each level before the level below it, so the
+/// absent commit of level 1 gives the error in both orders of field 2. With
+/// `upper` alone, the error names `upper`, which names the absent commit of
+/// level 2. A first entry that names the parent of the tip needs no read. The
+/// pull leaves nothing.
 #[test]
-fn the_first_failing_local_attachment_gives_the_error() {
+fn a_missing_attachment_of_a_level_fails_before_the_level_below() {
     let tmp = TmpDir::new("pull-local-dependency-first-failure");
     block_on(async {
         let base = tmp.path();
@@ -9218,15 +9215,16 @@ fn the_first_failing_local_attachment_gives_the_error() {
         let plain = commit_tree(&src, base, "t", "main", Some(parent)).await;
         let absent = commit_tree(&src, base, "x", "dep/x", None).await;
         remove_commit_object(&src_dir, &absent);
-        let inner = commit_tree(&src, base, "d", "dep/d", None).await;
-        let nested = commit_tree_related(&src, base, "n", "dep/n", None, &[("lib/d", inner)]).await;
+        let deep = commit_tree(&src, base, "d", "dep/d", None).await;
+        let upper = commit_tree_related(&src, base, "n", "dep/n", None, &[("lib/d", deep)]).await;
+        remove_commit_object(&src_dir, &deep);
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         let opts = || PullOptions {
             depth: 1,
             ..PullOptions::default()
         };
 
-        for (first, second) in [(absent, nested), (nested, absent)] {
+        for (first, second) in [(absent, upper), (upper, absent)] {
             let tip = store_with_field2(
                 &src,
                 &plain,
@@ -9240,74 +9238,89 @@ fn the_first_failing_local_attachment_gives_the_error() {
             move_ref(&src, "main", &tip).await;
 
             let err = pull_main_with(&dst, &src, opts()).await.unwrap_err();
-            if first == absent {
-                assert_commit_not_found(&err, &absent);
-            } else {
-                let reason = format!(
-                    "attachment b/x names commit {nested}, which has attachments of its own"
-                );
-                assert_eq!(attachment_error(err), (Some(tip), reason));
-            }
+            let entry = if first == absent { "b/x" } else { "c/y" };
+            assert_eq!(
+                attachment_error(err),
+                (
+                    Some(tip),
+                    format!(
+                        "attachment {entry} names commit {absent}, which neither a source nor this repository holds"
+                    )
+                )
+            );
             assert_left_nothing(&dst).await;
         }
+
+        let tip = store_with_field2(
+            &src,
+            &plain,
+            &[("a/p", parent.as_bytes()), ("b/x", upper.as_bytes())],
+        )
+        .await;
+        move_ref(&src, "main", &tip).await;
+        let err = pull_main_with(&dst, &src, opts()).await.unwrap_err();
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(upper),
+                format!(
+                    "attachment lib/d names commit {deep}, which neither a source nor this repository holds"
+                )
+            )
+        );
+        assert_left_nothing(&dst).await;
     });
 }
 
-/// The tip of `main` names the tip of `other`, which the walk takes and which
-/// names attachments of its own, and an absent commit. The pull reads no
-/// attachment after the nested one, so the order of field 2 selects the
-/// error. The pull leaves nothing.
+/// The tip of `main` names the tip of `other` as an attachment, and `other`
+/// names an attachment of its own. With `other` as a target too, the walk of
+/// the chains takes `other`, and the pull takes its attachment. With `main`
+/// alone, `other` is an attachment of level 1, and its attachment is of level
+/// 2. In both, each commit ends complete, and the pull writes the requested
+/// refs alone.
 #[test]
-fn a_held_nested_attachment_before_a_missing_one_gives_the_nested_error() {
+fn an_attachment_that_the_walk_takes_brings_its_attachments() {
     let tmp = TmpDir::new("pull-local-dependency-held-nested");
     block_on(async {
         let base = tmp.path();
-        for sub in ["t", "o", "x", "d"] {
+        for sub in ["t", "o", "d"] {
             build_tree(&base.join(sub), sub.as_bytes());
         }
-        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
         let plain = commit_tree(&src, base, "t", "main", None).await;
         let inner = commit_tree(&src, base, "d", "dep/d", None).await;
         let other = commit_tree_related(&src, base, "o", "other", None, &[("lib/d", inner)]).await;
-        let absent = commit_tree(&src, base, "x", "dep/x", None).await;
-        remove_commit_object(&src_dir, &absent);
-        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let tip = store_with_field2(&src, &plain, &[("a/x", other.as_bytes())]).await;
+        move_ref(&src, "main", &tip).await;
 
-        for (first, second) in [(other, absent), (absent, other)] {
-            let tip = store_with_field2(
+        for (at, refs) in [&["main", "other"][..], &["main"]].into_iter().enumerate() {
+            let (dst_dir, dst) = make_repo(base, &format!("dst-{at}"), RepoMode::Archive).await;
+            dst.pull_local(
                 &src,
-                &plain,
-                &[("a/x", first.as_bytes()), ("b/y", second.as_bytes())],
+                PullOptions {
+                    refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    ..PullOptions::default()
+                },
             )
-            .await;
-            move_ref(&src, "main", &tip).await;
-
-            let err = dst
-                .pull_local(
-                    &src,
-                    PullOptions {
-                        refs: vec!["main".to_owned(), "other".to_owned()],
-                        ..PullOptions::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            if first == other {
-                let reason = format!(
-                    "attachment a/x names commit {other}, which has attachments of its own"
-                );
-                assert_eq!(attachment_error(err), (Some(tip), reason));
-            } else {
-                assert_commit_not_found(&err, &absent);
+            .await
+            .unwrap();
+            for commit in [tip, other, inner] {
+                assert_complete(&src, &dst, &dst_dir, &commit).await;
             }
-            assert_left_nothing(&dst).await;
+            assert_no_markers(&dst_dir);
+            let expected: Vec<(String, Checksum)> = [("main", tip), ("other", other)]
+                .into_iter()
+                .take(refs.len())
+                .map(|(name, commit)| (name.to_owned(), commit))
+                .collect();
+            assert_eq!(dst.list_refs(None).await.unwrap(), expected, "{refs:?}");
         }
     });
 }
 
 /// A parent that the source does not hold ends its chain. If a pulled commit
 /// names the parent as an attachment, the pull fails with
-/// `Error::ObjectNotFound`.
+/// `Error::InvalidRelations`, which names that commit.
 #[test]
 fn an_absent_local_parent_that_is_an_attachment_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-absent-parent");
@@ -9329,7 +9342,15 @@ fn an_absent_local_parent_that_is_an_attachment_fails_the_pull() {
         };
 
         let err = pull_main_with(&dst, &src, opts()).await.unwrap_err();
-        assert_commit_not_found(&err, &parent);
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(tip),
+                format!(
+                    "attachment boot/p names commit {parent}, which neither a source nor this repository holds"
+                )
+            )
+        );
         assert_left_nothing(&dst).await;
 
         // With no commit that names it, the absent parent ends its chain.
@@ -9480,8 +9501,9 @@ fn an_attachment_comes_from_a_localcache_or_the_destination() {
 
 /// One tip names three attachments. The source alone holds the first, a
 /// localcache repository alone holds the second, and the destination alone
-/// holds the third, complete. The pull reads each one from the repository
-/// that holds it, and each one ends complete in the destination.
+/// holds the third, complete. The pull reads the first two from the
+/// repository that holds each one, and skips the third. Each one ends
+/// complete in the destination.
 #[test]
 fn a_local_pull_reads_each_attachment_from_the_repository_that_holds_it() {
     let tmp = TmpDir::new("pull-local-dependency-holders");
@@ -9535,12 +9557,14 @@ fn a_local_pull_reads_each_attachment_from_the_repository_that_holds_it() {
     });
 }
 
-/// A tip names two attachments. The destination alone holds the first. Two
-/// repositories hold the second: the earlier one in the order source,
-/// localcache, destination holds a copy that does not read, and the later one
-/// holds a good copy. The pull fails on the defective copy. Thus the pull
-/// reads the source before a localcache and a localcache before the
-/// destination, and it starts the search of each attachment at the source.
+/// A tip names two attachments. The destination alone holds the first,
+/// complete, so the pull does not read it. Two repositories hold the second:
+/// the earlier one in the order source, localcache, destination holds a copy
+/// that does not read, and the later one holds a good copy. The copy in the
+/// destination is partial, so the pull reads the second attachment. The pull
+/// fails on the defective copy. Thus the pull reads the source before a
+/// localcache and a localcache before the destination, and it starts the
+/// search of each attachment at the source.
 #[test]
 fn a_local_pull_reads_an_attachment_from_its_first_holder() {
     let tmp = TmpDir::new("pull-local-dependency-holder-order");
@@ -9563,6 +9587,7 @@ fn a_local_pull_reads_an_attachment_from_its_first_holder() {
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         hold_commit(&dst, &src, &in_dst).await;
         hold_commit(&dst, &src, &past_cache).await;
+        mark_partial(&dst, &past_cache);
         remove_commit_object(&src_dir, &in_dst);
         remove_commit_object(&src_dir, &past_cache);
         spoil_commit_object(&src_dir, &in_cache);
@@ -9592,6 +9617,202 @@ fn a_local_pull_reads_an_attachment_from_its_first_holder() {
             );
             assert!(dst.list_refs(None).await.unwrap().is_empty());
         }
+    });
+}
+
+/// Returns the options of a pull of `branch`.
+fn pull_of(branch: &str) -> PullOptions {
+    PullOptions {
+        refs: vec![branch.to_owned()],
+        ..PullOptions::default()
+    }
+}
+
+/// A pull of R of the chain R -> C -> D takes C and D, complete, with no
+/// marker and no ref for C or D. A pull that reads static deltas keeps the
+/// entries of field 2, and gives the same result.
+#[test]
+fn a_local_pull_takes_the_full_set_of_attachments() {
+    let tmp = TmpDir::new("pull-local-attachment-chain");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let chain = write_chain(&src, base, "main").await;
+
+        for (name, opts) in [("plain", pull_of("main")), ("counted", counted_pull())] {
+            let (dst_dir, dst) = make_repo(base, name, RepoMode::Archive).await;
+            dst.pull_local(&src, opts).await.unwrap();
+            for commit in [chain.r, chain.c, chain.d] {
+                assert_complete(&src, &dst, &dst_dir, &commit).await;
+            }
+            assert_no_markers(&dst_dir);
+            assert_eq!(
+                dst.list_refs(None).await.unwrap(),
+                [("main".to_owned(), chain.r)],
+                "{name}"
+            );
+            // The fsck finds no defect of an object. Its check of field 2
+            // reports C, which names an attachment of its own.
+            let report = dst.fsck(&FsckOptions::default()).await.unwrap();
+            assert!(
+                report.errors.is_empty() && report.failure.is_none(),
+                "{name}: {report:?}"
+            );
+        }
+    });
+}
+
+/// In the diamond, A and B both name D. The pull takes D one time: it counts
+/// the `.commitmeta` of D one time. Each commit ends complete, and the pull
+/// writes the ref of R alone.
+#[test]
+fn an_attachment_that_two_attachments_name_crosses_once() {
+    let tmp = TmpDir::new("pull-local-attachment-diamond");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let diamond = write_diamond(&src, base, "main").await;
+        src.write_commit_detached_metadata(&diamond.d, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        let stats = dst.pull_local(&src, counted_pull()).await.unwrap();
+
+        for commit in [diamond.r, diamond.a, diamond.b, diamond.d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_eq!(stats.metadata_fetched, stats.metadata_imported + 1);
+        assert_eq!(
+            dst.read_commit_detached_metadata(&diamond.d).await.unwrap(),
+            Some(two_property_metadata())
+        );
+        assert_no_markers(&dst_dir);
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            [("main".to_owned(), diamond.r)]
+        );
+    });
+}
+
+/// The destination holds C of the chain R -> C -> D complete. The pull of R
+/// skips C and reads nothing below it: with the commit object of D gone from
+/// the source and from the destination, the pull passes, and imports no
+/// commit object of D.
+#[test]
+fn a_local_pull_reads_nothing_below_an_attachment_held_complete() {
+    let tmp = TmpDir::new("pull-local-attachment-held");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let chain = write_chain(&src, base, "main").await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &chain.c).await;
+        assert_complete(&src, &dst, &dst_dir, &chain.d).await;
+        remove_commit_object(&src_dir, &chain.d);
+        remove_commit_object(&dst_dir, &chain.d);
+
+        dst.pull_local(&src, pull_of("main")).await.unwrap();
+
+        assert_complete(&src, &dst, &dst_dir, &chain.r).await;
+        assert_eq!(
+            dst.commit_state(&chain.c).await.unwrap(),
+            CommitState::Normal
+        );
+        assert!(!dst.has_object(ObjectType::Commit, &chain.d).await.unwrap());
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// In two chains R -> C -> D, the source does not hold D of `main`, and holds
+/// D of `other` partial. The pull of each ref fails, the error names C as the
+/// commit that names D, and the pull leaves nothing.
+#[test]
+fn a_missing_attachment_below_an_attachment_names_its_commit() {
+    let tmp = TmpDir::new("pull-local-attachment-broken-bottom");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let main = write_chain(&src, base, "main").await;
+        let other = write_chain(&src, base, "other").await;
+        remove_commit_object(&src_dir, &main.d);
+        mark_partial(&src, &other.d);
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        for (branch, chain, end) in [
+            (
+                "main",
+                &main,
+                "which neither a source nor this repository holds",
+            ),
+            ("other", &other, "which is partial"),
+        ] {
+            let err = dst.pull_local(&src, pull_of(branch)).await.unwrap_err();
+            assert_eq!(
+                attachment_error(err),
+                (
+                    Some(chain.c),
+                    format!("attachment {CHAIN_D} names commit {}, {end}", chain.d)
+                ),
+                "{branch}"
+            );
+            assert_left_nothing(&dst).await;
+        }
+    });
+}
+
+/// The walk skips C of the chain R -> C -> D, which the destination holds
+/// complete. Then C becomes partial before the transaction of the pull opens.
+/// The pull checks C again after the open, fails with the error that names
+/// R, and writes no object, no marker, and no ref.
+///
+/// An exclusive transaction of a second handle holds the pull at the open.
+/// Neither the source nor the destination holds the commit object of D, so
+/// a walk that sees C partial reads C from the destination and fails with
+/// another error, which names C and D.
+#[test]
+fn an_attachment_that_the_walk_skips_is_checked_again_after_the_open() {
+    let tmp = TmpDir::new("pull-local-attachment-recheck");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let chain = write_chain(&src, base, "main").await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &chain.c).await;
+        remove_commit_object(&src_dir, &chain.c);
+        remove_commit_object(&src_dir, &chain.d);
+        remove_commit_object(&dst_dir, &chain.d);
+        let before = dst.list_objects().await.unwrap();
+        let pulling = Repo::open(&dst_dir).await.unwrap();
+
+        let held = dst
+            .transaction_with_lock(LockKind::Exclusive)
+            .await
+            .unwrap();
+        let mut task = spawn(async move { pulling.pull_local(&src, pull_of("main")).await });
+        ostrya_rt::Timer::after(GUARD_HOLD).await;
+        assert!(poll_once(&mut task).await.is_none(), "the pull waits");
+        mark_partial(&dst, &chain.c);
+        held.abort().await.unwrap();
+
+        let err = within("the pull", task).await.unwrap_err();
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(chain.r),
+                format!(
+                    "attachment {CHAIN_C} names commit {}, which this repository no longer \
+                     holds complete",
+                    chain.c
+                )
+            )
+        );
+        assert_eq!(dst.list_objects().await.unwrap(), before);
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            file_inventory(&dst_dir, "state"),
+            [(format!("state/{}.commitpartial", chain.c), Vec::new())]
+        );
     });
 }
 
@@ -9649,9 +9870,9 @@ fn a_collection_pull_imports_an_attachment() {
 }
 
 /// The intermediate commit B of a chain of static deltas names an attachment.
-/// The pull imports the attachment loose. If the target names B as an
-/// attachment, B is a nested attachment, and the pull fails before its
-/// transaction opens.
+/// The pull imports the attachment loose. A target that names B as an
+/// attachment gives the same result: the delta of its step makes B, and the
+/// pull takes the attachment of B.
 #[test]
 fn an_attachment_of_an_intermediate_commit_is_imported() {
     let tmp = TmpDir::new("pull-local-dependency-chain");
@@ -9665,36 +9886,33 @@ fn an_attachment_of_an_intermediate_commit_is_imported() {
         let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
         let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", att)]).await;
         let c = commit_tree(&src, base, "c", "main", Some(b)).await;
-        // The commit write refuses a nested attachment, so the commit that
-        // names B is a copy of C with its own field 2.
+        // The commit that names B is a copy of C with its own field 2.
         let naming = store_with_field2(&src, &c, &[("lib/b", b.as_bytes())]).await;
         let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (b, naming)]).await;
 
-        move_ref(&src, "main", &c).await;
-        let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
-        dst.pull_local(&src, chain_pull(list.clone()))
-            .await
-            .unwrap();
-        for commit in [b, c, att] {
-            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        for (target, name) in [(c, "dst"), (naming, "nested")] {
+            move_ref(&src, "main", &target).await;
+            let (dst_dir, dst) = dst_holding(base, name, &src, &a).await;
+            dst.pull_local(&src, chain_pull(list.clone()))
+                .await
+                .unwrap();
+            for commit in [b, target, att] {
+                assert_complete(&src, &dst, &dst_dir, &commit).await;
+            }
+            assert_no_markers(&dst_dir);
+            // The fsck finds no defect of an object. Under the second
+            // target, its check of field 2 reports the entry that names B,
+            // which names an attachment of its own.
+            let report = dst.fsck(&FsckOptions::default()).await.unwrap();
+            assert!(
+                report.errors.is_empty() && report.failure.is_none(),
+                "{report:?}"
+            );
+            assert_eq!(
+                dst.list_refs(None).await.unwrap(),
+                [("main".to_owned(), target)]
+            );
         }
-        assert_no_markers(&dst_dir);
-        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
-
-        move_ref(&src, "main", &naming).await;
-        let (nested_dir, nested) = dst_holding(base, "nested", &src, &a).await;
-        let held = nested.list_objects().await.unwrap();
-        let err = nested.pull_local(&src, chain_pull(list)).await.unwrap_err();
-        assert_eq!(
-            attachment_error(err),
-            (
-                Some(naming),
-                format!("attachment lib/b names commit {b}, which has attachments of its own")
-            )
-        );
-        assert_eq!(nested.list_objects().await.unwrap(), held);
-        assert!(nested.list_refs(None).await.unwrap().is_empty());
-        assert_no_markers(&nested_dir);
     });
 }
 

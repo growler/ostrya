@@ -3185,6 +3185,28 @@ the rules.
   one level, in which an attachment names no attachment, was rejected. It
   blocks the expected use Rootfs -> Container -> Container Details. It also
   gives no protection against a cycle, because none can occur.
+- A local pull takes the full set of attachments of each commit that it
+  walks. The media export and the media import make local pulls, so the
+  rule applies to them too. The pull reads field 2 of each attachment that
+  it reads, and takes the attachments that this field names. It continues
+  one level at a time, until a level has no new attachment. It reads each
+  commit object one time, also if two commits name it, and it reads no tree
+  in this walk. It skips an attachment that the repository holds complete,
+  and reads nothing below it. The write rule above makes the full set of
+  attachments of such an attachment complete. Each attachment has depth 0,
+  no ref, and no signature check, at each level. The walk ends before the
+  transaction opens. An attachment that neither a source nor the repository
+  holds fails the pull, at each level. The error names the commit that
+  first names the attachment. The walk also refuses an attachment that the
+  first source that holds it marks partial, with the same form of error. A
+  partial copy in the repository is the copy that the pull completes. After
+  the transaction opens, and before the pull writes a marker, the pull
+  checks each attachment that it skipped again. Another process can make
+  such an attachment partial or absent between the walk and the open. If
+  one is no longer complete, the pull fails and writes no object, no
+  marker, and no ref. A walk that also reads below an attachment held
+  complete was rejected: it reads commits that the write rule already makes
+  complete.
 - The commit write of `ostrya commit` checks each attachment one time.
   `Transaction::check_attachments` checks the attachments before the command
   reads the tree, and gives a `CheckedAttachments` that borrows the transaction.

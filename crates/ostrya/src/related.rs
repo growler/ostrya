@@ -67,6 +67,15 @@ pub(crate) const PARTIAL_REASON: &str = "which is partial";
 /// The end of the reason of an attachment that the repository does not hold.
 pub(crate) const ABSENT_REASON: &str = "which the repository does not hold";
 
+/// The end of the reason of an attachment that a local pull finds in no
+/// source and not in the repository.
+pub(crate) const UNHELD_REASON: &str = "which neither a source nor this repository holds";
+
+/// The end of the reason of an attachment that a local pull found complete
+/// in the repository, and that the repository no longer holds complete when
+/// the transaction of the pull opens.
+pub(crate) const NO_LONGER_COMPLETE_REASON: &str = "which this repository no longer holds complete";
+
 /// The type of a commit object. The parse of field 2 decodes member 2 alone.
 static COMMIT_TYPE: LazyLock<Type> =
     LazyLock::new(|| Type::parse("(a{sv}aya(say)sstayay)").expect("the commit signature is valid"));

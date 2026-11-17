@@ -4488,13 +4488,18 @@ nothing, since `pull-local` reads no delta by default. Ten differences stand:
   regular-file mode with bits outside `0755` -- because the object would get a
   name that its stored form does not hash to. What the port imports passes its
   own `fsck` and the `fsck` of the tool;
-- the attachments of a commit. The port imports the attachments that field
-  2 of each pulled commit names, each at depth 0 and with no ref, unless the
-  pull is commit-only (`../format-reference.md`, "Attachments in a local
-  pull"). An attachment that neither the source, a localcache repository, nor
-  the destination holds, a field 2 entry with an empty name or with a
-  checksum that is not 32 bytes, and a nested attachment fail the pull at
-  exit 1, and the pull writes no object and no ref. Under
+- the attachments of a commit. The port imports the full set of
+  attachments of each pulled commit: the attachments that field 2 names, and
+  the attachments of each attachment, level by level. It imports each one at
+  depth 0 and with no ref, unless the pull is commit-only
+  (`../format-reference.md`, "Attachments in a local pull"). It skips an
+  attachment that the destination holds complete, and reads nothing below
+  it. A field 2 entry with an empty name or with a checksum that is not 32
+  bytes fails the pull at exit 1. At each level, an attachment that neither
+  the source, a localcache repository, nor the destination holds fails the
+  pull at exit 1, and so does an attachment that the first source that holds
+  it marks partial. The error names the commit that first names the
+  attachment. The pull then writes no object and no ref. Under
   `--require-static-deltas`, the port also looks for a delta of each
   attachment, and an attachment with no delta fails the pull at exit 1 before
   it writes an object (`../format-reference.md`, "Static deltas of

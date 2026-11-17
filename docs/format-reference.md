@@ -3567,9 +3567,9 @@ empty name and checks nothing else in the name.
 
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
-checksum that is not 32 bytes. For a transfer, a field 2 entry that names a
-nested attachment is defective too. A nested attachment is an attachment whose
-own field 2 is not empty.
+checksum that is not 32 bytes. For a pull from a remote, a push, and a
+receive, a field 2 entry that names a nested attachment is defective too. A
+nested attachment is an attachment whose own field 2 is not empty.
 
 ### Attachments
 
@@ -3755,16 +3755,26 @@ The pull of the `ostree` command fetches no attachment
 
 ### Attachments in a local pull
 
-A local pull follows the attachments of each commit that it walks: each
-target and each parent that the depth of the pull takes, also a commit that
-the repository holds complete. It also follows the attachments of each
-intermediate commit of a chain of static deltas. Discovery reads field 2 of
-such a commit from the superblock of its step. These rules apply to a pull of
-refs and to a pull of collection refs:
+A local pull takes the full set of attachments of each commit that it walks:
+each target and each parent that the depth of the pull takes, also a commit
+that the repository holds complete. It also takes the full set of attachments
+of each intermediate commit of a chain of static deltas. Discovery reads field
+2 of such a commit from the superblock of its step. The full set is the
+attachments of the commit, the attachments of each attachment, and so on. The
+pull reads field 2 of each attachment that it reads, and takes the
+attachments that this field names, one level at a time, until a level has no
+new attachment. These rules apply to a pull of refs and to a pull of
+collection refs:
 
-- The pull imports each attachment at depth 0, so an attachment entry adds no
-  parent to the pull. The pull imports an attachment one time, also if
-  several commits name it.
+- The pull imports each attachment at depth 0, at each level, so an
+  attachment entry adds no parent to the pull. The pull imports an attachment
+  one time, also if several commits name it, and the walk of the attachments
+  reads its commit object one time.
+- The pull skips an attachment that the repository holds complete, and reads
+  nothing below it. Each write of a commit checks that its attachments are
+  complete, so the full set of attachments of a complete commit is complete.
+  The walk of the attachments reads commit objects alone, and no tree, before
+  the transaction opens.
 - The pull writes no ref for an attachment.
 - The pull checks no signature of an attachment commit. Field 2 holds the
   checksum of the attachment, and the checksum and the signatures of the
@@ -3783,9 +3793,10 @@ refs and to a pull of collection refs:
   `.commitmeta` only if the rule drops `ostrya.related`. A `.commitmeta` that
   does not parse then fails the pull. Under the default rule, the pull copies
   the bytes as it reads them.
-- The pull reads the commit object of an attachment from the source, then
-  from each localcache repository, then from the repository. It reads no
-  commit object of an attachment that a chain of static deltas makes.
+- The pull reads the commit object of an attachment that the repository does
+  not hold complete from the source, then from each localcache repository,
+  then from the repository. It reads no commit object of an attachment that a
+  chain of static deltas makes.
 - For an attachment that the repository holds complete, the pull walks no
   tree and copies no `.commitmeta`. So the attachment does not get the
   signatures that the source added after the repository stored it. A pull
@@ -3801,16 +3812,31 @@ refs and to a pull of collection refs:
 - The pull does not follow a supplement.
 - A commit-only pull imports no attachment.
 
-The pull checks the format of field 2 of each commit that it walks, and of
-each commit of a chain of static deltas. A commit-only pull checks it too. A
-defective related value in field 2 fails the pull: an entry with an empty
-name, an entry with a checksum that is not 32 bytes, and an entry that names
-a nested attachment. An attachment that neither a source nor the repository
-holds fails the pull too. This is also true for a parent that the source does
-not hold, if a commit of the pull names it as an attachment. The pull finds
-each of these failures before its transaction opens, so it writes no object,
-no ref, and no `.commitpartial` marker. The same is true for an attachment with
-no delta under the requirement of static deltas.
+The pull checks the format of field 2 of each commit that it walks, of each
+commit of a chain of static deltas, and of each attachment that it reads. A
+commit-only pull checks it too, for the commits that it walks. A defective
+related value in field 2 fails the pull: an entry with an empty name, and an
+entry with a checksum that is not 32 bytes. These failures also fail the
+pull, at each level of the attachments:
+
+- An attachment that neither a source nor the repository holds. This is also
+  true for a parent that the source does not hold, if a commit of the pull
+  names it as an attachment.
+- An attachment that the first source or localcache repository that holds it
+  marks partial. A partial copy in the repository is the copy that the pull
+  completes.
+
+The error of these two failures names the commit that first names the
+attachment. The pull finds each of these failures before its transaction
+opens, so it writes no object, no ref, and no `.commitpartial` marker. The
+same is true for an attachment with no delta under the requirement of static
+deltas.
+
+After the transaction opens, and before the pull writes a marker, the pull
+checks each attachment that it skipped again. If the repository no longer
+holds one of them complete, the pull fails with an error that names the
+commit that first names the attachment, and writes no object, no ref, and no
+marker.
 
 The `pull-local` command of `ostree` imports no attachment
 (`conformance/cli-behavior.md`, "Related commits in a pull").
@@ -3890,8 +3916,7 @@ not hold it or if it names attachments of its own. An attachment that names
 attachments of its own and has a delta fails the pull as a nested
 attachment, after the pull fetched and checked the superblock. A local pull
 reads the commit of each attachment before the search. So an attachment that
-no source holds, and a nested attachment, fail the pull before the search for
-its delta.
+no source holds fails the pull before the search for its delta.
 
 The pull checks no signature of the superblock of the delta of an attachment.
 It checks the digest that the advertisement or the list states, the `from`
@@ -5887,8 +5912,10 @@ a ref of the media to an older commit.
 The export makes one local pull for each collection, in the order of the
 first operand of each collection. Each pull is at depth 0, with no signature
 check and no timestamp check. It copies the `.commitmeta` of each commit, and
-the attachments of field 2 of each commit as loose objects, with no ref
-("Static deltas of attachments"). It copies no static delta, no
+the full set of attachments of each commit as loose objects, with no ref
+("Static deltas of attachments"). The full set is the attachments that field
+2 names, and the attachments of each attachment, level by level ("Attachments
+in a local pull"). It copies no static delta, no
 `delta-indexes/` entry, and no `summary.sig` of the source. On the file system
 of the source, the pull can share an object by hardlink or reflink. Where the
 file system refuses the link, it copies the object.
@@ -6104,8 +6131,8 @@ A ref whose current ref holds the commit of the media is unchanged. The
 import does not pull it, and writes no ref for it. For each other ref, the
 import makes one local pull from the media repository, with its own
 transaction. The pull is at depth 0, and reads no static delta. It copies
-the `.commitmeta` of the commit, and the attachments of field 2 of the
-commit as loose objects. The `ostree.collection-binding` of the commit must
+the `.commitmeta` of the commit, and the full set of attachments of the
+commit as loose objects ("Attachments in a local pull"). The `ostree.collection-binding` of the commit must
 state `ID`, and the ref-binding check applies. The pull refuses a commit
 whose timestamp is older than the timestamp of the commit of the current
 ref. The `ostree` command moves the ref back. If the current ref is the

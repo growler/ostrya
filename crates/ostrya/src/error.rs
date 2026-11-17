@@ -559,13 +559,21 @@ pub enum Error {
     ///   queued, for a stored `ostrya.related` value with one of these
     ///   defects. `commit` is the commit that gets the supplement.
     /// - [`Repo::pull`](crate::Repo::pull),
-    ///   [`Repo::pull_with_session`](crate::Repo::pull_with_session),
-    ///   [`Repo::pull_collection`](crate::Repo::pull_collection), and
-    ///   [`Repo::pull_local`](crate::Repo::pull_local), for an
-    ///   entry of field 2 with an empty name or with a checksum that is not 32
-    ///   bytes, and for a nested attachment. `commit` is the commit that holds
-    ///   the entry. For a nested attachment, it is the commit that names the
-    ///   attachment.
+    ///   [`Repo::pull_with_session`](crate::Repo::pull_with_session), and
+    ///   [`Repo::pull_collection`](crate::Repo::pull_collection) from a
+    ///   remote, for an entry of field 2 with an empty name or with a
+    ///   checksum that is not 32 bytes, and for a nested attachment. `commit`
+    ///   is the commit that holds the entry. For a nested attachment, it is
+    ///   the commit that names the attachment.
+    /// - [`Repo::pull_local`](crate::Repo::pull_local), and
+    ///   [`Repo::pull_collection`](crate::Repo::pull_collection) from a local
+    ///   repository, for an entry of field 2 with an empty name or with a
+    ///   checksum that is not 32 bytes. Also for an attachment, at each level,
+    ///   that neither a source nor the repository holds, that the first
+    ///   source that holds it marks partial, or that the repository held
+    ///   complete and no longer holds complete when the transaction opens.
+    ///   `commit` is the commit that holds the entry. For an attachment, it
+    ///   is the commit that first names the attachment.
     /// - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`,
     ///   for an entry of field 2 with an empty name or with a checksum that is
     ///   not 32 bytes, in a commit of the walk of the push: a source commit or

@@ -15,8 +15,8 @@
 //! it holds no paired entry complete.
 //!
 //! [`Attachments`] holds the attachments that a pull met, the commits that
-//! name them, and the error for an attachment that names attachments of its
-//! own, for the local pull and for the pull over HTTP.
+//! name them, and the errors that name the commit that first named an
+//! attachment, for the local pull and for the pull over HTTP.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -33,9 +33,10 @@ use super::delta::{AttachmentLookup, complete_here_blocking};
 /// The attachments that one pull met, and the commits that name them.
 ///
 /// The type records the state alone. Each engine chooses when it calls
-/// [`nested_error`](Attachments::nested_error): the local pull checks each
-/// attachment after the walk of the chains, and the pull over HTTP checks
-/// each commit when its step ends.
+/// [`named_error`](Attachments::named_error) or
+/// [`nested_error`](Attachments::nested_error): the local pull gives an
+/// error when its walk of the attachments reads an attachment, and the pull
+/// over HTTP checks each commit when its step ends.
 #[derive(Default)]
 pub(super) struct Attachments {
     /// Each attachment, in the order in which the pull first recorded it.
@@ -117,6 +118,19 @@ impl Attachments {
     pub(super) fn nested_error(&self, attachment: &Checksum) -> Option<Error> {
         self.named(attachment)
             .map(|(commit, name)| related::nested_attachment(commit, name, attachment))
+    }
+
+    /// Returns the [`Error::InvalidRelations`] in field 2 for `attachment`,
+    /// with the end `end` of its reason, or `None` if no commit named it.
+    /// The error names the commit that first named the attachment, and the
+    /// name of its entry.
+    pub(super) fn named_error(&self, attachment: &Checksum, end: &str) -> Option<Error> {
+        self.named(attachment)
+            .map(|(commit, name)| Error::InvalidRelations {
+                commit: Some(commit),
+                field: RelationField::Attachments,
+                reason: related::attachment_reason(name, attachment, end),
+            })
     }
 }
 
@@ -254,6 +268,10 @@ pub(super) fn pair_targets(
 /// a defective entry. If field 2 has two entries with one name, the first
 /// entry is the paired entry.
 ///
+/// `checked` holds the completeness of commits that the caller checked. The
+/// call makes no check of such a commit, and gives `checked` back in the
+/// result with its own checks.
+///
 /// The reads and the checks of completeness run in one call on the blocking
 /// pool. Each commit gets one check. The search for the deltas reads the
 /// checks again, and does not make them a second time.
@@ -268,9 +286,10 @@ pub(super) async fn lookups(
     targets: &[(String, Checksum)],
     place: RefPlace<'_>,
     named: Vec<Named>,
+    checked: HashMap<Checksum, bool>,
 ) -> Result<(Vec<AttachmentLookup>, HashMap<Checksum, bool>)> {
     if named.is_empty() {
-        return Ok((Vec::new(), HashMap::new()));
+        return Ok((Vec::new(), checked));
     }
     let mut relpaths: Vec<Option<String>> = vec![None; targets.len()];
     for (target, _) in named.iter().flat_map(|named| &named.pairs) {
@@ -289,7 +308,7 @@ pub(super) async fn lookups(
                 None => None,
             });
         }
-        let mut complete: HashMap<Checksum, bool> = HashMap::new();
+        let mut complete = checked;
         let mut is_complete = |commit: &Checksum| -> Result<bool> {
             if let Some(held) = complete.get(commit) {
                 return Ok(*held);
@@ -406,31 +425,45 @@ mod tests {
         assert!(atts.naming().values().all(Vec::is_empty));
     }
 
-    /// The error for a nested attachment names the commit and the entry that
-    /// first named the attachment. An attachment that no commit named gives no
-    /// error.
+    /// The error for an attachment names the commit and the entry that first
+    /// named the attachment, with the end of the reason that the caller
+    /// gives. The nested-attachment error has the same form. An attachment
+    /// that no commit named gives no error.
     #[test]
-    fn a_nested_attachment_error_names_the_first_naming_commit() {
+    fn an_attachment_error_names_the_first_naming_commit() {
         let mut atts = Attachments::new(false);
         atts.record(cs(1), entries(&[("lib/b", 2)]));
         atts.record(cs(3), entries(&[("lib/x", 2)]));
-        match atts.nested_error(&cs(2)) {
+        let reason = |err: Option<Error>| match err {
             Some(Error::InvalidRelations {
                 commit,
                 field: RelationField::Attachments,
                 reason,
-            }) => {
-                assert_eq!(commit, Some(cs(1)));
-                assert_eq!(
-                    reason,
-                    format!(
-                        "attachment lib/b names commit {}, which has attachments of its own",
-                        cs(2)
-                    )
-                );
-            }
+            }) => (commit, reason),
             other => panic!("expected InvalidRelations in field 2, got {other:?}"),
-        }
+        };
+        assert_eq!(
+            reason(atts.named_error(&cs(2), related::UNHELD_REASON)),
+            (
+                Some(cs(1)),
+                format!(
+                    "attachment lib/b names commit {}, which neither a source nor this \
+                     repository holds",
+                    cs(2)
+                )
+            )
+        );
+        assert_eq!(
+            reason(atts.nested_error(&cs(2))),
+            (
+                Some(cs(1)),
+                format!(
+                    "attachment lib/b names commit {}, which has attachments of its own",
+                    cs(2)
+                )
+            )
+        );
+        assert!(atts.named_error(&cs(4), related::UNHELD_REASON).is_none());
         assert!(atts.nested_error(&cs(4)).is_none());
     }
 

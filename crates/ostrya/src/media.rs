@@ -176,8 +176,11 @@ impl Repo {
     /// The call makes one pull for each collection, in the order of the
     /// first operand of each collection. Each pull is a local pull at depth
     /// 0 with no signature check. It copies the `.commitmeta` of each
-    /// commit, and the attachments of field 2 of each commit as loose
-    /// objects. It copies no static delta. It writes each ref to
+    /// commit, and the full set of attachments of each commit as loose
+    /// objects: the attachments that field 2 names, and the attachments of
+    /// each attachment, level by level. It skips an attachment that the
+    /// media repository holds complete, and reads nothing below it. It
+    /// copies no static delta. It writes each ref to
     /// `refs/mirrors/ID/NAME`, or to `refs/heads/NAME` when `ID` is the
     /// `[core] collection-id` of the media repository. It moves a ref to an
     /// older commit with no error.
@@ -409,8 +412,11 @@ impl Repo {
     /// the media. It makes one local pull from the media repository for each
     /// other ref, with its own transaction, as the pull of a local candidate
     /// of [`Repo::pull_collection`] does. The pull is at depth 0, and reads
-    /// no static delta. It takes the `.commitmeta` and the attachments of
-    /// field 2 of the commit. The `ostree.collection-binding` of the commit
+    /// no static delta. It takes the `.commitmeta` and the full set of
+    /// attachments of the commit: the attachments that field 2 names, and
+    /// the attachments of each attachment, level by level. It skips an
+    /// attachment that this repository holds complete, and reads nothing
+    /// below it. The `ostree.collection-binding` of the commit
     /// must state `ID`, and the ref-binding check applies. The pull refuses
     /// a commit that is older than the commit of the current ref. If the
     /// current ref is the ref at the place that the import writes, and this

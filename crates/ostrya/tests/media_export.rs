@@ -12,7 +12,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use common::{TmpDir, file_inventory};
+use common::{CHAIN_C, TmpDir, file_inventory, write_chain};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
     Error, FsckOptions, MediaExportOptions, MutableTree, ObjectType, Ref, Repo, RepoMode, Summary,
@@ -685,6 +685,44 @@ fn a_field_2_attachment_lands_as_loose_objects() {
             )]
         );
         assert!(file_inventory(&media(&mount), "deltas").is_empty());
+        assert_fsck_clean(&media(&mount)).await;
+    });
+}
+
+/// The tip names C of the chain C -> D in field 2. The export takes the full
+/// set of attachments: C and D go onto the media, complete, with no ref and
+/// no partial marker.
+#[test]
+fn a_chain_of_attachments_lands_on_the_media() {
+    let tmp = TmpDir::new("media-field-2-chain");
+    block_on(async {
+        let src = source(tmp.path(), Some(ID)).await;
+        let chain = write_chain(&src, tmp.path(), "chain").await;
+        let tip = commit(
+            &src,
+            tmp.path(),
+            "main",
+            Some(&Ref::local(REF)),
+            BOUND,
+            &[(CHAIN_C, chain.c)],
+        )
+        .await;
+        let mount = mount_dir(tmp.path());
+        export(&src, &mount, &[Ref::local(REF)]).await.unwrap();
+        let repo = Repo::open(&media(&mount)).await.unwrap();
+        for commit in [tip, chain.c, chain.d] {
+            for name in src.traverse_commit(&commit, 0).await.unwrap() {
+                assert!(repo.has_object(name.ty, &name.checksum).await.unwrap());
+            }
+        }
+        assert!(file_inventory(&media(&mount), "state").is_empty());
+        assert_eq!(
+            file_inventory(&media(&mount), "refs"),
+            [(
+                format!("refs/mirrors/{ID}/{REF}"),
+                format!("{tip}\n").into_bytes()
+            )]
+        );
         assert_fsck_clean(&media(&mount)).await;
     });
 }

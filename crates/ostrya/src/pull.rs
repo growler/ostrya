@@ -1295,15 +1295,23 @@ impl Repo {
     ///
     /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The pull
-    /// follows the attachments of each commit that it walks: each target, and
-    /// each parent that [`depth`](PullOptions::depth) takes. It also follows
-    /// the attachments of each intermediate commit of a chain of static
-    /// deltas. Discovery reads field 2 of such a commit from the superblock of
-    /// its step.
+    /// takes the full set of attachments of each commit that it walks: each
+    /// target, and each parent that [`depth`](PullOptions::depth) takes. It
+    /// also takes the full set of attachments of each intermediate commit of a
+    /// chain of static deltas. Discovery reads field 2 of such a commit from
+    /// the superblock of its step. The full set is the attachments of the
+    /// commit, the attachments of each attachment, and so on, level by level,
+    /// until a level has no new attachment.
     ///
     /// - The pull takes each attachment at depth 0, so an attachment entry adds
     ///   no parent to the pull. The pull takes an attachment one time, also if
-    ///   several commits name it.
+    ///   several commits name it, and the walk of the attachments reads its
+    ///   commit object one time.
+    /// - The pull skips an attachment that this repository holds complete, and
+    ///   reads nothing below it: a write and a pull of a commit make the
+    ///   attachments of the commit complete first. The walk of the attachments
+    ///   reads commit objects alone, and no tree, before the transaction
+    ///   opens.
     /// - The pull writes no ref for an attachment.
     /// - The pull checks no signature of an attachment commit. Field 2 holds
     ///   the checksum of the attachment, and the checksum and the signatures
@@ -1318,7 +1326,10 @@ impl Repo {
     /// - The pull reads the commit object of an attachment from the source,
     ///   then from each localcache repository, then from this repository. It
     ///   reads no commit object of an attachment that a chain of static deltas
-    ///   makes, so the source can hold that commit in the delta alone.
+    ///   makes, so the source can hold that commit in the delta alone. If the
+    ///   first repository that holds the attachment is a source or a
+    ///   localcache repository that marks it partial, the pull fails. The pull
+    ///   completes a partial copy in this repository.
     /// - An attachment is a commit of the pull for each other rule: its
     ///   `.commitpartial` marker, the walk of its tree, and its detached
     ///   metadata. For an attachment that this repository holds complete, the
@@ -1344,14 +1355,21 @@ impl Repo {
     ///
     /// - An entry of field 2 has an empty name or a checksum that is not 32
     ///   bytes.
-    /// - An attachment names attachments of its own: its own field 2 is not
-    ///   empty.
-    /// - Neither a source nor this repository holds an attachment. This is
-    ///   also true for a parent that the source does not hold, if a commit of
-    ///   the pull names that parent as an attachment.
+    /// - Neither a source nor this repository holds an attachment, at any
+    ///   level. This is also true for a parent that the source does not hold,
+    ///   if a commit of the pull names that parent as an attachment.
+    /// - The first source or localcache repository that holds an attachment
+    ///   marks it partial.
     ///
+    /// For an attachment that no repository holds, or that a source marks
+    /// partial, the error names the commit that first names the attachment.
     /// The pull reports these defects before a target or a parent that fails
     /// the signature policy, as for each other defect of the walk.
+    ///
+    /// The pull checks each attachment that it skipped again after the
+    /// transaction opens, before it writes a marker. If this repository no
+    /// longer holds one of them complete, the pull fails, and writes no
+    /// object, no marker, and no ref.
     ///
     /// # Remote config
     ///
@@ -1758,9 +1776,7 @@ impl Repo {
     ///   leaves alone counts as found: the pull does not fail, and imports
     ///   that target loose. The walk reads the commit of each attachment
     ///   before the search for its delta. So an attachment that no source
-    ///   holds gives [`Error::ObjectNotFound`], and an attachment that names
-    ///   attachments of its own gives [`Error::InvalidRelations`], before this
-    ///   error.
+    ///   holds gives [`Error::InvalidRelations`] before this error.
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
     /// - [`Error::Pull`] if the policy checks the signatures of the commits and
@@ -1776,10 +1792,13 @@ impl Repo {
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit has an
-    ///   empty name or a checksum that is not 32 bytes, or if an attachment
-    ///   names attachments of its own. The pull reports it before a failed
-    ///   signature check of the walk, and before a `.commitmeta` of the walk
-    ///   that does not parse.
+    ///   empty name or a checksum that is not 32 bytes. Also, at each level of
+    ///   the attachments, if neither a source nor this repository holds an
+    ///   attachment, or if the first source that holds it marks it partial.
+    ///   The pull reports it before a failed signature check of the walk, and
+    ///   before a `.commitmeta` of the walk that does not parse. Also if an
+    ///   attachment that the walk skipped is no longer complete in this
+    ///   repository when the transaction opens.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
     ///   policy, each commit of a chain included. Also if the signatures of the
     ///   superblock of a target or of a step fail the policy, or if the policy
@@ -1787,9 +1806,8 @@ impl Repo {
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref. For a
     ///   collection ref, the error holds `@ID:NAME`.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
-    ///   holds an attachment or an object that a pulled commit reaches. Also if
-    ///   a dirtree that this repository holds is a symlink that points to no
-    ///   file.
+    ///   holds an object that a pulled commit reaches. Also if a dirtree that
+    ///   this repository holds is a symlink that points to no file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the `.filez`
     ///   copy and the re-ingest path. Also under
@@ -2000,7 +2018,7 @@ impl Repo {
         let edges = deltas.take_edges();
         // The intermediate commits of the chains. The run of the levels
         // imports each of them, and the commit loop skips them.
-        let done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
+        let mut done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
         // Discovery read field 2 of each intermediate commit of the chains.
         let mut level_attachments = deltas.take_attachments();
 
@@ -2028,14 +2046,16 @@ impl Repo {
         // Discovery checked each commit of a chain, so the walk does not check
         // it again.
         //
-        // The attachments of the commits are commits of the pull too. The
-        // walk appends each one after the chains, at depth 0. It checks no
-        // signature of an appended attachment: field 2 of the commit that
-        // names it holds its checksum, and the signatures of that commit
-        // cover field 2. A pull that reads static deltas then looks for the
-        // delta of each attachment that it appended, before the transaction
-        // opens. The search checks no signature of the superblock of such a
-        // delta.
+        // The attachments of the commits are commits of the pull too, with
+        // the attachments of each attachment, level by level. The walk
+        // appends each one after the chains, at depth 0. It skips an
+        // attachment that this repository holds complete, and reads nothing
+        // below it. It checks no signature of an appended attachment: field 2
+        // of the commit that names it holds its checksum, and the signatures
+        // of that commit cover field 2. A pull that reads static deltas then
+        // looks for the delta of each attachment that it appended, before the
+        // transaction opens. The search checks no signature of the superblock
+        // of such a delta.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -2053,6 +2073,9 @@ impl Repo {
             parents: HashMap::new(),
         });
         let mut appended: Vec<Checksum> = Vec::new();
+        // The attachments that the walk skipped because this repository held
+        // them complete.
+        let mut skipped: Vec<SkippedAttachment> = Vec::new();
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
@@ -2097,11 +2120,11 @@ impl Repo {
                     atts.inner.record(*commit, entries);
                 }
             }
-            appended = collect_attachments(
+            (appended, skipped) = collect_attachments(
                 self,
                 &sources,
                 atts,
-                &done,
+                &mut done,
                 untrusted,
                 &mut commits,
                 &mut seen,
@@ -2121,6 +2144,10 @@ impl Repo {
         // transaction opens.
         let mut attachment_deltas = match atts.take() {
             Some(atts) if reads_deltas && !appended.is_empty() => {
+                // The walk found each appended attachment not complete here,
+                // so the lookups check none of them again.
+                let checked: HashMap<Checksum, bool> =
+                    appended.iter().map(|checksum| (*checksum, false)).collect();
                 let named = attachment::pair_targets(
                     targets,
                     opts.depth,
@@ -2129,7 +2156,8 @@ impl Repo {
                     appended,
                 );
                 drop(atts);
-                let (lookups, known) = attachment::lookups(self, targets, place, named).await?;
+                let (lookups, known) =
+                    attachment::lookups(self, targets, place, named, checked).await?;
                 delta::discover_attachments(
                     self,
                     &delta::DeltaSource::Local(src),
@@ -2148,6 +2176,41 @@ impl Repo {
         drop(edges);
 
         let mut txn = self.transaction().await?;
+        // Mark each commit partial before the import of its objects. Skip a
+        // commit that this repository already holds complete: an unrelated
+        // failure must not demote a complete commit. The plan of the tree
+        // reads the same answer and plans nothing for a complete commit. The
+        // intermediate commits of the chains come first, with one batched
+        // check and one batched write.
+        //
+        // Another process can remove an attachment that the walk skipped, or
+        // mark it partial, before the transaction opens. The check of the
+        // intermediate commits checks each such attachment again, so the pull
+        // writes nothing if one of them is no longer complete.
+        let level_commits: Vec<Checksum> = deltas.levels().iter().flatten().copied().collect();
+        let checks: Vec<Checksum> = level_commits
+            .iter()
+            .copied()
+            .chain(skipped.iter().map(|skip| skip.checksum))
+            .collect();
+        let mut states = chain::check_complete(self, &checks).await?;
+        let skipped_states = states.split_off(level_commits.len());
+        if let Some((skip, _)) = skipped
+            .iter()
+            .zip(skipped_states)
+            .find(|(_, (_, complete))| !complete)
+        {
+            return Err(skip.no_longer_complete());
+        }
+        let mut held_levels: HashSet<Checksum> = HashSet::new();
+        let mut level_marks = Vec::new();
+        for (commit, held) in states {
+            if held {
+                held_levels.insert(commit);
+            } else {
+                level_marks.push(commit);
+            }
+        }
         apply_durability(&mut txn, &opts);
         // The markers follow the `fsync` rule of the transaction.
         let marker_fsync = txn.fsync_flags()?.0;
@@ -2157,26 +2220,10 @@ impl Repo {
         // left.
         let mut marked: Vec<Checksum> = Vec::new();
         let published = async {
-            // Mark each commit partial before the import of its objects. Skip a
-            // commit that this repository already holds complete: an unrelated
-            // failure must not demote a complete commit. The plan of the tree
-            // reads the same answer and plans nothing for a complete commit.
-            // The intermediate commits of the chains come first, with one
-            // batched check and one batched write. `marked` takes each commit
-            // before the write of its marker, so the cleanup also sees a
-            // marker that a failed write created.
-            let level_commits: Vec<Checksum> = deltas.levels().iter().flatten().copied().collect();
-            let mut held_levels: HashSet<Checksum> = HashSet::new();
-            let mut to_mark = Vec::new();
-            for (commit, held) in chain::check_complete(self, &level_commits).await? {
-                if held {
-                    held_levels.insert(commit);
-                } else {
-                    to_mark.push(commit);
-                }
-            }
-            marked.extend_from_slice(&to_mark);
-            self.create_partial_markers(to_mark, &[], marker_fsync)
+            // `marked` takes each commit before the write of its marker, so
+            // the cleanup also sees a marker that a failed write created.
+            marked.extend_from_slice(&level_marks);
+            self.create_partial_markers(level_marks, &[], marker_fsync)
                 .await?;
             // The other commits follow, with one batched check.
             let walked: Vec<Checksum> = commits
@@ -3078,7 +3125,8 @@ struct ChainAttachments {
     /// The attachments, in the order in which the pull first recorded them,
     /// and the commits that name them. The pull records the attachments of
     /// the commits of the walk first, then the attachments of the
-    /// intermediate commits of the delta levels.
+    /// intermediate commits of the delta levels, then the attachments of
+    /// each attachment that the walk of the attachments reads.
     inner: attachment::Attachments,
     /// The parent that each commit of the chains named. Under
     /// [`keys_only`](attachment::Attachments::keys_only), the map stays
@@ -3087,26 +3135,63 @@ struct ChainAttachments {
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
-/// Appends each attachment of `atts` that the walk did not collect to `out`,
-/// at depth 0, in the order of `atts`. Returns each appended attachment, in
-/// the same order.
+/// An attachment that this repository held complete when the walk of the
+/// attachments of a local pull got to it, and the entry that first named it.
+struct SkippedAttachment {
+    /// The attachment.
+    checksum: Checksum,
+    /// The commit that first named the attachment.
+    commit: Checksum,
+    /// The name of the entry of `commit` that names the attachment.
+    name: String,
+}
+
+impl SkippedAttachment {
+    /// Returns the error for an attachment that this repository no longer
+    /// holds complete. The error names the commit that first named the
+    /// attachment.
+    fn no_longer_complete(&self) -> Error {
+        Error::InvalidRelations {
+            commit: Some(self.commit),
+            field: related::RelationField::Attachments,
+            reason: related::attachment_reason(
+                &self.name,
+                &self.checksum,
+                related::NO_LONGER_COMPLETE_REASON,
+            ),
+        }
+    }
+}
+
+/// Appends the full set of attachments of the commits of `atts` that the
+/// walk did not collect to `out`, at depth 0, in the order of the walk of
+/// the attachments. Returns each appended attachment in the same order, and
+/// each attachment that the call skipped because `repo` holds it complete.
+///
+/// The call walks the attachments level by level. Level 1 is the
+/// attachments that `atts` holds when the call starts. The call records
+/// field 2 of each attachment that it reads in `atts`, so the attachments
+/// that field 2 names are the next level. The walk ends at the first level
+/// that has no new attachment. `atts` records each attachment one time, so
+/// the call reads an attachment that two commits name one time.
 ///
 /// An attachment that `seen` holds, or that `made` holds, needs no read: the
-/// walk collected it, or a chain of static deltas makes it. `made` holds the
-/// intermediate commits of the chains, and `atts` holds their attachments.
-/// The call reads each other attachment from the first repository of
-/// `sources` that holds it, else from `repo`. It follows no parent of an
-/// attachment.
+/// walk of the chains collected it, or a chain of static deltas makes it.
+/// `atts` holds field 2 of each such commit. `made` holds the intermediate
+/// commits of the chains. The call skips an attachment that `repo` holds
+/// complete, and reads nothing below it: the write of that attachment and
+/// each pull of it make its full set of attachments complete. The call reads
+/// each other attachment from the first repository of `sources` that holds
+/// it, else from `repo`. It follows no parent of an attachment, and reads no
+/// tree.
 ///
-/// The function reads the attachments that neither `seen` nor `made` holds in
-/// one call on the blocking pool, in the order of `atts`. If `untrusted` is
-/// set, it hashes each attachment that it reads from a source, as
-/// [`load_attachments_blocking`] states. The call stops at the first
-/// failure. If no attachment needs a read, the function makes no call. The
-/// call reads no attachment after the first attachment that `seen` or `made`
-/// holds and that names attachments of its own. If the caller drops the
-/// future, the blocking call continues to the end of its list or to the first
-/// failure.
+/// The call reads the attachments in one call on the blocking pool. It reads
+/// one commit object at a time, and keeps the root of the tree of the
+/// commit alone. If `untrusted` is set, it hashes each attachment that it
+/// reads from a source. If no attachment needs a read, the function makes
+/// no call. The call stops at the first failure. If the caller drops the
+/// future, the blocking call continues to the end of the walk or to the
+/// first failure.
 ///
 /// The call checks no signature of an attachment. Field 2 of the commit that
 /// names the attachment holds its checksum, and the checksum and the
@@ -3115,13 +3200,12 @@ struct ChainAttachments {
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelations`] if an attachment names attachments of its own.
-///   The error names the commit that first named the attachment.
+/// - [`Error::InvalidRelations`] if neither a source nor `repo` holds an
+///   attachment, or if the first source that holds an attachment marks it
+///   partial. The error names the commit that first named the attachment.
 /// - [`Error::InvalidRelations`] if field 2 of an attachment that the call reads
 ///   has an entry with an empty name or with a checksum that is not 32 bytes.
 ///   The error names the attachment.
-/// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds an
-///   attachment.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and an attachment that
 ///   the call reads from a source does not hash to its name.
 /// - [`Error::Core`] if the commit object of an attachment does not parse.
@@ -3132,59 +3216,55 @@ struct ChainAttachments {
 async fn collect_attachments(
     repo: &Repo,
     sources: &[&Repo],
-    atts: &ChainAttachments,
-    made: &HashSet<Checksum>,
+    atts: &mut ChainAttachments,
+    made: &mut HashSet<Checksum>,
     untrusted: bool,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
-) -> Result<Vec<Checksum>> {
-    // The position in `atts.inner.order()` of each attachment to read, and
-    // its checksum. A held attachment that names attachments of its own
-    // stops the list: the call reads no attachment after it.
-    let order = atts.inner.order();
-    let nested_error = |attachment: &Checksum| {
-        atts.inner
-            .nested_error(attachment)
-            .expect("a commit names each attachment of the order")
-    };
-    let mut positions = Vec::new();
-    let mut wanted = Vec::new();
-    let mut stop = None;
-    for (at, attachment) in order.iter().enumerate() {
-        if seen.contains_key(attachment) || made.contains(attachment) {
-            if atts.inner.naming().contains_key(attachment) {
-                stop = Some(at);
-                break;
+) -> Result<(Vec<Checksum>, Vec<SkippedAttachment>)> {
+    if atts
+        .inner
+        .order()
+        .iter()
+        .all(|attachment| seen.contains_key(attachment) || made.contains(attachment))
+    {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    let holders: Vec<Repo> = sources
+        .iter()
+        .map(|src| (*src).clone())
+        .chain(std::iter::once(repo.clone()))
+        .collect();
+    // The blocking call owns the record, the walked commits, and the made
+    // commits, and gives them back with its result.
+    let mut inner = std::mem::take(&mut atts.inner);
+    let walked = std::mem::take(seen);
+    let made_here = std::mem::take(made);
+    let (inner, walked, made_here, walk) = ostrya_rt::unblock(move || {
+        let walk = walk_attachments_blocking(&holders, &mut inner, &walked, &made_here, untrusted);
+        (inner, walked, made_here, walk)
+    })
+    .await;
+    atts.inner = inner;
+    *seen = walked;
+    *made = made_here;
+    let AttachmentWalk { loaded, skipped } = walk?;
+    let skipped = skipped
+        .into_iter()
+        .map(|checksum| {
+            let (commit, name) = atts
+                .inner
+                .named(&checksum)
+                .expect("a commit names each attachment of the walk");
+            SkippedAttachment {
+                checksum,
+                commit,
+                name: name.to_owned(),
             }
-            continue;
-        }
-        positions.push(at);
-        wanted.push(*attachment);
-    }
-    let mut loaded = Vec::new();
-    if !wanted.is_empty() {
-        let holders: Vec<Repo> = sources
-            .iter()
-            .map(|src| (*src).clone())
-            .chain(std::iter::once(repo.clone()))
-            .collect();
-        // The closure gives the position in `wanted` of a nested attachment.
-        // The names stay here.
-        loaded = match ostrya_rt::unblock(move || {
-            load_attachments_blocking(&holders, &wanted, untrusted)
         })
-        .await?
-        {
-            Ok(loaded) => loaded,
-            Err(nested) => return Err(nested_error(&order[positions[nested]])),
-        };
-    }
-    if let Some(at) = stop {
-        return Err(nested_error(&order[at]));
-    }
+        .collect();
     let mut appended = Vec::with_capacity(loaded.len());
-    for (at, attachment) in positions.into_iter().zip(loaded) {
-        let checksum = order[at];
+    for (checksum, attachment) in loaded {
         seen.insert(checksum, 0);
         appended.push(checksum);
         out.push(ChainCommit {
@@ -3196,7 +3276,7 @@ async fn collect_attachments(
             detached: CheckedDetached::Unchecked,
         });
     }
-    Ok(appended)
+    Ok((appended, skipped))
 }
 
 /// The signature verification that a local pull runs on each commit of the
@@ -3650,23 +3730,42 @@ async fn try_load_commit(
     }
 }
 
-/// Loads the attachments `wanted`, in order, each from the first repository
-/// of `holders` that holds it.
+/// What the walk of the attachments of a local pull gives back.
+#[derive(Default)]
+struct AttachmentWalk {
+    /// Each attachment that the walk read, in the order of the walk, with the
+    /// root of its tree.
+    loaded: Vec<(Checksum, LoadedAttachment)>,
+    /// Each attachment that the walk skipped because this repository holds
+    /// it complete, in the order of the walk.
+    skipped: Vec<Checksum>,
+}
+
+/// Walks the attachments of `atts`, level by level, and reads each one that
+/// needs a read from the first repository of `holders` that holds it.
+/// `holders` holds the sources, in the order of the reads, and this
+/// repository last.
 ///
-/// For each attachment, the call parses the commit and checks the format of
-/// its field 2. If `untrusted` is set, it first hashes a commit that it read
-/// from a repository other than the last of `holders`, and compares the
-/// result with the checksum of the attachment. It keeps the root of the tree
-/// of the commit alone, and drops the bytes before it reads the next
-/// attachment. It stops at the first failure. The inner `Err` holds the
-/// position in `wanted` of an attachment that names attachments of its own.
+/// The walk takes the attachments in the order of `atts`, and records field
+/// 2 of each attachment that it reads in `atts`. So the walk reads each level
+/// before the level below it, and ends when no attachment is left. It skips
+/// an attachment that `seen` or `made` holds, as [`collect_attachments`]
+/// states, and an attachment that this repository holds complete. For each
+/// other attachment, the call refuses a source that marks the attachment
+/// partial. If `untrusted` is set, it hashes a commit that it read from a
+/// source, and compares the result with the checksum of the attachment.
+/// Then it parses the commit and checks the format of its field 2. It keeps
+/// the root of the tree of the commit alone, and drops the bytes before it
+/// reads the next attachment. It stops at the first failure.
 ///
 /// The function reads on the calling thread. A caller on the executor calls
-/// it in one call on the blocking pool for all attachments.
+/// it in one call on the blocking pool for the whole walk.
 ///
 /// # Errors
 ///
-/// - [`Error::ObjectNotFound`] if no repository of `holders` holds an
+/// - [`Error::InvalidRelations`] if no repository of `holders` holds an
+///   attachment, or if the first repository that holds it is a source that
+///   marks it partial. The error names the commit that first named the
 ///   attachment.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a commit that the
 ///   call hashes does not hash to the checksum of its attachment.
@@ -3675,43 +3774,64 @@ async fn try_load_commit(
 ///   the attachment.
 /// - The errors of [`parse_loaded`], and the errors of the read of a commit
 ///   object other than an absent object.
-fn load_attachments_blocking(
+fn walk_attachments_blocking(
     holders: &[Repo],
-    wanted: &[Checksum],
+    atts: &mut attachment::Attachments,
+    seen: &HashMap<Checksum, i32>,
+    made: &HashSet<Checksum>,
     untrusted: bool,
-) -> Result<std::result::Result<Vec<LoadedAttachment>, usize>> {
-    let mut loaded = Vec::with_capacity(wanted.len());
-    for (at, checksum) in wanted.iter().enumerate() {
+) -> Result<AttachmentWalk> {
+    let (repo, sources) = holders
+        .split_last()
+        .expect("the holders end with this repository");
+    let mut walk = AttachmentWalk::default();
+    let mut next = 0;
+    while let Some(&checksum) = atts.order().get(next) {
+        next += 1;
+        if seen.contains_key(&checksum) || made.contains(&checksum) {
+            continue;
+        }
+        if delta::complete_here_blocking(repo, &checksum)? {
+            walk.skipped.push(checksum);
+            continue;
+        }
+        let error = |end: &str| {
+            atts.named_error(&checksum, end)
+                .expect("a commit names each attachment of the walk")
+        };
         let mut bytes = None;
         for (position, held) in holders.iter().enumerate() {
-            if let Some(read) = held.held_object_bytes_blocking(ObjectType::Commit, checksum)? {
-                if untrusted && position + 1 < holders.len() {
-                    check_hash(checksum, &read)?;
+            if let Some(read) = held.held_object_bytes_blocking(ObjectType::Commit, &checksum)? {
+                if position < sources.len() {
+                    if held.commit_state_blocking(&checksum)? == crate::read::CommitState::Partial {
+                        return Err(error(related::PARTIAL_REASON));
+                    }
+                    if untrusted {
+                        check_hash(&checksum, &read)?;
+                    }
                 }
                 bytes = Some(read);
                 break;
             }
         }
         let Some(bytes) = bytes else {
-            return Err(Error::ObjectNotFound {
-                checksum: *checksum,
-                ty: ObjectType::Commit,
-            });
+            return Err(error(related::UNHELD_REASON));
         };
         let LoadedCommit {
             commit,
             attachments,
             ..
-        } = parse_loaded(*checksum, Arc::new(bytes))?;
-        if !attachments?.is_empty() {
-            return Ok(Err(at));
-        }
-        loaded.push(LoadedAttachment {
-            root_dirtree: commit.root_dirtree,
-            root_dirmeta: commit.root_dirmeta,
-        });
+        } = parse_loaded(checksum, Arc::new(bytes))?;
+        atts.record(checksum, attachments?);
+        walk.loaded.push((
+            checksum,
+            LoadedAttachment {
+                root_dirtree: commit.root_dirtree,
+                root_dirmeta: commit.root_dirmeta,
+            },
+        ));
     }
-    Ok(Ok(loaded))
+    Ok(walk)
 }
 
 /// Reads the `.commitmeta` bytes of a commit from the first source that holds

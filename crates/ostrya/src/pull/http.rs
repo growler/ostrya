@@ -1467,7 +1467,8 @@ impl Repo {
                     pending,
                 );
                 let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
-                let (lookups, known) = attachment::lookups(self, &targets, place, named).await?;
+                let (lookups, known) =
+                    attachment::lookups(self, &targets, place, named, HashMap::new()).await?;
                 let found = delta::discover_attachments(
                     self,
                     &delta_source,

@@ -214,7 +214,9 @@ impl Repo {
     ///    (`protocol`).
     /// 2. The size of `CommitReply` (`limit-exceeded`).
     /// 3. Each detached metadata object belongs to a commit of the session
-    ///    (`protocol`).
+    ///    (`protocol`). The session drops the dict of a held commit that
+    ///    field 2 of a commit of the session, or of a held attachment below
+    ///    it, names at any depth.
     /// 4. The rights of each update (`ref-denied`): an update that writes a
     ///    commit needs `w` or `t`. An update of `ostree-metadata` in the local
     ///    refs of a repository with a collection id is refused.
@@ -223,9 +225,10 @@ impl Repo {
     ///    commit, the staged parents of a new commit included, and of each new
     ///    commit that the repository holds with a partial marker: each entry
     ///    of field 2 has a name that is not empty and a 32-byte checksum
-    ///    (`protocol`), each attachment is staged, a new commit, or held
-    ///    complete (`missing-objects`), and no attachment has attachments of
-    ///    its own (`protocol`).
+    ///    (`protocol`), and each attachment is staged, a new commit, or held
+    ///    complete (`missing-objects`). A staged attachment gets these checks
+    ///    as a staged commit. The check reads nothing below a held
+    ///    attachment.
     /// 6. The ref binding and the collection binding of each new commit
     ///    (`binding-mismatch`), for each ref in its namespace. The ref binding
     ///    must hold the name of the ref, without the `@ID:` part. A commit

@@ -438,15 +438,16 @@ impl ReceiveService {
     ///   the session holds a detached metadata dict or staged a commit object.
     /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
     ///   commit that is not a commit of the session, unless the repository
-    ///   holds the commit and field 2 of a commit of the session names it.
-    ///   The session drops the dict of such a held attachment.
+    ///   holds the commit and field 2 of a commit of the session, or of a held
+    ///   attachment below the session, names it. The session drops the dict
+    ///   of such a held attachment.
     /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
     /// - [`remote::Error::Protocol`] if an entry of field 2 of a staged commit
-    ///   has an empty name or a checksum that is not 32 bytes, or if an
-    ///   attachment of a staged commit has attachments of its own. The
-    ///   message is the text of [`Error::InvalidRelations`]. A new commit that
-    ///   the repository holds with a partial marker gets the checks of a
+    ///   has an empty name or a checksum that is not 32 bytes. A staged
+    ///   attachment is a staged commit, so its entries get this check too.
+    ///   The message is the text of [`Error::InvalidRelations`]. A new commit
+    ///   that the repository holds with a partial marker gets the checks of a
     ///   staged commit, here and for `missing-objects`.
     /// - [`remote::Error::Protocol`] if `[ex-ostrya] generate-composefs` of
     ///   the repository is `true`, and `ostree.composefs.digest.v0` of a new

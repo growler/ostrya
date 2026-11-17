@@ -229,10 +229,13 @@ struct Edit<'a> {
 ///   commit of the session parses.
 /// - A dict for a commit that the repository holds, that the session did not
 ///   stage, and that no update names, belongs to an attachment: an entry of
-///   field 2 of a commit of the session names the commit (`protocol`). The
-///   session drops each such dict, with no merge and no write. The repository
-///   held the attachment and its dict before the session, and no rule of the
-///   session covers a change to them.
+///   field 2 of a commit of the session, or of a held attachment below the
+///   session, names the commit (`protocol`). The check reads field 2 of the
+///   held attachments only if a dict stays unnamed after the commits of the
+///   session, and it reads their commit objects alone. The session drops each
+///   such dict, with no merge and no write. The repository held the
+///   attachment and its dict before the session, and no rule of the session
+///   covers a change to them.
 /// - The tree of each commit of the session is complete (`missing-objects`).
 /// - Each entry of field 2 of each staged commit, the staged parents of a new
 ///   commit included, has a name that is not empty and a 32-byte checksum
@@ -240,7 +243,8 @@ struct Edit<'a> {
 ///   marker gets the same check. Each attachment that these entries name is
 ///   staged or held (`missing-objects`, with each absent attachment listed).
 ///   A held attachment is complete (`missing-objects`, with no object
-///   listed), and no attachment has attachments of its own (`protocol`). An
+///   listed). A staged attachment is a staged commit, so its own entries get
+///   these checks. The check reads nothing below a held attachment. An
 ///   attachment that is a new commit is complete, also with a partial marker,
 ///   because the completeness walk ran over its tree.
 /// - The ref binding and the collection binding of each new commit name each
@@ -408,7 +412,14 @@ pub(super) async fn finish(
         let outside = check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
         let rules = select_rules(repo, policy, &names, &updates)?;
         let loaded = load_commits(&txn, &updates).await?;
-        drop_attachment_meta(outside, &loaded.fields, &mut commit_meta)?;
+        drop_attachment_meta(
+            &txn,
+            outside,
+            &loaded.session_commits,
+            &loaded.fields,
+            &mut commit_meta,
+        )
+        .await?;
         Ok::<_, Failure>((rules, loaded))
     })
     .await?;
@@ -773,8 +784,8 @@ async fn check_commit_meta_commits(
 }
 
 /// Drops the dict of each commit that the session did not stage and that no
-/// update names, if an entry of field 2 of a commit of the session names that
-/// commit.
+/// update names, if an entry of field 2 of a commit of the session, or of a
+/// held attachment below the session, names that commit.
 ///
 /// `outside` is the list that [`check_commit_meta_commits`] returns: the
 /// commits of `commit_meta` that the session did not stage and that no update
@@ -783,32 +794,95 @@ async fn check_commit_meta_commits(
 /// before the session, and no rule of the session covers a change to them. A
 /// staged attachment is a commit that the repository did not hold before the
 /// session, and its dict merges as the dict of each other staged commit.
-/// `fields` holds field 2 of each commit of the session, as [`load_commits`]
-/// reads it. An entry with an empty name or a checksum that is not 32 bytes
-/// names no commit.
+/// `session_commits` lists the commits of the session, and `fields` holds
+/// their field 2, as [`load_commits`] reads it. An entry with an empty name
+/// or a checksum that is not 32 bytes names no commit.
+///
+/// If the entries of `fields` name each commit of `outside`, the function
+/// reads nothing. Otherwise it reads field 2 of the held attachments, one
+/// level at a time. The first level is each commit that an entry of `fields`
+/// names and that is not a commit of the session. The next level is each
+/// commit that an entry of field 2 of a commit of the level names, that is
+/// not a commit of the session, and that no level before it holds. The walk
+/// reads the commit objects alone, and each commit one time. The reads of
+/// one level run in one trip to the blocking pool. The walk stops when the
+/// entries name each commit of `outside`, also in the middle of a level, or
+/// when a level is empty. A commit that the repository does not hold names
+/// no commit. The walk reads no partial marker.
 ///
 /// A dict for such a commit that no entry names is `protocol`. Without this
 /// check, a dict can edit the detached metadata of a commit that no rule of
 /// the message covers.
-fn drop_attachment_meta(
+///
+/// A commit of the walk whose field 2 does not decode is a failure on the
+/// server side ([`Error::Core`]), as for a held attachment in
+/// [`check_attachments`].
+async fn drop_attachment_meta(
+    txn: &Transaction,
     outside: Vec<Checksum>,
+    session_commits: &[Checksum],
     fields: &HashMap<Checksum, Vec<(String, Vec<u8>)>>,
     commit_meta: &mut HashMap<Checksum, Vec<u8>>,
 ) -> Checked<()> {
     if outside.is_empty() {
         return Ok(());
     }
-    let named: HashSet<&[u8]> = fields
+    let named: HashSet<Checksum> = fields
         .values()
         .flatten()
         .filter(|(name, _)| !name.is_empty())
-        .map(|(_, bytes)| bytes.as_slice())
+        .filter_map(|(_, bytes)| Checksum::from_ay(bytes).ok())
         .collect();
+    let mut unnamed: HashSet<Checksum> = outside
+        .iter()
+        .filter(|commit| !named.contains(commit))
+        .copied()
+        .collect();
+    if !unnamed.is_empty() {
+        let mut seen: HashSet<Checksum> = session_commits.iter().copied().collect();
+        let mut level: Vec<Checksum> = named
+            .into_iter()
+            .filter(|commit| seen.insert(*commit))
+            .collect();
+        while !level.is_empty() && !unnamed.is_empty() {
+            level.sort_unstable();
+            let repo = txn.repo().clone();
+            (level, seen, unnamed) = ostrya_rt::unblock(move || {
+                let mut below = Vec::new();
+                for commit in level {
+                    let Some(bytes) =
+                        repo.held_object_bytes_blocking(ObjectType::Commit, &commit)?
+                    else {
+                        continue;
+                    };
+                    for entry in related::parse_attachments(&bytes)? {
+                        if entry.name.is_empty() {
+                            continue;
+                        }
+                        let Ok(named) = entry.checksum else {
+                            continue;
+                        };
+                        unnamed.remove(&named);
+                        if seen.insert(named) {
+                            below.push(named);
+                        }
+                    }
+                    if unnamed.is_empty() {
+                        break;
+                    }
+                }
+                Ok::<_, Error>((below, seen, unnamed))
+            })
+            .await
+            .map_err(Failure::Internal)?;
+        }
+    }
     for commit in outside {
-        if !named.contains(&commit.as_bytes()[..]) {
+        if unnamed.contains(&commit) {
             return Err(protocol(format!(
                 "detached metadata for commit {commit}, which the session did not stage, no ref \
-                 update names, and no commit of the session names as an attachment"
+                 update names, and no commit of the session or held attachment below it names \
+                 as an attachment"
             )));
         }
         commit_meta.remove(&commit);
@@ -1096,16 +1170,16 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
 ///   each attachment that is neither, in the order of the commits that name
 ///   them.
 /// - Each held attachment is complete (`missing-objects`, with no object
-///   listed), and the field 2 of each attachment is empty (`protocol`). The
-///   attachments are taken in the order of the commits that name them.
+///   listed), in the order of the commits that name them.
 ///
 /// An attachment that is a commit of the session is complete, because the
-/// completeness walk ran over its tree, and `fields` holds its field 2. A new
-/// commit that the repository marks partial is such an attachment too. The
-/// reads of the partial markers of the held new commits run in one trip to
-/// the blocking pool, and the reads of the other held attachments in one
-/// more trip. Field 2 of a new commit that the repository holds with no
-/// partial marker gets no check.
+/// completeness walk ran over its tree. A new commit that the repository
+/// marks partial is such an attachment too. A staged attachment is a checked
+/// commit, so its own entries get these checks, at each depth. The check
+/// reads nothing below a held attachment. The reads of the partial markers of
+/// the held new commits run in one trip to the blocking pool, and the reads
+/// of the other held attachments in one more trip. Field 2 of a new commit
+/// that the repository holds with no partial marker gets no check.
 async fn check_attachments(
     txn: &Transaction,
     targets: &[Target],
@@ -1196,21 +1270,11 @@ async fn check_attachments(
         ));
     }
     for (attachment, naming, name) in named {
-        let nested = match states.get(&attachment) {
-            None => fields.contains_key(&attachment),
-            Some(HeldAttachment::Complete { nested, .. }) => *nested,
-            Some(HeldAttachment::Partial) => {
-                return Err(Failure::Wire(remote::Error::MissingObjects {
-                    message: related::partial_attachment(naming, name, &attachment).to_string(),
-                    missing: Vec::new(),
-                }));
-            }
-            Some(HeldAttachment::Absent) => unreachable!("an absent attachment was refused"),
-        };
-        if nested {
-            return Err(protocol(
-                related::nested_attachment(naming, name, &attachment).to_string(),
-            ));
+        if states.get(&attachment) == Some(&HeldAttachment::Partial) {
+            return Err(Failure::Wire(remote::Error::MissingObjects {
+                message: related::partial_attachment(naming, name, &attachment).to_string(),
+                missing: Vec::new(),
+            }));
         }
     }
     Ok(())

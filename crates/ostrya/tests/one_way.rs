@@ -20,11 +20,14 @@ use std::time::{Duration, Instant};
 
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, PIPE_CAP, SECRET_B64, SERVER_SECRET_B64,
-    assert_nothing_published, build_commit, ed25519_signature, ed25519_signatures, fixture_objects,
-    fixture_tree_digest, keyed_commit, new_repo, outcomes, pipe, policy_allowing, returned_code,
-    server_signer, session, signed_dict, staging_entries, trust,
+    assert_nothing_published, build_commit, commit_objects, ed25519_signature, ed25519_signatures,
+    fixture_objects, fixture_tree_digest, keyed_commit, new_repo, outcomes, pipe, policy_allowing,
+    returned_code, server_signer, session, signed_dict, staging_entries, trust,
 };
-use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
+use common::{
+    CHAIN_C, COMMIT, Chain, DIAMOND_A, DIAMOND_B, TmpDir, file_inventory, foreign_holder,
+    lock_holder_main, tool_fsck, write_chain, write_diamond,
+};
 use futures_io::AsyncWrite;
 use futures_lite::io::AsyncWriteExt;
 use ostrya::remote::proto::{
@@ -1436,30 +1439,285 @@ fn an_absent_attachment_is_missing_objects() {
     assert_nothing_published(&repo, &before);
 }
 
-/// A nested attachment and a defective field 2 entry are `protocol`.
+/// A defective field 2 entry is `protocol`.
 #[test]
-fn a_nested_or_defective_attachment_is_protocol() {
-    let inner = commit_naming("inner", &[]);
-    let nested = commit_naming("nested", &[("lib/i", &inner.checksum.as_bytes()[..])]);
-    let over_nested = commit_naming("target", &[("lib/n", &nested.checksum.as_bytes()[..])]);
+fn a_defective_attachment_entry_is_protocol() {
     let defective = commit_naming("defective", &[("lib/s", &[7; 31])]);
-    let cases = [
-        (vec![&inner, &nested, &over_nested], over_nested.checksum),
-        (vec![&defective], defective.checksum),
-    ];
-    for (commits, target) in cases {
-        let tmp = TmpDir::new("one-way-dep-protocol");
-        let (repo, before) = empty_repo(&tmp, "");
-        let bytes = attachment_stream(&with_tree(&commits), &[], &[("main", target)]);
-        match receive(&repo, &StreamPolicy::default(), &bytes) {
-            Err(Error::Remote(remote::Error::Protocol(m))) => assert!(
-                m.starts_with(&format!("related commits in field 2 of commit {target}: ")),
-                "{m}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert_nothing_published(&repo, &before);
+    let tmp = TmpDir::new("one-way-dep-protocol");
+    let (repo, before) = empty_repo(&tmp, "");
+    let bytes = attachment_stream(
+        &with_tree(&[&defective]),
+        &[],
+        &[("main", defective.checksum)],
+    );
+    match receive(&repo, &StreamPolicy::default(), &bytes) {
+        Err(Error::Remote(remote::Error::Protocol(m))) => assert!(
+            m.starts_with(&format!(
+                "related commits in field 2 of commit {}: ",
+                defective.checksum
+            )),
+            "{m}"
+        ),
+        other => panic!("{other:?}"),
     }
+    assert_nothing_published(&repo, &before);
+}
+
+/// Writes the chain R -> C -> D into a new `archive` repository under `tmp`.
+fn source_chain(tmp: &TmpDir) -> (Repo, Chain) {
+    let src = new_repo(tmp, RepoMode::Archive, "");
+    let chain = block_on(write_chain(&src, tmp.path(), "main"));
+    (src, chain)
+}
+
+/// The objects of each commit of `commits` in `src`, with the file objects
+/// in the raw encoding.
+fn chain_objects(src: &Repo, commits: &[Checksum]) -> Vec<Obj> {
+    commits
+        .iter()
+        .flat_map(|commit| commit_objects(src.path(), commit, Encoding::Raw))
+        .collect()
+}
+
+/// Asserts that `repo` holds each commit of `commits` complete, with no
+/// partial marker.
+fn assert_held_complete(repo: &Repo, commits: &[Checksum]) {
+    for commit in commits {
+        for name in block_on(repo.traverse_commit(commit, 0)).unwrap() {
+            assert!(
+                block_on(repo.has_object(name.ty, &name.checksum)).unwrap(),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            block_on(repo.commit_state(commit)).unwrap(),
+            ostrya::CommitState::Normal
+        );
+        assert!(
+            !repo
+                .path()
+                .join(format!("state/{commit}.commitpartial"))
+                .exists(),
+            "{commit}"
+        );
+    }
+}
+
+/// A stream of the chain R -> C -> D that updates `main` to R commits. C is
+/// a staged attachment, so its own entry gets the checks of a staged commit.
+/// C and D get no ref.
+#[test]
+fn a_stream_with_a_chain_of_attachments_commits() {
+    let src_tmp = TmpDir::new("one-way-dep-chain-src");
+    let (src, chain) = source_chain(&src_tmp);
+    let objects = chain_objects(&src, &[chain.r, chain.c, chain.d]);
+    let tmp = TmpDir::new("one-way-dep-chain");
+    let (repo, _) = empty_repo(&tmp, "");
+    let bytes = attachment_stream(&objects, &[], &[("main", chain.r)]);
+    let report = receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    assert_eq!(
+        outcomes(&report),
+        vec![RefOutcome {
+            name: "main".into(),
+            old: None,
+            new: Some(chain.r),
+        }]
+    );
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [("main".to_owned(), chain.r)]
+    );
+    assert_held_complete(&repo, &[chain.r, chain.c, chain.d]);
+}
+
+/// The receiver holds the chain R -> C -> D, and D has a dict. A second
+/// stream updates a ref to a new commit that names C. It carries the objects
+/// of C and D again, and a dict for each of them. The stream names D through
+/// C alone, which the receiver holds. The receiver drops both dicts, so the
+/// stored dict of D keeps its bytes and C gets no dict.
+#[test]
+fn a_dict_of_an_attachment_below_a_held_attachment_is_dropped() {
+    let src_tmp = TmpDir::new("one-way-dep-chain-dict-src");
+    let (src, chain) = source_chain(&src_tmp);
+    let tmp = TmpDir::new("one-way-dep-chain-dict");
+    let (repo, _) = empty_repo(&tmp, "");
+    let d = Obj {
+        ty: ObjectType::Commit,
+        checksum: chain.d,
+        encoding: Encoding::Raw,
+        bytes: block_on(src.load_object_bytes(ObjectType::Commit, &chain.d)).unwrap(),
+    };
+    let c = Obj {
+        bytes: block_on(src.load_object_bytes(ObjectType::Commit, &chain.c)).unwrap(),
+        checksum: chain.c,
+        ..d.clone()
+    };
+    let bytes = attachment_stream(
+        &chain_objects(&src, &[chain.r, chain.c, chain.d]),
+        &[signed(&d, &[SECRET_B64])],
+        &[("main", chain.r)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    let meta_path = |commit: &Checksum| {
+        repo.path().join("objects").join(ostrya::loose_path(
+            commit,
+            ObjectType::CommitMeta,
+            repo.mode(),
+        ))
+    };
+    let stored = std::fs::read(meta_path(&chain.d)).unwrap();
+
+    let top = commit_naming("top", &[(CHAIN_C, &chain.c.as_bytes()[..])]);
+    let mut objects = with_tree(&[&top]);
+    objects.extend(chain_objects(&src, &[chain.c, chain.d]));
+    let bytes = attachment_stream(
+        &objects,
+        &[
+            signed(&c, &[OTHER_SECRET_B64]),
+            signed(&d, &[OTHER_SECRET_B64]),
+        ],
+        &[("top", top.checksum)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    assert_eq!(std::fs::read(meta_path(&chain.d)).unwrap(), stored);
+    assert_eq!(
+        ed25519_signatures(&repo, &chain.d),
+        [ed25519_signature(SECRET_B64, &d.bytes)]
+    );
+    assert!(!meta_path(&chain.c).exists());
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [
+            ("main".to_owned(), chain.r),
+            ("top".to_owned(), top.checksum)
+        ]
+    );
+    assert_held_complete(&repo, &[top.checksum, chain.c, chain.d]);
+}
+
+/// The commit object `commit` of `src`, in the raw encoding.
+fn commit_obj(src: &Repo, commit: Checksum) -> Obj {
+    Obj {
+        ty: ObjectType::Commit,
+        checksum: commit,
+        encoding: Encoding::Raw,
+        bytes: block_on(src.load_object_bytes(ObjectType::Commit, &commit)).unwrap(),
+    }
+}
+
+/// The path of the `.commitmeta` of `commit` in `repo`.
+fn meta_path(repo: &Repo, commit: &Checksum) -> std::path::PathBuf {
+    repo.path().join("objects").join(ostrya::loose_path(
+        commit,
+        ObjectType::CommitMeta,
+        repo.mode(),
+    ))
+}
+
+/// The receiver holds the chain R -> C -> D, and D has a dict. A second
+/// stream updates a ref to a new commit that names R. It stages no commit of
+/// the chain, and it carries a dict for R, C, and D. The stream names D
+/// through R and C, two held levels down. The receiver drops the three
+/// dicts, so the stored dict of D keeps its bytes, and R and C get no dict.
+#[test]
+fn a_dict_two_held_levels_below_the_session_is_dropped() {
+    let src_tmp = TmpDir::new("one-way-dep-deep-dict-src");
+    let (src, chain) = source_chain(&src_tmp);
+    let tmp = TmpDir::new("one-way-dep-deep-dict");
+    let (repo, _) = empty_repo(&tmp, "");
+    let [r, c, d] = [chain.r, chain.c, chain.d].map(|commit| commit_obj(&src, commit));
+    let bytes = attachment_stream(
+        &chain_objects(&src, &[chain.r, chain.c, chain.d]),
+        &[signed(&d, &[SECRET_B64])],
+        &[("main", chain.r)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    let stored = std::fs::read(meta_path(&repo, &chain.d)).unwrap();
+
+    let top = commit_naming("top", &[("app/fe", &chain.r.as_bytes()[..])]);
+    let bytes = attachment_stream(
+        &with_tree(&[&top]),
+        &[
+            signed(&r, &[OTHER_SECRET_B64]),
+            signed(&c, &[OTHER_SECRET_B64]),
+            signed(&d, &[OTHER_SECRET_B64]),
+        ],
+        &[("top", top.checksum)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    assert_eq!(std::fs::read(meta_path(&repo, &chain.d)).unwrap(), stored);
+    assert_eq!(
+        ed25519_signatures(&repo, &chain.d),
+        [ed25519_signature(SECRET_B64, &d.bytes)]
+    );
+    assert!(!meta_path(&repo, &chain.r).exists());
+    assert!(!meta_path(&repo, &chain.c).exists());
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [
+            ("main".to_owned(), chain.r),
+            ("top".to_owned(), top.checksum)
+        ]
+    );
+    assert_held_complete(&repo, &[top.checksum, chain.r, chain.c, chain.d]);
+}
+
+/// The receiver holds the diamond R -> A, B -> D, and D has a dict. A second
+/// stream updates a ref to a new commit that names A and B. It stages no
+/// commit of the diamond, and it carries a dict for A, B, and D. A and B
+/// both name D. The receiver drops the three dicts, so the stored dict of D
+/// keeps its bytes, and A and B get no dict.
+#[test]
+fn a_dict_below_a_held_diamond_is_dropped() {
+    let src_tmp = TmpDir::new("one-way-dep-diamond-dict-src");
+    let src = new_repo(&src_tmp, RepoMode::Archive, "");
+    let diamond = block_on(write_diamond(&src, src_tmp.path(), "main"));
+    let tmp = TmpDir::new("one-way-dep-diamond-dict");
+    let (repo, _) = empty_repo(&tmp, "");
+    let [a, b, d] = [diamond.a, diamond.b, diamond.d].map(|commit| commit_obj(&src, commit));
+    let bytes = attachment_stream(
+        &chain_objects(&src, &[diamond.r, diamond.a, diamond.b, diamond.d]),
+        &[signed(&d, &[SECRET_B64])],
+        &[("main", diamond.r)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    let stored = std::fs::read(meta_path(&repo, &diamond.d)).unwrap();
+
+    let top = commit_naming(
+        "top",
+        &[
+            (DIAMOND_A, &diamond.a.as_bytes()[..]),
+            (DIAMOND_B, &diamond.b.as_bytes()[..]),
+        ],
+    );
+    let bytes = attachment_stream(
+        &with_tree(&[&top]),
+        &[
+            signed(&a, &[OTHER_SECRET_B64]),
+            signed(&b, &[OTHER_SECRET_B64]),
+            signed(&d, &[OTHER_SECRET_B64]),
+        ],
+        &[("top", top.checksum)],
+    );
+    receive_piped(&repo, &StreamPolicy::default(), bytes).unwrap();
+    assert_eq!(std::fs::read(meta_path(&repo, &diamond.d)).unwrap(), stored);
+    assert_eq!(
+        ed25519_signatures(&repo, &diamond.d),
+        [ed25519_signature(SECRET_B64, &d.bytes)]
+    );
+    assert!(!meta_path(&repo, &diamond.a).exists());
+    assert!(!meta_path(&repo, &diamond.b).exists());
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [
+            ("main".to_owned(), diamond.r),
+            ("top".to_owned(), top.checksum)
+        ]
+    );
+    assert_held_complete(
+        &repo,
+        &[top.checksum, diamond.r, diamond.a, diamond.b, diamond.d],
+    );
 }
 
 /// A one-way stream ignores the server keys of its rules, so a staged

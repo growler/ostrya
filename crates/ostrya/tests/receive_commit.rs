@@ -15,14 +15,14 @@ use std::sync::Arc;
 
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, SECOND_SERVER_SECRET_B64, SECRET_B64, SERVER_SECRET_B64,
-    build_commit, collections_policy, connect, ed25519_signature, ed25519_signatures,
-    fixture_objects, keyed_commit, new_repo, outcomes, policy_allowing, returned_code, secret,
-    server_signer, session, sha, signed_dict, staging_entries, trust,
+    build_commit, collections_policy, commit_objects, connect, ed25519_signature,
+    ed25519_signatures, fixture_objects, keyed_commit, new_repo, outcomes, policy_allowing,
+    returned_code, secret, server_signer, session, sha, signed_dict, staging_entries, trust,
 };
 use common::{
-    COMMIT, Field2Entry, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir,
+    COMMIT, Chain, Field2Entry, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir,
     file_inventory, foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main,
-    mark_partial, regular_objects, store_with_field2, tool_fsck,
+    mark_partial, regular_objects, tool_fsck, write_chain,
 };
 use ostrya::remote::proto::ErrorMessage;
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
@@ -2477,70 +2477,174 @@ fn a_defective_field_2_entry_is_protocol() {
     }
 }
 
-/// An attachment whose own field 2 is not empty is `protocol`, for a staged
-/// attachment and for an attachment that the repository holds.
+/// Writes the chain R -> C -> D into a new `archive` repository under `tmp`.
+fn source_chain(tmp: &TmpDir) -> (Repo, Chain) {
+    let src = new_repo(tmp, RepoMode::Archive, "");
+    let chain = block_on(write_chain(&src, tmp.path(), "main"));
+    (src, chain)
+}
+
+/// The objects of each commit of `commits` in `src`, with the file objects
+/// in the raw encoding.
+fn chain_objects(src: &Repo, commits: &[Checksum]) -> Vec<Obj> {
+    commits
+        .iter()
+        .flat_map(|commit| commit_objects(src.path(), commit, Encoding::Raw))
+        .collect()
+}
+
+/// A session stages the chain R -> C -> D and updates `main` to R. C is a
+/// staged attachment, so its own entry gets the checks of a staged commit,
+/// and the session commits. C and D get no ref, no partial marker, and no
+/// server signature.
 #[test]
-fn a_nested_attachment_is_protocol() {
-    let inner = build_commit(None, "inner", no_metadata(), &[]);
-    let att = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
-    let tmp = TmpDir::new("recv-dep-nested");
+fn a_chain_of_attachments_staged_in_one_session_commits() {
+    let src_tmp = TmpDir::new("recv-dep-chain-src");
+    let (src, chain) = source_chain(&src_tmp);
+    let objects = chain_objects(&src, &[chain.r, chain.c, chain.d]);
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..policy()
+    };
+    let tmp = TmpDir::new("recv-dep-chain");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let before = snapshot(&repo);
-    let error = refused(
-        push(
-            &repo,
-            &policy(),
-            &with_tree(&[&inner, &att, &target]),
-            &[],
-            vec![update("main", Expected::Absent, Some(target.checksum))],
-            false,
-        ),
-        ErrorCode::Protocol,
+    let report = committed(push(
+        &repo,
+        &policy,
+        &objects,
+        &[],
+        vec![update("main", Expected::Absent, Some(chain.r))],
+        false,
+    ));
+    assert_eq!(
+        outcomes(&report),
+        vec![RefOutcome {
+            name: "main".into(),
+            old: None,
+            new: Some(chain.r),
+        }]
+    );
+    assert_eq!(refs(&repo), [("main".to_owned(), chain.r)]);
+    for commit in [chain.r, chain.c, chain.d] {
+        assert!(block_on(repo.has_object(ObjectType::Commit, &commit)).unwrap());
+        assert_eq!(
+            block_on(repo.commit_state(&commit)).unwrap(),
+            ostrya::CommitState::Normal
+        );
+        assert!(!marker(&repo, &commit).exists(), "{commit}");
+        for name in block_on(repo.traverse_commit(&commit, 0)).unwrap() {
+            assert!(
+                block_on(repo.has_object(name.ty, &name.checksum)).unwrap(),
+                "{name:?}"
+            );
+        }
+    }
+    assert_eq!(ed25519_signatures(&repo, &chain.r).len(), 1);
+    assert!(ed25519_signatures(&repo, &chain.c).is_empty());
+    assert!(ed25519_signatures(&repo, &chain.d).is_empty());
+}
+
+/// The repository holds C of the chain R -> C -> D complete, and a session
+/// stages R alone. The check reads nothing below C: with the commit object
+/// of D gone from the repository, the session commits.
+#[test]
+fn an_attachment_held_complete_is_not_read_below() {
+    let src_tmp = TmpDir::new("recv-dep-chain-held-src");
+    let (src, chain) = source_chain(&src_tmp);
+    let tmp = TmpDir::new("recv-dep-chain-held");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy(),
+        &chain_objects(&src, &[chain.c, chain.d]),
+        &[],
+        vec![update("container", Expected::Absent, Some(chain.c))],
+        false,
+    ));
+    std::fs::remove_file(repo.path().join("objects").join(ostrya::loose_path(
+        &chain.d,
+        ObjectType::Commit,
+        repo.mode(),
+    )))
+    .unwrap();
+    committed(push(
+        &repo,
+        &policy(),
+        &chain_objects(&src, &[chain.r]),
+        &[],
+        vec![update("main", Expected::Absent, Some(chain.r))],
+        false,
+    ));
+    assert_eq!(
+        refs(&repo),
+        [
+            ("container".to_owned(), chain.c),
+            ("main".to_owned(), chain.r),
+        ]
     );
     assert_eq!(
-        error.message,
-        format!(
-            "related commits in field 2 of commit {}: attachment lib/d names commit {}, which \
-             has attachments of its own",
-            target.checksum, att.checksum
-        )
+        block_on(repo.commit_state(&chain.c)).unwrap(),
+        ostrya::CommitState::Normal
     );
-    assert_unchanged(&repo, &before);
+    assert!(!block_on(repo.has_object(ObjectType::Commit, &chain.d)).unwrap());
+    for commit in [chain.r, chain.c] {
+        assert!(!marker(&repo, &commit).exists(), "{commit}");
+    }
+}
 
-    let tmp = TmpDir::new("recv-dep-nested-held");
-    let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
-    let held = block_on(store_with_field2(
-        &repo,
-        &fixture_commit(),
-        &[("lib/x", &[7; 32])],
-    ));
-    let target = build_commit(
-        None,
-        "target",
-        no_metadata(),
-        &[("lib/h", &held.as_bytes()[..])],
-    );
-    let before = snapshot(&repo);
-    let error = refused(
-        push(
-            &repo,
-            &policy(),
-            std::slice::from_ref(&target),
-            &[],
-            vec![update("main", Expected::Absent, Some(target.checksum))],
-            false,
-        ),
-        ErrorCode::Protocol,
-    );
-    assert!(
-        error.message.contains(&format!(
-            "attachment lib/h names commit {held}, which has attachments of its own"
-        )),
-        "{}",
-        error.message
-    );
-    assert_unchanged(&repo, &before);
+/// A session stages R and C, where R names C and C names D. C is a staged
+/// attachment, so its entry gets the checks of a staged commit. If the
+/// repository does not hold D, the session is `missing-objects`, and the
+/// error lists D. If the repository holds D with a partial marker, the
+/// session is `missing-objects` with no object listed, and the message names
+/// C as the commit that holds the entry. The session publishes nothing.
+#[test]
+fn an_attachment_below_a_staged_attachment_gets_the_checks() {
+    let d = build_commit(None, "details", no_metadata(), &[]);
+    let c = build_commit(None, "container", no_metadata(), &[entry("details/fe", &d)]);
+    let r = build_commit(None, "root", no_metadata(), &[entry("container/fe", &c)]);
+    for partial in [false, true] {
+        let tmp = TmpDir::new("recv-dep-below-staged");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        if partial {
+            hold_commit(&repo, &d);
+            mark_partial(&repo, &d.checksum);
+        }
+        let before = snapshot(&repo);
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &with_tree(&[&c, &r]),
+                &[],
+                vec![update("main", Expected::Absent, Some(r.checksum))],
+                false,
+            ),
+            ErrorCode::MissingObjects,
+        );
+        if partial {
+            assert!(error.missing.is_empty(), "{:?}", error.missing);
+            assert_eq!(
+                error.message,
+                format!(
+                    "related commits in field 2 of commit {}: attachment details/fe names commit \
+                     {}, which is partial",
+                    c.checksum, d.checksum
+                )
+            );
+        } else {
+            assert_eq!(
+                error.missing,
+                [ObjectName::new(d.checksum, ObjectType::Commit)]
+            );
+            assert_eq!(
+                error.message,
+                "1 objects that the staged commits name as attachments are neither staged nor \
+                 present"
+            );
+        }
+        assert_unchanged(&repo, &before);
+    }
 }
 
 /// An attachment that the repository holds complete passes with no
@@ -2800,21 +2904,13 @@ fn marker(repo: &Repo, commit: &Checksum) -> PathBuf {
 
 /// The repository holds a new commit with a partial marker, and the session
 /// sends its tree. Field 2 of the commit gets the checks of a staged commit:
-/// an absent attachment is `missing-objects`, and a defective entry and a
-/// nested attachment are `protocol`. The session publishes nothing, and the
-/// marker stays.
+/// an absent attachment is `missing-objects`, and a defective entry is
+/// `protocol`. The session publishes nothing, and the marker stays.
 #[test]
 fn a_partial_held_target_gets_the_attachment_checks() {
     let att = build_commit(None, "dependency", no_metadata(), &[]);
-    let nested = build_commit(None, "nested", no_metadata(), &[("lib/x", &[7; 32])]);
     let absent = build_commit(None, "absent", no_metadata(), &[entry("lib/d", &att)]);
     let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
-    let over_nested = build_commit(
-        None,
-        "over nested",
-        no_metadata(),
-        &[entry("lib/n", &nested)],
-    );
     let cases = [
         (&absent, ErrorCode::MissingObjects, None),
         (
@@ -2826,20 +2922,10 @@ fn a_partial_held_target_gets_the_attachment_checks() {
                 short.checksum
             )),
         ),
-        (
-            &over_nested,
-            ErrorCode::Protocol,
-            Some(format!(
-                "related commits in field 2 of commit {}: attachment lib/n names commit {}, \
-                 which has attachments of its own",
-                over_nested.checksum, nested.checksum
-            )),
-        ),
     ];
     for (target, code, text) in cases {
         let tmp = TmpDir::new("recv-dep-partial-target");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        hold_commit(&repo, &nested);
         hold_commit(&repo, target);
         mark_partial(&repo, &target.checksum);
         let before = snapshot(&repo);
@@ -2950,12 +3036,11 @@ fn a_staged_attachment_with_a_stale_marker_counts_as_complete() {
     assert!(!marker(&repo, &att.checksum).exists(), "the marker goes");
 }
 
-/// The refusal of a nested attachment that two new commits name names the
-/// new commit of the first update, also when its checksum sorts last.
+/// The refusal of a partial held attachment that two new commits name names
+/// the new commit of the first update, also when its checksum sorts last.
 #[test]
-fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
-    let inner = build_commit(None, "inner", no_metadata(), &[]);
-    let att = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
+fn a_partial_attachment_refusal_names_the_first_new_commit_in_update_order() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
     let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &att)]);
     let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &att)]);
     let (first, last) = if a.checksum > b.checksum {
@@ -2965,12 +3050,14 @@ fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
     };
     let tmp = TmpDir::new("recv-dep-first-target");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &att);
+    mark_partial(&repo, &att.checksum);
     let before = snapshot(&repo);
     let error = refused(
         push(
             &repo,
             &policy(),
-            &with_tree(&[&inner, &att, &first, &last]),
+            &with_tree(&[&first, &last]),
             &[],
             vec![
                 update("x", Expected::Absent, Some(first.checksum)),
@@ -2978,13 +3065,14 @@ fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
             ],
             false,
         ),
-        ErrorCode::Protocol,
+        ErrorCode::MissingObjects,
     );
+    assert!(error.missing.is_empty(), "{:?}", error.missing);
     assert_eq!(
         error.message,
         format!(
             "related commits in field 2 of commit {}: attachment lib/d names commit {}, which \
-             has attachments of its own",
+             is partial",
             first.checksum, att.checksum
         )
     );

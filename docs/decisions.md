@@ -3415,7 +3415,14 @@ the rules.
   partial-commit marker, because the session completes the tree of that
   commit and removes its marker. For the same reason, an attachment that is a
   new commit counts as complete. Each other attachment must be staged or
-  held complete, and no attachment can have attachments of its own. The
+  held complete. An attachment can have attachments of its own. A staged
+  attachment is a staged commit, so the receiver checks its attachments too,
+  at each depth. The attachment check reads nothing below an attachment that
+  the receiver holds complete. The write rule above makes the full set of
+  attachments of such an attachment complete. As the writes do, the receiver
+  accepts a held attachment whose own field 2 holds a defective entry. An
+  attachment check that also reads below an attachment held complete was
+  rejected: it reads commits that the write rule already makes complete. The
   receiver checks no signature of an attachment and adds no server signature
   to it. An attachment that is also a new commit gets the check and the
   signatures of its own updates alone. The checksum of an attachment is in
@@ -3431,10 +3438,16 @@ the rules.
   `verify`, a client can store a dict with signatures that no key trusts on
   a staged attachment. The server drops a detached metadata dict for a
   commit that it holds, that the session did not stage, and that no update
-  names, if field 2 of a commit of the session names that commit. The
-  server writes and merges nothing from the dict. The one-way export sends
-  such a dict, because it does no negotiation. A refusal of the dict was
-  rejected: it refuses each second export of an attachment with a
+  names, if field 2 of a commit of the session names that commit. Field 2 of
+  a held attachment below the session can also name it. A session that
+  stages R of the chain R -> C -> D can carry the dict of D to a receiver
+  that holds C and D. Field 2 of R names C alone, and field 2 of C names D.
+  So if a dict stays unnamed after the commits of the session, the server
+  reads field 2 of the held attachments, one level at a time, until each
+  dict is named or a level is empty. It reads the commit objects alone, each
+  one time. The server writes and merges nothing from the dict. The one-way
+  export sends such a dict, because it does no negotiation. A refusal of the
+  dict was rejected: it refuses each second export of an attachment with a
   `.commitmeta` to one receiver. A merge of the dict was rejected: the
   server held the attachment and its dict before the session, and no rule
   of the session covers a change to them. A dict for each other commit that

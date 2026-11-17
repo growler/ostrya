@@ -3567,9 +3567,9 @@ empty name and checks nothing else in the name.
 
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
-checksum that is not 32 bytes. For a push and a receive, a field 2 entry
-that names a nested attachment is defective too. A nested attachment is an
-attachment whose own field 2 is not empty.
+checksum that is not 32 bytes. For a push and a one-way export, a field 2
+entry that names a nested attachment is defective too. A nested attachment
+is an attachment whose own field 2 is not empty.
 
 ### Attachments
 
@@ -4778,8 +4778,12 @@ Each failed check ends the session, and the session writes nothing:
    names as `new`. If an entry of field 2 of a commit of the session names
    that commit, the commit is an attachment that the repository holds, and
    the server drops the dict with no merge and no write. An entry with an
-   empty name or with a checksum that is not 32 bytes names no commit. Each
-   other such dict is `protocol`.
+   empty name or with a checksum that is not 32 bytes names no commit. If a
+   dict stays unnamed, the server reads field 2 of the held attachments that
+   the commits of the session name, then of the commits that these name, one
+   level at a time, until each dict is named or a level is empty. It reads
+   the commit objects alone, each one time, and a dict that an entry of this
+   walk names is dropped too. Each other such dict is `protocol`.
 6. Each object that the tree of a commit of the session reaches must be
    staged or present, else `missing-objects`. The parents of a commit are not
    required. The `missing` detail names at most 16384 objects. A staged
@@ -4798,13 +4802,15 @@ Each failed check ends the session, and the session writes nothing:
    `missing-objects`. The absent attachments fail together, and the
    `missing` detail names each one. Then, in the order of the commits that
    name them, an attachment that the repository holds with a partial-commit
-   marker is `missing-objects` with no `missing` detail, and an attachment
-   whose own field 2 is not empty is `protocol`. The message names the
-   commit that holds the entry, field 2, and the defect. An attachment that
-   the session staged, and an attachment that is a new commit, are complete
-   through the walk above, also with a partial-commit marker. The server
-   does not check field 2 of a new commit that the repository holds with no
-   partial-commit marker.
+   marker is `missing-objects` with no `missing` detail. The message names
+   the commit that holds the entry, field 2, and the defect. An attachment
+   can have attachments of its own. An attachment that the session staged
+   is a staged commit, so its entries get this check. The attachment check
+   reads nothing below an attachment that the server holds complete. An
+   attachment that the session staged, and an attachment that is a new
+   commit, are complete through the walk above, also with a partial-commit
+   marker. The server does not check field 2 of a new commit that the
+   repository holds with no partial-commit marker.
 7. The bindings of each new commit must agree with the ref of each update
    that takes the commit as its new value, else `binding-mismatch`. The
    server checks each ref in its own namespace:

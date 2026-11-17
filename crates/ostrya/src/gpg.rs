@@ -1337,6 +1337,19 @@ pub(crate) mod tests {
             let mode = Mode::from_raw_mode(0o600);
             rustix::fs::mknodat(rustix::fs::CWD, path, file_type, mode, dev).unwrap();
         }
+        // A `nodev` mount, and a file system that a user namespace mounts,
+        // refuse the open of a device with `EACCES`. There the device is
+        // refused as a file that cannot be opened.
+        let device_denied = matches!(
+            rustix::fs::open(
+                &device,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                Mode::empty(),
+            ),
+            Err(rustix::io::Errno::ACCESS)
+        );
         let mut results = Vec::new();
         for target in [&fifo, &device] {
             std::fs::rename(target, repo.join(&name)).unwrap();
@@ -1348,8 +1361,6 @@ pub(crate) mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
         let expected = format!("the keyring '{name}' is not a regular file");
-        // A `nodev` mount refuses the open of a device with `EACCES`, so
-        // there the device is refused as a file that cannot be opened.
         let denied = format!("the keyring '{name}' cannot be opened: Permission denied");
         for (index, result) in results.into_iter().enumerate() {
             let message = match &result {
@@ -1360,10 +1371,8 @@ pub(crate) mod tests {
             if message == expected {
                 continue;
             }
-            let nodev = rustix::fs::statvfs(std::env::temp_dir())
-                .is_ok_and(|vfs| vfs.f_flag.contains(rustix::fs::StatVfsMountFlags::NODEV));
             assert!(
-                index >= 2 && nodev && message.starts_with(&denied),
+                index >= 2 && device_denied && message.starts_with(&denied),
                 "{message}"
             );
         }

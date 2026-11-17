@@ -746,15 +746,27 @@ mod tests {
             ("dir.file", FileType::Directory),
         ];
         // A whiteout is a character device 0:0. Its create needs no
-        // privilege, and its open gives `ENXIO`.
+        // privilege, and its open gives `ENXIO`. A `nodev` mount, and a file
+        // system that a user namespace mounts, refuse the open with `EACCES`
+        // before the type check.
+        let dev = ab.join("dev.file");
         match rustix::fs::mknodat(
             rustix::fs::CWD,
-            ab.join("dev.file"),
+            &dev,
             FileType::CharacterDevice,
             Mode::from_raw_mode(0o600),
             rustix::fs::makedev(0, 0),
         ) {
-            Ok(()) => cases.push(("dev.file", FileType::CharacterDevice)),
+            Ok(()) => match rustix::fs::open(
+                &dev,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Err(Errno::ACCESS) => {
+                    eprintln!("skipping the device case: the open of a device gives EACCES");
+                }
+                _ => cases.push(("dev.file", FileType::CharacterDevice)),
+            },
             Err(e) => eprintln!("skipping the device case: mknod gives {e}"),
         }
         for (name, expected) in cases {

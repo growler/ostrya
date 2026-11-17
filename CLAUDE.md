@@ -1037,13 +1037,23 @@ until the maintainer asks for that step in words.
    to the command or its package, and the line of the maintainer with the
    date in the `date -R` format. If the command and the package do not
    change, the one item is `New upstream release.`
-5. Run the gates of `.github/workflows/ci.yml`. Run the tests with
+5. Lock `build.les` and `test.les` again for amd64 and arm64. A lock records
+   the content of the source tree, so each change to the tree needs new
+   locks.
+
+   ```sh
+   for les in build.les test.les; do
+     for arch in amd64 arm64; do debles lock "$les" --arch "$arch"; done
+   done
+   ```
+
+6. Run the gates of `.github/workflows/ci.yml`. Run the tests with
    `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1 OSTRYA_REQUIRE_S3=1`,
    as CI does.
-6. Commit as `chore(release): bump the workspace version to <version>`. The
-   commit includes the man pages of step 3 and the changelog entries of
-   step 4.
-7. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
+7. Commit as `chore(release): bump the workspace version to <version>`. The
+   commit includes the man pages of step 3, the changelog entries of step 4,
+   and the four lock files of step 5.
+8. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
    It refuses an uncommitted tracked file, so it comes after the commit. Fix
    a failure with `git commit --amend`.
-8. Make a signed tag: `git tag -s -m 'ostrya <version>' v<version>`.
+9. Make a signed tag: `git tag -s -m 'ostrya <version>' v<version>`.

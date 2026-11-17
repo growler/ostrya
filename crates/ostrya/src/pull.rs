@@ -235,10 +235,10 @@ use crate::traverse::reaches_at_least;
 use crate::verify::Payload;
 use crate::write::FileMeta;
 
+mod attachment;
 mod chain;
 mod collection;
 mod delta;
-mod dependency;
 pub(crate) mod drive;
 #[doc(hidden)]
 pub mod http;
@@ -1294,7 +1294,7 @@ impl Repo {
     /// # Dependencies
     ///
     /// Field 2 of a commit names the dependencies of the commit.
-    /// [`read_commit_related`](Repo::read_commit_related) reads them. The pull
+    /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The pull
     /// follows the dependencies of each commit that it walks: each target, and
     /// each parent that [`depth`](PullOptions::depth) takes. It also follows
     /// the dependencies of each intermediate commit of a chain of static
@@ -1759,7 +1759,7 @@ impl Repo {
     ///   that target loose. The walk reads the commit of each dependency
     ///   before the search for its delta. So a dependency that no source
     ///   holds gives [`Error::ObjectNotFound`], and a dependency that names
-    ///   dependencies of its own gives [`Error::InvalidRelated`], before this
+    ///   dependencies of its own gives [`Error::InvalidRelations`], before this
     ///   error.
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
@@ -1775,7 +1775,7 @@ impl Repo {
     /// - [`Error::Pull`] if an object fails the
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
-    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit has an
     ///   empty name or a checksum that is not 32 bytes, or if a dependency
     ///   names dependencies of its own. The pull reports it before a failed
     ///   signature check of the walk, and before a `.commitmeta` of the walk
@@ -2002,7 +2002,7 @@ impl Repo {
         // imports each of them, and the commit loop skips them.
         let done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
         // Discovery read field 2 of each intermediate commit of the chains.
-        let mut level_dependencies = deltas.take_dependencies();
+        let mut level_attachments = deltas.take_attachments();
 
         let sources: Vec<&Repo> = std::iter::once(src)
             .chain(opts.localcache_repos.iter())
@@ -2048,8 +2048,8 @@ impl Repo {
         // of field 2 of each commit that it walks.
         // A pull that reads no static delta pairs no dependency with a target,
         // so it keeps no entry of field 2 and no parent.
-        let mut deps = (!flags.contains(PullFlags::COMMIT_ONLY)).then(|| ChainDependencies {
-            inner: dependency::Dependencies::new(!reads_deltas),
+        let mut atts = (!flags.contains(PullFlags::COMMIT_ONLY)).then(|| ChainAttachments {
+            inner: attachment::Attachments::new(!reads_deltas),
             parents: HashMap::new(),
         });
         let mut appended: Vec<Checksum> = Vec::new();
@@ -2085,22 +2085,22 @@ impl Repo {
                 &mut commits,
                 &mut seen,
                 check.as_mut(),
-                deps.as_mut(),
+                atts.as_mut(),
             )
             .await?;
         }
-        if let Some(deps) = deps.as_mut() {
+        if let Some(atts) = atts.as_mut() {
             // The run of the levels imports the intermediate commits of the
             // chains, so the walk reads none of them again.
             for commit in deltas.levels().iter().flatten() {
-                if let Some(entries) = level_dependencies.remove(commit) {
-                    deps.inner.record(*commit, entries);
+                if let Some(entries) = level_attachments.remove(commit) {
+                    atts.inner.record(*commit, entries);
                 }
             }
-            appended = collect_dependencies(
+            appended = collect_attachments(
                 self,
                 &sources,
-                deps,
+                atts,
                 &done,
                 untrusted,
                 &mut commits,
@@ -2119,18 +2119,18 @@ impl Repo {
         // dependency alone. The pull reads each superblock again just before
         // it applies the delta. The maps of the walk drop here, before the
         // transaction opens.
-        let mut dependency_deltas = match deps.take() {
-            Some(deps) if reads_deltas && !appended.is_empty() => {
-                let named = dependency::pair_targets(
+        let mut attachment_deltas = match atts.take() {
+            Some(atts) if reads_deltas && !appended.is_empty() => {
+                let named = attachment::pair_targets(
                     targets,
                     opts.depth,
-                    &deps.parents,
-                    deps.inner.naming(),
+                    &atts.parents,
+                    atts.inner.naming(),
                     appended,
                 );
-                drop(deps);
-                let (lookups, known) = dependency::lookups(self, targets, place, named).await?;
-                delta::discover_dependencies(
+                drop(atts);
+                let (lookups, known) = attachment::lookups(self, targets, place, named).await?;
+                delta::discover_attachments(
                     self,
                     &delta::DeltaSource::Local(src),
                     advert.as_ref(),
@@ -2142,7 +2142,7 @@ impl Repo {
                 )
                 .await?
             }
-            _ => delta::DependencyDeltas::default(),
+            _ => delta::AttachmentDeltas::default(),
         };
         drop(advert);
         drop(edges);
@@ -2250,7 +2250,7 @@ impl Repo {
                         root_dirtree: parsed.root_dirtree,
                         root_dirmeta: parsed.root_dirmeta,
                         held,
-                        dependency: false,
+                        attachment: false,
                         detached: deltas.checked_detached(commit),
                     });
                 }
@@ -2306,12 +2306,12 @@ impl Repo {
             // as the deltas of the targets. The pull parses the job of one
             // dependency at a time, and drops it after its parts.
             for chain_commit in &commits {
-                if dependency_deltas.is_empty() {
+                if attachment_deltas.is_empty() {
                     break;
                 }
-                let dependency = &chain_commit.checksum;
-                let Some(job) = dependency_deltas
-                    .take_job(self, &delta_source, dependency)
+                let attachment = &chain_commit.checksum;
+                let Some(job) = attachment_deltas
+                    .take_job(self, &delta_source, attachment)
                     .await?
                 else {
                     continue;
@@ -2320,7 +2320,7 @@ impl Repo {
                     delta::apply_job_part(&txn, &delta_source, &job, index, checks, &counters)
                         .await?;
                 }
-                txn.write_metadata(ObjectType::Commit, Some(dependency), &job.commit_bytes)
+                txn.write_metadata(ObjectType::Commit, Some(attachment), &job.commit_bytes)
                     .await?;
             }
             // The pull is done with the deltas, the inline part bodies of the
@@ -2344,7 +2344,7 @@ impl Repo {
                 .await?;
                 // A dependency that this repository holds complete keeps the
                 // detached metadata of this repository.
-                if !(chain_commit.dependency && chain_commit.held) {
+                if !(chain_commit.attachment && chain_commit.held) {
                     self.import_detached_metadata(
                         &txn,
                         &sources,
@@ -2937,14 +2937,14 @@ fn operand_collection(name: &str) -> Option<(&str, &str)> {
 /// read the commit object again.
 ///
 /// The walk takes the format check of field 2 of each commit when it appends
-/// the commit, also if `deps` is `None`. If `deps` is present, the walk
+/// the commit, also if `atts` is `None`. If `atts` is present, the walk
 /// records the dependencies of each commit that it appends there. Unless
-/// `deps` keeps the commits alone, the walk also records the parent of each
+/// `atts` keeps the commits alone, the walk also records the parent of each
 /// commit that it gets to.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelated`] if field 2 of a commit of the chain has an
+/// - [`Error::InvalidRelations`] if field 2 of a commit of the chain has an
 ///   entry with an empty name or with a checksum that is not 32 bytes.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a parent does not
 ///   hash to its name.
@@ -2958,7 +2958,7 @@ async fn collect_chain(
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
     mut check: Option<&mut ChainCheck<'_>>,
-    mut deps: Option<&mut ChainDependencies>,
+    mut atts: Option<&mut ChainAttachments>,
 ) -> Result<()> {
     let mut current = Some((tip, tip_commit));
     let mut remaining = depth;
@@ -2967,14 +2967,14 @@ async fn collect_chain(
         LoadedCommit {
             bytes,
             commit,
-            dependencies,
+            attachments,
         },
     )) = current
     {
-        if let Some(deps) = deps.as_deref_mut()
-            && !deps.inner.keys_only()
+        if let Some(atts) = atts.as_deref_mut()
+            && !atts.inner.keys_only()
         {
-            deps.parents.insert(checksum, commit.parent);
+            atts.parents.insert(checksum, commit.parent);
         }
         if let Some(&prev) = seen.get(&checksum)
             && reaches_at_least(prev, remaining)
@@ -2982,7 +2982,7 @@ async fn collect_chain(
             return Ok(());
         }
         if seen.insert(checksum, remaining).is_none() {
-            let dependencies = dependencies?;
+            let attachments = attachments?;
             let detached = match check.as_deref_mut() {
                 Some(check) => check.check(&checksum, &bytes).await,
                 None => CheckedDetached::Unchecked,
@@ -2992,11 +2992,11 @@ async fn collect_chain(
                 root_dirtree: commit.root_dirtree,
                 root_dirmeta: commit.root_dirmeta,
                 held: false,
-                dependency: false,
+                attachment: false,
                 detached,
             });
-            if let Some(deps) = deps.as_deref_mut() {
-                deps.inner.record(checksum, dependencies);
+            if let Some(atts) = atts.as_deref_mut() {
+                atts.inner.record(checksum, attachments);
             }
         }
         drop(bytes);
@@ -3031,7 +3031,7 @@ struct ChainCommit {
     /// `true` for a dependency that the walk appended after the chains. Such
     /// a commit is a dependency alone: a target, a parent, and a commit of a
     /// chain are not appended.
-    dependency: bool,
+    attachment: bool,
     /// What the signature check of the commit read of its `.commitmeta`.
     detached: CheckedDetached,
 }
@@ -3074,34 +3074,34 @@ impl CheckedDetached {
 
 /// The dependencies that the walk of the chains of a local pull met, and the
 /// commits that it checks them against.
-struct ChainDependencies {
+struct ChainAttachments {
     /// The dependencies, in the order in which the pull first recorded them,
     /// and the commits that name them. The pull records the dependencies of
     /// the commits of the walk first, then the dependencies of the
     /// intermediate commits of the delta levels.
-    inner: dependency::Dependencies,
+    inner: attachment::Attachments,
     /// The parent that each commit of the chains named. Under
-    /// [`keys_only`](dependency::Dependencies::keys_only), the map stays
+    /// [`keys_only`](attachment::Attachments::keys_only), the map stays
     /// empty: a pull that reads no static delta pairs no dependency with a
     /// target, so it reads no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
-/// Appends each dependency of `deps` that the walk did not collect to `out`,
-/// at depth 0, in the order of `deps`. Returns each appended dependency, in
+/// Appends each dependency of `atts` that the walk did not collect to `out`,
+/// at depth 0, in the order of `atts`. Returns each appended dependency, in
 /// the same order.
 ///
 /// A dependency that `seen` holds, or that `made` holds, needs no read: the
 /// walk collected it, or a chain of static deltas makes it. `made` holds the
-/// intermediate commits of the chains, and `deps` holds their dependencies.
+/// intermediate commits of the chains, and `atts` holds their dependencies.
 /// The call reads each other dependency from the first repository of
 /// `sources` that holds it, else from `repo`. It follows no parent of a
 /// dependency.
 ///
 /// The function reads the dependencies that neither `seen` nor `made` holds in
-/// one call on the blocking pool, in the order of `deps`. If `untrusted` is
+/// one call on the blocking pool, in the order of `atts`. If `untrusted` is
 /// set, it hashes each dependency that it reads from a source, as
-/// [`load_dependencies_blocking`] states. The call stops at the first
+/// [`load_attachments_blocking`] states. The call stops at the first
 /// failure. If no dependency needs a read, the function makes no call. The
 /// call reads no dependency after the first dependency that `seen` or `made`
 /// holds and that names dependencies of its own. If the caller drops the
@@ -3115,9 +3115,9 @@ struct ChainDependencies {
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelated`] if a dependency names dependencies of its own.
+/// - [`Error::InvalidRelations`] if a dependency names dependencies of its own.
 ///   The error names the commit that first named the dependency.
-/// - [`Error::InvalidRelated`] if field 2 of a dependency that the call reads
+/// - [`Error::InvalidRelations`] if field 2 of a dependency that the call reads
 ///   has an entry with an empty name or with a checksum that is not 32 bytes.
 ///   The error names the dependency.
 /// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds a
@@ -3129,37 +3129,37 @@ struct ChainDependencies {
 ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
 ///   file, or if a symlink is on its path.
 /// - [`Error::Io`] if a file system operation fails.
-async fn collect_dependencies(
+async fn collect_attachments(
     repo: &Repo,
     sources: &[&Repo],
-    deps: &ChainDependencies,
+    atts: &ChainAttachments,
     made: &HashSet<Checksum>,
     untrusted: bool,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
 ) -> Result<Vec<Checksum>> {
-    // The position in `deps.inner.order()` of each dependency to read, and
+    // The position in `atts.inner.order()` of each dependency to read, and
     // its checksum. A held dependency that names dependencies of its own
     // stops the list: the call reads no dependency after it.
-    let order = deps.inner.order();
-    let nested_error = |dependency: &Checksum| {
-        deps.inner
-            .nested_error(dependency)
+    let order = atts.inner.order();
+    let nested_error = |attachment: &Checksum| {
+        atts.inner
+            .nested_error(attachment)
             .expect("a commit names each dependency of the order")
     };
     let mut positions = Vec::new();
     let mut wanted = Vec::new();
     let mut stop = None;
-    for (at, dependency) in order.iter().enumerate() {
-        if seen.contains_key(dependency) || made.contains(dependency) {
-            if deps.inner.naming().contains_key(dependency) {
+    for (at, attachment) in order.iter().enumerate() {
+        if seen.contains_key(attachment) || made.contains(attachment) {
+            if atts.inner.naming().contains_key(attachment) {
                 stop = Some(at);
                 break;
             }
             continue;
         }
         positions.push(at);
-        wanted.push(*dependency);
+        wanted.push(*attachment);
     }
     let mut loaded = Vec::new();
     if !wanted.is_empty() {
@@ -3171,7 +3171,7 @@ async fn collect_dependencies(
         // The closure gives the position in `wanted` of a nested dependency.
         // The names stay here.
         loaded = match ostrya_rt::unblock(move || {
-            load_dependencies_blocking(&holders, &wanted, untrusted)
+            load_attachments_blocking(&holders, &wanted, untrusted)
         })
         .await?
         {
@@ -3183,16 +3183,16 @@ async fn collect_dependencies(
         return Err(nested_error(&order[at]));
     }
     let mut appended = Vec::with_capacity(loaded.len());
-    for (at, dependency) in positions.into_iter().zip(loaded) {
+    for (at, attachment) in positions.into_iter().zip(loaded) {
         let checksum = order[at];
         seen.insert(checksum, 0);
         appended.push(checksum);
         out.push(ChainCommit {
             checksum,
-            root_dirtree: dependency.root_dirtree,
-            root_dirmeta: dependency.root_dirmeta,
+            root_dirtree: attachment.root_dirtree,
+            root_dirmeta: attachment.root_dirmeta,
             held: false,
-            dependency: true,
+            attachment: true,
             detached: CheckedDetached::Unchecked,
         });
     }
@@ -3579,17 +3579,17 @@ struct LoadedCommit {
     /// blocking pool in this `Arc`, with no copy.
     bytes: Arc<Vec<u8>>,
     /// The parsed commit. Its field 2 is empty: the entries are in
-    /// `dependencies`.
+    /// `attachments`.
     commit: Commit,
     /// The entries of field 2 as names and checksums, in the stored order, or
-    /// the [`Error::InvalidRelated`] of the first defective entry. The caller
+    /// the [`Error::InvalidRelations`] of the first defective entry. The caller
     /// takes the result at its own point, so it sets the order of the errors.
-    dependencies: Result<Vec<(String, Checksum)>>,
+    attachments: Result<Vec<(String, Checksum)>>,
 }
 
 /// What a local pull keeps of a dependency that it read: the root of its
 /// tree.
-struct LoadedDependency {
+struct LoadedAttachment {
     root_dirtree: Checksum,
     root_dirmeta: Checksum,
 }
@@ -3605,7 +3605,7 @@ fn parse_loaded(checksum: Checksum, bytes: Arc<Vec<u8>>) -> Result<LoadedCommit>
     Ok(LoadedCommit {
         bytes,
         commit,
-        dependencies: related::checked_dependencies(&checksum, related),
+        attachments: related::checked_attachments(&checksum, related),
     })
 }
 
@@ -3670,16 +3670,16 @@ async fn try_load_commit(
 ///   dependency.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a commit that the
 ///   call hashes does not hash to the checksum of its dependency.
-/// - [`Error::InvalidRelated`] if field 2 of a dependency has an entry with
+/// - [`Error::InvalidRelations`] if field 2 of a dependency has an entry with
 ///   an empty name or with a checksum that is not 32 bytes. The error names
 ///   the dependency.
 /// - The errors of [`parse_loaded`], and the errors of the read of a commit
 ///   object other than an absent object.
-fn load_dependencies_blocking(
+fn load_attachments_blocking(
     holders: &[Repo],
     wanted: &[Checksum],
     untrusted: bool,
-) -> Result<std::result::Result<Vec<LoadedDependency>, usize>> {
+) -> Result<std::result::Result<Vec<LoadedAttachment>, usize>> {
     let mut loaded = Vec::with_capacity(wanted.len());
     for (at, checksum) in wanted.iter().enumerate() {
         let mut bytes = None;
@@ -3700,13 +3700,13 @@ fn load_dependencies_blocking(
         };
         let LoadedCommit {
             commit,
-            dependencies,
+            attachments,
             ..
         } = parse_loaded(*checksum, Arc::new(bytes))?;
-        if !dependencies?.is_empty() {
+        if !attachments?.is_empty() {
             return Ok(Err(at));
         }
-        loaded.push(LoadedDependency {
+        loaded.push(LoadedAttachment {
             root_dirtree: commit.root_dirtree,
             root_dirmeta: commit.root_dirmeta,
         });

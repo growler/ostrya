@@ -528,9 +528,9 @@ pub enum Error {
     /// These calls give this error:
     ///
     /// - [`Transaction::write_commit`](crate::Transaction::write_commit) and
-    ///   [`Transaction::check_related`](crate::Transaction::check_related),
+    ///   [`Transaction::check_attachments`](crate::Transaction::check_attachments),
     ///   for an entry of
-    ///   [`CommitOptions::related`](crate::CommitOptions::related) with an
+    ///   [`CommitOptions::attachments`](crate::CommitOptions::attachments) with an
     ///   empty name, for two entries with the same name, and for a dependency
     ///   that is absent, partial, or nested. The calls check before the
     ///   commit has a checksum, so `commit` is `None`.
@@ -539,7 +539,7 @@ pub enum Error {
     ///   name or with a checksum that is not 32 bytes, entries that are not
     ///   sorted by name, two entries with the same name, and a dependency
     ///   that is absent, partial, or nested. `commit` is the source commit.
-    /// - [`Repo::read_commit_related`](crate::Repo::read_commit_related), for
+    /// - [`Repo::read_commit_relations`](crate::Repo::read_commit_relations), for
     ///   an entry with an empty name or with a checksum that is not 32 bytes,
     ///   and for an `ostrya.related` value that is not a variant of type
     ///   `a(say)`. `commit` is the commit that the call reads.
@@ -549,14 +549,14 @@ pub enum Error {
     ///   [`Transaction::set_commit_detached_metadata`](crate::Transaction::set_commit_detached_metadata)
     ///   queued, for an `ostrya.related` entry of the dict with one of these
     ///   defects. `commit` is the commit of the dict.
-    /// - [`Repo::add_detached_related`](crate::Repo::add_detached_related) and
-    ///   [`Transaction::add_detached_related`](crate::Transaction::add_detached_related),
+    /// - [`Repo::add_supplement`](crate::Repo::add_supplement) and
+    ///   [`Transaction::add_supplement`](crate::Transaction::add_supplement),
     ///   for an empty name. `commit` is the commit that gets the build
     ///   source.
-    /// - [`Repo::add_detached_related`](crate::Repo::add_detached_related),
+    /// - [`Repo::add_supplement`](crate::Repo::add_supplement),
     ///   and [`Transaction::commit`](crate::Transaction::commit) for an add
     ///   that
-    ///   [`Transaction::add_detached_related`](crate::Transaction::add_detached_related)
+    ///   [`Transaction::add_supplement`](crate::Transaction::add_supplement)
     ///   queued, for a stored `ostrya.related` value with one of these
     ///   defects. `commit` is the commit that gets the build source.
     /// - [`Repo::pull`](crate::Repo::pull),
@@ -583,18 +583,18 @@ pub enum Error {
     ///   absent, partial, or nested. `commit` is the target commit.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a
-    /// [`RelatedWarning`](crate::RelatedWarning) with the same text in place
+    /// [`RelationWarning`](crate::RelationWarning) with the same text in place
     /// of this error, and continues.
     #[error(
         "related commits in {field}{}: {reason}",
         .commit.map(|c| format!(" of commit {c}")).unwrap_or_default()
     )]
-    InvalidRelated {
+    InvalidRelations {
         /// The commit that holds the entries, or `None` for a commit that is
         /// not written yet.
         commit: Option<Checksum>,
         /// The field that holds the entries.
-        field: crate::RelatedField,
+        field: crate::RelationField,
         /// The text that names the defect.
         reason: String,
     },

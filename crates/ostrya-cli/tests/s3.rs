@@ -1676,7 +1676,7 @@ fn remote_fsck_of_a_corrupt_bucket_prints_each_finding_and_exits_1() {
 /// A commit whose field 2 names a commit that the bucket does not hold gives
 /// a `dependency` error on the key of the commit, and the command exits 1.
 #[test]
-fn remote_fsck_reports_an_absent_dependency_and_exits_1() {
+fn remote_fsck_reports_an_absent_attachment_and_exits_1() {
     let scratch = Scratch::new("fsck-dependency");
     let server = StandIn::start();
     let (_, tip) = fsck_fixture(&scratch, &server, &[]);
@@ -2205,7 +2205,7 @@ fn remote_prune_with_break_lock_removes_a_lock_and_prints_its_holder() {
 /// `remote prune` roots on the valid field 2 entries of a commit, writes one
 /// warning line on standard error for each defective entry, and exits 0.
 #[test]
-fn remote_prune_keeps_the_dependencies_and_warns_on_a_defective_entry() {
+fn remote_prune_keeps_the_attachments_and_warns_on_a_defective_entry() {
     let scratch = Scratch::new("prune-related");
     let server = StandIn::start();
     let (_, one, two) = prune_fixture(&scratch, &server);

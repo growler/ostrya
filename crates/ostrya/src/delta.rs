@@ -35,7 +35,7 @@ use crate::deltagen::SUPERBLOCK_FILE;
 use crate::error::{Error, Result};
 use crate::hashing::HashingReader;
 use crate::pull::{ModeChecks, PullFlags};
-use crate::related::{self, RelatedField};
+use crate::related::{self, RelationField};
 use crate::repo::Repo;
 use crate::repo_fs::{FsError, FsResultExt, Reason, RepoDir, RepoLayout, TempFile};
 use crate::sign::{Verifier, VerifyOutcome, verify_all};
@@ -434,7 +434,7 @@ impl Repo {
     ///
     /// - [`Error::ObjectNotFound`] if a fallback object of the delta, or a
     ///   source object that a part reads, is not in the repository.
-    /// - [`Error::InvalidRelated`] if an entry of field 2 of the target commit
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of the target commit
     ///   has an empty name or a checksum that is not 32 bytes, or if a
     ///   dependency is absent, partial, or has dependencies of its own. The
     ///   call writes no object.
@@ -500,22 +500,22 @@ impl Repo {
         // call on the blocking pool decodes field 2 and checks its format.
         let bytes = std::mem::take(&mut sb.commit_bytes);
         let to = sb.to;
-        let (bytes, dependencies) = ostrya_rt::unblock(move || {
-            let dependencies = related::parse_dependencies(&bytes).and_then(|entries| {
-                related::checked_entries(RelatedField::Dependencies, Some(to), entries)
+        let (bytes, attachments) = ostrya_rt::unblock(move || {
+            let attachments = related::parse_attachments(&bytes).and_then(|entries| {
+                related::checked_entries(RelationField::Attachments, Some(to), entries)
             });
-            (bytes, dependencies)
+            (bytes, attachments)
         })
         .await;
         sb.commit_bytes = bytes;
-        let dependencies = dependencies?;
+        let attachments = attachments?;
 
         let txn = self.transaction().await?;
         // Each dependency must be complete and must have no dependencies of
         // its own. The check runs before the first write, so a refusal writes
         // no object.
-        related::check_dependencies(&txn, Some(sb.to), &dependencies).await?;
-        drop(dependencies);
+        related::check_attachments(&txn, Some(sb.to), &attachments).await?;
+        drop(attachments);
         let staging = txn.staging_dir().clone();
 
         // The target commit object is embedded in the superblock, not a part.

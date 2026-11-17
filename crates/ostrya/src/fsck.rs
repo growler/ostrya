@@ -14,7 +14,7 @@ use ostrya_core::{
 
 use crate::error::{Error, Result};
 use crate::refs::CollectionRefEntry;
-use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
+use crate::related::{self, RelatedEntry, RelationField, RelationWarning};
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
 use crate::write::COPY_CHUNK;
@@ -41,17 +41,17 @@ pub struct FsckOptions {
     /// syncs `state/` after the create of each marker. It does not sync the
     /// content of a marker.
     ///
-    /// If [`mark_dependencies`](FsckOptions::mark_dependencies) is also
+    /// If [`mark_attachments`](FsckOptions::mark_attachments) is also
     /// `true`, the switch marks each commit that has an
-    /// [`Absent`](FsckDependencyErrorKind::Absent) or a
-    /// [`Partial`](FsckDependencyErrorKind::Partial) dependency, so a later
+    /// [`Absent`](FsckAttachmentErrorKind::Absent) or a
+    /// [`Partial`](FsckAttachmentErrorKind::Partial) dependency, so a later
     /// pull of the commit fetches its dependencies. A
-    /// [`Defective`](FsckDependencyErrorKind::Defective) entry marks no
+    /// [`Defective`](FsckAttachmentErrorKind::Defective) entry marks no
     /// commit, because a pull cannot repair it.
     pub mark_partial: bool,
     /// The switch that marks each commit that has an
-    /// [`Absent`](FsckDependencyErrorKind::Absent) or a
-    /// [`Partial`](FsckDependencyErrorKind::Partial) dependency as partial.
+    /// [`Absent`](FsckAttachmentErrorKind::Absent) or a
+    /// [`Partial`](FsckAttachmentErrorKind::Partial) dependency as partial.
     ///
     /// The switch has an effect only if
     /// [`mark_partial`](FsckOptions::mark_partial) is `true`. The default is
@@ -59,11 +59,11 @@ pub struct FsckOptions {
     /// `ostrya fsck` command spells `--no-mark-dependencies`.
     ///
     /// With the value `false`, the run reports each finding in
-    /// [`FsckReport::dependency_errors`] and marks no commit for a
+    /// [`FsckReport::attachment_errors`] and marks no commit for a
     /// dependency. The marks for absent and deleted objects do not change.
     /// A later run verifies again each commit that the run did not mark, and
     /// gives the same finding.
-    pub mark_dependencies: bool,
+    pub mark_attachments: bool,
     /// The switch that unlinks each object whose checksum differs from its name.
     ///
     /// The option of the `ostree fsck` command is `--delete`.
@@ -137,7 +137,7 @@ impl Default for FsckOptions {
     fn default() -> Self {
         FsckOptions {
             mark_partial: true,
-            mark_dependencies: true,
+            mark_attachments: true,
             delete: false,
             all: false,
             add_tombstones: false,
@@ -151,7 +151,7 @@ impl FsckOptions {
     /// Creates the default options.
     ///
     /// [`mark_partial`](FsckOptions::mark_partial) and
-    /// [`mark_dependencies`](FsckOptions::mark_dependencies) are `true`, and
+    /// [`mark_attachments`](FsckOptions::mark_attachments) are `true`, and
     /// each other field is `false`.
     pub fn new() -> FsckOptions {
         FsckOptions::default()
@@ -343,23 +343,23 @@ enum ImageKey {
 ///
 /// [`Repo::fsck`] gives one for each such entry in field 2 of a commit that
 /// it checks. The [`Display`](std::fmt::Display) output is the text of
-/// [`Error::InvalidRelated`] with the same commit, field 2, and reason.
+/// [`Error::InvalidRelations`] with the same commit, field 2, and reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FsckDependencyError {
+pub struct FsckAttachmentError {
     /// The commit whose field 2 holds the entry.
     pub commit: Checksum,
     /// The name of the entry.
     pub name: String,
     /// The commit that the entry names, or `None` if the entry holds a
     /// checksum that is not 32 bytes.
-    pub dependency: Option<Checksum>,
+    pub attachment: Option<Checksum>,
     /// The cause of the finding.
-    pub kind: FsckDependencyErrorKind,
+    pub kind: FsckAttachmentErrorKind,
 }
 
 /// The cause of a finding on a dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum FsckDependencyErrorKind {
+pub enum FsckAttachmentErrorKind {
     /// The repository does not hold the commit object of the dependency.
     Absent,
     /// The commit of the dependency is partial: it has a `.commitpartial`
@@ -371,26 +371,26 @@ pub enum FsckDependencyErrorKind {
     Defective(String),
 }
 
-impl FsckDependencyError {
+impl FsckAttachmentError {
     /// Returns the reason of the finding.
     pub(crate) fn reason(&self) -> String {
         let end = match &self.kind {
-            FsckDependencyErrorKind::Absent => related::ABSENT_REASON,
-            FsckDependencyErrorKind::Partial => related::PARTIAL_REASON,
-            FsckDependencyErrorKind::Defective(reason) => return reason.clone(),
+            FsckAttachmentErrorKind::Absent => related::ABSENT_REASON,
+            FsckAttachmentErrorKind::Partial => related::PARTIAL_REASON,
+            FsckAttachmentErrorKind::Defective(reason) => return reason.clone(),
         };
-        match &self.dependency {
-            Some(dependency) => related::dependency_reason(&self.name, dependency, end),
+        match &self.attachment {
+            Some(attachment) => related::attachment_reason(&self.name, attachment, end),
             None => format!("dependency {}, {end}", self.name),
         }
     }
 }
 
-impl std::fmt::Display for FsckDependencyError {
+impl std::fmt::Display for FsckAttachmentError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        RelatedWarning {
+        RelationWarning {
             commit: self.commit,
-            field: RelatedField::Dependencies,
+            field: RelationField::Attachments,
             reason: self.reason(),
         }
         .fmt(f)
@@ -402,28 +402,28 @@ impl std::fmt::Display for FsckDependencyError {
 ///
 /// `absent` and `partial` tell the state of a dependency. `nested` tells if
 /// the field 2 of a dependency is not empty.
-pub(crate) fn dependency_findings(
+pub(crate) fn attachment_findings(
     commit: Checksum,
     entries: &[RelatedEntry],
     absent: impl Fn(&Checksum) -> bool,
     partial: impl Fn(&Checksum) -> bool,
     nested: impl Fn(&Checksum) -> bool,
-) -> Vec<FsckDependencyError> {
+) -> Vec<FsckAttachmentError> {
     let mut findings = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let kind = match (entry.defect(index), entry.checksum) {
-            (Some(reason), _) => FsckDependencyErrorKind::Defective(reason),
-            (None, Ok(dependency)) if absent(&dependency) => FsckDependencyErrorKind::Absent,
-            (None, Ok(dependency)) if partial(&dependency) => FsckDependencyErrorKind::Partial,
-            (None, Ok(dependency)) if nested(&dependency) => FsckDependencyErrorKind::Defective(
-                related::dependency_reason(&entry.name, &dependency, related::NESTED_REASON),
+            (Some(reason), _) => FsckAttachmentErrorKind::Defective(reason),
+            (None, Ok(attachment)) if absent(&attachment) => FsckAttachmentErrorKind::Absent,
+            (None, Ok(attachment)) if partial(&attachment) => FsckAttachmentErrorKind::Partial,
+            (None, Ok(attachment)) if nested(&attachment) => FsckAttachmentErrorKind::Defective(
+                related::attachment_reason(&entry.name, &attachment, related::NESTED_REASON),
             ),
             (None, _) => continue,
         };
-        findings.push(FsckDependencyError {
+        findings.push(FsckAttachmentError {
             commit,
             name: entry.name.clone(),
-            dependency: entry.checksum.ok(),
+            attachment: entry.checksum.ok(),
             kind,
         });
     }
@@ -520,7 +520,7 @@ pub struct FsckReport {
     /// the commit that names them, then in the stored order of its field 2.
     ///
     /// [`Repo::fsck`] states the check under "Dependencies".
-    pub dependency_errors: Vec<FsckDependencyError>,
+    pub attachment_errors: Vec<FsckAttachmentError>,
     /// The refs under `refs/mirrors/ID/` of the `[core] collection-id` of the
     /// repository, by their names below that directory, sorted.
     ///
@@ -541,7 +541,7 @@ impl FsckReport {
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
             && self.image_errors.is_empty()
-            && self.dependency_errors.is_empty()
+            && self.attachment_errors.is_empty()
             && self.failure.is_none()
             && self.commits_partial == 0
     }
@@ -581,7 +581,7 @@ struct Ctx {
     /// run marks no commit.
     incomplete: HashSet<Checksum>,
     /// The findings of the dependency check, in the order of the run.
-    dependency_errors: Vec<FsckDependencyError>,
+    attachment_errors: Vec<FsckAttachmentError>,
     /// The names of the refs under `refs/mirrors/ID/` of the own collection
     /// id, sorted.
     own_mirror_refs: Vec<String>,
@@ -635,7 +635,7 @@ impl Ctx {
             image_errors: self.image_errors,
             orphan_images: self.orphan_images,
             missing_images: self.missing_images,
-            dependency_errors: self.dependency_errors,
+            attachment_errors: self.attachment_errors,
             own_mirror_refs: self.own_mirror_refs,
         }
     }
@@ -702,7 +702,7 @@ impl Repo {
     ///      marker of the commit.
     ///
     /// [`mark_partial`](FsckOptions::mark_partial),
-    /// [`mark_dependencies`](FsckOptions::mark_dependencies), and
+    /// [`mark_attachments`](FsckOptions::mark_attachments), and
     /// [`delete`](FsckOptions::delete) state the actions on a finding.
     ///
     /// # Refs of the own collection id
@@ -726,18 +726,18 @@ impl Repo {
     /// After the four phases and the actions on their findings, the run
     /// checks field 2 of each verified commit that it did not delete. It
     /// reads field 2 from the read of phase 4, so it reads no object again.
-    /// [`FsckReport::dependency_errors`] holds one [`FsckDependencyError`]
+    /// [`FsckReport::attachment_errors`] holds one [`FsckAttachmentError`]
     /// for each entry, in the stored order:
     ///
-    /// - [`Defective`](FsckDependencyErrorKind::Defective) if the entry has
+    /// - [`Defective`](FsckAttachmentErrorKind::Defective) if the entry has
     ///   an empty name or a checksum that is not 32 bytes.
-    /// - [`Absent`](FsckDependencyErrorKind::Absent) if the object store does
+    /// - [`Absent`](FsckAttachmentErrorKind::Absent) if the object store does
     ///   not hold the commit at the start of the run, or if the run deleted
     ///   it.
-    /// - [`Partial`](FsckDependencyErrorKind::Partial) if the commit has a
+    /// - [`Partial`](FsckAttachmentErrorKind::Partial) if the commit has a
     ///   `.commitpartial` marker at the start of the run, or if it reaches an
     ///   absent or a deleted object.
-    /// - [`Defective`](FsckDependencyErrorKind::Defective) if the field 2 of
+    /// - [`Defective`](FsckAttachmentErrorKind::Defective) if the field 2 of
     ///   the commit is not empty.
     ///
     /// The first rule that applies gives the finding of an entry. An entry
@@ -745,7 +745,7 @@ impl Repo {
     /// names under two names gives two findings. Two entries with one name,
     /// and names that are not sorted, give no finding. If
     /// [`mark_partial`](FsckOptions::mark_partial) and
-    /// [`mark_dependencies`](FsckOptions::mark_dependencies) are set, the run
+    /// [`mark_attachments`](FsckOptions::mark_attachments) are set, the run
     /// marks each commit with an `Absent` or a `Partial` finding as partial.
     /// Such a mark does not change the other findings of the run.
     ///
@@ -912,14 +912,14 @@ impl Repo {
         // verify each object in it.
         let mut image_keys = HashMap::new();
         let mut keyed = note.then(Vec::new);
-        let mut dependencies = Vec::new();
+        let mut attachments = Vec::new();
         let order = match self
             .fsck_collect_objects(
                 &ctx.verified,
                 &images,
                 &mut image_keys,
                 keyed.as_mut(),
-                &mut dependencies,
+                &mut attachments,
             )
             .await?
         {
@@ -938,7 +938,7 @@ impl Repo {
         }
 
         // The dependencies, against the state after the actions above.
-        self.fsck_check_dependencies(&commits, &dependencies, opts, &mut ctx)
+        self.fsck_check_attachments(&commits, &attachments, opts, &mut ctx)
             .await?;
 
         // The tombstone step writes to the repository, so it has the
@@ -1175,7 +1175,7 @@ impl Repo {
     /// and has a value to it.
     ///
     /// For each commit whose field 2 is not empty, the function adds the
-    /// commit and the entries of field 2 to `dependencies`, in the order of
+    /// commit and the entries of field 2 to `attachments`, in the order of
     /// `commits`.
     async fn fsck_collect_objects(
         &self,
@@ -1183,7 +1183,7 @@ impl Repo {
         images: &[Checksum],
         image_keys: &mut HashMap<Checksum, Option<[u8; 32]>>,
         mut keyed: Option<&mut Vec<Checksum>>,
-        dependencies: &mut Vec<(Checksum, Vec<RelatedEntry>)>,
+        attachments: &mut Vec<(Checksum, Vec<RelatedEntry>)>,
     ) -> Result<std::result::Result<Vec<ObjectName>, FsckFailure>> {
         let mut order = Vec::new();
         let mut seen = HashSet::new();
@@ -1210,7 +1210,7 @@ impl Repo {
                 }
             }
             if !parsed.related.is_empty() {
-                dependencies.push((
+                attachments.push((
                     *commit,
                     related::into_entries(std::mem::take(&mut parsed.related)),
                 ));
@@ -1424,17 +1424,17 @@ impl Repo {
     }
 
     /// Checks the dependencies of each verified commit that the run did not
-    /// delete, and under `mark_partial` and `mark_dependencies` marks each
+    /// delete, and under `mark_partial` and `mark_attachments` marks each
     /// commit with an absent or a partial dependency as partial.
     ///
-    /// `all` is the commit listing of the start of the run. `dependencies`
+    /// `all` is the commit listing of the start of the run. `attachments`
     /// holds each verified commit whose field 2 is not empty, with its
     /// entries, sorted by commit. A dependency in that list has dependencies
     /// of its own. The function reads no object.
-    async fn fsck_check_dependencies(
+    async fn fsck_check_attachments(
         &self,
         all: &[Checksum],
-        dependencies: &[(Checksum, Vec<RelatedEntry>)],
+        attachments: &[(Checksum, Vec<RelatedEntry>)],
         opts: &FsckOptions,
         ctx: &mut Ctx,
     ) -> Result<()> {
@@ -1443,32 +1443,32 @@ impl Repo {
                 .contains(&ObjectName::new(*commit, ObjectType::Commit))
         };
         let nested = |commit: &Checksum| {
-            dependencies
+            attachments
                 .binary_search_by_key(commit, |(naming, _)| *naming)
                 .is_ok()
         };
         let mut findings = Vec::new();
-        for (commit, entries) in dependencies {
+        for (commit, entries) in attachments {
             if deleted(commit) {
                 continue;
             }
-            findings.extend(dependency_findings(
+            findings.extend(attachment_findings(
                 *commit,
                 entries,
-                |dependency| all.binary_search(dependency).is_err() || deleted(dependency),
-                |dependency| {
-                    ctx.verified.binary_search(dependency).is_err()
-                        || ctx.incomplete.contains(dependency)
+                |attachment| all.binary_search(attachment).is_err() || deleted(attachment),
+                |attachment| {
+                    ctx.verified.binary_search(attachment).is_err()
+                        || ctx.incomplete.contains(attachment)
                 },
                 nested,
             ));
         }
-        if opts.mark_partial && opts.mark_dependencies {
+        if opts.mark_partial && opts.mark_attachments {
             let mut marked = HashSet::new();
             let mut to_mark = Vec::new();
             for finding in &findings {
                 let commit = finding.commit;
-                if matches!(finding.kind, FsckDependencyErrorKind::Defective(_))
+                if matches!(finding.kind, FsckAttachmentErrorKind::Defective(_))
                     || ctx.incomplete.contains(&commit)
                     || !marked.insert(commit)
                 {
@@ -1482,7 +1482,7 @@ impl Repo {
                 self.mark_commits_partial(to_mark, fsync).await?;
             }
         }
-        ctx.dependency_errors = findings;
+        ctx.attachment_errors = findings;
         Ok(())
     }
 

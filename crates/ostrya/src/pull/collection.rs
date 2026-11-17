@@ -3151,21 +3151,21 @@ mod tests {
     /// The pull fails with [`Error::ChecksumMismatch`] at the read of the
     /// dependency, and writes nothing.
     #[test]
-    fn a_dependency_that_changes_after_the_walk_fails_an_untrusted_pull() {
+    fn an_attachment_that_changes_after_the_walk_fails_an_untrusted_pull() {
         ostrya_rt::block_on(async {
             let scratch = Scratch::new();
             let src = scratch.create("src").await;
-            let dependency = local_commit(&src, &[], None, 1_700_000_001, b"dep").await;
+            let attachment = local_commit(&src, &[], None, 1_700_000_001, b"dep").await;
             let other = local_commit(&src, &[], None, 1_700_000_001, b"other").await;
             let options = crate::commit::CommitOptions {
                 timestamp: Some(1_700_000_001),
-                related: vec![("lib/b".to_owned(), dependency)],
+                attachments: vec![("lib/b".to_owned(), attachment)],
                 ..crate::commit::CommitOptions::default()
             };
             local_commit_with(&src, &["os/a"], options, b"one").await;
             let src_dir = scratch.root.join("src");
-            let restore = restore_object_file(&src_dir, &dependency, ObjectType::Commit);
-            replace_commit_file(&src_dir, &dependency, &other);
+            let restore = restore_object_file(&src_dir, &attachment, ObjectType::Commit);
+            replace_commit_file(&src_dir, &attachment, &other);
             let dst = scratch.create("dst").await;
             let dst_dir = scratch.root.join("dst");
             import_seam::arm(&dst_dir, restore);
@@ -3181,7 +3181,7 @@ mod tests {
             let armed = import_seam::disarm(&dst_dir);
             match pulled {
                 Err(Error::ChecksumMismatch { expected, actual }) => {
-                    assert_eq!((expected, actual), (dependency, other));
+                    assert_eq!((expected, actual), (attachment, other));
                 }
                 other => panic!("{other:?}"),
             }

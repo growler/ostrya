@@ -1266,9 +1266,9 @@ fn with_tree(commits: &[&Obj]) -> Vec<Obj> {
 }
 
 /// A commit over the fixture tree with the subject `subject` and one field 2
-/// entry for each of `deps`.
-fn commit_naming(subject: &str, deps: &[(&str, &[u8])]) -> Obj {
-    build_commit(None, subject, Value::Array(Vec::new()), deps)
+/// entry for each of `atts`.
+fn commit_naming(subject: &str, atts: &[(&str, &[u8])]) -> Obj {
+    build_commit(None, subject, Value::Array(Vec::new()), atts)
 }
 
 /// The detached metadata of `commit` with a signature of each key of
@@ -1280,7 +1280,7 @@ fn signed(commit: &Obj, secrets: &[&str]) -> (Checksum, Vec<u8>) {
 /// A stream with `Hello` for `refs`, one object stream of `objects` and
 /// `meta`, and `Commit` with an update from absent to each commit of
 /// `updates`.
-fn dependency_stream(
+fn attachment_stream(
     objects: &[Obj],
     meta: &[(Checksum, Vec<u8>)],
     updates: &[(&str, Checksum)],
@@ -1321,31 +1321,31 @@ fn verify_policy(refs: &[(&str, &str)]) -> StreamPolicy {
 /// signature. A dependency with a signature of a key that no rule trusts
 /// passes and keeps that signature.
 #[test]
-fn a_dependency_gets_no_rule_of_the_targets_that_name_it() {
-    let dep = commit_naming("dependency", &[]);
-    let a = commit_naming("a", &[("lib/d", &dep.checksum.as_bytes()[..])]);
-    let b = commit_naming("b", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+fn an_attachment_gets_no_rule_of_the_targets_that_name_it() {
+    let att = commit_naming("dependency", &[]);
+    let a = commit_naming("a", &[("lib/d", &att.checksum.as_bytes()[..])]);
+    let b = commit_naming("b", &[("lib/d", &att.checksum.as_bytes()[..])]);
     let policy = verify_policy(&[("a", SECRET_B64), ("b", OTHER_SECRET_B64)]);
-    let objects = with_tree(&[&dep, &a, &b]);
+    let objects = with_tree(&[&att, &a, &b]);
     let updates = [("a", a.checksum), ("b", b.checksum)];
     let targets = [signed(&a, &[SECRET_B64]), signed(&b, &[OTHER_SECRET_B64])];
 
     let tmp = TmpDir::new("one-way-dep-two-rules");
     let (repo, _) = empty_repo(&tmp, "");
-    let bytes = dependency_stream(&objects, &targets, &updates);
+    let bytes = attachment_stream(&objects, &targets, &updates);
     receive_piped(&repo, &policy, bytes).unwrap();
-    assert!(block_on(repo.has_object(ObjectType::Commit, &dep.checksum)).unwrap());
-    assert!(ed25519_signatures(&repo, &dep.checksum).is_empty());
+    assert!(block_on(repo.has_object(ObjectType::Commit, &att.checksum)).unwrap());
+    assert!(ed25519_signatures(&repo, &att.checksum).is_empty());
 
     let tmp = TmpDir::new("one-way-dep-untrusted");
     let (repo, _) = empty_repo(&tmp, "");
     let mut meta = targets.to_vec();
-    meta.push(signed(&dep, &[SERVER_SECRET_B64]));
-    let bytes = dependency_stream(&objects, &meta, &updates);
+    meta.push(signed(&att, &[SERVER_SECRET_B64]));
+    let bytes = attachment_stream(&objects, &meta, &updates);
     receive_piped(&repo, &policy, bytes).unwrap();
     assert_eq!(
-        ed25519_signatures(&repo, &dep.checksum),
-        [ed25519_signature(SERVER_SECRET_B64, &dep.bytes)]
+        ed25519_signatures(&repo, &att.checksum),
+        [ed25519_signature(SERVER_SECRET_B64, &att.bytes)]
     );
 }
 
@@ -1354,35 +1354,35 @@ fn a_dependency_gets_no_rule_of_the_targets_that_name_it() {
 /// key of `a` alone is `signature-required`, and the refusal names the
 /// dependency as a new commit. A signature of the key of `b` passes.
 #[test]
-fn a_dependency_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
-    let dep = commit_naming("dependency", &[]);
-    let a = commit_naming("a", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+fn an_attachment_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
+    let att = commit_naming("dependency", &[]);
+    let a = commit_naming("a", &[("lib/d", &att.checksum.as_bytes()[..])]);
     let policy = verify_policy(&[("a", SECRET_B64), ("b", OTHER_SECRET_B64)]);
-    let objects = with_tree(&[&dep, &a]);
-    let updates = [("a", a.checksum), ("b", dep.checksum)];
+    let objects = with_tree(&[&att, &a]);
+    let updates = [("a", a.checksum), ("b", att.checksum)];
 
     let tmp = TmpDir::new("one-way-dep-new-commit");
     let (repo, before) = empty_repo(&tmp, "");
-    let meta = [signed(&a, &[SECRET_B64]), signed(&dep, &[SECRET_B64])];
+    let meta = [signed(&a, &[SECRET_B64]), signed(&att, &[SECRET_B64])];
     let result = receive(
         &repo,
         &policy,
-        &dependency_stream(&objects, &meta, &updates),
+        &attachment_stream(&objects, &meta, &updates),
     );
     match result {
         Err(Error::Remote(remote::Error::SignatureRequired(m))) => {
-            assert!(m.starts_with(&format!("commit {}: ", dep.checksum)), "{m}")
+            assert!(m.starts_with(&format!("commit {}: ", att.checksum)), "{m}")
         }
         other => panic!("{other:?}"),
     }
     assert_nothing_published(&repo, &before);
 
-    let meta = [signed(&a, &[SECRET_B64]), signed(&dep, &[OTHER_SECRET_B64])];
-    let bytes = dependency_stream(&objects, &meta, &updates);
+    let meta = [signed(&a, &[SECRET_B64]), signed(&att, &[OTHER_SECRET_B64])];
+    let bytes = attachment_stream(&objects, &meta, &updates);
     receive_piped(&repo, &policy, bytes).unwrap();
     assert_eq!(
         block_on(repo.list_refs(None)).unwrap(),
-        [("a".to_owned(), a.checksum), ("b".to_owned(), dep.checksum)]
+        [("a".to_owned(), a.checksum), ("b".to_owned(), att.checksum)]
     );
 }
 
@@ -1390,17 +1390,17 @@ fn a_dependency_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
 /// is `checksum-mismatch`. The stream sends the bytes of another commit
 /// under the checksum of the dependency, and nothing is published.
 #[test]
-fn a_dependency_with_the_bytes_of_another_commit_is_checksum_mismatch() {
-    let dep = commit_naming("dependency", &[]);
+fn an_attachment_with_the_bytes_of_another_commit_is_checksum_mismatch() {
+    let att = commit_naming("dependency", &[]);
     let other = commit_naming("other", &[]);
-    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let target = commit_naming("target", &[("lib/d", &att.checksum.as_bytes()[..])]);
     let forged = Obj {
         bytes: other.bytes.clone(),
-        ..dep.clone()
+        ..att.clone()
     };
     let tmp = TmpDir::new("one-way-dep-forged");
     let (repo, before) = empty_repo(&tmp, "");
-    let bytes = dependency_stream(
+    let bytes = attachment_stream(
         &with_tree(&[&forged, &target]),
         &[],
         &[("main", target.checksum)],
@@ -1410,7 +1410,7 @@ fn a_dependency_with_the_bytes_of_another_commit_is_checksum_mismatch() {
             m,
             format!(
                 "commit object {}: the bytes hash to {}",
-                dep.checksum, other.checksum
+                att.checksum, other.checksum
             )
         ),
         other => panic!("{other:?}"),
@@ -1421,15 +1421,15 @@ fn a_dependency_with_the_bytes_of_another_commit_is_checksum_mismatch() {
 /// A dependency that the stream neither stages nor finds in the repository
 /// is `missing-objects`, and the error lists it.
 #[test]
-fn an_absent_dependency_is_missing_objects() {
-    let dep = commit_naming("dependency", &[]);
-    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+fn an_absent_attachment_is_missing_objects() {
+    let att = commit_naming("dependency", &[]);
+    let target = commit_naming("target", &[("lib/d", &att.checksum.as_bytes()[..])]);
     let tmp = TmpDir::new("one-way-dep-absent");
     let (repo, before) = empty_repo(&tmp, "");
-    let bytes = dependency_stream(&with_tree(&[&target]), &[], &[("main", target.checksum)]);
+    let bytes = attachment_stream(&with_tree(&[&target]), &[], &[("main", target.checksum)]);
     match receive(&repo, &StreamPolicy::default(), &bytes) {
         Err(Error::Remote(remote::Error::MissingObjects { missing, .. })) => {
-            assert_eq!(missing, [ObjectName::new(dep.checksum, ObjectType::Commit)])
+            assert_eq!(missing, [ObjectName::new(att.checksum, ObjectType::Commit)])
         }
         other => panic!("{other:?}"),
     }
@@ -1438,7 +1438,7 @@ fn an_absent_dependency_is_missing_objects() {
 
 /// A nested dependency and a defective field 2 entry are `protocol`.
 #[test]
-fn a_nested_or_defective_dependency_is_protocol() {
+fn a_nested_or_defective_attachment_is_protocol() {
     let inner = commit_naming("inner", &[]);
     let nested = commit_naming("nested", &[("lib/i", &inner.checksum.as_bytes()[..])]);
     let over_nested = commit_naming("target", &[("lib/n", &nested.checksum.as_bytes()[..])]);
@@ -1450,7 +1450,7 @@ fn a_nested_or_defective_dependency_is_protocol() {
     for (commits, target) in cases {
         let tmp = TmpDir::new("one-way-dep-protocol");
         let (repo, before) = empty_repo(&tmp, "");
-        let bytes = dependency_stream(&with_tree(&commits), &[], &[("main", target)]);
+        let bytes = attachment_stream(&with_tree(&commits), &[], &[("main", target)]);
         match receive(&repo, &StreamPolicy::default(), &bytes) {
             Err(Error::Remote(remote::Error::Protocol(m))) => assert!(
                 m.starts_with(&format!("related commits in field 2 of commit {target}: ")),
@@ -1465,9 +1465,9 @@ fn a_nested_or_defective_dependency_is_protocol() {
 /// A one-way stream ignores the server keys of its rules, so a staged
 /// dependency gets no server signature.
 #[test]
-fn a_dependency_gets_no_server_signature() {
-    let dep = commit_naming("dependency", &[]);
-    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+fn an_attachment_gets_no_server_signature() {
+    let att = commit_naming("dependency", &[]);
+    let target = commit_naming("target", &[("lib/d", &att.checksum.as_bytes()[..])]);
     let rule = StreamRule {
         signers: vec![server_signer(SERVER_SECRET_B64)],
         ..StreamRule::default()
@@ -1478,13 +1478,13 @@ fn a_dependency_gets_no_server_signature() {
     };
     let tmp = TmpDir::new("one-way-dep-no-signer");
     let (repo, _) = empty_repo(&tmp, "");
-    let bytes = dependency_stream(
-        &with_tree(&[&dep, &target]),
+    let bytes = attachment_stream(
+        &with_tree(&[&att, &target]),
         &[],
         &[("main", target.checksum)],
     );
     receive_piped(&repo, &policy, bytes).unwrap();
-    assert!(ed25519_signatures(&repo, &dep.checksum).is_empty());
+    assert!(ed25519_signatures(&repo, &att.checksum).is_empty());
     assert!(ed25519_signatures(&repo, &target.checksum).is_empty());
 }
 
@@ -1517,7 +1517,7 @@ fn trust_group_keys_verify_a_stream() {
     let objects = with_tree(&[&target]);
     let updates = [("main", target.checksum)];
 
-    let unsigned = dependency_stream(&objects, &[], &updates);
+    let unsigned = attachment_stream(&objects, &[], &updates);
     match receive(&repo, &policy, &unsigned) {
         Err(Error::Remote(remote::Error::SignatureRequired(m))) => {
             assert!(
@@ -1530,7 +1530,7 @@ fn trust_group_keys_verify_a_stream() {
     assert_nothing_published(&repo, &before);
 
     let meta = [signed(&target, &[SECRET_B64])];
-    let bytes = dependency_stream(&objects, &meta, &updates);
+    let bytes = attachment_stream(&objects, &meta, &updates);
     receive_piped(&repo, &policy, bytes).unwrap();
     assert_eq!(
         block_on(repo.list_refs(None)).unwrap(),
@@ -1553,7 +1553,7 @@ mod export {
 
     use common::receive::is_root;
     use common::{
-        Untouchable, dependency_error, is_sealed, mark_partial, regular_objects, store_with_field2,
+        Untouchable, attachment_error, is_sealed, mark_partial, regular_objects, store_with_field2,
     };
     use futures_lite::future::zip;
     use ostrya::remote::proto::ABANDON;
@@ -1697,9 +1697,9 @@ mod export {
                         subject: Some("one-way".into()),
                         timestamp: Some(1_700_000_000),
                         metadata,
-                        related: related
+                        attachments: related
                             .iter()
-                            .map(|(name, dependency)| ((*name).to_owned(), *dependency))
+                            .map(|(name, attachment)| ((*name).to_owned(), *attachment))
                             .collect(),
                         ..CommitOptions::default()
                     },
@@ -2366,10 +2366,10 @@ mod export {
     /// as `boot/uki`. The file `large` of each commit holds other bytes, so
     /// each commit has its own root dirtree. Returns the target and the
     /// dependency.
-    fn dependency_chain(repo: &Repo) -> (Checksum, Checksum) {
-        let (dep, _) = commit_tree(repo, None, b"dependency\n");
-        let (target, _) = commit_tree_related(repo, None, None, b"target\n", &[("boot/uki", dep)]);
-        (target, dep)
+    fn attachment_chain(repo: &Repo) -> (Checksum, Checksum) {
+        let (att, _) = commit_tree(repo, None, b"dependency\n");
+        let (target, _) = commit_tree_related(repo, None, None, b"target\n", &[("boot/uki", att)]);
+        (target, att)
     }
 
     /// An export with an update from absent to the commit of each of
@@ -2385,7 +2385,7 @@ mod export {
     }
 
     /// A detached metadata dict with one property.
-    fn dependency_dict() -> Value {
+    fn attachment_dict() -> Value {
         let mut builder = DictBuilder::new();
         builder.insert_str("xa.note", "dependency");
         builder.build()
@@ -2418,14 +2418,14 @@ mod export {
     /// dirmeta and three files, and the stream carries each of them one time:
     /// two commits, two root dirtrees, one dirmeta, and five files.
     #[test]
-    fn an_export_sends_the_dependencies_of_each_new_commit() {
+    fn an_export_sends_the_attachments_of_each_new_commit() {
         let tmp = TmpDir::new("one-way-export-dependency-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
         let (old, _) = commit_tree(&source, None, b"old\n");
-        let (dep, _) = commit_tree_related(&source, Some(old), None, b"dependency\n", &[]);
-        block_on(source.write_commit_detached_metadata(&dep, Some(&dependency_dict()))).unwrap();
+        let (att, _) = commit_tree_related(&source, Some(old), None, b"dependency\n", &[]);
+        block_on(source.write_commit_detached_metadata(&att, Some(&attachment_dict()))).unwrap();
         let (commit, _) =
-            commit_tree_related(&source, None, None, b"target\n", &[("boot/uki", dep)]);
+            commit_tree_related(&source, None, None, b"target\n", &[("boot/uki", att)]);
 
         let target_tmp = TmpDir::new("one-way-export-dependency");
         let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2454,10 +2454,10 @@ mod export {
             [("main".to_owned(), commit)]
         );
         assert_complete(&source, &target, &commit);
-        assert_complete(&source, &target, &dep);
+        assert_complete(&source, &target, &att);
         assert_eq!(
-            block_on(target.read_commit_detached_metadata(&dep)).unwrap(),
-            Some(dependency_dict())
+            block_on(target.read_commit_detached_metadata(&att)).unwrap(),
+            Some(attachment_dict())
         );
         assert!(!has_commit(&target, &old));
         let fsck = block_on(target.fsck(&FsckOptions::default())).unwrap();
@@ -2470,19 +2470,19 @@ mod export {
     /// for one commit, so each export passes only if it sends the
     /// `.commitmeta` of the dependency one time.
     #[test]
-    fn an_export_sends_a_shared_dependency_once() {
+    fn an_export_sends_a_shared_attachment_once() {
         let tmp = TmpDir::new("one-way-export-dependency-once-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&source);
-        let (other, _) = commit_tree_related(&source, None, None, b"other\n", &[("boot/uki", dep)]);
+        let (main, att) = attachment_chain(&source);
+        let (other, _) = commit_tree_related(&source, None, None, b"other\n", &[("boot/uki", att)]);
 
         // Each case gives the updates and the number of objects: the
         // commits, and per commit a root dirtree and a file `large`, then
         // the shared dirmeta and three shared files.
         for (updates, objects) in [
             (vec![("main", main), ("other", other)], 13),
-            (vec![("main", main), ("dep/uki", dep)], 10),
-            (vec![("dep/uki", dep), ("main", main)], 10),
+            (vec![("main", main), ("dep/uki", att)], 10),
+            (vec![("dep/uki", att), ("main", main)], 10),
         ] {
             let target_tmp = TmpDir::new("one-way-export-dependency-once");
             let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2492,9 +2492,9 @@ mod export {
             let stats = exported.unwrap();
             assert_eq!(stats.objects_total, objects, "{updates:?}: {stats:?}");
             assert_eq!(report.refs.len(), updates.len(), "{updates:?}");
-            assert_complete(&source, &target, &dep);
+            assert_complete(&source, &target, &att);
             assert!(
-                block_on(target.read_commit_detached_metadata(&dep))
+                block_on(target.read_commit_detached_metadata(&att))
                     .unwrap()
                     .is_some(),
                 "{updates:?}"
@@ -2506,10 +2506,10 @@ mod export {
     /// commit alone. The source signs the new commit and not its dependency,
     /// and the stream commits with the whole dependency.
     #[test]
-    fn the_receiver_verifies_no_exported_dependency() {
+    fn the_receiver_verifies_no_exported_attachment() {
         let tmp = TmpDir::new("one-way-export-dependency-verify-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&source);
+        let (main, att) = attachment_chain(&source);
         let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
         block_on(source.sign_commit(&main, &signer)).unwrap();
         let policy = StreamPolicy {
@@ -2523,7 +2523,7 @@ mod export {
             export_piped(&source, &target, &policy, exporting(&[("main", main)]));
         exported.unwrap();
         received.unwrap();
-        assert_complete(&source, &target, &dep);
+        assert_complete(&source, &target, &att);
         assert_eq!(
             block_on(target.list_refs(None)).unwrap(),
             [("main".to_owned(), main)]
@@ -2540,27 +2540,27 @@ mod export {
     /// A dependency that the repository marks partial, or does not hold,
     /// refuses the export before it writes a byte.
     #[test]
-    fn an_absent_or_partial_dependency_writes_no_byte() {
+    fn an_absent_or_partial_attachment_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-absent");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
+        let (main, att) = attachment_chain(&repo);
 
-        mark_partial(&repo, &dep);
+        mark_partial(&repo, &att);
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (
                 Some(main),
-                format!("dependency boot/uki names commit {dep}, which is partial")
+                format!("dependency boot/uki names commit {att}, which is partial")
             )
         );
         assert_eq!(calls, 0);
 
-        remove_commit_object(&repo, &dep);
+        remove_commit_object(&repo, &att);
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
         match error {
             Error::ObjectNotFound { checksum, ty } => {
-                assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+                assert_eq!((checksum, ty), (att, ObjectType::Commit));
             }
             other => panic!("expected ObjectNotFound, got {other:?}"),
         }
@@ -2571,21 +2571,21 @@ mod export {
     /// marker: a directory at the path of the object gives the partial
     /// refusal.
     #[test]
-    fn a_partial_dependency_with_an_unreadable_object_is_refused_as_partial() {
+    fn a_partial_attachment_with_an_unreadable_object_is_refused_as_partial() {
         let tmp = TmpDir::new("one-way-export-dependency-partial-unreadable");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
-        mark_partial(&repo, &dep);
-        remove_commit_object(&repo, &dep);
-        let path = ostrya::loose_path(&dep, ObjectType::Commit, RepoMode::Archive);
+        let (main, att) = attachment_chain(&repo);
+        mark_partial(&repo, &att);
+        remove_commit_object(&repo, &att);
+        let path = ostrya::loose_path(&att, ObjectType::Commit, RepoMode::Archive);
         std::fs::create_dir(repo.path().join("objects").join(path)).unwrap();
 
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (
                 Some(main),
-                format!("dependency boot/uki names commit {dep}, which is partial")
+                format!("dependency boot/uki names commit {att}, which is partial")
             )
         );
         assert_eq!(calls, 0);
@@ -2594,22 +2594,22 @@ mod export {
     /// A field 2 entry of a new commit with an empty name or with a checksum
     /// that is not 32 bytes refuses the export before it writes a byte.
     #[test]
-    fn a_defective_dependency_entry_writes_no_byte() {
+    fn a_defective_attachment_entry_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-defective");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
-        let short: &[u8] = &dep.as_bytes()[..31];
+        let (main, att) = attachment_chain(&repo);
+        let short: &[u8] = &att.as_bytes()[..31];
         for (entry, reason) in [
             (
                 ("boot/uki", short),
                 "entry 0 (boot/uki) has a checksum of 31 bytes, not 32",
             ),
-            (("", dep.as_bytes()), "entry 0 has an empty name"),
+            (("", att.as_bytes()), "entry 0 has an empty name"),
         ] {
             let defective = block_on(store_with_field2(&repo, &main, &[entry]));
             let (error, calls) = refused(&repo, exporting(&[("main", defective)]));
             assert_eq!(
-                dependency_error(error),
+                attachment_error(error),
                 (Some(defective), reason.to_owned())
             );
             assert_eq!(calls, 0);
@@ -2621,16 +2621,16 @@ mod export {
     /// second new commit. The error names the commit that names the nested
     /// dependency.
     #[test]
-    fn a_nested_dependency_writes_no_byte() {
+    fn a_nested_attachment_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-nested");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
+        let (main, att) = attachment_chain(&repo);
         let (other, _) = commit_tree(&repo, None, b"other\n");
         // `nested` names a dependency, and `head` names `nested`.
         let nested = block_on(store_with_field2(
             &repo,
             &other,
-            &[("lib/c", dep.as_bytes())],
+            &[("lib/c", att.as_bytes())],
         ));
         let head = block_on(store_with_field2(
             &repo,
@@ -2647,7 +2647,7 @@ mod export {
         ] {
             let (error, calls) = refused(&repo, exporting(updates));
             assert_eq!(
-                dependency_error(error),
+                attachment_error(error),
                 (Some(head), reason.clone()),
                 "{updates:?}"
             );
@@ -2659,12 +2659,12 @@ mod export {
     /// `ostrya.related` names. The key goes with the detached metadata of its
     /// commit.
     #[test]
-    fn an_export_does_not_send_a_build_source() {
+    fn an_export_does_not_send_a_supplement() {
         let tmp = TmpDir::new("one-way-export-build-source-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, _dep) = dependency_chain(&source);
+        let (main, _att) = attachment_chain(&source);
         let (base, _) = commit_tree(&source, None, b"base\n");
-        block_on(source.add_detached_related(&main, "layer/base", &base)).unwrap();
+        block_on(source.add_supplement(&main, "layer/base", &base)).unwrap();
 
         let target_tmp = TmpDir::new("one-way-export-build-source");
         let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2678,9 +2678,9 @@ mod export {
         exported.unwrap();
 
         assert_eq!(
-            block_on(target.read_commit_related(&main))
+            block_on(target.read_commit_relations(&main))
                 .unwrap()
-                .build_sources,
+                .supplements,
             [("layer/base".to_owned(), base)]
         );
         assert!(!has_commit(&target, &base));
@@ -2701,13 +2701,13 @@ mod export {
     /// to one more ref also passes: the receiver holds the new commit, and
     /// field 2 of that held commit names the dependency.
     #[test]
-    fn a_second_export_of_a_held_dependency_keeps_its_commitmeta() {
+    fn a_second_export_of_a_held_attachment_keeps_its_commitmeta() {
         let tmp = TmpDir::new("one-way-export-dependency-held-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&source);
-        let (other, _) = commit_tree_related(&source, None, None, b"other\n", &[("boot/uki", dep)]);
+        let (main, att) = attachment_chain(&source);
+        let (other, _) = commit_tree_related(&source, None, None, b"other\n", &[("boot/uki", att)]);
         let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
-        block_on(source.sign_commit(&dep, &signer)).unwrap();
+        block_on(source.sign_commit(&att, &signer)).unwrap();
 
         let target_tmp = TmpDir::new("one-way-export-dependency-held");
         let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2719,15 +2719,15 @@ mod export {
         );
         exported.unwrap();
         received.unwrap();
-        let held = commitmeta_bytes(&target, &dep);
+        let held = commitmeta_bytes(&target, &att);
         assert_eq!(
-            ed25519_signatures(&target, &dep).len(),
+            ed25519_signatures(&target, &att).len(),
             1,
             "the first export carries the signature of the dependency"
         );
 
         let other_signer = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
-        block_on(source.sign_commit(&dep, &other_signer)).unwrap();
+        block_on(source.sign_commit(&att, &other_signer)).unwrap();
         for (name, commit) in [("other", other), ("again", main)] {
             let (received, exported) = export_piped(
                 &source,
@@ -2745,7 +2745,7 @@ mod export {
                     new: Some(commit),
                 }]
             );
-            assert_eq!(commitmeta_bytes(&target, &dep), held, "{name}");
+            assert_eq!(commitmeta_bytes(&target, &att), held, "{name}");
         }
         assert_eq!(
             block_on(target.list_refs(None)).unwrap(),
@@ -2764,10 +2764,10 @@ mod export {
     /// dependency. A stream that also takes the dependency as a new commit
     /// completes it: the receiver removes the marker.
     #[test]
-    fn a_receiver_that_holds_a_partial_dependency_refuses_the_stream() {
+    fn a_receiver_that_holds_a_partial_attachment_refuses_the_stream() {
         let tmp = TmpDir::new("one-way-export-dependency-receiver-partial-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&source);
+        let (main, att) = attachment_chain(&source);
 
         let target_tmp = TmpDir::new("one-way-export-dependency-receiver-partial");
         let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2775,11 +2775,11 @@ mod export {
             &source,
             &target,
             &export_policy(),
-            exporting(&[("dep", dep)]),
+            exporting(&[("dep", att)]),
         );
         exported.unwrap();
         received.unwrap();
-        mark_partial(&target, &dep);
+        mark_partial(&target, &att);
         let before = file_inventory(target.path(), "objects");
 
         let (received, exported) = export_piped(
@@ -2796,7 +2796,7 @@ mod export {
                     message,
                     format!(
                         "related commits in field 2 of commit {main}: dependency boot/uki names \
-                         commit {dep}, which is partial"
+                         commit {att}, which is partial"
                     )
                 );
             }
@@ -2805,10 +2805,10 @@ mod export {
         assert_eq!(file_inventory(target.path(), "objects"), before);
         assert_eq!(
             block_on(target.list_refs(None)).unwrap(),
-            [("dep".to_owned(), dep)]
+            [("dep".to_owned(), att)]
         );
         assert_eq!(
-            block_on(target.commit_state(&dep)).unwrap(),
+            block_on(target.commit_state(&att)).unwrap(),
             ostrya::CommitState::Partial
         );
 
@@ -2816,17 +2816,17 @@ mod export {
             &source,
             &target,
             &export_policy(),
-            exporting(&[("uki", dep), ("main", main)]),
+            exporting(&[("uki", att), ("main", main)]),
         );
         exported.unwrap();
         received.unwrap();
-        assert_complete(&source, &target, &dep);
+        assert_complete(&source, &target, &att);
         assert_eq!(
             block_on(target.list_refs(None)).unwrap(),
             [
-                ("dep".to_owned(), dep),
+                ("dep".to_owned(), att),
                 ("main".to_owned(), main),
-                ("uki".to_owned(), dep),
+                ("uki".to_owned(), att),
             ]
         );
     }
@@ -2834,15 +2834,15 @@ mod export {
     /// A dependency that the repository does not hold, with no partial
     /// marker, refuses the export before it writes a byte.
     #[test]
-    fn an_absent_dependency_writes_no_byte() {
+    fn an_absent_attachment_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-gone");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
-        remove_commit_object(&repo, &dep);
+        let (main, att) = attachment_chain(&repo);
+        remove_commit_object(&repo, &att);
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
         match error {
             Error::ObjectNotFound { checksum, ty } => {
-                assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+                assert_eq!((checksum, ty), (att, ObjectType::Commit));
             }
             other => panic!("expected ObjectNotFound, got {other:?}"),
         }
@@ -2854,12 +2854,12 @@ mod export {
     /// that dependency as a new commit, the format check of field 2 of the
     /// new commits refuses its defective entry first.
     #[test]
-    fn a_dependency_with_a_defective_field_2_is_nested() {
+    fn an_attachment_with_a_defective_field_2_is_nested() {
         let tmp = TmpDir::new("one-way-export-dependency-defective-nested");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, dep) = dependency_chain(&repo);
+        let (main, att) = attachment_chain(&repo);
         let (other, _) = commit_tree(&repo, None, b"other\n");
-        let defective = block_on(store_with_field2(&repo, &other, &[("", dep.as_bytes())]));
+        let defective = block_on(store_with_field2(&repo, &other, &[("", att.as_bytes())]));
         let head = block_on(store_with_field2(
             &repo,
             &main,
@@ -2868,7 +2868,7 @@ mod export {
 
         let (error, calls) = refused(&repo, exporting(&[("main", head)]));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (
                 Some(head),
                 format!(
@@ -2884,7 +2884,7 @@ mod export {
         ] {
             let (error, calls) = refused(&repo, exporting(updates));
             assert_eq!(
-                dependency_error(error),
+                attachment_error(error),
                 (Some(defective), "entry 0 has an empty name".to_owned()),
                 "{updates:?}"
             );
@@ -2896,11 +2896,11 @@ mod export {
     /// bound to a ref that no update names goes in the stream, and the
     /// receiver accepts it.
     #[test]
-    fn a_dependency_bound_to_another_ref_is_sent() {
+    fn an_attachment_bound_to_another_ref_is_sent() {
         let tmp = TmpDir::new("one-way-export-dependency-bound-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
-        let (dep, _) = commit_tree(&source, Some(bound_to(&["elsewhere"])), b"dependency\n");
-        let (main, _) = commit_tree_related(&source, None, None, b"target\n", &[("boot/uki", dep)]);
+        let (att, _) = commit_tree(&source, Some(bound_to(&["elsewhere"])), b"dependency\n");
+        let (main, _) = commit_tree_related(&source, None, None, b"target\n", &[("boot/uki", att)]);
 
         let target_tmp = TmpDir::new("one-way-export-dependency-bound");
         let target = new_repo(&target_tmp, RepoMode::BareUser, "");
@@ -2912,7 +2912,7 @@ mod export {
         );
         exported.unwrap();
         received.unwrap();
-        assert_complete(&source, &target, &dep);
+        assert_complete(&source, &target, &att);
         assert_eq!(
             block_on(target.list_refs(None)).unwrap(),
             [("main".to_owned(), main)]

@@ -17,15 +17,15 @@
 //! turn, and then the targets. It parses, applies, and drops the job of one
 //! step of a list at a time, so the heap holds one job of the list.
 //!
-//! [`discover_dependencies`] finds one delta for each dependency of a pull,
+//! [`discover_attachments`] finds one delta for each dependency of a pull,
 //! after the pull read the commits that name the dependencies. The sibling
-//! module `dependency` gives the source commit of each search. With a list,
+//! module `attachment` gives the source commit of each search. With a list,
 //! the search takes one entry of the list, and plans no chain. The searches
-//! check no signature of a superblock, as [`discover_dependencies`] states.
+//! check no signature of a superblock, as [`discover_attachments`] states.
 //! From a remote, the searches keep each superblock after its checks and the
 //! commit that it carries in a record file, as the discovery of a chain below
 //! does. The pull parses the superblock of a dependency again just before its
-//! parts, as [`DependencyDeltas`] states.
+//! parts, as [`AttachmentDeltas`] states.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
@@ -99,7 +99,7 @@ use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, RefPlace};
 use crate::read::CommitState;
-use crate::related::{self, RelatedField, RelatedRule};
+use crate::related::{self, RelatedRule, RelationField};
 use crate::repo::Repo;
 use crate::repo_fs::{FsResultExt, RepoDir, RepoLayout, TempFile};
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
@@ -145,7 +145,7 @@ const MAX_RECORD_FILE: u64 = 8 * MAX_METADATA_SIZE;
 /// after the run of the last level. A local pull builds the job of one step
 /// at a time with [`DeltaPlan::parse_record`], and drops it after its parts.
 /// The run of the dependencies builds the job of a dependency just before its
-/// parts, and drops it after its last part, as [`DependencyDeltas`] states.
+/// parts, and drops it after its last part, as [`AttachmentDeltas`] states.
 /// A job holds only what the application of the parts reads.
 ///
 /// The parse of a superblock reads the raw superblock bytes, the signature
@@ -255,7 +255,7 @@ pub(crate) struct DeltaPlan {
     levels: Vec<Vec<Checksum>>,
     /// The entries of field 2 of each intermediate commit of the chains whose
     /// field 2 is not empty, for a local source.
-    dependencies: HashMap<Checksum, Vec<(String, Checksum)>>,
+    attachments: HashMap<Checksum, Vec<(String, Checksum)>>,
     /// The file of the raw bytes of the records from a remote.
     store: Option<RecordStore>,
     /// The list of static deltas, after the discovery of the chains. The
@@ -433,8 +433,8 @@ impl DeltaPlan {
     /// The map holds no commit whose field 2 is empty. For a plan from a
     /// remote source, the map is empty. The call reads nothing, and a second
     /// call returns an empty map.
-    pub(crate) fn take_dependencies(&mut self) -> HashMap<Checksum, Vec<(String, Checksum)>> {
-        std::mem::take(&mut self.dependencies)
+    pub(crate) fn take_attachments(&mut self) -> HashMap<Checksum, Vec<(String, Checksum)>> {
+        std::mem::take(&mut self.attachments)
     }
 
     /// Takes the list of static deltas, or `None` for a pull with no list or
@@ -511,7 +511,7 @@ struct Checked {
     /// The entries of field 2 of the commit, in the stored order, after the
     /// format check. The list is empty for a remote source: a pull from a
     /// remote reads field 2 when it stages the commit.
-    dependencies: Vec<(String, Checksum)>,
+    attachments: Vec<(String, Checksum)>,
 }
 
 /// The file that keeps the raw superblocks and the verified `.commitmeta`
@@ -528,7 +528,7 @@ struct Checked {
 ///
 /// The search for the deltas of the dependencies has a file of its own,
 /// which its concurrent searches share. It keeps the superblocks and the
-/// commits that they carry, as [`discover_dependencies`] states.
+/// commits that they carry, as [`discover_attachments`] states.
 ///
 /// The length of the file has a limit. Discovery checks the limit before each
 /// write, so the file never passes it. A write that would pass the limit
@@ -554,7 +554,7 @@ enum Records {
     Chain,
     /// The superblocks and the commits of the search for the deltas of the
     /// dependencies.
-    Dependencies,
+    Attachments,
 }
 
 impl RecordStore {
@@ -573,9 +573,9 @@ impl RecordStore {
     /// Returns a record store in `tmp/` of `repo` for the search for the
     /// deltas of the dependencies, with no file yet, and with the limit
     /// [`MAX_RECORD_FILE`].
-    fn for_dependencies(repo: &Repo) -> RecordStore {
+    fn for_attachments(repo: &Repo) -> RecordStore {
         RecordStore {
-            records: Records::Dependencies,
+            records: Records::Attachments,
             ..RecordStore::new(repo)
         }
     }
@@ -597,7 +597,7 @@ impl RecordStore {
                     what(),
                     self.limit
                 ),
-                Records::Dependencies => format!(
+                Records::Attachments => format!(
                     "static deltas of the dependencies: {} passes the limit of {} bytes for \
                      the superblocks and the commits that the search keeps",
                     what(),
@@ -750,8 +750,8 @@ impl FetchedDelta {
         from: Option<Checksum>,
         superblock: Range<u64>,
         commit: Range<u64>,
-    ) -> DependencyHead {
-        DependencyHead {
+    ) -> AttachmentHead {
+        AttachmentHead {
             from,
             superblock,
             parts: self.meta_entries.len(),
@@ -959,9 +959,9 @@ pub(crate) async fn discover(
 
 /// The search for the delta of one dependency of a pull.
 ///
-/// The module `dependency` builds it from the paired entries of the
+/// The module `attachment` builds it from the paired entries of the
 /// dependency.
-pub(crate) struct DependencyLookup {
+pub(crate) struct AttachmentLookup {
     /// The dependency.
     pub(crate) checksum: Checksum,
     /// The dependency in an error: `<name> of <ref>`. `<ref>` is the first
@@ -977,9 +977,9 @@ pub(crate) struct DependencyLookup {
     pub(crate) scratch: bool,
 }
 
-/// The deltas that [`discover_dependencies`] found, keyed by dependency.
+/// The deltas that [`discover_attachments`] found, keyed by dependency.
 ///
-/// A delta from a remote keeps a [`DependencyHead`] on the heap, and its
+/// A delta from a remote keeps an [`AttachmentHead`] on the heap, and its
 /// checked superblock and the commit that it carries in the record file of
 /// the search. The step of the commit reads the commit from the record file,
 /// and takes the fallbacks of the head. The head then keeps the number of
@@ -994,14 +994,14 @@ pub(crate) struct DependencyLookup {
 /// superblock from the source again, checks it against its digest, and parses
 /// it, just before the pull applies it.
 ///
-/// [`load_job`]: DependencyDeltas::load_job
-/// [`release_job`]: DependencyDeltas::release_job
-/// [`take_job`]: DependencyDeltas::take_job
+/// [`load_job`]: AttachmentDeltas::load_job
+/// [`release_job`]: AttachmentDeltas::release_job
+/// [`take_job`]: AttachmentDeltas::take_job
 #[derive(Default)]
-pub(crate) struct DependencyDeltas {
+pub(crate) struct AttachmentDeltas {
     /// The head of the delta of each dependency, from a remote. The steps of
     /// the run share the map.
-    heads: Mutex<HashMap<Checksum, DependencyHead>>,
+    heads: Mutex<HashMap<Checksum, AttachmentHead>>,
     /// The file of the checked superblocks and commits from a remote.
     store: Option<RecordStore>,
     /// The jobs that the run loaded and did not release yet.
@@ -1011,9 +1011,9 @@ pub(crate) struct DependencyDeltas {
     local: HashMap<Checksum, (Option<Checksum>, Option<Checksum>)>,
 }
 
-/// What [`DependencyDeltas`] keeps on the heap of the delta of one dependency
+/// What [`AttachmentDeltas`] keeps on the heap of the delta of one dependency
 /// from a remote, until the run releases its job.
-struct DependencyHead {
+struct AttachmentHead {
     /// The source commit of the delta, or `None` for a from-scratch delta.
     from: Option<Checksum>,
     /// The range of the checked superblock in the record file.
@@ -1029,7 +1029,7 @@ struct DependencyHead {
     fallbacks: Vec<ObjectName>,
 }
 
-impl DependencyDeltas {
+impl AttachmentDeltas {
     /// Returns `true` if no dependency has a delta.
     pub(crate) fn is_empty(&self) -> bool {
         self.heads
@@ -1039,22 +1039,22 @@ impl DependencyDeltas {
             && self.local.is_empty()
     }
 
-    /// Reads the commit bytes of the delta of `dependency` from a remote
+    /// Reads the commit bytes of the delta of `attachment` from a remote
     /// from the record file, on the blocking pool. Returns `None` if the
     /// dependency has no delta or the step of the commit took the delta.
     ///
     /// Discovery wrote the bytes after the parse of the superblock verified
-    /// that they hash to `dependency`.
+    /// that they hash to `attachment`.
     ///
     /// # Errors
     ///
     /// [`Error::Io`] if the record file cannot be read.
-    pub(crate) async fn commit_bytes(&self, dependency: &Checksum) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn commit_bytes(&self, attachment: &Checksum) -> Result<Option<Vec<u8>>> {
         let range = self
             .heads
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(dependency)
+            .get(attachment)
             .and_then(|head| head.commit.clone());
         match (range, &self.store) {
             (Some(range), Some(store)) => store.read(range).await.map(Some),
@@ -1063,7 +1063,7 @@ impl DependencyDeltas {
     }
 
     /// Returns the number of parts and the fallbacks of the delta of
-    /// `dependency` from a remote, or `None` if it has no delta.
+    /// `attachment` from a remote, or `None` if it has no delta.
     ///
     /// The step of the commit calls it one time. The head then drops the
     /// range of the commit and its fallbacks, and keeps the number of parts
@@ -1071,20 +1071,20 @@ impl DependencyDeltas {
     /// load step, so its head goes here.
     pub(crate) fn take_commit_delta(
         &self,
-        dependency: &Checksum,
+        attachment: &Checksum,
     ) -> Option<(usize, Vec<ObjectName>)> {
         let mut heads = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
-        let head = heads.get_mut(dependency)?;
+        let head = heads.get_mut(attachment)?;
         let taken = (head.parts, std::mem::take(&mut head.fallbacks));
         head.commit = None;
         if head.parts == 0 {
-            heads.remove(dependency);
+            heads.remove(attachment);
         }
         Some(taken)
     }
 
-    /// Parses the job of the delta of `dependency` from the record file, and
-    /// keeps it until [`release_job`](DependencyDeltas::release_job).
+    /// Parses the job of the delta of `attachment` from the record file, and
+    /// keeps it until [`release_job`](AttachmentDeltas::release_job).
     ///
     /// These are the bytes that discovery checked, so the parse checks no
     /// digest and no inline part again. Discovery checked no signature of the
@@ -1096,20 +1096,20 @@ impl DependencyDeltas {
     ///
     /// - [`Error::Io`] if the record file cannot be read.
     /// - [`Error::InvalidFormat`] if discovery kept no superblock of
-    ///   `dependency`.
-    pub(crate) async fn load_job(&self, repo: &Repo, dependency: &Checksum) -> Result<()> {
+    ///   `attachment`.
+    pub(crate) async fn load_job(&self, repo: &Repo, attachment: &Checksum) -> Result<()> {
         let kept = self
             .heads
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(dependency)
+            .get(attachment)
             .map(|head| (head.from, head.superblock.clone()));
         let (Some((from, range)), Some(store)) = (kept, &self.store) else {
             return Err(Error::InvalidFormat(format!(
-                "the static delta to {dependency}: discovery kept no superblock"
+                "the static delta to {attachment}: discovery kept no superblock"
             )));
         };
-        let fetched = parse_kept(store, range, from, *dependency).await?;
+        let fetched = parse_kept(store, range, from, *attachment).await?;
         let mut job = fetched.into_job(repo).await?;
         // The step of the commit read the commit bytes and the fallbacks. The
         // parts read neither, so the job keeps neither.
@@ -1118,32 +1118,32 @@ impl DependencyDeltas {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(*dependency, Arc::new(job));
+            .insert(*attachment, Arc::new(job));
         Ok(())
     }
 
-    /// Returns the job of the delta of `dependency` that
-    /// [`load_job`](DependencyDeltas::load_job) parsed, or `None` if the job
+    /// Returns the job of the delta of `attachment` that
+    /// [`load_job`](AttachmentDeltas::load_job) parsed, or `None` if the job
     /// is not loaded.
-    pub(crate) fn live_job(&self, dependency: &Checksum) -> Option<Arc<DeltaJob>> {
+    pub(crate) fn live_job(&self, attachment: &Checksum) -> Option<Arc<DeltaJob>> {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(dependency)
+            .get(attachment)
             .cloned()
     }
 
-    /// Drops the job and the head of the delta of `dependency`: after its
+    /// Drops the job and the head of the delta of `attachment`: after its
     /// last part, or in the step of a commit that needs no delta.
-    pub(crate) fn release_job(&self, dependency: &Checksum) {
+    pub(crate) fn release_job(&self, attachment: &Checksum) {
         self.live
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(dependency);
+            .remove(attachment);
         self.heads
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(dependency);
+            .remove(attachment);
     }
 
     /// Returns the number of loaded jobs.
@@ -1155,38 +1155,38 @@ impl DependencyDeltas {
             .len()
     }
 
-    /// Returns `true` if the head of the delta of `dependency` still keeps
+    /// Returns `true` if the head of the delta of `attachment` still keeps
     /// the range of its commit or a fallback.
     #[cfg(test)]
-    pub(crate) fn holds_commit_data(&self, dependency: &Checksum) -> bool {
+    pub(crate) fn holds_commit_data(&self, attachment: &Checksum) -> bool {
         self.heads
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(dependency)
+            .get(attachment)
             .is_some_and(|head| head.commit.is_some() || !head.fallbacks.is_empty())
     }
 
-    /// Returns `true` if the delta of `dependency` from a remote has a head.
+    /// Returns `true` if the delta of `attachment` from a remote has a head.
     #[cfg(test)]
-    pub(crate) fn has_head(&self, dependency: &Checksum) -> bool {
+    pub(crate) fn has_head(&self, attachment: &Checksum) -> bool {
         self.heads
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(dependency)
+            .contains_key(attachment)
     }
 
     /// Returns the deltas `deltas` of the local source `src`, kept as the
-    /// search of [`discover_dependencies`] keeps the deltas from a remote: in
+    /// search of [`discover_attachments`] keeps the deltas from a remote: in
     /// one shared record file in `tmp/` of `repo`, with a head of each.
     #[cfg(test)]
     pub(crate) async fn kept_from(
         repo: &Repo,
         src: &Repo,
         deltas: &[(Option<Checksum>, Checksum)],
-    ) -> DependencyDeltas {
-        let shared = Arc::new(Mutex::new(RecordStore::for_dependencies(repo)));
+    ) -> AttachmentDeltas {
+        let shared = Arc::new(Mutex::new(RecordStore::for_attachments(repo)));
         let progress = PullCounters::new(None);
-        let mut found = DependencyDeltas::default();
+        let mut found = AttachmentDeltas::default();
         for (from, to) in deltas {
             let (fetched, kept) = fetch_job(
                 &DeltaSource::Local(src),
@@ -1210,7 +1210,7 @@ impl DependencyDeltas {
         found
     }
 
-    /// Takes the job of the delta of `dependency` from a local source, or
+    /// Takes the job of the delta of `attachment` from a local source, or
     /// returns `None` if it has no such delta. The call reads the superblock
     /// from `source` again and checks it against its digest.
     ///
@@ -1224,18 +1224,18 @@ impl DependencyDeltas {
         &mut self,
         repo: &Repo,
         source: &DeltaSource<'_>,
-        dependency: &Checksum,
+        attachment: &Checksum,
     ) -> Result<Option<DeltaJob>> {
-        let Some((from, digest)) = self.local.remove(dependency) else {
+        let Some((from, digest)) = self.local.remove(attachment) else {
             return Ok(None);
         };
         let DeltaSource::Local(src) = source else {
             return Err(Error::InvalidFormat(format!(
                 "static delta {}: discovery kept no superblock",
-                delta_name(from.as_ref(), dependency)
+                delta_name(from.as_ref(), attachment)
             )));
         };
-        let fetched = read_local_superblock(src, from, *dependency, digest).await?;
+        let fetched = read_local_superblock(src, from, *attachment, digest).await?;
         fetched.into_job(repo).await.map(Some)
     }
 }
@@ -1267,11 +1267,11 @@ impl DependencyDeltas {
 /// after the digest check, and the commit that the superblock carries after
 /// the parse, as [`fetch_job`] states. The file has the limit
 /// [`MAX_RECORD_FILE`]. A failed check fails the pull, so the file holds
-/// checked bytes. The result keeps a [`DependencyHead`] of each delta, and
+/// checked bytes. The result keeps an [`AttachmentHead`] of each delta, and
 /// the parsed superblock drops. A search holds the superblock that it fetched
 /// and the parse of it until its checks end, so the heap holds at most one
 /// superblock and its parse for each search in flight. A delta from a local
-/// source keeps no bytes, as [`DependencyDeltas`] states.
+/// source keeps no bytes, as [`AttachmentDeltas`] states.
 ///
 /// After a search fails, the call starts no further search. The searches in
 /// flight end, so the first error in the order of `lookups` is still the
@@ -1293,16 +1293,16 @@ impl DependencyDeltas {
 ///   pass the limit of the record file. The pull then does not fetch loose.
 /// - [`Error::Io`] if the record file cannot be opened or written.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn discover_dependencies(
+pub(crate) async fn discover_attachments(
     repo: &Repo,
     source: &DeltaSource<'_>,
     advert: Option<&DeltaAdvert>,
     edges: Option<&Edges>,
-    lookups: Vec<DependencyLookup>,
+    lookups: Vec<AttachmentLookup>,
     known: &HashMap<Checksum, bool>,
     opts: &PullOptions,
     progress: &PullCounters,
-) -> Result<DependencyDeltas> {
+) -> Result<AttachmentDeltas> {
     let limit = match source {
         DeltaSource::Remote(remote) => remote.max_outstanding(),
         DeltaSource::Local(_) => 1,
@@ -1311,11 +1311,11 @@ pub(crate) async fn discover_dependencies(
     // under the lock, and writes them on the blocking pool. The file opens at
     // the first write.
     let shared = match source {
-        DeltaSource::Remote(_) => Some(Arc::new(Mutex::new(RecordStore::for_dependencies(repo)))),
+        DeltaSource::Remote(_) => Some(Arc::new(Mutex::new(RecordStore::for_attachments(repo)))),
         DeltaSource::Local(_) => None,
     };
     let store = shared.as_ref();
-    let mut found = DependencyDeltas::default();
+    let mut found = AttachmentDeltas::default();
     let mut ready: Vec<Option<Result<Option<Kept>>>> = Vec::new();
     ready.resize_with(lookups.len(), || None);
     let mut next = 0;
@@ -1358,7 +1358,7 @@ pub(crate) async fn discover_dependencies(
                         _ => Found::Local(delta.from, delta.digest),
                     };
                     Ok(Some(Kept {
-                        dependency: lookup.checksum,
+                        attachment: lookup.checksum,
                         parts,
                         delta,
                     }))
@@ -1389,21 +1389,21 @@ pub(crate) async fn discover_dependencies(
                         .heads
                         .get_mut()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .insert(kept.dependency, head);
+                        .insert(kept.attachment, head);
                 }
                 Found::Local(from, digest) => {
-                    found.local.insert(kept.dependency, (from, digest));
+                    found.local.insert(kept.attachment, (from, digest));
                 }
             }
         }
     }
 }
 
-/// The delta of one dependency that a search of [`discover_dependencies`]
+/// The delta of one dependency that a search of [`discover_attachments`]
 /// found, with the number of its part files and their declared sizes.
 struct Kept {
     /// The dependency.
-    dependency: Checksum,
+    attachment: Checksum,
     /// The number of part files of the delta and the sum of their declared
     /// sizes.
     parts: (u32, u64),
@@ -1411,10 +1411,10 @@ struct Kept {
     delta: Found,
 }
 
-/// What [`DependencyDeltas`] keeps of the delta of one dependency.
+/// What [`AttachmentDeltas`] keeps of the delta of one dependency.
 enum Found {
     /// The head, from a remote.
-    Head(DependencyHead),
+    Head(AttachmentHead),
     /// The source commit and the superblock digest, from a local source.
     Local(Option<Checksum>, Option<Checksum>),
 }
@@ -1441,7 +1441,7 @@ enum Found {
 /// For a local source, discovery also reads field 2 of the commit of each
 /// step and checks the format of its entries. It keeps the entries of each
 /// intermediate commit of the last plan.
-/// [`DeltaPlan::take_dependencies`] gives them to the pull, which follows the
+/// [`DeltaPlan::take_attachments`] gives them to the pull, which follows the
 /// dependencies of each intermediate commit.
 ///
 /// If the source does not hold the superblock of a step, discovery excludes
@@ -1469,7 +1469,7 @@ enum Found {
 ///   The pull then does not fetch loose.
 /// - [`Error::InvalidFormat`] if a superblock or an inline part is
 ///   malformed.
-/// - [`Error::InvalidRelated`] if field 2 of the commit of a step of a local
+/// - [`Error::InvalidRelations`] if field 2 of the commit of a step of a local
 ///   source has an entry with an empty name or with a checksum that is not 32
 ///   bytes. Discovery reports it after the checks of the commit, as
 ///   [`check_step_commit`] states.
@@ -1597,7 +1597,7 @@ async fn discover_chain(
     // The walk of the commit chains reads field 2 of each target again.
     let intermediate: HashSet<&Checksum> = pass.plan.levels.iter().flatten().collect();
     let mut kept_records = HashMap::with_capacity(pass.plan.steps.len());
-    let mut dependencies = HashMap::new();
+    let mut attachments = HashMap::new();
     for (commit, index) in &pass.plan.steps {
         let Some(mut record) = records.remove(index) else {
             continue;
@@ -1608,8 +1608,8 @@ async fn discover_chain(
                 filtered: check.filtered,
                 local: check.local,
             };
-            if intermediate.contains(commit) && !check.dependencies.is_empty() {
-                dependencies.insert(*commit, check.dependencies);
+            if intermediate.contains(commit) && !check.attachments.is_empty() {
+                attachments.insert(*commit, check.attachments);
             }
         }
         kept_records.insert(*commit, record);
@@ -1618,7 +1618,7 @@ async fn discover_chain(
         jobs: HashMap::new(),
         records: kept_records,
         levels: pass.plan.levels,
-        dependencies,
+        attachments,
         store,
         edges: Some(search.into_edges()),
     })
@@ -1872,7 +1872,7 @@ async fn fetch_step(
 ///   of `refs`, or if the commit is older than the timestamp check allows.
 /// - [`Error::Pull`] if the `.commitmeta` would pass the limit of the record
 ///   file.
-/// - [`Error::InvalidRelated`] if field 2 of the commit from a local source
+/// - [`Error::InvalidRelations`] if field 2 of the commit from a local source
 ///   has an entry with an empty name or with a checksum that is not 32 bytes.
 async fn check_step_commit(
     ctx: &CheckCtx<'_>,
@@ -1893,11 +1893,11 @@ async fn check_step_commit(
             let checksum = *commit;
             let parse = !refs.is_empty();
             ostrya_rt::unblock(move || {
-                let dependencies = related::parse_dependencies(&commit_bytes).and_then(|entries| {
-                    related::checked_entries(RelatedField::Dependencies, Some(checksum), entries)
+                let attachments = related::parse_attachments(&commit_bytes).and_then(|entries| {
+                    related::checked_entries(RelationField::Attachments, Some(checksum), entries)
                 });
                 let parsed = parse.then(|| Commit::parse(&commit_bytes));
-                (commit_bytes, Some((parsed, dependencies)))
+                (commit_bytes, Some((parsed, attachments)))
             })
             .await
         }
@@ -1906,7 +1906,7 @@ async fn check_step_commit(
     // The signature check gives the bytes to the blocking pool in an `Arc`,
     // with no copy.
     let commit_bytes = Arc::new(commit_bytes);
-    let (parsed, dependencies) = local_parse.unzip();
+    let (parsed, attachments) = local_parse.unzip();
     let mut checked = match ctx.source {
         DeltaSource::Remote(remote) => {
             let detached = match detached {
@@ -1952,14 +1952,14 @@ async fn check_step_commit(
                 kept,
                 filtered,
                 local: CheckedDetached::Unchecked,
-                dependencies: Vec::new(),
+                attachments: Vec::new(),
             }
         }
         DeltaSource::Local(_) if !ctx.verification.checks_commits() => Checked {
             kept: None,
             filtered: false,
             local: CheckedDetached::Unchecked,
-            dependencies: Vec::new(),
+            attachments: Vec::new(),
         },
         DeltaSource::Local(src) => {
             // The source comes first, then the localcache repositories, then
@@ -1979,7 +1979,7 @@ async fn check_step_commit(
                 kept: None,
                 filtered: false,
                 local,
-                dependencies: Vec::new(),
+                attachments: Vec::new(),
             }
         }
     };
@@ -1994,8 +1994,8 @@ async fn check_step_commit(
     }
     // A defective entry of field 2 fails the pull after the other checks of
     // the commit.
-    if let Some(dependencies) = dependencies {
-        checked.dependencies = dependencies?;
+    if let Some(attachments) = attachments {
+        checked.attachments = attachments?;
     }
     Ok(checked)
 }
@@ -2191,7 +2191,7 @@ pub(crate) fn no_summary_error() -> Error {
 ///
 /// The error names `subject` and the commit `to`. For a target, `subject` is
 /// the ref, and the message is the message of the `ostree` command. For a
-/// dependency, it is `<name> of <ref>`, as [`DependencyLookup::subject`]
+/// dependency, it is `<name> of <ref>`, as [`AttachmentLookup::subject`]
 /// states.
 fn none_found_error(subject: &str, to: &Checksum) -> Error {
     Error::Pull(format!(
@@ -2389,7 +2389,7 @@ enum Advertisement<'a> {
 ///
 /// `from` is the commit that the pulled ref names here, if this repository
 /// holds it complete. `scratch` is `true` if the ref names no commit held
-/// complete and does not name `to`. For a dependency, [`DependencyLookup`]
+/// complete and does not name `to`. For a dependency, [`AttachmentLookup`]
 /// gives the two values. `subject` names `to` in an error, as
 /// [`none_found_error`] states.
 ///
@@ -2518,7 +2518,7 @@ enum Keep<'a> {
     /// superblock at a time.
     Own(&'a mut RecordStore),
     /// The record file that the concurrent searches of
-    /// [`discover_dependencies`] share. The file also keeps the commit that
+    /// [`discover_attachments`] share. The file also keeps the commit that
     /// each superblock carries.
     Shared(&'a Arc<Mutex<RecordStore>>),
 }
@@ -3178,7 +3178,7 @@ mod tests {
             body: None,
             timestamp: Some(1_700_000_000),
             metadata: None,
-            related: Vec::new(),
+            attachments: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();
@@ -4612,7 +4612,7 @@ mod tests {
     /// opens, and a commit past the limit fails after the superblock. Each
     /// error names the limit and the dependency search.
     #[test]
-    fn the_dependency_record_file_keeps_the_commit_and_stops_at_its_limit() {
+    fn the_attachment_record_file_keeps_the_commit_and_stops_at_its_limit() {
         ostrya_rt::block_on(async {
             let f = Fixture::new().await;
             let delta = f.delta(Some(f.a), f.b).await;
@@ -4636,7 +4636,7 @@ mod tests {
             };
             let name = delta_name(delta.from.as_ref(), &delta.to);
 
-            let store = RecordStore::for_dependencies(&f.dst);
+            let store = RecordStore::for_attachments(&f.dst);
             assert!(store.file.is_none());
             let (result, store) = fetch(Arc::new(Mutex::new(store))).await;
             let (fetched, kept) = result.unwrap().unwrap();
@@ -4659,7 +4659,7 @@ mod tests {
             ] {
                 let store = RecordStore {
                     limit,
-                    ..RecordStore::for_dependencies(&f.dst)
+                    ..RecordStore::for_attachments(&f.dst)
                 };
                 let (result, store) = fetch(Arc::new(Mutex::new(store))).await;
                 let Some(Error::Pull(message)) = result.err() else {
@@ -4683,12 +4683,12 @@ mod tests {
     /// so it goes there.
     #[test]
     fn the_step_of_the_commit_takes_the_commit_data_of_a_head() {
-        let found = DependencyDeltas::default();
+        let found = AttachmentDeltas::default();
         let fallback = ObjectName::new(checksum(9), ObjectType::File);
         for (commit, parts) in [(checksum(1), 0), (checksum(2), 2)] {
             found.heads.lock().unwrap().insert(
                 commit,
-                DependencyHead {
+                AttachmentHead {
                     from: None,
                     superblock: 0..10,
                     parts,

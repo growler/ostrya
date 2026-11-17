@@ -79,7 +79,7 @@ use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::image_store;
 use crate::read::CommitState;
-use crate::related::{self, RelatedField};
+use crate::related::{self, RelationField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
@@ -1068,7 +1068,7 @@ impl Repo {
     ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs).
     /// - [`Error::InvalidFormat`] if `commit` already carries
     ///   `ostree.composefs.digest.v0`.
-    /// - [`Error::InvalidRelated`] with `commit` if field 2 of `commit` is
+    /// - [`Error::InvalidRelations`] with `commit` if field 2 of `commit` is
     ///   defective, if its entries are not sorted or have a name two times,
     ///   or if a dependency is absent, partial, or has a dependency of its
     ///   own.
@@ -1110,13 +1110,13 @@ impl Repo {
                 "commit already carries {COMPOSEFS_DIGEST_KEY}"
             )));
         }
-        let deps = related::checked_entries(
-            RelatedField::Dependencies,
+        let atts = related::checked_entries(
+            RelationField::Attachments,
             Some(*commit),
             related::entries_of(&commit_obj.related),
         )?;
-        related::check_order(Some(*commit), deps.iter().map(|(name, _)| name.as_str()))?;
-        related::check_dependencies(txn, Some(*commit), &deps).await?;
+        related::check_order(Some(*commit), atts.iter().map(|(name, _)| name.as_str()))?;
+        related::check_attachments(txn, Some(*commit), &atts).await?;
         // With the key, the one build gives the digest and the image, so the
         // commit of `txn` does not build the image again.
         let image = if self.config().generate_composefs()? {

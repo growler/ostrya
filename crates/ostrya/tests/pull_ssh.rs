@@ -265,7 +265,7 @@ fn the_stream_source_pulls_what_the_http_pull_pulls() {
 /// The stream source fetches the dependency that field 2 of the pulled commit
 /// names, as the HTTP pull does, and writes no ref for it.
 #[test]
-fn the_stream_source_fetches_a_dependency() {
+fn the_stream_source_fetches_an_attachment() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-dependency");
         build_tree(&dir.path().join("uki"), b"uki\n");
@@ -274,14 +274,14 @@ fn the_stream_source_fetches_a_dependency() {
         let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        let dep = commit_tree(&remote, dir.path(), "uki", "dep/uki", None, FIXED_TS).await;
+        let att = commit_tree(&remote, dir.path(), "uki", "dep/uki", None, FIXED_TS).await;
         let tip = commit_tree_related(
             &remote,
             dir.path(),
             "main",
             "test/main",
             None,
-            &[("boot/uki", dep)],
+            &[("boot/uki", att)],
         )
         .await;
         summarize(&remote).await;
@@ -298,9 +298,9 @@ fn the_stream_source_fetches_a_dependency() {
         let dest = Repo::open(&dir.path().join("dependency-ssh"))
             .await
             .unwrap();
-        assert!(dest.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert!(dest.has_object(ObjectType::Commit, &att).await.unwrap());
         assert_eq!(
-            dest.commit_state(&dep).await.unwrap(),
+            dest.commit_state(&att).await.unwrap(),
             ostrya::CommitState::Normal
         );
         assert!(dest.list_refs(None).await.unwrap().is_empty());

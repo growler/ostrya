@@ -76,7 +76,7 @@ impl Repo {
     /// # Dependencies
     ///
     /// Field 2 of a commit names the dependencies of the commit.
-    /// [`read_commit_related`](Repo::read_commit_related) reads them. The
+    /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The
     /// stream carries the dependencies of each new commit.
     ///
     /// - The call sends each dependency at depth 0, so a dependency entry
@@ -160,7 +160,7 @@ impl Repo {
     /// - [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) if the
     ///   repository does not hold a new commit or a dependency, or a dirtree
     ///   or a dirmeta that the tree of a sent commit reaches.
-    /// - [`Error::InvalidRelated`](crate::Error::InvalidRelated) if an entry
+    /// - [`Error::InvalidRelations`](crate::Error::InvalidRelations) if an entry
     ///   of field 2 of a new commit has an empty name or a checksum that is
     ///   not 32 bytes, or if the repository marks a dependency partial, or if
     ///   a dependency names dependencies of its own.
@@ -278,7 +278,7 @@ impl Repo {
                         .local
                         .insert(checksum, Local::Held(link_of(&commit)));
                     let related = std::mem::take(&mut commit.related);
-                    commits.record(checksum, related::checked_dependencies(&checksum, related));
+                    commits.record(checksum, related::checked_attachments(&checksum, related));
                     targets.push(checksum);
                     loaded.push(commit);
                     loaded.len() - 1
@@ -298,15 +298,15 @@ impl Repo {
         // The format of field 2 of each new commit, then its dependencies,
         // before the first byte.
         commits.check_fields(&targets)?;
-        commits.check_dependencies(self, &targets).await?;
+        commits.check_attachments(self, &targets).await?;
 
         // The new commits, then each dependency once.
         let mut sent = targets.clone();
         let mut known: HashSet<Checksum> = targets.iter().copied().collect();
         for target in &targets {
-            for dependency in commits.dependencies_of(target) {
-                if known.insert(dependency) {
-                    sent.push(dependency);
+            for attachment in commits.attachments_of(target) {
+                if known.insert(attachment) {
+                    sent.push(attachment);
                 }
             }
         }

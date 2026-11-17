@@ -1489,7 +1489,7 @@ mod cli {
     /// the pushed commit names. The server holds the dependency complete,
     /// and writes no ref for it.
     #[test]
-    fn push_sends_a_dependency() {
+    fn push_sends_an_attachment() {
         let setup = Setup::new("cli-dependency");
         let src = tree(setup.tmp.path(), "tree", 3, 1000);
         let uki = tree(setup.tmp.path(), "uki", 2, 500);
@@ -1500,8 +1500,8 @@ mod cli {
             all.extend_from_slice(args);
             ok("ostrya", &all).trim().to_owned()
         };
-        let dep = commit(&["-b", "dep/uki", uki.to_str().unwrap()]);
-        let related = format!("--related=boot/uki={dep}");
+        let att = commit(&["-b", "dep/uki", uki.to_str().unwrap()]);
+        let related = format!("--related=boot/uki={att}");
         let tip = commit(&["-b", "main", &related, src.to_str().unwrap()]);
         let server = setup.init("server", "archive");
         add_config(
@@ -1514,8 +1514,8 @@ mod cli {
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stdout(&out), format!("main (new) {tip}\n"));
 
-        let object = server.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
-        assert!(object.is_file(), "dependency {dep} was not sent");
+        let object = server.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
+        assert!(object.is_file(), "dependency {att} was not sent");
         let refs = ok("ostrya", &[&format!("--repo={}", server.display()), "refs"]);
         assert_eq!(refs, "main\n");
         ok("ostrya", &[&format!("--repo={}", server.display()), "fsck"]);

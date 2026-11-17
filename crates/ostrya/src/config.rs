@@ -682,7 +682,7 @@ impl RepoConfig {
     ///
     /// A local write does not read the key: a commit write,
     /// [`Repo::write_commit_detached_metadata`], and
-    /// [`Repo::add_detached_related`] store `ostrya.related`. The key controls
+    /// [`Repo::add_supplement`] store `ostrya.related`. The key controls
     /// what a transfer stores. A pull, also a local pull and a pull through a
     /// static delta, and a push to a bucket replace the whole stored
     /// `.commitmeta` with the dict that the key leaves. So a stored

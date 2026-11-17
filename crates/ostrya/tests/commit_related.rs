@@ -1,14 +1,14 @@
 //! Integration tests of the related commits of a commit.
 //!
-//! `Transaction::write_commit` writes `CommitOptions::related` into field 2
+//! `Transaction::write_commit` writes `CommitOptions::attachments` into field 2
 //! of the commit object, sorted by name, and refuses dependencies that are
-//! defective, not complete, or nested. `Transaction::check_related` runs the
+//! defective, not complete, or nested. `Transaction::check_attachments` runs the
 //! same checks before a tree is built, and `Transaction::write_commit_checked`
 //! writes the checked list with no second check.
 //! `Repo::commit_add_composefs_metadata`
-//! keeps field 2 and applies the same check. `Repo::read_commit_related`
+//! keeps field 2 and applies the same check. `Repo::read_commit_relations`
 //! reads field 2 and the detached key `ostrya.related`.
-//! `Repo::add_detached_related` and `Transaction::add_detached_related` add
+//! `Repo::add_supplement` and `Transaction::add_supplement` add
 //! a build source, and the detached metadata writes check the value of
 //! `ostrya.related`. The `ostree` command has no counterpart, so the tests
 //! use ostrya alone.
@@ -19,9 +19,9 @@ use std::path::Path;
 
 use common::{Field2Entry, TmpDir, file_inventory, store_with_field2};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelated, CreateOptions,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelations, CreateOptions,
     DictBuilder, DummySigner, Error, LockKind, MutableTree, ObjectType, PullOptions, Ref,
-    RelatedField, Repo, RepoMode, RepoTree, Transaction, Type, Value,
+    RelationField, Repo, RepoMode, RepoTree, Transaction, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -72,7 +72,7 @@ fn options(name: &str, related: &[(&str, Checksum)]) -> CommitOptions {
     CommitOptions {
         subject: Some(name.to_owned()),
         timestamp: Some(FIXED_TS),
-        related: related
+        attachments: related
             .iter()
             .map(|(entry, checksum)| ((*entry).to_owned(), *checksum))
             .collect(),
@@ -135,15 +135,15 @@ fn dict(entries: Vec<(&str, (Type, Value))>) -> Value {
 }
 
 /// Returns the commit, the field, and the reason of an
-/// [`Error::InvalidRelated`].
-fn related_error(err: Error) -> (Option<Checksum>, RelatedField, String) {
+/// [`Error::InvalidRelations`].
+fn related_error(err: Error) -> (Option<Checksum>, RelationField, String) {
     match err {
-        Error::InvalidRelated {
+        Error::InvalidRelations {
             commit,
             field,
             reason,
         } => (commit, field, reason),
-        other => panic!("expected InvalidRelated, got {other:?}"),
+        other => panic!("expected InvalidRelations, got {other:?}"),
     }
 }
 
@@ -196,7 +196,7 @@ fn refs(repo: &Repo) -> Vec<(String, Vec<u8>)> {
 }
 
 #[test]
-fn write_commit_sorts_the_dependencies() {
+fn write_commit_sorts_the_attachments() {
     let tmp = TmpDir::new("related-sort");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["fe", "uki", "head"]).await;
@@ -213,17 +213,17 @@ fn write_commit_sorts_the_dependencies() {
         let (stored, _) = repo.load_commit(&head).await.unwrap();
         assert_eq!(stored.related, field2(&sorted));
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap(),
-            CommitRelated {
-                dependencies: owned(&sorted),
-                build_sources: Vec::new(),
+            repo.read_commit_relations(&head).await.unwrap(),
+            CommitRelations {
+                attachments: owned(&sorted),
+                supplements: Vec::new(),
             }
         );
     });
 }
 
 #[test]
-fn one_set_of_dependencies_gives_one_checksum() {
+fn one_set_of_attachments_gives_one_checksum() {
     let tmp = TmpDir::new("related-stable");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["fe", "uki", "head"]).await;
@@ -250,11 +250,11 @@ fn one_set_of_dependencies_gives_one_checksum() {
 }
 
 #[test]
-fn write_commit_refuses_defective_or_incomplete_dependencies() {
+fn write_commit_refuses_defective_or_incomplete_attachments() {
     let tmp = TmpDir::new("related-refuse");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "partial", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let partial = commit(&repo, tmp.path(), "partial", &[]).await;
         let state = repo.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
@@ -263,15 +263,15 @@ fn write_commit_refuses_defective_or_incomplete_dependencies() {
 
         let cases = [
             (
-                vec![("a/x", dep), ("", dep)],
+                vec![("a/x", att), ("", att)],
                 "entry 1 has an empty name".to_owned(),
             ),
             (
-                vec![("b/x", dep), ("a/x", dep), ("b/x", absent)],
+                vec![("b/x", att), ("a/x", att), ("b/x", absent)],
                 "two entries have the name b/x".to_owned(),
             ),
             (
-                vec![("a/x", dep), ("b/x", absent)],
+                vec![("a/x", att), ("b/x", absent)],
                 format!(
                     "dependency b/x names commit {absent}, which is in neither the repository \
                      nor the transaction"
@@ -303,11 +303,11 @@ fn write_commit_refuses_defective_or_incomplete_dependencies() {
             );
             assert_eq!(
                 related_error(err),
-                (None, RelatedField::Dependencies, expected)
+                (None, RelationField::Attachments, expected)
             );
             // The transaction stays open.
             let written = txn
-                .write_commit(options("head", &[("a/x", dep)]), &root)
+                .write_commit(options("head", &[("a/x", att)]), &root)
                 .await
                 .unwrap();
             txn.set_ref(&Ref::local("main"), Some(&written));
@@ -319,11 +319,11 @@ fn write_commit_refuses_defective_or_incomplete_dependencies() {
 }
 
 #[test]
-fn check_related_runs_the_checks_of_write_commit() {
+fn check_attachments_runs_the_checks_of_write_commit() {
     let tmp = TmpDir::new("related-check");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "partial", "c", "nested"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let partial = commit(&repo, tmp.path(), "partial", &[]).await;
         let c = commit(&repo, tmp.path(), "c", &[]).await;
         let nested = commit(&repo, tmp.path(), "nested", &[("lib/c", c)]).await;
@@ -334,9 +334,9 @@ fn check_related_runs_the_checks_of_write_commit() {
 
         let txn = repo.transaction().await.unwrap();
         let cases = [
-            (vec![("", dep)], "entry 0 has an empty name".to_owned()),
+            (vec![("", att)], "entry 0 has an empty name".to_owned()),
             (
-                vec![("a/x", dep), ("a/x", dep)],
+                vec![("a/x", att), ("a/x", att)],
                 "two entries have the name a/x".to_owned(),
             ),
             (
@@ -357,17 +357,17 @@ fn check_related_runs_the_checks_of_write_commit() {
         ];
         for (related, expected) in cases {
             let staged_before = staged(&repo);
-            let err = txn.check_related(&owned(&related)).await.unwrap_err();
+            let err = txn.check_attachments(&owned(&related)).await.unwrap_err();
             assert_eq!(
                 related_error(err),
-                (None, RelatedField::Dependencies, expected)
+                (None, RelationField::Attachments, expected)
             );
             assert_eq!(staged(&repo), staged_before, "the call stages nothing");
         }
         // The checks run in the byte order of the names: the absent `a/x`
         // comes before the nested `b/x`.
         let err = txn
-            .check_related(&owned(&[("b/x", nested), ("a/x", absent)]))
+            .check_attachments(&owned(&[("b/x", nested), ("a/x", absent)]))
             .await
             .unwrap_err();
         assert!(
@@ -375,10 +375,10 @@ fn check_related_runs_the_checks_of_write_commit() {
             "the first name in byte order"
         );
         // An accepted list stays in the order of the caller.
-        let accepted = owned(&[("b/x", dep), ("a/x", c)]);
-        let _ = txn.check_related(&accepted).await.unwrap();
-        assert_eq!(accepted, owned(&[("b/x", dep), ("a/x", c)]));
-        let _ = txn.check_related(&[]).await.unwrap();
+        let accepted = owned(&[("b/x", att), ("a/x", c)]);
+        let _ = txn.check_attachments(&accepted).await.unwrap();
+        assert_eq!(accepted, owned(&[("b/x", att), ("a/x", c)]));
+        let _ = txn.check_attachments(&[]).await.unwrap();
         txn.abort().await.unwrap();
     });
 }
@@ -386,7 +386,7 @@ fn check_related_runs_the_checks_of_write_commit() {
 /// The check reads no commit object of a dependency with a partial marker: a
 /// directory at the path of the object gives the partial refusal.
 #[test]
-fn check_related_reads_no_object_of_a_partial_dependency() {
+fn check_attachments_reads_no_object_of_a_partial_attachment() {
     let tmp = TmpDir::new("related-partial-unreadable");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["partial"]).await;
@@ -404,14 +404,14 @@ fn check_related_reads_no_object_of_a_partial_dependency() {
 
         let txn = repo.transaction().await.unwrap();
         let err = txn
-            .check_related(&owned(&[("a/x", partial)]))
+            .check_attachments(&owned(&[("a/x", partial)]))
             .await
             .unwrap_err();
         assert_eq!(
             related_error(err),
             (
                 None,
-                RelatedField::Dependencies,
+                RelationField::Attachments,
                 format!("dependency a/x names commit {partial}, which is partial")
             )
         );
@@ -422,27 +422,27 @@ fn check_related_reads_no_object_of_a_partial_dependency() {
 /// A dependency that the transaction stages is partial if the repository has
 /// a partial marker for it.
 #[test]
-fn check_related_refuses_a_staged_dependency_with_a_partial_marker() {
+fn check_attachments_refuses_a_staged_attachment_with_a_partial_marker() {
     let tmp = TmpDir::new("related-staged-partial");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep"]).await;
         let txn = repo.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "dep").await;
-        let dep = txn.write_commit(options("dep", &[]), &root).await.unwrap();
+        let att = txn.write_commit(options("dep", &[]), &root).await.unwrap();
         let state = repo.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
-        std::fs::write(state.join(format!("{dep}.commitpartial")), b"").unwrap();
+        std::fs::write(state.join(format!("{att}.commitpartial")), b"").unwrap();
 
         let err = txn
-            .check_related(&owned(&[("a/x", dep)]))
+            .check_attachments(&owned(&[("a/x", att)]))
             .await
             .unwrap_err();
         assert_eq!(
             related_error(err),
             (
                 None,
-                RelatedField::Dependencies,
-                format!("dependency a/x names commit {dep}, which is partial")
+                RelationField::Attachments,
+                format!("dependency a/x names commit {att}, which is partial")
             )
         );
         txn.abort().await.unwrap();
@@ -477,7 +477,7 @@ fn write_commit_checked_does_not_check_again() {
         let unsorted = owned(&[("container/fe", fe), ("boot/uki", uki)]);
 
         let txn = repo.transaction().await.unwrap();
-        let checked = txn.check_related(&unsorted).await.unwrap();
+        let checked = txn.check_attachments(&unsorted).await.unwrap();
         mark_partial(&repo, &fe);
         let root = stage_tree(&txn, tmp.path(), "head").await;
         let head = txn
@@ -494,13 +494,13 @@ fn write_commit_checked_does_not_check_again() {
         let txn = repo.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
         let mut opts = options("head", &[]);
-        opts.related = unsorted;
+        opts.attachments = unsorted;
         let err = txn.write_commit(opts, &root).await.unwrap_err();
         assert_eq!(
             related_error(err),
             (
                 None,
-                RelatedField::Dependencies,
+                RelationField::Attachments,
                 format!("dependency container/fe names commit {fe}, which is partial")
             )
         );
@@ -515,11 +515,14 @@ fn write_commit_checked_refuses_a_list_of_another_transaction() {
     let tmp = TmpDir::new("related-checked-other");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let other = repo.transaction().await.unwrap();
         let txn = repo.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
-        let checked = other.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let checked = other
+            .check_attachments(&owned(&[("a/x", att)]))
+            .await
+            .unwrap();
 
         let staged_before = staged(&repo);
         let err = txn
@@ -533,34 +536,40 @@ fn write_commit_checked_refuses_a_list_of_another_transaction() {
         assert_eq!(staged(&repo), staged_before, "the call stages nothing");
         other.abort().await.unwrap();
 
-        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let checked = txn
+            .check_attachments(&owned(&[("a/x", att)]))
+            .await
+            .unwrap();
         let head = txn
             .write_commit_checked(options("head", &[]), checked, &root)
             .await
             .unwrap();
         txn.commit().await.unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().dependencies,
-            owned(&[("a/x", dep)])
+            repo.read_commit_relations(&head).await.unwrap().attachments,
+            owned(&[("a/x", att)])
         );
     });
 }
 
-/// The checked list gives the dependencies alone, so `opts.related` must be
+/// The checked list gives the dependencies alone, so `opts.attachments` must be
 /// empty. The call stages nothing, and the transaction stays usable.
 #[test]
-fn write_commit_checked_refuses_dependencies_in_the_options() {
+fn write_commit_checked_refuses_attachments_in_the_options() {
     let tmp = TmpDir::new("related-checked-options");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let txn = repo.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
-        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let checked = txn
+            .check_attachments(&owned(&[("a/x", att)]))
+            .await
+            .unwrap();
 
         let staged_before = staged(&repo);
         let err = txn
-            .write_commit_checked(options("head", &[("a/x", dep)]), checked, &root)
+            .write_commit_checked(options("head", &[("a/x", att)]), checked, &root)
             .await
             .unwrap_err();
         assert_eq!(
@@ -569,15 +578,18 @@ fn write_commit_checked_refuses_dependencies_in_the_options() {
         );
         assert_eq!(staged(&repo), staged_before, "the call stages nothing");
 
-        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let checked = txn
+            .check_attachments(&owned(&[("a/x", att)]))
+            .await
+            .unwrap();
         let head = txn
             .write_commit_checked(options("head", &[]), checked, &root)
             .await
             .unwrap();
         txn.commit().await.unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().dependencies,
-            owned(&[("a/x", dep)])
+            repo.read_commit_relations(&head).await.unwrap().attachments,
+            owned(&[("a/x", att)])
         );
     });
 }
@@ -595,7 +607,7 @@ fn write_commit_checked_gives_the_commit_of_write_commit() {
 
         let txn = repo.transaction().await.unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
-        let checked = txn.check_related(&owned(&unsorted)).await.unwrap();
+        let checked = txn.check_attachments(&owned(&unsorted)).await.unwrap();
         let through_list = txn
             .write_commit_checked(options("head", &[]), checked, &root)
             .await
@@ -610,7 +622,7 @@ fn write_commit_checked_gives_the_commit_of_write_commit() {
 }
 
 #[test]
-fn write_commit_refuses_a_nested_dependency() {
+fn write_commit_refuses_a_nested_attachment() {
     let tmp = TmpDir::new("related-nested");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c", "b", "a"]).await;
@@ -626,7 +638,7 @@ fn write_commit_refuses_a_nested_dependency() {
             related_error(err),
             (
                 None,
-                RelatedField::Dependencies,
+                RelationField::Attachments,
                 format!("dependency lib/b names commit {b}, which has dependencies of its own")
             )
         );
@@ -635,19 +647,19 @@ fn write_commit_refuses_a_nested_dependency() {
 }
 
 #[test]
-fn write_commit_accepts_a_dependency_of_the_same_transaction() {
+fn write_commit_accepts_an_attachment_of_the_same_transaction() {
     let tmp = TmpDir::new("related-same-txn");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "head", "nested"]).await;
         let txn = repo.transaction().await.unwrap();
-        let dep_root = stage_tree(&txn, tmp.path(), "dep").await;
-        let dep = txn
-            .write_commit(options("dep", &[]), &dep_root)
+        let att_root = stage_tree(&txn, tmp.path(), "dep").await;
+        let att = txn
+            .write_commit(options("dep", &[]), &att_root)
             .await
             .unwrap();
         let root = stage_tree(&txn, tmp.path(), "head").await;
         let head = txn
-            .write_commit(options("head", &[("a/dep", dep)]), &root)
+            .write_commit(options("head", &[("a/dep", att)]), &root)
             .await
             .unwrap();
         // A staged dependency with a dependency of its own is nested.
@@ -662,19 +674,19 @@ fn write_commit_accepts_a_dependency_of_the_same_transaction() {
         );
         txn.commit().await.unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().dependencies,
-            owned(&[("a/dep", dep)])
+            repo.read_commit_relations(&head).await.unwrap().attachments,
+            owned(&[("a/dep", att)])
         );
     });
 }
 
 #[test]
-fn composefs_metadata_keeps_the_dependencies() {
+fn composefs_metadata_keeps_the_attachments() {
     let tmp = TmpDir::new("related-composefs-keep");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
-        let head = commit(&repo, tmp.path(), "head", &[("a/dep", dep)]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[("a/dep", att)]).await;
         let txn = repo.transaction().await.unwrap();
         let rewritten = repo
             .commit_add_composefs_metadata(&txn, &head)
@@ -682,7 +694,7 @@ fn composefs_metadata_keeps_the_dependencies() {
             .unwrap();
         txn.commit().await.unwrap();
         let (stored, _) = repo.load_commit(&rewritten).await.unwrap();
-        assert_eq!(stored.related, field2(&[("a/dep", dep)]));
+        assert_eq!(stored.related, field2(&[("a/dep", att)]));
     });
 }
 
@@ -731,7 +743,7 @@ fn composefs_metadata_refuses_a_defective_source_field() {
                 .unwrap_err();
             assert_eq!(
                 related_error(err),
-                (Some(source), RelatedField::Dependencies, expected)
+                (Some(source), RelationField::Attachments, expected)
             );
             txn.abort().await.unwrap();
             assert_eq!(objects(&repo), objects_before, "no new object");
@@ -740,13 +752,13 @@ fn composefs_metadata_refuses_a_defective_source_field() {
 }
 
 #[test]
-fn read_commit_related_gives_both_fields() {
+fn read_commit_relations_gives_both_fields() {
     let tmp = TmpDir::new("related-read-both");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "src", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let src = commit(&repo, tmp.path(), "src", &[]).await;
-        let head = commit(&repo, tmp.path(), "head", &[("a/dep", dep)]).await;
+        let head = commit(&repo, tmp.path(), "head", &[("a/dep", att)]).await;
         let absent = [0x44; 32];
         let meta = dict(vec![(
             RELATED_KEY,
@@ -756,10 +768,10 @@ fn read_commit_related_gives_both_fields() {
             .await
             .unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap(),
-            CommitRelated {
-                dependencies: owned(&[("a/dep", dep)]),
-                build_sources: owned(&[
+            repo.read_commit_relations(&head).await.unwrap(),
+            CommitRelations {
+                attachments: owned(&[("a/dep", att)]),
+                supplements: owned(&[
                     ("source/src", src),
                     ("source/gone", Checksum::from_ay(&absent).unwrap()),
                 ]),
@@ -767,14 +779,14 @@ fn read_commit_related_gives_both_fields() {
         );
         // With no detached metadata, the build sources are empty.
         assert_eq!(
-            repo.read_commit_related(&dep).await.unwrap(),
-            CommitRelated::default()
+            repo.read_commit_relations(&att).await.unwrap(),
+            CommitRelations::default()
         );
     });
 }
 
 #[test]
-fn read_commit_related_takes_the_first_build_source_key() {
+fn read_commit_relations_takes_the_first_supplement_key() {
     let tmp = TmpDir::new("related-read-first-key");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
@@ -788,14 +800,14 @@ fn read_commit_related_takes_the_first_build_source_key() {
             .await
             .unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().build_sources,
+            repo.read_commit_relations(&head).await.unwrap().supplements,
             owned(&[("source/first", src)])
         );
     });
 }
 
 #[test]
-fn read_commit_related_refuses_a_defective_build_source_value() {
+fn read_commit_relations_refuses_a_defective_supplement_value() {
     let tmp = TmpDir::new("related-read-bad-sources");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
@@ -817,43 +829,43 @@ fn read_commit_related_refuses_a_defective_build_source_value() {
             // writes the file out of band.
             let meta = dict(vec![(RELATED_KEY, value)]);
             write_raw_detached(&repo, &head, &meta);
-            let err = repo.read_commit_related(&head).await.unwrap_err();
+            let err = repo.read_commit_relations(&head).await.unwrap_err();
             assert_eq!(
                 err.to_string(),
                 format!("related commits in ostrya.related of commit {head}: {expected}")
             );
             assert_eq!(
                 related_error(err),
-                (Some(head), RelatedField::BuildSources, expected.to_owned())
+                (Some(head), RelationField::Supplements, expected.to_owned())
             );
         }
     });
 }
 
 #[test]
-fn read_commit_related_checks_the_format_of_field2() {
+fn read_commit_relations_checks_the_format_of_field2() {
     let tmp = TmpDir::new("related-read-field2");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
         let head = commit(&repo, tmp.path(), "head", &[]).await;
-        let bytes = dep.as_bytes().as_slice();
+        let bytes = att.as_bytes().as_slice();
 
         let short = store_with_field2(&repo, &head, &[("a/x", &bytes[..31])]).await;
         assert_eq!(
-            related_error(repo.read_commit_related(&short).await.unwrap_err()),
+            related_error(repo.read_commit_relations(&short).await.unwrap_err()),
             (
                 Some(short),
-                RelatedField::Dependencies,
+                RelationField::Attachments,
                 "entry 0 (a/x) has a checksum of 31 bytes, not 32".to_owned()
             )
         );
         let unnamed = store_with_field2(&repo, &head, &[("a/x", bytes), ("", bytes)]).await;
         assert_eq!(
-            related_error(repo.read_commit_related(&unnamed).await.unwrap_err()),
+            related_error(repo.read_commit_relations(&unnamed).await.unwrap_err()),
             (
                 Some(unnamed),
-                RelatedField::Dependencies,
+                RelationField::Attachments,
                 "entry 1 has an empty name".to_owned()
             )
         );
@@ -868,28 +880,28 @@ fn read_commit_related_checks_the_format_of_field2() {
         .await;
         let absent = Checksum::from_ay(&absent).unwrap();
         assert_eq!(
-            repo.read_commit_related(&unsorted)
+            repo.read_commit_relations(&unsorted)
                 .await
                 .unwrap()
-                .dependencies,
-            owned(&[("b/x", dep), ("a/x", absent), ("b/x", dep)])
+                .attachments,
+            owned(&[("b/x", att), ("a/x", absent), ("b/x", att)])
         );
     });
 }
 
 #[test]
-fn read_commit_related_of_an_absent_commit() {
+fn read_commit_relations_of_an_absent_commit() {
     let tmp = TmpDir::new("related-read-absent");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &[]).await;
         let absent = Checksum::from_ay(&[0x77; 32]).unwrap();
-        let err = repo.read_commit_related(&absent).await.unwrap_err();
+        let err = repo.read_commit_relations(&absent).await.unwrap_err();
         assert!(matches!(err, Error::ObjectNotFound { .. }), "got {err:?}");
     });
 }
 
 #[test]
-fn add_detached_related_replaces_by_name_and_keeps_the_sort() {
+fn add_supplement_replaces_by_name_and_keeps_the_sort() {
     let tmp = TmpDir::new("related-add-sort");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["x", "y", "head"]).await;
@@ -900,16 +912,16 @@ fn add_detached_related_replaces_by_name_and_keeps_the_sort() {
             .await
             .unwrap();
 
-        repo.add_detached_related(&head, "z/x", &x).await.unwrap();
-        repo.add_detached_related(&head, "a/y", &y).await.unwrap();
+        repo.add_supplement(&head, "z/x", &x).await.unwrap();
+        repo.add_supplement(&head, "a/y", &y).await.unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().build_sources,
+            repo.read_commit_relations(&head).await.unwrap().supplements,
             owned(&[("a/y", y), ("z/x", x)])
         );
         // An add with a stored name replaces the entry.
-        repo.add_detached_related(&head, "z/x", &y).await.unwrap();
+        repo.add_supplement(&head, "z/x", &y).await.unwrap();
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().build_sources,
+            repo.read_commit_relations(&head).await.unwrap().supplements,
             owned(&[("a/y", y), ("z/x", y)])
         );
         // The new key comes after the stored keys, and the other key stays.
@@ -921,11 +933,11 @@ fn add_detached_related_replaces_by_name_and_keeps_the_sort() {
         // A commit with no detached metadata gets a dict with the one key. A
         // checksum that the repository does not hold is accepted.
         let absent = Checksum::from_ay(&[0x31; 32]).unwrap();
-        repo.add_detached_related(&x, "layer/gone", &absent)
+        repo.add_supplement(&x, "layer/gone", &absent)
             .await
             .unwrap();
         assert_eq!(
-            repo.read_commit_related(&x).await.unwrap().build_sources,
+            repo.read_commit_relations(&x).await.unwrap().supplements,
             owned(&[("layer/gone", absent)])
         );
         assert_eq!(detached_keys(&repo, &x).await, [RELATED_KEY]);
@@ -933,7 +945,7 @@ fn add_detached_related_replaces_by_name_and_keeps_the_sort() {
 }
 
 #[test]
-fn add_detached_related_edits_the_first_key() {
+fn add_supplement_edits_the_first_key() {
     let tmp = TmpDir::new("related-add-first-key");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
@@ -947,7 +959,7 @@ fn add_detached_related_edits_the_first_key() {
         repo.write_commit_detached_metadata(&head, Some(&meta))
             .await
             .unwrap();
-        repo.add_detached_related(&head, "source/added", &src)
+        repo.add_supplement(&head, "source/added", &src)
             .await
             .unwrap();
         let expected = dict(vec![
@@ -968,30 +980,27 @@ fn add_detached_related_edits_the_first_key() {
 }
 
 #[test]
-fn add_detached_related_refuses_an_empty_name() {
+fn add_supplement_refuses_an_empty_name() {
     let tmp = TmpDir::new("related-add-empty-name");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
         let src = commit(&repo, tmp.path(), "src", &[]).await;
         let head = commit(&repo, tmp.path(), "head", &[]).await;
-        repo.add_detached_related(&head, "source/src", &src)
+        repo.add_supplement(&head, "source/src", &src)
             .await
             .unwrap();
         let before = objects(&repo);
         let expected = (
             Some(head),
-            RelatedField::BuildSources,
+            RelationField::Supplements,
             "the new entry has an empty name".to_owned(),
         );
-        let err = repo
-            .add_detached_related(&head, "", &src)
-            .await
-            .unwrap_err();
+        let err = repo.add_supplement(&head, "", &src).await.unwrap_err();
         assert_eq!(related_error(err), expected);
         assert_eq!(objects(&repo), before, "the refused add writes nothing");
 
         let txn = repo.transaction().await.unwrap();
-        let err = txn.add_detached_related(&head, "", &src).unwrap_err();
+        let err = txn.add_supplement(&head, "", &src).unwrap_err();
         assert_eq!(related_error(err), expected);
         txn.commit().await.unwrap();
         assert_eq!(objects(&repo), before, "the refused add queues nothing");
@@ -999,7 +1008,7 @@ fn add_detached_related_refuses_an_empty_name() {
 }
 
 #[test]
-fn add_detached_related_of_an_absent_commit() {
+fn add_supplement_of_an_absent_commit() {
     let tmp = TmpDir::new("related-add-absent");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src"]).await;
@@ -1007,7 +1016,7 @@ fn add_detached_related_of_an_absent_commit() {
         let absent = Checksum::from_ay(&[0x77; 32]).unwrap();
         let before = objects(&repo);
         let err = repo
-            .add_detached_related(&absent, "source/src", &src)
+            .add_supplement(&absent, "source/src", &src)
             .await
             .unwrap_err();
         assert!(
@@ -1019,7 +1028,7 @@ fn add_detached_related_of_an_absent_commit() {
 }
 
 #[test]
-fn add_detached_related_refuses_a_defective_stored_value() {
+fn add_supplement_refuses_a_defective_stored_value() {
     let tmp = TmpDir::new("related-add-defective");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
@@ -1033,12 +1042,12 @@ fn add_detached_related_refuses_a_defective_stored_value() {
         let before = objects(&repo);
         let expected = (
             Some(head),
-            RelatedField::BuildSources,
+            RelationField::Supplements,
             "entry 0 (source/short) has a checksum of 31 bytes, not 32".to_owned(),
         );
 
         let err = repo
-            .add_detached_related(&head, "source/src", &src)
+            .add_supplement(&head, "source/src", &src)
             .await
             .unwrap_err();
         assert_eq!(related_error(err), expected);
@@ -1048,7 +1057,7 @@ fn add_detached_related_refuses_a_defective_stored_value() {
         // writes no ref, and the file stays as it was.
         let refs_before = refs(&repo);
         let txn = repo.transaction().await.unwrap();
-        txn.add_detached_related(&head, "source/src", &src).unwrap();
+        txn.add_supplement(&head, "source/src", &src).unwrap();
         txn.set_ref(&Ref::local("main"), Some(&head));
         let err = txn.commit().await.unwrap_err();
         assert_eq!(related_error(err), expected);
@@ -1058,7 +1067,7 @@ fn add_detached_related_refuses_a_defective_stored_value() {
 }
 
 #[test]
-fn transaction_add_detached_related_gives_the_result_of_the_repo_add() {
+fn transaction_add_supplement_gives_the_result_of_the_repo_add() {
     let tmp = TmpDir::new("related-add-txn");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["x", "y", "one", "two"]).await;
@@ -1069,13 +1078,11 @@ fn transaction_add_detached_related_gives_the_result_of_the_repo_add() {
         let adds = [("z/x", x), ("a/y", y), ("z/x", y)];
 
         for (name, source) in adds {
-            repo.add_detached_related(&one, name, &source)
-                .await
-                .unwrap();
+            repo.add_supplement(&one, name, &source).await.unwrap();
         }
         let txn = repo.transaction().await.unwrap();
         for (name, source) in adds {
-            txn.add_detached_related(&two, name, &source).unwrap();
+            txn.add_supplement(&two, name, &source).unwrap();
         }
         txn.commit().await.unwrap();
         assert_eq!(
@@ -1083,7 +1090,7 @@ fn transaction_add_detached_related_gives_the_result_of_the_repo_add() {
             repo.read_commit_detached_metadata(&one).await.unwrap()
         );
         assert_eq!(
-            repo.read_commit_related(&two).await.unwrap().build_sources,
+            repo.read_commit_relations(&two).await.unwrap().supplements,
             owned(&[("a/y", y), ("z/x", y)])
         );
     });
@@ -1099,7 +1106,7 @@ fn transaction_adds_apply_after_the_queued_dict_and_before_the_signatures() {
 
         let txn = repo.transaction().await.unwrap();
         txn.set_commit_detached_metadata(&head, dict(vec![("test.note", string("n"))]));
-        txn.add_detached_related(&head, "source/src", &src).unwrap();
+        txn.add_supplement(&head, "source/src", &src).unwrap();
         txn.sign_commit(&head, &DummySigner::new("key"))
             .await
             .unwrap();
@@ -1108,22 +1115,21 @@ fn transaction_adds_apply_after_the_queued_dict_and_before_the_signatures() {
         assert_eq!(keys.len(), 3, "got {keys:?}");
         assert_eq!(keys[..2], ["test.note", RELATED_KEY]);
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().build_sources,
+            repo.read_commit_relations(&head).await.unwrap().supplements,
             owned(&[("source/src", src)])
         );
 
         // A queued dict after an add drops the add.
         let txn = repo.transaction().await.unwrap();
-        txn.add_detached_related(&head, "source/other", &src)
-            .unwrap();
+        txn.add_supplement(&head, "source/other", &src).unwrap();
         txn.set_commit_detached_metadata(&head, dict(vec![("test.note", string("m"))]));
         txn.commit().await.unwrap();
         assert_eq!(detached_keys(&repo, &head).await, ["test.note"]);
         assert!(
-            repo.read_commit_related(&head)
+            repo.read_commit_relations(&head)
                 .await
                 .unwrap()
-                .build_sources
+                .supplements
                 .is_empty()
         );
     });
@@ -1160,11 +1166,11 @@ fn a_local_write_keeps_the_related_key_under_the_switch() {
         let txn = repo.transaction().await.unwrap();
         txn.set_commit_detached_metadata(&two, meta.clone());
         txn.commit().await.unwrap();
-        repo.add_detached_related(&three, "source/src", &src)
+        repo.add_supplement(&three, "source/src", &src)
             .await
             .unwrap();
         let txn = repo.transaction().await.unwrap();
-        txn.add_detached_related(&four, "source/src", &src).unwrap();
+        txn.add_supplement(&four, "source/src", &src).unwrap();
         txn.commit().await.unwrap();
 
         for head in [one, two, three, four] {
@@ -1179,7 +1185,7 @@ fn a_local_write_keeps_the_related_key_under_the_switch() {
                 "{head}"
             );
             assert_eq!(
-                repo.read_commit_related(&head).await.unwrap().build_sources,
+                repo.read_commit_relations(&head).await.unwrap().supplements,
                 owned(&[("source/src", src)]),
                 "{head}"
             );
@@ -1205,7 +1211,7 @@ fn defective_values() -> Vec<((Type, Value), &'static str)> {
 }
 
 #[test]
-fn write_commit_detached_metadata_checks_each_build_source_key() {
+fn write_commit_detached_metadata_checks_each_supplement_key() {
     let tmp = TmpDir::new("related-write-check");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
@@ -1235,7 +1241,7 @@ fn write_commit_detached_metadata_checks_each_build_source_key() {
                 );
                 assert_eq!(
                     related_error(err),
-                    (Some(head), RelatedField::BuildSources, reason.to_owned())
+                    (Some(head), RelationField::Supplements, reason.to_owned())
                 );
                 assert_eq!(objects(&repo), before, "the refused write writes nothing");
             }
@@ -1296,7 +1302,7 @@ fn write_commit_detached_metadata_checks_before_the_lock() {
             related_error(err),
             (
                 Some(head),
-                RelatedField::BuildSources,
+                RelationField::Supplements,
                 "entry 0 has an empty name".to_owned()
             ),
             "the check comes before the lock"
@@ -1326,7 +1332,7 @@ fn a_queued_defective_dict_fails_the_commit() {
             let err = txn.commit().await.unwrap_err();
             assert_eq!(
                 related_error(err),
-                (Some(head), RelatedField::BuildSources, reason.to_owned())
+                (Some(head), RelationField::Supplements, reason.to_owned())
             );
             assert_eq!(
                 objects(&repo),

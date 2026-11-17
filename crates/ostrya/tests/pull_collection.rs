@@ -1144,9 +1144,7 @@ fn the_switch_drops_the_related_key_of_a_collection_pull() {
         a.write_commit_detached_metadata(&tip, Some(&kept))
             .await
             .unwrap();
-        a.add_detached_related(&tip, "layer/base", &base)
-            .await
-            .unwrap();
+        a.add_supplement(&tip, "layer/base", &base).await.unwrap();
         summarize(&a).await;
         let server_a = RepoServer::start(&dir.path().join("a"), false).await;
         drop(dest(dir.path(), None, &[("a", &server_a.url(), "")]).await);
@@ -1236,7 +1234,7 @@ fn a_bad_fsync_value_refuses_a_collection_pull() {
 /// names, complete, and writes no ref for it. The dependency gets no binding
 /// check.
 #[test]
-fn a_collection_pull_fetches_the_dependency() {
+fn a_collection_pull_fetches_the_attachment() {
     block_on(async {
         let dir = TmpDir::new("pull-collection-dependency");
         let a = create(dir.path(), "a", Some(ID)).await;
@@ -1244,9 +1242,9 @@ fn a_collection_pull_fetches_the_dependency() {
             collection: None,
             refs: None,
         };
-        let dep = commit(&a, dir.path(), "dep", None, "os/dep", FIXED_TS, unbound).await;
+        let att = commit(&a, dir.path(), "dep", None, "os/dep", FIXED_TS, unbound).await;
         let plain = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
-        let tip = store_with_field2(&a, &plain, &[("boot/uki", dep.as_bytes())]).await;
+        let tip = store_with_field2(&a, &plain, &[("boot/uki", att.as_bytes())]).await;
         let txn = a.transaction().await.unwrap();
         txn.set_ref(&Ref::local(REF), Some(&tip));
         txn.commit().await.unwrap();
@@ -1261,12 +1259,12 @@ fn a_collection_pull_fetches_the_dependency() {
         assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
         assert!(dest.list_refs(None).await.unwrap().is_empty());
         assert!(dest.list_remote_refs().await.unwrap().is_empty());
-        assert!(dest.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert!(dest.has_object(ObjectType::Commit, &att).await.unwrap());
         assert_eq!(
-            dest.commit_state(&dep).await.unwrap(),
+            dest.commit_state(&att).await.unwrap(),
             ostrya::CommitState::Normal
         );
-        for name in &a.traverse_commit(&dep, 0).await.unwrap() {
+        for name in &a.traverse_commit(&att, 0).await.unwrap() {
             assert!(
                 dest.has_object(name.ty, &name.checksum).await.unwrap(),
                 "{name} missing from the destination"

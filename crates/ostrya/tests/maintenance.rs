@@ -1768,7 +1768,7 @@ fn fsck_binding_checks_report_each_kind() {
 /// Commits the tree at `base/rel` with the dependencies `related` in field 2
 /// to `repo`, points the branch `branch` at it if one is given, and returns
 /// the new commit.
-async fn dependency_commit(
+async fn attachment_commit(
     repo: &Repo,
     base: &Path,
     rel: &str,
@@ -1793,7 +1793,7 @@ async fn dependency_commit(
             CommitOptions {
                 subject: Some("c".to_owned()),
                 timestamp: Some(1_700_000_000),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -1813,15 +1813,15 @@ async fn dependency_commit(
 /// Creates an archive repository under `base/repo` with a commit that no ref
 /// names, and the branch `main`, whose field 2 names that commit as
 /// `boot/uki`. Returns the repository, the tip, and the dependency.
-async fn build_dependency_repo(base: &Path) -> (Repo, Checksum, Checksum) {
+async fn build_attachment_repo(base: &Path) -> (Repo, Checksum, Checksum) {
     write_tree(&base.join("uki"), "uki.txt", b"uki\n");
     write_tree(&base.join("main"), "main.txt", b"main\n");
     let repo = Repo::create(&base.join("repo"), CreateOptions::new(RepoMode::Archive))
         .await
         .unwrap();
-    let dep = dependency_commit(&repo, base, "uki", None, &[]).await;
-    let tip = dependency_commit(&repo, base, "main", Some("main"), &[("boot/uki", dep)]).await;
-    (repo, tip, dep)
+    let att = attachment_commit(&repo, base, "uki", None, &[]).await;
+    let tip = attachment_commit(&repo, base, "main", Some("main"), &[("boot/uki", att)]).await;
+    (repo, tip, att)
 }
 
 /// Removes the loose object `name` from the archive repository `repo`.
@@ -1835,29 +1835,29 @@ fn remove_object(repo: &Repo, name: ObjectName) {
 }
 
 /// Returns the finding of a dependency.
-fn dependency_finding(
+fn attachment_finding(
     commit: Checksum,
     name: &str,
-    dependency: Option<Checksum>,
-    kind: ostrya::FsckDependencyErrorKind,
-) -> ostrya::FsckDependencyError {
-    ostrya::FsckDependencyError {
+    attachment: Option<Checksum>,
+    kind: ostrya::FsckAttachmentErrorKind,
+) -> ostrya::FsckAttachmentError {
+    ostrya::FsckAttachmentError {
         commit,
         name: name.to_owned(),
-        dependency,
+        attachment,
         kind,
     }
 }
 
 #[test]
-fn fsck_passes_with_complete_dependencies() {
+fn fsck_passes_with_complete_attachments() {
     let tmp = TmpDir::new("maint-fsck-dep-ok");
     block_on(async {
-        let (repo, _tip, _dep) = build_dependency_repo(tmp.path()).await;
+        let (repo, _tip, _att) = build_attachment_repo(tmp.path()).await;
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
         assert!(report.is_ok(), "{report:?}");
         assert_eq!(report.commits_checked, 2);
-        assert!(report.dependency_errors.is_empty());
+        assert!(report.attachment_errors.is_empty());
         assert!(report.marked_partial.is_empty());
     });
 }
@@ -1866,11 +1866,11 @@ fn fsck_passes_with_complete_dependencies() {
 /// partial. A pull of the ref of that commit then fetches the dependency, and
 /// the next run is clean.
 #[test]
-fn fsck_marks_the_commit_of_an_absent_dependency_and_a_pull_repairs_it() {
+fn fsck_marks_the_commit_of_an_absent_attachment_and_a_pull_repairs_it() {
     let tmp = TmpDir::new("maint-fsck-dep-absent");
     block_on(async {
         let base = tmp.path();
-        let (src, tip, dep) = build_dependency_repo(base).await;
+        let (src, tip, att) = build_attachment_repo(base).await;
         let dst = Repo::create(&base.join("dst"), CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
@@ -1879,21 +1879,21 @@ fn fsck_marks_the_commit_of_an_absent_dependency_and_a_pull_repairs_it() {
             ..ostrya::PullOptions::default()
         };
         dst.pull_local(&src, main()).await.unwrap();
-        remove_object(&dst, ObjectName::new(dep, ObjectType::Commit));
+        remove_object(&dst, ObjectName::new(att, ObjectType::Commit));
 
         let report = dst.fsck(&FsckOptions::new()).await.unwrap();
-        let finding = dependency_finding(
+        let finding = attachment_finding(
             tip,
             "boot/uki",
-            Some(dep),
-            ostrya::FsckDependencyErrorKind::Absent,
+            Some(att),
+            ostrya::FsckAttachmentErrorKind::Absent,
         );
-        assert_eq!(report.dependency_errors, std::slice::from_ref(&finding));
+        assert_eq!(report.attachment_errors, std::slice::from_ref(&finding));
         assert_eq!(
             finding.to_string(),
             format!(
                 "related commits in field 2 of commit {tip}: dependency boot/uki names commit \
-                 {dep}, which the repository does not hold"
+                 {att}, which the repository does not hold"
             )
         );
         assert!(report.errors.is_empty(), "{:?}", report.errors);
@@ -1905,7 +1905,7 @@ fn fsck_marks_the_commit_of_an_absent_dependency_and_a_pull_repairs_it() {
         );
 
         dst.pull_local(&src, main()).await.unwrap();
-        assert!(dst.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert!(dst.has_object(ObjectType::Commit, &att).await.unwrap());
         let again = dst.fsck(&FsckOptions::new()).await.unwrap();
         assert!(again.is_ok(), "{again:?}");
     });
@@ -1914,20 +1914,20 @@ fn fsck_marks_the_commit_of_an_absent_dependency_and_a_pull_repairs_it() {
 /// With `mark_partial` off, the run writes no marker. A checksum under two
 /// names gives two findings, in the stored order.
 #[test]
-fn fsck_reports_an_absent_dependency_without_a_marker() {
+fn fsck_reports_an_absent_attachment_without_a_marker() {
     let tmp = TmpDir::new("maint-fsck-dep-nomark");
     block_on(async {
         let base = tmp.path();
-        let (repo, first, dep) = build_dependency_repo(base).await;
-        let tip = dependency_commit(
+        let (repo, first, att) = build_attachment_repo(base).await;
+        let tip = attachment_commit(
             &repo,
             base,
             "main",
             Some("main"),
-            &[("boot/a", dep), ("boot/b", dep)],
+            &[("boot/a", att), ("boot/b", att)],
         )
         .await;
-        remove_object(&repo, ObjectName::new(dep, ObjectType::Commit));
+        remove_object(&repo, ObjectName::new(att, ObjectType::Commit));
 
         let report = repo
             .fsck(&FsckOptions {
@@ -1937,11 +1937,11 @@ fn fsck_reports_an_absent_dependency_without_a_marker() {
             .await
             .unwrap();
         let absent = |commit, name| {
-            dependency_finding(
+            attachment_finding(
                 commit,
                 name,
-                Some(dep),
-                ostrya::FsckDependencyErrorKind::Absent,
+                Some(att),
+                ostrya::FsckAttachmentErrorKind::Absent,
             )
         };
         let mut expected = vec![
@@ -1950,7 +1950,7 @@ fn fsck_reports_an_absent_dependency_without_a_marker() {
             absent(tip, "boot/b"),
         ];
         expected.sort_by_key(|error| error.commit);
-        assert_eq!(report.dependency_errors, expected);
+        assert_eq!(report.attachment_errors, expected);
         assert!(report.marked_partial.is_empty());
         for commit in [first, tip] {
             assert_eq!(
@@ -1961,28 +1961,28 @@ fn fsck_reports_an_absent_dependency_without_a_marker() {
     });
 }
 
-/// With `mark_dependencies` off, the run reports an absent dependency and
+/// With `mark_attachments` off, the run reports an absent dependency and
 /// writes no marker. A second run gives the same finding.
 #[test]
-fn fsck_without_dependency_marks_reports_an_absent_dependency_and_marks_nothing() {
+fn fsck_without_attachment_marks_reports_an_absent_attachment_and_marks_nothing() {
     let tmp = TmpDir::new("maint-fsck-dep-nodepmark");
     block_on(async {
-        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
-        remove_object(&repo, ObjectName::new(dep, ObjectType::Commit));
+        let (repo, tip, att) = build_attachment_repo(tmp.path()).await;
+        remove_object(&repo, ObjectName::new(att, ObjectType::Commit));
         let opts = FsckOptions {
-            mark_dependencies: false,
+            mark_attachments: false,
             ..FsckOptions::new()
         };
-        let finding = dependency_finding(
+        let finding = attachment_finding(
             tip,
             "boot/uki",
-            Some(dep),
-            ostrya::FsckDependencyErrorKind::Absent,
+            Some(att),
+            ostrya::FsckAttachmentErrorKind::Absent,
         );
 
         for _ in 0..2 {
             let report = repo.fsck(&opts).await.unwrap();
-            assert_eq!(report.dependency_errors, std::slice::from_ref(&finding));
+            assert_eq!(report.attachment_errors, std::slice::from_ref(&finding));
             assert!(report.errors.is_empty(), "{:?}", report.errors);
             assert!(report.marked_partial.is_empty());
             assert!(!report.is_ok());
@@ -1994,14 +1994,14 @@ fn fsck_without_dependency_marks_reports_an_absent_dependency_and_marks_nothing(
     });
 }
 
-/// With `mark_dependencies` off, an absent object still marks the commit
+/// With `mark_attachments` off, an absent object still marks the commit
 /// that reaches it, and the dependency finding stays.
 #[test]
-fn fsck_without_dependency_marks_still_marks_the_commit_of_an_absent_object() {
+fn fsck_without_attachment_marks_still_marks_the_commit_of_an_absent_object() {
     let tmp = TmpDir::new("maint-fsck-dep-objmark");
     block_on(async {
-        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
-        let shared: HashSet<ObjectName> = repo.traverse_commit(&dep, 0).await.unwrap();
+        let (repo, tip, att) = build_attachment_repo(tmp.path()).await;
+        let shared: HashSet<ObjectName> = repo.traverse_commit(&att, 0).await.unwrap();
         let file = repo
             .traverse_commit(&tip, 0)
             .await
@@ -2010,11 +2010,11 @@ fn fsck_without_dependency_marks_still_marks_the_commit_of_an_absent_object() {
             .find(|name| name.ty == ObjectType::File && !shared.contains(name))
             .expect("a file of the tip alone");
         remove_object(&repo, file);
-        remove_object(&repo, ObjectName::new(dep, ObjectType::Commit));
+        remove_object(&repo, ObjectName::new(att, ObjectType::Commit));
 
         let report = repo
             .fsck(&FsckOptions {
-                mark_dependencies: false,
+                mark_attachments: false,
                 ..FsckOptions::new()
             })
             .await
@@ -2022,12 +2022,12 @@ fn fsck_without_dependency_marks_still_marks_the_commit_of_an_absent_object() {
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
         assert_eq!(report.errors[0].in_commits, [tip]);
         assert_eq!(
-            report.dependency_errors,
-            [dependency_finding(
+            report.attachment_errors,
+            [attachment_finding(
                 tip,
                 "boot/uki",
-                Some(dep),
-                ostrya::FsckDependencyErrorKind::Absent,
+                Some(att),
+                ostrya::FsckAttachmentErrorKind::Absent,
             )]
         );
         assert_eq!(report.marked_partial, [tip]);
@@ -2041,24 +2041,24 @@ fn fsck_without_dependency_marks_still_marks_the_commit_of_an_absent_object() {
 /// A dependency with a marker, and a dependency whose tree misses a file,
 /// are each partial in the same run.
 #[test]
-fn fsck_reports_a_partial_dependency() {
+fn fsck_reports_a_partial_attachment() {
     let tmp = TmpDir::new("maint-fsck-dep-partial");
     block_on(async {
-        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
-        common::mark_partial(&repo, &dep);
+        let (repo, tip, att) = build_attachment_repo(tmp.path()).await;
+        common::mark_partial(&repo, &att);
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
-        let partial = dependency_finding(
+        let partial = attachment_finding(
             tip,
             "boot/uki",
-            Some(dep),
-            ostrya::FsckDependencyErrorKind::Partial,
+            Some(att),
+            ostrya::FsckAttachmentErrorKind::Partial,
         );
-        assert_eq!(report.dependency_errors, std::slice::from_ref(&partial));
+        assert_eq!(report.attachment_errors, std::slice::from_ref(&partial));
         assert!(
             partial
                 .to_string()
-                .ends_with(&format!("names commit {dep}, which is partial")),
+                .ends_with(&format!("names commit {att}, which is partial")),
             "{partial}"
         );
         assert_eq!(report.commits_partial, 1);
@@ -2066,11 +2066,11 @@ fn fsck_reports_a_partial_dependency() {
 
         // The same tree with its own marker removed and one file of its own
         // removed.
-        std::fs::remove_file(repo.path().join(format!("state/{dep}.commitpartial"))).unwrap();
+        std::fs::remove_file(repo.path().join(format!("state/{att}.commitpartial"))).unwrap();
         std::fs::remove_file(repo.path().join(format!("state/{tip}.commitpartial"))).unwrap();
         let shared: HashSet<ObjectName> = repo.traverse_commit(&tip, 0).await.unwrap();
         let file = repo
-            .traverse_commit(&dep, 0)
+            .traverse_commit(&att, 0)
             .await
             .unwrap()
             .into_iter()
@@ -2080,9 +2080,9 @@ fn fsck_reports_a_partial_dependency() {
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
-        assert_eq!(report.errors[0].in_commits, [dep]);
-        assert_eq!(report.dependency_errors, [partial]);
-        let mut marked = vec![dep, tip];
+        assert_eq!(report.errors[0].in_commits, [att]);
+        assert_eq!(report.attachment_errors, [partial]);
+        let mut marked = vec![att, tip];
         marked.sort();
         assert_eq!(report.marked_partial, marked);
     });
@@ -2091,29 +2091,29 @@ fn fsck_reports_a_partial_dependency() {
 /// A defective entry and a nested dependency each give one `Defective`
 /// finding and no marker.
 #[test]
-fn fsck_reports_defective_dependencies_without_a_marker() {
+fn fsck_reports_defective_attachments_without_a_marker() {
     let tmp = TmpDir::new("maint-fsck-dep-defective");
     block_on(async {
         let base = tmp.path();
-        let (repo, tip, dep) = build_dependency_repo(base).await;
+        let (repo, tip, att) = build_attachment_repo(base).await;
         let defective =
-            common::store_with_field2(&repo, &dep, &[("", dep.as_bytes()), ("lib/a", &[7; 31])])
+            common::store_with_field2(&repo, &att, &[("", att.as_bytes()), ("lib/a", &[7; 31])])
                 .await;
-        // `tip` names `dep`, so a commit that names `tip` names a nested
+        // `tip` names `att`, so a commit that names `tip` names a nested
         // dependency.
-        let nested = common::store_with_field2(&repo, &dep, &[("lib/b", tip.as_bytes())]).await;
+        let nested = common::store_with_field2(&repo, &att, &[("lib/b", tip.as_bytes())]).await;
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
-        let kind = |reason: &str| ostrya::FsckDependencyErrorKind::Defective(reason.to_owned());
+        let kind = |reason: &str| ostrya::FsckAttachmentErrorKind::Defective(reason.to_owned());
         let mut expected = vec![
-            dependency_finding(defective, "", Some(dep), kind("entry 0 has an empty name")),
-            dependency_finding(
+            attachment_finding(defective, "", Some(att), kind("entry 0 has an empty name")),
+            attachment_finding(
                 defective,
                 "lib/a",
                 None,
                 kind("entry 1 (lib/a) has a checksum of 31 bytes, not 32"),
             ),
-            dependency_finding(
+            attachment_finding(
                 nested,
                 "lib/b",
                 Some(tip),
@@ -2123,7 +2123,7 @@ fn fsck_reports_defective_dependencies_without_a_marker() {
             ),
         ];
         expected.sort_by_key(|error| error.commit);
-        assert_eq!(report.dependency_errors, expected);
+        assert_eq!(report.attachment_errors, expected);
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.marked_partial.is_empty());
         assert!(!report.is_ok());
@@ -2147,19 +2147,19 @@ fn object_file(repo: &Repo, name: ObjectName) -> std::path::PathBuf {
 /// With `delete`, a dependency whose commit object has the bytes of another
 /// commit is deleted, and the commit that names it gets an `Absent` finding.
 #[test]
-fn fsck_delete_removes_a_bad_dependency_commit_and_reports_it_absent() {
+fn fsck_delete_removes_a_bad_attachment_commit_and_reports_it_absent() {
     let tmp = TmpDir::new("maint-fsck-dep-delete-commit");
     block_on(async {
         let base = tmp.path();
-        let (repo, tip, dep) = build_dependency_repo(base).await;
-        let other = dependency_commit(&repo, base, "main", None, &[]).await;
-        let dep_name = ObjectName::new(dep, ObjectType::Commit);
+        let (repo, tip, att) = build_attachment_repo(base).await;
+        let other = attachment_commit(&repo, base, "main", None, &[]).await;
+        let att_name = ObjectName::new(att, ObjectType::Commit);
         let bytes = std::fs::read(object_file(
             &repo,
             ObjectName::new(other, ObjectType::Commit),
         ))
         .unwrap();
-        std::fs::write(object_file(&repo, dep_name), bytes).unwrap();
+        std::fs::write(object_file(&repo, att_name), bytes).unwrap();
 
         let report = repo
             .fsck(&FsckOptions {
@@ -2168,15 +2168,15 @@ fn fsck_delete_removes_a_bad_dependency_commit_and_reports_it_absent() {
             })
             .await
             .unwrap();
-        assert_eq!(report.deleted, [dep_name]);
-        assert!(!object_file(&repo, dep_name).exists());
+        assert_eq!(report.deleted, [att_name]);
+        assert!(!object_file(&repo, att_name).exists());
         assert_eq!(
-            report.dependency_errors,
-            [dependency_finding(
+            report.attachment_errors,
+            [attachment_finding(
                 tip,
                 "boot/uki",
-                Some(dep),
-                ostrya::FsckDependencyErrorKind::Absent,
+                Some(att),
+                ostrya::FsckAttachmentErrorKind::Absent,
             )]
         );
         assert!(report.marked_partial.contains(&tip), "{report:?}");
@@ -2187,13 +2187,13 @@ fn fsck_delete_removes_a_bad_dependency_commit_and_reports_it_absent() {
 /// bad object of it gets a `Partial` finding. Without `delete`, the bad
 /// object alone leaves the dependency complete.
 #[test]
-fn fsck_delete_of_a_bad_object_makes_its_dependency_partial() {
+fn fsck_delete_of_a_bad_object_makes_its_attachment_partial() {
     let tmp = TmpDir::new("maint-fsck-dep-delete-object");
     block_on(async {
-        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
+        let (repo, tip, att) = build_attachment_repo(tmp.path()).await;
         let shared: HashSet<ObjectName> = repo.traverse_commit(&tip, 0).await.unwrap();
         let file = repo
-            .traverse_commit(&dep, 0)
+            .traverse_commit(&att, 0)
             .await
             .unwrap()
             .into_iter()
@@ -2203,7 +2203,7 @@ fn fsck_delete_of_a_bad_object_makes_its_dependency_partial() {
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
         assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
-        assert!(report.dependency_errors.is_empty(), "{report:?}");
+        assert!(report.attachment_errors.is_empty(), "{report:?}");
         assert!(report.marked_partial.is_empty());
 
         let report = repo
@@ -2215,15 +2215,15 @@ fn fsck_delete_of_a_bad_object_makes_its_dependency_partial() {
             .unwrap();
         assert_eq!(report.deleted, [file]);
         assert_eq!(
-            report.dependency_errors,
-            [dependency_finding(
+            report.attachment_errors,
+            [attachment_finding(
                 tip,
                 "boot/uki",
-                Some(dep),
-                ostrya::FsckDependencyErrorKind::Partial,
+                Some(att),
+                ostrya::FsckAttachmentErrorKind::Partial,
             )]
         );
-        let mut marked = vec![dep, tip];
+        let mut marked = vec![att, tip];
         marked.sort();
         assert_eq!(report.marked_partial, marked);
     });
@@ -2240,8 +2240,8 @@ fn fsck_options_and_report_are_send_sync() {
     assert_send_sync::<ostrya::FsckError>();
     assert_send_sync::<ostrya::FsckBindingError>();
     assert_send_sync::<ostrya::FsckFailure>();
-    assert_send_sync::<ostrya::FsckDependencyError>();
-    assert_send_sync::<ostrya::FsckDependencyErrorKind>();
+    assert_send_sync::<ostrya::FsckAttachmentError>();
+    assert_send_sync::<ostrya::FsckAttachmentErrorKind>();
 }
 
 /// Finds one loose object with the extension `ext` under the repository `repo`.

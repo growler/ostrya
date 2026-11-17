@@ -3166,16 +3166,16 @@ the rules.
   Thus a reader finds the related commits with no repository config, and
   the check of a write is the same in each repository.
 - A dependency names no dependency. The commit write and the composefs
-  rewrite refuse a nested dependency with `Error::InvalidRelated`. A
+  rewrite refuse a nested dependency with `Error::InvalidRelations`. A
   dependency can have a parent and build sources. A UKI, a kernel, an
   initrd, or a container needs no dependency of its own. With one level,
   field 2 cannot make a cycle, and a check reads one commit and the commits
   that it names.
 - The commit write of `ostrya commit` checks each dependency one time.
-  `Transaction::check_related` checks the dependencies before the command
-  reads the tree, and gives a `CheckedRelated` that borrows the transaction.
+  `Transaction::check_attachments` checks the dependencies before the command
+  reads the tree, and gives a `CheckedAttachments` that borrows the transaction.
   `Transaction::write_commit_checked` takes it and writes the sorted entries
-  with no second check. It refuses a `CheckedRelated` of another
+  with no second check. It refuses a `CheckedAttachments` of another
   transaction. A process outside the transaction can make a dependency
   partial or absent after the check: an fsck, which takes no repository
   lock, or a prune in a repository with `[core] locking=false`. The write
@@ -3193,7 +3193,7 @@ the rules.
   warning. To keep too much is the safe direction.
 - Build sources are recursive in the local prune: the prune reads
   `ostrya.related` of each commit that it reaches, a build source included.
-  `Repo::add_detached_related` can make a cycle. The walk reads the fields of
+  `Repo::add_supplement` can make a cycle. The walk reads the fields of
   each commit one time, so a cycle ends the walk.
 - A related entry that names a commit that the repository does not hold
   gives no error, and the walk reads nothing below it. The prune keeps the
@@ -3356,20 +3356,20 @@ the rules.
   trust.
 - The fsck (`Repo::fsck` and `ostrya fsck`) reports each dependency of a
   commit that it checks that is absent, partial, or defective, in
-  `FsckReport::dependency_errors`. A nested dependency is defective. The run
+  `FsckReport::attachment_errors`. A nested dependency is defective. The run
   reads field 2 from the read of its object walk, and classifies each entry
   against the state after its own findings: a dependency that the run
   deletes is absent, and a dependency whose tree the run finds incomplete is
-  partial. Under `mark_partial` and `mark_dependencies`, the run marks the
+  partial. Under `mark_partial` and `mark_attachments`, the run marks the
   commit of an absent or a partial dependency as partial, so a later pull
   fetches the commit again with its dependencies. A pull cannot repair a
-  defective entry, so it gets no marker. `mark_dependencies` is a separate
+  defective entry, so it gets no marker. `mark_attachments` is a separate
   switch, because a caller can accept a commit whose dependencies are
   absent and still need the marks of absent objects. A pull walks the tree
   of a commit only when the commit is marked partial. One enum in place of
   `mark_partial` was rejected: it removes the field `mark_partial`, so it
   breaks each caller that sets the field, also a caller that starts from
-  `..FsckOptions::new()`. The field `mark_dependencies` breaks only a caller
+  `..FsckOptions::new()`. The field `mark_attachments` breaks only a caller
   that builds the struct with a full literal. Public marker functions were
   rejected: the marks are on disk before `Repo::fsck` returns, so a caller
   cannot filter the findings first. The marks of this check do not change

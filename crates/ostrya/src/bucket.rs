@@ -132,7 +132,7 @@
 //!   with a partial-commit marker included. Each entry must have a name that
 //!   is not empty and a checksum of 32 bytes. The listing must hold the
 //!   commit of each dependency, the bucket must hold no partial-commit marker
-//!   of it, and its field 2 must be empty. Each fault is a `Dependency`
+//!   of it, and its field 2 must be empty. Each fault is an `Attachment`
 //!   finding. With `delete`, the check reads the state after the repair.
 //! - The partial-commit markers of the commits whose trees are whole, the
 //!   incomplete multipart uploads, and a writer lock at the start or at the
@@ -159,8 +159,8 @@
 //! repair: a dependency whose marker the run deletes is not partial, a
 //! dependency that gets a marker is partial, a dependency whose commit
 //! object the run deletes is absent, and a commit whose own object the run
-//! deletes gets no check. The run writes and deletes no key for a
-//! `Dependency` finding. A push of a ref whose commit has a marker uploads
+//! deletes gets no check. The run writes and deletes no key for an
+//! `Attachment` finding. A push of a ref whose commit has a marker uploads
 //! the missing objects of its tree. A repair that fails after its first change gives
 //! [`Error::BucketRepairIncomplete`](crate::Error::BucketRepairIncomplete),
 //! with the report of the changes that completed: run the fsck with

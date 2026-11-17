@@ -617,7 +617,7 @@ mod tests {
             repo.write_commit_detached_metadata(&commit, Some(&dict.build()))
                 .await
                 .unwrap();
-            repo.add_detached_related(&commit, "build/source", &commit)
+            repo.add_supplement(&commit, "build/source", &commit)
                 .await
                 .unwrap();
 
@@ -640,7 +640,7 @@ mod tests {
             repo.write_commit_detached_metadata(&commit, None)
                 .await
                 .unwrap();
-            repo.add_detached_related(&commit, "build/source", &commit)
+            repo.add_supplement(&commit, "build/source", &commit)
                 .await
                 .unwrap();
             assert!(
@@ -698,7 +698,7 @@ mod tests {
                 Some(&file)
             );
 
-            repo.add_detached_related(&commit, "build/source", &commit)
+            repo.add_supplement(&commit, "build/source", &commit)
                 .await
                 .unwrap();
             let file = stored(&scratch, &repo, &name);
@@ -711,7 +711,7 @@ mod tests {
             repo.write_commit_detached_metadata(&commit, None)
                 .await
                 .unwrap();
-            repo.add_detached_related(&commit, "build/source", &commit)
+            repo.add_supplement(&commit, "build/source", &commit)
                 .await
                 .unwrap();
             assert_eq!(encoded(&dropping(&repo), &commit).await, None);

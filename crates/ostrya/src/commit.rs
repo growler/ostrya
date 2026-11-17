@@ -2,16 +2,16 @@
 //!
 //! - [`Transaction::write_commit`] stages a commit object over a root tree,
 //!   with the options in [`CommitOptions`].
-//! - [`Transaction::check_related`] checks the dependencies of a new commit
-//!   before the tree is built, and gives a [`CheckedRelated`].
+//! - [`Transaction::check_attachments`] checks the dependencies of a new commit
+//!   before the tree is built, and gives a [`CheckedAttachments`].
 //!   [`Transaction::write_commit_checked`] stages the commit with these
 //!   dependencies and does not check them again.
 //! - [`Repo::read_commit_detached_metadata`] and
 //!   [`Repo::write_commit_detached_metadata`] read and write the detached
 //!   metadata of a commit.
-//! - [`Repo::read_commit_related`] reads the related commits of a commit:
+//! - [`Repo::read_commit_relations`] reads the related commits of a commit:
 //!   the dependencies and the build sources.
-//! - [`Repo::add_detached_related`] adds a build source to a commit.
+//! - [`Repo::add_supplement`] adds a build source to a commit.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -23,7 +23,7 @@ use ostrya_core::{
 
 use crate::error::{Error, Result};
 use crate::file::FileKind;
-use crate::related::{self, CommitRelated, RelatedField};
+use crate::related::{self, CommitRelations, RelationField};
 use crate::repo::Repo;
 use crate::repo_fs::{FsError, FsResultExt, Publish, RepoDir, TempFile};
 use crate::transaction::Transaction;
@@ -75,17 +75,17 @@ pub struct CommitOptions {
     /// dependency of its own. [`Transaction::write_commit`] states the rule.
     ///
     /// [`Transaction::write_commit_checked`] refuses a list that is not
-    /// empty. The [`CheckedRelated`] that it takes gives the dependencies.
+    /// empty. The [`CheckedAttachments`] that it takes gives the dependencies.
     ///
     /// A local prune keeps the dependencies of each commit that it reaches.
     /// [`Repo::prune`], "Related commits", states the rules.
-    pub related: Vec<(String, Checksum)>,
+    pub attachments: Vec<(String, Checksum)>,
 }
 
 /// The dependencies of a new commit, after the checks of
-/// [`Transaction::check_related`].
+/// [`Transaction::check_attachments`].
 ///
-/// [`Transaction::check_related`] gives it, and
+/// [`Transaction::check_attachments`] gives it, and
 /// [`Transaction::write_commit_checked`] takes it. It holds the entries sorted
 /// by name in byte order, and it borrows the transaction that checked them.
 /// A drop writes and removes nothing.
@@ -95,17 +95,17 @@ pub struct CommitOptions {
 /// [`set_per_object_fsync`](Transaction::set_per_object_fsync),
 /// [`set_generate_sizes`](Transaction::set_generate_sizes),
 /// [`commit`](Transaction::commit), and [`abort`](Transaction::abort). Call
-/// the setters before [`check_related`](Transaction::check_related).
+/// the setters before [`check_attachments`](Transaction::check_attachments).
 #[must_use = "write_commit_checked takes the checked dependencies"]
-pub struct CheckedRelated<'txn> {
+pub struct CheckedAttachments<'txn> {
     txn: &'txn Transaction,
     /// The entries, sorted by name in byte order.
     entries: Vec<(String, Checksum)>,
 }
 
-impl std::fmt::Debug for CheckedRelated<'_> {
+impl std::fmt::Debug for CheckedAttachments<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CheckedRelated")
+        f.debug_struct("CheckedAttachments")
             .field("entries", &self.entries)
             .finish_non_exhaustive()
     }
@@ -167,7 +167,7 @@ impl Transaction {
     ///
     /// # Dependencies
     ///
-    /// Field 2 of the commit object holds the entries of `opts.related`,
+    /// Field 2 of the commit object holds the entries of `opts.attachments`,
     /// sorted by name in byte order. The call refuses an entry with an empty
     /// name and two entries with the same name. It checks nothing else in a
     /// name.
@@ -180,19 +180,19 @@ impl Transaction {
     /// no dependency. It can have a parent and build sources.
     ///
     /// The call checks the dependencies as
-    /// [`check_related`](Transaction::check_related) does, after the timestamp
+    /// [`check_attachments`](Transaction::check_attachments) does, after the timestamp
     /// and before it serializes the commit. On a refusal, it writes nothing
     /// and the transaction stays open.
     ///
     /// A caller that checks the dependencies before it builds the tree calls
-    /// [`check_related`](Transaction::check_related) and then
+    /// [`check_attachments`](Transaction::check_attachments) and then
     /// [`write_commit_checked`](Transaction::write_commit_checked). Then each
     /// dependency is checked one time.
     ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
-    /// - [`Error::InvalidRelated`] if an entry of `opts.related` has an empty
+    /// - [`Error::InvalidRelations`] if an entry of `opts.attachments` has an empty
     ///   name, if two entries have the same name, or if a dependency is
     ///   absent, partial, or has a dependency of its own.
     /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
@@ -229,25 +229,25 @@ impl Transaction {
     pub async fn write_commit(&self, mut opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
         self.resolve_commit_options(&mut opts)?;
         let checked = self
-            .check_owned_related(std::mem::take(&mut opts.related))
+            .check_owned_attachments(std::mem::take(&mut opts.attachments))
             .await?;
-        opts.related = checked.entries;
+        opts.attachments = checked.entries;
         self.write_commit_unchecked(opts, root).await
     }
 
     /// Stages a commit object over the tree `root` with the dependencies
-    /// `related`, and returns its checksum.
+    /// `attachments`, and returns its checksum.
     ///
     /// The call writes the commit as [`write_commit`](Transaction::write_commit)
-    /// does. Field 2 of the commit object holds the entries of `related`,
-    /// sorted by name in byte order. `opts.related` must be empty. For the
+    /// does. Field 2 of the commit object holds the entries of `attachments`,
+    /// sorted by name in byte order. `opts.attachments` must be empty. For the
     /// same inputs, the call and `write_commit` give the same commit.
     ///
     /// The call records the commit for the composefs image as `write_commit`
     /// does.
     ///
     /// The call does not check the dependencies again.
-    /// [`check_related`](Transaction::check_related) checked them. A process
+    /// [`check_attachments`](Transaction::check_attachments) checked them. A process
     /// outside the transaction can make a dependency partial or absent after
     /// that check: for example, an fsck, which takes no repository lock, or a
     /// prune in a repository with `[core] locking=false`. The call does not
@@ -255,12 +255,12 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// The call checks the origin of `related`, then `opts.related`, then the
+    /// The call checks the origin of `attachments`, then `opts.attachments`, then the
     /// repository mode, then the timestamp. On these refusals, it writes
     /// nothing and the transaction stays open.
     ///
-    /// - [`Error::InvalidInput`] if `related` comes from another transaction.
-    /// - [`Error::InvalidInput`] if `opts.related` is not empty.
+    /// - [`Error::InvalidInput`] if `attachments` comes from another transaction.
+    /// - [`Error::InvalidInput`] if `opts.attachments` is not empty.
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
     /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
     ///   fs-verity seal fails.
@@ -294,21 +294,21 @@ impl Transaction {
     pub async fn write_commit_checked(
         &self,
         mut opts: CommitOptions,
-        related: CheckedRelated<'_>,
+        attachments: CheckedAttachments<'_>,
         root: &RepoTree,
     ) -> Result<Checksum> {
-        if !std::ptr::eq(related.txn, self) {
+        if !std::ptr::eq(attachments.txn, self) {
             return Err(Error::InvalidInput(
                 "the checked dependencies come from another transaction".into(),
             ));
         }
-        if !opts.related.is_empty() {
+        if !opts.attachments.is_empty() {
             return Err(Error::InvalidInput(
                 "the commit options name dependencies; the checked dependencies give them".into(),
             ));
         }
         self.resolve_commit_options(&mut opts)?;
-        opts.related = related.entries;
+        opts.attachments = attachments.entries;
         self.write_commit_unchecked(opts, root).await
     }
 
@@ -330,16 +330,16 @@ impl Transaction {
         Ok(())
     }
 
-    /// Checks the dependencies `related` of a new commit, as
+    /// Checks the dependencies `attachments` of a new commit, as
     /// [`write_commit`](Transaction::write_commit) checks
-    /// [`CommitOptions::related`].
+    /// [`CommitOptions::attachments`].
     ///
     /// The call refuses an entry with an empty name and two entries with the
     /// same name. Then it checks each dependency in the byte order of the
     /// names: the dependency must be complete in the repository or in this
     /// transaction, and it must have no dependency of its own.
     /// [`write_commit`](Transaction::write_commit) states the rules and runs
-    /// the same checks. The call does not change `related` and writes
+    /// the same checks. The call does not change `attachments` and writes
     /// nothing.
     ///
     /// The call reads no tree. A caller can call it before it builds a large
@@ -351,7 +351,7 @@ impl Transaction {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRelated`] with no commit, if an entry of `related`
+    /// - [`Error::InvalidRelations`] with no commit, if an entry of `attachments`
     ///   has an empty name, if two entries have the same name, or if a
     ///   dependency is absent, partial, or has a dependency of its own.
     /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
@@ -361,29 +361,29 @@ impl Transaction {
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn check_related(
+    pub async fn check_attachments(
         &self,
-        related: &[(String, Checksum)],
-    ) -> Result<CheckedRelated<'_>> {
-        self.check_owned_related(related.to_vec()).await
+        attachments: &[(String, Checksum)],
+    ) -> Result<CheckedAttachments<'_>> {
+        self.check_owned_attachments(attachments.to_vec()).await
     }
 
-    /// Checks the dependencies `related` as
-    /// [`check_related`](Transaction::check_related) does, and keeps the
+    /// Checks the dependencies `attachments` as
+    /// [`check_attachments`](Transaction::check_attachments) does, and keeps the
     /// entries in the result with no copy.
-    async fn check_owned_related(
+    async fn check_owned_attachments(
         &self,
-        related: Vec<(String, Checksum)>,
-    ) -> Result<CheckedRelated<'_>> {
-        let entries = related::sorted_new(related)?;
-        related::check_dependencies(self, None, &entries).await?;
-        Ok(CheckedRelated { txn: self, entries })
+        attachments: Vec<(String, Checksum)>,
+    ) -> Result<CheckedAttachments<'_>> {
+        let entries = related::sorted_new(attachments)?;
+        related::check_attachments(self, None, &entries).await?;
+        Ok(CheckedAttachments { txn: self, entries })
     }
 
     /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
     /// with no check of the dependencies.
     ///
-    /// Field 2 holds the entries of `opts.related` in the given order.
+    /// Field 2 holds the entries of `opts.attachments` in the given order.
     /// [`write_commit`](Transaction::write_commit) and
     /// [`write_commit_checked`](Transaction::write_commit_checked) call it
     /// with the sorted entries after the check. The anchor commit of a
@@ -412,7 +412,7 @@ impl Transaction {
             metadata,
             parent: opts.parent,
             related: opts
-                .related
+                .attachments
                 .into_iter()
                 .map(|(name, checksum)| (name, checksum.as_bytes().to_vec()))
                 .collect(),
@@ -609,7 +609,7 @@ impl Repo {
     ///   object.
     /// - [`Error::Core`] if the commit tuple does not frame, if field 2 does
     ///   not decode, or if the detached metadata does not parse.
-    /// - [`Error::InvalidRelated`] with the field and the reason, if an entry
+    /// - [`Error::InvalidRelations`] with the field and the reason, if an entry
     ///   of either field has an empty name or a checksum that is not 32
     ///   bytes, or if the value of `ostrya.related` is not a variant of type
     ///   `a(say)`.
@@ -617,7 +617,7 @@ impl Repo {
     ///   metadata is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
     ///   or is not a regular file, or if a symlink is on its path.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn read_commit_related(&self, commit: &Checksum) -> Result<CommitRelated> {
+    pub async fn read_commit_relations(&self, commit: &Checksum) -> Result<CommitRelations> {
         let repo = self.clone();
         let commit = *commit;
         // A commit object can be as large as `MAX_METADATA_SIZE`, so the two
@@ -627,25 +627,25 @@ impl Repo {
         ostrya_rt::unblock(move || {
             let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &commit)?;
             let detached = repo.read_commit_detached_metadata_blocking(&commit)?;
-            let dependencies = related::checked_entries(
-                RelatedField::Dependencies,
+            let attachments = related::checked_entries(
+                RelationField::Attachments,
                 Some(commit),
-                related::parse_dependencies(&bytes)?,
+                related::parse_attachments(&bytes)?,
             )?;
-            let build_sources = related::build_sources(detached.as_ref())
-                .map_err(|reason| Error::InvalidRelated {
+            let supplements = related::supplements(detached.as_ref())
+                .map_err(|reason| Error::InvalidRelations {
                     commit: Some(commit),
-                    field: RelatedField::BuildSources,
+                    field: RelationField::Supplements,
                     reason,
                 })?
                 .map(|entries| {
-                    related::checked_entries(RelatedField::BuildSources, Some(commit), entries)
+                    related::checked_entries(RelationField::Supplements, Some(commit), entries)
                 })
                 .transpose()?
                 .unwrap_or_default();
-            Ok(CommitRelated {
-                dependencies,
-                build_sources,
+            Ok(CommitRelations {
+                attachments,
+                supplements,
             })
         })
         .await
@@ -672,7 +672,7 @@ impl Repo {
     ///
     /// The call reads the file as
     /// [`read_commit_detached_metadata_blocking`](Repo::read_commit_detached_metadata_blocking)
-    /// does, and parses it with [`parse_build_source_dict`]. So a
+    /// does, and parses it with [`parse_supplement_dict`]. So a
     /// `.commitmeta` that does not hold the key `ostrya.related` gives
     /// `None`, also if it does not parse. The read and the parse block the
     /// thread, so an async caller runs this call on the blocking pool.
@@ -685,26 +685,26 @@ impl Repo {
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
     /// - [`Error::Io`] if a file system operation fails.
-    pub(crate) fn read_build_source_dict_blocking(
+    pub(crate) fn read_supplement_dict_blocking(
         &self,
         checksum: &Checksum,
     ) -> Result<Option<Value>> {
         let Some(bytes) = self.held_object_bytes_blocking(ObjectType::CommitMeta, checksum)? else {
             return Ok(None);
         };
-        parse_build_source_dict(&bytes)
+        parse_supplement_dict(&bytes)
     }
 
     /// Loads the bytes of the commit object `checksum` and its detached
     /// metadata dict, as
-    /// [`read_build_source_dict_blocking`](Repo::read_build_source_dict_blocking)
+    /// [`read_supplement_dict_blocking`](Repo::read_supplement_dict_blocking)
     /// reads it.
     ///
     /// The two reads and the parse run in one call on the blocking pool. The
     /// read of the commit comes first, so a commit that this repository does
     /// not hold gives [`Error::ObjectNotFound`] before an error of the
     /// `.commitmeta`.
-    pub(crate) async fn load_commit_and_build_source_dict(
+    pub(crate) async fn load_commit_and_supplement_dict(
         &self,
         checksum: &Checksum,
     ) -> Result<(Vec<u8>, Option<Value>)> {
@@ -712,7 +712,7 @@ impl Repo {
         let key = *checksum;
         ostrya_rt::unblock(move || {
             let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &key)?;
-            let detached = repo.read_build_source_dict_blocking(&key)?;
+            let detached = repo.read_supplement_dict_blocking(&key)?;
             Ok((bytes, detached))
         })
         .await
@@ -774,8 +774,8 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRelated`] with `checksum` and
-    ///   [`RelatedField::BuildSources`] if an `ostrya.related` entry of `meta`
+    /// - [`Error::InvalidRelations`] with `checksum` and
+    ///   [`RelationField::Supplements`] if an `ostrya.related` entry of `meta`
     ///   is not a variant of type `a(say)`, or if one of its elements has an
     ///   empty name or a checksum that is not 32 bytes.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
@@ -851,13 +851,13 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRelated`] with `commit` and
-    ///   [`RelatedField::BuildSources`] if `name` is empty. The call refuses
+    /// - [`Error::InvalidRelations`] with `commit` and
+    ///   [`RelationField::Supplements`] if `name` is empty. The call refuses
     ///   it before it reads anything.
     /// - [`Error::ObjectNotFound`] if the repository does not hold the commit
     ///   object. The call writes no file.
-    /// - [`Error::InvalidRelated`] with `commit` and
-    ///   [`RelatedField::BuildSources`] if the stored value of the first
+    /// - [`Error::InvalidRelations`] with `commit` and
+    ///   [`RelationField::Supplements`] if the stored value of the first
     ///   `ostrya.related` entry is not a variant of type `a(say)`, or if one
     ///   of its elements has an empty name or a checksum that is not 32
     ///   bytes. The `.commitmeta` file stays as it was.
@@ -877,19 +877,19 @@ impl Repo {
     /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
     ///   file systems.
     /// - [`Error::Io`] if another file system operation fails.
-    pub async fn add_detached_related(
+    pub async fn add_supplement(
         &self,
         commit: &Checksum,
         name: &str,
         source: &Checksum,
     ) -> Result<()> {
         if name.is_empty() {
-            return Err(empty_build_source_name(commit));
+            return Err(empty_supplement_name(commit));
         }
         let fsync = self.config().fsync()?;
         let repo_mode = self.mode();
         let checksum = *commit;
-        let related = vec![(name.to_owned(), *source)];
+        let supplements = vec![(name.to_owned(), *source)];
         self.write_locked(move |repo| {
             // A prune takes the exclusive lock, so the commit stays until the
             // write ends.
@@ -905,7 +905,7 @@ impl Repo {
                 &checksum,
                 None,
                 None,
-                related,
+                supplements,
                 Vec::new(),
                 fsync,
                 repo_mode,
@@ -917,10 +917,10 @@ impl Repo {
 
 /// Returns the refusal of a build source with an empty name, for the commit
 /// `commit`.
-pub(crate) fn empty_build_source_name(commit: &Checksum) -> Error {
-    Error::InvalidRelated {
+pub(crate) fn empty_supplement_name(commit: &Checksum) -> Error {
+    Error::InvalidRelations {
         commit: Some(*commit),
-        field: RelatedField::BuildSources,
+        field: RelationField::Supplements,
         reason: "the new entry has an empty name".into(),
     }
 }
@@ -943,7 +943,7 @@ pub(crate) fn parse_detached_metadata(bytes: &[u8]) -> Result<Option<Value>> {
 /// metadata only if they can hold build sources.
 ///
 /// Returns `None` with no parse if
-/// [`may_hold_build_sources`](related::may_hold_build_sources) does not
+/// [`may_hold_supplements`](related::may_hold_supplements) does not
 /// accept `bytes`. Else the result is the result of
 /// [`parse_detached_metadata`]. The parse blocks the thread, so an async
 /// caller runs it on the blocking pool.
@@ -952,8 +952,8 @@ pub(crate) fn parse_detached_metadata(bytes: &[u8]) -> Result<Option<Value>> {
 ///
 /// [`Error::Core`] if `bytes` hold the bytes of the key `ostrya.related` and
 /// do not parse as an `a{sv}` dict.
-pub(crate) fn parse_build_source_dict(bytes: &[u8]) -> Result<Option<Value>> {
-    if !related::may_hold_build_sources(bytes) {
+pub(crate) fn parse_supplement_dict(bytes: &[u8]) -> Result<Option<Value>> {
+    if !related::may_hold_supplements(bytes) {
         return Ok(None);
     }
     parse_detached_metadata(bytes)
@@ -984,9 +984,9 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// If `merge` is given, it holds a serialized `a{sv}` dict and a list of
 /// keys. The call merges that dict into the base dict with a union of each
 /// signature list. The listed keys keep the value that the base dict holds.
-/// Next, the call adds the entries of `build_sources` to the first
+/// Next, the call adds the entries of `supplements` to the first
 /// `ostrya.related` entry in one step. The result is the same as one add of
-/// each entry, in order, as [`Repo::add_detached_related`] states.
+/// each entry, in order, as [`Repo::add_supplement`] states.
 /// Then each entry of `appends` appends one signature to the `aay` array of
 /// its engine, in order. The result replaces the file atomically. If a step
 /// fails, the file stays as it was.
@@ -1003,7 +1003,7 @@ pub(crate) fn merge_detached_blocking(
     checksum: &Checksum,
     replace: Option<Value>,
     merge: Option<(Vec<u8>, Vec<String>)>,
-    build_sources: Vec<(String, Checksum)>,
+    supplements: Vec<(String, Checksum)>,
     appends: Vec<(String, Vec<u8>)>,
     fsync: bool,
     repo_mode: RepoMode,
@@ -1023,7 +1023,7 @@ pub(crate) fn merge_detached_blocking(
             },
             _ => base.unwrap_or_else(|| Value::Array(Vec::new())),
         };
-        related::add_build_sources(&mut dict, checksum, build_sources)?;
+        related::add_supplements(&mut dict, checksum, supplements)?;
         for (key, signature) in appends {
             crate::sign::append_signature(&mut dict, &key, signature)?;
         }

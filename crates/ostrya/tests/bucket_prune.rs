@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use common::modes::object_path;
 use common::s3::{PROBE_BODY, PROBE_KEY, Rclone, StandIn, endpoint, rclone_available};
-use common::{TmpDir, dependency_warning, store_with_field2};
+use common::{TmpDir, attachment_warning, store_with_field2};
 use ostrya::bucket::{
     BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo, BucketSummaryOptions,
 };
@@ -334,7 +334,7 @@ async fn commit_tree(
                 parent,
                 subject: Some(subject.to_owned()),
                 timestamp: Some(timestamp),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -1464,7 +1464,7 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_dependency_survives_as_in_the_local_prune() {
+fn an_attachment_survives_as_in_the_local_prune() {
     // Each case gives `true` if the run keeps the parent of the dependency.
     let cases: Vec<(&str, PruneOptions, bool)> = vec![
         ("default", PruneOptions::default(), true),
@@ -1485,8 +1485,8 @@ fn a_dependency_survives_as_in_the_local_prune() {
             let base = f.tmp.path();
             // The two commits are younger than the time bound, so the bound
             // of the run keeps the parent of the dependency.
-            let dep_base = commit_related(&f.local, base, "dep-base", None, &[], T0 + 130).await;
-            let dep = commit_related(&f.local, base, "dep", Some(dep_base), &[], T0 + 140).await;
+            let att_base = commit_related(&f.local, base, "dep-base", None, &[], T0 + 130).await;
+            let att = commit_related(&f.local, base, "dep", Some(att_base), &[], T0 + 140).await;
             // No store holds the parent of this dependency.
             let gone = Checksum::sha256(b"gone parent");
             let lone = commit_related(&f.local, base, "lone", Some(gone), &[], T0 + 150).await;
@@ -1495,7 +1495,7 @@ fn a_dependency_survives_as_in_the_local_prune() {
                 base,
                 "head",
                 Some(f.c3),
-                &[("boot/fallback", lone), ("boot/uki", dep)],
+                &[("boot/fallback", lone), ("boot/uki", att)],
                 T0 + 300,
             )
             .await;
@@ -1509,16 +1509,16 @@ fn a_dependency_survives_as_in_the_local_prune() {
                 .collect();
             let report = prune_as_local(&f, &opts, case).await;
             assert!(report.stats.warnings.is_empty(), "{case}");
-            let dep_root = f.local.load_commit(&dep).await.unwrap().0.root_dirtree;
+            let att_root = f.local.load_commit(&att).await.unwrap().0.root_dirtree;
             for kept in [
                 key(ObjectType::Commit, &head),
-                key(ObjectType::Commit, &dep),
-                key(ObjectType::DirTree, &dep_root),
+                key(ObjectType::Commit, &att),
+                key(ObjectType::DirTree, &att_root),
             ] {
                 assert!(f.get(&kept).is_some(), "{case}: {kept}");
             }
             assert_eq!(
-                f.get(&key(ObjectType::Commit, &dep_base)).is_some(),
+                f.get(&key(ObjectType::Commit, &att_base)).is_some(),
                 keeps_base,
                 "{case}: the parent of the dependency"
             );
@@ -1541,7 +1541,7 @@ fn a_dependency_survives_as_in_the_local_prune() {
 }
 
 #[test]
-fn a_dependency_on_a_parent_chain_is_read_once_unless_the_time_bound_rejected_it() {
+fn an_attachment_on_a_parent_chain_is_read_once_unless_the_time_bound_rejected_it() {
     // The third value is `true` if the time bound rejects `d` as the parent
     // of `e` before `d` arrives as a root.
     let cases: Vec<(&str, PruneOptions, bool)> = vec![
@@ -1617,7 +1617,7 @@ fn a_dependency_on_a_parent_chain_is_read_once_unless_the_time_bound_rejected_it
 }
 
 #[test]
-fn a_dependency_of_a_commit_of_the_summary_takes_the_bound_of_the_run() {
+fn an_attachment_of_a_commit_of_the_summary_takes_the_bound_of_the_run() {
     let cases: Vec<(&str, PruneOptions)> = vec![
         ("depth 1", refs_only(1)),
         ("depth 3", refs_only(3)),
@@ -1665,7 +1665,7 @@ fn a_dependency_of_a_commit_of_the_summary_takes_the_bound_of_the_run() {
 }
 
 #[test]
-fn an_absent_dependency_roots_nothing() {
+fn an_absent_attachment_roots_nothing() {
     block_on(async {
         let (f, _) = Fixture::rich().await;
         // The fixture holds the detached metadata of this commit, and not
@@ -1691,13 +1691,13 @@ fn an_absent_dependency_roots_nothing() {
 }
 
 #[test]
-fn a_build_source_that_no_ref_keeps_is_deleted() {
+fn a_supplement_that_no_ref_keeps_is_deleted() {
     block_on(async {
         let (f, _) = Fixture::rich().await;
         let src = commit_related(&f.local, f.tmp.path(), "src", None, &[], T0 + 10).await;
         let src_root = f.local.load_commit(&src).await.unwrap().0.root_dirtree;
         f.local
-            .add_detached_related(&f.c3, "layer/src", &src)
+            .add_supplement(&f.c3, "layer/src", &src)
             .await
             .unwrap();
         f.copy("objects");
@@ -1728,15 +1728,15 @@ fn a_defective_field_2_entry_gives_a_warning() {
     block_on(async {
         let (f, _) = Fixture::rich().await;
         let base = f.tmp.path();
-        let dep = commit_related(&f.local, base, "dep", None, &[], T0 + 10).await;
+        let att = commit_related(&f.local, base, "dep", None, &[], T0 + 10).await;
         let other = commit_related(&f.local, base, "other", None, &[], T0 + 20).await;
         let head = store_with_field2(
             &f.local,
             &f.c3,
             &[
-                ("a/ok", dep.as_bytes()),
+                ("a/ok", att.as_bytes()),
                 ("", other.as_bytes()),
-                ("b/short", &dep.as_bytes()[..31]),
+                ("b/short", &att.as_bytes()[..31]),
             ],
         )
         .await;
@@ -1744,8 +1744,8 @@ fn a_defective_field_2_entry_gives_a_warning() {
         f.copy("objects");
         f.put_ref("refs/heads/main", &head);
         let expected = vec![
-            dependency_warning(head, "entry 1 has an empty name"),
-            dependency_warning(head, "entry 2 (b/short) has a checksum of 31 bytes, not 32"),
+            attachment_warning(head, "entry 1 has an empty name"),
+            attachment_warning(head, "entry 2 (b/short) has a checksum of 31 bytes, not 32"),
         ];
         let before = f.snapshot();
         let dry = f
@@ -1765,7 +1765,7 @@ fn a_defective_field_2_entry_gives_a_warning() {
             format!("related commits in field 2 of commit {head}: entry 1 has an empty name")
         );
         assert!(
-            f.get(&key(ObjectType::Commit, &dep)).is_some(),
+            f.get(&key(ObjectType::Commit, &att)).is_some(),
             "the valid entry roots"
         );
         assert!(
@@ -1815,7 +1815,7 @@ fn a_config_key_that_names_metadata_keys_changes_no_prune() {
 }
 
 #[test]
-fn a_nested_dependency_roots_its_dependencies_with_no_warning() {
+fn a_nested_attachment_roots_its_attachments_with_no_warning() {
     block_on(async {
         let f = Fixture::new(None).await;
         let base = f.tmp.path();

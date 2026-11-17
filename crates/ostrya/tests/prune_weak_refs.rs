@@ -349,9 +349,7 @@ fn the_ancestry_rule_b_reaches_roots_a_second_weak_ref() {
         // c1 names x as a build source. The walk reads this entry only if the
         // weak ref pool/a re-seeds c2 at the bound of its own name.
         let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
-        repo.add_detached_related(&c1, "source/x", &x)
-            .await
-            .unwrap();
+        repo.add_supplement(&c1, "source/x", &x).await.unwrap();
         let c2 = commit(&repo, tmp.path(), "c2", Some(c1), Some("pool/a")).await;
         let c3 = commit(&repo, tmp.path(), "c3", Some(c2), Some("main")).await;
         let y = commit(&repo, tmp.path(), "y", None, Some("pool/c")).await;
@@ -758,7 +756,7 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
         let dropped = commit(&repo, tmp.path(), "drop", None, Some("origin:pool/drop")).await;
         let dropped_root = commit_root(&repo, &dropped).await;
         let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
-        repo.add_detached_related(&head, "source/keep", &keep)
+        repo.add_supplement(&head, "source/keep", &keep)
             .await
             .unwrap();
 
@@ -1633,7 +1631,7 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
         // `main` reaches g3 over a build-source edge with the global bound of
         // 0. g2 and g1 survive only under the weak ref's own bound.
         let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
-        repo.add_detached_related(&head, "source/chain", &g3)
+        repo.add_supplement(&head, "source/chain", &g3)
             .await
             .unwrap();
         // The control chain has a strong ref at the global depth of 0. The walk

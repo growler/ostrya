@@ -7272,7 +7272,7 @@ fn assert_applied_without_ref(run: &Run, dst: &Path, commit: &str, label: &str) 
 /// dependency that the repository does not hold. It exits 1 and writes no
 /// object and no ref. After the delta of the dependency, the target applies.
 #[test]
-fn static_delta_apply_offline_refuses_a_missing_dependency() {
+fn static_delta_apply_offline_refuses_a_missing_attachment() {
     let tmp = TmpDir::new("static-delta-dependency");
     let base = tmp.path();
     let src = build_remote(base, "src");
@@ -7284,12 +7284,12 @@ fn static_delta_apply_offline_refuses_a_missing_dependency() {
             .ok()
             .stdout_trimmed()
     };
-    let dep = commit(&[
+    let att = commit(&[
         "-b",
         "dep/uki",
         ex_ostrya_tree(base, "uki").to_str().unwrap(),
     ]);
-    let related = format!("--related=boot/uki={dep}");
+    let related = format!("--related=boot/uki={att}");
     let tip = commit(&[
         "-b",
         BRANCH,
@@ -7316,7 +7316,7 @@ fn static_delta_apply_offline_refuses_a_missing_dependency() {
         .ok();
         out
     };
-    let dep_delta = generate(&dep, "dep-delta");
+    let att_delta = generate(&att, "dep-delta");
     let tip_delta = generate(&tip, "tip-delta");
 
     let dest = build_dest(base, "dest");
@@ -7341,7 +7341,7 @@ fn static_delta_apply_offline_refuses_a_missing_dependency() {
         String::from_utf8_lossy(&refused.stderr),
         format!(
             "error: related commits in field 2 of commit {tip}: dependency boot/uki names \
-             commit {dep}, which is in neither the repository nor the transaction\n"
+             commit {att}, which is in neither the repository nor the transaction\n"
         )
     );
     assert_eq!(
@@ -7350,9 +7350,9 @@ fn static_delta_apply_offline_refuses_a_missing_dependency() {
         "the store holds the same objects and refs"
     );
 
-    apply(&dep_delta).ok();
+    apply(&att_delta).ok();
     apply(&tip_delta).ok();
-    for commit in [&dep, &tip] {
+    for commit in [&att, &tip] {
         let object = dest.join(format!("objects/{}/{}.commit", &commit[..2], &commit[2..]));
         assert!(object.is_file(), "commit {commit} was not applied");
     }
@@ -8284,7 +8284,7 @@ fn pull_depth_and_commit_metadata_only() {
 /// `pull` fetches the dependency that field 2 of the pulled commit names,
 /// complete, and writes no ref for it. The fsck of the destination passes.
 #[test]
-fn pull_fetches_a_dependency() {
+fn pull_fetches_an_attachment() {
     let tmp = TmpDir::new("pull-dependency");
     let base = tmp.path();
     let remote = build_remote(base, "remote");
@@ -8296,12 +8296,12 @@ fn pull_fetches_a_dependency() {
             .ok()
             .stdout_trimmed()
     };
-    let dep = commit(&[
+    let att = commit(&[
         "-b",
         "dep/uki",
         ex_ostrya_tree(base, "uki").to_str().unwrap(),
     ]);
-    let related = format!("--related=boot/uki={dep}");
+    let related = format!("--related=boot/uki={att}");
     let tip = commit(&[
         "-b",
         BRANCH,
@@ -8320,10 +8320,10 @@ fn pull_fetches_a_dependency() {
     )
     .ok();
 
-    let object = dest.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
-    assert!(object.is_file(), "dependency {dep} was not fetched");
-    let marker = dest.join(format!("state/{dep}.commitpartial"));
-    assert!(!marker.exists(), "dependency {dep} is marked partial");
+    let object = dest.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
+    assert!(object.is_file(), "dependency {att} was not fetched");
+    let marker = dest.join(format!("state/{att}.commitpartial"));
+    assert!(!marker.exists(), "dependency {att} is marked partial");
     block_on(async {
         let repo = Repo::open(&dest).await.unwrap();
         assert!(repo.list_refs(None).await.unwrap().is_empty());
@@ -8343,7 +8343,7 @@ fn pull_fetches_a_dependency() {
 /// names, complete, and writes no ref for it. The fsck of the destination
 /// passes.
 #[test]
-fn pull_local_imports_a_dependency() {
+fn pull_local_imports_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency");
     let base = tmp.path();
     let src = build_remote(base, "src");
@@ -8355,12 +8355,12 @@ fn pull_local_imports_a_dependency() {
             .ok()
             .stdout_trimmed()
     };
-    let dep = commit(&[
+    let att = commit(&[
         "-b",
         "dep/uki",
         ex_ostrya_tree(base, "uki").to_str().unwrap(),
     ]);
-    let related = format!("--related=boot/uki={dep}");
+    let related = format!("--related=boot/uki={att}");
     let tip = commit(&[
         "-b",
         BRANCH,
@@ -8382,10 +8382,10 @@ fn pull_local_imports_a_dependency() {
     )
     .ok();
 
-    let object = dest.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
-    assert!(object.is_file(), "dependency {dep} was not imported");
-    let marker = dest.join(format!("state/{dep}.commitpartial"));
-    assert!(!marker.exists(), "dependency {dep} is marked partial");
+    let object = dest.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
+    assert!(object.is_file(), "dependency {att} was not imported");
+    let marker = dest.join(format!("state/{att}.commitpartial"));
+    assert!(!marker.exists(), "dependency {att} is marked partial");
     block_on(async {
         let repo = Repo::open(&dest).await.unwrap();
         let refs: Vec<(String, String)> = repo
@@ -8404,13 +8404,13 @@ fn pull_local_imports_a_dependency() {
 /// commit that names it as partial, and exits 1. A defective entry also exits
 /// 1, and marks no commit.
 #[test]
-fn fsck_reports_a_dependency_error() {
+fn fsck_reports_an_attachment_error() {
     let tmp = TmpDir::new("fsck-dependency");
     let base = tmp.path();
     let repo = build_dest(base, "repo");
     let repo_s = repo.to_str().unwrap().to_owned();
-    let dep = ex_ostrya_commit(&repo, base, "uki", None);
-    let related = format!("--related=boot/uki={dep}");
+    let att = ex_ostrya_commit(&repo, base, "uki", None);
+    let related = format!("--related=boot/uki={att}");
     let tip = ostrya(
         &[
             "commit",
@@ -8427,11 +8427,11 @@ fn fsck_reports_a_dependency_error() {
     )
     .ok()
     .stdout_trimmed();
-    let dep_hex = dep.to_hex();
+    let att_hex = att.to_hex();
     std::fs::remove_file(repo.join(format!(
         "objects/{}/{}.commit",
-        &dep_hex[..2],
-        &dep_hex[2..]
+        &att_hex[..2],
+        &att_hex[2..]
     )))
     .unwrap();
 
@@ -8442,7 +8442,7 @@ fn fsck_reports_a_dependency_error() {
         stderr,
         format!(
             "related commits in field 2 of commit {tip}: dependency boot/uki names commit \
-             {dep}, which the repository does not hold\nMarking commit as partial: {tip}\n\
+             {att}, which the repository does not hold\nMarking commit as partial: {tip}\n\
              error: Repository corruption encountered\n"
         )
     );
@@ -8486,8 +8486,8 @@ fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
     let base = tmp.path();
     let repo = build_dest(base, "repo");
     let repo_s = repo.to_str().unwrap().to_owned();
-    let dep = ex_ostrya_commit(&repo, base, "uki", None);
-    let related = format!("--related=boot/uki={dep}");
+    let att = ex_ostrya_commit(&repo, base, "uki", None);
+    let related = format!("--related=boot/uki={att}");
     let tip = ostrya(
         &[
             "commit",
@@ -8504,15 +8504,15 @@ fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
     )
     .ok()
     .stdout_trimmed();
-    let dep_hex = dep.to_hex();
+    let att_hex = att.to_hex();
     std::fs::remove_file(repo.join(format!(
         "objects/{}/{}.commit",
-        &dep_hex[..2],
-        &dep_hex[2..]
+        &att_hex[..2],
+        &att_hex[2..]
     )))
     .unwrap();
     let finding = format!(
-        "related commits in field 2 of commit {tip}: dependency boot/uki names commit {dep}, \
+        "related commits in field 2 of commit {tip}: dependency boot/uki names commit {att}, \
          which the repository does not hold\n"
     );
     let marker = repo.join(format!("state/{tip}.commitpartial"));
@@ -15577,7 +15577,7 @@ fn commit_main_run(repo: &Path, tree: &Path, extra: &[&str]) -> Run {
 /// `ostree` command is installed, it prints the same lines and its fsck
 /// accepts the repository.
 #[test]
-fn commit_related_writes_sorted_dependencies() {
+fn commit_related_writes_sorted_attachments() {
     let tmp = TmpDir::new("commit-related");
     let base = tmp.path();
     let repo = create_repo(base, RepoMode::Archive);
@@ -15623,22 +15623,22 @@ fn commit_related_writes_sorted_dependencies() {
 /// The option conflicts with `--skip-if-unchanged`. Each refusal exits 1 and
 /// writes no object and no ref.
 #[test]
-fn commit_related_refuses_a_malformed_or_absent_dependency() {
+fn commit_related_refuses_a_malformed_or_absent_attachment() {
     let tmp = TmpDir::new("commit-related-refuse");
     let base = tmp.path();
     let repo = create_repo(base, RepoMode::Archive);
-    let dep = commit_main_run(&repo, &ex_ostrya_tree(base, "dep"), &[])
+    let att = commit_main_run(&repo, &ex_ostrya_tree(base, "dep"), &[])
         .ok()
         .stdout_trimmed();
     let tree = ex_ostrya_tree(base, "head");
     let absent = "ab".repeat(32);
-    let short = &dep[..63];
-    let upper = dep.to_uppercase();
-    let not_hex = format!("{}g", &dep[..63]);
+    let short = &att[..63];
+    let upper = att.to_uppercase();
+    let not_hex = format!("{}g", &att[..63]);
     let cases = [
         (
-            format!("--related=a/x{dep}"),
-            format!("Missing '=' in NAME=CHECKSUM argument 'a/x{dep}'"),
+            format!("--related=a/x{att}"),
+            format!("Missing '=' in NAME=CHECKSUM argument 'a/x{att}'"),
         ),
         (
             format!("--related=a/x={short}"),
@@ -15660,7 +15660,7 @@ fn commit_related_refuses_a_malformed_or_absent_dependency() {
             ),
         ),
         (
-            format!("--related=={dep}"),
+            format!("--related=={att}"),
             "related commits in field 2: entry 0 has an empty name".to_owned(),
         ),
         (
@@ -15707,7 +15707,7 @@ fn commit_related_refuses_a_malformed_or_absent_dependency() {
         "missing tree: the error line"
     );
 
-    let option = format!("--related=a/x={dep}");
+    let option = format!("--related=a/x={att}");
     let run = commit_main_run(&repo, &tree, &[&option, "--skip-if-unchanged"]);
     assert_eq!(
         run.status.code(),
@@ -15727,7 +15727,7 @@ fn commit_related_refuses_a_malformed_or_absent_dependency() {
 /// one time. The dependency is on another branch, so no other step of the
 /// command reads it.
 #[test]
-fn commit_related_checks_each_dependency_once() {
+fn commit_related_checks_each_attachment_once() {
     if !strace_available() {
         return;
     }
@@ -15735,7 +15735,7 @@ fn commit_related_checks_each_dependency_once() {
     let base = &tmp.path().canonicalize().expect("the temp dir resolves");
     let repo = create_repo(base, RepoMode::Archive);
     let repo_arg = format!("--repo={}", repo.display());
-    let dep = ex_ostrya_commit(&repo, base, "dep", Some("dep")).to_string();
+    let att = ex_ostrya_commit(&repo, base, "dep", Some("dep")).to_string();
     let tree = ex_ostrya_tree(base, "head");
     let trace = base.join("trace");
     let out = Command::new("strace")
@@ -15754,7 +15754,7 @@ fn commit_related_checks_each_dependency_once() {
             "-b",
             "main",
             "--timestamp=@1700000000",
-            &format!("--related=a/x={dep}"),
+            &format!("--related=a/x={att}"),
             tree.to_str().unwrap(),
         ])
         .output()
@@ -15767,8 +15767,8 @@ fn commit_related_checks_each_dependency_once() {
     // A path argument ends with a quote. The `strace -y` form of a descriptor
     // ends with `>`, so a descriptor of the object is not counted.
     let text = std::fs::read_to_string(&trace).expect("the trace is written");
-    let object = format!("{}/{}.commit\"", &dep[..2], &dep[2..]);
-    let marker = format!("{dep}.commitpartial\"");
+    let object = format!("{}/{}.commit\"", &att[..2], &att[2..]);
+    let marker = format!("{att}.commitpartial\"");
     let opens = text
         .lines()
         .filter(|line| is_read_open(line) && line.contains(&object))
@@ -15808,22 +15808,20 @@ fn prune_keeps_the_related_commits_and_warns_on_a_defective_value() {
     let base = tmp.path();
     let repo = create_repo(base, RepoMode::Archive);
     let repo_arg = format!("--repo={}", repo.display());
-    let dep = ex_ostrya_commit(&repo, base, "dep", None);
+    let att = ex_ostrya_commit(&repo, base, "dep", None);
     let src = ex_ostrya_commit(&repo, base, "src", None);
     let orphan = ex_ostrya_commit(&repo, base, "orphan", None);
     let head = commit_main_run(
         &repo,
         &ex_ostrya_tree(base, "head"),
-        &[&format!("--related=boot/dep={dep}")],
+        &[&format!("--related=boot/dep={att}")],
     )
     .ok()
     .stdout_trimmed();
     let head = Checksum::from_hex(&head).unwrap();
     block_on(async {
         let repo = Repo::open(&repo).await.unwrap();
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
     });
 
     let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
@@ -15833,7 +15831,7 @@ fn prune_keeps_the_related_commits_and_warns_on_a_defective_value() {
         "no warning: {}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert!(ex_ostrya_holds(&repo, &dep), "the dependency survives");
+    assert!(ex_ostrya_holds(&repo, &att), "the dependency survives");
     assert!(ex_ostrya_holds(&repo, &src), "the build source survives");
     assert!(!ex_ostrya_holds(&repo, &orphan), "the orphan is pruned");
 
@@ -15942,7 +15940,7 @@ fn prune_parses_a_commitmeta_only_if_it_holds_the_key() {
 /// gives the key a string value, which is not an `a(say)`. The command exits
 /// 1 and writes no object and no ref.
 #[test]
-fn commit_refuses_a_string_build_source_value() {
+fn commit_refuses_a_string_supplement_value() {
     let tmp = TmpDir::new("commit-related-detached-string");
     let base = tmp.path();
     let repo = create_repo(base, RepoMode::Archive);

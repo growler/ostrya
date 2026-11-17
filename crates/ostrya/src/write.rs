@@ -722,7 +722,7 @@ impl Transaction {
     /// The call checks no entry of field 2 of a commit.
     /// [`write_commit`](Transaction::write_commit) checks them, and
     /// [`write_commit_checked`](Transaction::write_commit_checked) writes the
-    /// entries that [`check_related`](Transaction::check_related) checked.
+    /// entries that [`check_attachments`](Transaction::check_attachments) checked.
     ///
     /// The call does not record a commit as complete, because a pull writes
     /// partial commits through it. So a commit that it writes gets no

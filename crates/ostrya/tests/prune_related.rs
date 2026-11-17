@@ -12,10 +12,10 @@ mod common;
 
 use std::path::Path;
 
-use common::{TmpDir, dependency_warning, store_with_field2};
+use common::{TmpDir, attachment_warning, store_with_field2};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
-    Error, MutableTree, ObjectType, PruneOptions, Ref, RelatedField, RelatedWarning, Repo,
+    Error, MutableTree, ObjectType, PruneOptions, Ref, RelationField, RelationWarning, Repo,
     RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
@@ -79,7 +79,7 @@ async fn commit(
         parent,
         subject: Some(name.to_owned()),
         timestamp: Some(FIXED_TS),
-        related: related
+        attachments: related
             .iter()
             .map(|(entry, checksum)| ((*entry).to_owned(), *checksum))
             .collect(),
@@ -168,49 +168,47 @@ fn refs_only() -> PruneOptions {
 }
 
 /// Returns a warning of the build sources of `commit`.
-fn build_source_warning(commit: Checksum, reason: &str) -> RelatedWarning {
-    RelatedWarning {
+fn supplement_warning(commit: Checksum, reason: &str) -> RelationWarning {
+    RelationWarning {
         commit,
-        field: RelatedField::BuildSources,
+        field: RelationField::Supplements,
         reason: reason.to_owned(),
     }
 }
 
 #[test]
-fn a_dependency_and_a_build_source_of_a_kept_commit_survive() {
+fn an_attachment_and_a_supplement_of_a_kept_commit_survive() {
     let tmp = TmpDir::new("prune-related-keep");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "src", "head", "plain"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", None, &[], None).await;
+        let att = commit(&repo, tmp.path(), "dep", None, &[], None).await;
         let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
         let head = commit(
             &repo,
             tmp.path(),
             "head",
             None,
-            &[("boot/dep", dep)],
+            &[("boot/dep", att)],
             Some("main"),
         )
         .await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
         // Each related commit has detached metadata of its own.
         let note = dict(vec![(
             "test.note",
             (Type::parse("s").unwrap(), Value::Str("kept".into())),
         )]);
-        for commit in [dep, src] {
+        for commit in [att, src] {
             repo.write_commit_detached_metadata(&commit, Some(&note))
                 .await
                 .unwrap();
         }
-        let dep_root = commit_root(&repo, &dep).await;
+        let att_root = commit_root(&repo, &att).await;
         let src_root = commit_root(&repo, &src).await;
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
-        for (label, commit, root) in [("dep", dep, dep_root), ("src", src, src_root)] {
+        for (label, commit, root) in [("dep", att, att_root), ("src", src, src_root)] {
             assert!(holds(&repo, &commit).await, "{label} survives");
             assert!(
                 holds_tree(&repo, &root).await,
@@ -231,7 +229,7 @@ fn a_dependency_and_a_build_source_of_a_kept_commit_survive() {
         assert!(holds(&repo, &plain).await);
         for (label, commit, root) in [
             ("head", head, head_root),
-            ("dep", dep, dep_root),
+            ("dep", att, att_root),
             ("src", src, src_root),
         ] {
             assert!(!holds(&repo, &commit).await, "{label} is pruned");
@@ -256,7 +254,7 @@ fn a_related_entry_that_names_an_absent_commit_roots_nothing() {
         repo.set_ref_immediate(&Ref::local("main"), Some(&head))
             .await
             .unwrap();
-        repo.add_detached_related(
+        repo.add_supplement(
             &head,
             "layer/gone",
             &Checksum::from_ay(&[0x45; 32]).unwrap(),
@@ -272,16 +270,14 @@ fn a_related_entry_that_names_an_absent_commit_roots_nothing() {
 }
 
 #[test]
-fn a_weak_ref_named_by_a_build_source_of_a_strong_commit_survives() {
+fn a_weak_ref_named_by_a_supplement_of_a_strong_commit_survives() {
     let tmp = TmpDir::new("prune-related-weak");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "other", "head"]).await;
         let src = commit(&repo, tmp.path(), "src", None, &[], Some("cache/src")).await;
         let other = commit(&repo, tmp.path(), "other", None, &[], Some("cache/other")).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
 
         let opts = PruneOptions {
             weak_ref_filter: WeakRefFilter::new(
@@ -322,30 +318,30 @@ async fn set_cache_ref(repo: &Repo, name: &str, commit: &Checksum) -> Ref {
 }
 
 #[test]
-fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
+fn a_weak_collection_ref_named_by_an_attachment_of_a_strong_commit_survives() {
     let tmp = TmpDir::new("prune-related-weak-collection-dep");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "other", "head"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", None, &[], None).await;
+        let att = commit(&repo, tmp.path(), "dep", None, &[], None).await;
         let other = commit(&repo, tmp.path(), "other", None, &[], None).await;
         commit(
             &repo,
             tmp.path(),
             "head",
             None,
-            &[("boot/dep", dep)],
+            &[("boot/dep", att)],
             Some("main"),
         )
         .await;
-        let kept = set_cache_ref(&repo, "dep", &dep).await;
+        let kept = set_cache_ref(&repo, "dep", &att).await;
         let dropped = set_cache_ref(&repo, "other", &other).await;
 
         let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
         assert_eq!(stats.deleted_refs, vec![dropped.clone()]);
-        assert!(holds(&repo, &dep).await, "the dependency survives");
+        assert!(holds(&repo, &att).await, "the dependency survives");
         assert_eq!(
             repo.resolve_ref_tip(&kept).await.unwrap(),
-            Some(dep),
+            Some(att),
             "the weak collection ref of the dependency survives"
         );
         assert!(
@@ -357,16 +353,14 @@ fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
 }
 
 #[test]
-fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
+fn a_weak_collection_ref_named_by_a_supplement_of_a_strong_commit_survives() {
     let tmp = TmpDir::new("prune-related-weak-collection-src");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "other", "head"]).await;
         let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
         let other = commit(&repo, tmp.path(), "other", None, &[], None).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
         let kept = set_cache_ref(&repo, "src", &src).await;
         let dropped = set_cache_ref(&repo, "other", &other).await;
 
@@ -387,7 +381,7 @@ fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
 }
 
 #[test]
-fn a_build_source_of_a_build_source_survives() {
+fn a_supplement_of_a_supplement_survives() {
     let tmp = TmpDir::new("prune-related-recursive");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["base", "mid", "head", "orphan"]).await;
@@ -395,10 +389,8 @@ fn a_build_source_of_a_build_source_survives() {
         let mid = commit(&repo, tmp.path(), "mid", None, &[], None).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
-        repo.add_detached_related(&head, "layer/mid", &mid)
-            .await
-            .unwrap();
-        repo.add_detached_related(&mid, "layer/base", &base)
+        repo.add_supplement(&head, "layer/mid", &mid).await.unwrap();
+        repo.add_supplement(&mid, "layer/base", &base)
             .await
             .unwrap();
 
@@ -410,16 +402,16 @@ fn a_build_source_of_a_build_source_survives() {
 }
 
 #[test]
-fn a_cycle_of_build_sources_ends_the_walk() {
+fn a_cycle_of_supplements_ends_the_walk() {
     let tmp = TmpDir::new("prune-related-cycle");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["a", "b", "orphan"]).await;
         let a = commit(&repo, tmp.path(), "a", None, &[], Some("main")).await;
         let b = commit(&repo, tmp.path(), "b", None, &[], None).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
-        repo.add_detached_related(&a, "layer/b", &b).await.unwrap();
-        repo.add_detached_related(&b, "layer/a", &a).await.unwrap();
-        repo.add_detached_related(&a, "layer/a", &a).await.unwrap();
+        repo.add_supplement(&a, "layer/b", &b).await.unwrap();
+        repo.add_supplement(&b, "layer/a", &a).await.unwrap();
+        repo.add_supplement(&a, "layer/a", &a).await.unwrap();
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty());
@@ -430,7 +422,7 @@ fn a_cycle_of_build_sources_ends_the_walk() {
 }
 
 #[test]
-fn a_nested_dependency_roots_its_dependencies_with_no_warning() {
+fn a_nested_attachment_roots_its_attachments_with_no_warning() {
     let tmp = TmpDir::new("prune-related-nested");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c", "b", "head", "orphan"]).await;
@@ -459,7 +451,7 @@ fn a_nested_dependency_roots_its_dependencies_with_no_warning() {
 }
 
 #[test]
-fn unsorted_and_repeated_dependency_names_root_each_entry() {
+fn unsorted_and_repeated_attachment_names_root_each_entry() {
     let tmp = TmpDir::new("prune-related-unsorted");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["x", "y", "z", "head"]).await;
@@ -490,7 +482,7 @@ fn unsorted_and_repeated_dependency_names_root_each_entry() {
 }
 
 #[test]
-fn a_defective_build_source_value_gives_a_warning() {
+fn a_defective_supplement_value_gives_a_warning() {
     let tmp = TmpDir::new("prune-related-bad-sources");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head", "orphan"]).await;
@@ -521,9 +513,9 @@ fn a_defective_build_source_value_gives_a_warning() {
             let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
             write_raw_detached(&repo, &head, &dict(vec![(RELATED_KEY, value)]));
             let stats = repo.prune(&refs_only()).await.unwrap();
-            let expected: Vec<RelatedWarning> = reasons
+            let expected: Vec<RelationWarning> = reasons
                 .iter()
-                .map(|reason| build_source_warning(head, reason))
+                .map(|reason| supplement_warning(head, reason))
                 .collect();
             assert_eq!(stats.warnings, expected);
             assert_eq!(
@@ -544,11 +536,11 @@ fn a_defective_build_source_value_gives_a_warning() {
 }
 
 #[test]
-fn a_defective_dependency_entry_gives_a_warning() {
+fn a_defective_attachment_entry_gives_a_warning() {
     let tmp = TmpDir::new("prune-related-bad-field2");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dep", "other", "src", "head", "orphan"]).await;
-        let dep = commit(&repo, tmp.path(), "dep", None, &[], None).await;
+        let att = commit(&repo, tmp.path(), "dep", None, &[], None).await;
         let other = commit(&repo, tmp.path(), "other", None, &[], None).await;
         let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
         let plain = commit(&repo, tmp.path(), "head", None, &[], None).await;
@@ -557,9 +549,9 @@ fn a_defective_dependency_entry_gives_a_warning() {
             &repo,
             &plain,
             &[
-                ("a/ok", dep.as_bytes()),
+                ("a/ok", att.as_bytes()),
                 ("", other.as_bytes()),
-                ("b/short", &dep.as_bytes()[..31]),
+                ("b/short", &att.as_bytes()[..31]),
             ],
         )
         .await;
@@ -581,16 +573,16 @@ fn a_defective_dependency_entry_gives_a_warning() {
         assert_eq!(
             stats.warnings,
             vec![
-                dependency_warning(head, "entry 1 has an empty name"),
-                dependency_warning(head, "entry 2 (b/short) has a checksum of 31 bytes, not 32"),
-                build_source_warning(head, "entry 1 (layer/x) has a checksum of 2 bytes, not 32"),
+                attachment_warning(head, "entry 1 has an empty name"),
+                attachment_warning(head, "entry 2 (b/short) has a checksum of 31 bytes, not 32"),
+                supplement_warning(head, "entry 1 (layer/x) has a checksum of 2 bytes, not 32"),
             ]
         );
         assert_eq!(
             stats.warnings[0].to_string(),
             format!("related commits in field 2 of commit {head}: entry 1 has an empty name")
         );
-        assert!(holds(&repo, &dep).await, "the valid dependency survives");
+        assert!(holds(&repo, &att).await, "the valid dependency survives");
         assert!(holds(&repo, &src).await, "the valid build source survives");
         assert!(
             !holds(&repo, &other).await,
@@ -637,7 +629,7 @@ fn the_parent_edge_off_still_follows_related_edges() {
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["dp", "dep", "sp", "src", "hp", "head"]).await;
         let dp = commit(&repo, tmp.path(), "dp", None, &[], None).await;
-        let dep = commit(&repo, tmp.path(), "dep", Some(dp), &[], None).await;
+        let att = commit(&repo, tmp.path(), "dep", Some(dp), &[], None).await;
         let sp = commit(&repo, tmp.path(), "sp", None, &[], None).await;
         let src = commit(&repo, tmp.path(), "src", Some(sp), &[], None).await;
         let hp = commit(&repo, tmp.path(), "hp", None, &[], None).await;
@@ -646,13 +638,11 @@ fn the_parent_edge_off_still_follows_related_edges() {
             tmp.path(),
             "head",
             Some(hp),
-            &[("boot/dep", dep)],
+            &[("boot/dep", att)],
             Some("main"),
         )
         .await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
 
         let opts = PruneOptions {
             traverse_parent: false,
@@ -660,7 +650,7 @@ fn the_parent_edge_off_still_follows_related_edges() {
         };
         repo.prune(&opts).await.unwrap();
         assert!(holds(&repo, &head).await);
-        assert!(holds(&repo, &dep).await, "the dependency survives");
+        assert!(holds(&repo, &att).await, "the dependency survives");
         assert!(holds(&repo, &src).await, "the build source survives");
         for (label, parent) in [("head", hp), ("dep", dp), ("src", sp)] {
             assert!(
@@ -679,9 +669,7 @@ fn a_related_commit_takes_the_global_bound() {
         let sp = commit(&repo, tmp.path(), "sp", None, &[], None).await;
         let src = commit(&repo, tmp.path(), "src", Some(sp), &[], None).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
 
         // The global depth applies to the build source, as to a ref.
         repo.prune(&refs_only()).await.unwrap();
@@ -706,9 +694,7 @@ fn a_related_commit_deep_in_history_takes_the_global_bound() {
         let h0 = commit(&repo, tmp.path(), "h0", None, &[], None).await;
         let h1 = commit(&repo, tmp.path(), "h1", Some(h0), &[], None).await;
         commit(&repo, tmp.path(), "h2", Some(h1), &[], Some("main")).await;
-        repo.add_detached_related(&h1, "layer/src", &src)
-            .await
-            .unwrap();
+        repo.add_supplement(&h1, "layer/src", &src).await.unwrap();
 
         // The walk reaches h1 with no parent left. The build source of h1
         // gets the global depth, so it keeps its parent.
@@ -734,9 +720,7 @@ fn a_commit_expanded_twice_gives_its_warnings_once() {
         let repo = repo_with_trees(tmp.path(), &["h1", "h2"]).await;
         let h1 = commit(&repo, tmp.path(), "h1", None, &[], None).await;
         let h2 = commit(&repo, tmp.path(), "h2", Some(h1), &[], Some("main")).await;
-        repo.add_detached_related(&h2, "layer/h1", &h1)
-            .await
-            .unwrap();
+        repo.add_supplement(&h2, "layer/h1", &h1).await.unwrap();
         write_raw_detached(
             &repo,
             &h1,
@@ -752,7 +736,7 @@ fn a_commit_expanded_twice_gives_its_warnings_once() {
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(
             stats.warnings,
-            vec![build_source_warning(h1, "entry 0 has an empty name")]
+            vec![supplement_warning(h1, "entry 0 has an empty name")]
         );
     });
 }
@@ -776,7 +760,7 @@ fn an_absent_or_empty_commitmeta_gives_no_warning() {
             let stats = repo.prune(&opts).await.unwrap();
             assert_eq!(
                 stats.warnings,
-                vec![build_source_warning(bad, "entry 0 has an empty name")]
+                vec![supplement_warning(bad, "entry 0 has an empty name")]
             );
             assert!(holds(&repo, &plain).await);
             assert!(holds(&repo, &marked).await);
@@ -808,7 +792,7 @@ fn a_dry_run_reports_the_warnings() {
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(
             stats.warnings,
-            vec![build_source_warning(head, "entry 0 has an empty name")]
+            vec![supplement_warning(head, "entry 0 has an empty name")]
         );
         assert!(stats.pruned_objects > 0);
         assert_eq!(
@@ -832,10 +816,8 @@ fn a_commit_that_a_related_field_names_can_be_deleted() {
         let base = commit(&repo, tmp.path(), "base", None, &[], None).await;
         let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
-        repo.add_detached_related(&head, "layer/src", &src)
-            .await
-            .unwrap();
-        repo.add_detached_related(&src, "layer/base", &base)
+        repo.add_supplement(&head, "layer/src", &src).await.unwrap();
+        repo.add_supplement(&src, "layer/base", &base)
             .await
             .unwrap();
 
@@ -850,7 +832,7 @@ fn a_commit_that_a_related_field_names_can_be_deleted() {
         assert!(holds(&repo, &head).await);
         // The entry stays and names an absent commit, which roots nothing.
         assert_eq!(
-            repo.read_commit_related(&head).await.unwrap().build_sources,
+            repo.read_commit_relations(&head).await.unwrap().supplements,
             vec![("layer/src".to_owned(), src)]
         );
         assert!(repo.prune(&refs_only()).await.unwrap().warnings.is_empty());
@@ -873,8 +855,8 @@ fn a_prune_of_each_commit_gives_the_same_warnings() {
             );
         }
         let mut expected = vec![
-            build_source_warning(head, "entry 0 (x) has a checksum of 4 bytes, not 32"),
-            build_source_warning(loose, "entry 0 (x) has a checksum of 4 bytes, not 32"),
+            supplement_warning(head, "entry 0 (x) has a checksum of 4 bytes, not 32"),
+            supplement_warning(loose, "entry 0 (x) has a checksum of 4 bytes, not 32"),
         ];
         expected.sort_by_key(|w| w.commit);
         let stats = repo.prune(&PruneOptions::new()).await.unwrap();
@@ -973,7 +955,7 @@ fn a_commitmeta_that_holds_the_key_and_does_not_parse_fails_the_prune() {
 }
 
 #[test]
-fn a_build_source_after_a_signature_entry_survives() {
+fn a_supplement_after_a_signature_entry_survives() {
     let tmp = TmpDir::new("prune-related-signed");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["src", "head", "orphan"]).await;
@@ -1209,7 +1191,7 @@ fn a_config_key_that_names_metadata_keys_changes_no_write_and_no_prune() {
             );
             assert_eq!(
                 stats.warnings,
-                [build_source_warning(cfs, "type is `as`, not `a(say)`")],
+                [supplement_warning(cfs, "type is `as`, not `a(say)`")],
                 "{label}"
             );
             (stats.pruned_objects, stats.warnings)

@@ -9496,7 +9496,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // The dependencies are checked before the tree is read, so a refused
     // dependency stops the command before the ingest and the composefs build.
     // The commit write takes the checked list and does not check it again.
-    let checked = match txn.check_related(&related).await {
+    let checked = match txn.check_attachments(&related).await {
         Ok(checked) => checked,
         Err(err) => {
             txn.abort().await?;
@@ -9696,7 +9696,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
             body,
             timestamp,
             metadata: Some(metadata),
-            related: Vec::new(),
+            attachments: Vec::new(),
         };
         let checksum = txn.write_commit_checked(opts, checked, &root).await?;
         if let Some(image) =
@@ -15604,7 +15604,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
     let opts = FsckOptions {
         mark_partial: !args.no_mark_partial,
-        mark_dependencies: !args.no_mark_dependencies,
+        mark_attachments: !args.no_mark_dependencies,
         delete: args.delete,
         all: args.all,
         add_tombstones: args.add_tombstones,
@@ -15647,7 +15647,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     for error in &report.errors {
         eprintln!("{}", fsck_finding_line(error));
     }
-    for error in &report.dependency_errors {
+    for error in &report.attachment_errors {
         eprintln!("{error}");
     }
     for commit in &report.marked_partial {
@@ -15682,7 +15682,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     std::io::stdout().flush().ok();
     if !report.errors.is_empty()
         || !report.image_errors.is_empty()
-        || !report.dependency_errors.is_empty()
+        || !report.attachment_errors.is_empty()
     {
         eprintln!("error: Repository corruption encountered");
         exit_process(1);

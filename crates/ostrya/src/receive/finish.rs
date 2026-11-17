@@ -29,7 +29,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::read::CommitState;
 use crate::refs::{RefFileState, nested_ref_paths};
-use crate::related::{self, HeldDependency, RelatedRule};
+use crate::related::{self, HeldAttachment, RelatedRule};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
@@ -408,7 +408,7 @@ pub(super) async fn finish(
         let outside = check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
         let rules = select_rules(repo, policy, &names, &updates)?;
         let loaded = load_commits(&txn, &updates).await?;
-        drop_dependency_meta(outside, &loaded.fields, &mut commit_meta)?;
+        drop_attachment_meta(outside, &loaded.fields, &mut commit_meta)?;
         Ok::<_, Failure>((rules, loaded))
     })
     .await?;
@@ -416,7 +416,7 @@ pub(super) async fn finish(
     if missing.total > 0 {
         return Err(missing_objects(missing, "the trees of the commits reach"));
     }
-    check_dependencies(&txn, &targets, &staged, &fields).await?;
+    check_attachments(&txn, &targets, &staged, &fields).await?;
     check_bindings(
         repo,
         policy.verifies_ref_bindings(),
@@ -736,7 +736,7 @@ fn outside_commits(
 ///
 /// A commit of the session is a commit that the session staged, or the new
 /// commit of an update. A dict for a held commit outside the session goes to
-/// [`drop_dependency_meta`]. A dict for a commit that is neither is
+/// [`drop_attachment_meta`]. A dict for a commit that is neither is
 /// `protocol`. The reads of the held commits run in one trip to the blocking
 /// pool, and only if the session has a dict outside the session.
 ///
@@ -790,7 +790,7 @@ async fn check_commit_meta_commits(
 /// A dict for such a commit that no entry names is `protocol`. Without this
 /// check, a dict can edit the detached metadata of a commit that no rule of
 /// the message covers.
-fn drop_dependency_meta(
+fn drop_attachment_meta(
     outside: Vec<Checksum>,
     fields: &HashMap<Checksum, Vec<(String, Vec<u8>)>>,
     commit_meta: &mut HashMap<Checksum, Vec<u8>>,
@@ -1106,7 +1106,7 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
 /// the blocking pool, and the reads of the other held dependencies in one
 /// more trip. Field 2 of a new commit that the repository holds with no
 /// partial marker gets no check.
-async fn check_dependencies(
+async fn check_attachments(
     txn: &Transaction,
     targets: &[Target],
     staged: &HashSet<Checksum>,
@@ -1156,27 +1156,27 @@ async fn check_dependencies(
             continue;
         };
         let entries =
-            related::borrowed_dependencies(commit, field).map_err(|e| protocol(e.to_string()))?;
-        for (name, dependency) in entries {
-            if known.insert(dependency) {
-                named.push((dependency, *commit, name));
+            related::borrowed_attachments(commit, field).map_err(|e| protocol(e.to_string()))?;
+        for (name, attachment) in entries {
+            if known.insert(attachment) {
+                named.push((attachment, *commit, name));
             }
         }
     }
     let held: Vec<Checksum> = named
         .iter()
-        .map(|(dependency, ..)| *dependency)
-        .filter(|dependency| !staged.contains(dependency) && !news.contains(dependency))
+        .map(|(attachment, ..)| *attachment)
+        .filter(|attachment| !staged.contains(attachment) && !news.contains(attachment))
         .collect();
-    let states: HashMap<Checksum, HeldDependency> = if held.is_empty() {
+    let states: HashMap<Checksum, HeldAttachment> = if held.is_empty() {
         HashMap::new()
     } else {
         let repo = txn.repo().clone();
         ostrya_rt::unblock(move || {
             held.into_iter()
-                .map(|dependency| {
-                    related::held_dependency_blocking(&repo, None, &dependency, |_| Ok(()))
-                        .map(|state| (dependency, state))
+                .map(|attachment| {
+                    related::held_attachment_blocking(&repo, None, &attachment, |_| Ok(()))
+                        .map(|state| (attachment, state))
                 })
                 .collect::<Result<_>>()
         })
@@ -1184,9 +1184,9 @@ async fn check_dependencies(
         .map_err(Failure::Internal)?
     };
     let mut absent = Missing::default();
-    for (dependency, ..) in &named {
-        if states.get(dependency) == Some(&HeldDependency::Absent) {
-            absent.add(ObjectName::new(*dependency, ObjectType::Commit));
+    for (attachment, ..) in &named {
+        if states.get(attachment) == Some(&HeldAttachment::Absent) {
+            absent.add(ObjectName::new(*attachment, ObjectType::Commit));
         }
     }
     if absent.total > 0 {
@@ -1195,21 +1195,21 @@ async fn check_dependencies(
             "the staged commits name as dependencies",
         ));
     }
-    for (dependency, naming, name) in named {
-        let nested = match states.get(&dependency) {
-            None => fields.contains_key(&dependency),
-            Some(HeldDependency::Complete { nested, .. }) => *nested,
-            Some(HeldDependency::Partial) => {
+    for (attachment, naming, name) in named {
+        let nested = match states.get(&attachment) {
+            None => fields.contains_key(&attachment),
+            Some(HeldAttachment::Complete { nested, .. }) => *nested,
+            Some(HeldAttachment::Partial) => {
                 return Err(Failure::Wire(remote::Error::MissingObjects {
-                    message: related::partial_dependency(naming, name, &dependency).to_string(),
+                    message: related::partial_attachment(naming, name, &attachment).to_string(),
                     missing: Vec::new(),
                 }));
             }
-            Some(HeldDependency::Absent) => unreachable!("an absent dependency was refused"),
+            Some(HeldAttachment::Absent) => unreachable!("an absent dependency was refused"),
         };
         if nested {
             return Err(protocol(
-                related::nested_dependency(naming, name, &dependency).to_string(),
+                related::nested_attachment(naming, name, &attachment).to_string(),
             ));
         }
     }

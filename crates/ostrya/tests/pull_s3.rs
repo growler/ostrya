@@ -388,28 +388,28 @@ fn a_session_to_an_s3_endpoint_pulls_with_the_session() {
 /// A pull through a session to an `Endpoint::S3` fetches the dependency that
 /// field 2 of the pulled commit names, complete, and writes no ref for it.
 #[test]
-fn a_session_to_an_s3_endpoint_fetches_a_dependency() {
-    if !rclone_available("a_session_to_an_s3_endpoint_fetches_a_dependency") {
+fn a_session_to_an_s3_endpoint_fetches_an_attachment() {
+    if !rclone_available("a_session_to_an_s3_endpoint_fetches_an_attachment") {
         return;
     }
     let scratch = TmpDir::new("pull-s3-dependency");
     let root = scratch.path().join("root");
     let bucket = root.join("bkt").join("repo");
     std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
-    let (tip, dep) = block_on(async {
+    let (tip, att) = block_on(async {
         build_tree(&scratch.path().join("uki"), b"uki\n");
         build_tree(&scratch.path().join("main"), b"main\n");
         let remote = Repo::create(&bucket, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        let dep = commit_tree(&remote, scratch.path(), "uki", "dep/uki", None, FIXED_TS).await;
+        let att = commit_tree(&remote, scratch.path(), "uki", "dep/uki", None, FIXED_TS).await;
         let tip = commit_tree_related(
             &remote,
             scratch.path(),
             "main",
             REF,
             None,
-            &[("boot/uki", dep)],
+            &[("boot/uki", att)],
         )
         .await;
         remote
@@ -419,7 +419,7 @@ fn a_session_to_an_s3_endpoint_fetches_a_dependency() {
             })
             .await
             .unwrap();
-        (tip, dep)
+        (tip, att)
     });
     let server = Rclone::start(scratch.path(), &root);
     block_on(async {
@@ -440,7 +440,7 @@ fn a_session_to_an_s3_endpoint_fetches_a_dependency() {
             .unwrap();
         assert_eq!(repo.list_refs(None).await.unwrap(), [(REF.to_owned(), tip)]);
         assert!(repo.list_remote_refs().await.unwrap().is_empty());
-        assert_eq!(repo.commit_state(&dep).await.unwrap(), CommitState::Normal);
+        assert_eq!(repo.commit_state(&att).await.unwrap(), CommitState::Normal);
         assert_eq!(object_names(&path), object_names(&bucket));
     });
 }

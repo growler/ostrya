@@ -158,8 +158,8 @@ struct Staged {
 ///   queued to replace the stored one.
 /// - `merge`: the dict that a receiving session merges in, with the keys whose
 ///   stored value stays.
-/// - `related`: the build sources that
-///   [`add_detached_related`](Transaction::add_detached_related) adds after
+/// - `supplements`: the build sources that
+///   [`add_supplement`](Transaction::add_supplement) adds after
 ///   it, in call order.
 /// - `appends`: the signatures that [`sign_commit`](Transaction::sign_commit)
 ///   made after it, in call order.
@@ -181,7 +181,7 @@ struct DetachedEdit {
     merge: Option<(Vec<u8>, Vec<String>)>,
     /// The build sources to add after the merge, each a name and the checksum
     /// of a commit.
-    related: Vec<(String, Checksum)>,
+    supplements: Vec<(String, Checksum)>,
     /// The signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
 }
@@ -798,13 +798,13 @@ impl Transaction {
     /// If the call runs twice for one checksum, the last dict stays. The call
     /// also drops the signatures that [`sign_commit`](Transaction::sign_commit)
     /// queued before it, and the build sources that
-    /// [`add_detached_related`](Transaction::add_detached_related) queued
+    /// [`add_supplement`](Transaction::add_supplement) queued
     /// before it.
     ///
     /// The call does not check `meta`, and it cannot fail. [`commit`] checks
     /// each `ostrya.related` entry of the queued dict, as
     /// [`Repo::write_commit_detached_metadata`] does. If an entry is
-    /// defective, `commit` fails with [`Error::InvalidRelated`] and publishes
+    /// defective, `commit` fails with [`Error::InvalidRelations`] and publishes
     /// nothing.
     ///
     /// [`commit`]: Transaction::commit
@@ -814,7 +814,7 @@ impl Transaction {
         edit.staged = None;
         edit.replace = Some(meta);
         edit.merge = None;
-        edit.related.clear();
+        edit.supplements.clear();
         edit.appends.clear();
     }
 
@@ -823,7 +823,7 @@ impl Transaction {
     ///
     /// The write at [`commit`](Transaction::commit) adds the entry to the
     /// first `ostrya.related` entry of the detached metadata, as
-    /// [`Repo::add_detached_related`] does: it removes each element with the
+    /// [`Repo::add_supplement`] does: it removes each element with the
     /// name `name`, adds the new element, and keeps the elements sorted by
     /// name in byte order. The write adds the entries of all calls for one
     /// commit in one step. The result is the same as one add for each call,
@@ -837,28 +837,23 @@ impl Transaction {
     ///
     /// If the stored value of the first `ostrya.related` entry is defective,
     /// the write at [`commit`](Transaction::commit) fails with
-    /// [`Error::InvalidRelated`]. The commit fails after it publishes the
+    /// [`Error::InvalidRelations`]. The commit fails after it publishes the
     /// staged objects. It then writes no ref, and the `.commitmeta` file of
     /// `commit` stays as it was. The detached-metadata edits of other commits
     /// that the queue holds before this one stay written.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidRelated`] with `commit` and
-    /// [`RelatedField::BuildSources`](crate::RelatedField::BuildSources) if
+    /// [`Error::InvalidRelations`] with `commit` and
+    /// [`RelationField::Supplements`](crate::RelationField::Supplements) if
     /// `name` is empty. The call then queues nothing.
-    pub fn add_detached_related(
-        &self,
-        commit: &Checksum,
-        name: &str,
-        source: &Checksum,
-    ) -> Result<()> {
+    pub fn add_supplement(&self, commit: &Checksum, name: &str, source: &Checksum) -> Result<()> {
         if name.is_empty() {
-            return Err(crate::commit::empty_build_source_name(commit));
+            return Err(crate::commit::empty_supplement_name(commit));
         }
         let mut queue = self.detached.lock().unwrap();
         Self::edit_for(&mut queue, commit)
-            .related
+            .supplements
             .push((name.to_owned(), *source));
         Ok(())
     }
@@ -895,7 +890,7 @@ impl Transaction {
         edit.staged = Some(name);
         edit.replace = None;
         edit.merge = None;
-        edit.related.clear();
+        edit.supplements.clear();
         edit.appends.clear();
         Ok(())
     }
@@ -1607,12 +1602,12 @@ impl Transaction {
     ///   the collection id of a queued collection ref does not pass
     ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
     ///   bytes. The call publishes no object and writes no ref.
-    /// - [`Error::InvalidRelated`] if an `ostrya.related` entry of a queued
+    /// - [`Error::InvalidRelations`] if an `ostrya.related` entry of a queued
     ///   detached-metadata dict is not a variant of type `a(say)`, or if one
     ///   of its elements has an empty name or a checksum that is not 32
     ///   bytes. The call publishes no object and writes nothing.
-    /// - [`Error::InvalidRelated`] if a build source that
-    ///   [`add_detached_related`](Transaction::add_detached_related) queued
+    /// - [`Error::InvalidRelations`] if a build source that
+    ///   [`add_supplement`](Transaction::add_supplement) queued
     ///   meets a defective stored `ostrya.related` value. The published
     ///   objects stay, and the call writes no ref.
     /// - Under `[ex-ostrya] generate-composefs`, the errors of
@@ -1911,7 +1906,7 @@ impl DetachedJob {
             if edit.staged.is_some()
                 && edit.replace.is_none()
                 && edit.merge.is_none()
-                && edit.related.is_empty()
+                && edit.supplements.is_empty()
                 && edit.appends.is_empty()
             {
                 continue;
@@ -1922,7 +1917,7 @@ impl DetachedJob {
                 &checksum,
                 edit.replace,
                 edit.merge,
-                edit.related,
+                edit.supplements,
                 edit.appends,
                 self.fsync,
                 self.repo_mode,

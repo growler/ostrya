@@ -123,7 +123,7 @@ async fn commit(
                 subject: Some(marker.to_owned()),
                 timestamp: Some(1_700_000_000),
                 metadata: Some(Value::Array(metadata)),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -658,24 +658,24 @@ fn a_destination_of_the_refs_collection_writes_local_refs_and_field_0() {
 /// A dependency of field 2 goes onto the media as loose objects, with no
 /// ref and no static delta.
 #[test]
-fn a_field_2_dependency_lands_as_loose_objects() {
+fn a_field_2_attachment_lands_as_loose_objects() {
     let tmp = TmpDir::new("media-field-2");
     block_on(async {
         let src = source(tmp.path(), Some(ID)).await;
-        let dep = commit(&src, tmp.path(), "dep", None, BOUND, &[]).await;
+        let att = commit(&src, tmp.path(), "dep", None, BOUND, &[]).await;
         let tip = commit(
             &src,
             tmp.path(),
             "main",
             Some(&Ref::local(REF)),
             BOUND,
-            &[("dep", dep)],
+            &[("dep", att)],
         )
         .await;
         let mount = mount_dir(tmp.path());
         export(&src, &mount, &[Ref::local(REF)]).await.unwrap();
         let repo = Repo::open(&media(&mount)).await.unwrap();
-        assert!(repo.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert!(repo.has_object(ObjectType::Commit, &att).await.unwrap());
         assert!(repo.has_object(ObjectType::Commit, &tip).await.unwrap());
         assert_eq!(
             file_inventory(&media(&mount), "refs"),

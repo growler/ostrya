@@ -14,7 +14,7 @@ use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
-use crate::related::{self, HeldDependency, RelatedField, RelatedRule};
+use crate::related::{self, HeldAttachment, RelatedRule, RelationField};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
     SessionOptions,
@@ -267,7 +267,7 @@ pub(super) struct Commits {
     pub(super) local: HashMap<Checksum, Local>,
     /// The entries of field 2 of each commit that `local` holds as
     /// [`Local::Held`], as names and checksums in the stored order, or the
-    /// [`Error::InvalidRelated`] of the first defective entry. The caller
+    /// [`Error::InvalidRelations`] of the first defective entry. The caller
     /// takes the result at its own point, so it sets the order of the errors.
     /// A held commit with no entry here has an empty field 2.
     fields: HashMap<Checksum, Result<Vec<(String, Checksum)>>>,
@@ -309,7 +309,7 @@ impl Commits {
     /// The push and the export call it for a commit whose dependencies they
     /// resolved. A commit with no entry in `fields` has an empty field 2 and
     /// gives none.
-    pub(super) fn dependencies_of(
+    pub(super) fn attachments_of(
         &self,
         commit: &Checksum,
     ) -> impl Iterator<Item = Checksum> + use<'_> {
@@ -317,7 +317,7 @@ impl Commits {
             .get(commit)
             .into_iter()
             .flat_map(|field| field.iter().flatten())
-            .map(|(_, dependency)| *dependency)
+            .map(|(_, attachment)| *attachment)
     }
 
     /// Resolves the dependencies of each commit of `commits`, in order, and
@@ -340,7 +340,7 @@ impl Commits {
     ///
     /// - [`Error::ObjectNotFound`] if the repository does not hold the
     ///   dependency.
-    /// - [`Error::InvalidRelated`] if the repository marks the dependency
+    /// - [`Error::InvalidRelations`] if the repository marks the dependency
     ///   partial, or if the field 2 of the dependency is not empty. The error
     ///   names the commit that first named the dependency.
     /// - [`Error::Io`] or [`Error::Core`] if the read of a dependency with no
@@ -350,7 +350,7 @@ impl Commits {
     /// - [`Error::Io`] if the lstat of the partial marker of a dependency
     ///   fails, or if the lstat of the commit object of a dependency with a
     ///   partial marker fails.
-    pub(super) async fn check_dependencies<'a>(
+    pub(super) async fn check_attachments<'a>(
         &mut self,
         repo: &Repo,
         commits: impl IntoIterator<Item = &'a Checksum>,
@@ -366,18 +366,18 @@ impl Commits {
                 }
                 None => continue,
             };
-            for (name, dependency) in entries {
-                if self.known.insert(*dependency) {
-                    named.push((*dependency, *commit, name));
+            for (name, attachment) in entries {
+                if self.known.insert(*attachment) {
+                    named.push((*attachment, *commit, name));
                 }
             }
         }
         let unread: Vec<Checksum> = named
             .iter()
-            .map(|(dependency, _, _)| *dependency)
-            .filter(|dependency| !self.local.contains_key(dependency))
+            .map(|(attachment, _, _)| *attachment)
+            .filter(|attachment| !self.local.contains_key(attachment))
             .collect();
-        let mut loaded: HashMap<_, Result<HeldDependency<CommitLink>>> = if unread.is_empty() {
+        let mut loaded: HashMap<_, Result<HeldAttachment<CommitLink>>> = if unread.is_empty() {
             HashMap::new()
         } else {
             let repo = repo.clone();
@@ -385,7 +385,7 @@ impl Commits {
                 unread
                     .into_iter()
                     .map(|key| {
-                        let state = related::held_dependency_blocking(&repo, None, &key, |b| {
+                        let state = related::held_attachment_blocking(&repo, None, &key, |b| {
                             Ok(Commit::parse_link(b)?)
                         });
                         (key, state)
@@ -394,33 +394,33 @@ impl Commits {
             })
             .await
         };
-        for (dependency, naming, name) in named {
-            let nested = match loaded.remove(&dependency) {
+        for (attachment, naming, name) in named {
+            let nested = match loaded.remove(&attachment) {
                 Some(result) => {
                     let (local, nested) = match result? {
-                        HeldDependency::Absent => (Local::Absent, false),
-                        HeldDependency::Partial => (Local::Partial, false),
-                        HeldDependency::Complete { nested, value } => (Local::Held(value), nested),
+                        HeldAttachment::Absent => (Local::Absent, false),
+                        HeldAttachment::Partial => (Local::Partial, false),
+                        HeldAttachment::Complete { nested, value } => (Local::Held(value), nested),
                     };
-                    self.local.insert(dependency, local);
+                    self.local.insert(attachment, local);
                     nested
                 }
                 // A commit that `local` holds: `fields` holds its field 2 if
                 // that field is not empty, valid or not.
-                None => self.fields.contains_key(&dependency),
+                None => self.fields.contains_key(&attachment),
             };
-            match self.local[&dependency] {
+            match self.local[&attachment] {
                 Local::Absent => {
                     return Err(Error::ObjectNotFound {
-                        checksum: dependency,
+                        checksum: attachment,
                         ty: ObjectType::Commit,
                     });
                 }
                 Local::Partial => {
-                    return Err(related::partial_dependency(naming, name, &dependency));
+                    return Err(related::partial_attachment(naming, name, &attachment));
                 }
                 Local::Held(_) if nested => {
-                    return Err(related::nested_dependency(naming, name, &dependency));
+                    return Err(related::nested_attachment(naming, name, &attachment));
                 }
                 Local::Held(_) => {}
             }
@@ -617,7 +617,7 @@ impl Repo {
     /// # Dependencies
     ///
     /// Field 2 of a commit names the dependencies of the commit.
-    /// [`read_commit_related`](Repo::read_commit_related) reads them. The push
+    /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The push
     /// sends the dependencies of each commit that it offers: each source
     /// commit, and each history commit of the offer.
     ///
@@ -724,7 +724,7 @@ impl Repo {
     ///   `@OWN:NAME`. The server refuses such a `Hello` before `HelloReply`.
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
-    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit of the
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit of the
     ///   walk has an empty name or a checksum that is not 32 bytes, or if a
     ///   dependency of an offered commit is partial in the local repository
     ///   or names dependencies of its own. [`Error::ObjectNotFound`] if the
@@ -801,7 +801,7 @@ impl Repo {
                         .local
                         .insert(checksum, Local::Held(link_of(&commit)));
                     let related = std::mem::take(&mut commit.related);
-                    commits.record(checksum, related::checked_dependencies(&checksum, related));
+                    commits.record(checksum, related::checked_attachments(&checksum, related));
                     sources.push((checksum, commit));
                     sources.len() - 1
                 }
@@ -871,10 +871,10 @@ impl Repo {
             .chain(chains.iter().flatten());
         commits.check_fields(walked.clone())?;
         match opts.depth {
-            Some(_) => commits.check_dependencies(self, walked).await?,
+            Some(_) => commits.check_attachments(self, walked).await?,
             None => {
                 let sources = sources.iter().map(|(checksum, _)| checksum);
-                commits.check_dependencies(self, sources).await?;
+                commits.check_attachments(self, sources).await?;
             }
         }
 
@@ -916,8 +916,8 @@ impl Repo {
             };
             Ok(match repo.commit_state_blocking(&key)? {
                 CommitState::Normal => {
-                    let field = related::parse_dependencies(&bytes).and_then(|entries| {
-                        related::checked_entries(RelatedField::Dependencies, Some(key), entries)
+                    let field = related::parse_attachments(&bytes).and_then(|entries| {
+                        related::checked_entries(RelationField::Attachments, Some(key), entries)
                     });
                     (Local::Held(Commit::parse_link(&bytes)?), Some(field))
                 }
@@ -1297,14 +1297,14 @@ impl Plan {
         // here, before the first upload.
         if opts.depth.is_none() {
             let offer = names.iter().map(|name| &name.checksum);
-            self.commits.check_dependencies(&self.repo, offer).await?;
+            self.commits.check_attachments(&self.repo, offer).await?;
         }
         let resolved = names.len();
         for at in 0..resolved {
             let commit = names[at].checksum;
-            for dependency in self.commits.dependencies_of(&commit) {
-                if offered.insert(dependency) {
-                    names.push(ObjectName::new(dependency, ObjectType::Commit));
+            for attachment in self.commits.attachments_of(&commit) {
+                if offered.insert(attachment) {
+                    names.push(ObjectName::new(attachment, ObjectType::Commit));
                 }
             }
         }

@@ -13,7 +13,7 @@ use crate::deltagen::delta_name;
 use crate::error::{Error, Result};
 use crate::object::MAX_METADATA_SIZE;
 use crate::prune::{PruneOptions, PruneStats, counted};
-use crate::related::RelatedWarning;
+use crate::related::RelationWarning;
 use crate::remote::s3::{Bucket, Upload, is_repository_key};
 use crate::summary::{SUMMARY_READ_CAP, Summary};
 use crate::traverse::{GcRoots, MetadataSource, ParentBound, walk_reachable_gc};
@@ -436,7 +436,7 @@ impl BucketRepo {
         refs: &BucketRefs,
         summary: &BTreeSet<Checksum>,
         listing: &ObjectListing,
-    ) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
+    ) -> Result<(HashSet<ObjectName>, Vec<RelationWarning>)> {
         let targets: HashSet<Checksum> = refs
             .heads
             .values()
@@ -492,8 +492,8 @@ impl BucketRepo {
         // The walk reads field 2 from the bytes of each commit that it reads,
         // and reads no detached metadata, so it follows no build source.
         let gc = GcRoots {
-            dependencies: true,
-            build_sources: false,
+            attachments: true,
+            supplements: false,
             traverse_parent: true,
             traverse_tree: true,
             weak_roots: Default::default(),

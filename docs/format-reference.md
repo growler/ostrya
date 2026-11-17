@@ -3580,8 +3580,8 @@ sources.
 
 ### Build sources
 
-The add of a build source (`Repo::add_detached_related` and
-`Transaction::add_detached_related`) edits the first `ostrya.related` entry
+The add of a build source (`Repo::add_supplement` and
+`Transaction::add_supplement`) edits the first `ostrya.related` entry
 of the dict:
 
 - It removes each element with the name of the new element, also when two
@@ -3600,7 +3600,7 @@ name build sources of its own, so the add can make a cycle.
 `Repo::write_commit_detached_metadata`, and the commit of a transaction for a
 dict that `Transaction::set_commit_detached_metadata` queued, check each
 `ostrya.related` entry of the dict, also a second entry with the key. A
-defective value fails the write with `Error::InvalidRelated`, and the write
+defective value fails the write with `Error::InvalidRelations`, and the write
 changes no file. The check accepts elements that are not sorted, two
 elements with one name, and a checksum of a commit that the repository does
 not hold. A signature, a pull, and a receive store a dict with no check of
@@ -3637,7 +3637,7 @@ value stays.
 
 A local write ignores the switch and stores `ostrya.related`: a commit write,
 `Repo::write_commit_detached_metadata`, the commit of a transaction,
-`Repo::add_detached_related`, `Transaction::add_detached_related`, and a
+`Repo::add_supplement`, `Transaction::add_supplement`, and a
 signature. The host entries of the receive hooks are local writes of the
 server, and the switch does not apply to them. The offline apply of a static
 delta writes no detached metadata, so the switch does not apply to it.
@@ -3991,7 +3991,7 @@ the failure of that entry. A dependency that the repository of the sender
 does not hold, or marks partial, refuses the export too. The sender finds
 each of these failures before it writes the first byte of the stream.
 `Repo::export_stream` then gives `Error::ObjectNotFound` for a dependency
-that the repository does not hold, and `Error::InvalidRelated` for each other
+that the repository does not hold, and `Error::InvalidRelations` for each other
 failure.
 
 The server checks the dependencies of the commits that it stages, as in a
@@ -4022,16 +4022,16 @@ stored order, and the first rule that applies gives the kind:
 An entry that no rule applies to gives no finding. A checksum that field 2
 names under two names gives two findings. Two entries with one name, and
 names that are not sorted, give no finding. The text of a finding is the
-text of `Error::InvalidRelated` for field 2: `related commits in field 2 of
+text of `Error::InvalidRelations` for field 2: `related commits in field 2 of
 commit C: dependency N names commit D, which the repository does not hold`,
 `..., which is partial`, `..., which has dependencies of its own`, or the
 defect of the entry.
 
-With the default `mark_partial` and `mark_dependencies`, the run writes the
+With the default `mark_partial` and `mark_attachments`, the run writes the
 marker `state/<commit>.commitpartial` of each commit with an `Absent` or a
 `Partial` finding. A later pull of that commit fetches it again with its
 dependencies. A `Defective` finding gets no marker, because a pull cannot
-repair it. With `mark_dependencies` false, or with
+repair it. With `mark_attachments` false, or with
 `ostrya fsck --no-mark-dependencies`, the run reports each finding and writes
 no marker for it. The markers for absent and deleted objects do not change.
 With `mark_partial` false, the run writes neither kind of marker. A marker of

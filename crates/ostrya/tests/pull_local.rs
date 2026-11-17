@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::{
-    TmpDir, dependency_error, file_inventory, ostree_available, store_with_field2,
+    TmpDir, attachment_error, file_inventory, ostree_available, store_with_field2,
     wait_for_commit_under_guard, within,
 };
 use futures_lite::future::poll_once;
@@ -166,7 +166,7 @@ async fn commit_tree_full(
                 subject: Some(format!("{branch} {sub}")),
                 timestamp: Some(FIXED_TS),
                 metadata: Some(ref_binding(branch)),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -2506,9 +2506,7 @@ fn the_switch_stores_nothing_for_a_dict_that_holds_the_related_key_alone() {
     block_on(async {
         let base = tmp.path();
         let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.add_detached_related(&c2, "layer/base", &c1)
-            .await
-            .unwrap();
+        src.add_supplement(&c2, "layer/base", &c1).await.unwrap();
         assert_eq!(detached_keys(&src, &c2).await, ["ostrya.related"]);
 
         let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
@@ -2681,9 +2679,7 @@ fn the_switch_drops_the_related_key_and_keeps_the_rest() {
         src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
             .await
             .unwrap();
-        src.add_detached_related(&c2, "layer/base", &c1)
-            .await
-            .unwrap();
+        src.add_supplement(&c2, "layer/base", &c1).await.unwrap();
         assert_eq!(
             detached_keys(&src, &c2).await,
             ["ostree.gpgsigs", "build.gc-roots", "ostrya.related"]
@@ -2731,9 +2727,7 @@ fn the_switch_keeps_the_destinations_own_metadata() {
             .await
             .unwrap();
         let before = std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap();
-        src.add_detached_related(&c2, "layer/base", &c1)
-            .await
-            .unwrap();
+        src.add_supplement(&c2, "layer/base", &c1).await.unwrap();
         assert_eq!(detached_keys(&src, &c2).await, ["ostrya.related"]);
 
         let dst = with_keep_related(&dst_dir, "false").await;
@@ -2767,9 +2761,7 @@ fn the_default_switch_keeps_the_related_key() {
             src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
                 .await
                 .unwrap();
-            src.add_detached_related(&c2, "layer/base", &c1)
-                .await
-                .unwrap();
+            src.add_supplement(&c2, "layer/base", &c1).await.unwrap();
 
             let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
             let dst = match value {
@@ -3494,9 +3486,7 @@ fn the_switch_applies_after_the_signature_check() {
         let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
         src.sign_commit(&c1, &signer).await.unwrap();
         src.sign_commit(&c2, &signer).await.unwrap();
-        src.add_detached_related(&c2, "layer/base", &c1)
-            .await
-            .unwrap();
+        src.add_supplement(&c2, "layer/base", &c1).await.unwrap();
         assert_eq!(
             detached_keys(&src, &c2).await,
             ["ostree.sign.ed25519", "ostrya.related"]
@@ -6104,7 +6094,7 @@ async fn commit_collection_ref_full(
                 subject: Some(format!("{name} {sub}")),
                 timestamp: Some(FIXED_TS),
                 metadata: Some(Value::Array(metadata)),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -6966,7 +6956,7 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
 /// entry, and it takes the delta from scratch to D2. Each case runs with the
 /// deltas of the summary and with a list.
 #[test]
-fn a_collection_pull_reads_the_paired_entry_of_a_dependency_at_the_written_ref() {
+fn a_collection_pull_reads_the_paired_entry_of_an_attachment_at_the_written_ref() {
     let tmp = TmpDir::new("pull-collection-dependency-place");
     block_on(async {
         let base = tmp.path();
@@ -7995,9 +7985,7 @@ fn the_switch_applies_through_a_local_chain_under_verification() {
         };
         sign_commits(&src, &[a, b, c]).await;
         for commit in [b, c] {
-            src.add_detached_related(&commit, "layer/base", &a)
-                .await
-                .unwrap();
+            src.add_supplement(&commit, "layer/base", &a).await.unwrap();
         }
         let (list, _dirs) = chain_list(&src, &[(a, b), (b, c)]).await;
         let (dst_dir, _dst) = signed_dst_holding(base, &src, &a).await;
@@ -8534,13 +8522,13 @@ fn a_commit_only_local_pull_with_a_list_reads_a_bare_source() {
 /// Creates an archive source under `base/src`. `dep/uki` names the
 /// dependency, and `main` names the tip, whose field 2 names the dependency
 /// as `boot/uki`. Returns the path, the source, the tip, and the dependency.
-async fn build_dependency_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
+async fn build_attachment_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
     build_tree(&base.join("uki"), b"uki\n");
     build_tree(&base.join("main"), b"main\n");
     let (path, src) = make_repo(base, "src", RepoMode::Archive).await;
-    let dep = commit_tree(&src, base, "uki", "dep/uki", None).await;
-    let tip = commit_tree_related(&src, base, "main", "main", None, &[("boot/uki", dep)]).await;
-    (path, src, tip, dep)
+    let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
+    let tip = commit_tree_related(&src, base, "main", "main", None, &[("boot/uki", att)]).await;
+    (path, src, tip, att)
 }
 
 /// Points the ref `name` of `repo` at `commit`.
@@ -8606,11 +8594,11 @@ fn counted_pull() -> PullOptions {
 /// complete, and writes no ref for it. The import counts hold the objects of
 /// the dependency. A repeat pull imports nothing.
 #[test]
-fn a_local_pull_imports_the_dependency_of_the_commit() {
+fn a_local_pull_imports_the_attachment_of_the_commit() {
     let tmp = TmpDir::new("pull-local-dependency");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let main = || PullOptions {
@@ -8620,10 +8608,10 @@ fn a_local_pull_imports_the_dependency_of_the_commit() {
         let stats = dst.pull_local(&src, main()).await.unwrap();
 
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
         let mut expected = src.traverse_commit(&tip, 0).await.unwrap();
-        expected.extend(src.traverse_commit(&dep, 0).await.unwrap());
+        expected.extend(src.traverse_commit(&att, 0).await.unwrap());
         assert_eq!(dst.list_objects().await.unwrap(), expected);
         let content = expected
             .iter()
@@ -8648,17 +8636,17 @@ fn a_local_pull_imports_the_dependency_of_the_commit() {
 /// object of its dependency. A repeat pull follows the dependency of the tip
 /// and imports that commit object alone.
 #[test]
-fn a_local_pull_follows_the_dependency_of_a_tip_held_complete() {
+fn a_local_pull_follows_the_attachment_of_a_tip_held_complete() {
     let tmp = TmpDir::new("pull-local-dependency-tip-held");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         pull_main_with(&dst, &src, PullOptions::default())
             .await
             .unwrap();
-        remove_commit_object(&dst_dir, &dep);
-        assert!(!dst.has_object(ObjectType::Commit, &dep).await.unwrap());
+        remove_commit_object(&dst_dir, &att);
+        assert!(!dst.has_object(ObjectType::Commit, &att).await.unwrap());
         assert_eq!(dst.commit_state(&tip).await.unwrap(), CommitState::Normal);
 
         let stats = dst
@@ -8674,7 +8662,7 @@ fn a_local_pull_follows_the_dependency_of_a_tip_held_complete() {
 
         assert_eq!((stats.metadata_imported, stats.content_imported), (1, 0));
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
     });
 }
@@ -8683,7 +8671,7 @@ fn a_local_pull_follows_the_dependency_of_a_tip_held_complete() {
 /// At depth 0 it takes no parent, so it imports the dependency of the tip
 /// alone.
 #[test]
-fn a_local_pull_with_depth_imports_the_dependencies_of_the_parents() {
+fn a_local_pull_with_depth_imports_the_attachments_of_the_parents() {
     let tmp = TmpDir::new("pull-local-dependency-parent");
     block_on(async {
         let base = tmp.path();
@@ -8732,7 +8720,7 @@ fn a_local_pull_with_depth_imports_the_dependencies_of_the_parents() {
 /// A dependency that two pulled commits name is imported one time. The
 /// dependency has a `.commitmeta`, and the pull counts it one time.
 #[test]
-fn a_dependency_that_two_local_commits_name_is_imported_once() {
+fn an_attachment_that_two_local_commits_name_is_imported_once() {
     let tmp = TmpDir::new("pull-local-dependency-once");
     block_on(async {
         let base = tmp.path();
@@ -8740,12 +8728,12 @@ fn a_dependency_that_two_local_commits_name_is_imported_once() {
             build_tree(&base.join(sub), sub.as_bytes());
         }
         let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
-        let dep = commit_tree(&src, base, "uki", "dep/uki", None).await;
-        src.write_commit_detached_metadata(&dep, Some(&two_property_metadata()))
+        let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
+        src.write_commit_detached_metadata(&att, Some(&two_property_metadata()))
             .await
             .unwrap();
-        let parent = commit_tree_related(&src, base, "p", "main", None, &[("boot/uki", dep)]).await;
-        commit_tree_related(&src, base, "t", "main", Some(parent), &[("boot/uki", dep)]).await;
+        let parent = commit_tree_related(&src, base, "p", "main", None, &[("boot/uki", att)]).await;
+        commit_tree_related(&src, base, "t", "main", Some(parent), &[("boot/uki", att)]).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let stats = dst
@@ -8759,10 +8747,10 @@ fn a_dependency_that_two_local_commits_name_is_imported_once() {
             .await
             .unwrap();
 
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
         assert_eq!(stats.metadata_fetched, stats.metadata_imported + 1);
         assert_eq!(
-            dst.read_commit_detached_metadata(&dep).await.unwrap(),
+            dst.read_commit_detached_metadata(&att).await.unwrap(),
             Some(two_property_metadata())
         );
     });
@@ -8771,7 +8759,7 @@ fn a_dependency_that_two_local_commits_name_is_imported_once() {
 /// A pull imports a dependency at depth 0, also under a pull of the whole
 /// history. The parent of the dependency stays in the source.
 #[test]
-fn a_local_dependency_is_imported_at_depth_zero() {
+fn a_local_attachment_is_imported_at_depth_zero() {
     let tmp = TmpDir::new("pull-local-dependency-depth");
     block_on(async {
         let base = tmp.path();
@@ -8780,8 +8768,8 @@ fn a_local_dependency_is_imported_at_depth_zero() {
         }
         let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
         let old = commit_tree(&src, base, "old", "dep/uki", None).await;
-        let dep = commit_tree(&src, base, "uki", "dep/uki", Some(old)).await;
-        let tip = commit_tree_related(&src, base, "main", "main", None, &[("boot/uki", dep)]).await;
+        let att = commit_tree(&src, base, "uki", "dep/uki", Some(old)).await;
+        let tip = commit_tree_related(&src, base, "main", "main", None, &[("boot/uki", att)]).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         pull_main_with(
@@ -8796,7 +8784,7 @@ fn a_local_dependency_is_imported_at_depth_zero() {
         .unwrap();
 
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
         assert!(!dst.has_object(ObjectType::Commit, &old).await.unwrap());
     });
 }
@@ -8804,14 +8792,14 @@ fn a_local_dependency_is_imported_at_depth_zero() {
 /// A pull does not import a build source: the commit that `ostrya.related`
 /// names. The key travels with the detached metadata of the commit.
 #[test]
-fn a_local_pull_does_not_import_a_build_source() {
+fn a_local_pull_does_not_import_a_supplement() {
     let tmp = TmpDir::new("pull-local-build-source");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, _dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, _att) = build_attachment_source(base).await;
         build_tree(&base.join("base"), b"base\n");
         let source = commit_tree(&src, base, "base", "other/base", None).await;
-        src.add_detached_related(&tip, "layer/base", &source)
+        src.add_supplement(&tip, "layer/base", &source)
             .await
             .unwrap();
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
@@ -8821,7 +8809,7 @@ fn a_local_pull_does_not_import_a_build_source() {
             .unwrap();
 
         assert_eq!(
-            dst.read_commit_related(&tip).await.unwrap().build_sources,
+            dst.read_commit_relations(&tip).await.unwrap().supplements,
             [("layer/base".to_owned(), source)]
         );
         assert!(!dst.has_object(ObjectType::Commit, &source).await.unwrap());
@@ -8831,20 +8819,20 @@ fn a_local_pull_does_not_import_a_build_source() {
 /// A commit-only pull imports no dependency. A later full pull imports it
 /// and completes the tip.
 #[test]
-fn a_commit_only_local_pull_imports_no_dependency() {
+fn a_commit_only_local_pull_imports_no_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-commit-only");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         pull_main(&dst, &src, PullFlags::COMMIT_ONLY).await;
         assert!(dst.has_object(ObjectType::Commit, &tip).await.unwrap());
-        assert!(!dst.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert!(!dst.has_object(ObjectType::Commit, &att).await.unwrap());
 
         pull_main(&dst, &src, PullFlags::NONE).await;
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
     });
 }
 
@@ -8856,8 +8844,8 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
     let tmp = TmpDir::new("pull-local-dependency-commit-only-check");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
-        let short: &[u8] = &dep.as_bytes()[..31];
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
+        let short: &[u8] = &att.as_bytes()[..31];
         let defective = store_with_field2(&src, &tip, &[("boot/uki", short)]).await;
         move_ref(&src, "main", &defective).await;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
@@ -8868,7 +8856,7 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
 
         let err = pull_main_with(&dst, &src, commit_only()).await.unwrap_err();
         assert_eq!(
-            dependency_error(err),
+            attachment_error(err),
             (
                 Some(defective),
                 "entry 0 (boot/uki) has a checksum of 31 bytes, not 32".to_owned()
@@ -8878,7 +8866,7 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
 
         build_tree(&base.join("other"), b"other\n");
         let other = commit_tree(&src, base, "other", "other", None).await;
-        let nested = store_with_field2(&src, &other, &[("lib/c", dep.as_bytes())]).await;
+        let nested = store_with_field2(&src, &other, &[("lib/c", att.as_bytes())]).await;
         let absent = [7u8; 32];
         let entries: [(&str, &[u8]); 2] = [("lib/b", nested.as_bytes()), ("lib/x", &absent)];
         for entry in entries {
@@ -8899,11 +8887,11 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
 /// no signature of the dependency, so under a remote with `sign-verify` and a
 /// signed tip the pull fails with the same error.
 #[test]
-fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
+fn a_local_attachment_with_wrong_bytes_fails_an_untrusted_pull() {
     let tmp = TmpDir::new("pull-local-dependency-wrong-bytes");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         sign_commits(&src, &[tip]).await;
         build_tree(&base.join("other"), b"other\n");
         let donor = commit_tree(&src, base, "other", "other/x", None).await;
@@ -8916,7 +8904,7 @@ fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
         std::fs::write(
             object_path(
                 &src_dir,
-                &ObjectName::new(dep, ObjectType::Commit),
+                &ObjectName::new(att, ObjectType::Commit),
                 RepoMode::Archive,
             ),
             donor_bytes,
@@ -8935,7 +8923,7 @@ fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
         .await
         .unwrap_err();
         assert!(
-            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == dep),
+            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == att),
             "{err}"
         );
         assert_left_nothing(&dst).await;
@@ -8954,7 +8942,7 @@ fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
             .await
             .unwrap_err();
         assert!(
-            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == dep),
+            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == att),
             "verified: {err}"
         );
         assert_left_nothing(&dst).await;
@@ -8967,15 +8955,15 @@ fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
 /// signed that the destination does not trust passes too, and the destination
 /// holds the `.commitmeta` of the source.
 #[test]
-fn a_local_dependency_with_no_trusted_signature_passes_the_pull() {
+fn a_local_attachment_with_no_trusted_signature_passes_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-signature");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         sign_commits(&src, &[tip]).await;
         let meta = |dir: &Path| {
             dir.join("objects")
-                .join(ObjectName::new(dep, ObjectType::Commit).loose_path(RepoMode::Archive))
+                .join(ObjectName::new(att, ObjectType::Commit).loose_path(RepoMode::Archive))
                 .with_extension("commitmeta")
         };
 
@@ -8983,19 +8971,19 @@ fn a_local_dependency_with_no_trusted_signature_passes_the_pull() {
         pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
             .await
             .unwrap();
-        assert_complete(&src, &dst, &base.join("dst"), &dep).await;
+        assert_complete(&src, &dst, &base.join("dst"), &att).await;
         assert!(!meta(&base.join("dst")).exists());
         drop(dst);
         std::fs::remove_dir_all(base.join("dst")).unwrap();
 
-        src.sign_commit(&dep, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
+        src.sign_commit(&att, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
             .await
             .unwrap();
         let dst = dest_with_remote(base, &signed_remote()).await;
         pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
             .await
             .unwrap();
-        assert_complete(&src, &dst, &base.join("dst"), &dep).await;
+        assert_complete(&src, &dst, &base.join("dst"), &att).await;
         assert_eq!(
             std::fs::read(meta(&base.join("dst"))).unwrap(),
             std::fs::read(meta(&src_dir)).unwrap()
@@ -9008,25 +8996,25 @@ fn a_local_dependency_with_no_trusted_signature_passes_the_pull() {
 /// pull that takes the dependency as a target copies the `.commitmeta` of the
 /// source.
 #[test]
-fn a_local_dependency_held_complete_keeps_its_detached_metadata() {
+fn a_local_attachment_held_complete_keeps_its_detached_metadata() {
     let tmp = TmpDir::new("pull-local-dependency-held-meta");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, _tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, _tip, att) = build_attachment_source(base).await;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         pull_main_with(&dst, &src, PullOptions::default())
             .await
             .unwrap();
-        assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Normal);
-        assert_eq!(dst.read_commit_detached_metadata(&dep).await.unwrap(), None);
+        assert_eq!(dst.commit_state(&att).await.unwrap(), CommitState::Normal);
+        assert_eq!(dst.read_commit_detached_metadata(&att).await.unwrap(), None);
 
-        src.write_commit_detached_metadata(&dep, Some(&two_property_metadata()))
+        src.write_commit_detached_metadata(&att, Some(&two_property_metadata()))
             .await
             .unwrap();
         pull_main_with(&dst, &src, PullOptions::default())
             .await
             .unwrap();
-        assert_eq!(dst.read_commit_detached_metadata(&dep).await.unwrap(), None);
+        assert_eq!(dst.read_commit_detached_metadata(&att).await.unwrap(), None);
 
         dst.pull_local(
             &src,
@@ -9038,7 +9026,7 @@ fn a_local_dependency_held_complete_keeps_its_detached_metadata() {
         .await
         .unwrap();
         assert_eq!(
-            dst.read_commit_detached_metadata(&dep).await.unwrap(),
+            dst.read_commit_detached_metadata(&att).await.unwrap(),
             Some(two_property_metadata())
         );
     });
@@ -9049,11 +9037,11 @@ fn a_local_dependency_held_complete_keeps_its_detached_metadata() {
 /// dependency that a requested ref names fails the pull, and the pull leaves
 /// nothing.
 #[test]
-fn a_local_dependency_that_is_also_a_target_is_checked() {
+fn a_local_attachment_that_is_also_a_target_is_checked() {
     let tmp = TmpDir::new("pull-local-dependency-target-signature");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         sign_commits(&src, &[tip]).await;
         let dst = dest_with_remote(base, &signed_remote()).await;
 
@@ -9068,7 +9056,7 @@ fn a_local_dependency_that_is_also_a_target_is_checked() {
             .await
             .unwrap_err();
         assert!(
-            matches!(&err, Error::Signature(m) if m.contains(&format!("commit {dep}"))),
+            matches!(&err, Error::Signature(m) if m.contains(&format!("commit {att}"))),
             "{err}"
         );
         assert_left_nothing(&dst).await;
@@ -9080,7 +9068,7 @@ fn a_local_dependency_that_is_also_a_target_is_checked() {
 /// tip, and an unsigned parent, a pull at depth 0 takes the parent as a
 /// dependency alone and passes. A pull at depth 1 refuses the parent.
 #[test]
-fn a_local_dependency_that_is_also_a_parent_is_checked() {
+fn a_local_attachment_that_is_also_a_parent_is_checked() {
     let tmp = TmpDir::new("pull-local-dependency-parent-signature");
     block_on(async {
         let base = tmp.path();
@@ -9124,67 +9112,67 @@ fn a_local_dependency_that_is_also_a_parent_is_checked() {
 /// A dependency that neither the source nor the destination holds fails the
 /// pull with `Error::ObjectNotFound`, and the pull leaves nothing.
 #[test]
-fn a_missing_local_dependency_fails_the_pull() {
+fn a_missing_local_attachment_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-missing");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, _tip, dep) = build_dependency_source(base).await;
-        remove_commit_object(&src_dir, &dep);
+        let (src_dir, src, _tip, att) = build_attachment_source(base).await;
+        remove_commit_object(&src_dir, &att);
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let err = pull_main_with(&dst, &src, PullOptions::default())
             .await
             .unwrap_err();
-        assert_commit_not_found(&err, &dep);
+        assert_commit_not_found(&err, &att);
         assert_left_nothing(&dst).await;
     });
 }
 
 /// A field 2 entry with an empty name or with a checksum that is not 32
-/// bytes fails the pull with `Error::InvalidRelated`, and the pull leaves
+/// bytes fails the pull with `Error::InvalidRelations`, and the pull leaves
 /// nothing.
 #[test]
-fn a_defective_local_dependency_entry_fails_the_pull() {
+fn a_defective_local_attachment_entry_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-defective");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        let short: &[u8] = &dep.as_bytes()[..31];
+        let short: &[u8] = &att.as_bytes()[..31];
         for (entry, reason) in [
             (
                 ("boot/uki", short),
                 "entry 0 (boot/uki) has a checksum of 31 bytes, not 32",
             ),
-            (("", dep.as_bytes()), "entry 0 has an empty name"),
+            (("", att.as_bytes()), "entry 0 has an empty name"),
         ] {
             let defective = store_with_field2(&src, &tip, &[entry]).await;
             move_ref(&src, "main", &defective).await;
             let err = pull_main_with(&dst, &src, PullOptions::default())
                 .await
                 .unwrap_err();
-            assert_eq!(dependency_error(err), (Some(defective), reason.to_owned()));
+            assert_eq!(attachment_error(err), (Some(defective), reason.to_owned()));
             assert_left_nothing(&dst).await;
         }
     });
 }
 
 /// A dependency that names dependencies of its own fails the pull with
-/// `Error::InvalidRelated`, also if the walk takes that commit as a target.
+/// `Error::InvalidRelations`, also if the walk takes that commit as a target.
 /// The error names the commit that names the nested dependency. The pull
 /// leaves nothing.
 #[test]
-fn a_nested_local_dependency_fails_the_pull() {
+fn a_nested_local_attachment_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-nested");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         build_tree(&base.join("other"), b"other\n");
         let other = commit_tree(&src, base, "other", "other", None).await;
         // `other` names a commit with a dependency, and `main` names a commit
         // whose dependency is that commit.
-        let nested = store_with_field2(&src, &other, &[("lib/c", dep.as_bytes())]).await;
+        let nested = store_with_field2(&src, &other, &[("lib/c", att.as_bytes())]).await;
         let head = store_with_field2(&src, &tip, &[("lib/b", nested.as_bytes())]).await;
         move_ref(&src, "other", &nested).await;
         move_ref(&src, "main", &head).await;
@@ -9204,7 +9192,7 @@ fn a_nested_local_dependency_fails_the_pull() {
                 .await
                 .unwrap_err();
             assert_eq!(
-                dependency_error(err),
+                attachment_error(err),
                 (Some(head), reason.clone()),
                 "{refs:?}"
             );
@@ -9218,7 +9206,7 @@ fn a_nested_local_dependency_fails_the_pull() {
 /// the first defect. A first entry that names the parent of the tip needs no
 /// read. The pull leaves nothing.
 #[test]
-fn the_first_failing_local_dependency_gives_the_error() {
+fn the_first_failing_local_attachment_gives_the_error() {
     let tmp = TmpDir::new("pull-local-dependency-first-failure");
     block_on(async {
         let base = tmp.path();
@@ -9258,7 +9246,7 @@ fn the_first_failing_local_dependency_gives_the_error() {
                 let reason = format!(
                     "dependency b/x names commit {nested}, which has dependencies of its own"
                 );
-                assert_eq!(dependency_error(err), (Some(tip), reason));
+                assert_eq!(attachment_error(err), (Some(tip), reason));
             }
             assert_left_nothing(&dst).await;
         }
@@ -9270,7 +9258,7 @@ fn the_first_failing_local_dependency_gives_the_error() {
 /// dependency after the nested one, so the order of field 2 selects the
 /// error. The pull leaves nothing.
 #[test]
-fn a_held_nested_dependency_before_a_missing_one_gives_the_nested_error() {
+fn a_held_nested_attachment_before_a_missing_one_gives_the_nested_error() {
     let tmp = TmpDir::new("pull-local-dependency-held-nested");
     block_on(async {
         let base = tmp.path();
@@ -9308,7 +9296,7 @@ fn a_held_nested_dependency_before_a_missing_one_gives_the_nested_error() {
                 let reason = format!(
                     "dependency a/x names commit {other}, which has dependencies of its own"
                 );
-                assert_eq!(dependency_error(err), (Some(tip), reason));
+                assert_eq!(attachment_error(err), (Some(tip), reason));
             } else {
                 assert_commit_not_found(&err, &absent);
             }
@@ -9321,7 +9309,7 @@ fn a_held_nested_dependency_before_a_missing_one_gives_the_nested_error() {
 /// names the parent as a dependency, the pull fails with
 /// `Error::ObjectNotFound`.
 #[test]
-fn an_absent_local_parent_that_is_a_dependency_fails_the_pull() {
+fn an_absent_local_parent_that_is_an_attachment_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-absent-parent");
     block_on(async {
         let base = tmp.path();
@@ -9354,11 +9342,11 @@ fn an_absent_local_parent_that_is_a_dependency_fails_the_pull() {
 /// A dependency that the destination holds partial is imported whole, and
 /// the pull removes its marker.
 #[test]
-fn a_local_dependency_held_partial_is_completed() {
+fn a_local_attachment_held_partial_is_completed() {
     let tmp = TmpDir::new("pull-local-dependency-partial");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, _tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, _tip, att) = build_attachment_source(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(
             &src,
@@ -9370,11 +9358,11 @@ fn a_local_dependency_held_partial_is_completed() {
         )
         .await
         .unwrap();
-        assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Partial);
+        assert_eq!(dst.commit_state(&att).await.unwrap(), CommitState::Partial);
 
         pull_main(&dst, &src, PullFlags::NONE).await;
 
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
     });
 }
 
@@ -9383,7 +9371,7 @@ fn a_local_dependency_held_partial_is_completed() {
 /// takes the parent one time, with no parent of its own, and counts its
 /// `.commitmeta` one time.
 #[test]
-fn a_local_parent_that_is_a_dependency_is_imported_once() {
+fn a_local_parent_that_is_an_attachment_is_imported_once() {
     let tmp = TmpDir::new("pull-local-dependency-parent-once");
     block_on(async {
         let base = tmp.path();
@@ -9425,21 +9413,21 @@ fn a_local_parent_that_is_a_dependency_is_imported_once() {
 /// import fails after the pull wrote the marker of each commit, and the pull
 /// removes each marker and publishes nothing.
 #[test]
-fn a_failure_in_the_import_of_a_dependency_clears_its_marker() {
+fn a_failure_in_the_import_of_an_attachment_clears_its_marker() {
     let tmp = TmpDir::new("pull-local-dependency-import-fails");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         let own = src.traverse_commit(&tip, 0).await.unwrap();
-        let only_dep: Vec<ObjectName> = src
-            .traverse_commit(&dep, 0)
+        let only_att: Vec<ObjectName> = src
+            .traverse_commit(&att, 0)
             .await
             .unwrap()
             .into_iter()
             .filter(|name| name.ty == ObjectType::File && !own.contains(name))
             .collect();
-        assert!(!only_dep.is_empty());
-        std::fs::remove_file(object_path(&src_dir, &only_dep[0], RepoMode::Archive)).unwrap();
+        assert!(!only_att.is_empty());
+        std::fs::remove_file(object_path(&src_dir, &only_att[0], RepoMode::Archive)).unwrap();
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let err = pull_main_with(&dst, &src, PullOptions::default())
@@ -9455,16 +9443,16 @@ fn a_failure_in_the_import_of_a_dependency_clears_its_marker() {
 /// hold. A dependency that the destination holds complete, and that no
 /// source holds, needs no source.
 #[test]
-fn a_dependency_comes_from_a_localcache_or_the_destination() {
+fn an_attachment_comes_from_a_localcache_or_the_destination() {
     let tmp = TmpDir::new("pull-local-dependency-localcache");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         let (_cache_dir, cache) = make_repo(base, "cache", RepoMode::Archive).await;
-        hold_commit(&cache, &src, &dep).await;
+        hold_commit(&cache, &src, &att).await;
         let (held_dir, held) = make_repo(base, "held", RepoMode::Archive).await;
-        hold_commit(&held, &src, &dep).await;
-        remove_commit_object(&src_dir, &dep);
+        hold_commit(&held, &src, &att).await;
+        remove_commit_object(&src_dir, &att);
 
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         pull_main_with(
@@ -9478,14 +9466,14 @@ fn a_dependency_comes_from_a_localcache_or_the_destination() {
         .await
         .unwrap();
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Normal);
-        assert!(!has_partial_marker(&dst_dir, &dep));
+        assert_eq!(dst.commit_state(&att).await.unwrap(), CommitState::Normal);
+        assert!(!has_partial_marker(&dst_dir, &att));
 
         pull_main_with(&held, &src, PullOptions::default())
             .await
             .unwrap();
         assert_complete(&src, &held, &held_dir, &tip).await;
-        assert_eq!(held.commit_state(&dep).await.unwrap(), CommitState::Normal);
+        assert_eq!(held.commit_state(&att).await.unwrap(), CommitState::Normal);
         assert!(held.fsck(&FsckOptions::default()).await.unwrap().is_ok());
     });
 }
@@ -9495,7 +9483,7 @@ fn a_dependency_comes_from_a_localcache_or_the_destination() {
 /// holds the third, complete. The pull reads each one from the repository
 /// that holds it, and each one ends complete in the destination.
 #[test]
-fn a_local_pull_reads_each_dependency_from_the_repository_that_holds_it() {
+fn a_local_pull_reads_each_attachment_from_the_repository_that_holds_it() {
     let tmp = TmpDir::new("pull-local-dependency-holders");
     block_on(async {
         let base = tmp.path();
@@ -9535,9 +9523,9 @@ fn a_local_pull_reads_each_dependency_from_the_repository_that_holds_it() {
 
         assert_complete(&src, &dst, &dst_dir, &tip).await;
         assert_complete(&src, &dst, &dst_dir, &in_src).await;
-        for dep in [in_cache, in_dst] {
-            assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Normal);
-            assert!(!has_partial_marker(&dst_dir, &dep));
+        for att in [in_cache, in_dst] {
+            assert_eq!(dst.commit_state(&att).await.unwrap(), CommitState::Normal);
+            assert!(!has_partial_marker(&dst_dir, &att));
         }
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
         assert_eq!(
@@ -9554,7 +9542,7 @@ fn a_local_pull_reads_each_dependency_from_the_repository_that_holds_it() {
 /// reads the source before a localcache and a localcache before the
 /// destination, and it starts the search of each dependency at the source.
 #[test]
-fn a_local_pull_reads_a_dependency_from_its_first_holder() {
+fn a_local_pull_reads_an_attachment_from_its_first_holder() {
     let tmp = TmpDir::new("pull-local-dependency-holder-order");
     block_on(async {
         let base = tmp.path();
@@ -9611,19 +9599,17 @@ fn a_local_pull_reads_a_dependency_from_its_first_holder() {
 /// `ostrya.related` from the detached metadata of a dependency and stores
 /// each other property.
 #[test]
-fn the_switch_drops_the_related_key_of_a_dependency() {
+fn the_switch_drops_the_related_key_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-switch");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
-        src.write_commit_detached_metadata(&dep, Some(&two_property_metadata()))
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
+        src.write_commit_detached_metadata(&att, Some(&two_property_metadata()))
             .await
             .unwrap();
-        src.add_detached_related(&dep, "layer/base", &tip)
-            .await
-            .unwrap();
+        src.add_supplement(&att, "layer/base", &tip).await.unwrap();
         assert_eq!(
-            detached_keys(&src, &dep).await,
+            detached_keys(&src, &att).await,
             ["ostree.gpgsigs", "build.gc-roots", "ostrya.related"]
         );
         let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
@@ -9634,7 +9620,7 @@ fn the_switch_drops_the_related_key_of_a_dependency() {
             .unwrap();
 
         assert_eq!(
-            dst.read_commit_detached_metadata(&dep).await.unwrap(),
+            dst.read_commit_detached_metadata(&att).await.unwrap(),
             Some(two_property_metadata())
         );
     });
@@ -9643,11 +9629,11 @@ fn the_switch_drops_the_related_key_of_a_dependency() {
 /// A pull of a collection ref imports the dependency of the commit, and
 /// writes no ref.
 #[test]
-fn a_collection_pull_imports_a_dependency() {
+fn a_collection_pull_imports_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-collection");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         set_ref(&src, COLLECTION, "main", &tip).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
@@ -9656,7 +9642,7 @@ fn a_collection_pull_imports_a_dependency() {
             .unwrap();
 
         assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
         assert!(dst.list_refs(None).await.unwrap().is_empty());
         assert!(dst.list_remote_refs().await.unwrap().is_empty());
     });
@@ -9667,7 +9653,7 @@ fn a_collection_pull_imports_a_dependency() {
 /// dependency, B is a nested dependency, and the pull fails before its
 /// transaction opens.
 #[test]
-fn a_dependency_of_an_intermediate_commit_is_imported() {
+fn an_attachment_of_an_intermediate_commit_is_imported() {
     let tmp = TmpDir::new("pull-local-dependency-chain");
     block_on(async {
         let base = tmp.path();
@@ -9676,8 +9662,8 @@ fn a_dependency_of_an_intermediate_commit_is_imported() {
         }
         let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
         let a = commit_tree(&src, base, "a", "main", None).await;
-        let dep = commit_tree(&src, base, "uki", "dep/uki", None).await;
-        let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", dep)]).await;
+        let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
+        let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", att)]).await;
         let c = commit_tree(&src, base, "c", "main", Some(b)).await;
         // The commit write refuses a nested dependency, so the commit that
         // names B is a copy of C with its own field 2.
@@ -9689,7 +9675,7 @@ fn a_dependency_of_an_intermediate_commit_is_imported() {
         dst.pull_local(&src, chain_pull(list.clone()))
             .await
             .unwrap();
-        for commit in [b, c, dep] {
+        for commit in [b, c, att] {
             assert_complete(&src, &dst, &dst_dir, &commit).await;
         }
         assert_no_markers(&dst_dir);
@@ -9700,7 +9686,7 @@ fn a_dependency_of_an_intermediate_commit_is_imported() {
         let held = nested.list_objects().await.unwrap();
         let err = nested.pull_local(&src, chain_pull(list)).await.unwrap_err();
         assert_eq!(
-            dependency_error(err),
+            attachment_error(err),
             (
                 Some(naming),
                 format!("dependency lib/b names commit {b}, which has dependencies of its own")
@@ -9716,7 +9702,7 @@ fn a_dependency_of_an_intermediate_commit_is_imported() {
 /// The source holds no commit object of B, so only the delta of its step
 /// makes B. The pull reads no commit of B and imports it from its delta.
 #[test]
-fn an_intermediate_commit_that_is_a_dependency_comes_from_its_delta() {
+fn an_intermediate_commit_that_is_an_attachment_comes_from_its_delta() {
     let tmp = TmpDir::new("pull-local-dependency-chain-level");
     block_on(async {
         let base = tmp.path();
@@ -9746,7 +9732,7 @@ fn an_intermediate_commit_that_is_a_dependency_comes_from_its_delta() {
 
 /// Field 2 of the intermediate commit B of a chain of static deltas has an
 /// entry with a checksum of 31 bytes. Discovery reads field 2 from the
-/// superblock of the step, and the pull fails with `Error::InvalidRelated`
+/// superblock of the step, and the pull fails with `Error::InvalidRelations`
 /// before its transaction opens.
 #[test]
 fn a_defective_entry_of_an_intermediate_commit_fails_the_pull() {
@@ -9769,7 +9755,7 @@ fn a_defective_entry_of_an_intermediate_commit_fails_the_pull() {
         let err = dst.pull_local(&src, chain_pull(list)).await.unwrap_err();
 
         assert_eq!(
-            dependency_error(err),
+            attachment_error(err),
             (
                 Some(b),
                 "entry 0 (boot/a) has a checksum of 31 bytes, not 32".to_owned()
@@ -9786,11 +9772,11 @@ fn a_defective_entry_of_an_intermediate_commit_fails_the_pull() {
 /// before its transaction opens. The message names the entry, the ref, and
 /// the dependency.
 #[test]
-fn a_required_delta_pull_refuses_a_dependency_with_no_delta() {
+fn a_required_delta_pull_refuses_an_attachment_with_no_delta() {
     let tmp = TmpDir::new("pull-local-dependency-required");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         delta_with(&src, None, &tip, DeltaOptions::default()).await;
         src.reindex_static_deltas().await.unwrap();
         summarize(&src).await;
@@ -9804,7 +9790,7 @@ fn a_required_delta_pull_refuses_a_dependency_with_no_delta() {
         match err {
             Error::Pull(message) => assert_eq!(
                 message,
-                format!("Static deltas required, but none found for boot/uki of main to {dep}")
+                format!("Static deltas required, but none found for boot/uki of main to {att}")
             ),
             other => panic!("{other:?}"),
         }
@@ -9816,7 +9802,7 @@ fn a_required_delta_pull_refuses_a_dependency_with_no_delta() {
 /// and the depth of the pull also takes B as the parent of the target. The
 /// pull imports the dependency one time, complete.
 #[test]
-fn a_dependency_of_an_intermediate_commit_that_the_depth_reaches_is_imported_once() {
+fn an_attachment_of_an_intermediate_commit_that_the_depth_reaches_is_imported_once() {
     let tmp = TmpDir::new("pull-local-dependency-chain-depth");
     block_on(async {
         let base = tmp.path();
@@ -9825,8 +9811,8 @@ fn a_dependency_of_an_intermediate_commit_that_the_depth_reaches_is_imported_onc
         }
         let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
         let a = commit_tree(&src, base, "a", "main", None).await;
-        let dep = commit_tree(&src, base, "uki", "dep/uki", None).await;
-        let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", dep)]).await;
+        let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
+        let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", att)]).await;
         let c = commit_tree(&src, base, "c", "main", Some(b)).await;
         let (list, _dirs) = chain_list(&src, &[(a, b), (b, c)]).await;
         let (dst_dir, dst) = dst_holding(base, "dst", &src, &a).await;
@@ -9843,14 +9829,14 @@ fn a_dependency_of_an_intermediate_commit_that_the_depth_reaches_is_imported_onc
             .await
             .unwrap();
 
-        for commit in [b, c, dep] {
+        for commit in [b, c, att] {
             assert_complete(&src, &dst, &dst_dir, &commit).await;
         }
         assert_no_markers(&dst_dir);
         assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
         let after = dst.list_objects().await.unwrap();
         let mut expected = before.clone();
-        for commit in [b, c, dep] {
+        for commit in [b, c, att] {
             expected.extend(src.traverse_commit(&commit, 0).await.unwrap());
         }
         assert_eq!(after, expected);
@@ -9867,7 +9853,7 @@ fn a_dependency_of_an_intermediate_commit_that_the_depth_reaches_is_imported_onc
 /// dependency, D1 and D2, and two commits on `main`, T1 and T2. T1 names D1
 /// as `boot/uki`, and T2, a child of T1, names D2 as `boot/uki`. The ref
 /// `main` names T1. Returns the source and `[T1, D1, T2, D2]`.
-async fn build_dependency_generations(base: &Path) -> (Repo, [Checksum; 4]) {
+async fn build_attachment_generations(base: &Path) -> (Repo, [Checksum; 4]) {
     for sub in ["uki1", "uki2", "main1", "main2"] {
         build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
     }
@@ -9921,11 +9907,11 @@ fn required_refs(refs: &[&str]) -> PullOptions {
 /// pull. The from-scratch delta of D2 has a spoiled superblock, so a pull
 /// that took it would fail. No content object of D2 is imported loose.
 #[test]
-fn a_local_dependency_delta_from_its_paired_entry_is_taken() {
+fn a_local_attachment_delta_from_its_paired_entry_is_taken() {
     let tmp = TmpDir::new("pull-local-dependency-delta-paired");
     block_on(async {
         let base = tmp.path();
-        let (src, [t1, d1, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [t1, d1, t2, d2]) = build_attachment_generations(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
         move_ref(&src, "main", &t2).await;
@@ -9956,11 +9942,11 @@ fn a_local_dependency_delta_from_its_paired_entry_is_taken() {
 /// complete, before the from-scratch delta of D2, whose superblock is
 /// spoiled.
 #[test]
-fn a_local_dependency_delta_from_another_held_commit_is_taken() {
+fn a_local_attachment_delta_from_another_held_commit_is_taken() {
     let tmp = TmpDir::new("pull-local-dependency-delta-held");
     block_on(async {
         let base = tmp.path();
-        let (src, [_, d1, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [_, d1, t2, d2]) = build_attachment_generations(base).await;
         move_ref(&src, "main", &t2).await;
         let dirs = publish_deltas(&src, &[(None, t2), (Some(d1), d2), (None, d2)]).await;
         spoil_superblock(&dirs[2]);
@@ -9983,24 +9969,24 @@ fn a_local_dependency_delta_from_another_held_commit_is_taken() {
 /// imports the dependency loose. That delta counts as found, so the pull
 /// passes.
 #[test]
-fn the_from_scratch_delta_of_a_local_dependency_needs_no_paired_entry_held() {
+fn the_from_scratch_delta_of_a_local_attachment_needs_no_paired_entry_held() {
     let tmp = TmpDir::new("pull-local-dependency-delta-scratch");
     block_on(async {
         let base = tmp.path();
-        let (src, [t1, _, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [t1, _, t2, d2]) = build_attachment_generations(base).await;
         let (paired_dir, paired) = make_repo(base, "paired", RepoMode::Archive).await;
         paired.pull_local(&src, pull_refs(&["main"])).await.unwrap();
         move_ref(&src, "main", &t2).await;
         publish_deltas(&src, &[(None, t2), (Some(t1), t2), (None, d2)]).await;
         let own = src.traverse_commit(&t2, 0).await.unwrap();
-        let only_dep = src
+        let only_att = src
             .traverse_commit(&d2, 0)
             .await
             .unwrap()
             .into_iter()
             .filter(|name| name.ty == ObjectType::File && !own.contains(name))
             .count();
-        assert!(only_dep > 0);
+        assert!(only_att > 0);
 
         let (fresh_dir, fresh) = make_repo(base, "fresh", RepoMode::Archive).await;
         let stats = fresh
@@ -10016,7 +10002,7 @@ fn the_from_scratch_delta_of_a_local_dependency_needs_no_paired_entry_held() {
             .await
             .unwrap();
         assert_eq!(stats.delta_parts, 1);
-        assert_eq!(stats.content_fetched as usize, only_dep);
+        assert_eq!(stats.content_fetched as usize, only_att);
         assert_complete(&src, &paired, &paired_dir, &d2).await;
         assert_no_markers(&paired_dir);
     });
@@ -10028,7 +10014,7 @@ fn the_from_scratch_delta_of_a_local_dependency_needs_no_paired_entry_held() {
 /// `[left, right]` takes `<DA>-<D>` and passes, and the pull of
 /// `[right, left]` takes `<DB>-<D>` and fails.
 #[test]
-fn the_first_local_target_gives_the_from_of_a_dependency() {
+fn the_first_local_target_gives_the_from_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-targets");
     block_on(async {
         let base = tmp.path();
@@ -10088,11 +10074,11 @@ fn the_first_local_target_gives_the_from_of_a_dependency() {
 /// entry, and the pull takes its from-scratch delta. A pull of `main` holds
 /// the paired entry D1 complete and imports the dependency loose.
 #[test]
-fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_a_dependency() {
+fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-checksum");
     block_on(async {
         let base = tmp.path();
-        let (src, [_, _, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [_, _, t2, d2]) = build_attachment_generations(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
         move_ref(&src, "main", &t2).await;
@@ -10118,12 +10104,12 @@ fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_a_dependency() {
 /// Under `disable_static_deltas`, a pull that requires static deltas reads
 /// no delta, also for a dependency that has one, and imports it loose.
 #[test]
-fn a_local_pull_with_disabled_deltas_reads_no_dependency_delta() {
+fn a_local_pull_with_disabled_deltas_reads_no_attachment_delta() {
     let tmp = TmpDir::new("pull-local-dependency-delta-disabled");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
-        publish_deltas(&src, &[(None, tip), (None, dep)]).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
+        publish_deltas(&src, &[(None, tip), (None, att)]).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let stats = dst
@@ -10138,7 +10124,7 @@ fn a_local_pull_with_disabled_deltas_reads_no_dependency_delta() {
             .unwrap();
 
         assert_eq!(stats.delta_parts, 0);
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
+        assert_complete(&src, &dst, &dst_dir, &att).await;
     });
 }
 
@@ -10147,11 +10133,11 @@ fn a_local_pull_with_disabled_deltas_reads_no_dependency_delta() {
 /// the dependency loose. Under `require_static_deltas`, a list with no entry
 /// to the dependency fails the pull before its transaction opens.
 #[test]
-fn a_local_list_pull_takes_the_listed_delta_of_a_dependency() {
+fn a_local_list_pull_takes_the_listed_delta_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-list");
     block_on(async {
         let base = tmp.path();
-        let (src, [t1, d1, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [t1, d1, t2, d2]) = build_attachment_generations(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
         let (refused_dir, refused) = make_repo(base, "refused", RepoMode::Archive).await;
@@ -10203,11 +10189,11 @@ fn a_local_list_pull_takes_the_listed_delta_of_a_dependency() {
 /// entry in the list comes as loose objects, and the pull passes. The pull
 /// applies the listed delta of the target.
 #[test]
-fn a_local_list_pull_imports_a_dependency_with_no_listed_delta_loose() {
+fn a_local_list_pull_imports_an_attachment_with_no_listed_delta_loose() {
     let tmp = TmpDir::new("pull-local-dependency-delta-list-loose");
     block_on(async {
         let base = tmp.path();
-        let (src, [t1, _, t2, d2]) = build_dependency_generations(base).await;
+        let (src, [t1, _, t2, d2]) = build_attachment_generations(base).await;
         let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
         dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
         move_ref(&src, "main", &t2).await;
@@ -10247,15 +10233,15 @@ const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yay
 /// remote that checks the commits against a key that signed the tip, and
 /// leaves nothing.
 #[test]
-fn a_local_dependency_delta_that_gives_another_commit_fails_the_pull() {
+fn a_local_attachment_delta_that_gives_another_commit_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-delta-other-commit");
     block_on(async {
         let base = tmp.path();
-        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (src_dir, src, tip, att) = build_attachment_source(base).await;
         sign_commits(&src, &[tip]).await;
         build_tree(&base.join("other"), b"other\n");
         let donor = commit_tree(&src, base, "other", "other/x", None).await;
-        let dir = delta_with(&src, None, &dep, DeltaOptions::default()).await;
+        let dir = delta_with(&src, None, &att, DeltaOptions::default()).await;
         let donor_dir = delta_with(&src, None, &donor, DeltaOptions::default()).await;
 
         let ty = Type::parse(SUPERBLOCK_SIG).unwrap();
@@ -10281,7 +10267,7 @@ fn a_local_dependency_delta_that_gives_another_commit_fails_the_pull() {
             std::fs::write(dir.join("superblock"), &bytes).unwrap();
             let list = vec![AdvertisedDelta {
                 from: None,
-                to: dep,
+                to: att,
                 superblock: Checksum::sha256(&bytes),
             }];
             for (tag, extra) in [("unverified", None), ("verified", Some(signed_remote()))] {
@@ -10323,13 +10309,13 @@ fn a_local_dependency_delta_that_gives_another_commit_fails_the_pull() {
 /// dependency as a target too checks the superblock, and fails with
 /// [`Error::Signature`].
 #[test]
-fn a_local_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
+fn a_local_attachment_delta_signed_by_an_untrusted_key_passes_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-delta-untrusted");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         sign_commits(&src, &[tip]).await;
-        let dir = delta_with(&src, None, &dep, DeltaOptions::default()).await;
+        let dir = delta_with(&src, None, &att, DeltaOptions::default()).await;
         src.sign_static_delta(&dir, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
             .await
             .unwrap();
@@ -10337,9 +10323,9 @@ fn a_local_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
         src.reindex_static_deltas().await.unwrap();
         summarize(&src).await;
 
-        let dependency = base.join("dependency");
-        std::fs::create_dir(&dependency).unwrap();
-        let dst = dest_with_remote(&dependency, &signed_remote()).await;
+        let attachment = base.join("dependency");
+        std::fs::create_dir(&attachment).unwrap();
+        let dst = dest_with_remote(&attachment, &signed_remote()).await;
         let stats = dst
             .pull_local(
                 &src,
@@ -10351,8 +10337,8 @@ fn a_local_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
             .await
             .unwrap();
         assert_eq!(stats.delta_parts, 2);
-        assert_complete(&src, &dst, &dependency.join("dst"), &dep).await;
-        assert_no_markers(&dependency.join("dst"));
+        assert_complete(&src, &dst, &attachment.join("dst"), &att).await;
+        assert_no_markers(&attachment.join("dst"));
 
         let target = base.join("target");
         std::fs::create_dir(&target).unwrap();

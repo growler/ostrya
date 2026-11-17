@@ -17,7 +17,7 @@ use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, Value};
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
 use crate::refs::{open_refs, open_top_in, read_listed_ref, refuse_top_symlink, walk_ref_dir};
-use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
+use crate::related::{self, RelatedEntry, RelationField, RelationWarning};
 use crate::repo::Repo;
 use crate::repo_fs::{FsResultExt, RepoDir};
 
@@ -245,15 +245,15 @@ impl Expanded {
 #[derive(Debug, Clone)]
 pub(crate) struct GcRoots {
     /// `true` if the walk follows field 2 of a commit: the dependencies.
-    pub dependencies: bool,
+    pub attachments: bool,
     /// `true` if the walk follows the `ostrya.related` entry of the detached
     /// metadata of a commit: the build sources.
     ///
     /// The walk reads the detached metadata of a commit only if this is
     /// `true`. It parses the `.commitmeta` of a commit only if the bytes of
     /// the file hold the key `ostrya.related` and its terminating NUL
-    /// ([`MetadataSource::load_build_source_dict`]).
-    pub build_sources: bool,
+    /// ([`MetadataSource::load_supplement_dict`]).
+    pub supplements: bool,
     /// `true` if the walk follows the `parent` edge of a commit.
     pub traverse_parent: bool,
     /// `true` if the objects of the tree of a commit are reachable.
@@ -277,8 +277,8 @@ impl GcRoots {
     /// edge, the trees, and no related edges.
     fn parents_only() -> GcRoots {
         GcRoots {
-            dependencies: false,
-            build_sources: false,
+            attachments: false,
+            supplements: false,
             traverse_parent: true,
             traverse_tree: true,
             weak_roots: HashMap::new(),
@@ -488,7 +488,7 @@ impl Repo {
         bounded_roots: &HashSet<Checksum>,
         pending_delete: Option<Checksum>,
         listing: &HashSet<ObjectName>,
-    ) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
+    ) -> Result<(HashSet<ObjectName>, Vec<RelationWarning>)> {
         let store = ListedLoose {
             repo: self,
             listing,
@@ -678,14 +678,14 @@ pub(crate) trait MetadataSource: Sync {
     /// [`load_metadata`](MetadataSource::load_metadata) and tests and parses
     /// it on the blocking pool. [`Repo`] reads, tests, and parses the file in
     /// one trip to the blocking pool.
-    fn load_build_source_dict(
+    fn load_supplement_dict(
         &self,
         commit: Checksum,
     ) -> impl Future<Output = Result<Option<Value>>> + Send {
         async move {
             match self.load_metadata(ObjectType::CommitMeta, commit).await? {
                 Some(bytes) => {
-                    ostrya_rt::unblock(move || crate::commit::parse_build_source_dict(&bytes)).await
+                    ostrya_rt::unblock(move || crate::commit::parse_supplement_dict(&bytes)).await
                 }
                 None => Ok(None),
             }
@@ -696,12 +696,12 @@ pub(crate) trait MetadataSource: Sync {
     /// metadata dict, or `None` if the store does not hold the commit.
     ///
     /// The detached metadata is the value that
-    /// [`load_build_source_dict`](MetadataSource::load_build_source_dict)
+    /// [`load_supplement_dict`](MetadataSource::load_supplement_dict)
     /// gives. The default calls
     /// [`load_metadata`](MetadataSource::load_metadata) and then
-    /// `load_build_source_dict`. [`Repo`] reads the two files and tests and
+    /// `load_supplement_dict`. [`Repo`] reads the two files and tests and
     /// parses the detached metadata in one trip to the blocking pool.
-    fn load_commit_with_build_source_dict(
+    fn load_commit_with_supplement_dict(
         &self,
         commit: Checksum,
     ) -> impl Future<Output = Result<Option<(Vec<u8>, Option<Value>)>>> + Send {
@@ -709,7 +709,7 @@ pub(crate) trait MetadataSource: Sync {
             let Some(bytes) = self.load_metadata(ObjectType::Commit, commit).await? else {
                 return Ok(None);
             };
-            Ok(Some((bytes, self.load_build_source_dict(commit).await?)))
+            Ok(Some((bytes, self.load_supplement_dict(commit).await?)))
         }
     }
 }
@@ -719,16 +719,16 @@ impl MetadataSource for Repo {
         self.held_object_bytes(ty, &checksum).await
     }
 
-    async fn load_build_source_dict(&self, commit: Checksum) -> Result<Option<Value>> {
+    async fn load_supplement_dict(&self, commit: Checksum) -> Result<Option<Value>> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || repo.read_build_source_dict_blocking(&commit)).await
+        ostrya_rt::unblock(move || repo.read_supplement_dict_blocking(&commit)).await
     }
 
-    async fn load_commit_with_build_source_dict(
+    async fn load_commit_with_supplement_dict(
         &self,
         commit: Checksum,
     ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
-        match self.load_commit_and_build_source_dict(&commit).await {
+        match self.load_commit_and_supplement_dict(&commit).await {
             Ok(loaded) => Ok(Some(loaded)),
             Err(Error::ObjectNotFound {
                 ty: ObjectType::Commit,
@@ -772,14 +772,14 @@ impl MetadataSource for ListedLoose<'_> {
         self.repo.load_metadata(ty, checksum).await
     }
 
-    async fn load_build_source_dict(&self, commit: Checksum) -> Result<Option<Value>> {
+    async fn load_supplement_dict(&self, commit: Checksum) -> Result<Option<Value>> {
         if !self.has_detached(commit) {
             return Ok(None);
         }
-        self.repo.load_build_source_dict(commit).await
+        self.repo.load_supplement_dict(commit).await
     }
 
-    async fn load_commit_with_build_source_dict(
+    async fn load_commit_with_supplement_dict(
         &self,
         commit: Checksum,
     ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
@@ -787,7 +787,7 @@ impl MetadataSource for ListedLoose<'_> {
             let bytes = self.repo.load_metadata(ObjectType::Commit, commit).await?;
             return Ok(bytes.map(|bytes| (bytes, None)));
         }
-        self.repo.load_commit_with_build_source_dict(commit).await
+        self.repo.load_commit_with_supplement_dict(commit).await
     }
 }
 
@@ -828,7 +828,7 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
     gc: &GcRoots,
     bounded_roots: &HashSet<Checksum>,
     pending_delete: Option<Checksum>,
-) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
+) -> Result<(HashSet<ObjectName>, Vec<RelationWarning>)> {
     let seeds = roots
         .into_iter()
         .map(|(c, bound)| (c, bound, Arrival::Root))
@@ -849,7 +849,7 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
     // The walk reads the commits in an order that depends on the order of
     // the roots. The sort is stable, so the warnings of one field keep the
     // order of its entries.
-    warnings.sort_by_key(|w| (w.commit, w.field == RelatedField::BuildSources));
+    warnings.sort_by_key(|w| (w.commit, w.field == RelationField::Supplements));
     Ok((reachable, warnings))
 }
 
@@ -909,9 +909,9 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// its first expansion. A later expansion follows more parents, and the
 /// seeds of the edges are the same. The related edges are:
 ///
-/// - With `gc.dependencies`, the entries of field 2. The walk reads field 2
+/// - With `gc.attachments`, the entries of field 2. The walk reads field 2
 ///   of each commit that it reaches, a dependency included.
-/// - With `gc.build_sources`, the entries of the first `ostrya.related` entry
+/// - With `gc.supplements`, the entries of the first `ostrya.related` entry
 ///   of the detached metadata. The walk reads it for each commit that it
 ///   reaches, a build source included.
 ///
@@ -921,7 +921,7 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// that adds its own name alone. Unless the arrival is over a `parent` edge
 /// under a timestamp bound, the walk reads the detached metadata with the
 /// commit in one call of
-/// [`load_commit_with_build_source_dict`](MetadataSource::load_commit_with_build_source_dict).
+/// [`load_commit_with_supplement_dict`](MetadataSource::load_commit_with_supplement_dict).
 /// The walk parses a `.commitmeta` only if its bytes hold the key
 /// `ostrya.related`. A `.commitmeta` that holds the key and does not parse
 /// stops the walk with an error. The walk parses no `.commitmeta` that does
@@ -938,7 +938,7 @@ async fn collect_reachable<S: MetadataSource>(
     bounded_roots: &HashSet<Checksum>,
     pending_delete: Option<Checksum>,
     reachable: &mut HashSet<ObjectName>,
-    warnings: &mut Vec<RelatedWarning>,
+    warnings: &mut Vec<RelationWarning>,
 ) -> Result<()> {
     let mut commit_stack = seeds;
     let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
@@ -954,7 +954,7 @@ async fn collect_reachable<S: MetadataSource>(
     // adds a commit when it reads them, so an arrival that the timestamp
     // bound rejects reads nothing and adds nothing.
     let mut edges_read: HashSet<Checksum> = HashSet::new();
-    let reads_edges = gc.dependencies || gc.build_sources;
+    let reads_edges = gc.attachments || gc.supplements;
 
     while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
         // When the walk reaches the commit of a weak ref over any edge,
@@ -1041,16 +1041,16 @@ async fn collect_reachable<S: MetadataSource>(
         let mut prefetched: Option<std::result::Result<Option<Vec<RelatedEntry>>, String>> = None;
         let loaded = if pending_delete == Some(commit_checksum) {
             None
-        } else if gc.build_sources
+        } else if gc.supplements
             && arrival != Arrival::TimedParent
             && !edges_read.contains(&commit_checksum)
         {
             match store
-                .load_commit_with_build_source_dict(commit_checksum)
+                .load_commit_with_supplement_dict(commit_checksum)
                 .await?
             {
                 Some((bytes, detached)) => {
-                    prefetched = Some(related::build_sources(detached.as_ref()));
+                    prefetched = Some(related::supplements(detached.as_ref()));
                     Some(Commit::parse(&bytes)?)
                 }
                 None => None,
@@ -1098,33 +1098,30 @@ async fn collect_reachable<S: MetadataSource>(
                     commit_stack.push((target, root_bound, Arrival::Root));
                 }
             };
-            if gc.dependencies {
+            if gc.attachments {
                 let (targets, defects) =
                     related::split_entries(related::entries_of(&commit.related));
-                warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
+                warnings.extend(defects.into_iter().map(|reason| RelationWarning {
                     commit: commit_checksum,
-                    field: RelatedField::Dependencies,
+                    field: RelationField::Attachments,
                     reason,
                 }));
                 targets.into_iter().for_each(&mut push);
             }
-            if gc.build_sources {
+            if gc.supplements {
                 let sources = match prefetched {
                     Some(sources) => sources,
-                    None => related::build_sources(
-                        store
-                            .load_build_source_dict(commit_checksum)
-                            .await?
-                            .as_ref(),
+                    None => related::supplements(
+                        store.load_supplement_dict(commit_checksum).await?.as_ref(),
                     ),
                 };
                 let (targets, defects) = match sources {
                     Ok(entries) => related::split_entries(entries.unwrap_or_default()),
                     Err(reason) => (Vec::new(), vec![reason]),
                 };
-                warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
+                warnings.extend(defects.into_iter().map(|reason| RelationWarning {
                     commit: commit_checksum,
-                    field: RelatedField::BuildSources,
+                    field: RelationField::Supplements,
                     reason,
                 }));
                 targets.into_iter().for_each(&mut push);

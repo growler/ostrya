@@ -19,7 +19,7 @@ use common::receive::{
     ed25519_signature, ed25519_signatures, is_root, new_repo, pipe, policy_allowing, secret,
     server_signer, trust,
 };
-use common::{Counting, TmpDir, dependency_error, mark_partial, store_with_field2};
+use common::{Counting, TmpDir, attachment_error, mark_partial, store_with_field2};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
@@ -119,9 +119,9 @@ fn commit_related(
                     subject: Some(content.to_owned()),
                     timestamp: Some(1_700_000_000),
                     metadata,
-                    related: related
+                    attachments: related
                         .iter()
-                        .map(|(name, dependency)| ((*name).to_owned(), *dependency))
+                        .map(|(name, attachment)| ((*name).to_owned(), *attachment))
                         .collect(),
                     ..CommitOptions::default()
                 },
@@ -1436,7 +1436,7 @@ fn the_switch_of_the_server_drops_the_related_key() {
             .await
             .unwrap();
         pair.client
-            .add_detached_related(&c2, "layer/base", &c1)
+            .add_supplement(&c2, "layer/base", &c1)
             .await
             .unwrap();
     });
@@ -1931,10 +1931,10 @@ fn a_session_push_refuses_the_bucket_fields() {
 
 /// Commits a dependency on `dep/uki` of `repo`, and a tip on `main` whose
 /// field 2 names it as `boot/uki`. Returns the tip and the dependency.
-fn dependency_chain(repo: &Repo) -> (Checksum, Checksum) {
-    let dep = commit(repo, "dep/uki", None, "uki", None);
-    let main = commit_related(repo, "main", None, "main", None, &[("boot/uki", dep)]);
-    (main, dep)
+fn attachment_chain(repo: &Repo) -> (Checksum, Checksum) {
+    let att = commit(repo, "dep/uki", None, "uki", None);
+    let main = commit_related(repo, "main", None, "main", None, &[("boot/uki", att)]);
+    (main, att)
 }
 
 /// Asserts that `server` holds `commit` with no marker and each object of
@@ -1980,12 +1980,12 @@ fn detached_dict() -> Value {
 /// complete and with its `.commitmeta`, and the server writes no ref for it.
 /// A second push sends no object.
 #[test]
-fn a_push_sends_the_dependency_of_the_commit() {
+fn a_push_sends_the_attachment_of_the_commit() {
     let pair = Pair::new("dependency", RepoMode::Archive, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     block_on(
         pair.client
-            .write_commit_detached_metadata(&dep, Some(&detached_dict())),
+            .write_commit_detached_metadata(&att, Some(&detached_dict())),
     )
     .unwrap();
 
@@ -1994,9 +1994,9 @@ fn a_push_sends_the_dependency_of_the_commit() {
     outcome.unwrap();
 
     assert_complete(&pair.client, &pair.server, &main);
-    assert_complete(&pair.client, &pair.server, &dep);
+    assert_complete(&pair.client, &pair.server, &att);
     assert_eq!(
-        block_on(pair.server.read_commit_detached_metadata(&dep)).unwrap(),
+        block_on(pair.server.read_commit_detached_metadata(&att)).unwrap(),
         Some(detached_dict())
     );
     assert_eq!(
@@ -2013,7 +2013,7 @@ fn a_push_sends_the_dependency_of_the_commit() {
 /// At depth 0 it sends no parent, so it sends the dependency of the source
 /// commit alone.
 #[test]
-fn a_push_with_depth_sends_the_dependencies_of_the_parents() {
+fn a_push_with_depth_sends_the_attachments_of_the_parents() {
     for depth in [0, 1, -1] {
         let pair = Pair::new(
             &format!("dependency-parent-{depth}"),
@@ -2063,7 +2063,7 @@ fn a_push_with_depth_sends_the_dependencies_of_the_parents() {
 /// history and with no depth. The parent of the dependency stays in the
 /// local repository.
 #[test]
-fn a_dependency_is_sent_at_depth_zero() {
+fn an_attachment_is_sent_at_depth_zero() {
     for depth in [Some(-1), None] {
         let pair = Pair::new(
             &format!("dependency-depth-{depth:?}"),
@@ -2072,14 +2072,14 @@ fn a_dependency_is_sent_at_depth_zero() {
             "",
         );
         let old = commit(&pair.client, "dep/uki", None, "old", None);
-        let dep = commit(&pair.client, "dep/uki", Some(old), "uki", None);
+        let att = commit(&pair.client, "dep/uki", Some(old), "uki", None);
         let main = commit_related(
             &pair.client,
             "main",
             None,
             "main",
             None,
-            &[("boot/uki", dep)],
+            &[("boot/uki", att)],
         );
 
         let (report, outcome) = push(
@@ -2093,7 +2093,7 @@ fn a_dependency_is_sent_at_depth_zero() {
         outcome.unwrap();
 
         assert_complete(&pair.client, &pair.server, &main);
-        assert_complete(&pair.client, &pair.server, &dep);
+        assert_complete(&pair.client, &pair.server, &att);
         assert!(!has_commit(&pair.server, &old), "{depth:?}");
     }
 }
@@ -2102,22 +2102,22 @@ fn a_dependency_is_sent_at_depth_zero() {
 /// refuses a second dict for one commit, so the push passes only if it sends
 /// the `.commitmeta` of the dependency one time.
 #[test]
-fn a_dependency_that_two_commits_name_is_sent_once() {
+fn an_attachment_that_two_commits_name_is_sent_once() {
     let pair = Pair::new("dependency-once", RepoMode::Archive, RepoMode::Archive, "");
-    let dep = commit(&pair.client, "dep/uki", None, "uki", None);
+    let att = commit(&pair.client, "dep/uki", None, "uki", None);
     block_on(
         pair.client
-            .write_commit_detached_metadata(&dep, Some(&detached_dict())),
+            .write_commit_detached_metadata(&att, Some(&detached_dict())),
     )
     .unwrap();
-    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/uki", dep)]);
+    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/uki", att)]);
     commit_related(
         &pair.client,
         "main",
         Some(parent),
         "t",
         None,
-        &[("boot/uki", dep)],
+        &[("boot/uki", att)],
     );
 
     let (report, outcome) = push(
@@ -2130,9 +2130,9 @@ fn a_dependency_that_two_commits_name_is_sent_once() {
     report.unwrap();
     outcome.unwrap();
 
-    assert_complete(&pair.client, &pair.server, &dep);
+    assert_complete(&pair.client, &pair.server, &att);
     assert_eq!(
-        block_on(pair.server.read_commit_detached_metadata(&dep)).unwrap(),
+        block_on(pair.server.read_commit_detached_metadata(&att)).unwrap(),
         Some(detached_dict())
     );
 }
@@ -2142,7 +2142,7 @@ fn a_dependency_that_two_commits_name_is_sent_once() {
 /// the push sends the parent and its `.commitmeta` one time, with no parent
 /// of its own.
 #[test]
-fn a_parent_that_is_a_dependency_is_sent_once() {
+fn a_parent_that_is_an_attachment_is_sent_once() {
     for depth in [0, 1] {
         let pair = Pair::new(
             &format!("dependency-parent-once-{depth}"),
@@ -2189,13 +2189,13 @@ fn a_parent_that_is_a_dependency_is_sent_once() {
 /// The push walks no tree of a dependency that the server holds: the local
 /// repository lacks the root dirtree of the dependency, and the push passes.
 #[test]
-fn a_dependency_the_server_holds_gets_no_tree_walk() {
+fn an_attachment_the_server_holds_gets_no_tree_walk() {
     let pair = Pair::new("dependency-held", RepoMode::Archive, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     let (report, outcome) = push(&pair, opts(&["dep/uki"]));
     report.unwrap();
     outcome.unwrap();
-    let (root, _) = block_on(pair.client.load_commit(&dep)).unwrap();
+    let (root, _) = block_on(pair.client.load_commit(&att)).unwrap();
     let path = ostrya::loose_path(&root.root_dirtree, ObjectType::DirTree, RepoMode::Archive);
     std::fs::remove_file(pair.client.path().join("objects").join(path)).unwrap();
 
@@ -2204,33 +2204,33 @@ fn a_dependency_the_server_holds_gets_no_tree_walk() {
     outcome.unwrap();
 
     assert_eq!(tip(&pair.server, "main"), Some(main));
-    assert_complete(&pair.server, &pair.server, &dep);
+    assert_complete(&pair.server, &pair.server, &att);
 }
 
 /// A dependency that the local repository does not hold, or marks partial,
 /// is refused before the push writes a byte.
 #[test]
-fn an_absent_or_partial_dependency_is_refused_before_any_byte() {
+fn an_absent_or_partial_attachment_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-absent");
     let repo = new_repo(&dir, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&repo);
+    let (main, att) = attachment_chain(&repo);
 
-    mark_partial(&repo, &dep);
+    mark_partial(&repo, &att);
     let (error, written) = refused(&repo, opts(&["main"]));
     assert_eq!(
-        dependency_error(error),
+        attachment_error(error),
         (
             Some(main),
-            format!("dependency boot/uki names commit {dep}, which is partial")
+            format!("dependency boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
 
-    remove_commit_object(&repo, &dep);
+    remove_commit_object(&repo, &att);
     let (error, written) = refused(&repo, opts(&["main"]));
     match error {
         Error::ObjectNotFound { checksum, ty } => {
-            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+            assert_eq!((checksum, ty), (att, ObjectType::Commit));
         }
         other => panic!("expected ObjectNotFound, got {other:?}"),
     }
@@ -2240,21 +2240,21 @@ fn an_absent_or_partial_dependency_is_refused_before_any_byte() {
 /// The push reads no commit object of a dependency with a partial marker: a
 /// directory at the path of the object gives the partial refusal.
 #[test]
-fn a_partial_dependency_with_an_unreadable_object_is_refused_as_partial() {
+fn a_partial_attachment_with_an_unreadable_object_is_refused_as_partial() {
     let dir = TmpDir::new("push-repo-dependency-partial-unreadable");
     let repo = new_repo(&dir, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&repo);
-    mark_partial(&repo, &dep);
-    remove_commit_object(&repo, &dep);
-    let path = ostrya::loose_path(&dep, ObjectType::Commit, RepoMode::Archive);
+    let (main, att) = attachment_chain(&repo);
+    mark_partial(&repo, &att);
+    remove_commit_object(&repo, &att);
+    let path = ostrya::loose_path(&att, ObjectType::Commit, RepoMode::Archive);
     std::fs::create_dir(repo.path().join("objects").join(path)).unwrap();
 
     let (error, written) = refused(&repo, opts(&["main"]));
     assert_eq!(
-        dependency_error(error),
+        attachment_error(error),
         (
             Some(main),
-            format!("dependency boot/uki names commit {dep}, which is partial")
+            format!("dependency boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
@@ -2264,23 +2264,23 @@ fn a_partial_dependency_with_an_unreadable_object_is_refused_as_partial() {
 /// bytes is refused before the push writes a byte, also in a history commit
 /// that a push with no depth does not send.
 #[test]
-fn a_defective_dependency_entry_is_refused_before_any_byte() {
+fn a_defective_attachment_entry_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-defective");
     let repo = new_repo(&dir, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&repo);
-    let short: &[u8] = &dep.as_bytes()[..31];
+    let (main, att) = attachment_chain(&repo);
+    let short: &[u8] = &att.as_bytes()[..31];
     for (entry, reason) in [
         (
             ("boot/uki", short),
             "entry 0 (boot/uki) has a checksum of 31 bytes, not 32",
         ),
-        (("", dep.as_bytes()), "entry 0 has an empty name"),
+        (("", att.as_bytes()), "entry 0 has an empty name"),
     ] {
         let defective = block_on(store_with_field2(&repo, &main, &[entry]));
         move_ref(&repo, "main", &defective);
         let (error, written) = refused(&repo, opts(&["main"]));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (Some(defective), reason.to_owned())
         );
         assert_eq!(written, 0);
@@ -2289,7 +2289,7 @@ fn a_defective_dependency_entry_is_refused_before_any_byte() {
         let child = commit(&repo, "main", Some(defective), "child", None);
         let (error, written) = refused(&repo, opts(&["main"]));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (Some(defective), reason.to_owned())
         );
         assert_eq!(written, 0);
@@ -2301,17 +2301,17 @@ fn a_defective_dependency_entry_is_refused_before_any_byte() {
 /// push writes a byte, also if the push takes that commit as a source
 /// commit. The error names the commit that names the nested dependency.
 #[test]
-fn a_nested_dependency_is_refused_before_any_byte() {
+fn a_nested_attachment_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-nested");
     let repo = new_repo(&dir, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&repo);
+    let (main, att) = attachment_chain(&repo);
     let other = commit(&repo, "other", None, "other", None);
     // `other` names a commit with a dependency, and `main` names a commit
     // whose dependency is that commit.
     let nested = block_on(store_with_field2(
         &repo,
         &other,
-        &[("lib/c", dep.as_bytes())],
+        &[("lib/c", att.as_bytes())],
     ));
     let head = block_on(store_with_field2(
         &repo,
@@ -2326,7 +2326,7 @@ fn a_nested_dependency_is_refused_before_any_byte() {
     for specs in [&["main"][..], &["main", "other"], &["other", "main"]] {
         let (error, written) = refused(&repo, opts(specs));
         assert_eq!(
-            dependency_error(error),
+            attachment_error(error),
             (Some(head), reason.clone()),
             "{specs:?}"
         );
@@ -2338,7 +2338,7 @@ fn a_nested_dependency_is_refused_before_any_byte() {
 /// source commit names the parent as a dependency, the push is refused
 /// before it writes a byte.
 #[test]
-fn an_absent_parent_that_is_a_dependency_is_refused_before_any_byte() {
+fn an_absent_parent_that_is_an_attachment_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-absent-parent");
     let repo = new_repo(&dir, RepoMode::Archive, "");
     let parent = commit(&repo, "main", None, "p", None);
@@ -2373,7 +2373,7 @@ fn an_absent_parent_that_is_a_dependency_is_refused_before_any_byte() {
 /// before it writes a byte. A nested, a partial, and an absent dependency
 /// that the parent of the source commit alone names are each refused.
 #[test]
-fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
+fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-history");
     let repo = new_repo(&dir, RepoMode::Archive, "");
     let depth_one = || RepoPushOptions {
@@ -2382,12 +2382,12 @@ fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
     };
 
     // The parent names a commit that names a dependency of its own.
-    let dep = commit(&repo, "dep/uki", None, "uki", None);
+    let att = commit(&repo, "dep/uki", None, "uki", None);
     let other = commit(&repo, "other", None, "other", None);
     let nested = block_on(store_with_field2(
         &repo,
         &other,
-        &[("lib/c", dep.as_bytes())],
+        &[("lib/c", att.as_bytes())],
     ));
     let plain = commit(&repo, "main", None, "p", None);
     let parent = block_on(store_with_field2(
@@ -2398,7 +2398,7 @@ fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
     commit(&repo, "main", Some(parent), "t", None);
     let (error, written) = refused(&repo, depth_one());
     assert_eq!(
-        dependency_error(error),
+        attachment_error(error),
         (
             Some(parent),
             format!("dependency lib/b names commit {nested}, which has dependencies of its own")
@@ -2407,24 +2407,24 @@ fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
     assert_eq!(written, 0);
 
     // The parent names a partial dependency, then an absent one.
-    let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", dep)]);
+    let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", att)]);
     commit(&repo, "main", Some(parent), "t", None);
-    mark_partial(&repo, &dep);
+    mark_partial(&repo, &att);
     let (error, written) = refused(&repo, depth_one());
     assert_eq!(
-        dependency_error(error),
+        attachment_error(error),
         (
             Some(parent),
-            format!("dependency boot/uki names commit {dep}, which is partial")
+            format!("dependency boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
 
-    remove_commit_object(&repo, &dep);
+    remove_commit_object(&repo, &att);
     let (error, written) = refused(&repo, depth_one());
     match error {
         Error::ObjectNotFound { checksum, ty } => {
-            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+            assert_eq!((checksum, ty), (att, ObjectType::Commit));
         }
         other => panic!("expected ObjectNotFound, got {other:?}"),
     }
@@ -2434,24 +2434,20 @@ fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
 /// A push does not send a build source: the commit that `ostrya.related`
 /// names. The key travels with the detached metadata of the commit.
 #[test]
-fn a_push_does_not_send_a_build_source() {
+fn a_push_does_not_send_a_supplement() {
     let pair = Pair::new("build-source", RepoMode::Archive, RepoMode::Archive, "");
-    let (main, _dep) = dependency_chain(&pair.client);
+    let (main, _att) = attachment_chain(&pair.client);
     let source = commit(&pair.client, "other/base", None, "base", None);
-    block_on(
-        pair.client
-            .add_detached_related(&main, "layer/base", &source),
-    )
-    .unwrap();
+    block_on(pair.client.add_supplement(&main, "layer/base", &source)).unwrap();
 
     let (report, outcome) = push(&pair, opts(&["main"]));
     report.unwrap();
     outcome.unwrap();
 
     assert_eq!(
-        block_on(pair.server.read_commit_related(&main))
+        block_on(pair.server.read_commit_relations(&main))
             .unwrap()
-            .build_sources,
+            .supplements,
         [("layer/base".to_owned(), source)]
     );
     assert!(!has_commit(&pair.server, &source));
@@ -2462,7 +2458,7 @@ fn a_push_does_not_send_a_build_source() {
 /// session with `Abort` before the first upload. A dependency of the server
 /// tip, which the push does not send, is not resolved.
 #[test]
-fn with_no_depth_a_dependency_of_the_offered_history_is_resolved_after_the_cut() {
+fn with_no_depth_an_attachment_of_the_offered_history_is_resolved_after_the_cut() {
     let pair = Pair::new("dependency-cut", RepoMode::Archive, RepoMode::Archive, "");
     let held = commit(&pair.client, "dep/held", None, "held", None);
     let c1 = commit_related(
@@ -2480,17 +2476,17 @@ fn with_no_depth_a_dependency_of_the_offered_history_is_resolved_after_the_cut()
     // The client loses the dependency of the server tip.
     remove_commit_object(&pair.client, &held);
 
-    let dep = commit(&pair.client, "dep/uki", None, "uki", None);
+    let att = commit(&pair.client, "dep/uki", None, "uki", None);
     let c2 = commit_related(
         &pair.client,
         "main",
         Some(c1),
         "c2",
         None,
-        &[("boot/uki", dep)],
+        &[("boot/uki", att)],
     );
     let c3 = commit(&pair.client, "main", Some(c2), "c3", None);
-    remove_commit_object(&pair.client, &dep);
+    remove_commit_object(&pair.client, &att);
     let progress = PushProgress::new();
     let (kinds, hook) = frame_kinds();
     let (report, outcome) = push_through(
@@ -2504,7 +2500,7 @@ fn with_no_depth_a_dependency_of_the_offered_history_is_resolved_after_the_cut()
     assert_aborted(&report);
     match outcome {
         Err(Error::ObjectNotFound { checksum, ty }) => {
-            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+            assert_eq!((checksum, ty), (att, ObjectType::Commit));
         }
         other => panic!("expected ObjectNotFound, got {other:?}"),
     }
@@ -2565,36 +2561,36 @@ fn assert_refused(pushed: Pushed, code: remote::ErrorCode) {
 /// Under a server policy with `verify`, a dependency with no signature
 /// passes. The server verifies the source commit alone.
 #[test]
-fn an_unsigned_dependency_passes_under_verify() {
+fn an_unsigned_attachment_passes_under_verify() {
     let pair = Pair::new(
         "dependency-verify",
         RepoMode::Archive,
         RepoMode::Archive,
         "",
     );
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     client_sign(&pair.client, &main);
 
     let (report, outcome) = push_under(&pair, opts(&["main"]), &verify_policy(), |_| {});
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(main));
-    assert_complete(&pair.client, &pair.server, &dep);
-    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
+    assert_complete(&pair.client, &pair.server, &att);
+    assert!(ed25519_signatures(&pair.server, &att).is_empty());
 }
 
 /// With depth 1, a dependency of the parent gets no verification. The push
 /// passes with a signature on the source commit alone.
 #[test]
-fn with_a_depth_a_dependency_of_the_parent_gets_no_rule() {
+fn with_a_depth_an_attachment_of_the_parent_gets_no_rule() {
     let pair = Pair::new(
         "dependency-verify-parent",
         RepoMode::Archive,
         RepoMode::Archive,
         "",
     );
-    let dep = commit(&pair.client, "dep/d", None, "d", None);
-    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/d", dep)]);
+    let att = commit(&pair.client, "dep/d", None, "d", None);
+    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/d", att)]);
     let main = commit(&pair.client, "main", Some(parent), "t", None);
     client_sign(&pair.client, &main);
     let options = RepoPushOptions {
@@ -2607,19 +2603,19 @@ fn with_a_depth_a_dependency_of_the_parent_gets_no_rule() {
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(main));
     assert!(has_commit(&pair.server, &parent));
-    assert_complete(&pair.client, &pair.server, &dep);
+    assert_complete(&pair.client, &pair.server, &att);
 }
 
 /// Under a server policy with `sign`, a staged dependency gets no server
 /// signature, and the source commit gets the signature of the server key.
 #[test]
-fn a_staged_dependency_gets_no_server_signature() {
+fn a_staged_attachment_gets_no_server_signature() {
     let pair = Pair::new("dependency-sign", RepoMode::Archive, RepoMode::Archive, "");
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
     report.unwrap();
     outcome.unwrap();
-    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
+    assert!(ed25519_signatures(&pair.server, &att).is_empty());
     let bytes = block_on(pair.server.load_object_bytes(ObjectType::Commit, &main)).unwrap();
     assert_eq!(
         ed25519_signatures(&pair.server, &main),
@@ -2629,14 +2625,14 @@ fn a_staged_dependency_gets_no_server_signature() {
 
 /// A dependency that the server already holds gets no server signature.
 #[test]
-fn a_dependency_the_server_holds_gets_no_server_signature() {
+fn an_attachment_the_server_holds_gets_no_server_signature() {
     let pair = Pair::new(
         "dependency-held-sign",
         RepoMode::Archive,
         RepoMode::Archive,
         "",
     );
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     let (report, outcome) = push(&pair, opts(&["dep/uki"]));
     report.unwrap();
     outcome.unwrap();
@@ -2645,25 +2641,25 @@ fn a_dependency_the_server_holds_gets_no_server_signature() {
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(main));
-    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
+    assert!(ed25519_signatures(&pair.server, &att).is_empty());
     assert_eq!(ed25519_signatures(&pair.server, &main).len(), 1);
 }
 
 /// A dependency that the server holds and marks partial refuses the push
 /// with `missing-objects`. The server moves no ref.
 #[test]
-fn a_dependency_the_server_holds_partial_refuses_the_push() {
+fn an_attachment_the_server_holds_partial_refuses_the_push() {
     let pair = Pair::new(
         "dependency-held-partial",
         RepoMode::Archive,
         RepoMode::Archive,
         "",
     );
-    let (main, dep) = dependency_chain(&pair.client);
+    let (main, att) = attachment_chain(&pair.client);
     let (report, outcome) = push(&pair, opts(&["dep/uki"]));
     report.unwrap();
     outcome.unwrap();
-    mark_partial(&pair.server, &dep);
+    mark_partial(&pair.server, &att);
 
     assert_refused(
         push(&pair, opts(&["main"])),

@@ -25,7 +25,7 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::lock::LockKind;
-use crate::related::RelatedWarning;
+use crate::related::RelationWarning;
 use crate::repo::Repo;
 use crate::repo_fs::{FsError, FsResultExt, RepoDir, RepoLayout};
 use crate::tombstone::write_tombstone;
@@ -625,7 +625,7 @@ pub struct PruneStats {
     /// list as a run without it. A
     /// [`static_deltas_only`](PruneOptions::static_deltas_only) run walks
     /// nothing, so its list is empty.
-    pub warnings: Vec<RelatedWarning>,
+    pub warnings: Vec<RelationWarning>,
 }
 
 /// Returns the [`Ref`] that a run reads for a listed ref, or `None` if the
@@ -741,9 +741,9 @@ impl Repo {
     /// A commit names its related commits in two fields:
     ///
     /// - Field 2 of the commit object holds the dependencies
-    ///   ([`CommitOptions::related`](crate::CommitOptions::related)).
+    ///   ([`CommitOptions::attachments`](crate::CommitOptions::attachments)).
     /// - The key `ostrya.related` of the detached metadata holds the build
-    ///   sources ([`Repo::add_detached_related`]). If the key occurs more than
+    ///   sources ([`Repo::add_supplement`]). If the key occurs more than
     ///   one time, the run reads the first entry alone.
     ///
     /// The run reads both fields of each commit that the walk reaches, and
@@ -1140,8 +1140,8 @@ impl Repo {
         }
 
         let gc = crate::traverse::GcRoots {
-            dependencies: true,
-            build_sources: true,
+            attachments: true,
+            supplements: true,
             traverse_parent: opts.traverse_parent,
             // A `commit_only` run reads only the commit names of the reachable
             // set, so the walk neither reads nor collects the trees.

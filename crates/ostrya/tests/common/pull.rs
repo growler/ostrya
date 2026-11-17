@@ -809,7 +809,7 @@ async fn commit_tree_full(
                 subject: Some(format!("{branch} {sub}")),
                 timestamp: Some(timestamp),
                 metadata: Some(ref_binding(branch)),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -876,7 +876,7 @@ pub async fn commit_tree_keyed(
                 subject: Some(format!("{branch} {sub}")),
                 timestamp: Some(timestamp),
                 metadata: Some(Value::Array(metadata)),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),

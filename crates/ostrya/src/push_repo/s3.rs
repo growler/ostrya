@@ -384,7 +384,7 @@ impl Repo {
     ///   push then sends no request.
     /// - The errors of the checks and of the commit walk of
     ///   [`Repo::push_over_stream`], before a request.
-    /// - With no depth, [`Error::InvalidRelated`] or [`Error::ObjectNotFound`]
+    /// - With no depth, [`Error::InvalidRelations`] or [`Error::ObjectNotFound`]
     ///   for a dependency of a history commit after the cut at the tip of the
     ///   ref in the bucket, as "Dependencies" of [`Repo::push_over_stream`]
     ///   states. The push then uploads nothing and releases the lock.
@@ -716,14 +716,14 @@ impl Repo {
         // depth, the push resolves the dependencies of the offered history
         // here, before the first upload.
         if opts.depth.is_none() {
-            plan.commits.check_dependencies(self, &offered).await?;
+            plan.commits.check_attachments(self, &offered).await?;
         }
         let resolved = offered.len();
         for at in 0..resolved {
             let commit = offered[at];
-            for dependency in plan.commits.dependencies_of(&commit) {
-                if seen.insert(dependency) {
-                    offered.push(dependency);
+            for attachment in plan.commits.attachments_of(&commit) {
+                if seen.insert(attachment) {
+                    offered.push(attachment);
                 }
             }
         }

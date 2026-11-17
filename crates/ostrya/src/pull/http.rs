@@ -54,11 +54,11 @@ use crate::verify::PullTrust;
 use crate::verify::trust::FieldGroup;
 use crate::write::FileMeta;
 
+use super::attachment;
 use super::chain::Edges;
 use super::delta::{
-    self, CommitCheck, DeltaAdvert, DeltaJob, DeltaPlan, DeltaSource, DependencyDeltas, PART_CAP,
+    self, AttachmentDeltas, CommitCheck, DeltaAdvert, DeltaJob, DeltaPlan, DeltaSource, PART_CAP,
 };
-use super::dependency;
 use super::drive::Slots;
 use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
@@ -301,7 +301,7 @@ impl Repo {
     /// # Dependencies
     ///
     /// Field 2 of a commit names the dependencies of the commit.
-    /// [`read_commit_related`](Repo::read_commit_related) reads them. The pull
+    /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The pull
     /// follows the dependencies of each commit that it reads: each target, and
     /// each parent that [`depth`](PullOptions::depth) takes. It also follows
     /// the dependencies of a commit that this repository holds complete.
@@ -737,8 +737,8 @@ impl Repo {
     ///   The search comes before the fetch of the dependency. So a dependency
     ///   with no delta that the remote does not hold, or that names
     ///   dependencies of its own, gives this error, and not
-    ///   [`Error::ObjectNotFound`] or [`Error::InvalidRelated`].
-    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
+    ///   [`Error::ObjectNotFound`] or [`Error::InvalidRelations`].
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit has an
     ///   empty name or a checksum that is not 32 bytes, or if a dependency
     ///   names dependencies of its own. If such a dependency has a delta, the
     ///   pull fetches and checks the superblock first, and the error comes
@@ -1372,7 +1372,7 @@ impl Repo {
         let mut carry = Carry::default();
         // A pull that looks for no delta of a dependency pairs no dependency
         // with a target, so it keeps no entry of field 2.
-        carry.dependencies.inner = dependency::Dependencies::new(!looks);
+        carry.attachments.inner = attachment::Attachments::new(!looks);
         for level in deltas.levels() {
             let jobs = deltas.parse_level(self, &delta_source, level).await?;
             let phase = Phase {
@@ -1383,7 +1383,7 @@ impl Repo {
                 deltas: RunDeltas::Ready(&jobs),
                 done: &done,
                 last: false,
-                dependency_run: false,
+                attachment_run: false,
             };
             self.drive(
                 &txn,
@@ -1421,7 +1421,7 @@ impl Repo {
             deltas: RunDeltas::Ready(&jobs),
             done: &done,
             last: !follows,
-            dependency_run: false,
+            attachment_run: false,
         };
         self.drive(
             &txn,
@@ -1450,25 +1450,25 @@ impl Repo {
             // dependency alone, so the run checks no signature. The search for
             // their deltas checks no signature of a superblock.
             let mut pending: Vec<Checksum> = carry
-                .dependencies
+                .attachments
                 .inner
                 .order()
                 .iter()
-                .filter(|dependency| !carry.parents.contains_key(*dependency))
+                .filter(|attachment| !carry.parents.contains_key(*attachment))
                 .copied()
                 .collect();
             pending.sort_unstable();
             let (roots, found) = if looks {
-                let named = dependency::pair_targets(
+                let named = attachment::pair_targets(
                     &targets,
                     opts.depth,
                     &carry.parents,
-                    carry.dependencies.inner.naming(),
+                    carry.attachments.inner.naming(),
                     pending,
                 );
                 let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
-                let (lookups, known) = dependency::lookups(self, &targets, place, named).await?;
-                let found = delta::discover_dependencies(
+                let (lookups, known) = attachment::lookups(self, &targets, place, named).await?;
+                let found = delta::discover_attachments(
                     self,
                     &delta_source,
                     advert.as_ref(),
@@ -1481,7 +1481,7 @@ impl Repo {
                 .await?;
                 (roots, found)
             } else {
-                (pending, DependencyDeltas::default())
+                (pending, AttachmentDeltas::default())
             };
             drop(advert);
             drop(edges);
@@ -1495,7 +1495,7 @@ impl Repo {
                 deltas: RunDeltas::Lazy(&found),
                 done: &done,
                 last: true,
-                dependency_run: true,
+                attachment_run: true,
             };
             self.drive(
                 &txn,
@@ -1817,15 +1817,15 @@ impl Repo {
             delta_plan,
             verification,
             related,
-            dependencies: whole,
-            dependency_run: phase.dependency_run,
+            attachments: whole,
+            attachment_run: phase.attachment_run,
             marking: Mutex::new(Vec::new()),
             marker_fsync,
             progress,
         };
         let mut plan = Plan::new(phase.subpaths);
         plan.queued = std::mem::take(&mut carry.queued);
-        plan.dependencies = std::mem::take(&mut carry.dependencies);
+        plan.attachments = std::mem::take(&mut carry.attachments);
         for root in phase.roots {
             plan.push_commit(CommitItem {
                 checksum: *root,
@@ -1900,7 +1900,7 @@ impl Repo {
             return Err(e);
         }
         carry.queued = plan.queued;
-        carry.dependencies = plan.dependencies;
+        carry.attachments = plan.attachments;
         // The parents tell which commits a run reached, and give the chains
         // of the targets. A pull that follows no dependency reads neither.
         if whole {
@@ -2008,7 +2008,7 @@ impl Repo {
                 Some(detached) => detached,
                 // The pull checks no signature of a dependency, and the
                 // dependency keeps the detached metadata of this repository.
-                None if ctx.dependency_run && complete => None,
+                None if ctx.attachment_run && complete => None,
                 None => {
                     fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum)
                         .await?
@@ -2081,10 +2081,10 @@ impl Repo {
         // signatures and of the refs, and before the marker and the staging of
         // the commit.
         let shared = Arc::clone(&bytes);
-        let (commit, dependencies) = ostrya_rt::unblock(move || {
+        let (commit, attachments) = ostrya_rt::unblock(move || {
             let mut commit = Commit::parse(&shared)?;
             let related = std::mem::take(&mut commit.related);
-            Ok::<_, Error>((commit, related::checked_dependencies(&checksum, related)))
+            Ok::<_, Error>((commit, related::checked_attachments(&checksum, related)))
         })
         .await?;
         // The signature verification runs before the pull stages the commit
@@ -2107,7 +2107,7 @@ impl Repo {
                 None if filtered => Some(CheckedMeta::Filtered(detached)),
                 _ => detached.map(CheckedMeta::Source),
             }
-        } else if ctx.dependency_run {
+        } else if ctx.attachment_run {
             // The pull checks no signature of a dependency. Field 2 of the
             // commit that names the dependency holds its checksum, and the
             // checksum and the signatures of that commit cover field 2. A
@@ -2131,7 +2131,7 @@ impl Repo {
             self.check_tips(ctx, &checksum, &commit).await?;
             detached
         };
-        let dependencies = dependencies?;
+        let attachments = attachments?;
         // The checks are the last readers of these bytes. A write keeps its
         // own reference in `staging`, so the other stagings drop the bytes
         // here.
@@ -2216,8 +2216,8 @@ impl Repo {
             checksum,
             next,
             parent: commit.parent,
-            dependencies: if ctx.dependencies {
-                dependencies
+            attachments: if ctx.attachments {
+                attachments
             } else {
                 Vec::new()
             },
@@ -2262,14 +2262,14 @@ impl Repo {
         // Field 2 can hold many entries, so the check runs on the blocking
         // pool.
         let related = std::mem::take(&mut commit.related);
-        let dependencies =
-            ostrya_rt::unblock(move || related::checked_dependencies(&checksum, related)).await?;
+        let attachments =
+            ostrya_rt::unblock(move || related::checked_attachments(&checksum, related)).await?;
         Ok(Step::Commit(CommitOutcome {
             checksum,
             next: CommitNext::Nothing,
             parent: commit.parent,
-            dependencies: if ctx.dependencies {
-                dependencies
+            attachments: if ctx.attachments {
+                attachments
             } else {
                 Vec::new()
             },
@@ -2729,10 +2729,10 @@ struct StepCtx<'a> {
     related: RelatedRule,
     /// `true` if the pull follows the dependencies of each commit that it
     /// reads: a pull that is not commit-only and has no subpath.
-    dependencies: bool,
+    attachments: bool,
     /// `true` for the run of the dependencies. Each commit of that run is a
     /// dependency alone, and the step checks no signature of it.
-    dependency_run: bool,
+    attachment_run: bool,
     /// The commits whose `.commitpartial` marker a step of this run writes. A
     /// step adds the commit before it starts the write of the marker, and the
     /// write is a tracked job of the transaction. A failed run waits for the
@@ -2764,7 +2764,7 @@ struct Phase<'a> {
     /// `true` for the last run of the pull.
     last: bool,
     /// `true` for the run of the dependencies, as [`StepCtx`] holds it.
-    dependency_run: bool,
+    attachment_run: bool,
 }
 
 /// The static deltas of one run of the plan.
@@ -2777,7 +2777,7 @@ enum RunDeltas<'a> {
     /// its delta. A load step parses the job just before the parts, and the
     /// run releases the job after the last part. The plan loads at most
     /// [`PART_CAP`] jobs at a time.
-    Lazy(&'a DependencyDeltas),
+    Lazy(&'a AttachmentDeltas),
 }
 
 impl RunDeltas<'_> {
@@ -2839,7 +2839,7 @@ struct Carry {
     started: usize,
     /// The dependencies that the runs met, so that the checks of a
     /// dependency span all runs.
-    dependencies: PlanDependencies,
+    attachments: PlanAttachments,
     /// The parent that each commit of the runs named. A commit is here if a
     /// run reached it. A pull that follows no dependency keeps no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
@@ -2905,7 +2905,7 @@ struct CommitOutcome {
     parent: Option<Checksum>,
     /// The name and the checksum of each dependency to follow, in the order
     /// of field 2. The list is empty if the pull follows no dependency.
-    dependencies: Vec<(String, Checksum)>,
+    attachments: Vec<(String, Checksum)>,
     /// `true` if this pull wrote the `.commitpartial` marker of the commit.
     marked: bool,
 }
@@ -2997,7 +2997,7 @@ struct Plan {
     parents: HashMap<Checksum, Option<Checksum>>,
     /// The dependencies that the plan met, and the commits that it checks
     /// them against.
-    dependencies: PlanDependencies,
+    attachments: PlanAttachments,
 }
 
 /// The state of the checks of the dependencies of one pull.
@@ -3007,10 +3007,10 @@ struct Plan {
 /// whichever of the two facts the plan learns first. The same holds for a
 /// dependency that is also a parent that the remote does not hold.
 #[derive(Default)]
-struct PlanDependencies {
+struct PlanAttachments {
     /// The dependencies, and the commits that name them. A pull that looks
     /// for no delta of a dependency keeps no entry of field 2.
-    inner: dependency::Dependencies,
+    inner: attachment::Attachments,
     /// The parents that the remote does not hold.
     absent: HashSet<Checksum>,
 }
@@ -3242,7 +3242,7 @@ impl Plan {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidRelated`] if a dependency names dependencies of its
+    /// - [`Error::InvalidRelations`] if a dependency names dependencies of its
     ///   own. The error names the commit that names the dependency.
     /// - [`Error::ObjectNotFound`] if the remote does not hold a dependency.
     fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) -> Result<()> {
@@ -3304,7 +3304,7 @@ impl Plan {
                 optional: true,
             });
         }
-        self.apply_dependencies(outcome.checksum, outcome.dependencies)
+        self.apply_attachments(outcome.checksum, outcome.attachments)
     }
 
     /// Records the dependencies of `commit`, for the checks and for the run
@@ -3313,29 +3313,29 @@ impl Plan {
     /// # Errors
     ///
     /// The errors of [`apply_commit`](Plan::apply_commit).
-    fn apply_dependencies(
+    fn apply_attachments(
         &mut self,
         commit: Checksum,
-        dependencies: Vec<(String, Checksum)>,
+        attachments: Vec<(String, Checksum)>,
     ) -> Result<()> {
-        if dependencies.is_empty() {
+        if attachments.is_empty() {
             return Ok(());
         }
-        if let Some(err) = self.dependencies.inner.nested_error(&commit) {
+        if let Some(err) = self.attachments.inner.nested_error(&commit) {
             return Err(err);
         }
-        for (name, dependency) in &dependencies {
-            if *dependency == commit || self.dependencies.inner.naming().contains_key(dependency) {
-                return Err(related::nested_dependency(commit, name, dependency));
+        for (name, attachment) in &attachments {
+            if *attachment == commit || self.attachments.inner.naming().contains_key(attachment) {
+                return Err(related::nested_attachment(commit, name, attachment));
             }
-            if self.dependencies.absent.contains(dependency) {
+            if self.attachments.absent.contains(attachment) {
                 return Err(Error::ObjectNotFound {
-                    checksum: *dependency,
+                    checksum: *attachment,
                     ty: ObjectType::Commit,
                 });
             }
         }
-        self.dependencies.inner.record(commit, dependencies);
+        self.attachments.inner.record(commit, attachments);
         Ok(())
     }
 
@@ -3346,13 +3346,13 @@ impl Plan {
     /// [`Error::ObjectNotFound`] if a commit of this pull names the parent as
     /// a dependency.
     fn apply_absent(&mut self, commit: Checksum) -> Result<()> {
-        if self.dependencies.inner.named(&commit).is_some() {
+        if self.attachments.inner.named(&commit).is_some() {
             return Err(Error::ObjectNotFound {
                 checksum: commit,
                 ty: ObjectType::Commit,
             });
         }
-        self.dependencies.absent.insert(commit);
+        self.attachments.absent.insert(commit);
         Ok(())
     }
 }
@@ -4388,7 +4388,7 @@ mod tests {
             checksum,
             next: CommitNext::Scan(tree),
             parent,
-            dependencies: Vec::new(),
+            attachments: Vec::new(),
             marked: true,
         })
     }
@@ -4405,7 +4405,7 @@ mod tests {
 
     /// Returns the outcome of a commit that the delta of a dependency
     /// delivers. A load step loads the job of the delta.
-    fn by_dependency_delta(checksum: Checksum, parts: usize, tree: Vec<ObjectName>) -> Step {
+    fn by_attachment_delta(checksum: Checksum, parts: usize, tree: Vec<ObjectName>) -> Step {
         delta_outcome(checksum, parts, Vec::new(), tree, true)
     }
 
@@ -4427,7 +4427,7 @@ mod tests {
                 lazy,
             },
             parent: None,
-            dependencies: Vec::new(),
+            attachments: Vec::new(),
             marked: true,
         })
     }
@@ -4632,11 +4632,11 @@ mod tests {
     /// follow the load. After the last part the plan counts the job as
     /// loaded no longer, and queues the tree.
     #[test]
-    fn the_load_of_a_dependency_job_comes_before_its_parts() {
+    fn the_load_of_an_attachment_job_comes_before_its_parts() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         let tree = vec![object(2, ObjectType::DirMeta)];
-        plan.apply(by_dependency_delta(csum(1), 2, tree), &mut marked)
+        plan.apply(by_attachment_delta(csum(1), 2, tree), &mut marked)
             .unwrap();
 
         assert!(matches!(plan.next(), Some(Item::Load(commit)) if commit == csum(1)));
@@ -4668,7 +4668,7 @@ mod tests {
     /// jobs of the deltas from the record file. Each job goes after its last
     /// part.
     #[test]
-    fn a_dependency_run_holds_at_most_part_cap_jobs() {
+    fn an_attachment_run_holds_at_most_part_cap_jobs() {
         block_on(async {
             let dir = ScratchDir::new("dependency-jobs");
             let archive = || crate::CreateOptions::new(RepoMode::Archive);
@@ -4683,7 +4683,7 @@ mod tests {
                 deltas.push((None, commit));
             }
             assert!(deltas.len() > PART_CAP);
-            let found = DependencyDeltas::kept_from(&dest, &src, &deltas).await;
+            let found = AttachmentDeltas::kept_from(&dest, &src, &deltas).await;
             let run = RunDeltas::Lazy(&found);
 
             let mut plan = Plan::default();
@@ -4705,7 +4705,7 @@ mod tests {
                 assert!(run.commit_bytes(commit).await.unwrap().is_none());
                 assert!(!found.holds_commit_data(commit));
                 assert!(found.has_head(commit));
-                plan.apply(by_dependency_delta(*commit, parts, Vec::new()), &mut marked)
+                plan.apply(by_attachment_delta(*commit, parts, Vec::new()), &mut marked)
                     .unwrap();
             }
 
@@ -4757,7 +4757,7 @@ mod tests {
     /// pull, or a commit that an earlier run made complete. No load follows,
     /// so the head goes with no job.
     #[test]
-    fn a_commit_that_needs_no_delta_releases_the_dependency_head() {
+    fn a_commit_that_needs_no_delta_releases_the_attachment_head() {
         block_on(async {
             let dir = ScratchDir::new("dependency-head-release");
             let archive = || crate::CreateOptions::new(RepoMode::Archive);
@@ -4767,7 +4767,7 @@ mod tests {
             src.generate_static_delta(None, &commit, &crate::DeltaOptions::default())
                 .await
                 .unwrap();
-            let found = DependencyDeltas::kept_from(&dest, &src, &[(None, commit)]).await;
+            let found = AttachmentDeltas::kept_from(&dest, &src, &[(None, commit)]).await;
             assert!(found.holds_commit_data(&commit));
 
             RunDeltas::Lazy(&found).release(&commit);
@@ -4801,7 +4801,7 @@ mod tests {
 
         let lazy_progress = PullCounters::new(None);
         let mut lazy = Plan::default();
-        lazy.apply(by_dependency_delta(csum(1), 3, tree()), &mut marked)
+        lazy.apply(by_attachment_delta(csum(1), 3, tree()), &mut marked)
             .unwrap();
         lazy.report(&lazy_progress, 1, false);
         assert_eq!(total(&lazy_progress), total(&eager_progress));
@@ -5028,13 +5028,13 @@ mod tests {
     }
 
     /// Returns the outcome of a fetched commit with no tree to fetch, which
-    /// names the commit `dep` of each `(name, dep)` as a dependency.
-    fn naming(checksum: Checksum, parent: Option<Checksum>, deps: &[(&str, u8)]) -> Step {
+    /// names the commit `att` of each `(name, att)` as a dependency.
+    fn naming(checksum: Checksum, parent: Option<Checksum>, atts: &[(&str, u8)]) -> Step {
         Step::Commit(CommitOutcome {
             checksum,
             next: CommitNext::Nothing,
             parent,
-            dependencies: deps
+            attachments: atts
                 .iter()
                 .map(|(name, byte)| ((*name).to_owned(), csum(*byte)))
                 .collect(),
@@ -5051,22 +5051,22 @@ mod tests {
     }
 
     /// Returns the commit, the field, and the reason of an
-    /// [`Error::InvalidRelated`].
-    fn invalid_related(err: Error) -> (Option<Checksum>, String) {
+    /// [`Error::InvalidRelations`].
+    fn invalid_relations(err: Error) -> (Option<Checksum>, String) {
         match err {
-            Error::InvalidRelated {
+            Error::InvalidRelations {
                 commit,
-                field: crate::related::RelatedField::Dependencies,
+                field: crate::related::RelationField::Attachments,
                 reason,
             } => (commit, reason),
-            other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+            other => panic!("expected InvalidRelations in field 2, got {other:?}"),
         }
     }
 
     /// A dependency is recorded and not queued, also under a commit that the
     /// plan follows to its full depth. The parent is queued.
     #[test]
-    fn a_dependency_is_recorded_and_not_queued() {
+    fn an_attachment_is_recorded_and_not_queued() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         plan.push_commit(CommitItem {
@@ -5086,11 +5086,11 @@ mod tests {
         assert!(plan.next().is_none());
         assert_eq!(marked, [csum(1)]);
         assert_eq!(
-            plan.dependencies.inner.named(&csum(3)),
+            plan.attachments.inner.named(&csum(3)),
             Some((csum(1), "boot/uki"))
         );
         assert_eq!(
-            plan.dependencies.inner.naming().get(&csum(1)),
+            plan.attachments.inner.naming().get(&csum(1)),
             Some(&vec![("boot/uki".to_owned(), csum(3))])
         );
     }
@@ -5098,7 +5098,7 @@ mod tests {
     /// A dependency that two commits name keeps the first commit and entry
     /// name. The plan records the entries of each commit.
     #[test]
-    fn a_dependency_two_commits_name_keeps_the_first_entry() {
+    fn an_attachment_two_commits_name_keeps_the_first_entry() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         plan.apply(naming(csum(1), None, &[("a/x", 3)]), &mut marked)
@@ -5107,11 +5107,11 @@ mod tests {
             .unwrap();
         assert!(plan.next().is_none());
         assert_eq!(
-            plan.dependencies.inner.named(&csum(3)),
+            plan.attachments.inner.named(&csum(3)),
             Some((csum(1), "a/x"))
         );
-        assert_eq!(plan.dependencies.inner.order(), [csum(3)]);
-        assert_eq!(plan.dependencies.inner.naming().len(), 2);
+        assert_eq!(plan.attachments.inner.order(), [csum(3)]);
+        assert_eq!(plan.attachments.inner.naming().len(), 2);
         plan.apply(naming(csum(3), None, &[]), &mut marked).unwrap();
         assert_eq!(plan.parents.get(&csum(3)), Some(&None));
     }
@@ -5120,7 +5120,7 @@ mod tests {
     /// either order of the two steps. The error names the commit that names
     /// the nested dependency.
     #[test]
-    fn a_nested_dependency_fails_in_either_order() {
+    fn a_nested_attachment_fails_in_either_order() {
         let nested = format!(
             "dependency lib/b names commit {}, which has dependencies of its own",
             csum(2)
@@ -5133,7 +5133,7 @@ mod tests {
         let err = plan
             .apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked)
             .unwrap_err();
-        assert_eq!(invalid_related(err), (Some(csum(1)), nested.clone()));
+        assert_eq!(invalid_relations(err), (Some(csum(1)), nested.clone()));
         assert_eq!(marked, [csum(1), csum(2)], "the marker is recorded first");
 
         // The dependency comes first.
@@ -5143,13 +5143,13 @@ mod tests {
         let err = plan
             .apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
             .unwrap_err();
-        assert_eq!(invalid_related(err), (Some(csum(1)), nested));
+        assert_eq!(invalid_relations(err), (Some(csum(1)), nested));
     }
 
     /// A parent that the remote does not hold fails the pull if a commit
     /// names it as a dependency, in either order of the two steps.
     #[test]
-    fn an_absent_parent_that_is_a_dependency_fails_in_either_order() {
+    fn an_absent_parent_that_is_an_attachment_fails_in_either_order() {
         let missing = |err: Error| {
             assert!(
                 matches!(
@@ -5182,7 +5182,7 @@ mod tests {
         plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
         plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked)
             .unwrap();
-        assert!(plan.dependencies.inner.named(&csum(3)).is_some());
+        assert!(plan.attachments.inner.named(&csum(3)).is_some());
         assert!(!plan.parents.contains_key(&csum(2)));
     }
 
@@ -5239,7 +5239,7 @@ mod tests {
             body: None,
             timestamp: Some(1_700_000_000),
             metadata: None,
-            related: Vec::new(),
+            attachments: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.set_ref(&Ref::local(name), Some(&commit));

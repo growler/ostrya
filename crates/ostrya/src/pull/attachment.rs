@@ -14,7 +14,7 @@
 //! repository holds complete. The pull takes the from-scratch delta only if
 //! it holds no paired entry complete.
 //!
-//! [`Dependencies`] holds the dependencies that a pull met, the commits that
+//! [`Attachments`] holds the dependencies that a pull met, the commits that
 //! name them, and the error for a dependency that names dependencies of its
 //! own, for the local pull and for the pull over HTTP.
 
@@ -24,20 +24,20 @@ use std::collections::{HashMap, HashSet};
 use ostrya_core::{Checksum, ObjectType};
 
 use crate::error::{Error, Result};
-use crate::related::{self, RelatedField};
+use crate::related::{self, RelationField};
 use crate::repo::Repo;
 
 use super::RefPlace;
-use super::delta::{DependencyLookup, complete_here_blocking};
+use super::delta::{AttachmentLookup, complete_here_blocking};
 
 /// The dependencies that one pull met, and the commits that name them.
 ///
 /// The type records the state alone. Each engine chooses when it calls
-/// [`nested_error`](Dependencies::nested_error): the local pull checks each
+/// [`nested_error`](Attachments::nested_error): the local pull checks each
 /// dependency after the walk of the chains, and the pull over HTTP checks
 /// each commit when its step ends.
 #[derive(Default)]
-pub(super) struct Dependencies {
+pub(super) struct Attachments {
     /// Each dependency, in the order in which the pull first recorded it.
     order: Vec<Checksum>,
     /// The commit that first named each dependency, and the name of its
@@ -53,7 +53,7 @@ pub(super) struct Dependencies {
     keys_only: bool,
 }
 
-impl Dependencies {
+impl Attachments {
     /// Returns an empty record. `keys_only` is `true` if the record keeps no
     /// entry of field 2.
     pub(super) fn new(keys_only: bool) -> Self {
@@ -68,24 +68,24 @@ impl Dependencies {
         self.keys_only
     }
 
-    /// Records the dependencies `dependencies` of `commit`.
+    /// Records the dependencies `attachments` of `commit`.
     ///
     /// A dependency that an earlier commit named keeps the first commit and
     /// entry name. An empty list records nothing.
-    pub(super) fn record(&mut self, commit: Checksum, dependencies: Vec<(String, Checksum)>) {
-        if dependencies.is_empty() {
+    pub(super) fn record(&mut self, commit: Checksum, attachments: Vec<(String, Checksum)>) {
+        if attachments.is_empty() {
             return;
         }
-        for (name, dependency) in &dependencies {
-            if let Entry::Vacant(slot) = self.named.entry(*dependency) {
+        for (name, attachment) in &attachments {
+            if let Entry::Vacant(slot) = self.named.entry(*attachment) {
                 slot.insert((commit, name.clone()));
-                self.order.push(*dependency);
+                self.order.push(*attachment);
             }
         }
         let entries = if self.keys_only {
             Vec::new()
         } else {
-            dependencies
+            attachments
         };
         self.naming.insert(commit, entries);
     }
@@ -96,11 +96,11 @@ impl Dependencies {
         &self.order
     }
 
-    /// Returns the commit that first named `dependency`, and the name of its
+    /// Returns the commit that first named `attachment`, and the name of its
     /// entry, or `None` if no commit named it.
-    pub(super) fn named(&self, dependency: &Checksum) -> Option<(Checksum, &str)> {
+    pub(super) fn named(&self, attachment: &Checksum) -> Option<(Checksum, &str)> {
         self.named
-            .get(dependency)
+            .get(attachment)
             .map(|(commit, name)| (*commit, name.as_str()))
     }
 
@@ -110,13 +110,13 @@ impl Dependencies {
         &self.naming
     }
 
-    /// Returns the nested-dependency error for `dependency`, or `None` if no
+    /// Returns the nested-dependency error for `attachment`, or `None` if no
     /// commit named it. The error names the commit that first named the
     /// dependency. The caller calls this method when it finds that
-    /// `dependency` has dependencies of its own.
-    pub(super) fn nested_error(&self, dependency: &Checksum) -> Option<Error> {
-        self.named(dependency)
-            .map(|(commit, name)| related::nested_dependency(commit, name, dependency))
+    /// `attachment` has dependencies of its own.
+    pub(super) fn nested_error(&self, attachment: &Checksum) -> Option<Error> {
+        self.named(attachment)
+            .map(|(commit, name)| related::nested_attachment(commit, name, attachment))
     }
 }
 
@@ -173,13 +173,13 @@ pub(super) fn pair_targets(
         let mut commit = *tip;
         let mut left = depth;
         loop {
-            for (name, dependency) in naming.get(&commit).into_iter().flatten() {
-                if !wanted.contains(dependency) {
+            for (name, attachment) in naming.get(&commit).into_iter().flatten() {
+                if !wanted.contains(attachment) {
                     continue;
                 }
-                let at = *position.entry(*dependency).or_insert_with(|| {
+                let at = *position.entry(*attachment).or_insert_with(|| {
                     out.push(Named {
-                        checksum: *dependency,
+                        checksum: *attachment,
                         first: Some(target),
                         name: name.clone(),
                         pairs: Vec::new(),
@@ -213,13 +213,13 @@ pub(super) fn pair_targets(
     }
     let mut names: HashMap<Checksum, (Checksum, &str)> = HashMap::new();
     for (commit, entries) in naming {
-        for (name, dependency) in entries {
-            if !outside.contains(dependency) {
+        for (name, attachment) in entries {
+            if !outside.contains(attachment) {
                 continue;
             }
             let candidate = (*commit, name.as_str());
             names
-                .entry(*dependency)
+                .entry(*attachment)
                 .and_modify(|lowest| *lowest = (*lowest).min(candidate))
                 .or_insert(candidate);
         }
@@ -268,7 +268,7 @@ pub(super) async fn lookups(
     targets: &[(String, Checksum)],
     place: RefPlace<'_>,
     named: Vec<Named>,
-) -> Result<(Vec<DependencyLookup>, HashMap<Checksum, bool>)> {
+) -> Result<(Vec<AttachmentLookup>, HashMap<Checksum, bool>)> {
     if named.is_empty() {
         return Ok((Vec::new(), HashMap::new()));
     }
@@ -315,7 +315,7 @@ pub(super) async fn lookups(
             let target = names
                 .get(named.first.unwrap_or(0))
                 .map_or("", String::as_str);
-            out.push(DependencyLookup {
+            out.push(AttachmentLookup {
                 checksum: named.checksum,
                 subject: format!("{} of {target}", named.name),
                 from,
@@ -338,8 +338,8 @@ fn held_entries(repo: &Repo, relpath: &str) -> Result<Option<HashMap<String, Che
     let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &tip)? else {
         return Ok(None);
     };
-    let Ok(entries) = related::parse_dependencies(&bytes).and_then(|entries| {
-        related::checked_entries(RelatedField::Dependencies, Some(tip), entries)
+    let Ok(entries) = related::parse_attachments(&bytes).and_then(|entries| {
+        related::checked_entries(RelationField::Attachments, Some(tip), entries)
     }) else {
         return Ok(None);
     };
@@ -372,52 +372,52 @@ mod tests {
     /// and the entry name of the first. Each commit with a dependency is
     /// recorded, and a commit with an empty field 2 is not.
     #[test]
-    fn dependencies_keep_the_first_naming_commit() {
-        let mut deps = Dependencies::new(false);
-        deps.record(cs(1), entries(&[("boot/uki", 3)]));
-        deps.record(cs(2), entries(&[("lib/uki", 3), ("lib/c", 4)]));
-        deps.record(cs(5), Vec::new());
-        assert!(!deps.keys_only());
-        assert_eq!(deps.order(), [cs(3), cs(4)]);
-        assert_eq!(deps.named(&cs(3)), Some((cs(1), "boot/uki")));
-        assert_eq!(deps.named(&cs(4)), Some((cs(2), "lib/c")));
-        assert_eq!(deps.named(&cs(5)), None);
-        let mut naming: Vec<&Checksum> = deps.naming().keys().collect();
+    fn attachments_keep_the_first_naming_commit() {
+        let mut atts = Attachments::new(false);
+        atts.record(cs(1), entries(&[("boot/uki", 3)]));
+        atts.record(cs(2), entries(&[("lib/uki", 3), ("lib/c", 4)]));
+        atts.record(cs(5), Vec::new());
+        assert!(!atts.keys_only());
+        assert_eq!(atts.order(), [cs(3), cs(4)]);
+        assert_eq!(atts.named(&cs(3)), Some((cs(1), "boot/uki")));
+        assert_eq!(atts.named(&cs(4)), Some((cs(2), "lib/c")));
+        assert_eq!(atts.named(&cs(5)), None);
+        let mut naming: Vec<&Checksum> = atts.naming().keys().collect();
         naming.sort_unstable();
         assert_eq!(naming, [&cs(1), &cs(2)]);
-        assert_eq!(deps.naming()[&cs(2)][1], ("lib/c".to_owned(), cs(4)));
+        assert_eq!(atts.naming()[&cs(2)][1], ("lib/c".to_owned(), cs(4)));
     }
 
     /// Under `keys_only`, the record keeps each commit that names a
     /// dependency, with an empty list, and keeps the order and the first
     /// naming commit of each dependency.
     #[test]
-    fn dependencies_keep_the_commits_alone_under_keys_only() {
-        let mut deps = Dependencies::new(true);
-        deps.record(cs(1), entries(&[("boot/uki", 3)]));
-        deps.record(cs(2), entries(&[("lib/c", 4), ("lib/uki", 3)]));
-        deps.record(cs(5), Vec::new());
-        assert!(deps.keys_only());
-        assert_eq!(deps.order(), [cs(3), cs(4)]);
-        assert_eq!(deps.named(&cs(3)), Some((cs(1), "boot/uki")));
-        let mut naming: Vec<&Checksum> = deps.naming().keys().collect();
+    fn attachments_keep_the_commits_alone_under_keys_only() {
+        let mut atts = Attachments::new(true);
+        atts.record(cs(1), entries(&[("boot/uki", 3)]));
+        atts.record(cs(2), entries(&[("lib/c", 4), ("lib/uki", 3)]));
+        atts.record(cs(5), Vec::new());
+        assert!(atts.keys_only());
+        assert_eq!(atts.order(), [cs(3), cs(4)]);
+        assert_eq!(atts.named(&cs(3)), Some((cs(1), "boot/uki")));
+        let mut naming: Vec<&Checksum> = atts.naming().keys().collect();
         naming.sort_unstable();
         assert_eq!(naming, [&cs(1), &cs(2)]);
-        assert!(deps.naming().values().all(Vec::is_empty));
+        assert!(atts.naming().values().all(Vec::is_empty));
     }
 
     /// The error for a nested dependency names the commit and the entry that
     /// first named the dependency. A dependency that no commit named gives no
     /// error.
     #[test]
-    fn a_nested_dependency_error_names_the_first_naming_commit() {
-        let mut deps = Dependencies::new(false);
-        deps.record(cs(1), entries(&[("lib/b", 2)]));
-        deps.record(cs(3), entries(&[("lib/x", 2)]));
-        match deps.nested_error(&cs(2)) {
-            Some(Error::InvalidRelated {
+    fn a_nested_attachment_error_names_the_first_naming_commit() {
+        let mut atts = Attachments::new(false);
+        atts.record(cs(1), entries(&[("lib/b", 2)]));
+        atts.record(cs(3), entries(&[("lib/x", 2)]));
+        match atts.nested_error(&cs(2)) {
+            Some(Error::InvalidRelations {
                 commit,
-                field: RelatedField::Dependencies,
+                field: RelationField::Attachments,
                 reason,
             }) => {
                 assert_eq!(commit, Some(cs(1)));
@@ -429,9 +429,9 @@ mod tests {
                     )
                 );
             }
-            other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+            other => panic!("expected InvalidRelations in field 2, got {other:?}"),
         }
-        assert!(deps.nested_error(&cs(4)).is_none());
+        assert!(atts.nested_error(&cs(4)).is_none());
     }
 
     /// One result of [`pair_targets`]: the first byte of the checksum, the
@@ -461,7 +461,7 @@ mod tests {
     /// target gives the first pair and the name of the error. A dependency
     /// that no chain names follows.
     #[test]
-    fn the_first_target_names_a_dependency_first() {
+    fn the_first_target_names_an_attachment_first() {
         let targets = vec![("one".to_owned(), cs(1)), ("two".to_owned(), cs(2))];
         let parents = HashMap::from([(cs(1), None), (cs(2), None), (cs(5), None)]);
         let naming = HashMap::from([
@@ -486,7 +486,7 @@ mod tests {
     /// commit. The order in which the pull recorded the commits does not
     /// change the name.
     #[test]
-    fn a_dependency_outside_every_chain_takes_the_lowest_name() {
+    fn an_attachment_outside_every_chain_takes_the_lowest_name() {
         let targets = vec![("main".to_owned(), cs(1))];
         let parents = HashMap::from([(cs(1), None)]);
         let records = [

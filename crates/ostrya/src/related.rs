@@ -10,13 +10,13 @@
 //! Each entry is a name and the 32-byte checksum of a commit. The name has
 //! the form `<class>/<name>` by convention, for example `container/fe`.
 //!
-//! - [`Repo::read_commit_related`] reads both fields.
-//! - [`Repo::add_detached_related`] and [`Transaction::add_detached_related`]
+//! - [`Repo::read_commit_relations`] reads both fields.
+//! - [`Repo::add_supplement`] and [`Transaction::add_supplement`]
 //!   add a build source to a commit.
 //! - [`Repo::prune`] keeps the commits that the two fields of each reached
-//!   commit name, and gives a [`RelatedWarning`] for each defective value.
+//!   commit name, and gives a [`RelationWarning`] for each defective value.
 //!   `BucketRepo::prune` keeps the commits that field 2 of each reached
-//!   commit names, and gives a [`RelatedWarning`] for each defective field 2
+//!   commit names, and gives a [`RelationWarning`] for each defective field 2
 //!   entry.
 //! - [`Repo::pull`], [`Repo::pull_with_session`], and [`Repo::pull_collection`]
 //!   fetch the dependencies of each commit that they read.
@@ -73,18 +73,18 @@ static COMMIT_TYPE: LazyLock<Type> =
 
 /// The field of a commit that holds a list of related entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RelatedField {
+pub enum RelationField {
     /// Field 2 of the commit object: the dependencies.
-    Dependencies,
+    Attachments,
     /// The detached metadata key `ostrya.related`: the build sources.
-    BuildSources,
+    Supplements,
 }
 
-impl std::fmt::Display for RelatedField {
+impl std::fmt::Display for RelationField {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            RelatedField::Dependencies => "field 2",
-            RelatedField::BuildSources => RELATED_KEY,
+            RelationField::Attachments => "field 2",
+            RelationField::Supplements => RELATED_KEY,
         })
     }
 }
@@ -92,22 +92,22 @@ impl std::fmt::Display for RelatedField {
 /// A defective related value that [`Repo::prune`] or `BucketRepo::prune`
 /// read.
 ///
-/// The prune gives this warning in place of [`Error::InvalidRelated`] and
+/// The prune gives this warning in place of [`Error::InvalidRelations`] and
 /// continues. The defective value or entry roots nothing. The other entries
 /// of the field root as usual. The text of the warning is the text of the
 /// error with the same commit, field, and reason. `BucketRepo::prune` reads
 /// field 2 alone, so each of its warnings is about field 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RelatedWarning {
+pub struct RelationWarning {
     /// The commit that holds the defective value.
     pub commit: Checksum,
     /// The field that holds the defective value.
-    pub field: RelatedField,
+    pub field: RelationField,
     /// The text that names the defect.
     pub reason: String,
 }
 
-impl std::fmt::Display for RelatedWarning {
+impl std::fmt::Display for RelationWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -117,18 +117,18 @@ impl std::fmt::Display for RelatedWarning {
     }
 }
 
-/// The related commits of a commit, from [`Repo::read_commit_related`].
+/// The related commits of a commit, from [`Repo::read_commit_relations`].
 ///
 /// Each list holds the entries in the order that the commit stores them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct CommitRelated {
+pub struct CommitRelations {
     /// The entries of field 2 of the commit object: the name and the
     /// checksum of each dependency.
-    pub dependencies: Vec<(String, Checksum)>,
+    pub attachments: Vec<(String, Checksum)>,
     /// The entries of the detached metadata key `ostrya.related`: the name
     /// and the checksum of each build source. The list is empty if the
     /// commit has no detached metadata or no such key.
-    pub build_sources: Vec<(String, Checksum)>,
+    pub supplements: Vec<(String, Checksum)>,
 }
 
 /// One related entry as stored, before the check of its format.
@@ -166,7 +166,7 @@ impl RelatedEntry {
 ///
 /// [`Error::Core`] if the commit tuple does not frame, or if field 2 does not
 /// decode.
-pub(crate) fn parse_dependencies(commit_bytes: &[u8]) -> Result<Vec<RelatedEntry>> {
+pub(crate) fn parse_attachments(commit_bytes: &[u8]) -> Result<Vec<RelatedEntry>> {
     let field =
         tuple_field_from_bytes(&COMMIT_TYPE, commit_bytes, 2).map_err(ostrya_core::Error::from)?;
     entries_of_value(&field).map_err(Error::InvalidFormat)
@@ -182,7 +182,7 @@ pub(crate) fn parse_dependencies(commit_bytes: &[u8]) -> Result<Vec<RelatedEntry
 ///
 /// [`Error::Core`] if the commit tuple does not frame, or if field 2 does not
 /// decode.
-pub(crate) fn has_dependencies(commit_bytes: &[u8]) -> Result<bool> {
+pub(crate) fn has_attachments(commit_bytes: &[u8]) -> Result<bool> {
     let field =
         tuple_field_from_bytes(&COMMIT_TYPE, commit_bytes, 2).map_err(ostrya_core::Error::from)?;
     Ok(field.as_array().is_some_and(|entries| !entries.is_empty()))
@@ -220,7 +220,7 @@ pub(crate) fn into_entries(related: Vec<(String, Vec<u8>)>) -> Vec<RelatedEntry>
 /// # Errors
 ///
 /// The reason of the defect, if the value is not a variant of type `a(say)`.
-pub(crate) fn build_sources(
+pub(crate) fn supplements(
     detached: Option<&Value>,
 ) -> std::result::Result<Option<Vec<RelatedEntry>>, String> {
     match detached.and_then(|dict| dict.dict_get(RELATED_KEY)) {
@@ -238,7 +238,7 @@ pub(crate) fn build_sources(
 /// only if `bytes` holds these bytes. These bytes can also be in a value, for
 /// example in a string. Then the test gives `true`, and the parse finds no
 /// entry.
-pub(crate) fn may_hold_build_sources(bytes: &[u8]) -> bool {
+pub(crate) fn may_hold_supplements(bytes: &[u8]) -> bool {
     bytes
         .windows(RELATED_KEY_BYTES.len())
         .any(|window| window == RELATED_KEY_BYTES)
@@ -288,17 +288,17 @@ pub(crate) fn split_entries(entries: Vec<RelatedEntry>) -> (Vec<Checksum>, Vec<S
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with `commit` and
-/// [`RelatedField::BuildSources`] for the first defect, in the order of the
+/// [`Error::InvalidRelations`] with `commit` and
+/// [`RelationField::Supplements`] for the first defect, in the order of the
 /// entries and then of the elements.
 pub(crate) fn check_detached(commit: &Checksum, dict: &Value) -> Result<()> {
     for value in related_values(dict) {
-        let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+        let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelations {
             commit: Some(*commit),
-            field: RelatedField::BuildSources,
+            field: RelationField::Supplements,
             reason,
         })?;
-        checked_entries(RelatedField::BuildSources, Some(*commit), entries)?;
+        checked_entries(RelationField::Supplements, Some(*commit), entries)?;
     }
     Ok(())
 }
@@ -506,12 +506,12 @@ fn kept_entries(commit: &Checksum, dict: Value) -> Result<Kept> {
 ///
 /// - [`Error::InvalidFormat`] if `sources` is not empty and `dict` is not an
 ///   array.
-/// - [`Error::InvalidRelated`] with `commit` and
-///   [`RelatedField::BuildSources`] if `sources` is not empty and the value of
+/// - [`Error::InvalidRelations`] with `commit` and
+///   [`RelationField::Supplements`] if `sources` is not empty and the value of
 ///   the first entry is not a variant of type `a(say)`, or if one of its
 ///   elements has an empty name or a checksum that is not 32 bytes. `dict`
 ///   then stays as it is.
-pub(crate) fn add_build_sources(
+pub(crate) fn add_supplements(
     dict: &mut Value,
     commit: &Checksum,
     sources: Vec<(String, Checksum)>,
@@ -533,12 +533,12 @@ pub(crate) fn add_build_sources(
     });
     let stored = match &slot {
         Some(value) => {
-            let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+            let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelations {
                 commit: Some(*commit),
-                field: RelatedField::BuildSources,
+                field: RelationField::Supplements,
                 reason,
             })?;
-            checked_entries(RelatedField::BuildSources, Some(*commit), entries)?
+            checked_entries(RelationField::Supplements, Some(*commit), entries)?
         }
         None => Vec::new(),
     };
@@ -601,10 +601,10 @@ fn entries_of_value(value: &Value) -> std::result::Result<Vec<RelatedEntry>, Str
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with `commit` and `field` for the first entry
+/// [`Error::InvalidRelations`] with `commit` and `field` for the first entry
 /// with an empty name or with a checksum that is not 32 bytes.
 pub(crate) fn checked_entries(
-    field: RelatedField,
+    field: RelationField,
     commit: Option<Checksum>,
     entries: impl IntoIterator<Item = RelatedEntry>,
 ) -> Result<Vec<(String, Checksum)>> {
@@ -612,7 +612,7 @@ pub(crate) fn checked_entries(
         .into_iter()
         .enumerate()
         .map(|(index, entry)| match entry.defect(index) {
-            Some(reason) => Err(Error::InvalidRelated {
+            Some(reason) => Err(Error::InvalidRelations {
                 commit,
                 field,
                 reason,
@@ -630,10 +630,10 @@ pub(crate) fn checked_entries(
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with `commit` and [`RelatedField::Dependencies`]
+/// [`Error::InvalidRelations`] with `commit` and [`RelationField::Attachments`]
 /// for the first entry with an empty name or with a checksum that is not 32
 /// bytes.
-pub(crate) fn checked_dependencies(
+pub(crate) fn checked_attachments(
     commit: &Checksum,
     related: Vec<(String, Vec<u8>)>,
 ) -> Result<Vec<(String, Checksum)>> {
@@ -641,22 +641,22 @@ pub(crate) fn checked_dependencies(
         checksum: Checksum::from_ay(&bytes).map_err(|_| bytes.len()),
         name,
     });
-    checked_entries(RelatedField::Dependencies, Some(*commit), entries)
+    checked_entries(RelationField::Attachments, Some(*commit), entries)
 }
 
 /// Checks the format of each entry of field 2 of the parsed commit `commit`
 /// and returns the name and the checksum of each entry, in the stored order.
 ///
-/// The call is [`checked_dependencies`] over a borrowed field: the result
+/// The call is [`checked_attachments`] over a borrowed field: the result
 /// borrows the names, and the call copies a name only for its error.
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with `commit` and [`RelatedField::Dependencies`]
+/// [`Error::InvalidRelations`] with `commit` and [`RelationField::Attachments`]
 /// for the first entry with an empty name or with a checksum that is not 32
 /// bytes.
 #[cfg_attr(not(feature = "receive"), allow(dead_code))]
-pub(crate) fn borrowed_dependencies<'a>(
+pub(crate) fn borrowed_attachments<'a>(
     commit: &Checksum,
     related: &'a [(String, Vec<u8>)],
 ) -> Result<Vec<(&'a str, Checksum)>> {
@@ -670,9 +670,9 @@ pub(crate) fn borrowed_dependencies<'a>(
                     name: name.clone(),
                     checksum: checksum.map_err(|_| bytes.len()),
                 };
-                Err(Error::InvalidRelated {
+                Err(Error::InvalidRelations {
                     commit: Some(*commit),
-                    field: RelatedField::Dependencies,
+                    field: RelationField::Attachments,
                     reason: entry.defect(index).expect("the entry is defective"),
                 })
             }
@@ -686,7 +686,7 @@ pub(crate) fn borrowed_dependencies<'a>(
 /// `T` is the value that the caller reads from the commit object of a
 /// complete dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeldDependency<T = ()> {
+pub(crate) enum HeldAttachment<T = ()> {
     /// The repository does not hold the commit object, and the transaction
     /// does not stage it.
     Absent,
@@ -711,7 +711,7 @@ pub(crate) enum HeldDependency<T = ()> {
 /// The call reads the partial marker, then the commit object, on the calling
 /// thread. A caller on the executor calls it on the blocking pool. For a
 /// commit with a partial marker, the call reads no object. A staged commit is
-/// then [`HeldDependency::Partial`]. For a commit that is not staged, the call
+/// then [`HeldAttachment::Partial`]. For a commit that is not staged, the call
 /// only finds if the object store holds the object. For a commit with no
 /// marker, the call reads the object, decodes field 2 alone, and then calls
 /// `read` with the bytes of the object.
@@ -725,18 +725,18 @@ pub(crate) enum HeldDependency<T = ()> {
 ///   file, or if a symlink is on its path.
 /// - [`Error::Io`] if a file system operation fails.
 /// - Each error of `read`.
-pub(crate) fn held_dependency_blocking<T>(
+pub(crate) fn held_attachment_blocking<T>(
     repo: &Repo,
     staging: Option<&RepoDir>,
     checksum: &Checksum,
     read: impl FnOnce(&[u8]) -> Result<T>,
-) -> Result<HeldDependency<T>> {
+) -> Result<HeldAttachment<T>> {
     if repo.commit_state_blocking(checksum)? == CommitState::Partial {
         let held = staging.is_some() || repo.has_object_blocking(ObjectType::Commit, checksum)?;
         return Ok(if held {
-            HeldDependency::Partial
+            HeldAttachment::Partial
         } else {
-            HeldDependency::Absent
+            HeldAttachment::Absent
         });
     }
     let bytes = match staging {
@@ -746,41 +746,41 @@ pub(crate) fn held_dependency_blocking<T>(
         }
         None => match repo.held_object_bytes_blocking(ObjectType::Commit, checksum)? {
             Some(bytes) => bytes,
-            None => return Ok(HeldDependency::Absent),
+            None => return Ok(HeldAttachment::Absent),
         },
     };
-    let nested = has_dependencies(&bytes)?;
-    Ok(HeldDependency::Complete {
+    let nested = has_attachments(&bytes)?;
+    Ok(HeldAttachment::Complete {
         nested,
         value: read(&bytes)?,
     })
 }
 
 /// Returns the error for the dependency `name` of `commit`, which names the
-/// commit `dependency` whose own field 2 is not empty.
-pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
-    Error::InvalidRelated {
+/// commit `attachment` whose own field 2 is not empty.
+pub(crate) fn nested_attachment(commit: Checksum, name: &str, attachment: &Checksum) -> Error {
+    Error::InvalidRelations {
         commit: Some(commit),
-        field: RelatedField::Dependencies,
-        reason: dependency_reason(name, dependency, NESTED_REASON),
+        field: RelationField::Attachments,
+        reason: attachment_reason(name, attachment, NESTED_REASON),
     }
 }
 
 /// Returns the error for the dependency `name` of `commit`, which names the
-/// commit `dependency` that the repository marks partial.
+/// commit `attachment` that the repository marks partial.
 #[cfg_attr(not(any(feature = "push", feature = "receive")), allow(dead_code))]
-pub(crate) fn partial_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
-    Error::InvalidRelated {
+pub(crate) fn partial_attachment(commit: Checksum, name: &str, attachment: &Checksum) -> Error {
+    Error::InvalidRelations {
         commit: Some(commit),
-        field: RelatedField::Dependencies,
-        reason: dependency_reason(name, dependency, PARTIAL_REASON),
+        field: RelationField::Attachments,
+        reason: attachment_reason(name, attachment, PARTIAL_REASON),
     }
 }
 
 /// Returns the reason for the dependency `name`, which names the commit
-/// `dependency`, with the end `end`.
-pub(crate) fn dependency_reason(name: &str, dependency: &Checksum, end: &str) -> String {
-    format!("dependency {name} names commit {dependency}, {end}")
+/// `attachment`, with the end `end`.
+pub(crate) fn attachment_reason(name: &str, attachment: &Checksum, end: &str) -> String {
+    format!("dependency {name} names commit {attachment}, {end}")
 }
 
 /// Returns the dependencies `entries` of a new commit, sorted by name in byte
@@ -791,13 +791,13 @@ pub(crate) fn dependency_reason(name: &str, dependency: &Checksum, end: &str) ->
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with no commit, if an entry has an empty name or
+/// [`Error::InvalidRelations`] with no commit, if an entry has an empty name or
 /// if two entries have the same name.
 pub(crate) fn sorted_new(mut entries: Vec<(String, Checksum)>) -> Result<Vec<(String, Checksum)>> {
     if let Some(index) = entries.iter().position(|(name, _)| name.is_empty()) {
-        return Err(Error::InvalidRelated {
+        return Err(Error::InvalidRelations {
             commit: None,
-            field: RelatedField::Dependencies,
+            field: RelationField::Attachments,
             reason: format!("entry {index} has an empty name"),
         });
     }
@@ -811,7 +811,7 @@ pub(crate) fn sorted_new(mut entries: Vec<(String, Checksum)>) -> Result<Vec<(St
 ///
 /// # Errors
 ///
-/// [`Error::InvalidRelated`] with `commit` for the first pair of names out of
+/// [`Error::InvalidRelations`] with `commit` for the first pair of names out of
 /// order or with the same value.
 pub(crate) fn check_order<'a>(
     commit: Option<Checksum>,
@@ -832,30 +832,30 @@ pub(crate) fn check_order<'a>(
                 format!("entries are not sorted by name: {b} follows {a}")
             }
         };
-        return Err(Error::InvalidRelated {
+        return Err(Error::InvalidRelations {
             commit,
-            field: RelatedField::Dependencies,
+            field: RelationField::Attachments,
             reason,
         });
     }
     Ok(())
 }
 
-/// Checks that the dependencies `deps` are complete and that none of them is
+/// Checks that the dependencies `atts` are complete and that none of them is
 /// nested.
 ///
 /// A dependency is complete if `txn` stages its commit object or the
 /// repository holds it, and the repository holds no
 /// `state/<checksum>.commitpartial` marker for it. A dependency is nested if
 /// its own field 2 is not empty. The checks of all dependencies run in one
-/// trip to the blocking pool, in the order of `deps`. A checksum that `deps`
+/// trip to the blocking pool, in the order of `atts`. A checksum that `atts`
 /// names more than once is checked once, at its first entry. For each
 /// dependency, the check reads the partial marker first, and reads no commit
 /// object of a dependency with a marker.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelated`] with `commit` for the first dependency that is
+/// - [`Error::InvalidRelations`] with `commit` for the first dependency that is
 ///   absent, partial, or nested.
 /// - [`Error::Core`] if the commit tuple of a dependency with no partial
 ///   marker does not frame, or if its field 2 does not decode.
@@ -864,16 +864,16 @@ pub(crate) fn check_order<'a>(
 ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
 ///   file, or if a symlink is on its path.
 /// - [`Error::Io`] if a file system operation fails.
-pub(crate) async fn check_dependencies<'a>(
+pub(crate) async fn check_attachments<'a>(
     txn: &Transaction,
     commit: Option<Checksum>,
-    deps: impl IntoIterator<Item = &'a (String, Checksum)>,
+    atts: impl IntoIterator<Item = &'a (String, Checksum)>,
 ) -> Result<()> {
-    let deps: Vec<&(String, Checksum)> = deps.into_iter().collect();
-    if deps.is_empty() {
+    let atts: Vec<&(String, Checksum)> = atts.into_iter().collect();
+    if atts.is_empty() {
         return Ok(());
     }
-    let checksums: Vec<Checksum> = deps.iter().map(|(_, checksum)| *checksum).collect();
+    let checksums: Vec<Checksum> = atts.iter().map(|(_, checksum)| *checksum).collect();
     let staged = txn.staged_flags(ObjectType::Commit, &checksums);
     let staging = if staged.contains(&true) {
         Some(txn.staging_dir().clone())
@@ -892,11 +892,11 @@ pub(crate) async fn check_dependencies<'a>(
                 continue;
             }
             let staging = staging.as_ref().filter(|_| staged);
-            let defect = match held_dependency_blocking(&repo, staging, checksum, |_| Ok(()))? {
-                HeldDependency::Absent => "which is in neither the repository nor the transaction",
-                HeldDependency::Partial => PARTIAL_REASON,
-                HeldDependency::Complete { nested: true, .. } => NESTED_REASON,
-                HeldDependency::Complete { nested: false, .. } => continue,
+            let defect = match held_attachment_blocking(&repo, staging, checksum, |_| Ok(()))? {
+                HeldAttachment::Absent => "which is in neither the repository nor the transaction",
+                HeldAttachment::Partial => PARTIAL_REASON,
+                HeldAttachment::Complete { nested: true, .. } => NESTED_REASON,
+                HeldAttachment::Complete { nested: false, .. } => continue,
             };
             return Ok(Some((index, defect)));
         }
@@ -906,11 +906,11 @@ pub(crate) async fn check_dependencies<'a>(
     match refused {
         None => Ok(()),
         Some((index, defect)) => {
-            let (name, checksum) = deps[index];
-            Err(Error::InvalidRelated {
+            let (name, checksum) = atts[index];
+            Err(Error::InvalidRelations {
                 commit,
-                field: RelatedField::Dependencies,
-                reason: dependency_reason(name, checksum, defect),
+                field: RelationField::Attachments,
+                reason: attachment_reason(name, checksum, defect),
             })
         }
     }
@@ -941,32 +941,32 @@ mod tests {
         .unwrap()
     }
 
-    fn reason(err: Error) -> (Option<Checksum>, RelatedField, String) {
+    fn reason(err: Error) -> (Option<Checksum>, RelationField, String) {
         match err {
-            Error::InvalidRelated {
+            Error::InvalidRelations {
                 commit,
                 field,
                 reason,
             } => (commit, field, reason),
-            other => panic!("expected InvalidRelated, got {other:?}"),
+            other => panic!("expected InvalidRelations, got {other:?}"),
         }
     }
 
     #[test]
-    fn parse_dependencies_of_empty_field() {
+    fn parse_attachments_of_empty_field() {
         let bytes = commit_bytes(Vec::new());
-        assert!(parse_dependencies(&bytes).unwrap().is_empty());
-        assert!(!has_dependencies(&bytes).unwrap());
+        assert!(parse_attachments(&bytes).unwrap().is_empty());
+        assert!(!has_attachments(&bytes).unwrap());
     }
 
     #[test]
-    fn parse_dependencies_keeps_stored_order_and_lengths() {
+    fn parse_attachments_keeps_stored_order_and_lengths() {
         let bytes = commit_bytes(vec![
             ("b/x".into(), vec![3; 32]),
             ("a/y".into(), vec![4; 31]),
             (String::new(), vec![5; 32]),
         ]);
-        let entries = parse_dependencies(&bytes).unwrap();
+        let entries = parse_attachments(&bytes).unwrap();
         assert_eq!(
             entries,
             vec![
@@ -984,7 +984,7 @@ mod tests {
                 },
             ]
         );
-        assert!(has_dependencies(&bytes).unwrap());
+        assert!(has_attachments(&bytes).unwrap());
         assert_eq!(entries[0].defect(0), None);
         assert_eq!(
             entries[1].defect(1).unwrap(),
@@ -999,11 +999,11 @@ mod tests {
     }
 
     #[test]
-    fn parse_dependencies_refuses_torn_bytes() {
+    fn parse_attachments_refuses_torn_bytes() {
         let bytes = commit_bytes(vec![("a/x".into(), vec![3; 32])]);
         let torn = &bytes[..bytes.len() - 3];
-        assert!(matches!(parse_dependencies(torn), Err(Error::Core(_))));
-        assert!(matches!(has_dependencies(torn), Err(Error::Core(_))));
+        assert!(matches!(parse_attachments(torn), Err(Error::Core(_))));
+        assert!(matches!(has_attachments(torn), Err(Error::Core(_))));
     }
 
     #[test]
@@ -1019,30 +1019,30 @@ mod tests {
             },
         ];
         let (commit, field, reason) = reason(
-            checked_entries(RelatedField::BuildSources, Some(checksum(9)), entries).unwrap_err(),
+            checked_entries(RelationField::Supplements, Some(checksum(9)), entries).unwrap_err(),
         );
         assert_eq!(commit, Some(checksum(9)));
-        assert_eq!(field, RelatedField::BuildSources);
+        assert_eq!(field, RelationField::Supplements);
         assert_eq!(reason, "entry 1 (b/x) has a checksum of 0 bytes, not 32");
     }
 
     #[test]
-    fn checked_dependencies_keeps_order_and_names_the_commit() {
+    fn checked_attachments_keeps_order_and_names_the_commit() {
         let related = vec![("b/x".into(), vec![3; 32]), ("a/y".into(), vec![4; 32])];
         assert_eq!(
-            checked_dependencies(&checksum(9), related).unwrap(),
+            checked_attachments(&checksum(9), related).unwrap(),
             vec![("b/x".into(), checksum(3)), ("a/y".into(), checksum(4))]
         );
         let (commit, field, text) = reason(
-            checked_dependencies(&checksum(9), vec![(String::new(), vec![3; 32])]).unwrap_err(),
+            checked_attachments(&checksum(9), vec![(String::new(), vec![3; 32])]).unwrap_err(),
         );
         assert_eq!(commit, Some(checksum(9)));
-        assert_eq!(field, RelatedField::Dependencies);
+        assert_eq!(field, RelationField::Attachments);
         assert_eq!(text, "entry 0 has an empty name");
 
-        let (commit, field, text) = reason(nested_dependency(checksum(9), "lib/b", &checksum(3)));
+        let (commit, field, text) = reason(nested_attachment(checksum(9), "lib/b", &checksum(3)));
         assert_eq!(commit, Some(checksum(9)));
-        assert_eq!(field, RelatedField::Dependencies);
+        assert_eq!(field, RelationField::Attachments);
         assert_eq!(
             text,
             format!(
@@ -1075,7 +1075,7 @@ mod tests {
             .unwrap_err(),
         );
         assert_eq!(commit, None);
-        assert_eq!(field, RelatedField::Dependencies);
+        assert_eq!(field, RelationField::Attachments);
         assert_eq!(text, "entry 1 has an empty name");
 
         let (_, _, text) = reason(
@@ -1111,34 +1111,34 @@ mod tests {
     }
 
     #[test]
-    fn may_hold_build_sources_needs_the_key_and_its_nul() {
-        assert!(!may_hold_build_sources(b""));
-        assert!(!may_hold_build_sources(b"ostree.gpgsigs\0"));
-        assert!(may_hold_build_sources(b"ostrya.related\0"));
-        assert!(may_hold_build_sources(b"\x01\x02ostrya.related\0\0\0v"));
-        assert!(!may_hold_build_sources(b"\x01\x02ostrya.related"));
-        assert!(!may_hold_build_sources(b"ostrya.relatedX\0"));
-        assert!(!may_hold_build_sources(b"ostrya.relate\0"));
+    fn may_hold_supplements_needs_the_key_and_its_nul() {
+        assert!(!may_hold_supplements(b""));
+        assert!(!may_hold_supplements(b"ostree.gpgsigs\0"));
+        assert!(may_hold_supplements(b"ostrya.related\0"));
+        assert!(may_hold_supplements(b"\x01\x02ostrya.related\0\0\0v"));
+        assert!(!may_hold_supplements(b"\x01\x02ostrya.related"));
+        assert!(!may_hold_supplements(b"ostrya.relatedX\0"));
+        assert!(!may_hold_supplements(b"ostrya.relate\0"));
     }
 
     #[test]
-    fn may_hold_build_sources_finds_the_key_of_a_serialized_dict() {
+    fn may_hold_supplements_finds_the_key_of_a_serialized_dict() {
         let dict = detached(Value::variant(
             Type::parse(RELATED_SIGNATURE).unwrap(),
             Value::Array(Vec::new()),
         ));
         let bytes = crate::summary::serialize_signature_dict(&dict).unwrap();
-        assert!(may_hold_build_sources(&bytes));
+        assert!(may_hold_supplements(&bytes));
     }
 
     #[test]
-    fn build_sources_of_absent_key() {
-        assert_eq!(build_sources(None), Ok(None));
-        assert_eq!(build_sources(Some(&Value::Array(Vec::new()))), Ok(None));
+    fn supplements_of_absent_key() {
+        assert_eq!(supplements(None), Ok(None));
+        assert_eq!(supplements(Some(&Value::Array(Vec::new()))), Ok(None));
     }
 
     #[test]
-    fn build_sources_reads_pairs() {
+    fn supplements_reads_pairs() {
         let ty = Type::parse(RELATED_SIGNATURE).unwrap();
         let value = Value::variant(
             ty,
@@ -1147,7 +1147,7 @@ mod tests {
                 Value::Bytes(vec![6; 32]),
             ])]),
         );
-        let entries = build_sources(Some(&detached(value))).unwrap().unwrap();
+        let entries = supplements(Some(&detached(value))).unwrap().unwrap();
         assert_eq!(
             entries,
             vec![RelatedEntry {
@@ -1158,17 +1158,17 @@ mod tests {
     }
 
     #[test]
-    fn build_sources_refuses_wrong_type_and_non_variant() {
+    fn supplements_refuses_wrong_type_and_non_variant() {
         let strings = Value::variant(
             Type::parse("as").unwrap(),
             Value::Array(vec![Value::Str("x".into())]),
         );
         assert_eq!(
-            build_sources(Some(&detached(strings))),
+            supplements(Some(&detached(strings))),
             Err("type is `as`, not `a(say)`".into())
         );
         assert_eq!(
-            build_sources(Some(&detached(Value::Str("x".into())))),
+            supplements(Some(&detached(Value::Str("x".into())))),
             Err("value is not a variant".into())
         );
         let shape = Value::variant(
@@ -1176,7 +1176,7 @@ mod tests {
             Value::Array(vec![Value::Str("x".into())]),
         );
         assert_eq!(
-            build_sources(Some(&detached(shape))),
+            supplements(Some(&detached(shape))),
             Err("element 0 is not a (say) pair".into())
         );
     }
@@ -1190,17 +1190,17 @@ mod tests {
     /// the add appends one after the other entries, with the new element alone.
     /// Each other entry of `dict` stays as it is.
     ///
-    /// The tests compare [`add_build_sources`] with one call of this function
+    /// The tests compare [`add_supplements`] with one call of this function
     /// for each entry, in order.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if `dict` is not an array.
-    /// - [`Error::InvalidRelated`] with `commit` and
-    ///   [`RelatedField::BuildSources`] if the value of the first entry is not a
+    /// - [`Error::InvalidRelations`] with `commit` and
+    ///   [`RelationField::Supplements`] if the value of the first entry is not a
     ///   variant of type `a(say)`, or if one of its elements has an empty name or
     ///   a checksum that is not 32 bytes. `dict` then stays as it is.
-    fn add_one_build_source(
+    fn add_one_supplement(
         dict: &mut Value,
         commit: &Checksum,
         name: &str,
@@ -1221,12 +1221,12 @@ mod tests {
         let mut sources = match &slot {
             Some(value) => {
                 let entries =
-                    entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+                    entries_of_variant(value).map_err(|reason| Error::InvalidRelations {
                         commit: Some(*commit),
-                        field: RelatedField::BuildSources,
+                        field: RelationField::Supplements,
                         reason,
                     })?;
-                checked_entries(RelatedField::BuildSources, Some(*commit), entries)?
+                checked_entries(RelationField::Supplements, Some(*commit), entries)?
             }
             None => Vec::new(),
         };
@@ -1280,7 +1280,7 @@ mod tests {
             .collect()
     }
 
-    /// Runs one call of [`add_one_build_source`] for each entry of
+    /// Runs one call of [`add_one_supplement`] for each entry of
     /// `sources`, in order, on a copy of `dict`.
     fn by_one_add(
         dict: &Value,
@@ -1289,28 +1289,28 @@ mod tests {
     ) -> Result<Value> {
         let mut dict = dict.clone();
         for (name, source) in sources {
-            add_one_build_source(&mut dict, commit, name, source)?;
+            add_one_supplement(&mut dict, commit, name, source)?;
         }
         Ok(dict)
     }
 
-    /// Asserts that [`add_build_sources`] gives the result of one add for
+    /// Asserts that [`add_supplements`] gives the result of one add for
     /// each entry, and returns that result.
     fn assert_same_as_one_add(dict: &Value, sources: Vec<(String, Checksum)>) -> Value {
         let expected = by_one_add(dict, &checksum(9), &sources).unwrap();
         let mut actual = dict.clone();
-        add_build_sources(&mut actual, &checksum(9), sources).unwrap();
+        add_supplements(&mut actual, &checksum(9), sources).unwrap();
         assert_eq!(actual, expected);
         actual
     }
 
     fn elements_of(dict: &Value) -> Vec<(String, Checksum)> {
-        let entries = build_sources(Some(dict)).unwrap().unwrap();
-        checked_entries(RelatedField::BuildSources, None, entries).unwrap()
+        let entries = supplements(Some(dict)).unwrap().unwrap();
+        checked_entries(RelationField::Supplements, None, entries).unwrap()
     }
 
     #[test]
-    fn add_build_sources_appends_an_absent_entry_last() {
+    fn add_supplements_appends_an_absent_entry_last() {
         let other = Value::Tuple(vec![
             Value::Str("ostree.other".into()),
             Value::variant(Type::parse("s").unwrap(), Value::Str("x".into())),
@@ -1327,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_fills_an_empty_stored_array() {
+    fn add_supplements_fills_an_empty_stored_array() {
         let dict = detached(related_value(&[]));
         let result = assert_same_as_one_add(&dict, queued(&[("b/x", 1), ("a/x", 2)]));
         assert_eq!(
@@ -1337,7 +1337,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_keeps_stored_duplicates_of_other_names() {
+    fn add_supplements_keeps_stored_duplicates_of_other_names() {
         let dict = detached(related_value(&[
             ("c/x", &[1; 32]),
             ("a/d", &[2; 32]),
@@ -1358,7 +1358,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_keeps_the_stored_order_of_many_duplicates() {
+    fn add_supplements_keeps_the_stored_order_of_many_duplicates() {
         // 64 stored elements under 8 names, 8 elements for each name. The
         // names interleave and are not sorted. Each element has its own
         // checksum, so the order of the elements of one name is observable.
@@ -1397,7 +1397,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_collapses_stored_duplicates_of_a_queued_name() {
+    fn add_supplements_collapses_stored_duplicates_of_a_queued_name() {
         let dict = detached(related_value(&[
             ("a/x", &[1; 32]),
             ("b/x", &[3; 32]),
@@ -1411,7 +1411,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_takes_the_last_checksum_of_a_name() {
+    fn add_supplements_takes_the_last_checksum_of_a_name() {
         let dict = detached(related_value(&[("a/x", &[7; 32])]));
         let result = assert_same_as_one_add(&dict, queued(&[("a/x", 1), ("b/x", 2), ("a/x", 3)]));
         assert_eq!(
@@ -1421,7 +1421,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_edits_the_first_of_two_entries() {
+    fn add_supplements_edits_the_first_of_two_entries() {
         let second = Value::Tuple(vec![
             Value::Str(RELATED_KEY.into()),
             related_value(&[("z/x", &[8; 32])]),
@@ -1444,7 +1444,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_sorts_by_bytes() {
+    fn add_supplements_sorts_by_bytes() {
         let dict = detached(related_value(&[("boot/uki", &[7; 32])]));
         let result = assert_same_as_one_add(
             &dict,
@@ -1467,19 +1467,19 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_of_an_empty_list_changes_nothing() {
+    fn add_supplements_of_an_empty_list_changes_nothing() {
         let unsorted = detached(related_value(&[("b/x", &[1; 32]), ("a/x", &[2; 32])]));
         let mut dict = unsorted.clone();
-        add_build_sources(&mut dict, &checksum(9), Vec::new()).unwrap();
+        add_supplements(&mut dict, &checksum(9), Vec::new()).unwrap();
         assert_eq!(dict, unsorted);
 
         let mut not_a_dict = Value::Str("x".into());
-        add_build_sources(&mut not_a_dict, &checksum(9), Vec::new()).unwrap();
+        add_supplements(&mut not_a_dict, &checksum(9), Vec::new()).unwrap();
         assert_eq!(not_a_dict, Value::Str("x".into()));
     }
 
     #[test]
-    fn add_build_sources_refuses_a_value_that_is_not_a_dict() {
+    fn add_supplements_refuses_a_value_that_is_not_a_dict() {
         let dict = Value::Str("x".into());
         let sources = queued(&[("a/x", 1)]);
         let expected = match by_one_add(&dict, &checksum(9), &sources).unwrap_err() {
@@ -1487,7 +1487,7 @@ mod tests {
             other => panic!("expected InvalidFormat, got {other:?}"),
         };
         let mut actual = dict.clone();
-        match add_build_sources(&mut actual, &checksum(9), sources).unwrap_err() {
+        match add_supplements(&mut actual, &checksum(9), sources).unwrap_err() {
             Error::InvalidFormat(text) => assert_eq!(text, expected),
             other => panic!("expected InvalidFormat, got {other:?}"),
         }
@@ -1495,7 +1495,7 @@ mod tests {
     }
 
     #[test]
-    fn add_build_sources_refuses_a_defective_stored_value() {
+    fn add_supplements_refuses_a_defective_stored_value() {
         let shape = Value::variant(
             Type::parse(RELATED_SIGNATURE).unwrap(),
             Value::Array(vec![Value::Str("x".into())]),
@@ -1515,16 +1515,16 @@ mod tests {
             let sources = queued(&[("c/x", 3), ("a/x", 4)]);
             let expected = reason(by_one_add(&dict, &checksum(9), &sources).unwrap_err());
             let mut actual = dict.clone();
-            let got = reason(add_build_sources(&mut actual, &checksum(9), sources).unwrap_err());
+            let got = reason(add_supplements(&mut actual, &checksum(9), sources).unwrap_err());
             assert_eq!(got, expected);
             assert_eq!(got.0, Some(checksum(9)));
-            assert_eq!(got.1, RelatedField::BuildSources);
+            assert_eq!(got.1, RelationField::Supplements);
             assert_eq!(actual, dict);
         }
     }
 
     #[test]
-    fn add_build_sources_sorts_a_long_list() {
+    fn add_supplements_sorts_a_long_list() {
         fn numbered(number: u64) -> Checksum {
             let mut bytes = [0u8; 32];
             bytes[..8].copy_from_slice(&number.to_le_bytes());
@@ -1540,7 +1540,7 @@ mod tests {
             sources.push((name.to_owned(), numbered(COUNT + offset)));
         }
         let mut dict = detached(related_value(&[("pkg/stored", &[0xff; 32])]));
-        add_build_sources(&mut dict, &checksum(9), sources).unwrap();
+        add_supplements(&mut dict, &checksum(9), sources).unwrap();
 
         let elements = elements_of(&dict);
         assert_eq!(elements.len(), 3001);

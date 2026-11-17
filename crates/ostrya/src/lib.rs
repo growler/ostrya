@@ -151,7 +151,7 @@ pub use bucket::{
 #[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 #[doc(hidden)]
-pub use commit::{CheckedRelated, CommitOptions};
+pub use commit::{CheckedAttachments, CommitOptions};
 #[doc(hidden)]
 pub use composefs::{
     ComposefsImageAdd, ComposefsImageState, ComposefsOptions, StagedComposefsImage, VerityPolicy,
@@ -179,7 +179,7 @@ pub use fetch::{
 pub use file::{ContentReader, FileKind, FileObject};
 #[doc(hidden)]
 pub use fsck::{
-    FsckBindingError, FsckBindingErrorKind, FsckDependencyError, FsckDependencyErrorKind,
+    FsckAttachmentError, FsckAttachmentErrorKind, FsckBindingError, FsckBindingErrorKind,
     FsckError, FsckErrorKind, FsckFailure, FsckImageError, FsckImageErrorKind, FsckOptions,
     FsckPhase, FsckReport,
 };
@@ -239,7 +239,7 @@ pub use receive::{
 };
 #[doc(hidden)]
 pub use refs::{CollectionRefEntry, RefAlias, validate_refspec};
-pub use related::{CommitRelated, RelatedField, RelatedWarning};
+pub use related::{CommitRelations, RelationField, RelationWarning};
 #[doc(hidden)]
 pub use repo::{CreateOptions, OpenOptions, RemotesDir, Repo};
 pub use send::{SendEvent, SendEventFn, SendOptions};

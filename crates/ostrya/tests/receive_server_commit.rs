@@ -992,18 +992,18 @@ fn server_keys_sign_the_commit() {
 /// A server commit onto a tip that names a dependency signs the new commit
 /// alone. The dependency gets no server signature.
 #[test]
-fn a_dependency_of_the_tip_gets_no_server_signature() {
+fn an_attachment_of_the_tip_gets_no_server_signature() {
     let tmp = TmpDir::new("sc-sign-dependency");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let dep = build_commit(None, "dependency", Value::Array(Vec::new()), &[]);
+    let att = build_commit(None, "dependency", Value::Array(Vec::new()), &[]);
     let tip = build_commit(
         None,
         "tip",
         Value::Array(Vec::new()),
-        &[("lib/d", &dep.checksum.as_bytes()[..])],
+        &[("lib/d", &att.checksum.as_bytes()[..])],
     );
     let mut objects = tree_objects();
-    objects.extend([dep.clone(), tip.clone()]);
+    objects.extend([att.clone(), tip.clone()]);
     let updates = vec![RefUpdate {
         name: "main".into(),
         expected: Expected::Absent,
@@ -1035,7 +1035,7 @@ fn a_dependency_of_the_tip_gets_no_server_signature() {
         stored_signatures(&repo, &commit, ED25519_KEY),
         vec![ed25519_signature(SERVER_SECRET_B64, &bytes)]
     );
-    assert!(stored_signatures(&repo, &dep.checksum, ED25519_KEY).is_empty());
+    assert!(stored_signatures(&repo, &att.checksum, ED25519_KEY).is_empty());
     assert!(stored_signatures(&repo, &tip.checksum, ED25519_KEY).is_empty());
 }
 

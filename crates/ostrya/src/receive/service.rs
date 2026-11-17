@@ -445,7 +445,7 @@ impl ReceiveService {
     /// - [`remote::Error::Protocol`] if an entry of field 2 of a staged commit
     ///   has an empty name or a checksum that is not 32 bytes, or if a
     ///   dependency of a staged commit has dependencies of its own. The
-    ///   message is the text of [`Error::InvalidRelated`]. A new commit that
+    ///   message is the text of [`Error::InvalidRelations`]. A new commit that
     ///   the repository holds with a partial marker gets the checks of a
     ///   staged commit, here and for `missing-objects`.
     /// - [`remote::Error::Protocol`] if `[ex-ostrya] generate-composefs` of
@@ -485,7 +485,7 @@ impl ReceiveService {
     ///   is neither staged nor present. The error lists each such dependency.
     ///   A dependency that the repository holds and marks partial also gives
     ///   this error, with no object listed and the text of
-    ///   [`Error::InvalidRelated`], unless it is a new commit of an update.
+    ///   [`Error::InvalidRelations`], unless it is a new commit of an update.
     /// - [`remote::Error::BindingMismatch`] if the `ostree.ref-binding` of a
     ///   new commit does not hold the name of one of its refs, without the
     ///   `@ID:` part. A commit with no such key passes, and a commit with an

@@ -31,14 +31,14 @@ use ostrya::bucket::{
 use ostrya::verify::TrustedKeys;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Ed25519Signer, Ed25519Verifier, Error, FsckDependencyError, FsckDependencyErrorKind,
+    Ed25519Signer, Ed25519Verifier, Error, FsckAttachmentError, FsckAttachmentErrorKind,
     FsckErrorKind, FsckOptions, MutableTree, ObjectName, ObjectType, Repo, RepoMode, Signer,
     SummaryOptions,
 };
 use ostrya_rt::block_on;
 
 use BucketFindingKind::{
-    Config, Corrupt, Dependency, Lock, Marker, Mismatch, Missing, Ref, Stray, Summary, Upload,
+    Attachment, Config, Corrupt, Lock, Marker, Mismatch, Missing, Ref, Stray, Summary, Upload,
 };
 
 /// The address of the repository in each test.
@@ -281,7 +281,7 @@ async fn commit_related(
                 parent,
                 subject: Some(content.to_owned()),
                 timestamp: Some(1_700_000_000),
-                related: related
+                attachments: related
                     .iter()
                     .map(|(name, checksum)| ((*name).to_owned(), *checksum))
                     .collect(),
@@ -1908,48 +1908,48 @@ fn a_marker_of_a_whole_tree_is_a_note_and_the_repair_deletes_it() {
 /// Adds a commit and a tip whose field 2 names it as `boot/uki` to the
 /// fixture, copies the objects, and points `refs/heads/tip` at the tip.
 /// Returns the tip and the dependency.
-async fn dependency_fixture(f: &Fixture) -> (Checksum, Checksum) {
-    let dep = commit(&f.local, f.tmp.path(), "dep", "dep", None).await;
+async fn attachment_fixture(f: &Fixture) -> (Checksum, Checksum) {
+    let att = commit(&f.local, f.tmp.path(), "dep", "dep", None).await;
     let tip = commit_related(
         &f.local,
         f.tmp.path(),
         "tip",
         "tip",
         None,
-        &[("boot/uki", dep)],
+        &[("boot/uki", att)],
     )
     .await;
     f.copy("objects");
     f.put_ref("refs/heads/tip", &tip);
-    (tip, dep)
+    (tip, att)
 }
 
-/// Returns the `Dependency` findings of the report.
-fn dependency_findings(report: &BucketFsckReport) -> Vec<&BucketFinding> {
+/// Returns the `Attachment` findings of the report.
+fn attachment_findings(report: &BucketFsckReport) -> Vec<&BucketFinding> {
     report
         .findings
         .iter()
-        .filter(|finding| finding.kind == Dependency)
+        .filter(|finding| finding.kind == Attachment)
         .collect()
 }
 
-/// Asserts that `found` is the `Dependency` error on the commit `commit` for
-/// the entry `name`, which names `dependency`, with the kind `kind`.
-fn assert_dependency(
+/// Asserts that `found` is the `Attachment` error on the commit `commit` for
+/// the entry `name`, which names `attachment`, with the kind `kind`.
+fn assert_attachment(
     found: &BucketFinding,
     commit: Checksum,
     name: &str,
-    dependency: Option<Checksum>,
-    kind: FsckDependencyErrorKind,
+    attachment: Option<Checksum>,
+    kind: FsckAttachmentErrorKind,
 ) {
-    let error = FsckDependencyError {
+    let error = FsckAttachmentError {
         commit,
         name: name.to_owned(),
-        dependency,
+        attachment,
         kind,
     };
     let object = ObjectName::new(commit, ObjectType::Commit);
-    assert_eq!(found.kind, Dependency);
+    assert_eq!(found.kind, Attachment);
     assert!(found.error, "{found}");
     assert_eq!(found.key, object_path(ObjectType::Commit, &commit));
     assert_eq!(found.object, Some(object));
@@ -1957,40 +1957,40 @@ fn assert_dependency(
     let reason = error.to_string();
     let reason = reason.split_once(": ").unwrap().1;
     assert_eq!(found.detail, reason);
-    assert_eq!(found.dependency, Some(error));
+    assert_eq!(found.attachment, Some(error));
 }
 
 #[test]
-fn an_absent_or_a_partial_dependency_is_a_dependency_error() {
+fn an_absent_or_a_partial_attachment_is_an_attachment_error() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
+        let (tip, att) = attachment_fixture(&f).await;
         let report = f.fsck().await;
         assert!(without_summary_note(&report).is_empty(), "{report:#?}");
 
         // The run reads the commit of an absent dependency again, one time.
-        f.remove(ObjectType::Commit, &dep);
+        f.remove(ObjectType::Commit, &att);
         f.server.state().requests.clear();
         let report = f.fsck().await;
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/uki",
-            Some(dep),
-            FsckDependencyErrorKind::Absent,
+            Some(att),
+            FsckAttachmentErrorKind::Absent,
         );
         assert!(report.has_errors());
         assert_eq!(
             found[0].to_string(),
             format!(
-                "dependency {}: dependency boot/uki names commit {dep}, which the repository \
+                "dependency {}: dependency boot/uki names commit {att}, which the repository \
                  does not hold",
                 object_path(ObjectType::Commit, &tip)
             )
         );
-        let key = object_path(ObjectType::Commit, &dep);
+        let key = object_path(ObjectType::Commit, &att);
         let reads = f
             .requests()
             .into_iter()
@@ -2001,39 +2001,39 @@ fn an_absent_or_a_partial_dependency_is_a_dependency_error() {
         // A dependency with a marker is partial. A commit with a marker is
         // checked too.
         f.copy("objects");
-        f.put(&format!("state/{}.commitpartial", dep.to_hex()), &[0x66]);
+        f.put(&format!("state/{}.commitpartial", att.to_hex()), &[0x66]);
         f.put(&format!("state/{}.commitpartial", tip.to_hex()), &[0x66]);
         let report = f.fsck().await;
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/uki",
-            Some(dep),
-            FsckDependencyErrorKind::Partial,
+            Some(att),
+            FsckAttachmentErrorKind::Partial,
         );
     });
 }
 
 #[test]
-fn a_defective_entry_and_a_nested_dependency_are_dependency_errors() {
+fn a_defective_entry_and_a_nested_attachment_are_attachment_errors() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
+        let (tip, att) = attachment_fixture(&f).await;
         let defective =
-            common::store_with_field2(&f.local, &dep, &[("", dep.as_bytes()), ("lib/a", &[7; 31])])
+            common::store_with_field2(&f.local, &att, &[("", att.as_bytes()), ("lib/a", &[7; 31])])
                 .await;
-        let nested = common::store_with_field2(&f.local, &dep, &[("lib/b", tip.as_bytes())]).await;
+        let nested = common::store_with_field2(&f.local, &att, &[("lib/b", tip.as_bytes())]).await;
         f.copy("objects");
         let report = f.fsck().await;
-        let found = dependency_findings(&report);
-        let defect = |reason: &str| FsckDependencyErrorKind::Defective(reason.to_owned());
+        let found = attachment_findings(&report);
+        let defect = |reason: &str| FsckAttachmentErrorKind::Defective(reason.to_owned());
         let mut expected = vec![
             (
                 defective,
                 "",
-                Some(dep),
+                Some(att),
                 defect("entry 0 has an empty name"),
             ),
             (
@@ -2053,38 +2053,38 @@ fn a_defective_entry_and_a_nested_dependency_are_dependency_errors() {
         ];
         expected.sort_by_key(|(commit, ..)| *commit);
         assert_eq!(found.len(), expected.len(), "{:#?}", report.findings);
-        for (found, (commit, name, dependency, kind)) in found.into_iter().zip(expected) {
-            assert_dependency(found, commit, name, dependency, kind);
+        for (found, (commit, name, attachment, kind)) in found.into_iter().zip(expected) {
+            assert_attachment(found, commit, name, attachment, kind);
         }
     });
 }
 
-/// The repair writes and deletes no key for a `Dependency` finding, and the
+/// The repair writes and deletes no key for an `Attachment` finding, and the
 /// finding stays.
 #[test]
-fn the_repair_does_nothing_for_a_dependency_error() {
+fn the_repair_does_nothing_for_an_attachment_error() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
-        let defective = common::store_with_field2(&f.local, &dep, &[("lib/a", &[7; 31])]).await;
+        let (tip, att) = attachment_fixture(&f).await;
+        let defective = common::store_with_field2(&f.local, &att, &[("lib/a", &[7; 31])]).await;
         f.copy("objects");
-        f.remove(ObjectType::Commit, &dep);
+        f.remove(ObjectType::Commit, &att);
         f.server.state().requests.clear();
         let report = f.repair().await.unwrap();
-        let found: Vec<(Checksum, Option<FsckDependencyErrorKind>)> = dependency_findings(&report)
+        let found: Vec<(Checksum, Option<FsckAttachmentErrorKind>)> = attachment_findings(&report)
             .into_iter()
             .map(|found| {
                 (
                     found.object.unwrap().checksum,
-                    found.dependency.as_ref().map(|error| error.kind.clone()),
+                    found.attachment.as_ref().map(|error| error.kind.clone()),
                 )
             })
             .collect();
         let mut expected = vec![
-            (tip, Some(FsckDependencyErrorKind::Absent)),
+            (tip, Some(FsckAttachmentErrorKind::Absent)),
             (
                 defective,
-                Some(FsckDependencyErrorKind::Defective(
+                Some(FsckAttachmentErrorKind::Defective(
                     "entry 0 (lib/a) has a checksum of 31 bytes, not 32".to_owned(),
                 )),
             ),
@@ -2113,36 +2113,36 @@ fn the_repair_does_nothing_for_a_dependency_error() {
 /// The run reads the commit of an absent dependency again one time, also
 /// when two commits name it.
 #[test]
-fn two_commits_that_name_one_absent_dependency_read_it_again_one_time() {
+fn two_commits_that_name_one_absent_attachment_read_it_again_one_time() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
+        let (tip, att) = attachment_fixture(&f).await;
         let other = commit_related(
             &f.local,
             f.tmp.path(),
             "other",
             "other",
             None,
-            &[("boot/uki", dep)],
+            &[("boot/uki", att)],
         )
         .await;
         f.copy("objects");
-        f.remove(ObjectType::Commit, &dep);
+        f.remove(ObjectType::Commit, &att);
         f.server.state().requests.clear();
         let report = f.fsck().await;
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         let naming = sorted(&[tip, other]);
         assert_eq!(found.len(), naming.len(), "{:#?}", report.findings);
         for (found, commit) in found.into_iter().zip(naming) {
-            assert_dependency(
+            assert_attachment(
                 found,
                 commit,
                 "boot/uki",
-                Some(dep),
-                FsckDependencyErrorKind::Absent,
+                Some(att),
+                FsckAttachmentErrorKind::Absent,
             );
         }
-        let key = object_path(ObjectType::Commit, &dep);
+        let key = object_path(ObjectType::Commit, &att);
         let reads = f
             .requests()
             .into_iter()
@@ -2156,50 +2156,50 @@ fn two_commits_that_name_one_absent_dependency_read_it_again_one_time() {
 /// the repair. Without `delete`, it checks them against the markers of the
 /// list of `state/`.
 #[test]
-fn the_repair_checks_a_dependency_against_the_markers_after_the_repair() {
+fn the_repair_checks_an_attachment_against_the_markers_after_the_repair() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
-        let marker = format!("state/{}.commitpartial", dep.to_hex());
+        let (tip, att) = attachment_fixture(&f).await;
+        let marker = format!("state/{}.commitpartial", att.to_hex());
         f.put(&marker, &[0x66]);
         let report = f.fsck().await;
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/uki",
-            Some(dep),
-            FsckDependencyErrorKind::Partial,
+            Some(att),
+            FsckAttachmentErrorKind::Partial,
         );
         assert!(f.get(&marker).is_some());
 
         // The tree of the dependency is whole, so the repair deletes its
         // marker, and the dependency is not partial.
         let report = f.repair().await.unwrap();
-        assert_eq!(report.cleared_partial, [dep]);
+        assert_eq!(report.cleared_partial, [att]);
         assert!(f.get(&marker).is_none());
         assert!(
-            dependency_findings(&report).is_empty(),
+            attachment_findings(&report).is_empty(),
             "{:#?}",
             report.findings
         );
         assert!(!report.has_errors(), "{:#?}", report.findings);
 
         // A dependency that gets a marker from the repair is partial.
-        let file = f.entry(&dep, &[], "file", false).await;
+        let file = f.entry(&att, &[], "file", false).await;
         f.remove(ObjectType::File, &file);
         let report = f.repair().await.unwrap();
-        assert_eq!(report.marked_partial, [(dep, Vec::new())]);
+        assert_eq!(report.marked_partial, [(att, Vec::new())]);
         assert!(f.get(&marker).is_some());
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/uki",
-            Some(dep),
-            FsckDependencyErrorKind::Partial,
+            Some(att),
+            FsckAttachmentErrorKind::Partial,
         );
     });
 }
@@ -2207,31 +2207,31 @@ fn the_repair_checks_a_dependency_against_the_markers_after_the_repair() {
 /// With `delete`, a dependency whose commit object the repair deletes is
 /// absent.
 #[test]
-fn the_repair_deletes_a_bad_dependency_commit_and_reports_it_absent() {
+fn the_repair_deletes_a_bad_attachment_commit_and_reports_it_absent() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
+        let (tip, att) = attachment_fixture(&f).await;
         let other = f.object(ObjectType::Commit, &f.side);
-        f.replace(ObjectType::Commit, &dep, &other);
+        f.replace(ObjectType::Commit, &att, &other);
         let report = f.fsck().await;
-        finding(&report, Mismatch, ObjectType::Commit, &dep);
+        finding(&report, Mismatch, ObjectType::Commit, &att);
         assert!(
-            dependency_findings(&report).is_empty(),
+            attachment_findings(&report).is_empty(),
             "{:#?}",
             report.findings
         );
 
         let report = f.repair().await.unwrap();
-        assert_eq!(report.deleted, [object_path(ObjectType::Commit, &dep)]);
-        assert!(f.get(&object_path(ObjectType::Commit, &dep)).is_none());
-        let found = dependency_findings(&report);
+        assert_eq!(report.deleted, [object_path(ObjectType::Commit, &att)]);
+        assert!(f.get(&object_path(ObjectType::Commit, &att)).is_none());
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/uki",
-            Some(dep),
-            FsckDependencyErrorKind::Absent,
+            Some(att),
+            FsckAttachmentErrorKind::Absent,
         );
     });
 }
@@ -2239,10 +2239,10 @@ fn the_repair_deletes_a_bad_dependency_commit_and_reports_it_absent() {
 /// With `delete`, a commit whose own object the repair deletes gets no
 /// check of its dependencies.
 #[test]
-fn the_repair_checks_no_dependency_of_a_commit_that_it_deletes() {
+fn the_repair_checks_no_attachment_of_a_commit_that_it_deletes() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, _dep) = dependency_fixture(&f).await;
+        let (tip, _att) = attachment_fixture(&f).await;
         // A commit with another field 2, under the key of `tip`. The fixture
         // copied the objects before, so the bucket does not hold it.
         let other = common::store_with_field2(&f.local, &tip, &[("boot/x", &[7; 31])]).await;
@@ -2251,14 +2251,14 @@ fn the_repair_checks_no_dependency_of_a_commit_that_it_deletes() {
         f.replace(ObjectType::Commit, &tip, &bytes);
         let report = f.fsck().await;
         finding(&report, Mismatch, ObjectType::Commit, &tip);
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
-        assert_dependency(
+        assert_attachment(
             found[0],
             tip,
             "boot/x",
             None,
-            FsckDependencyErrorKind::Defective(
+            FsckAttachmentErrorKind::Defective(
                 "entry 0 (boot/x) has a checksum of 31 bytes, not 32".to_owned(),
             ),
         );
@@ -2270,7 +2270,7 @@ fn the_repair_checks_no_dependency_of_a_commit_that_it_deletes() {
             [(tip, vec!["refs/heads/tip".to_owned()])]
         );
         assert!(
-            dependency_findings(&report).is_empty(),
+            attachment_findings(&report).is_empty(),
             "{:#?}",
             report.findings
         );
@@ -2278,13 +2278,13 @@ fn the_repair_checks_no_dependency_of_a_commit_that_it_deletes() {
 }
 
 #[test]
-fn a_dependency_that_a_writer_adds_during_the_run_is_a_note() {
+fn an_attachment_that_a_writer_adds_during_the_run_is_a_note() {
     block_on(async {
         let f = Fixture::new(None).await;
-        let (tip, dep) = dependency_fixture(&f).await;
-        let key = object_path(ObjectType::Commit, &dep);
-        let bytes = f.object(ObjectType::Commit, &dep);
-        f.remove(ObjectType::Commit, &dep);
+        let (tip, att) = attachment_fixture(&f).await;
+        let key = object_path(ObjectType::Commit, &att);
+        let bytes = f.object(ObjectType::Commit, &att);
+        f.remove(ObjectType::Commit, &att);
         // A writer puts the commit back after the listing, at the read of the
         // tip.
         let stored = format!("repo/{key}");
@@ -2303,19 +2303,19 @@ fn a_dependency_that_a_writer_adds_during_the_run_is_a_note() {
         ));
         let report = f.fsck().await;
         assert!(!report.has_errors(), "{:#?}", report.findings);
-        let found = dependency_findings(&report);
+        let found = attachment_findings(&report);
         assert_eq!(found.len(), 1, "{:#?}", report.findings);
         assert!(!found[0].error);
         assert_eq!(
             found[0].detail,
             format!(
-                "dependency boot/uki names commit {dep}, which the listing does not hold, and a \
+                "dependency boot/uki names commit {att}, which the listing does not hold, and a \
                  read after the listing finds it: a writer changed the bucket during the run"
             )
         );
         assert_eq!(
-            found[0].dependency.as_ref().map(|error| &error.kind),
-            Some(&FsckDependencyErrorKind::Absent)
+            found[0].attachment.as_ref().map(|error| &error.kind),
+            Some(&FsckAttachmentErrorKind::Absent)
         );
     });
 }

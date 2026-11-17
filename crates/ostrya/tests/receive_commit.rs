@@ -835,8 +835,7 @@ fn the_switch_removes_the_related_key_from_the_incoming_dict() {
 fn the_switch_keeps_a_stored_related_value() {
     let tmp = TmpDir::new("recv-keep-related-stored");
     let repo = repo_with_fixture(&tmp, RepoMode::Archive, DROP_RELATED);
-    block_on(repo.add_detached_related(&fixture_commit(), "layer/base", &fixture_commit()))
-        .unwrap();
+    block_on(repo.add_supplement(&fixture_commit(), "layer/base", &fixture_commit())).unwrap();
     let held = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
         .unwrap()
         .unwrap();
@@ -2294,10 +2293,10 @@ fn refs(repo: &Repo) -> Vec<(String, Checksum)> {
 /// key that the rule does not trust passes, and keeps that signature. The
 /// dependency gets no ref.
 #[test]
-fn an_unsigned_dependency_is_accepted() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
-    let objects = with_tree(&[&dep, &target]);
+fn an_unsigned_attachment_is_accepted() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
+    let objects = with_tree(&[&att, &target]);
     let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
 
     let tmp = TmpDir::new("recv-dep-unsigned");
@@ -2310,12 +2309,12 @@ fn an_unsigned_dependency_is_accepted() {
         updates(),
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
 
     let tmp = TmpDir::new("recv-dep-untrusted");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let untrusted = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
+    let untrusted = (att.checksum, signed_dict(&att.bytes, &[OTHER_SECRET_B64]));
     committed(push(
         &repo,
         &verify_policy(),
@@ -2325,8 +2324,8 @@ fn an_unsigned_dependency_is_accepted() {
         false,
     ));
     assert_eq!(
-        ed25519_signatures(&repo, &dep.checksum),
-        [ed25519_signature(OTHER_SECRET_B64, &dep.bytes)]
+        ed25519_signatures(&repo, &att.checksum),
+        [ed25519_signature(OTHER_SECRET_B64, &att.bytes)]
     );
     assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
 }
@@ -2334,21 +2333,21 @@ fn an_unsigned_dependency_is_accepted() {
 /// A dependency that only a staged parent of a new commit names gets no
 /// verification. The parent itself needs no signature either.
 #[test]
-fn a_dependency_of_a_staged_parent_gets_no_rule() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/d", &dep)]);
+fn an_attachment_of_a_staged_parent_gets_no_rule() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/d", &att)]);
     let target = build_commit(Some(parent.checksum), "target", no_metadata(), &[]);
     let tmp = TmpDir::new("recv-dep-parent");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     committed(push(
         &repo,
         &verify_policy(),
-        &with_tree(&[&dep, &parent, &target]),
+        &with_tree(&[&att, &parent, &target]),
         &[client_signed(&target)],
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     assert!(!commit_meta_path(&repo, &parent.checksum).exists());
 }
 
@@ -2357,8 +2356,8 @@ fn a_dependency_of_a_staged_parent_gets_no_rule() {
 /// check alone: no verification and no server signature.
 #[test]
 fn a_staged_commit_outside_each_history_gets_no_rule() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let other = build_commit(None, "other", no_metadata(), &[entry("lib/d", &dep)]);
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let other = build_commit(None, "other", no_metadata(), &[entry("lib/d", &att)]);
     let target = build_commit(None, "target", no_metadata(), &[]);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64)],
@@ -2369,12 +2368,12 @@ fn a_staged_commit_outside_each_history_gets_no_rule() {
     committed(push(
         &repo,
         &policy,
-        &with_tree(&[&dep, &other, &target]),
+        &with_tree(&[&att, &other, &target]),
         &[client_signed(&target)],
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     assert!(!commit_meta_path(&repo, &other.checksum).exists());
     assert_eq!(
         ed25519_signatures(&repo, &target.checksum),
@@ -2389,7 +2388,7 @@ fn a_staged_commit_outside_each_history_gets_no_rule() {
 /// nor held is `missing-objects`. The error lists each such dependency, in
 /// the order of the commits that name them.
 #[test]
-fn absent_dependencies_are_missing_objects_together() {
+fn absent_attachments_are_missing_objects_together() {
     let first = build_commit(None, "first dependency", no_metadata(), &[]);
     let second = build_commit(None, "second dependency", no_metadata(), &[]);
     let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/b", &second)]);
@@ -2435,13 +2434,13 @@ fn absent_dependencies_are_missing_objects_together() {
 /// message names the commit that holds the entry.
 #[test]
 fn a_defective_field_2_entry_is_protocol() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let empty = build_commit(None, "empty name", no_metadata(), &[entry("", &dep)]);
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let empty = build_commit(None, "empty name", no_metadata(), &[entry("", &att)]);
     let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
     let over_short = build_commit(Some(short.checksum), "over short", no_metadata(), &[]);
     let cases = [
         (
-            vec![&dep, &empty],
+            vec![&att, &empty],
             empty.checksum,
             format!(
                 "related commits in field 2 of commit {}: entry 0 has an empty name",
@@ -2481,10 +2480,10 @@ fn a_defective_field_2_entry_is_protocol() {
 /// A dependency whose own field 2 is not empty is `protocol`, for a staged
 /// dependency and for a dependency that the repository holds.
 #[test]
-fn a_nested_dependency_is_protocol() {
+fn a_nested_attachment_is_protocol() {
     let inner = build_commit(None, "inner", no_metadata(), &[]);
-    let dep = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let att = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-nested");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     let before = snapshot(&repo);
@@ -2492,7 +2491,7 @@ fn a_nested_dependency_is_protocol() {
         push(
             &repo,
             &policy(),
-            &with_tree(&[&inner, &dep, &target]),
+            &with_tree(&[&inner, &att, &target]),
             &[],
             vec![update("main", Expected::Absent, Some(target.checksum))],
             false,
@@ -2504,7 +2503,7 @@ fn a_nested_dependency_is_protocol() {
         format!(
             "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
              has dependencies of its own",
-            target.checksum, dep.checksum
+            target.checksum, att.checksum
         )
     );
     assert_unchanged(&repo, &before);
@@ -2548,20 +2547,20 @@ fn a_nested_dependency_is_protocol() {
 /// verification, and the server does not sign it: its detached metadata
 /// stays as it was.
 #[test]
-fn a_held_dependency_gets_no_check_and_no_signature() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn a_held_attachment_gets_no_check_and_no_signature() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-held");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     committed(push(
         &repo,
         &policy(),
-        &with_tree(&[&dep]),
+        &with_tree(&[&att]),
         &[],
-        vec![update("dep", Expected::Absent, Some(dep.checksum))],
+        vec![update("dep", Expected::Absent, Some(att.checksum))],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64)],
         ..verify_policy()
@@ -2574,7 +2573,7 @@ fn a_held_dependency_gets_no_check_and_no_signature() {
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     assert_eq!(
         ed25519_signatures(&repo, &target.checksum),
         [
@@ -2587,20 +2586,20 @@ fn a_held_dependency_gets_no_check_and_no_signature() {
 /// A dependency that the repository holds and marks partial is
 /// `missing-objects`, with no object listed.
 #[test]
-fn a_partial_held_dependency_is_missing_objects() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn a_partial_held_attachment_is_missing_objects() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-partial");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     committed(push(
         &repo,
         &policy(),
-        &with_tree(&[&dep]),
+        &with_tree(&[&att]),
         &[],
-        vec![update("dep", Expected::Absent, Some(dep.checksum))],
+        vec![update("dep", Expected::Absent, Some(att.checksum))],
         false,
     ));
-    mark_partial(&repo, &dep.checksum);
+    mark_partial(&repo, &att.checksum);
     let before = snapshot(&repo);
     let error = refused(
         push(
@@ -2619,7 +2618,7 @@ fn a_partial_held_dependency_is_missing_objects() {
         format!(
             "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
              is partial",
-            target.checksum, dep.checksum
+            target.checksum, att.checksum
         )
     );
     assert_unchanged(&repo, &before);
@@ -2631,42 +2630,42 @@ fn a_partial_held_dependency_is_missing_objects() {
 /// dict, so the stored dict keeps its bytes. A dict for a held commit that no
 /// field 2 of a commit of the session names stays `protocol`.
 #[test]
-fn a_dict_for_a_held_dependency_is_dropped() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+fn a_dict_for_a_held_attachment_is_dropped() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
     let lone = build_commit(None, "lone", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
-    let second = build_commit(None, "second", no_metadata(), &[entry("lib/d", &dep)]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
+    let second = build_commit(None, "second", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-held-dict");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     committed(push(
         &repo,
         &policy(),
-        &with_tree(&[&dep, &lone]),
-        &[client_signed(&dep)],
+        &with_tree(&[&att, &lone]),
+        &[client_signed(&att)],
         vec![
-            update("dep", Expected::Absent, Some(dep.checksum)),
+            update("dep", Expected::Absent, Some(att.checksum)),
             update("lone", Expected::Absent, Some(lone.checksum)),
         ],
         false,
     ));
-    let held = std::fs::read(commit_meta_path(&repo, &dep.checksum)).unwrap();
+    let held = std::fs::read(commit_meta_path(&repo, &att.checksum)).unwrap();
 
-    let other = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
+    let other = (att.checksum, signed_dict(&att.bytes, &[OTHER_SECRET_B64]));
     committed(push(
         &repo,
         &policy(),
-        &[dep.clone(), target.clone()],
+        &[att.clone(), target.clone()],
         std::slice::from_ref(&other),
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
     assert_eq!(
-        std::fs::read(commit_meta_path(&repo, &dep.checksum)).unwrap(),
+        std::fs::read(commit_meta_path(&repo, &att.checksum)).unwrap(),
         held
     );
     assert_eq!(
-        ed25519_signatures(&repo, &dep.checksum),
-        [ed25519_signature(SECRET_B64, &dep.bytes)]
+        ed25519_signatures(&repo, &att.checksum),
+        [ed25519_signature(SECRET_B64, &att.bytes)]
     );
     assert_eq!(
         ref_file(&repo, "refs/heads/main"),
@@ -2697,10 +2696,10 @@ fn a_dict_for_a_held_dependency_is_dropped() {
 /// Each new commit gets each server key of its rule once, also a key that the
 /// list holds two times.
 #[test]
-fn a_dependency_of_two_targets_gets_no_server_signature() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
-    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
+fn an_attachment_of_two_targets_gets_no_server_signature() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &att)]);
+    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &att)]);
     let shared = server_signer(SECOND_SERVER_SECRET_B64);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64), shared.clone(), shared],
@@ -2711,7 +2710,7 @@ fn a_dependency_of_two_targets_gets_no_server_signature() {
     committed(push(
         &repo,
         &policy,
-        &with_tree(&[&dep, &a, &b]),
+        &with_tree(&[&att, &a, &b]),
         &[],
         vec![
             update("a", Expected::Absent, Some(a.checksum)),
@@ -2719,7 +2718,7 @@ fn a_dependency_of_two_targets_gets_no_server_signature() {
         ],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     for commit in [&a, &b] {
         assert_eq!(
             ed25519_signatures(&repo, &commit.checksum),
@@ -2735,9 +2734,9 @@ fn a_dependency_of_two_targets_gets_no_server_signature() {
 /// its update, and the refusal names it as a new commit. It gets each server
 /// key of its update once.
 #[test]
-fn a_dependency_that_is_also_a_target_is_signed_once() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn an_attachment_that_is_also_a_target_is_signed_once() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64)],
         ..verify_policy()
@@ -2745,7 +2744,7 @@ fn a_dependency_that_is_also_a_target_is_signed_once() {
     let updates = || {
         vec![
             update("main", Expected::Absent, Some(target.checksum)),
-            update("dep", Expected::Absent, Some(dep.checksum)),
+            update("dep", Expected::Absent, Some(att.checksum)),
         ]
     };
     let tmp = TmpDir::new("recv-dep-target");
@@ -2755,30 +2754,30 @@ fn a_dependency_that_is_also_a_target_is_signed_once() {
         push(
             &repo,
             &policy,
-            &with_tree(&[&dep, &target]),
+            &with_tree(&[&att, &target]),
             &[client_signed(&target)],
             updates(),
             false,
         ),
         ErrorCode::SignatureRequired,
     );
-    let subject = format!("commit {}: ", dep.checksum);
+    let subject = format!("commit {}: ", att.checksum);
     assert!(error.message.starts_with(&subject), "{}", error.message);
     assert_unchanged(&repo, &before);
 
     committed(push(
         &repo,
         &policy,
-        &with_tree(&[&dep, &target]),
-        &[client_signed(&target), client_signed(&dep)],
+        &with_tree(&[&att, &target]),
+        &[client_signed(&target), client_signed(&att)],
         updates(),
         false,
     ));
     assert_eq!(
-        ed25519_signatures(&repo, &dep.checksum),
+        ed25519_signatures(&repo, &att.checksum),
         [
-            ed25519_signature(SECRET_B64, &dep.bytes),
-            ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
+            ed25519_signature(SECRET_B64, &att.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &att.bytes),
         ]
     );
 }
@@ -2805,10 +2804,10 @@ fn marker(repo: &Repo, commit: &Checksum) -> PathBuf {
 /// nested dependency are `protocol`. The session publishes nothing, and the
 /// marker stays.
 #[test]
-fn a_partial_held_target_gets_the_dependency_checks() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+fn a_partial_held_target_gets_the_attachment_checks() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
     let nested = build_commit(None, "nested", no_metadata(), &[("lib/x", &[7; 32])]);
-    let absent = build_commit(None, "absent", no_metadata(), &[entry("lib/d", &dep)]);
+    let absent = build_commit(None, "absent", no_metadata(), &[entry("lib/d", &att)]);
     let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
     let over_nested = build_commit(
         None,
@@ -2858,7 +2857,7 @@ fn a_partial_held_target_gets_the_dependency_checks() {
         match text {
             None => assert_eq!(
                 error.missing,
-                [ObjectName::new(dep.checksum, ObjectType::Commit)]
+                [ObjectName::new(att.checksum, ObjectType::Commit)]
             ),
             Some(text) => assert_eq!(error.message, text),
         }
@@ -2871,29 +2870,29 @@ fn a_partial_held_target_gets_the_dependency_checks() {
 /// sends its tree and names it as a new commit counts it as complete: the
 /// session commits, and the marker goes.
 #[test]
-fn a_partial_held_dependency_that_is_a_new_commit_counts_as_complete() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn a_partial_held_attachment_that_is_a_new_commit_counts_as_complete() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-partial-new");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    hold_commit(&repo, &dep);
-    mark_partial(&repo, &dep.checksum);
+    hold_commit(&repo, &att);
+    mark_partial(&repo, &att.checksum);
     committed(push(
         &repo,
         &policy(),
         &with_tree(&[&target]),
         &[],
         vec![
-            update("dep", Expected::Absent, Some(dep.checksum)),
+            update("dep", Expected::Absent, Some(att.checksum)),
             update("main", Expected::Absent, Some(target.checksum)),
         ],
         false,
     ));
-    assert!(!marker(&repo, &dep.checksum).exists(), "the marker goes");
+    assert!(!marker(&repo, &att.checksum).exists(), "the marker goes");
     assert_eq!(
         refs(&repo),
         [
-            ("dep".to_owned(), dep.checksum),
+            ("dep".to_owned(), att.checksum),
             ("main".to_owned(), target.checksum),
         ]
     );
@@ -2903,9 +2902,9 @@ fn a_partial_held_dependency_that_is_a_new_commit_counts_as_complete() {
 /// staged dependency: the dependency gets no verification and no server
 /// signature.
 #[test]
-fn a_held_target_gives_no_rule_to_a_staged_dependency() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn a_held_target_gives_no_rule_to_a_staged_attachment() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64)],
         ..verify_policy()
@@ -2916,12 +2915,12 @@ fn a_held_target_gives_no_rule_to_a_staged_dependency() {
     committed(push(
         &repo,
         &policy,
-        std::slice::from_ref(&dep),
+        std::slice::from_ref(&att),
         &[client_signed(&target)],
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
-    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &att.checksum).exists());
     assert_eq!(
         ed25519_signatures(&repo, &target.checksum),
         [
@@ -2934,31 +2933,31 @@ fn a_held_target_gives_no_rule_to_a_staged_dependency() {
 /// A staged dependency with a partial marker that no object backs counts as
 /// complete, and the session removes the marker.
 #[test]
-fn a_staged_dependency_with_a_stale_marker_counts_as_complete() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
-    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+fn a_staged_attachment_with_a_stale_marker_counts_as_complete() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
     let tmp = TmpDir::new("recv-dep-stale-marker");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    mark_partial(&repo, &dep.checksum);
+    mark_partial(&repo, &att.checksum);
     committed(push(
         &repo,
         &policy(),
-        &with_tree(&[&dep, &target]),
+        &with_tree(&[&att, &target]),
         &[],
         vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
-    assert!(!marker(&repo, &dep.checksum).exists(), "the marker goes");
+    assert!(!marker(&repo, &att.checksum).exists(), "the marker goes");
 }
 
 /// The refusal of a nested dependency that two new commits name names the
 /// new commit of the first update, also when its checksum sorts last.
 #[test]
-fn a_nested_dependency_refusal_names_the_first_new_commit_in_update_order() {
+fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
     let inner = build_commit(None, "inner", no_metadata(), &[]);
-    let dep = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
-    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
-    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
+    let att = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
+    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &att)]);
+    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &att)]);
     let (first, last) = if a.checksum > b.checksum {
         (a, b)
     } else {
@@ -2971,7 +2970,7 @@ fn a_nested_dependency_refusal_names_the_first_new_commit_in_update_order() {
         push(
             &repo,
             &policy(),
-            &with_tree(&[&inner, &dep, &first, &last]),
+            &with_tree(&[&inner, &att, &first, &last]),
             &[],
             vec![
                 update("x", Expected::Absent, Some(first.checksum)),
@@ -2986,7 +2985,7 @@ fn a_nested_dependency_refusal_names_the_first_new_commit_in_update_order() {
         format!(
             "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
              has dependencies of its own",
-            first.checksum, dep.checksum
+            first.checksum, att.checksum
         )
     );
     assert!(

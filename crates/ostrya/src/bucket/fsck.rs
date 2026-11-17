@@ -13,7 +13,7 @@ use ostrya_core::{
 };
 
 use self::BucketFindingKind::{
-    Config, Corrupt, Dependency, Lock, Marker, Mismatch, Missing, Ref, Stray, Upload,
+    Attachment, Config, Corrupt, Lock, Marker, Mismatch, Missing, Ref, Stray, Upload,
 };
 use super::listing::is_fanout_prefix;
 use super::lock::{LOCK_KEY, LockHolder, LockOperation, WriterLock};
@@ -22,7 +22,7 @@ use super::summary::SuperblockKey;
 use super::{BucketRepo, ObjectListing, each_slot, object_key, release_on_error};
 use crate::deltagen::delta_name;
 use crate::error::{Error, Result};
-use crate::fsck::{FsckDependencyError, FsckDependencyErrorKind, dependency_findings};
+use crate::fsck::{FsckAttachmentError, FsckAttachmentErrorKind, attachment_findings};
 use crate::object::MAX_METADATA_SIZE;
 use crate::pull::drive::Slots;
 use crate::pull::http::{
@@ -150,8 +150,8 @@ pub struct BucketFinding {
     /// bucket does not hold. Each other `Summary` finding is a note. A
     /// `Missing` finding of a run without
     /// [`delete`](BucketFsckOptions::delete) is a note if the listing does
-    /// not hold the object and a read after the listing finds it. A
-    /// `Dependency` finding of a run without `delete` is a note if the
+    /// not hold the object and a read after the listing finds it. An
+    /// `Attachment` finding of a run without `delete` is a note if the
     /// listing does not hold the commit of the dependency and a read after
     /// the listing finds it. A `Ref` finding of a ref under `refs/mirrors/`
     /// of the own collection id is a note. A `Marker`, an `Upload`, and a
@@ -163,7 +163,7 @@ pub struct BucketFinding {
     /// or the key of the writer lock.
     pub key: String,
     /// The object of a `Missing`, a `Mismatch`, or a `Corrupt` finding, and
-    /// the commit whose field 2 holds the entry of a `Dependency` finding.
+    /// the commit whose field 2 holds the entry of an `Attachment` finding.
     pub object: Option<ObjectName>,
     /// The commits of the listing that reach the object of a `Missing`, a
     /// `Mismatch`, or a `Corrupt` finding, sorted.
@@ -172,15 +172,15 @@ pub struct BucketFinding {
     pub commits: Vec<Checksum>,
     /// The reason, in words.
     pub detail: String,
-    /// The dependency of a `Dependency` finding, and `None` for each other
+    /// The dependency of an `Attachment` finding, and `None` for each other
     /// kind.
     ///
     /// Its fields are the fields of the finding of the local fsck. A
-    /// dependency is [`Partial`](FsckDependencyErrorKind::Partial) if the
+    /// dependency is [`Partial`](FsckAttachmentErrorKind::Partial) if the
     /// bucket holds its marker `state/<checksum>.commitpartial`. A run with
     /// [`delete`](BucketFsckOptions::delete) reads the markers and the
     /// commit objects after its repair.
-    pub dependency: Option<FsckDependencyError>,
+    pub attachment: Option<FsckAttachmentError>,
 }
 
 impl std::fmt::Display for BucketFinding {
@@ -227,10 +227,10 @@ pub enum BucketFindingKind {
     /// its declared size.
     Corrupt,
     /// A dependency in field 2 of a commit that is absent, partial, or
-    /// defective. [`BucketFinding::dependency`] holds it. A run with
+    /// defective. [`BucketFinding::attachment`] holds it. A run with
     /// [`delete`](BucketFsckOptions::delete) writes and deletes no key for
     /// it.
-    Dependency,
+    Attachment,
     /// A partial-commit marker of a commit whose tree the run finds whole. A
     /// run with [`delete`](BucketFsckOptions::delete) deletes such a marker.
     Marker,
@@ -253,7 +253,7 @@ impl BucketFindingKind {
             BucketFindingKind::Missing => "missing",
             BucketFindingKind::Mismatch => "mismatch",
             BucketFindingKind::Corrupt => "corrupt",
-            BucketFindingKind::Dependency => "dependency",
+            BucketFindingKind::Attachment => "dependency",
             BucketFindingKind::Marker => "marker",
             BucketFindingKind::Upload => "upload",
             BucketFindingKind::Lock => "lock",
@@ -289,7 +289,7 @@ impl Run {
             object: None,
             commits: Vec::new(),
             detail,
-            dependency: None,
+            attachment: None,
         });
     }
 
@@ -302,7 +302,7 @@ impl Run {
             object: Some(name),
             commits: Vec::new(),
             detail,
-            dependency: None,
+            attachment: None,
         });
     }
 
@@ -343,23 +343,23 @@ impl Run {
         }
     }
 
-    /// Records a `Dependency` error for each entry of field 2 of the commits
-    /// of `dependencies` that is absent, partial, or defective.
+    /// Records an `Attachment` error for each entry of field 2 of the commits
+    /// of `attachments` that is absent, partial, or defective.
     ///
-    /// `dependencies` holds each commit that parses and whose field 2 is not
+    /// `attachments` holds each commit that parses and whose field 2 is not
     /// empty, sorted by commit. A dependency in that list has dependencies
     /// of its own. `partial` holds the commits with a partial-commit marker.
     /// `deleted` holds the commit objects that the repair deletes, sorted:
     /// such a dependency is absent, and such a commit gets no check.
-    fn dependencies(
+    fn attachments(
         &mut self,
         listing: &ObjectListing,
         partial: &BTreeSet<Checksum>,
         deleted: &[ObjectName],
-        dependencies: &[(Checksum, Vec<RelatedEntry>)],
+        attachments: &[(Checksum, Vec<RelatedEntry>)],
     ) {
         let nested = |commit: &Checksum| {
-            dependencies
+            attachments
                 .binary_search_by_key(commit, |(naming, _)| *naming)
                 .is_ok()
         };
@@ -368,32 +368,32 @@ impl Run {
                 .binary_search_by_key(commit, |name| name.checksum)
                 .is_ok()
         };
-        for (commit, entries) in dependencies {
+        for (commit, entries) in attachments {
             if deleted(commit) {
                 continue;
             }
             let name = ObjectName::new(*commit, ObjectType::Commit);
-            let found = dependency_findings(
+            let found = attachment_findings(
                 *commit,
                 entries,
-                |dependency| {
+                |attachment| {
                     !listing
                         .objects
-                        .contains_key(&ObjectName::new(*dependency, ObjectType::Commit))
-                        || deleted(dependency)
+                        .contains_key(&ObjectName::new(*attachment, ObjectType::Commit))
+                        || deleted(attachment)
                 },
-                |dependency| partial.contains(dependency),
+                |attachment| partial.contains(attachment),
                 nested,
             );
             for error in found {
                 self.findings.push(BucketFinding {
-                    kind: Dependency,
+                    kind: Attachment,
                     error: true,
                     key: object_key(&name),
                     object: Some(name),
                     commits: Vec::new(),
                     detail: error.reason(),
-                    dependency: Some(error),
+                    attachment: Some(error),
                 });
             }
         }
@@ -427,7 +427,7 @@ struct Commits {
     roots: Vec<Root>,
     /// Each commit that parses and whose field 2 is not empty, with the
     /// entries of its field 2, sorted by commit.
-    dependencies: Vec<(Checksum, Vec<RelatedEntry>)>,
+    attachments: Vec<(Checksum, Vec<RelatedEntry>)>,
 }
 
 /// The result of the read of one metadata object.
@@ -542,7 +542,7 @@ impl BucketRepo {
     ///    the finding is a note. Else the run reads each commit of the
     ///    finding again, and drops the commits that are gone. If no commit
     ///    stays, the run records no finding. The same read covers each
-    ///    absent dependency of a `Dependency` finding, one time for each
+    ///    absent dependency of an `Attachment` finding, one time for each
     ///    commit. If the key holds an object, the finding is a note.
     /// 8. With `delete`: the check of the dependencies of step 5, against
     ///    the state after the repair. A dependency is partial if it holds a
@@ -558,7 +558,7 @@ impl BucketRepo {
     ///    tree objects. A commit that holds a marker gets no new one, and a
     ///    commit whose own object the run deletes gets none. The run deletes
     ///    no commit because of a bad tree object, and writes and deletes no
-    ///    key for a `Dependency` finding. Then the release of the lock.
+    ///    key for an `Attachment` finding. Then the release of the lock.
     ///    Without `delete`, a marker of a commit whose tree the run finds
     ///    whole gives a `Marker` note, and the run reads the lock again: a new
     ///    lock gives a `Lock` note.
@@ -741,12 +741,12 @@ impl BucketRepo {
             .await?;
         let Commits {
             roots,
-            mut dependencies,
+            mut attachments,
         } = self.fsck_commits(run, &listing).await?;
         // With the lock, the check waits for the plan of the repair.
         if lock.is_none() {
-            run.dependencies(&listing, &partial, &[], &dependencies);
-            dependencies = Vec::new();
+            run.attachments(&listing, &partial, &[], &attachments);
+            attachments = Vec::new();
         }
         let (seen, files) = self.fsck_trees(run, &listing, &roots).await?;
         self.fsck_contents(run, &listing, &files).await?;
@@ -773,8 +773,8 @@ impl BucketRepo {
                     .copied()
                     .collect();
                 marked.extend(plan.markers.iter().copied());
-                run.dependencies(&listing, &marked, &plan.commits, &dependencies);
-                drop(dependencies);
+                run.attachments(&listing, &marked, &plan.commits, &attachments);
+                drop(attachments);
                 self.fsck_repair(run, &refs, &plan, &whole, lock).await
             }
             None => {
@@ -1196,7 +1196,7 @@ impl BucketRepo {
             .collect();
         commits.sort_by_key(|(name, _)| name.checksum);
         let mut roots = Vec::new();
-        let mut dependencies = Vec::new();
+        let mut attachments = Vec::new();
         let mut reads = Slots::new(self.max_outstanding);
         let mut pending = commits.into_iter();
         loop {
@@ -1235,16 +1235,13 @@ impl BucketRepo {
                 });
                 if !commit.related.is_empty() {
                     let related = std::mem::take(&mut commit.related);
-                    dependencies.push((name.checksum, related::into_entries(related)));
+                    attachments.push((name.checksum, related::into_entries(related)));
                 }
             }
         }
         roots.sort_by_key(|root| root.commit);
-        dependencies.sort_by_key(|(commit, _)| *commit);
-        Ok(Commits {
-            roots,
-            dependencies,
-        })
+        attachments.sort_by_key(|(commit, _)| *commit);
+        Ok(Commits { roots, attachments })
     }
 
     /// Reads the metadata object `name` whole, by the strict rule of an
@@ -1625,8 +1622,8 @@ impl BucketRepo {
     }
 
     /// Reads again each object that a `Missing` finding names and that the
-    /// listing does not hold, and each commit of an absent dependency of a
-    /// `Dependency` finding, and then the commits of each object of a
+    /// listing does not hold, and each commit of an absent dependency of an
+    /// `Attachment` finding, and then the commits of each object of a
     /// `Missing` finding that is still absent.
     ///
     /// A run with no lock does not stop a writer, and the listing of the 256
@@ -1638,9 +1635,9 @@ impl BucketRepo {
         let absent: HashSet<ObjectName> = run
             .findings
             .iter()
-            .filter_map(|finding| finding.dependency.as_ref())
-            .filter(|error| error.kind == FsckDependencyErrorKind::Absent)
-            .filter_map(|error| error.dependency)
+            .filter_map(|finding| finding.attachment.as_ref())
+            .filter(|error| error.kind == FsckAttachmentErrorKind::Absent)
+            .filter_map(|error| error.attachment)
             .map(|commit| ObjectName::new(commit, ObjectType::Commit))
             .collect();
         if run.unlisted.is_empty() && absent.is_empty() {
@@ -1670,15 +1667,15 @@ impl BucketRepo {
             .await?;
         let unlisted = &run.unlisted;
         run.findings.retain_mut(|finding| {
-            if let Some(error) = &finding.dependency
-                && error.kind == FsckDependencyErrorKind::Absent
-                && let Some(dependency) = error.dependency
-                && present.contains(&ObjectName::new(dependency, ObjectType::Commit))
+            if let Some(error) = &finding.attachment
+                && error.kind == FsckAttachmentErrorKind::Absent
+                && let Some(attachment) = error.attachment
+                && present.contains(&ObjectName::new(attachment, ObjectType::Commit))
             {
                 finding.error = false;
-                finding.detail = related::dependency_reason(
+                finding.detail = related::attachment_reason(
                     &error.name,
-                    &dependency,
+                    &attachment,
                     "which the listing does not hold, and a read after the listing finds it: a \
                      writer changed the bucket during the run",
                 );
@@ -2128,7 +2125,7 @@ mod tests {
             object: Some(name),
             commits: commits.iter().map(|byte| csum(*byte)).collect(),
             detail: String::new(),
-            dependency: None,
+            attachment: None,
         }
     }
 
@@ -2148,7 +2145,7 @@ mod tests {
                 object: None,
                 commits: Vec::new(),
                 detail: String::new(),
-                dependency: None,
+                attachment: None,
             },
         ];
         let partial: BTreeSet<Checksum> = [csum(7)].into();
@@ -2216,7 +2213,7 @@ mod tests {
             object: None,
             commits: Vec::new(),
             detail: "an incomplete multipart upload".into(),
-            dependency: None,
+            attachment: None,
         };
         assert_eq!(
             note.to_string(),
@@ -2234,7 +2231,7 @@ mod tests {
             (Missing, "missing"),
             (Mismatch, "mismatch"),
             (Corrupt, "corrupt"),
-            (Dependency, "dependency"),
+            (Attachment, "dependency"),
             (Marker, "marker"),
             (Upload, "upload"),
             (Lock, "lock"),

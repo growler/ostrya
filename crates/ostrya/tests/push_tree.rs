@@ -660,7 +660,7 @@ async fn local_commit(
         body: Some(BODY.into()),
         timestamp: Some(TIMESTAMP),
         metadata: Some(metadata),
-        related: Vec::new(),
+        attachments: Vec::new(),
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
     txn.commit().await.unwrap();
@@ -901,7 +901,7 @@ fn a_second_tree_push_sends_no_object() {
 /// The server commit of a tree push has an empty field 2, also onto a tip
 /// whose field 2 names a dependency.
 #[test]
-fn the_server_commit_of_a_tree_push_names_no_dependency() {
+fn the_server_commit_of_a_tree_push_names_no_attachment() {
     let tmp = TmpDir::new("push-tree-no-dependency");
     let src = build_rich_source(tmp.path());
     let repo = new_repo(&tmp, RepoMode::Archive, "");
@@ -915,9 +915,9 @@ fn the_server_commit_of_a_tree_push_names_no_dependency() {
         named
     });
     assert_eq!(
-        block_on(repo.read_commit_related(&named))
+        block_on(repo.read_commit_relations(&named))
             .unwrap()
-            .dependencies,
+            .attachments,
         [("boot/first".to_owned(), first)]
     );
 

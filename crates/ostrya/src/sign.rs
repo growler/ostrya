@@ -14,6 +14,9 @@
 //! - the key store of the ed25519 and spki engines: [`load_sign_keys`] and
 //!   [`load_sign_keys_from`]
 //! - a verifier that trusts the system key store: [`FromSystemKeys`]
+//! - the signing keys of a key group of the repository config, and the
+//!   search for their signatures: [`SigningKey`] and
+//!   [`Repo::has_signed_commit`]
 //!
 //! The engines are:
 //!
@@ -32,6 +35,9 @@ use ostrya_core::{Checksum, ObjectType, Value, base64};
 
 use crate::repo::Repo;
 
+pub(crate) mod key_group;
+mod signing_key;
+
 #[cfg(feature = "sign-x509")]
 pub use ostrya_sign::X509Signer;
 pub use ostrya_sign::{
@@ -41,6 +47,13 @@ pub use ostrya_sign::{
 };
 #[doc(hidden)]
 pub use ostrya_sign::{Error, Result};
+pub use signing_key::SigningKey;
+
+/// A signing key moves freely across tasks and threads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SigningKey>();
+};
 
 /// Methods that sign and verify commits.
 impl Repo {
@@ -191,6 +204,57 @@ impl Repo {
             verify_all(&verifiers, &data, dict.as_ref())
         })
         .await
+    }
+
+    /// Returns `true` if the detached metadata of the commit `checksum` holds
+    /// a signature of `key`.
+    ///
+    /// The payload is the serialized commit object, the payload that
+    /// [`sign_commit`](Self::sign_commit) signs. The call makes the search of
+    /// [`SigningKey::has_signed`], whose rules
+    /// [`SigningKey`](SigningKey#existing-signatures) states. A caller that
+    /// signs the commit with `key` only when the call gives `false` adds no
+    /// second signature of one key, if no other writer signs the commit
+    /// between the two calls. The call and the sign are two separate steps,
+    /// and no lock holds the detached metadata between them.
+    ///
+    /// The call sees the stored detached metadata alone. It does not see a
+    /// signature that [`Transaction::sign_commit`](crate::Transaction::sign_commit)
+    /// queued and did not write.
+    ///
+    /// The read of the commit object, the read of the `.commitmeta` file, and
+    /// the parse of the file run in one call on the blocking pool. If the
+    /// detached metadata holds a signature under the metadata key of the
+    /// engine of `key`, the search runs in one more call on the blocking
+    /// pool, with no copy of the payload.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`load_object_bytes`](Self::load_object_bytes) and
+    /// [`read_commit_detached_metadata`](Self::read_commit_detached_metadata):
+    ///
+    /// - [`Error::ObjectNotFound`] if the commit object is not in the object
+    ///   store.
+    /// - [`Error::Core`] if the `.commitmeta` file does not parse as an
+    ///   `a{sv}` dict.
+    /// - [`Error::InvalidFormat`] if the commit object or the `.commitmeta`
+    ///   file is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE)
+    ///   or is not a regular file, or if a symlink is on its path.
+    /// - [`Error::InvalidFormat`] with the message `<path> is not a directory`
+    ///   if `objects/<xx>` of the commit object is not a directory.
+    /// - [`Error::Io`] if a file system operation fails.
+    ///
+    /// [`Error::ObjectNotFound`]: crate::Error::ObjectNotFound
+    /// [`Error::Core`]: crate::Error::Core
+    /// [`Error::InvalidFormat`]: crate::Error::InvalidFormat
+    /// [`Error::Io`]: crate::Error::Io
+    pub async fn has_signed_commit(
+        &self,
+        checksum: &Checksum,
+        key: &SigningKey,
+    ) -> crate::Result<bool> {
+        let (data, dict) = self.load_commit_and_detached(checksum).await?;
+        Ok(key.has_signed_payload(&Arc::new(data), dict.as_ref()).await)
     }
 
     /// Removes the signatures of a commit that `remove` selects.

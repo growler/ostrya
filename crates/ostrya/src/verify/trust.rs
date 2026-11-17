@@ -411,9 +411,9 @@ pub(crate) fn check_remote_group(
     Ok(group)
 }
 
-/// Returns `true` if `name` is a valid name of a trust group: it is not
-/// empty, and holds no `"` and no control character.
-fn valid_group_name(name: &str) -> bool {
+/// Returns `true` if `name` is a valid name of a trust group or of a key
+/// group: it is not empty, and holds no `"` and no control character.
+pub(crate) fn valid_group_name(name: &str) -> bool {
     !name.is_empty() && !name.contains('"') && !name.contains(char::is_control)
 }
 

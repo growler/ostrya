@@ -702,7 +702,7 @@ One client group.
 A set of trusted keys.
 .TP
 \fB\%[ex\-ostrya key "NAME"]\fR
-A signing key of the server.
+A signing key that \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and a program that uses the ostrya library sign with.
 .PP
 ostrya refuses an unknown key, a reference to a group that does not exist, and a group name that starts with \fB\%ex\-ostrya \fR and has no form of this list.
 It refuses \fB\%[ex\-ostrya receive]\fR and \fB\%[ex\-ostrya receive "PATTERN"]\fR, with a message that names \fB\%[ex\-ostrya client "NAME"]\fR.
@@ -716,7 +716,8 @@ Thus a key source that ostrya cannot read stops the command.
 \fB\%ostrya send\fR reads no key of a trust group or a key group.
 \fB\%ostrya receive \-\-one\-way\fR and \fB\%ostrya send \-\-one\-way\fR read no client group, no server group, and no key group.
 A pull from a remote with the key \fB\%trust\fR, \fB\%ostrya pull\-local \-\-trust=NAME\fR, and \fB\%ostrya receive \-\-one\-way \-\-trust=NAME\fR check and build the one trust group that they name, and no other group.
-A bad group stops the command with status 1.
+A program that uses the ostrya library can check and build the one key group that it names, and no other group.
+In a command, a bad group stops the command with status 1.
 Each ref of a push session names its own namespace: \fB\%NAME\fR is a local ref, and \fB\%@ID:NAME\fR is a ref of the collection \fB\%ID\fR.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs, so \fB\%@ID:NAME\fR of that id is the local ref \fB\%NAME\fR.
 One session can write local refs and the refs of more than one collection.
@@ -1139,7 +1140,7 @@ The key is necessary.
 .TP
 \fB\%secret\-key\-file\fR (string)
 For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB.
-A relative path is relative to the repository root, and a relative path with a \fB\%..\fR component is refused when the config is read.
+A relative path is relative to the repository root, and a relative path with a \fB\%..\fR component is refused when ostrya reads the key group, in a command and in a program that uses the ostrya library.
 The read follows a symlink, and a FIFO, a device, or a socket at the path is refused.
 For \fB\%ed25519\fR, the file holds exactly one line that is not blank, the base64 of the 64\-byte seed and public key.
 For \fB\%spki\fR, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a PKCS#8 DER of a P\-256, a P\-384, an Ed25519, or an RSA key, as \fB\%ostrya sign \-\-keys\-file\fR takes them.

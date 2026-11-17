@@ -711,6 +711,56 @@ pub fn remove_gnupg_sockets(dir: &Path) {
     }
 }
 
+/// A private GnuPG home that holds one new signing key with no passphrase.
+/// A drop of the value stops the GnuPG daemons of the home and removes their
+/// socket directory.
+#[cfg(feature = "verify-gpg")]
+pub struct GnupgHome {
+    pub dir: std::path::PathBuf,
+}
+
+#[cfg(feature = "verify-gpg")]
+impl GnupgHome {
+    pub fn new(dir: &Path, uid: &str) -> GnupgHome {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
+        let status = std::process::Command::new("gpg")
+            .arg("--homedir")
+            .arg(dir)
+            .args(["--batch", "--pinentry-mode", "loopback", "--passphrase", ""])
+            .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --quick-gen-key failed");
+        GnupgHome {
+            dir: dir.to_owned(),
+        }
+    }
+
+    /// Returns the public certificates of the home, as `gpg --export` writes
+    /// them.
+    pub fn export(&self) -> Vec<u8> {
+        let out = std::process::Command::new("gpg")
+            .arg("--homedir")
+            .arg(&self.dir)
+            .args(["--batch", "--export"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success() && !out.stdout.is_empty(),
+            "gpg --export failed"
+        );
+        out.stdout
+    }
+}
+
+#[cfg(feature = "verify-gpg")]
+impl Drop for GnupgHome {
+    fn drop(&mut self) {
+        remove_gnupg_sockets(&self.dir);
+    }
+}
+
 /// Returns each regular file and symlink under `root/sub`, sorted by path.
 ///
 /// Each entry holds the path relative to `root` and the bytes of the file. For

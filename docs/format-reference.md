@@ -3406,6 +3406,7 @@ group that the key names. A pull with `PullOptions::trust_group`, which
 `ostrya pull-local --trust=NAME` sets, reads the one trust group that the
 field names, and does not read the key `trust`.
 `TrustedKeys::from_trust_group` reads the one trust group that its argument
+names. `SigningKey::from_key_group` reads the one key group that its argument
 names.
 
 The key `[ex-ostrya] remotes-config-dir` names the remotes directory of the

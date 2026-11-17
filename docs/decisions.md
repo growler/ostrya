@@ -1273,6 +1273,35 @@ Two alternatives were rejected:
 - A field that `Repo::pull_local` alone reads. A pull over HTTP with the same
   options would then use the keys of the remote, with no message.
 
+## The signing keys of a key group
+
+`SigningKey::from_key_group(repo, name)` builds the signing keys of one key
+group `[ex-ostrya key "NAME"]` of `Repo::config`. It checks and builds that
+group alone, as `TrustedKeys::from_trust_group` does for a trust group. It
+reads no client group, no server group, no trust group, and no other key
+group, so a bad group that the caller does not name does not stop it. One
+group holds one key for `ostrya serve`, `ostrya receive`, and a program that
+uses the library.
+
+The rules of the group are the rules of the receive path, and the messages
+name the group. An `Error::Core` for a malformed escape sequence or for an
+`ed25519` key line that is not valid base64 does not name the group. An
+`ed25519` group and a `gpg` group give one key. An `spki` group gives one key
+for each `PRIVATE KEY` block, in the order of the file. A malformed name and a name of no group are `Error::InvalidInput`, because the
+caller gives the name.
+
+`SigningKey` is in the module `sign`, which no feature gates, with the
+reader of the key groups. The receive policy reads each key group with the
+same reader, and `ReceivePolicy::signers`, `ReceivePolicy::summary_signers`,
+`StreamPolicy::summary_signers`, and `StreamRule::signers` hold
+`Arc<SigningKey>`. A caller with no feature `receive` builds the keys of a
+group, and finds a signature of a key with `SigningKey::has_signed` and
+`Repo::has_signed_commit` before it signs.
+
+One alternative was rejected: the call in the module `receive`, with a caller
+that turns on the feature `receive`. That keeps the change small, and gives
+a signing program the whole receive side for one call.
+
 ## The engine of each signing key
 
 Each command that takes `--sign-type` gives each key the engine of the

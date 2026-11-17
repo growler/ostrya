@@ -33,7 +33,6 @@ mod reader;
 mod server_commit;
 mod service;
 mod session;
-mod signer;
 mod stream;
 mod stream_policy;
 mod trust;
@@ -52,7 +51,6 @@ pub use hooks::{
 pub use policy::{ReceivePolicies, ReceivePolicy, ReceiveVerify};
 pub use service::ReceiveService;
 pub use session::{ReceiveCommit, ReceiveRefOutcome, ReceiveReport, ReceiveStep, ReceiveWarning};
-pub use signer::ServerSigner;
 pub use stream_policy::{StreamPolicy, StreamRule};
 
 pub(crate) use merge::merge_detached;
@@ -67,7 +65,6 @@ const _: fn() = || {
     assert_send_sync::<StreamPolicy>();
     assert_send_sync::<StreamRule>();
     assert_send_sync::<TrustedKeys>();
-    assert_send_sync::<ServerSigner>();
     assert_send_sync::<ReceiveReport>();
     assert_send_sync::<ReceiveWarning>();
     assert_send_sync::<ReceiveService>();

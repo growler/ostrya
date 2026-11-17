@@ -3789,7 +3789,7 @@ fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
     let signer = ostrya::GpgSigner::new("server@example.org").with_homedir(&home.dir);
     let policy = ReceivePolicy {
         signers: vec![std::sync::Arc::new(
-            block_on(ostrya::ServerSigner::gpg(signer)).unwrap(),
+            block_on(ostrya::SigningKey::gpg(signer)).unwrap(),
         )],
         ..policy()
     };

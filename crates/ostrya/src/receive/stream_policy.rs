@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use ostrya_core::Ref;
 
-use super::{ReceivePattern, ReceiveVerify, ServerSigner};
+use super::{ReceivePattern, ReceiveVerify};
+use crate::sign::SigningKey;
 
 /// The rules that decide what a one-way stream accepts.
 ///
@@ -52,7 +53,7 @@ pub struct StreamPolicy {
     /// `ostree.collection-binding` stays on.
     pub disable_verify_bindings: bool,
     /// The keys of a summary signature. A one-way stream ignores them.
-    pub summary_signers: Vec<Arc<ServerSigner>>,
+    pub summary_signers: Vec<Arc<SigningKey>>,
     /// The switch of the summary regeneration. A one-way stream ignores it.
     pub update_summary: bool,
 }
@@ -87,7 +88,7 @@ pub struct StreamRule {
     /// The switch that accepts a delete of a matching ref.
     pub allow_delete: bool,
     /// The keys of a server signature. A one-way stream ignores them.
-    pub signers: Vec<Arc<ServerSigner>>,
+    pub signers: Vec<Arc<SigningKey>>,
 }
 
 impl Default for StreamRule {

@@ -20,7 +20,7 @@ use common::wrap_pem;
 use ostrya::access::{AccessModes, AuthItem};
 use ostrya::{
     CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Ref, Repo, RepoMode,
-    ServerSigner, TrustedKeys, base64,
+    SigningKey, TrustedKeys, base64,
 };
 use ostrya_rt::block_on;
 
@@ -396,7 +396,7 @@ fn an_ed25519_key_group_is_read() {
     let signers = &group(&policies, "c").signers;
     assert_eq!(signers.len(), 1);
     assert_eq!(signers[0].signer().name(), "ed25519");
-    let expected = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
+    let expected = SigningKey::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
     let payload = b"payload";
     assert_eq!(
         block_on(signers[0].signer().sign(payload)).unwrap(),
@@ -1110,7 +1110,7 @@ fn the_policies_are_send_and_sync() {
     assert_send_sync::<ReceivePolicy>();
     assert_send_sync::<ReceiveVerify>();
     assert_send_sync::<TrustedKeys>();
-    assert_send_sync::<ServerSigner>();
+    assert_send_sync::<SigningKey>();
 }
 
 /// A relative `secret-key-file` is relative to the repository root, and not

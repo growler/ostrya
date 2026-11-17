@@ -17,7 +17,7 @@ use ostrya::remote::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, CreateOptions, Ed25519Signer, Ed25519Verifier, Error, ObjectName, ObjectType,
-    ReceivePolicy, ReceiveReport, Repo, RepoMode, ServerSigner, Signer, TrustedKeys, Type, Value,
+    ReceivePolicy, ReceiveReport, Repo, RepoMode, Signer, SigningKey, TrustedKeys, Type, Value,
     Verifier, Xattrs,
 };
 use ostrya_core::DeflateSink;
@@ -26,6 +26,9 @@ use ostrya_core::filehdr::frame;
 use ostrya_rt::block_on;
 use sha2::{Digest, Sha256};
 
+#[cfg(feature = "verify-gpg")]
+#[allow(unused_imports)]
+pub use super::GnupgHome;
 pub use super::pipe::{PipeReader, PipeWriter, pipe};
 use super::{
     COMMIT, Field2Entry, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory, fixture_repo,
@@ -471,8 +474,8 @@ pub fn signed_dict(payload: &[u8], secrets: &[&str]) -> Vec<u8> {
 }
 
 /// A server signer with the ed25519 key `secret_b64`.
-pub fn server_signer(secret_b64: &str) -> Arc<ServerSigner> {
-    Arc::new(ServerSigner::ed25519(&secret(secret_b64)).unwrap())
+pub fn server_signer(secret_b64: &str) -> Arc<SigningKey> {
+    Arc::new(SigningKey::ed25519(&secret(secret_b64)).unwrap())
 }
 
 /// Trusted keys that trust the ed25519 key `secret_b64`.
@@ -569,58 +572,4 @@ pub fn assert_nothing_published(repo: &Repo, before: &[(String, Vec<u8>)]) {
         staging_entries(repo.path()).is_empty(),
         "no staging entry left"
     );
-}
-
-// ---------------------------------------------------------------------------
-// GnuPG.
-// ---------------------------------------------------------------------------
-
-/// A private GnuPG home that holds one new signing key with no passphrase.
-/// A drop of the value stops the GnuPG daemons of the home and removes their
-/// socket directory.
-#[cfg(feature = "verify-gpg")]
-pub struct GnupgHome {
-    pub dir: std::path::PathBuf,
-}
-
-#[cfg(feature = "verify-gpg")]
-impl GnupgHome {
-    pub fn new(dir: &Path, uid: &str) -> GnupgHome {
-        use std::os::unix::fs::DirBuilderExt;
-        std::fs::DirBuilder::new().mode(0o700).create(dir).unwrap();
-        let status = std::process::Command::new("gpg")
-            .arg("--homedir")
-            .arg(dir)
-            .args(["--batch", "--pinentry-mode", "loopback", "--passphrase", ""])
-            .args(["--quick-gen-key", uid, "ed25519", "sign", "never"])
-            .status()
-            .unwrap();
-        assert!(status.success(), "gpg --quick-gen-key failed");
-        GnupgHome {
-            dir: dir.to_owned(),
-        }
-    }
-
-    /// Returns the public certificates of the home, as `gpg --export` writes
-    /// them.
-    pub fn export(&self) -> Vec<u8> {
-        let out = std::process::Command::new("gpg")
-            .arg("--homedir")
-            .arg(&self.dir)
-            .args(["--batch", "--export"])
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success() && !out.stdout.is_empty(),
-            "gpg --export failed"
-        );
-        out.stdout
-    }
-}
-
-#[cfg(feature = "verify-gpg")]
-impl Drop for GnupgHome {
-    fn drop(&mut self) {
-        super::remove_gnupg_sockets(&self.dir);
-    }
 }

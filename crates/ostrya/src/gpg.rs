@@ -18,9 +18,10 @@
 //!
 //! - The signing run of `GpgSigner`.
 //! - The secret-key listing of `GpgSigner`.
-//! - The export of `GpgSigner` under the `receive` and `sign-gpg` features.
-//!   It gives the minimal public certificate of a server signing key, so the
-//!   receive path can recognize a signature that this key made.
+//! - The export of `GpgSigner` under the `sign-gpg` feature, in
+//!   `SigningKey::gpg`. It gives the minimal public certificate of a signing
+//!   key, so `SigningKey::has_signed` can recognize a signature that this key
+//!   made.
 //!
 //! The private key stays with GnuPG and its agent. It never goes through this
 //! crate.
@@ -2225,8 +2226,8 @@ pub(crate) mod tests {
 
     /// Returns `true` if the `gpg` binary runs.
     ///
-    /// The trust group cases in `verify::trust` and the receive signer cases
-    /// in `receive::signer` build their fixtures with `gpg`. Each of these
+    /// The trust group cases in `verify::trust` and the signing key cases in
+    /// `sign::signing_key` build their fixtures with `gpg`. Each of these
     /// cases skips if the binary is absent. If `OSTRYA_REQUIRE_GNUPG` is set,
     /// the absence of the binary fails the case.
     pub(crate) fn gpg_available() -> bool {

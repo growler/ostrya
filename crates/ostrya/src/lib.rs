@@ -234,8 +234,8 @@ pub use read::{CommitSizes, CommitState, MetadataReader};
 pub use receive::{
     HookFuture, HookRefusal, HostEntry, ReceiveCommit, ReceiveHooks, ReceivePolicies,
     ReceivePolicy, ReceiveRefOutcome, ReceiveRefUpdate, ReceiveReport, ReceiveServerCommit,
-    ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, ServerSigner, StreamPolicy,
-    StreamRule, UpdatePlan,
+    ReceiveService, ReceiveStep, ReceiveVerify, ReceiveWarning, StreamPolicy, StreamRule,
+    UpdatePlan,
 };
 #[doc(hidden)]
 pub use refs::{CollectionRefEntry, RefAlias, validate_refspec};
@@ -249,7 +249,8 @@ pub use sign::X509Signer;
 #[doc(hidden)]
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
-    SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys, load_sign_keys_from,
+    SignKeys, SignatureInfo, Signer, SigningKey, Verifier, VerifyOutcome, load_sign_keys,
+    load_sign_keys_from,
 };
 #[cfg(all(feature = "sign-x509", feature = "sign-spki"))]
 #[doc(hidden)]

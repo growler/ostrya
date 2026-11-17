@@ -21,7 +21,7 @@ use super::session::{
     Failure, ReceiveCommit, ReceiveRefOutcome, ReceiveReport, ReceiveStep, ReceiveWarning,
 };
 use super::walk::{self, Missing};
-use super::{ReceiveVerify, ServerSigner, TrustedKeys};
+use super::{ReceiveVerify, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
 use crate::access::ClientAccess;
 use crate::composefs::RecordedBuildError;
@@ -33,7 +33,7 @@ use crate::related::{self, HeldDependency, RelatedRule};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
-use crate::sign::{Signer, append_signature};
+use crate::sign::{Signer, SigningKey, append_signature};
 use crate::summary::{
     OSTREE_METADATA_REF, SummaryOptions, SummaryStep, parse_signature_dict,
     serialize_signature_dict,
@@ -160,7 +160,7 @@ struct Target {
 /// A server signature over the bytes of a new commit, made before the
 /// update lock.
 struct Prepared<'a> {
-    signer: &'a ServerSigner,
+    signer: &'a SigningKey,
     signature: Vec<u8>,
 }
 
@@ -182,7 +182,7 @@ struct Edit<'a> {
     keep: Arc<Vec<String>>,
     /// The server keys of the rules of the updates of the commit, which the
     /// plan before the lock signs with.
-    signers: Vec<&'a Arc<ServerSigner>>,
+    signers: Vec<&'a Arc<SigningKey>>,
     /// The prepared signatures whose key did not sign the commit in the
     /// merged dict, with the signatures kept before each.
     signatures: Vec<Prepared<'a>>,
@@ -1319,8 +1319,8 @@ fn target_keys<'a>(
 
 /// Returns the union of the server keys of the rules of the updates
 /// `indices`, each key once.
-fn target_signers<'a>(rules: &[UpdateRule<'a>], indices: &[usize]) -> Vec<&'a Arc<ServerSigner>> {
-    let mut signers: Vec<&Arc<ServerSigner>> = Vec::new();
+fn target_signers<'a>(rules: &[UpdateRule<'a>], indices: &[usize]) -> Vec<&'a Arc<SigningKey>> {
+    let mut signers: Vec<&Arc<SigningKey>> = Vec::new();
     for &i in indices {
         for signer in rules[i].signers {
             if !signers.iter().any(|s| Arc::ptr_eq(s, signer)) {
@@ -1371,9 +1371,9 @@ pub(super) async fn sign_server_commit(
     txn: &Transaction,
     commit: Checksum,
     payload: &Arc<Vec<u8>>,
-    signers: &[Arc<ServerSigner>],
+    signers: &[Arc<SigningKey>],
 ) -> Checked<()> {
-    let mut unique: Vec<&Arc<ServerSigner>> = Vec::with_capacity(signers.len());
+    let mut unique: Vec<&Arc<SigningKey>> = Vec::with_capacity(signers.len());
     for signer in signers {
         if !unique.iter().any(|s| Arc::ptr_eq(s, signer)) {
             unique.push(signer);
@@ -1891,7 +1891,7 @@ async fn prepare_signatures(mut edits: Vec<Edit<'_>>, size: bool) -> Checked<Vec
         .await?;
         if let Some(dict) = written.as_mut() {
             for signer in signers {
-                if signer.has_signed(edit.payload, Some(dict)).await {
+                if signer.has_signed_payload(edit.payload, Some(dict)).await {
                     continue;
                 }
                 let key = signer.signer().metadata_key();
@@ -2226,7 +2226,11 @@ async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) ->
             .await?;
             if let Some(dict) = written.as_mut() {
                 for prepared in prepared {
-                    if prepared.signer.has_signed(edit.payload, Some(dict)).await {
+                    if prepared
+                        .signer
+                        .has_signed_payload(edit.payload, Some(dict))
+                        .await
+                    {
                         continue;
                     }
                     let key = prepared.signer.signer().metadata_key();
@@ -2290,7 +2294,7 @@ fn queue_edit(txn: &Transaction, edit: Edit<'_>) -> Checked<()> {
 /// were, and its step goes into the warning.
 async fn write_summary(
     repo: &Repo,
-    signers: &[Arc<ServerSigner>],
+    signers: &[Arc<SigningKey>],
 ) -> std::result::Result<(), ReceiveWarning> {
     let warning = |step, what: &str, e: Error| ReceiveWarning {
         step,
@@ -2298,7 +2302,7 @@ async fn write_summary(
     };
     let access = ClientAccess::from_config(repo.config())
         .map_err(|e| warning(ReceiveStep::SummaryBuild, "the summary build", e))?;
-    let is_gpg = |s: &&Arc<ServerSigner>| s.signer().metadata_key() == GPG_KEY;
+    let is_gpg = |s: &&Arc<SigningKey>| s.signer().metadata_key() == GPG_KEY;
     let ordered: Vec<&dyn Signer> = signers
         .iter()
         .filter(is_gpg)
@@ -2612,7 +2616,7 @@ mod tests {
         let recorder = ThreadRecorder::new("ostree.sign.dummy");
         let server = || {
             Arc::new(
-                ServerSigner::new(
+                SigningKey::new(
                     Box::new(DummySigner::new(b"k".to_vec())),
                     Box::new(recorder.clone()),
                 )

@@ -9,10 +9,11 @@ use crate::access::{AccessModes, AuthItem, ClientAccess, ClientGroup, Namespace,
 use crate::error::Result;
 use crate::remote::{self, RefUpdate};
 use crate::repo::Repo;
+use crate::sign::SigningKey;
 
 use super::reader;
 use super::session::Failure;
-use super::{ServerSigner, StreamPolicy, TrustedKeys};
+use super::{StreamPolicy, TrustedKeys};
 
 /// The rules of one client group for a push session.
 ///
@@ -85,7 +86,7 @@ pub struct ReceivePolicy {
     /// commit is a new commit too. The server signs no other commit, a staged
     /// parent and a dependency included. The server signature on a new
     /// commit covers its field 2 and its parent checksum.
-    pub signers: Vec<Arc<ServerSigner>>,
+    pub signers: Vec<Arc<SigningKey>>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///
     /// Privileged content is a setuid or setgid mode bit, or the
@@ -102,7 +103,7 @@ pub struct ReceivePolicy {
     /// The keys that the server signs each regenerated summary with, in
     /// order. An spki key group gives one key for each block of its secret
     /// key file.
-    pub summary_signers: Vec<Arc<ServerSigner>>,
+    pub summary_signers: Vec<Arc<SigningKey>>,
     /// The switch that regenerates the summary of each auth item, as
     /// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries)
     /// writes them, after a session that writes a ref.
@@ -307,7 +308,7 @@ pub(super) struct UpdateRule<'a> {
     /// `verify`.
     pub(super) allow_unsigned: bool,
     /// The keys that the server signs the new commit with.
-    pub(super) signers: &'a [Arc<ServerSigner>],
+    pub(super) signers: &'a [Arc<SigningKey>],
 }
 
 /// The rule that the commit of a session applies to a server commit.
@@ -315,7 +316,7 @@ pub(super) struct ServerCommitRule<'a> {
     /// `true` if an `orphan` server commit can replace a branch that exists.
     pub(super) allow_orphan_over_branch: bool,
     /// The keys that the server signs the commit with.
-    pub(super) signers: &'a [Arc<ServerSigner>],
+    pub(super) signers: &'a [Arc<SigningKey>],
 }
 
 /// The rules that a session applies: the policy of a client group, or the
@@ -357,7 +358,7 @@ pub(super) trait SessionPolicy: Send + Sync {
     fn regenerates_summary(&self) -> bool;
 
     /// Returns the keys that sign each regenerated summary.
-    fn summary_keys(&self) -> &[Arc<ServerSigner>];
+    fn summary_keys(&self) -> &[Arc<SigningKey>];
 
     /// Returns the name of the client group of the session, for the report.
     fn group(&self) -> Option<&str>;
@@ -472,7 +473,7 @@ impl SessionPolicy for ReceivePolicy {
         self.update_summary
     }
 
-    fn summary_keys(&self) -> &[Arc<ServerSigner>] {
+    fn summary_keys(&self) -> &[Arc<SigningKey>] {
         &self.summary_signers
     }
 
@@ -538,7 +539,7 @@ impl SessionPolicy for StreamPolicy {
     }
 
     /// A one-way stream does not regenerate the summary.
-    fn summary_keys(&self) -> &[Arc<ServerSigner>] {
+    fn summary_keys(&self) -> &[Arc<SigningKey>] {
         &[]
     }
 

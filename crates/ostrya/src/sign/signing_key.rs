@@ -1,4 +1,4 @@
-//! The signing keys a receiving server holds.
+//! A signing key, with a verifier that trusts that key alone.
 
 use std::sync::Arc;
 
@@ -12,21 +12,32 @@ use crate::verify::Payload;
 /// public key.
 const ED25519_SECRET_LEN: usize = 64;
 
-/// A signing key of the server, with a verifier that trusts that key alone.
+/// A signing key, with a verifier that trusts that key alone.
 ///
-/// The server signs each commit that becomes the new value of a ref with the
-/// keys in [`ReceivePolicy::signers`](super::ReceivePolicy::signers). Before it
-/// signs, the server looks for a signature of this key in the detached
-/// metadata of the commit, stored or incoming. If it finds one, the server
-/// does not add a second signature.
+/// [`SigningKey::from_key_group`] builds the keys of one
+/// `[ex-ostrya key "NAME"]` group of the repository config. A caller signs a
+/// commit with the [`signer`](Self::signer) of the key, through
+/// [`Repo::sign_commit`](crate::Repo::sign_commit) or
+/// [`Transaction::sign_commit`](crate::Transaction::sign_commit). Before it
+/// signs, the caller can look for a signature of this key with
+/// [`has_signed`](Self::has_signed) or
+/// [`Repo::has_signed_commit`](crate::Repo::has_signed_commit). If it finds
+/// one, the caller does not add a second signature.
+///
+/// With the `receive` feature, `ReceivePolicy::signers` holds the keys that
+/// a receiving server signs with. The server signs each commit that becomes
+/// the new value of a ref with these keys. Before it signs, the server looks
+/// for a signature of each key in the detached metadata of the commit, stored
+/// or incoming. If it finds one, the server does not add a second signature.
 ///
 /// # Existing signatures
 ///
-/// The server verifies each signature with the verifier and makes no byte
-/// comparison. A GPG signature holds the time of signing, so two GPG
-/// signatures from one key over one commit have different bytes.
+/// The search for a signature of this key verifies each signature with the
+/// verifier and makes no byte comparison. A GPG signature holds the time of
+/// signing, so two GPG signatures from one key over one commit have different
+/// bytes.
 ///
-/// The server reads the signatures under the detached-metadata key of the
+/// The search reads the signatures under the detached-metadata key of the
 /// engine, in the stored order. It verifies each signature on its own, with
 /// this key alone, and stops at the first signature that verifies. These
 /// signatures count as not made by this key:
@@ -37,29 +48,32 @@ const ED25519_SECRET_LEN: usize = 64;
 ///   parse, a blob over 1 MiB, or a blob with more than 64 GPG signature
 ///   packets (the limits of `GpgVerifier`).
 ///
-/// A refused signature does not stop the search, so a signature that a
-/// client adds cannot hide the signature of the server.
-pub struct ServerSigner {
-    /// The key that the server signs with.
+/// A refused signature does not stop the search, so a signature that another
+/// party adds, for example a client of a server, cannot hide the signature of
+/// this key.
+pub struct SigningKey {
+    /// The key that the caller signs with.
     signer: Box<dyn Signer>,
     /// A verifier that trusts the public half of the key of `signer` and no
     /// other key.
     verifier: Arc<dyn Verifier>,
 }
 
-impl ServerSigner {
-    /// Creates a server key from a signer and a verifier of its public key.
+impl SigningKey {
+    /// Creates a signing key from a signer and a verifier of its public key.
     ///
     /// `verifier` must trust the public half of the key of `signer` and no
     /// other key. The caller is responsible for this pairing, and `new` does
     /// not check it:
     ///
-    /// - If `verifier` trusts another key, the server signs a commit that its
-    ///   own key already signed.
-    /// - If `verifier` trusts more keys, the server does not sign a commit
-    ///   that another key signed.
+    /// - If `verifier` trusts another key, the search does not find a
+    ///   signature of this key, and a caller signs a commit that this key
+    ///   already signed.
+    /// - If `verifier` trusts more keys, the search finds the signature of
+    ///   another key, and a caller does not sign a commit that another key
+    ///   signed.
     ///
-    /// The server verifies the [existing signatures](ServerSigner#existing-signatures)
+    /// The search verifies the [existing signatures](SigningKey#existing-signatures)
     /// with this pair on the blocking pool.
     ///
     /// # Errors
@@ -67,7 +81,7 @@ impl ServerSigner {
     /// - [`Error::InvalidFormat`] if `signer` and `verifier` use different
     ///   detached-metadata keys. The message is
     ///   `the signer writes '<key>' and the verifier reads '<key>'`.
-    pub fn new(signer: Box<dyn Signer>, verifier: Box<dyn Verifier>) -> Result<ServerSigner> {
+    pub fn new(signer: Box<dyn Signer>, verifier: Box<dyn Verifier>) -> Result<SigningKey> {
         if signer.metadata_key() != verifier.metadata_key() {
             return Err(Error::InvalidFormat(format!(
                 "the signer writes '{}' and the verifier reads '{}'",
@@ -75,13 +89,13 @@ impl ServerSigner {
                 verifier.metadata_key()
             )));
         }
-        Ok(ServerSigner {
+        Ok(SigningKey {
             signer,
             verifier: Arc::from(verifier),
         })
     }
 
-    /// Creates a server key from a 64-byte ed25519 secret key.
+    /// Creates a signing key from a 64-byte ed25519 secret key.
     ///
     /// The secret is the 32-byte seed, then the 32-byte public key. The
     /// verifier trusts that public key alone.
@@ -92,17 +106,17 @@ impl ServerSigner {
     ///   `ed25519 secret key must be 64 bytes, got <n>`.
     /// - [`Error::Signature`] if the public half of `secret` does not match
     ///   its seed. The message starts with `ed25519 secret key:`.
-    pub fn ed25519(secret: &[u8]) -> Result<ServerSigner> {
+    pub fn ed25519(secret: &[u8]) -> Result<SigningKey> {
         let signer = Ed25519Signer::from_secret_key(secret)?;
         let public = &secret[ED25519_SECRET_LEN / 2..ED25519_SECRET_LEN];
         let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new())?;
-        Ok(ServerSigner {
+        Ok(SigningKey {
             signer: Box::new(signer),
             verifier: Arc::new(verifier),
         })
     }
 
-    /// Creates a server key from an spki signer.
+    /// Creates a signing key from an spki signer.
     ///
     /// The verifier is a [`SpkiVerifier`](crate::spki::SpkiVerifier) that
     /// trusts the public key of `signer` alone.
@@ -118,10 +132,10 @@ impl ServerSigner {
     ///   key of `signer`. The message is
     ///   `spki public key: expected SubjectPublicKeyInfo DER`.
     #[cfg(feature = "sign-spki")]
-    pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
+    pub fn spki(signer: crate::spki::SpkiSigner) -> Result<SigningKey> {
         let verifier =
             crate::spki::SpkiVerifier::new([signer.public_key_der()], Vec::<Vec<u8>>::new())?;
-        Ok(ServerSigner {
+        Ok(SigningKey {
             signer: Box::new(Unblocked {
                 inner: Arc::new(signer),
             }),
@@ -129,11 +143,12 @@ impl ServerSigner {
         })
     }
 
-    /// Creates a server key from the one secret key that a GPG signer selects.
+    /// Creates a signing key from the one secret key that a GPG signer
+    /// selects.
     ///
     /// The selector of `signer` must name exactly one secret key in the GnuPG
     /// home of `signer`. The function refuses a user id that matches two keys.
-    /// The server key signs with the selected key by its fingerprint.
+    /// The signing key signs with the selected key by its fingerprint.
     ///
     /// [`GpgSigner::export_public`](crate::gpg::GpgSigner::export_public) gives
     /// the minimal public certificate of the key from the same home. The
@@ -160,7 +175,7 @@ impl ServerSigner {
     ///   [`GpgVerifier::from_keyring_bytes`](crate::gpg::GpgVerifier::from_keyring_bytes)
     ///   for the exported certificate.
     #[cfg(feature = "sign-gpg")]
-    pub async fn gpg(signer: crate::gpg::GpgSigner) -> Result<ServerSigner> {
+    pub async fn gpg(signer: crate::gpg::GpgSigner) -> Result<SigningKey> {
         let fingerprints = signer.secret_key_fingerprints().await?;
         let fingerprint = match fingerprints.as_slice() {
             [one] => one,
@@ -181,13 +196,13 @@ impl ServerSigner {
         }
         let certificate = bound.export_public(fingerprint).await?;
         let verifier = crate::gpg::GpgVerifier::from_keyring_bytes([certificate])?;
-        Ok(ServerSigner {
+        Ok(SigningKey {
             signer: Box::new(bound),
             verifier: Arc::new(verifier),
         })
     }
 
-    /// Returns the key that the server signs with.
+    /// Returns the signer of the key.
     pub fn signer(&self) -> &dyn Signer {
         self.signer.as_ref()
     }
@@ -195,14 +210,28 @@ impl ServerSigner {
     /// Returns `true` if `dict` holds a signature over `payload` that this key
     /// made.
     ///
-    /// `dict` is the detached metadata of a commit, or `None` for a commit
-    /// with no detached metadata. [`ServerSigner`](ServerSigner#existing-signatures)
-    /// states the rules of the search.
+    /// `payload` is the signed bytes, for example the serialized commit
+    /// object that [`Repo::sign_commit`](crate::Repo::sign_commit) signs.
+    /// `dict` is the signature dict of the payload, for example the detached
+    /// metadata of a commit, or `None` for a commit with no detached metadata.
+    /// [`SigningKey`](SigningKey#existing-signatures) states the rules of the
+    /// search. [`Repo::has_signed_commit`](crate::Repo::has_signed_commit)
+    /// reads the commit and its detached metadata from a repository and makes
+    /// the same search.
     ///
     /// The search runs on the blocking pool, because a verifier does its work
-    /// in the call. The pool gets a [`Payload::Shared`] payload with no copy,
-    /// and a copy of a [`Payload::Borrowed`] payload.
-    pub(crate) async fn has_signed<'p>(
+    /// in the call. If `dict` holds a signature under the detached-metadata
+    /// key of the engine, the pool gets a copy of `payload`.
+    pub async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> bool {
+        self.has_signed_payload(payload, dict).await
+    }
+
+    /// Returns `true` if `dict` holds a signature over `payload` that this key
+    /// made, the search of [`has_signed`](Self::has_signed).
+    ///
+    /// The pool gets a [`Payload::Shared`] payload with no copy, and a copy of
+    /// a [`Payload::Borrowed`] payload.
+    pub(crate) async fn has_signed_payload<'p>(
         &self,
         payload: impl Into<Payload<'p>>,
         dict: Option<&Value>,
@@ -264,9 +293,9 @@ fn any_verifies(verifier: &dyn Verifier, payload: &[u8], blobs: &[Vec<u8>]) -> b
     false
 }
 
-impl std::fmt::Debug for ServerSigner {
+impl std::fmt::Debug for SigningKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ServerSigner")
+        f.debug_struct("SigningKey")
             .field("engine", &self.signer.name())
             .finish_non_exhaustive()
     }
@@ -310,11 +339,11 @@ mod tests {
     }
 
     /// Returns a signature that `signer` makes over [`PAYLOAD`].
-    fn signature(signer: &ServerSigner) -> Vec<u8> {
+    fn signature(signer: &SigningKey) -> Vec<u8> {
         ostrya_rt::block_on(signer.signer().sign(PAYLOAD)).unwrap()
     }
 
-    fn has_signed(signer: &ServerSigner, dict: Option<&Value>) -> bool {
+    fn has_signed(signer: &SigningKey, dict: Option<&Value>) -> bool {
         ostrya_rt::block_on(signer.has_signed(PAYLOAD, dict))
     }
 
@@ -322,8 +351,8 @@ mod tests {
     /// signature.
     #[test]
     fn an_ed25519_key_recognizes_its_own_signature() {
-        let server = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
-        let other = ServerSigner::ed25519(&base64::decode(OTHER_SECRET_B64).unwrap()).unwrap();
+        let server = SigningKey::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
+        let other = SigningKey::ed25519(&base64::decode(OTHER_SECRET_B64).unwrap()).unwrap();
         let key = server.signer().metadata_key().to_owned();
 
         assert!(has_signed(
@@ -356,7 +385,7 @@ mod tests {
     /// not hide that signature, in either order.
     #[test]
     fn an_ed25519_signature_beside_a_bad_blob_is_recognized() {
-        let server = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
+        let server = SigningKey::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
         let key = server.signer().metadata_key().to_owned();
         let own = signature(&server);
         for bad in [b"garbage".to_vec(), oversize_blob()] {
@@ -401,7 +430,7 @@ mod tests {
     /// does not hide a blob that verifies.
     #[test]
     fn a_refused_blob_counts_as_not_signed() {
-        let server = ServerSigner::new(
+        let server = SigningKey::new(
             Box::new(DummySigner::new(b"k".to_vec())),
             Box::new(RefusesOthers {
                 good: b"good".to_vec(),
@@ -422,7 +451,7 @@ mod tests {
         use crate::verify::trust::tests::ThreadRecorder;
 
         let recorder = ThreadRecorder::new("ostree.sign.dummy");
-        let server = ServerSigner::new(
+        let server = SigningKey::new(
             Box::new(DummySigner::new(b"k".to_vec())),
             Box::new(recorder.clone()),
         )
@@ -430,29 +459,29 @@ mod tests {
         let payload = Arc::new(PAYLOAD.to_vec());
         let dict = dict_with("ostree.sign.dummy", b"k".to_vec());
         assert!(ostrya_rt::block_on(
-            server.has_signed(&payload, Some(&dict))
+            server.has_signed_payload(&payload, Some(&dict))
         ));
         recorder.assert_one_foreign_call();
         recorder.assert_no_copy_of(&payload);
     }
 
-    /// `ServerSigner::ed25519` refuses a secret of another length and a secret
+    /// `SigningKey::ed25519` refuses a secret of another length and a secret
     /// whose public half does not match its seed.
     #[test]
     fn a_malformed_ed25519_secret_is_refused() {
         let secret = base64::decode(SECRET_B64).unwrap();
-        assert!(ServerSigner::ed25519(&secret[..63]).is_err());
+        assert!(SigningKey::ed25519(&secret[..63]).is_err());
         let other = base64::decode(OTHER_SECRET_B64).unwrap();
         let mut mixed = secret[..32].to_vec();
         mixed.extend_from_slice(&other[32..]);
-        assert!(ServerSigner::ed25519(&mixed).is_err());
+        assert!(SigningKey::ed25519(&mixed).is_err());
     }
 
     /// The search recognizes a signature of a pair that the caller builds. `new`
     /// refuses a pair whose two halves read different detached-metadata keys.
     #[test]
     fn new_checks_the_metadata_key() {
-        let server = ServerSigner::new(
+        let server = SigningKey::new(
             Box::new(DummySigner::new(b"k".to_vec())),
             Box::new(DummyVerifier::new([b"k".to_vec()])),
         )
@@ -462,7 +491,7 @@ mod tests {
             Some(&dict_with("ostree.sign.dummy", signature(&server)))
         ));
 
-        let err = ServerSigner::new(
+        let err = SigningKey::new(
             Box::new(DummySigner::new(b"k".to_vec())),
             Box::new(Ed25519Verifier::new(Vec::<Vec<u8>>::new(), Vec::<Vec<u8>>::new()).unwrap()),
         )
@@ -479,7 +508,7 @@ mod tests {
         use crate::spki::SpkiSigner;
 
         // Two P-256 secret keys, base64 of the PKCS#8 DER.
-        let server = ServerSigner::spki(
+        let server = SigningKey::spki(
             SpkiSigner::from_base64(concat!(
                 "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
                 "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
@@ -488,7 +517,7 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
-        let other = ServerSigner::spki(
+        let other = SigningKey::spki(
             SpkiSigner::from_base64(concat!(
                 "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
                 "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
@@ -511,7 +540,7 @@ mod tests {
         ));
     }
 
-    /// An spki server key of the RSA key type signs on the blocking pool, and
+    /// An spki signing key of the RSA key type signs on the blocking pool, and
     /// the search recognizes its own signature alone. It does not recognize
     /// the signature of another key, or a blob of another length.
     #[cfg(feature = "sign-spki")]
@@ -519,14 +548,14 @@ mod tests {
     fn an_rsa_spki_key_recognizes_its_own_signature_alone() {
         use crate::spki::{SpkiSigner, spki_secret_keys};
 
-        /// Returns the server key of the key fixture file `name`.
-        fn server(name: &str) -> ServerSigner {
+        /// Returns the signing key of the key fixture file `name`.
+        fn server(name: &str) -> SigningKey {
             let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join("../../tests/fixtures/spki/keys")
                 .join(name);
             let mut signers = spki_secret_keys(std::fs::read(path).unwrap(), name).unwrap();
             assert_eq!(signers.len(), 1);
-            ServerSigner::spki(signers.remove(0)).unwrap()
+            SigningKey::spki(signers.remove(0)).unwrap()
         }
 
         let server_key = server("rsa-2048.pem");
@@ -592,8 +621,9 @@ mod tests {
         false
     }
 
-    /// The GPG search recognizes a signature that the server key made, stored
-    /// or from the merge. It does not recognize a signature from another key.
+    /// The GPG search recognizes a signature that the key made, stored or,
+    /// with the `receive` feature, from the merge of a receiving server. It
+    /// does not recognize a signature from another key.
     #[cfg(feature = "sign-gpg")]
     #[test]
     fn a_gpg_key_recognizes_its_own_signature() {
@@ -605,7 +635,7 @@ mod tests {
         }
         let home = KeyFixture::new("Receive Server <server@example.org>");
         let stranger = KeyFixture::new("Stranger <stranger@example.org>");
-        let server = ostrya_rt::block_on(ServerSigner::gpg(
+        let server = ostrya_rt::block_on(SigningKey::gpg(
             GpgSigner::new("server@example.org").with_homedir(&home.dir),
         ))
         .unwrap();
@@ -622,13 +652,16 @@ mod tests {
 
         // Through the merge: a stored signature from another key and an
         // incoming signature from the server key.
-        let merged = super::super::merge::merge_detached(
-            Some(dict_with(&key, foreign)),
-            dict_with(&key, own),
-            &[],
-        )
-        .unwrap();
-        assert!(has_signed(&server, Some(&merged)));
+        #[cfg(feature = "receive")]
+        {
+            let merged = crate::receive::merge_detached(
+                Some(dict_with(&key, foreign)),
+                dict_with(&key, own),
+                &[],
+            )
+            .unwrap();
+            assert!(has_signed(&server, Some(&merged)));
+        }
     }
 
     /// A blob that the GPG verifier refuses does not hide the signature of the
@@ -644,7 +677,7 @@ mod tests {
             return;
         }
         let home = KeyFixture::new("Receive Server <server@example.org>");
-        let server = ostrya_rt::block_on(ServerSigner::gpg(
+        let server = ostrya_rt::block_on(SigningKey::gpg(
             GpgSigner::new("server@example.org").with_homedir(&home.dir),
         ))
         .unwrap();
@@ -657,7 +690,7 @@ mod tests {
         }
     }
 
-    /// `ServerSigner::gpg` refuses a selector that names no secret key and a
+    /// `SigningKey::gpg` refuses a selector that names no secret key and a
     /// selector that names two.
     #[cfg(feature = "sign-gpg")]
     #[test]
@@ -672,7 +705,7 @@ mod tests {
         home.add_key("Server B <b@example.org>");
 
         let refused = |selector: &str, part: &str| {
-            let err = ostrya_rt::block_on(ServerSigner::gpg(
+            let err = ostrya_rt::block_on(SigningKey::gpg(
                 GpgSigner::new(selector).with_homedir(&home.dir),
             ))
             .unwrap_err();
@@ -686,7 +719,7 @@ mod tests {
 
         // The fingerprint names one of the two.
         let fingerprint = home.fingerprint();
-        ostrya_rt::block_on(ServerSigner::gpg(
+        ostrya_rt::block_on(SigningKey::gpg(
             GpgSigner::new(fingerprint).with_homedir(&home.dir),
         ))
         .unwrap();

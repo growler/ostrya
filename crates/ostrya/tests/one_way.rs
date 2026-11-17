@@ -35,7 +35,7 @@ use ostrya::verify::TrustedKeys;
 use ostrya::{
     Checksum, ComposefsImageState, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName,
     ObjectType, ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Ref, Repo, RepoMode,
-    ServerSigner, StreamPolicy, StreamRule, Type, Value,
+    SigningKey, StreamPolicy, StreamRule, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -78,7 +78,7 @@ fn detached_meta() -> Vec<u8> {
 /// keys and the summary step.
 fn policy() -> StreamPolicy {
     let secret = ostrya::base64::decode(SERVER_SECRET_B64).unwrap();
-    let signer = Arc::new(ServerSigner::ed25519(&secret).unwrap());
+    let signer = Arc::new(SigningKey::ed25519(&secret).unwrap());
     let rule = StreamRule {
         signers: vec![signer.clone()],
         ..StreamRule::default()

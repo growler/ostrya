@@ -28,7 +28,7 @@ use ostrya::remote::proto::{CommitRequest, ErrorMessage, Message, ServerCommit};
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, Commit, Ed25519Signer, Ed25519Verifier, ObjectType, ReceivePolicies, ReceivePolicy,
-    ReceiveReport, ReceiveVerify, Ref, Repo, RepoMode, ServerSigner, Signer, Summary, TrustedKeys,
+    ReceiveReport, ReceiveVerify, Ref, Repo, RepoMode, Signer, SigningKey, Summary, TrustedKeys,
     Type, Value, Verifier,
 };
 use ostrya_rt::block_on;
@@ -296,8 +296,8 @@ fn secret(b64: &str) -> Vec<u8> {
     ostrya::base64::decode(b64).unwrap()
 }
 
-fn server_signer(secret_b64: &str) -> Arc<ServerSigner> {
-    Arc::new(ServerSigner::ed25519(&secret(secret_b64)).unwrap())
+fn server_signer(secret_b64: &str) -> Arc<SigningKey> {
+    Arc::new(SigningKey::ed25519(&secret(secret_b64)).unwrap())
 }
 
 fn ed25519_signature(secret_b64: &str, payload: &[u8]) -> Vec<u8> {
@@ -1165,7 +1165,7 @@ fn a_gpg_server_key_signs_the_commit() {
     );
     let signer = ostrya::GpgSigner::new("server@example.org").with_homedir(&home.dir);
     let policy = ReceivePolicy {
-        signers: vec![Arc::new(block_on(ServerSigner::gpg(signer)).unwrap())],
+        signers: vec![Arc::new(block_on(SigningKey::gpg(signer)).unwrap())],
         ..policy_allowing(&["c:**"])
     };
     let repo = new_repo(&tmp, RepoMode::Archive, "");

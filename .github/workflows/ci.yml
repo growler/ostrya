@@ -185,6 +185,11 @@ jobs:
       - name: The receive feature without a GPG feature compiles
         run: cargo check -p ostrya --no-default-features --features smol,receive
 
+      # `SigningKey::from_key_group` and `Repo::has_signed_commit` need no
+      # receive feature. This runs their tests in a build without it.
+      - name: The signing keys of a key group without the receive feature
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki,sign-gpg --test signing_key
+
       # The client side of a push compiles without the receive side.
       - name: The push feature without the receive feature compiles
         run: cargo check -p ostrya --no-default-features --features smol,push

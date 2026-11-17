@@ -427,25 +427,18 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c", "b", "head", "orphan"]).await;
         let c = commit(&repo, tmp.path(), "c", None, &[], None).await;
-        let plain_b = commit(&repo, tmp.path(), "b", None, &[], None).await;
-        let plain_head = commit(&repo, tmp.path(), "head", None, &[], None).await;
+        let b = commit(&repo, tmp.path(), "b", None, &[("x/c", c)], None).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[("x/b", b)], Some("main")).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
-        // The commit write refuses a nested attachment, so the commits are
-        // stored as metadata objects.
-        let b = store_with_field2(&repo, &plain_b, &[("x/c", c.as_bytes())]).await;
-        let head = store_with_field2(&repo, &plain_head, &[("x/b", b.as_bytes())]).await;
-        repo.set_ref_immediate(&Ref::local("main"), Some(&head))
-            .await
-            .unwrap();
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
+        assert!(holds(&repo, &head).await);
         assert!(holds(&repo, &b).await, "the attachment survives");
         assert!(
             holds(&repo, &c).await,
             "the attachment of the attachment survives"
         );
-        assert!(!holds(&repo, &plain_b).await);
         assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
     });
 }

@@ -78,7 +78,7 @@ Name an attachment of the commit in field \%2 of the commit object.
 .IP
 The argument splits at its last \fB\%=\fR, so NAME can hold \fB\%=\fR\&. CHECKSUM is \%64 lowercase hexadecimal characters. By convention, NAME has the form \fB\%<class>/<name>\fR, for example \fB\%container/fe\fR\&. The option can occur more than once. The commit holds the entries sorted by name in byte order.
 .IP
-The command refuses an argument with no \fB\%=\fR and a CHECKSUM of another form before it takes the repository lock. It refuses an empty NAME, a NAME that occurs two times, and an attachment that the repository does not hold complete or that has an attachment of its own before it reads the tree. A refusal gives no new object and no ref. The option conflicts with \%\-\-skip\-if\-unchanged. This option is an extension of ostrya.
+The command refuses an argument with no \fB\%=\fR and a CHECKSUM of another form before it takes the repository lock. It refuses an empty NAME, a NAME that occurs two times, and an attachment that the repository does not hold complete before it reads the tree. The command does not check the attachments of an attachment. A refusal gives no new object and no ref. The option conflicts with \%\-\-skip\-if\-unchanged. This option is an extension of ostrya.
 .TP
 \fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the commit metadata.

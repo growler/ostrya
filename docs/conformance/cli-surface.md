@@ -960,10 +960,11 @@ port refuses these values at exit 1:
   before it takes the repository lock;
 - an empty `NAME`, and a `NAME` given two times, before it reads the tree;
 - an attachment that the repository does not hold, or holds partial, before it
-  reads the tree;
-- an attachment whose own field 2 is not empty, before it reads the tree.
+  reads the tree.
 
-A refusal writes no object and no ref. `--related` conflicts with
+The port accepts an attachment that has attachments of its own, and reads no
+attachment of an attachment. A refusal writes no object and no ref.
+`--related` conflicts with
 `--skip-if-unchanged`, and `clap` refuses the pair at exit 1.
 
 `--add-detached-metadata-string=ostrya.related=VALUE` gives the detached
@@ -3453,9 +3454,9 @@ details", "spki"). Fifty-two differences stand on `show`,
 - the attachments of the target under `apply-offline`. The port reads field
   2 of the target commit before it writes an object
   (`../format-reference.md`, "Object delivery"). It refuses a defective
-  entry, and an attachment that the repository does not hold complete or that
-  is nested, at exit 1 with `error: related commits in field 2 of commit
-  <target>: <reason>` and nothing on standard output. It writes no object.
+  entry, and an attachment that the repository does not hold complete, at
+  exit 1 with `error: related commits in field 2 of commit <target>:
+  <reason>` and nothing on standard output. It writes no object.
   The check also runs if the repository holds the target. The tool applies
   the delta with no check of field 2, also if the repository holds the
   target;

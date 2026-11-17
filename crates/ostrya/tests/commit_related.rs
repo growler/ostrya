@@ -2,9 +2,10 @@
 //!
 //! `Transaction::write_commit` writes `CommitOptions::attachments` into field 2
 //! of the commit object, sorted by name, and refuses attachments that are
-//! defective, not complete, or nested. `Transaction::check_attachments` runs the
-//! same checks before a tree is built, and `Transaction::write_commit_checked`
-//! writes the checked list with no second check.
+//! defective or not complete. The check is shallow: it reads no attachment of
+//! an attachment. `Transaction::check_attachments` runs the same checks before
+//! a tree is built, and `Transaction::write_commit_checked` writes the checked
+//! list with no second check.
 //! `Repo::commit_add_composefs_metadata`
 //! keeps field 2 and applies the same check. `Repo::read_commit_relations`
 //! reads field 2 and the detached key `ostrya.related`.
@@ -327,6 +328,7 @@ fn check_attachments_runs_the_checks_of_write_commit() {
         let partial = commit(&repo, tmp.path(), "partial", &[]).await;
         let c = commit(&repo, tmp.path(), "c", &[]).await;
         let nested = commit(&repo, tmp.path(), "nested", &[("lib/c", c)]).await;
+        let defective = store_with_field2(&repo, &att, &[("lib/c", &c.as_bytes()[..31])]).await;
         let state = repo.path().join("state");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::write(state.join(format!("{partial}.commitpartial")), b"").unwrap();
@@ -350,10 +352,6 @@ fn check_attachments_runs_the_checks_of_write_commit() {
                 vec![("a/x", partial)],
                 format!("attachment a/x names commit {partial}, which is partial"),
             ),
-            (
-                vec![("a/x", nested)],
-                format!("attachment a/x names commit {nested}, which has attachments of its own"),
-            ),
         ];
         for (related, expected) in cases {
             let staged_before = staged(&repo);
@@ -365,21 +363,81 @@ fn check_attachments_runs_the_checks_of_write_commit() {
             assert_eq!(staged(&repo), staged_before, "the call stages nothing");
         }
         // The checks run in the byte order of the names: the absent `a/x`
-        // comes before the nested `b/x`.
+        // comes before the partial `b/x`.
         let err = txn
-            .check_attachments(&owned(&[("b/x", nested), ("a/x", absent)]))
+            .check_attachments(&owned(&[("b/x", partial), ("a/x", absent)]))
             .await
             .unwrap_err();
         assert!(
             related_error(err).2.starts_with("attachment a/x "),
             "the first name in byte order"
         );
-        // An accepted list stays in the order of the caller.
-        let accepted = owned(&[("b/x", att), ("a/x", c)]);
+        // An accepted list stays in the order of the caller. An attachment
+        // with attachments of its own is accepted, also if its own field 2
+        // holds a defective entry.
+        let accepted = owned(&[
+            ("b/x", att),
+            ("a/x", c),
+            ("c/x", nested),
+            ("d/x", defective),
+        ]);
         let _ = txn.check_attachments(&accepted).await.unwrap();
-        assert_eq!(accepted, owned(&[("b/x", att), ("a/x", c)]));
+        assert_eq!(
+            accepted,
+            owned(&[
+                ("b/x", att),
+                ("a/x", c),
+                ("c/x", nested),
+                ("d/x", defective)
+            ])
+        );
         let _ = txn.check_attachments(&[]).await.unwrap();
         txn.abort().await.unwrap();
+    });
+}
+
+/// The check refuses an attachment whose field 2 does not decode, and a
+/// commit write that names it writes no commit.
+#[test]
+fn check_attachments_refuses_an_attachment_whose_field2_does_not_decode() {
+    let tmp = TmpDir::new("related-undecodable");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["dep", "source", "head"]).await;
+        let att = commit(&repo, tmp.path(), "dep", &[]).await;
+        let source = commit(&repo, tmp.path(), "source", &[("lib/undecodable", att)]).await;
+        // The string of the entry loses its terminating nul byte.
+        let (stored, _) = repo.load_commit(&source).await.unwrap();
+        let mut bytes = stored.serialize().unwrap();
+        let name = b"lib/undecodable\0";
+        let at = bytes
+            .windows(name.len())
+            .position(|window| window == name)
+            .unwrap();
+        bytes[at + name.len() - 1] = b'!';
+        let txn = repo.transaction().await.unwrap();
+        let broken = txn
+            .write_metadata(ObjectType::Commit, None, &bytes)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let objects_before = objects(&repo);
+        let refs_before = refs(&repo);
+        let txn = repo.transaction().await.unwrap();
+        let err = txn
+            .check_attachments(&owned(&[("a/x", broken)]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let err = txn
+            .write_commit(options("head", &[("a/x", broken)]), &root)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        txn.abort().await.unwrap();
+        assert_eq!(objects(&repo), objects_before, "no new object");
+        assert_eq!(refs(&repo), refs_before, "no new ref");
     });
 }
 
@@ -622,27 +680,142 @@ fn write_commit_checked_gives_the_commit_of_write_commit() {
 }
 
 #[test]
-fn write_commit_refuses_a_nested_attachment() {
+fn write_commit_accepts_a_nested_attachment() {
     let tmp = TmpDir::new("related-nested");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c", "b", "a"]).await;
         let c = commit(&repo, tmp.path(), "c", &[]).await;
         let b = commit(&repo, tmp.path(), "b", &[("lib/c", c)]).await;
-        let txn = repo.transaction().await.unwrap();
-        let root = stage_tree(&txn, tmp.path(), "a").await;
-        let err = txn
-            .write_commit(options("a", &[("lib/b", b)]), &root)
-            .await
-            .unwrap_err();
+        let a = commit(&repo, tmp.path(), "a", &[("lib/b", b)]).await;
         assert_eq!(
-            related_error(err),
-            (
-                None,
-                RelationField::Attachments,
-                format!("attachment lib/b names commit {b}, which has attachments of its own")
-            )
+            repo.read_commit_relations(&a).await.unwrap().attachments,
+            owned(&[("lib/b", b)])
         );
+        assert_eq!(
+            repo.read_commit_relations(&b).await.unwrap().attachments,
+            owned(&[("lib/c", c)])
+        );
+    });
+}
+
+/// The chain R -> C -> D of the commit write holds one entry in field 2 of
+/// R and of C, and none in D. The check of an attachment list that names R
+/// passes.
+#[test]
+fn write_commit_writes_a_chain_of_attachments() {
+    let tmp = TmpDir::new("related-chain");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let chain = common::write_chain(&repo, tmp.path(), "rootfs").await;
+        for (commit, expected) in [
+            (chain.r, owned(&[(common::CHAIN_C, chain.c)])),
+            (chain.c, owned(&[(common::CHAIN_D, chain.d)])),
+            (chain.d, Vec::new()),
+        ] {
+            let (stored, _) = repo.load_commit(&commit).await.unwrap();
+            let expected_field2: Vec<(String, Vec<u8>)> = expected
+                .iter()
+                .map(|(name, checksum)| (name.clone(), checksum.as_bytes().to_vec()))
+                .collect();
+            assert_eq!(stored.related, expected_field2, "field 2 of {commit}");
+            assert_eq!(
+                repo.read_commit_relations(&commit)
+                    .await
+                    .unwrap()
+                    .attachments,
+                expected
+            );
+        }
+        let txn = repo.transaction().await.unwrap();
+        let _ = txn
+            .check_attachments(&owned(&[("system/rootfs", chain.r)]))
+            .await
+            .unwrap();
         txn.abort().await.unwrap();
+    });
+}
+
+/// The diamond of the commit write: R names A and B, and A and B name one D.
+#[test]
+fn write_commit_writes_a_diamond_of_attachments() {
+    let tmp = TmpDir::new("related-diamond");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let diamond = common::write_diamond(&repo, tmp.path(), "rootfs").await;
+        assert_ne!(diamond.a, diamond.b);
+        for (commit, expected) in [
+            (
+                diamond.r,
+                owned(&[
+                    (common::DIAMOND_A, diamond.a),
+                    (common::DIAMOND_B, diamond.b),
+                ]),
+            ),
+            (diamond.a, owned(&[(common::DIAMOND_D, diamond.d)])),
+            (diamond.b, owned(&[(common::DIAMOND_D, diamond.d)])),
+            (diamond.d, Vec::new()),
+        ] {
+            assert_eq!(
+                repo.read_commit_relations(&commit)
+                    .await
+                    .unwrap()
+                    .attachments,
+                expected,
+                "field 2 of {commit}"
+            );
+        }
+        let txn = repo.transaction().await.unwrap();
+        let _ = txn
+            .check_attachments(&owned(&[("system/rootfs", diamond.r)]))
+            .await
+            .unwrap();
+        txn.abort().await.unwrap();
+    });
+}
+
+/// The check reads no attachment of an attachment: a write that names C
+/// passes if D is gone from the disk, or if D has a partial marker.
+#[test]
+fn the_attachment_check_reads_no_attachment_of_an_attachment() {
+    let tmp = TmpDir::new("related-shallow");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["gone-top", "partial-top"]).await;
+        let gone = common::write_chain(&repo, tmp.path(), "gone").await;
+        std::fs::remove_file(repo.path().join("objects").join(ostrya::loose_path(
+            &gone.d,
+            ObjectType::Commit,
+            repo.mode(),
+        )))
+        .unwrap();
+        let partial = common::write_chain(&repo, tmp.path(), "partial").await;
+        mark_partial(&repo, &partial.d);
+
+        for (c, top) in [(gone.c, "gone-top"), (partial.c, "partial-top")] {
+            let txn = repo.transaction().await.unwrap();
+            let _ = txn
+                .check_attachments(&owned(&[(common::CHAIN_C, c)]))
+                .await
+                .unwrap();
+            txn.abort().await.unwrap();
+            let written = commit(&repo, tmp.path(), top, &[(common::CHAIN_C, c)]).await;
+            assert_eq!(
+                repo.read_commit_relations(&written)
+                    .await
+                    .unwrap()
+                    .attachments,
+                owned(&[(common::CHAIN_C, c)])
+            );
+        }
     });
 }
 
@@ -662,20 +835,23 @@ fn write_commit_accepts_an_attachment_of_the_same_transaction() {
             .write_commit(options("head", &[("a/dep", att)]), &root)
             .await
             .unwrap();
-        // A staged attachment with an attachment of its own is nested.
+        // A staged attachment can have an attachment of its own.
         let nested_root = stage_tree(&txn, tmp.path(), "nested").await;
-        let err = txn
+        let nested = txn
             .write_commit(options("nested", &[("a/head", head)]), &nested_root)
             .await
-            .unwrap_err();
-        assert_eq!(
-            related_error(err).2,
-            format!("attachment a/head names commit {head}, which has attachments of its own")
-        );
+            .unwrap();
         txn.commit().await.unwrap();
         assert_eq!(
             repo.read_commit_relations(&head).await.unwrap().attachments,
             owned(&[("a/dep", att)])
+        );
+        assert_eq!(
+            repo.read_commit_relations(&nested)
+                .await
+                .unwrap()
+                .attachments,
+            owned(&[("a/head", head)])
         );
     });
 }
@@ -698,20 +874,36 @@ fn composefs_metadata_keeps_the_attachments() {
     });
 }
 
+/// The rewrite of a commit whose attachment has an attachment of its own
+/// keeps field 2.
 #[test]
-fn composefs_metadata_refuses_a_defective_source_field() {
-    let tmp = TmpDir::new("related-composefs-refuse");
+fn composefs_metadata_accepts_a_nested_attachment() {
+    let tmp = TmpDir::new("related-composefs-nested");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c", "b", "head"]).await;
         let c = commit(&repo, tmp.path(), "c", &[]).await;
         let b = commit(&repo, tmp.path(), "b", &[("lib/c", c)]).await;
+        let head = commit(&repo, tmp.path(), "head", &[("lib/b", b)]).await;
+        let txn = repo.transaction().await.unwrap();
+        let rewritten = repo
+            .commit_add_composefs_metadata(&txn, &head)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let (stored, _) = repo.load_commit(&rewritten).await.unwrap();
+        assert_eq!(stored.related, field2(&[("lib/b", b)]));
+    });
+}
+
+#[test]
+fn composefs_metadata_refuses_a_defective_source_field() {
+    let tmp = TmpDir::new("related-composefs-refuse");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["c", "head"]).await;
+        let c = commit(&repo, tmp.path(), "c", &[]).await;
         let head = commit(&repo, tmp.path(), "head", &[]).await;
-        let (c_bytes, b_bytes) = (c.as_bytes().as_slice(), b.as_bytes().as_slice());
-        let cases: [(&[Field2Entry], String); 5] = [
-            (
-                &[("lib/b", b_bytes)],
-                format!("attachment lib/b names commit {b}, which has attachments of its own"),
-            ),
+        let c_bytes = c.as_bytes().as_slice();
+        let cases: [(&[Field2Entry], String); 4] = [
             (
                 &[("lib/y", c_bytes), ("lib/x", c_bytes)],
                 "entries are not sorted by name: lib/x follows lib/y".to_owned(),

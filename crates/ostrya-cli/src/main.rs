@@ -1076,10 +1076,10 @@ struct CommitArgs {
     /// The command refuses an argument with no `=` and a CHECKSUM of another
     /// form before it takes the repository lock. It refuses an empty NAME, a
     /// NAME that occurs two times, and an attachment that the repository does
-    /// not hold complete or that has an attachment of its own before it reads
-    /// the tree. A refusal gives no new object and no ref. The option
-    /// conflicts with --skip-if-unchanged. This option is an extension of
-    /// ostrya.
+    /// not hold complete before it reads the tree. The command does not check
+    /// the attachments of an attachment. A refusal gives no new object and no
+    /// ref. The option conflicts with --skip-if-unchanged. This option is an
+    /// extension of ostrya.
     #[arg(
         long = "related",
         value_name = "NAME=CHECKSUM",
@@ -3492,7 +3492,7 @@ enum StaticDeltaCommand {
     /// engine finds a signature, the command skips each engine that finds
     /// none. Without a key source, the command verifies no signature.
     /// Each attachment of the target commit must be complete in the
-    /// repository, so apply the delta of each attachment first.
+    /// repository, so apply the deltas of the deepest attachments first.
     ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
     ///

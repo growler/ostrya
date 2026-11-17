@@ -532,13 +532,13 @@ pub enum Error {
     ///   for an entry of
     ///   [`CommitOptions::attachments`](crate::CommitOptions::attachments) with an
     ///   empty name, for two entries with the same name, and for an attachment
-    ///   that is absent, partial, or nested. The calls check before the
-    ///   commit has a checksum, so `commit` is `None`.
+    ///   that is absent or partial. The calls check before the commit has a
+    ///   checksum, so `commit` is `None`.
     /// - [`Repo::commit_add_composefs_metadata`](crate::Repo::commit_add_composefs_metadata),
     ///   for a defective field 2 of the source commit: an entry with an empty
     ///   name or with a checksum that is not 32 bytes, entries that are not
     ///   sorted by name, two entries with the same name, and an attachment
-    ///   that is absent, partial, or nested. `commit` is the source commit.
+    ///   that is absent or partial. `commit` is the source commit.
     /// - [`Repo::read_commit_relations`](crate::Repo::read_commit_relations), for
     ///   an entry with an empty name or with a checksum that is not 32 bytes,
     ///   and for an `ostrya.related` value that is not a variant of type
@@ -579,7 +579,7 @@ pub enum Error {
     ///   [`Repo::apply_static_delta_offline`](crate::Repo::apply_static_delta_offline),
     ///   for an entry of field 2 of the target commit with an empty name or
     ///   with a checksum that is not 32 bytes, and for an attachment that is
-    ///   absent, partial, or nested. `commit` is the target commit.
+    ///   absent or partial. `commit` is the target commit.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a
     /// [`RelationWarning`](crate::RelationWarning) with the same text in place

@@ -1820,11 +1820,8 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
         let f = Fixture::new(None).await;
         let base = f.tmp.path();
         let c = commit_related(&f.local, base, "c", None, &[], T0 + 10).await;
-        let plain_b = commit_related(&f.local, base, "b", None, &[], T0 + 20).await;
-        // The commit write refuses a nested attachment, so the commits are
-        // stored as metadata objects.
-        let b = store_with_field2(&f.local, &plain_b, &[("x/c", c.as_bytes())]).await;
-        let head = store_with_field2(&f.local, &f.c3, &[("x/b", b.as_bytes())]).await;
+        let b = commit_related(&f.local, base, "b", None, &[("x/c", c)], T0 + 20).await;
+        let head = commit_related(&f.local, base, "head", None, &[("x/b", b)], T0 + 30).await;
         f.set_local_ref("main", &head).await;
         f.copy("objects");
         f.put_ref("refs/heads/main", &head);
@@ -1843,7 +1840,6 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
             f.get(&key(ObjectType::Commit, &c)).is_some(),
             "the attachment of the attachment survives"
         );
-        assert!(f.get(&key(ObjectType::Commit, &plain_b)).is_none());
     });
 }
 

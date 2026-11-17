@@ -842,22 +842,21 @@ pub(crate) fn check_order<'a>(
     Ok(())
 }
 
-/// Checks that the attachments `atts` are complete and that none of them is
-/// nested.
+/// Checks that the attachments `atts` are complete.
 ///
 /// An attachment is complete if `txn` stages its commit object or the
 /// repository holds it, and the repository holds no
-/// `state/<checksum>.commitpartial` marker for it. An attachment is nested if
-/// its own field 2 is not empty. The checks of all attachments run in one
-/// trip to the blocking pool, in the order of `atts`. A checksum that `atts`
-/// names more than once is checked once, at its first entry. For each
+/// `state/<checksum>.commitpartial` marker for it. The check is shallow: it
+/// reads no attachment of an attachment. The checks of all attachments run
+/// in one trip to the blocking pool, in the order of `atts`. A checksum that
+/// `atts` names more than once is checked once, at its first entry. For each
 /// attachment, the check reads the partial marker first, and reads no commit
 /// object of an attachment with a marker.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidRelations`] with `commit` for the first attachment that is
-///   absent, partial, or nested.
+///   absent or partial.
 /// - [`Error::Core`] if the commit tuple of an attachment with no partial
 ///   marker does not frame, or if its field 2 does not decode.
 /// - [`Error::InvalidFormat`] if the commit object of an attachment with no
@@ -896,8 +895,7 @@ pub(crate) async fn check_attachments<'a>(
             let defect = match held_attachment_blocking(&repo, staging, checksum, |_| Ok(()))? {
                 HeldAttachment::Absent => "which is in neither the repository nor the transaction",
                 HeldAttachment::Partial => PARTIAL_REASON,
-                HeldAttachment::Complete { nested: true, .. } => NESTED_REASON,
-                HeldAttachment::Complete { nested: false, .. } => continue,
+                HeldAttachment::Complete { .. } => continue,
             };
             return Ok(Some((index, defect)));
         }

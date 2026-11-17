@@ -71,8 +71,8 @@ pub struct CommitOptions {
     /// `container/fe`. The write sorts the entries by name in byte order, so
     /// one set of entries gives one commit checksum. It refuses an empty name
     /// and two entries with the same name. Each attachment must be complete
-    /// in the repository or in the writing transaction, and must have no
-    /// attachment of its own. [`Transaction::write_commit`] states the rule.
+    /// in the repository or in the writing transaction. An attachment can have
+    /// attachments of its own. [`Transaction::write_commit`] states the rule.
     ///
     /// [`Transaction::write_commit_checked`] refuses a list that is not
     /// empty. The [`CheckedAttachments`] that it takes gives the attachments.
@@ -175,9 +175,9 @@ impl Transaction {
     /// Each attachment must be complete: this transaction stages its commit
     /// object or the repository holds it, and the repository holds no
     /// `state/<checksum>.commitpartial` marker for it. An attachment that this
-    /// transaction writes must be staged before the call that names it. An
-    /// attachment must have no attachment of its own, so an attachment names
-    /// no attachment. It can have a parent and supplements.
+    /// transaction writes must be staged before the call that names it. The
+    /// check is shallow: it reads no attachment of an attachment. An
+    /// attachment can have attachments, a parent, and supplements of its own.
     ///
     /// The call checks the attachments as
     /// [`check_attachments`](Transaction::check_attachments) does, after the timestamp
@@ -194,7 +194,7 @@ impl Transaction {
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
     /// - [`Error::InvalidRelations`] if an entry of `opts.attachments` has an empty
     ///   name, if two entries have the same name, or if an attachment is
-    ///   absent, partial, or has an attachment of its own.
+    ///   absent or partial.
     /// - [`Error::Core`] if the commit tuple of an attachment does not frame,
     ///   or if its field 2 does not decode.
     /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
@@ -337,7 +337,7 @@ impl Transaction {
     /// The call refuses an entry with an empty name and two entries with the
     /// same name. Then it checks each attachment in the byte order of the
     /// names: the attachment must be complete in the repository or in this
-    /// transaction, and it must have no attachment of its own.
+    /// transaction. The call reads no attachment of an attachment.
     /// [`write_commit`](Transaction::write_commit) states the rules and runs
     /// the same checks. The call does not change `attachments` and writes
     /// nothing.
@@ -353,7 +353,7 @@ impl Transaction {
     ///
     /// - [`Error::InvalidRelations`] with no commit, if an entry of `attachments`
     ///   has an empty name, if two entries have the same name, or if an
-    ///   attachment is absent, partial, or has an attachment of its own.
+    ///   attachment is absent or partial.
     /// - [`Error::Core`] if the commit tuple of an attachment does not frame,
     ///   or if its field 2 does not decode.
     /// - [`Error::InvalidFormat`] if the commit object of an attachment with no

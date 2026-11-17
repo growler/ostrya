@@ -850,6 +850,139 @@ pub fn attachment_warning(commit: ostrya::Checksum, reason: &str) -> ostrya::Rel
     }
 }
 
+/// The entry name in field 2 of R that names C, in a chain of
+/// [`write_chain`].
+pub const CHAIN_C: &str = "container/fe";
+
+/// The entry name in field 2 of C that names D, in a chain of
+/// [`write_chain`].
+pub const CHAIN_D: &str = "details/fe";
+
+/// The entry name in field 2 of R that names A, in a diamond of
+/// [`write_diamond`].
+pub const DIAMOND_A: &str = "lib/a";
+
+/// The entry name in field 2 of R that names B, in a diamond of
+/// [`write_diamond`].
+pub const DIAMOND_B: &str = "lib/b";
+
+/// The entry name in field 2 of A and of B that names D, in a diamond of
+/// [`write_diamond`].
+pub const DIAMOND_D: &str = "lib/d";
+
+/// The commits of a chain of attachments: R names C, and C names D.
+pub struct Chain {
+    pub r: ostrya::Checksum,
+    pub c: ostrya::Checksum,
+    pub d: ostrya::Checksum,
+}
+
+/// The commits of a diamond of attachments: R names A and B, and A and B
+/// each name D.
+pub struct Diamond {
+    pub r: ostrya::Checksum,
+    pub a: ostrya::Checksum,
+    pub b: ostrya::Checksum,
+    pub d: ostrya::Checksum,
+}
+
+/// Writes the chain R -> C -> D into `repo` with the commit write, and
+/// returns its commits.
+///
+/// R names C as [`CHAIN_C`], and C names D as [`CHAIN_D`]. The function
+/// writes one commit in each transaction, D first. The trees are under
+/// `base`, and their labels start with `branch`, so two chains in one
+/// repository have different commits. The function sets `branch` to R. C and
+/// D get no ref.
+pub async fn write_chain(repo: &ostrya::Repo, base: &Path, branch: &str) -> Chain {
+    let d = write_labelled(repo, base, &format!("{branch}-d"), &[], None).await;
+    let c = write_labelled(repo, base, &format!("{branch}-c"), &[(CHAIN_D, d)], None).await;
+    let r = write_labelled(
+        repo,
+        base,
+        &format!("{branch}-r"),
+        &[(CHAIN_C, c)],
+        Some(branch),
+    )
+    .await;
+    Chain { r, c, d }
+}
+
+/// Writes the diamond of attachments into `repo` with the commit write, and
+/// returns its commits.
+///
+/// R names A as [`DIAMOND_A`] and B as [`DIAMOND_B`], and A and B each name
+/// D as [`DIAMOND_D`]. The function writes one commit in each transaction, D
+/// first. The trees are under `base`, and their labels start with `branch`.
+/// The function sets `branch` to R. A, B, and D get no ref.
+pub async fn write_diamond(repo: &ostrya::Repo, base: &Path, branch: &str) -> Diamond {
+    let d = write_labelled(repo, base, &format!("{branch}-d"), &[], None).await;
+    let a = write_labelled(repo, base, &format!("{branch}-a"), &[(DIAMOND_D, d)], None).await;
+    let b = write_labelled(repo, base, &format!("{branch}-b"), &[(DIAMOND_D, d)], None).await;
+    let r = write_labelled(
+        repo,
+        base,
+        &format!("{branch}-r"),
+        &[(DIAMOND_A, a), (DIAMOND_B, b)],
+        Some(branch),
+    )
+    .await;
+    Diamond { r, a, b, d }
+}
+
+/// Writes the tree `base/<label>` with one file `payload.txt` that holds
+/// `label`, and commits it into `repo` in one transaction with the
+/// attachments `attachments`. The subject is `label`. If `branch` is set,
+/// the transaction sets `branch` to the commit.
+async fn write_labelled(
+    repo: &ostrya::Repo,
+    base: &Path,
+    label: &str,
+    attachments: &[(&str, ostrya::Checksum)],
+    branch: Option<&str>,
+) -> ostrya::Checksum {
+    use std::os::fd::AsFd;
+    let dir = base.join(label);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("payload.txt"), label).unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = ostrya::MutableTree::new();
+    let mut modifier = ostrya::CommitModifier::new(
+        ostrya::CommitModifierFlags::SKIP_XATTRS
+            | ostrya::CommitModifierFlags::CANONICAL_PERMISSIONS,
+    );
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(
+        dfd.as_fd(),
+        Path::new(label),
+        &mut mtree,
+        Some(&mut modifier),
+    )
+    .await
+    .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            ostrya::CommitOptions {
+                subject: Some(label.to_owned()),
+                timestamp: Some(1_700_000_000),
+                attachments: attachments
+                    .iter()
+                    .map(|(name, checksum)| ((*name).to_owned(), *checksum))
+                    .collect(),
+                ..ostrya::CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    if let Some(branch) = branch {
+        txn.set_ref(&branch.parse::<ostrya::Ref>().unwrap(), Some(&commit));
+    }
+    txn.commit().await.unwrap();
+    commit
+}
+
 /// Returns `true` if fs-verity seals the regular file at `path`.
 ///
 /// A sealed file refuses an open for writing. The objects are writable by the

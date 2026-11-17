@@ -24,7 +24,7 @@ ostrya static\-delta list [OPTIONS]
 .SS "apply\-offline"
 Apply a static delta offline and write the objects of its target commit.
 .PP
-The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta with each engine before it writes an object, and applies an unsigned delta with no check. With a \%\-\-keys\-dir and no key, if one engine finds a signature, the command skips each engine that finds none. Without a key source, the command verifies no signature. Each attachment of the target commit must be complete in the repository, so apply the delta of each attachment first.
+The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta with each engine before it writes an object, and applies an unsigned delta with no check. With a \%\-\-keys\-dir and no key, if one engine finds a signature, the command skips each engine that finds none. Without a key source, the command verifies no signature. Each attachment of the target commit must be complete in the repository, so apply the deltas of the deepest attachments first.
 .PP
 .nf
 ostrya static\-delta apply\-offline [OPTIONS] [PATH] [KEY_ID]...

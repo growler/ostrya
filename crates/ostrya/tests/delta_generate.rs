@@ -1772,10 +1772,10 @@ fn the_attachments_are_checked_before_the_parts_apply() {
     });
 }
 
-/// An attachment with attachments of its own is refused, and the apply writes
-/// no object.
+/// An attachment with attachments of its own is accepted, and the target
+/// applies.
 #[test]
-fn a_target_with_a_nested_attachment_writes_no_object() {
+fn a_target_with_a_nested_attachment_applies() {
     let tmp = TmpDir::new("apply-deps-nested");
     block_on(async {
         let fx = AttachmentFixture::new(tmp.path()).await;
@@ -1791,10 +1791,92 @@ fn a_target_with_a_nested_attachment_writes_no_object() {
             .await
             .unwrap();
         assert_eq!(
-            refused_apply(&dst, &target_delta).await,
+            dst.apply_static_delta_offline(&target_delta).await.unwrap(),
+            target
+        );
+        assert!(dst.has_object(ObjectType::Commit, &target).await.unwrap());
+    });
+}
+
+/// Generates the delta from scratch to `to` in `src` and returns its
+/// directory.
+async fn scratch_delta(src: &Repo, to: &Checksum) -> PathBuf {
+    let relative = src
+        .generate_static_delta(None, to, &DeltaOptions::default())
+        .await
+        .unwrap();
+    src.path().join(relative)
+}
+
+/// Returns the names of the partial-commit markers under `state/` of `repo`.
+fn partial_markers(repo: &Repo) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(repo.path().join("state")) else {
+        return Vec::new();
+    };
+    entries
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".commitpartial"))
+        .collect()
+}
+
+/// The deltas of the chain R -> C -> D apply with the deepest delta first:
+/// D, then C, then R. The destination then holds the three commits complete,
+/// with no ref.
+#[test]
+fn a_chain_applies_with_the_deepest_delta_first() {
+    let tmp = TmpDir::new("apply-deps-chain");
+    block_on(async {
+        let src = fresh_archive(tmp.path(), "src").await;
+        let chain = common::write_chain(&src, tmp.path(), "rootfs").await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        for commit in [chain.d, chain.c, chain.r] {
+            let delta = scratch_delta(&src, &commit).await;
+            assert_eq!(
+                dst.apply_static_delta_offline(&delta).await.unwrap(),
+                commit
+            );
+        }
+        for commit in [chain.r, chain.c, chain.d] {
+            assert!(dst.has_object(ObjectType::Commit, &commit).await.unwrap());
+        }
+        assert_eq!(dst.list_refs(None).await.unwrap(), []);
+        assert_eq!(partial_markers(&dst), Vec::<String>::new());
+    });
+}
+
+/// A level of the chain R -> C -> D whose attachment is absent is refused,
+/// and the apply writes no object: C before D, and R before C.
+#[test]
+fn a_chain_level_with_an_absent_attachment_writes_no_object() {
+    let tmp = TmpDir::new("apply-deps-chain-absent");
+    block_on(async {
+        let src = fresh_archive(tmp.path(), "src").await;
+        let chain = common::write_chain(&src, tmp.path(), "rootfs").await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        let absent = "which is in neither the repository nor the transaction";
+        assert_eq!(
+            refused_apply(&dst, &scratch_delta(&src, &chain.c).await).await,
             (
-                Some(target),
-                att_reason(&nested, "which has attachments of its own")
+                Some(chain.c),
+                format!(
+                    "attachment {} names commit {}, {absent}",
+                    common::CHAIN_D,
+                    chain.d
+                )
+            )
+        );
+        dst.apply_static_delta_offline(&scratch_delta(&src, &chain.d).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused_apply(&dst, &scratch_delta(&src, &chain.r).await).await,
+            (
+                Some(chain.r),
+                format!(
+                    "attachment {} names commit {}, {absent}",
+                    common::CHAIN_C,
+                    chain.c
+                )
             )
         );
     });

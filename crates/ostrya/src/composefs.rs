@@ -1045,8 +1045,8 @@ impl Repo {
     /// rules of [`write_commit`](Transaction::write_commit): each entry has a
     /// name that is not empty and a checksum of 32 bytes, the entries are
     /// sorted by name in byte order with no name two times, and each
-    /// attachment is complete in the repository or in `txn` and has no
-    /// attachment of its own.
+    /// attachment is complete in the repository or in `txn`. The check reads
+    /// no attachment of an attachment.
     ///
     /// The image depends on the tree of the commit alone, so the metadata of
     /// the commit and the repository mode do not change the digest.
@@ -1070,8 +1070,7 @@ impl Repo {
     ///   `ostree.composefs.digest.v0`.
     /// - [`Error::InvalidRelations`] with `commit` if field 2 of `commit` is
     ///   defective, if its entries are not sorted or have a name two times,
-    ///   or if an attachment is absent, partial, or has an attachment of its
-    ///   own.
+    ///   or if an attachment is absent or partial.
     /// - [`Error::Core`] if the commit tuple of an attachment does not frame,
     ///   or if its field 2 does not decode.
     /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,

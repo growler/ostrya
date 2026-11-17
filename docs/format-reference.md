@@ -124,10 +124,11 @@ and `log` does not read them.
    `<class>/<name>`, for example `container/fe` or `boot/uki`. The `ostree`
    command writes an empty array. The port writes the entries sorted by name
    in byte order, with no name two times, so one set of entries gives one
-   commit checksum. An attachment names no attachment of its own. The commit
-   write of the port refuses an attachment whose field 2 is not empty, and an
-   attachment that the repository or the writing transaction does not hold
-   complete. An attachment can have a parent.
+   commit checksum. The commit write of the port accepts an attachment that
+   has attachments of its own. It refuses an attachment that the repository
+   or the writing transaction does not hold complete. The check is shallow:
+   it reads no attachment of an attachment. An attachment can have a
+   parent.
 3. `s` subject (empty string if none).
 4. `s` body (empty string if none).
 5. `t` timestamp, seconds since Unix epoch UTC, big-endian.
@@ -2223,11 +2224,12 @@ the commits that it moves, as for a target ("Static deltas of attachments").
 
 An offline application of the port reads field 2 of the target commit before
 it writes an object. It refuses the delta if an entry of the field is
-defective, or if an attachment is not complete in the repository or is nested.
-The refusal writes no object. The check also runs if the repository holds the
-target. It accepts entries that are not sorted by name and two entries with
-one name. Offline media thus carry one delta for each attachment, and the
-deltas of the attachments apply first.
+defective, or if an attachment is not complete in the repository. The check is
+shallow: it reads no attachment of an attachment. The refusal writes no
+object. The check also runs if the repository holds the target. It accepts
+entries that are not sorted by name and two entries with one name. Offline
+media thus carry one delta for each attachment, and the deltas of the deepest
+attachments apply first.
 
 ### Fallback selection
 
@@ -3571,11 +3573,13 @@ own field 2 is not empty.
 
 ### Attachments
 
-An attachment names no attachment: the relation is one level deep. The commit
-write of the port sorts the entries by name in byte order. It refuses two
-entries with one name, an attachment that the repository or the writing
-transaction does not hold, an attachment that is partial, and an attachment
-whose own field 2 is not empty. An attachment can have a parent and supplements.
+Field 2 cannot make a cycle, because the commit checksum covers field 2. Two
+commits can name one attachment. The commit write of the port sorts the
+entries by name in byte order. It accepts an attachment that has attachments
+of its own. It refuses two entries with one name, an attachment that the
+repository or the writing transaction does not hold, and an attachment that
+is partial. The check is shallow: it reads no attachment of an attachment. An
+attachment can have a parent and supplements.
 
 ### Supplements
 

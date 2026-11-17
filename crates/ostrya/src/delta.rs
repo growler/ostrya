@@ -364,13 +364,16 @@ impl Repo {
     /// # Attachments
     ///
     /// Each attachment of the target, which field 2 of the target commit
-    /// names, must be complete in the repository, and must have no
-    /// attachments of its own. The call checks this before it writes an
-    /// object. The check runs also if the repository holds the target. A delta
-    /// carries its target alone, so offline media carry one delta for each
-    /// attachment. Apply the deltas of the attachments first. The check
-    /// accepts entries that are not sorted by name and two entries with the
-    /// same name.
+    /// names, must be complete in the repository. The call checks this before
+    /// it writes an object. The check runs also if the repository holds the
+    /// target. The check is shallow: it reads no attachment of an attachment.
+    /// The check accepts entries that are not sorted by name and two entries
+    /// with the same name.
+    ///
+    /// A delta carries its target alone, so offline media carry one delta for
+    /// each attachment. Apply the deltas of the deepest attachments first. For
+    /// example, if R names C and C names D, apply the delta of D, then of C,
+    /// then of R.
     ///
     /// # Verification
     ///
@@ -436,8 +439,7 @@ impl Repo {
     ///   source object that a part reads, is not in the repository.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of the target commit
     ///   has an empty name or a checksum that is not 32 bytes, or if an
-    ///   attachment is absent, partial, or has attachments of its own. The
-    ///   call writes no object.
+    ///   attachment is absent or partial. The call writes no object.
     /// - [`Error::InvalidFormat`] if a part breaks the format:
     ///   - an inline part that is not a `(yay)` variant
     ///   - a part that passes its declared size or fails its checksum
@@ -511,9 +513,8 @@ impl Repo {
         let attachments = attachments?;
 
         let txn = self.transaction().await?;
-        // Each attachment must be complete and must have no attachments of
-        // its own. The check runs before the first write, so a refusal writes
-        // no object.
+        // Each attachment must be complete. The check runs before the first
+        // write, so a refusal writes no object.
         related::check_attachments(&txn, Some(sb.to), &attachments).await?;
         drop(attachments);
         let staging = txn.staging_dir().clone();

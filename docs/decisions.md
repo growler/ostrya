@@ -664,9 +664,6 @@ depends on the tree alone.
 
 Rejected alternatives:
 
-- An image commit that the commit names by `root/composefs` in field 2. A
-  commit that is an attachment then cannot carry an image, because an
-  attachment names no attachment.
 - An image commit that the commit names by `root/composefs` in
   `ostrya.related`. No transfer follows a supplement,
   `keep-detached-related=false` drops the entry, and the prune of a bucket
@@ -3173,12 +3170,21 @@ the rules.
   "build source", "build input", "input", and "lineage". "annotation" was
   rejected because the word suggests plain text. "note" was rejected
   because the docs use the word in other senses.
-- An attachment names no attachment. The commit write and the composefs
-  rewrite refuse a nested attachment with `Error::InvalidRelations`. An
-  attachment can have a parent and supplements. A UKI, a kernel, an
-  initrd, or a container needs no attachment of its own. With one level,
-  field 2 cannot make a cycle, and a check reads one commit and the commits
-  that it names.
+- A write accepts an attachment that has attachments of its own. The
+  writes are the commit write, `Transaction::check_attachments`, the
+  composefs rewrite, and the apply and the offline apply of a static delta.
+  The check of these writes is shallow. Each attachment must be complete:
+  the transaction stages it, or the repository holds it with no partial
+  marker. The write reads no attachment of an attachment. Each write checks
+  the level below it, so the full set of attachments of a complete commit
+  is complete. The check accepts an attachment whose own field 2 holds a
+  defective entry. It refuses an attachment whose field 2 does not decode.
+  Field 2 cannot make a cycle at any depth, because the commit checksum
+  covers field 2. Two commits can name one attachment. The depth has no
+  limit. An attachment can also have a parent and supplements. A rule of
+  one level, in which an attachment names no attachment, was rejected. It
+  blocks the expected use Rootfs -> Container -> Container Details. It also
+  gives no protection against a cycle, because none can occur.
 - The commit write of `ostrya commit` checks each attachment one time.
   `Transaction::check_attachments` checks the attachments before the command
   reads the tree, and gives a `CheckedAttachments` that borrows the transaction.

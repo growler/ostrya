@@ -15617,6 +15617,44 @@ fn commit_related_writes_sorted_attachments() {
     }
 }
 
+/// `commit --related` accepts an attachment that has an attachment of its
+/// own, and writes field 2 of each level.
+#[test]
+fn commit_related_accepts_a_nested_attachment() {
+    let tmp = TmpDir::new("commit-related-nested");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let details = commit_main_run(&repo, &ex_ostrya_tree(base, "details"), &[])
+        .ok()
+        .stdout_trimmed();
+    let container = commit_main_run(
+        &repo,
+        &ex_ostrya_tree(base, "container"),
+        &[&format!("--related=details/fe={details}")],
+    )
+    .ok()
+    .stdout_trimmed();
+    let rootfs = commit_main_run(
+        &repo,
+        &ex_ostrya_tree(base, "rootfs"),
+        &[&format!("--related=container/fe={container}")],
+    )
+    .ok()
+    .stdout_trimmed();
+    let repo_arg = format!("--repo={}", repo.display());
+    for (commit, expected) in [
+        (&rootfs, format!("container/fe {container}\n")),
+        (&container, format!("details/fe {details}\n")),
+    ] {
+        let run = ostrya(&[&repo_arg, "show", "--print-related", commit], None, &[]);
+        assert_eq!(
+            String::from_utf8(run.ok().stdout.clone()).unwrap(),
+            expected,
+            "field 2 of {commit}"
+        );
+    }
+}
+
 /// `commit --related` refuses an argument with no `=` and a checksum that is
 /// not 64 lowercase hexadecimal characters. It also refuses an empty name and
 /// an attachment that the repository does not hold, before it reads the tree.

@@ -23,7 +23,9 @@
 //!   [`Repo::pull_local`] imports the attachments of each commit that it
 //!   walks.
 //! - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` send
-//!   the attachments of each commit that they offer.
+//!   the full set of attachments of each commit that they offer.
+//!   `Repo::export_stream` sends the full set of attachments of each new
+//!   commit of the stream.
 //! - `Repo::receive`, `Repo::receive_stream`, and
 //!   `Repo::receive_stream_to_commit` check the attachments of each commit
 //!   that the session stages. They check no signature of an attachment and add
@@ -707,7 +709,11 @@ pub(crate) enum HeldAttachment<T = ()> {
     /// repository does not mark it partial.
     /// `nested` is `true` if the field 2 of the commit is not empty. `value`
     /// is the value that the caller reads from the commit object.
-    Complete { nested: bool, value: T },
+    Complete {
+        #[allow(dead_code)]
+        nested: bool,
+        value: T,
+    },
 }
 
 /// Returns the state of the attachment `checksum` in `repo` or in the

@@ -647,8 +647,10 @@ enum Command {
     /// server makes a new commit over it on the branch BRANCH. The server
     /// picks the parent, writes the bindings, and signs the commit.
     ///
-    /// The push also sends the attachments that field 2 of each pushed commit
-    /// names, each with no parent and no ref, unless it takes --onto.
+    /// The push also sends the full set of attachments of each pushed
+    /// commit: each attachment that field 2 of the commit names, and each
+    /// attachment of such an attachment, at each depth. It sends each with no
+    /// parent and no ref, unless it takes --onto.
     ///
     /// With no refspec, the command reads the key `push-branches` of the
     /// section of REMOTE, a list of ref patterns. It lists each local ref and
@@ -4455,10 +4457,12 @@ struct SendArgs {
     /// stream.
     ///
     /// The stream carries each commit, the objects of its tree, and its
-    /// detached metadata. It also carries each attachment that field 2 of a
-    /// commit names, with no ref update. It ends with a `Commit` frame that
-    /// holds one ref update for each refspec. The stream carries no parent
-    /// commit. The command does no negotiation, so it sends each object.
+    /// detached metadata. It also carries the full set of attachments of each
+    /// commit, with no ref update: each attachment that field 2 of the commit
+    /// names, and each attachment of such an attachment, at each depth. It
+    /// ends with a `Commit` frame that holds one ref update for each refspec.
+    /// The stream carries no parent commit. The command does no negotiation,
+    /// so it sends each object.
     ///
     /// Each update expects any state of the ref, so the receiver applies its
     /// own rules. A failure before the first byte writes nothing to standard

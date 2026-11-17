@@ -3386,25 +3386,40 @@ the rules.
   come after the search, so the heap then holds the commits of all the
   attachments.
 - A push (`Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`)
-  sends the attachments of each commit that it offers, at depth 0 and with
-  no ref. It refuses an absent or a partial attachment, a defective field 2
-  entry, and a nested attachment before the first upload. With a depth, the
-  push resolves each attachment before it writes a byte. With no depth, the
+  sends the full set of attachments of each commit that it offers, at depth
+  0 and with no ref, at each level. The push reads field 2 of each
+  attachment that it reads, and takes the attachments that this field
+  names. It continues one level at a time, until a level has no new
+  attachment. It reads the commit objects alone, and no tree, and it reads
+  each commit one time, also if two commits name it. The push reads the
+  full set from the local repository before the negotiation of the commits.
+  The one commit `Have` offers the full set, and the push walks the trees
+  of the commits that the server lacks alone. An attachment in the full set
+  that the local repository does not hold or marks partial refuses the
+  push, also below an attachment that the server holds. The error names the
+  commit that first names the attachment. By the write rule above, this
+  occurs in a damaged repository alone. A defective entry of field 2 of an
+  attachment refuses the push, and the error names that attachment. The
+  push finds each refusal before the first upload. With a depth, the push
+  resolves each attachment before it writes a byte. With no depth, the
   history of the offer ends at the server tip, which the push knows only
   after `HelloReply`, or under the writer lock of a bucket. So the push
   resolves the attachments of the source commits first, and the
   attachments of the offered history commits after the cut. It checks the
   format of field 2 of each commit of its walk, from the bytes that it
-  already read. Two alternatives were rejected. To leave each check to the
+  already read. One `Have` for each level was rejected. It reads field 2 of
+  the commits that the server lacks alone, and the protocol allows it, but
+  it adds one round trip for each level. It also makes a second path next
+  to the export, which has no negotiation and must read the full set. Two
+  more alternatives were rejected. To leave each check to the
   receiver was rejected: a push to a bucket repository has no receiver, and
   the client can refuse before it sends an object. To resolve the
   attachments of the whole local history with no depth was rejected: the
-  push reads the commit objects of attachments that it does not send, and
-  an attachment of old history that the server holds, which the local
-  repository no longer holds, refuses the push. The one-way export
-  (`Repo::export_stream`) sends the attachments of each new commit by the
-  same rules. It does no negotiation, so it sends an attachment that the
-  receiver holds, and it finds each refusal before it writes the first byte.
+  push then reads the attachments of commits that it does not send. The
+  one-way export (`Repo::export_stream`) sends the full set of attachments
+  of each new commit by the same rules, and reads it on the same path. It
+  does no negotiation, so it sends an attachment that the receiver holds,
+  and it finds each refusal before it writes the first byte.
   A receiver that holds an attachment with a partial-commit marker refuses
   the stream, also though the stream carries the whole tree of the
   attachment. The sender completes such an attachment with an update that

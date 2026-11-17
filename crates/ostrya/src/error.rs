@@ -577,15 +577,15 @@ pub enum Error {
     ///   complete and no longer holds complete when the transaction opens.
     ///   `commit` is the commit that holds the entry. For an attachment, it
     ///   is the commit that first names the attachment.
-    /// - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`,
-    ///   for an entry of field 2 with an empty name or with a checksum that is
-    ///   not 32 bytes, in a commit of the walk of the push: a source commit or
-    ///   a commit of the parent chain that the push walks. Also for an
-    ///   attachment that the local repository marks partial or that is
-    ///   nested. An attachment whose own field 2 holds a defective entry is
-    ///   nested. `commit` is the commit that holds the entry. For a partial or
-    ///   a nested attachment, it is the commit that first names the
-    ///   attachment.
+    /// - `Repo::push`, `Repo::push_over_stream`, `Repo::push_to_bucket`, and
+    ///   `Repo::export_stream`, for an entry of field 2 with an empty name or
+    ///   with a checksum that is not 32 bytes, in a commit that the push or
+    ///   the export reads: a source commit, a commit of the parent chain that
+    ///   the push walks, a new commit of the export, or an attachment at each
+    ///   level. Also for an attachment, at each level, that the local
+    ///   repository does not hold or marks partial. `commit` is the commit
+    ///   that holds the entry. For an absent or a partial attachment, it is
+    ///   the commit that first names the attachment.
     /// - [`Repo::apply_static_delta`](crate::Repo::apply_static_delta) and
     ///   [`Repo::apply_static_delta_offline`](crate::Repo::apply_static_delta_offline),
     ///   for an entry of field 2 of the target commit with an empty name or

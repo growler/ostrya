@@ -284,13 +284,14 @@ impl Repo {
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
     ///    repository does not hold, or marks partial, is no ancestor.
     /// 4. It walks the commits to offer: each source commit, its history, and
-    ///    the attachments of each offered commit, as
+    ///    the full set of attachments of the offered commits, as
     ///    [`Repo::push_over_stream`] offers them, with the tip of the ref in
     ///    the bucket in the role of the server tip. With no depth, it checks
-    ///    the attachments of the offered history here, as "Attachments" of
-    ///    [`Repo::push_over_stream`] states. It walks the tree of
-    ///    each offered commit that the listing lacks, and of each offered
-    ///    commit with a partial-commit marker `state/<checksum>.commitpartial`.
+    ///    the full set of attachments of the offered history here, as
+    ///    "Attachments" of [`Repo::push_over_stream`] states. It walks the
+    ///    tree of each offered commit that the listing lacks, and of each
+    ///    offered commit with a partial-commit marker
+    ///    `state/<checksum>.commitpartial`.
     ///    It walks no tree of another commit that the listing holds: each
     ///    writer uploads a commit object after its tree, so a commit object in
     ///    the bucket has its whole tree in the bucket, or a marker that
@@ -384,10 +385,11 @@ impl Repo {
     ///   push then sends no request.
     /// - The errors of the checks and of the commit walk of
     ///   [`Repo::push_over_stream`], before a request.
-    /// - With no depth, [`Error::InvalidRelations`] or [`Error::ObjectNotFound`]
-    ///   for an attachment of a history commit after the cut at the tip of the
-    ///   ref in the bucket, as "Attachments" of [`Repo::push_over_stream`]
-    ///   states. The push then uploads nothing and releases the lock.
+    /// - With no depth, [`Error::InvalidRelations`] for an attachment in the
+    ///   full set of attachments of a history commit after the cut at the tip
+    ///   of the ref in the bucket, as "Attachments" of
+    ///   [`Repo::push_over_stream`] states. The push then uploads nothing and
+    ///   releases the lock.
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
@@ -712,21 +714,14 @@ impl Repo {
             }
         }
         drop(chains);
-        // Then the attachments of each offered commit, each once. With no
-        // depth, the push resolves the attachments of the offered history
-        // here, before the first upload.
+        // Then the full set of attachments of the offered commits, each
+        // once. With no depth, the push resolves the attachments of the
+        // offered history here, before the first upload.
         if opts.depth.is_none() {
             plan.commits.check_attachments(self, &offered).await?;
         }
-        let resolved = offered.len();
-        for at in 0..resolved {
-            let commit = offered[at];
-            for attachment in plan.commits.attachments_of(&commit) {
-                if seen.insert(attachment) {
-                    offered.push(attachment);
-                }
-            }
-        }
+        let attachments = plan.commits.full_set(&offered, &mut seen);
+        offered.extend(attachments);
         let missing_commits: Vec<Checksum> = offered
             .iter()
             .filter(|commit| !holds(commit, ObjectType::Commit))

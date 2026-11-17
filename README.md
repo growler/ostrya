@@ -82,10 +82,11 @@ Ostrya adds these functions, which the `ostree` command does not have:
   keeps the related commits of each kept commit, and gives a warning for a
   defective value. `ostrya remote prune` of a bucket repository keeps the
   attachments and reads no supplement. A pull from a remote, a local
-  pull, a push, and a one-way stream copy the attachments of each commit
-  that they move, with no ref. A pull looks for a static delta of each
-  attachment. `ostrya fsck` and `ostrya remote fsck` report each attachment
-  that is absent, partial, or defective. With
+  pull, a push, and a one-way stream copy the full set of attachments of
+  each commit that they move, with no ref: the attachments of the commit,
+  and the attachments of each attachment, at each depth. A pull looks for a
+  static delta of each attachment. `ostrya fsck` and `ostrya remote fsck`
+  report each attachment that is absent, partial, or defective. With
   `[ex-ostrya] keep-detached-related=false`, a transfer into the repository
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage

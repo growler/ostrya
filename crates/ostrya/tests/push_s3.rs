@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use common::modes::{build_tree, object_path, repo_of};
 use common::s3::{Rclone, Seaweed, StandIn, endpoint, rclone_available, seaweed_available};
-use common::{TmpDir, attachment_error, mark_partial, store_with_field2};
+use common::{CHAIN_D, TmpDir, attachment_error, mark_partial, store_with_field2, write_chain};
 use ostrya::bucket::{BucketPushOutcome, BucketRepo};
 use ostrya::remote::s3::S3Endpoint;
 use ostrya::remote::{
@@ -998,6 +998,30 @@ fn a_push_uploads_the_attachment_of_the_commit() {
     });
 }
 
+/// A push of R uploads the full set of its attachments: C, which R names,
+/// and D, which C names, each with its whole tree. It writes the ref file of
+/// the refspec alone.
+#[test]
+fn a_push_uploads_the_full_set_of_attachments() {
+    let scratch = TmpDir::new("push-s3-attachment-chain");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let chain = write_chain(&repo, &scratch.path().join("chain"), "main").await;
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+
+        for commit in [chain.r, chain.c, chain.d] {
+            assert!(holds_commit(&server, &commit), "{commit}");
+        }
+        assert_trees_whole(&server);
+        assert_eq!(keys(&server, "repo/refs/"), ["repo/refs/heads/main"]);
+    });
+}
+
 /// A push with a depth uploads the attachments of each parent that it
 /// uploads. At depth 0 it uploads no parent, so it uploads the attachment of
 /// the source commit alone.
@@ -1108,8 +1132,9 @@ fn an_attachment_with_a_marker_in_the_bucket_gets_its_tree() {
 }
 
 /// An absent attachment, an attachment that the local repository marks
-/// partial, a defective field 2 entry, and a nested attachment are each
-/// refused before the push sends a request.
+/// partial, a defective field 2 entry, and a partial and an absent
+/// attachment below the first level are each refused before the push sends
+/// a request.
 #[test]
 fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
     let scratch = TmpDir::new("push-s3-dependency-refused");
@@ -1133,19 +1158,35 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
             )
         );
 
-        // A nested attachment.
-        let other = commit(&repo, "other", None, "other", None).await;
-        let nested = store_with_field2(&repo, &other, &[("lib/c", att.as_bytes())]).await;
-        let head = store_with_field2(&repo, &tip, &[("lib/b", nested.as_bytes())]).await;
-        move_ref(&repo, "main", &head).await;
-        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+        // A partial attachment below the first level, then an absent one.
+        let chain = write_chain(&repo, &scratch.path().join("chain"), "chain").await;
+        mark_partial(&repo, &chain.d);
+        let err = push(&repo, &server.endpoint(), opts(&["chain"]))
             .await
             .unwrap_err();
         assert_eq!(
             attachment_error(err),
             (
-                Some(head),
-                format!("attachment lib/b names commit {nested}, which has attachments of its own")
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which is partial",
+                    chain.d
+                )
+            )
+        );
+        std::fs::remove_file(repo.path().join(format!("state/{}.commitpartial", chain.d))).unwrap();
+        remove_commit_object(&repo, &chain.d);
+        let err = push(&repo, &server.endpoint(), opts(&["chain"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which the repository does not hold",
+                    chain.d
+                )
             )
         );
 
@@ -1166,21 +1207,80 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
         let err = push(&repo, &server.endpoint(), opts(&["main"]))
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == att
-            ),
-            "{err:?}"
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(tip),
+                format!(
+                    "attachment boot/uki names commit {att}, which the repository does not hold"
+                )
+            )
         );
 
         assert!(server.state().requests.is_empty());
     });
 }
 
-/// With a depth, the push resolves the attachments of each history commit
-/// before it sends a request. A nested, a partial, and an absent attachment
-/// that the parent of the source commit alone names are each refused.
+/// An attachment whose own field 2 holds a defective entry refuses the push
+/// before it sends a request. The error names the attachment.
+#[test]
+fn an_attachment_with_a_defective_field_2_is_refused_before_a_request() {
+    let scratch = TmpDir::new("push-s3-attachment-defective-nested");
+    block_on(async {
+        let server = StandIn::start();
+        let repo = archive(&scratch.path().join("src")).await;
+        let base = commit(&repo, "dep/base", None, "base", None).await;
+        let defective = store_with_field2(&repo, &base, &[("", base.as_bytes())]).await;
+        commit_related(&repo, "main", None, "r", None, &[("lib/x", defective)]).await;
+
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            attachment_error(err),
+            (Some(defective), "entry 0 has an empty name".to_owned())
+        );
+        assert!(server.state().requests.is_empty());
+    });
+}
+
+/// The bucket holds C and D. A push of R walks the tree of R alone, so it
+/// passes with no root dirtree of D in the local repository. The bucket then
+/// holds R with its whole tree.
+#[test]
+fn a_push_walks_no_tree_below_an_attachment_the_bucket_holds() {
+    let scratch = TmpDir::new("push-s3-attachment-chain-held");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let chain = write_chain(&repo, &scratch.path().join("chain"), "main").await;
+        move_ref(&repo, "c", &chain.c).await;
+        push(&repo, &server.endpoint(), opts(&["c"])).await.unwrap();
+        assert!(holds_commit(&server, &chain.d));
+        assert!(!holds_commit(&server, &chain.r));
+        // With no root dirtree in the local repository, a walk of the tree
+        // of D fails.
+        let stored =
+            std::fs::read(repo.path().join(object_path(ObjectType::Commit, &chain.d))).unwrap();
+        let root = Commit::parse(&stored).unwrap().root_dirtree;
+        std::fs::remove_file(repo.path().join(object_path(ObjectType::DirTree, &root))).unwrap();
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+
+        assert!(holds_commit(&server, &chain.r));
+        assert_trees_whole(&server);
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(chain.r));
+    });
+}
+
+/// With a depth, the push resolves the full set of attachments of each
+/// history commit before it sends a request. A partial attachment below an
+/// attachment of the parent of the source commit, and a partial and an
+/// absent attachment that the parent alone names, are each refused.
 #[test]
 fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() {
     let scratch = TmpDir::new("push-s3-dependency-history");
@@ -1192,12 +1292,10 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
             ..opts(&["main"])
         };
 
-        // The parent names a commit that names an attachment of its own.
-        let att = commit(&repo, "dep/uki", None, "uki", None).await;
-        let other = commit(&repo, "other", None, "other", None).await;
-        let nested = store_with_field2(&repo, &other, &[("lib/c", att.as_bytes())]).await;
-        let plain = commit(&repo, "main", None, "p", None).await;
-        let parent = store_with_field2(&repo, &plain, &[("lib/b", nested.as_bytes())]).await;
+        // The parent names C of a chain, and D, which C names, is partial.
+        let chain = write_chain(&repo, &scratch.path().join("chain"), "chain").await;
+        mark_partial(&repo, &chain.d);
+        let parent = commit_related(&repo, "main", None, "p", None, &[("lib/c", chain.c)]).await;
         commit(&repo, "main", Some(parent), "t", None).await;
         let err = push(&repo, &server.endpoint(), depth_one())
             .await
@@ -1205,12 +1303,16 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
         assert_eq!(
             attachment_error(err),
             (
-                Some(parent),
-                format!("attachment lib/b names commit {nested}, which has attachments of its own")
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which is partial",
+                    chain.d
+                )
             )
         );
 
         // The parent names a partial attachment, then an absent one.
+        let att = commit(&repo, "dep/uki", None, "uki", None).await;
         let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", att)]).await;
         commit(&repo, "main", Some(parent), "t", None).await;
         mark_partial(&repo, &att);
@@ -1228,12 +1330,14 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
         let err = push(&repo, &server.endpoint(), depth_one())
             .await
             .unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == att
-            ),
-            "{err:?}"
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(parent),
+                format!(
+                    "attachment boot/uki names commit {att}, which the repository does not hold"
+                )
+            )
         );
 
         assert!(server.state().requests.is_empty());
@@ -1266,12 +1370,14 @@ fn with_no_depth_an_attachment_of_the_offered_history_is_refused_before_an_uploa
             .await
             .unwrap_err();
 
-        assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == att
-            ),
-            "{err:?}"
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(c2),
+                format!(
+                    "attachment boot/uki names commit {att}, which the repository does not hold"
+                )
+            )
         );
         assert_eq!(keys(&server, "repo/objects/"), objects);
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(c1));

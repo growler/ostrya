@@ -6081,20 +6081,22 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   source commit alone. `--depth=-1` sends the whole local chain. A value
   below `-1` is refused before the ssh client starts and before the first
   HTTP request.
-- The push also sends the attachments that field 2 of each offered commit
-  names, each at depth 0 and with no ref (`../format-reference.md`,
-  "Attachments in a push"). It sends no supplement. It refuses at exit 1
-  a field 2 entry with an empty name or with a checksum that is not 32
-  bytes, in a source commit and in each parent that the push walks: `N`
-  parents with `--depth=N`, and the whole local chain with `--depth=-1` or
-  without `--depth`. It also refuses an attachment that the local repository
-  does not hold or marks partial, and an attachment whose own field 2 is not
-  empty, also if that field 2 holds a defective entry. Each of these
-  refusals comes before the ssh client starts, before the first HTTP
-  request, and before the first request to a bucket. Without `--depth`, the
-  push checks the attachments of the history commits after the server
-  reports its refs, or under the writer lock of a bucket. A refusal there
-  comes before the push sends an object.
+- The push also sends the full set of attachments of each offered commit:
+  each attachment that field 2 of the commit names, and each attachment
+  that field 2 of such an attachment names, at each depth. It sends each at
+  depth 0 and with no ref (`../format-reference.md`, "Attachments in a
+  push"). It sends no supplement. It refuses at exit 1 a field 2 entry with
+  an empty name or with a checksum that is not 32 bytes, in a source
+  commit, in each attachment of the full set, and in each parent that the
+  push walks: `N` parents with `--depth=N`, and the whole local chain with
+  `--depth=-1` or without `--depth`. It also refuses an attachment of the
+  full set that the local repository does not hold or marks partial, also
+  below an attachment that the server holds. Each of these refusals comes
+  before the ssh client starts, before the first HTTP request, and before
+  the first request to a bucket. Without `--depth`, the push checks the
+  attachments of the history commits after the server reports its refs, or
+  under the writer lock of a bucket. A refusal there comes before the push
+  sends an object.
 - `--force` sends each update with any expected state, and asks the server
   to allow an update that is not a fast-forward. The server refuses such an
   update unless the client group of the push has `w` and `d` on the ref
@@ -7001,9 +7003,10 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
 - Each update of the `Commit` frame expects any state of its ref, so the
   receiver applies its own rules to the state of the ref. The stream
   carries each commit of a refspec, the objects of its tree, its detached
-  metadata, and each attachment that field 2 names with no ref update. It
-  carries no parent commit. The command does no negotiation, so it sends
-  each object.
+  metadata, and the full set of its attachments with no ref update: each
+  attachment that field 2 names, and each attachment of such an
+  attachment, at each depth. It carries no parent commit. The command does
+  no negotiation, so it sends each object.
 - The command holds the repository lock as shared while it writes the
   stream. Standard output carries the stream alone. A failure before the
   first byte writes nothing to standard output. A failure after the first

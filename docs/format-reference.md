@@ -3567,9 +3567,7 @@ empty name and checks nothing else in the name.
 
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
-checksum that is not 32 bytes. For a push and a one-way export, a field 2
-entry that names a nested attachment is defective too. A nested attachment
-is an attachment whose own field 2 is not empty.
+checksum that is not 32 bytes.
 
 ### Attachments
 
@@ -3992,15 +3990,24 @@ text at each level.
 
 ### Attachments in a push
 
-A push follows the attachments of each commit that it offers: each source
-commit and each history commit of the offer. These rules apply to a push over
+A push follows the full set of attachments of each commit that it offers:
+each source commit and each history commit of the offer. The full set is the
+attachments of the commit, the attachments of each attachment, and so on. The
+push reads field 2 of each attachment that it reads from the local
+repository, and takes the attachments that this field names, one level at a
+time, until a level has no new attachment. These rules apply to a push over
 ssh and over HTTP, to a push over the streams of the caller, and to a push to
 a bucket repository:
 
-- The push sends each attachment at depth 0, so an attachment entry adds no
-  parent to the push. The push offers an attachment one time, also if several
-  commits name it. A prune of the server accepts the parents that the push
-  did not send, as after a push with a small depth.
+- The push reads the commit objects of the full set alone, and no tree, and
+  it reads each commit one time, also if several commits name it. It reads
+  the full set before the negotiation of the commits, also below an
+  attachment that the server holds.
+- The push sends each attachment at depth 0, at each level, so an attachment
+  entry adds no parent to the push. The push offers an attachment one time,
+  also if several commits name it. The first `Have` offers the full set. A
+  prune of the server accepts the parents that the push did not send, as
+  after a push with a small depth.
 - The push writes no ref for an attachment.
 - The push makes no ref-binding check and no collection-binding check on an
   attachment.
@@ -4015,22 +4022,29 @@ a bucket repository:
 The push checks the format of field 2 of each commit of its walk: each source
 commit, and each parent that the depth takes, or each parent of the local
 chain with no depth. This is also true for a history commit that the push
-does not offer. A defective related value in field 2 refuses the push: an
-entry with an empty name, an entry with a checksum that is not 32 bytes, and
-an entry that names a nested attachment. An attachment whose own field 2 is
-not empty is nested, also if that field 2 holds a defective entry. An
-attachment that the local repository does not hold, or marks partial,
-refuses the push too. This is also true for a parent that ends a chain, if a
-commit of the push names it as an attachment.
+does not offer. It also checks the format of field 2 of each attachment of
+the full set. A defective related value in field 2 refuses the push: an
+entry with an empty name, and an entry with a checksum that is not 32 bytes.
+For a defective entry of an attachment, the error names the attachment. An
+attachment of the full set that the local repository does not hold, or
+marks partial, refuses the push too, also below an attachment that the
+server holds. This is also true for a parent that ends a chain, if a commit
+of the push names it as an attachment. The error names the commit that
+first names the attachment. Each write of a commit checks that its
+attachments are complete, so this refusal occurs in a damaged repository
+alone.
+`Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` give
+`Error::InvalidRelations` for each of these failures.
 
 With a depth, the push finds each of these failures before it writes a byte
-or sends a request. With no depth, the push finds the failures of the
-attachments of the history commits after the cut at the tip of the
+or sends a request. With no depth, the push finds the failures of the full
+set of attachments of the history commits after the cut at the tip of the
 destination ref: after `HelloReply` in a session, and under the writer lock
 of a bucket repository. The push then sends no object. A session ends with
 `Abort`, and a push to a bucket repository uploads nothing and releases the
 lock. The push reads no attachment of a history commit that it does not
-offer.
+offer, unless that commit is in the full set of attachments of an offered
+commit.
 
 `ostrya push --onto` and `ostrya push-tree` send no attachment. The field 2 of
 a server commit is empty ("Server commit").
@@ -4042,12 +4056,15 @@ and 9).
 
 ### Attachments in a one-way stream
 
-An ostrya sender of a one-way stream follows the attachments of each new
-commit of the stream: each commit that an update of `Commit` sets.
+An ostrya sender of a one-way stream follows the full set of attachments of
+each new commit of the stream: each commit that an update of `Commit` sets.
+The sender reads the full set as a push does ("Attachments in a push"): one
+level at a time, from the commit objects alone, and each commit one time.
 
-- The sender sends each attachment at depth 0, so an attachment entry adds no
-  parent to the stream. The stream carries an attachment one time, also if
-  several new commits name it, or if it is also a new commit.
+- The sender sends each attachment at depth 0, at each level, so an
+  attachment entry adds no parent to the stream. The stream carries an
+  attachment one time, also if several new commits name it, or if it is also
+  a new commit.
 - `Commit` holds no update for an attachment.
 - The sender makes no ref-binding check on an attachment.
 - For each attachment, the stream carries the commit object, the objects of its
@@ -4059,19 +4076,16 @@ commit of the stream: each commit that an update of `Commit` sets.
 - The sender does not follow a supplement. `ostrya.related` goes with the
   `.commitmeta` of its commit.
 
-The sender checks the format of field 2 of each new commit. A defective
-related value in field 2 refuses the export: an entry with an empty name, an
-entry with a checksum that is not 32 bytes, and an entry that names a nested
-attachment. An attachment whose own field 2 is not empty is nested, also if
-that field 2 holds a defective entry, and also if the attachment is a new
-commit. The format check of field 2 of each new commit runs first, so an
-attachment that is a new commit with a defective entry in its field 2 gives
-the failure of that entry. An attachment that the repository of the sender
-does not hold, or marks partial, refuses the export too. The sender finds
-each of these failures before it writes the first byte of the stream.
-`Repo::export_stream` then gives `Error::ObjectNotFound` for an attachment
-that the repository does not hold, and `Error::InvalidRelations` for each other
-failure.
+The sender checks the format of field 2 of each new commit and of each
+attachment of the full set. A defective related value in field 2 refuses the
+export: an entry with an empty name, and an entry with a checksum that is not
+32 bytes. For a defective entry of an attachment, the error names the
+attachment. An attachment of the full set that the repository of the sender
+does not hold, or marks partial, refuses the export too. The error names the
+commit that first names the attachment. The sender finds each of these
+failures before it writes the first byte of the stream.
+`Repo::export_stream` then gives `Error::InvalidRelations` for each of these
+failures.
 
 The server checks the attachments of the commits that it stages, as in a
 push session ("The one-way stream"). A server that holds an attachment with a
@@ -4562,8 +4576,8 @@ them:
 
 A push of a repository (`ostrya push`, `Repo::push`, and
 `Repo::push_over_stream`) offers its commits in the first `Have`: each source
-commit, its history, and then the attachments of each offered commit
-("Attachments in a push"). With no depth, the history ends before the
+commit, its history, and then the full set of attachments of the offered
+commits ("Attachments in a push"). With no depth, the history ends before the
 current commit of the ref in `HelloReply`. If the server does not hold the
 ref, or the local chain does not hold the commit of the ref, the push offers
 no history commit. The client then offers the objects of the trees of the
@@ -5213,8 +5227,8 @@ If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session
 with no change.
 
-An ostrya sender also sends the attachments of each new commit, with no
-ref update ("Attachments in a one-way stream").
+An ostrya sender also sends the full set of attachments of each new commit,
+with no ref update ("Attachments in a one-way stream").
 
 An ostrya sender checks the bindings of each update before it writes the
 first byte. It refuses a commit with no `ostree.collection-binding`, and a
@@ -8204,8 +8218,8 @@ are:
    is no ancestor. The fast-forward rule and the force apply to each ref in
    its own namespace.
 5. The walk: each source commit, its history, cut at the tip of the ref in the
-   bucket, and the attachments of each offered commit, as a push over a session
-   offers them ("Attachments in a push"). The trees of the commits that the
+   bucket, and the full set of attachments of the offered commits, as a push
+   over a session offers them ("Attachments in a push"). The trees of the commits that the
    bucket lacks and of the offered commits with a partial-commit marker under
    `state/`. The walk reads no tree of another commit that the listing holds,
    because a commit object in the bucket has its whole tree in the bucket. The

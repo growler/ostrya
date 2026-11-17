@@ -2816,12 +2816,15 @@ mod export {
 
         remove_commit_object(&repo, &att);
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
-        match error {
-            Error::ObjectNotFound { checksum, ty } => {
-                assert_eq!((checksum, ty), (att, ObjectType::Commit));
-            }
-            other => panic!("expected ObjectNotFound, got {other:?}"),
-        }
+        assert_eq!(
+            attachment_error(error),
+            (
+                Some(main),
+                format!(
+                    "attachment boot/uki names commit {att}, which the repository does not hold"
+                )
+            )
+        );
         assert_eq!(calls, 0);
     }
 
@@ -2874,43 +2877,92 @@ mod export {
         }
     }
 
-    /// An attachment that names attachments of its own refuses the export
-    /// before it writes a byte, also if the export takes that commit as a
-    /// second new commit. The error names the commit that names the nested
-    /// attachment.
-    #[test]
-    fn a_nested_attachment_writes_no_byte() {
-        let tmp = TmpDir::new("one-way-export-dependency-nested");
-        let repo = new_repo(&tmp, RepoMode::Archive, "");
-        let (main, att) = attachment_chain(&repo);
-        let (other, _) = commit_tree(&repo, None, b"other\n");
-        // `nested` names an attachment, and `head` names `nested`.
-        let nested = block_on(store_with_field2(
-            &repo,
-            &other,
-            &[("lib/c", att.as_bytes())],
-        ));
-        let head = block_on(store_with_field2(
-            &repo,
-            &main,
-            &[("lib/b", nested.as_bytes())],
-        ));
+    /// Returns the objects of the commits `commits` of `repo` at depth 0, each
+    /// once.
+    fn objects_of(repo: &Repo, commits: &[Checksum]) -> std::collections::HashSet<ObjectName> {
+        commits
+            .iter()
+            .flat_map(|commit| block_on(repo.traverse_commit(commit, 0)).unwrap())
+            .collect()
+    }
 
-        let reason =
-            format!("attachment lib/b names commit {nested}, which has attachments of its own");
+    /// An export of R sends the full set of its attachments: C, which R
+    /// names, and D, which C names. The receiver holds the three complete,
+    /// and writes the refs of the updates alone. An update of C as a second
+    /// new commit, before or after R, changes nothing: the stream carries each
+    /// commit one time.
+    #[test]
+    fn an_export_sends_the_full_set_of_attachments() {
+        let tmp = TmpDir::new("one-way-export-attachment-chain-source");
+        let (source, chain) = source_chain(&tmp);
+        let objects = objects_of(&source, &[chain.r, chain.c, chain.d]).len() as u64;
         for updates in [
-            &[("main", head)][..],
-            &[("main", head), ("other", nested)],
-            &[("other", nested), ("main", head)],
+            &[("main", chain.r)][..],
+            &[("main", chain.r), ("c", chain.c)],
+            &[("c", chain.c), ("main", chain.r)],
         ] {
-            let (error, calls) = refused(&repo, exporting(updates));
+            let target_tmp = TmpDir::new("one-way-export-attachment-chain");
+            let target = new_repo(&target_tmp, RepoMode::BareUser, "");
+            let (received, exported) =
+                export_piped(&source, &target, &export_policy(), exporting(updates));
+            received.unwrap_or_else(|e| panic!("{updates:?}: {e}"));
+            let stats = exported.unwrap();
+            assert_eq!(stats.objects_total, objects, "{updates:?}: {stats:?}");
+            for commit in [chain.r, chain.c, chain.d] {
+                assert_complete(&source, &target, &commit);
+            }
+            let mut expected: Vec<(String, Checksum)> = updates
+                .iter()
+                .map(|(name, commit)| ((*name).to_owned(), *commit))
+                .collect();
+            expected.sort();
             assert_eq!(
-                attachment_error(error),
-                (Some(head), reason.clone()),
+                block_on(target.list_refs(None)).unwrap(),
+                expected,
                 "{updates:?}"
             );
-            assert_eq!(calls, 0, "{updates:?}");
         }
+    }
+
+    /// In the diamond R -> A, B -> D, the stream carries D one time. D has a
+    /// `.commitmeta`, and the receiver refuses a second dict for one commit,
+    /// so the export passes only if it sends the dict of D one time.
+    #[test]
+    fn an_export_sends_an_attachment_of_two_attachments_once() {
+        let tmp = TmpDir::new("one-way-export-attachment-diamond-source");
+        let source = new_repo(&tmp, RepoMode::Archive, "");
+        let diamond = block_on(write_diamond(&source, tmp.path(), "main"));
+        block_on(source.write_commit_detached_metadata(&diamond.d, Some(&attachment_dict())))
+            .unwrap();
+
+        let target_tmp = TmpDir::new("one-way-export-attachment-diamond");
+        let target = new_repo(&target_tmp, RepoMode::BareUser, "");
+        let (received, exported) = export_piped(
+            &source,
+            &target,
+            &export_policy(),
+            exporting(&[("main", diamond.r)]),
+        );
+        received.unwrap();
+        let stats = exported.unwrap();
+
+        let all = [diamond.r, diamond.a, diamond.b, diamond.d];
+        assert_eq!(
+            stats.objects_total,
+            objects_of(&source, &all).len() as u64,
+            "{stats:?}"
+        );
+        for commit in all {
+            assert_complete(&source, &target, &commit);
+        }
+        assert_eq!(
+            block_on(target.read_commit_detached_metadata(&diamond.d)).unwrap(),
+            Some(attachment_dict())
+        );
+        assert_eq!(
+            block_on(target.list_refs(None)).unwrap(),
+            [("main".to_owned(), diamond.r)]
+        );
     }
 
     /// An export does not send a supplement: the commit that
@@ -3098,21 +3150,23 @@ mod export {
         let (main, att) = attachment_chain(&repo);
         remove_commit_object(&repo, &att);
         let (error, calls) = refused(&repo, exporting(&[("main", main)]));
-        match error {
-            Error::ObjectNotFound { checksum, ty } => {
-                assert_eq!((checksum, ty), (att, ObjectType::Commit));
-            }
-            other => panic!("expected ObjectNotFound, got {other:?}"),
-        }
+        assert_eq!(
+            attachment_error(error),
+            (
+                Some(main),
+                format!(
+                    "attachment boot/uki names commit {att}, which the repository does not hold"
+                )
+            )
+        );
         assert_eq!(calls, 0);
     }
 
-    /// An attachment whose own field 2 holds a defective entry is nested, and
-    /// refuses the export before it writes a byte. If the export also takes
-    /// that attachment as a new commit, the format check of field 2 of the
-    /// new commits refuses its defective entry first.
+    /// An attachment whose own field 2 holds a defective entry refuses the
+    /// export before it writes a byte, also if the export takes that
+    /// attachment as a second new commit. The error names the attachment.
     #[test]
-    fn an_attachment_with_a_defective_field_2_is_nested() {
+    fn an_attachment_with_a_defective_field_2_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-defective-nested");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
         let (main, att) = attachment_chain(&repo);
@@ -3124,20 +3178,9 @@ mod export {
             &[("lib/b", defective.as_bytes())],
         ));
 
-        let (error, calls) = refused(&repo, exporting(&[("main", head)]));
-        assert_eq!(
-            attachment_error(error),
-            (
-                Some(head),
-                format!(
-                    "attachment lib/b names commit {defective}, which has attachments of its own"
-                )
-            )
-        );
-        assert_eq!(calls, 0);
-
         for updates in [
-            &[("main", head), ("other", defective)][..],
+            &[("main", head)][..],
+            &[("main", head), ("other", defective)],
             &[("other", defective), ("main", head)],
         ] {
             let (error, calls) = refused(&repo, exporting(updates));

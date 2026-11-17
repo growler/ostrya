@@ -73,9 +73,9 @@ pub struct RepoPushOptions {
     /// The push refuses a value less than `-1`.
     ///
     /// A push sends each attachment at depth 0, whatever this value is. It
-    /// sends the attachments of each commit that it offers, the history
-    /// commits included. [`Repo::push_over_stream`] states the rules in
-    /// "Attachments".
+    /// sends the full set of attachments of each commit that it offers, the
+    /// history commits included. [`Repo::push_over_stream`] states the rules
+    /// in "Attachments".
     pub depth: Option<i32>,
     /// The collection id that each plain `DST` and each plain tag takes.
     ///
@@ -258,6 +258,11 @@ pub(super) fn link_of(commit: &Commit) -> CommitLink {
     }
 }
 
+/// The parts of the commit object of an attachment that
+/// [`Commits::check_attachments`] reads: the link of the commit, and the
+/// entries of its field 2 or the error of the first defective entry.
+type Loaded = (CommitLink, Result<Vec<(String, Checksum)>>);
+
 /// The commits that the walk of a push or the load of an export read, and
 /// the attachments that the push or the export resolved.
 #[derive(Default)]
@@ -309,10 +314,7 @@ impl Commits {
     /// The push and the export call it for a commit whose attachments they
     /// resolved. A commit with no entry in `fields` has an empty field 2 and
     /// gives none.
-    pub(super) fn attachments_of(
-        &self,
-        commit: &Checksum,
-    ) -> impl Iterator<Item = Checksum> + use<'_> {
+    fn attachments_of(&self, commit: &Checksum) -> impl Iterator<Item = Checksum> + use<'_> {
         self.fields
             .get(commit)
             .into_iter()
@@ -320,29 +322,75 @@ impl Commits {
             .map(|(_, attachment)| *attachment)
     }
 
-    /// Resolves the attachments of each commit of `commits`, in order, and
-    /// refuses an attachment that the push or the export cannot send.
+    /// Returns the full set of attachments of the commits `commits` that
+    /// `seen` does not hold, and adds each of them to `seen`.
+    ///
+    /// The result holds the attachments of the commits of `commits`, in order,
+    /// then the attachments of each attachment of the result, in the order of
+    /// the result. The push and the export call it for commits whose
+    /// attachments [`check_attachments`](Commits::check_attachments)
+    /// resolved.
+    pub(super) fn full_set<'a>(
+        &self,
+        commits: impl IntoIterator<Item = &'a Checksum>,
+        seen: &mut HashSet<Checksum>,
+    ) -> Vec<Checksum> {
+        let mut found = Vec::new();
+        let mut add = |commit: &Checksum, found: &mut Vec<Checksum>| {
+            for attachment in self.attachments_of(commit) {
+                if seen.insert(attachment) {
+                    found.push(attachment);
+                }
+            }
+        };
+        for commit in commits {
+            add(commit, &mut found);
+        }
+        let mut at = 0;
+        while let Some(commit) = found.get(at).copied() {
+            add(&commit, &mut found);
+            at += 1;
+        }
+        found
+    }
+
+    /// Resolves the full set of attachments of each commit of `commits`, in
+    /// order, and refuses an attachment that the push or the export cannot
+    /// send.
     ///
     /// The repository holds each commit of `commits`, and its field 2 passed
-    /// the format check. The call records each attachment with the commit and
-    /// the entry name that first named it, and skips an attachment that it
-    /// resolved before. An attachment that `local` holds needs no read. One
+    /// the format check. The call reads the attachments one level at a time.
+    /// The first level is each attachment that field 2 of a commit of
+    /// `commits` names. The next level is each attachment that field 2 of an
+    /// attachment of the level names. The call stops when a level has no new
+    /// attachment. It records each attachment with the commit and the entry
+    /// name that first named it, and skips an attachment that it resolved
+    /// before, also in an earlier call. So it reads each commit one time, also
+    /// if several commits name it. The call also reads below an attachment
+    /// that the destination holds, because it does not know the destination.
+    ///
+    /// An attachment that `local` holds needs no read. For each level, one
     /// trip to the blocking pool reads each other attachment: its partial
-    /// marker, then its commit object, if its field 2 is empty, and the link
-    /// of the commit. The call reads no commit object of an attachment with a
+    /// marker, then its commit object, the link of the commit, and its
+    /// field 2. The call reads no commit object of an attachment with a
     /// partial marker. No object bytes leave the pool. The call reads no
-    /// parent of an attachment. Each attachment that passes is [`Local::Held`]
-    /// in `local`, so the walk of the trees finds it.
+    /// parent and no tree of an attachment. Each attachment that passes is [`Local::Held`]
+    /// in `local`, so the walk of the trees finds it, and its field 2 is in
+    /// `fields`, so [`attachments_of`](Commits::attachments_of) gives its
+    /// attachments.
     ///
     /// # Errors
     ///
-    /// For the first refused attachment, in the order of naming:
+    /// For the first refused attachment, level by level, and in a level in
+    /// the order of naming, after the state check of the attachment and then
+    /// the check of its field 2:
     ///
-    /// - [`Error::ObjectNotFound`] if the repository does not hold the
-    ///   attachment.
-    /// - [`Error::InvalidRelations`] if the repository marks the attachment
-    ///   partial, or if the field 2 of the attachment is not empty. The error
-    ///   names the commit that first named the attachment.
+    /// - [`Error::InvalidRelations`] if the repository does not hold the
+    ///   attachment, or marks it partial. The error names the commit that
+    ///   first named the attachment.
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of the attachment
+    ///   has an empty name or a checksum that is not 32 bytes. The error
+    ///   names the attachment.
     /// - [`Error::Io`] or [`Error::Core`] if the read of an attachment with no
     ///   partial marker fails, or if the tuple frame, field 2, or the parent
     ///   or root checksums of its commit object do not decode. The call
@@ -355,74 +403,90 @@ impl Commits {
         repo: &Repo,
         commits: impl IntoIterator<Item = &'a Checksum>,
     ) -> Result<()> {
-        // Each new attachment, the commit that first named it, and the name of
-        // that entry.
-        let mut named: Vec<(Checksum, Checksum, &str)> = Vec::new();
-        for commit in commits {
-            let entries = match self.fields.get(commit) {
-                Some(Ok(entries)) => entries,
-                Some(Err(_)) => {
-                    unreachable!("the field 2 of a resolved commit passed the check")
-                }
-                None => continue,
-            };
-            for (name, attachment) in entries {
-                if self.known.insert(*attachment) {
-                    named.push((*attachment, *commit, name));
+        let mut level: Vec<Checksum> = commits.into_iter().copied().collect();
+        while !level.is_empty() {
+            // Each new attachment, the commit that first named it, and the
+            // name of that entry.
+            let mut named: Vec<(Checksum, Checksum, String)> = Vec::new();
+            for commit in &level {
+                let entries = match self.fields.get(commit) {
+                    Some(Ok(entries)) => entries,
+                    Some(Err(_)) => {
+                        unreachable!("the field 2 of a resolved commit passed the check")
+                    }
+                    None => continue,
+                };
+                for (name, attachment) in entries {
+                    if self.known.insert(*attachment) {
+                        named.push((*attachment, *commit, name.clone()));
+                    }
                 }
             }
-        }
-        let unread: Vec<Checksum> = named
-            .iter()
-            .map(|(attachment, _, _)| *attachment)
-            .filter(|attachment| !self.local.contains_key(attachment))
-            .collect();
-        let mut loaded: HashMap<_, Result<HeldAttachment<CommitLink>>> = if unread.is_empty() {
-            HashMap::new()
-        } else {
-            let repo = repo.clone();
-            ostrya_rt::unblock(move || {
-                unread
-                    .into_iter()
-                    .map(|key| {
-                        let state = related::held_attachment_blocking(&repo, None, &key, |b| {
-                            Ok(Commit::parse_link(b)?)
-                        });
-                        (key, state)
-                    })
-                    .collect()
-            })
-            .await
-        };
-        for (attachment, naming, name) in named {
-            let nested = match loaded.remove(&attachment) {
-                Some(result) => {
-                    let (local, nested) = match result? {
-                        HeldAttachment::Absent => (Local::Absent, false),
-                        HeldAttachment::Partial => (Local::Partial, false),
-                        HeldAttachment::Complete { nested, value } => (Local::Held(value), nested),
+            let unread: Vec<Checksum> = named
+                .iter()
+                .map(|(attachment, _, _)| *attachment)
+                .filter(|attachment| !self.local.contains_key(attachment))
+                .collect();
+            let mut loaded: HashMap<_, Result<HeldAttachment<Loaded>>> = if unread.is_empty() {
+                HashMap::new()
+            } else {
+                let repo = repo.clone();
+                ostrya_rt::unblock(move || {
+                    unread
+                        .into_iter()
+                        .map(|key| {
+                            let state = related::held_attachment_blocking(&repo, None, &key, |b| {
+                                let field = related::parse_attachments(b).and_then(|entries| {
+                                    related::checked_entries(
+                                        RelationField::Attachments,
+                                        Some(key),
+                                        entries,
+                                    )
+                                });
+                                Ok((Commit::parse_link(b)?, field))
+                            });
+                            (key, state)
+                        })
+                        .collect()
+                })
+                .await
+            };
+            level.clear();
+            for (attachment, naming, name) in named {
+                if let Some(result) = loaded.remove(&attachment) {
+                    let local = match result? {
+                        HeldAttachment::Absent => Local::Absent,
+                        HeldAttachment::Partial => Local::Partial,
+                        HeldAttachment::Complete {
+                            value: (link, field),
+                            ..
+                        } => {
+                            self.record(attachment, field);
+                            Local::Held(link)
+                        }
                     };
                     self.local.insert(attachment, local);
-                    nested
                 }
-                // A commit that `local` holds: `fields` holds its field 2 if
-                // that field is not empty, valid or not.
-                None => self.fields.contains_key(&attachment),
-            };
-            match self.local[&attachment] {
-                Local::Absent => {
-                    return Err(Error::ObjectNotFound {
-                        checksum: attachment,
-                        ty: ObjectType::Commit,
-                    });
+                match self.local[&attachment] {
+                    Local::Absent => {
+                        return Err(Error::InvalidRelations {
+                            commit: Some(naming),
+                            field: RelationField::Attachments,
+                            reason: related::attachment_reason(
+                                &name,
+                                &attachment,
+                                related::ABSENT_REASON,
+                            ),
+                        });
+                    }
+                    Local::Partial => {
+                        return Err(related::partial_attachment(naming, &name, &attachment));
+                    }
+                    // A commit that `local` held before the call can have a
+                    // field 2 that no check read.
+                    Local::Held(_) => self.check_fields([&attachment])?,
                 }
-                Local::Partial => {
-                    return Err(related::partial_attachment(naming, name, &attachment));
-                }
-                Local::Held(_) if nested => {
-                    return Err(related::nested_attachment(naming, name, &attachment));
-                }
-                Local::Held(_) => {}
+                level.push(attachment);
             }
         }
         Ok(())
@@ -474,8 +538,8 @@ impl Repo {
     /// After this step, the push runs the checks and the walk. It opens the
     /// session with [`PreparedSession::open`](crate::remote::PreparedSession::open)
     /// and does the rest of the work of `push_over_stream`. The push sends
-    /// the attachments of each commit that it offers, as "Attachments" of
-    /// [`push_over_stream`](Repo::push_over_stream) states.
+    /// the full set of attachments of each commit that it offers, as
+    /// "Attachments" of [`push_over_stream`](Repo::push_over_stream) states.
     ///
     /// # Tokio runtime
     ///
@@ -598,10 +662,10 @@ impl Repo {
     /// if the update is a fast-forward.
     ///
     /// The negotiation offers the commits first, in the first `Have` round:
-    /// each source commit and its history, then the attachments of each
-    /// offered commit. Then the push walks the tree of each source commit,
-    /// also when the server holds that commit. It also walks the tree of
-    /// each history commit and each attachment that the server lacks. It
+    /// each source commit and its history, then the full set of attachments
+    /// of the offered commits. Then the push walks the tree of each source
+    /// commit, also when the server holds that commit. It also walks the tree
+    /// of each history commit and each attachment that the server lacks. It
     /// does not walk the tree of a history commit or an attachment that the
     /// server holds.
     ///
@@ -618,12 +682,19 @@ impl Repo {
     ///
     /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The push
-    /// sends the attachments of each commit that it offers: each source
-    /// commit, and each history commit of the offer.
+    /// sends the full set of attachments of each commit that it offers: each
+    /// source commit, and each history commit of the offer. The full set is
+    /// each attachment of the commit, and each attachment of an attachment of
+    /// the full set, at each depth.
     ///
-    /// - The push sends each attachment at depth 0, so an attachment entry
-    ///   adds no parent to the push. The push offers an attachment one time,
-    ///   also if several commits name it.
+    /// - The push reads the full set from the local repository, one level at
+    ///   a time, until a level has no new attachment. It reads the commit
+    ///   objects alone, and each commit one time, also if several commits
+    ///   name it. The first `Have` round offers the full set, and the push
+    ///   walks the trees of the attachments that the server lacks alone.
+    /// - The push sends each attachment at depth 0, at each level, so an
+    ///   attachment entry adds no parent to the push. The push offers an
+    ///   attachment one time, also if several commits name it.
     /// - The push sets no ref for an attachment.
     /// - An attachment is a commit of the offer for each other rule. For an
     ///   attachment that the server lacks, the push sends the commit object,
@@ -636,21 +707,22 @@ impl Repo {
     ///
     /// These cases refuse the push:
     ///
-    /// - An entry of field 2 of a commit of the walk has an empty name or a
-    ///   checksum that is not 32 bytes.
+    /// - An entry of field 2 of a commit of the walk, or of an attachment at
+    ///   each level, has an empty name or a checksum that is not 32 bytes.
     /// - The local repository does not hold an attachment, or marks it
-    ///   partial. This is also true for a parent that ends a chain, if a
-    ///   commit of the push names that parent as an attachment.
-    /// - An attachment names attachments of its own: its own field 2 is not
-    ///   empty, also if that field 2 holds a defective entry.
+    ///   partial, at each level. This is also true for a parent that ends a
+    ///   chain, if a commit of the push names that parent as an attachment,
+    ///   and for an attachment below an attachment that the server holds.
     ///
     /// If `depth` is `Some`, the push finds each case before it writes a
-    /// byte. If `depth` is `None`, the push finds a defective entry and each
-    /// defect of an attachment of a source commit before it writes a byte. It
-    /// finds a defect of an attachment of a history commit after the cut at
-    /// the server tip, which comes after `HelloReply`. It then ends the
-    /// session with `Abort` and sends no object. The push reads no attachment
-    /// of a history commit that it does not offer.
+    /// byte. If `depth` is `None`, the push finds a defective entry of a
+    /// commit of the walk, and each defect in the full set of attachments of
+    /// a source commit, before it writes a byte. It finds a defect in the
+    /// full set of attachments of a history commit after the cut at the
+    /// server tip, which comes after `HelloReply`. It then ends the session
+    /// with `Abort` and sends no object. The push reads no attachment of a
+    /// history commit that it does not offer, unless that commit is in the
+    /// full set of attachments of an offered commit.
     ///
     /// # Ref updates
     ///
@@ -725,11 +797,10 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit of the
-    ///   walk has an empty name or a checksum that is not 32 bytes, or if an
-    ///   attachment of an offered commit is partial in the local repository
-    ///   or names attachments of its own. [`Error::ObjectNotFound`] if the
-    ///   local repository lacks such an attachment. "Attachments" states when
-    ///   the push finds each case.
+    ///   walk or of an attachment has an empty name or a checksum that is not
+    ///   32 bytes, or if the local repository lacks an attachment of the full
+    ///   set of an offered commit or marks it partial. "Attachments" states
+    ///   when the push finds each case.
     /// - [`Error::LockTimeout`] if the wait for the lock passes
     ///   `[core] lock-timeout-secs`.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
@@ -862,9 +933,9 @@ impl Repo {
         }
 
         // The format of field 2 of each commit that the walk read, then the
-        // attachments. With no depth, the cut at the server tip comes after
-        // `HelloReply`, so the negotiation resolves the attachments of the
-        // history that it offers.
+        // full set of attachments. With no depth, the cut at the server tip
+        // comes after `HelloReply`, so the negotiation resolves the
+        // attachments of the history that it offers.
         let walked = sources
             .iter()
             .map(|(checksum, _)| checksum)
@@ -1292,22 +1363,21 @@ impl Plan {
         }
         drop(chains);
 
-        // Then the attachments of each offered commit, each once. With no
-        // depth, the push resolves the attachments of the offered history
-        // here, before the first upload.
+        // Then the full set of attachments of the offered commits, each
+        // once. With no depth, the push resolves the attachments of the
+        // offered history here, before the first upload.
         if opts.depth.is_none() {
             let offer = names.iter().map(|name| &name.checksum);
             self.commits.check_attachments(&self.repo, offer).await?;
         }
-        let resolved = names.len();
-        for at in 0..resolved {
-            let commit = names[at].checksum;
-            for attachment in self.commits.attachments_of(&commit) {
-                if offered.insert(attachment) {
-                    names.push(ObjectName::new(attachment, ObjectType::Commit));
-                }
-            }
-        }
+        let attachments = self
+            .commits
+            .full_set(names.iter().map(|name| &name.checksum), &mut offered);
+        names.extend(
+            attachments
+                .into_iter()
+                .map(|attachment| ObjectName::new(attachment, ObjectType::Commit)),
+        );
 
         drop(offered);
         let commits = std::mem::take(&mut self.commits);

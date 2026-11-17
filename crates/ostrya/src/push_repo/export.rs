@@ -26,8 +26,8 @@ pub struct ExportStreamOptions {
     /// Each update expects [`Absent`](Expected::Absent) or
     /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME`,
     /// `@ID:NAME`, or `REMOTE:NAME`. The new commits are the commits of the
-    /// stream. The stream also carries the attachments of the new commits,
-    /// with no ref. [`Repo::export_updates`] returns these updates for a set
+    /// stream. The stream also carries the full set of attachments of the
+    /// new commits, with no ref. [`Repo::export_updates`] returns these updates for a set
     /// of refspecs.
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
@@ -58,8 +58,8 @@ impl Repo {
     ///
     /// # Stream content
     ///
-    /// The stream carries each new commit once, then each attachment of the
-    /// new commits once. With each commit, it carries each object that the
+    /// The stream carries each new commit once, then each attachment in the
+    /// full set of attachments of the new commits once. With each commit, it carries each object that the
     /// tree of the commit reaches. It also carries the stored `.commitmeta`
     /// bytes of the commit with no parse, so the receiver refuses a
     /// `.commitmeta` that is not an `a{sv}` dict. The stream carries no parent
@@ -77,12 +77,17 @@ impl Repo {
     ///
     /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The
-    /// stream carries the attachments of each new commit.
+    /// stream carries the full set of attachments of each new commit: each
+    /// attachment of the commit, and each attachment of an attachment of the
+    /// full set, at each depth.
     ///
-    /// - The call sends each attachment at depth 0, so an attachment entry
-    ///   adds no parent to the stream. The stream carries an attachment one
-    ///   time, also if several commits name it, or if it is also a new
-    ///   commit.
+    /// - The call reads the full set one level at a time, until a level has
+    ///   no new attachment. It reads the commit objects alone, and each
+    ///   commit one time, also if several commits name it.
+    /// - The call sends each attachment at depth 0, at each level, so an
+    ///   attachment entry adds no parent to the stream. The stream carries an
+    ///   attachment one time, also if several commits name it, or if it is
+    ///   also a new commit.
     /// - The `Commit` frame holds no ref update for an attachment.
     /// - For each attachment, the stream carries the commit object, the
     ///   objects of its tree, and its detached metadata. An object that a new
@@ -104,14 +109,10 @@ impl Repo {
     ///
     /// These cases refuse the export before the call writes the first byte:
     ///
-    /// - An entry of field 2 of a new commit has an empty name or a checksum
-    ///   that is not 32 bytes.
-    /// - The repository does not hold an attachment, or marks it partial.
-    /// - An attachment names attachments of its own: its own field 2 is not
-    ///   empty, also if that field 2 holds a defective entry. This is also
-    ///   true for an attachment that is also a new commit. If the field 2 of
-    ///   such a new commit holds a defective entry, the first case refuses
-    ///   the export first.
+    /// - An entry of field 2 of a new commit, or of an attachment at each
+    ///   level, has an empty name or a checksum that is not 32 bytes.
+    /// - The repository does not hold an attachment, or marks it partial, at
+    ///   each level.
     ///
     /// # Lock
     ///
@@ -158,12 +159,14 @@ impl Repo {
     /// - [`Error::Core`](crate::Error::Core) if `[core] locking` is not a
     ///   boolean or `[core] lock-timeout-secs` is not an integer.
     /// - [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) if the
-    ///   repository does not hold a new commit or an attachment, or a dirtree
-    ///   or a dirmeta that the tree of a sent commit reaches.
+    ///   repository does not hold a new commit, or a dirtree or a dirmeta that
+    ///   the tree of a sent commit reaches.
     /// - [`Error::InvalidRelations`](crate::Error::InvalidRelations) if an entry
-    ///   of field 2 of a new commit has an empty name or a checksum that is
-    ///   not 32 bytes, or if the repository marks an attachment partial, or if
-    ///   an attachment names attachments of its own.
+    ///   of field 2 of a new commit or of an attachment has an empty name or a
+    ///   checksum that is not 32 bytes, or if the repository does not hold an
+    ///   attachment of the full set or marks it partial. For an absent or a
+    ///   partial attachment, the error names the commit that first names the
+    ///   attachment.
     /// - [`Error::Core`](crate::Error::Core) if a new commit or a dirtree
     ///   object does not parse. For the commit object of an attachment, the
     ///   call decodes the tuple frame, the parent and root checksums, and
@@ -295,21 +298,15 @@ impl Repo {
         drop(loaded);
         drop(refs);
 
-        // The format of field 2 of each new commit, then its attachments,
-        // before the first byte.
+        // The format of field 2 of each new commit, then the full set of
+        // attachments, before the first byte.
         commits.check_fields(&targets)?;
         commits.check_attachments(self, &targets).await?;
 
-        // The new commits, then each attachment once.
+        // The new commits, then each attachment of the full set once.
         let mut sent = targets.clone();
         let mut known: HashSet<Checksum> = targets.iter().copied().collect();
-        for target in &targets {
-            for attachment in commits.attachments_of(target) {
-                if known.insert(attachment) {
-                    sent.push(attachment);
-                }
-            }
-        }
+        sent.extend(commits.full_set(&targets, &mut known));
         drop(known);
 
         let mut names: Vec<ObjectName> = sent

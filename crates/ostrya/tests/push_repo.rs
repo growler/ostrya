@@ -81,7 +81,7 @@ fn commit(
     commit_related(repo, branch, parent, content, metadata, &[])
 }
 
-/// Commits a tree as [`commit`] does, with the dependencies `related` in
+/// Commits a tree as [`commit`] does, with the attachments `related` in
 /// field 2.
 fn commit_related(
     repo: &Repo,
@@ -1926,11 +1926,11 @@ fn a_session_push_refuses_the_bucket_fields() {
 }
 
 // ---------------------------------------------------------------------------
-// Dependencies.
+// Attachments.
 // ---------------------------------------------------------------------------
 
-/// Commits a dependency on `dep/uki` of `repo`, and a tip on `main` whose
-/// field 2 names it as `boot/uki`. Returns the tip and the dependency.
+/// Commits an attachment on `dep/uki` of `repo`, and a tip on `main` whose
+/// field 2 names it as `boot/uki`. Returns the tip and the attachment.
 fn attachment_chain(repo: &Repo) -> (Checksum, Checksum) {
     let att = commit(repo, "dep/uki", None, "uki", None);
     let main = commit_related(repo, "main", None, "main", None, &[("boot/uki", att)]);
@@ -1976,7 +1976,7 @@ fn detached_dict() -> Value {
     builder.build()
 }
 
-/// A push sends the dependency that field 2 of the source commit names,
+/// A push sends the attachment that field 2 of the source commit names,
 /// complete and with its `.commitmeta`, and the server writes no ref for it.
 /// A second push sends no object.
 #[test]
@@ -2009,8 +2009,8 @@ fn a_push_sends_the_attachment_of_the_commit() {
     assert_eq!(outcome.unwrap().stats.objects_sent, 0);
 }
 
-/// A push with a depth sends the dependencies of each parent that it sends.
-/// At depth 0 it sends no parent, so it sends the dependency of the source
+/// A push with a depth sends the attachments of each parent that it sends.
+/// At depth 0 it sends no parent, so it sends the attachment of the source
 /// commit alone.
 #[test]
 fn a_push_with_depth_sends_the_attachments_of_the_parents() {
@@ -2059,8 +2059,8 @@ fn a_push_with_depth_sends_the_attachments_of_the_parents() {
     }
 }
 
-/// A push sends a dependency at depth 0, also under a push of the whole
-/// history and with no depth. The parent of the dependency stays in the
+/// A push sends an attachment at depth 0, also under a push of the whole
+/// history and with no depth. The parent of the attachment stays in the
 /// local repository.
 #[test]
 fn an_attachment_is_sent_at_depth_zero() {
@@ -2098,9 +2098,9 @@ fn an_attachment_is_sent_at_depth_zero() {
     }
 }
 
-/// A dependency that two sent commits name is sent one time. The server
+/// An attachment that two sent commits name is sent one time. The server
 /// refuses a second dict for one commit, so the push passes only if it sends
-/// the `.commitmeta` of the dependency one time.
+/// the `.commitmeta` of the attachment one time.
 #[test]
 fn an_attachment_that_two_commits_name_is_sent_once() {
     let pair = Pair::new("dependency-once", RepoMode::Archive, RepoMode::Archive, "");
@@ -2137,8 +2137,8 @@ fn an_attachment_that_two_commits_name_is_sent_once() {
     );
 }
 
-/// The source commit names its own parent as a dependency. At depth 0 the
-/// dependency brings the parent in, and at depth 1 the walk does. In both,
+/// The source commit names its own parent as an attachment. At depth 0 the
+/// attachment brings the parent in, and at depth 1 the walk does. In both,
 /// the push sends the parent and its `.commitmeta` one time, with no parent
 /// of its own.
 #[test]
@@ -2186,8 +2186,8 @@ fn a_parent_that_is_an_attachment_is_sent_once() {
     }
 }
 
-/// The push walks no tree of a dependency that the server holds: the local
-/// repository lacks the root dirtree of the dependency, and the push passes.
+/// The push walks no tree of an attachment that the server holds: the local
+/// repository lacks the root dirtree of the attachment, and the push passes.
 #[test]
 fn an_attachment_the_server_holds_gets_no_tree_walk() {
     let pair = Pair::new("dependency-held", RepoMode::Archive, RepoMode::Archive, "");
@@ -2207,7 +2207,7 @@ fn an_attachment_the_server_holds_gets_no_tree_walk() {
     assert_complete(&pair.server, &pair.server, &att);
 }
 
-/// A dependency that the local repository does not hold, or marks partial,
+/// An attachment that the local repository does not hold, or marks partial,
 /// is refused before the push writes a byte.
 #[test]
 fn an_absent_or_partial_attachment_is_refused_before_any_byte() {
@@ -2221,7 +2221,7 @@ fn an_absent_or_partial_attachment_is_refused_before_any_byte() {
         attachment_error(error),
         (
             Some(main),
-            format!("dependency boot/uki names commit {att}, which is partial")
+            format!("attachment boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
@@ -2237,7 +2237,7 @@ fn an_absent_or_partial_attachment_is_refused_before_any_byte() {
     assert_eq!(written, 0);
 }
 
-/// The push reads no commit object of a dependency with a partial marker: a
+/// The push reads no commit object of an attachment with a partial marker: a
 /// directory at the path of the object gives the partial refusal.
 #[test]
 fn a_partial_attachment_with_an_unreadable_object_is_refused_as_partial() {
@@ -2254,7 +2254,7 @@ fn a_partial_attachment_with_an_unreadable_object_is_refused_as_partial() {
         attachment_error(error),
         (
             Some(main),
-            format!("dependency boot/uki names commit {att}, which is partial")
+            format!("attachment boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
@@ -2297,17 +2297,17 @@ fn a_defective_attachment_entry_is_refused_before_any_byte() {
     }
 }
 
-/// A dependency that names dependencies of its own is refused before the
+/// An attachment that names attachments of its own is refused before the
 /// push writes a byte, also if the push takes that commit as a source
-/// commit. The error names the commit that names the nested dependency.
+/// commit. The error names the commit that names the nested attachment.
 #[test]
 fn a_nested_attachment_is_refused_before_any_byte() {
     let dir = TmpDir::new("push-repo-dependency-nested");
     let repo = new_repo(&dir, RepoMode::Archive, "");
     let (main, att) = attachment_chain(&repo);
     let other = commit(&repo, "other", None, "other", None);
-    // `other` names a commit with a dependency, and `main` names a commit
-    // whose dependency is that commit.
+    // `other` names a commit with an attachment, and `main` names a commit
+    // whose attachment is that commit.
     let nested = block_on(store_with_field2(
         &repo,
         &other,
@@ -2322,7 +2322,7 @@ fn a_nested_attachment_is_refused_before_any_byte() {
     move_ref(&repo, "main", &head);
 
     let reason =
-        format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+        format!("attachment lib/b names commit {nested}, which has attachments of its own");
     for specs in [&["main"][..], &["main", "other"], &["other", "main"]] {
         let (error, written) = refused(&repo, opts(specs));
         assert_eq!(
@@ -2335,7 +2335,7 @@ fn a_nested_attachment_is_refused_before_any_byte() {
 }
 
 /// A parent that the local repository does not hold ends its chain. If the
-/// source commit names the parent as a dependency, the push is refused
+/// source commit names the parent as an attachment, the push is refused
 /// before it writes a byte.
 #[test]
 fn an_absent_parent_that_is_an_attachment_is_refused_before_any_byte() {
@@ -2369,8 +2369,8 @@ fn an_absent_parent_that_is_an_attachment_is_refused_before_any_byte() {
     }
 }
 
-/// With a depth, the push resolves the dependencies of each history commit
-/// before it writes a byte. A nested, a partial, and an absent dependency
+/// With a depth, the push resolves the attachments of each history commit
+/// before it writes a byte. A nested, a partial, and an absent attachment
 /// that the parent of the source commit alone names are each refused.
 #[test]
 fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
@@ -2381,7 +2381,7 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
         ..opts(&["main"])
     };
 
-    // The parent names a commit that names a dependency of its own.
+    // The parent names a commit that names an attachment of its own.
     let att = commit(&repo, "dep/uki", None, "uki", None);
     let other = commit(&repo, "other", None, "other", None);
     let nested = block_on(store_with_field2(
@@ -2401,12 +2401,12 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
         attachment_error(error),
         (
             Some(parent),
-            format!("dependency lib/b names commit {nested}, which has dependencies of its own")
+            format!("attachment lib/b names commit {nested}, which has attachments of its own")
         )
     );
     assert_eq!(written, 0);
 
-    // The parent names a partial dependency, then an absent one.
+    // The parent names a partial attachment, then an absent one.
     let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", att)]);
     commit(&repo, "main", Some(parent), "t", None);
     mark_partial(&repo, &att);
@@ -2415,7 +2415,7 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
         attachment_error(error),
         (
             Some(parent),
-            format!("dependency boot/uki names commit {att}, which is partial")
+            format!("attachment boot/uki names commit {att}, which is partial")
         )
     );
     assert_eq!(written, 0);
@@ -2431,7 +2431,7 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_any_byte() {
     assert_eq!(written, 0);
 }
 
-/// A push does not send a build source: the commit that `ostrya.related`
+/// A push does not send a supplement: the commit that `ostrya.related`
 /// names. The key travels with the detached metadata of the commit.
 #[test]
 fn a_push_does_not_send_a_supplement() {
@@ -2453,9 +2453,9 @@ fn a_push_does_not_send_a_supplement() {
     assert!(!has_commit(&pair.server, &source));
 }
 
-/// With no depth, the push resolves the dependencies of the history after
-/// the cut at the server tip. A refused dependency of such a commit ends the
-/// session with `Abort` before the first upload. A dependency of the server
+/// With no depth, the push resolves the attachments of the history after
+/// the cut at the server tip. A refused attachment of such a commit ends the
+/// session with `Abort` before the first upload. An attachment of the server
 /// tip, which the push does not send, is not resolved.
 #[test]
 fn with_no_depth_an_attachment_of_the_offered_history_is_resolved_after_the_cut() {
@@ -2473,7 +2473,7 @@ fn with_no_depth_an_attachment_of_the_offered_history_is_resolved_after_the_cut(
     report.unwrap();
     outcome.unwrap();
     assert!(has_commit(&pair.server, &held));
-    // The client loses the dependency of the server tip.
+    // The client loses the attachment of the server tip.
     remove_commit_object(&pair.client, &held);
 
     let att = commit(&pair.client, "dep/uki", None, "uki", None);
@@ -2511,7 +2511,7 @@ fn with_no_depth_an_attachment_of_the_offered_history_is_resolved_after_the_cut(
     assert!(!has_commit(&pair.server, &c3));
     assert_eq!(tip(&pair.server, "main"), Some(c1));
 
-    // With the commit that names the absent dependency out of the push, the
+    // With the commit that names the absent attachment out of the push, the
     // push passes.
     move_ref(&pair.client, "main", &c1);
     let c4 = commit(&pair.client, "main", Some(c1), "c4", None);
@@ -2522,7 +2522,7 @@ fn with_no_depth_an_attachment_of_the_offered_history_is_resolved_after_the_cut(
 }
 
 // ---------------------------------------------------------------------------
-// The checks of the server on the dependencies.
+// The checks of the server on the attachments.
 // ---------------------------------------------------------------------------
 
 /// Signs `commit` of `repo` with the key [`SECRET_B64`].
@@ -2558,7 +2558,7 @@ fn assert_refused(pushed: Pushed, code: remote::ErrorCode) {
     assert!(outcome.is_err(), "{outcome:?}");
 }
 
-/// Under a server policy with `verify`, a dependency with no signature
+/// Under a server policy with `verify`, an attachment with no signature
 /// passes. The server verifies the source commit alone.
 #[test]
 fn an_unsigned_attachment_passes_under_verify() {
@@ -2579,7 +2579,7 @@ fn an_unsigned_attachment_passes_under_verify() {
     assert!(ed25519_signatures(&pair.server, &att).is_empty());
 }
 
-/// With depth 1, a dependency of the parent gets no verification. The push
+/// With depth 1, an attachment of the parent gets no verification. The push
 /// passes with a signature on the source commit alone.
 #[test]
 fn with_a_depth_an_attachment_of_the_parent_gets_no_rule() {
@@ -2606,7 +2606,7 @@ fn with_a_depth_an_attachment_of_the_parent_gets_no_rule() {
     assert_complete(&pair.client, &pair.server, &att);
 }
 
-/// Under a server policy with `sign`, a staged dependency gets no server
+/// Under a server policy with `sign`, a staged attachment gets no server
 /// signature, and the source commit gets the signature of the server key.
 #[test]
 fn a_staged_attachment_gets_no_server_signature() {
@@ -2623,7 +2623,7 @@ fn a_staged_attachment_gets_no_server_signature() {
     );
 }
 
-/// A dependency that the server already holds gets no server signature.
+/// An attachment that the server already holds gets no server signature.
 #[test]
 fn an_attachment_the_server_holds_gets_no_server_signature() {
     let pair = Pair::new(
@@ -2645,7 +2645,7 @@ fn an_attachment_the_server_holds_gets_no_server_signature() {
     assert_eq!(ed25519_signatures(&pair.server, &main).len(), 1);
 }
 
-/// A dependency that the server holds and marks partial refuses the push
+/// An attachment that the server holds and marks partial refuses the push
 /// with `missing-objects`. The server moves no ref.
 #[test]
 fn an_attachment_the_server_holds_partial_refuses_the_push() {

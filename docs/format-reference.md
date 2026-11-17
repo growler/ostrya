@@ -118,16 +118,16 @@ and `log` does not read them.
 
 0. `a{sv}` metadata dict.
 1. `ay` parent commit checksum: 32 raw bytes, empty array for a root commit.
-2. `a(say)` related objects. The port uses this field for the dependencies
+2. `a(say)` related objects. The port uses this field for the attachments
    of a commit. Each entry is a name and the 32 raw bytes of the checksum of
    a commit. The name is not empty. By convention, it has the form
    `<class>/<name>`, for example `container/fe` or `boot/uki`. The `ostree`
    command writes an empty array. The port writes the entries sorted by name
    in byte order, with no name two times, so one set of entries gives one
-   commit checksum. A dependency names no dependency of its own. The commit
-   write of the port refuses a dependency whose field 2 is not empty, and a
-   dependency that the repository or the writing transaction does not hold
-   complete. A dependency can have a parent.
+   commit checksum. An attachment names no attachment of its own. The commit
+   write of the port refuses an attachment whose field 2 is not empty, and an
+   attachment that the repository or the writing transaction does not hold
+   complete. An attachment can have a parent.
 3. `s` subject (empty string if none).
 4. `s` body (empty string if none).
 5. `t` timestamp, seconds since Unix epoch UTC, big-endian.
@@ -314,7 +314,7 @@ A bare dict, with no tuple around it. It is not part of the commit checksum. It
 is a separate loose file, it is mutable, and it holds the signatures. A write
 with no metadata gives a zero-length file, which deletes the metadata.
 "Signing details" lists the signature keys and their values. The key
-`ostrya.related` of the port holds the build sources of the commit ("Related
+`ostrya.related` of the port holds the supplements of the commit ("Related
 commits").
 
 ## Summary and summary signature
@@ -2218,16 +2218,16 @@ already. `conformance/cli-surface.md`, "P2", `static-delta`, records the limits
 of the tool's `apply-offline`.
 
 A delta carries its target commit alone, and no field of the superblock names
-a dependency. A pull of the port looks for one delta for each dependency of
-the commits that it moves, as for a target ("Static deltas of dependencies").
+an attachment. A pull of the port looks for one delta for each attachment of
+the commits that it moves, as for a target ("Static deltas of attachments").
 
 An offline application of the port reads field 2 of the target commit before
 it writes an object. It refuses the delta if an entry of the field is
-defective, or if a dependency is not complete in the repository or is nested.
+defective, or if an attachment is not complete in the repository or is nested.
 The refusal writes no object. The check also runs if the repository holds the
 target. It accepts entries that are not sorted by name and two entries with
-one name. Offline media thus carry one delta for each dependency, and the
-deltas of the dependencies apply first.
+one name. Offline media thus carry one delta for each attachment, and the
+deltas of the attachments apply first.
 
 ### Fallback selection
 
@@ -3552,12 +3552,12 @@ its working directory, and accepts a `..` component
 A commit names its related commits in two fields. Each field is an `a(say)`
 array. Each entry is a name and the 32 raw bytes of the checksum of a commit.
 
-- Field 2 of the commit object holds the dependencies ("Commit --
+- Field 2 of the commit object holds the attachments ("Commit --
   `(a{sv}aya(say)sstayay)`"). The commit checksum and each signature of the
   commit cover the field.
 - The key `ostrya.related` of the detached metadata (`.commitmeta`) holds the
-  build sources. The value is a variant of type `a(say)`. The commit checksum
-  does not cover the key, so a build source can be added after the commit.
+  supplements. The value is a variant of type `a(say)`. The commit checksum
+  does not cover the key, so a supplement can be added after the commit.
 
 The name of an entry has the form `<class>/<name>` by convention, for example
 `container/fe`, `boot/uki`, or `layer/base`. Each write of the port refuses an
@@ -3566,21 +3566,20 @@ empty name and checks nothing else in the name.
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
 checksum that is not 32 bytes. For a transfer, a field 2 entry that names a
-nested dependency is defective too. A nested dependency is a dependency whose
+nested attachment is defective too. A nested attachment is an attachment whose
 own field 2 is not empty.
 
-### Dependencies
+### Attachments
 
-A dependency names no dependency: the relation is one level deep. The commit
+An attachment names no attachment: the relation is one level deep. The commit
 write of the port sorts the entries by name in byte order. It refuses two
-entries with one name, a dependency that the repository or the writing
-transaction does not hold, a dependency that is partial, and a dependency
-whose own field 2 is not empty. A dependency can have a parent and build
-sources.
+entries with one name, an attachment that the repository or the writing
+transaction does not hold, an attachment that is partial, and an attachment
+whose own field 2 is not empty. An attachment can have a parent and supplements.
 
-### Build sources
+### Supplements
 
-The add of a build source (`Repo::add_supplement` and
+The add of a supplement (`Repo::add_supplement` and
 `Transaction::add_supplement`) edits the first `ostrya.related` entry
 of the dict:
 
@@ -3594,8 +3593,8 @@ of the dict:
 The add checks the format of the new element alone: a name that is not empty
 and a checksum of 32 bytes. It does not check that the repository holds the
 named commit. If the stored value of the first entry is defective, the add
-refuses it, and the `.commitmeta` file stays as it was. A build source can
-name build sources of its own, so the add can make a cycle.
+refuses it, and the `.commitmeta` file stays as it was. A supplement can
+name supplements of its own, so the add can make a cycle.
 
 `Repo::write_commit_detached_metadata`, and the commit of a transaction for a
 dict that `Transaction::set_commit_detached_metadata` queued, check each
@@ -3606,7 +3605,7 @@ elements with one name, and a checksum of a commit that the repository does
 not hold. A signature, a pull, and a receive store a dict with no check of
 the key.
 
-A reader of the build sources reads the first `ostrya.related` entry of the
+A reader of the supplements reads the first `ostrya.related` entry of the
 dict.
 
 ### The switch of the destination
@@ -3657,7 +3656,7 @@ that they reach:
   each commit that they name as a root of its own, at the global bound of the
   run: `--depth`, or `--keep-younger-than`.
 - The prune reads the two fields of each related commit too. So it keeps the
-  dependencies of a dependency and the build sources of a build source. The
+  attachments of an attachment and the supplements of a supplement. The
   walk reads the fields of each commit one time, so a cycle ends the walk.
 - A related entry that names a commit that the repository does not hold
   gives no error, and the walk reads nothing below it. The prune keeps the
@@ -3665,7 +3664,7 @@ that they reach:
   bound. So the prune keeps the `.commitmeta` of that commit if the store
   holds it.
 - The prune accepts field 2 entries that are not sorted, two entries with one
-  name, and a dependency whose own field 2 is not empty. It roots on each
+  name, and an attachment whose own field 2 is not empty. It roots on each
   such entry.
 - A defective related value gives one warning for each defective entry, or
   one warning for a defective `ostrya.related` value. The defective entry or
@@ -3697,144 +3696,144 @@ bucket repository").
 The `ostree` command keeps no commit for an entry of field 2
 (`conformance/cli-behavior.md`, "Related commits in a prune").
 
-### Dependencies in a pull from a remote
+### Attachments in a pull from a remote
 
-A pull from a remote follows the dependencies of each commit that it reads:
+A pull from a remote follows the attachments of each commit that it reads:
 each target and each parent that the depth of the pull takes, also a commit
 that the repository holds complete. These rules apply to a pull over HTTP,
 over ssh, and from an `s3://` address, to a pull through a session of the
 caller, and to a pull of collection refs:
 
-- The pull fetches each dependency at depth 0, so a dependency entry adds no
-  parent to the pull. The pull fetches a dependency one time, also if several
+- The pull fetches each attachment at depth 0, so an attachment entry adds no
+  parent to the pull. The pull fetches an attachment one time, also if several
   commits name it. A prune of the destination accepts the parents that the
   pull did not fetch, as after a pull with a small depth.
-- The pull writes no ref for a dependency.
-- The pull checks no signature of a dependency commit. Field 2 holds the
-  checksum of the dependency, and the checksum and the signatures of the
-  commit that names it cover field 2. The pull hashes the dependency commit
+- The pull writes no ref for an attachment.
+- The pull checks no signature of an attachment commit. Field 2 holds the
+  checksum of the attachment, and the checksum and the signatures of the
+  commit that names it cover field 2. The pull hashes the attachment commit
   that it stores and compares the result with that checksum. The pull makes
   no ref-binding check, no collection-binding check, and no timestamp check
-  on a dependency.
+  on an attachment.
 - A target, a parent that the depth of the pull takes, and a commit of a
   chain of static deltas keep the checks of that role, also if a field 2
   names them.
-- The pull stores the `.commitmeta` of a dependency that it fetches, under
+- The pull stores the `.commitmeta` of an attachment that it fetches, under
   the rule of `[ex-ostrya] keep-detached-related`. It parses that
   `.commitmeta` only if the rule drops `ostrya.related`. A `.commitmeta` that
   does not parse then fails the pull. Under the default rule, the pull stores
   the bytes as the remote serves them.
-- For a dependency that the repository holds complete, the pull requests no
-  `.commitmeta` and no object of the tree. So the dependency does not get the
+- For an attachment that the repository holds complete, the pull requests no
+  `.commitmeta` and no object of the tree. So the attachment does not get the
   signatures that the remote added after the repository stored it. A pull
-  that takes the dependency as a target requests its `.commitmeta`. A
-  dependency that the repository holds partial gets its whole tree and its
+  that takes the attachment as a target requests its `.commitmeta`. An
+  attachment that the repository holds partial gets its whole tree and its
   `.commitmeta`, and the pull removes its `.commitpartial` marker.
-- A localcache repository can supply a dependency.
-- The pull fetches the dependencies after the commits that name them, in one
-  more run. It looks for a static delta of each dependency ("Static deltas of
-  dependencies"). A dependency with no delta comes as loose objects.
-- The pull does not follow a build source.
-- A commit-only pull and a pull with subpaths fetch no dependency.
+- A localcache repository can supply an attachment.
+- The pull fetches the attachments after the commits that name them, in one
+  more run. It looks for a static delta of each attachment ("Static deltas of
+  attachments"). An attachment with no delta comes as loose objects.
+- The pull does not follow a supplement.
+- A commit-only pull and a pull with subpaths fetch no attachment.
 
 The pull checks the format of field 2 of each commit that it reads. A
 commit-only pull and a pull with subpaths check it too. A defective related
 value in field 2 fails the pull: an entry with an empty name, an entry with a
-checksum that is not 32 bytes, and an entry that names a nested dependency. A
-dependency that neither the repository, a localcache repository, nor the
+checksum that is not 32 bytes, and an entry that names a nested attachment. An
+attachment that neither the repository, a localcache repository, nor the
 remote holds fails the pull too. This is also true for a parent that none of
-them holds, if a commit of the pull names it as a dependency. A failure of the
+them holds, if a commit of the pull names it as an attachment. A failure of the
 pull writes no object and no ref, and leaves no `.commitpartial` marker that
 the pull wrote.
 
-The pull of the `ostree` command fetches no dependency
+The pull of the `ostree` command fetches no attachment
 (`conformance/cli-behavior.md`, "Related commits in a pull").
 
-### Dependencies in a local pull
+### Attachments in a local pull
 
-A local pull follows the dependencies of each commit that it walks: each
+A local pull follows the attachments of each commit that it walks: each
 target and each parent that the depth of the pull takes, also a commit that
-the repository holds complete. It also follows the dependencies of each
+the repository holds complete. It also follows the attachments of each
 intermediate commit of a chain of static deltas. Discovery reads field 2 of
 such a commit from the superblock of its step. These rules apply to a pull of
 refs and to a pull of collection refs:
 
-- The pull imports each dependency at depth 0, so a dependency entry adds no
-  parent to the pull. The pull imports a dependency one time, also if
+- The pull imports each attachment at depth 0, so an attachment entry adds no
+  parent to the pull. The pull imports an attachment one time, also if
   several commits name it.
-- The pull writes no ref for a dependency.
-- The pull checks no signature of a dependency commit. Field 2 holds the
-  checksum of the dependency, and the checksum and the signatures of the
+- The pull writes no ref for an attachment.
+- The pull checks no signature of an attachment commit. Field 2 holds the
+  checksum of the attachment, and the checksum and the signatures of the
   commit that names it cover field 2. An untrusted pull (`--untrusted`,
-  `PullFlags::UNTRUSTED`) hashes the dependency commit that it reads and
+  `PullFlags::UNTRUSTED`) hashes the attachment commit that it reads and
   imports, and compares the result with that checksum. The pull from a
   local candidate of a collection pull whose keys check signatures does
-  the same. A pull without the flag trusts the source for a dependency as
-  for each other object. The pull makes no ref-binding check on a
-  dependency.
+  the same. A pull without the flag trusts the source for an attachment as
+  for each other object. The pull makes no ref-binding check on an
+  attachment.
 - A target, a parent that the depth of the pull takes, and a commit of a
   chain of static deltas keep the checks of that role, also if a field 2
   names them.
-- The pull copies the `.commitmeta` of a dependency that it imports, under
+- The pull copies the `.commitmeta` of an attachment that it imports, under
   the rule of `[ex-ostrya] keep-detached-related`. It parses that
   `.commitmeta` only if the rule drops `ostrya.related`. A `.commitmeta` that
   does not parse then fails the pull. Under the default rule, the pull copies
   the bytes as it reads them.
-- The pull reads the commit object of a dependency from the source, then
+- The pull reads the commit object of an attachment from the source, then
   from each localcache repository, then from the repository. It reads no
-  commit object of a dependency that a chain of static deltas makes.
-- For a dependency that the repository holds complete, the pull walks no
-  tree and copies no `.commitmeta`. So the dependency does not get the
+  commit object of an attachment that a chain of static deltas makes.
+- For an attachment that the repository holds complete, the pull walks no
+  tree and copies no `.commitmeta`. So the attachment does not get the
   signatures that the source added after the repository stored it. A pull
-  that takes the dependency as a target copies its `.commitmeta`. A
-  dependency that the repository holds partial gets the walk of its whole
+  that takes the attachment as a target copies its `.commitmeta`. An
+  attachment that the repository holds partial gets the walk of its whole
   tree and its `.commitmeta`, and the pull removes its `.commitpartial`
   marker.
-- A pull that reads static deltas looks for a delta of each dependency that
-  it appends, before its transaction opens ("Static deltas of dependencies").
-  The pull applies these deltas after the deltas of the targets. It imports a
-  dependency with no delta loose, unless a chain of static deltas of the pull
+- A pull that reads static deltas looks for a delta of each attachment that
+  it appends, before its transaction opens ("Static deltas of attachments").
+  The pull applies these deltas after the deltas of the targets. It imports an
+  attachment with no delta loose, unless a chain of static deltas of the pull
   makes that commit.
-- The pull does not follow a build source.
-- A commit-only pull imports no dependency.
+- The pull does not follow a supplement.
+- A commit-only pull imports no attachment.
 
 The pull checks the format of field 2 of each commit that it walks, and of
 each commit of a chain of static deltas. A commit-only pull checks it too. A
 defective related value in field 2 fails the pull: an entry with an empty
 name, an entry with a checksum that is not 32 bytes, and an entry that names
-a nested dependency. A dependency that neither a source nor the repository
+a nested attachment. An attachment that neither a source nor the repository
 holds fails the pull too. This is also true for a parent that the source does
-not hold, if a commit of the pull names it as a dependency. The pull finds
+not hold, if a commit of the pull names it as an attachment. The pull finds
 each of these failures before its transaction opens, so it writes no object,
-no ref, and no `.commitpartial` marker. The same is true for a dependency with
+no ref, and no `.commitpartial` marker. The same is true for an attachment with
 no delta under the requirement of static deltas.
 
-The `pull-local` command of `ostree` imports no dependency
+The `pull-local` command of `ostree` imports no attachment
 (`conformance/cli-behavior.md`, "Related commits in a pull").
 
-### Static deltas of dependencies
+### Static deltas of attachments
 
-A static delta carries its target alone, so each dependency gets a delta of
-its own. A pull looks for the delta of each dependency that it fetches and
+A static delta carries its target alone, so each attachment gets a delta of
+its own. A pull looks for the delta of each attachment that it fetches and
 that the repository does not hold complete. A pull from a remote looks after
-the runs of the commits that name the dependencies, and fetches the
-dependencies in one more run. A local pull looks after the walk of the commit
+the runs of the commits that name the attachments, and fetches the
+attachments in one more run. A local pull looks after the walk of the commit
 chains, before its transaction opens, and only if it reads static deltas:
-under the option that requires them, or with a list. A dependency that the pull reaches as a
+under the option that requires them, or with a list. An attachment that the pull reaches as a
 target, as a parent, or as an intermediate commit of a chain of static deltas
 gets no search of its own.
 
-The search for the delta of a dependency is the search for the delta of a
+The search for the delta of an attachment is the search for the delta of a
 target (the rustdoc of `Repo::pull`, "Static deltas"), with this `from`:
 
 paired entry
-: For a dependency with the name N, the entry with the name N in field 2 of
+: For an attachment with the name N, the entry with the name N in field 2 of
   the commit that the local ref of a target names before the pull. The target
-  is a target whose chain names the dependency. The chain of a target is the
+  is a target whose chain names the attachment. The chain of a target is the
   target and the parents that the depth of the pull takes.
 
 - Each target gives at most one paired entry. If its chain names the
-  dependency under two names, the name nearest to the tip applies. If field 2
+  attachment under two names, the name nearest to the tip applies. If field 2
   holds two entries with that name, the first entry applies.
 - A target gives no paired entry if the repository has no local ref for it,
   does not hold the commit of the ref, or reads a field 2 of that commit that
@@ -3854,50 +3853,50 @@ The pull takes the first delta that it finds, in this order:
 3. the from-scratch `<to>`, only if the repository holds no paired entry
    complete
 
-With a summary, the pull reads the delta index of the dependency ("Static
+With a summary, the pull reads the delta index of the attachment ("Static
 delta index files"), and else the `ostree.static-deltas` map of the summary,
 as for a target. With no summary, a pull from a remote requests `<from>-<to>`
 by name, or the from-scratch `<to>` if it has no `from`. With a list of static
-deltas, the pull takes one entry of the list whose target is the dependency,
+deltas, the pull takes one entry of the list whose target is the attachment,
 in the order above, and plans no chain for it. Step 2 then goes in list
 order.
 
-The option that disables static deltas applies to each dependency. Under the
-option that requires static deltas, a dependency with no delta fails the pull
+The option that disables static deltas applies to each attachment. Under the
+option that requires static deltas, an attachment with no delta fails the pull
 with this message, and the pull moves no ref:
 
 ```text
 Static deltas required, but none found for <name> of <ref> to <checksum>
 ```
 
-`<ref>` is the first target whose chain names the dependency, as the pull
+`<ref>` is the first target whose chain names the attachment, as the pull
 names it. `<name>` is the name of the entry nearest to the tip of that chain.
-If no chain of a target names the dependency, `<ref>` is the first target of
+If no chain of a target names the attachment, `<ref>` is the first target of
 the pull. `<name>` then comes from the commit of the pull with the lowest
-checksum that names the dependency, and is the lowest name if that commit has
-two entries for it. `<checksum>` is the dependency. A from-scratch delta that
-step 3 leaves alone counts as found, and the pull fetches the dependency
+checksum that names the attachment, and is the lowest name if that commit has
+two entries for it. `<checksum>` is the attachment. A from-scratch delta that
+step 3 leaves alone counts as found, and the pull fetches the attachment
 loose. A delta that the advertisement or the list names and the source does
 not hold counts as none.
 
-A pull from a remote looks for the delta of a dependency before it fetches
-the dependency. Under the option that requires static deltas, a dependency
+A pull from a remote looks for the delta of an attachment before it fetches
+the attachment. Under the option that requires static deltas, an attachment
 with no delta fails the pull with the message above, also if the remote does
-not hold it or if it names dependencies of its own. A dependency that names
-dependencies of its own and has a delta fails the pull as a nested
-dependency, after the pull fetched and checked the superblock. A local pull
-reads the commit of each dependency before the search. So a dependency that
-no source holds, and a nested dependency, fail the pull before the search for
+not hold it or if it names attachments of its own. An attachment that names
+attachments of its own and has a delta fails the pull as a nested
+attachment, after the pull fetched and checked the superblock. A local pull
+reads the commit of each attachment before the search. So an attachment that
+no source holds, and a nested attachment, fail the pull before the search for
 its delta.
 
-The pull checks no signature of the superblock of the delta of a dependency.
+The pull checks no signature of the superblock of the delta of an attachment.
 It checks the digest that the advertisement or the list states, the `from`
 and the `to` of the superblock, and each inline part. The parse of the
 superblock compares the checksum of the commit that the superblock carries
 with the `to`, and the `to` is the checksum in field 2. A failed check fails
 the pull.
 
-A pull from a remote requests the superblock of the delta of each dependency
+A pull from a remote requests the superblock of the delta of each attachment
 one time. It writes each superblock to one temp file in `tmp/` of the
 repository after the digest check, and the commit that the superblock carries
 after the parse of the superblock. The file opens at the first write, and the
@@ -3907,30 +3906,30 @@ Just before the parts of a delta, the pull parses its superblock again from
 the file, and it drops the parse after the last part. This is also true for a
 remote with no summary, which states no digest of a superblock. The file holds
 at most 1 GiB, four superblocks of 128 MiB with their commits. If the
-superblocks and the commits of the dependencies pass this limit, the pull
-fails with an error that names the limit, and does not fetch the dependencies
+superblocks and the commits of the attachments pass this limit, the pull
+fails with an error that names the limit, and does not fetch the attachments
 loose.
 
-### Dependencies in a push
+### Attachments in a push
 
-A push follows the dependencies of each commit that it offers: each source
+A push follows the attachments of each commit that it offers: each source
 commit and each history commit of the offer. These rules apply to a push over
 ssh and over HTTP, to a push over the streams of the caller, and to a push to
 a bucket repository:
 
-- The push sends each dependency at depth 0, so a dependency entry adds no
-  parent to the push. The push offers a dependency one time, also if several
+- The push sends each attachment at depth 0, so an attachment entry adds no
+  parent to the push. The push offers an attachment one time, also if several
   commits name it. A prune of the server accepts the parents that the push
   did not send, as after a push with a small depth.
-- The push writes no ref for a dependency.
-- The push makes no ref-binding check and no collection-binding check on a
-  dependency.
-- A dependency is an offered commit for each other rule. For a dependency that
+- The push writes no ref for an attachment.
+- The push makes no ref-binding check and no collection-binding check on an
+  attachment.
+- An attachment is an offered commit for each other rule. For an attachment that
   the server lacks, the push sends the commit object, the objects of its tree,
-  and its `.commitmeta`. The push walks no tree of a dependency that the server
-  holds. A dependency that a bucket repository holds with a partial-commit
+  and its `.commitmeta`. The push walks no tree of an attachment that the server
+  holds. An attachment that a bucket repository holds with a partial-commit
   marker gets the walk of its whole tree, and the push deletes the marker.
-- The push does not follow a build source. `ostrya.related` goes with the
+- The push does not follow a supplement. `ostrya.related` goes with the
   `.commitmeta` of its commit.
 
 The push checks the format of field 2 of each commit of its walk: each source
@@ -3938,72 +3937,72 @@ commit, and each parent that the depth takes, or each parent of the local
 chain with no depth. This is also true for a history commit that the push
 does not offer. A defective related value in field 2 refuses the push: an
 entry with an empty name, an entry with a checksum that is not 32 bytes, and
-an entry that names a nested dependency. A dependency whose own field 2 is
-not empty is nested, also if that field 2 holds a defective entry. A
-dependency that the local repository does not hold, or marks partial,
+an entry that names a nested attachment. An attachment whose own field 2 is
+not empty is nested, also if that field 2 holds a defective entry. An
+attachment that the local repository does not hold, or marks partial,
 refuses the push too. This is also true for a parent that ends a chain, if a
-commit of the push names it as a dependency.
+commit of the push names it as an attachment.
 
 With a depth, the push finds each of these failures before it writes a byte
 or sends a request. With no depth, the push finds the failures of the
-dependencies of the history commits after the cut at the tip of the
+attachments of the history commits after the cut at the tip of the
 destination ref: after `HelloReply` in a session, and under the writer lock
 of a bucket repository. The push then sends no object. A session ends with
 `Abort`, and a push to a bucket repository uploads nothing and releases the
-lock. The push reads no dependency of a history commit that it does not
+lock. The push reads no attachment of a history commit that it does not
 offer.
 
-`ostrya push --onto` and `ostrya push-tree` send no dependency. The field 2 of
+`ostrya push --onto` and `ostrya push-tree` send no attachment. The field 2 of
 a server commit is empty ("Server commit").
 
-The server checks the dependencies of the commits that it stages ("Commit and
-CommitReply", check 6). It checks no signature of a dependency and adds no
-server signature to it, unless the dependency is also a new commit (checks 8
+The server checks the attachments of the commits that it stages ("Commit and
+CommitReply", check 6). It checks no signature of an attachment and adds no
+server signature to it, unless the attachment is also a new commit (checks 8
 and 9).
 
-### Dependencies in a one-way stream
+### Attachments in a one-way stream
 
-An ostrya sender of a one-way stream follows the dependencies of each new
+An ostrya sender of a one-way stream follows the attachments of each new
 commit of the stream: each commit that an update of `Commit` sets.
 
-- The sender sends each dependency at depth 0, so a dependency entry adds no
-  parent to the stream. The stream carries a dependency one time, also if
+- The sender sends each attachment at depth 0, so an attachment entry adds no
+  parent to the stream. The stream carries an attachment one time, also if
   several new commits name it, or if it is also a new commit.
-- `Commit` holds no update for a dependency.
-- The sender makes no ref-binding check on a dependency.
-- For each dependency, the stream carries the commit object, the objects of its
-  tree, and its `.commitmeta`. An object that a new commit and a dependency
+- `Commit` holds no update for an attachment.
+- The sender makes no ref-binding check on an attachment.
+- For each attachment, the stream carries the commit object, the objects of its
+  tree, and its `.commitmeta`. An object that a new commit and an attachment
   share goes in the stream one time.
-- The sender does no negotiation, so it sends a dependency that the server
-  holds. The server accepts that dependency and drops its `.commitmeta`
+- The sender does no negotiation, so it sends an attachment that the server
+  holds. The server accepts that attachment and drops its `.commitmeta`
   ("Commit and CommitReply", check 5).
-- The sender does not follow a build source. `ostrya.related` goes with the
+- The sender does not follow a supplement. `ostrya.related` goes with the
   `.commitmeta` of its commit.
 
 The sender checks the format of field 2 of each new commit. A defective
 related value in field 2 refuses the export: an entry with an empty name, an
 entry with a checksum that is not 32 bytes, and an entry that names a nested
-dependency. A dependency whose own field 2 is not empty is nested, also if
-that field 2 holds a defective entry, and also if the dependency is a new
-commit. The format check of field 2 of each new commit runs first, so a
-dependency that is a new commit with a defective entry in its field 2 gives
-the failure of that entry. A dependency that the repository of the sender
+attachment. An attachment whose own field 2 is not empty is nested, also if
+that field 2 holds a defective entry, and also if the attachment is a new
+commit. The format check of field 2 of each new commit runs first, so an
+attachment that is a new commit with a defective entry in its field 2 gives
+the failure of that entry. An attachment that the repository of the sender
 does not hold, or marks partial, refuses the export too. The sender finds
 each of these failures before it writes the first byte of the stream.
-`Repo::export_stream` then gives `Error::ObjectNotFound` for a dependency
+`Repo::export_stream` then gives `Error::ObjectNotFound` for an attachment
 that the repository does not hold, and `Error::InvalidRelations` for each other
 failure.
 
-The server checks the dependencies of the commits that it stages, as in a
-push session ("The one-way stream"). A server that holds a dependency with a
+The server checks the attachments of the commits that it stages, as in a
+push session ("The one-way stream"). A server that holds an attachment with a
 partial-commit marker refuses the stream with `missing-objects` and no
 `missing` detail, also though the stream carries the whole tree of the
-dependency ("Commit and CommitReply", check 6). To complete the dependency
+attachment ("Commit and CommitReply", check 6). To complete the attachment
 at the server, a sender sends it as the new commit of an update, in that
 stream or in an earlier one. The server then checks the tree of the
-dependency and removes its marker.
+attachment and removes its marker.
 
-### Dependencies in the fsck
+### Attachments in the fsck
 
 `Repo::fsck` and `ostrya fsck` check field 2 of each commit that they verify:
 each commit with no partial-commit marker at the start of the run that the
@@ -4023,16 +4022,16 @@ An entry that no rule applies to gives no finding. A checksum that field 2
 names under two names gives two findings. Two entries with one name, and
 names that are not sorted, give no finding. The text of a finding is the
 text of `Error::InvalidRelations` for field 2: `related commits in field 2 of
-commit C: dependency N names commit D, which the repository does not hold`,
-`..., which is partial`, `..., which has dependencies of its own`, or the
+commit C: attachment N names commit D, which the repository does not hold`,
+`..., which is partial`, `..., which has attachments of its own`, or the
 defect of the entry.
 
 With the default `mark_partial` and `mark_attachments`, the run writes the
 marker `state/<commit>.commitpartial` of each commit with an `Absent` or a
 `Partial` finding. A later pull of that commit fetches it again with its
-dependencies. A `Defective` finding gets no marker, because a pull cannot
+attachments. A `Defective` finding gets no marker, because a pull cannot
 repair it. With `mark_attachments` false, or with
-`ostrya fsck --no-mark-dependencies`, the run reports each finding and writes
+`ostrya fsck --no-mark-attachments`, the run reports each finding and writes
 no marker for it. The markers for absent and deleted objects do not change.
 With `mark_partial` false, the run writes neither kind of marker. A marker of
 this check does not change the other findings of the run. `ostrya fsck` writes
@@ -4040,7 +4039,7 @@ each finding on standard error and exits 1. A run that ends early does not
 reach this check. The check runs before the tombstone step of
 `--add-tombstones`.
 
-The fsck of a bucket repository makes the same findings as `dependency`
+The fsck of a bucket repository makes the same findings as `attachment`
 findings ("The fsck of a bucket repository").
 
 ## Ref patterns
@@ -4483,8 +4482,8 @@ them:
 
 A push of a repository (`ostrya push`, `Repo::push`, and
 `Repo::push_over_stream`) offers its commits in the first `Have`: each source
-commit, its history, and then the dependencies of each offered commit
-("Dependencies in a push"). With no depth, the history ends before the
+commit, its history, and then the attachments of each offered commit
+("Attachments in a push"). With no depth, the history ends before the
 current commit of the ref in `HelloReply`. If the server does not hold the
 ref, or the local chain does not hold the commit of the ref, the push offers
 no history commit. The client then offers the objects of the trees of the
@@ -4697,7 +4696,7 @@ Each failed check ends the session, and the session writes nothing:
    the server takes each detached metadata dict for a commit that the
    repository holds, that the session did not stage, and that no update
    names as `new`. If an entry of field 2 of a commit of the session names
-   that commit, the commit is a dependency that the repository holds, and
+   that commit, the commit is an attachment that the repository holds, and
    the server drops the dict with no merge and no write. An entry with an
    empty name or with a checksum that is not 32 bytes names no commit. Each
    other such dict is `protocol`.
@@ -4707,22 +4706,22 @@ Each failed check ends the session, and the session writes nothing:
    dirtree that does not parse is `protocol`, and a stored one is
    `internal`.
 
-   Then the server checks the dependencies of each staged commit: the field
+   Then the server checks the attachments of each staged commit: the field
    2 entries of each commit that the session staged, the staged parents of a
    new commit included ("Related commits"). A new commit that the repository
    holds with a partial-commit marker gets the same check, because the walk
    above completes its tree and the session removes its marker. The server
    takes the new commits that it checks in the order of the updates, then
    the other staged commits in the order of their checksums. An entry with an empty
-   name or with a checksum that is not 32 bytes is `protocol`. A dependency
+   name or with a checksum that is not 32 bytes is `protocol`. An attachment
    that the session did not stage and that the repository does not hold is
-   `missing-objects`. The absent dependencies fail together, and the
+   `missing-objects`. The absent attachments fail together, and the
    `missing` detail names each one. Then, in the order of the commits that
-   name them, a dependency that the repository holds with a partial-commit
-   marker is `missing-objects` with no `missing` detail, and a dependency
+   name them, an attachment that the repository holds with a partial-commit
+   marker is `missing-objects` with no `missing` detail, and an attachment
    whose own field 2 is not empty is `protocol`. The message names the
-   commit that holds the entry, field 2, and the defect. A dependency that
-   the session staged, and a dependency that is a new commit, are complete
+   commit that holds the entry, field 2, and the defect. An attachment that
+   the session staged, and an attachment that is a new commit, are complete
    through the walk above, also with a partial-commit marker. The server
    does not check field 2 of a new commit that the repository holds with no
    partial-commit marker.
@@ -4762,14 +4761,14 @@ Each failed check ends the session, and the session writes nothing:
    not read fails.
 
    A commit that no update names gets no verification, a staged parent and
-   a dependency included. The checksum of a dependency is in field 2 of a
+   an attachment included. The checksum of an attachment is in field 2 of a
    commit of the session. A new commit is that commit, or binds it through
    the parent checksums of its history, and the signatures of the new
    commit cover these checksums. The server checks that the bytes of each
    object hash to the checksum that names it ("Object streams"), so a
-   signature on a dependency adds no trust. A dependency that only a staged
-   commit outside each history names is bound to no new commit. A
-   dependency that is also a new commit gets the verification of its own
+   signature on an attachment adds no trust. An attachment that only a staged
+   commit outside each history names is bound to no new commit. An
+   attachment that is also a new commit gets the verification of its own
    updates alone, and the message names it as a new commit.
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
@@ -4780,8 +4779,8 @@ Each failed check ends the session, and the session writes nothing:
    `internal` for each other failure.
    The server then makes the staged objects durable, and signs each new commit one time with each key
    of the key `sign` of the client group. The server signs no other commit,
-   a staged parent and a dependency included. The incoming dict of each
-   other commit of the session, a staged dependency included, merges into
+   a staged parent and an attachment included. The incoming dict of each
+   other commit of the session, a staged attachment included, merges into
    its stored dict with no signature. The server then walks the history of each update
    that needs the fast-forward check. The walk starts at the new commit and
    follows the parents until it reaches the commit of the ref, an absent
@@ -5128,8 +5127,8 @@ If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session
 with no change.
 
-An ostrya sender also sends the dependencies of each new commit, with no
-ref update ("Dependencies in a one-way stream").
+An ostrya sender also sends the attachments of each new commit, with no
+ref update ("Attachments in a one-way stream").
 
 An ostrya sender checks the bindings of each update before it writes the
 first byte. It refuses a commit with no `ostree.collection-binding`, and a
@@ -5155,7 +5154,7 @@ repository lock, and `Commit` still takes the update lock ("The update lock").
 The size check of `CommitReply` (check 2 of "Commit and CommitReply")
 applies. The server runs the other `Commit` checks after the end of the
 input, or at `Commit` if it stops at `Commit`. Check 6 checks the
-dependencies of the staged commits as in a push session. A one-way stream
+attachments of the staged commits as in a push session. A one-way stream
 adds no server signature, writes no anchor commit, and does not regenerate
 the summary. It calls no hook of a host application.
 
@@ -5176,7 +5175,7 @@ and an update whose rule does not accept it, with `ref-denied`. The rules
 can also skip the check of `ostree.ref-binding` of check 7. They never skip
 the checks of the collection binding. Check 8 with
 trusted keys refuses a commit with no signature. The trusted keys of the rule
-of an update apply to the new commit of that update alone. A dependency gets
+of an update apply to the new commit of that update alone. An attachment gets
 no verification, unless it is also a new commit. Then the rules of its own
 updates apply. Check 11 refuses a delete
 that the rule does not allow with `delete-denied`.
@@ -5278,9 +5277,9 @@ Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
 A pull of collection refs reads the ref listing or the summary of a remote,
 over both transports ("The pull of collection refs").
 
-A pull of the port requests the dependencies of a commit over both
-transports, as `.commitmeta` and `.commit` requests of their own ("Dependencies
-in a pull from a remote"). For a dependency that the repository holds
+A pull of the port requests the attachments of a commit over both
+transports, as `.commitmeta` and `.commit` requests of their own ("Attachments
+in a pull from a remote"). For an attachment that the repository holds
 complete, it requests neither file.
 
 ## The ref listing
@@ -5884,8 +5883,8 @@ a ref of the media to an older commit.
 The export makes one local pull for each collection, in the order of the
 first operand of each collection. Each pull is at depth 0, with no signature
 check and no timestamp check. It copies the `.commitmeta` of each commit, and
-the dependencies of field 2 of each commit as loose objects, with no ref
-("Static deltas of dependencies"). It copies no static delta, no
+the attachments of field 2 of each commit as loose objects, with no ref
+("Static deltas of attachments"). It copies no static delta, no
 `delta-indexes/` entry, and no `summary.sig` of the source. On the file system
 of the source, the pull can share an object by hardlink or reflink. Where the
 file system refuses the link, it copies the object.
@@ -6101,7 +6100,7 @@ A ref whose current ref holds the commit of the media is unchanged. The
 import does not pull it, and writes no ref for it. For each other ref, the
 import makes one local pull from the media repository, with its own
 transaction. The pull is at depth 0, and reads no static delta. It copies
-the `.commitmeta` of the commit, and the dependencies of field 2 of the
+the `.commitmeta` of the commit, and the attachments of field 2 of the
 commit as loose objects. The `ostree.collection-binding` of the commit must
 state `ID`, and the ref-binding check applies. The pull refuses a commit
 whose timestamp is older than the timestamp of the commit of the current
@@ -7357,7 +7356,7 @@ The generation:
   `ostree.composefs.digest.v0`. The writers are `ostrya commit`, a pull from a
   remote, a local pull, a receive (the push session, the one-way stream, and
   the server commit), and `ostrya static-delta apply-offline`. A pull records
-  its targets, the parents within its depth, the dependencies, and each held
+  its targets, the parents within its depth, the attachments, and each held
   partial commit that it completes. A commit-only pull and a subpath pull
   record no commit.
 - The build runs after the transaction stages its objects and before it
@@ -8116,8 +8115,8 @@ are:
    is no ancestor. The fast-forward rule and the force apply to each ref in
    its own namespace.
 5. The walk: each source commit, its history, cut at the tip of the ref in the
-   bucket, and the dependencies of each offered commit, as a push over a session
-   offers them ("Dependencies in a push"). The trees of the commits that the
+   bucket, and the attachments of each offered commit, as a push over a session
+   offers them ("Attachments in a push"). The trees of the commits that the
    bucket lacks and of the offered commits with a partial-commit marker under
    `state/`. The walk reads no tree of another commit that the listing holds,
    because a commit object in the bucket has its whole tree in the bucket. The
@@ -8420,8 +8419,8 @@ The steps of the fsck are:
    the bytes must be the checksum of the name, and the bytes must parse as
    a commit. Then, without the repair, the check of field 2 of each commit
    that parses, the commits with a partial-commit marker included, as
-   "Dependencies in the fsck" states. The listing must hold the commit of
-   each dependency, and `state/` must hold no marker
+   "Attachments in the fsck" states. The listing must hold the commit of
+   each attachment, and `state/` must hold no marker
    `state/<checksum>.commitpartial` of it. This check reads no object.
 6. The walk of the tree of each commit that parses, also of a commit whose
    bytes do not match its name. The run reads each dirtree and each dirmeta
@@ -8438,7 +8437,7 @@ The steps of the fsck are:
    such object.
 9. Without the repair, the read again of each object of a `missing`
    finding that the listing does not hold, and of the commit of each
-   `Absent` dependency of a `dependency` finding, one time for each
+   `Absent` attachment of an `attachment` finding, one time for each
    commit. Then the read again of the commits of each object of a
    `missing` finding that is still absent. Each read is a `GET` with
    `Range: bytes=0-0`, by the strict rule of an absent key.
@@ -8503,13 +8502,13 @@ Each finding has one kind, and is an error or a note:
 - `corrupt`, an error: an object that does not parse, a `.filez` that does
   not inflate as its header declares, or an object over the metadata size
   cap.
-- `dependency`, an error: an entry of field 2 of a commit that is
+- `attachment`, an error: an entry of field 2 of a commit that is
   `Absent`, `Partial`, or `Defective`. The key is the object key of the
   commit that holds the entry, and the detail is the reason of the finding
   of the local fsck. With the repair, the run classifies the entry against
   the state after the repair (step 10). The repair writes and deletes no
   key for it.
-- `dependency`, a note: without the repair, an `Absent` dependency whose
+- `attachment`, a note: without the repair, an `Absent` attachment whose
   commit the read again finds.
 - `marker`, a note: without the repair, the partial-commit marker of a
   commit that the run walked, whose tree has no `missing`, `mismatch`, or
@@ -8569,18 +8568,18 @@ before a request. The prune also refuses `--break-lock` together with
 writer lock of another writer. The prune keeps the objects of the listing
 that a local prune with the same options keeps in a repository with the
 same refs and objects, and also the objects of the commits that the summary
-names and of their dependencies, under the bound of the run. Two
+names and of their attachments, under the bound of the run. Two
 differences apply:
 
 - The prune reads field 2 of each commit that the walk reaches, and keeps the
-  dependencies as the local prune keeps them ("Related commits"). It reads no
-  `.commitmeta`, so it reads no build source. So it deletes a build source that
+  attachments as the local prune keeps them ("Related commits"). It reads no
+  `.commitmeta`, so it reads no supplement. So it deletes a supplement that
   no other root reaches, and the objects that only that commit reaches. It also
-  deletes the `.commitmeta` of a build source that the listing does not hold.
+  deletes the `.commitmeta` of a supplement that the listing does not hold.
   The local prune keeps it. With `--refs-only` or `--keep-younger-than`, the
-  local prune keeps each build source of a reached commit. Without these
+  local prune keeps each supplement of a reached commit. Without these
   options, each commit of the listing is a root, and the difference is the
-  `.commitmeta` of an absent build source alone.
+  `.commitmeta` of an absent supplement alone.
 - Without `--refs-only` and `--keep-younger-than`, the prune also deletes the
   `.commitmeta` of a parent commit that the listing does not hold. The local
   prune keeps it when its bound reaches that parent.
@@ -8603,16 +8602,16 @@ The roots are:
   does not reach a parent commit that the listing does not hold, so the
   prune deletes the `.commitmeta` of that commit.
 - the commit of each field 2 entry of a commit that the walk reaches: the
-  dependencies. With `--refs-only` or `--keep-younger-than`, a dependency is
-  a root under the bound of `--depth` or `--keep-younger-than`, also a
-  dependency of a commit of the summary. Without these options, a
-  dependency keeps no parent, as each other root, so the walk still reads
+  attachments. With `--refs-only` or `--keep-younger-than`, an attachment is
+  a root under the bound of `--depth` or `--keep-younger-than`, also an
+  attachment of a commit of the summary. Without these options, an
+  attachment keeps no parent, as each other root, so the walk still reads
   each commit one time.
 
 The walk reads field 2 from the bytes of each commit object that it reads,
 and sends no other request for it. It roots on field 2 entries that are not
-sorted, on two entries with one name, and on the field 2 entries of a
-dependency. A defective field 2 entry, with an empty name or with a
+sorted, on two entries with one name, and on the field 2 entries of an
+attachment. A defective field 2 entry, with an empty name or with a
 checksum that is not 32 bytes, roots nothing and gives one warning. The
 other entries of the field root as usual. The text of the warning is
 `related commits in field 2 of commit <checksum>: <reason>`, and
@@ -8638,7 +8637,7 @@ hold, and reads it as absent: an absent commit or dirtree keeps its own name
 and no object below it. A listed object that is gone at its read fails the
 run. With `--keep-younger-than`, the walk reads a commit a second time
 when the time bound rejected the commit as a parent and the walk then
-reaches the commit as a root, for example as a dependency. The walk reads
+reaches the commit as a root, for example as an attachment. The walk reads
 each other commit one time.
 
 A kept commit keeps its `.commitmeta`. A partial commit that the prune keeps

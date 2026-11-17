@@ -1485,8 +1485,8 @@ mod cli {
         }
     }
 
-    /// `ostrya push` to `ostrya serve` sends the dependency that field 2 of
-    /// the pushed commit names. The server holds the dependency complete,
+    /// `ostrya push` to `ostrya serve` sends the attachment that field 2 of
+    /// the pushed commit names. The server holds the attachment complete,
     /// and writes no ref for it.
     #[test]
     fn push_sends_an_attachment() {
@@ -1515,7 +1515,7 @@ mod cli {
         assert_eq!(stdout(&out), format!("main (new) {tip}\n"));
 
         let object = server.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
-        assert!(object.is_file(), "dependency {att} was not sent");
+        assert!(object.is_file(), "attachment {att} was not sent");
         let refs = ok("ostrya", &[&format!("--repo={}", server.display()), "refs"]);
         assert_eq!(refs, "main\n");
         ok("ostrya", &[&format!("--repo={}", server.display()), "fsck"]);

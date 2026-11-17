@@ -756,10 +756,10 @@ pub async fn commit_tree_with(
     commit_tree_full(repo, base, sub, branch, parent, timestamp, flags, &[]).await
 }
 
-/// Commits the subtree `sub` as [`commit_tree`] does, with the dependencies
+/// Commits the subtree `sub` as [`commit_tree`] does, with the attachments
 /// `related` in field 2.
 ///
-/// The repository must hold each dependency complete.
+/// The repository must hold each attachment complete.
 pub async fn commit_tree_related(
     repo: &Repo,
     base: &Path,
@@ -782,7 +782,7 @@ pub async fn commit_tree_related(
 }
 
 /// Commits the subtree `sub` as [`commit_tree_with`] does, with the
-/// dependencies `related` in field 2.
+/// attachments `related` in field 2.
 #[allow(clippy::too_many_arguments)]
 async fn commit_tree_full(
     repo: &Repo,

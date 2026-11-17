@@ -2254,7 +2254,7 @@ fn two_key_groups_with_one_key_file_sign_once() {
 }
 
 // ---------------------------------------------------------------------------
-// Dependencies.
+// Attachments.
 // ---------------------------------------------------------------------------
 
 /// The field 2 entry `name` that names `commit`.
@@ -2288,10 +2288,10 @@ fn refs(repo: &Repo) -> Vec<(String, Checksum)> {
     block_on(repo.list_refs(None)).unwrap()
 }
 
-/// A staged dependency of a new commit gets no verification. A dependency
-/// with no dict passes and gets no dict. A dependency with a signature of a
+/// A staged attachment of a new commit gets no verification. An attachment
+/// with no dict passes and gets no dict. An attachment with a signature of a
 /// key that the rule does not trust passes, and keeps that signature. The
-/// dependency gets no ref.
+/// attachment gets no ref.
 #[test]
 fn an_unsigned_attachment_is_accepted() {
     let att = build_commit(None, "dependency", no_metadata(), &[]);
@@ -2330,7 +2330,7 @@ fn an_unsigned_attachment_is_accepted() {
     assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
 }
 
-/// A dependency that only a staged parent of a new commit names gets no
+/// An attachment that only a staged parent of a new commit names gets no
 /// verification. The parent itself needs no signature either.
 #[test]
 fn an_attachment_of_a_staged_parent_gets_no_rule() {
@@ -2352,7 +2352,7 @@ fn an_attachment_of_a_staged_parent_gets_no_rule() {
 }
 
 /// A staged commit that no update names and that no parent chain reaches,
-/// and the staged dependency that its field 2 names, get the completeness
+/// and the staged attachment that its field 2 names, get the completeness
 /// check alone: no verification and no server signature.
 #[test]
 fn a_staged_commit_outside_each_history_gets_no_rule() {
@@ -2384,8 +2384,8 @@ fn a_staged_commit_outside_each_history_gets_no_rule() {
     );
 }
 
-/// A dependency of a new commit or of a staged parent that is neither staged
-/// nor held is `missing-objects`. The error lists each such dependency, in
+/// An attachment of a new commit or of a staged parent that is neither staged
+/// nor held is `missing-objects`. The error lists each such attachment, in
 /// the order of the commits that name them.
 #[test]
 fn absent_attachments_are_missing_objects_together() {
@@ -2422,7 +2422,7 @@ fn absent_attachments_are_missing_objects_together() {
     assert!(
         error
             .message
-            .contains("2 objects that the staged commits name as dependencies"),
+            .contains("2 objects that the staged commits name as attachments"),
         "{}",
         error.message
     );
@@ -2477,8 +2477,8 @@ fn a_defective_field_2_entry_is_protocol() {
     }
 }
 
-/// A dependency whose own field 2 is not empty is `protocol`, for a staged
-/// dependency and for a dependency that the repository holds.
+/// An attachment whose own field 2 is not empty is `protocol`, for a staged
+/// attachment and for an attachment that the repository holds.
 #[test]
 fn a_nested_attachment_is_protocol() {
     let inner = build_commit(None, "inner", no_metadata(), &[]);
@@ -2501,8 +2501,8 @@ fn a_nested_attachment_is_protocol() {
     assert_eq!(
         error.message,
         format!(
-            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
-             has dependencies of its own",
+            "related commits in field 2 of commit {}: attachment lib/d names commit {}, which \
+             has attachments of its own",
             target.checksum, att.checksum
         )
     );
@@ -2535,7 +2535,7 @@ fn a_nested_attachment_is_protocol() {
     );
     assert!(
         error.message.contains(&format!(
-            "dependency lib/h names commit {held}, which has dependencies of its own"
+            "attachment lib/h names commit {held}, which has attachments of its own"
         )),
         "{}",
         error.message
@@ -2543,7 +2543,7 @@ fn a_nested_attachment_is_protocol() {
     assert_unchanged(&repo, &before);
 }
 
-/// A dependency that the repository holds complete passes with no
+/// An attachment that the repository holds complete passes with no
 /// verification, and the server does not sign it: its detached metadata
 /// stays as it was.
 #[test]
@@ -2583,7 +2583,7 @@ fn a_held_attachment_gets_no_check_and_no_signature() {
     );
 }
 
-/// A dependency that the repository holds and marks partial is
+/// An attachment that the repository holds and marks partial is
 /// `missing-objects`, with no object listed.
 #[test]
 fn a_partial_held_attachment_is_missing_objects() {
@@ -2616,7 +2616,7 @@ fn a_partial_held_attachment_is_missing_objects() {
     assert_eq!(
         error.message,
         format!(
-            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
+            "related commits in field 2 of commit {}: attachment lib/d names commit {}, which \
              is partial",
             target.checksum, att.checksum
         )
@@ -2624,8 +2624,8 @@ fn a_partial_held_attachment_is_missing_objects() {
     assert_unchanged(&repo, &before);
 }
 
-/// The repository holds a dependency with a signed dict. A session sends
-/// the commit object of the dependency again, a new commit whose field 2
+/// The repository holds an attachment with a signed dict. A session sends
+/// the commit object of the attachment again, a new commit whose field 2
 /// names it, and a dict for it with another signature. The server drops that
 /// dict, so the stored dict keeps its bytes. A dict for a held commit that no
 /// field 2 of a commit of the session names stays `protocol`.
@@ -2692,7 +2692,7 @@ fn a_dict_for_a_held_attachment_is_dropped() {
     assert_unchanged(&repo, &before);
 }
 
-/// A staged dependency that two new commits name gets no server signature.
+/// A staged attachment that two new commits name gets no server signature.
 /// Each new commit gets each server key of its rule once, also a key that the
 /// list holds two times.
 #[test]
@@ -2730,7 +2730,7 @@ fn an_attachment_of_two_targets_gets_no_server_signature() {
     }
 }
 
-/// A staged dependency that is also a new commit passes the verification of
+/// A staged attachment that is also a new commit passes the verification of
 /// its update, and the refusal names it as a new commit. It gets each server
 /// key of its update once.
 #[test]
@@ -2800,8 +2800,8 @@ fn marker(repo: &Repo, commit: &Checksum) -> PathBuf {
 
 /// The repository holds a new commit with a partial marker, and the session
 /// sends its tree. Field 2 of the commit gets the checks of a staged commit:
-/// an absent dependency is `missing-objects`, and a defective entry and a
-/// nested dependency are `protocol`. The session publishes nothing, and the
+/// an absent attachment is `missing-objects`, and a defective entry and a
+/// nested attachment are `protocol`. The session publishes nothing, and the
 /// marker stays.
 #[test]
 fn a_partial_held_target_gets_the_attachment_checks() {
@@ -2830,8 +2830,8 @@ fn a_partial_held_target_gets_the_attachment_checks() {
             &over_nested,
             ErrorCode::Protocol,
             Some(format!(
-                "related commits in field 2 of commit {}: dependency lib/n names commit {}, \
-                 which has dependencies of its own",
+                "related commits in field 2 of commit {}: attachment lib/n names commit {}, \
+                 which has attachments of its own",
                 over_nested.checksum, nested.checksum
             )),
         ),
@@ -2866,7 +2866,7 @@ fn a_partial_held_target_gets_the_attachment_checks() {
     }
 }
 
-/// The repository holds a dependency with a partial marker. A session that
+/// The repository holds an attachment with a partial marker. A session that
 /// sends its tree and names it as a new commit counts it as complete: the
 /// session commits, and the marker goes.
 #[test]
@@ -2899,7 +2899,7 @@ fn a_partial_held_attachment_that_is_a_new_commit_counts_as_complete() {
 }
 
 /// Field 2 of a new commit that the repository holds gives no rule to a
-/// staged dependency: the dependency gets no verification and no server
+/// staged attachment: the attachment gets no verification and no server
 /// signature.
 #[test]
 fn a_held_target_gives_no_rule_to_a_staged_attachment() {
@@ -2930,7 +2930,7 @@ fn a_held_target_gives_no_rule_to_a_staged_attachment() {
     );
 }
 
-/// A staged dependency with a partial marker that no object backs counts as
+/// A staged attachment with a partial marker that no object backs counts as
 /// complete, and the session removes the marker.
 #[test]
 fn a_staged_attachment_with_a_stale_marker_counts_as_complete() {
@@ -2950,7 +2950,7 @@ fn a_staged_attachment_with_a_stale_marker_counts_as_complete() {
     assert!(!marker(&repo, &att.checksum).exists(), "the marker goes");
 }
 
-/// The refusal of a nested dependency that two new commits name names the
+/// The refusal of a nested attachment that two new commits name names the
 /// new commit of the first update, also when its checksum sorts last.
 #[test]
 fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
@@ -2983,8 +2983,8 @@ fn a_nested_attachment_refusal_names_the_first_new_commit_in_update_order() {
     assert_eq!(
         error.message,
         format!(
-            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
-             has dependencies of its own",
+            "related commits in field 2 of commit {}: attachment lib/d names commit {}, which \
+             has attachments of its own",
             first.checksum, att.checksum
         )
     );

@@ -1674,7 +1674,7 @@ fn remote_fsck_of_a_corrupt_bucket_prints_each_finding_and_exits_1() {
 }
 
 /// A commit whose field 2 names a commit that the bucket does not hold gives
-/// a `dependency` error on the key of the commit, and the command exits 1.
+/// an `attachment` error on the key of the commit, and the command exits 1.
 #[test]
 fn remote_fsck_reports_an_absent_attachment_and_exits_1() {
     let scratch = Scratch::new("fsck-dependency");
@@ -1703,7 +1703,7 @@ fn remote_fsck_reports_an_absent_attachment_and_exits_1() {
     assert_eq!(
         stderr(&out),
         format!(
-            "dependency {}: dependency lib/x names commit {absent}, which the repository does \
+            "attachment {}: attachment lib/x names commit {absent}, which the repository does \
              not hold\nerror: Bucket repository corruption encountered\n",
             key(&naming)
         )

@@ -899,7 +899,7 @@ fn a_second_tree_push_sends_no_object() {
 }
 
 /// The server commit of a tree push has an empty field 2, also onto a tip
-/// whose field 2 names a dependency.
+/// whose field 2 names an attachment.
 #[test]
 fn the_server_commit_of_a_tree_push_names_no_attachment() {
     let tmp = TmpDir::new("push-tree-no-dependency");

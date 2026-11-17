@@ -3,38 +3,38 @@
 //! A commit names related commits in two places:
 //!
 //! - Field 2 of the commit object, an `a(say)` array, holds the
-//!   dependencies. The commit checksum covers them.
+//!   attachments. The commit checksum covers them.
 //! - The detached metadata key `ostrya.related`, a variant of type `a(say)`,
-//!   holds the build sources. The commit checksum does not cover them.
+//!   holds the supplements. The commit checksum does not cover them.
 //!
 //! Each entry is a name and the 32-byte checksum of a commit. The name has
 //! the form `<class>/<name>` by convention, for example `container/fe`.
 //!
 //! - [`Repo::read_commit_relations`] reads both fields.
 //! - [`Repo::add_supplement`] and [`Transaction::add_supplement`]
-//!   add a build source to a commit.
+//!   add a supplement to a commit.
 //! - [`Repo::prune`] keeps the commits that the two fields of each reached
 //!   commit name, and gives a [`RelationWarning`] for each defective value.
 //!   `BucketRepo::prune` keeps the commits that field 2 of each reached
 //!   commit names, and gives a [`RelationWarning`] for each defective field 2
 //!   entry.
 //! - [`Repo::pull`], [`Repo::pull_with_session`], and [`Repo::pull_collection`]
-//!   fetch the dependencies of each commit that they read.
-//!   [`Repo::pull_local`] imports the dependencies of each commit that it
+//!   fetch the attachments of each commit that they read.
+//!   [`Repo::pull_local`] imports the attachments of each commit that it
 //!   walks.
 //! - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` send
-//!   the dependencies of each commit that they offer.
+//!   the attachments of each commit that they offer.
 //! - `Repo::receive`, `Repo::receive_stream`, and
-//!   `Repo::receive_stream_to_commit` check the dependencies of each commit
-//!   that the session stages. They check no signature of a dependency and add
-//!   no server signature to it, unless the dependency is also the new commit
+//!   `Repo::receive_stream_to_commit` check the attachments of each commit
+//!   that the session stages. They check no signature of an attachment and add
+//!   no server signature to it, unless the attachment is also the new commit
 //!   of a ref update.
 //! - [`Repo::apply_static_delta`] and [`Repo::apply_static_delta_offline`]
-//!   check the dependencies of the target commit before they write an object.
-//! - [`Repo::fsck`] reports each dependency of a checked commit that is
+//!   check the attachments of the target commit before they write an object.
+//! - [`Repo::fsck`] reports each attachment of a checked commit that is
 //!   absent, partial, or defective, and marks the commit of an absent or a
-//!   partial dependency as partial. `BucketRepo::fsck` reports the same
-//!   dependencies and writes nothing for them.
+//!   partial attachment as partial. `BucketRepo::fsck` reports the same
+//!   attachments and writes nothing for them.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::LazyLock;
@@ -48,7 +48,7 @@ use crate::repo::Repo;
 use crate::repo_fs::RepoDir;
 use crate::transaction::Transaction;
 
-/// The detached metadata key of the build sources.
+/// The detached metadata key of the supplements.
 pub(crate) const RELATED_KEY: &str = "ostrya.related";
 
 /// The bytes of the key [`RELATED_KEY`] in a serialized `a{sv}` dict: the
@@ -58,13 +58,13 @@ const RELATED_KEY_BYTES: &[u8] = b"ostrya.related\0";
 /// The type string of a field of related entries.
 const RELATED_SIGNATURE: &str = "a(say)";
 
-/// The end of the reason of a dependency whose own field 2 is not empty.
-pub(crate) const NESTED_REASON: &str = "which has dependencies of its own";
+/// The end of the reason of an attachment whose own field 2 is not empty.
+pub(crate) const NESTED_REASON: &str = "which has attachments of its own";
 
-/// The end of the reason of a dependency that the repository marks partial.
+/// The end of the reason of an attachment that the repository marks partial.
 pub(crate) const PARTIAL_REASON: &str = "which is partial";
 
-/// The end of the reason of a dependency that the repository does not hold.
+/// The end of the reason of an attachment that the repository does not hold.
 pub(crate) const ABSENT_REASON: &str = "which the repository does not hold";
 
 /// The type of a commit object. The parse of field 2 decodes member 2 alone.
@@ -74,9 +74,9 @@ static COMMIT_TYPE: LazyLock<Type> =
 /// The field of a commit that holds a list of related entries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelationField {
-    /// Field 2 of the commit object: the dependencies.
+    /// Field 2 of the commit object: the attachments.
     Attachments,
-    /// The detached metadata key `ostrya.related`: the build sources.
+    /// The detached metadata key `ostrya.related`: the supplements.
     Supplements,
 }
 
@@ -123,11 +123,12 @@ impl std::fmt::Display for RelationWarning {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitRelations {
     /// The entries of field 2 of the commit object: the name and the
-    /// checksum of each dependency.
+    /// checksum of each attachment.
     pub attachments: Vec<(String, Checksum)>,
     /// The entries of the detached metadata key `ostrya.related`: the name
-    /// and the checksum of each build source. The list is empty if the
-    /// commit has no detached metadata or no such key.
+    /// and the checksum of each supplement. The commit checksum does not cover
+    /// them, so a supplement can be added after the commit. The list is empty
+    /// if the commit has no detached metadata or no such key.
     pub supplements: Vec<(String, Checksum)>,
 }
 
@@ -480,7 +481,7 @@ fn kept_entries(commit: &Checksum, dict: Value) -> Result<Kept> {
     Ok(Kept::Part(kept))
 }
 
-/// Adds the build sources `sources` to the detached metadata dict `dict` of
+/// Adds the supplements `sources` to the detached metadata dict `dict` of
 /// the commit `commit`.
 ///
 /// An empty `sources` changes nothing, and the call then does not examine
@@ -544,7 +545,7 @@ pub(crate) fn add_supplements(
     };
     let mut queued = BTreeMap::new();
     for (name, source) in sources {
-        debug_assert!(!name.is_empty(), "a build source name is empty");
+        debug_assert!(!name.is_empty(), "a supplement name is empty");
         queued.insert(name, source);
     }
     let mut kept: Vec<(String, Checksum)> = stored
@@ -680,11 +681,11 @@ pub(crate) fn borrowed_attachments<'a>(
         .collect()
 }
 
-/// The state of a commit that the repository or the transaction holds, as a
-/// dependency.
+/// The state of a commit that the repository or the transaction holds, as an
+/// attachment.
 ///
 /// `T` is the value that the caller reads from the commit object of a
-/// complete dependency.
+/// complete attachment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HeldAttachment<T = ()> {
     /// The repository does not hold the commit object, and the transaction
@@ -700,7 +701,7 @@ pub(crate) enum HeldAttachment<T = ()> {
     Complete { nested: bool, value: T },
 }
 
-/// Returns the state of the dependency `checksum` in `repo` or in the
+/// Returns the state of the attachment `checksum` in `repo` or in the
 /// transaction that stages it.
 ///
 /// If `staging` is set, the transaction stages the commit object of
@@ -756,7 +757,7 @@ pub(crate) fn held_attachment_blocking<T>(
     })
 }
 
-/// Returns the error for the dependency `name` of `commit`, which names the
+/// Returns the error for the attachment `name` of `commit`, which names the
 /// commit `attachment` whose own field 2 is not empty.
 pub(crate) fn nested_attachment(commit: Checksum, name: &str, attachment: &Checksum) -> Error {
     Error::InvalidRelations {
@@ -766,7 +767,7 @@ pub(crate) fn nested_attachment(commit: Checksum, name: &str, attachment: &Check
     }
 }
 
-/// Returns the error for the dependency `name` of `commit`, which names the
+/// Returns the error for the attachment `name` of `commit`, which names the
 /// commit `attachment` that the repository marks partial.
 #[cfg_attr(not(any(feature = "push", feature = "receive")), allow(dead_code))]
 pub(crate) fn partial_attachment(commit: Checksum, name: &str, attachment: &Checksum) -> Error {
@@ -777,13 +778,13 @@ pub(crate) fn partial_attachment(commit: Checksum, name: &str, attachment: &Chec
     }
 }
 
-/// Returns the reason for the dependency `name`, which names the commit
+/// Returns the reason for the attachment `name`, which names the commit
 /// `attachment`, with the end `end`.
 pub(crate) fn attachment_reason(name: &str, attachment: &Checksum, end: &str) -> String {
-    format!("dependency {name} names commit {attachment}, {end}")
+    format!("attachment {name} names commit {attachment}, {end}")
 }
 
-/// Returns the dependencies `entries` of a new commit, sorted by name in byte
+/// Returns the attachments `entries` of a new commit, sorted by name in byte
 /// order.
 ///
 /// The call does no I/O. The sort is stable. The index in the error for an
@@ -806,7 +807,7 @@ pub(crate) fn sorted_new(mut entries: Vec<(String, Checksum)>) -> Result<Vec<(St
     Ok(entries)
 }
 
-/// Checks that the names of the dependencies are sorted in byte order, with
+/// Checks that the names of the attachments are sorted in byte order, with
 /// no name two times.
 ///
 /// # Errors
@@ -841,25 +842,25 @@ pub(crate) fn check_order<'a>(
     Ok(())
 }
 
-/// Checks that the dependencies `atts` are complete and that none of them is
+/// Checks that the attachments `atts` are complete and that none of them is
 /// nested.
 ///
-/// A dependency is complete if `txn` stages its commit object or the
+/// An attachment is complete if `txn` stages its commit object or the
 /// repository holds it, and the repository holds no
-/// `state/<checksum>.commitpartial` marker for it. A dependency is nested if
-/// its own field 2 is not empty. The checks of all dependencies run in one
+/// `state/<checksum>.commitpartial` marker for it. An attachment is nested if
+/// its own field 2 is not empty. The checks of all attachments run in one
 /// trip to the blocking pool, in the order of `atts`. A checksum that `atts`
 /// names more than once is checked once, at its first entry. For each
-/// dependency, the check reads the partial marker first, and reads no commit
-/// object of a dependency with a marker.
+/// attachment, the check reads the partial marker first, and reads no commit
+/// object of an attachment with a marker.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelations`] with `commit` for the first dependency that is
+/// - [`Error::InvalidRelations`] with `commit` for the first attachment that is
 ///   absent, partial, or nested.
-/// - [`Error::Core`] if the commit tuple of a dependency with no partial
+/// - [`Error::Core`] if the commit tuple of an attachment with no partial
 ///   marker does not frame, or if its field 2 does not decode.
-/// - [`Error::InvalidFormat`] if the commit object of a dependency with no
+/// - [`Error::InvalidFormat`] if the commit object of an attachment with no
 ///   partial marker is larger than
 ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
 ///   file, or if a symlink is on its path.
@@ -881,7 +882,7 @@ pub(crate) async fn check_attachments<'a>(
         None
     };
     let repo: Repo = txn.repo().clone();
-    // The closure gives the index of the first refused dependency and the end
+    // The closure gives the index of the first refused attachment and the end
     // of the reason. The names stay here.
     let refused = ostrya_rt::unblock(move || -> Result<Option<(usize, &'static str)>> {
         // A repeated checksum has the result of its first entry, so the check
@@ -1046,7 +1047,7 @@ mod tests {
         assert_eq!(
             text,
             format!(
-                "dependency lib/b names commit {}, which has dependencies of its own",
+                "attachment lib/b names commit {}, which has attachments of its own",
                 checksum(3)
             )
         );
@@ -1181,7 +1182,7 @@ mod tests {
         );
     }
 
-    /// Adds the build source `name` with the checksum `source` to the detached
+    /// Adds the supplement `name` with the checksum `source` to the detached
     /// metadata dict `dict` of the commit `commit`.
     ///
     /// The add edits the first `ostrya.related` entry of `dict`. It removes each

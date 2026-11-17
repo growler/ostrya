@@ -439,12 +439,12 @@ impl ReceiveService {
     /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
     ///   commit that is not a commit of the session, unless the repository
     ///   holds the commit and field 2 of a commit of the session names it.
-    ///   The session drops the dict of such a held dependency.
+    ///   The session drops the dict of such a held attachment.
     /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
     /// - [`remote::Error::Protocol`] if an entry of field 2 of a staged commit
-    ///   has an empty name or a checksum that is not 32 bytes, or if a
-    ///   dependency of a staged commit has dependencies of its own. The
+    ///   has an empty name or a checksum that is not 32 bytes, or if an
+    ///   attachment of a staged commit has attachments of its own. The
     ///   message is the text of [`Error::InvalidRelations`]. A new commit that
     ///   the repository holds with a partial marker gets the checks of a
     ///   staged commit, here and for `missing-objects`.
@@ -481,9 +481,9 @@ impl ReceiveService {
     ///   with `ref-denied`.
     /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
-    /// - [`remote::Error::MissingObjects`] if a dependency of a staged commit
-    ///   is neither staged nor present. The error lists each such dependency.
-    ///   A dependency that the repository holds and marks partial also gives
+    /// - [`remote::Error::MissingObjects`] if an attachment of a staged commit
+    ///   is neither staged nor present. The error lists each such attachment.
+    ///   An attachment that the repository holds and marks partial also gives
     ///   this error, with no object listed and the text of
     ///   [`Error::InvalidRelations`], unless it is a new commit of an update.
     /// - [`remote::Error::BindingMismatch`] if the `ostree.ref-binding` of a
@@ -501,8 +501,8 @@ impl ReceiveService {
     ///   repository.
     /// - [`remote::Error::SignatureRequired`] if a new commit that the client
     ///   built fails the signature verification of the policy. A commit that
-    ///   no update names gets no verification, a staged parent and a
-    ///   dependency included. With
+    ///   no update names gets no verification, a staged parent and an
+    ///   attachment included. With
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
     ///   with no signature passes, and a commit with a signature that does not
     ///   verify fails.
@@ -526,7 +526,7 @@ impl ReceiveService {
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.
     /// - [`Error::InvalidFormat`] if a commit or a dirtree that the repository
     ///   holds does not parse.
-    /// - [`Error::Core`] if the field 2 of a dependency that the repository
+    /// - [`Error::Core`] if the field 2 of an attachment that the repository
     ///   holds does not decode.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if a stored detached
     ///   metadata dict is not an `a{sv}` in normal form.

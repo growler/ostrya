@@ -989,8 +989,8 @@ fn server_keys_sign_the_commit() {
     assert!(outcome.valid, "the server signature verifies");
 }
 
-/// A server commit onto a tip that names a dependency signs the new commit
-/// alone. The dependency gets no server signature.
+/// A server commit onto a tip that names an attachment signs the new commit
+/// alone. The attachment gets no server signature.
 #[test]
 fn an_attachment_of_the_tip_gets_no_server_signature() {
     let tmp = TmpDir::new("sc-sign-dependency");

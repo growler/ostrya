@@ -1765,7 +1765,7 @@ fn fsck_binding_checks_report_each_kind() {
     });
 }
 
-/// Commits the tree at `base/rel` with the dependencies `related` in field 2
+/// Commits the tree at `base/rel` with the attachments `related` in field 2
 /// to `repo`, points the branch `branch` at it if one is given, and returns
 /// the new commit.
 async fn attachment_commit(
@@ -1812,7 +1812,7 @@ async fn attachment_commit(
 
 /// Creates an archive repository under `base/repo` with a commit that no ref
 /// names, and the branch `main`, whose field 2 names that commit as
-/// `boot/uki`. Returns the repository, the tip, and the dependency.
+/// `boot/uki`. Returns the repository, the tip, and the attachment.
 async fn build_attachment_repo(base: &Path) -> (Repo, Checksum, Checksum) {
     write_tree(&base.join("uki"), "uki.txt", b"uki\n");
     write_tree(&base.join("main"), "main.txt", b"main\n");
@@ -1834,7 +1834,7 @@ fn remove_object(repo: &Repo, name: ObjectName) {
     .unwrap();
 }
 
-/// Returns the finding of a dependency.
+/// Returns the finding of an attachment.
 fn attachment_finding(
     commit: Checksum,
     name: &str,
@@ -1862,8 +1862,8 @@ fn fsck_passes_with_complete_attachments() {
     });
 }
 
-/// An absent dependency gives one finding and marks the naming commit
-/// partial. A pull of the ref of that commit then fetches the dependency, and
+/// An absent attachment gives one finding and marks the naming commit
+/// partial. A pull of the ref of that commit then fetches the attachment, and
 /// the next run is clean.
 #[test]
 fn fsck_marks_the_commit_of_an_absent_attachment_and_a_pull_repairs_it() {
@@ -1892,7 +1892,7 @@ fn fsck_marks_the_commit_of_an_absent_attachment_and_a_pull_repairs_it() {
         assert_eq!(
             finding.to_string(),
             format!(
-                "related commits in field 2 of commit {tip}: dependency boot/uki names commit \
+                "related commits in field 2 of commit {tip}: attachment boot/uki names commit \
                  {att}, which the repository does not hold"
             )
         );
@@ -1961,7 +1961,7 @@ fn fsck_reports_an_absent_attachment_without_a_marker() {
     });
 }
 
-/// With `mark_attachments` off, the run reports an absent dependency and
+/// With `mark_attachments` off, the run reports an absent attachment and
 /// writes no marker. A second run gives the same finding.
 #[test]
 fn fsck_without_attachment_marks_reports_an_absent_attachment_and_marks_nothing() {
@@ -1995,7 +1995,7 @@ fn fsck_without_attachment_marks_reports_an_absent_attachment_and_marks_nothing(
 }
 
 /// With `mark_attachments` off, an absent object still marks the commit
-/// that reaches it, and the dependency finding stays.
+/// that reaches it, and the attachment finding stays.
 #[test]
 fn fsck_without_attachment_marks_still_marks_the_commit_of_an_absent_object() {
     let tmp = TmpDir::new("maint-fsck-dep-objmark");
@@ -2038,7 +2038,7 @@ fn fsck_without_attachment_marks_still_marks_the_commit_of_an_absent_object() {
     });
 }
 
-/// A dependency with a marker, and a dependency whose tree misses a file,
+/// An attachment with a marker, and an attachment whose tree misses a file,
 /// are each partial in the same run.
 #[test]
 fn fsck_reports_a_partial_attachment() {
@@ -2075,7 +2075,7 @@ fn fsck_reports_a_partial_attachment() {
             .unwrap()
             .into_iter()
             .find(|name| name.ty == ObjectType::File && !shared.contains(name))
-            .expect("a file of the dependency alone");
+            .expect("a file of the attachment alone");
         remove_object(&repo, file);
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
@@ -2088,7 +2088,7 @@ fn fsck_reports_a_partial_attachment() {
     });
 }
 
-/// A defective entry and a nested dependency each give one `Defective`
+/// A defective entry and a nested attachment each give one `Defective`
 /// finding and no marker.
 #[test]
 fn fsck_reports_defective_attachments_without_a_marker() {
@@ -2100,7 +2100,7 @@ fn fsck_reports_defective_attachments_without_a_marker() {
             common::store_with_field2(&repo, &att, &[("", att.as_bytes()), ("lib/a", &[7; 31])])
                 .await;
         // `tip` names `att`, so a commit that names `tip` names a nested
-        // dependency.
+        // attachment.
         let nested = common::store_with_field2(&repo, &att, &[("lib/b", tip.as_bytes())]).await;
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();
@@ -2118,7 +2118,7 @@ fn fsck_reports_defective_attachments_without_a_marker() {
                 "lib/b",
                 Some(tip),
                 kind(&format!(
-                    "dependency lib/b names commit {tip}, which has dependencies of its own"
+                    "attachment lib/b names commit {tip}, which has attachments of its own"
                 )),
             ),
         ];
@@ -2144,7 +2144,7 @@ fn object_file(repo: &Repo, name: ObjectName) -> std::path::PathBuf {
         .join(name.loose_path(RepoMode::Archive))
 }
 
-/// With `delete`, a dependency whose commit object has the bytes of another
+/// With `delete`, an attachment whose commit object has the bytes of another
 /// commit is deleted, and the commit that names it gets an `Absent` finding.
 #[test]
 fn fsck_delete_removes_a_bad_attachment_commit_and_reports_it_absent() {
@@ -2183,9 +2183,9 @@ fn fsck_delete_removes_a_bad_attachment_commit_and_reports_it_absent() {
     });
 }
 
-/// A dependency whose tree is incomplete only because `delete` removed a
+/// An attachment whose tree is incomplete only because `delete` removed a
 /// bad object of it gets a `Partial` finding. Without `delete`, the bad
-/// object alone leaves the dependency complete.
+/// object alone leaves the attachment complete.
 #[test]
 fn fsck_delete_of_a_bad_object_makes_its_attachment_partial() {
     let tmp = TmpDir::new("maint-fsck-dep-delete-object");
@@ -2198,7 +2198,7 @@ fn fsck_delete_of_a_bad_object_makes_its_attachment_partial() {
             .unwrap()
             .into_iter()
             .find(|name| name.ty == ObjectType::File && !shared.contains(name))
-            .expect("a file of the dependency alone");
+            .expect("a file of the attachment alone");
         std::fs::write(object_file(&repo, file), b"not the object of this name").unwrap();
 
         let report = repo.fsck(&FsckOptions::new()).await.unwrap();

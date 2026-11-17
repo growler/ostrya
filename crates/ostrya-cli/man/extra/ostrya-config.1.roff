@@ -300,7 +300,7 @@ A remote whose value holds a malformed escape sequence gives no row in \fB\%ostr
 .SS "Verification"
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
 The checks of the commits apply to each target, each parent that the depth takes, and each commit of a chain of static deltas.
-A pull checks no signature of a dependency in field 2 of a commit, unless the dependency also has one of these roles.
+A pull checks no signature of an attachment in field 2 of a commit, unless the attachment also has one of these roles.
 When the keys of a \fB\%file://\fR candidate of \fB\%ostrya pull \-\-collection\fR check the signatures of the commits or of the summary, the pull hashes each object that it imports from that candidate.
 These keys do not make \fB\%ostrya pull\-local \-\-remote=NAME\fR hash an object.
 For a source that is not trusted, give \fB\%\-\-untrusted\fR to \fB\%ostrya pull\-local\fR.
@@ -620,7 +620,7 @@ A malformed pattern, an empty value, or a list of exclusions alone stops the pru
 Store the composefs image of each complete commit that a write adds and that carries the key \fB\%ostree.composefs.digest.v0\fR.
 \fB\%ostrya\-repo\fR(5) describes the image file.
 The writers are \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR and \fB\%ostrya serve\fR (a push, a one\-way stream, and a server commit), and \fB\%ostrya static\-delta apply\-offline\fR.
-A pull builds the image of each target, of each parent within the depth, of each dependency, and of each held partial commit that it completes.
+A pull builds the image of each target, of each parent within the depth, of each attachment, and of each held partial commit that it completes.
 A commit\-only pull and a pull with subpaths build no image.
 A commit that the repository holds complete before the write gets no image.
 \fB\%ostrya composefs\-image \-\-add\fR stores the image of such a commit.
@@ -658,7 +658,7 @@ The line does not change the exit status.
 \fB\%keep\-detached\-related\fR (boolean, default true)
 Store the detached metadata key \fB\%ostrya.related\fR that a transfer gives.
 With false, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR remove \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that they write.
-A local write ignores the key: \fB\%ostrya commit\fR, \fB\%ostrya sign\fR, and the add of a build source store \fB\%ostrya.related\fR.
+A local write ignores the key: \fB\%ostrya commit\fR, \fB\%ostrya sign\fR, and the add of a supplement store \fB\%ostrya.related\fR.
 A pull, also through \fB\%ostrya pull\-local\fR and through a static delta, and a push to a bucket repository replace the whole stored \fB\%.commitmeta\fR with the dict that the key leaves.
 So a stored \fB\%ostrya.related\fR stays only if that dict is empty: the transfer then writes nothing, and the destination keeps its \fB\%.commitmeta\fR.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR merge the incoming dict into the stored dict, so a stored value stays.
@@ -847,8 +847,8 @@ A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with 
 .TP
 \fB\%verify\fR (string)
 \fB\%trust:NAME\fR, the trust group that verifies each new commit of a ref update that a client builds and pushes.
-The trust group verifies no other commit: no staged parent and no dependency in field 2 of a commit, unless a ref update also takes that commit as its new commit.
-The checksum of a dependency is in field 2 of a commit.
+The trust group verifies no other commit: no staged parent and no attachment in field 2 of a commit, unless a ref update also takes that commit as its new commit.
+The checksum of an attachment is in field 2 of a commit.
 A new commit is that commit, or binds it through the parent checksums of its history, and the signatures of the new commit cover these checksums.
 Each other value is refused, \fB\%off\fR and \fB\%remote:NAME\fR included.
 Without the key, the group verifies no signature.
@@ -862,7 +862,7 @@ The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
 .TP
 \fB\%sign\fR (list)
 The key groups whose keys sign each new commit of a ref update of the group, and each server commit of the group.
-The keys sign no other commit: no staged parent and no dependency in field 2 of a commit, unless a ref update also takes that commit as its new commit.
+The keys sign no other commit: no staged parent and no attachment in field 2 of a commit, unless a ref update also takes that commit as its new commit.
 A key that already signed a commit adds no signature.
 A name that occurs two times counts one time.
 An empty value is refused.

@@ -9201,7 +9201,7 @@ fn a_session_pull_takes_its_request_limit_from_the_session() {
     });
 }
 
-// --- dependencies ------------------------------------------------------------
+// --- attachments ------------------------------------------------------------
 
 /// Regenerates the summary of `repo` with a fixed timestamp.
 async fn summarize(repo: &Repo) {
@@ -9214,9 +9214,9 @@ async fn summarize(repo: &Repo) {
 }
 
 /// Builds an archive remote under `dir/remote`, with a summary. `dep/uki`
-/// names the dependency, and `test/main` names the tip, whose field 2 names
-/// the dependency as `boot/uki`. Returns the remote, the tip, and the
-/// dependency.
+/// names the attachment, and `test/main` names the tip, whose field 2 names
+/// the attachment as `boot/uki`. Returns the remote, the tip, and the
+/// attachment.
 async fn build_attachment_remote(dir: &Path) -> (Repo, Checksum, Checksum) {
     build_tree(&dir.join("uki"), b"uki\n");
     build_tree(&dir.join("main"), b"main\n");
@@ -9263,9 +9263,9 @@ async fn assert_left_nothing(dest: &Repo) {
     assert_eq!(file_inventory(dest.path(), "state"), Vec::new());
 }
 
-/// A pull fetches the dependency that field 2 of the pulled commit names,
+/// A pull fetches the attachment that field 2 of the pulled commit names,
 /// complete, and writes no ref for it. The content count of the pull holds
-/// the content of the dependency. A repeat pull reads the detached metadata
+/// the content of the attachment. A repeat pull reads the detached metadata
 /// of the tip alone again, and fetches no object.
 #[test]
 fn a_pull_fetches_the_attachment_of_the_commit() {
@@ -9308,8 +9308,8 @@ fn a_pull_fetches_the_attachment_of_the_commit() {
     });
 }
 
-/// A pull with depth follows the dependencies of each parent that it
-/// moves. At depth 0 it moves no parent, so it fetches the dependency of the
+/// A pull with depth follows the attachments of each parent that it
+/// moves. At depth 0 it moves no parent, so it fetches the attachment of the
 /// tip alone.
 #[test]
 fn a_pull_with_depth_fetches_the_attachments_of_the_parents() {
@@ -9371,7 +9371,7 @@ fn a_pull_with_depth_fetches_the_attachments_of_the_parents() {
     });
 }
 
-/// A dependency that two pulled commits name is fetched one time.
+/// An attachment that two pulled commits name is fetched one time.
 #[test]
 fn an_attachment_that_two_commits_name_is_fetched_once() {
     block_on(async {
@@ -9415,8 +9415,8 @@ fn an_attachment_that_two_commits_name_is_fetched_once() {
     });
 }
 
-/// A pull fetches a dependency at depth 0, also under a pull of the whole
-/// history. The parent of the dependency stays on the remote.
+/// A pull fetches an attachment at depth 0, also under a pull of the whole
+/// history. The parent of the attachment stays on the remote.
 #[test]
 fn an_attachment_is_fetched_at_depth_zero() {
     block_on(async {
@@ -9460,7 +9460,7 @@ fn an_attachment_is_fetched_at_depth_zero() {
     });
 }
 
-/// A pull does not fetch a build source: the commit that `ostrya.related`
+/// A pull does not fetch a supplement: the commit that `ostrya.related`
 /// names.
 #[test]
 fn a_pull_does_not_fetch_a_supplement() {
@@ -9490,7 +9490,7 @@ fn a_pull_does_not_fetch_a_supplement() {
     });
 }
 
-/// A commit-only pull and a pull with subpaths fetch no dependency. A later
+/// A commit-only pull and a pull with subpaths fetch no attachment. A later
 /// full pull fetches it.
 #[test]
 fn a_partial_pull_fetches_no_attachment() {
@@ -9530,11 +9530,11 @@ fn a_partial_pull_fetches_no_attachment() {
     }
 }
 
-/// A dependency whose bytes do not hash to the checksum in field 2 of the tip
+/// An attachment whose bytes do not hash to the checksum in field 2 of the tip
 /// fails the pull with `Error::ChecksumMismatch` for that checksum, and the
 /// pull leaves nothing. The served bytes are those of a different commit with
 /// an empty field 2, so the format check of field 2 passes and the hash of the
-/// stage finds the defect. The pull checks no signature of the dependency, so
+/// stage finds the defect. The pull checks no signature of the attachment, so
 /// under `sign-verify` with a signed tip the pull fails with the same error.
 #[test]
 fn an_attachment_with_wrong_bytes_fails_the_pull() {
@@ -9563,9 +9563,9 @@ fn an_attachment_with_wrong_bytes_fails_the_pull() {
     });
 }
 
-/// The pull checks no signature of a dependency. Under `sign-verify` with a
-/// signed tip, an unsigned dependency passes the pull, and the destination
-/// holds no detached metadata for it. A dependency that a key signed that the
+/// The pull checks no signature of an attachment. Under `sign-verify` with a
+/// signed tip, an unsigned attachment passes the pull, and the destination
+/// holds no detached metadata for it. An attachment that a key signed that the
 /// destination does not trust passes too, and the destination holds the
 /// `.commitmeta` of the remote.
 #[test]
@@ -9606,8 +9606,8 @@ fn an_attachment_with_no_trusted_signature_passes_the_pull() {
     });
 }
 
-/// A dependency that the pull also takes as a target gets the check of a
-/// target. Under `sign-verify` with a signed tip, an unsigned dependency that a
+/// An attachment that the pull also takes as a target gets the check of a
+/// target. Under `sign-verify` with a signed tip, an unsigned attachment that a
 /// requested ref names fails the pull, and the pull leaves nothing.
 #[test]
 fn an_attachment_that_is_also_a_target_is_checked() {
@@ -9644,7 +9644,7 @@ fn an_attachment_that_is_also_a_target_is_checked() {
 
 /// A parent that the depth of the pull takes gets the check of a parent, also
 /// if field 2 of the tip names it. Under `sign-verify` with a signed tip and
-/// an unsigned parent, a pull at depth 0 takes the parent as a dependency
+/// an unsigned parent, a pull at depth 0 takes the parent as an attachment
 /// alone and passes. A pull at depth 1 refuses the parent.
 #[test]
 fn an_attachment_that_is_also_a_parent_is_checked() {
@@ -9698,9 +9698,9 @@ fn an_attachment_that_is_also_a_parent_is_checked() {
     });
 }
 
-/// The pull checks no signature of a dependency, so under `sign-verify` and
+/// The pull checks no signature of an attachment, so under `sign-verify` and
 /// the default `keep-detached-related` it does not parse the `.commitmeta` of
-/// a dependency. A `.commitmeta` that does not parse passes the pull, and the
+/// an attachment. A `.commitmeta` that does not parse passes the pull, and the
 /// destination holds its bytes. With `keep-detached-related=false`, the rule
 /// parses the `.commitmeta`, and the pull fails with `Error::Core` and leaves
 /// nothing.
@@ -9732,7 +9732,7 @@ fn an_attachment_commitmeta_that_does_not_parse_is_stored() {
     });
 }
 
-/// A dependency that the remote does not hold fails the pull with
+/// An attachment that the remote does not hold fails the pull with
 /// `Error::ObjectNotFound`, and the pull leaves nothing.
 #[test]
 fn a_missing_attachment_fails_the_pull() {
@@ -9786,9 +9786,9 @@ fn a_defective_attachment_entry_fails_the_pull() {
     });
 }
 
-/// A dependency that names dependencies of its own fails the pull with
+/// An attachment that names attachments of its own fails the pull with
 /// `Error::InvalidRelations`, whichever of the two commits the pull reads
-/// first. The error names the commit that names the nested dependency. The
+/// first. The error names the commit that names the nested attachment. The
 /// pull leaves nothing.
 #[test]
 fn a_nested_attachment_fails_the_pull() {
@@ -9798,8 +9798,8 @@ fn a_nested_attachment_fails_the_pull() {
         let (remote, tip, att) = build_attachment_remote(base).await;
         build_tree(&base.join("other"), b"other\n");
         let other = commit_tree(&remote, base, "other", "test/other", None, FIXED_TS).await;
-        // `test/other` names a commit with a dependency, and `test/main` names
-        // a commit whose dependency is that commit.
+        // `test/other` names a commit with an attachment, and `test/main` names
+        // a commit whose attachment is that commit.
         let nested = store_with_field2(&remote, &other, &[("lib/c", att.as_bytes())]).await;
         let head = store_with_field2(&remote, &tip, &[("lib/b", nested.as_bytes())]).await;
         move_ref(&remote, "test/other", &nested).await;
@@ -9808,7 +9808,7 @@ fn a_nested_attachment_fails_the_pull() {
         let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
 
         let reason =
-            format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+            format!("attachment lib/b names commit {nested}, which has attachments of its own");
         for refs in [&["test/main"][..], &["test/main", "test/other"]] {
             let err = dest
                 .pull(
@@ -9831,9 +9831,9 @@ fn a_nested_attachment_fails_the_pull() {
 }
 
 /// A parent that the remote does not hold ends its chain. If a pulled commit
-/// names the parent as a dependency, the pull fails with
+/// names the parent as an attachment, the pull fails with
 /// `Error::ObjectNotFound`. The tip names its own parent, so the plan queues
-/// the parent first as an optional commit, and the dependency adds no item.
+/// the parent first as an optional commit, and the attachment adds no item.
 #[test]
 fn an_absent_parent_that_is_an_attachment_fails_the_pull() {
     block_on(async {
@@ -9877,10 +9877,10 @@ fn an_absent_parent_that_is_an_attachment_fails_the_pull() {
     });
 }
 
-/// A pull that takes a static delta of the target fetches the dependency as
+/// A pull that takes a static delta of the target fetches the attachment as
 /// loose objects. The remote serves no summary, so the pull asks for the
 /// from-scratch delta of the target by name, and then for the from-scratch
-/// delta of the dependency, which the remote does not hold.
+/// delta of the attachment, which the remote does not hold.
 #[test]
 fn a_pull_through_a_delta_fetches_the_attachment_loose() {
     block_on(async {
@@ -9916,7 +9916,7 @@ fn a_pull_through_a_delta_fetches_the_attachment_loose() {
     });
 }
 
-/// A pull through a chain of static deltas fetches a dependency one time, if
+/// A pull through a chain of static deltas fetches an attachment one time, if
 /// an intermediate commit and the target both name it.
 #[test]
 fn an_attachment_of_a_chain_is_fetched_once() {
@@ -9968,7 +9968,7 @@ fn an_attachment_of_a_chain_is_fetched_once() {
     });
 }
 
-/// A dependency that this repository holds partial is fetched whole, with a
+/// An attachment that this repository holds partial is fetched whole, with a
 /// request of its `.commitmeta`, and the pull removes its marker.
 #[test]
 fn an_attachment_held_partial_is_completed() {
@@ -9997,10 +9997,10 @@ fn an_attachment_held_partial_is_completed() {
     });
 }
 
-// --- static deltas of dependencies ---------------------------------------
+// --- static deltas of attachments ---------------------------------------
 
-/// Builds an archive remote under `dir/remote` with two commits of a
-/// dependency, D1 and D2, and two commits on `test/main`, T1 and T2. T1 names
+/// Builds an archive remote under `dir/remote` with two commits of an
+/// attachment, D1 and D2, and two commits on `test/main`, T1 and T2. T1 names
 /// D1 as `boot/uki`, and T2, a child of T1, names D2 as `boot/uki`. The ref
 /// `test/main` names T1, and the remote holds a summary. Returns the remote
 /// and `[T1, D1, T2, D2]`.
@@ -10039,7 +10039,7 @@ fn scratch_superblock(to: &Checksum) -> String {
     format!("{}/superblock", static_delta_relative_dir(None, to))
 }
 
-/// The pull of T2 takes the delta of its dependency D2 from the paired entry
+/// The pull of T2 takes the delta of its attachment D2 from the paired entry
 /// D1: the entry `boot/uki` of T1, which the local ref names before the pull.
 /// The remote also publishes the from-scratch delta of D2, and the pull does
 /// not request it. The commit of D2 comes from the superblock.
@@ -10113,10 +10113,10 @@ fn an_attachment_delta_from_another_held_commit_is_taken() {
     });
 }
 
-/// The pull takes the from-scratch delta of a dependency if it holds no
+/// The pull takes the from-scratch delta of an attachment if it holds no
 /// paired entry complete: here the destination has no local ref. If the
 /// paired entry is held complete, the pull does not take the from-scratch
-/// delta and fetches the dependency loose. That delta counts as found, so a
+/// delta and fetches the attachment loose. That delta counts as found, so a
 /// pull that requires static deltas passes.
 #[test]
 fn the_from_scratch_delta_of_an_attachment_needs_no_paired_entry_held() {
@@ -10171,7 +10171,7 @@ fn the_from_scratch_delta_of_an_attachment_needs_no_paired_entry_held() {
     });
 }
 
-/// Two targets name one dependency D, with the paired entries DA and DB.
+/// Two targets name one attachment D, with the paired entries DA and DB.
 /// With the delta `<DB>-<D>` alone, the pull of `[a, b]` finds it in the step
 /// `<c>-<to>`. With both deltas, the paired entry of the first target is the
 /// `from`: the pull of `[a, b]` takes `<DA>-<D>`, and the pull of `[b, a]`
@@ -10262,8 +10262,8 @@ fn the_first_target_gives_the_from_of_an_attachment() {
     });
 }
 
-/// A pull that requires static deltas fails if a dependency has no delta.
-/// The message names the entry, the ref of the target, and the dependency.
+/// A pull that requires static deltas fails if an attachment has no delta.
+/// The message names the entry, the ref of the target, and the attachment.
 /// The pull moves no ref and leaves nothing.
 #[test]
 fn a_required_delta_pull_refuses_an_attachment_with_no_delta() {
@@ -10293,7 +10293,7 @@ fn a_required_delta_pull_refuses_an_attachment_with_no_delta() {
 }
 
 /// Under `disable_static_deltas`, the pull requests no delta and no delta
-/// index for a dependency, and fetches it loose.
+/// index for an attachment, and fetches it loose.
 #[test]
 fn a_pull_with_disabled_deltas_requests_no_attachment_delta() {
     block_on(async {
@@ -10326,7 +10326,7 @@ fn a_pull_with_disabled_deltas_requests_no_attachment_delta() {
 }
 
 /// A remote with no summary advertises no delta. The pull requests the delta
-/// of the dependency from its paired entry by name, and not the from-scratch
+/// of the attachment from its paired entry by name, and not the from-scratch
 /// delta.
 #[test]
 fn a_pull_with_no_summary_requests_the_attachment_delta_by_name() {
@@ -10361,9 +10361,9 @@ fn a_pull_with_no_summary_requests_the_attachment_delta_by_name() {
 }
 
 /// A remote with no summary states no digest of a superblock. The target
-/// names three dependencies, and the remote holds the from-scratch delta of
-/// each. The pull requests each superblock one time: it parses the job of a
-/// dependency from the bytes that discovery checked and kept, and sends no
+/// names three attachments, and the remote holds the from-scratch delta of
+/// each. The pull requests each superblock one time: it parses the job of an
+/// attachment from the bytes that discovery checked and kept, and sends no
 /// second request.
 #[test]
 fn each_attachment_superblock_is_fetched_once_with_no_summary() {
@@ -10413,10 +10413,10 @@ fn each_attachment_superblock_is_fetched_once_with_no_summary() {
     });
 }
 
-/// With a list of static deltas, the pull takes the list entry to a
-/// dependency from its paired entry, in one step. Under
-/// `require_static_deltas`, a list with no entry to the dependency fails the
-/// pull with the message of a dependency, and the pull moves no ref.
+/// With a list of static deltas, the pull takes the list entry to an
+/// attachment from its paired entry, in one step. Under
+/// `require_static_deltas`, a list with no entry to the attachment fails the
+/// pull with the message of an attachment, and the pull moves no ref.
 #[test]
 fn a_list_pull_takes_the_listed_delta_of_an_attachment() {
     block_on(async {
@@ -10486,11 +10486,11 @@ fn a_list_pull_takes_the_listed_delta_of_an_attachment() {
     });
 }
 
-/// The pull checks no signature of a dependency whose commit comes from the
+/// The pull checks no signature of an attachment whose commit comes from the
 /// superblock of its delta. Under `sign-verify` with a signed tip, an unsigned
-/// dependency and its unsigned delta pass the pull. The pull requests the
-/// superblock and the `.commitmeta` of the dependency one time each, and no
-/// `.commit` of the dependency.
+/// attachment and its unsigned delta pass the pull. The pull requests the
+/// superblock and the `.commitmeta` of the attachment one time each, and no
+/// `.commit` of the attachment.
 #[test]
 fn an_unsigned_attachment_from_its_delta_passes_the_pull() {
     block_on(async {
@@ -10528,16 +10528,16 @@ fn an_unsigned_attachment_from_its_delta_passes_the_pull() {
     });
 }
 
-/// The superblock of a dependency delta must give the commit that field 2
+/// The superblock of an attachment delta must give the commit that field 2
 /// names. The remote serves two changed superblocks under the path of the
-/// delta of the dependency:
+/// delta of the attachment:
 ///
-/// - the superblock of the dependency, with the commit of another tree in
-///   place of the dependency commit. The parse of the superblock finds that
+/// - the superblock of the attachment, with the commit of another tree in
+///   place of the attachment commit. The parse of the superblock finds that
 ///   the commit does not hash to the `to` of the superblock, and the pull
 ///   fails with [`Error::InvalidFormat`].
 /// - the superblock of the delta of another commit. The `to` of the
-///   superblock is not the dependency, and the pull fails with
+///   superblock is not the attachment, and the pull fails with
 ///   [`Error::Pull`].
 ///
 /// The remote serves no summary, so no advertised digest catches a changed
@@ -10602,10 +10602,10 @@ fn an_attachment_delta_that_gives_another_commit_fails_the_pull() {
     });
 }
 
-/// The pull checks no signature of the superblock of a dependency delta. A
+/// The pull checks no signature of the superblock of an attachment delta. A
 /// key that the destination does not trust signs the delta of the
-/// dependency, and the pull under `sign-verify` with a signed tip takes the
-/// delta. A pull that takes the dependency as a target too checks the
+/// attachment, and the pull under `sign-verify` with a signed tip takes the
+/// delta. A pull that takes the attachment as a target too checks the
 /// superblock, and fails with [`Error::Signature`].
 #[test]
 fn an_attachment_delta_signed_by_an_untrusted_key_passes_the_pull() {
@@ -10668,8 +10668,8 @@ fn index_path(to: &Checksum) -> String {
     format!("{}.index", dir.replacen("deltas/", "delta-indexes/", 1))
 }
 
-/// A dependency that the run of the targets reaches gets no search for a
-/// delta of its own. Here one dependency is the parent of the target, and the
+/// An attachment that the run of the targets reaches gets no search for a
+/// delta of its own. Here one attachment is the parent of the target, and the
 /// other is the second target of the pull. The pull requests no delta index
 /// for the parent, and one delta index for each target, the search of the
 /// target. It requests no superblock.
@@ -10881,7 +10881,7 @@ fn a_pull_of_a_held_complete_commit_stores_no_image() {
     });
 }
 
-/// A full pull stores the image of a dependency that carries the key, beside
+/// A full pull stores the image of an attachment that carries the key, beside
 /// the image of the target.
 #[test]
 fn an_attachment_of_a_full_pull_gets_an_image() {

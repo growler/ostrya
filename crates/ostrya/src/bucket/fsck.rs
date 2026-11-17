@@ -152,7 +152,7 @@ pub struct BucketFinding {
     /// [`delete`](BucketFsckOptions::delete) is a note if the listing does
     /// not hold the object and a read after the listing finds it. An
     /// `Attachment` finding of a run without `delete` is a note if the
-    /// listing does not hold the commit of the dependency and a read after
+    /// listing does not hold the commit of the attachment and a read after
     /// the listing finds it. A `Ref` finding of a ref under `refs/mirrors/`
     /// of the own collection id is a note. A `Marker`, an `Upload`, and a
     /// `Lock` finding are notes. Each other finding is an error.
@@ -172,11 +172,11 @@ pub struct BucketFinding {
     pub commits: Vec<Checksum>,
     /// The reason, in words.
     pub detail: String,
-    /// The dependency of an `Attachment` finding, and `None` for each other
+    /// The attachment of an `Attachment` finding, and `None` for each other
     /// kind.
     ///
-    /// Its fields are the fields of the finding of the local fsck. A
-    /// dependency is [`Partial`](FsckAttachmentErrorKind::Partial) if the
+    /// Its fields are the fields of the finding of the local fsck. An
+    /// attachment is [`Partial`](FsckAttachmentErrorKind::Partial) if the
     /// bucket holds its marker `state/<checksum>.commitpartial`. A run with
     /// [`delete`](BucketFsckOptions::delete) reads the markers and the
     /// commit objects after its repair.
@@ -226,7 +226,7 @@ pub enum BucketFindingKind {
     /// An object that does not parse, or a `.filez` that does not inflate to
     /// its declared size.
     Corrupt,
-    /// A dependency in field 2 of a commit that is absent, partial, or
+    /// An attachment in field 2 of a commit that is absent, partial, or
     /// defective. [`BucketFinding::attachment`] holds it. A run with
     /// [`delete`](BucketFsckOptions::delete) writes and deletes no key for
     /// it.
@@ -242,7 +242,7 @@ pub enum BucketFindingKind {
 
 impl BucketFindingKind {
     /// Returns the name of the kind: `config`, `ref`, `summary`, `stray`,
-    /// `missing`, `mismatch`, `corrupt`, `dependency`, `marker`, `upload`,
+    /// `missing`, `mismatch`, `corrupt`, `attachment`, `marker`, `upload`,
     /// or `lock`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -253,7 +253,7 @@ impl BucketFindingKind {
             BucketFindingKind::Missing => "missing",
             BucketFindingKind::Mismatch => "mismatch",
             BucketFindingKind::Corrupt => "corrupt",
-            BucketFindingKind::Attachment => "dependency",
+            BucketFindingKind::Attachment => "attachment",
             BucketFindingKind::Marker => "marker",
             BucketFindingKind::Upload => "upload",
             BucketFindingKind::Lock => "lock",
@@ -347,10 +347,10 @@ impl Run {
     /// of `attachments` that is absent, partial, or defective.
     ///
     /// `attachments` holds each commit that parses and whose field 2 is not
-    /// empty, sorted by commit. A dependency in that list has dependencies
+    /// empty, sorted by commit. An attachment in that list has attachments
     /// of its own. `partial` holds the commits with a partial-commit marker.
     /// `deleted` holds the commit objects that the repair deletes, sorted:
-    /// such a dependency is absent, and such a commit gets no check.
+    /// such an attachment is absent, and such a commit gets no check.
     fn attachments(
         &mut self,
         listing: &ObjectListing,
@@ -532,7 +532,7 @@ impl BucketRepo {
     /// 5. The commits, then the dirtrees and the dirmetas, then the
     ///    `.filez` objects. A phase starts after the phase before it ends.
     ///    Without `delete`, after the commits, the run checks the
-    ///    dependencies in field 2 of each commit that parses, the commits
+    ///    attachments in field 2 of each commit that parses, the commits
     ///    with a partial-commit marker included, against the listing and the
     ///    markers. This check reads no object.
     /// 6. The count of the objects that no commit reaches.
@@ -542,12 +542,12 @@ impl BucketRepo {
     ///    the finding is a note. Else the run reads each commit of the
     ///    finding again, and drops the commits that are gone. If no commit
     ///    stays, the run records no finding. The same read covers each
-    ///    absent dependency of an `Attachment` finding, one time for each
+    ///    absent attachment of an `Attachment` finding, one time for each
     ///    commit. If the key holds an object, the finding is a note.
-    /// 8. With `delete`: the check of the dependencies of step 5, against
-    ///    the state after the repair. A dependency is partial if it holds a
+    /// 8. With `delete`: the check of the attachments of step 5, against
+    ///    the state after the repair. An attachment is partial if it holds a
     ///    marker that the repair does not delete, or gets a marker from the
-    ///    repair. A dependency whose commit object the repair deletes is
+    ///    repair. An attachment whose commit object the repair deletes is
     ///    absent, and a commit whose own object the repair deletes gets no
     ///    check. Then a check of the lock, a marker
     ///    `state/<checksum>.commitpartial` for each commit that reaches a
@@ -764,7 +764,7 @@ impl BucketRepo {
         let whole = whole_marked(&run.findings, &roots, &partial);
         match lock {
             Some(lock) => {
-                // The dependencies, against the markers and the commit
+                // The attachments, against the markers and the commit
                 // objects after the repair.
                 let plan = delete_plan(&run.findings, &partial);
                 let mut marked: BTreeSet<Checksum> = partial
@@ -1622,7 +1622,7 @@ impl BucketRepo {
     }
 
     /// Reads again each object that a `Missing` finding names and that the
-    /// listing does not hold, and each commit of an absent dependency of an
+    /// listing does not hold, and each commit of an absent attachment of an
     /// `Attachment` finding, and then the commits of each object of a
     /// `Missing` finding that is still absent.
     ///
@@ -2231,7 +2231,7 @@ mod tests {
             (Missing, "missing"),
             (Mismatch, "mismatch"),
             (Corrupt, "corrupt"),
-            (Attachment, "dependency"),
+            (Attachment, "attachment"),
             (Marker, "marker"),
             (Upload, "upload"),
             (Lock, "lock"),

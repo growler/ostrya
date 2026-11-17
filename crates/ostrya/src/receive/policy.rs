@@ -61,7 +61,7 @@ pub struct ReceivePolicy {
     /// The verification applies to each new commit of a ref update that a
     /// client builds and pushes. A server commit gets no verification. A
     /// commit that no update names gets no verification, a staged parent and
-    /// a dependency included. The checksum of a dependency is in field 2 of
+    /// an attachment included. The checksum of an attachment is in field 2 of
     /// a commit. A new commit is that commit, or binds it through the parent
     /// checksums of its history, and the signatures of the new commit cover
     /// these checksums.
@@ -84,7 +84,7 @@ pub struct ReceivePolicy {
     ///
     /// A new commit is a commit that becomes the new value of a ref. A server
     /// commit is a new commit too. The server signs no other commit, a staged
-    /// parent and a dependency included. The server signature on a new
+    /// parent and an attachment included. The server signature on a new
     /// commit covers its field 2 and its parent checksum.
     pub signers: Vec<Arc<SigningKey>>,
     /// The switch that accepts privileged content in a `bare` repository.

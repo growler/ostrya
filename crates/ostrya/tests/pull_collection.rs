@@ -1228,10 +1228,10 @@ fn a_bad_fsync_value_refuses_a_collection_pull() {
     }
 }
 
-// --- dependencies ------------------------------------------------------------
+// --- attachments ------------------------------------------------------------
 
-/// A collection pull fetches the dependency that field 2 of the pulled commit
-/// names, complete, and writes no ref for it. The dependency gets no binding
+/// A collection pull fetches the attachment that field 2 of the pulled commit
+/// names, complete, and writes no ref for it. The attachment gets no binding
 /// check.
 #[test]
 fn a_collection_pull_fetches_the_attachment() {

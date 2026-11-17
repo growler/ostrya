@@ -122,7 +122,7 @@ async fn commit(
     commit_related(repo, branch, parent, content, metadata, &[]).await
 }
 
-/// Commits a tree as [`commit`] does, with the dependencies `related` in
+/// Commits a tree as [`commit`] does, with the attachments `related` in
 /// field 2.
 async fn commit_related(
     repo: &Repo,
@@ -943,10 +943,10 @@ fn a_commitmeta_that_the_switch_empties_is_not_uploaded() {
     });
 }
 
-// --- dependencies --------------------------------------------------------
+// --- attachments --------------------------------------------------------
 
-/// Commits a dependency on `dep/uki` of `repo`, and a tip on `main` whose
-/// field 2 names it as `boot/uki`. Returns the tip and the dependency.
+/// Commits an attachment on `dep/uki` of `repo`, and a tip on `main` whose
+/// field 2 names it as `boot/uki`. Returns the tip and the attachment.
 async fn attachment_chain(repo: &Repo) -> (Checksum, Checksum) {
     let att = commit(repo, "dep/uki", None, "uki", None).await;
     let tip = commit_related(repo, "main", None, "main", None, &[("boot/uki", att)]).await;
@@ -974,7 +974,7 @@ fn remove_commit_object(repo: &Repo, commit: &Checksum) {
     std::fs::remove_file(repo.path().join(object_path(ObjectType::Commit, commit))).unwrap();
 }
 
-/// A push uploads the dependency that field 2 of the source commit names,
+/// A push uploads the attachment that field 2 of the source commit names,
 /// with its whole tree and its `.commitmeta`, and writes no ref file for it.
 #[test]
 fn a_push_uploads_the_attachment_of_the_commit() {
@@ -998,8 +998,8 @@ fn a_push_uploads_the_attachment_of_the_commit() {
     });
 }
 
-/// A push with a depth uploads the dependencies of each parent that it
-/// uploads. At depth 0 it uploads no parent, so it uploads the dependency of
+/// A push with a depth uploads the attachments of each parent that it
+/// uploads. At depth 0 it uploads no parent, so it uploads the attachment of
 /// the source commit alone.
 #[test]
 fn a_push_with_depth_uploads_the_attachments_of_the_parents() {
@@ -1040,8 +1040,8 @@ fn a_push_with_depth_uploads_the_attachments_of_the_parents() {
     }
 }
 
-/// A push uploads a dependency at depth 0, also under a push of the whole
-/// history. The parent of the dependency stays in the local repository.
+/// A push uploads an attachment at depth 0, also under a push of the whole
+/// history. The parent of the attachment stays in the local repository.
 #[test]
 fn an_attachment_is_uploaded_at_depth_zero() {
     let scratch = TmpDir::new("push-s3-dependency-depth");
@@ -1070,7 +1070,7 @@ fn an_attachment_is_uploaded_at_depth_zero() {
     });
 }
 
-/// A dependency that the bucket holds with a partial-commit marker gets the
+/// An attachment that the bucket holds with a partial-commit marker gets the
 /// walk of its whole tree. The push uploads the missing objects and deletes
 /// the marker.
 #[test]
@@ -1107,8 +1107,8 @@ fn an_attachment_with_a_marker_in_the_bucket_gets_its_tree() {
     });
 }
 
-/// An absent dependency, a dependency that the local repository marks
-/// partial, a defective field 2 entry, and a nested dependency are each
+/// An absent attachment, an attachment that the local repository marks
+/// partial, a defective field 2 entry, and a nested attachment are each
 /// refused before the push sends a request.
 #[test]
 fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
@@ -1133,7 +1133,7 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
             )
         );
 
-        // A nested dependency.
+        // A nested attachment.
         let other = commit(&repo, "other", None, "other", None).await;
         let nested = store_with_field2(&repo, &other, &[("lib/c", att.as_bytes())]).await;
         let head = store_with_field2(&repo, &tip, &[("lib/b", nested.as_bytes())]).await;
@@ -1145,13 +1145,11 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
             attachment_error(err),
             (
                 Some(head),
-                format!(
-                    "dependency lib/b names commit {nested}, which has dependencies of its own"
-                )
+                format!("attachment lib/b names commit {nested}, which has attachments of its own")
             )
         );
 
-        // A partial dependency, then an absent one.
+        // A partial attachment, then an absent one.
         move_ref(&repo, "main", &tip).await;
         mark_partial(&repo, &att);
         let err = push(&repo, &server.endpoint(), opts(&["main"]))
@@ -1161,7 +1159,7 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
             attachment_error(err),
             (
                 Some(tip),
-                format!("dependency boot/uki names commit {att}, which is partial")
+                format!("attachment boot/uki names commit {att}, which is partial")
             )
         );
         remove_commit_object(&repo, &att);
@@ -1180,8 +1178,8 @@ fn an_attachment_the_push_cannot_upload_is_refused_before_a_request() {
     });
 }
 
-/// With a depth, the push resolves the dependencies of each history commit
-/// before it sends a request. A nested, a partial, and an absent dependency
+/// With a depth, the push resolves the attachments of each history commit
+/// before it sends a request. A nested, a partial, and an absent attachment
 /// that the parent of the source commit alone names are each refused.
 #[test]
 fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() {
@@ -1194,7 +1192,7 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
             ..opts(&["main"])
         };
 
-        // The parent names a commit that names a dependency of its own.
+        // The parent names a commit that names an attachment of its own.
         let att = commit(&repo, "dep/uki", None, "uki", None).await;
         let other = commit(&repo, "other", None, "other", None).await;
         let nested = store_with_field2(&repo, &other, &[("lib/c", att.as_bytes())]).await;
@@ -1208,13 +1206,11 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
             attachment_error(err),
             (
                 Some(parent),
-                format!(
-                    "dependency lib/b names commit {nested}, which has dependencies of its own"
-                )
+                format!("attachment lib/b names commit {nested}, which has attachments of its own")
             )
         );
 
-        // The parent names a partial dependency, then an absent one.
+        // The parent names a partial attachment, then an absent one.
         let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", att)]).await;
         commit(&repo, "main", Some(parent), "t", None).await;
         mark_partial(&repo, &att);
@@ -1225,7 +1221,7 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
             attachment_error(err),
             (
                 Some(parent),
-                format!("dependency boot/uki names commit {att}, which is partial")
+                format!("attachment boot/uki names commit {att}, which is partial")
             )
         );
         remove_commit_object(&repo, &att);
@@ -1244,9 +1240,9 @@ fn with_a_depth_an_attachment_of_a_history_commit_is_refused_before_a_request() 
     });
 }
 
-/// With no depth, the push resolves the dependencies of the history after the
+/// With no depth, the push resolves the attachments of the history after the
 /// cut at the tip of the ref in the bucket, under the lock. A refused
-/// dependency of such a commit ends the push before its first upload, and
+/// attachment of such a commit ends the push before its first upload, and
 /// the push releases the lock.
 #[test]
 fn with_no_depth_an_attachment_of_the_offered_history_is_refused_before_an_upload() {
@@ -1285,9 +1281,9 @@ fn with_no_depth_an_attachment_of_the_offered_history_is_refused_before_an_uploa
     });
 }
 
-/// A push does not upload a build source: the commit that `ostrya.related`
+/// A push does not upload a supplement: the commit that `ostrya.related`
 /// names. Under `keep-detached-related=false` in the config of the bucket,
-/// the push drops the key from the `.commitmeta` of a dependency too.
+/// the push drops the key from the `.commitmeta` of an attachment too.
 #[test]
 fn a_push_uploads_no_supplement_and_the_switch_applies_to_an_attachment() {
     let scratch = TmpDir::new("push-s3-dependency-build-source");

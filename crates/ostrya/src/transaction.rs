@@ -158,7 +158,7 @@ struct Staged {
 ///   queued to replace the stored one.
 /// - `merge`: the dict that a receiving session merges in, with the keys whose
 ///   stored value stays.
-/// - `supplements`: the build sources that
+/// - `supplements`: the supplements that
 ///   [`add_supplement`](Transaction::add_supplement) adds after
 ///   it, in call order.
 /// - `appends`: the signatures that [`sign_commit`](Transaction::sign_commit)
@@ -179,7 +179,7 @@ struct DetachedEdit {
     /// the starting dict holds keeps its value. Each other key takes the value
     /// of this dict.
     merge: Option<(Vec<u8>, Vec<String>)>,
-    /// The build sources to add after the merge, each a name and the checksum
+    /// The supplements to add after the merge, each a name and the checksum
     /// of a commit.
     supplements: Vec<(String, Checksum)>,
     /// The signatures to append, each an engine metadata key and one signature.
@@ -797,7 +797,7 @@ impl Transaction {
     ///
     /// If the call runs twice for one checksum, the last dict stays. The call
     /// also drops the signatures that [`sign_commit`](Transaction::sign_commit)
-    /// queued before it, and the build sources that
+    /// queued before it, and the supplements that
     /// [`add_supplement`](Transaction::add_supplement) queued
     /// before it.
     ///
@@ -818,7 +818,7 @@ impl Transaction {
         edit.appends.clear();
     }
 
-    /// Queues the build source `name` with the checksum `source` for the
+    /// Queues the supplement `name` with the checksum `source` for the
     /// detached metadata of the commit `commit`.
     ///
     /// The write at [`commit`](Transaction::commit) adds the entry to the
@@ -1534,7 +1534,7 @@ impl Transaction {
     /// object, so a commit that the repository holds already, complete or
     /// partial, gets no image from them. A pull records each commit that it
     /// completes: the targets, the parents within the depth, the
-    /// dependencies, and each held partial commit. A partial commit is not
+    /// attachments, and each held partial commit. A partial commit is not
     /// recorded. [`write_metadata`](Transaction::write_metadata) records no
     /// commit. [`Repo::commit_add_composefs_metadata`] and the server commit
     /// of a receive build the image of their commit themselves, and stage it
@@ -1606,7 +1606,7 @@ impl Transaction {
     ///   detached-metadata dict is not a variant of type `a(say)`, or if one
     ///   of its elements has an empty name or a checksum that is not 32
     ///   bytes. The call publishes no object and writes nothing.
-    /// - [`Error::InvalidRelations`] if a build source that
+    /// - [`Error::InvalidRelations`] if a supplement that
     ///   [`add_supplement`](Transaction::add_supplement) queued
     ///   meets a defective stored `ostrya.related` value. The published
     ///   objects stay, and the call writes no ref.

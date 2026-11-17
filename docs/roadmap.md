@@ -107,18 +107,18 @@ for it.
   from the copy in the superblock (`conformance/cli-behavior.md`, "CLI output
   formats", `static-delta`, "`apply-offline`"). `conformance/cli-surface.md`,
   "P2", `static-delta`, records the difference.
-- The partial marker of a dependency in an offline apply.
+- The partial marker of an attachment in an offline apply.
   `Repo::apply_static_delta_offline` and `Repo::apply_static_delta` refuse a
-  target whose dependency has a `.commitpartial` marker, and do not remove the
-  marker when they apply the delta of the dependency. So offline media cannot
-  repair a dependency that the repository holds partial.
-- The tombstone step of `fsck --add-tombstones` and dependencies. The step
+  target whose attachment has a `.commitpartial` marker, and do not remove the
+  marker when they apply the delta of the attachment. So offline media cannot
+  repair an attachment that the repository holds partial.
+- The tombstone step of `fsck --add-tombstones` and attachments. The step
   deletes each commit whose parent commit is absent, also a commit that
-  another commit names as a dependency. A pull takes a dependency at depth
-  0, with no parent, so a dependency with a parent is such a commit. The
+  another commit names as an attachment. A pull takes an attachment at depth
+  0, with no parent, so an attachment with a parent is such a commit. The
   next run then gives an `Absent` finding for the commit that names it. The
-  dependency check of the run runs before the tombstone step, so the run
-  that deletes the dependency does not report it.
+  attachment check of the run runs before the tombstone step, so the run
+  that deletes the attachment does not report it.
 - The rules of the one-way stream come from code (`StreamPolicy`) or from
   the options of `ostrya receive --one-way`, and they can name remote refs.
   No client group applies to the stream. A later command, for example
@@ -165,7 +165,7 @@ work on a local repository are not carried for it:
 - Tombstone commits. `ostrya remote prune` refuses a bucket `config` that
   sets `[core] tombstone-commits=true`.
 - These options of `fsck`: `--add-tombstones`, `--all`, `--verify-bindings`,
-  `--verify-back-refs`, `--no-mark-partial`, and `--no-mark-dependencies`.
+  `--verify-back-refs`, `--no-mark-partial`, and `--no-mark-attachments`.
 - `push --onto`, and tags.
 - A signed tree push to a bucket repository. `BucketRepo::push_tree` and
   `ostrya push-tree` to an `s3://` address sign no commit. A user pulls the

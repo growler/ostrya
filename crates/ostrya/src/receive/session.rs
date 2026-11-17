@@ -219,12 +219,12 @@ impl Repo {
     ///    commit needs `w` or `t`. An update of `ostree-metadata` in the local
     ///    refs of a repository with a collection id is refused.
     /// 5. Each new commit, and the tree of each commit of the session, is
-    ///    complete (`missing-objects`). Then the dependencies of each staged
+    ///    complete (`missing-objects`). Then the attachments of each staged
     ///    commit, the staged parents of a new commit included, and of each new
     ///    commit that the repository holds with a partial marker: each entry
     ///    of field 2 has a name that is not empty and a 32-byte checksum
-    ///    (`protocol`), each dependency is staged, a new commit, or held
-    ///    complete (`missing-objects`), and no dependency has dependencies of
+    ///    (`protocol`), each attachment is staged, a new commit, or held
+    ///    complete (`missing-objects`), and no attachment has attachments of
     ///    its own (`protocol`).
     /// 6. The ref binding and the collection binding of each new commit
     ///    (`binding-mismatch`), for each ref in its namespace. The ref binding
@@ -237,7 +237,7 @@ impl Repo {
     ///    local ref, and fails for a ref of another collection.
     /// 7. The signature verification of the policy (`signature-required`).
     ///    The verification applies to each new commit alone. A staged parent
-    ///    and a dependency get no verification, unless an update names them.
+    ///    and an attachment get no verification, unless an update names them.
     ///
     /// [`ReceiveService::commit`](super::ReceiveService::commit) runs the same
     /// checks. The errors section of its doc states the condition of each code.
@@ -256,8 +256,8 @@ impl Repo {
     /// After the checks, the session makes the staged objects durable. At the
     /// same time, it signs each new commit with each server key of the
     /// policy, each key once. A key that already signed the commit makes no
-    /// signature. The session signs no other commit, a staged parent and a
-    /// dependency included.
+    /// signature. The session signs no other commit, a staged parent and an
+    /// attachment included.
     ///
     /// # Under the update lock
     ///

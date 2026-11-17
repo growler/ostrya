@@ -2,7 +2,7 @@
 //!
 //! [`Repo::prune`] walks from a set of roots and removes each loose object
 //! that the walk does not reach. The walk also keeps the related commits of
-//! each commit that it reaches: the dependencies and the build sources. If
+//! each commit that it reaches: the attachments and the supplements. If
 //! the two ostrya extensions of [`PruneOptions`] keep their defaults and no
 //! reached commit names a related commit, a run deletes the same objects as
 //! the `ostree prune` command, as observed. The run also reads the
@@ -620,7 +620,7 @@ pub struct PruneStats {
     ///
     /// The list holds one warning for each defective entry and one for each
     /// defective `ostrya.related` value. It is sorted by commit and then by
-    /// field, dependencies first. The warnings of one field keep the order of
+    /// field, attachments first. The warnings of one field keep the order of
     /// its entries. A [`no_prune`](PruneOptions::no_prune) run gives the same
     /// list as a run without it. A
     /// [`static_deltas_only`](PruneOptions::static_deltas_only) run walks
@@ -740,10 +740,10 @@ impl Repo {
     ///
     /// A commit names its related commits in two fields:
     ///
-    /// - Field 2 of the commit object holds the dependencies
+    /// - Field 2 of the commit object holds the attachments
     ///   ([`CommitOptions::attachments`](crate::CommitOptions::attachments)).
-    /// - The key `ostrya.related` of the detached metadata holds the build
-    ///   sources ([`Repo::add_supplement`]). If the key occurs more than
+    /// - The key `ostrya.related` of the detached metadata holds the
+    ///   supplements ([`Repo::add_supplement`]). If the key occurs more than
     ///   one time, the run reads the first entry alone.
     ///
     /// The run reads both fields of each commit that the walk reaches, and
@@ -751,8 +751,8 @@ impl Repo {
     /// gets the global bound of the run, [`depth`](PruneOptions::depth) or
     /// [`keep_younger_than`](PruneOptions::keep_younger_than), because the
     /// bound counts `parent` edges. The run reads the two fields of a related
-    /// commit too, so it keeps the dependencies of a dependency and the build
-    /// sources of a build source. A cycle of build sources ends the walk,
+    /// commit too, so it keeps the attachments of an attachment and the
+    /// supplements of a supplement. A cycle of supplements ends the walk,
     /// because the walk reads the fields of each commit one time.
     ///
     /// A related entry that names a commit that the repository does not hold
@@ -768,7 +768,7 @@ impl Repo {
     /// not 32 bytes, or if the value of `ostrya.related` is not a variant of
     /// type `a(say)`. The defective entry or value roots nothing, and the
     /// other entries of the field root as usual. Entries that are not sorted,
-    /// two entries with the same name, and a dependency with dependencies of
+    /// two entries with the same name, and an attachment with attachments of
     /// its own are not defective.
     ///
     /// The run reads the related values also if each commit in the store is

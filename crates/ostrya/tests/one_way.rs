@@ -1252,7 +1252,7 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
 }
 
 // ---------------------------------------------------------------------------
-// Dependencies.
+// Attachments.
 // ---------------------------------------------------------------------------
 
 /// The objects of the fixture tree, then `commits`.
@@ -1316,9 +1316,9 @@ fn verify_policy(refs: &[(&str, &str)]) -> StreamPolicy {
     }
 }
 
-/// A staged dependency that two new commits name gets no verification under
-/// the rules of their refs. A dependency with no dict passes and gets no
-/// signature. A dependency with a signature of a key that no rule trusts
+/// A staged attachment that two new commits name gets no verification under
+/// the rules of their refs. An attachment with no dict passes and gets no
+/// signature. An attachment with a signature of a key that no rule trusts
 /// passes and keeps that signature.
 #[test]
 fn an_attachment_gets_no_rule_of_the_targets_that_name_it() {
@@ -1349,10 +1349,10 @@ fn an_attachment_gets_no_rule_of_the_targets_that_name_it() {
     );
 }
 
-/// A dependency of the new commit of ref `a` that is also the new commit of
+/// An attachment of the new commit of ref `a` that is also the new commit of
 /// ref `b` gets the verification of the rule of `b` alone. A signature of the
 /// key of `a` alone is `signature-required`, and the refusal names the
-/// dependency as a new commit. A signature of the key of `b` passes.
+/// attachment as a new commit. A signature of the key of `b` passes.
 #[test]
 fn an_attachment_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
     let att = commit_naming("dependency", &[]);
@@ -1386,9 +1386,9 @@ fn an_attachment_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
     );
 }
 
-/// A dependency whose bytes do not hash to the checksum that field 2 names
+/// An attachment whose bytes do not hash to the checksum that field 2 names
 /// is `checksum-mismatch`. The stream sends the bytes of another commit
-/// under the checksum of the dependency, and nothing is published.
+/// under the checksum of the attachment, and nothing is published.
 #[test]
 fn an_attachment_with_the_bytes_of_another_commit_is_checksum_mismatch() {
     let att = commit_naming("dependency", &[]);
@@ -1418,7 +1418,7 @@ fn an_attachment_with_the_bytes_of_another_commit_is_checksum_mismatch() {
     assert_nothing_published(&repo, &before);
 }
 
-/// A dependency that the stream neither stages nor finds in the repository
+/// An attachment that the stream neither stages nor finds in the repository
 /// is `missing-objects`, and the error lists it.
 #[test]
 fn an_absent_attachment_is_missing_objects() {
@@ -1436,7 +1436,7 @@ fn an_absent_attachment_is_missing_objects() {
     assert_nothing_published(&repo, &before);
 }
 
-/// A nested dependency and a defective field 2 entry are `protocol`.
+/// A nested attachment and a defective field 2 entry are `protocol`.
 #[test]
 fn a_nested_or_defective_attachment_is_protocol() {
     let inner = commit_naming("inner", &[]);
@@ -1463,7 +1463,7 @@ fn a_nested_or_defective_attachment_is_protocol() {
 }
 
 /// A one-way stream ignores the server keys of its rules, so a staged
-/// dependency gets no server signature.
+/// attachment gets no server signature.
 #[test]
 fn an_attachment_gets_no_server_signature() {
     let att = commit_naming("dependency", &[]);
@@ -1635,7 +1635,7 @@ mod export {
     }
 
     /// Commits the fixture tree as [`commit_tree`] does, with the parent
-    /// `parent` and the dependencies `related` in field 2.
+    /// `parent` and the attachments `related` in field 2.
     fn commit_tree_related(
         repo: &Repo,
         parent: Option<Checksum>,
@@ -2359,13 +2359,13 @@ mod export {
     }
 
     // -----------------------------------------------------------------------
-    // Dependencies.
+    // Attachments.
     // -----------------------------------------------------------------------
 
-    /// Commits a dependency into `repo`, and a target whose field 2 names it
+    /// Commits an attachment into `repo`, and a target whose field 2 names it
     /// as `boot/uki`. The file `large` of each commit holds other bytes, so
     /// each commit has its own root dirtree. Returns the target and the
-    /// dependency.
+    /// attachment.
     fn attachment_chain(repo: &Repo) -> (Checksum, Checksum) {
         let (att, _) = commit_tree(repo, None, b"dependency\n");
         let (target, _) = commit_tree_related(repo, None, None, b"target\n", &[("boot/uki", att)]);
@@ -2412,9 +2412,9 @@ mod export {
         block_on(repo.has_object(ObjectType::Commit, commit)).unwrap()
     }
 
-    /// An export sends the dependency of the new commit with its tree and its
-    /// `.commitmeta`, and no parent of the dependency. The `Commit` frame
-    /// holds no update for the dependency. The two commits share their
+    /// An export sends the attachment of the new commit with its tree and its
+    /// `.commitmeta`, and no parent of the attachment. The `Commit` frame
+    /// holds no update for the attachment. The two commits share their
     /// dirmeta and three files, and the stream carries each of them one time:
     /// two commits, two root dirtrees, one dirmeta, and five files.
     #[test]
@@ -2465,10 +2465,10 @@ mod export {
         assert_eq!(fsck.commits_checked, 2);
     }
 
-    /// The stream carries a dependency one time when two new commits name it,
+    /// The stream carries an attachment one time when two new commits name it,
     /// and when it is also a new commit. The receiver refuses a second dict
     /// for one commit, so each export passes only if it sends the
-    /// `.commitmeta` of the dependency one time.
+    /// `.commitmeta` of the attachment one time.
     #[test]
     fn an_export_sends_a_shared_attachment_once() {
         let tmp = TmpDir::new("one-way-export-dependency-once-source");
@@ -2503,8 +2503,8 @@ mod export {
     }
 
     /// The receiver applies the rule of the ref of a new commit to that
-    /// commit alone. The source signs the new commit and not its dependency,
-    /// and the stream commits with the whole dependency.
+    /// commit alone. The source signs the new commit and not its attachment,
+    /// and the stream commits with the whole attachment.
     #[test]
     fn the_receiver_verifies_no_exported_attachment() {
         let tmp = TmpDir::new("one-way-export-dependency-verify-source");
@@ -2537,7 +2537,7 @@ mod export {
         std::fs::remove_file(repo.path().join("objects").join(path)).unwrap();
     }
 
-    /// A dependency that the repository marks partial, or does not hold,
+    /// An attachment that the repository marks partial, or does not hold,
     /// refuses the export before it writes a byte.
     #[test]
     fn an_absent_or_partial_attachment_writes_no_byte() {
@@ -2551,7 +2551,7 @@ mod export {
             attachment_error(error),
             (
                 Some(main),
-                format!("dependency boot/uki names commit {att}, which is partial")
+                format!("attachment boot/uki names commit {att}, which is partial")
             )
         );
         assert_eq!(calls, 0);
@@ -2567,7 +2567,7 @@ mod export {
         assert_eq!(calls, 0);
     }
 
-    /// The export reads no commit object of a dependency with a partial
+    /// The export reads no commit object of an attachment with a partial
     /// marker: a directory at the path of the object gives the partial
     /// refusal.
     #[test]
@@ -2585,7 +2585,7 @@ mod export {
             attachment_error(error),
             (
                 Some(main),
-                format!("dependency boot/uki names commit {att}, which is partial")
+                format!("attachment boot/uki names commit {att}, which is partial")
             )
         );
         assert_eq!(calls, 0);
@@ -2616,17 +2616,17 @@ mod export {
         }
     }
 
-    /// A dependency that names dependencies of its own refuses the export
+    /// An attachment that names attachments of its own refuses the export
     /// before it writes a byte, also if the export takes that commit as a
     /// second new commit. The error names the commit that names the nested
-    /// dependency.
+    /// attachment.
     #[test]
     fn a_nested_attachment_writes_no_byte() {
         let tmp = TmpDir::new("one-way-export-dependency-nested");
         let repo = new_repo(&tmp, RepoMode::Archive, "");
         let (main, att) = attachment_chain(&repo);
         let (other, _) = commit_tree(&repo, None, b"other\n");
-        // `nested` names a dependency, and `head` names `nested`.
+        // `nested` names an attachment, and `head` names `nested`.
         let nested = block_on(store_with_field2(
             &repo,
             &other,
@@ -2639,7 +2639,7 @@ mod export {
         ));
 
         let reason =
-            format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+            format!("attachment lib/b names commit {nested}, which has attachments of its own");
         for updates in [
             &[("main", head)][..],
             &[("main", head), ("other", nested)],
@@ -2655,7 +2655,7 @@ mod export {
         }
     }
 
-    /// An export does not send a build source: the commit that
+    /// An export does not send a supplement: the commit that
     /// `ostrya.related` names. The key goes with the detached metadata of its
     /// commit.
     #[test]
@@ -2694,12 +2694,12 @@ mod export {
     }
 
     /// Two exports into one receiver, of two new commits that name one
-    /// dependency with a signed `.commitmeta`, both pass. The second export
-    /// sends the dependency again with a changed `.commitmeta`, and the
-    /// receiver, which holds the dependency, drops that dict: the held
+    /// attachment with a signed `.commitmeta`, both pass. The second export
+    /// sends the attachment again with a changed `.commitmeta`, and the
+    /// receiver, which holds the attachment, drops that dict: the held
     /// `.commitmeta` keeps its bytes. A third export of the first new commit
     /// to one more ref also passes: the receiver holds the new commit, and
-    /// field 2 of that held commit names the dependency.
+    /// field 2 of that held commit names the attachment.
     #[test]
     fn a_second_export_of_a_held_attachment_keeps_its_commitmeta() {
         let tmp = TmpDir::new("one-way-export-dependency-held-source");
@@ -2723,7 +2723,7 @@ mod export {
         assert_eq!(
             ed25519_signatures(&target, &att).len(),
             1,
-            "the first export carries the signature of the dependency"
+            "the first export carries the signature of the attachment"
         );
 
         let other_signer = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
@@ -2758,10 +2758,10 @@ mod export {
         assert_complete(&source, &target, &other);
     }
 
-    /// A receiver that holds a dependency and marks it partial refuses a
+    /// A receiver that holds an attachment and marks it partial refuses a
     /// stream whose new commit names it with `missing-objects` and no object
     /// listed, also though the stream carries the whole tree of the
-    /// dependency. A stream that also takes the dependency as a new commit
+    /// attachment. A stream that also takes the attachment as a new commit
     /// completes it: the receiver removes the marker.
     #[test]
     fn a_receiver_that_holds_a_partial_attachment_refuses_the_stream() {
@@ -2795,7 +2795,7 @@ mod export {
                 assert_eq!(
                     message,
                     format!(
-                        "related commits in field 2 of commit {main}: dependency boot/uki names \
+                        "related commits in field 2 of commit {main}: attachment boot/uki names \
                          commit {att}, which is partial"
                     )
                 );
@@ -2831,7 +2831,7 @@ mod export {
         );
     }
 
-    /// A dependency that the repository does not hold, with no partial
+    /// An attachment that the repository does not hold, with no partial
     /// marker, refuses the export before it writes a byte.
     #[test]
     fn an_absent_attachment_writes_no_byte() {
@@ -2849,9 +2849,9 @@ mod export {
         assert_eq!(calls, 0);
     }
 
-    /// A dependency whose own field 2 holds a defective entry is nested, and
+    /// An attachment whose own field 2 holds a defective entry is nested, and
     /// refuses the export before it writes a byte. If the export also takes
-    /// that dependency as a new commit, the format check of field 2 of the
+    /// that attachment as a new commit, the format check of field 2 of the
     /// new commits refuses its defective entry first.
     #[test]
     fn an_attachment_with_a_defective_field_2_is_nested() {
@@ -2872,7 +2872,7 @@ mod export {
             (
                 Some(head),
                 format!(
-                    "dependency lib/b names commit {defective}, which has dependencies of its own"
+                    "attachment lib/b names commit {defective}, which has attachments of its own"
                 )
             )
         );
@@ -2892,7 +2892,7 @@ mod export {
         }
     }
 
-    /// The export makes no ref-binding check on a dependency: a dependency
+    /// The export makes no ref-binding check on an attachment: an attachment
     /// bound to a ref that no update names goes in the stream, and the
     /// receiver accepts it.
     #[test]

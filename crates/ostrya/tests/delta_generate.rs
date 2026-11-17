@@ -87,10 +87,10 @@ async fn commit_tree(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Chec
     commit_tree_related(repo, tree, parent, &[]).await
 }
 
-/// Commits `tree` as [`commit_tree`] does, with the dependencies `related` in
+/// Commits `tree` as [`commit_tree`] does, with the attachments `related` in
 /// field 2.
 ///
-/// The repository must hold each dependency complete.
+/// The repository must hold each attachment complete.
 async fn commit_tree_related(
     repo: &Repo,
     tree: &Path,
@@ -1627,9 +1627,9 @@ fn apply_static_delta_writes_no_ref() {
     });
 }
 
-// --- the dependencies of the target ------------------------------------------
+// --- the attachments of the target ------------------------------------------
 
-/// A source repository with a dependency `att`, a base commit `base`, and a
+/// A source repository with an attachment `att`, a base commit `base`, and a
 /// target commit `target`. The target has the parent `base` and names `att`
 /// as `boot/dep` in field 2.
 struct AttachmentFixture {
@@ -1692,12 +1692,12 @@ async fn refused_apply(dst: &Repo, dir: &Path) -> (Option<Checksum>, String) {
     common::attachment_error(err)
 }
 
-/// The reason of a dependency `boot/dep` on `att` that ends in `defect`.
+/// The reason of an attachment `boot/dep` on `att` that ends in `defect`.
 fn att_reason(att: &Checksum, defect: &str) -> String {
-    format!("dependency boot/dep names commit {att}, {defect}")
+    format!("attachment boot/dep names commit {att}, {defect}")
 }
 
-/// A target applies after the delta of its dependency, and is refused before.
+/// A target applies after the delta of its attachment, and is refused before.
 #[test]
 fn a_target_applies_after_the_deltas_of_its_attachments() {
     let tmp = TmpDir::new("apply-deps-order");
@@ -1721,7 +1721,7 @@ fn a_target_applies_after_the_deltas_of_its_attachments() {
     });
 }
 
-/// A dependency that the repository does not hold is refused through both
+/// An attachment that the repository does not hold is refused through both
 /// apply calls, and neither writes an object.
 #[test]
 fn a_target_with_a_missing_attachment_writes_no_object() {
@@ -1749,8 +1749,8 @@ fn a_target_with_a_missing_attachment_writes_no_object() {
     });
 }
 
-/// The check of the dependencies runs before the parts apply. The delta has
-/// no part file, and the apply gives the error of the absent dependency.
+/// The check of the attachments runs before the parts apply. The delta has
+/// no part file, and the apply gives the error of the absent attachment.
 #[test]
 fn the_attachments_are_checked_before_the_parts_apply() {
     let tmp = TmpDir::new("apply-deps-before-parts");
@@ -1772,7 +1772,7 @@ fn the_attachments_are_checked_before_the_parts_apply() {
     });
 }
 
-/// A dependency with dependencies of its own is refused, and the apply writes
+/// An attachment with attachments of its own is refused, and the apply writes
 /// no object.
 #[test]
 fn a_target_with_a_nested_attachment_writes_no_object() {
@@ -1794,13 +1794,13 @@ fn a_target_with_a_nested_attachment_writes_no_object() {
             refused_apply(&dst, &target_delta).await,
             (
                 Some(target),
-                att_reason(&nested, "which has dependencies of its own")
+                att_reason(&nested, "which has attachments of its own")
             )
         );
     });
 }
 
-/// A dependency that the repository marks partial is refused, and the apply
+/// An attachment that the repository marks partial is refused, and the apply
 /// writes no object. The marker stays.
 #[test]
 fn a_target_with_a_partial_attachment_writes_no_object() {
@@ -1853,7 +1853,7 @@ fn a_defective_attachment_entry_writes_no_object() {
     });
 }
 
-/// A delta from a source commit checks the dependencies of its target as a
+/// A delta from a source commit checks the attachments of its target as a
 /// delta from scratch does.
 #[test]
 fn a_from_delta_checks_the_attachments_of_its_target() {
@@ -1886,7 +1886,7 @@ fn a_from_delta_checks_the_attachments_of_its_target() {
 }
 
 /// The check runs also if the repository holds the target. The test removes
-/// the commit object of the dependency after both apply.
+/// the commit object of the attachment after both apply.
 #[test]
 fn a_held_target_checks_its_attachments() {
     let tmp = TmpDir::new("apply-deps-held");
@@ -1914,7 +1914,7 @@ fn a_held_target_checks_its_attachments() {
 }
 
 /// Field 2 entries that are not sorted by name, or two entries with the same
-/// name, apply if each dependency is complete.
+/// name, apply if each attachment is complete.
 #[test]
 fn unsorted_attachment_names_apply() {
     let tmp = TmpDir::new("apply-deps-unsorted");

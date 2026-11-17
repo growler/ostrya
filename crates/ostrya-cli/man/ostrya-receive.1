@@ -42,7 +42,7 @@ ID is one literal collection id. A ref of the collection takes the rules of a pl
 \fB\-\-trust\fR \fINAME\fR
 Verify each new commit with the keys of the trust group \fB\%[ex\-ostrya trust "NAME"]\fR (see \%ostrya\-config(1)).
 .IP
-The keys apply to each plain ref, to each remote ref of \%\-\-allow\-remote, and to each collection ref of \%\-\-allow\-collection. A commit that is the new value of a ref must pass the verification, and a commit with no signature gets \fB\%signature\-required\fR\&. A dependency of a commit gets no verification of its own. Field \%2 of the signed commit holds the checksum of each dependency, so the signature of the commit covers each dependency. A NAME that the config has no group for, and a bad group, end the command with one \fB\%error:\fR line and exit \%1 before it reads its input. The option needs \%\-\-one\-way.
+The keys apply to each plain ref, to each remote ref of \%\-\-allow\-remote, and to each collection ref of \%\-\-allow\-collection. A commit that is the new value of a ref must pass the verification, and a commit with no signature gets \fB\%signature\-required\fR\&. An attachment of a commit gets no verification of its own. Field \%2 of the signed commit holds the checksum of each attachment, so the signature of the commit covers each attachment. A NAME that the config has no group for, and a bad group, end the command with one \fB\%error:\fR line and exit \%1 before it reads its input. The option needs \%\-\-one\-way.
 .TP
 \fB\-\-allow\-privileged\fR
 Accept privileged content in a \fB\%bare\fR repository.

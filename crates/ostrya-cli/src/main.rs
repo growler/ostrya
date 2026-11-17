@@ -322,8 +322,8 @@ enum Command {
     /// roots, under the bound of --depth or --keep-younger-than. A related
     /// commit gets this bound also if --retain-branch-depth gives the commit
     /// that names it a different depth. Field 2 of a commit holds its
-    /// dependencies, which `commit --related` writes. The detached metadata
-    /// key `ostrya.related` holds its build sources. The walk reads the two
+    /// attachments, which `commit --related` writes. The detached metadata
+    /// key `ostrya.related` holds its supplements. The walk reads the two
     /// fields of each related commit too. An entry that names a commit that
     /// is not in the store gives no error. The command then keeps the
     /// detached metadata of that commit if it is in the store. For each defective value, the command writes a warning
@@ -364,12 +364,12 @@ enum Command {
     /// ends the run early. If the command finds an error or skips a partial
     /// commit, it exits 1.
     ///
-    /// After the walk, the command checks the dependencies in field 2 of each
+    /// After the walk, the command checks the attachments in field 2 of each
     /// commit that it verified. It writes one line on standard error for each
-    /// dependency that is absent, partial, or defective, and exits 1. It marks
-    /// a commit with an absent or a partial dependency as partial, so a later
-    /// pull fetches the dependency. --no-mark-partial and
-    /// --no-mark-dependencies each stop these marks.
+    /// attachment that is absent, partial, or defective, and exits 1. It marks
+    /// a commit with an absent or a partial attachment as partial, so a later
+    /// pull fetches the attachment. --no-mark-partial and
+    /// --no-mark-attachments each stop these marks.
     ///
     /// After the walk, the command checks each composefs image in
     /// `extensions/ostrya/composefs/` against the key
@@ -474,7 +474,7 @@ enum Command {
     /// --mirror and --collection read neither key. ostrya-config(1) states
     /// the keys.
     ///
-    /// The pull also fetches the dependencies that field 2 of each pulled
+    /// The pull also fetches the attachments that field 2 of each pulled
     /// commit names, each with no parent and no ref, unless it takes
     /// --commit-metadata-only or --subpath.
     ///
@@ -498,7 +498,7 @@ enum Command {
     /// With `[ex-ostrya] keep-detached-related=false`, it drops
     /// `ostrya.related`.
     ///
-    /// The pull also imports the dependencies that field 2 of each pulled
+    /// The pull also imports the attachments that field 2 of each pulled
     /// commit names, each with no parent and no ref, unless it takes
     /// --commit-metadata-only.
     ///
@@ -642,7 +642,7 @@ enum Command {
     /// server makes a new commit over it on the branch BRANCH. The server
     /// picks the parent, writes the bindings, and signs the commit.
     ///
-    /// The push also sends the dependencies that field 2 of each pushed commit
+    /// The push also sends the attachments that field 2 of each pushed commit
     /// names, each with no parent and no ref, unless it takes --onto.
     ///
     /// With no refspec, the command reads the key `push-branches` of the
@@ -1065,7 +1065,7 @@ struct CommitArgs {
         conflicts_with_all = ["no_bindings", "skip_if_unchanged"]
     )]
     tags: Vec<String>,
-    /// Name a dependency of the commit in field 2 of the commit object.
+    /// Name an attachment of the commit in field 2 of the commit object.
     ///
     /// The argument splits at its last `=`, so NAME can hold `=`. CHECKSUM
     /// is 64 lowercase hexadecimal characters. By convention, NAME has the
@@ -1075,8 +1075,8 @@ struct CommitArgs {
     ///
     /// The command refuses an argument with no `=` and a CHECKSUM of another
     /// form before it takes the repository lock. It refuses an empty NAME, a
-    /// NAME that occurs two times, and a dependency that the repository does
-    /// not hold complete or that has a dependency of its own before it reads
+    /// NAME that occurs two times, and an attachment that the repository does
+    /// not hold complete or that has an attachment of its own before it reads
     /// the tree. A refusal gives no new object and no ref. The option
     /// conflicts with --skip-if-unchanged. This option is an extension of
     /// ostrya.
@@ -1728,7 +1728,7 @@ struct CatArgs {
 struct ShowArgs {
     /// Show the "related" commits.
     ///
-    /// The command prints one `<name> <checksum>` line for each dependency of
+    /// The command prints one `<name> <checksum>` line for each attachment of
     /// the commit, the entries of field 2 of the commit object, in the stored
     /// order. An empty field prints nothing.
     #[arg(long)]
@@ -1983,10 +1983,10 @@ enum RemoteCommand {
     /// in the bucket now gives a note, and an object whose commits are all
     /// gone now gives no line.
     ///
-    /// The command checks the dependencies in field 2 of each commit. A
-    /// dependency that is absent, partial, or defective gives a `dependency`
+    /// The command checks the attachments in field 2 of each commit. An
+    /// attachment that is absent, partial, or defective gives an `attachment`
     /// error on the key of the commit that names it. With --delete, the
-    /// command checks the dependencies against the bucket after the repair,
+    /// command checks the attachments against the bucket after the repair,
     /// and writes and deletes no key for such an error.
     ///
     /// With --delete, the command takes the writer lock, writes the marker
@@ -2028,12 +2028,12 @@ enum RemoteCommand {
     /// are roots, and the command keeps them with no parent. A kept commit
     /// keeps its detached metadata.
     ///
-    /// The dependencies in field 2 of each commit that the walk reaches are
+    /// The attachments in field 2 of each commit that the walk reaches are
     /// also roots, as in `ostrya prune`. With --refs-only or
-    /// --keep-younger-than, a dependency gets the bound of --depth or
-    /// --keep-younger-than, also a dependency of a commit that the summary
+    /// --keep-younger-than, an attachment gets the bound of --depth or
+    /// --keep-younger-than, also an attachment of a commit that the summary
     /// names. Without them, each commit of the bucket is a root
-    /// that keeps no parent, and a dependency keeps no parent too. The
+    /// that keeps no parent, and an attachment keeps no parent too. The
     /// command reads field 2 from the commit object, with no other request.
     /// An entry that names a commit that is not in the bucket gives no error,
     /// and the command keeps the detached metadata of that commit if it is in
@@ -2042,8 +2042,8 @@ enum RemoteCommand {
     /// standard error before the lines on standard output, and the defective
     /// entry roots nothing.
     ///
-    /// The command reads no detached metadata, so it reads no build source in
-    /// the detached metadata key `ostrya.related`. It deletes a build source
+    /// The command reads no detached metadata, so it reads no supplement in
+    /// the detached metadata key `ostrya.related`. It deletes a supplement
     /// that no root reaches, which `ostrya prune` keeps. Without --refs-only
     /// and --keep-younger-than, the command also deletes the detached
     /// metadata of a parent commit that the bucket does not hold, which
@@ -2744,24 +2744,24 @@ struct PruneArgs {
 
 #[derive(Args)]
 struct FsckArgs {
-    /// Do not mark a commit partial for a missing object or a dependency.
+    /// Do not mark a commit partial for a missing object or an attachment.
     ///
     /// Without this option, the command writes the marker
     /// `state/<commit>.commitpartial` for each commit that reaches a missing
     /// object, or an object that --delete removed, and for each commit with
-    /// an absent or a partial dependency. This option stops all of these
+    /// an absent or a partial attachment. This option stops all of these
     /// marks.
     #[arg(long)]
     no_mark_partial: bool,
-    /// Do not mark a commit partial for an absent or a partial dependency.
+    /// Do not mark a commit partial for an absent or a partial attachment.
     ///
-    /// The command still reports each dependency that is absent, partial,
+    /// The command still reports each attachment that is absent, partial,
     /// or defective, and exits 1. It still marks each commit that reaches a
     /// missing object, or an object that --delete removed. A later run
     /// verifies again each commit that the run did not mark, and gives the
     /// same finding. --no-mark-partial also stops these marks.
     #[arg(long)]
-    no_mark_dependencies: bool,
+    no_mark_attachments: bool,
     /// Delete each commit whose parent commit is missing, and add a tombstone.
     ///
     /// This step comes after the object walk. It writes a `.tombstone-commit`
@@ -3491,8 +3491,8 @@ enum StaticDeltaCommand {
     /// an unsigned delta with no check. With a --keys-dir and no key, if one
     /// engine finds a signature, the command skips each engine that finds
     /// none. Without a key source, the command verifies no signature.
-    /// Each dependency of the target commit must be complete in the
-    /// repository, so apply the delta of each dependency first.
+    /// Each attachment of the target commit must be complete in the
+    /// repository, so apply the delta of each attachment first.
     ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
     ///
@@ -4198,7 +4198,7 @@ struct PullArgs {
     /// Refuse the pull if a missing commit has no static delta on the remote.
     ///
     /// A missing commit is a commit that this repository does not hold
-    /// complete, a dependency of a pulled commit included. The pull also fails
+    /// complete, an attachment of a pulled commit included. The pull also fails
     /// if the remote serves no summary. The option conflicts with
     /// --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
@@ -4207,8 +4207,8 @@ struct PullArgs {
     ///
     /// Without this option, the `gpg-verify` key of the remote applies, and
     /// its default is true. `--gpg-verify` requires a signature, and
-    /// `--gpg-verify=false` requires none. The pull checks no signature of a
-    /// dependency, unless the dependency is also a target, a parent that
+    /// `--gpg-verify=false` requires none. The pull checks no signature of an
+    /// attachment, unless the attachment is also a target, a parent that
     /// --depth takes, or a commit of a chain of static deltas. The trusted keys
     /// are `<remote>.trustedkeys.gpg` of the repository, or, when that file is
     /// absent, of the remotes directory of the repository, and the keyrings
@@ -4235,7 +4235,7 @@ struct PullArgs {
     /// its default is off. `--sign-verify` requires a signature and selects
     /// every engine of this build. `--sign-verify=false` requires none. A
     /// valid signature of one engine is sufficient. The pull checks no
-    /// signature of a dependency, unless the dependency is also a target, a
+    /// signature of an attachment, unless the attachment is also a target, a
     /// parent that --depth takes, or a commit of a chain of static deltas. The
     /// trusted keys come from the `verification-<engine>-key` and
     /// `verification-<engine>-file` keys of the remote, and from the system
@@ -4350,9 +4350,9 @@ struct ReceiveArgs {
     /// The keys apply to each plain ref, to each remote ref of
     /// --allow-remote, and to each collection ref of --allow-collection. A
     /// commit that is the new value of a ref must pass the verification, and
-    /// a commit with no signature gets `signature-required`. A dependency of
+    /// a commit with no signature gets `signature-required`. An attachment of
     /// a commit gets no verification of its own. Field 2 of the signed commit holds the checksum of each
-    /// dependency, so the signature of the commit covers each dependency. A
+    /// attachment, so the signature of the commit covers each attachment. A
     /// NAME that the config has no group for, and a bad group, end the
     /// command with one `error:` line and exit 1 before it reads its input.
     /// The option needs --one-way.
@@ -4450,7 +4450,7 @@ struct SendArgs {
     /// stream.
     ///
     /// The stream carries each commit, the objects of its tree, and its
-    /// detached metadata. It also carries each dependency that field 2 of a
+    /// detached metadata. It also carries each attachment that field 2 of a
     /// commit names, with no ref update. It ends with a `Commit` frame that
     /// holds one ref update for each refspec. The stream carries no parent
     /// commit. The command does no negotiation, so it sends each object.
@@ -5303,7 +5303,7 @@ enum MediaCommand {
     /// name of the ref.
     ///
     /// The command copies each commit at depth 0, with its `.commitmeta` and
-    /// the dependencies in field 2, and copies no static delta. It writes the
+    /// the attachments in field 2, and copies no static delta. It writes the
     /// ref NAME of the collection ID to `refs/mirrors/ID/NAME`, or to
     /// `refs/heads/NAME` when ID is the `collection-id` of the media
     /// repository. It moves a ref to an older commit with no error. Then it
@@ -5546,7 +5546,7 @@ struct PullLocalArgs {
     ///
     /// The pull uses the keys of the remote that --remote names. Without
     /// --remote, the command refuses this switch. The switch takes no value.
-    /// The pull checks no signature of a dependency, unless the dependency is
+    /// The pull checks no signature of an attachment, unless the attachment is
     /// also a target, a parent that --depth takes, or a commit of a chain of
     /// static deltas.
     #[arg(long)]
@@ -5565,7 +5565,7 @@ struct PullLocalArgs {
     /// `verification-<engine>-key` and `verification-<engine>-file` keys of
     /// the remote that --remote names, and from the system key store. The
     /// switch needs --remote and takes no value. The pull checks no signature
-    /// of a dependency, unless the dependency is also a target, a parent that
+    /// of an attachment, unless the attachment is also a target, a parent that
     /// --depth takes, or a commit of a chain of static deltas.
     #[arg(long, requires = "remote")]
     sign_verify: bool,
@@ -5611,7 +5611,7 @@ struct PullLocalArgs {
     /// Apply the static delta that the summary of the source advertises.
     ///
     /// If the source advertises no delta for a commit, the command refuses the
-    /// pull. This includes each dependency that the pull imports and that this
+    /// pull. This includes each attachment that the pull imports and that this
     /// repository does not hold complete. The source must be an archive
     /// repository with a summary. The
     /// statistics line then has the form of a pull from a remote. This switch
@@ -8621,7 +8621,7 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
 ///    another engine finds one.
 /// 6. The delta applies. First the fallback objects of the delta are present.
 ///    Then the entries of field 2 of the target are valid, and the
-///    dependencies of the target are complete. The `ostree` command has no
+///    attachments of the target are complete. The `ostree` command has no
 ///    check of field 2. Then the parts apply.
 ///
 /// The superblock is read once, so the verified bytes are the applied bytes.
@@ -9493,8 +9493,8 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // skip list names the walk root, no source is read. Then no object is
     // counted, and the commit has no `ostree.sizes` key.
     txn.set_generate_sizes(args.generate_sizes && !walk.root_pruned);
-    // The dependencies are checked before the tree is read, so a refused
-    // dependency stops the command before the ingest and the composefs build.
+    // The attachments are checked before the tree is read, so a refused
+    // attachment stops the command before the ingest and the composefs build.
     // The commit write takes the checked list and does not check it again.
     let checked = match txn.check_attachments(&related).await {
         Ok(checked) => checked,
@@ -15604,7 +15604,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
     let opts = FsckOptions {
         mark_partial: !args.no_mark_partial,
-        mark_attachments: !args.no_mark_dependencies,
+        mark_attachments: !args.no_mark_attachments,
         delete: args.delete,
         all: args.all,
         add_tombstones: args.add_tombstones,

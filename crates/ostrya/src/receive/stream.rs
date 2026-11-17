@@ -71,7 +71,7 @@ impl Repo {
     ///   [`ReceiveVerify::Keys`](super::ReceiveVerify::Keys), each new commit
     ///   must pass the verification of the rule of each of its updates, and a
     ///   commit with no signature fails. A commit that no update names gets
-    ///   no verification, a dependency included.
+    ///   no verification, an attachment included.
     /// - In a repository with no collection id, the check of
     ///   `ostree.collection-binding` does not run for a local ref and a remote
     ///   ref. A ref `@ID:NAME` keeps the check.

@@ -76,15 +76,15 @@ Ostrya adds these functions, which the `ostree` command does not have:
 - Client access. Client groups in the `config` file give each client the
   access modes of each ref. The same groups apply to `serve`, and to
   `receive` and `send` without `--one-way`.
-- Related commits. Field 2 of a commit holds its dependencies, which
+- Related commits. Field 2 of a commit holds its attachments, which
   `ostrya commit --related` writes. The detached metadata key
-  `ostrya.related` holds its build sources, which the library adds. A prune
+  `ostrya.related` holds its supplements, which the library adds. A prune
   keeps the related commits of each kept commit, and gives a warning for a
   defective value. `ostrya remote prune` of a bucket repository keeps the
-  dependencies and reads no build source. A pull from a remote, a local
-  pull, a push, and a one-way stream copy the dependencies of each commit
+  attachments and reads no supplement. A pull from a remote, a local
+  pull, a push, and a one-way stream copy the attachments of each commit
   that they move, with no ref. A pull looks for a static delta of each
-  dependency. `ostrya fsck` and `ostrya remote fsck` report each dependency
+  attachment. `ostrya fsck` and `ostrya remote fsck` report each attachment
   that is absent, partial, or defective. With
   `[ex-ostrya] keep-detached-related=false`, a transfer into the repository
   does not store `ostrya.related`.

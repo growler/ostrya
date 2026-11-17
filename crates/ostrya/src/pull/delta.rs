@@ -17,14 +17,14 @@
 //! turn, and then the targets. It parses, applies, and drops the job of one
 //! step of a list at a time, so the heap holds one job of the list.
 //!
-//! [`discover_attachments`] finds one delta for each dependency of a pull,
-//! after the pull read the commits that name the dependencies. The sibling
+//! [`discover_attachments`] finds one delta for each attachment of a pull,
+//! after the pull read the commits that name the attachments. The sibling
 //! module `attachment` gives the source commit of each search. With a list,
 //! the search takes one entry of the list, and plans no chain. The searches
 //! check no signature of a superblock, as [`discover_attachments`] states.
 //! From a remote, the searches keep each superblock after its checks and the
 //! commit that it carries in a record file, as the discovery of a chain below
-//! does. The pull parses the superblock of a dependency again just before its
+//! does. The pull parses the superblock of an attachment again just before its
 //! parts, as [`AttachmentDeltas`] states.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
@@ -126,7 +126,7 @@ pub(crate) const PART_CAP: usize = 2;
 /// holds four steps of the maximum size. The limit applies to the length of
 /// the file, the bytes of the records that discovery drops included.
 ///
-/// The search for the deltas of the dependencies has a record file of its
+/// The search for the deltas of the attachments has a record file of its
 /// own, with the same limit. It keeps the superblocks and the commits that
 /// they carry. A superblock carries its commit, so the commit is smaller than
 /// the superblock, and the file holds four superblocks of the maximum size
@@ -144,7 +144,7 @@ const MAX_RECORD_FILE: u64 = 8 * MAX_METADATA_SIZE;
 /// alone. [`DeltaPlan::target_jobs`] builds the jobs of the target commits
 /// after the run of the last level. A local pull builds the job of one step
 /// at a time with [`DeltaPlan::parse_record`], and drops it after its parts.
-/// The run of the dependencies builds the job of a dependency just before its
+/// The run of the attachments builds the job of an attachment just before its
 /// parts, and drops it after its last part, as [`AttachmentDeltas`] states.
 /// A job holds only what the application of the parts reads.
 ///
@@ -259,7 +259,7 @@ pub(crate) struct DeltaPlan {
     /// The file of the raw bytes of the records from a remote.
     store: Option<RecordStore>,
     /// The list of static deltas, after the discovery of the chains. The
-    /// pull looks up the delta of each dependency in it.
+    /// pull looks up the delta of each attachment in it.
     edges: Option<Edges>,
 }
 
@@ -526,7 +526,7 @@ struct Checked {
 /// record that discovery drops stay in the file. The file goes away when the
 /// pull drops it.
 ///
-/// The search for the deltas of the dependencies has a file of its own,
+/// The search for the deltas of the attachments has a file of its own,
 /// which its concurrent searches share. It keeps the superblocks and the
 /// commits that they carry, as [`discover_attachments`] states.
 ///
@@ -553,7 +553,7 @@ enum Records {
     /// chain.
     Chain,
     /// The superblocks and the commits of the search for the deltas of the
-    /// dependencies.
+    /// attachments.
     Attachments,
 }
 
@@ -571,7 +571,7 @@ impl RecordStore {
     }
 
     /// Returns a record store in `tmp/` of `repo` for the search for the
-    /// deltas of the dependencies, with no file yet, and with the limit
+    /// deltas of the attachments, with no file yet, and with the limit
     /// [`MAX_RECORD_FILE`].
     fn for_attachments(repo: &Repo) -> RecordStore {
         RecordStore {
@@ -598,7 +598,7 @@ impl RecordStore {
                     self.limit
                 ),
                 Records::Attachments => format!(
-                    "static deltas of the dependencies: {} passes the limit of {} bytes for \
+                    "static deltas of the attachments: {} passes the limit of {} bytes for \
                      the superblocks and the commits that the search keeps",
                     what(),
                     self.limit
@@ -873,7 +873,7 @@ impl ParsedDelta {
 /// [`TimestampBase::Off`](super::TimestampBase::Off). A
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A pull that
 /// requires static deltas needs no summary for the list. The plan keeps the
-/// list for the deltas of the dependencies, as
+/// list for the deltas of the attachments, as
 /// [`DeltaPlan::take_edges`] gives it. `related` is the rule of
 /// `[ex-ostrya] keep-detached-related` that the entry of the pull read.
 #[allow(clippy::too_many_arguments)]
@@ -957,17 +957,17 @@ pub(crate) async fn discover(
     })
 }
 
-/// The search for the delta of one dependency of a pull.
+/// The search for the delta of one attachment of a pull.
 ///
 /// The module `attachment` builds it from the paired entries of the
-/// dependency.
+/// attachment.
 pub(crate) struct AttachmentLookup {
-    /// The dependency.
+    /// The attachment.
     pub(crate) checksum: Checksum,
-    /// The dependency in an error: `<name> of <ref>`. `<ref>` is the first
-    /// target whose chain names the dependency, and `<name>` is the name of
+    /// The attachment in an error: `<name> of <ref>`. `<ref>` is the first
+    /// target whose chain names the attachment, and `<name>` is the name of
     /// the entry nearest to its tip. If no chain of a target names the
-    /// dependency, `<ref>` is the first target of the pull, and `<name>` comes
+    /// attachment, `<ref>` is the first target of the pull, and `<name>` comes
     /// from the commit of the pull with the lowest checksum that names it.
     pub(crate) subject: String,
     /// The first paired entry that this repository holds complete.
@@ -977,7 +977,7 @@ pub(crate) struct AttachmentLookup {
     pub(crate) scratch: bool,
 }
 
-/// The deltas that [`discover_attachments`] found, keyed by dependency.
+/// The deltas that [`discover_attachments`] found, keyed by attachment.
 ///
 /// A delta from a remote keeps an [`AttachmentHead`] on the heap, and its
 /// checked superblock and the commit that it carries in the record file of
@@ -987,7 +987,7 @@ pub(crate) struct AttachmentLookup {
 /// delta, [`load_job`] parses the superblock again from the record file, and
 /// the job lives until [`release_job`] after the last part. The run loads at
 /// most [`PART_CAP`] jobs at a time, so the heap holds at most that number of
-/// jobs, whatever the number of dependencies. A head whose delta has no part,
+/// jobs, whatever the number of attachments. A head whose delta has no part,
 /// or whose commit needs no delta, goes in the step of the commit.
 ///
 /// A delta from a local source keeps no bytes: [`take_job`] reads its
@@ -999,7 +999,7 @@ pub(crate) struct AttachmentLookup {
 /// [`take_job`]: AttachmentDeltas::take_job
 #[derive(Default)]
 pub(crate) struct AttachmentDeltas {
-    /// The head of the delta of each dependency, from a remote. The steps of
+    /// The head of the delta of each attachment, from a remote. The steps of
     /// the run share the map.
     heads: Mutex<HashMap<Checksum, AttachmentHead>>,
     /// The file of the checked superblocks and commits from a remote.
@@ -1007,11 +1007,11 @@ pub(crate) struct AttachmentDeltas {
     /// The jobs that the run loaded and did not release yet.
     live: Mutex<HashMap<Checksum, Arc<DeltaJob>>>,
     /// The source commit and the superblock digest of the delta of each
-    /// dependency, from a local source.
+    /// attachment, from a local source.
     local: HashMap<Checksum, (Option<Checksum>, Option<Checksum>)>,
 }
 
-/// What [`AttachmentDeltas`] keeps on the heap of the delta of one dependency
+/// What [`AttachmentDeltas`] keeps on the heap of the delta of one attachment
 /// from a remote, until the run releases its job.
 struct AttachmentHead {
     /// The source commit of the delta, or `None` for a from-scratch delta.
@@ -1021,7 +1021,7 @@ struct AttachmentHead {
     /// The number of parts of the delta, inline parts and part files.
     parts: usize,
     /// The range in the record file of the normal-form bytes of the
-    /// dependency, which the superblock carries. `None` after the step of the
+    /// attachment, which the superblock carries. `None` after the step of the
     /// commit.
     commit: Option<Range<u64>>,
     /// The objects that the delta names and does not carry, as
@@ -1030,7 +1030,7 @@ struct AttachmentHead {
 }
 
 impl AttachmentDeltas {
-    /// Returns `true` if no dependency has a delta.
+    /// Returns `true` if no attachment has a delta.
     pub(crate) fn is_empty(&self) -> bool {
         self.heads
             .lock()
@@ -1041,7 +1041,7 @@ impl AttachmentDeltas {
 
     /// Reads the commit bytes of the delta of `attachment` from a remote
     /// from the record file, on the blocking pool. Returns `None` if the
-    /// dependency has no delta or the step of the commit took the delta.
+    /// attachment has no delta or the step of the commit took the delta.
     ///
     /// Discovery wrote the bytes after the parse of the superblock verified
     /// that they hash to `attachment`.
@@ -1240,18 +1240,18 @@ impl AttachmentDeltas {
     }
 }
 
-/// Finds the delta of each dependency of `lookups`, keyed by the dependency.
+/// Finds the delta of each attachment of `lookups`, keyed by the attachment.
 ///
-/// The search of each dependency is the search of [`discover_one`] for a
+/// The search of each attachment is the search of [`discover_one`] for a
 /// target, with the `from` and the scratch rule of its lookup. With `edges`,
-/// the search takes one delta of the list to the dependency, and plans no
-/// chain. Else it reads the delta index of the dependency and the map of
+/// the search takes one delta of the list to the attachment, and plans no
+/// chain. Else it reads the delta index of the attachment and the map of
 /// `advert`, as for a target, or requests the delta by name if `advert` is
 /// `None`. The call adds the part files of each delta and their declared
 /// sizes to the planned counts in `progress`.
 ///
 /// The searches check no signature of a superblock. Field 2 of the commit
-/// that names a dependency holds its checksum, the `to` of the search. The
+/// that names an attachment holds its checksum, the `to` of the search. The
 /// parse of a superblock checks that the commit that it carries hashes to
 /// its `to`, and [`fetch_job`] checks that `to` against the search. The
 /// digest, the `from`, and the inline parts get their checks, as for a
@@ -1278,16 +1278,16 @@ impl AttachmentDeltas {
 /// error of the call.
 ///
 /// `known` holds the completeness of commits that the caller checked. The
-/// searches check no such commit again. The caller passes no lookup for a
-/// dependency that this repository holds complete, and makes no call for a
+/// searches check no such commit again. The caller passes no lookup for an
+/// attachment that this repository holds complete, and makes no call for a
 /// pull with [`disable_static_deltas`](PullOptions::disable_static_deltas)
 /// set.
 ///
 /// # Errors
 ///
 /// - The errors of [`discover_one`], except [`Error::Signature`]. Under
-///   [`require_static_deltas`](PullOptions::require_static_deltas), a
-///   dependency with no delta gives [`Error::Pull`] with the subject of its
+///   [`require_static_deltas`](PullOptions::require_static_deltas), an
+///   attachment with no delta gives [`Error::Pull`] with the subject of its
 ///   lookup.
 /// - [`Error::Pull`] if the superblocks and the commits from a remote would
 ///   pass the limit of the record file. The pull then does not fetch loose.
@@ -1399,10 +1399,10 @@ pub(crate) async fn discover_attachments(
     }
 }
 
-/// The delta of one dependency that a search of [`discover_attachments`]
+/// The delta of one attachment that a search of [`discover_attachments`]
 /// found, with the number of its part files and their declared sizes.
 struct Kept {
-    /// The dependency.
+    /// The attachment.
     attachment: Checksum,
     /// The number of part files of the delta and the sum of their declared
     /// sizes.
@@ -1411,7 +1411,7 @@ struct Kept {
     delta: Found,
 }
 
-/// What [`AttachmentDeltas`] keeps of the delta of one dependency.
+/// What [`AttachmentDeltas`] keeps of the delta of one attachment.
 enum Found {
     /// The head, from a remote.
     Head(AttachmentHead),
@@ -1442,7 +1442,7 @@ enum Found {
 /// step and checks the format of its entries. It keeps the entries of each
 /// intermediate commit of the last plan.
 /// [`DeltaPlan::take_attachments`] gives them to the pull, which follows the
-/// dependencies of each intermediate commit.
+/// attachments of each intermediate commit.
 ///
 /// If the source does not hold the superblock of a step, discovery excludes
 /// that delta and plans again. It fetches only the steps that it did not
@@ -1593,7 +1593,7 @@ async fn discover_chain(
         }
     }
 
-    // The pull follows the dependencies of the intermediate commits alone.
+    // The pull follows the attachments of the intermediate commits alone.
     // The walk of the commit chains reads field 2 of each target again.
     let intermediate: HashSet<&Checksum> = pass.plan.levels.iter().flatten().collect();
     let mut kept_records = HashMap::with_capacity(pass.plan.steps.len());
@@ -1882,7 +1882,7 @@ async fn check_step_commit(
     detached: Option<Option<Vec<u8>>>,
     store: Option<&mut RecordStore>,
 ) -> Result<Checked> {
-    // A local pull follows the dependencies of each commit that a step makes,
+    // A local pull follows the attachments of each commit that a step makes,
     // so for a local source the check reads field 2 of the commit and checks
     // its format. The bytes can be as large as `MAX_METADATA_SIZE`, so one
     // call on the blocking pool decodes field 2 alone, and parses the commit
@@ -2190,8 +2190,8 @@ pub(crate) fn no_summary_error() -> Error {
 /// Returns the error of a pull that requires a static delta and finds none.
 ///
 /// The error names `subject` and the commit `to`. For a target, `subject` is
-/// the ref, and the message is the message of the `ostree` command. For a
-/// dependency, it is `<name> of <ref>`, as [`AttachmentLookup::subject`]
+/// the ref, and the message is the message of the `ostree` command. For an
+/// attachment, it is `<name> of <ref>`, as [`AttachmentLookup::subject`]
 /// states.
 fn none_found_error(subject: &str, to: &Checksum) -> Error {
     Error::Pull(format!(
@@ -2389,7 +2389,7 @@ enum Advertisement<'a> {
 ///
 /// `from` is the commit that the pulled ref names here, if this repository
 /// holds it complete. `scratch` is `true` if the ref names no commit held
-/// complete and does not name `to`. For a dependency, [`AttachmentLookup`]
+/// complete and does not name `to`. For an attachment, [`AttachmentLookup`]
 /// gives the two values. `subject` names `to` in an error, as
 /// [`none_found_error`] states.
 ///
@@ -2425,7 +2425,7 @@ enum Advertisement<'a> {
 /// checks no such commit again.
 ///
 /// `verification` is the policy for the signatures of the superblock, as
-/// [`fetch_job`] states. The search for the delta of a dependency passes
+/// [`fetch_job`] states. The search for the delta of an attachment passes
 /// `None`.
 ///
 /// If `keep` is set, the search writes the superblock to that record file, as
@@ -2539,7 +2539,7 @@ struct KeptRanges {
 /// If `digest` is set, the SHA-256 of the superblock must be `digest`. The
 /// superblock must produce `to` from `from`. If `verification` is set, its
 /// signatures must pass that policy, as [`verify_fetched_delta`] states. The
-/// search for the delta of a dependency passes `None`, and the function then
+/// search for the delta of an attachment passes `None`, and the function then
 /// checks no signature. Each inline part must pass its meta-entry.
 ///
 /// If `keep` is set, the function appends the raw bytes to that record file
@@ -2780,7 +2780,7 @@ async fn take_inline_parts(
 /// also verify the delta, because a delta carries sign-api signatures alone.
 /// A delta with none of those signatures passes, and the pull holds the
 /// commit that it delivers to the commit policy, as any other target or
-/// commit of a chain. The search for the delta of a dependency does not call
+/// commit of a chain. The search for the delta of an attachment does not call
 /// the function.
 ///
 /// The call is in discovery, where the raw superblock bytes and the signature
@@ -2801,7 +2801,7 @@ async fn verify_fetched_delta(
 /// `ostree.summary.indexed-deltas` key and the `ostree.static-deltas` map.
 ///
 /// The pull keeps these two values and drops the rest of the summary. It
-/// reads them for the targets, and for the dependencies after the run of the
+/// reads them for the targets, and for the attachments after the run of the
 /// commits that name them.
 pub(crate) struct DeltaAdvert {
     /// `true` if the summary states `indexed-deltas`, or omits the key.
@@ -4606,11 +4606,11 @@ mod tests {
         });
     }
 
-    /// The record file of the search for the deltas of the dependencies
+    /// The record file of the search for the deltas of the attachments
     /// keeps the superblock and then the commit that it carries, and opens
     /// at the first write. A superblock past the limit fails before the file
     /// opens, and a commit past the limit fails after the superblock. Each
-    /// error names the limit and the dependency search.
+    /// error names the limit and the attachment search.
     #[test]
     fn the_attachment_record_file_keeps_the_commit_and_stops_at_its_limit() {
         ostrya_rt::block_on(async {
@@ -4666,7 +4666,7 @@ mod tests {
                     panic!("no limit error at {limit}");
                 };
                 assert!(
-                    message.starts_with("static deltas of the dependencies: "),
+                    message.starts_with("static deltas of the attachments: "),
                     "{message}"
                 );
                 assert!(message.contains(&what), "{message}");
@@ -4677,8 +4677,8 @@ mod tests {
         });
     }
 
-    /// The step of the commit takes the fallbacks of the head of a
-    /// dependency delta, and drops the range of its commit. A head with
+    /// The step of the commit takes the fallbacks of the head of an
+    /// attachment delta, and drops the range of its commit. A head with
     /// parts stays for the load step. A head with no part has no load step,
     /// so it goes there.
     #[test]

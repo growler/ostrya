@@ -265,7 +265,7 @@ impl Repo {
     /// 1. The push refuses the options that it cannot carry, and runs the
     ///    checks and the commit walk of [`Repo::push_over_stream`] with no
     ///    request: the depth, the collection, the refspecs, the source
-    ///    commits, the bindings, and the dependencies. It holds the repository
+    ///    commits, the bindings, and the attachments. It holds the repository
     ///    lock shared until it returns.
     /// 2. It takes the writer lock of the bucket repository for
     ///    [`LockOperation::Push`], with
@@ -284,10 +284,10 @@ impl Repo {
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
     ///    repository does not hold, or marks partial, is no ancestor.
     /// 4. It walks the commits to offer: each source commit, its history, and
-    ///    the dependencies of each offered commit, as
+    ///    the attachments of each offered commit, as
     ///    [`Repo::push_over_stream`] offers them, with the tip of the ref in
     ///    the bucket in the role of the server tip. With no depth, it checks
-    ///    the dependencies of the offered history here, as "Dependencies" of
+    ///    the attachments of the offered history here, as "Attachments" of
     ///    [`Repo::push_over_stream`] states. It walks the tree of
     ///    each offered commit that the listing lacks, and of each offered
     ///    commit with a partial-commit marker `state/<checksum>.commitpartial`.
@@ -385,8 +385,8 @@ impl Repo {
     /// - The errors of the checks and of the commit walk of
     ///   [`Repo::push_over_stream`], before a request.
     /// - With no depth, [`Error::InvalidRelations`] or [`Error::ObjectNotFound`]
-    ///   for a dependency of a history commit after the cut at the tip of the
-    ///   ref in the bucket, as "Dependencies" of [`Repo::push_over_stream`]
+    ///   for an attachment of a history commit after the cut at the tip of the
+    ///   ref in the bucket, as "Attachments" of [`Repo::push_over_stream`]
     ///   states. The push then uploads nothing and releases the lock.
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
@@ -712,8 +712,8 @@ impl Repo {
             }
         }
         drop(chains);
-        // Then the dependencies of each offered commit, each once. With no
-        // depth, the push resolves the dependencies of the offered history
+        // Then the attachments of each offered commit, each once. With no
+        // depth, the push resolves the attachments of the offered history
         // here, before the first upload.
         if opts.depth.is_none() {
             plan.commits.check_attachments(self, &offered).await?;

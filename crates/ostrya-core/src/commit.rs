@@ -53,7 +53,7 @@ pub struct Commit {
     /// The related objects.
     ///
     /// The `ostree` command writes an empty array. The port uses the field
-    /// for the dependencies of a commit: each entry is a name and the 32-byte
+    /// for the attachments of a commit: each entry is a name and the 32-byte
     /// checksum of a commit. A parse keeps the entries as read, so the commit
     /// serializes to the same bytes.
     pub related: Vec<(String, Vec<u8>)>,

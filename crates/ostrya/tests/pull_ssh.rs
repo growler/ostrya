@@ -262,7 +262,7 @@ fn the_stream_source_pulls_what_the_http_pull_pulls() {
     });
 }
 
-/// The stream source fetches the dependency that field 2 of the pulled commit
+/// The stream source fetches the attachment that field 2 of the pulled commit
 /// names, as the HTTP pull does, and writes no ref for it.
 #[test]
 fn the_stream_source_fetches_an_attachment() {

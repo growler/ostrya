@@ -536,8 +536,8 @@ impl Repo {
     /// summary, the pull uses those bytes and does not read the summary
     /// again. The remotes pull in the order of `remotes`, each with its own
     /// transaction. A remote with no selected ref is not asked again. The
-    /// pull fetches the dependencies of each commit from the remote of the
-    /// commit, as [`Repo::pull`] states in "Dependencies".
+    /// pull fetches the attachments of each commit from the remote of the
+    /// commit, as [`Repo::pull`] states in "Attachments".
     ///
     /// So a failure of a later remote leaves the objects and the refs of the
     /// earlier remotes in place. A failure of a selected remote stops the
@@ -555,7 +555,7 @@ impl Repo {
     /// - The timestamp of the commit must be the timestamp that the remote
     ///   listed for the ref.
     ///
-    /// The pull makes none of these checks on a dependency.
+    /// The pull makes none of these checks on an attachment.
     ///
     /// # Refs
     ///
@@ -3145,11 +3145,11 @@ mod tests {
         });
     }
 
-    /// Under `UNTRUSTED`, the pull hashes each dependency that it reads for
+    /// Under `UNTRUSTED`, the pull hashes each attachment that it reads for
     /// the walk. The source holds the bytes of another commit under the name
-    /// of the dependency, and holds the right bytes again before the import.
+    /// of the attachment, and holds the right bytes again before the import.
     /// The pull fails with [`Error::ChecksumMismatch`] at the read of the
-    /// dependency, and writes nothing.
+    /// attachment, and writes nothing.
     #[test]
     fn an_attachment_that_changes_after_the_walk_fails_an_untrusted_pull() {
         ostrya_rt::block_on(async {

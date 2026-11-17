@@ -44,23 +44,23 @@ pub struct FsckOptions {
     /// If [`mark_attachments`](FsckOptions::mark_attachments) is also
     /// `true`, the switch marks each commit that has an
     /// [`Absent`](FsckAttachmentErrorKind::Absent) or a
-    /// [`Partial`](FsckAttachmentErrorKind::Partial) dependency, so a later
-    /// pull of the commit fetches its dependencies. A
+    /// [`Partial`](FsckAttachmentErrorKind::Partial) attachment, so a later
+    /// pull of the commit fetches its attachments. A
     /// [`Defective`](FsckAttachmentErrorKind::Defective) entry marks no
     /// commit, because a pull cannot repair it.
     pub mark_partial: bool,
     /// The switch that marks each commit that has an
     /// [`Absent`](FsckAttachmentErrorKind::Absent) or a
-    /// [`Partial`](FsckAttachmentErrorKind::Partial) dependency as partial.
+    /// [`Partial`](FsckAttachmentErrorKind::Partial) attachment as partial.
     ///
     /// The switch has an effect only if
     /// [`mark_partial`](FsckOptions::mark_partial) is `true`. The default is
     /// `true`. The value `false` is an ostrya extension, which the
-    /// `ostrya fsck` command spells `--no-mark-dependencies`.
+    /// `ostrya fsck` command spells `--no-mark-attachments`.
     ///
     /// With the value `false`, the run reports each finding in
-    /// [`FsckReport::attachment_errors`] and marks no commit for a
-    /// dependency. The marks for absent and deleted objects do not change.
+    /// [`FsckReport::attachment_errors`] and marks no commit for an
+    /// attachment. The marks for absent and deleted objects do not change.
     /// A later run verifies again each commit that the run did not mark, and
     /// gives the same finding.
     pub mark_attachments: bool,
@@ -339,7 +339,7 @@ enum ImageKey {
     Read(Option<[u8; 32]>),
 }
 
-/// A dependency of a commit that is absent, partial, or defective.
+/// An attachment of a commit that is absent, partial, or defective.
 ///
 /// [`Repo::fsck`] gives one for each such entry in field 2 of a commit that
 /// it checks. The [`Display`](std::fmt::Display) output is the text of
@@ -357,16 +357,16 @@ pub struct FsckAttachmentError {
     pub kind: FsckAttachmentErrorKind,
 }
 
-/// The cause of a finding on a dependency.
+/// The cause of a finding on an attachment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FsckAttachmentErrorKind {
-    /// The repository does not hold the commit object of the dependency.
+    /// The repository does not hold the commit object of the attachment.
     Absent,
-    /// The commit of the dependency is partial: it has a `.commitpartial`
+    /// The commit of the attachment is partial: it has a `.commitpartial`
     /// marker, or its tree is not complete.
     Partial,
     /// The entry has an empty name or a checksum that is not 32 bytes, or
-    /// the commit of the dependency has dependencies of its own. The payload
+    /// the commit of the attachment has attachments of its own. The payload
     /// is the reason.
     Defective(String),
 }
@@ -381,7 +381,7 @@ impl FsckAttachmentError {
         };
         match &self.attachment {
             Some(attachment) => related::attachment_reason(&self.name, attachment, end),
-            None => format!("dependency {}, {end}", self.name),
+            None => format!("attachment {}, {end}", self.name),
         }
     }
 }
@@ -400,8 +400,8 @@ impl std::fmt::Display for FsckAttachmentError {
 /// Returns the finding on each entry of `entries`, the field 2 of `commit`,
 /// in the stored order.
 ///
-/// `absent` and `partial` tell the state of a dependency. `nested` tells if
-/// the field 2 of a dependency is not empty.
+/// `absent` and `partial` tell the state of an attachment. `nested` tells if
+/// the field 2 of an attachment is not empty.
 pub(crate) fn attachment_findings(
     commit: Checksum,
     entries: &[RelatedEntry],
@@ -516,10 +516,10 @@ pub struct FsckReport {
     /// `true`. Such a commit is not an error. [`Repo::fsck`] states the rule
     /// under "Composefs images".
     pub missing_images: Vec<Checksum>,
-    /// The dependencies that are absent, partial, or defective, sorted by
+    /// The attachments that are absent, partial, or defective, sorted by
     /// the commit that names them, then in the stored order of its field 2.
     ///
-    /// [`Repo::fsck`] states the check under "Dependencies".
+    /// [`Repo::fsck`] states the check under "Attachments".
     pub attachment_errors: Vec<FsckAttachmentError>,
     /// The refs under `refs/mirrors/ID/` of the `[core] collection-id` of the
     /// repository, by their names below that directory, sorted.
@@ -534,7 +534,7 @@ impl FsckReport {
     /// Returns `true` if the repository passed with no finding.
     ///
     /// A pass has no faulty object, no faulty composefs image, no faulty
-    /// dependency, no condition that ended the run, and no commit that the
+    /// attachment, no condition that ended the run, and no commit that the
     /// run skipped as already partial. A composefs image with no commit and
     /// a ref of [`own_mirror_refs`](FsckReport::own_mirror_refs) do not stop
     /// a pass.
@@ -580,7 +580,7 @@ struct Ctx {
     /// The commits that reach an absent or a deleted object, also when the
     /// run marks no commit.
     incomplete: HashSet<Checksum>,
-    /// The findings of the dependency check, in the order of the run.
+    /// The findings of the attachment check, in the order of the run.
     attachment_errors: Vec<FsckAttachmentError>,
     /// The names of the refs under `refs/mirrors/ID/` of the own collection
     /// id, sorted.
@@ -721,7 +721,7 @@ impl Repo {
     /// [`FsckFailure::RefTarget`], and a binding mismatch under
     /// `verify_bindings` ends the run with [`FsckFailure::Binding`].
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
     /// After the four phases and the actions on their findings, the run
     /// checks field 2 of each verified commit that it did not delete. It
@@ -789,7 +789,7 @@ impl Repo {
     /// key reads, that is complete, and that the run did not remove or mark
     /// partial. A commit with a malformed key gets no note, and a partial
     /// commit gets no note. A commit that the run marks partial for an absent
-    /// or a partial dependency gets no note.
+    /// or a partial attachment gets no note.
     /// A note is not an error, and the run repairs nothing for it. The run
     /// takes no lock, so a transaction that publishes an image during the run
     /// can make a note that is already stale. With the key `false`, the list
@@ -819,12 +819,12 @@ impl Repo {
     /// # Tombstones
     ///
     /// If [`add_tombstones`](FsckOptions::add_tombstones) is set, one step
-    /// follows the four phases and the dependency check. The image check
+    /// follows the four phases and the attachment check. The image check
     /// follows the step.
     /// The step deletes each commit object whose parent commit object is
     /// absent. It writes a `.tombstone-commit` object that names each deleted
     /// commit. The step also deletes such a commit if another commit names it
-    /// as a dependency.
+    /// as an attachment.
     ///
     /// The step writes to the repository. After a walk that found a corrupt
     /// object, the step runs only if [`all`](FsckOptions::all) or
@@ -937,7 +937,7 @@ impl Repo {
             self.fsck_apply_findings(opts, &mut ctx).await?;
         }
 
-        // The dependencies, against the state after the actions above.
+        // The attachments, against the state after the actions above.
         self.fsck_check_attachments(&commits, &attachments, opts, &mut ctx)
             .await?;
 
@@ -1423,13 +1423,13 @@ impl Repo {
         Ok(())
     }
 
-    /// Checks the dependencies of each verified commit that the run did not
+    /// Checks the attachments of each verified commit that the run did not
     /// delete, and under `mark_partial` and `mark_attachments` marks each
-    /// commit with an absent or a partial dependency as partial.
+    /// commit with an absent or a partial attachment as partial.
     ///
     /// `all` is the commit listing of the start of the run. `attachments`
     /// holds each verified commit whose field 2 is not empty, with its
-    /// entries, sorted by commit. A dependency in that list has dependencies
+    /// entries, sorted by commit. An attachment in that list has attachments
     /// of its own. The function reads no object.
     async fn fsck_check_attachments(
         &self,

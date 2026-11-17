@@ -841,7 +841,7 @@ pub fn attachment_error(err: ostrya::Error) -> (Option<ostrya::Checksum>, String
     }
 }
 
-/// Returns a warning of the dependencies of `commit`.
+/// Returns a warning of the attachments of `commit`.
 pub fn attachment_warning(commit: ostrya::Checksum, reason: &str) -> ostrya::RelationWarning {
     ostrya::RelationWarning {
         commit,

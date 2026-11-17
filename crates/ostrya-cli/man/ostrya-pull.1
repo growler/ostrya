@@ -14,7 +14,7 @@ The pull stores the objects in one transaction, and then writes each ref under \
 .PP
 With no REF, the pull reads the keys \fB\%branches\fR and \fB\%pull\-branches\fR of the section of REMOTE. It takes each ref of \fB\%branches\fR, and each ref of the summary of the remote that the list of ref patterns of \fB\%pull\-branches\fR selects: a ref of the ref list of the summary as REF, and a ref of its collection map as \%@ID:REF. It writes each one as a pull of that ref does, and a ref that both keys give one time. A malformed value of either key stops the pull before it connects. \%\-\-mirror and \%\-\-collection read neither key. \%ostrya\-config(1) states the keys.
 .PP
-The pull also fetches the dependencies that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
+The pull also fetches the attachments that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
 .PP
 With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
 .PP
@@ -155,12 +155,12 @@ Fetch every object loose, and ignore all static deltas of the remote.
 \fB\-\-require\-static\-deltas\fR
 Refuse the pull if a missing commit has no static delta on the remote.
 .IP
-A missing commit is a commit that this repository does not hold complete, a dependency of a pulled commit included. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
+A missing commit is a commit that this repository does not hold complete, an attachment of a pulled commit included. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
 .TP
 \fB\-\-gpg\-verify\fR[=\fIBOOL\fR]
 Require a GPG signature on the commits that the pull carries.
 .IP
-Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, or, when that file is absent, of the remotes directory of the repository, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. When neither \fB\%<remote>.trustedkeys.gpg\fR exists, the global trusted keyrings take part too. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-gpg\-verify\fR, and \fB\%\-\-gpg\-verify=false\fR turns off the GPG check of the group. Possible values: true, false.
+Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The pull checks no signature of an attachment, unless the attachment is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, or, when that file is absent, of the remotes directory of the repository, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. When neither \fB\%<remote>.trustedkeys.gpg\fR exists, the global trusted keyrings take part too. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-gpg\-verify\fR, and \fB\%\-\-gpg\-verify=false\fR turns off the GPG check of the group. Possible values: true, false.
 .TP
 \fB\-\-gpg\-verify\-summary\fR[=\fIBOOL\fR]
 Require a GPG signature on the summary of the remote.
@@ -170,7 +170,7 @@ Without this option, the \fB\%gpg\-verify\-summary\fR key of the remote applies,
 \fB\-\-sign\-verify\fR[=\fIBOOL\fR]
 Require an \%ed25519 or spki signature on the pulled commits.
 .IP
-Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-sign\-verify\fR, and \fB\%\-\-sign\-verify=false\fR turns off the \%sign\-api check of the group. Possible values: true, false.
+Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The pull checks no signature of an attachment, unless the attachment is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-sign\-verify\fR, and \fB\%\-\-sign\-verify=false\fR turns off the \%sign\-api check of the group. Possible values: true, false.
 .TP
 \fB\-\-sign\-verify\-summary\fR[=\fIBOOL\fR]
 Require an \%ed25519 or spki signature on the summary of the remote.

@@ -250,7 +250,7 @@ async fn commit(
     commit_related(repo, base, branch, content, parent, &[]).await
 }
 
-/// Commits a tree as [`commit`] does, with the dependencies `related` in
+/// Commits a tree as [`commit`] does, with the attachments `related` in
 /// field 2.
 async fn commit_related(
     repo: &Repo,
@@ -1907,7 +1907,7 @@ fn a_marker_of_a_whole_tree_is_a_note_and_the_repair_deletes_it() {
 
 /// Adds a commit and a tip whose field 2 names it as `boot/uki` to the
 /// fixture, copies the objects, and points `refs/heads/tip` at the tip.
-/// Returns the tip and the dependency.
+/// Returns the tip and the attachment.
 async fn attachment_fixture(f: &Fixture) -> (Checksum, Checksum) {
     let att = commit(&f.local, f.tmp.path(), "dep", "dep", None).await;
     let tip = commit_related(
@@ -1968,7 +1968,7 @@ fn an_absent_or_a_partial_attachment_is_an_attachment_error() {
         let report = f.fsck().await;
         assert!(without_summary_note(&report).is_empty(), "{report:#?}");
 
-        // The run reads the commit of an absent dependency again, one time.
+        // The run reads the commit of an absent attachment again, one time.
         f.remove(ObjectType::Commit, &att);
         f.server.state().requests.clear();
         let report = f.fsck().await;
@@ -1985,7 +1985,7 @@ fn an_absent_or_a_partial_attachment_is_an_attachment_error() {
         assert_eq!(
             found[0].to_string(),
             format!(
-                "dependency {}: dependency boot/uki names commit {att}, which the repository \
+                "attachment {}: attachment boot/uki names commit {att}, which the repository \
                  does not hold",
                 object_path(ObjectType::Commit, &tip)
             )
@@ -1998,7 +1998,7 @@ fn an_absent_or_a_partial_attachment_is_an_attachment_error() {
             .count();
         assert_eq!(reads, 1);
 
-        // A dependency with a marker is partial. A commit with a marker is
+        // An attachment with a marker is partial. A commit with a marker is
         // checked too.
         f.copy("objects");
         f.put(&format!("state/{}.commitpartial", att.to_hex()), &[0x66]);
@@ -2047,7 +2047,7 @@ fn a_defective_entry_and_a_nested_attachment_are_attachment_errors() {
                 "lib/b",
                 Some(tip),
                 defect(&format!(
-                    "dependency lib/b names commit {tip}, which has dependencies of its own"
+                    "attachment lib/b names commit {tip}, which has attachments of its own"
                 )),
             ),
         ];
@@ -2110,7 +2110,7 @@ fn the_repair_does_nothing_for_an_attachment_error() {
     });
 }
 
-/// The run reads the commit of an absent dependency again one time, also
+/// The run reads the commit of an absent attachment again one time, also
 /// when two commits name it.
 #[test]
 fn two_commits_that_name_one_absent_attachment_read_it_again_one_time() {
@@ -2152,7 +2152,7 @@ fn two_commits_that_name_one_absent_attachment_read_it_again_one_time() {
     });
 }
 
-/// With `delete`, the run checks the dependencies against the markers after
+/// With `delete`, the run checks the attachments against the markers after
 /// the repair. Without `delete`, it checks them against the markers of the
 /// list of `state/`.
 #[test]
@@ -2174,8 +2174,8 @@ fn the_repair_checks_an_attachment_against_the_markers_after_the_repair() {
         );
         assert!(f.get(&marker).is_some());
 
-        // The tree of the dependency is whole, so the repair deletes its
-        // marker, and the dependency is not partial.
+        // The tree of the attachment is whole, so the repair deletes its
+        // marker, and the attachment is not partial.
         let report = f.repair().await.unwrap();
         assert_eq!(report.cleared_partial, [att]);
         assert!(f.get(&marker).is_none());
@@ -2186,7 +2186,7 @@ fn the_repair_checks_an_attachment_against_the_markers_after_the_repair() {
         );
         assert!(!report.has_errors(), "{:#?}", report.findings);
 
-        // A dependency that gets a marker from the repair is partial.
+        // An attachment that gets a marker from the repair is partial.
         let file = f.entry(&att, &[], "file", false).await;
         f.remove(ObjectType::File, &file);
         let report = f.repair().await.unwrap();
@@ -2204,7 +2204,7 @@ fn the_repair_checks_an_attachment_against_the_markers_after_the_repair() {
     });
 }
 
-/// With `delete`, a dependency whose commit object the repair deletes is
+/// With `delete`, an attachment whose commit object the repair deletes is
 /// absent.
 #[test]
 fn the_repair_deletes_a_bad_attachment_commit_and_reports_it_absent() {
@@ -2237,7 +2237,7 @@ fn the_repair_deletes_a_bad_attachment_commit_and_reports_it_absent() {
 }
 
 /// With `delete`, a commit whose own object the repair deletes gets no
-/// check of its dependencies.
+/// check of its attachments.
 #[test]
 fn the_repair_checks_no_attachment_of_a_commit_that_it_deletes() {
     block_on(async {
@@ -2309,7 +2309,7 @@ fn an_attachment_that_a_writer_adds_during_the_run_is_a_note() {
         assert_eq!(
             found[0].detail,
             format!(
-                "dependency boot/uki names commit {att}, which the listing does not hold, and a \
+                "attachment boot/uki names commit {att}, which the listing does not hold, and a \
                  read after the listing finds it: a writer changed the bucket during the run"
             )
         );

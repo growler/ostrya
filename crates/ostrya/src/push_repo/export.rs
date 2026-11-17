@@ -26,7 +26,7 @@ pub struct ExportStreamOptions {
     /// Each update expects [`Absent`](Expected::Absent) or
     /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME`,
     /// `@ID:NAME`, or `REMOTE:NAME`. The new commits are the commits of the
-    /// stream. The stream also carries the dependencies of the new commits,
+    /// stream. The stream also carries the attachments of the new commits,
     /// with no ref. [`Repo::export_updates`] returns these updates for a set
     /// of refspecs.
     pub updates: Vec<RefUpdate>,
@@ -58,7 +58,7 @@ impl Repo {
     ///
     /// # Stream content
     ///
-    /// The stream carries each new commit once, then each dependency of the
+    /// The stream carries each new commit once, then each attachment of the
     /// new commits once. With each commit, it carries each object that the
     /// tree of the commit reaches. It also carries the stored `.commitmeta`
     /// bytes of the commit with no parse, so the receiver refuses a
@@ -73,32 +73,32 @@ impl Repo {
     /// in `deflate`. The stream copies the bytes of the stored `.filez` file
     /// of the object.
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
-    /// Field 2 of a commit names the dependencies of the commit.
+    /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The
-    /// stream carries the dependencies of each new commit.
+    /// stream carries the attachments of each new commit.
     ///
-    /// - The call sends each dependency at depth 0, so a dependency entry
-    ///   adds no parent to the stream. The stream carries a dependency one
+    /// - The call sends each attachment at depth 0, so an attachment entry
+    ///   adds no parent to the stream. The stream carries an attachment one
     ///   time, also if several commits name it, or if it is also a new
     ///   commit.
-    /// - The `Commit` frame holds no ref update for a dependency.
-    /// - For each dependency, the stream carries the commit object, the
+    /// - The `Commit` frame holds no ref update for an attachment.
+    /// - For each attachment, the stream carries the commit object, the
     ///   objects of its tree, and its detached metadata. An object that a new
-    ///   commit and a dependency share goes in the stream one time.
-    /// - The call does no negotiation, so it sends a dependency that the
+    ///   commit and an attachment share goes in the stream one time.
+    /// - The call does no negotiation, so it sends an attachment that the
     ///   receiver holds. The receiver accepts it, and drops its
-    ///   `.commitmeta`: a held dependency gets no merge of detached metadata
+    ///   `.commitmeta`: a held attachment gets no merge of detached metadata
     ///   and no signature.
-    /// - A receiver that holds a dependency and marks it partial refuses the
+    /// - A receiver that holds an attachment and marks it partial refuses the
     ///   stream with [`MissingObjects`](crate::remote::Error::MissingObjects)
     ///   and no object listed, also though the stream carries the whole tree
-    ///   of the dependency. To complete the dependency at the receiver, send
+    ///   of the attachment. To complete the attachment at the receiver, send
     ///   it as the new commit of an update, in this stream or in an earlier
     ///   one. The receiver then removes its partial marker.
-    /// - The call makes no ref-binding check on a dependency.
-    /// - The call does not send a build source: a commit that the detached
+    /// - The call makes no ref-binding check on an attachment.
+    /// - The call does not send a supplement: a commit that the detached
     ///   metadata key `ostrya.related` names. The key goes with the detached
     ///   metadata of its commit.
     ///
@@ -106,10 +106,10 @@ impl Repo {
     ///
     /// - An entry of field 2 of a new commit has an empty name or a checksum
     ///   that is not 32 bytes.
-    /// - The repository does not hold a dependency, or marks it partial.
-    /// - A dependency names dependencies of its own: its own field 2 is not
+    /// - The repository does not hold an attachment, or marks it partial.
+    /// - An attachment names attachments of its own: its own field 2 is not
     ///   empty, also if that field 2 holds a defective entry. This is also
-    ///   true for a dependency that is also a new commit. If the field 2 of
+    ///   true for an attachment that is also a new commit. If the field 2 of
     ///   such a new commit holds a defective entry, the first case refuses
     ///   the export first.
     ///
@@ -158,14 +158,14 @@ impl Repo {
     /// - [`Error::Core`](crate::Error::Core) if `[core] locking` is not a
     ///   boolean or `[core] lock-timeout-secs` is not an integer.
     /// - [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) if the
-    ///   repository does not hold a new commit or a dependency, or a dirtree
+    ///   repository does not hold a new commit or an attachment, or a dirtree
     ///   or a dirmeta that the tree of a sent commit reaches.
     /// - [`Error::InvalidRelations`](crate::Error::InvalidRelations) if an entry
     ///   of field 2 of a new commit has an empty name or a checksum that is
-    ///   not 32 bytes, or if the repository marks a dependency partial, or if
-    ///   a dependency names dependencies of its own.
+    ///   not 32 bytes, or if the repository marks an attachment partial, or if
+    ///   an attachment names attachments of its own.
     /// - [`Error::Core`](crate::Error::Core) if a new commit or a dirtree
-    ///   object does not parse. For the commit object of a dependency, the
+    ///   object does not parse. For the commit object of an attachment, the
     ///   call decodes the tuple frame, the parent and root checksums, and
     ///   field 2 alone, and gives this error if one of them does not decode.
     /// - [`Error::Remote`](crate::Error::Remote) with
@@ -196,11 +196,11 @@ impl Repo {
     ///   frame or the `Commit` frame is more than 1 MiB.
     /// - [`Error::Io`](crate::Error::Io) if the open or the lock of the lock
     ///   file fails.
-    /// - [`Error::Io`](crate::Error::Io) if a read of a commit or of a
-    ///   dependency, of its `.commitpartial` marker, or of a dirtree fails, or
+    /// - [`Error::Io`](crate::Error::Io) if a read of a commit or of an
+    ///   attachment, of its `.commitpartial` marker, or of a dirtree fails, or
     ///   if a lookup of a dirmeta fails.
     /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if a new
-    ///   commit, a dependency with no partial marker, or a dirtree is not a
+    ///   commit, an attachment with no partial marker, or a dirtree is not a
     ///   regular file, is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or has a symlink on
     ///   its path.
@@ -295,12 +295,12 @@ impl Repo {
         drop(loaded);
         drop(refs);
 
-        // The format of field 2 of each new commit, then its dependencies,
+        // The format of field 2 of each new commit, then its attachments,
         // before the first byte.
         commits.check_fields(&targets)?;
         commits.check_attachments(self, &targets).await?;
 
-        // The new commits, then each dependency once.
+        // The new commits, then each attachment once.
         let mut sent = targets.clone();
         let mut known: HashSet<Checksum> = targets.iter().copied().collect();
         for target in &targets {

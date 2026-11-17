@@ -3,7 +3,7 @@
 //! Tests of a pull from an `s3://` address.
 //!
 //! Each test serves a repository with `rclone serve s3` on a scratch
-//! directory. The test of a dependency serves a repository that ostrya
+//! directory. The test of an attachment serves a repository that ostrya
 //! builds. Each other test serves a copy of the `archive` fixture of the
 //! `ostree` command. The `ostree` command signs the summary of the copy with
 //! a new GPG key, before the server starts.
@@ -385,7 +385,7 @@ fn a_session_to_an_s3_endpoint_pulls_with_the_session() {
     });
 }
 
-/// A pull through a session to an `Endpoint::S3` fetches the dependency that
+/// A pull through a session to an `Endpoint::S3` fetches the attachment that
 /// field 2 of the pulled commit names, complete, and writes no ref for it.
 #[test]
 fn a_session_to_an_s3_endpoint_fetches_an_attachment() {

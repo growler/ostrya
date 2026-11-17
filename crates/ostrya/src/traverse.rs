@@ -244,10 +244,10 @@ impl Expanded {
 /// of its tree.
 #[derive(Debug, Clone)]
 pub(crate) struct GcRoots {
-    /// `true` if the walk follows field 2 of a commit: the dependencies.
+    /// `true` if the walk follows field 2 of a commit: the attachments.
     pub attachments: bool,
     /// `true` if the walk follows the `ostrya.related` entry of the detached
-    /// metadata of a commit: the build sources.
+    /// metadata of a commit: the supplements.
     ///
     /// The walk reads the detached metadata of a commit only if this is
     /// `true`. It parses the `.commitmeta` of a commit only if the bytes of
@@ -460,7 +460,7 @@ impl Repo {
     /// and keep another branch in full. The walk seeds each commit that a
     /// related edge names at `root_bound`.
     ///
-    /// The warnings are sorted by commit and then by field, dependencies
+    /// The warnings are sorted by commit and then by field, attachments
     /// first. The warnings of one field keep the order of its entries.
     ///
     /// `bounded_roots` names the commits whose bound belongs to the commit,
@@ -665,7 +665,7 @@ pub(crate) trait MetadataSource: Sync {
     }
 
     /// Returns the detached metadata dict of the commit `commit` if its
-    /// `.commitmeta` can hold build sources, or `None`.
+    /// `.commitmeta` can hold supplements, or `None`.
     ///
     /// The result is `None` if the store holds no `.commitmeta` for the
     /// commit, if it holds the zero-length marker, or if the bytes of the
@@ -910,10 +910,10 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// seeds of the edges are the same. The related edges are:
 ///
 /// - With `gc.attachments`, the entries of field 2. The walk reads field 2
-///   of each commit that it reaches, a dependency included.
+///   of each commit that it reaches, an attachment included.
 /// - With `gc.supplements`, the entries of the first `ostrya.related` entry
 ///   of the detached metadata. The walk reads it for each commit that it
-///   reaches, a build source included.
+///   reaches, a supplement included.
 ///
 /// A defective related value or entry adds one warning to `warnings` and
 /// seeds nothing. The other entries of the field seed as usual. A related
@@ -1034,7 +1034,7 @@ async fn collect_reachable<S: MetadataSource>(
 
         // At the first expansion of a commit, the walk reads the detached
         // metadata with the commit, in one read of the store. It keeps the
-        // build sources of the dict alone, so the dict drops before the walk
+        // supplements of the dict alone, so the dict drops before the walk
         // of the tree. A `TimedParent` arrival can be rejected, so it reads
         // the commit alone, and the walk reads the detached metadata after
         // the bound accepts it.

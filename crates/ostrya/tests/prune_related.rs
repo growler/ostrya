@@ -1,7 +1,7 @@
 //! The local prune on the related commits of a commit.
 //!
-//! `Repo::prune` keeps the commits that field 2 (the dependencies) and the
-//! detached key `ostrya.related` (the build sources) of each reached commit
+//! `Repo::prune` keeps the commits that field 2 (the attachments) and the
+//! detached key `ostrya.related` (the supplements) of each reached commit
 //! name. It walks each such commit as a root of its own at the global bound
 //! of the run, and reads the two fields of each related commit too. A
 //! defective value gives a warning in `PruneStats::warnings` and roots
@@ -23,7 +23,7 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The detached metadata key of the build sources.
+/// The detached metadata key of the supplements.
 const RELATED_KEY: &str = "ostrya.related";
 
 /// Writes a tree with one file at `base/<name>`. The content of the file names
@@ -63,7 +63,7 @@ async fn stage_tree(txn: &Transaction, base: &Path, name: &str) -> RepoTree {
 }
 
 /// Commits the tree `base/<name>` into `repo` with the parent `parent` and the
-/// dependencies `related`. If `branch` names a ref, the transaction also sets
+/// attachments `related`. If `branch` names a ref, the transaction also sets
 /// that ref to the new commit.
 async fn commit(
     repo: &Repo,
@@ -93,7 +93,7 @@ async fn commit(
     commit
 }
 
-/// Returns an `a(say)` variant of the build sources `entries`.
+/// Returns an `a(say)` variant of the supplements `entries`.
 fn sources(entries: &[(&str, &[u8])]) -> (Type, Value) {
     let elements = entries
         .iter()
@@ -167,7 +167,7 @@ fn refs_only() -> PruneOptions {
     }
 }
 
-/// Returns a warning of the build sources of `commit`.
+/// Returns a warning of the supplements of `commit`.
 fn supplement_warning(commit: Checksum, reason: &str) -> RelationWarning {
     RelationWarning {
         commit,
@@ -287,11 +287,11 @@ fn a_weak_ref_named_by_a_supplement_of_a_strong_commit_survives() {
         };
         let stats = repo.prune(&opts).await.unwrap();
         assert_eq!(stats.deleted_refs, [Ref::local("cache/other")]);
-        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(holds(&repo, &src).await, "the supplement survives");
         assert_eq!(
             repo.resolve_rev("cache/src", true).await.unwrap(),
             Some(src),
-            "the weak ref of the build source survives"
+            "the weak ref of the supplement survives"
         );
         assert!(
             !holds(&repo, &other).await,
@@ -338,11 +338,11 @@ fn a_weak_collection_ref_named_by_an_attachment_of_a_strong_commit_survives() {
 
         let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
         assert_eq!(stats.deleted_refs, vec![dropped.clone()]);
-        assert!(holds(&repo, &att).await, "the dependency survives");
+        assert!(holds(&repo, &att).await, "the attachment survives");
         assert_eq!(
             repo.resolve_ref_tip(&kept).await.unwrap(),
             Some(att),
-            "the weak collection ref of the dependency survives"
+            "the weak collection ref of the attachment survives"
         );
         assert!(
             !holds(&repo, &other).await,
@@ -366,11 +366,11 @@ fn a_weak_collection_ref_named_by_a_supplement_of_a_strong_commit_survives() {
 
         let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
         assert_eq!(stats.deleted_refs, vec![dropped.clone()]);
-        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(holds(&repo, &src).await, "the supplement survives");
         assert_eq!(
             repo.resolve_ref_tip(&kept).await.unwrap(),
             Some(src),
-            "the weak collection ref of the build source survives"
+            "the weak collection ref of the supplement survives"
         );
         assert!(
             !holds(&repo, &other).await,
@@ -395,8 +395,8 @@ fn a_supplement_of_a_supplement_survives() {
             .unwrap();
 
         repo.prune(&refs_only()).await.unwrap();
-        assert!(holds(&repo, &mid).await, "the build source survives");
-        assert!(holds(&repo, &base).await, "its build source survives");
+        assert!(holds(&repo, &mid).await, "the supplement survives");
+        assert!(holds(&repo, &base).await, "its supplement survives");
         assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
     });
 }
@@ -430,7 +430,7 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
         let plain_b = commit(&repo, tmp.path(), "b", None, &[], None).await;
         let plain_head = commit(&repo, tmp.path(), "head", None, &[], None).await;
         let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
-        // The commit write refuses a nested dependency, so the commits are
+        // The commit write refuses a nested attachment, so the commits are
         // stored as metadata objects.
         let b = store_with_field2(&repo, &plain_b, &[("x/c", c.as_bytes())]).await;
         let head = store_with_field2(&repo, &plain_head, &[("x/b", b.as_bytes())]).await;
@@ -440,10 +440,10 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
 
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
-        assert!(holds(&repo, &b).await, "the dependency survives");
+        assert!(holds(&repo, &b).await, "the attachment survives");
         assert!(
             holds(&repo, &c).await,
-            "the dependency of the dependency survives"
+            "the attachment of the attachment survives"
         );
         assert!(!holds(&repo, &plain_b).await);
         assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
@@ -558,7 +558,7 @@ fn a_defective_attachment_entry_gives_a_warning() {
         repo.set_ref_immediate(&Ref::local("main"), Some(&head))
             .await
             .unwrap();
-        // The build sources of the same commit are defective too. The
+        // The supplements of the same commit are defective too. The
         // warnings of field 2 come first.
         write_raw_detached(
             &repo,
@@ -582,8 +582,8 @@ fn a_defective_attachment_entry_gives_a_warning() {
             stats.warnings[0].to_string(),
             format!("related commits in field 2 of commit {head}: entry 1 has an empty name")
         );
-        assert!(holds(&repo, &att).await, "the valid dependency survives");
-        assert!(holds(&repo, &src).await, "the valid build source survives");
+        assert!(holds(&repo, &att).await, "the valid attachment survives");
+        assert!(holds(&repo, &src).await, "the valid supplement survives");
         assert!(
             !holds(&repo, &other).await,
             "the defective entry roots nothing"
@@ -650,8 +650,8 @@ fn the_parent_edge_off_still_follows_related_edges() {
         };
         repo.prune(&opts).await.unwrap();
         assert!(holds(&repo, &head).await);
-        assert!(holds(&repo, &att).await, "the dependency survives");
-        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(holds(&repo, &att).await, "the attachment survives");
+        assert!(holds(&repo, &src).await, "the supplement survives");
         for (label, parent) in [("head", hp), ("dep", dp), ("src", sp)] {
             assert!(
                 !holds(&repo, &parent).await,
@@ -671,7 +671,7 @@ fn a_related_commit_takes_the_global_bound() {
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
         repo.add_supplement(&head, "layer/src", &src).await.unwrap();
 
-        // The global depth applies to the build source, as to a ref.
+        // The global depth applies to the supplement, as to a ref.
         repo.prune(&refs_only()).await.unwrap();
         assert!(holds(&repo, &sp).await, "the full depth keeps the parent");
         let opts = PruneOptions {
@@ -679,7 +679,7 @@ fn a_related_commit_takes_the_global_bound() {
             ..refs_only()
         };
         repo.prune(&opts).await.unwrap();
-        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(holds(&repo, &src).await, "the supplement survives");
         assert!(!holds(&repo, &sp).await, "depth 0 keeps no parent");
     });
 }
@@ -696,7 +696,7 @@ fn a_related_commit_deep_in_history_takes_the_global_bound() {
         commit(&repo, tmp.path(), "h2", Some(h1), &[], Some("main")).await;
         repo.add_supplement(&h1, "layer/src", &src).await.unwrap();
 
-        // The walk reaches h1 with no parent left. The build source of h1
+        // The walk reaches h1 with no parent left. The supplement of h1
         // gets the global depth, so it keeps its parent.
         let opts = PruneOptions {
             depth: 1,
@@ -708,8 +708,8 @@ fn a_related_commit_deep_in_history_takes_the_global_bound() {
             "depth 1 keeps the parent of the head"
         );
         assert!(!holds(&repo, &h0).await, "depth 1 keeps no second parent");
-        assert!(holds(&repo, &src).await, "the build source survives");
-        assert!(holds(&repo, &sp).await, "the build source keeps its parent");
+        assert!(holds(&repo, &src).await, "the supplement survives");
+        assert!(holds(&repo, &sp).await, "the supplement keeps its parent");
     });
 }
 
@@ -728,7 +728,7 @@ fn a_commit_expanded_twice_gives_its_warnings_once() {
         );
 
         // The walk reaches h1 over the parent edge with depth 1, and again as
-        // a build source with depth 2. It reads the fields of h1 one time.
+        // a supplement with depth 2. It reads the fields of h1 one time.
         let opts = PruneOptions {
             depth: 2,
             ..refs_only()
@@ -972,7 +972,7 @@ fn a_supplement_after_a_signature_entry_survives() {
         );
         let stats = repo.prune(&refs_only()).await.unwrap();
         assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
-        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(holds(&repo, &src).await, "the supplement survives");
         assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
     });
 }
@@ -1177,7 +1177,7 @@ fn a_config_key_that_names_metadata_keys_changes_no_write_and_no_prune() {
             txn.set_ref(&Ref::local("cfs"), Some(&cfs));
             txn.commit().await.unwrap();
 
-            // A defective build-source value on a reached commit.
+            // A defective supplement value on a reached commit.
             let strings = (
                 Type::parse("as").unwrap(),
                 Value::Array(vec![Value::Str(orphan.to_hex())]),

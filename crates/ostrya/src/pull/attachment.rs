@@ -1,21 +1,21 @@
-//! The search for the static delta of each dependency of a pull.
+//! The search for the static delta of each attachment of a pull.
 //!
 //! A static delta carries its target commit alone. A pull looks for the delta
-//! of each dependency after it reads the commits that name the dependency,
-//! and fetches the dependencies as one more level. [`pair_targets`] finds the
-//! targets whose chains name each dependency, and [`lookups`] finds the
+//! of each attachment after it reads the commits that name the attachment,
+//! and fetches the attachments as one more level. [`pair_targets`] finds the
+//! targets whose chains name each attachment, and [`lookups`] finds the
 //! source commit of each delta from the paired entries.
 //!
 //! The chain of a target is the target and the parents that the depth of the
-//! pull takes. The paired entry of a dependency for one target is the entry
+//! pull takes. The paired entry of an attachment for one target is the entry
 //! with the same name in field 2 of the commit that the ref of the target
 //! names here before the pull. A target gives at most one paired entry. The
 //! `from` of the delta is the first paired entry, in target order, that this
 //! repository holds complete. The pull takes the from-scratch delta only if
 //! it holds no paired entry complete.
 //!
-//! [`Attachments`] holds the dependencies that a pull met, the commits that
-//! name them, and the error for a dependency that names dependencies of its
+//! [`Attachments`] holds the attachments that a pull met, the commits that
+//! name them, and the error for an attachment that names attachments of its
 //! own, for the local pull and for the pull over HTTP.
 
 use std::collections::hash_map::Entry;
@@ -30,17 +30,17 @@ use crate::repo::Repo;
 use super::RefPlace;
 use super::delta::{AttachmentLookup, complete_here_blocking};
 
-/// The dependencies that one pull met, and the commits that name them.
+/// The attachments that one pull met, and the commits that name them.
 ///
 /// The type records the state alone. Each engine chooses when it calls
 /// [`nested_error`](Attachments::nested_error): the local pull checks each
-/// dependency after the walk of the chains, and the pull over HTTP checks
+/// attachment after the walk of the chains, and the pull over HTTP checks
 /// each commit when its step ends.
 #[derive(Default)]
 pub(super) struct Attachments {
-    /// Each dependency, in the order in which the pull first recorded it.
+    /// Each attachment, in the order in which the pull first recorded it.
     order: Vec<Checksum>,
-    /// The commit that first named each dependency, and the name of its
+    /// The commit that first named each attachment, and the name of its
     /// entry.
     named: HashMap<Checksum, (Checksum, String)>,
     /// The entries of field 2 of each commit whose field 2 is not empty, in
@@ -48,7 +48,7 @@ pub(super) struct Attachments {
     /// here.
     naming: HashMap<Checksum, Vec<(String, Checksum)>>,
     /// `true` if `naming` keeps the commits alone, for the checks. A pull
-    /// that reads no static delta of a dependency pairs no dependency with a
+    /// that reads no static delta of an attachment pairs no attachment with a
     /// target, so it keeps no entry.
     keys_only: bool,
 }
@@ -68,9 +68,9 @@ impl Attachments {
         self.keys_only
     }
 
-    /// Records the dependencies `attachments` of `commit`.
+    /// Records the attachments `attachments` of `commit`.
     ///
-    /// A dependency that an earlier commit named keeps the first commit and
+    /// An attachment that an earlier commit named keeps the first commit and
     /// entry name. An empty list records nothing.
     pub(super) fn record(&mut self, commit: Checksum, attachments: Vec<(String, Checksum)>) {
         if attachments.is_empty() {
@@ -90,7 +90,7 @@ impl Attachments {
         self.naming.insert(commit, entries);
     }
 
-    /// Returns each dependency, in the order in which the pull first
+    /// Returns each attachment, in the order in which the pull first
     /// recorded it.
     pub(super) fn order(&self) -> &[Checksum] {
         &self.order
@@ -110,49 +110,49 @@ impl Attachments {
         &self.naming
     }
 
-    /// Returns the nested-dependency error for `attachment`, or `None` if no
+    /// Returns the nested-attachment error for `attachment`, or `None` if no
     /// commit named it. The error names the commit that first named the
-    /// dependency. The caller calls this method when it finds that
-    /// `attachment` has dependencies of its own.
+    /// attachment. The caller calls this method when it finds that
+    /// `attachment` has attachments of its own.
     pub(super) fn nested_error(&self, attachment: &Checksum) -> Option<Error> {
         self.named(attachment)
             .map(|(commit, name)| related::nested_attachment(commit, name, attachment))
     }
 }
 
-/// A dependency that a pull fetches, with the targets whose chains name it.
+/// An attachment that a pull fetches, with the targets whose chains name it.
 pub(super) struct Named {
-    /// The dependency.
+    /// The attachment.
     pub(super) checksum: Checksum,
-    /// The position of the first target whose chain names the dependency, or
+    /// The position of the first target whose chain names the attachment, or
     /// `None` if no chain of a target names it.
     first: Option<usize>,
-    /// The name of the entry that names the dependency in the chain of the
-    /// first target, nearest to its tip. If no chain names the dependency,
+    /// The name of the entry that names the attachment in the chain of the
+    /// first target, nearest to its tip. If no chain names the attachment,
     /// the name comes from the commit with the lowest checksum that names it,
     /// as [`pair_targets`] states.
     name: String,
-    /// The position of each target whose chain names the dependency, in
+    /// The position of each target whose chain names the attachment, in
     /// target order, with the name of the entry nearest to its tip.
     pairs: Vec<(usize, String)>,
 }
 
-/// Returns each dependency of `pending`, with the targets whose chains name
+/// Returns each attachment of `pending`, with the targets whose chains name
 /// it.
 ///
 /// `targets` holds the name and the commit of each target, in the order of
 /// the pull. `depth` is the depth of the pull, `-1` for all parents.
 /// `parents` holds the parent of each commit that the pull reached, and
 /// `naming` holds the entries of field 2 of each commit of the pull whose
-/// field 2 is not empty. `pending` holds each dependency that the pull did
+/// field 2 is not empty. `pending` holds each attachment that the pull did
 /// not reach.
 ///
 /// The walk of each chain stops at a parent that the pull did not reach. The
-/// result holds the dependencies that a chain names first, in the order in
+/// result holds the attachments that a chain names first, in the order in
 /// which the walk meets them: target by target, from the tip, and in field 2
-/// order. The other dependencies of `pending` follow, in the given order.
+/// order. The other attachments of `pending` follow, in the given order.
 ///
-/// A dependency that no chain names gets its name from the commit of
+/// An attachment that no chain names gets its name from the commit of
 /// `naming` with the lowest checksum that names it. If that commit names it
 /// in two entries, the lowest name applies. So the name does not depend on
 /// the order in which the pull fetched the commits.
@@ -240,7 +240,7 @@ pub(super) fn pair_targets(
     out
 }
 
-/// Returns the delta lookup of each dependency of `named` that this
+/// Returns the delta lookup of each attachment of `named` that this
 /// repository does not hold complete, in order, and the completeness of each
 /// commit that the call checked.
 ///
@@ -368,8 +368,8 @@ mod tests {
         list.iter().map(|byte| cs(*byte)).collect()
     }
 
-    /// A dependency that two commits name is recorded once, with the commit
-    /// and the entry name of the first. Each commit with a dependency is
+    /// An attachment that two commits name is recorded once, with the commit
+    /// and the entry name of the first. Each commit with an attachment is
     /// recorded, and a commit with an empty field 2 is not.
     #[test]
     fn attachments_keep_the_first_naming_commit() {
@@ -388,9 +388,9 @@ mod tests {
         assert_eq!(atts.naming()[&cs(2)][1], ("lib/c".to_owned(), cs(4)));
     }
 
-    /// Under `keys_only`, the record keeps each commit that names a
-    /// dependency, with an empty list, and keeps the order and the first
-    /// naming commit of each dependency.
+    /// Under `keys_only`, the record keeps each commit that names an
+    /// attachment, with an empty list, and keeps the order and the first
+    /// naming commit of each attachment.
     #[test]
     fn attachments_keep_the_commits_alone_under_keys_only() {
         let mut atts = Attachments::new(true);
@@ -406,8 +406,8 @@ mod tests {
         assert!(atts.naming().values().all(Vec::is_empty));
     }
 
-    /// The error for a nested dependency names the commit and the entry that
-    /// first named the dependency. A dependency that no commit named gives no
+    /// The error for a nested attachment names the commit and the entry that
+    /// first named the attachment. An attachment that no commit named gives no
     /// error.
     #[test]
     fn a_nested_attachment_error_names_the_first_naming_commit() {
@@ -424,7 +424,7 @@ mod tests {
                 assert_eq!(
                     reason,
                     format!(
-                        "dependency lib/b names commit {}, which has dependencies of its own",
+                        "attachment lib/b names commit {}, which has attachments of its own",
                         cs(2)
                     )
                 );
@@ -457,8 +457,8 @@ mod tests {
             .collect()
     }
 
-    /// Two targets name one dependency under different names. The first
-    /// target gives the first pair and the name of the error. A dependency
+    /// Two targets name one attachment under different names. The first
+    /// target gives the first pair and the name of the error. An attachment
     /// that no chain names follows.
     #[test]
     fn the_first_target_names_an_attachment_first() {
@@ -481,7 +481,7 @@ mod tests {
         assert!(pair_targets(&targets, 0, &parents, &naming, Vec::new()).is_empty());
     }
 
-    /// A dependency that no chain names takes its name from the commit with
+    /// An attachment that no chain names takes its name from the commit with
     /// the lowest checksum that names it, and from the lowest name of that
     /// commit. The order in which the pull recorded the commits does not
     /// change the name.

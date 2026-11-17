@@ -128,10 +128,10 @@
 //!   of each commit, and each `.filez` of these trees. Each object must be
 //!   in the listing, have the checksum of its name, and parse. A `.filez`
 //!   must inflate to its declared size with no bytes after its payload.
-//! - The dependencies in field 2 of each commit that parses, the commits
+//! - The attachments in field 2 of each commit that parses, the commits
 //!   with a partial-commit marker included. Each entry must have a name that
 //!   is not empty and a checksum of 32 bytes. The listing must hold the
-//!   commit of each dependency, the bucket must hold no partial-commit marker
+//!   commit of each attachment, the bucket must hold no partial-commit marker
 //!   of it, and its field 2 must be empty. Each fault is an `Attachment`
 //!   finding. With `delete`, the check reads the state after the repair.
 //! - The partial-commit markers of the commits whose trees are whole, the
@@ -144,7 +144,7 @@
 //! the listing does not hold, it reads the object again, and then the
 //! commits of the object. An object that is in the bucket now is a note, and
 //! an object whose commits are all gone is no finding. The run also reads
-//! again the commit of each dependency that the listing does not hold, and
+//! again the commit of each attachment that the listing does not hold, and
 //! a commit that is in the bucket now makes its finding a note.
 //!
 //! With `delete`, the run takes the writer lock with the operation `fsck`.
@@ -155,9 +155,9 @@
 //! tree, so each ref keeps its commit, unless the object of the commit is
 //! bad. A commit object whose own bytes are bad goes, also when a ref names
 //! it, the report names the ref, and a push of the ref uploads the commit
-//! again. The run checks the dependencies against the state after the
-//! repair: a dependency whose marker the run deletes is not partial, a
-//! dependency that gets a marker is partial, a dependency whose commit
+//! again. The run checks the attachments against the state after the
+//! repair: an attachment whose marker the run deletes is not partial, an
+//! attachment that gets a marker is partial, an attachment whose commit
 //! object the run deletes is absent, and a commit whose own object the run
 //! deletes gets no check. The run writes and deletes no key for an
 //! `Attachment` finding. A push of a ref whose commit has a marker uploads
@@ -177,14 +177,14 @@
 //!
 //! - The roots are the commits of the refs, the refs of `refs/mirrors/ID/`
 //!   of the collection id of the bucket included, the commits that the
-//!   `summary` names, the dependencies in field 2 of each commit that the walk
+//!   `summary` names, the attachments in field 2 of each commit that the walk
 //!   reaches, and, unless the roots are on the refs alone, each commit of
 //!   the listing. The objects that the run keeps are the objects that a
 //!   local prune keeps with the same options, refs, and objects, and the
-//!   objects of the commits of the summary and of their dependencies, under
+//!   objects of the commits of the summary and of their attachments, under
 //!   the bound of the run. The run reads field 2 of each commit
-//!   that it reaches, and keeps the dependencies as a local prune keeps
-//!   them. It reads no detached metadata, so it deletes a build source that
+//!   that it reaches, and keeps the attachments as a local prune keeps
+//!   them. It reads no detached metadata, so it deletes a supplement that
 //!   no other root reaches, which a local prune keeps. Each defective
 //!   field 2 entry gives a warning in the report. Unless the roots are on
 //!   the refs alone, the run also deletes the detached metadata of a parent

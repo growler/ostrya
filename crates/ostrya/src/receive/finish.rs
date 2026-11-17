@@ -228,20 +228,20 @@ struct Edit<'a> {
 /// - Each new commit is staged or present (`missing-objects`), and each
 ///   commit of the session parses.
 /// - A dict for a commit that the repository holds, that the session did not
-///   stage, and that no update names, belongs to a dependency: an entry of
+///   stage, and that no update names, belongs to an attachment: an entry of
 ///   field 2 of a commit of the session names the commit (`protocol`). The
 ///   session drops each such dict, with no merge and no write. The repository
-///   held the dependency and its dict before the session, and no rule of the
+///   held the attachment and its dict before the session, and no rule of the
 ///   session covers a change to them.
 /// - The tree of each commit of the session is complete (`missing-objects`).
 /// - Each entry of field 2 of each staged commit, the staged parents of a new
 ///   commit included, has a name that is not empty and a 32-byte checksum
 ///   (`protocol`). A new commit that the repository holds with a partial
-///   marker gets the same check. Each dependency that these entries name is
-///   staged or held (`missing-objects`, with each absent dependency listed).
-///   A held dependency is complete (`missing-objects`, with no object
-///   listed), and no dependency has dependencies of its own (`protocol`). A
-///   dependency that is a new commit is complete, also with a partial marker,
+///   marker gets the same check. Each attachment that these entries name is
+///   staged or held (`missing-objects`, with each absent attachment listed).
+///   A held attachment is complete (`missing-objects`, with no object
+///   listed), and no attachment has attachments of its own (`protocol`). An
+///   attachment that is a new commit is complete, also with a partial marker,
 ///   because the completeness walk ran over its tree.
 /// - The ref binding and the collection binding of each new commit name each
 ///   of its refs and the namespace of each ref (`binding-mismatch`), as
@@ -250,11 +250,11 @@ struct Edit<'a> {
 ///   (`signature-required`). The verification reads the union of the stored
 ///   and the incoming detached metadata. A rule that accepts a commit with no
 ///   signature skips a commit whose union holds no signature blob. A commit
-///   that no update names gets no verification, a staged parent and a
-///   dependency included. The checksum of a dependency is in field 2 of a
+///   that no update names gets no verification, a staged parent and an
+///   attachment included. The checksum of an attachment is in field 2 of a
 ///   commit of the session. A new commit is that commit, or binds it through
 ///   the parent checksums of its history, and the signatures of the new
-///   commit cover these checksums. A dependency that only a staged commit
+///   commit cover these checksums. An attachment that only a staged commit
 ///   outside each history names is bound to no new commit. The session staged
 ///   each object under the checksum of its bytes.
 ///
@@ -271,7 +271,7 @@ struct Edit<'a> {
 /// staged objects and the staged images become durable. At the same time,
 /// each new commit gets a signature from each server key of its rules. No
 /// other commit gets a server signature. Each other commit with a filtered incoming dict, a staged
-/// dependency included, gets the merge of that dict alone. A key makes no
+/// attachment included, gets the merge of that dict alone. A key makes no
 /// signature if it already signed the commit in one of these places:
 ///
 /// - The merge of the filtered incoming dict into the stored dict.
@@ -778,10 +778,10 @@ async fn check_commit_meta_commits(
 ///
 /// `outside` is the list that [`check_commit_meta_commits`] returns: the
 /// commits of `commit_meta` that the session did not stage and that no update
-/// names. The repository holds each of them. A named commit is a dependency
+/// names. The repository holds each of them. A named commit is an attachment
 /// that the repository holds. The repository held that commit and its dict
 /// before the session, and no rule of the session covers a change to them. A
-/// staged dependency is a commit that the repository did not hold before the
+/// staged attachment is a commit that the repository did not hold before the
 /// session, and its dict merges as the dict of each other staged commit.
 /// `fields` holds field 2 of each commit of the session, as [`load_commits`]
 /// reads it. An entry with an empty name or a checksum that is not 32 bytes
@@ -808,7 +808,7 @@ fn drop_attachment_meta(
         if !named.contains(&commit.as_bytes()[..]) {
             return Err(protocol(format!(
                 "detached metadata for commit {commit}, which the session did not stage, no ref \
-                 update names, and no commit of the session names as a dependency"
+                 update names, and no commit of the session names as an attachment"
             )));
         }
         commit_meta.remove(&commit);
@@ -1080,7 +1080,7 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
     })
 }
 
-/// Checks the dependencies of each checked commit of the session.
+/// Checks the attachments of each checked commit of the session.
 ///
 /// The checked commits are the staged commits, and each new commit that the
 /// repository holds with a partial marker: the session completes the tree of
@@ -1092,18 +1092,18 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
 ///
 /// - Each entry of field 2 of each checked commit has a name that is not
 ///   empty and a 32-byte checksum (`protocol`).
-/// - Each dependency is staged or held (`missing-objects`). The failure lists
-///   each dependency that is neither, in the order of the commits that name
+/// - Each attachment is staged or held (`missing-objects`). The failure lists
+///   each attachment that is neither, in the order of the commits that name
 ///   them.
-/// - Each held dependency is complete (`missing-objects`, with no object
-///   listed), and the field 2 of each dependency is empty (`protocol`). The
-///   dependencies are taken in the order of the commits that name them.
+/// - Each held attachment is complete (`missing-objects`, with no object
+///   listed), and the field 2 of each attachment is empty (`protocol`). The
+///   attachments are taken in the order of the commits that name them.
 ///
-/// A dependency that is a commit of the session is complete, because the
+/// An attachment that is a commit of the session is complete, because the
 /// completeness walk ran over its tree, and `fields` holds its field 2. A new
-/// commit that the repository marks partial is such a dependency too. The
+/// commit that the repository marks partial is such an attachment too. The
 /// reads of the partial markers of the held new commits run in one trip to
-/// the blocking pool, and the reads of the other held dependencies in one
+/// the blocking pool, and the reads of the other held attachments in one
 /// more trip. Field 2 of a new commit that the repository holds with no
 /// partial marker gets no check.
 async fn check_attachments(
@@ -1147,7 +1147,7 @@ async fn check_attachments(
         .map(|t| &t.checksum)
         .filter(|c| staged.contains(c) || partial.contains(c))
         .chain(others);
-    // Each dependency, the commit that first names it, and the name of that
+    // Each attachment, the commit that first names it, and the name of that
     // entry.
     let mut known = HashSet::new();
     let mut named: Vec<(Checksum, Checksum, &str)> = Vec::new();
@@ -1192,7 +1192,7 @@ async fn check_attachments(
     if absent.total > 0 {
         return Err(missing_objects(
             absent,
-            "the staged commits name as dependencies",
+            "the staged commits name as attachments",
         ));
     }
     for (attachment, naming, name) in named {
@@ -1205,7 +1205,7 @@ async fn check_attachments(
                     missing: Vec::new(),
                 }));
             }
-            Some(HeldAttachment::Absent) => unreachable!("an absent dependency was refused"),
+            Some(HeldAttachment::Absent) => unreachable!("an absent attachment was refused"),
         };
         if nested {
             return Err(protocol(
@@ -1675,7 +1675,7 @@ async fn filter_detached(
 /// Returns the detached-metadata edits of the session.
 ///
 /// A new commit gets an edit if it has a server key or a filtered incoming
-/// dict. Each other commit with a filtered incoming dict, a staged dependency
+/// dict. Each other commit with a filtered incoming dict, a staged attachment
 /// included, also gets an edit, with no server key. Each commit gets one edit
 /// at most. Each edit takes its stored dict out of `stored`.
 fn plan<'a>(

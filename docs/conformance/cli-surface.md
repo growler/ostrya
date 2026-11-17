@@ -943,7 +943,7 @@ refuses a symlink in the repository` at exit 1, at the read of the tip of
 the branch, before it writes an object. It writes no ref, and the link
 stays.
 
-`--related=NAME=CHECKSUM` of the port names one dependency of the commit in
+`--related=NAME=CHECKSUM` of the port names one attachment of the commit in
 field 2 of the commit object (`../format-reference.md`, "Commit --
 `(a{sv}aya(say)sstayay)`"). The option can occur more than once. The port
 splits the value at its last `=`, so `NAME` can hold `=`. `CHECKSUM` is 64
@@ -959,16 +959,16 @@ port refuses these values at exit 1:
   '<checksum>' in '<value>' is not 64 lowercase hexadecimal characters`,
   before it takes the repository lock;
 - an empty `NAME`, and a `NAME` given two times, before it reads the tree;
-- a dependency that the repository does not hold, or holds partial, before it
+- an attachment that the repository does not hold, or holds partial, before it
   reads the tree;
-- a dependency whose own field 2 is not empty, before it reads the tree.
+- an attachment whose own field 2 is not empty, before it reads the tree.
 
 A refusal writes no object and no ref. `--related` conflicts with
 `--skip-if-unchanged`, and `clap` refuses the pair at exit 1.
 
 `--add-detached-metadata-string=ostrya.related=VALUE` gives the detached
 metadata key `ostrya.related` a string value. The key is a port extension
-that holds the build sources of the commit, and its value must be an
+that holds the supplements of the commit, and its value must be an
 `a(say)` (`../format-reference.md`, "Related commits"). The port refuses the
 option at exit 1 with ``error: related commits in ostrya.related of commit
 <checksum>: type is `s`, not `a(say)` ``, and writes no object and no ref. The
@@ -2845,7 +2845,7 @@ matrix cell reads the tool's own behavior.
 
 `fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
 `--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extensions
-`--no-mark-partial` and `--no-mark-dependencies`. Nothing is missing. The phase,
+`--no-mark-partial` and `--no-mark-attachments`. Nothing is missing. The phase,
 finding, and summary text the command writes, the two binding checks, and the
 exit statuses are in `cli-behavior.md`, "CLI output formats", `fsck`, together
 with the progress line the tool writes and the port does not. A symlink under
@@ -2951,15 +2951,15 @@ Ten divergences stand at `fsck`:
   refuses it with `error: the argument '<flag>' cannot be used multiple times`
   at exit 1. This is the repeated-boolean-flag class already recorded for
   `export --no-xattrs` and the four `prune` flags;
-- a dependency in field 2 that is absent, partial, or defective. The tool
+- an attachment in field 2 that is absent, partial, or defective. The tool
   reports no finding for an entry of field 2 and exits 0 (`cli-behavior.md`,
   "CLI output formats", `fsck`, "Related commits in fsck"). The port writes one
   line for each such entry on standard error, marks the commit that names an
-  absent or a partial dependency as partial unless `--no-mark-partial` or
-  `--no-mark-dependencies` is given, and exits 1 with
+  absent or a partial attachment as partial unless `--no-mark-partial` or
+  `--no-mark-attachments` is given, and exits 1 with
   `error: Repository corruption encountered`. A defective entry gets no marker.
-  `../format-reference.md`, "Dependencies in the fsck", states the rules. Over a
-  repository whose dependencies are complete, the two agree;
+  `../format-reference.md`, "Attachments in the fsck", states the rules. Over a
+  repository whose attachments are complete, the two agree;
 - a ref under `refs/mirrors/<own id>/`, where `<own id>` is the
   `collection-id` of the repository. Such a ref comes from an out-of-band
   change alone, because no writer of the port writes it. The tool prints no
@@ -3450,10 +3450,10 @@ details", "spki"). Fifty-two differences stand on `show`,
   port has neither limit. It applies rollsum and bspatch objects into an
   `archive` repository. It applies a delta with fallbacks where the objects
   that they name are already in the repository;
-- the dependencies of the target under `apply-offline`. The port reads field
+- the attachments of the target under `apply-offline`. The port reads field
   2 of the target commit before it writes an object
   (`../format-reference.md`, "Object delivery"). It refuses a defective
-  entry, and a dependency that the repository does not hold complete or that
+  entry, and an attachment that the repository does not hold complete or that
   is nested, at exit 1 with `error: related commits in field 2 of commit
   <target>: <reason>` and nothing on standard output. It writes no object.
   The check also runs if the repository holds the target. The tool applies
@@ -3863,16 +3863,16 @@ until a prune. `pull-local` does the same. An alias under `refs/remotes` or
 `refs/mirrors` comes from a write of the library or from an out-of-band
 write. The `ostrya` command writes none.
 
-`pull` also fetches the dependencies that field 2 of each pulled commit
+`pull` also fetches the attachments that field 2 of each pulled commit
 names, each at depth 0 and with no ref, unless the pull is commit-only or has a
-subpath (`../format-reference.md`, "Dependencies in a pull from a remote"). A
-dependency that neither the repository, a localcache repository, nor the
+subpath (`../format-reference.md`, "Attachments in a pull from a remote"). An
+attachment that neither the repository, a localcache repository, nor the
 remote holds, a field 2 entry with an empty name or with a checksum that is
-not 32 bytes, and a nested dependency fail the pull at exit 1, and the pull
+not 32 bytes, and a nested attachment fail the pull at exit 1, and the pull
 writes no object and no ref. The pull looks for a static delta of each
-dependency, from the entry of the same name in the commit that the local ref
+attachment, from the entry of the same name in the commit that the local ref
 names before the pull (`../format-reference.md`, "Static deltas of
-dependencies"). The tool fetches no dependency (`cli-behavior.md`, "Related
+attachments"). The tool fetches no attachment (`cli-behavior.md`, "Related
 commits in a pull").
 
 The port adds `--collection=ID`, the pull of the refs of the collection ID
@@ -4254,8 +4254,8 @@ superblock names what the delta writes, and the pull checks the commit that
 the delta delivers as it checks the target or the commit of the chain. So a
 delta with its signature removed gets nothing past the checks.
 
-The port verifies no superblock of the delta of a dependency. Field 2 of the
-signed commit names the dependency by its checksum, and the superblock gives
+The port verifies no superblock of the delta of an attachment. Field 2 of the
+signed commit names the attachment by its checksum, and the superblock gives
 that commit.
 
 The port checks a commit that a delta delivers against the `.commitmeta` that
@@ -4287,13 +4287,13 @@ not. Two differences stand:
   from-scratch delta alone and fetches loose, and the port takes the delta.
   Both land the same objects, and neither refuses.
 
-The requirement also applies to each dependency that the port fetches and
-that the destination does not hold complete. A dependency with no delta fails
+The requirement also applies to each attachment that the port fetches and
+that the destination does not hold complete. An attachment with no delta fails
 the pull at exit 1 with `error: pull: Static deltas required, but none found
 for <name> of <ref> to <checksum>`, where `<name>` is the name of the field 2
 entry, and the pull writes no ref (`../format-reference.md`, "Static deltas
-of dependencies", which also gives the rule of `<name>` and `<ref>`). The
-tool fetches no dependency, so it has no such refusal.
+of attachments", which also gives the rule of `<name>` and `<ref>`). The
+tool fetches no attachment, so it has no such refusal.
 
 A pull that returns an error removes the `state/<commit>.commitpartial` marker
 of each commit it marked whose commit object the destination does not hold, a
@@ -4487,17 +4487,17 @@ nothing, since `pull-local` reads no delta by default. Ten differences stand:
   regular-file mode with bits outside `0755` -- because the object would get a
   name that its stored form does not hash to. What the port imports passes its
   own `fsck` and the `fsck` of the tool;
-- the dependencies of a commit. The port imports the dependencies that field
+- the attachments of a commit. The port imports the attachments that field
   2 of each pulled commit names, each at depth 0 and with no ref, unless the
-  pull is commit-only (`../format-reference.md`, "Dependencies in a local
-  pull"). A dependency that neither the source, a localcache repository, nor
+  pull is commit-only (`../format-reference.md`, "Attachments in a local
+  pull"). An attachment that neither the source, a localcache repository, nor
   the destination holds, a field 2 entry with an empty name or with a
-  checksum that is not 32 bytes, and a nested dependency fail the pull at
+  checksum that is not 32 bytes, and a nested attachment fail the pull at
   exit 1, and the pull writes no object and no ref. Under
   `--require-static-deltas`, the port also looks for a delta of each
-  dependency, and a dependency with no delta fails the pull at exit 1 before
+  attachment, and an attachment with no delta fails the pull at exit 1 before
   it writes an object (`../format-reference.md`, "Static deltas of
-  dependencies"). The tool imports no dependency (`cli-behavior.md`,
+  attachments"). The tool imports no attachment (`cli-behavior.md`,
   "Related commits in a pull");
 - a `--remote=REMOTE` that is not a valid remote name, such as `../x`. The
   port refuses it at exit 1 with `error: invalid input: invalid remote name:
@@ -5771,8 +5771,8 @@ ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]...
   `TrustedKeys::from_trust_group`, on the default rule and on each rule of
   `--allow-remote` and of `--allow-collection`. Each commit that is the new
   value of a ref must pass the keys, and a commit with no signature gets
-  `signature-required`. A
-  dependency that field 2 of the commit names gets no verification of its
+  `signature-required`. An
+  attachment that field 2 of the commit names gets no verification of its
   own, because the signature of the commit covers field 2. A name with no
   group gets `error: invalid input: the config has no [ex-ostrya trust
   "NAME"] group`, and a bad group gets `error: MESSAGE`. Each refusal comes
@@ -6069,18 +6069,18 @@ ostrya push [--repo=PATH] REMOTE REF --onto=NAME|@ID:NAME
   source commit alone. `--depth=-1` sends the whole local chain. A value
   below `-1` is refused before the ssh client starts and before the first
   HTTP request.
-- The push also sends the dependencies that field 2 of each offered commit
+- The push also sends the attachments that field 2 of each offered commit
   names, each at depth 0 and with no ref (`../format-reference.md`,
-  "Dependencies in a push"). It sends no build source. It refuses at exit 1
+  "Attachments in a push"). It sends no supplement. It refuses at exit 1
   a field 2 entry with an empty name or with a checksum that is not 32
   bytes, in a source commit and in each parent that the push walks: `N`
   parents with `--depth=N`, and the whole local chain with `--depth=-1` or
-  without `--depth`. It also refuses a dependency that the local repository
-  does not hold or marks partial, and a dependency whose own field 2 is not
+  without `--depth`. It also refuses an attachment that the local repository
+  does not hold or marks partial, and an attachment whose own field 2 is not
   empty, also if that field 2 holds a defective entry. Each of these
   refusals comes before the ssh client starts, before the first HTTP
   request, and before the first request to a bucket. Without `--depth`, the
-  push checks the dependencies of the history commits after the server
+  push checks the attachments of the history commits after the server
   reports its refs, or under the writer lock of a bucket. A refusal there
   comes before the push sends an object.
 - `--force` sends each update with any expected state, and asks the server
@@ -6251,10 +6251,10 @@ allow-cleartext-credentials`.
   output, then `N partial commits` when the count is not zero. It writes one
   line for each finding to standard error, sorted by key and then by kind:
   `KIND KEY: DETAIL`, then `; in commits C1, C2` when the finding names
-  commits. A note starts with `note: `. A dependency in field 2 of a commit
-  that is absent, partial, or defective gives a `dependency` error on the
+  commits. A note starts with `note: `. An attachment in field 2 of a commit
+  that is absent, partial, or defective gives an `attachment` error on the
   key of that commit, with the reason of the finding of `fsck` as its detail
-  (`../format-reference.md`, "Dependencies in the fsck"). A report with an
+  (`../format-reference.md`, "Attachments in the fsck"). A report with an
   error ends with `error: Bucket repository corruption encountered` and exit
   status 1. Else the command writes `fsck of the bucket repository ADDRESS: no
   errors found` and exits 0. Notes alone give exit status 0. A ref key under
@@ -6270,12 +6270,12 @@ allow-cleartext-credentials`.
 - `remote fsck --delete` takes the writer lock, writes the marker
   `state/<checksum>.commitpartial` of each commit that reaches a missing or
   a bad object of a tree, deletes the marker of each commit whose tree is
-  whole, and deletes each bad object. It checks the dependencies against
-  the state after the repair: a dependency whose marker the repair deletes
-  is not partial, a dependency that gets a marker is partial, a dependency
+  whole, and deletes each bad object. It checks the attachments against
+  the state after the repair: an attachment whose marker the repair deletes
+  is not partial, an attachment that gets a marker is partial, an attachment
   whose commit object the repair deletes is absent, and a commit whose own
   object the repair deletes gets no check. It writes and deletes no key for
-  a `dependency` error. It writes `Marking commit as partial:
+  an `attachment` error. It writes `Marking commit as partial:
   COMMIT (REF, ...)`, `Deleted the partial-commit marker of commit COMMIT`,
   `Deleted KEY`, and `Deleted the commit object of a ref: COMMIT (REF,
   ...)` lines to standard output. A bucket repository with no valid
@@ -6296,9 +6296,9 @@ allow-cleartext-credentials`.
   parser refuses the other options of `prune`. The commit of each ref is a
   root, also of a ref under `refs/mirrors/ID/` of the collection id of the
   bucket, and the command deletes no ref. The commits that the summary
-  names are roots with no parent. The dependencies in field 2 of each
+  names are roots with no parent. The attachments in field 2 of each
   reached commit, also of a commit of the summary, are roots, as in
-  `prune`, and the command reads no build source. For each defective
+  `prune`, and the command reads no supplement. For each defective
   field 2 entry, the command writes one
   `warning: related commits in field 2 of commit CHECKSUM: REASON` line to
   standard error before the lines on standard output. The command writes
@@ -6989,7 +6989,7 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
 - Each update of the `Commit` frame expects any state of its ref, so the
   receiver applies its own rules to the state of the ref. The stream
   carries each commit of a refspec, the objects of its tree, its detached
-  metadata, and each dependency that field 2 names with no ref update. It
+  metadata, and each attachment that field 2 names with no ref update. It
   carries no parent commit. The command does no negotiation, so it sends
   each object.
 - The command holds the repository lock as shared while it writes the

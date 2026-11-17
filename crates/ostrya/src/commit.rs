@@ -2,16 +2,16 @@
 //!
 //! - [`Transaction::write_commit`] stages a commit object over a root tree,
 //!   with the options in [`CommitOptions`].
-//! - [`Transaction::check_attachments`] checks the dependencies of a new commit
+//! - [`Transaction::check_attachments`] checks the attachments of a new commit
 //!   before the tree is built, and gives a [`CheckedAttachments`].
 //!   [`Transaction::write_commit_checked`] stages the commit with these
-//!   dependencies and does not check them again.
+//!   attachments and does not check them again.
 //! - [`Repo::read_commit_detached_metadata`] and
 //!   [`Repo::write_commit_detached_metadata`] read and write the detached
 //!   metadata of a commit.
 //! - [`Repo::read_commit_relations`] reads the related commits of a commit:
-//!   the dependencies and the build sources.
-//! - [`Repo::add_supplement`] adds a build source to a commit.
+//!   the attachments and the supplements.
+//! - [`Repo::add_supplement`] adds a supplement to a commit.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -64,25 +64,25 @@ pub struct CommitOptions {
     pub timestamp: Option<u64>,
     /// The `a{sv}` metadata dict, or `None` for an empty dict.
     pub metadata: Option<Value>,
-    /// The dependencies of the commit: the name and the checksum of each
+    /// The attachments of the commit: the name and the checksum of each
     /// commit that field 2 of the commit object names.
     ///
     /// The name has the form `<class>/<name>` by convention, for example
     /// `container/fe`. The write sorts the entries by name in byte order, so
     /// one set of entries gives one commit checksum. It refuses an empty name
-    /// and two entries with the same name. Each dependency must be complete
+    /// and two entries with the same name. Each attachment must be complete
     /// in the repository or in the writing transaction, and must have no
-    /// dependency of its own. [`Transaction::write_commit`] states the rule.
+    /// attachment of its own. [`Transaction::write_commit`] states the rule.
     ///
     /// [`Transaction::write_commit_checked`] refuses a list that is not
-    /// empty. The [`CheckedAttachments`] that it takes gives the dependencies.
+    /// empty. The [`CheckedAttachments`] that it takes gives the attachments.
     ///
-    /// A local prune keeps the dependencies of each commit that it reaches.
+    /// A local prune keeps the attachments of each commit that it reaches.
     /// [`Repo::prune`], "Related commits", states the rules.
     pub attachments: Vec<(String, Checksum)>,
 }
 
-/// The dependencies of a new commit, after the checks of
+/// The attachments of a new commit, after the checks of
 /// [`Transaction::check_attachments`].
 ///
 /// [`Transaction::check_attachments`] gives it, and
@@ -96,7 +96,7 @@ pub struct CommitOptions {
 /// [`set_generate_sizes`](Transaction::set_generate_sizes),
 /// [`commit`](Transaction::commit), and [`abort`](Transaction::abort). Call
 /// the setters before [`check_attachments`](Transaction::check_attachments).
-#[must_use = "write_commit_checked takes the checked dependencies"]
+#[must_use = "write_commit_checked takes the checked attachments"]
 pub struct CheckedAttachments<'txn> {
     txn: &'txn Transaction,
     /// The entries, sorted by name in byte order.
@@ -165,37 +165,37 @@ impl Transaction {
     /// the repository holds already, complete or partial, is not staged, so it
     /// gets no image.
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
     /// Field 2 of the commit object holds the entries of `opts.attachments`,
     /// sorted by name in byte order. The call refuses an entry with an empty
     /// name and two entries with the same name. It checks nothing else in a
     /// name.
     ///
-    /// Each dependency must be complete: this transaction stages its commit
+    /// Each attachment must be complete: this transaction stages its commit
     /// object or the repository holds it, and the repository holds no
-    /// `state/<checksum>.commitpartial` marker for it. A dependency that this
-    /// transaction writes must be staged before the call that names it. A
-    /// dependency must have no dependency of its own, so a dependency names
-    /// no dependency. It can have a parent and build sources.
+    /// `state/<checksum>.commitpartial` marker for it. An attachment that this
+    /// transaction writes must be staged before the call that names it. An
+    /// attachment must have no attachment of its own, so an attachment names
+    /// no attachment. It can have a parent and supplements.
     ///
-    /// The call checks the dependencies as
+    /// The call checks the attachments as
     /// [`check_attachments`](Transaction::check_attachments) does, after the timestamp
     /// and before it serializes the commit. On a refusal, it writes nothing
     /// and the transaction stays open.
     ///
-    /// A caller that checks the dependencies before it builds the tree calls
+    /// A caller that checks the attachments before it builds the tree calls
     /// [`check_attachments`](Transaction::check_attachments) and then
     /// [`write_commit_checked`](Transaction::write_commit_checked). Then each
-    /// dependency is checked one time.
+    /// attachment is checked one time.
     ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
     /// - [`Error::InvalidRelations`] if an entry of `opts.attachments` has an empty
-    ///   name, if two entries have the same name, or if a dependency is
-    ///   absent, partial, or has a dependency of its own.
-    /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
+    ///   name, if two entries have the same name, or if an attachment is
+    ///   absent, partial, or has an attachment of its own.
+    /// - [`Error::Core`] if the commit tuple of an attachment does not frame,
     ///   or if its field 2 does not decode.
     /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
     ///   fs-verity seal fails.
@@ -235,7 +235,7 @@ impl Transaction {
         self.write_commit_unchecked(opts, root).await
     }
 
-    /// Stages a commit object over the tree `root` with the dependencies
+    /// Stages a commit object over the tree `root` with the attachments
     /// `attachments`, and returns its checksum.
     ///
     /// The call writes the commit as [`write_commit`](Transaction::write_commit)
@@ -246,12 +246,12 @@ impl Transaction {
     /// The call records the commit for the composefs image as `write_commit`
     /// does.
     ///
-    /// The call does not check the dependencies again.
+    /// The call does not check the attachments again.
     /// [`check_attachments`](Transaction::check_attachments) checked them. A process
-    /// outside the transaction can make a dependency partial or absent after
+    /// outside the transaction can make an attachment partial or absent after
     /// that check: for example, an fsck, which takes no repository lock, or a
     /// prune in a repository with `[core] locking=false`. The call does not
-    /// refuse such a dependency, and an fsck reports it.
+    /// refuse such an attachment, and an fsck reports it.
     ///
     /// # Errors
     ///
@@ -299,12 +299,12 @@ impl Transaction {
     ) -> Result<Checksum> {
         if !std::ptr::eq(attachments.txn, self) {
             return Err(Error::InvalidInput(
-                "the checked dependencies come from another transaction".into(),
+                "the checked attachments come from another transaction".into(),
             ));
         }
         if !opts.attachments.is_empty() {
             return Err(Error::InvalidInput(
-                "the commit options name dependencies; the checked dependencies give them".into(),
+                "the commit options name attachments; the checked attachments give them".into(),
             ));
         }
         self.resolve_commit_options(&mut opts)?;
@@ -330,20 +330,20 @@ impl Transaction {
         Ok(())
     }
 
-    /// Checks the dependencies `attachments` of a new commit, as
+    /// Checks the attachments `attachments` of a new commit, as
     /// [`write_commit`](Transaction::write_commit) checks
     /// [`CommitOptions::attachments`].
     ///
     /// The call refuses an entry with an empty name and two entries with the
-    /// same name. Then it checks each dependency in the byte order of the
-    /// names: the dependency must be complete in the repository or in this
-    /// transaction, and it must have no dependency of its own.
+    /// same name. Then it checks each attachment in the byte order of the
+    /// names: the attachment must be complete in the repository or in this
+    /// transaction, and it must have no attachment of its own.
     /// [`write_commit`](Transaction::write_commit) states the rules and runs
     /// the same checks. The call does not change `attachments` and writes
     /// nothing.
     ///
     /// The call reads no tree. A caller can call it before it builds a large
-    /// tree, so that a refused dependency stops the work before the build.
+    /// tree, so that a refused attachment stops the work before the build.
     ///
     /// Returns the checked entries, sorted by name in byte order.
     /// [`write_commit_checked`](Transaction::write_commit_checked) takes them
@@ -352,11 +352,11 @@ impl Transaction {
     /// # Errors
     ///
     /// - [`Error::InvalidRelations`] with no commit, if an entry of `attachments`
-    ///   has an empty name, if two entries have the same name, or if a
-    ///   dependency is absent, partial, or has a dependency of its own.
-    /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
+    ///   has an empty name, if two entries have the same name, or if an
+    ///   attachment is absent, partial, or has an attachment of its own.
+    /// - [`Error::Core`] if the commit tuple of an attachment does not frame,
     ///   or if its field 2 does not decode.
-    /// - [`Error::InvalidFormat`] if the commit object of a dependency with no
+    /// - [`Error::InvalidFormat`] if the commit object of an attachment with no
     ///   partial marker is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
     ///   file, or if a symlink is on its path.
@@ -368,7 +368,7 @@ impl Transaction {
         self.check_owned_attachments(attachments.to_vec()).await
     }
 
-    /// Checks the dependencies `attachments` as
+    /// Checks the attachments `attachments` as
     /// [`check_attachments`](Transaction::check_attachments) does, and keeps the
     /// entries in the result with no copy.
     async fn check_owned_attachments(
@@ -381,13 +381,13 @@ impl Transaction {
     }
 
     /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
-    /// with no check of the dependencies.
+    /// with no check of the attachments.
     ///
     /// Field 2 holds the entries of `opts.attachments` in the given order.
     /// [`write_commit`](Transaction::write_commit) and
     /// [`write_commit_checked`](Transaction::write_commit_checked) call it
     /// with the sorted entries after the check. The anchor commit of a
-    /// summary uses this path, because it has no dependency. A
+    /// summary uses this path, because it has no attachment. A
     /// `bare-split-xattrs` repository refuses the write in
     /// [`write_metadata`](Transaction::write_metadata).
     pub(crate) async fn write_commit_unchecked(
@@ -590,17 +590,17 @@ impl Repo {
 
     /// Returns the related commits of the commit `commit`.
     ///
-    /// The dependencies come from field 2 of the commit object. The build
-    /// sources come from the key `ostrya.related` of the detached metadata.
+    /// The attachments come from field 2 of the commit object. The
+    /// supplements come from the key `ostrya.related` of the detached metadata.
     /// If the detached metadata is absent or has no such key, the list of
-    /// build sources is empty. If the key occurs more than one time, the
+    /// supplements is empty. If the key occurs more than one time, the
     /// first entry gives the value. Each list keeps the stored order.
     ///
     /// The call checks the format alone: each entry has a name that is not
     /// empty and a checksum of 32 bytes, and the value of `ostrya.related`
     /// is a variant of type `a(say)`. It accepts entries that are not sorted
     /// and two entries with the same name. It does not check that the
-    /// repository holds a related commit. The checks of the dependencies of
+    /// repository holds a related commit. The checks of the attachments of
     /// [`Transaction::write_commit`] apply when a commit is written.
     ///
     /// # Errors
@@ -668,7 +668,7 @@ impl Repo {
     }
 
     /// Returns the detached metadata dict of the commit `checksum` if its
-    /// `.commitmeta` can hold build sources, or `None`.
+    /// `.commitmeta` can hold supplements, or `None`.
     ///
     /// The call reads the file as
     /// [`read_commit_detached_metadata_blocking`](Repo::read_commit_detached_metadata_blocking)
@@ -761,9 +761,9 @@ impl Repo {
     /// If the caller holds an [`UpdateGuard`](crate::UpdateGuard) of this
     /// repository, the call waits for that guard.
     ///
-    /// # Build sources
+    /// # Supplements
     ///
-    /// The key `ostrya.related` holds the build sources of the commit. The
+    /// The key `ostrya.related` holds the supplements of the commit. The
     /// call checks each entry with this key, also when the key occurs more
     /// than one time. The value must be a variant of type `a(say)`, and each
     /// element must have a name that is not empty and a checksum of 32 bytes.
@@ -814,15 +814,15 @@ impl Repo {
         .await
     }
 
-    /// Adds the build source `name` with the checksum `source` to the commit
+    /// Adds the supplement `name` with the checksum `source` to the commit
     /// `commit`.
     ///
-    /// The build sources of a commit are the entries of the key
+    /// The supplements of a commit are the entries of the key
     /// `ostrya.related` in its detached metadata, a variant of type `a(say)`.
     /// Each entry is a name and the checksum of a commit. The name has the
     /// form `<class>/<name>` by convention, for example `layer/base`. The
     /// call checks nothing else in the name. It does not check that the
-    /// repository holds `source`. A build source can name build sources of
+    /// repository holds `source`. A supplement can name supplements of
     /// its own, and the add can make a cycle.
     ///
     /// The call edits the first `ostrya.related` entry of the detached
@@ -834,7 +834,7 @@ impl Repo {
     /// one entry. Each other entry stays as it is. The new file replaces the
     /// old file atomically.
     ///
-    /// A local prune keeps the build sources of each commit that it reaches.
+    /// A local prune keeps the supplements of each commit that it reaches.
     /// [`Repo::prune`], "Related commits", states the rules.
     ///
     /// # Locks
@@ -915,7 +915,7 @@ impl Repo {
     }
 }
 
-/// Returns the refusal of a build source with an empty name, for the commit
+/// Returns the refusal of a supplement with an empty name, for the commit
 /// `commit`.
 pub(crate) fn empty_supplement_name(commit: &Checksum) -> Error {
     Error::InvalidRelations {
@@ -940,7 +940,7 @@ pub(crate) fn parse_detached_metadata(bytes: &[u8]) -> Result<Option<Value>> {
 }
 
 /// Parses `bytes`, the contents of a `.commitmeta` file, as detached
-/// metadata only if they can hold build sources.
+/// metadata only if they can hold supplements.
 ///
 /// Returns `None` with no parse if
 /// [`may_hold_supplements`](related::may_hold_supplements) does not

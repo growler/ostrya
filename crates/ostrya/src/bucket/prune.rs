@@ -175,15 +175,15 @@ impl BucketRepo {
     /// The run keeps the objects that [`Repo::prune`](crate::Repo::prune)
     /// keeps with the same options in a local repository with the same
     /// objects and refs, and the commits that the summary names, with their
-    /// dependencies under the bound of the run. A kept commit keeps its
+    /// attachments under the bound of the run. A kept commit keeps its
     /// detached metadata. Two differences apply:
     ///
     /// - The run reads field 2 of each commit that the walk reaches, and keeps
-    ///   the dependencies as [`Repo::prune`](crate::Repo::prune) keeps them
+    ///   the attachments as [`Repo::prune`](crate::Repo::prune) keeps them
     ///   ("Related commits"). It reads no detached metadata, so it reads no
-    ///   build source. Thus it deletes a build source that no other root
+    ///   supplement. Thus it deletes a supplement that no other root
     ///   reaches, and the objects that only that commit reaches. It also
-    ///   deletes the detached metadata of a build source that the listing
+    ///   deletes the detached metadata of a supplement that the listing
     ///   does not hold. `Repo::prune` keeps it.
     /// - Unless the roots are on the refs alone, the run also deletes the
     ///   detached metadata of a parent commit that the listing does not hold.
@@ -216,13 +216,13 @@ impl BucketRepo {
     /// each commit of the listing once: each commit of the listing is a root
     /// of its own. With `keep_younger_than`, the walk reads a commit a second
     /// time when the time bound rejected the commit as a parent and the walk
-    /// then reaches the commit as a root, for example as a dependency. The
+    /// then reaches the commit as a root, for example as an attachment. The
     /// walk reads each other commit once.
     ///
     /// The commit of each field 2 entry of a commit that the walk reaches is
-    /// a root too: the dependencies. With `refs_only` or `keep_younger_than`,
-    /// a dependency is a root under the bound of the run, also a dependency
-    /// of a commit of the summary. Otherwise a dependency keeps no parent, as
+    /// a root too: the attachments. With `refs_only` or `keep_younger_than`,
+    /// an attachment is a root under the bound of the run, also an attachment
+    /// of a commit of the summary. Otherwise an attachment keeps no parent, as
     /// each other root, so the walk still reads each commit once. The walk
     /// reads field 2 from the bytes of the commit object, and sends no other
     /// request for it.
@@ -232,7 +232,7 @@ impl BucketRepo {
     ///   [`PruneStats::warnings`]. The other entries of the field root as
     ///   usual.
     /// - The walk roots on entries that are not sorted, on two entries with
-    ///   one name, and on the field 2 entries of a dependency. These are not
+    ///   one name, and on the field 2 entries of an attachment. These are not
     ///   defective.
     /// - An entry that names a commit that the listing does not hold roots
     ///   nothing and gives no warning. The walk keeps the name of that commit,
@@ -446,9 +446,9 @@ impl BucketRepo {
             .collect();
         let global = opts.global_bound();
         let mut roots: Vec<(Checksum, ParentBound)> = Vec::new();
-        // A dependency takes the bound of the run when the roots are on the
+        // An attachment takes the bound of the run when the roots are on the
         // refs alone, as in a local prune. Otherwise each commit of the
-        // listing is a root that keeps no parent, so a dependency keeps no
+        // listing is a root that keeps no parent, so an attachment keeps no
         // parent either: a parent bound adds no commit of the listing.
         let related_bound = if opts.roots_on_refs_alone() {
             global
@@ -460,7 +460,7 @@ impl BucketRepo {
             // tree, so a second root for it at no parent adds nothing.
             // The walk takes the roots from the end, so it expands the
             // commits of the summary last. An earlier expansion of such a
-            // commit, as a dependency or as a parent, covers its root.
+            // commit, as an attachment or as a parent, covers its root.
             roots.extend(
                 summary
                     .iter()
@@ -490,7 +490,7 @@ impl BucketRepo {
             );
         }
         // The walk reads field 2 from the bytes of each commit that it reads,
-        // and reads no detached metadata, so it follows no build source.
+        // and reads no detached metadata, so it follows no supplement.
         let gc = GcRoots {
             attachments: true,
             supplements: false,

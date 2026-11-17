@@ -1,7 +1,7 @@
 //! Integration tests of the related commits of a commit.
 //!
 //! `Transaction::write_commit` writes `CommitOptions::attachments` into field 2
-//! of the commit object, sorted by name, and refuses dependencies that are
+//! of the commit object, sorted by name, and refuses attachments that are
 //! defective, not complete, or nested. `Transaction::check_attachments` runs the
 //! same checks before a tree is built, and `Transaction::write_commit_checked`
 //! writes the checked list with no second check.
@@ -9,7 +9,7 @@
 //! keeps field 2 and applies the same check. `Repo::read_commit_relations`
 //! reads field 2 and the detached key `ostrya.related`.
 //! `Repo::add_supplement` and `Transaction::add_supplement` add
-//! a build source, and the detached metadata writes check the value of
+//! a supplement, and the detached metadata writes check the value of
 //! `ostrya.related`. The `ostree` command has no counterpart, so the tests
 //! use ostrya alone.
 
@@ -28,7 +28,7 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The detached metadata key of the build sources.
+/// The detached metadata key of the supplements.
 const RELATED_KEY: &str = "ostrya.related";
 
 /// Writes a tree with one file at `base/<name>`. The content of the file names
@@ -80,7 +80,7 @@ fn options(name: &str, related: &[(&str, Checksum)]) -> CommitOptions {
     }
 }
 
-/// Commits the tree `base/<name>` into `repo` with the dependencies
+/// Commits the tree `base/<name>` into `repo` with the attachments
 /// `related`, and returns the commit.
 async fn commit(repo: &Repo, base: &Path, name: &str, related: &[(&str, Checksum)]) -> Checksum {
     let txn = repo.transaction().await.unwrap();
@@ -110,7 +110,7 @@ fn owned(entries: &[(&str, Checksum)]) -> Vec<(String, Checksum)> {
         .collect()
 }
 
-/// Returns an `a(say)` variant of the build sources `entries`.
+/// Returns an `a(say)` variant of the supplements `entries`.
 fn sources(entries: &[(&str, &[u8])]) -> (Type, Value) {
     let elements = entries
         .iter()
@@ -273,13 +273,13 @@ fn write_commit_refuses_defective_or_incomplete_attachments() {
             (
                 vec![("a/x", att), ("b/x", absent)],
                 format!(
-                    "dependency b/x names commit {absent}, which is in neither the repository \
+                    "attachment b/x names commit {absent}, which is in neither the repository \
                      nor the transaction"
                 ),
             ),
             (
                 vec![("a/x", partial)],
-                format!("dependency a/x names commit {partial}, which is partial"),
+                format!("attachment a/x names commit {partial}, which is partial"),
             ),
         ];
         for (related, expected) in cases {
@@ -342,17 +342,17 @@ fn check_attachments_runs_the_checks_of_write_commit() {
             (
                 vec![("a/x", absent)],
                 format!(
-                    "dependency a/x names commit {absent}, which is in neither the repository \
+                    "attachment a/x names commit {absent}, which is in neither the repository \
                      nor the transaction"
                 ),
             ),
             (
                 vec![("a/x", partial)],
-                format!("dependency a/x names commit {partial}, which is partial"),
+                format!("attachment a/x names commit {partial}, which is partial"),
             ),
             (
                 vec![("a/x", nested)],
-                format!("dependency a/x names commit {nested}, which has dependencies of its own"),
+                format!("attachment a/x names commit {nested}, which has attachments of its own"),
             ),
         ];
         for (related, expected) in cases {
@@ -371,7 +371,7 @@ fn check_attachments_runs_the_checks_of_write_commit() {
             .await
             .unwrap_err();
         assert!(
-            related_error(err).2.starts_with("dependency a/x "),
+            related_error(err).2.starts_with("attachment a/x "),
             "the first name in byte order"
         );
         // An accepted list stays in the order of the caller.
@@ -383,7 +383,7 @@ fn check_attachments_runs_the_checks_of_write_commit() {
     });
 }
 
-/// The check reads no commit object of a dependency with a partial marker: a
+/// The check reads no commit object of an attachment with a partial marker: a
 /// directory at the path of the object gives the partial refusal.
 #[test]
 fn check_attachments_reads_no_object_of_a_partial_attachment() {
@@ -412,14 +412,14 @@ fn check_attachments_reads_no_object_of_a_partial_attachment() {
             (
                 None,
                 RelationField::Attachments,
-                format!("dependency a/x names commit {partial}, which is partial")
+                format!("attachment a/x names commit {partial}, which is partial")
             )
         );
         txn.abort().await.unwrap();
     });
 }
 
-/// A dependency that the transaction stages is partial if the repository has
+/// An attachment that the transaction stages is partial if the repository has
 /// a partial marker for it.
 #[test]
 fn check_attachments_refuses_a_staged_attachment_with_a_partial_marker() {
@@ -442,7 +442,7 @@ fn check_attachments_refuses_a_staged_attachment_with_a_partial_marker() {
             (
                 None,
                 RelationField::Attachments,
-                format!("dependency a/x names commit {att}, which is partial")
+                format!("attachment a/x names commit {att}, which is partial")
             )
         );
         txn.abort().await.unwrap();
@@ -464,9 +464,9 @@ fn invalid_input(err: Error) -> String {
     }
 }
 
-/// The write through the checked list does not check the dependencies again:
+/// The write through the checked list does not check the attachments again:
 /// a partial marker that comes after the check does not stop the write.
-/// `write_commit` refuses the same dependency.
+/// `write_commit` refuses the same attachment.
 #[test]
 fn write_commit_checked_does_not_check_again() {
     let tmp = TmpDir::new("related-checked-once");
@@ -501,7 +501,7 @@ fn write_commit_checked_does_not_check_again() {
             (
                 None,
                 RelationField::Attachments,
-                format!("dependency container/fe names commit {fe}, which is partial")
+                format!("attachment container/fe names commit {fe}, which is partial")
             )
         );
         txn.abort().await.unwrap();
@@ -531,7 +531,7 @@ fn write_commit_checked_refuses_a_list_of_another_transaction() {
             .unwrap_err();
         assert_eq!(
             invalid_input(err),
-            "the checked dependencies come from another transaction"
+            "the checked attachments come from another transaction"
         );
         assert_eq!(staged(&repo), staged_before, "the call stages nothing");
         other.abort().await.unwrap();
@@ -552,7 +552,7 @@ fn write_commit_checked_refuses_a_list_of_another_transaction() {
     });
 }
 
-/// The checked list gives the dependencies alone, so `opts.attachments` must be
+/// The checked list gives the attachments alone, so `opts.attachments` must be
 /// empty. The call stages nothing, and the transaction stays usable.
 #[test]
 fn write_commit_checked_refuses_attachments_in_the_options() {
@@ -574,7 +574,7 @@ fn write_commit_checked_refuses_attachments_in_the_options() {
             .unwrap_err();
         assert_eq!(
             invalid_input(err),
-            "the commit options name dependencies; the checked dependencies give them"
+            "the commit options name attachments; the checked attachments give them"
         );
         assert_eq!(staged(&repo), staged_before, "the call stages nothing");
 
@@ -639,7 +639,7 @@ fn write_commit_refuses_a_nested_attachment() {
             (
                 None,
                 RelationField::Attachments,
-                format!("dependency lib/b names commit {b}, which has dependencies of its own")
+                format!("attachment lib/b names commit {b}, which has attachments of its own")
             )
         );
         txn.abort().await.unwrap();
@@ -662,7 +662,7 @@ fn write_commit_accepts_an_attachment_of_the_same_transaction() {
             .write_commit(options("head", &[("a/dep", att)]), &root)
             .await
             .unwrap();
-        // A staged dependency with a dependency of its own is nested.
+        // A staged attachment with an attachment of its own is nested.
         let nested_root = stage_tree(&txn, tmp.path(), "nested").await;
         let err = txn
             .write_commit(options("nested", &[("a/head", head)]), &nested_root)
@@ -670,7 +670,7 @@ fn write_commit_accepts_an_attachment_of_the_same_transaction() {
             .unwrap_err();
         assert_eq!(
             related_error(err).2,
-            format!("dependency a/head names commit {head}, which has dependencies of its own")
+            format!("attachment a/head names commit {head}, which has attachments of its own")
         );
         txn.commit().await.unwrap();
         assert_eq!(
@@ -710,7 +710,7 @@ fn composefs_metadata_refuses_a_defective_source_field() {
         let cases: [(&[Field2Entry], String); 5] = [
             (
                 &[("lib/b", b_bytes)],
-                format!("dependency lib/b names commit {b}, which has dependencies of its own"),
+                format!("attachment lib/b names commit {b}, which has attachments of its own"),
             ),
             (
                 &[("lib/y", c_bytes), ("lib/x", c_bytes)],
@@ -727,7 +727,7 @@ fn composefs_metadata_refuses_a_defective_source_field() {
             (
                 &[("lib/x", &[0x33; 32])],
                 format!(
-                    "dependency lib/x names commit {}, which is in neither the repository nor \
+                    "attachment lib/x names commit {}, which is in neither the repository nor \
                      the transaction",
                     Checksum::from_ay(&[0x33; 32]).unwrap()
                 ),
@@ -777,7 +777,7 @@ fn read_commit_relations_gives_both_fields() {
                 ]),
             }
         );
-        // With no detached metadata, the build sources are empty.
+        // With no detached metadata, the supplements are empty.
         assert_eq!(
             repo.read_commit_relations(&att).await.unwrap(),
             CommitRelations::default()

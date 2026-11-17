@@ -18,7 +18,7 @@ use crate::verify::{Found, Payload, Policy, PullTrust, examine};
 
 /// The signature verification of one pull.
 pub(crate) struct Verification {
-    /// The policy for each commit that the pull carries, except a dependency
+    /// The policy for each commit that the pull carries, except an attachment
     /// in no other role.
     commit: Policy,
     /// The policy for the summary of the remote.
@@ -34,7 +34,7 @@ impl Verification {
         Verification { commit, summary }
     }
 
-    /// Returns `true` if this pull verifies its commits. A dependency in no
+    /// Returns `true` if this pull verifies its commits. An attachment in no
     /// other role gets no check.
     pub(crate) fn checks_commits(&self) -> bool {
         self.commit.applies()
@@ -131,7 +131,7 @@ impl Verification {
     /// - The advertisement names the superblock.
     /// - The commit policy applies to the delivered commit: a target or a
     ///   commit of a chain. The pull does not call this function for the
-    ///   delta of a dependency.
+    ///   delta of an attachment.
     ///
     /// If a delta carries signatures and no signature is from a trusted key,
     /// this function fails with [`Error::Signature`].

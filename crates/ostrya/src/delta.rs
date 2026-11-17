@@ -361,14 +361,14 @@ impl Repo {
     /// must be in the repository too, because an offline application does not
     /// fetch them.
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
-    /// Each dependency of the target, which field 2 of the target commit
+    /// Each attachment of the target, which field 2 of the target commit
     /// names, must be complete in the repository, and must have no
-    /// dependencies of its own. The call checks this before it writes an
+    /// attachments of its own. The call checks this before it writes an
     /// object. The check runs also if the repository holds the target. A delta
     /// carries its target alone, so offline media carry one delta for each
-    /// dependency. Apply the deltas of the dependencies first. The check
+    /// attachment. Apply the deltas of the attachments first. The check
     /// accepts entries that are not sorted by name and two entries with the
     /// same name.
     ///
@@ -421,7 +421,7 @@ impl Repo {
     /// superblock, and each other part from the file `parts_dir/<index>`. The
     /// other rules of [`apply_static_delta_offline`](Repo::apply_static_delta_offline)
     /// apply: the call verifies no signature, the fallback objects must be in
-    /// the repository, the dependencies of the target must be complete, and
+    /// the repository, the attachments of the target must be complete, and
     /// the call sets no ref.
     ///
     /// If the call stages the target commit object, it records the target as
@@ -435,8 +435,8 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if a fallback object of the delta, or a
     ///   source object that a part reads, is not in the repository.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of the target commit
-    ///   has an empty name or a checksum that is not 32 bytes, or if a
-    ///   dependency is absent, partial, or has dependencies of its own. The
+    ///   has an empty name or a checksum that is not 32 bytes, or if an
+    ///   attachment is absent, partial, or has attachments of its own. The
     ///   call writes no object.
     /// - [`Error::InvalidFormat`] if a part breaks the format:
     ///   - an inline part that is not a `(yay)` variant
@@ -452,8 +452,8 @@ impl Repo {
     ///     object or a symlink target larger than 128 MiB
     ///   - a symlink target that is not UTF-8
     /// - [`Error::Core`] if a part payload, an operand, a checksum, or an xattr
-    ///   set does not decode, or if field 2 of the target commit or of a
-    ///   dependency does not decode.
+    ///   set does not decode, or if field 2 of the target commit or of an
+    ///   attachment does not decode.
     /// - [`Error::ChecksumMismatch`] if an object that a part produces does not
     ///   hash to the checksum that the part names for it.
     /// - [`Error::Pull`] if the repository is `bare-user-only` and a content
@@ -496,7 +496,7 @@ impl Repo {
             }
         }
 
-        // The dependencies of the target are in field 2 of the commit. One
+        // The attachments of the target are in field 2 of the commit. One
         // call on the blocking pool decodes field 2 and checks its format.
         let bytes = std::mem::take(&mut sb.commit_bytes);
         let to = sb.to;
@@ -511,7 +511,7 @@ impl Repo {
         let attachments = attachments?;
 
         let txn = self.transaction().await?;
-        // Each dependency must be complete and must have no dependencies of
+        // Each attachment must be complete and must have no attachments of
         // its own. The check runs before the first write, so a refusal writes
         // no object.
         related::check_attachments(&txn, Some(sb.to), &attachments).await?;

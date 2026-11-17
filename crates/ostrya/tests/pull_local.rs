@@ -109,10 +109,10 @@ async fn commit_tree_with(
     commit_tree_full(repo, base, sub, branch, parent, flags, owner, &[]).await
 }
 
-/// Commits subtree `sub` as [`commit_tree`] does, with the dependencies
+/// Commits subtree `sub` as [`commit_tree`] does, with the attachments
 /// `related` in field 2.
 ///
-/// The repository must hold each dependency complete.
+/// The repository must hold each attachment complete.
 async fn commit_tree_related(
     repo: &Repo,
     base: &Path,
@@ -134,7 +134,7 @@ async fn commit_tree_related(
     .await
 }
 
-/// Commits subtree `sub` as [`commit_tree_with`] does, with the dependencies
+/// Commits subtree `sub` as [`commit_tree_with`] does, with the attachments
 /// `related` in field 2.
 #[allow(clippy::too_many_arguments)]
 async fn commit_tree_full(
@@ -6052,9 +6052,9 @@ async fn commit_collection_ref(
 }
 
 /// Commits the tree under `base/<sub>` as [`commit_collection_ref`] does, with
-/// the dependencies `related` in field 2.
+/// the attachments `related` in field 2.
 ///
-/// The repository must hold each dependency complete.
+/// The repository must hold each attachment complete.
 #[allow(clippy::too_many_arguments)]
 async fn commit_collection_ref_full(
     repo: &Repo,
@@ -6943,7 +6943,7 @@ fn a_collection_delta_pull_reads_the_from_commit_at_the_written_ref() {
     });
 }
 
-/// The search for the delta of a dependency reads the paired entry from the
+/// The search for the delta of an attachment reads the paired entry from the
 /// commit that the ref names at the place where the pull writes the ref. In a
 /// destination whose `[core] collection-id` is the id, that place is the
 /// local ref, also when `refs/mirrors/COLLECTION/main` names another commit.
@@ -8517,11 +8517,11 @@ fn a_commit_only_local_pull_with_a_list_reads_a_bare_source() {
     });
 }
 
-// --- dependencies --------------------------------------------------------
+// --- attachments --------------------------------------------------------
 
 /// Creates an archive source under `base/src`. `dep/uki` names the
-/// dependency, and `main` names the tip, whose field 2 names the dependency
-/// as `boot/uki`. Returns the path, the source, the tip, and the dependency.
+/// attachment, and `main` names the tip, whose field 2 names the attachment
+/// as `boot/uki`. Returns the path, the source, the tip, and the attachment.
 async fn build_attachment_source(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
     build_tree(&base.join("uki"), b"uki\n");
     build_tree(&base.join("main"), b"main\n");
@@ -8590,9 +8590,9 @@ fn counted_pull() -> PullOptions {
     chain_pull(Vec::new())
 }
 
-/// A pull imports the dependency that field 2 of the pulled commit names,
+/// A pull imports the attachment that field 2 of the pulled commit names,
 /// complete, and writes no ref for it. The import counts hold the objects of
-/// the dependency. A repeat pull imports nothing.
+/// the attachment. A repeat pull imports nothing.
 #[test]
 fn a_local_pull_imports_the_attachment_of_the_commit() {
     let tmp = TmpDir::new("pull-local-dependency");
@@ -8633,7 +8633,7 @@ fn a_local_pull_imports_the_attachment_of_the_commit() {
 }
 
 /// The destination holds the tip complete and does not hold the commit
-/// object of its dependency. A repeat pull follows the dependency of the tip
+/// object of its attachment. A repeat pull follows the attachment of the tip
 /// and imports that commit object alone.
 #[test]
 fn a_local_pull_follows_the_attachment_of_a_tip_held_complete() {
@@ -8667,8 +8667,8 @@ fn a_local_pull_follows_the_attachment_of_a_tip_held_complete() {
     });
 }
 
-/// A pull with depth follows the dependencies of each parent that it takes.
-/// At depth 0 it takes no parent, so it imports the dependency of the tip
+/// A pull with depth follows the attachments of each parent that it takes.
+/// At depth 0 it takes no parent, so it imports the attachment of the tip
 /// alone.
 #[test]
 fn a_local_pull_with_depth_imports_the_attachments_of_the_parents() {
@@ -8717,8 +8717,8 @@ fn a_local_pull_with_depth_imports_the_attachments_of_the_parents() {
     });
 }
 
-/// A dependency that two pulled commits name is imported one time. The
-/// dependency has a `.commitmeta`, and the pull counts it one time.
+/// An attachment that two pulled commits name is imported one time. The
+/// attachment has a `.commitmeta`, and the pull counts it one time.
 #[test]
 fn an_attachment_that_two_local_commits_name_is_imported_once() {
     let tmp = TmpDir::new("pull-local-dependency-once");
@@ -8756,8 +8756,8 @@ fn an_attachment_that_two_local_commits_name_is_imported_once() {
     });
 }
 
-/// A pull imports a dependency at depth 0, also under a pull of the whole
-/// history. The parent of the dependency stays in the source.
+/// A pull imports an attachment at depth 0, also under a pull of the whole
+/// history. The parent of the attachment stays in the source.
 #[test]
 fn a_local_attachment_is_imported_at_depth_zero() {
     let tmp = TmpDir::new("pull-local-dependency-depth");
@@ -8789,7 +8789,7 @@ fn a_local_attachment_is_imported_at_depth_zero() {
     });
 }
 
-/// A pull does not import a build source: the commit that `ostrya.related`
+/// A pull does not import a supplement: the commit that `ostrya.related`
 /// names. The key travels with the detached metadata of the commit.
 #[test]
 fn a_local_pull_does_not_import_a_supplement() {
@@ -8816,7 +8816,7 @@ fn a_local_pull_does_not_import_a_supplement() {
     });
 }
 
-/// A commit-only pull imports no dependency. A later full pull imports it
+/// A commit-only pull imports no attachment. A later full pull imports it
 /// and completes the tip.
 #[test]
 fn a_commit_only_local_pull_imports_no_attachment() {
@@ -8837,7 +8837,7 @@ fn a_commit_only_local_pull_imports_no_attachment() {
 }
 
 /// A commit-only pull checks the format of field 2: a defective entry fails
-/// it. It follows no dependency, so a nested dependency and a dependency
+/// it. It follows no attachment, so a nested attachment and an attachment
 /// that no repository holds do not fail it.
 #[test]
 fn a_commit_only_local_pull_checks_the_format_of_field_2() {
@@ -8878,13 +8878,13 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
     });
 }
 
-/// Under `PullFlags::UNTRUSTED`, a dependency whose bytes do not hash to the
+/// Under `PullFlags::UNTRUSTED`, an attachment whose bytes do not hash to the
 /// checksum in field 2 of the tip fails the pull with
 /// `Error::ChecksumMismatch` for that checksum, and the pull leaves nothing.
 /// The source holds the bytes of a different commit with an empty field 2 at
-/// the path of the dependency. The walk hashes the bytes that it reads, so
+/// the path of the attachment. The walk hashes the bytes that it reads, so
 /// the hash finds the defect before the walk reads field 2. The pull checks
-/// no signature of the dependency, so under a remote with `sign-verify` and a
+/// no signature of the attachment, so under a remote with `sign-verify` and a
 /// signed tip the pull fails with the same error.
 #[test]
 fn a_local_attachment_with_wrong_bytes_fails_an_untrusted_pull() {
@@ -8949,9 +8949,9 @@ fn a_local_attachment_with_wrong_bytes_fails_an_untrusted_pull() {
     });
 }
 
-/// The pull checks no signature of a dependency. Under a remote with
-/// `sign-verify` and a signed tip, an unsigned dependency passes the pull, and
-/// the destination holds no detached metadata for it. A dependency that a key
+/// The pull checks no signature of an attachment. Under a remote with
+/// `sign-verify` and a signed tip, an unsigned attachment passes the pull, and
+/// the destination holds no detached metadata for it. An attachment that a key
 /// signed that the destination does not trust passes too, and the destination
 /// holds the `.commitmeta` of the source.
 #[test]
@@ -8991,9 +8991,9 @@ fn a_local_attachment_with_no_trusted_signature_passes_the_pull() {
     });
 }
 
-/// A dependency that this repository holds complete keeps the detached
+/// An attachment that this repository holds complete keeps the detached
 /// metadata of this repository: the pull copies no `.commitmeta` for it. A
-/// pull that takes the dependency as a target copies the `.commitmeta` of the
+/// pull that takes the attachment as a target copies the `.commitmeta` of the
 /// source.
 #[test]
 fn a_local_attachment_held_complete_keeps_its_detached_metadata() {
@@ -9032,9 +9032,9 @@ fn a_local_attachment_held_complete_keeps_its_detached_metadata() {
     });
 }
 
-/// A dependency that the pull also takes as a target gets the check of a
+/// An attachment that the pull also takes as a target gets the check of a
 /// target. Under a remote with `sign-verify` and a signed tip, an unsigned
-/// dependency that a requested ref names fails the pull, and the pull leaves
+/// attachment that a requested ref names fails the pull, and the pull leaves
 /// nothing.
 #[test]
 fn a_local_attachment_that_is_also_a_target_is_checked() {
@@ -9065,8 +9065,8 @@ fn a_local_attachment_that_is_also_a_target_is_checked() {
 
 /// A parent that the depth of the pull takes gets the check of a parent, also
 /// if field 2 of the tip names it. Under a remote with `sign-verify`, a signed
-/// tip, and an unsigned parent, a pull at depth 0 takes the parent as a
-/// dependency alone and passes. A pull at depth 1 refuses the parent.
+/// tip, and an unsigned parent, a pull at depth 0 takes the parent as an
+/// attachment alone and passes. A pull at depth 1 refuses the parent.
 #[test]
 fn a_local_attachment_that_is_also_a_parent_is_checked() {
     let tmp = TmpDir::new("pull-local-dependency-parent-signature");
@@ -9109,7 +9109,7 @@ fn a_local_attachment_that_is_also_a_parent_is_checked() {
     });
 }
 
-/// A dependency that neither the source nor the destination holds fails the
+/// An attachment that neither the source nor the destination holds fails the
 /// pull with `Error::ObjectNotFound`, and the pull leaves nothing.
 #[test]
 fn a_missing_local_attachment_fails_the_pull() {
@@ -9158,9 +9158,9 @@ fn a_defective_local_attachment_entry_fails_the_pull() {
     });
 }
 
-/// A dependency that names dependencies of its own fails the pull with
+/// An attachment that names attachments of its own fails the pull with
 /// `Error::InvalidRelations`, also if the walk takes that commit as a target.
-/// The error names the commit that names the nested dependency. The pull
+/// The error names the commit that names the nested attachment. The pull
 /// leaves nothing.
 #[test]
 fn a_nested_local_attachment_fails_the_pull() {
@@ -9170,8 +9170,8 @@ fn a_nested_local_attachment_fails_the_pull() {
         let (_src_dir, src, tip, att) = build_attachment_source(base).await;
         build_tree(&base.join("other"), b"other\n");
         let other = commit_tree(&src, base, "other", "other", None).await;
-        // `other` names a commit with a dependency, and `main` names a commit
-        // whose dependency is that commit.
+        // `other` names a commit with an attachment, and `main` names a commit
+        // whose attachment is that commit.
         let nested = store_with_field2(&src, &other, &[("lib/c", att.as_bytes())]).await;
         let head = store_with_field2(&src, &tip, &[("lib/b", nested.as_bytes())]).await;
         move_ref(&src, "other", &nested).await;
@@ -9179,7 +9179,7 @@ fn a_nested_local_attachment_fails_the_pull() {
         let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
         let reason =
-            format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+            format!("attachment lib/b names commit {nested}, which has attachments of its own");
         for refs in [&["main"][..], &["main", "other"]] {
             let err = dst
                 .pull_local(
@@ -9201,8 +9201,8 @@ fn a_nested_local_attachment_fails_the_pull() {
     });
 }
 
-/// One tip names an absent commit and a commit that names dependencies of its
-/// own. The pull reads the dependencies in the order of field 2 and fails at
+/// One tip names an absent commit and a commit that names attachments of its
+/// own. The pull reads the attachments in the order of field 2 and fails at
 /// the first defect. A first entry that names the parent of the tip needs no
 /// read. The pull leaves nothing.
 #[test]
@@ -9244,7 +9244,7 @@ fn the_first_failing_local_attachment_gives_the_error() {
                 assert_commit_not_found(&err, &absent);
             } else {
                 let reason = format!(
-                    "dependency b/x names commit {nested}, which has dependencies of its own"
+                    "attachment b/x names commit {nested}, which has attachments of its own"
                 );
                 assert_eq!(attachment_error(err), (Some(tip), reason));
             }
@@ -9254,8 +9254,8 @@ fn the_first_failing_local_attachment_gives_the_error() {
 }
 
 /// The tip of `main` names the tip of `other`, which the walk takes and which
-/// names dependencies of its own, and an absent commit. The pull reads no
-/// dependency after the nested one, so the order of field 2 selects the
+/// names attachments of its own, and an absent commit. The pull reads no
+/// attachment after the nested one, so the order of field 2 selects the
 /// error. The pull leaves nothing.
 #[test]
 fn a_held_nested_attachment_before_a_missing_one_gives_the_nested_error() {
@@ -9294,7 +9294,7 @@ fn a_held_nested_attachment_before_a_missing_one_gives_the_nested_error() {
                 .unwrap_err();
             if first == other {
                 let reason = format!(
-                    "dependency a/x names commit {other}, which has dependencies of its own"
+                    "attachment a/x names commit {other}, which has attachments of its own"
                 );
                 assert_eq!(attachment_error(err), (Some(tip), reason));
             } else {
@@ -9306,7 +9306,7 @@ fn a_held_nested_attachment_before_a_missing_one_gives_the_nested_error() {
 }
 
 /// A parent that the source does not hold ends its chain. If a pulled commit
-/// names the parent as a dependency, the pull fails with
+/// names the parent as an attachment, the pull fails with
 /// `Error::ObjectNotFound`.
 #[test]
 fn an_absent_local_parent_that_is_an_attachment_fails_the_pull() {
@@ -9339,7 +9339,7 @@ fn an_absent_local_parent_that_is_an_attachment_fails_the_pull() {
     });
 }
 
-/// A dependency that the destination holds partial is imported whole, and
+/// An attachment that the destination holds partial is imported whole, and
 /// the pull removes its marker.
 #[test]
 fn a_local_attachment_held_partial_is_completed() {
@@ -9366,7 +9366,7 @@ fn a_local_attachment_held_partial_is_completed() {
     });
 }
 
-/// The tip names its own parent as a dependency. At depth 0 the dependency
+/// The tip names its own parent as an attachment. At depth 0 the attachment
 /// brings the parent in, and at depth 1 the walk does. In both, the pull
 /// takes the parent one time, with no parent of its own, and counts its
 /// `.commitmeta` one time.
@@ -9409,7 +9409,7 @@ fn a_local_parent_that_is_an_attachment_is_imported_once() {
     });
 }
 
-/// A content object of the dependency alone is missing from the source. The
+/// A content object of the attachment alone is missing from the source. The
 /// import fails after the pull wrote the marker of each commit, and the pull
 /// removes each marker and publishes nothing.
 #[test]
@@ -9439,8 +9439,8 @@ fn a_failure_in_the_import_of_an_attachment_clears_its_marker() {
     });
 }
 
-/// A localcache repository supplies a dependency that the source does not
-/// hold. A dependency that the destination holds complete, and that no
+/// A localcache repository supplies an attachment that the source does not
+/// hold. An attachment that the destination holds complete, and that no
 /// source holds, needs no source.
 #[test]
 fn an_attachment_comes_from_a_localcache_or_the_destination() {
@@ -9478,7 +9478,7 @@ fn an_attachment_comes_from_a_localcache_or_the_destination() {
     });
 }
 
-/// One tip names three dependencies. The source alone holds the first, a
+/// One tip names three attachments. The source alone holds the first, a
 /// localcache repository alone holds the second, and the destination alone
 /// holds the third, complete. The pull reads each one from the repository
 /// that holds it, and each one ends complete in the destination.
@@ -9535,12 +9535,12 @@ fn a_local_pull_reads_each_attachment_from_the_repository_that_holds_it() {
     });
 }
 
-/// A tip names two dependencies. The destination alone holds the first. Two
+/// A tip names two attachments. The destination alone holds the first. Two
 /// repositories hold the second: the earlier one in the order source,
 /// localcache, destination holds a copy that does not read, and the later one
 /// holds a good copy. The pull fails on the defective copy. Thus the pull
 /// reads the source before a localcache and a localcache before the
-/// destination, and it starts the search of each dependency at the source.
+/// destination, and it starts the search of each attachment at the source.
 #[test]
 fn a_local_pull_reads_an_attachment_from_its_first_holder() {
     let tmp = TmpDir::new("pull-local-dependency-holder-order");
@@ -9596,7 +9596,7 @@ fn a_local_pull_reads_an_attachment_from_its_first_holder() {
 }
 
 /// With `keep-detached-related=false` in the destination, the pull drops
-/// `ostrya.related` from the detached metadata of a dependency and stores
+/// `ostrya.related` from the detached metadata of an attachment and stores
 /// each other property.
 #[test]
 fn the_switch_drops_the_related_key_of_an_attachment() {
@@ -9626,7 +9626,7 @@ fn the_switch_drops_the_related_key_of_an_attachment() {
     });
 }
 
-/// A pull of a collection ref imports the dependency of the commit, and
+/// A pull of a collection ref imports the attachment of the commit, and
 /// writes no ref.
 #[test]
 fn a_collection_pull_imports_an_attachment() {
@@ -9648,9 +9648,9 @@ fn a_collection_pull_imports_an_attachment() {
     });
 }
 
-/// The intermediate commit B of a chain of static deltas names a dependency.
-/// The pull imports the dependency loose. If the target names B as a
-/// dependency, B is a nested dependency, and the pull fails before its
+/// The intermediate commit B of a chain of static deltas names an attachment.
+/// The pull imports the attachment loose. If the target names B as an
+/// attachment, B is a nested attachment, and the pull fails before its
 /// transaction opens.
 #[test]
 fn an_attachment_of_an_intermediate_commit_is_imported() {
@@ -9665,7 +9665,7 @@ fn an_attachment_of_an_intermediate_commit_is_imported() {
         let att = commit_tree(&src, base, "uki", "dep/uki", None).await;
         let b = commit_tree_related(&src, base, "b", "main", Some(a), &[("boot/uki", att)]).await;
         let c = commit_tree(&src, base, "c", "main", Some(b)).await;
-        // The commit write refuses a nested dependency, so the commit that
+        // The commit write refuses a nested attachment, so the commit that
         // names B is a copy of C with its own field 2.
         let naming = store_with_field2(&src, &c, &[("lib/b", b.as_bytes())]).await;
         let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (b, naming)]).await;
@@ -9689,7 +9689,7 @@ fn an_attachment_of_an_intermediate_commit_is_imported() {
             attachment_error(err),
             (
                 Some(naming),
-                format!("dependency lib/b names commit {b}, which has dependencies of its own")
+                format!("attachment lib/b names commit {b}, which has attachments of its own")
             )
         );
         assert_eq!(nested.list_objects().await.unwrap(), held);
@@ -9698,7 +9698,7 @@ fn an_attachment_of_an_intermediate_commit_is_imported() {
     });
 }
 
-/// The target names the intermediate commit B of its chain as a dependency.
+/// The target names the intermediate commit B of its chain as an attachment.
 /// The source holds no commit object of B, so only the delta of its step
 /// makes B. The pull reads no commit of B and imports it from its delta.
 #[test]
@@ -9768,9 +9768,9 @@ fn a_defective_entry_of_an_intermediate_commit_fails_the_pull() {
 }
 
 /// A pull that requires static deltas applies the from-scratch delta of the
-/// tip. The tip names a dependency that has no delta, so the pull fails
+/// tip. The tip names an attachment that has no delta, so the pull fails
 /// before its transaction opens. The message names the entry, the ref, and
-/// the dependency.
+/// the attachment.
 #[test]
 fn a_required_delta_pull_refuses_an_attachment_with_no_delta() {
     let tmp = TmpDir::new("pull-local-dependency-required");
@@ -9798,9 +9798,9 @@ fn a_required_delta_pull_refuses_an_attachment_with_no_delta() {
     });
 }
 
-/// The intermediate commit B of a chain of static deltas names a dependency,
+/// The intermediate commit B of a chain of static deltas names an attachment,
 /// and the depth of the pull also takes B as the parent of the target. The
-/// pull imports the dependency one time, complete.
+/// pull imports the attachment one time, complete.
 #[test]
 fn an_attachment_of_an_intermediate_commit_that_the_depth_reaches_is_imported_once() {
     let tmp = TmpDir::new("pull-local-dependency-chain-depth");
@@ -9847,10 +9847,10 @@ fn an_attachment_of_an_intermediate_commit_that_the_depth_reaches_is_imported_on
     });
 }
 
-// --- static deltas of dependencies ---------------------------------------
+// --- static deltas of attachments ---------------------------------------
 
-/// Creates an archive source under `base/src` with two commits of a
-/// dependency, D1 and D2, and two commits on `main`, T1 and T2. T1 names D1
+/// Creates an archive source under `base/src` with two commits of an
+/// attachment, D1 and D2, and two commits on `main`, T1 and T2. T1 names D1
 /// as `boot/uki`, and T2, a child of T1, names D2 as `boot/uki`. The ref
 /// `main` names T1. Returns the source and `[T1, D1, T2, D2]`.
 async fn build_attachment_generations(base: &Path) -> (Repo, [Checksum; 4]) {
@@ -9902,7 +9902,7 @@ fn required_refs(refs: &[&str]) -> PullOptions {
     }
 }
 
-/// The pull of T2 takes the delta of its dependency D2 from the paired entry
+/// The pull of T2 takes the delta of its attachment D2 from the paired entry
 /// D1: the entry `boot/uki` of T1, which the ref `main` names before the
 /// pull. The from-scratch delta of D2 has a spoiled superblock, so a pull
 /// that took it would fail. No content object of D2 is imported loose.
@@ -9963,10 +9963,10 @@ fn a_local_attachment_delta_from_another_held_commit_is_taken() {
     });
 }
 
-/// The pull takes the from-scratch delta of a dependency if it holds no
+/// The pull takes the from-scratch delta of an attachment if it holds no
 /// paired entry complete: here the destination is empty. If the paired entry
 /// is held complete, the pull does not take the from-scratch delta and
-/// imports the dependency loose. That delta counts as found, so the pull
+/// imports the attachment loose. That delta counts as found, so the pull
 /// passes.
 #[test]
 fn the_from_scratch_delta_of_a_local_attachment_needs_no_paired_entry_held() {
@@ -10008,7 +10008,7 @@ fn the_from_scratch_delta_of_a_local_attachment_needs_no_paired_entry_held() {
     });
 }
 
-/// Two targets name one dependency D, with the paired entries DA and DB.
+/// Two targets name one attachment D, with the paired entries DA and DB.
 /// With the delta `<DB>-<D>` alone, the pull of `[left, right]` finds it in
 /// the step `<c>-<to>`. With both deltas and a spoiled `<DB>-<D>`, the pull of
 /// `[left, right]` takes `<DA>-<D>` and passes, and the pull of
@@ -10070,9 +10070,9 @@ fn the_first_local_target_gives_the_from_of_an_attachment() {
     });
 }
 
-/// A pull by checksum names no local ref, so a dependency gets no paired
+/// A pull by checksum names no local ref, so an attachment gets no paired
 /// entry, and the pull takes its from-scratch delta. A pull of `main` holds
-/// the paired entry D1 complete and imports the dependency loose.
+/// the paired entry D1 complete and imports the attachment loose.
 #[test]
 fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-checksum");
@@ -10102,7 +10102,7 @@ fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_an_attachment() {
 }
 
 /// Under `disable_static_deltas`, a pull that requires static deltas reads
-/// no delta, also for a dependency that has one, and imports it loose.
+/// no delta, also for an attachment that has one, and imports it loose.
 #[test]
 fn a_local_pull_with_disabled_deltas_reads_no_attachment_delta() {
     let tmp = TmpDir::new("pull-local-dependency-delta-disabled");
@@ -10128,10 +10128,10 @@ fn a_local_pull_with_disabled_deltas_reads_no_attachment_delta() {
     });
 }
 
-/// With a list of static deltas, the pull takes the list entry to a
-/// dependency from its paired entry, in one step, and imports no content of
-/// the dependency loose. Under `require_static_deltas`, a list with no entry
-/// to the dependency fails the pull before its transaction opens.
+/// With a list of static deltas, the pull takes the list entry to an
+/// attachment from its paired entry, in one step, and imports no content of
+/// the attachment loose. Under `require_static_deltas`, a list with no entry
+/// to the attachment fails the pull before its transaction opens.
 #[test]
 fn a_local_list_pull_takes_the_listed_delta_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-list");
@@ -10185,7 +10185,7 @@ fn a_local_list_pull_takes_the_listed_delta_of_an_attachment() {
     });
 }
 
-/// With a list of static deltas and no requirement, a dependency with no
+/// With a list of static deltas and no requirement, an attachment with no
 /// entry in the list comes as loose objects, and the pull passes. The pull
 /// applies the listed delta of the target.
 #[test]
@@ -10216,16 +10216,16 @@ fn a_local_list_pull_imports_an_attachment_with_no_listed_delta_loose() {
 /// The superblock type string, for a test that rewrites a superblock.
 const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
 
-/// The superblock of a dependency delta must give the commit that field 2
+/// The superblock of an attachment delta must give the commit that field 2
 /// names. The source holds two changed superblocks in turn in the directory of
-/// the delta of the dependency:
+/// the delta of the attachment:
 ///
-/// - the superblock of the dependency, with the commit of another tree in
-///   place of the dependency commit. The parse of the superblock finds that
+/// - the superblock of the attachment, with the commit of another tree in
+///   place of the attachment commit. The parse of the superblock finds that
 ///   the commit does not hash to the `to` of the superblock, and the pull
 ///   fails with [`Error::InvalidFormat`].
 /// - the superblock of the delta of another commit. The `to` of the
-///   superblock is not the dependency, and the pull fails with
+///   superblock is not the attachment, and the pull fails with
 ///   [`Error::Pull`].
 ///
 /// A list names the delta with the digest of the changed bytes, so no digest
@@ -10302,11 +10302,11 @@ fn a_local_attachment_delta_that_gives_another_commit_fails_the_pull() {
     });
 }
 
-/// The pull checks no signature of the superblock of a dependency delta. A
+/// The pull checks no signature of the superblock of an attachment delta. A
 /// key that the destination does not trust signs the delta of the
-/// dependency, and the pull under a remote that checks the commits against
+/// attachment, and the pull under a remote that checks the commits against
 /// the key that signed the tip takes the delta. A pull that takes the
-/// dependency as a target too checks the superblock, and fails with
+/// attachment as a target too checks the superblock, and fails with
 /// [`Error::Signature`].
 #[test]
 fn a_local_attachment_delta_signed_by_an_untrusted_key_passes_the_pull() {

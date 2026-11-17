@@ -346,7 +346,7 @@ fn the_ancestry_rule_b_reaches_roots_a_second_weak_ref() {
         let repo = repo_with_trees(tmp.path(), &["c1", "c2", "c3", "x", "y"]).await;
         let x = commit(&repo, tmp.path(), "x", None, Some("pool/b")).await;
         let x_root = commit_root(&repo, &x).await;
-        // c1 names x as a build source. The walk reads this entry only if the
+        // c1 names x as a supplement. The walk reads this entry only if the
         // weak ref pool/a re-seeds c2 at the bound of its own name.
         let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
         repo.add_supplement(&c1, "source/x", &x).await.unwrap();
@@ -1628,7 +1628,7 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
         let g1 = commit(&repo, tmp.path(), "g1", None, None).await;
         let g2 = commit(&repo, tmp.path(), "g2", Some(g1), None).await;
         let g3 = commit(&repo, tmp.path(), "g3", Some(g2), Some("origin:pool/chain")).await;
-        // `main` reaches g3 over a build-source edge with the global bound of
+        // `main` reaches g3 over a supplement edge with the global bound of
         // 0. g2 and g1 survive only under the weak ref's own bound.
         let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
         repo.add_supplement(&head, "source/chain", &g3)

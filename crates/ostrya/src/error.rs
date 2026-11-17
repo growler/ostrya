@@ -522,7 +522,7 @@ pub enum Error {
         /// The text that names what ended the upload.
         message: String,
     },
-    /// A defective list of related commits, or dependencies that are not
+    /// A defective list of related commits, or attachments that are not
     /// complete.
     ///
     /// These calls give this error:
@@ -531,13 +531,13 @@ pub enum Error {
     ///   [`Transaction::check_attachments`](crate::Transaction::check_attachments),
     ///   for an entry of
     ///   [`CommitOptions::attachments`](crate::CommitOptions::attachments) with an
-    ///   empty name, for two entries with the same name, and for a dependency
+    ///   empty name, for two entries with the same name, and for an attachment
     ///   that is absent, partial, or nested. The calls check before the
     ///   commit has a checksum, so `commit` is `None`.
     /// - [`Repo::commit_add_composefs_metadata`](crate::Repo::commit_add_composefs_metadata),
     ///   for a defective field 2 of the source commit: an entry with an empty
     ///   name or with a checksum that is not 32 bytes, entries that are not
-    ///   sorted by name, two entries with the same name, and a dependency
+    ///   sorted by name, two entries with the same name, and an attachment
     ///   that is absent, partial, or nested. `commit` is the source commit.
     /// - [`Repo::read_commit_relations`](crate::Repo::read_commit_relations), for
     ///   an entry with an empty name or with a checksum that is not 32 bytes,
@@ -551,35 +551,34 @@ pub enum Error {
     ///   defects. `commit` is the commit of the dict.
     /// - [`Repo::add_supplement`](crate::Repo::add_supplement) and
     ///   [`Transaction::add_supplement`](crate::Transaction::add_supplement),
-    ///   for an empty name. `commit` is the commit that gets the build
-    ///   source.
+    ///   for an empty name. `commit` is the commit that gets the supplement.
     /// - [`Repo::add_supplement`](crate::Repo::add_supplement),
     ///   and [`Transaction::commit`](crate::Transaction::commit) for an add
     ///   that
     ///   [`Transaction::add_supplement`](crate::Transaction::add_supplement)
     ///   queued, for a stored `ostrya.related` value with one of these
-    ///   defects. `commit` is the commit that gets the build source.
+    ///   defects. `commit` is the commit that gets the supplement.
     /// - [`Repo::pull`](crate::Repo::pull),
     ///   [`Repo::pull_with_session`](crate::Repo::pull_with_session),
     ///   [`Repo::pull_collection`](crate::Repo::pull_collection), and
     ///   [`Repo::pull_local`](crate::Repo::pull_local), for an
     ///   entry of field 2 with an empty name or with a checksum that is not 32
-    ///   bytes, and for a nested dependency. `commit` is the commit that holds
-    ///   the entry. For a nested dependency, it is the commit that names the
-    ///   dependency.
+    ///   bytes, and for a nested attachment. `commit` is the commit that holds
+    ///   the entry. For a nested attachment, it is the commit that names the
+    ///   attachment.
     /// - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`,
     ///   for an entry of field 2 with an empty name or with a checksum that is
     ///   not 32 bytes, in a commit of the walk of the push: a source commit or
-    ///   a commit of the parent chain that the push walks. Also for a
-    ///   dependency that the local repository marks partial or that is
-    ///   nested. A dependency whose own field 2 holds a defective entry is
+    ///   a commit of the parent chain that the push walks. Also for an
+    ///   attachment that the local repository marks partial or that is
+    ///   nested. An attachment whose own field 2 holds a defective entry is
     ///   nested. `commit` is the commit that holds the entry. For a partial or
-    ///   a nested dependency, it is the commit that first names the
-    ///   dependency.
+    ///   a nested attachment, it is the commit that first names the
+    ///   attachment.
     /// - [`Repo::apply_static_delta`](crate::Repo::apply_static_delta) and
     ///   [`Repo::apply_static_delta_offline`](crate::Repo::apply_static_delta_offline),
     ///   for an entry of field 2 of the target commit with an empty name or
-    ///   with a checksum that is not 32 bytes, and for a dependency that is
+    ///   with a checksum that is not 32 bytes, and for an attachment that is
     ///   absent, partial, or nested. `commit` is the target commit.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a

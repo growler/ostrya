@@ -510,7 +510,7 @@ fn the_fsck_notes_a_commit_with_no_image() {
 }
 
 /// With the key `true`, the fsck notes no commit that the same run marks
-/// partial because a dependency in field 2 is absent.
+/// partial because an attachment in field 2 is absent.
 #[test]
 fn the_fsck_notes_no_commit_that_it_marks_partial() {
     let scratch = TmpDir::new("cfs-gen-fsck-dep");

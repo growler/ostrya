@@ -277,7 +277,7 @@ impl PullFlags {
     /// The import of the commit objects alone.
     ///
     /// The pull does not walk the trees, and it keeps the `.commitpartial`
-    /// marker of each commit. A pull takes no dependency under this flag.
+    /// marker of each commit. A pull takes no attachment under this flag.
     pub const COMMIT_ONLY: PullFlags = PullFlags(1 << 1);
     /// The refusal of a regular file whose logical mode has bits outside
     /// `0775`.
@@ -463,8 +463,8 @@ pub enum TimestampCheck {
 /// The policy belongs to the pull. The pull verifies each target, each
 /// parent that a depth pull follows, and each commit of a chain of static
 /// deltas, also a commit that this repository already holds. It verifies no
-/// dependency, unless the dependency also has one of these roles. The section
-/// `# Dependencies` of [`Repo::pull`] states the reason. A commit that fails
+/// attachment, unless the attachment also has one of these roles. The section
+/// `# Attachments` of [`Repo::pull`] states the reason. A commit that fails
 /// the policy fails the pull with [`Error::Signature`].
 ///
 /// A pull from a remote verifies a commit outside a chain of static deltas in
@@ -506,10 +506,10 @@ pub enum TimestampCheck {
 /// If each such signature of a superblock is from a key that is not trusted,
 /// the pull fails with [`Error::Signature`].
 ///
-/// The pull verifies no superblock of the static delta of a dependency. The
-/// superblock gives the dependency commit, and field 2 names that commit by
+/// The pull verifies no superblock of the static delta of an attachment. The
+/// superblock gives the attachment commit, and field 2 names that commit by
 /// its checksum. The pull compares the checksum of the commit that the
-/// superblock gives with that checksum. A dependency that is also a target,
+/// superblock gives with that checksum. An attachment that is also a target,
 /// or that a chain of static deltas makes, keeps the checks of that role.
 ///
 /// A local pull verifies the commits and the summary before the transaction
@@ -645,10 +645,10 @@ pub struct PullOptions {
     /// commits. A value below `-1` is [`Error::InvalidInput`], and the pull
     /// writes no object and no ref.
     ///
-    /// A pull takes each dependency at depth 0, whatever this value is. It
-    /// follows the dependencies of each commit that it takes, the parents
+    /// A pull takes each attachment at depth 0, whatever this value is. It
+    /// follows the attachments of each commit that it takes, the parents
     /// included. [`Repo::pull`] and [`Repo::pull_local`] state the rules in
-    /// "Dependencies".
+    /// "Attachments".
     pub depth: i32,
     /// More local repositories that supply an object that the source does not
     /// hold, in order.
@@ -693,7 +693,7 @@ pub struct PullOptions {
     ///
     /// A pull with subpaths leaves each commit that it marks partial, and a
     /// later pull without subpaths completes it. A pull with subpaths fetches
-    /// no dependency. A value that does not start
+    /// no attachment. A value that does not start
     /// with `/`, the empty value included, fails the pull with
     /// [`Error::Pull`]. [`Repo::pull_local`] refuses the option with
     /// [`Error::Unsupported`].
@@ -751,7 +751,7 @@ pub struct PullOptions {
     /// local pull reads a delta only if it requires one or applies a list of
     /// [`static_deltas`](PullOptions::static_deltas). So with this option, a
     /// local pull reads no delta. The option also applies to the delta of
-    /// each dependency. [`Repo::pull`] states the static delta rules of a
+    /// each attachment. [`Repo::pull`] states the static delta rules of a
     /// pull.
     ///
     /// A pull refuses this option together with
@@ -779,19 +779,19 @@ pub struct PullOptions {
     /// target that the rule above leaves alone counts as found: the pull does
     /// not fail, and fetches that target loose.
     ///
-    /// The requirement also applies to each dependency that the pull fetches
-    /// and that this repository does not hold complete. A dependency with no
+    /// The requirement also applies to each attachment that the pull fetches
+    /// and that this repository does not hold complete. An attachment with no
     /// delta fails the pull with [`Error::Pull`], and the pull moves no ref.
     /// The message is `Static deltas required, but none found for <name> of
     /// <ref> to <checksum>`. `<ref>` is the first target whose chain names
-    /// the dependency, as the pull names it, and `<name>` is the name of the
+    /// the attachment, as the pull names it, and `<name>` is the name of the
     /// entry nearest to the tip of that chain. If no chain of a target names
-    /// the dependency, `<ref>` is the first target of the pull. `<name>` then
+    /// the attachment, `<ref>` is the first target of the pull. `<name>` then
     /// comes from the commit of the pull with the lowest checksum that names
-    /// the dependency, and is the lowest name if that commit has two entries
-    /// for it. `<checksum>` is the dependency. A from-scratch delta that the
-    /// rules of a dependency leave alone counts as found. With a list, the
-    /// pull takes one entry of the list to the dependency, and plans no chain
+    /// the attachment, and is the lowest name if that commit has two entries
+    /// for it. `<checksum>` is the attachment. A from-scratch delta that the
+    /// rules of an attachment leave alone counts as found. With a list, the
+    /// pull takes one entry of the list to the attachment, and plans no chain
     /// for it. [`Repo::pull`] states the search, under `# Static deltas`.
     ///
     /// A local pull reads a delta from the source directory only under this
@@ -908,7 +908,7 @@ fn apply_durability(txn: &mut Transaction, opts: &PullOptions) {
 /// pull staged. An object that the destination already held does not count.
 /// The plan of a [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull is the commit
 /// objects alone, so the pull reports those and no content. The objects of
-/// the dependencies that a pull takes count as the other objects of the
+/// the attachments that a pull takes count as the other objects of the
 /// pull.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullStats {
@@ -1238,8 +1238,8 @@ impl Repo {
     ///
     /// A parent commit that the source does not hold ends its chain without an
     /// error. So a source with a truncated history pulls what it has. A parent
-    /// that a commit of the pull names as a dependency is a dependency too, as
-    /// "Dependencies" states.
+    /// that a commit of the pull names as an attachment is an attachment too, as
+    /// "Attachments" states.
     ///
     /// The pull writes the refs last, after the objects are published. So no
     /// ref of this repository names a commit with objects that are not durable.
@@ -1291,51 +1291,51 @@ impl Repo {
     /// `ostree.collection-binding`. The ref-binding check reads the part
     /// after `@ID:` of an `@ID:NAME` name, and each other name whole.
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
-    /// Field 2 of a commit names the dependencies of the commit.
+    /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The pull
-    /// follows the dependencies of each commit that it walks: each target, and
+    /// follows the attachments of each commit that it walks: each target, and
     /// each parent that [`depth`](PullOptions::depth) takes. It also follows
-    /// the dependencies of each intermediate commit of a chain of static
+    /// the attachments of each intermediate commit of a chain of static
     /// deltas. Discovery reads field 2 of such a commit from the superblock of
     /// its step.
     ///
-    /// - The pull takes each dependency at depth 0, so a dependency entry adds
-    ///   no parent to the pull. The pull takes a dependency one time, also if
+    /// - The pull takes each attachment at depth 0, so an attachment entry adds
+    ///   no parent to the pull. The pull takes an attachment one time, also if
     ///   several commits name it.
-    /// - The pull writes no ref for a dependency.
-    /// - The pull checks no signature of a dependency commit. Field 2 holds
-    ///   the checksum of the dependency, and the checksum and the signatures
+    /// - The pull writes no ref for an attachment.
+    /// - The pull checks no signature of an attachment commit. Field 2 holds
+    ///   the checksum of the attachment, and the checksum and the signatures
     ///   of the commit that names it cover field 2. Under
-    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), the import hashes the dependency
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), the import hashes the attachment
     ///   commit and compares the result with that checksum. Without the flag,
-    ///   the pull trusts the source for a dependency as for each other
-    ///   object. The pull makes no ref-binding check on a dependency.
+    ///   the pull trusts the source for an attachment as for each other
+    ///   object. The pull makes no ref-binding check on an attachment.
     /// - A target, a parent that [`depth`](PullOptions::depth) takes, and a
     ///   commit of a chain of static deltas keep the checks of that role,
     ///   also if a field 2 names them.
-    /// - The pull reads the commit object of a dependency from the source,
+    /// - The pull reads the commit object of an attachment from the source,
     ///   then from each localcache repository, then from this repository. It
-    ///   reads no commit object of a dependency that a chain of static deltas
+    ///   reads no commit object of an attachment that a chain of static deltas
     ///   makes, so the source can hold that commit in the delta alone.
-    /// - A dependency is a commit of the pull for each other rule: its
+    /// - An attachment is a commit of the pull for each other rule: its
     ///   `.commitpartial` marker, the walk of its tree, and its detached
-    ///   metadata. For a dependency that this repository holds complete, the
-    ///   pull walks no tree and copies no `.commitmeta`. So the dependency
+    ///   metadata. For an attachment that this repository holds complete, the
+    ///   pull walks no tree and copies no `.commitmeta`. So the attachment
     ///   does not get the signatures that the source added after this
-    ///   repository stored it. A pull that takes the dependency as a target
-    ///   copies its `.commitmeta`. A dependency that this repository holds
+    ///   repository stored it. A pull that takes the attachment as a target
+    ///   copies its `.commitmeta`. An attachment that this repository holds
     ///   partial gets the walk of its whole tree and its `.commitmeta`.
-    /// - A pull that reads static deltas looks for a delta of each dependency
+    /// - A pull that reads static deltas looks for a delta of each attachment
     ///   that it appends and that this repository does not hold complete, as
-    ///   "Static deltas" states. The pull imports the objects of a dependency
+    ///   "Static deltas" states. The pull imports the objects of an attachment
     ///   with no delta loose, unless a chain of static deltas of the pull
     ///   makes that commit.
-    /// - The pull does not follow a build source: a commit that the detached
+    /// - The pull does not follow a supplement: a commit that the detached
     ///   metadata key `ostrya.related` names.
     ///
-    /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull takes no dependency. It
+    /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull takes no attachment. It
     /// also checks the format of the entries of field 2 of each commit that it
     /// walks.
     ///
@@ -1344,11 +1344,11 @@ impl Repo {
     ///
     /// - An entry of field 2 has an empty name or a checksum that is not 32
     ///   bytes.
-    /// - A dependency names dependencies of its own: its own field 2 is not
+    /// - An attachment names attachments of its own: its own field 2 is not
     ///   empty.
-    /// - Neither a source nor this repository holds a dependency. This is
+    /// - Neither a source nor this repository holds an attachment. This is
     ///   also true for a parent that the source does not hold, if a commit of
-    ///   the pull names that parent as a dependency.
+    ///   the pull names that parent as an attachment.
     ///
     /// The pull reports these defects before a target or a parent that fails
     /// the signature policy, as for each other defect of the walk.
@@ -1418,8 +1418,8 @@ impl Repo {
     /// A commit is complete in this repository if the commit object is present
     /// and no `.commitpartial` marker names it. The pull does not walk such a
     /// commit: it reads no object of its tree, and imports its detached
-    /// metadata alone. For a dependency that is complete here, the pull also
-    /// imports no detached metadata, as `# Dependencies` states.
+    /// metadata alone. For an attachment that is complete here, the pull also
+    /// imports no detached metadata, as `# Attachments` states.
     ///
     /// A gap in a complete commit stays until [`fsck`](Repo::fsck) marks the
     /// commit partial. Then a pull walks its tree and fills the gap. `fsck`
@@ -1585,7 +1585,7 @@ impl Repo {
     /// source that changes during the import cannot pass the hash. The import
     /// hashes each object once.
     ///
-    /// The flag also hashes each commit and each dependency that the walk of
+    /// The flag also hashes each commit and each attachment that the walk of
     /// the chains reads from a source, and each dirtree that the walk of the
     /// tree reads from a source. It compares each result with the name of the
     /// object before the pull uses the bytes. So the signature check, the
@@ -1608,8 +1608,8 @@ impl Repo {
     /// the signatures with the commit needs this order.
     ///
     /// The pull copies the `.commitmeta` of the first source that holds one.
-    /// It copies no `.commitmeta` of a dependency that this repository holds
-    /// complete, as `# Dependencies` states. If
+    /// It copies no `.commitmeta` of an attachment that this repository holds
+    /// complete, as `# Attachments` states. If
     /// `[ex-ostrya] keep-detached-related` of this repository is `false`
     /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
     /// the pull drops `ostrya.related` from it. A zero-length `.commitmeta` in
@@ -1655,7 +1655,7 @@ impl Repo {
     /// also checks the signatures of the commit, and the ref binding of each
     /// requested ref that names the commit. It checks the collection binding
     /// of the commit too, if the pull makes that check. Then it checks the
-    /// format of field 2 of the commit, as "Dependencies" states. The walk of
+    /// format of field 2 of the commit, as "Attachments" states. The walk of
     /// the commit chains does not check the signatures or the bindings of that
     /// commit again. This pull makes no timestamp check. So a target that
     /// the policy or its bindings refuse costs the reads of the superblocks,
@@ -1679,20 +1679,20 @@ impl Repo {
     /// under `require_static_deltas`.
     ///
     /// After the walk of the commit chains, and before the transaction opens,
-    /// the pull looks for a delta of each dependency that the walk appends and
+    /// the pull looks for a delta of each attachment that the walk appends and
     /// that this repository does not hold complete. The search and its `from`
     /// are those of [`Repo::pull`] under `# Static deltas`: the summary and
     /// the delta index of the source, or one entry of the list. A target whose
     /// name is the full hex form of its commit is a pull by checksum, and
-    /// gives no paired entry. Under `require_static_deltas`, a dependency with
+    /// gives no paired entry. Under `require_static_deltas`, an attachment with
     /// no delta fails the pull, and the pull writes nothing. The pull applies
-    /// the deltas of the dependencies after the deltas of the targets, one
+    /// the deltas of the attachments after the deltas of the targets, one
     /// part at a time, in the order of the walk. The search keeps no
-    /// superblock of a dependency. Before the pull applies the delta of a
-    /// dependency, it reads the superblock again from the source and compares
+    /// superblock of an attachment. Before the pull applies the delta of an
+    /// attachment, it reads the superblock again from the source and compares
     /// it with the digest that the summary, the delta index, or the list
-    /// states. The pull checks no signature of the superblock of a
-    /// dependency, as [`Repo::pull`] states.
+    /// states. The pull checks no signature of the superblock of an
+    /// attachment, as [`Repo::pull`] states.
     ///
     /// # Errors
     ///
@@ -1750,16 +1750,16 @@ impl Repo {
     ///   no trusted key, or if a keyring or a key file of the remote cannot
     ///   be read.
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
-    ///   summary, or no delta for a commit or for a dependency that this
+    ///   summary, or no delta for a commit or for an attachment that this
     ///   repository does not hold complete. With a `static_deltas` list, the
     ///   pull needs no summary, and fails if no chain of the list reaches a
     ///   target commit. A listed delta from scratch to the target that the
     ///   rule of [`require_static_deltas`](PullOptions::require_static_deltas)
     ///   leaves alone counts as found: the pull does not fail, and imports
-    ///   that target loose. The walk reads the commit of each dependency
-    ///   before the search for its delta. So a dependency that no source
-    ///   holds gives [`Error::ObjectNotFound`], and a dependency that names
-    ///   dependencies of its own gives [`Error::InvalidRelations`], before this
+    ///   that target loose. The walk reads the commit of each attachment
+    ///   before the search for its delta. So an attachment that no source
+    ///   holds gives [`Error::ObjectNotFound`], and an attachment that names
+    ///   attachments of its own gives [`Error::InvalidRelations`], before this
     ///   error.
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
@@ -1776,8 +1776,8 @@ impl Repo {
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit has an
-    ///   empty name or a checksum that is not 32 bytes, or if a dependency
-    ///   names dependencies of its own. The pull reports it before a failed
+    ///   empty name or a checksum that is not 32 bytes, or if an attachment
+    ///   names attachments of its own. The pull reports it before a failed
     ///   signature check of the walk, and before a `.commitmeta` of the walk
     ///   that does not parse.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
@@ -1787,13 +1787,13 @@ impl Repo {
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref. For a
     ///   collection ref, the error holds `@ID:NAME`.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
-    ///   holds a dependency or an object that a pulled commit reaches. Also if
+    ///   holds an attachment or an object that a pulled commit reaches. Also if
     ///   a dirtree that this repository holds is a symlink that points to no
     ///   file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the `.filez`
     ///   copy and the re-ingest path. Also under
-    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), if a commit or a dependency that
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), if a commit or an attachment that
     ///   the walk of the chains reads from a source, or a dirtree that the walk
     ///   of the tree reads from a source, does not hash to its name. Also if a
     ///   delta superblock does not match its advertised digest or its digest
@@ -1806,13 +1806,13 @@ impl Repo {
     ///   parse. If the signature policy verifies commits, the pull parses the
     ///   `.commitmeta` of each commit that it verifies: the copy that it reads
     ///   from `src` or a localcache repository, or the copy in this repository
-    ///   if no source holds one. It verifies no dependency. If
+    ///   if no source holds one. It verifies no attachment. If
     ///   `[ex-ostrya] keep-detached-related` of this repository is `false`, the
     ///   pull parses each `.commitmeta` that it stores.
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
     ///   `src` is malformed, or if `src` does not hold a superblock of a chain
-    ///   or of a dependency when the pull applies its delta. Also if a
+    ///   or of an attachment when the pull applies its delta. Also if a
     ///   `.filez` that the pull copies has bytes after its payload, or a
     ///   payload that does not inflate to the size that its header declares.
     /// - [`Error::InvalidFormat`] for a held dirtree that is not a regular
@@ -1995,7 +1995,7 @@ impl Repo {
             delta::DeltaPlan::default()
         };
         let mut deltas = deltas;
-        // The search for the deltas of the dependencies reads the summary
+        // The search for the deltas of the attachments reads the summary
         // values or the list of static deltas, after the walk of the chains.
         let edges = deltas.take_edges();
         // The intermediate commits of the chains. The run of the levels
@@ -2028,12 +2028,12 @@ impl Repo {
         // Discovery checked each commit of a chain, so the walk does not check
         // it again.
         //
-        // The dependencies of the commits are commits of the pull too. The
+        // The attachments of the commits are commits of the pull too. The
         // walk appends each one after the chains, at depth 0. It checks no
-        // signature of an appended dependency: field 2 of the commit that
+        // signature of an appended attachment: field 2 of the commit that
         // names it holds its checksum, and the signatures of that commit
         // cover field 2. A pull that reads static deltas then looks for the
-        // delta of each dependency that it appended, before the transaction
+        // delta of each attachment that it appended, before the transaction
         // opens. The search checks no signature of the superblock of such a
         // delta.
         let mut check = verification.checks_commits().then(|| ChainCheck {
@@ -2044,9 +2044,9 @@ impl Repo {
             failed: None,
         });
 
-        // A commit-only pull follows no dependency. It also checks the format
+        // A commit-only pull follows no attachment. It also checks the format
         // of field 2 of each commit that it walks.
-        // A pull that reads no static delta pairs no dependency with a target,
+        // A pull that reads no static delta pairs no attachment with a target,
         // so it keeps no entry of field 2 and no parent.
         let mut atts = (!flags.contains(PullFlags::COMMIT_ONLY)).then(|| ChainAttachments {
             inner: attachment::Attachments::new(!reads_deltas),
@@ -2115,8 +2115,8 @@ impl Repo {
         {
             return Err(err);
         }
-        // The search keeps the source commit and the digest of each delta of a
-        // dependency alone. The pull reads each superblock again just before
+        // The search keeps the source commit and the digest of each delta of an
+        // attachment alone. The pull reads each superblock again just before
         // it applies the delta. The maps of the walk drop here, before the
         // transaction opens.
         let mut attachment_deltas = match atts.take() {
@@ -2302,9 +2302,9 @@ impl Repo {
                 txn.write_metadata(ObjectType::Commit, Some(tip), &job.commit_bytes)
                     .await?;
             }
-            // The deltas of the dependencies follow, in the order of the walk,
+            // The deltas of the attachments follow, in the order of the walk,
             // as the deltas of the targets. The pull parses the job of one
-            // dependency at a time, and drops it after its parts.
+            // attachment at a time, and drops it after its parts.
             for chain_commit in &commits {
                 if attachment_deltas.is_empty() {
                     break;
@@ -2342,7 +2342,7 @@ impl Repo {
                     count,
                 )
                 .await?;
-                // A dependency that this repository holds complete keeps the
+                // An attachment that this repository holds complete keeps the
                 // detached metadata of this repository.
                 if !(chain_commit.attachment && chain_commit.held) {
                     self.import_detached_metadata(
@@ -2821,7 +2821,7 @@ fn create_partial_marker(
 /// The place of the refs of a pull.
 ///
 /// The pull writes each pulled ref at this place. Delta discovery, the
-/// search for the delta of a dependency, and the timestamp check read the
+/// search for the delta of an attachment, and the timestamp check read the
 /// current commit of a ref at the same place.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefPlace<'a> {
@@ -2938,7 +2938,7 @@ fn operand_collection(name: &str) -> Option<(&str, &str)> {
 ///
 /// The walk takes the format check of field 2 of each commit when it appends
 /// the commit, also if `atts` is `None`. If `atts` is present, the walk
-/// records the dependencies of each commit that it appends there. Unless
+/// records the attachments of each commit that it appends there. Unless
 /// `atts` keeps the commits alone, the walk also records the parent of each
 /// commit that it gets to.
 ///
@@ -3028,8 +3028,8 @@ struct ChainCommit {
     /// The pull sets it when the transaction is open, where it writes the
     /// markers.
     held: bool,
-    /// `true` for a dependency that the walk appended after the chains. Such
-    /// a commit is a dependency alone: a target, a parent, and a commit of a
+    /// `true` for an attachment that the walk appended after the chains. Such
+    /// a commit is an attachment alone: a target, a parent, and a commit of a
     /// chain are not appended.
     attachment: bool,
     /// What the signature check of the commit read of its `.commitmeta`.
@@ -3072,60 +3072,60 @@ impl CheckedDetached {
     }
 }
 
-/// The dependencies that the walk of the chains of a local pull met, and the
+/// The attachments that the walk of the chains of a local pull met, and the
 /// commits that it checks them against.
 struct ChainAttachments {
-    /// The dependencies, in the order in which the pull first recorded them,
-    /// and the commits that name them. The pull records the dependencies of
-    /// the commits of the walk first, then the dependencies of the
+    /// The attachments, in the order in which the pull first recorded them,
+    /// and the commits that name them. The pull records the attachments of
+    /// the commits of the walk first, then the attachments of the
     /// intermediate commits of the delta levels.
     inner: attachment::Attachments,
     /// The parent that each commit of the chains named. Under
     /// [`keys_only`](attachment::Attachments::keys_only), the map stays
-    /// empty: a pull that reads no static delta pairs no dependency with a
+    /// empty: a pull that reads no static delta pairs no attachment with a
     /// target, so it reads no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
-/// Appends each dependency of `atts` that the walk did not collect to `out`,
-/// at depth 0, in the order of `atts`. Returns each appended dependency, in
+/// Appends each attachment of `atts` that the walk did not collect to `out`,
+/// at depth 0, in the order of `atts`. Returns each appended attachment, in
 /// the same order.
 ///
-/// A dependency that `seen` holds, or that `made` holds, needs no read: the
+/// An attachment that `seen` holds, or that `made` holds, needs no read: the
 /// walk collected it, or a chain of static deltas makes it. `made` holds the
-/// intermediate commits of the chains, and `atts` holds their dependencies.
-/// The call reads each other dependency from the first repository of
-/// `sources` that holds it, else from `repo`. It follows no parent of a
-/// dependency.
+/// intermediate commits of the chains, and `atts` holds their attachments.
+/// The call reads each other attachment from the first repository of
+/// `sources` that holds it, else from `repo`. It follows no parent of an
+/// attachment.
 ///
-/// The function reads the dependencies that neither `seen` nor `made` holds in
+/// The function reads the attachments that neither `seen` nor `made` holds in
 /// one call on the blocking pool, in the order of `atts`. If `untrusted` is
-/// set, it hashes each dependency that it reads from a source, as
+/// set, it hashes each attachment that it reads from a source, as
 /// [`load_attachments_blocking`] states. The call stops at the first
-/// failure. If no dependency needs a read, the function makes no call. The
-/// call reads no dependency after the first dependency that `seen` or `made`
-/// holds and that names dependencies of its own. If the caller drops the
+/// failure. If no attachment needs a read, the function makes no call. The
+/// call reads no attachment after the first attachment that `seen` or `made`
+/// holds and that names attachments of its own. If the caller drops the
 /// future, the blocking call continues to the end of its list or to the first
 /// failure.
 ///
-/// The call checks no signature of a dependency. Field 2 of the commit that
-/// names the dependency holds its checksum, and the checksum and the
-/// signatures of that commit cover field 2. A dependency that the walk
+/// The call checks no signature of an attachment. Field 2 of the commit that
+/// names the attachment holds its checksum, and the checksum and the
+/// signatures of that commit cover field 2. An attachment that the walk
 /// collected, or that a chain makes, keeps the check of that role.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidRelations`] if a dependency names dependencies of its own.
-///   The error names the commit that first named the dependency.
-/// - [`Error::InvalidRelations`] if field 2 of a dependency that the call reads
+/// - [`Error::InvalidRelations`] if an attachment names attachments of its own.
+///   The error names the commit that first named the attachment.
+/// - [`Error::InvalidRelations`] if field 2 of an attachment that the call reads
 ///   has an entry with an empty name or with a checksum that is not 32 bytes.
-///   The error names the dependency.
-/// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds a
-///   dependency.
-/// - [`Error::ChecksumMismatch`] if `untrusted` is set and a dependency that
+///   The error names the attachment.
+/// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds an
+///   attachment.
+/// - [`Error::ChecksumMismatch`] if `untrusted` is set and an attachment that
 ///   the call reads from a source does not hash to its name.
-/// - [`Error::Core`] if the commit object of a dependency does not parse.
-/// - [`Error::InvalidFormat`] if the commit object of a dependency is larger
+/// - [`Error::Core`] if the commit object of an attachment does not parse.
+/// - [`Error::InvalidFormat`] if the commit object of an attachment is larger
 ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) or is not a regular
 ///   file, or if a symlink is on its path.
 /// - [`Error::Io`] if a file system operation fails.
@@ -3138,14 +3138,14 @@ async fn collect_attachments(
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
 ) -> Result<Vec<Checksum>> {
-    // The position in `atts.inner.order()` of each dependency to read, and
-    // its checksum. A held dependency that names dependencies of its own
-    // stops the list: the call reads no dependency after it.
+    // The position in `atts.inner.order()` of each attachment to read, and
+    // its checksum. A held attachment that names attachments of its own
+    // stops the list: the call reads no attachment after it.
     let order = atts.inner.order();
     let nested_error = |attachment: &Checksum| {
         atts.inner
             .nested_error(attachment)
-            .expect("a commit names each dependency of the order")
+            .expect("a commit names each attachment of the order")
     };
     let mut positions = Vec::new();
     let mut wanted = Vec::new();
@@ -3168,7 +3168,7 @@ async fn collect_attachments(
             .map(|src| (*src).clone())
             .chain(std::iter::once(repo.clone()))
             .collect();
-        // The closure gives the position in `wanted` of a nested dependency.
+        // The closure gives the position in `wanted` of a nested attachment.
         // The names stay here.
         loaded = match ostrya_rt::unblock(move || {
             load_attachments_blocking(&holders, &wanted, untrusted)
@@ -3587,7 +3587,7 @@ struct LoadedCommit {
     attachments: Result<Vec<(String, Checksum)>>,
 }
 
-/// What a local pull keeps of a dependency that it read: the root of its
+/// What a local pull keeps of an attachment that it read: the root of its
 /// tree.
 struct LoadedAttachment {
     root_dirtree: Checksum,
@@ -3650,29 +3650,29 @@ async fn try_load_commit(
     }
 }
 
-/// Loads the dependencies `wanted`, in order, each from the first repository
+/// Loads the attachments `wanted`, in order, each from the first repository
 /// of `holders` that holds it.
 ///
-/// For each dependency, the call parses the commit and checks the format of
+/// For each attachment, the call parses the commit and checks the format of
 /// its field 2. If `untrusted` is set, it first hashes a commit that it read
 /// from a repository other than the last of `holders`, and compares the
-/// result with the checksum of the dependency. It keeps the root of the tree
+/// result with the checksum of the attachment. It keeps the root of the tree
 /// of the commit alone, and drops the bytes before it reads the next
-/// dependency. It stops at the first failure. The inner `Err` holds the
-/// position in `wanted` of a dependency that names dependencies of its own.
+/// attachment. It stops at the first failure. The inner `Err` holds the
+/// position in `wanted` of an attachment that names attachments of its own.
 ///
 /// The function reads on the calling thread. A caller on the executor calls
-/// it in one call on the blocking pool for all dependencies.
+/// it in one call on the blocking pool for all attachments.
 ///
 /// # Errors
 ///
-/// - [`Error::ObjectNotFound`] if no repository of `holders` holds a
-///   dependency.
+/// - [`Error::ObjectNotFound`] if no repository of `holders` holds an
+///   attachment.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a commit that the
-///   call hashes does not hash to the checksum of its dependency.
-/// - [`Error::InvalidRelations`] if field 2 of a dependency has an entry with
+///   call hashes does not hash to the checksum of its attachment.
+/// - [`Error::InvalidRelations`] if field 2 of an attachment has an entry with
 ///   an empty name or with a checksum that is not 32 bytes. The error names
-///   the dependency.
+///   the attachment.
 /// - The errors of [`parse_loaded`], and the errors of the read of a commit
 ///   object other than an absent object.
 fn load_attachments_blocking(
@@ -3847,7 +3847,7 @@ impl Repo {
     ///
     /// The pull is the pull of a local candidate of [`Repo::pull_collection`]
     /// at depth 0, with no static delta. It takes the `.commitmeta` and the
-    /// dependencies of field 2 of each commit. It writes each ref at
+    /// attachments of field 2 of each commit. It writes each ref at
     /// [`RefPlace::of_collection`]. The `ostree.collection-binding` of each
     /// tip must state `collection`, and the ref-binding check applies. If
     /// `listed` holds a timestamp for a ref, the timestamp of its tip must

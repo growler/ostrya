@@ -291,7 +291,7 @@ async fn commit(
 }
 
 /// Commits a tree with the file `file`, which holds `content`, with the
-/// dependencies `related` at the time `timestamp`, and sets no ref.
+/// attachments `related` at the time `timestamp`, and sets no ref.
 async fn commit_related(
     repo: &Repo,
     base: &Path,
@@ -307,7 +307,7 @@ async fn commit_related(
 }
 
 /// Commits the directory `tree` with the subject `subject` and the
-/// dependencies `related` at the time `timestamp`. Sets the ref `branch` to
+/// attachments `related` at the time `timestamp`. Sets the ref `branch` to
 /// the commit if it is given.
 async fn commit_tree(
     repo: &Repo,
@@ -1465,7 +1465,7 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
 
 #[test]
 fn an_attachment_survives_as_in_the_local_prune() {
-    // Each case gives `true` if the run keeps the parent of the dependency.
+    // Each case gives `true` if the run keeps the parent of the attachment.
     let cases: Vec<(&str, PruneOptions, bool)> = vec![
         ("default", PruneOptions::default(), true),
         ("depth 0", refs_only(0), false),
@@ -1484,10 +1484,10 @@ fn an_attachment_survives_as_in_the_local_prune() {
             let (f, _) = Fixture::rich().await;
             let base = f.tmp.path();
             // The two commits are younger than the time bound, so the bound
-            // of the run keeps the parent of the dependency.
+            // of the run keeps the parent of the attachment.
             let att_base = commit_related(&f.local, base, "dep-base", None, &[], T0 + 130).await;
             let att = commit_related(&f.local, base, "dep", Some(att_base), &[], T0 + 140).await;
-            // No store holds the parent of this dependency.
+            // No store holds the parent of this attachment.
             let gone = Checksum::sha256(b"gone parent");
             let lone = commit_related(&f.local, base, "lone", Some(gone), &[], T0 + 150).await;
             let head = commit_related(
@@ -1520,15 +1520,15 @@ fn an_attachment_survives_as_in_the_local_prune() {
             assert_eq!(
                 f.get(&key(ObjectType::Commit, &att_base)).is_some(),
                 keeps_base,
-                "{case}: the parent of the dependency"
+                "{case}: the parent of the attachment"
             );
             assert_each_commit_read_once(&f, case);
             if case == "default" {
                 // Each commit of the listing is a root that keeps no parent,
-                // and so is the dependency, so the walk reads each commit
+                // and so is the attachment, so the walk reads each commit
                 // once.
                 assert_eq!(gets(&f, ".commit"), commits);
-                // The dependency keeps no parent, so the run deletes the
+                // The attachment keeps no parent, so the run deletes the
                 // detached metadata of a parent that the listing does not
                 // hold. A local prune keeps it.
                 let meta = key(ObjectType::CommitMeta, &gone);
@@ -1559,7 +1559,7 @@ fn an_attachment_on_a_parent_chain_is_read_once_unless_the_time_bound_rejected_i
             false,
         ),
         (
-            "keep_younger_than, older dependency",
+            "keep_younger_than, older attachment",
             PruneOptions {
                 keep_younger_than: Some(T0 + 25),
                 ..PruneOptions::default()
@@ -1708,7 +1708,7 @@ fn a_supplement_that_no_ref_keeps_is_deleted() {
         local.prune(&opts).await.unwrap();
         assert!(
             local.has_object(ObjectType::Commit, &src).await.unwrap(),
-            "the local prune keeps the build source"
+            "the local prune keeps the supplement"
         );
         let report = f.prune(&opts).await.unwrap();
         assert!(report.stats.warnings.is_empty());
@@ -1821,7 +1821,7 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
         let base = f.tmp.path();
         let c = commit_related(&f.local, base, "c", None, &[], T0 + 10).await;
         let plain_b = commit_related(&f.local, base, "b", None, &[], T0 + 20).await;
-        // The commit write refuses a nested dependency, so the commits are
+        // The commit write refuses a nested attachment, so the commits are
         // stored as metadata objects.
         let b = store_with_field2(&f.local, &plain_b, &[("x/c", c.as_bytes())]).await;
         let head = store_with_field2(&f.local, &f.c3, &[("x/b", b.as_bytes())]).await;
@@ -1837,11 +1837,11 @@ fn a_nested_attachment_roots_its_attachments_with_no_warning() {
         assert_each_commit_read_once(&f, "depth 0");
         assert!(
             f.get(&key(ObjectType::Commit, &b)).is_some(),
-            "the dependency survives"
+            "the attachment survives"
         );
         assert!(
             f.get(&key(ObjectType::Commit, &c)).is_some(),
-            "the dependency of the dependency survives"
+            "the attachment of the attachment survives"
         );
         assert!(f.get(&key(ObjectType::Commit, &plain_b)).is_none());
     });

@@ -7268,9 +7268,9 @@ fn assert_applied_without_ref(run: &Run, dst: &Path, commit: &str, label: &str) 
     );
 }
 
-/// `static-delta apply-offline` refuses a delta whose target names a
-/// dependency that the repository does not hold. It exits 1 and writes no
-/// object and no ref. After the delta of the dependency, the target applies.
+/// `static-delta apply-offline` refuses a delta whose target names an
+/// attachment that the repository does not hold. It exits 1 and writes no
+/// object and no ref. After the delta of the attachment, the target applies.
 #[test]
 fn static_delta_apply_offline_refuses_a_missing_attachment() {
     let tmp = TmpDir::new("static-delta-dependency");
@@ -7340,7 +7340,7 @@ fn static_delta_apply_offline_refuses_a_missing_attachment() {
     assert_eq!(
         String::from_utf8_lossy(&refused.stderr),
         format!(
-            "error: related commits in field 2 of commit {tip}: dependency boot/uki names \
+            "error: related commits in field 2 of commit {tip}: attachment boot/uki names \
              commit {att}, which is in neither the repository nor the transaction\n"
         )
     );
@@ -8281,7 +8281,7 @@ fn pull_depth_and_commit_metadata_only() {
     );
 }
 
-/// `pull` fetches the dependency that field 2 of the pulled commit names,
+/// `pull` fetches the attachment that field 2 of the pulled commit names,
 /// complete, and writes no ref for it. The fsck of the destination passes.
 #[test]
 fn pull_fetches_an_attachment() {
@@ -8321,9 +8321,9 @@ fn pull_fetches_an_attachment() {
     .ok();
 
     let object = dest.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
-    assert!(object.is_file(), "dependency {att} was not fetched");
+    assert!(object.is_file(), "attachment {att} was not fetched");
     let marker = dest.join(format!("state/{att}.commitpartial"));
-    assert!(!marker.exists(), "dependency {att} is marked partial");
+    assert!(!marker.exists(), "attachment {att} is marked partial");
     block_on(async {
         let repo = Repo::open(&dest).await.unwrap();
         assert!(repo.list_refs(None).await.unwrap().is_empty());
@@ -8339,7 +8339,7 @@ fn pull_fetches_an_attachment() {
     ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
 }
 
-/// `pull-local` imports the dependency that field 2 of the pulled commit
+/// `pull-local` imports the attachment that field 2 of the pulled commit
 /// names, complete, and writes no ref for it. The fsck of the destination
 /// passes.
 #[test]
@@ -8383,9 +8383,9 @@ fn pull_local_imports_an_attachment() {
     .ok();
 
     let object = dest.join(format!("objects/{}/{}.commit", &att[..2], &att[2..]));
-    assert!(object.is_file(), "dependency {att} was not imported");
+    assert!(object.is_file(), "attachment {att} was not imported");
     let marker = dest.join(format!("state/{att}.commitpartial"));
-    assert!(!marker.exists(), "dependency {att} is marked partial");
+    assert!(!marker.exists(), "attachment {att} is marked partial");
     block_on(async {
         let repo = Repo::open(&dest).await.unwrap();
         let refs: Vec<(String, String)> = repo
@@ -8400,7 +8400,7 @@ fn pull_local_imports_an_attachment() {
     ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
 }
 
-/// `ostrya fsck` prints the finding of an absent dependency, marks the
+/// `ostrya fsck` prints the finding of an absent attachment, marks the
 /// commit that names it as partial, and exits 1. A defective entry also exits
 /// 1, and marks no commit.
 #[test]
@@ -8441,7 +8441,7 @@ fn fsck_reports_an_attachment_error() {
     assert_eq!(
         stderr,
         format!(
-            "related commits in field 2 of commit {tip}: dependency boot/uki names commit \
+            "related commits in field 2 of commit {tip}: attachment boot/uki names commit \
              {att}, which the repository does not hold\nMarking commit as partial: {tip}\n\
              error: Repository corruption encountered\n"
         )
@@ -8476,13 +8476,13 @@ fn fsck_reports_an_attachment_error() {
     assert!(!other.join("state").read_dir().unwrap().any(|_| true));
 }
 
-/// `ostrya fsck --no-mark-dependencies` prints the finding of an absent
-/// dependency, exits 1, and writes no marker. A run with
-/// `--no-mark-partial` and `--no-mark-dependencies` does the same. A run with
+/// `ostrya fsck --no-mark-attachments` prints the finding of an absent
+/// attachment, exits 1, and writes no marker. A run with
+/// `--no-mark-partial` and `--no-mark-attachments` does the same. A run with
 /// no option then writes the marker.
 #[test]
-fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
-    let tmp = TmpDir::new("fsck-no-mark-dependencies");
+fn fsck_no_mark_attachments_reports_and_writes_no_marker() {
+    let tmp = TmpDir::new("fsck-no-mark-attachments");
     let base = tmp.path();
     let repo = build_dest(base, "repo");
     let repo_s = repo.to_str().unwrap().to_owned();
@@ -8512,13 +8512,13 @@ fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
     )))
     .unwrap();
     let finding = format!(
-        "related commits in field 2 of commit {tip}: dependency boot/uki names commit {att}, \
+        "related commits in field 2 of commit {tip}: attachment boot/uki names commit {att}, \
          which the repository does not hold\n"
     );
     let marker = repo.join(format!("state/{tip}.commitpartial"));
 
     let run = ostrya(
-        &["fsck", "--repo", &repo_s, "--no-mark-dependencies"],
+        &["fsck", "--repo", &repo_s, "--no-mark-attachments"],
         None,
         &[],
     );
@@ -8535,7 +8535,7 @@ fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
             "--repo",
             &repo_s,
             "--no-mark-partial",
-            "--no-mark-dependencies",
+            "--no-mark-attachments",
         ],
         None,
         &[],
@@ -15619,7 +15619,7 @@ fn commit_related_writes_sorted_attachments() {
 
 /// `commit --related` refuses an argument with no `=` and a checksum that is
 /// not 64 lowercase hexadecimal characters. It also refuses an empty name and
-/// a dependency that the repository does not hold, before it reads the tree.
+/// an attachment that the repository does not hold, before it reads the tree.
 /// The option conflicts with `--skip-if-unchanged`. Each refusal exits 1 and
 /// writes no object and no ref.
 #[test]
@@ -15666,7 +15666,7 @@ fn commit_related_refuses_a_malformed_or_absent_attachment() {
         (
             format!("--related=a/x={absent}"),
             format!(
-                "related commits in field 2: dependency a/x names commit {absent}, which is in \
+                "related commits in field 2: attachment a/x names commit {absent}, which is in \
                  neither the repository nor the transaction"
             ),
         ),
@@ -15688,8 +15688,8 @@ fn commit_related_refuses_a_malformed_or_absent_attachment() {
         );
     }
 
-    // The dependencies are checked before the tree is read, so a tree that
-    // does not exist gives the error of the dependency.
+    // The attachments are checked before the tree is read, so a tree that
+    // does not exist gives the error of the attachment.
     let before = commit_store_state(&repo);
     let option = format!("--related=a/x={absent}");
     let run = commit_main_run(&repo, &base.join("missing"), &[&option]);
@@ -15701,7 +15701,7 @@ fn commit_related_refuses_a_malformed_or_absent_attachment() {
     assert_eq!(
         String::from_utf8_lossy(&run.stderr),
         format!(
-            "error: related commits in field 2: dependency a/x names commit {absent}, which is \
+            "error: related commits in field 2: attachment a/x names commit {absent}, which is \
              in neither the repository nor the transaction\n"
         ),
         "missing tree: the error line"
@@ -15722,9 +15722,9 @@ fn commit_related_refuses_a_malformed_or_absent_attachment() {
     );
 }
 
-/// `commit --related` checks each dependency one time: the run opens the
-/// commit object of the dependency one time and looks up its partial marker
-/// one time. The dependency is on another branch, so no other step of the
+/// `commit --related` checks each attachment one time: the run opens the
+/// commit object of the attachment one time and looks up its partial marker
+/// one time. The attachment is on another branch, so no other step of the
 /// command reads it.
 #[test]
 fn commit_related_checks_each_attachment_once() {
@@ -15774,7 +15774,7 @@ fn commit_related_checks_each_attachment_once() {
         .filter(|line| is_read_open(line) && line.contains(&object))
         .count();
     let stats = text.lines().filter(|line| line.contains(&marker)).count();
-    assert_eq!(opens, 1, "the opens of the dependency commit object");
+    assert_eq!(opens, 1, "the opens of the attachment commit object");
     assert_eq!(stats, 1, "the lookups of the partial marker");
 }
 
@@ -15798,8 +15798,8 @@ fn related_dict(key: &str, entries: &[(&str, &[u8])]) -> Value {
     ])])
 }
 
-/// `prune --refs-only` keeps the dependency that `commit --related` writes
-/// and a build source that the library adds. A defective `ostrya.related`
+/// `prune --refs-only` keeps the attachment that `commit --related` writes
+/// and a supplement that the library adds. A defective `ostrya.related`
 /// value gives one `warning:` line on standard error for each defect, the
 /// valid entries still root, and the prune exits 0.
 #[test]
@@ -15831,8 +15831,8 @@ fn prune_keeps_the_related_commits_and_warns_on_a_defective_value() {
         "no warning: {}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert!(ex_ostrya_holds(&repo, &att), "the dependency survives");
-    assert!(ex_ostrya_holds(&repo, &src), "the build source survives");
+    assert!(ex_ostrya_holds(&repo, &att), "the attachment survives");
+    assert!(ex_ostrya_holds(&repo, &src), "the supplement survives");
     assert!(!ex_ostrya_holds(&repo, &orphan), "the orphan is pruned");
 
     // Each write path of the library refuses a defective value. So the test

@@ -72,10 +72,10 @@ pub struct RepoPushOptions {
     ///
     /// The push refuses a value less than `-1`.
     ///
-    /// A push sends each dependency at depth 0, whatever this value is. It
-    /// sends the dependencies of each commit that it offers, the history
+    /// A push sends each attachment at depth 0, whatever this value is. It
+    /// sends the attachments of each commit that it offers, the history
     /// commits included. [`Repo::push_over_stream`] states the rules in
-    /// "Dependencies".
+    /// "Attachments".
     pub depth: Option<i32>,
     /// The collection id that each plain `DST` and each plain tag takes.
     ///
@@ -259,11 +259,11 @@ pub(super) fn link_of(commit: &Commit) -> CommitLink {
 }
 
 /// The commits that the walk of a push or the load of an export read, and
-/// the dependencies that the push or the export resolved.
+/// the attachments that the push or the export resolved.
 #[derive(Default)]
 pub(super) struct Commits {
     /// The local state of each commit that the walk or the load read, and of
-    /// each dependency that the call read.
+    /// each attachment that the call read.
     pub(super) local: HashMap<Checksum, Local>,
     /// The entries of field 2 of each commit that `local` holds as
     /// [`Local::Held`], as names and checksums in the stored order, or the
@@ -271,7 +271,7 @@ pub(super) struct Commits {
     /// takes the result at its own point, so it sets the order of the errors.
     /// A held commit with no entry here has an empty field 2.
     fields: HashMap<Checksum, Result<Vec<(String, Checksum)>>>,
-    /// The dependencies that the call resolved.
+    /// The attachments that the call resolved.
     known: HashSet<Checksum>,
 }
 
@@ -304,9 +304,9 @@ impl Commits {
         Ok(())
     }
 
-    /// Returns the dependencies of the commit `commit`, in the stored order.
+    /// Returns the attachments of the commit `commit`, in the stored order.
     ///
-    /// The push and the export call it for a commit whose dependencies they
+    /// The push and the export call it for a commit whose attachments they
     /// resolved. A commit with no entry in `fields` has an empty field 2 and
     /// gives none.
     pub(super) fn attachments_of(
@@ -320,42 +320,42 @@ impl Commits {
             .map(|(_, attachment)| *attachment)
     }
 
-    /// Resolves the dependencies of each commit of `commits`, in order, and
-    /// refuses a dependency that the push or the export cannot send.
+    /// Resolves the attachments of each commit of `commits`, in order, and
+    /// refuses an attachment that the push or the export cannot send.
     ///
     /// The repository holds each commit of `commits`, and its field 2 passed
-    /// the format check. The call records each dependency with the commit and
-    /// the entry name that first named it, and skips a dependency that it
-    /// resolved before. A dependency that `local` holds needs no read. One
-    /// trip to the blocking pool reads each other dependency: its partial
+    /// the format check. The call records each attachment with the commit and
+    /// the entry name that first named it, and skips an attachment that it
+    /// resolved before. An attachment that `local` holds needs no read. One
+    /// trip to the blocking pool reads each other attachment: its partial
     /// marker, then its commit object, if its field 2 is empty, and the link
-    /// of the commit. The call reads no commit object of a dependency with a
+    /// of the commit. The call reads no commit object of an attachment with a
     /// partial marker. No object bytes leave the pool. The call reads no
-    /// parent of a dependency. Each dependency that passes is [`Local::Held`]
+    /// parent of an attachment. Each attachment that passes is [`Local::Held`]
     /// in `local`, so the walk of the trees finds it.
     ///
     /// # Errors
     ///
-    /// For the first refused dependency, in the order of naming:
+    /// For the first refused attachment, in the order of naming:
     ///
     /// - [`Error::ObjectNotFound`] if the repository does not hold the
-    ///   dependency.
-    /// - [`Error::InvalidRelations`] if the repository marks the dependency
-    ///   partial, or if the field 2 of the dependency is not empty. The error
-    ///   names the commit that first named the dependency.
-    /// - [`Error::Io`] or [`Error::Core`] if the read of a dependency with no
+    ///   attachment.
+    /// - [`Error::InvalidRelations`] if the repository marks the attachment
+    ///   partial, or if the field 2 of the attachment is not empty. The error
+    ///   names the commit that first named the attachment.
+    /// - [`Error::Io`] or [`Error::Core`] if the read of an attachment with no
     ///   partial marker fails, or if the tuple frame, field 2, or the parent
     ///   or root checksums of its commit object do not decode. The call
     ///   decodes no other part of the commit object.
-    /// - [`Error::Io`] if the lstat of the partial marker of a dependency
-    ///   fails, or if the lstat of the commit object of a dependency with a
+    /// - [`Error::Io`] if the lstat of the partial marker of an attachment
+    ///   fails, or if the lstat of the commit object of an attachment with a
     ///   partial marker fails.
     pub(super) async fn check_attachments<'a>(
         &mut self,
         repo: &Repo,
         commits: impl IntoIterator<Item = &'a Checksum>,
     ) -> Result<()> {
-        // Each new dependency, the commit that first named it, and the name of
+        // Each new attachment, the commit that first named it, and the name of
         // that entry.
         let mut named: Vec<(Checksum, Checksum, &str)> = Vec::new();
         for commit in commits {
@@ -447,7 +447,7 @@ pub(super) struct Plan {
     /// commit on, as the walk read them. A delete has none. The negotiation
     /// drops the chains when it has the commits to offer.
     pub(super) chains: Vec<Vec<Checksum>>,
-    /// Each commit that the walk read, with its field 2, and each dependency
+    /// Each commit that the walk read, with its field 2, and each attachment
     /// that the push read. The negotiation drops them after the tree walk.
     pub(super) commits: Commits,
 }
@@ -474,7 +474,7 @@ impl Repo {
     /// After this step, the push runs the checks and the walk. It opens the
     /// session with [`PreparedSession::open`](crate::remote::PreparedSession::open)
     /// and does the rest of the work of `push_over_stream`. The push sends
-    /// the dependencies of each commit that it offers, as "Dependencies" of
+    /// the attachments of each commit that it offers, as "Attachments" of
     /// [`push_over_stream`](Repo::push_over_stream) states.
     ///
     /// # Tokio runtime
@@ -598,11 +598,11 @@ impl Repo {
     /// if the update is a fast-forward.
     ///
     /// The negotiation offers the commits first, in the first `Have` round:
-    /// each source commit and its history, then the dependencies of each
+    /// each source commit and its history, then the attachments of each
     /// offered commit. Then the push walks the tree of each source commit,
     /// also when the server holds that commit. It also walks the tree of
-    /// each history commit and each dependency that the server lacks. It
-    /// does not walk the tree of a history commit or a dependency that the
+    /// each history commit and each attachment that the server lacks. It
+    /// does not walk the tree of a history commit or an attachment that the
     /// server holds.
     ///
     /// If the local repository lacks a dirtree or a dirmeta, the push ends
@@ -614,23 +614,23 @@ impl Repo {
     /// no parse, so the server refuses a `.commitmeta` that is not an `a{sv}`
     /// dict.
     ///
-    /// # Dependencies
+    /// # Attachments
     ///
-    /// Field 2 of a commit names the dependencies of the commit.
+    /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The push
-    /// sends the dependencies of each commit that it offers: each source
+    /// sends the attachments of each commit that it offers: each source
     /// commit, and each history commit of the offer.
     ///
-    /// - The push sends each dependency at depth 0, so a dependency entry
-    ///   adds no parent to the push. The push offers a dependency one time,
+    /// - The push sends each attachment at depth 0, so an attachment entry
+    ///   adds no parent to the push. The push offers an attachment one time,
     ///   also if several commits name it.
-    /// - The push sets no ref for a dependency.
-    /// - A dependency is a commit of the offer for each other rule. For a
-    ///   dependency that the server lacks, the push sends the commit object,
+    /// - The push sets no ref for an attachment.
+    /// - An attachment is a commit of the offer for each other rule. For an
+    ///   attachment that the server lacks, the push sends the commit object,
     ///   the objects of its tree, and its detached metadata.
     /// - The push makes no ref-binding check and no collection-binding check
-    ///   on a dependency.
-    /// - The push does not send a build source: a commit that the detached
+    ///   on an attachment.
+    /// - The push does not send a supplement: a commit that the detached
     ///   metadata key `ostrya.related` names. The key goes with the detached
     ///   metadata of its commit.
     ///
@@ -638,18 +638,18 @@ impl Repo {
     ///
     /// - An entry of field 2 of a commit of the walk has an empty name or a
     ///   checksum that is not 32 bytes.
-    /// - The local repository does not hold a dependency, or marks it
+    /// - The local repository does not hold an attachment, or marks it
     ///   partial. This is also true for a parent that ends a chain, if a
-    ///   commit of the push names that parent as a dependency.
-    /// - A dependency names dependencies of its own: its own field 2 is not
+    ///   commit of the push names that parent as an attachment.
+    /// - An attachment names attachments of its own: its own field 2 is not
     ///   empty, also if that field 2 holds a defective entry.
     ///
     /// If `depth` is `Some`, the push finds each case before it writes a
     /// byte. If `depth` is `None`, the push finds a defective entry and each
-    /// defect of a dependency of a source commit before it writes a byte. It
-    /// finds a defect of a dependency of a history commit after the cut at
+    /// defect of an attachment of a source commit before it writes a byte. It
+    /// finds a defect of an attachment of a history commit after the cut at
     /// the server tip, which comes after `HelloReply`. It then ends the
-    /// session with `Abort` and sends no object. The push reads no dependency
+    /// session with `Abort` and sends no object. The push reads no attachment
     /// of a history commit that it does not offer.
     ///
     /// # Ref updates
@@ -725,10 +725,10 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
     /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit of the
-    ///   walk has an empty name or a checksum that is not 32 bytes, or if a
-    ///   dependency of an offered commit is partial in the local repository
-    ///   or names dependencies of its own. [`Error::ObjectNotFound`] if the
-    ///   local repository lacks such a dependency. "Dependencies" states when
+    ///   walk has an empty name or a checksum that is not 32 bytes, or if an
+    ///   attachment of an offered commit is partial in the local repository
+    ///   or names attachments of its own. [`Error::ObjectNotFound`] if the
+    ///   local repository lacks such an attachment. "Attachments" states when
     ///   the push finds each case.
     /// - [`Error::LockTimeout`] if the wait for the lock passes
     ///   `[core] lock-timeout-secs`.
@@ -737,7 +737,7 @@ impl Repo {
     /// - [`Error::Core`] if `[core] locking` is not a boolean or
     ///   `[core] lock-timeout-secs` is not an integer, or if a source commit
     ///   or a dirtree object does not parse. For the commit object of a
-    ///   parent or of a dependency, the push decodes the tuple frame, the
+    ///   parent or of an attachment, the push decodes the tuple frame, the
     ///   parent and root checksums, and field 2 alone, and gives this error
     ///   if one of them does not decode.
     /// - [`Error::InvalidFormat`] if a metadata object is larger than
@@ -862,8 +862,8 @@ impl Repo {
         }
 
         // The format of field 2 of each commit that the walk read, then the
-        // dependencies. With no depth, the cut at the server tip comes after
-        // `HelloReply`, so the negotiation resolves the dependencies of the
+        // attachments. With no depth, the cut at the server tip comes after
+        // `HelloReply`, so the negotiation resolves the attachments of the
         // history that it offers.
         let walked = sources
             .iter()
@@ -1292,8 +1292,8 @@ impl Plan {
         }
         drop(chains);
 
-        // Then the dependencies of each offered commit, each once. With no
-        // depth, the push resolves the dependencies of the offered history
+        // Then the attachments of each offered commit, each once. With no
+        // depth, the push resolves the attachments of the offered history
         // here, before the first upload.
         if opts.depth.is_none() {
             let offer = names.iter().map(|name| &name.checksum);

@@ -76,7 +76,7 @@ fn mount_dir(dir: &Path) -> std::path::PathBuf {
 }
 
 /// Commits a small tree with the marker `marker` into `repo`, with the
-/// bindings `bind` and the dependencies `related` in field 2. Writes the
+/// bindings `bind` and the attachments `related` in field 2. Writes the
 /// commit to the ref `target`, or to no ref if `target` is `None`.
 async fn commit(
     repo: &Repo,
@@ -655,7 +655,7 @@ fn a_destination_of_the_refs_collection_writes_local_refs_and_field_0() {
     });
 }
 
-/// A dependency of field 2 goes onto the media as loose objects, with no
+/// An attachment of field 2 goes onto the media as loose objects, with no
 /// ref and no static delta.
 #[test]
 fn a_field_2_attachment_lands_as_loose_objects() {

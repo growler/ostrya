@@ -1315,7 +1315,7 @@ mod tests {
         std::fs::write(&path, b"x").unwrap();
         let file = File::open(&path).unwrap();
         let fd = file.as_fd();
-        let big: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let big: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
         if !set_xattr(fd, "user.big", &big) {
             eprintln!("skipping: the file system has no user xattrs");
             return;

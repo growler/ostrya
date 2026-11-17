@@ -562,9 +562,12 @@ pub enum Error {
     ///   [`Repo::pull_with_session`](crate::Repo::pull_with_session), and
     ///   [`Repo::pull_collection`](crate::Repo::pull_collection) from a
     ///   remote, for an entry of field 2 with an empty name or with a
-    ///   checksum that is not 32 bytes, and for a nested attachment. `commit`
-    ///   is the commit that holds the entry. For a nested attachment, it is
-    ///   the commit that names the attachment.
+    ///   checksum that is not 32 bytes. Also for an attachment, at each level,
+    ///   that neither the remote, a localcache repository, nor the repository
+    ///   holds. `commit` is the commit that holds the entry. For an
+    ///   attachment, it is a commit of the lowest level that names the
+    ///   attachment, the commit with the lowest checksum of that level, as
+    ///   [`Repo::pull`](crate::Repo::pull) states in `# Attachments`.
     /// - [`Repo::pull_local`](crate::Repo::pull_local), and
     ///   [`Repo::pull_collection`](crate::Repo::pull_collection) from a local
     ///   repository, for an entry of field 2 with an empty name or with a

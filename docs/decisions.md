@@ -3207,6 +3207,39 @@ the rules.
   marker, and no ref. A walk that also reads below an attachment held
   complete was rejected: it reads commits that the write rule already makes
   complete.
+- A pull from a remote takes the full set of attachments of each commit that
+  it reads. The rule applies to the pull over HTTP, over ssh, and from a
+  bucket, to a pull through a session, and to a pull of collection refs. All
+  of them share one engine. After the runs of the targets and of the chains
+  of static deltas, the pull runs one delta search and one run for each
+  level of attachments. A level holds the attachments that the commits of
+  the level above name and that no run of the pull reached. The pull stops
+  when a level has no new attachment. The record of the attachments adds
+  each attachment one time, so a diamond fetches the shared attachment one
+  time. The run of a level reads field 2 of each attachment from the commit
+  that it stages, so the next level needs no request of its own. The run
+  ignores field 2 of an attachment that the repository holds complete: it
+  checks no entry, records none, and requests nothing below the attachment.
+  The write rule above makes the full set of attachments of such an
+  attachment complete. Each attachment has depth 0, no ref, and no
+  signature check, at each level. An attachment that neither the
+  repository, a localcache repository, nor the remote holds fails the pull,
+  at each level. The error has the form of the local pull. It names a
+  commit that names the attachment: of the commits of the lowest level that
+  name it, the commit with the lowest checksum, with the first entry of that
+  commit that names the attachment. The targets, the parents, and the
+  commits of the chains of static deltas are level 0. The pull gives the
+  error when the run of the level ends, and of several such attachments it
+  names the attachment with the lowest checksum. So the error does not
+  change with the order in which the fetches end, which the network sets.
+  To name the commit that first names the attachment, as the local pull
+  does, was rejected: in a pull from a remote, that commit is the commit
+  whose fetch ends first. The pull reads no
+  `.commitpartial` marker of the remote, and a bucket pull reads no
+  `state/` file. An attachment that the remote holds partial fails the
+  pull on the first object that the remote does not hold. A run that also
+  reads below an attachment held complete was rejected: it requests commits
+  that the write rule already makes complete.
 - The commit write of `ostrya commit` checks each attachment one time.
   `Transaction::check_attachments` checks the attachments before the command
   reads the tree, and gives a `CheckedAttachments` that borrows the transaction.
@@ -3266,8 +3299,9 @@ the rules.
   `ostrya remote prune` writes each one to standard error. A bucket prune
   that also reads the `.commitmeta` of each commit that it reaches was
   rejected: it sends one more `GET` for each such commit.
-- A pull from a remote and a local pull follow the attachments of each commit
-  that they read, the parents that their depth takes included. Field 2 is in
+- A pull from a remote and a local pull take the full set of attachments of
+  each commit that they read, the parents that their depth takes included,
+  as the two bullets above state. Field 2 is in
   the signed commit, so the pull is complete with no option. Field 2 also
   binds each attachment to its checksum in a commit that the signature policy
   covers, so the pull checks no signature of an attachment. An attachment that
@@ -3294,18 +3328,29 @@ the rules.
   before the pull, the paired entry, so an update of an attachment goes from
   the attachment that the client runs. The pull takes the first paired entry
   that it holds complete, in the order of the targets, and takes the
-  from-scratch delta only if it holds no paired entry complete. The
-  requirement of static deltas applies to each attachment. With a list of
-  static deltas, the pull takes one entry of the list to the attachment. The
-  search checks no signature of the superblock: the parse compares the
-  checksum of the commit that the superblock carries with the checksum in
-  field 2. Two alternatives were rejected. A change to the delta format, so
-  that the delta of a target also carries its attachments, was rejected: the
-  tool writes and reads the format, and a delta of each attachment keeps it.
-  A search that verifies the superblock of the delta of an attachment under
-  the policy of the pull was rejected: the superblock gives the attachment
-  commit, and field 2 of the signed commit names that commit by its
-  checksum, so a signature on the superblock adds no trust.
+  from-scratch delta only if it holds no paired entry complete. A pull from
+  a remote looks for the deltas of each level of attachments after the run
+  of the level above. An attachment X of a later level that an attachment D
+  of the level above names takes its paired entry from the `from` of the
+  delta of D: the entry with the name of X in D, in field 2 of that `from`.
+  The pairs follow the order of the attachments of the level above, and a D
+  with no `from` gives X no pair. So an update of the chain Rootfs ->
+  Container -> Container Details goes from the details that the client
+  runs. The requirement of static deltas applies to each attachment. With a
+  list of static deltas, the pull takes one entry of the list to the
+  attachment. The search checks no signature of the superblock: the parse
+  compares the checksum of the commit that the superblock carries with the
+  checksum in field 2. Three alternatives were rejected. A change to the
+  delta format, so that the delta of a target also carries its attachments,
+  was rejected: the tool writes and reads the format, and a delta of each
+  attachment keeps it. No paired entry for an attachment of a later level
+  was rejected: a remote with no summary then gives the from-scratch delta,
+  which sends the whole tree of the attachment on each update, also when the
+  client holds the previous version complete. A search that verifies the
+  superblock of the delta of an attachment under the policy of the pull was
+  rejected: the superblock gives the attachment commit, and field 2 of the
+  signed commit names that commit by its checksum, so a signature on the
+  superblock adds no trust.
 - A pull from a remote requests the superblock of the delta of each
   attachment one time. The search writes each superblock to one temp file
   after the digest check, and the commit that it carries after the parse. A
@@ -3315,14 +3360,25 @@ the rules.
   and takes the fallbacks. Just before the parts of a delta, a load step
   parses the superblock again from the file, and the run drops the parse
   after the last part. The application of the parts loads the jobs of at most
-  two attachments at a time, the cap of the part fetches. The file has the
-  limit of the record file of a chain, 1 GiB, and a pull whose superblocks
-  and commits of attachments pass it fails. After a search fails, the pull
-  starts no further search. Three alternatives were rejected. To request the
-  superblock again at the start of its parts was rejected: it doubles the
-  transfer of each superblock, and with no summary no digest checks that the
-  second copy is the checked copy. A failure then also comes late in the
-  transaction. To keep each parsed delta until the run ends was rejected:
+  two attachments at a time, the cap of the part fetches. Each level of
+  attachments has a file of its own, and the pull removes it after the run
+  of the level and before the search of the next level. So `tmp/` holds at
+  most one such file at a time. The next level reads field 2 from the
+  commits that the run staged, and reads no record of the removed file. The
+  search of each level reads the parse of the `ostree.static-deltas` map of
+  the summary, or the list of static deltas, so the pull keeps it in memory
+  until the run of the last level ends. The
+  file has the limit of the record file of a chain, 1 GiB, and a level whose
+  superblocks and commits of attachments pass it fails the pull, with one
+  text at each level. After a search fails, the pull starts no further
+  search. Four alternatives were rejected. One file for the whole pull, with
+  one limit over all levels, was rejected: it keeps the records of each
+  level after its run, although no later level reads them, and it fails a
+  level that fits the limit alone. To request the superblock again at the
+  start of its parts was rejected: it doubles the transfer of each
+  superblock, and with no summary no digest checks that the second copy is
+  the checked copy. A failure then also comes late in the transaction. To
+  keep each parsed delta until the run ends was rejected:
   field 2 of the commits that the remote serves sets the number of
   attachments, which has no cap, so the heap cost of the parsed deltas then
   has no limit. To keep the commit of each delta on the heap until the step

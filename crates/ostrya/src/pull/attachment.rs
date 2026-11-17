@@ -2,21 +2,27 @@
 //!
 //! A static delta carries its target commit alone. A pull looks for the delta
 //! of each attachment after it reads the commits that name the attachment,
-//! and fetches the attachments as one more level. [`pair_targets`] finds the
-//! targets whose chains name each attachment, and [`lookups`] finds the
-//! source commit of each delta from the paired entries.
+//! and fetches the attachments as one more level. A pull from a remote runs
+//! one level for the attachments of the commits of its other runs, and one
+//! more level for the attachments of each level. [`pair_targets`] finds the
+//! commits that give the paired entries of each attachment, and [`lookups`]
+//! finds the source commit of each delta from the paired entries.
 //!
 //! The chain of a target is the target and the parents that the depth of the
 //! pull takes. The paired entry of an attachment for one target is the entry
 //! with the same name in field 2 of the commit that the ref of the target
-//! names here before the pull. A target gives at most one paired entry. The
-//! `from` of the delta is the first paired entry, in target order, that this
-//! repository holds complete. The pull takes the from-scratch delta only if
-//! it holds no paired entry complete.
+//! names here before the pull. A target gives at most one paired entry. An
+//! attachment X of a later level that an attachment D of the level above
+//! names gets one paired entry from D: the entry with the name of X in D, in
+//! field 2 of the `from` of the delta of D. A D with no `from` gives X no
+//! paired entry. The `from` of the delta is the first paired entry that this
+//! repository holds complete: in target order, or in the order of the
+//! attachments of the level above. The pull takes the from-scratch delta only
+//! if it holds no paired entry complete.
 //!
 //! [`Attachments`] holds the attachments that a pull met, the commits that
-//! name them, and the errors that name the commit that first named an
-//! attachment, for the local pull and for the pull over HTTP.
+//! name them, and the errors that name a commit that names an attachment, for
+//! the local pull and for the pull over HTTP.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -33,17 +39,18 @@ use super::delta::{AttachmentLookup, complete_here_blocking};
 /// The attachments that one pull met, and the commits that name them.
 ///
 /// The type records the state alone. Each engine chooses when it calls
-/// [`named_error`](Attachments::named_error) or
-/// [`nested_error`](Attachments::nested_error): the local pull gives an
-/// error when its walk of the attachments reads an attachment, and the pull
-/// over HTTP checks each commit when its step ends.
+/// [`named_error`](Attachments::named_error): the local pull gives an error
+/// when its walk of the attachments reads an attachment, and the pull over
+/// HTTP gives an error at the end of a run, for an attachment that no source
+/// holds.
 #[derive(Default)]
 pub(super) struct Attachments {
     /// Each attachment, in the order in which the pull first recorded it.
     order: Vec<Checksum>,
-    /// The commit that first named each attachment, and the name of its
-    /// entry.
-    named: HashMap<Checksum, (Checksum, String)>,
+    /// The commit that the errors name for each attachment, the name of its
+    /// entry, and the level of that commit, as [`record`](Self::record) and
+    /// [`record_at`](Self::record_at) state.
+    named: HashMap<Checksum, (Checksum, String, usize)>,
     /// The entries of field 2 of each commit whose field 2 is not empty, in
     /// the stored order. Under `keys_only`, each commit has an empty list
     /// here.
@@ -74,13 +81,54 @@ impl Attachments {
     /// An attachment that an earlier commit named keeps the first commit and
     /// entry name. An empty list records nothing.
     pub(super) fn record(&mut self, commit: Checksum, attachments: Vec<(String, Checksum)>) {
+        self.insert(None, commit, attachments);
+    }
+
+    /// Records the attachments `attachments` of `commit`, a commit of the
+    /// level `level` of the pull.
+    ///
+    /// Of the commits that name an attachment, the errors name a commit of
+    /// the lowest level, and of these the commit with the lowest checksum.
+    /// The entry name is the name of the first entry of that commit that
+    /// names the attachment. So the commit and the name do not depend on the
+    /// order of the calls within one level. The order of the attachments is
+    /// the order in which the calls first name them, as for
+    /// [`record`](Self::record). An empty list records nothing.
+    pub(super) fn record_at(
+        &mut self,
+        level: usize,
+        commit: Checksum,
+        attachments: Vec<(String, Checksum)>,
+    ) {
+        self.insert(Some(level), commit, attachments);
+    }
+
+    /// Records the attachments `attachments` of `commit`. With a level, a
+    /// commit of a lower level, or of the same level with a lower checksum,
+    /// replaces the commit that an attachment keeps. With no level, the
+    /// first commit stays.
+    fn insert(
+        &mut self,
+        level: Option<usize>,
+        commit: Checksum,
+        attachments: Vec<(String, Checksum)>,
+    ) {
         if attachments.is_empty() {
             return;
         }
+        let rank = level.unwrap_or(0);
         for (name, attachment) in &attachments {
-            if let Entry::Vacant(slot) = self.named.entry(*attachment) {
-                slot.insert((commit, name.clone()));
-                self.order.push(*attachment);
+            match self.named.entry(*attachment) {
+                Entry::Vacant(slot) => {
+                    slot.insert((commit, name.clone(), rank));
+                    self.order.push(*attachment);
+                }
+                Entry::Occupied(mut slot) => {
+                    let (kept, _, kept_rank) = slot.get();
+                    if level.is_some() && (rank, commit) < (*kept_rank, *kept) {
+                        slot.insert((commit, name.clone(), rank));
+                    }
+                }
             }
         }
         let entries = if self.keys_only {
@@ -97,12 +145,12 @@ impl Attachments {
         &self.order
     }
 
-    /// Returns the commit that first named `attachment`, and the name of its
-    /// entry, or `None` if no commit named it.
+    /// Returns the commit that the errors name for `attachment`, and the
+    /// name of its entry, or `None` if no commit named it.
     pub(super) fn named(&self, attachment: &Checksum) -> Option<(Checksum, &str)> {
         self.named
             .get(attachment)
-            .map(|(commit, name)| (*commit, name.as_str()))
+            .map(|(commit, name, _)| (*commit, name.as_str()))
     }
 
     /// Returns the entries of field 2 of each commit whose field 2 is not
@@ -114,7 +162,8 @@ impl Attachments {
     /// Returns the nested-attachment error for `attachment`, or `None` if no
     /// commit named it. The error names the commit that first named the
     /// attachment. The caller calls this method when it finds that
-    /// `attachment` has attachments of its own.
+    /// `attachment` has attachments of its own. No engine calls it.
+    #[allow(dead_code)]
     pub(super) fn nested_error(&self, attachment: &Checksum) -> Option<Error> {
         self.named(attachment)
             .map(|(commit, name)| related::nested_attachment(commit, name, attachment))
@@ -122,8 +171,8 @@ impl Attachments {
 
     /// Returns the [`Error::InvalidRelations`] in field 2 for `attachment`,
     /// with the end `end` of its reason, or `None` if no commit named it.
-    /// The error names the commit that first named the attachment, and the
-    /// name of its entry.
+    /// The error names the commit and the entry name that
+    /// [`named`](Self::named) gives.
     pub(super) fn named_error(&self, attachment: &Checksum, end: &str) -> Option<Error> {
         self.named(attachment)
             .map(|(commit, name)| Error::InvalidRelations {
@@ -134,7 +183,8 @@ impl Attachments {
     }
 }
 
-/// An attachment that a pull fetches, with the targets whose chains name it.
+/// An attachment that a pull fetches, with the commits that give its paired
+/// entries.
 pub(super) struct Named {
     /// The attachment.
     pub(super) checksum: Checksum,
@@ -146,35 +196,69 @@ pub(super) struct Named {
     /// the name comes from the commit with the lowest checksum that names it,
     /// as [`pair_targets`] states.
     name: String,
-    /// The position of each target whose chain names the attachment, in
-    /// target order, with the name of the entry nearest to its tip.
-    pairs: Vec<(usize, String)>,
+    /// The commit that gives each paired entry, in order, with the name of
+    /// the entry.
+    pairs: Vec<(Pair, String)>,
 }
 
-/// Returns each attachment of `pending`, with the targets whose chains name
-/// it.
+/// The commit whose field 2 gives a paired entry of an attachment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pair {
+    /// The commit that the ref of the target at this position names here
+    /// before the pull.
+    Target(usize),
+    /// A commit of this repository: the `from` of the delta of an attachment
+    /// of the level above.
+    Commit(Checksum),
+}
+
+/// The level of the attachments that [`pair_targets`] pairs.
+pub(super) enum Level<'a> {
+    /// The first level: the attachments of the commits of the other runs of
+    /// the pull. The local pull pairs its attachments as a first level.
+    First,
+    /// A later level. The slice holds each attachment D of the level above,
+    /// in the order of the roots of that level, with the `from` of the delta
+    /// of D, or `None` if the delta of D has no `from`. Only the attachments
+    /// of the level above name an attachment of a later level.
+    Later(&'a [(Checksum, Option<Checksum>)]),
+}
+
+/// Returns each attachment of `pending`, with the commits that give its
+/// paired entries.
 ///
 /// `targets` holds the name and the commit of each target, in the order of
 /// the pull. `depth` is the depth of the pull, `-1` for all parents.
 /// `parents` holds the parent of each commit that the pull reached, and
 /// `naming` holds the entries of field 2 of each commit of the pull whose
-/// field 2 is not empty. `pending` holds each attachment that the pull did
-/// not reach.
+/// field 2 is not empty. `pending` holds each attachment of one level that
+/// the pull did not reach. `level` tells the level of `pending`.
 ///
-/// The walk of each chain stops at a parent that the pull did not reach. The
-/// result holds the attachments that a chain names first, in the order in
-/// which the walk meets them: target by target, from the tip, and in field 2
-/// order. The other attachments of `pending` follow, in the given order.
+/// At the first level, the walk of each chain stops at a parent that the
+/// pull did not reach. The result holds the attachments that a chain names
+/// first, in the order in which the walk meets them: target by target, from
+/// the tip, and in field 2 order. The other attachments of `pending` follow,
+/// in the given order.
+///
+/// At a later level, no chain names an attachment of `pending`: an
+/// attachment that a commit of a chain names is an attachment of the first
+/// level. So the call walks no chain, and the result holds `pending` in the
+/// given order. An attachment X takes one pair for each attachment D of the
+/// level above that names X and whose delta has a `from`, in the order of
+/// the level above: the `from` of D, with the name of the first entry of
+/// field 2 of D that names X. A D with no `from` gives X no pair.
 ///
 /// An attachment that no chain names gets its name from the commit of
 /// `naming` with the lowest checksum that names it. If that commit names it
 /// in two entries, the lowest name applies. So the name does not depend on
-/// the order in which the pull fetched the commits.
+/// the order in which the pull fetched the commits. At a later level, the
+/// call reads field 2 of the attachments of the level above alone.
 pub(super) fn pair_targets(
     targets: &[(String, Checksum)],
     depth: i32,
     parents: &HashMap<Checksum, Option<Checksum>>,
     naming: &HashMap<Checksum, Vec<(String, Checksum)>>,
+    level: &Level<'_>,
     pending: Vec<Checksum>,
 ) -> Vec<Named> {
     if pending.is_empty() {
@@ -183,7 +267,11 @@ pub(super) fn pair_targets(
     let wanted: HashSet<Checksum> = pending.iter().copied().collect();
     let mut out: Vec<Named> = Vec::new();
     let mut position: HashMap<Checksum, usize> = HashMap::new();
-    for (target, (_, tip)) in targets.iter().enumerate() {
+    let chains = match level {
+        Level::First => targets,
+        Level::Later(_) => &[],
+    };
+    for (target, (_, tip)) in chains.iter().enumerate() {
         let mut commit = *tip;
         let mut left = depth;
         loop {
@@ -201,8 +289,9 @@ pub(super) fn pair_targets(
                     out.len() - 1
                 });
                 let named = &mut out[at];
-                if named.pairs.last().is_none_or(|(last, _)| *last != target) {
-                    named.pairs.push((target, name.clone()));
+                let pair = Pair::Target(target);
+                if named.pairs.last().is_none_or(|(last, _)| *last != pair) {
+                    named.pairs.push((pair, name.clone()));
                 }
             }
             if left == 0 {
@@ -225,8 +314,19 @@ pub(super) fn pair_targets(
     if outside.is_empty() {
         return out;
     }
+    let (all, above) = match level {
+        Level::First => (Some(naming), &[][..]),
+        Level::Later(above) => (None, *above),
+    };
+    // The commits that can name an attachment of `pending`, with their
+    // entries.
+    let candidates = all.into_iter().flatten().chain(
+        above
+            .iter()
+            .filter_map(|(commit, _)| naming.get_key_value(commit)),
+    );
     let mut names: HashMap<Checksum, (Checksum, &str)> = HashMap::new();
-    for (commit, entries) in naming {
+    for (commit, entries) in candidates {
         for (name, attachment) in entries {
             if !outside.contains(attachment) {
                 continue;
@@ -238,6 +338,22 @@ pub(super) fn pair_targets(
                 .or_insert(candidate);
         }
     }
+    let mut pairs: HashMap<Checksum, Vec<(Pair, String)>> = HashMap::new();
+    let mut seen: HashSet<Checksum> = HashSet::new();
+    for (attachment, from) in above {
+        let Some(from) = from else {
+            continue;
+        };
+        seen.clear();
+        for (name, named) in naming.get(attachment).into_iter().flatten() {
+            if outside.contains(named) && seen.insert(*named) {
+                pairs
+                    .entry(*named)
+                    .or_default()
+                    .push((Pair::Commit(*from), name.clone()));
+            }
+        }
+    }
     for checksum in pending {
         if !position.contains_key(&checksum) {
             let name = names
@@ -247,7 +363,7 @@ pub(super) fn pair_targets(
                 checksum,
                 first: None,
                 name,
-                pairs: Vec::new(),
+                pairs: pairs.remove(&checksum).unwrap_or_default(),
             });
         }
     }
@@ -265,8 +381,9 @@ pub(super) fn pair_targets(
 /// form of its commit is a pull by checksum, and gives no paired entry. So
 /// does a name that is not a ref path, a ref that is absent, a commit that
 /// this repository does not hold, and a field 2 that does not decode or has
-/// a defective entry. If field 2 has two entries with one name, the first
-/// entry is the paired entry.
+/// a defective entry. For a pair with a commit of this repository, the call
+/// reads field 2 of that commit one time, under the same rules. If field 2
+/// has two entries with one name, the first entry is the paired entry.
 ///
 /// `checked` holds the completeness of commits that the caller checked. The
 /// call makes no check of such a commit, and gives `checked` back in the
@@ -292,10 +409,13 @@ pub(super) async fn lookups(
         return Ok((Vec::new(), checked));
     }
     let mut relpaths: Vec<Option<String>> = vec![None; targets.len()];
-    for (target, _) in named.iter().flat_map(|named| &named.pairs) {
-        let (name, tip) = &targets[*target];
-        if relpaths[*target].is_none() && *name != tip.to_hex() {
-            relpaths[*target] = place.ref_path(name).ok();
+    for (pair, _) in named.iter().flat_map(|named| &named.pairs) {
+        let Pair::Target(target) = *pair else {
+            continue;
+        };
+        let (name, tip) = &targets[target];
+        if relpaths[target].is_none() && *name != tip.to_hex() {
+            relpaths[target] = place.ref_path(name).ok();
         }
     }
     let names: Vec<String> = targets.iter().map(|(name, _)| name.clone()).collect();
@@ -317,14 +437,25 @@ pub(super) async fn lookups(
             complete.insert(*commit, held);
             Ok(held)
         };
+        // The entries of field 2 of each commit of a pair with a commit.
+        let mut commits: HashMap<Checksum, Option<HashMap<String, Checksum>>> = HashMap::new();
         let mut out = Vec::with_capacity(named.len());
         for named in named {
             if is_complete(&named.checksum)? {
                 continue;
             }
             let mut from = None;
-            for (target, name) in &named.pairs {
-                if let Some(paired) = entries[*target].as_ref().and_then(|map| map.get(name))
+            for (pair, name) in &named.pairs {
+                let map = match pair {
+                    Pair::Target(target) => entries[*target].as_ref(),
+                    Pair::Commit(commit) => {
+                        if !commits.contains_key(commit) {
+                            commits.insert(*commit, commit_entries(&repo, commit)?);
+                        }
+                        commits[commit].as_ref()
+                    }
+                };
+                if let Some(paired) = map.and_then(|map| map.get(name))
                     && is_complete(paired)?
                 {
                     from = Some(*paired);
@@ -348,17 +479,24 @@ pub(super) async fn lookups(
 
 /// Returns the entries of field 2 of the commit that the ref at `relpath`
 /// names in `repo`, by name, on the calling thread. Returns `None` for an
-/// absent ref, an absent commit, and a field 2 that does not decode or has a
-/// defective entry.
+/// absent ref, and as [`commit_entries`] states.
 fn held_entries(repo: &Repo, relpath: &str) -> Result<Option<HashMap<String, Checksum>>> {
     let Some(tip) = repo.resolve_relpath_tip_blocking(relpath)? else {
         return Ok(None);
     };
-    let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &tip)? else {
+    commit_entries(repo, &tip)
+}
+
+/// Returns the entries of field 2 of `commit` in `repo`, by name, on the
+/// calling thread. Returns `None` for an absent commit, and for a field 2
+/// that does not decode or has a defective entry. The read of the commit
+/// object has the size limit of a metadata object.
+fn commit_entries(repo: &Repo, commit: &Checksum) -> Result<Option<HashMap<String, Checksum>>> {
+    let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, commit)? else {
         return Ok(None);
     };
     let Ok(entries) = related::parse_attachments(&bytes).and_then(|entries| {
-        related::checked_entries(RelationField::Attachments, Some(tip), entries)
+        related::checked_entries(RelationField::Attachments, Some(*commit), entries)
     }) else {
         return Ok(None);
     };
@@ -371,6 +509,7 @@ fn held_entries(repo: &Repo, relpath: &str) -> Result<Option<HashMap<String, Che
 
 #[cfg(test)]
 mod tests {
+    use super::Pair::Target;
     use super::*;
 
     fn cs(byte: u8) -> Checksum {
@@ -469,7 +608,7 @@ mod tests {
 
     /// One result of [`pair_targets`]: the first byte of the checksum, the
     /// first target, the name, and the pairs.
-    type Flat<'a> = (u8, Option<usize>, &'a str, Vec<(usize, &'a str)>);
+    type Flat<'a> = (u8, Option<usize>, &'a str, Vec<(Pair, &'a str)>);
 
     /// Returns each result of [`pair_targets`] as a [`Flat`].
     fn flat(named: &[Named]) -> Vec<Flat<'_>> {
@@ -483,7 +622,7 @@ mod tests {
                     named
                         .pairs
                         .iter()
-                        .map(|(target, name)| (*target, name.as_str()))
+                        .map(|(pair, name)| (*pair, name.as_str()))
                         .collect(),
                 )
             })
@@ -502,16 +641,28 @@ mod tests {
             (cs(2), entries(&[("boot/b", 9), ("boot/c", 8)])),
             (cs(5), entries(&[("lib/x", 7)])),
         ]);
-        let named = pair_targets(&targets, 0, &parents, &naming, pending(&[7, 8, 9]));
+        let named = pair_targets(
+            &targets,
+            0,
+            &parents,
+            &naming,
+            &Level::First,
+            pending(&[7, 8, 9]),
+        );
         assert_eq!(
             flat(&named),
             [
-                (9, Some(0), "boot/a", vec![(0, "boot/a"), (1, "boot/b")]),
-                (8, Some(1), "boot/c", vec![(1, "boot/c")]),
+                (
+                    9,
+                    Some(0),
+                    "boot/a",
+                    vec![(Target(0), "boot/a"), (Target(1), "boot/b")]
+                ),
+                (8, Some(1), "boot/c", vec![(Target(1), "boot/c")]),
                 (7, None, "lib/x", vec![]),
             ]
         );
-        assert!(pair_targets(&targets, 0, &parents, &naming, Vec::new()).is_empty());
+        assert!(pair_targets(&targets, 0, &parents, &naming, &Level::First, Vec::new()).is_empty());
     }
 
     /// An attachment that no chain names takes its name from the commit with
@@ -532,9 +683,61 @@ mod tests {
             for at in order {
                 naming.insert(records[at].0, records[at].1.clone());
             }
-            let named = pair_targets(&targets, -1, &parents, &naming, pending(&[9]));
+            let named = pair_targets(
+                &targets,
+                -1,
+                &parents,
+                &naming,
+                &Level::First,
+                pending(&[9]),
+            );
             assert_eq!(flat(&named), [(9, None, "lib/d", vec![])]);
         }
+    }
+
+    /// An attachment of a later level takes one pair for each attachment of
+    /// the level above that names it and has a `from`, in the order of the
+    /// level above: the `from`, with the first entry that names it. An
+    /// attachment of the level above with no `from` gives no pair.
+    #[test]
+    fn a_nested_attachment_pairs_with_field_2_of_the_paired_commit() {
+        let targets = vec![("main".to_owned(), cs(1))];
+        let parents = HashMap::from([(cs(1), None), (cs(2), None), (cs(3), None), (cs(4), None)]);
+        let naming = HashMap::from([
+            (
+                cs(1),
+                entries(&[("lib/d1", 2), ("lib/d2", 3), ("lib/d3", 4)]),
+            ),
+            (cs(2), entries(&[("x/one", 9), ("x/dup", 9)])),
+            (cs(3), entries(&[("x/two", 9), ("y/two", 8)])),
+            (cs(4), entries(&[("x/three", 9)])),
+        ]);
+        // The level above holds 3 with a `from`, 4 with none, and 2 with a
+        // `from`.
+        let above = [(cs(3), Some(cs(30))), (cs(4), None), (cs(2), Some(cs(20)))];
+        let named = pair_targets(
+            &targets,
+            0,
+            &parents,
+            &naming,
+            &Level::Later(&above),
+            pending(&[8, 9]),
+        );
+        assert_eq!(
+            flat(&named),
+            [
+                (8, None, "y/two", vec![(Pair::Commit(cs(30)), "y/two")]),
+                (
+                    9,
+                    None,
+                    "x/dup",
+                    vec![
+                        (Pair::Commit(cs(30)), "x/two"),
+                        (Pair::Commit(cs(20)), "x/one")
+                    ]
+                ),
+            ]
+        );
     }
 
     /// The walk of a chain stops at the depth of the pull and at a parent
@@ -562,6 +765,7 @@ mod tests {
                 depth,
                 &parents,
                 &naming,
+                &Level::First,
                 all.clone(),
             ))
             .into_iter()
@@ -569,8 +773,15 @@ mod tests {
             .collect::<Vec<_>>()
         };
         assert_eq!(
-            flat(&pair_targets(&targets, 1, &parents, &naming, all.clone()))[0],
-            (9, Some(0), "boot/new", vec![(0, "boot/new")])
+            flat(&pair_targets(
+                &targets,
+                1,
+                &parents,
+                &naming,
+                &Level::First,
+                all.clone()
+            ))[0],
+            (9, Some(0), "boot/new", vec![(Target(0), "boot/new")])
         );
         assert_eq!(
             at(0),

@@ -14,7 +14,7 @@ The pull stores the objects in one transaction, and then writes each ref under \
 .PP
 With no REF, the pull reads the keys \fB\%branches\fR and \fB\%pull\-branches\fR of the section of REMOTE. It takes each ref of \fB\%branches\fR, and each ref of the summary of the remote that the list of ref patterns of \fB\%pull\-branches\fR selects: a ref of the ref list of the summary as REF, and a ref of its collection map as \%@ID:REF. It writes each one as a pull of that ref does, and a ref that both keys give one time. A malformed value of either key stops the pull before it connects. \%\-\-mirror and \%\-\-collection read neither key. \%ostrya\-config(1) states the keys.
 .PP
-The pull also fetches the attachments that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
+The pull also fetches the full set of attachments of each pulled commit, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath: the attachments that field \%2 names, and the attachments of each attachment, level by level. It fetches each one with no parent and no ref. It ignores field \%2 of an attachment that this repository holds complete, and requests nothing below it.
 .PP
 With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
 .PP

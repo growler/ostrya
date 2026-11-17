@@ -3567,9 +3567,9 @@ empty name and checks nothing else in the name.
 
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
-checksum that is not 32 bytes. For a pull from a remote, a push, and a
-receive, a field 2 entry that names a nested attachment is defective too. A
-nested attachment is an attachment whose own field 2 is not empty.
+checksum that is not 32 bytes. For a push and a receive, a field 2 entry
+that names a nested attachment is defective too. A nested attachment is an
+attachment whose own field 2 is not empty.
 
 ### Attachments
 
@@ -3702,16 +3702,28 @@ The `ostree` command keeps no commit for an entry of field 2
 
 ### Attachments in a pull from a remote
 
-A pull from a remote follows the attachments of each commit that it reads:
-each target and each parent that the depth of the pull takes, also a commit
-that the repository holds complete. These rules apply to a pull over HTTP,
-over ssh, and from an `s3://` address, to a pull through a session of the
-caller, and to a pull of collection refs:
+A pull from a remote takes the full set of attachments of each commit that
+it reads: each target and each parent that the depth of the pull takes, also
+a target or a parent that the repository holds complete. The full set is the
+attachments of the commit, the attachments of each attachment, and so on.
+The pull fetches the attachments one level at a time, until a level has no
+new attachment. These rules apply to a pull over HTTP, over ssh, and from an
+`s3://` address, to a pull through a session of the caller, and to a pull of
+collection refs:
 
-- The pull fetches each attachment at depth 0, so an attachment entry adds no
-  parent to the pull. The pull fetches an attachment one time, also if several
-  commits name it. A prune of the destination accepts the parents that the
-  pull did not fetch, as after a pull with a small depth.
+- The first level holds the attachments of the targets, of the parents, and
+  of the intermediate commits of a chain of static deltas. Each later level
+  holds the attachments that the attachments of the level above name. A
+  level holds no commit that an earlier run of the pull reached.
+- The pull fetches each attachment at depth 0, at each level, so an
+  attachment entry adds no parent to the pull. The pull fetches an attachment
+  one time, also if several commits name it. A prune of the destination
+  accepts the parents that the pull did not fetch, as after a pull with a
+  small depth.
+- The pull ignores field 2 of an attachment that the repository holds
+  complete: it checks no entry of that field, and requests nothing below the
+  attachment. Each write of a commit checks that its attachments are
+  complete, so the full set of attachments of a complete commit is complete.
 - The pull writes no ref for an attachment.
 - The pull checks no signature of an attachment commit. Field 2 holds the
   checksum of the attachment, and the checksum and the signatures of the
@@ -3735,20 +3747,42 @@ caller, and to a pull of collection refs:
   `.commitmeta`, and the pull removes its `.commitpartial` marker.
 - A localcache repository can supply an attachment.
 - The pull fetches the attachments after the commits that name them, in one
-  more run. It looks for a static delta of each attachment ("Static deltas of
-  attachments"). An attachment with no delta comes as loose objects.
+  more run for each level. It looks for a static delta of each attachment of
+  a level after the run of the level above ("Static deltas of attachments").
+  An attachment with no delta comes as loose objects.
 - The pull does not follow a supplement.
 - A commit-only pull and a pull with subpaths fetch no attachment.
 
-The pull checks the format of field 2 of each commit that it reads. A
-commit-only pull and a pull with subpaths check it too. A defective related
-value in field 2 fails the pull: an entry with an empty name, an entry with a
-checksum that is not 32 bytes, and an entry that names a nested attachment. An
-attachment that neither the repository, a localcache repository, nor the
-remote holds fails the pull too. This is also true for a parent that none of
-them holds, if a commit of the pull names it as an attachment. A failure of the
-pull writes no object and no ref, and leaves no `.commitpartial` marker that
-the pull wrote.
+The pull checks the format of field 2 of each commit that it reads, except
+an attachment that the repository holds complete. A commit-only pull and a
+pull with subpaths check it too. A defective related value in field 2 fails
+the pull: an entry with an empty name, and an entry with a checksum that is
+not 32 bytes. At each level, an attachment that neither the repository, a
+localcache repository, nor the remote holds fails the pull too. This is also
+true for a parent that none of them holds, if a commit of the pull names it
+as an attachment. The error names one commit that names the attachment:
+
+```text
+related commits in field 2 of commit <commit>: attachment <name> names commit <checksum>, which neither a source nor this repository holds
+```
+
+- Of the commits that name the attachment, the pull takes those of the
+  lowest level, and of these the commit with the lowest checksum. The
+  targets, the parents, and the commits of the chains of static deltas are
+  level 0, and the attachments of the first level are level 1.
+- `<name>` is the name of the first entry of that commit that names the
+  attachment.
+- The pull gives the error when the run of the level ends. If several
+  attachments fail in one run, the error names the attachment with the
+  lowest checksum.
+
+So the error does not change with the order in which the fetches end.
+
+The pull reads no `.commitpartial` marker of the remote, also from an
+`s3://` address. An attachment that the remote holds partial fails the pull
+with the error of the first object that the remote does not hold. A failure
+of the pull writes no object and no ref, and leaves no `.commitpartial`
+marker that the pull wrote.
 
 The pull of the `ostree` command fetches no attachment
 (`conformance/cli-behavior.md`, "Related commits in a pull").
@@ -3845,9 +3879,10 @@ The `pull-local` command of `ostree` imports no attachment
 
 A static delta carries its target alone, so each attachment gets a delta of
 its own. A pull looks for the delta of each attachment that it fetches and
-that the repository does not hold complete. A pull from a remote looks after
-the runs of the commits that name the attachments, and fetches the
-attachments in one more run. A local pull looks after the walk of the commit
+that the repository does not hold complete. A pull from a remote looks for
+the deltas of one level of attachments after the run of the level above, and
+fetches the attachments of the level in one more run. A local pull looks
+after the walk of the commit
 chains, before its transaction opens, and only if it reads static deltas:
 under the option that requires them, or with a list. An attachment that the pull reaches as a
 target, as a parent, or as an intermediate commit of a chain of static deltas
@@ -3872,8 +3907,17 @@ paired entry
   paired entry. An intermediate commit of a chain of static deltas that the
   depth does not take is not in the chain of a target, so it gives no paired
   entry.
+- For a pull from a remote, an attachment X that no chain names, and that
+  an attachment D of the level above names, takes its paired entries from
+  the `from` of the delta of D. D gives at most one paired entry: the entry
+  with the name N in field 2 of the `from` of D, where N is the name of the
+  first entry that names X in field 2 of D. A D with no `from` gives X no
+  paired entry, so X takes the from-scratch delta if no other D gives it a
+  paired entry that the repository holds complete. The paired entries follow
+  the order of the attachments of the level above.
 - The `from` is the first paired entry, in the order of the targets of the
-  pull, that the repository holds complete.
+  pull or of the attachments of the level above, that the repository holds
+  complete.
 
 The pull takes the first delta that it finds, in this order:
 
@@ -3902,7 +3946,8 @@ Static deltas required, but none found for <name> of <ref> to <checksum>
 `<ref>` is the first target whose chain names the attachment, as the pull
 names it. `<name>` is the name of the entry nearest to the tip of that chain.
 If no chain of a target names the attachment, `<ref>` is the first target of
-the pull. `<name>` then comes from the commit of the pull with the lowest
+the pull. An attachment that only attachments name is such a case. `<name>`
+then comes from the commit of the pull with the lowest
 checksum that names the attachment, and is the lowest name if that commit has
 two entries for it. `<checksum>` is the attachment. A from-scratch delta that
 step 3 leaves alone counts as found, and the pull fetches the attachment
@@ -3911,12 +3956,10 @@ not hold counts as none.
 
 A pull from a remote looks for the delta of an attachment before it fetches
 the attachment. Under the option that requires static deltas, an attachment
-with no delta fails the pull with the message above, also if the remote does
-not hold it or if it names attachments of its own. An attachment that names
-attachments of its own and has a delta fails the pull as a nested
-attachment, after the pull fetched and checked the superblock. A local pull
-reads the commit of each attachment before the search. So an attachment that
-no source holds fails the pull before the search for its delta.
+with no delta fails the pull with the message above, also if no source holds
+it. A local pull reads the commit of each attachment before the search. So
+an attachment that no source holds fails the pull before the search for its
+delta.
 
 The pull checks no signature of the superblock of the delta of an attachment.
 It checks the digest that the advertisement or the list states, the `from`
@@ -3926,18 +3969,26 @@ with the `to`, and the `to` is the checksum in field 2. A failed check fails
 the pull.
 
 A pull from a remote requests the superblock of the delta of each attachment
-one time. It writes each superblock to one temp file in `tmp/` of the
-repository after the digest check, and the commit that the superblock carries
-after the parse of the superblock. The file opens at the first write, and the
-pull keeps it until the pull ends. A failed check fails the pull, so the file
+one time. It writes each superblock of a level to one temp file in `tmp/` of
+the repository after the digest check, and the commit that the superblock
+carries after the parse of the superblock. Each level has a file of its own.
+The file opens at the first write, and the pull keeps it until the run of the
+level ends. The pull removes it before the search of the next level, so
+`tmp/` holds at most one such file at a time. The step of an attachment
+parses field 2 when it reads the commit bytes: from the remote, from a
+localcache repository, or, for a commit that a delta carries, from the file of
+its level. The pull keeps these entries in memory, and the next level reads
+them. It reads no record of the removed file. A failed check fails the pull,
+so the file
 holds checked bytes. The step of the commit reads the commit from the file.
 Just before the parts of a delta, the pull parses its superblock again from
 the file, and it drops the parse after the last part. This is also true for a
 remote with no summary, which states no digest of a superblock. The file holds
 at most 1 GiB, four superblocks of 128 MiB with their commits. If the
-superblocks and the commits of the attachments pass this limit, the pull
-fails with an error that names the limit, and does not fetch the attachments
-loose.
+superblocks and the commits of the attachments of one level pass this limit,
+the pull fails with an error that names the limit, and does not fetch the
+attachments loose. The limit applies to each level, and the error has the same
+text at each level.
 
 ### Attachments in a push
 
@@ -5309,7 +5360,8 @@ over both transports ("The pull of collection refs").
 A pull of the port requests the attachments of a commit over both
 transports, as `.commitmeta` and `.commit` requests of their own ("Attachments
 in a pull from a remote"). For an attachment that the repository holds
-complete, it requests neither file.
+complete, it requests neither file, and requests nothing below the
+attachment.
 
 ## The ref listing
 

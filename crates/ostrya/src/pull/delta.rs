@@ -18,13 +18,14 @@
 //! step of a list at a time, so the heap holds one job of the list.
 //!
 //! [`discover_attachments`] finds one delta for each attachment of a pull,
-//! after the pull read the commits that name the attachments. The sibling
-//! module `attachment` gives the source commit of each search. With a list,
+//! after the pull read the commits that name the attachments. A pull from a
+//! remote makes one call for each level of attachments. The sibling module
+//! `attachment` gives the source commit of each search. With a list,
 //! the search takes one entry of the list, and plans no chain. The searches
 //! check no signature of a superblock, as [`discover_attachments`] states.
 //! From a remote, the searches keep each superblock after its checks and the
 //! commit that it carries in a record file, as the discovery of a chain below
-//! does. The pull parses the superblock of an attachment again just before its
+//! does. Each call has a record file of its own. The pull parses the superblock of an attachment again just before its
 //! parts, as [`AttachmentDeltas`] states.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
@@ -126,9 +127,9 @@ pub(crate) const PART_CAP: usize = 2;
 /// holds four steps of the maximum size. The limit applies to the length of
 /// the file, the bytes of the records that discovery drops included.
 ///
-/// The search for the deltas of the attachments has a record file of its
-/// own, with the same limit. It keeps the superblocks and the commits that
-/// they carry. A superblock carries its commit, so the commit is smaller than
+/// Each search for the deltas of one level of attachments has a record file
+/// of its own, with the same limit. It keeps the superblocks and the commits
+/// that they carry. A superblock carries its commit, so the commit is smaller than
 /// the superblock, and the file holds four superblocks of the maximum size
 /// with their commits.
 const MAX_RECORD_FILE: u64 = 8 * MAX_METADATA_SIZE;
@@ -526,8 +527,8 @@ struct Checked {
 /// record that discovery drops stay in the file. The file goes away when the
 /// pull drops it.
 ///
-/// The search for the deltas of the attachments has a file of its own,
-/// which its concurrent searches share. It keeps the superblocks and the
+/// Each search for the deltas of one level of attachments has a file of its
+/// own, which its concurrent searches share. It keeps the superblocks and the
 /// commits that they carry, as [`discover_attachments`] states.
 ///
 /// The length of the file has a limit. Discovery checks the limit before each
@@ -968,7 +969,8 @@ pub(crate) struct AttachmentLookup {
     /// target whose chain names the attachment, and `<name>` is the name of
     /// the entry nearest to its tip. If no chain of a target names the
     /// attachment, `<ref>` is the first target of the pull, and `<name>` comes
-    /// from the commit of the pull with the lowest checksum that names it.
+    /// from the commit of the pull with the lowest checksum that names it. An
+    /// attachment that only an attachment names is such a case.
     pub(crate) subject: String,
     /// The first paired entry that this repository holds complete.
     pub(crate) from: Option<Checksum>,

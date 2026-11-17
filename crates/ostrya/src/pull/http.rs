@@ -302,13 +302,25 @@ impl Repo {
     ///
     /// Field 2 of a commit names the attachments of the commit.
     /// [`read_commit_relations`](Repo::read_commit_relations) reads them. The pull
-    /// follows the attachments of each commit that it reads: each target, and
-    /// each parent that [`depth`](PullOptions::depth) takes. It also follows
-    /// the attachments of a commit that this repository holds complete.
+    /// takes the full set of attachments of each commit that it reads: each
+    /// target, and each parent that [`depth`](PullOptions::depth) takes. It
+    /// also takes the full set of attachments of a target or a parent that
+    /// this repository holds complete. The full set is the attachments of the
+    /// commit, the attachments of each attachment, and so on, level by level,
+    /// until a level has no new attachment.
     ///
     /// - The pull fetches each attachment at depth 0, so an attachment entry
     ///   adds no parent to the pull. The pull fetches an attachment one time,
     ///   also if several commits name it.
+    /// - The pull fetches the attachments one level at a time. A level holds
+    ///   the attachments that the commits of the level above name and that the
+    ///   pull did not reach. The first level holds the attachments of the
+    ///   targets, of the parents, and of the commits of the chains of static
+    ///   deltas.
+    /// - The pull ignores field 2 of an attachment that this repository holds
+    ///   complete: it checks no entry of it and requests nothing below it. A
+    ///   write and a pull of a commit make the attachments of the commit
+    ///   complete first.
     /// - The pull writes no ref for an attachment.
     /// - The pull checks no signature of an attachment commit. Field 2 holds the
     ///   checksum of the attachment, and the checksum and the signatures of
@@ -330,8 +342,9 @@ impl Repo {
     ///   target requests its `.commitmeta`. An attachment that this repository
     ///   holds partial gets its whole tree and its `.commitmeta`.
     /// - The pull fetches the attachments after the commits that name them.
-    ///   It looks for a static delta of each attachment, as `# Static deltas`
-    ///   states. An attachment with no delta comes as loose objects.
+    ///   It looks for a static delta of each attachment of a level after the
+    ///   run of the level above, as `# Static deltas` states. An attachment
+    ///   with no delta comes as loose objects.
     /// - The pull does not follow a supplement: a commit that the detached
     ///   metadata key `ostrya.related` names.
     ///
@@ -344,11 +357,25 @@ impl Repo {
     ///
     /// - An entry of field 2 has an empty name or a checksum that is not 32
     ///   bytes.
-    /// - An attachment names attachments of its own: its own field 2 is not
-    ///   empty.
     /// - Neither this repository, a localcache repository, nor the remote
-    ///   holds an attachment. This is also true for a parent that none of them
-    ///   holds, if a commit of the pull names that parent as an attachment.
+    ///   holds an attachment, at any level. This is also true for a parent
+    ///   that none of them holds, if a commit of the pull names that parent as
+    ///   an attachment.
+    ///
+    /// The error of an attachment that no source holds names one commit that
+    /// names the attachment. Of the commits that name it, the pull takes those
+    /// of the lowest level, and of these the commit with the lowest checksum.
+    /// The targets, the parents, and the commits of the chains of static
+    /// deltas are level 0, and the attachments of the first level are level 1.
+    /// The entry name is the name of the first entry of that commit that names
+    /// the attachment. The pull gives the error when the run of the level
+    /// ends. If several attachments fail in one run, the error names the
+    /// attachment with the lowest checksum. So the error does not change with
+    /// the order in which the fetches end.
+    ///
+    /// The pull makes no check of a `.commitpartial` marker on the remote. If
+    /// the remote holds an attachment partial, the pull fails on the first
+    /// object of the attachment that the remote does not hold.
     ///
     /// # Detached metadata
     ///
@@ -542,12 +569,13 @@ impl Repo {
     /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list.
     ///
     /// A static delta carries its target commit alone, so each attachment
-    /// gets a delta of its own. After the runs of the commits that name the
-    /// attachments, the pull looks for a delta of each attachment that no run
-    /// reached and that this repository does not hold complete. Then it
-    /// fetches these attachments in one more run, at depth 0. The search for
-    /// the delta of an attachment is the search for the delta of a target,
-    /// with these changes:
+    /// gets a delta of its own. The pull takes the attachments one level at a
+    /// time, as `# Attachments` states. After the run of the level above, the
+    /// pull looks for a delta of each attachment of the level that this
+    /// repository does not hold complete. Then it fetches the attachments of
+    /// the level in one more run, at depth 0. The levels stop when a level
+    /// has no new attachment. The search for the delta of an attachment is
+    /// the search for the delta of a target, with these changes:
     ///
     /// - The `from` comes from the paired entries of the attachment. Each
     ///   target whose chain names the attachment gives at most one paired
@@ -556,10 +584,17 @@ impl Repo {
     ///   of a target is the target and the parents that
     ///   [`depth`](PullOptions::depth) takes. If the chain names the
     ///   attachment under two names, the name nearest to the tip applies.
-    /// - The `from` is the first paired entry, in the order of the targets,
-    ///   that this repository holds complete. The step `<c>-<to>` finds a
-    ///   delta from each other commit held complete, the other paired entries
-    ///   included.
+    /// - An attachment X that no chain names, and that an attachment D of the
+    ///   level above names, takes its paired entries from the `from` of the
+    ///   delta of D. Each such D with a `from` gives at most one paired entry:
+    ///   the entry with the name of the first entry that names X in field 2 of
+    ///   D, in field 2 of the `from` of D. The paired entries follow the order
+    ///   of the attachments of the level above. A D with no `from` gives X no
+    ///   paired entry.
+    /// - The `from` is the first paired entry, in the order of the targets or
+    ///   of the attachments of the level above, that this repository holds
+    ///   complete. The step `<c>-<to>` finds a delta from each other commit
+    ///   held complete, the other paired entries included.
     /// - The pull takes the from-scratch delta only if this repository holds
     ///   no paired entry complete.
     /// - A target with no local ref gives no paired entry. A ref gives none if
@@ -586,8 +621,10 @@ impl Repo {
     /// own.
     ///
     /// After its checks, the pull keeps the superblock of the delta of each
-    /// attachment, and the commit that it carries, in one temp file in `tmp/`
-    /// of this repository until it ends. A search holds the superblock that it
+    /// attachment of a level, and the commit that it carries, in one temp
+    /// file in `tmp/` of this repository until the run of the level ends. Each
+    /// level has a file of its own, and the pull removes it before the search
+    /// of the next level. A search holds the superblock that it
     /// fetched and the parse of it until its checks end, so during the search
     /// the heap holds at most one superblock and its parse for each search in
     /// flight. The pull reads the commit from the file in the step of the
@@ -596,8 +633,8 @@ impl Repo {
     /// requests each superblock one time, also from a remote with no summary,
     /// and the application of the parts holds the parsed deltas of at most two
     /// attachments at a time. The file holds at most 1 GiB. If the superblocks
-    /// and the commits of the attachments pass this limit, the pull fails with
-    /// [`Error::Pull`], and does not fetch loose.
+    /// and the commits of the attachments of one level pass this limit, the
+    /// pull fails with [`Error::Pull`], and does not fetch loose.
     ///
     /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
     /// [`require_static_deltas`](PullOptions::require_static_deltas) control
@@ -732,17 +769,19 @@ impl Repo {
     ///   delta of a target.
     /// - [`Error::Pull`] if
     ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
-    ///   and the pull finds no delta for an attachment. The pull looks for it
-    ///   after it fetched the objects of the targets, and publishes nothing.
-    ///   The search comes before the fetch of the attachment. So an attachment
-    ///   with no delta that the remote does not hold, or that names
-    ///   attachments of its own, gives this error, and not
-    ///   [`Error::ObjectNotFound`] or [`Error::InvalidRelations`].
+    ///   and the pull finds no delta for an attachment, at any level. The pull
+    ///   looks for it after it fetched the objects of the level above, and
+    ///   publishes nothing. The search comes before the fetch of the
+    ///   attachment. So an attachment with no delta that no source holds gives
+    ///   this error, and not [`Error::InvalidRelations`].
     /// - [`Error::InvalidRelations`] if an entry of field 2 of a commit has an
-    ///   empty name or a checksum that is not 32 bytes, or if an attachment
-    ///   names attachments of its own. If such an attachment has a delta, the
-    ///   pull fetches and checks the superblock first, and the error comes
-    ///   when the pull reads the commit from the superblock.
+    ///   empty name or a checksum that is not 32 bytes. If the commit is an
+    ///   attachment with a delta, the pull fetches and checks the superblock
+    ///   first, and the error comes when the pull reads the commit from the
+    ///   superblock. Also, at each level of the attachments, if neither this
+    ///   repository, a localcache repository, nor the remote holds an
+    ///   attachment. The error then names a commit that names the
+    ///   attachment, as `# Attachments` states.
     /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
     ///   the ref, or if the `ostree.collection-binding` of the tip of an
     ///   `@ID:NAME` ref does not state `ID`.
@@ -750,7 +789,7 @@ impl Repo {
     ///   [`timestamp_check`](PullOptions::timestamp_check) allows, or if a
     ///   content object fails a mode check.
     /// - [`Error::ObjectNotFound`] if the remote does not hold a requested
-    ///   commit, an attachment, or an object of a tree.
+    ///   commit or an object of a tree, the tree of an attachment included.
     /// - [`Error::ChecksumMismatch`] if a fetched object does not hash to its
     ///   name, or a superblock does not hash to its advertised digest.
     /// - [`Error::Core`] if a fetched commit or the header of a content object
@@ -1217,9 +1256,10 @@ impl Repo {
     /// summary and its checks, the refs, the deltas, and then the plan, to
     /// its end. With a list of static deltas, the plan runs one time for each
     /// level of intermediate commits, and then one time for the targets. A
-    /// pull that follows attachments then looks for the deltas of the
-    /// attachments that no run reached, and runs the plan one more time for
-    /// them. The commits whose `.commitpartial` marker the pull wrote go into
+    /// pull that follows attachments then runs the plan one time for each
+    /// level of attachments that no run reached: it looks for the deltas of
+    /// the level, and fetches them, until a level has no new attachment. The
+    /// commits whose `.commitpartial` marker the pull wrote go into
     /// `marked`. The `fsync` rule of the transaction for the markers goes
     /// into `marker_fsync` when the transaction starts.
     #[allow(clippy::too_many_arguments)]
@@ -1354,7 +1394,9 @@ impl Repo {
         // A commit-only pull and a pull with subpaths follow no attachment.
         // The search for the deltas of the attachments reads the list of
         // static deltas, else the summary values, after the run of the
-        // targets. The pull keeps neither if it does not read it.
+        // targets. The pull keeps neither if it does not read it. The search
+        // of each level of attachments reads it, so the parse stays in memory
+        // until the run of the last level ends.
         let follows = !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty();
         let looks = follows && !opts.disable_static_deltas;
         let edges = deltas.take_edges().filter(|_| looks);
@@ -1439,80 +1481,120 @@ impl Repo {
         )
         .await?;
         drop(jobs);
-        // The run of the attachments reads no record of a chain: each commit
+        // The runs of the attachments read no record of a chain: each commit
         // with a record is a commit that a run reached.
         drop(deltas);
         if follows {
-            // The attachments that no run reached. The search for their
-            // deltas runs after the runs of the commits that name them, and
-            // the last run fetches them at depth 0. An attachment with no delta
-            // is fetched object by object. Each commit of the run is an
-            // attachment alone, so the run checks no signature. The search for
-            // their deltas checks no signature of a superblock.
-            let mut pending: Vec<Checksum> = carry
-                .attachments
-                .inner
-                .order()
-                .iter()
-                .filter(|attachment| !carry.parents.contains_key(*attachment))
-                .copied()
-                .collect();
-            pending.sort_unstable();
-            let (roots, found) = if looks {
-                let named = attachment::pair_targets(
-                    &targets,
-                    opts.depth,
-                    &carry.parents,
-                    carry.attachments.inner.naming(),
-                    pending,
-                );
-                let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
-                let (lookups, known) =
-                    attachment::lookups(self, &targets, place, named, HashMap::new()).await?;
-                let found = delta::discover_attachments(
-                    self,
-                    &delta_source,
-                    advert.as_ref(),
-                    edges.as_ref(),
-                    lookups,
-                    &known,
+            // The attachments that no run reached, one level at a time. The
+            // first level holds the attachments of the commits of the earlier
+            // runs. Each later level holds the attachments that the run of the
+            // level above recorded. The search for the deltas of a level runs
+            // after the run of the level above, and the run of the level
+            // fetches its attachments at depth 0. An attachment with no delta
+            // is fetched object by object. Each commit of these runs is an
+            // attachment alone, so the runs check no signature. The search for
+            // the deltas checks no signature of a superblock. The levels stop
+            // when a level records no new attachment. The record of the
+            // attachments adds each attachment one time, and field 2 cannot
+            // make a cycle, so the number of levels is finite.
+            //
+            // `start` is the position in the record of the first attachment of
+            // the next level. `above` holds each attachment of the level above,
+            // in the order of the roots of that level, with the `from` of its
+            // delta, if it has one. It is `None` for the first level.
+            //
+            // The scanning state of the pull stays on through the runs of all
+            // levels, and ends one time after the last level.
+            let mut start = 0;
+            let mut above: Option<Vec<(Checksum, Option<Checksum>)>> = None;
+            loop {
+                let order = carry.attachments.inner.order();
+                let mut pending: Vec<Checksum> = order[start..]
+                    .iter()
+                    .filter(|attachment| !carry.parents.contains_key(*attachment))
+                    .copied()
+                    .collect();
+                start = order.len();
+                if pending.is_empty() {
+                    break;
+                }
+                pending.sort_unstable();
+                let (roots, found) = if looks {
+                    let level = match &above {
+                        None => attachment::Level::First,
+                        Some(above) => attachment::Level::Later(above),
+                    };
+                    let named = attachment::pair_targets(
+                        &targets,
+                        opts.depth,
+                        &carry.parents,
+                        carry.attachments.inner.naming(),
+                        &level,
+                        pending,
+                    );
+                    let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
+                    let (lookups, known) =
+                        attachment::lookups(self, &targets, place, named, HashMap::new()).await?;
+                    let froms: HashMap<Checksum, Checksum> = lookups
+                        .iter()
+                        .filter_map(|lookup| lookup.from.map(|from| (lookup.checksum, from)))
+                        .collect();
+                    above = Some(
+                        roots
+                            .iter()
+                            .map(|root| (*root, froms.get(root).copied()))
+                            .collect(),
+                    );
+                    // Each level gets a new record file.
+                    let found = delta::discover_attachments(
+                        self,
+                        &delta_source,
+                        advert.as_ref(),
+                        edges.as_ref(),
+                        lookups,
+                        &known,
+                        opts,
+                        counters,
+                    )
+                    .await?;
+                    (roots, found)
+                } else {
+                    (pending, AttachmentDeltas::default())
+                };
+                let phase = Phase {
+                    roots: &roots,
+                    tips: &none,
+                    depth: 0,
+                    subpaths: None,
+                    deltas: RunDeltas::Lazy(&found),
+                    done: &done,
+                    last: false,
+                    attachment_run: true,
+                };
+                self.drive(
+                    &txn,
+                    source,
                     opts,
+                    tip_checks,
+                    phase,
+                    &DeltaPlan::default(),
+                    verification,
+                    related,
                     counters,
+                    &mut carry,
+                    marked,
+                    *marker_fsync,
                 )
                 .await?;
-                (roots, found)
-            } else {
-                (pending, AttachmentDeltas::default())
-            };
-            drop(advert);
-            drop(edges);
-            // The run of the attachments reads no parent of the earlier runs.
-            carry.parents = HashMap::new();
-            let phase = Phase {
-                roots: &roots,
-                tips: &none,
-                depth: 0,
-                subpaths: None,
-                deltas: RunDeltas::Lazy(&found),
-                done: &done,
-                last: true,
-                attachment_run: true,
-            };
-            self.drive(
-                &txn,
-                source,
-                opts,
-                tip_checks,
-                phase,
-                &DeltaPlan::default(),
-                verification,
-                related,
-                counters,
-                &mut carry,
-                marked,
-                *marker_fsync,
-            )
-            .await?;
+                // The record file of the level goes away here, before the
+                // search of the next level. The next level reads field 2 of
+                // each attachment of this level from the step that staged it,
+                // and reads no record of this file.
+                drop(found);
+            }
+            // No run follows. Each run ends with an empty queue, so the total
+            // is the units of work that the runs started.
+            counters.report(u32::try_from(carry.started).unwrap_or(u32::MAX), false);
         }
         Ok(FetchedPull {
             txn,
@@ -1827,11 +1909,17 @@ impl Repo {
         let mut plan = Plan::new(phase.subpaths);
         plan.queued = std::mem::take(&mut carry.queued);
         plan.attachments = std::mem::take(&mut carry.attachments);
+        // Each run of the attachments is one level more. An attachment that
+        // no source holds ends as an absent commit, and the plan gives the
+        // error that names a commit that names it at the end of the run.
+        if phase.attachment_run {
+            plan.attachments.level += 1;
+        }
         for root in phase.roots {
             plan.push_commit(CommitItem {
                 checksum: *root,
                 depth: phase.depth,
-                optional: false,
+                optional: phase.attachment_run,
             });
         }
 
@@ -1862,7 +1950,7 @@ impl Repo {
                 }
                 plan.report(progress, started, !phase.last);
                 let Some(outcome) = slots.next_ready().await else {
-                    return Ok(());
+                    return plan.check_attachments();
                 };
                 let (step, buffer) = outcome?;
                 buffers.push(buffer);
@@ -1873,7 +1961,7 @@ impl Repo {
                     Step::Part(commit) => Some(commit),
                     _ => None,
                 };
-                plan.apply(step, marked)?;
+                plan.apply(step, marked);
                 // After the last part of a delta, the plan counts no part of
                 // it, and the run releases the job of an attachment.
                 if let Some(commit) = part
@@ -1970,9 +2058,10 @@ impl Repo {
     /// checks of each requested ref that names it. The step stages the
     /// detached metadata when the commit object is here.
     ///
-    /// In the run of the attachments, the step checks no signature. For an
+    /// In a run of the attachments, the step checks no signature. For an
     /// attachment that this repository holds complete, it requests no
-    /// detached metadata.
+    /// detached metadata, and gives no attachment of it. An attachment that no
+    /// source holds gives [`Step::Absent`].
     async fn fetch_commit(&self, ctx: &StepCtx<'_>, item: CommitItem) -> Result<Step> {
         let checksum = item.checksum;
         let name = ObjectName::new(checksum, ObjectType::Commit);
@@ -2062,8 +2151,10 @@ impl Repo {
                 // A parent that the remote does not hold ends that chain, as a
                 // source with truncated history does for a local pull. The pull
                 // drops its detached metadata: this repository holds no commit
-                // for it. The plan fails the pull if a commit names the parent
-                // as an attachment.
+                // for it. The plan fails the pull at the end of the run if a
+                // commit names the parent as an attachment. A root of a run of
+                // the attachments ends here too, and the plan gives the error
+                // that names a commit that names it at the end of the run.
                 (_, None) if item.optional => return Ok(Step::Absent(checksum)),
                 (_, None) => {
                     return Err(Error::ObjectNotFound {
@@ -2080,12 +2171,21 @@ impl Repo {
         // for each commit that the pull reads, also for a pull that follows no
         // attachment. A defective entry fails the pull after the checks of the
         // signatures and of the refs, and before the marker and the staging of
-        // the commit.
+        // the commit. A run of the attachments ignores field 2 of an
+        // attachment that this repository holds complete: the write rule made
+        // each attachment of that commit complete. So the run checks no entry
+        // of it, records none, and requests nothing below it.
+        let ignored = ctx.attachment_run && complete;
         let shared = Arc::clone(&bytes);
         let (commit, attachments) = ostrya_rt::unblock(move || {
             let mut commit = Commit::parse(&shared)?;
             let related = std::mem::take(&mut commit.related);
-            Ok::<_, Error>((commit, related::checked_attachments(&checksum, related)))
+            let attachments = if ignored {
+                Ok(Vec::new())
+            } else {
+                related::checked_attachments(&checksum, related)
+            };
+            Ok::<_, Error>((commit, attachments))
         })
         .await?;
         // The signature verification runs before the pull stages the commit
@@ -2731,8 +2831,9 @@ struct StepCtx<'a> {
     /// `true` if the pull follows the attachments of each commit that it
     /// reads: a pull that is not commit-only and has no subpath.
     attachments: bool,
-    /// `true` for the run of the attachments. Each commit of that run is an
-    /// attachment alone, and the step checks no signature of it.
+    /// `true` for a run of the attachments, one for each level. Each commit
+    /// of that run is an attachment alone, and the step checks no signature
+    /// of it.
     attachment_run: bool,
     /// The commits whose `.commitpartial` marker a step of this run writes. A
     /// step adds the commit before it starts the write of the marker, and the
@@ -2762,9 +2863,12 @@ struct Phase<'a> {
     deltas: RunDeltas<'a>,
     /// The commits that an earlier run made complete in the transaction.
     done: &'a HashSet<Checksum>,
-    /// `true` for the last run of the pull.
+    /// `true` for the last run of the pull. The scanning state of the pull
+    /// ends with that run. A pull that follows attachments has no such run:
+    /// a run of the attachments does not know if a level follows it, so the
+    /// pull ends the scanning state after the last level.
     last: bool,
-    /// `true` for the run of the attachments, as [`StepCtx`] holds it.
+    /// `true` for a run of the attachments, as [`StepCtx`] holds it.
     attachment_run: bool,
 }
 
@@ -2774,10 +2878,10 @@ enum RunDeltas<'a> {
     /// The jobs that the pull parsed before the run: the jobs of a level of
     /// intermediate commits, or of the targets. They live for the run.
     Ready(&'a HashMap<Checksum, DeltaJob>),
-    /// The deltas of the attachments. The step of a commit reads the head of
-    /// its delta. A load step parses the job just before the parts, and the
-    /// run releases the job after the last part. The plan loads at most
-    /// [`PART_CAP`] jobs at a time.
+    /// The deltas of the attachments of one level. The step of a commit
+    /// reads the head of its delta. A load step parses the job just before
+    /// the parts, and the run releases the job after the last part. The plan
+    /// loads at most [`PART_CAP`] jobs at a time.
     Lazy(&'a AttachmentDeltas),
 }
 
@@ -2842,7 +2946,8 @@ struct Carry {
     /// attachment span all runs.
     attachments: PlanAttachments,
     /// The parent that each commit of the runs named. A commit is here if a
-    /// run reached it. A pull that follows no attachment keeps no parent.
+    /// run reached it, an attachment of a level included. A pull that follows
+    /// no attachment keeps no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
 }
 
@@ -2851,11 +2956,12 @@ struct CommitItem {
     checksum: Checksum,
     /// The number of parents to follow from here, `-1` for all of them.
     depth: i32,
-    /// `true` if a remote that does not hold this commit ends the chain, and
-    /// the pull goes on. A parent under `depth` has this value. An attachment
-    /// has the value `false`. If the plan reached a commit as a parent, the
-    /// item keeps the value `true`, and the plan fails the pull if the remote
-    /// does not hold a commit that an attachment entry names.
+    /// `true` if the step gives [`Step::Absent`] when no source holds this
+    /// commit, and `false` if the step fails. A parent under `depth` and a
+    /// root of a run of the attachments have the value `true`. A parent that
+    /// no source holds ends its chain, and the pull goes on. The plan fails
+    /// the pull at the end of the run if a commit of the pull names an absent
+    /// commit as an attachment.
     optional: bool,
 }
 
@@ -2892,8 +2998,8 @@ enum Step {
     Part(Checksum),
     /// Nothing follows: a dirmeta or content object is stored.
     Done,
-    /// A parent that the remote does not hold ended its chain. The value is
-    /// the commit of the parent.
+    /// No source holds a commit of an optional item: a parent, which ends
+    /// its chain, or an attachment. The value is the commit.
     Absent(Checksum),
 }
 
@@ -3004,16 +3110,25 @@ struct Plan {
 /// The state of the checks of the attachments of one pull.
 ///
 /// The checks do not depend on the order in which the steps end. A commit
-/// that is an attachment and names attachments of its own fails the pull,
-/// whichever of the two facts the plan learns first. The same holds for an
-/// attachment that is also a parent that the remote does not hold.
+/// that a commit of the pull names as an attachment, and that no source
+/// holds, fails the pull at the end of the run, whichever of the two facts
+/// the plan learns first. The error names a commit that names the
+/// attachment: of the commits of the lowest level that name it, the commit
+/// with the lowest checksum. The entry name is the name of the first entry
+/// of that commit that names the attachment. The commits of the runs of the
+/// chains and of the targets are level 0, and the attachments of level `k`
+/// are level `k`. If several attachments fail in one run, the error names
+/// the attachment with the lowest checksum.
 #[derive(Default)]
 struct PlanAttachments {
     /// The attachments, and the commits that name them. A pull that looks
     /// for no delta of an attachment keeps no entry of field 2.
     inner: attachment::Attachments,
-    /// The parents that the remote does not hold.
+    /// The commits that no source holds: the parents under `depth`, and the
+    /// roots of the runs of the attachments.
     absent: HashSet<Checksum>,
+    /// The level of the commits of the current run.
+    level: usize,
 }
 
 /// A dirtree walked under a scope smaller than the whole tree.
@@ -3184,21 +3299,40 @@ impl Plan {
     }
 
     /// Adds the outcome of one step to the plan.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`apply_commit`](Plan::apply_commit) and of
-    /// [`apply_absent`](Plan::apply_absent).
-    fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) -> Result<()> {
+    fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) {
         match step {
-            Step::Commit(outcome) => return self.apply_commit(outcome, marked),
+            Step::Commit(outcome) => self.apply_commit(outcome, marked),
             Step::DirTree(checksum, dirtree) => self.apply_dirtree(checksum, &dirtree),
             Step::Loaded(commit) => self.apply_load(commit),
             Step::Part(commit) => self.apply_part(commit),
-            Step::Absent(commit) => return self.apply_absent(commit),
+            Step::Absent(commit) => self.apply_absent(commit),
             Step::Done => {}
         }
-        Ok(())
+    }
+
+    /// Checks the attachments at the end of a run, when each step of the run
+    /// reached the plan.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRelations`] if a commit of the pull names as an
+    /// attachment a commit that no source holds. The error names the commit
+    /// and the entry, as [`PlanAttachments`] states.
+    fn check_attachments(&self) -> Result<()> {
+        let unheld = self
+            .attachments
+            .absent
+            .iter()
+            .filter(|commit| self.attachments.inner.named(commit).is_some())
+            .min();
+        match unheld.and_then(|commit| {
+            self.attachments
+                .inner
+                .named_error(commit, related::UNHELD_REASON)
+        }) {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Records a loaded job of a delta, and queues its parts.
@@ -3238,15 +3372,11 @@ impl Plan {
     /// Records a commit and queues what it needs: its objects and its parent
     /// under `depth`. The call records the attachments of the commit and does
     /// not queue them. The pull fetches them in a later run, at depth 0, so it
-    /// follows no parent of an attachment. The marker of the commit goes into
-    /// `marked` first, so the caller clears it if the call fails.
-    ///
-    /// # Errors
-    ///
-    /// - [`Error::InvalidRelations`] if an attachment names attachments of its
-    ///   own. The error names the commit that names the attachment.
-    /// - [`Error::ObjectNotFound`] if the remote does not hold an attachment.
-    fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) -> Result<()> {
+    /// follows no parent of an attachment. The commit can itself be an
+    /// attachment, and its attachments then go into the next level. The marker
+    /// of the commit goes into `marked` first, so the caller clears it if the
+    /// run fails.
+    fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) {
         if outcome.marked {
             marked.push(outcome.checksum);
         }
@@ -3305,56 +3435,22 @@ impl Plan {
                 optional: true,
             });
         }
-        self.apply_attachments(outcome.checksum, outcome.attachments)
+        self.apply_attachments(outcome.checksum, outcome.attachments);
     }
 
-    /// Records the attachments of `commit`, for the checks and for the run
-    /// that fetches them.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`apply_commit`](Plan::apply_commit).
-    fn apply_attachments(
-        &mut self,
-        commit: Checksum,
-        attachments: Vec<(String, Checksum)>,
-    ) -> Result<()> {
-        if attachments.is_empty() {
-            return Ok(());
-        }
-        if let Some(err) = self.attachments.inner.nested_error(&commit) {
-            return Err(err);
-        }
-        for (name, attachment) in &attachments {
-            if *attachment == commit || self.attachments.inner.naming().contains_key(attachment) {
-                return Err(related::nested_attachment(commit, name, attachment));
-            }
-            if self.attachments.absent.contains(attachment) {
-                return Err(Error::ObjectNotFound {
-                    checksum: *attachment,
-                    ty: ObjectType::Commit,
-                });
-            }
-        }
-        self.attachments.inner.record(commit, attachments);
-        Ok(())
+    /// Records the attachments of `commit`, a commit of the level of the
+    /// run, for the checks and for the run that fetches them.
+    fn apply_attachments(&mut self, commit: Checksum, attachments: Vec<(String, Checksum)>) {
+        let level = self.attachments.level;
+        self.attachments.inner.record_at(level, commit, attachments);
     }
 
-    /// Records a parent that the remote does not hold.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::ObjectNotFound`] if a commit of this pull names the parent as
-    /// an attachment.
-    fn apply_absent(&mut self, commit: Checksum) -> Result<()> {
-        if self.attachments.inner.named(&commit).is_some() {
-            return Err(Error::ObjectNotFound {
-                checksum: commit,
-                ty: ObjectType::Commit,
-            });
-        }
+    /// Records a commit that no source holds: a parent under `depth`, or an
+    /// attachment. [`check_attachments`](Plan::check_attachments) fails the
+    /// pull at the end of the run if a commit of the pull names it as an
+    /// attachment.
+    fn apply_absent(&mut self, commit: Checksum) {
         self.attachments.absent.insert(commit);
-        Ok(())
     }
 }
 
@@ -4446,7 +4542,7 @@ mod tests {
                 Item::Part(part) => Step::Part(part.commit),
                 Item::Commit(_) => panic!("the test queues no further commits"),
             };
-            plan.apply(step, marked).unwrap();
+            plan.apply(step, marked);
         }
     }
 
@@ -4472,8 +4568,7 @@ mod tests {
                 None,
             ),
             &mut marked,
-        )
-        .unwrap();
+        );
         assert_eq!(plan.scan.len(), 2);
         drain(&mut plan, &mut marked);
         assert!(plan.next().is_none());
@@ -4488,13 +4583,11 @@ mod tests {
         let mut marked = Vec::new();
         let shared = object(9, ObjectType::DirMeta);
         for byte in [1u8, 2] {
-            plan.apply(fetched(csum(byte), vec![shared], None), &mut marked)
-                .unwrap();
+            plan.apply(fetched(csum(byte), vec![shared], None), &mut marked);
         }
         assert_eq!(plan.scan.len(), 1);
         drain(&mut plan, &mut marked);
-        plan.apply(fetched(csum(3), vec![shared], None), &mut marked)
-            .unwrap();
+        plan.apply(fetched(csum(3), vec![shared], None), &mut marked);
         assert!(plan.next().is_none());
     }
 
@@ -4512,8 +4605,7 @@ mod tests {
         plan.push_commit(tip);
         assert!(matches!(plan.next(), Some(Item::Commit(_))));
         // Its parent is recorded, but depth 0 followed none of it.
-        plan.apply(fetched(csum(1), Vec::new(), Some(csum(2))), &mut marked)
-            .unwrap();
+        plan.apply(fetched(csum(1), Vec::new(), Some(csum(2))), &mut marked);
         assert!(plan.next().is_none());
 
         // A second ref reaches the same commit with one parent to follow.
@@ -4548,8 +4640,7 @@ mod tests {
                 None,
             ),
             &mut marked,
-        )
-        .unwrap();
+        );
         plan.push_commit(CommitItem {
             checksum: csum(5),
             depth: 0,
@@ -4578,8 +4669,7 @@ mod tests {
             object(2, ObjectType::DirMeta),
             object(3, ObjectType::DirTree),
         ];
-        plan.apply(by_delta(csum(1), 2, vec![fallback], tree), &mut marked)
-            .unwrap();
+        plan.apply(by_delta(csum(1), 2, vec![fallback], tree), &mut marked);
 
         // The parts come before the fallback, which is content.
         assert!(matches!(plan.next(), Some(Item::Part(_))));
@@ -4591,9 +4681,9 @@ mod tests {
         // The tree is not queued while a part is outstanding.
         assert!(plan.next().is_none());
 
-        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        plan.apply(Step::Part(csum(1)), &mut marked);
         assert!(plan.next().is_none());
-        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        plan.apply(Step::Part(csum(1)), &mut marked);
         let Some(Item::Object(name)) = plan.next() else {
             panic!("the tree was not queued after the last part");
         };
@@ -4606,8 +4696,7 @@ mod tests {
     fn the_part_cap_holds_however_many_parts_a_delta_has() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
-        plan.apply(by_delta(csum(1), 5, Vec::new(), Vec::new()), &mut marked)
-            .unwrap();
+        plan.apply(by_delta(csum(1), 5, Vec::new(), Vec::new()), &mut marked);
 
         let mut in_flight = 0;
         let mut high_water = 0;
@@ -4621,7 +4710,7 @@ mod tests {
             if in_flight == 0 {
                 break;
             }
-            plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+            plan.apply(Step::Part(csum(1)), &mut marked);
             in_flight -= 1;
             applied += 1;
         }
@@ -4637,24 +4726,23 @@ mod tests {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         let tree = vec![object(2, ObjectType::DirMeta)];
-        plan.apply(by_attachment_delta(csum(1), 2, tree), &mut marked)
-            .unwrap();
+        plan.apply(by_attachment_delta(csum(1), 2, tree), &mut marked);
 
         assert!(matches!(plan.next(), Some(Item::Load(commit)) if commit == csum(1)));
         assert!(plan.loaded.contains(&csum(1)));
         // No part and no tree before the job is loaded.
         assert!(plan.next().is_none());
 
-        plan.apply(Step::Loaded(csum(1)), &mut marked).unwrap();
+        plan.apply(Step::Loaded(csum(1)), &mut marked);
         assert!(matches!(plan.next(), Some(Item::Part(_))));
         assert!(matches!(plan.next(), Some(Item::Part(_))));
         assert!(plan.next().is_none());
 
-        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        plan.apply(Step::Part(csum(1)), &mut marked);
         assert!(plan.loaded.contains(&csum(1)));
         assert!(plan.delta_parts.contains_key(&csum(1)));
         assert!(plan.next().is_none());
-        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        plan.apply(Step::Part(csum(1)), &mut marked);
         assert!(plan.loaded.is_empty());
         assert!(!plan.delta_parts.contains_key(&csum(1)));
         let Some(Item::Object(name)) = plan.next() else {
@@ -4706,8 +4794,7 @@ mod tests {
                 assert!(run.commit_bytes(commit).await.unwrap().is_none());
                 assert!(!found.holds_commit_data(commit));
                 assert!(found.has_head(commit));
-                plan.apply(by_attachment_delta(*commit, parts, Vec::new()), &mut marked)
-                    .unwrap();
+                plan.apply(by_attachment_delta(*commit, parts, Vec::new()), &mut marked);
             }
 
             let mut in_flight = VecDeque::new();
@@ -4738,7 +4825,7 @@ mod tests {
                     Step::Part(commit) => Some(commit),
                     _ => None,
                 };
-                plan.apply(step, &mut marked).unwrap();
+                plan.apply(step, &mut marked);
                 if let Some(commit) = part
                     && !plan.delta_parts.contains_key(&commit)
                 {
@@ -4795,15 +4882,12 @@ mod tests {
 
         let eager_progress = PullCounters::new(None);
         let mut eager = Plan::default();
-        eager
-            .apply(by_delta(csum(1), 3, Vec::new(), tree()), &mut marked)
-            .unwrap();
+        eager.apply(by_delta(csum(1), 3, Vec::new(), tree()), &mut marked);
         eager.report(&eager_progress, 1, false);
 
         let lazy_progress = PullCounters::new(None);
         let mut lazy = Plan::default();
-        lazy.apply(by_attachment_delta(csum(1), 3, tree()), &mut marked)
-            .unwrap();
+        lazy.apply(by_attachment_delta(csum(1), 3, tree()), &mut marked);
         lazy.report(&lazy_progress, 1, false);
         assert_eq!(total(&lazy_progress), total(&eager_progress));
         assert_eq!(total(&lazy_progress), 1 + 3);
@@ -4812,7 +4896,7 @@ mod tests {
         assert!(matches!(lazy.next(), Some(Item::Load(_))));
         lazy.report(&lazy_progress, 1, false);
         assert_eq!(total(&lazy_progress), 1 + 3);
-        lazy.apply(Step::Loaded(csum(1)), &mut marked).unwrap();
+        lazy.apply(Step::Loaded(csum(1)), &mut marked);
         lazy.report(&lazy_progress, 1, false);
         assert_eq!(total(&lazy_progress), 1 + 3);
         assert_eq!(lazy.waiting_parts, 0);
@@ -4978,26 +5062,20 @@ mod tests {
                 None,
             ),
             &mut marked,
-        )
-        .unwrap();
+        );
         pop_dirtree(&mut plan, 1);
-        plan.apply(Step::DirTree(csum(1), root), &mut marked)
-            .unwrap();
+        plan.apply(Step::DirTree(csum(1), root), &mut marked);
         pop_dirtree(&mut plan, 10);
         pop_dirtree(&mut plan, 11);
-        plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked)
-            .unwrap();
+        plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked);
         // The walk of `x` is under `/p/x/` alone, which fetches nothing in it.
         pop_dirtree(&mut plan, 20);
-        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked)
-            .unwrap();
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
         assert!(plan.content.is_empty());
         // `/q/x` reaches it again and names it whole.
-        plan.apply(Step::DirTree(csum(11), parent), &mut marked)
-            .unwrap();
+        plan.apply(Step::DirTree(csum(11), parent), &mut marked);
         pop_dirtree(&mut plan, 20);
-        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked)
-            .unwrap();
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
         assert_eq!(
             plan.content.iter().copied().collect::<Vec<_>>(),
             [object(30, ObjectType::File)]
@@ -5021,8 +5099,7 @@ mod tests {
                 vec![object(2, ObjectType::DirMeta)],
             ),
             &mut marked,
-        )
-        .unwrap();
+        );
         assert_eq!(plan.scan.len(), 1);
         assert_eq!(plan.content.len(), 1);
         assert!(plan.parts.is_empty());
@@ -5079,8 +5156,7 @@ mod tests {
         plan.apply(
             naming(csum(1), Some(csum(2)), &[("boot/uki", 3)]),
             &mut marked,
-        )
-        .unwrap();
+        );
         let parent = next_commit(&mut plan);
         assert_eq!((parent.checksum, parent.depth), (csum(2), -1));
         assert!(parent.optional);
@@ -5096,93 +5172,125 @@ mod tests {
         );
     }
 
-    /// An attachment that two commits name keeps the first commit and entry
-    /// name. The plan records the entries of each commit.
+    /// An attachment that two commits of one level name keeps the commit
+    /// with the lower checksum and its first entry, in either order of the
+    /// two steps. A commit of a lower level stays over a commit of a later
+    /// level. The plan records the entries of each commit.
     #[test]
-    fn an_attachment_two_commits_name_keeps_the_first_entry() {
+    fn an_attachment_two_commits_name_keeps_the_lowest_commit() {
+        for order in [[1, 2], [2, 1]] {
+            let mut plan = Plan::default();
+            let mut marked = Vec::new();
+            for byte in order {
+                let entries: &[(&str, u8)] = if byte == 1 {
+                    &[("a/x", 3), ("a/y", 3)]
+                } else {
+                    &[("b/x", 3)]
+                };
+                plan.apply(naming(csum(byte), None, entries), &mut marked);
+            }
+            assert!(plan.next().is_none());
+            assert_eq!(
+                plan.attachments.inner.named(&csum(3)),
+                Some((csum(1), "a/x")),
+                "{order:?}"
+            );
+            assert_eq!(plan.attachments.inner.order(), [csum(3)]);
+            assert_eq!(plan.attachments.inner.naming().len(), 2);
+            plan.apply(naming(csum(3), None, &[]), &mut marked);
+            assert_eq!(plan.parents.get(&csum(3)), Some(&None));
+        }
+
         let mut plan = Plan::default();
         let mut marked = Vec::new();
-        plan.apply(naming(csum(1), None, &[("a/x", 3)]), &mut marked)
-            .unwrap();
-        plan.apply(naming(csum(2), None, &[("b/x", 3)]), &mut marked)
-            .unwrap();
-        assert!(plan.next().is_none());
+        plan.apply(naming(csum(2), None, &[("b/x", 3)]), &mut marked);
+        plan.attachments.level += 1;
+        plan.apply(naming(csum(1), None, &[("a/x", 3)]), &mut marked);
         assert_eq!(
             plan.attachments.inner.named(&csum(3)),
-            Some((csum(1), "a/x"))
+            Some((csum(2), "b/x"))
         );
-        assert_eq!(plan.attachments.inner.order(), [csum(3)]);
-        assert_eq!(plan.attachments.inner.naming().len(), 2);
-        plan.apply(naming(csum(3), None, &[]), &mut marked).unwrap();
-        assert_eq!(plan.parents.get(&csum(3)), Some(&None));
     }
 
-    /// An attachment that names attachments of its own fails the pull, in
-    /// either order of the two steps. The error names the commit that names
-    /// the nested attachment.
+    /// An attachment that names attachments of its own is recorded, in
+    /// either order of the two steps. Its attachments follow the attachments
+    /// of the earlier commits in the order of the record, and keep the
+    /// attachment as the commit that names them.
     #[test]
-    fn a_nested_attachment_fails_in_either_order() {
-        let nested = format!(
-            "attachment lib/b names commit {}, which has attachments of its own",
-            csum(2)
-        );
+    fn a_nested_attachment_is_recorded_in_either_order() {
         // The commit that names the attachment comes first.
         let mut plan = Plan::default();
         let mut marked = Vec::new();
-        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
-            .unwrap();
-        let err = plan
-            .apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked)
-            .unwrap_err();
-        assert_eq!(invalid_relations(err), (Some(csum(1)), nested.clone()));
-        assert_eq!(marked, [csum(1), csum(2)], "the marker is recorded first");
+        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked);
+        plan.apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked);
+        assert_eq!(marked, [csum(1), csum(2)]);
+        assert_eq!(plan.attachments.inner.order(), [csum(2), csum(3)]);
+        assert_eq!(
+            plan.attachments.inner.named(&csum(2)),
+            Some((csum(1), "lib/b"))
+        );
+        assert_eq!(
+            plan.attachments.inner.named(&csum(3)),
+            Some((csum(2), "lib/c"))
+        );
 
         // The attachment comes first.
         let mut plan = Plan::default();
-        plan.apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked)
-            .unwrap();
-        let err = plan
-            .apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
-            .unwrap_err();
-        assert_eq!(invalid_relations(err), (Some(csum(1)), nested));
+        plan.apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked);
+        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked);
+        assert_eq!(plan.attachments.inner.order(), [csum(3), csum(2)]);
+        assert_eq!(
+            plan.attachments.inner.named(&csum(3)),
+            Some((csum(2), "lib/c"))
+        );
+        assert!(plan.next().is_none());
     }
 
-    /// A parent that the remote does not hold fails the pull if a commit
-    /// names it as an attachment, in either order of the two steps.
+    /// A parent that no source holds fails the pull at the end of the run if
+    /// a commit names it as an attachment, in each order of the steps. The
+    /// error names the commit with the lower checksum of the two that name
+    /// the attachment.
     #[test]
-    fn an_absent_parent_that_is_an_attachment_fails_in_either_order() {
-        let missing = |err: Error| {
-            assert!(
-                matches!(
-                    err,
-                    Error::ObjectNotFound {
-                        checksum,
-                        ty: ObjectType::Commit,
-                    } if checksum == csum(2)
-                ),
-                "{err:?}"
-            );
-        };
-        let mut marked = Vec::new();
-        // The plan learns of the attachment first.
-        let mut plan = Plan::default();
-        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
-            .unwrap();
-        missing(plan.apply(Step::Absent(csum(2)), &mut marked).unwrap_err());
-
-        // The plan learns of the absent parent first.
-        let mut plan = Plan::default();
-        plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
-        missing(
-            plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
-                .unwrap_err(),
+    fn an_absent_parent_that_is_an_attachment_fails_in_each_order() {
+        let unheld = format!(
+            "attachment lib/b names commit {}, which neither a source nor this repository holds",
+            csum(2)
         );
+        let steps = || {
+            [
+                naming(csum(1), None, &[("lib/b", 2)]),
+                naming(csum(4), None, &[("lib/x", 2)]),
+                Step::Absent(csum(2)),
+            ]
+        };
+        for order in [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ] {
+            let mut marked = Vec::new();
+            let mut plan = Plan::default();
+            let mut steps = steps().map(Some);
+            for at in order {
+                plan.apply(steps[at].take().unwrap(), &mut marked);
+            }
+            let err = plan.check_attachments().unwrap_err();
+            assert_eq!(
+                invalid_relations(err),
+                (Some(csum(1)), unheld.clone()),
+                "{order:?}"
+            );
+        }
 
         // An absent parent that no commit names ends its chain.
+        let mut marked = Vec::new();
         let mut plan = Plan::default();
-        plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
-        plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked)
-            .unwrap();
+        plan.apply(Step::Absent(csum(2)), &mut marked);
+        plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked);
+        plan.check_attachments().unwrap();
         assert!(plan.attachments.inner.named(&csum(3)).is_some());
         assert!(!plan.parents.contains_key(&csum(2)));
     }

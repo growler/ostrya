@@ -2153,6 +2153,7 @@ impl Repo {
                     opts.depth,
                     &atts.parents,
                     atts.inner.naming(),
+                    &attachment::Level::First,
                     appended,
                 );
                 drop(atts);

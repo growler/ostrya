@@ -3864,17 +3864,23 @@ until a prune. `pull-local` does the same. An alias under `refs/remotes` or
 `refs/mirrors` comes from a write of the library or from an out-of-band
 write. The `ostrya` command writes none.
 
-`pull` also fetches the attachments that field 2 of each pulled commit
-names, each at depth 0 and with no ref, unless the pull is commit-only or has a
-subpath (`../format-reference.md`, "Attachments in a pull from a remote"). An
-attachment that neither the repository, a localcache repository, nor the
-remote holds, a field 2 entry with an empty name or with a checksum that is
-not 32 bytes, and a nested attachment fail the pull at exit 1, and the pull
-writes no object and no ref. The pull looks for a static delta of each
-attachment, from the entry of the same name in the commit that the local ref
-names before the pull (`../format-reference.md`, "Static deltas of
-attachments"). The tool fetches no attachment (`cli-behavior.md`, "Related
-commits in a pull").
+`pull` also fetches the full set of attachments of each pulled commit: the
+attachments that field 2 names, and the attachments of each attachment, level
+by level. It fetches each one at depth 0 and with no ref, unless the pull is
+commit-only or has a subpath (`../format-reference.md`, "Attachments in a pull
+from a remote"). It ignores field 2 of an attachment that the destination holds
+complete, and requests nothing below it. A field 2 entry with an empty name or
+with a checksum that is not 32 bytes fails the pull at exit 1. At each level,
+an attachment that neither the repository, a localcache repository, nor the
+remote holds fails the pull at exit 1. The error names a commit that names the
+attachment: of the commits of the lowest level that name it, the commit with
+the lowest checksum. The pull then writes no object and no ref. The pull
+looks for a static delta of each attachment of a level after the run of the
+level above. The `from` is the entry of the same name in the commit that the
+local ref names before the pull, or, for an attachment that an attachment of
+the level above names, in the `from` of the delta of that attachment
+(`../format-reference.md`, "Static deltas of attachments"). The tool fetches no
+attachment (`cli-behavior.md`, "Related commits in a pull").
 
 The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID or whose

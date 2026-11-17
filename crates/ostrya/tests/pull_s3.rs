@@ -444,3 +444,61 @@ fn a_session_to_an_s3_endpoint_fetches_an_attachment() {
         assert_eq!(object_names(&path), object_names(&bucket));
     });
 }
+
+/// A pull through a session to an `Endpoint::S3` takes the full set of
+/// attachments of the pulled commit: a pull of R of the chain R -> C -> D
+/// takes C and D, complete, and writes no ref for either.
+#[test]
+fn a_session_to_an_s3_endpoint_takes_the_full_set_of_attachments() {
+    if !rclone_available("a_session_to_an_s3_endpoint_takes_the_full_set_of_attachments") {
+        return;
+    }
+    let scratch = TmpDir::new("pull-s3-attachment-chain");
+    let root = scratch.path().join("root");
+    let bucket = root.join("bkt").join("repo");
+    std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+    let chain = block_on(async {
+        let remote = Repo::create(&bucket, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let chain = common::write_chain(&remote, &scratch.path().join("trees"), REF).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        chain
+    });
+    let server = Rclone::start(scratch.path(), &root);
+    block_on(async {
+        let endpoint = common::s3::endpoint(&server.endpoint(), "s3://bkt/repo");
+        let session = PullSession::connect(Endpoint::S3(endpoint), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let path = scratch.path().join("dest");
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let opts = PullOptions {
+            refs: vec![REF.to_owned()],
+            ..PullOptions::default()
+        };
+        repo.pull_with_session(session, PullTrust::unverified(), opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.list_refs(None).await.unwrap(),
+            [(REF.to_owned(), chain.r)]
+        );
+        assert!(repo.list_remote_refs().await.unwrap().is_empty());
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_eq!(
+                repo.commit_state(&commit).await.unwrap(),
+                CommitState::Normal
+            );
+        }
+        assert_eq!(object_names(&path), object_names(&bucket));
+    });
+}

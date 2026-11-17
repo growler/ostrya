@@ -31,8 +31,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::{
-    TmpDir, attachment_error, file_inventory, ostree_available, ostree_supports_ed25519,
-    store_with_field2, wait_for_commit_under_guard, within, writer_child_main, writer_child_with,
+    CHAIN_D, Chain, DIAMOND_D, TmpDir, attachment_error, file_inventory, ostree_available,
+    ostree_supports_ed25519, store_with_field2, wait_for_commit_under_guard, within, write_chain,
+    write_diamond, writer_child_main, writer_child_with,
 };
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
@@ -430,6 +431,59 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
             std::fs::read(commitmeta(&dest_dir)).unwrap(),
             std::fs::read(commitmeta(&dir.path().join("remote"))).unwrap()
         );
+    });
+}
+
+/// The scanning state of a pull ends when its fetch ends. Under a guard, the
+/// pull waits at the step that writes the refs, after the fetch. There, the
+/// progress handle shows the scanning state off, and each unit of work done.
+/// The commit of `test/main` has no attachment, and then the chain of
+/// attachments R -> C -> D, with two levels of attachments.
+#[test]
+fn a_pull_ends_the_scanning_state_when_its_fetch_ends() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-scanning-ends");
+        let plain = dir.path().join("plain");
+        let chained = dir.path().join("chained");
+        std::fs::create_dir(&plain).unwrap();
+        std::fs::create_dir(&chained).unwrap();
+        let (_remote, commit) = build_remote(&plain).await;
+        let (_remote, chain) = build_chain_remote_of_attachments(&chained).await;
+        for (base, tip) in [(plain, commit), (chained, chain.r)] {
+            let server = RepoServer::start(&base.join("remote"), false).await;
+            drop(build_dest(&base, RepoMode::Archive, &server.url(), "").await);
+            let dest_dir = base.join("dest");
+            let config = dest_dir.join("config");
+            let text = std::fs::read_to_string(&config).unwrap();
+            std::fs::write(
+                &config,
+                text.replacen("[core]\n", "[core]\nlock-timeout-secs=-1\n", 1),
+            )
+            .unwrap();
+            let a = Repo::open(&dest_dir).await.unwrap();
+            let b = Repo::open(&dest_dir).await.unwrap();
+            let progress = ostrya::PullProgress::new();
+            let handle = progress.clone();
+
+            let guard = a.begin_update().await.unwrap();
+            let mut task = spawn(async move {
+                let opts = PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    progress: Some(handle),
+                    ..PullOptions::default()
+                };
+                b.pull("origin", opts).await
+            });
+            wait_for_commit_under_guard(&a, &tip, &mut task).await;
+            assert!(poll_once(&mut task).await.is_none(), "the pull waits");
+            let snapshot = progress.snapshot();
+            assert!(!snapshot.scanning, "{snapshot:?}");
+            assert_eq!(snapshot.objects_done, snapshot.objects_total);
+            guard.finish().await.unwrap();
+
+            within("the pull", task).await.unwrap();
+            assert!(!progress.snapshot().scanning);
+        }
     });
 }
 
@@ -9733,26 +9787,27 @@ fn an_attachment_commitmeta_that_does_not_parse_is_stored() {
 }
 
 /// An attachment that the remote does not hold fails the pull with
-/// `Error::ObjectNotFound`, and the pull leaves nothing.
+/// `Error::InvalidRelations`, which names the commit that names the
+/// attachment. The pull leaves nothing.
 #[test]
 fn a_missing_attachment_fails_the_pull() {
     block_on(async {
         let dir = TmpDir::new("pull-http-dependency-missing");
-        let (_remote, _tip, att) = build_attachment_remote(dir.path()).await;
+        let (_remote, tip, att) = build_attachment_remote(dir.path()).await;
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         server.hide(&meta_path(&att, "commit"));
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
 
         let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound {
-                    checksum,
-                    ty: ObjectType::Commit,
-                } if checksum == att
-            ),
-            "{err:?}"
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(tip),
+                format!(
+                    "attachment boot/uki names commit {att}, which neither a source nor this \
+                     repository holds"
+                )
+            )
         );
         assert_left_nothing(&dest).await;
     });
@@ -9786,12 +9841,11 @@ fn a_defective_attachment_entry_fails_the_pull() {
     });
 }
 
-/// An attachment that names attachments of its own fails the pull with
-/// `Error::InvalidRelations`, whichever of the two commits the pull reads
-/// first. The error names the commit that names the nested attachment. The
-/// pull leaves nothing.
+/// An attachment that names attachments of its own brings them in, also if
+/// the pull takes that commit as a target. Each commit ends complete, and the
+/// pull writes the remote refs of the requested refs alone.
 #[test]
-fn a_nested_attachment_fails_the_pull() {
+fn a_nested_attachment_is_fetched_with_its_attachments() {
     block_on(async {
         let dir = TmpDir::new("pull-http-dependency-nested");
         let base = dir.path();
@@ -9805,35 +9859,44 @@ fn a_nested_attachment_fails_the_pull() {
         move_ref(&remote, "test/other", &nested).await;
         move_ref(&remote, "test/main", &head).await;
         let server = RepoServer::start(&base.join("remote"), false).await;
-        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
 
-        let reason =
-            format!("attachment lib/b names commit {nested}, which has attachments of its own");
-        for refs in [&["test/main"][..], &["test/main", "test/other"]] {
-            let err = dest
-                .pull(
-                    "origin",
-                    PullOptions {
-                        refs: refs.iter().map(|r| (*r).to_owned()).collect(),
-                        ..PullOptions::default()
-                    },
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(
-                attachment_error(err),
-                (Some(head), reason.clone()),
-                "{refs:?}"
-            );
-            assert_left_nothing(&dest).await;
+        for (at, refs) in [&["test/main"][..], &["test/main", "test/other"]]
+            .into_iter()
+            .enumerate()
+        {
+            let dest_dir = base.join(format!("dest-{at}"));
+            std::fs::create_dir_all(&dest_dir).unwrap();
+            let dest = build_dest(&dest_dir, RepoMode::Archive, &server.url(), "").await;
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            for commit in [head, nested, att] {
+                assert_complete(&remote, &dest, dest.path(), &commit).await;
+            }
+            assert_no_markers(dest.path());
+            let expected: Vec<(String, Checksum)> =
+                [("origin:test/main", head), ("origin:test/other", nested)]
+                    .into_iter()
+                    .take(refs.len())
+                    .map(|(name, commit)| (name.to_owned(), commit))
+                    .collect();
+            assert_eq!(dest.list_remote_refs().await.unwrap(), expected, "{refs:?}");
+            assert!(dest.list_refs(None).await.unwrap().is_empty());
         }
     });
 }
 
 /// A parent that the remote does not hold ends its chain. If a pulled commit
 /// names the parent as an attachment, the pull fails with
-/// `Error::ObjectNotFound`. The tip names its own parent, so the plan queues
-/// the parent first as an optional commit, and the attachment adds no item.
+/// `Error::InvalidRelations`, which names that commit. The tip names its own
+/// parent, so the plan queues the parent first as an optional commit, and the
+/// attachment adds no item.
 #[test]
 fn an_absent_parent_that_is_an_attachment_fails_the_pull() {
     block_on(async {
@@ -9858,15 +9921,15 @@ fn an_absent_parent_that_is_an_attachment_fails_the_pull() {
         };
 
         let err = pull_main(&dest, opts()).await.unwrap_err();
-        assert!(
-            matches!(
-                err,
-                Error::ObjectNotFound {
-                    checksum,
-                    ty: ObjectType::Commit,
-                } if checksum == parent
-            ),
-            "{err:?}"
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(tip),
+                format!(
+                    "attachment boot/p names commit {parent}, which neither a source nor this \
+                     repository holds"
+                )
+            )
         );
         assert_left_nothing(&dest).await;
 
@@ -9874,6 +9937,198 @@ fn an_absent_parent_that_is_an_attachment_fails_the_pull() {
         move_ref(&remote, "test/main", &plain).await;
         pull_main(&dest, opts()).await.unwrap();
         assert!(!dest.has_object(ObjectType::Commit, &parent).await.unwrap());
+    });
+}
+
+/// Builds an archive remote under `dir/remote` with the chain R -> C -> D on
+/// `test/main`, and its summary. The trees are under `dir/trees`.
+async fn build_chain_remote_of_attachments(dir: &Path) -> (Repo, Chain) {
+    let remote = create_remote(dir).await;
+    let chain = write_chain(&remote, &dir.join("trees"), "test/main").await;
+    summarize(&remote).await;
+    (remote, chain)
+}
+
+/// A pull of R of the chain R -> C -> D takes C and D, complete, with no
+/// marker and no ref for C or D.
+#[test]
+fn a_pull_takes_the_full_set_of_attachments() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-chain");
+        let (remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_no_markers(dest.path());
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), chain.r)]
+        );
+        // The fsck reports no error and no failure.
+        let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(
+            report.errors.is_empty() && report.failure.is_none(),
+            "{report:?}"
+        );
+    });
+}
+
+/// In the diamond, A and B both name D. The pull requests the commit object
+/// and the `.commitmeta` of D one time. Each commit ends complete.
+#[test]
+fn an_attachment_that_two_attachments_name_is_fetched_once() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-diamond");
+        let remote = create_remote(dir.path()).await;
+        let diamond = write_diamond(&remote, &dir.path().join("trees"), "test/main").await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            server.requests_for(&meta_path(&diamond.d, "commit")),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&diamond.d, "commitmeta")),
+            1,
+            "{seen:?}"
+        );
+        for commit in [diamond.r, diamond.a, diamond.b, diamond.d] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_no_markers(dest.path());
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// The destination holds C of the chain R -> C -> D complete. The pull of R
+/// ignores field 2 of C and requests nothing below it: with the commit object
+/// of D gone from the destination and hidden on the remote, the pull passes.
+/// It requests no file of C or of D, and stores no commit object of D.
+#[test]
+fn a_pull_requests_nothing_below_an_attachment_held_complete() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-held");
+        let (remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &chain.c).await;
+        std::fs::remove_file(dest.path().join(meta_path(&chain.d, "commit"))).unwrap();
+        server.hide(&meta_path(&chain.d, "commit"));
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        for commit in [chain.c, chain.d] {
+            for ext in ["commit", "commitmeta"] {
+                assert_eq!(server.requests_for(&meta_path(&commit, ext)), 0, "{seen:?}");
+            }
+            assert_eq!(server.requests_for(&index_path(&commit)), 0, "{seen:?}");
+        }
+        assert_complete(&remote, &dest, dest.path(), &chain.r).await;
+        assert_eq!(
+            dest.commit_state(&chain.c).await.unwrap(),
+            CommitState::Normal
+        );
+        assert!(!dest.has_object(ObjectType::Commit, &chain.d).await.unwrap());
+        assert_no_markers(dest.path());
+    });
+}
+
+/// In the chain R -> C -> D, the remote does not hold D. The pull of R fails,
+/// the error names C as the commit that names D, and the pull leaves nothing.
+#[test]
+fn a_missing_attachment_below_an_attachment_names_its_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-broken-bottom");
+        let (_remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        server.hide(&meta_path(&chain.d, "commit"));
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which neither a source nor this \
+                     repository holds",
+                    chain.d
+                )
+            )
+        );
+        assert_left_nothing(&dest).await;
+    });
+}
+
+/// In the diamond, the remote does not hold D, which A and B both name. The
+/// error names the one of A and B with the lower checksum, whichever of their
+/// steps ends first. A localcache repository that holds the commit object of
+/// A, or of B, makes the step of that commit end first.
+#[test]
+fn a_missing_attachment_that_two_attachments_name_names_the_lower_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-diamond-missing");
+        let remote = create_remote(dir.path()).await;
+        let diamond = write_diamond(&remote, &dir.path().join("trees"), "test/main").await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        server.hide(&meta_path(&diamond.d, "commit"));
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let mut caches = Vec::new();
+        for (at, held) in [diamond.a, diamond.b].into_iter().enumerate() {
+            let cache = Repo::create(
+                &dir.path().join(format!("cache-{at}")),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let bytes = remote
+                .load_object_bytes(ObjectType::Commit, &held)
+                .await
+                .unwrap();
+            let txn = cache.transaction().await.unwrap();
+            txn.write_metadata(ObjectType::Commit, None, &bytes)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+            caches.push(cache);
+        }
+        let expected = (
+            Some(diamond.a.min(diamond.b)),
+            format!(
+                "attachment {DIAMOND_D} names commit {}, which neither a source nor this \
+                 repository holds",
+                diamond.d
+            ),
+        );
+
+        for localcache_repos in [Vec::new(), vec![caches[0].clone()], vec![caches[1].clone()]] {
+            let err = pull_main(
+                &dest,
+                PullOptions {
+                    localcache_repos,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(attachment_error(err), expected);
+            assert_left_nothing(&dest).await;
+        }
     });
 }
 
@@ -10357,6 +10612,55 @@ fn a_pull_with_no_summary_requests_the_attachment_delta_by_name() {
             "{seen:?}"
         );
         assert_complete(&remote, &dest, dest.path(), &d2).await;
+    });
+}
+
+/// Two generations of the chain R -> C -> D: the destination holds R1, C1,
+/// and D1, and the pull takes R2. The remote serves no summary, so the pull
+/// requests each delta of an attachment by name, from its `from`. C2 takes
+/// C1, the entry `container/fe` of R1, which the local ref names. D2 takes
+/// D1: the entry `details/fe` of C1, the `from` of C2. The pull requests no
+/// from-scratch delta and no commit object of C2 or D2.
+#[test]
+fn each_level_takes_the_delta_from_its_paired_entry() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-attachment-delta-levels");
+        let base = dir.path();
+        let remote = create_remote(base).await;
+        let one = write_chain(&remote, &base.join("trees"), "gen1").await;
+        let two = write_chain(&remote, &base.join("trees"), "gen2").await;
+        move_ref(&remote, "test/main", &one.r).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        for (from, to) in [(one.c, two.c), (one.d, two.d)] {
+            publish_delta(&remote, Some(&from), &to).await;
+            publish_delta(&remote, None, &to).await;
+        }
+        move_ref(&remote, "test/main", &two.r).await;
+        std::fs::remove_file(remote.path().join("summary")).unwrap();
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        for (from, to) in [(one.c, two.c), (one.d, two.d)] {
+            assert_eq!(
+                server.statuses_for(&superblock_path(&from, &to)),
+                [200],
+                "{seen:?}"
+            );
+            assert_eq!(server.requests_for(&scratch_superblock(&to)), 0, "{seen:?}");
+            assert_eq!(
+                server.requests_for(&meta_path(&to, "commit")),
+                0,
+                "{seen:?}"
+            );
+        }
+        for commit in [two.r, two.c, two.d] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_no_markers(dest.path());
     });
 }
 

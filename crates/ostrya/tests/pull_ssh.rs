@@ -311,6 +311,48 @@ fn the_stream_source_fetches_an_attachment() {
     });
 }
 
+/// The stream source takes the full set of attachments of a pulled commit:
+/// a pull of R of the chain R -> C -> D takes C and D, complete, with no
+/// marker and no ref for C or D.
+#[test]
+fn the_stream_source_takes_the_full_set_of_attachments() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-attachment-chain");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let chain = common::write_chain(&remote, &dir.path().join("trees"), "test/main").await;
+        summarize(&remote).await;
+        let dest_dir = dir.path().join("dest");
+        let dest = dest_at(&dest_dir, RepoMode::Archive, None).await;
+
+        let (pulled, served) = pull_ssh(&dest, &remote, main_ref(0)).await;
+        pulled.unwrap();
+        served.unwrap();
+
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+        }
+        assert_eq!(common::file_inventory(&dest_dir, "state"), Vec::new());
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), chain.r)]
+        );
+        let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(
+            report.errors.is_empty() && report.failure.is_none(),
+            "{report:?}"
+        );
+    });
+}
+
 /// The stream source takes a from-scratch static delta of an archive remote as
 /// the HTTP pull does. It fetches the parts of the delta as files.
 #[test]

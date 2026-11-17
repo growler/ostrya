@@ -1274,6 +1274,54 @@ fn a_collection_pull_fetches_the_attachment() {
     });
 }
 
+/// A collection pull takes the full set of attachments of the pulled
+/// commit: the tip names C of the chain R -> C -> D, and the pull takes C
+/// and D, complete, with no marker and no ref for either.
+#[test]
+fn a_collection_pull_takes_the_full_set_of_attachments() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-attachment-chain");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let chain = common::write_chain(&a, &dir.path().join("trees"), "os/chain").await;
+        let plain = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let tip = store_with_field2(&a, &plain, &[(common::CHAIN_C, chain.c.as_bytes())]).await;
+        let txn = a.transaction().await.unwrap();
+        txn.set_ref(&Ref::local(REF), Some(&tip));
+        txn.commit().await.unwrap();
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let (opts, _) = options(&[REF]);
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        for commit in [tip, chain.c, chain.d] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+            for name in &a.traverse_commit(&commit, 0).await.unwrap() {
+                assert!(
+                    dest.has_object(name.ty, &name.checksum).await.unwrap(),
+                    "{name} missing from the destination"
+                );
+            }
+        }
+        assert_eq!(
+            common::file_inventory(&dir.path().join("dest"), "state"),
+            Vec::new()
+        );
+        let report = dest.fsck(&FsckOptions::default()).await.unwrap();
+        assert!(
+            report.errors.is_empty() && report.failure.is_none(),
+            "{report:?}"
+        );
+    });
+}
+
 // --- local repositories ------------------------------------------------------
 
 /// The bindings of a commit bound to `ID` with no ref binding.

@@ -474,9 +474,12 @@ enum Command {
     /// --mirror and --collection read neither key. ostrya-config(1) states
     /// the keys.
     ///
-    /// The pull also fetches the attachments that field 2 of each pulled
-    /// commit names, each with no parent and no ref, unless it takes
-    /// --commit-metadata-only or --subpath.
+    /// The pull also fetches the full set of attachments of each pulled
+    /// commit, unless it takes --commit-metadata-only or --subpath: the
+    /// attachments that field 2 names, and the attachments of each
+    /// attachment, level by level. It fetches each one with no parent and no
+    /// ref. It ignores field 2 of an attachment that this repository holds
+    /// complete, and requests nothing below it.
     ///
     /// With `[ex-ostrya] generate-composefs=true` in a repository that does
     /// not seal its objects with fs-verity, a pull that succeeds writes one

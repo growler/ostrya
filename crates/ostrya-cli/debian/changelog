@@ -1,8 +1,28 @@
-ostrya (0.13.0) UNRELEASED; urgency=medium
+ostrya (0.13.0) unstable; urgency=medium
 
-  * New upstream release.
+  * An attachment in field 2 of a commit can have attachments of its
+    own. commit --related accepts such an attachment, and does not
+    check the attachments of an attachment.
+  * pull, pull-local, push, send, and media export carry the full set
+    of attachments of each commit: the attachments in field 2, and the
+    attachments of each attachment, at each depth. Each attachment
+    gets no parent and no ref. A pull skips an attachment that the
+    repository holds complete, and reads nothing below it. receive
+    accepts the nested attachments.
+  * fsck and remote fsck report an attachment as partial when one of
+    its own attachments is absent or partial, at each depth. fsck
+    marks the commit that names it as partial.
+  * static-delta apply needs each attachment of the target commit
+    complete in the repository, at each depth. Apply the deltas of
+    the deepest attachments first.
+  * The help text and the man pages call the related commits in
+    field 2 attachments, and the related commits in the detached
+    metadata key ostrya.related supplements. fsck
+    --no-mark-dependencies is renamed to --no-mark-attachments. The
+    fsck lines and the remote fsck error kind say "attachment" in
+    place of "dependency".
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 17 Nov 2026 10:38:25 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 18 Nov 2026 09:15:56 +0100
 
 ostrya (0.12.1) unstable; urgency=medium
 

@@ -22,7 +22,7 @@ use common::receive::{
 };
 use common::{
     CHAIN_D, Chain, Counting, TmpDir, attachment_error, mark_partial, store_with_field2,
-    write_chain, write_diamond,
+    store_with_undecodable_field2, write_chain, write_diamond,
 };
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
@@ -2570,6 +2570,59 @@ fn an_attachment_with_a_defective_field_2_is_refused_before_any_byte() {
     assert_eq!(
         attachment_error(error),
         (Some(defective), "entry 0 has an empty name".to_owned())
+    );
+    assert_eq!(written, 0);
+}
+
+/// An attachment whose field 2 does not decode refuses the push with
+/// `Error::Core` before the push writes a byte. In one level, the push checks
+/// the attachments in the order of their names. So of an absent attachment
+/// and an attachment whose field 2 does not decode, the first name gives the
+/// error.
+#[test]
+fn an_attachment_whose_field_2_does_not_decode_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-attachment-undecodable");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let base = commit(&repo, "dep/base", None, "base", None);
+    let undecodable = block_on(store_with_undecodable_field2(&repo, &base));
+    let absent = commit(&repo, "dep/absent", None, "absent", None);
+    remove_commit_object(&repo, &absent);
+    let undecodable_first = block_on(store_with_field2(
+        &repo,
+        &base,
+        &[
+            ("a/x", undecodable.as_bytes()),
+            ("b/absent", absent.as_bytes()),
+        ],
+    ));
+    let absent_first = block_on(store_with_field2(
+        &repo,
+        &base,
+        &[
+            ("a/absent", absent.as_bytes()),
+            ("b/x", undecodable.as_bytes()),
+        ],
+    ));
+    move_ref(&repo, "main", &undecodable_first);
+    move_ref(&repo, "other", &absent_first);
+
+    let (error, written) = refused(&repo, opts(&["main"]));
+    assert!(matches!(error, Error::Core(_)), "got {error:?}");
+    assert_eq!(
+        error.to_string(),
+        "gvariant: data is not normal-form GVariant: string is not NUL-terminated"
+    );
+    assert_eq!(written, 0);
+
+    let (error, written) = refused(&repo, opts(&["other"]));
+    assert_eq!(
+        attachment_error(error),
+        (
+            Some(absent_first),
+            format!(
+                "attachment a/absent names commit {absent}, which the repository does not hold"
+            )
+        )
     );
     assert_eq!(written, 0);
 }

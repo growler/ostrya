@@ -1166,6 +1166,8 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
 ///
 /// - Each entry of field 2 of each checked commit has a name that is not
 ///   empty and a 32-byte checksum (`protocol`).
+/// - Field 2 of each held attachment with no partial marker decodes
+///   (`internal`).
 /// - Each attachment is staged or held (`missing-objects`). The failure lists
 ///   each attachment that is neither, in the order of the commits that name
 ///   them.
@@ -1249,7 +1251,7 @@ async fn check_attachments(
         ostrya_rt::unblock(move || {
             held.into_iter()
                 .map(|attachment| {
-                    related::held_attachment_blocking(&repo, None, &attachment, |_| Ok(()))
+                    related::held_attachment_blocking(&repo, None, &attachment, |_, _| Ok(()))
                         .map(|state| (attachment, state))
                 })
                 .collect::<Result<_>>()

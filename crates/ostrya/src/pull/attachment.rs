@@ -159,16 +159,6 @@ impl Attachments {
         &self.naming
     }
 
-    /// Returns the nested-attachment error for `attachment`, or `None` if no
-    /// commit named it. The error names the commit that first named the
-    /// attachment. The caller calls this method when it finds that
-    /// `attachment` has attachments of its own. No engine calls it.
-    #[allow(dead_code)]
-    pub(super) fn nested_error(&self, attachment: &Checksum) -> Option<Error> {
-        self.named(attachment)
-            .map(|(commit, name)| related::nested_attachment(commit, name, attachment))
-    }
-
     /// Returns the [`Error::InvalidRelations`] in field 2 for `attachment`,
     /// with the end `end` of its reason, or `None` if no commit named it.
     /// The error names the commit and the entry name that
@@ -566,8 +556,7 @@ mod tests {
 
     /// The error for an attachment names the commit and the entry that first
     /// named the attachment, with the end of the reason that the caller
-    /// gives. The nested-attachment error has the same form. An attachment
-    /// that no commit named gives no error.
+    /// gives. An attachment that no commit named gives no error.
     #[test]
     fn an_attachment_error_names_the_first_naming_commit() {
         let mut atts = Attachments::new(false);
@@ -592,18 +581,7 @@ mod tests {
                 )
             )
         );
-        assert_eq!(
-            reason(atts.nested_error(&cs(2))),
-            (
-                Some(cs(1)),
-                format!(
-                    "attachment lib/b names commit {}, which has attachments of its own",
-                    cs(2)
-                )
-            )
-        );
         assert!(atts.named_error(&cs(4), related::UNHELD_REASON).is_none());
-        assert!(atts.nested_error(&cs(4)).is_none());
     }
 
     /// One result of [`pair_targets`]: the first byte of the checksum, the

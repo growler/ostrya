@@ -564,7 +564,8 @@ The media repository is \fB\%MOUNT/.ostree/repo\fR on a mounted volume, in the l
 A new media repository is an archive repository, with \fB\%indexed\-deltas=true\fR in \fB\%[core]\fR.
 An existing media repository keeps its mode and its \fB\%collection\-id\fR, and gets \fB\%indexed\-deltas=true\fR.
 Each ref of the collection \fB\%<id>\fR is \fB\%refs/mirrors/<id>/<name>\fR, or \fB\%refs/heads/<name>\fR when \fB\%<id>\fR is the \fB\%collection\-id\fR of the media repository.
-The media repository holds each commit at depth 0, with its \fB\%.commitmeta\fR and the attachments of its related objects as loose objects.
+The media repository holds each commit at depth 0, with its \fB\%.commitmeta\fR and the full set of its attachments as loose objects.
+The full set is the attachments of its related objects, and the attachments of each attachment.
 It holds no static delta of the export.
 The summary of the media repository is unsigned: an export removes \fB\%summary.sig\fR.
 The summary holds no \fB\%ostree\-metadata\fR anchor commit, and the export writes no file under \fB\%extensions/ostrya/summary/\fR.

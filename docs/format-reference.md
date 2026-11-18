@@ -4821,10 +4821,13 @@ Each failed check ends the session, and the session writes nothing:
    above completes its tree and the session removes its marker. The server
    takes the new commits that it checks in the order of the updates, then
    the other staged commits in the order of their checksums. An entry with an empty
-   name or with a checksum that is not 32 bytes is `protocol`. An attachment
-   that the session did not stage and that the repository does not hold is
-   `missing-objects`. The absent attachments fail together, and the
-   `missing` detail names each one. Then, in the order of the commits that
+   name or with a checksum that is not 32 bytes is `protocol`. Then the
+   server reads each attachment that the session did not stage and that is
+   not a new commit. If the repository holds such an attachment with no
+   partial-commit marker and its field 2 does not decode, the check is
+   `internal`. An attachment that the session did not stage and that the
+   repository does not hold is `missing-objects`. The absent attachments
+   fail together, and the `missing` detail names each one. Then, in the order of the commits that
    name them, an attachment that the repository holds with a partial-commit
    marker is `missing-objects` with no `missing` detail. The message names
    the commit that holds the entry, field 2, and the defect. An attachment

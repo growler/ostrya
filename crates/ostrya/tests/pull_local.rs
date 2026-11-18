@@ -8823,8 +8823,8 @@ fn a_commit_only_local_pull_imports_no_attachment() {
 }
 
 /// A commit-only pull checks the format of field 2: a defective entry fails
-/// it. It follows no attachment, so a nested attachment and an attachment
-/// that no repository holds do not fail it.
+/// it. It follows no attachment, so an attachment that no repository holds
+/// does not fail it.
 #[test]
 fn a_commit_only_local_pull_checks_the_format_of_field_2() {
     let tmp = TmpDir::new("pull-local-dependency-commit-only-check");
@@ -8850,17 +8850,11 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
         );
         assert_left_nothing(&dst).await;
 
-        build_tree(&base.join("other"), b"other\n");
-        let other = commit_tree(&src, base, "other", "other", None).await;
-        let nested = store_with_field2(&src, &other, &[("lib/c", att.as_bytes())]).await;
         let absent = [7u8; 32];
-        let entries: [(&str, &[u8]); 2] = [("lib/b", nested.as_bytes()), ("lib/x", &absent)];
-        for entry in entries {
-            let head = store_with_field2(&src, &tip, &[entry]).await;
-            move_ref(&src, "main", &head).await;
-            pull_main_with(&dst, &src, commit_only()).await.unwrap();
-            assert!(dst.has_object(ObjectType::Commit, &head).await.unwrap());
-        }
+        let head = store_with_field2(&src, &tip, &[("lib/x", &absent)]).await;
+        move_ref(&src, "main", &head).await;
+        pull_main_with(&dst, &src, commit_only()).await.unwrap();
+        assert!(dst.has_object(ObjectType::Commit, &head).await.unwrap());
     });
 }
 
@@ -9651,13 +9645,14 @@ fn a_local_pull_takes_the_full_set_of_attachments() {
                 [("main".to_owned(), chain.r)],
                 "{name}"
             );
-            // The fsck finds no defect of an object. Its check of field 2
-            // reports C, which names an attachment of its own.
+            // The fsck finds no defect of an object, and no finding on an
+            // attachment.
             let report = dst.fsck(&FsckOptions::default()).await.unwrap();
             assert!(
                 report.errors.is_empty() && report.failure.is_none(),
                 "{name}: {report:?}"
             );
+            assert!(report.attachment_errors.is_empty(), "{name}: {report:?}");
         }
     });
 }
@@ -9900,14 +9895,14 @@ fn an_attachment_of_an_intermediate_commit_is_imported() {
                 assert_complete(&src, &dst, &dst_dir, &commit).await;
             }
             assert_no_markers(&dst_dir);
-            // The fsck finds no defect of an object. Under the second
-            // target, its check of field 2 reports the entry that names B,
-            // which names an attachment of its own.
+            // The fsck finds no defect of an object, and no finding on an
+            // attachment.
             let report = dst.fsck(&FsckOptions::default()).await.unwrap();
             assert!(
                 report.errors.is_empty() && report.failure.is_none(),
                 "{report:?}"
             );
+            assert!(report.attachment_errors.is_empty(), "{report:?}");
             assert_eq!(
                 dst.list_refs(None).await.unwrap(),
                 [("main".to_owned(), target)]

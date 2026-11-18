@@ -828,6 +828,33 @@ pub async fn store_with_field2(
     written
 }
 
+/// Stores a copy of the commit `source` whose field 2 does not decode, and
+/// returns its checksum.
+///
+/// Field 2 of the copy holds one entry, and the name of the entry loses its
+/// terminating nul byte. The frame of the commit tuple stays correct.
+pub async fn store_with_undecodable_field2(
+    repo: &ostrya::Repo,
+    source: &ostrya::Checksum,
+) -> ostrya::Checksum {
+    let name = b"lib/undecodable\0";
+    let (mut commit, _) = repo.load_commit(source).await.unwrap();
+    commit.related = vec![("lib/undecodable".to_owned(), source.as_bytes().to_vec())];
+    let mut bytes = commit.serialize().unwrap();
+    let at = bytes
+        .windows(name.len())
+        .position(|window| window == name)
+        .unwrap();
+    bytes[at + name.len() - 1] = b'!';
+    let txn = repo.transaction().await.unwrap();
+    let written = txn
+        .write_metadata(ostrya::ObjectType::Commit, None, &bytes)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    written
+}
+
 /// Returns the commit and the reason of an [`ostrya::Error::InvalidRelations`]
 /// for field 2.
 pub fn attachment_error(err: ostrya::Error) -> (Option<ostrya::Checksum>, String) {

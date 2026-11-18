@@ -272,7 +272,7 @@ pub(super) struct Commits {
     pub(super) local: HashMap<Checksum, Local>,
     /// The entries of field 2 of each commit that `local` holds as
     /// [`Local::Held`], as names and checksums in the stored order, or the
-    /// [`Error::InvalidRelations`] of the first defective entry. The caller
+    /// error of its decode or of its first defective entry. The caller
     /// takes the result at its own point, so it sets the order of the errors.
     /// A held commit with no entry here has an empty field 2.
     fields: HashMap<Checksum, Result<Vec<(String, Checksum)>>>,
@@ -435,16 +435,19 @@ impl Commits {
                     unread
                         .into_iter()
                         .map(|key| {
-                            let state = related::held_attachment_blocking(&repo, None, &key, |b| {
-                                let field = related::parse_attachments(b).and_then(|entries| {
-                                    related::checked_entries(
+                            let state = related::held_attachment_blocking(
+                                &repo,
+                                None,
+                                &key,
+                                |b, entries| {
+                                    let field = related::checked_entries(
                                         RelationField::Attachments,
                                         Some(key),
                                         entries,
-                                    )
-                                });
-                                Ok((Commit::parse_link(b)?, field))
-                            });
+                                    );
+                                    Ok((Commit::parse_link(b)?, field))
+                                },
+                            );
                             (key, state)
                         })
                         .collect()
@@ -459,7 +462,6 @@ impl Commits {
                         HeldAttachment::Partial => Local::Partial,
                         HeldAttachment::Complete {
                             value: (link, field),
-                            ..
                         } => {
                             self.record(attachment, field);
                             Local::Held(link)

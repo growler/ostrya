@@ -60,9 +60,6 @@ const RELATED_KEY_BYTES: &[u8] = b"ostrya.related\0";
 /// The type string of a field of related entries.
 const RELATED_SIGNATURE: &str = "a(say)";
 
-/// The end of the reason of an attachment whose own field 2 is not empty.
-pub(crate) const NESTED_REASON: &str = "which has attachments of its own";
-
 /// The end of the reason of an attachment that the repository marks partial.
 pub(crate) const PARTIAL_REASON: &str = "which is partial";
 
@@ -181,23 +178,7 @@ impl RelatedEntry {
 pub(crate) fn parse_attachments(commit_bytes: &[u8]) -> Result<Vec<RelatedEntry>> {
     let field =
         tuple_field_from_bytes(&COMMIT_TYPE, commit_bytes, 2).map_err(ostrya_core::Error::from)?;
-    entries_of_value(&field).map_err(Error::InvalidFormat)
-}
-
-/// Returns `true` if field 2 of the commit object `commit_bytes` holds at
-/// least one entry.
-///
-/// The call checks the framing of the commit tuple and decodes member 2
-/// alone.
-///
-/// # Errors
-///
-/// [`Error::Core`] if the commit tuple does not frame, or if field 2 does not
-/// decode.
-pub(crate) fn has_attachments(commit_bytes: &[u8]) -> Result<bool> {
-    let field =
-        tuple_field_from_bytes(&COMMIT_TYPE, commit_bytes, 2).map_err(ostrya_core::Error::from)?;
-    Ok(field.as_array().is_some_and(|entries| !entries.is_empty()))
+    entries_of_value(field).map_err(Error::InvalidFormat)
 }
 
 /// Returns the entries of field 2 of a parsed commit, in the stored order.
@@ -269,7 +250,7 @@ fn entries_of_variant(value: &Value) -> std::result::Result<Vec<RelatedEntry>, S
     if signature != RELATED_SIGNATURE {
         return Err(format!("type is `{signature}`, not `{RELATED_SIGNATURE}`"));
     }
-    entries_of_value(child)
+    entries_of_value_ref(child)
 }
 
 /// Returns the checksum of each entry of `entries` that has a name that is
@@ -586,26 +567,72 @@ pub(crate) fn add_supplements(
     Ok(())
 }
 
-/// Reads an `a(say)` value as related entries.
+/// Reads an `a(say)` value as related entries, and takes the names of `value`.
 ///
 /// # Errors
 ///
 /// The reason of the defect, if the value is not an array of `(say)` pairs.
-fn entries_of_value(value: &Value) -> std::result::Result<Vec<RelatedEntry>, String> {
+fn entries_of_value(value: Value) -> std::result::Result<Vec<RelatedEntry>, String> {
+    let Value::Array(items) = value else {
+        return Err("value is not an array".into());
+    };
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, item)| {
+            let pair = match item {
+                Value::Tuple(members) => <[Value; 2]>::try_from(members).ok(),
+                _ => None,
+            };
+            match pair {
+                Some([Value::Str(name), Value::Bytes(bytes)]) => {
+                    entry_of_pair(index, Some((name, &bytes)))
+                }
+                _ => entry_of_pair(index, None),
+            }
+        })
+        .collect()
+}
+
+/// Reads an `a(say)` value as related entries, and copies the names of `value`.
+///
+/// # Errors
+///
+/// The reason of the defect, if the value is not an array of `(say)` pairs.
+fn entries_of_value_ref(value: &Value) -> std::result::Result<Vec<RelatedEntry>, String> {
     let Some(items) = value.as_array() else {
         return Err("value is not an array".into());
     };
     items
         .iter()
         .enumerate()
-        .map(|(index, item)| match item.as_tuple() {
-            Some([Value::Str(name), Value::Bytes(bytes)]) => Ok(RelatedEntry {
-                name: name.clone(),
-                checksum: Checksum::from_ay(bytes).map_err(|_| bytes.len()),
-            }),
-            _ => Err(format!("element {index} is not a (say) pair")),
+        .map(|(index, item)| {
+            let pair = match item.as_tuple() {
+                Some([name, bytes]) => name.as_str().zip(bytes.as_bytes()),
+                _ => None,
+            };
+            entry_of_pair(index, pair.map(|(name, bytes)| (name.to_owned(), bytes)))
         })
         .collect()
+}
+
+/// Makes the related entry at `index` from the name and the bytes of one
+/// `(say)` pair.
+///
+/// # Errors
+///
+/// The reason of the defect, if `pair` is `None`.
+fn entry_of_pair(
+    index: usize,
+    pair: Option<(String, &[u8])>,
+) -> std::result::Result<RelatedEntry, String> {
+    let Some((name, bytes)) = pair else {
+        return Err(format!("element {index} is not a (say) pair"));
+    };
+    Ok(RelatedEntry {
+        checksum: Checksum::from_ay(bytes).map_err(|_| bytes.len()),
+        name,
+    })
 }
 
 /// Checks the format of each entry of `field` and returns the entries as
@@ -706,14 +733,9 @@ pub(crate) enum HeldAttachment<T = ()> {
     /// repository marks it partial.
     Partial,
     /// The repository or the transaction holds the commit object, and the
-    /// repository does not mark it partial.
-    /// `nested` is `true` if the field 2 of the commit is not empty. `value`
-    /// is the value that the caller reads from the commit object.
-    Complete {
-        #[allow(dead_code)]
-        nested: bool,
-        value: T,
-    },
+    /// repository does not mark it partial. `value` is the value that `read`
+    /// gives.
+    Complete { value: T },
 }
 
 /// Returns the state of the attachment `checksum` in `repo` or in the
@@ -729,8 +751,9 @@ pub(crate) enum HeldAttachment<T = ()> {
 /// commit with a partial marker, the call reads no object. A staged commit is
 /// then [`HeldAttachment::Partial`]. For a commit that is not staged, the call
 /// only finds if the object store holds the object. For a commit with no
-/// marker, the call reads the object, decodes field 2 alone, and then calls
-/// `read` with the bytes of the object.
+/// marker, the call reads the object and decodes field 2. It then calls
+/// `read` with the bytes of the object and the entries of field 2, in the
+/// stored order.
 ///
 /// # Errors
 ///
@@ -745,7 +768,7 @@ pub(crate) fn held_attachment_blocking<T>(
     repo: &Repo,
     staging: Option<&RepoDir>,
     checksum: &Checksum,
-    read: impl FnOnce(&[u8]) -> Result<T>,
+    read: impl FnOnce(&[u8], Vec<RelatedEntry>) -> Result<T>,
 ) -> Result<HeldAttachment<T>> {
     if repo.commit_state_blocking(checksum)? == CommitState::Partial {
         let held = staging.is_some() || repo.has_object_blocking(ObjectType::Commit, checksum)?;
@@ -765,21 +788,10 @@ pub(crate) fn held_attachment_blocking<T>(
             None => return Ok(HeldAttachment::Absent),
         },
     };
-    let nested = has_attachments(&bytes)?;
+    let entries = parse_attachments(&bytes)?;
     Ok(HeldAttachment::Complete {
-        nested,
-        value: read(&bytes)?,
+        value: read(&bytes, entries)?,
     })
-}
-
-/// Returns the error for the attachment `name` of `commit`, which names the
-/// commit `attachment` whose own field 2 is not empty.
-pub(crate) fn nested_attachment(commit: Checksum, name: &str, attachment: &Checksum) -> Error {
-    Error::InvalidRelations {
-        commit: Some(commit),
-        field: RelationField::Attachments,
-        reason: attachment_reason(name, attachment, NESTED_REASON),
-    }
 }
 
 /// Returns the error for the attachment `name` of `commit`, which names the
@@ -907,7 +919,7 @@ pub(crate) async fn check_attachments<'a>(
                 continue;
             }
             let staging = staging.as_ref().filter(|_| staged);
-            let defect = match held_attachment_blocking(&repo, staging, checksum, |_| Ok(()))? {
+            let defect = match held_attachment_blocking(&repo, staging, checksum, |_, _| Ok(()))? {
                 HeldAttachment::Absent => "which is in neither the repository nor the transaction",
                 HeldAttachment::Partial => PARTIAL_REASON,
                 HeldAttachment::Complete { .. } => continue,
@@ -970,7 +982,6 @@ mod tests {
     fn parse_attachments_of_empty_field() {
         let bytes = commit_bytes(Vec::new());
         assert!(parse_attachments(&bytes).unwrap().is_empty());
-        assert!(!has_attachments(&bytes).unwrap());
     }
 
     #[test]
@@ -998,7 +1009,6 @@ mod tests {
                 },
             ]
         );
-        assert!(has_attachments(&bytes).unwrap());
         assert_eq!(entries[0].defect(0), None);
         assert_eq!(
             entries[1].defect(1).unwrap(),
@@ -1017,7 +1027,6 @@ mod tests {
         let bytes = commit_bytes(vec![("a/x".into(), vec![3; 32])]);
         let torn = &bytes[..bytes.len() - 3];
         assert!(matches!(parse_attachments(torn), Err(Error::Core(_))));
-        assert!(matches!(has_attachments(torn), Err(Error::Core(_))));
     }
 
     #[test]
@@ -1053,17 +1062,6 @@ mod tests {
         assert_eq!(commit, Some(checksum(9)));
         assert_eq!(field, RelationField::Attachments);
         assert_eq!(text, "entry 0 has an empty name");
-
-        let (commit, field, text) = reason(nested_attachment(checksum(9), "lib/b", &checksum(3)));
-        assert_eq!(commit, Some(checksum(9)));
-        assert_eq!(field, RelationField::Attachments);
-        assert_eq!(
-            text,
-            format!(
-                "attachment lib/b names commit {}, which has attachments of its own",
-                checksum(3)
-            )
-        );
     }
 
     #[test]

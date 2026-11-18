@@ -22,7 +22,7 @@ use common::receive::{
 use common::{
     COMMIT, Chain, Field2Entry, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir,
     file_inventory, foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main,
-    mark_partial, regular_objects, tool_fsck, write_chain,
+    mark_partial, regular_objects, store_with_undecodable_field2, tool_fsck, write_chain,
 };
 use ostrya::remote::proto::ErrorMessage;
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
@@ -2725,6 +2725,45 @@ fn a_partial_held_attachment_is_missing_objects() {
             target.checksum, att.checksum
         )
     );
+    assert_unchanged(&repo, &before);
+}
+
+/// An attachment that the repository holds with no partial marker, and whose
+/// field 2 does not decode, is `internal`. The receiver reads each held
+/// attachment before it checks for absent attachments. So the decode refusal
+/// wins over an absent attachment that field 2 names first, and the session
+/// publishes nothing.
+#[test]
+fn a_held_attachment_whose_field_2_does_not_decode_is_internal() {
+    let source = build_commit(None, "source", no_metadata(), &[]);
+    let absent = build_commit(None, "absent", no_metadata(), &[]);
+    let tmp = TmpDir::new("recv-dep-held-undecodable");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &source);
+    let att = block_on(store_with_undecodable_field2(&repo, &source.checksum));
+    let target = build_commit(
+        None,
+        "target",
+        no_metadata(),
+        &[entry("a/absent", &absent), ("lib/d", &att.as_bytes()[..])],
+    );
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&target]),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::Internal,
+    );
+    assert_eq!(
+        error.message,
+        "gvariant: data is not normal-form GVariant: string is not NUL-terminated"
+    );
+    assert!(error.missing.is_empty(), "{:?}", error.missing);
     assert_unchanged(&repo, &before);
 }
 

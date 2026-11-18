@@ -116,7 +116,8 @@ for it.
   deletes each commit whose parent commit is absent, also a commit that
   another commit names as an attachment. A pull takes an attachment at depth
   0, with no parent, so an attachment with a parent is such a commit. The
-  next run then gives an `Absent` finding for the commit that names it. The
+  next run then gives an `Absent` finding for the commit that names it, and a
+  `Partial` finding on each entry that names that commit, at each depth. The
   attachment check of the run runs before the tombstone step, so the run
   that deletes the attachment does not report it.
 - The rules of the one-way stream come from code (`StreamPolicy`) or from

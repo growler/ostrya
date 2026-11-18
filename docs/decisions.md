@@ -3259,7 +3259,8 @@ the rules.
   its own, at the global bound of the run.
 - The prune reads field 2 of each commit that it reaches, an attachment
   included. So it keeps the commits that a nested attachment names, with no
-  warning. To keep too much is the safe direction.
+  warning. The full set of attachments of each kept commit stays in the
+  repository.
 - Supplements are recursive in the local prune: the prune reads
   `ostrya.related` of each commit that it reaches, a supplement included.
   `Repo::add_supplement` can make a cycle. The walk reads the fields of
@@ -3435,45 +3436,46 @@ the rules.
   at each depth. The attachment check reads nothing below an attachment that
   the receiver holds complete. The write rule above makes the full set of
   attachments of such an attachment complete. As the writes do, the receiver
-  accepts a held attachment whose own field 2 holds a defective entry. An
-  attachment check that also reads below an attachment held complete was
-  rejected: it reads commits that the write rule already makes complete. The
-  receiver checks no signature of an attachment and adds no server signature
-  to it. An attachment that is also a new commit gets the check and the
-  signatures of its own updates alone. The checksum of an attachment is in
-  field 2 of a commit of the session. A new commit is that commit, or binds
-  it through the parent checksums of its history, and the signature rules
-  cover the new commit. The receiver checks that the bytes of each object
-  hash to the checksum that names it. An attachment that only a staged commit
-  outside each history names is bound to no new commit, and no ref update of
-  the session reaches it. A staged parent gets no check and no signature,
-  also when a field 2 names it. The receiver merges the incoming dict of a staged attachment into the
-  stored dict, as for each other staged commit. A later pull can take the
-  attachment as a target, and that pull needs the signatures. So under
-  `verify`, a client can store a dict with signatures that no key trusts on
-  a staged attachment. The server drops a detached metadata dict for a
-  commit that it holds, that the session did not stage, and that no update
-  names, if field 2 of a commit of the session names that commit. Field 2 of
-  a held attachment below the session can also name it. A session that
-  stages R of the chain R -> C -> D can carry the dict of D to a receiver
-  that holds C and D. Field 2 of R names C alone, and field 2 of C names D.
-  So if a dict stays unnamed after the commits of the session, the server
-  reads field 2 of the held attachments, one level at a time, until each
-  dict is named or a level is empty. It reads the commit objects alone, each
-  one time. The server writes and merges nothing from the dict. The one-way
-  export sends such a dict, because it does no negotiation. A refusal of the
-  dict was rejected: it refuses each second export of an attachment with a
-  `.commitmeta` to one receiver. A merge of the dict was rejected: the
-  server held the attachment and its dict before the session, and no rule
-  of the session covers a change to them. A dict for each other commit that
-  the session did not stage and that no update names stays `protocol`. A
-  `Commit` message that lists the attachments of the push was rejected.
-  The attachments are in the signed commits, so a list in the message adds
-  a second source that can disagree with them. A receiver that checks the
-  signatures of a staged attachment and signs it, under the rules of the
-  updates that name it, was rejected: a new commit binds each attachment of
-  its history by its checksum, so a signature on the attachment adds no
-  trust.
+  accepts a held attachment whose own field 2 holds a defective entry. It
+  refuses with `internal` a held attachment with no partial-commit marker
+  whose field 2 does not decode. An attachment check that also reads below
+  an attachment held complete was rejected: it reads commits that the write
+  rule already makes complete. The receiver checks no signature of an
+  attachment and adds no server signature to it. An attachment that is also
+  a new commit gets the check and the signatures of its own updates alone.
+  The checksum of an attachment is in field 2 of a commit of the session. A
+  new commit is that commit, or binds it through the parent checksums of its
+  history, and the signature rules cover the new commit. The receiver checks
+  that the bytes of each object hash to the checksum that names it. An
+  attachment that only a staged commit outside each history names is bound to
+  no new commit, and no ref update of the session reaches it. A staged parent
+  gets no check and no signature, also when a field 2 names it. The receiver
+  merges the incoming dict of a staged attachment into the stored dict, as
+  for each other staged commit. A later pull can take the attachment as a
+  target, and that pull needs the signatures. So under `verify`, a client can
+  store a dict with signatures that no key trusts on a staged attachment. The
+  server drops a detached metadata dict for a commit that it holds, that the
+  session did not stage, and that no update names, if field 2 of a commit of
+  the session names that commit. Field 2 of a held attachment below the
+  session can also name it. A session that stages R of the chain R -> C -> D
+  can carry the dict of D to a receiver that holds C and D. Field 2 of R
+  names C alone, and field 2 of C names D. So if a dict stays unnamed after
+  the commits of the session, the server reads field 2 of the held
+  attachments, one level at a time, until each dict is named or a level is
+  empty. It reads the commit objects alone, each one time. The server writes
+  and merges nothing from the dict. The one-way export sends such a dict,
+  because it does no negotiation. A refusal of the dict was rejected: it
+  refuses each second export of an attachment with a `.commitmeta` to one
+  receiver. A merge of the dict was rejected: the server held the attachment
+  and its dict before the session, and no rule of the session covers a change
+  to them. A dict for each other commit that the session did not stage and
+  that no update names stays `protocol`. A `Commit` message that lists the
+  attachments of the push was rejected. The attachments are in the signed
+  commits, so a list in the message adds a second source that can disagree
+  with them. A receiver that checks the signatures of a staged attachment and
+  signs it, under the rules of the updates that name it, was rejected: a new
+  commit binds each attachment of its history by its checksum, so a signature
+  on the attachment adds no trust.
 - The fsck (`Repo::fsck` and `ostrya fsck`) reports each attachment of a
   commit that it checks that is absent, partial, or defective, in
   `FsckReport::attachment_errors`. The run reads field 2 from the read of

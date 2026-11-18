@@ -916,13 +916,14 @@ The tool selects a delta and requests the delta files by these rules:
   fetches no object loose in its place and does not move the ref. This rule
   applies to a from-to delta and to a from-scratch delta that the index names.
   It applies whether the map of the summary names the delta or not.
-- Under `--require-static-deltas`, the tool refuses a remote that serves no
-  summary, with no delta probe: `error: Fetch configured to require static
-  deltas, but no summary deltas or delta index found`. This refusal also applies
-  where the client holds the commit, and under `--commit-metadata-only`. The
-  same message ends a pull into `bare-user` from a remote whose summary has
-  no `ostree.static-deltas` and that answers 404 for each path under
-  `delta-indexes/`.
+- Under `--require-static-deltas`, the tool refuses a pull of a ref from a
+  remote that serves no summary, with no delta probe: `error: Fetch configured
+  to require static deltas, but no summary deltas or delta index found`. This
+  refusal also applies where the client holds the commit, and under
+  `--commit-metadata-only`. The same message ends a pull into `bare-user` from
+  a remote whose summary has no `ostree.static-deltas` and that answers 404 for
+  each path under `delta-indexes/`. "Static deltas of a checksum pull" states
+  the rules for a pull of a commit by its checksum.
 - With a summary, under `--require-static-deltas`, the tool refuses a commit
   that the client does not hold complete in two cases. In the first case, the
   pull can take no delta that the index or the summary names. In the second
@@ -984,7 +985,7 @@ error when its `config` is absent, does not parse, or states `mode=bare-user`.
 
 A pull by checksum requests `config` first. Where `config` states `[core]
 indexed-deltas=true`, the pull requests no summary ("Related commits in a
-pull").
+pull", "Pull of a commit by its checksum").
 
 A collection id fails a pull only through the remote of the client. The tool
 checks that remote against the binding of the commit:
@@ -1199,7 +1200,9 @@ The tool resolves an empty ref list by the kind of pull:
 Under `--mirror`, the tool writes `refs/heads/<ref>` when the remote serves
 no summary, or a summary that states no collection id. Otherwise it writes
 the ref in the collection of the summary ("The pulled ref under the own
-collection id"). A plain pull writes `refs/remotes/<remote>/<ref>`.
+collection id"). A plain pull writes `refs/remotes/<remote>/<ref>`. A mirror
+pull of `REF@CHECKSUM` writes `refs/heads/REF`, also where the summary states
+a collection id ("Pull of a commit by its checksum").
 
 A mirror pull of the tool that fetched every ref copies the bytes of the remote
 summary to `<repo>/summary` with no change. It copies the bytes of the remote
@@ -1510,7 +1513,8 @@ objects/<...>.dirtree, .dirmeta, .filez             200
   requests no `summary.sig` and no `summary`. Where `config` does not state
   the key, `summary.sig` and `summary` follow `config`. The other requests and
   the objects that the client holds after the pull are the same. The pull
-  writes no ref.
+  writes no ref. "Pull of a commit by its checksum" states the other rules of
+  such a pull.
 
 `pull-local` of the ref of C from the same source imports the commit object of
 C, its `.commitmeta`, and the tree of C, at exit 0. It imports no commit object
@@ -1563,10 +1567,13 @@ Each configuration key selects one check:
 - `gpg-verify-summary`, default false. `summary.sig` must hold a valid GPG
   signature over the bytes of the summary.
   - A remote that serves no summary: `error: GPG verification enabled, but no
-    summary found`.
-  - A remote that serves a summary and no `summary.sig`, or a `summary.sig`
-    with no GPG signature: `error: GPG verification enabled, but no signatures
-    found`.
+    summary found (use gpg-verify-summary=false in remote config to
+    disable)`.
+  - A remote that serves a summary and no `summary.sig`: `error: GPG
+    verification enabled, but no summary.sig found (use
+    gpg-verify-summary=false in remote config to disable)`.
+  - A `summary.sig` with no GPG signature: `error: GPG verification enabled,
+    but no signatures found`.
 - `sign-verify`, default off. The value is a boolean, or a list of engine names
   split on `;`. The tool does not trim a name. It drops an empty name at the
   end of the list alone. A commit that the trusted key signed pulls at exit 0
@@ -1894,6 +1901,439 @@ same delta, and `static-delta show` reports `Signed: yes`.
 
 Over a `file://` URL, the tool imports the commit at exit 0 in each case of
 this subsection. `cli-surface.md`, "P2", `pull`, records the port side.
+
+### Pull of a commit by its checksum
+
+These records come from libostree 2026.1 on a NixOS host, observed in three
+runs on 2026-11-18. `python3 -m http.server` serves the remotes.
+
+The remote `ra` is an `archive` repository with these refs:
+
+- `main` at M2. The parent of M2 is M1. The timestamp of M1 is 2020-01-01,
+  and the timestamp of M2 is 2021-01-01. The `ostree.ref-binding` of both is
+  `['main']`.
+- `side` at X, which `commit -b side --bind-ref=elsewhere` wrote. The
+  `ostree.ref-binding` of X is `['elsewhere', 'side']`.
+- `nob` at N, which `commit --no-bindings` wrote. N has no binding key.
+
+The remote `rc` is an `archive` repository that `init
+--collection-id=org.example.Test` made. Its ref `main` is at C1, and the
+`ostree.collection-binding` of C1 is `org.example.Test`. M1, M2, X, and N
+have no `ostree.collection-binding` key.
+
+Copies of the two remotes give the variants of a case. `summary -u` writes
+the summary, and it also writes `[core] indexed-deltas=true` into the `config`
+of the remote. In this section, "the index key" is this entry of the `config`
+of the remote. A remote "with the index key" has it. A remote "with no index
+key" does not have it: `config unset core.indexed-deltas` removed it after
+`summary -u`, or the remote never had a summary. The summary of `rc` states
+the collection id `org.example.Test`.
+
+Each client is a new `bare-user` repository. `remote add --no-gpg-verify
+--set=gpg-verify-summary=false` adds the remote `r` at the HTTP address of the
+variant. A case that adds other keys to the remote `r` states them. "The
+remote key `collection-id`" is the key `collection-id` of the remote `r` in
+the `config` of the client.
+
+A commit operand of `pull` has one of two forms:
+
+- `CHECKSUM`: the checksum of a commit, 64 lowercase hex characters.
+- `REF@CHECKSUM`: a ref name, the character `@`, and a `CHECKSUM`.
+
+`<M2>` is the `CHECKSUM` of M2, and `<c>` is the `CHECKSUM` of the target
+commit. In a path under `deltas/` or `delta-indexes/`, `<to_b64>` is the name
+of the target commit, and `<from_b64>` is the name of the start commit of a
+delta, as in "Delta selection in a pull". A request list gives the requests of
+a pull in the order that the tool sends them.
+
+Each pull of this section that fails writes no object to `objects/` and
+writes no ref. "Temporary files after a refused checksum pull" states what
+such a pull leaves in `tmp/` and in `state/`.
+
+#### The checksum operand forms
+
+- `pull --help` gives `pull [OPTION…] REMOTE [BRANCH...]`. `pull r main@<M2>`
+  and `pull r <M2>` take the two forms. The tool has no `REMOTE:REF` form.
+- The tool splits `REF@CHECKSUM` at the last `@`. Each malformed form exits 1
+  and sends no request:
+  - `main@` gives `error: Invalid rev ` with an empty value.
+  - `@<M2>` gives `error: Invalid ref name ` with an empty value.
+  - `main@` and the first 10 or the first 63 characters of `<M2>` give
+    `error: Invalid rev <value>`.
+  - `main@` and `<M2>` in uppercase give `error: Invalid character '<n>' in
+    rev '<value>'`. The message names the first refused byte by its decimal
+    value. The first character of `<M2>` in uppercase is `C`, so the text is
+    `Invalid character '67'`.
+  - `a@b@<M2>` gives `error: Invalid ref name a@b`.
+  - `main@<M2>^`, `main@<M2>x`, and `main@<M2>0` give `error: Invalid rev
+    <M2>`. The value is the first 64 characters after the `@`.
+  - `r:main@<M2>` gives `error: Invalid ref name r:main`.
+
+  The runs above are from a remote with the index key. From a remote with no
+  index key and no summary, `main@`, `@<M2>`, `main@` and the first 10
+  characters of `<M2>`, `main@` and `<M2>` in uppercase, `a@b@<M2>`, and
+  `main@<M2>^` give the same results. With the remote `r` at an HTTP address
+  where no server listens, `main@` and `<M2>` with one changed character give
+  `Invalid character`: `C` as the fourth character gives `'67'`, `G` as the
+  first or as the fifth character gives `'71'`, and `g` as the first
+  character gives `'103'`.
+- The tool refuses `@` in a ref name. `refs --create=a@b`, `refs
+  --create=@x`, `commit -b a@b`, and `commit -b ab@` exit 1 with `error:
+  Invalid refspec <name>`. `rev-parse a@b` and `rev-parse main@<M1>` give the
+  same error. So `REF@CHECKSUM` is not a revision.
+- `pull-local SRC main@<M1>` exits 1 with `error: Invalid ref name
+  main@<M1>`, also with `--remote=r`. `pull-local` takes a `CHECKSUM`
+  operand, makes no ref-binding check for it, and writes no ref ("Binding
+  checks of a checksum pull").
+- `pull f main@<M1>` exits 0 and writes `refs/remotes/f/main` to M1. The
+  remote `f` is at the `file://` URL of `ra`.
+
+#### Requests and refs of a checksum pull
+
+A pull of `main@<M2>` and a pull of `<M2>` send the same requests. From a
+remote with the index key, with a summary or with no summary, a new client
+sends these requests, with these statuses:
+
+```
+config                                              200
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index      404
+objects/<c>.commitmeta                              404
+objects/<c>.commit                                  200
+objects/<...>.dirtree, .dirmeta, .filez             200
+```
+
+From a remote with no index key and a summary, `summary.sig` (404) and
+`summary` (200) follow `config`. From a remote with no index key and no
+summary, `summary.sig` (404) and `summary` (404) follow `config`. The pull
+then requests the from-scratch superblock
+`deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock` (404) by name in place of the
+delta index.
+
+- No pull of a commit operand requests `refs/heads/<ref>`.
+- `main@<M2>` and `main@<M1>` exit 0 and write `refs/remotes/r/main` to the
+  named commit. The client holds that commit alone at depth 0: the commit
+  object, its dirtrees, its dirmeta, and its files.
+- `<M2>` exits 0, stores the same objects, and writes no ref.
+- `REF` need not be a ref of the remote. The ref-binding check refuses
+  `nosuchref@<M2>`. With `--disable-verify-bindings`, the pull writes
+  `refs/remotes/r/nosuchref` to M2.
+- `--depth=1 r main@<M2>` fetches M2 and M1, and writes `refs/remotes/r/main`
+  to M2.
+- A client that holds M2 complete, with `refs/remotes/r/main` at M2: `pull r
+  main@<M2>` and `pull r <M2>` request `config`, the delta index (404), and
+  `objects/<M2>.commitmeta` (404). From a remote with no index key and a
+  summary, `summary.sig` and `summary` follow `config`. The pull requests no
+  commit object and no tree object, and exits 0. The ref stays at M2. The
+  statistics line starts with `1 metadata, 0 content objects fetched`. With
+  `-v`, `pull r main@<M2>` reports the start of two fetches: `OT: starting
+  fetch of delta index delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index` and
+  `OT: starting fetch of <M2>.commit (detached)`. It reports `OT: fetch of
+  <M2>.commit (detached) complete` for the second fetch alone. That fetch is
+  the request for `objects/<M2>.commitmeta`, which answered 404.
+
+`--mirror` takes `REF@CHECKSUM` and writes `refs/heads/REF`:
+
+- `pull --mirror r main@<M1>` from `ra` with the index key writes
+  `refs/heads/main` to M1. The pull requests no summary and writes no
+  `summary` file.
+- `pull --mirror r main@<C1>` from `rc` writes `refs/heads/main` to C1 in
+  each of these cases. The client has no collection id, the collection id
+  `org.example.Other`, or the collection id `org.example.Test`. The remote key
+  `collection-id` is absent or `org.example.Test`. The remote has the index
+  key, or it has no index key. From a remote with the index key, the pull
+  requests no summary. From a remote with no index key, the pull requests
+  `summary.sig` and `summary`, and the summary states `org.example.Test`. No
+  case writes a `summary` file. In a client with a collection id, `refs -c`
+  lists `(<client id>, main)`.
+- `pull --mirror r main` from the same remote, into a client with no
+  collection id, writes `refs/mirrors/org.example.Test/main`.
+- `pull --mirror r <C1>` writes no ref.
+
+#### Two checksum operands for one ref
+
+The last operand for a ref wins, and the pull fetches that commit alone. The
+remote is `ra` with the index key.
+
+- `main@<M2> main@<M1>` writes M1. `main@<M1> main@<M2>` writes M2.
+- `main main@<M1>` writes M1, and requests no `summary.sig` and no `summary`.
+- `main@<M1> main` writes M2. It requests `summary.sig` and `summary` before
+  `config`, as a pull of a ref does.
+
+#### Binding checks of a checksum pull
+
+The ref-binding check of `pull` reads `REF` of `REF@CHECKSUM`:
+
+- `main@<X>` exits 1 with `error: Commit <X>: Commit has no requested ref
+  ‘main’ in ref binding metadata (‘elsewhere’, ‘side’)`. The pull fetches
+  `objects/<X>.commit` before the refusal.
+- `--disable-verify-bindings` takes `main@<X>`, and the pull writes
+  `refs/remotes/r/main` to X.
+- `elsewhere@<X>` exits 0 and writes `refs/remotes/r/elsewhere`. So a bound
+  name that is not a ref of the remote passes.
+- `nosuchref@<M2>` exits 1 with `error: Commit <M2>: Commit has no requested
+  ref ‘nosuchref’ in ref binding metadata (‘main’)`.
+- `main@<N>`, a commit with no binding key, exits 0.
+- `pull r <X>` exits 0, writes no ref, and makes no ref-binding check.
+
+The collection-binding check of `pull` compares the binding of the commit with
+the remote key `collection-id`, for each form:
+
+- With the remote key `org.example.Test` at `rc`, `main@<C1>` exits 0, writes
+  `refs/remotes/r/main`, and `refs -c` lists `(org.example.Test, main)`.
+  `<C1>` exits 0 and writes no ref.
+- With the remote key `org.example.Other` at `rc`, `<C1>`, `main@<C1>`, and
+  `main` exit 1 with `error: Commit <C1>: Commit has collection ID
+  ‘org.example.Test’ in collection binding metadata, while the remote it came
+  from has collection ID ‘org.example.Other’`.
+- With no remote key `collection-id` at `rc`, `<C1>` and `main@<C1>` exit 0.
+- With the remote key `org.example.Test` at `ra`, `<M2>`, `main@<M2>`, and
+  `main` exit 1 with `error: Commit <M2>: Expected commit metadata to have
+  collection ID binding information, found none`.
+- A client with the collection id `org.example.Other` and no remote key
+  `collection-id` takes `main@<C1>` and `<C1>` at exit 0. `main@<C1>` writes
+  `refs/remotes/r/main`.
+
+The results of `<C1>`, `<M2>`, and `main` are the same from a remote with
+the index key, from a remote with no index key and a summary, and from a
+remote with no index key and no summary.
+
+`pull-local` makes no ref-binding check for a `CHECKSUM` operand, and writes
+no ref for it. It reads no remote key `collection-id`. It compares the
+collection binding of the commit with the `[core] collection-id` of the
+source:
+
+- The remote key `collection-id` is `org.example.Other`. `pull-local
+  --remote=r <rc> <C1>` and `pull-local --remote=r <rc> main` exit 0. `main`
+  writes `refs/remotes/r/main`, and `<C1>` writes no ref.
+- The remote key `collection-id` is `org.example.Test`. `pull-local
+  --remote=r <ra> <M2>` and `pull-local --remote=r <ra> main` exit 0. The
+  `ostree.ref-binding` of M2 is `['main']`, and `<M2>` writes no ref.
+- The source is a copy of `rc` with `[core] collection-id=org.example.Other`.
+  `pull-local --remote=r <copy> <C1>` exits 1 with the text of the remote key
+  `org.example.Other` above. The remote key `org.example.Other`, no remote
+  key `collection-id`, and no `--remote` give the same refusal. `pull-local
+  --remote=r <copy> main` with the remote key `org.example.Other` gives it
+  too.
+
+#### Timestamp checks of a checksum pull
+
+`-T` (`--timestamp-check`) compares `REF@CHECKSUM` with the ref that the pull
+writes:
+
+- A client with `refs/remotes/r/main` at M2: `pull --timestamp-check r
+  main@<M1>` exits 1 with `error: Upgrade target revision '<M1>' with
+  timestamp 'Wed 01 Jan 2020 00:00:00 UTC' is chronologically older than
+  current revision '<M2>' with timestamp 'Fri 01 Jan 2021 00:00:00 UTC'; use
+  --allow-downgrade to permit`. The pull fetches `objects/<M1>.commit` before
+  the refusal. `-T r main@<M1>` gives the same result.
+- With no `-T`, `pull r main@<M1>` takes the downgrade and writes the ref to
+  M1.
+- A client with `refs/remotes/r/main` at M1: `-T r main@<M2>` exits 0.
+- A client with `refs/remotes/r/main` at M2: `--timestamp-check-from-rev=<M2>
+  r main@<M1>` gives the text of `-T` at exit 1.
+
+`-T` with a `CHECKSUM` ends the tool on an assertion. The tool writes the
+assertion two times, once on standard error behind a line that holds `**`,
+and once on standard output behind `Bail out! `. The source file name in it
+is the tool's own output. Standard error:
+
+```
+**
+OSTree:ERROR:src/libostree/ostree-repo-pull.c:1568:scan_commit_object: assertion failed: (ref)
+```
+
+Standard output:
+
+```
+Bail out! OSTree:ERROR:src/libostree/ostree-repo-pull.c:1568:scan_commit_object: assertion failed: (ref)
+```
+
+The tool ends with `SIGABRT`, exit 134 from a shell. The tool first sends
+the requests up to `objects/<c>.commit`. These runs give the abort:
+
+- `-T r <M1>` in a new client and in a client with `refs/remotes/r/main` at
+  M2, from a remote with the index key and a summary, and from a remote with
+  no index key and a summary;
+- `-T r <M2>` in a new client and in a client with `refs/remotes/r/main` at
+  M1, from a remote with the index key and a summary, and from a remote with
+  no index key and no summary.
+
+Not observed: `-T` with a `CHECKSUM` in the other client states and remote
+shapes.
+
+`--timestamp-check-from-rev=REV` compares a `CHECKSUM` with REV:
+
+- A client with `refs/remotes/r/main` at M2: `--timestamp-check-from-rev=<M2>
+  r <M1>` exits 1 with the text of `-T`. The REV values `main` and `r:main`
+  give the same result. The pull fetches `objects/<M1>.commit` before the
+  refusal.
+- A client with `refs/remotes/r/main` at M1: `--timestamp-check-from-rev=<M1>
+  r <M2>` exits 0 and writes no ref.
+- A new client: `--timestamp-check-from-rev=<M2> r <M1>` exits 1 with
+  `error: Reading <M2> for timestamp-check-from-rev: No such metadata object
+  <M2>.commit`. The pull requests `objects/<M1>.commit` before the error.
+
+The `--timestamp-check-from-rev` results are the same from a remote with the
+index key and from a remote with no index key.
+
+#### Summary verification of a checksum pull
+
+The client verifies the summary with one of two verification keys:
+
+- `sign-verify-summary`: `remote add` with `--set=sign-verify-summary=true`
+  and `--set=verification-ed25519-key=<public key>`, and with `sign-verify`
+  off. `summary -u --sign=<secret key> --sign-type=ed25519` signs the summary
+  of the remote.
+- `gpg-verify-summary`: `remote add` with `--set=gpgkeypath=<keyring file>`,
+  and then `config set 'remote "r".gpg-verify-summary' true`. `summary -u
+  --gpg-sign=<key id> --gpg-homedir=<dir>` signs the summary of the remote.
+
+The remote has one of four shapes: a summary that the trusted signing key
+signed, a summary with no `summary.sig`, a summary that another signing key
+signed, and no summary.
+
+- From a remote with the index key, `pull r main@<M2>` and `pull r <M2>`
+  request no `summary.sig` and no `summary`. They exit 0 in each shape, under
+  each of the two verification keys. `pull r main` reads the summary, and it
+  fails in each shape except the trusted signature.
+- From a remote with no index key, `main@<M2>` and `<M2>` request `config`,
+  `summary.sig`, and `summary`. `main` requests `summary.sig` and `summary`.
+  Each of the three operands gets the result of `main`. The trusted
+  signature passes at exit 0. In the other shapes, the pull requests no other
+  file and exits 1:
+  - `sign-verify-summary`, no `summary.sig` or no summary: `error: Signatures
+    verification enabled, but no summary.sig found (use
+    sign-verify-summary=false in remote config to disable)`
+  - `sign-verify-summary`, another signing key: `error: ed25519: Signature
+    couldn't be verified with: key '<hex of the trusted key>'`
+  - `gpg-verify-summary`, no `summary.sig`: `error: GPG verification enabled,
+    but no summary.sig found (use gpg-verify-summary=false in remote config to
+    disable)`
+  - `gpg-verify-summary`, another signing key: `error: Signature made <date>
+    using EdDSA key ID <key id>`, and then the line `Can't check signature:
+    public key not found`
+  - `gpg-verify-summary`, no summary: `error: GPG verification enabled, but
+    no summary found (use gpg-verify-summary=false in remote config to
+    disable)`
+
+`pull-local --remote=r --gpg-verify-summary SRC <M2>`, with the remote `r` of
+the `gpg-verify-summary` setup above, exits 0 over a source with no summary,
+with a summary with no `summary.sig`, with a summary that another signing key
+signed, and with a summary that the trusted signing key signed. It writes no
+ref. `pull-local --remote=r --gpg-verify-summary SRC main` exits 0 over the
+trusted signature alone. It refuses the other three sources with the texts of
+`gpg-verify-summary` above.
+
+#### Static deltas of a checksum pull
+
+The remotes have these shapes:
+
+- `A1`: a summary, the from-scratch delta to M2, and the delta from M1 to M2.
+  `summary -u` ran after `static-delta generate`.
+- `A2`: a summary and the from-scratch delta to M2.
+- `A3`: a summary and no delta.
+- `C`: no summary, the index key, the two deltas of `A1`, and the delta index
+  that `static-delta reindex` wrote.
+- `D`: no summary, no index key, the two deltas of `A1`, and no
+  `delta-indexes/` directory.
+- `E`: no summary, no index key, and no delta.
+
+`A1`, `A2`, and `A3` are each run with the index key and with no index key.
+The delta index of `A1` and of `A2` stays on the remote in both. The client
+has one of three states:
+
+- a new client;
+- a client whose `refs/remotes/r/main` names M1, which it holds complete
+  (`pull --disable-static-deltas r main@<M1>`);
+- a client that holds M1 complete and has no ref (`pull r <M1>`).
+
+Each pull names `main@<M2>` or `<M2>`, with no `--require-static-deltas`.
+These rules hold in each state, and for `A1`, `A2`, and `A3` with the index
+key and with no index key, unless a rule states otherwise:
+
+- From `A1`, `A2`, `A3`, and `C`, the pull requests the delta index of M2.
+  From `D` and `E`, the pull requests a superblock by name and no delta index.
+- A new client takes the from-scratch delta from the index in `A1`, `A2`, and
+  `C`.
+- From `A1` and `C`, a client that holds M1 complete takes the delta from M1
+  to M2, with the ref and with no ref, for both operands. So the tool takes a
+  delta from a commit that it holds complete and that no ref names.
+- From `D` and `E`, `main@<M2>` in a client whose ref names M1 requests
+  `deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock`, with M1 as the
+  start commit. Each other pull from `D` and `E` requests the from-scratch
+  superblock `deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock`. `D` serves both
+  superblocks, and the pull applies the delta. `E` answers 404, and the pull
+  fetches the objects loose.
+- From `A2`, in a client whose ref names M1, `main@<M2>` takes no delta and
+  fetches the objects loose. `<M2>` in the same client takes the from-scratch
+  delta. In the other two states, both operands take the from-scratch delta.
+- From `A3`, the delta index answers 404, and the pull fetches the objects
+  loose.
+
+`pull r <M2>` from `A1` with the index key, in a client that holds M1
+complete and has no ref, sends these requests, with these statuses:
+
+```
+config                                                     200
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index             200
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock  200
+deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0           200
+objects/<c>.commitmeta                                     404
+```
+
+Each pull that takes a delta requests the superblock, then the part
+`deltas/<name>/0`, then `objects/<c>.commitmeta` as the last request. It
+requests no commit object and no tree object. Each pull that fetches the
+objects loose requests `objects/<c>.commitmeta` before `objects/<c>.commit`.
+
+With `--require-static-deltas`:
+
+- From `A1`, `A2`, and `C`, each pull exits 0. This includes the loose fetch
+  of `main@<M2>` from `A2` in a client whose ref names M1 ("Delta selection
+  in a pull").
+- From `A3`, the pull requests the delta index (404) and stops. `main@<M2>`
+  exits 1 with `error: Static deltas required, but none found for main to
+  <M2>`. `<M2>` exits 1 with `error: Static deltas required, but none found
+  for  to <M2>`, with an empty name between `for` and `to`.
+- From `D` and `E`, the pull requests `config`, `summary.sig` (404), and
+  `summary` (404), and stops. It exits 1 with `error: Fetch configured to
+  require static deltas, but no summary deltas or delta index found`. `D`
+  serves both superblocks, and the pull requests neither.
+- `pull --require-static-deltas r main` from `C`, `D`, or `E` gives the same
+  refusal after `summary.sig` (404) and `summary` (404).
+
+#### Temporary files after a refused checksum pull
+
+Before each pull, `tmp/` of the client holds the directory `cache` alone.
+Some refusals leave a staging directory `tmp/staging-<boot id>-<six random
+characters>`, where `<boot id>` is the value of
+`/proc/sys/kernel/random/boot_id`:
+
+- The refusal of `main@<X>` by the ref binding, of `main@<C1>` by the
+  collection binding, and of `-T r main@<M1>` by the timestamp leave the
+  staging directory. It holds the commit object of the target in its object
+  directory, for example `tmp/staging-<boot id>-<random>/<xx>/<rest>.commit`.
+  The pull leaves `state/<c>.commitpartial` of the target.
+- The refusal of `--require-static-deltas r main@<M2>` from `A3` leaves an
+  empty staging directory.
+- The early refusal of `--require-static-deltas r main@<M2>` from `E`, and
+  the refusal of the malformed `main@`, add nothing to `tmp/`.
+- The abort of `-T r <M1>` leaves the staging directory with the commit
+  object of M1, and the file `tmp/staging-<boot id>-<random>-lock`. The
+  abort leaves `state/<M1>.commitpartial`.
+- A second refused pull of `main@<X>` in the same client uses the same
+  staging directory.
+
+The next successful pull uses the staging directory again. With `-v`, it
+reports `OT: Reusing tmpdir staging-<boot id>-<random>` and `OT: resuming
+legacy transaction`. The pull commits the staged commit object of the refused
+target into `objects/`. After it, `tmp/` holds `cache` alone. For example,
+after a refused `main@<X>` and a pull of `main@<M2>`, the client holds the
+commit object of X with no tree, and `state/<X>.commitpartial`. `fsck`
+exits 0 and reports `1 partial commits not verified`. `show <X>` exits 0.
+`ls <X> /` exits 1 with `error: No such metadata object <checksum>.dirtree`.
+
+`cli-surface.md`, "P2", `pull` and `pull-local`, records the port side.
 
 ## The fsync vocabulary
 

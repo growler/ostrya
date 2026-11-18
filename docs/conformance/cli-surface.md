@@ -4439,6 +4439,31 @@ is `REF` and `@ID:REF` with no `--remote`, into a destination whose collection
 id is ID. The port writes no object and no ref. An operand given two times
 counts one time.
 
+`pull` and `pull-local` of the port refuse a `REF@CHECKSUM` operand. They
+read a `CHECKSUM` operand as a ref name or as a revision. The tool takes both
+forms in `pull`, takes `CHECKSUM` in `pull-local`, and refuses `REF@CHECKSUM`
+in `pull-local` (`cli-behavior.md`, "Pull of a commit by its checksum"). The
+port gives these results:
+
+- `pull REMOTE REF@CHECKSUM` and `pull-local SRC REF@CHECKSUM` give `error:
+  Invalid refspec <operand>` at exit 1. `pull` sends no request.
+  `pull-local` refuses the operand after it opens the source, before it reads
+  a ref or an object of the source. With `--remote=NAME`, `pull-local` gives
+  `error: Invalid refspec NAME:REF@CHECKSUM`. A malformed operand, for
+  example `main@` or `main@` and an abbreviated checksum, gives the same text.
+- `pull REMOTE CHECKSUM` reads `CHECKSUM` as a ref name. From a remote that
+  serves a summary, the pull requests `summary.sig`, `summary`, `config`, and
+  `refs/heads/CHECKSUM`, and exits 1 with `error: ref not found: CHECKSUM`.
+- `pull-local SRC CHECKSUM` reads `CHECKSUM` as a revision of the source,
+  and the ref-binding check reads `CHECKSUM` as the ref name. A commit with a
+  ref binding gives `error: pull: commit <checksum>: no requested ref
+  '<checksum>' in ref binding metadata (<bound refs>)` at exit 1. A commit
+  with no binding key, and each commit under `--disable-verify-bindings`,
+  imports at exit 0. The port then writes the ref `refs/heads/CHECKSUM`, or
+  `refs/remotes/NAME/CHECKSUM` with `--remote=NAME`. The tool writes no ref.
+
+Each refusal writes no object and no ref.
+
 The two GPG switches check what the tool checks and refuse where it refuses
 (`cli-behavior.md`, "Signature verification during a pull"), with the
 port's own words. `--require-static-deltas` applies the delta the source's

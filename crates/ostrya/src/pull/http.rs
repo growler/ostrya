@@ -1412,12 +1412,16 @@ impl Repo {
         // A commit operand names its commit, so the pull takes no ref of it
         // from the summary. If each operand names its commit, the pull reads
         // no summary and no `summary.sig`, and makes no check of them.
-        let by_checksum_only = matches!(wanted, Wanted::Named | Wanted::Config { .. })
-            && !opts.refs.is_empty()
-            && !opts
-                .refs
-                .iter()
-                .any(|name| matches!(Operand::parse(name), Ok(Operand::Name(_))));
+        let by_checksum_only = match wanted {
+            Wanted::Pinned(pinned) => pinned.commits_alone,
+            _ => {
+                !opts.refs.is_empty()
+                    && !opts
+                        .refs
+                        .iter()
+                        .any(|name| matches!(Operand::parse(name), Ok(Operand::Name(_))))
+            }
+        };
         let summary = if let Some(bytes) = probed {
             // The parse runs on the blocking pool, as below.
             root = RootFiles::default();
@@ -1501,13 +1505,14 @@ impl Repo {
         // The checks of each requested ref. A collection pull adds the check
         // of the collection binding and of the timestamp that the remote
         // listed. Each other pull checks the collection binding of each
-        // `@ID:NAME` name, unless it writes no ref, and makes the checks of
-        // its commit operands.
+        // `@ID:NAME` name, unless it writes no ref. Each pull makes the
+        // checks of its commit operands.
         let tip_checks = match wanted {
             Wanted::Pinned(pinned) => TipChecks {
                 collection: Some(pinned.collection),
                 allow_unbound: pinned.allow_unbound,
                 listed: Some(&pinned.listed),
+                by_checksum: Some(&by_checksum),
                 ..TipChecks::new(opts.flags, timestamp, place)
             },
             _ => TipChecks {
@@ -1853,6 +1858,7 @@ impl Repo {
     ) -> Result<(Vec<(String, Checksum)>, ChecksumTargets)> {
         let mut by_checksum = ChecksumTargets::default();
         if let Wanted::Pinned(pinned) = wanted {
+            by_checksum.bare.clone_from(&pinned.bare);
             return Ok((pinned.targets.clone(), by_checksum));
         }
         let mirror = opts.flags.contains(PullFlags::MIRROR);
@@ -3712,7 +3718,7 @@ fn children_of(dirtree: &DirTree) -> Vec<ObjectName> {
 /// Returns the request path of a loose object. The remote is an archive
 /// repository, so a content object has the name `.filez` there, whatever this
 /// repository stores.
-fn object_path(checksum: &Checksum, ty: ObjectType) -> String {
+pub(super) fn object_path(checksum: &Checksum, ty: ObjectType) -> String {
     format!("objects/{}", loose_path(checksum, ty, RepoMode::Archive))
 }
 

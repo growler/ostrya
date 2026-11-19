@@ -41,6 +41,18 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   `Error::InvalidRelations`.
 - A pull from a remote with `no_ref_writes` does not refuse two operands that
   write one ref. It fetches the commit of each operand.
+- `Repo::pull_collection` takes commit operands in `PullOptions::refs`:
+  `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`. A plain operand of 64
+  lowercase hex characters is a commit operand, and names no ref. The pull
+  takes the commit from the first remote that serves its commit object. The
+  collection binding of the commit must be the collection of the call. Two
+  operands that write one ref with two commits are refused, unless
+  `no_ref_writes` is set. A pull whose operands are all commit operands reads
+  no ref listing, no `summary`, and no `summary.sig` of a remote. The one
+  exception is a remote at a `file://` address under `require_static_deltas`
+  without `disable_static_deltas`, whose summary the pull reads and verifies.
+  `CollectionPullStats::refs` holds an entry for `REF@CHECKSUM`, and none for
+  `CHECKSUM`.
 
 ## [0.13.0] - 2026-11-18
 

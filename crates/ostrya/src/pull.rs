@@ -467,7 +467,12 @@ pub enum TimestampCheck {
 /// the summary. If the policy covers the summary and the source has no
 /// `summary` or no `summary.sig`, the pull fails with [`Error::Signature`].
 /// A pull from a remote whose names are all commit operands reads no summary,
-/// and the policy of the summary does not apply to it.
+/// and the policy of the summary does not apply to it. The same rule applies
+/// to each remote of [`Repo::pull_collection`], as it states in "Commit
+/// operands". The one exception is a local repository under
+/// [`require_static_deltas`](PullOptions::require_static_deltas) without
+/// [`disable_static_deltas`](PullOptions::disable_static_deltas): that pull
+/// reads the summary, and the policy applies.
 ///
 /// The policy belongs to the pull. The pull verifies each target, each
 /// parent that a depth pull follows, and each commit of a chain of static
@@ -592,7 +597,8 @@ pub struct PullOptions {
     /// names the commit that the pull fetches: `CHECKSUM`, `NAME@CHECKSUM`,
     /// or `@ID:NAME@CHECKSUM`. [`commit_operand`] makes the text of the
     /// second and the third form. They take a name that occurs two times one
-    /// time.
+    /// time. [`Repo::pull_collection`] takes the same forms, as it states in
+    /// "Commit operands".
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
@@ -778,7 +784,10 @@ pub struct PullOptions {
     /// [`Error::Pull`] for a delta that it requests and the remote does not
     /// serve. A `CHECKSUM` operand takes no delta. So the pull refuses such
     /// an operand with [`Error::Pull`] before the first request, unless this
-    /// repository holds its commit complete.
+    /// repository holds its commit complete. A pull of
+    /// [`Repo::pull_collection`] from a local repository reads the summary
+    /// under this option, also when each name is a commit operand, unless
+    /// [`disable_static_deltas`](PullOptions::disable_static_deltas) is set.
     ///
     /// With a summary, the pull refuses with [`Error::Pull`] a commit that this
     /// repository does not hold complete, in two cases:
@@ -1946,7 +1955,15 @@ impl Repo {
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
         let needs_summary = fetching && edges.is_none();
-        let summary = read_checked_local_summary(src, &verification, needs_summary).await?;
+        // A commit operand names its commit. If each operand of a collection
+        // pull names its commit, the pull reads no summary of the source and
+        // makes no check of it, unless discovery needs the summary.
+        let commits_alone = matches!(wanted, LocalWanted::Pinned(pinned) if pinned.commits_alone);
+        let summary = if commits_alone && !needs_summary {
+            None
+        } else {
+            read_checked_local_summary(src, &verification, needs_summary).await?
+        };
         if needs_summary && summary.is_none() {
             return Err(delta::no_summary_error());
         }
@@ -2001,11 +2018,18 @@ impl Repo {
         } else {
             TimestampBase::Off
         };
+        // The targets of a collection pull that come from a commit operand
+        // with no ref.
+        let by_checksum = pinned.map(|pinned| ChecksumTargets {
+            bare: pinned.bare.clone(),
+            ..ChecksumTargets::default()
+        });
         let tip_checks = TipChecks {
             collection: collection.map(|(id, _)| id),
             allow_unbound: collection.is_some_and(|(_, allow_unbound)| allow_unbound),
             operand_collections: pinned.is_none() && !opts.no_ref_writes,
             listed: pinned.map(|pinned| &pinned.listed),
+            by_checksum: by_checksum.as_ref(),
             ..TipChecks::new(flags, timestamp, place)
         };
 
@@ -2425,7 +2449,10 @@ impl Repo {
             }
             if !opts.no_ref_writes {
                 for (ref_name, tip) in targets {
-                    place.queue(&txn, ref_name, tip);
+                    // A commit operand with no ref writes no ref.
+                    if !tip_checks.is_bare(ref_name, tip) {
+                        place.queue(&txn, ref_name, tip);
+                    }
                 }
             }
             if completes_marked(&opts) {
@@ -3941,11 +3968,20 @@ async fn load_dirtree_from(
 ///
 /// The pull from a remote and the pull from a local candidate read it.
 struct Pinned<'a> {
-    /// Each ref name, and the commit that the pull selected for it.
+    /// Each ref name, and the commit that the pull selected for it. A commit
+    /// of `bare` is a target too, under the hex form of its checksum.
     targets: Vec<(String, Checksum)>,
-    /// The timestamp that the candidate listed for each ref of `targets`,
-    /// which the timestamp of its tip must equal.
-    listed: HashMap<String, u64>,
+    /// The commit and the timestamp that the candidate listed for each ref of
+    /// `targets` that the pull selected from its listed refs. The timestamp
+    /// of that commit must equal the listed timestamp. The target of a commit
+    /// operand has no entry.
+    listed: HashMap<String, (Checksum, u64)>,
+    /// The commit of each target that comes from a commit operand with no
+    /// ref. The pull writes no ref for it.
+    bare: HashSet<Checksum>,
+    /// `true` if each operand of the collection pull names its commit. The
+    /// pull then reads no summary of the candidate.
+    commits_alone: bool,
     /// The collection id that the `ostree.collection-binding` of each tip
     /// must state.
     collection: &'a str,
@@ -4002,9 +4038,15 @@ impl Repo {
         trust: crate::verify::PullTrust,
         timestamp_check: TimestampCheck,
     ) -> Result<PullStats> {
+        let listed = targets
+            .iter()
+            .filter_map(|(name, commit)| Some((name.clone(), (*commit, *listed.get(name)?))))
+            .collect();
         let pinned = Pinned {
             targets,
             listed,
+            bare: HashSet::new(),
+            commits_alone: false,
             collection,
             allow_unbound: false,
             place: RefPlace::of_collection(self, collection),
@@ -4515,9 +4557,10 @@ struct TipChecks<'a> {
     /// `true` if a tip with no `ostree.collection-binding` key passes the
     /// collection-binding check.
     allow_unbound: bool,
-    /// The timestamp that the remote listed for each requested ref, which the
-    /// timestamp of its tip must equal. `None` for no such check.
-    listed: Option<&'a HashMap<String, u64>>,
+    /// The commit and the timestamp that the remote listed for each requested
+    /// ref. The timestamp of a tip that is the listed commit of its ref must
+    /// equal the listed timestamp. `None` for no such check.
+    listed: Option<&'a HashMap<String, (Checksum, u64)>>,
     /// The targets that come from the commit operands of the pull, or `None`
     /// for a pull that takes no commit operand.
     by_checksum: Option<&'a ChecksumTargets>,
@@ -4610,7 +4653,11 @@ async fn check_tip_refs(
         {
             check_own_collection_binding(tip, commit, own)?;
         }
-        if let Some(listed) = checks.listed.and_then(|listed| listed.get(*ref_name)) {
+        if let Some((_, listed)) = checks
+            .listed
+            .and_then(|listed| listed.get(*ref_name))
+            .filter(|(listed, _)| listed == tip)
+        {
             check_listed_timestamp(tip, commit, ref_name, *listed)?;
         }
         check_timestamp(repo, checks.timestamp, checks.place, ref_name, tip, commit).await?;

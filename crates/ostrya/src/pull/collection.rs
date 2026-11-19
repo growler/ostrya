@@ -9,19 +9,22 @@
 //! 2. The find step: the probe of each remote, in the given order. The probe
 //!    reads the commit and the timestamp of each ref, from the ref listing or
 //!    from the summary. The probe of a remote at a `file://` address reads
-//!    the ref files of the local repository, or its summary. The probe skips
-//!    each listed ref whose name fails the ref-name rule. The find step
-//!    gives the refs, the names of the skipped refs, and the session of each
-//!    remote that answers, and the error of each other remote. If the probe
-//!    of a remote read the refs from its `summary`, the find step also gives
-//!    these bytes. The pull from that remote reads them in place of the
-//!    `summary` and the `summary.sig`. The probe of a local repository gives
-//!    no summary. The pull skips a remote that fails. It reports each
-//!    skipped remote and each skipped ref through its event callback.
-//! 3. The selection of a remote for each ref, and then one pull from each
-//!    selected remote, in the given order, through the engine of
-//!    [`Repo::pull`], over the session of its probe. A local repository goes
-//!    through the engine of [`Repo::pull_local`].
+//!    the ref files of the local repository, or its summary. For each commit
+//!    operand, the probe asks the remote for the commit object, until one
+//!    remote serves it. With commit operands alone, the probe reads no ref.
+//!    The probe skips each listed ref whose name fails the ref-name rule. The
+//!    find step gives the refs, the names of the skipped refs, and the
+//!    session of each remote that answers, and the error of each other
+//!    remote. If the probe of a remote read the refs from its `summary`, the
+//!    find step also gives these bytes. The pull from that remote reads them
+//!    in place of the `summary` and the `summary.sig`. The probe of a local
+//!    repository gives no summary. The pull skips a remote that fails. It
+//!    reports each skipped remote and each skipped ref through its event
+//!    callback.
+//! 3. The selection of a remote for each ref and for each commit operand,
+//!    and then one pull from each selected remote, in the given order,
+//!    through the engine of [`Repo::pull`], over the session of its probe. A
+//!    local repository goes through the engine of [`Repo::pull_local`].
 //!
 //! [`Repo::remote_list_collection_refs_with`] makes the checks of part 1 and
 //! the find step of part 2 for its one remote. The error of that remote is
@@ -40,7 +43,8 @@ use ostrya_core::{Checksum, Commit, ObjectType, Ref, RefSelector, Value, is_vali
 
 use crate::endpoint::{EndpointOverrides, local_pull_path, resolve_pull};
 use crate::error::{Error, Result};
-use crate::fetch::Fetcher;
+use crate::fetch::{Fetcher, Priority};
+use crate::object::MAX_METADATA_SIZE;
 use crate::refs::{check_ref_path, is_ref_path};
 use crate::related::RelatedRule;
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
@@ -58,13 +62,13 @@ use crate::verify::trust::FieldGroup;
 
 #[cfg(feature = "s3")]
 use super::http::s3_fetcher;
-use super::http::{Wanted, connect, session_options};
+use super::http::{Wanted, connect, object_path, session_options};
 use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    LocalWanted, Pinned, PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth,
-    read_checked_local_summary,
+    LocalWanted, Operand, Pinned, PullFlags, PullOptions, PullStats, PullVerify, RefPlace,
+    check_commit_operands, check_depth, check_hash, check_one_place, read_checked_local_summary,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -93,10 +97,10 @@ const LISTING_BUDGET: usize = MAX_LISTING_TARGET - LISTING_PATH.len();
 pub struct CollectionPullOptions {
     /// The options of the pull from each selected remote.
     ///
-    /// [`refs`](PullOptions::refs) names the refs of the collection. An empty
-    /// list takes each ref of the collection that a remote lists.
-    /// [`Repo::pull_collection`] states the fields that it refuses, and the
-    /// fields that apply to each remote.
+    /// [`refs`](PullOptions::refs) names the refs of the collection, and
+    /// holds the commit operands. An empty list takes each ref of the
+    /// collection that a remote lists. [`Repo::pull_collection`] states the
+    /// fields that it refuses, and the fields that apply to each remote.
     pub pull: PullOptions,
     /// The callback for each [`CollectionPullEvent`] of the pull, or `None`.
     ///
@@ -115,7 +119,8 @@ pub struct CollectionPullOptions {
     /// applies only when the key is absent. A tip whose binding is not a
     /// string, or names another collection, fails with either value. The
     /// switch does not change the `ostree.ref-binding` check, the check of
-    /// the listed timestamp, or the timestamp check.
+    /// the listed timestamp, or the timestamp check. The switch applies to
+    /// the commit of a commit operand as to a tip.
     ///
     /// Apart from the ref binding, the pull does not check a commit against
     /// the name of its ref. So a remote can serve, for a name, any commit with
@@ -152,14 +157,17 @@ pub enum CollectionPullEvent {
     /// The pull selects no ref from this remote. The causes are a failed
     /// connection or request, a listing or a summary that does not parse, a
     /// listed ref with no valid timestamp, a summary that the policy of the
-    /// remote refuses, and a bucket repository with no summary. For a remote
-    /// at a `file://` address, the causes also include a path with no
-    /// repository, and a directory or a ref file of the selection that
-    /// cannot be read. Without a summary policy, they also include a ref
-    /// whose commit the repository does not hold. The message then names the
-    /// path. Under a summary policy, the probe reads no commit, and a listed
-    /// commit that the repository does not hold fails the pull from it, as
-    /// for a remote.
+    /// remote refuses, and a bucket repository with no summary. For a commit
+    /// operand, the causes are a request for the commit object that fails
+    /// for another cause than an absent object, and a commit object that
+    /// does not hash to its name or does not parse. For a remote at a
+    /// `file://` address, the causes also include a path with no repository,
+    /// and a directory or a ref file of the selection that cannot be read.
+    /// Without a summary policy, they also include a ref whose commit the
+    /// repository does not hold. The message then names the path. Under a
+    /// summary policy, the probe reads no commit of a listed ref, and a
+    /// listed commit that the repository does not hold fails the pull from
+    /// it, as for a remote.
     #[non_exhaustive]
     RemoteSkipped {
         /// The name of the remote.
@@ -212,7 +220,8 @@ pub struct CollectionPullStats {
     ///
     /// The order is the order of [`refs`](PullOptions::refs), or the
     /// byte-wise order of the names for a pull of each ref of the
-    /// collection.
+    /// collection. A `REF@CHECKSUM` operand gives an entry for `REF`. A
+    /// `CHECKSUM` operand gives no entry.
     pub refs: Vec<CollectionPullRef>,
     /// The sum of the statistics of the pulls from the selected remotes.
     ///
@@ -238,10 +247,12 @@ pub struct CollectionPullRef {
     pub name: String,
     /// The name of the selected remote.
     pub remote: String,
-    /// The commit that the selected remote listed for the ref.
+    /// The commit that the selected remote listed for the ref, or the commit
+    /// of a `REF@CHECKSUM` operand.
     pub commit: Checksum,
     /// The commit timestamp that the selected remote listed for the ref, in
-    /// seconds since the Unix epoch.
+    /// seconds since the Unix epoch. For a `REF@CHECKSUM` operand, the
+    /// timestamp of the commit that the probe read from the selected remote.
     pub timestamp: u64,
 }
 
@@ -357,8 +368,36 @@ struct Probed {
     /// The `summary` of a remote, if the probe read the refs from it. `None`
     /// for a local candidate.
     summary: Option<Arc<Vec<u8>>>,
-    /// The open session to the remote, for the pull from it.
-    session: Session,
+    /// Each commit of the commit operands that the probe asked for and that
+    /// the remote serves, with the timestamp of the commit.
+    commits: Vec<(Checksum, u64)>,
+    /// The open session to the remote, for the pull from it. `None` after
+    /// the find step ended the session.
+    session: Option<Session>,
+}
+
+/// The operands of a collection pull, as [`collection_names`] reads them.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Operands {
+    /// Each operand that names a ref, in the given order. A ref name with no
+    /// commit occurs one time, and a ref name with one commit occurs one
+    /// time.
+    refs: Vec<RefOperand>,
+    /// The commit of each `CHECKSUM` operand, in the given order, each one
+    /// time.
+    bare: Vec<Checksum>,
+}
+
+/// An operand of a collection pull that names a ref.
+#[derive(Debug, PartialEq, Eq)]
+struct RefOperand {
+    /// The operand as given.
+    given: String,
+    /// The ref name, with no `@ID:` part.
+    name: String,
+    /// The commit of a `REF@CHECKSUM` operand. `None` for an operand that
+    /// names no commit: the pull selects the commit that a remote lists.
+    commit: Option<Checksum>,
 }
 
 /// The refs of the collection that a listing, a summary, or the ref files
@@ -401,7 +440,8 @@ impl Repo {
     /// `collection_id`, and both forms name the ref `NAME` of the
     /// collection. An empty list takes each ref of the collection that a
     /// remote lists. A name that occurs again adds nothing, also in the
-    /// other form.
+    /// other form. A name can also be a commit operand: `CHECKSUM`,
+    /// `NAME@CHECKSUM`, or `@ID:NAME@CHECKSUM`, as "Commit operands" states.
     ///
     /// # Address and trust
     ///
@@ -528,6 +568,89 @@ impl Repo {
     /// commit, by the listed timestamp. If two remotes list the same
     /// timestamp, the earlier remote in `remotes` wins.
     ///
+    /// # Commit operands
+    ///
+    /// A commit operand names the commit that the pull fetches by its
+    /// checksum, 64 lowercase hex characters:
+    ///
+    /// - `CHECKSUM` fetches the commit and writes no ref.
+    /// - `NAME@CHECKSUM` and `@ID:NAME@CHECKSUM`, where `ID` is
+    ///   `collection_id`, fetch the commit and write the ref `NAME` of the
+    ///   collection to it. `NAME` need not be a ref that a remote lists.
+    ///   [`commit_operand`](crate::commit_operand) makes the text.
+    ///
+    /// The checksum part of an operand starts after the last `@` that is not
+    /// the first character, as [`Repo::pull`] states in "Refs". A plain name
+    /// of 64 lowercase hex characters is a `CHECKSUM` operand, and names no
+    /// ref.
+    ///
+    /// The pull reads no ref listing and no summary for a commit operand.
+    /// The probe asks each remote, in the order of `remotes`, for the commit
+    /// object of each commit operand that no earlier remote serves. The
+    /// first remote that serves the commit object is the remote of the
+    /// operand. A remote that does not serve the object leaves the operand to
+    /// the next remote, with no event. A request that fails for another cause
+    /// skips the remote with a
+    /// [`RemoteSkipped`](CollectionPullEvent::RemoteSkipped) event, and the
+    /// pull then selects no ref and no commit from it. The probe hashes the
+    /// commit object against its name, reads its timestamp, and keeps no
+    /// bytes of it. So the pull from the remote requests the commit object
+    /// again, unless this repository holds the commit. The probe of a local
+    /// repository reads the commit from the repository, and hashes nothing.
+    ///
+    /// If each name is a commit operand, the pull reads no ref listing, no
+    /// `summary`, and no `summary.sig` of a remote, and the summary policy
+    /// of a remote does not apply. The one exception is a local repository
+    /// under [`require_static_deltas`](PullOptions::require_static_deltas),
+    /// as "Local repository" states. The probe stops at the remote that
+    /// serves the last commit, and opens no session to the remotes after it.
+    /// If one name is not a commit operand, the probe and the pull read and
+    /// verify the summaries as "Probe" and "Pull" state, also the pull from
+    /// a remote that gives commits of commit operands alone.
+    ///
+    /// The pull from the remote of an operand fetches the commit with the
+    /// refs that it selected from that remote, in one transaction.
+    /// [`depth`](PullOptions::depth),
+    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY),
+    /// [`subpaths`](PullOptions::subpaths), the attachments, and the
+    /// signature checks apply to the commit as to the tip of a ref. The
+    /// checks of "Pull" apply as follows:
+    ///
+    /// - The collection-binding check applies to the commit of each commit
+    ///   operand, also under [`no_ref_writes`](PullOptions::no_ref_writes).
+    /// - The ref-binding check applies to the commit of `NAME@CHECKSUM`, and
+    ///   reads `NAME`. The commit of `CHECKSUM` gets no ref-binding check.
+    /// - No remote listed a timestamp for a commit operand, so its commit
+    ///   gets no check of a listed timestamp.
+    /// - [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef)
+    ///   compares the commit of `NAME@CHECKSUM` with the current commit of
+    ///   the ref. The pull refuses a `CHECKSUM` operand under that check.
+    ///   Under [`TimestampCheck::Rev`](crate::TimestampCheck::Rev), the pull
+    ///   compares each commit with the commit of the check.
+    ///
+    /// The static delta rules of a commit operand are the rules of
+    /// [`Repo::pull`]: the commit of `NAME@CHECKSUM` takes a delta as the tip
+    /// of the ref, and the commit of `CHECKSUM` takes none.
+    ///
+    /// Two names that give one ref name with two commits write one ref, and
+    /// the pull refuses them before its first request. A ref name with no
+    /// commit beside the same ref name with a commit is such a pair. Under
+    /// [`no_ref_writes`](PullOptions::no_ref_writes), the pull takes the pair
+    /// and fetches both commits. A `NAME@CHECKSUM` operand that occurs again
+    /// with the same commit adds nothing, also in the other form.
+    ///
+    /// A name of 64 lowercase hex characters is a valid ref name. The
+    /// operand `CHECKSUM@CHECKSUM` writes the ref of that name, and a
+    /// `CHECKSUM` operand of the same checksum beside it fetches no other
+    /// object and changes no ref. The operand `@ID:CHECKSUM` names the listed
+    /// ref of that name. The pull writes that ref at the commit that the
+    /// selected remote lists, also beside a `CHECKSUM` operand of that
+    /// commit. In both cases, the pull still refuses the `CHECKSUM` operand
+    /// under
+    /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) and
+    /// under [`require_static_deltas`](PullOptions::require_static_deltas),
+    /// as "Errors" states.
+    ///
     /// # Pull
     ///
     /// The pull then takes all objects of each ref from the selected remote,
@@ -535,9 +658,10 @@ impl Repo {
     /// no ref of the remote again. If the probe read the refs from the
     /// summary, the pull uses those bytes and does not read the summary
     /// again. The remotes pull in the order of `remotes`, each with its own
-    /// transaction. A remote with no selected ref is not asked again. The
-    /// pull fetches the attachments of each commit from the remote of the
-    /// commit, as [`Repo::pull`] states in "Attachments".
+    /// transaction. A remote with no selected ref and no commit of a commit
+    /// operand is not asked again. The pull fetches the attachments of each
+    /// commit from the remote of the commit, as [`Repo::pull`] states in
+    /// "Attachments".
     ///
     /// So a failure of a later remote leaves the objects and the refs of the
     /// earlier remotes in place. A failure of a selected remote stops the
@@ -555,7 +679,8 @@ impl Repo {
     /// - The timestamp of the commit must be the timestamp that the remote
     ///   listed for the ref.
     ///
-    /// The pull makes none of these checks on an attachment.
+    /// The pull makes none of these checks on an attachment. "Commit
+    /// operands" states the checks of the commit of a commit operand.
     ///
     /// # Refs
     ///
@@ -566,6 +691,9 @@ impl Repo {
     /// If the `[core] collection-id` of this repository is `collection_id`,
     /// the pull writes the local ref `refs/heads/<name>`, and it does not
     /// touch `refs/mirrors/<collection_id>/`.
+    ///
+    /// The pull writes no ref for a `CHECKSUM` operand, and no ref under
+    /// [`no_ref_writes`](PullOptions::no_ref_writes).
     ///
     /// Delta discovery and
     /// [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef) read
@@ -615,6 +743,15 @@ impl Repo {
     /// verified summary, and the pull reads and checks the `summary` and the
     /// `summary.sig` of the repository again. A listed commit that the
     /// repository does not hold fails the pull.
+    ///
+    /// A local repository serves the commit of a commit operand if it holds
+    /// the commit object. If each name is a commit operand, the pull reads no
+    /// `summary` and no `summary.sig` of the repository, unless
+    /// [`require_static_deltas`](PullOptions::require_static_deltas) is set
+    /// without [`disable_static_deltas`](PullOptions::disable_static_deltas).
+    /// Under `require_static_deltas` alone, the pull reads and checks the
+    /// summary as for a ref, the summary policy of the remote applies, and a
+    /// repository with no summary fails the pull.
     ///
     /// If the trust of the remote checks the signatures of the commits or of
     /// the summary, the pull runs as with [`UNTRUSTED`](PullFlags::UNTRUSTED).
@@ -671,12 +808,27 @@ impl Repo {
     /// - [`Error::InvalidInput`] if a name in [`refs`](PullOptions::refs)
     ///   is an `@ID:NAME` ref of a collection other than `collection_id`.
     /// - [`Error::InvalidRefspec`] if a name in [`refs`](PullOptions::refs)
-    ///   is not a valid ref name or a valid `@ID:NAME` ref.
+    ///   is not a valid ref name, a valid `@ID:NAME` ref, or a commit operand
+    ///   with such a ref part and a checksum part of 64 lowercase hex
+    ///   characters. The error holds the name as given.
     /// - [`Error::InvalidInput`] if a name in [`refs`](PullOptions::refs)
     ///   does not fit in a ref listing request alone: if its entry `ID/NAME`
     ///   is longer than [`MAX_REF_ENTRY_LEN`] bytes or has more than
     ///   [`MAX_REF_ENTRY_PARTS`] parts, or if the request target of the name
-    ///   alone over HTTP is longer than 16 KiB.
+    ///   alone over HTTP is longer than 16 KiB. The limits do not apply to
+    ///   the ref part of a commit operand, which no listing request holds.
+    /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) holds a
+    ///   `CHECKSUM` operand and
+    ///   [`timestamp_check`](PullOptions::timestamp_check) is
+    ///   [`TimestampCheck::CurrentRef`](crate::TimestampCheck::CurrentRef).
+    /// - [`Error::Pull`] if [`refs`](PullOptions::refs) holds a `CHECKSUM`
+    ///   operand whose commit this repository does not hold complete, under
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas)
+    ///   without [`disable_static_deltas`](PullOptions::disable_static_deltas)
+    ///   and without [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY).
+    /// - [`Error::Pull`] if two names write one ref with two commits, unless
+    ///   [`no_ref_writes`](PullOptions::no_ref_writes) is set. The error
+    ///   holds both names as given, and the path of the ref.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
     /// - The errors of
@@ -712,6 +864,8 @@ impl Repo {
     /// - [`Error::Pull`] if no remote lists a requested ref.
     /// - [`Error::Pull`] if [`refs`](PullOptions::refs) is empty and no
     ///   remote lists a ref of the collection.
+    /// - [`Error::Pull`] if no remote serves the commit of a commit operand.
+    ///   The error names the commit.
     ///
     /// After these checks, the pull from each selected remote has the errors
     /// of [`Repo::pull`] that stop it before it fetches an object, while it
@@ -753,7 +907,20 @@ impl Repo {
             mut on_event,
             allow_unbound,
         } = opts;
-        let (subpaths, names) = check_collection_pull(collection_id, remotes, &opts)?;
+        let (subpaths, operands) = check_collection_pull(collection_id, remotes, &opts)?;
+        check_commit_operands(self, &opts).await?;
+        let place = RefPlace::of_collection(self, collection_id);
+        // Two operands with one ref name write one ref. An operand that
+        // occurs again is one operand, so each other pair has two commits.
+        if !opts.no_ref_writes {
+            check_one_place(
+                place,
+                operands
+                    .refs
+                    .iter()
+                    .map(|operand| (operand.given.as_str(), operand.name.as_str())),
+            )?;
+        }
         // The pull reads the rule one time, here. A value that is not a
         // boolean stops the pull before its first request. Each run of each
         // remote takes this value.
@@ -765,7 +932,24 @@ impl Repo {
         // fails a bad value before the first request.
         self.config().fsync()?;
         self.config().per_object_fsync()?;
-        let names = first_of_each(names.iter().map(String::as_str));
+        let names: Vec<&str> = operands
+            .refs
+            .iter()
+            .filter(|operand| operand.commit.is_none())
+            .map(|operand| operand.name.as_str())
+            .collect();
+        // Each commit that an operand names, one time.
+        let mut named = HashSet::new();
+        let commits: Vec<Checksum> = operands
+            .refs
+            .iter()
+            .filter_map(|operand| operand.commit)
+            .chain(operands.bare.iter().copied())
+            .filter(|commit| named.insert(*commit))
+            .collect();
+        // An empty list of operands takes each ref of the collection. With
+        // commit operands alone, the pull reads no ref of a remote.
+        let commits_alone = names.is_empty() && !commits.is_empty();
 
         // The endpoint, the trust, and the transport of each remote come
         // before the first request, so an error in the config of one remote
@@ -797,6 +981,8 @@ impl Repo {
             &candidates,
             collection_id,
             &names,
+            !commits_alone,
+            &commits,
             |candidate, probed| match probed {
                 Ok(probed) => report_skipped_refs(&mut on_event, candidate, probed),
                 Err(e) => {
@@ -822,11 +1008,17 @@ impl Repo {
         let mut answers = Vec::with_capacity(found.len());
         let mut sessions = Vec::with_capacity(found.len());
         let mut summaries = Vec::with_capacity(found.len());
-        for probed in found {
+        // The first remote that serves each commit of the commit operands, by
+        // its position, and the timestamp of the commit.
+        let mut served: HashMap<Checksum, (usize, u64)> = HashMap::new();
+        for (index, probed) in found.into_iter().enumerate() {
             match probed {
                 Ok(probed) => {
+                    for (commit, timestamp) in probed.commits {
+                        served.insert(commit, (index, timestamp));
+                    }
                     answers.push(Some(probed.listed));
-                    sessions.push(Some(probed.session));
+                    sessions.push(probed.session);
                     summaries.push(probed.summary);
                 }
                 Err(_) => {
@@ -836,7 +1028,24 @@ impl Repo {
                 }
             }
         }
-        let selected = match select(collection_id, &names, &answers) {
+        let selected = if commits_alone {
+            if answers.iter().all(Option::is_none) {
+                Err(none_answered(collection_id))
+            } else {
+                Ok(Vec::new())
+            }
+        } else {
+            select(collection_id, &names, &answers)
+        };
+        let selected = selected.and_then(|selected| {
+            match commits.iter().find(|commit| !served.contains_key(commit)) {
+                Some(commit) => Err(Error::Pull(format!(
+                    "no remote of collection '{collection_id}' serves the commit {commit}"
+                ))),
+                None => Ok(selected),
+            }
+        });
+        let selected = match selected {
             Ok(selected) => selected,
             Err(e) => {
                 end_sessions(sessions.into_iter().flatten()).await;
@@ -844,18 +1053,20 @@ impl Repo {
             }
         };
         drop(answers);
-        // A remote with no selected ref is not asked again.
+        // A remote with no selected ref and no commit is not asked again.
         let unselected = take_unselected(&mut sessions, &mut summaries, |index| {
             selected.iter().any(|s| s.remote == index)
+                || served.values().any(|(remote, _)| *remote == index)
         });
         end_sessions(unselected).await;
 
-        let place = RefPlace::of_collection(self, collection_id);
         let candidate_names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
         let mut stats = PullStats::default();
         let mut local = PullStats::default();
         for (index, candidate) in candidates.into_iter().enumerate() {
-            let Some(session) = sessions[index].take() else {
+            // The find step gives no session for a remote that it did not
+            // probe.
+            let Some(session) = sessions.get_mut(index).and_then(Option::take) else {
                 continue;
             };
             let from_local = matches!(session, Session::Local(_));
@@ -864,10 +1075,32 @@ impl Repo {
                 .filter(|selected| selected.remote == index)
                 .map(|selected| &selected.listed)
                 .collect();
-            let targets: Vec<(String, Checksum)> =
+            let mut targets: Vec<(String, Checksum)> =
                 mine.iter().map(|l| (l.name.clone(), l.commit)).collect();
-            let listed: HashMap<String, u64> =
-                mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect();
+            let listed: HashMap<String, (Checksum, u64)> = mine
+                .iter()
+                .map(|l| (l.name.clone(), (l.commit, l.timestamp)))
+                .collect();
+            // The commit operands whose commit this remote serves first.
+            let serves = |commit: &Checksum| served[commit].0 == index;
+            targets.extend(operands.refs.iter().filter_map(|operand| {
+                let commit = operand.commit.filter(serves)?;
+                Some((operand.name.clone(), commit))
+            }));
+            // A listed ref whose name is the hex form of its commit writes
+            // its ref. It wins over the operand `CHECKSUM` of that commit.
+            let bare: Vec<Checksum> = operands
+                .bare
+                .iter()
+                .copied()
+                .filter(serves)
+                .filter(|commit| {
+                    listed
+                        .get(&commit.to_hex())
+                        .is_none_or(|(tip, _)| tip != commit)
+                })
+                .collect();
+            targets.extend(bare.iter().map(|commit| (commit.to_hex(), *commit)));
             let summary = summaries[index].take();
             // The trust and the session hold what these fields gave.
             let run = PullOptions {
@@ -881,6 +1114,8 @@ impl Repo {
             let pinned = Pinned {
                 targets,
                 listed,
+                bare: bare.into_iter().collect(),
+                commits_alone,
                 collection: collection_id,
                 allow_unbound,
                 place,
@@ -925,15 +1160,30 @@ impl Repo {
         }
         stats.elapsed = started.elapsed();
 
-        let refs = selected
-            .into_iter()
-            .map(|selected| CollectionPullRef {
-                name: selected.listed.name,
-                remote: candidate_names[selected.remote].to_owned(),
-                commit: selected.listed.commit,
-                timestamp: selected.listed.timestamp,
-            })
-            .collect();
+        // The selection follows the order of the operands with no commit.
+        let mut selected = selected.into_iter().map(|selected| CollectionPullRef {
+            name: selected.listed.name,
+            remote: candidate_names[selected.remote].to_owned(),
+            commit: selected.listed.commit,
+            timestamp: selected.listed.timestamp,
+        });
+        let mut refs = Vec::with_capacity(operands.refs.len());
+        for operand in operands.refs {
+            match operand.commit {
+                Some(commit) => {
+                    let (remote, timestamp) = served[&commit];
+                    refs.push(CollectionPullRef {
+                        name: operand.name,
+                        remote: candidate_names[remote].to_owned(),
+                        commit,
+                        timestamp,
+                    });
+                }
+                None => refs.extend(selected.next()),
+            }
+        }
+        // A pull with no operand selected each listed ref.
+        refs.extend(selected);
         Ok(CollectionPullStats { refs, stats, local })
     }
 
@@ -1170,6 +1420,8 @@ impl Repo {
             std::slice::from_ref(&candidate),
             collection_id,
             &names,
+            true,
+            &[],
             |candidate, probed| {
                 if let Ok(probed) = probed {
                     report_skipped_refs(&mut on_event, candidate, probed);
@@ -1186,7 +1438,7 @@ impl Repo {
             listed, session, ..
         } = found?;
         // A local repository has no session to end.
-        if let Session::Remote(connection) = session {
+        if let Some(Session::Remote(connection)) = session {
             RemoteSource::new(connection, Vec::new())
                 .finish(Ok(()))
                 .await?;
@@ -1336,13 +1588,13 @@ async fn resolve_candidate<'a>(
 
 /// Makes the checks of [`Repo::pull_collection`] that read the arguments
 /// alone, in the order of its `# Errors`, and returns the parsed subpaths and
-/// the ref names of [`refs`](PullOptions::refs), as [`collection_names`]
+/// the operands of [`refs`](PullOptions::refs), as [`collection_names`]
 /// returns them.
 fn check_collection_pull(
     collection_id: &str,
     remotes: &[&str],
     opts: &PullOptions,
-) -> Result<(Option<Subpaths>, Vec<String>)> {
+) -> Result<(Option<Subpaths>, Operands)> {
     check_collection_id(collection_id)?;
     if remotes.is_empty() {
         return Err(Error::InvalidInput(
@@ -1381,42 +1633,95 @@ fn check_collection_pull(
                 .into(),
         ));
     }
-    let names = collection_names(collection_id, &opts.refs)?;
-    Ok((subpaths, names))
+    let operands = collection_names(collection_id, &opts.refs)?;
+    Ok((subpaths, operands))
 }
 
-/// Returns the ref name of each name of `names` of a pull of the collection
-/// `collection_id`, in order.
+/// Reads the operands `names` of a pull of the collection `collection_id`.
 ///
-/// A name `NAME` gives itself. A name `@ID:NAME`, where `ID` is
-/// `collection_id`, gives `NAME`. Each ref name then passes the checks of
-/// [`check_ref_names`].
+/// [`Operand`] reads each operand. The ref part of an operand is `NAME` or
+/// `@ID:NAME`, where `ID` is `collection_id`, and both forms give the ref
+/// name `NAME`. An operand that names a ref and no commit adds nothing if
+/// its ref name occurred before with no commit. A `REF@CHECKSUM` operand adds
+/// nothing if its ref name occurred before with its commit. A `CHECKSUM`
+/// operand adds nothing if its commit occurred before with no ref, or if a
+/// `REF@CHECKSUM` operand names its commit under the hex form of that commit
+/// as `REF`.
+///
+/// Each ref name with no commit passes the checks of [`check_ref_names`].
+/// The pull sends no ref name of a `REF@CHECKSUM` operand in a ref listing
+/// request, so such a name passes the ref-name rule alone.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidInput`] if a name is an `@ID:NAME` ref of another
-///   collection.
-/// - [`Error::InvalidRefspec`] if a name that starts with `@` is not an
-///   `@ID:NAME` ref that [`Ref`] reads. The error holds the name as given.
+/// - [`Error::InvalidRefspec`] if the part after the last `@` of an operand,
+///   which is not at position 0, is not 64 lowercase hex characters. The
+///   error holds the operand as given.
+/// - [`Error::InvalidInput`] if the ref part of an operand is an `@ID:NAME`
+///   ref of another collection.
+/// - [`Error::InvalidRefspec`] if a ref part that starts with `@` is not an
+///   `@ID:NAME` ref that [`Ref`] reads, or if the ref name of a
+///   `REF@CHECKSUM` operand fails the ref-name rule. The error holds the
+///   operand as given.
 /// - The errors of [`check_ref_names`].
-fn collection_names(collection_id: &str, names: &[String]) -> Result<Vec<String>> {
-    let mut out = Vec::with_capacity(names.len());
-    for name in names {
-        if !name.starts_with('@') {
-            out.push(name.clone());
-            continue;
-        }
-        match name.parse::<Ref>() {
-            Ok(Ref::Collection { id, name }) if id == collection_id => out.push(name),
-            Ok(Ref::Collection { .. }) => {
-                return Err(Error::InvalidInput(format!(
-                    "the ref {name} is not a ref of the collection {collection_id}"
-                )));
+fn collection_names(collection_id: &str, names: &[String]) -> Result<Operands> {
+    let mut out = Operands::default();
+    let mut seen = HashSet::new();
+    let mut seen_bare = HashSet::new();
+    for given in names {
+        let (r, commit) = match Operand::parse(given)? {
+            Operand::Commit(commit) => {
+                if seen_bare.insert(commit) {
+                    out.bare.push(commit);
+                }
+                continue;
             }
-            _ => return Err(Error::InvalidRefspec(name.clone())),
+            Operand::Name(r) => (r, None),
+            Operand::NameAt { name, commit } => (name, Some(commit)),
+        };
+        let name = if r.starts_with('@') {
+            match r.parse::<Ref>() {
+                Ok(Ref::Collection { id, name }) if id == collection_id => name,
+                Ok(Ref::Collection { .. }) => {
+                    return Err(Error::InvalidInput(format!(
+                        "the ref {given} is not a ref of the collection {collection_id}"
+                    )));
+                }
+                _ => return Err(Error::InvalidRefspec(given.clone())),
+            }
+        } else {
+            r.to_owned()
+        };
+        if commit.is_some() && !is_ref_path(&name) {
+            return Err(Error::InvalidRefspec(given.clone()));
+        }
+        if seen.insert((name.clone(), commit)) {
+            out.refs.push(RefOperand {
+                given: given.clone(),
+                name,
+                commit,
+            });
         }
     }
-    check_ref_names(collection_id, &out)?;
+    let plain: Vec<&str> = out
+        .refs
+        .iter()
+        .filter(|operand| operand.commit.is_none())
+        .map(|operand| operand.name.as_str())
+        .collect();
+    check_ref_names(collection_id, &plain)?;
+    // The operand that writes a ref wins over the operand `CHECKSUM` of the
+    // same commit, when the name of that ref is the hex form of the commit.
+    let own_name: HashSet<Checksum> = out
+        .refs
+        .iter()
+        .filter_map(|operand| {
+            operand
+                .commit
+                .filter(|commit| operand.name == commit.to_hex())
+        })
+        .collect();
+    out.bare.retain(|commit| !own_name.contains(commit));
     Ok(out)
 }
 
@@ -1512,25 +1817,38 @@ fn name_cost(id: &str, name: &str) -> usize {
 
 /// Asks the remote of `candidate` for the commit of each ref of `names` in
 /// the collection `id`, or of each ref of the collection if `names` is
-/// empty.
+/// empty, and for each commit of `commits`.
+///
+/// If `read_refs` is `false`, the probe reads no ref, and its result lists
+/// none. The probe then asks for the commits alone.
 ///
 /// The probe opens a session. If the probe fails, it ends the session. If
 /// the probe succeeds, it gives the session back for the pull. The session
 /// of a local candidate is the open repository at its `file://` address.
 ///
 /// [`find_refs`] calls the probe for each candidate.
-async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Probed> {
+async fn probe(
+    candidate: &Candidate<'_>,
+    id: &str,
+    names: &[&str],
+    read_refs: bool,
+    commits: &[Checksum],
+) -> Result<Probed> {
     let connection = match candidate.transport.open().await? {
         Session::Remote(connection) => connection,
         Session::Local(src) => {
-            let verification = Verification::from_trust(candidate.trust.clone());
-            let ListedRefs { listed, skipped } =
-                probe_local(&src, &verification, id, names).await?;
+            let ListedRefs { listed, skipped } = if read_refs {
+                let verification = Verification::from_trust(candidate.trust.clone());
+                probe_local(&src, &verification, id, names).await?
+            } else {
+                ListedRefs::default()
+            };
             return Ok(Probed {
                 listed,
                 skipped,
                 summary: None,
-                session: Session::Local(src),
+                commits: local_commits(&src, commits).await?,
+                session: Some(Session::Local(src)),
             });
         }
     };
@@ -1538,39 +1856,141 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
     // The probe reads files that a pull reads before its count starts, so it
     // counts no byte.
     let source = RemoteSource::new(connection, Vec::new());
-    let verification = Verification::from_trust(candidate.trust.clone());
-    match probe_source(&source, &verification, id, names, http).await {
-        Ok((ListedRefs { listed, skipped }, summary)) => Ok(Probed {
+    let probed = async {
+        let (ListedRefs { listed, skipped }, summary) = if read_refs {
+            let verification = Verification::from_trust(candidate.trust.clone());
+            probe_source(&source, &verification, id, names, http).await?
+        } else {
+            (ListedRefs::default(), None)
+        };
+        let commits = served_commits(&source, commits).await?;
+        Ok((listed, skipped, summary, commits))
+    }
+    .await;
+    match probed {
+        Ok((listed, skipped, summary, commits)) => Ok(Probed {
             listed,
             skipped,
             summary,
-            session: Session::Remote(source.into_connection()),
+            commits,
+            session: Some(Session::Remote(source.into_connection())),
         }),
         Err(e) => source.finish(Err(e)).await,
     }
 }
 
+/// Returns each commit of `commits` that `source` serves, with its
+/// timestamp.
+///
+/// The call requests each commit object, one at a time, under the size cap
+/// of a metadata object. A commit that the remote does not serve is absent
+/// from the result. The call hashes the bytes of each other commit against
+/// its name and reads its timestamp, on the blocking pool, and drops the
+/// bytes before the next request.
+///
+/// # Errors
+///
+/// - The errors of a request that fails for another cause than an absent
+///   object.
+/// - [`Error::ChecksumMismatch`] if the bytes do not hash to the name of the
+///   commit.
+/// - [`Error::Core`] if the bytes hold no timestamp.
+async fn served_commits(
+    source: &RemoteSource,
+    commits: &[Checksum],
+) -> Result<Vec<(Checksum, u64)>> {
+    let mut served = Vec::new();
+    for commit in commits {
+        let path = object_path(commit, ObjectType::Commit);
+        let Some(bytes) = source
+            .read_optional(&path, Priority::High, MAX_METADATA_SIZE)
+            .await?
+        else {
+            continue;
+        };
+        let commit = *commit;
+        let timestamp = ostrya_rt::unblock(move || {
+            check_hash(&commit, &bytes)?;
+            Ok::<_, Error>(Commit::parse_timestamp(&bytes)?)
+        })
+        .await?;
+        served.push((commit, timestamp));
+    }
+    Ok(served)
+}
+
+/// Returns each commit of `commits` that the local repository `src` holds,
+/// with its timestamp.
+///
+/// The call reads each commit one time, on the blocking pool, under the size
+/// cap of a metadata object, and drops its bytes before it reads the next
+/// commit. A commit that `src` does not hold is absent from the result. The
+/// call hashes no commit: the pull from `src` reads each commit again, and
+/// hashes it under [`UNTRUSTED`](PullFlags::UNTRUSTED).
+async fn local_commits(src: &Repo, commits: &[Checksum]) -> Result<Vec<(Checksum, u64)>> {
+    if commits.is_empty() {
+        return Ok(Vec::new());
+    }
+    let src = src.clone();
+    let commits = commits.to_vec();
+    ostrya_rt::unblock(move || {
+        let mut held = Vec::new();
+        for commit in commits {
+            match src.load_object_bytes_blocking(ObjectType::Commit, &commit) {
+                Ok(bytes) => held.push((commit, Commit::parse_timestamp(&bytes)?)),
+                Err(Error::ObjectNotFound { .. }) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(held)
+    })
+    .await
+}
+
 /// The find step of a collection pull: probes each of `candidates` for the
 /// refs of `names` in the collection `id`, or for each ref of the collection
-/// if `names` is empty.
+/// if `names` is empty, and for the commits `commits`.
 ///
 /// The step probes the candidates one at a time, in their order, through
 /// [`probe`]. After each probe, and before the next one, it calls
 /// `on_probed` with the candidate and the result of its probe. `on_probed`
 /// can change the result, for example to take the skipped names out of it.
 ///
-/// The result holds the result of each candidate, at the position of the
-/// candidate: the [`Probed`] of a candidate that answered, or the error that
-/// skips the candidate.
+/// The step asks a candidate only for the commits that no earlier candidate
+/// serves. So the first candidate that serves a commit is the one candidate
+/// whose result holds it. If `read_refs` is `false`, the probes read no ref,
+/// and the step stops when no commit is left to find. It then opens no
+/// session to the candidates that follow, and it ends the session of a
+/// candidate that serves no commit before the next probe.
+///
+/// The result holds the result of each candidate that the step probed, at
+/// the position of the candidate: the [`Probed`] of a candidate that
+/// answered, or the error that skips the candidate.
 async fn find_refs(
     candidates: &[Candidate<'_>],
     id: &str,
     names: &[&str],
+    read_refs: bool,
+    commits: &[Checksum],
     mut on_probed: impl FnMut(&Candidate<'_>, &mut Result<Probed>),
 ) -> Vec<Result<Probed>> {
+    let mut wanted = commits.to_vec();
     let mut found = Vec::with_capacity(candidates.len());
     for candidate in candidates {
-        let mut probed = Box::pin(probe(candidate, id, names)).await;
+        if !read_refs && wanted.is_empty() {
+            break;
+        }
+        let mut probed = Box::pin(probe(candidate, id, names, read_refs, &wanted)).await;
+        if let Ok(probed) = &mut probed {
+            let served: HashSet<Checksum> =
+                probed.commits.iter().map(|(commit, _)| *commit).collect();
+            wanted.retain(|commit| !served.contains(commit));
+            // With commit operands alone, the pull reads nothing more from a
+            // candidate that serves no commit.
+            if !read_refs && served.is_empty() {
+                end_sessions(probed.session.take()).await;
+            }
+        }
         on_probed(candidate, &mut probed);
         found.push(probed);
     }
@@ -1934,9 +2354,7 @@ fn listing_chunks<'n, 'a>(id: &str, names: &'n [&'a str], http: bool) -> Vec<&'n
 /// - [`Error::Pull`] if `names` is empty and no candidate lists a ref.
 fn select(id: &str, names: &[&str], answers: &[Option<Vec<Listed>>]) -> Result<Vec<Selected>> {
     if answers.iter().all(Option::is_none) {
-        return Err(Error::Pull(format!(
-            "no remote of collection '{id}' answered"
-        )));
+        return Err(none_answered(id));
     }
     let mut best: HashMap<&str, (usize, &Listed)> = HashMap::new();
     for (remote, listed) in answers.iter().enumerate() {
@@ -1974,6 +2392,12 @@ fn select(id: &str, names: &[&str], answers: &[Option<Vec<Listed>>]) -> Result<V
             ))),
         })
         .collect()
+}
+
+/// Returns the error of a pull of the collection `id` whose candidates were
+/// all skipped.
+fn none_answered(id: &str) -> Error {
+    Error::Pull(format!("no remote of collection '{id}' answered"))
 }
 
 /// Adds the counts of `pulled` to `total`. The run time stays as it is.
@@ -2114,6 +2538,62 @@ mod tests {
 
     fn csum(byte: u8) -> Checksum {
         Checksum::from_bytes([byte; 32])
+    }
+
+    /// The operands of a collection pull split into the refs and the commits
+    /// with no ref. Both forms of a ref give one ref name. An operand that
+    /// occurs again adds nothing, and a ref name with two commits stays two
+    /// operands. The operand `CHECKSUM` gives way to the operand
+    /// `CHECKSUM@CHECKSUM` of the same commit.
+    #[test]
+    fn the_names_of_a_collection_pull_split_into_refs_and_commits() {
+        let id = "org.example.Os";
+        let (c1, c2, c3) = (csum(1), csum(2), csum(3));
+        let given: Vec<String> = [
+            "os/a".to_owned(),
+            format!("@{id}:os/a"),
+            format!("os/a@{c1}"),
+            format!("@{id}:os/a@{c1}"),
+            format!("@{id}:os/a@{c2}"),
+            c1.to_hex(),
+            c3.to_hex(),
+            c1.to_hex(),
+            format!("{c3}@{c3}"),
+            format!("{c2}@{c3}"),
+            format!("@{id}:os/b"),
+        ]
+        .into();
+        let operands = collection_names(id, &given).unwrap();
+        let refs: Vec<(&str, &str, Option<Checksum>)> = operands
+            .refs
+            .iter()
+            .map(|r| (r.given.as_str(), r.name.as_str(), r.commit))
+            .collect();
+        let (c2_hex, c3_hex) = (c2.to_hex(), c3.to_hex());
+        assert_eq!(
+            refs,
+            [
+                ("os/a", "os/a", None),
+                (given[2].as_str(), "os/a", Some(c1)),
+                (given[4].as_str(), "os/a", Some(c2)),
+                (given[8].as_str(), c3_hex.as_str(), Some(c3)),
+                (given[9].as_str(), c2_hex.as_str(), Some(c3)),
+                (given[10].as_str(), "os/b", None),
+            ]
+        );
+        assert_eq!(operands.bare, [c1]);
+
+        for bad in [format!("os/a@{}", &c1.to_hex()[..10]), format!("a:b@{c1}")] {
+            match collection_names(id, std::slice::from_ref(&bad)) {
+                Err(Error::InvalidRefspec(got)) => assert_eq!(got, bad),
+                other => panic!("{bad}: {other:?}"),
+            }
+        }
+        let other = format!("@org.example.Other:os/a@{c1}");
+        assert!(matches!(
+            collection_names(id, &[other]),
+            Err(Error::InvalidInput(_))
+        ));
     }
 
     fn listed(name: &str, byte: u8, timestamp: u64) -> Listed {
@@ -2661,8 +3141,10 @@ mod tests {
             targets: listed.iter().map(|l| (l.name.clone(), l.commit)).collect(),
             listed: listed
                 .iter()
-                .map(|l| (l.name.clone(), l.timestamp))
+                .map(|l| (l.name.clone(), (l.commit, l.timestamp)))
                 .collect(),
+            bare: HashSet::new(),
+            commits_alone: false,
             collection: LOCAL_ID,
             allow_unbound: true,
             place: RefPlace::of_collection(dst, LOCAL_ID),
@@ -2988,7 +3470,7 @@ mod tests {
                 let dir = format!("wrong{at}");
                 let dst = scratch.create(&dir).await;
                 let mut pinned = pinned_of(&dst, &listed);
-                pinned.listed.insert(wrong.to_owned(), 1_700_000_002);
+                pinned.listed.insert(wrong.to_owned(), (tip, 1_700_000_002));
                 let related = RelatedRule::of(dst.config()).unwrap();
                 let pulled = dst
                     .pull_local_candidate(

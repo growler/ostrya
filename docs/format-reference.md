@@ -5542,6 +5542,41 @@ request, the pull refuses an operand `@C:NAME` of another collection `C` with
 `@ID:NAME` ref with `Error::InvalidRefspec`. The library call
 `Repo::pull_collection` reads `PullOptions::refs` with the same rules.
 
+An operand of `Repo::pull_collection` can also be a commit operand, which
+names its commit by the checksum: `CHECKSUM`, `NAME@CHECKSUM`, or
+`@ID:NAME@CHECKSUM`. The checksum is 64 lowercase hex characters, and in the
+second and the third form it starts after the last `@` that is not the first
+character. `CHECKSUM` fetches the commit and writes no ref. The other two
+forms fetch the commit and write the ref `NAME` of `ID` to it, and `NAME`
+need not be a ref that a candidate lists. A plain operand of 64 lowercase hex
+characters is a `CHECKSUM` operand, and names no ref. Before its first
+request, the pull refuses these operands:
+
+- an operand whose checksum part is not 64 lowercase hex characters, and a
+  commit operand whose `NAME` fails the ref-name rule, with
+  `Error::InvalidRefspec`;
+- a commit operand `@C:NAME@CHECKSUM` of another collection `C`, with
+  `Error::InvalidInput`;
+- two operands that give one `NAME` with two commits, and `NAME` beside
+  `NAME@CHECKSUM`, with `Error::Pull("the refs A and B write one ref PATH")`,
+  unless the pull writes no ref (`PullOptions::no_ref_writes`);
+- a `CHECKSUM` operand under `TimestampCheck::CurrentRef`, with
+  `Error::InvalidInput`;
+- a `CHECKSUM` operand whose commit this repository does not hold complete,
+  under `require_static_deltas`, with `Error::Pull`.
+
+A commit operand that occurs again with the same commit adds nothing, also in
+the other form. The limits of a ref listing request below do not apply to the
+`NAME` of a commit operand.
+
+A name of 64 lowercase hex characters is a valid ref name. The operand
+`CHECKSUM@CHECKSUM` writes the ref of that name, and a `CHECKSUM` operand of
+the same checksum beside it fetches no other object and changes no ref. The
+operand `@ID:CHECKSUM` names the listed ref of that name. The pull writes
+that ref at the commit that the selected candidate lists, also beside a
+`CHECKSUM` operand of that commit. In both cases, the last two refusals of
+the list above still apply to the `CHECKSUM` operand.
+
 Before its first request, the pull refuses a `REF` whose entry `ID/REF` is
 longer than 4,096 bytes or has more than 256 parts, or whose request target
 alone over HTTP (item 2 below) is longer than 16 KiB. It resolves the address
@@ -5579,6 +5614,23 @@ same session.
    example 404 from a static server, the pull reads `summary`. A remote with
    no listing and no summary lists no ref. Over a stream session, the server
    always serves the listing.
+
+For each commit operand, the pull requests the commit object
+`objects/XX/REST.commit` from each candidate in turn, after the refs of that
+candidate, until one candidate serves it. That candidate is the candidate of
+the operand. A candidate that does not serve the object, for example with the
+status 404, gets no warning, and the pull asks the next candidate. The pull
+hashes the object against its name, reads the timestamp of the commit, and
+drops the bytes. It asks no later candidate for a commit that an earlier
+candidate serves. A local candidate serves a commit that its repository
+holds, and the pull hashes no commit in this step.
+
+If each operand is a commit operand, the pull reads no ref listing, no
+`summary`, and no `summary.sig` of a candidate, and a summary policy does not
+apply. The one exception is a local candidate under `require_static_deltas`,
+as the paragraph on a local candidate below states. The pull opens no session
+to the candidates after the candidate that serves the last commit. If one
+operand is not a commit operand, items 1 to 4 apply to each candidate.
 
 A candidate at an `s3://` address is a bucket repository ("The S3 bucket
 repository"), which serves no ref listing. The pull sends it no listing
@@ -5680,11 +5732,15 @@ no `ostree.commit.timestamp` of type `t`, or when a bucket repository has no
 repository, or when the probe cannot read a directory or a ref file that the
 names reach. Without a summary policy, it is also skipped when the source does
 not hold the commit of a ref. The warning names the path. Under a summary
-policy, the probe reads no commit. A listed commit that the source does not
-hold then fails the pull from the candidate, as for a remote. The pull fails
+policy, the probe reads no commit of a listed ref. A listed commit that the
+source does not hold then fails the pull from the candidate, as for a remote.
+A candidate is also skipped, with its listed refs, when the request for the
+commit of a commit operand fails with another cause than an absent object, or
+when the commit object does not hash to its name. The pull fails
 when each candidate is skipped, when no candidate lists a requested `REF`,
+when no candidate serves the commit of a commit operand,
 and, with no `REF`, when no candidate lists a ref of `ID`. These failures come
-before the first object request.
+before the first object request of a pull.
 
 A listed ref whose name fails the ref-name rule, for example `origin:main`,
 is skipped, with a warning that names the candidate and the ref. The other
@@ -5698,13 +5754,18 @@ rule`.
 
 For each ref, the pull selects the candidate with the newest listed
 timestamp. A tie goes to the first candidate in the config. After the
-selection, the pull ends the session of each candidate with no selected ref.
+selection, the pull ends the session of each candidate with no selected ref
+and no commit of a commit operand.
 The pull then takes the objects of the refs of each selected candidate, in
 the order of the config, as a pull from that remote does at the listed commit
-(`conformance/cli-behavior.md`, "HTTP pull surface"). It uses one transaction
+(`conformance/cli-behavior.md`, "HTTP pull surface"). It takes the commits of
+the commit operands of a candidate in the same pull, and requests each such
+commit object again unless this repository holds the commit. It uses one
+transaction
 for each such candidate. If the probe read the refs from the summary, the pull
 uses those bytes. Otherwise it reads the `summary.sig` and the `summary` of
-the candidate. It reads the `config` of the candidate, and no ref file. It
+the candidate, unless each operand is a commit operand. It reads the `config`
+of the candidate, and no ref file. It
 reads the `config` of a bucket repository through the bucket client. The
 keys of that candidate verify its commits. A failure of a selected candidate
 stops the pull, and the refs of the earlier candidates stay written.
@@ -5718,6 +5779,11 @@ probe, as for a remote. Under a summary policy, the listed timestamps come
 from the verified summary, and the pull reads and verifies the `summary` and
 the `summary.sig` of the source again. Without a summary policy, the probe
 reads each tip commit for its timestamp, and keeps no bytes for the pull.
+If each operand is a commit operand, the pull reads no `summary` and no
+`summary.sig` of the source, unless `require_static_deltas` is set without
+`disable_static_deltas`. Under `require_static_deltas` alone, the pull reads
+and verifies the summary, the summary policy applies, and a source with no
+summary fails the pull.
 With `--untrusted`, the pull hashes each commit that it reads for the checks
 and for the walk of the chain, and each dirtree that the walk of the tree
 reads. It compares each result with the name of the object before it uses
@@ -5754,6 +5820,14 @@ The pull refuses a commit:
 - whose `ostree.ref-binding` is present and does not hold `REF`;
 - whose timestamp is not the listed timestamp of `REF`.
 
+The commit of each commit operand has the collection-binding checks, also in
+a pull that writes no ref. The commit of `NAME@CHECKSUM` has the ref-binding
+check against `NAME`, and the commit of `CHECKSUM` has none. No candidate
+lists a timestamp for a commit operand, so its commit has no check of a
+listed timestamp. In a pull that writes no ref, `NAME` beside
+`NAME@CHECKSUM` gives two commits for `NAME`, and the check of the listed
+timestamp applies to the listed commit alone.
+
 The `ostrya` command does not set `allow_unbound`. The switch does not change
 the ref binding check, the check of the listed timestamp, or the timestamp
 check. The pull refuses `PullFlags::DISABLE_VERIFY_BINDINGS` with either value
@@ -5763,7 +5837,7 @@ no binding of either kind. The trust of the remote and a check of the content
 by the caller after the pull are the protection.
 
 The pull writes `refs/mirrors/ID/REF`. It writes no ref under
-`refs/remotes/`.
+`refs/remotes/`, and no ref for a `CHECKSUM` operand.
 
 In a repository with `[core] collection-id=ID`, the pull writes
 `refs/heads/REF`, and it does not touch `refs/mirrors/ID/`. Delta discovery

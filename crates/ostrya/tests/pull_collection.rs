@@ -25,7 +25,7 @@ use ostrya::{
     CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions, Ed25519Signer, Error,
     FileKind, FsckOptions, MAX_REF_PATTERNS, MutableTree, ObjectName, ObjectType, PullFlags,
     PullOptions, PullStats, Ref, RefSelector, Repo, RepoMode, SummaryOptions, TimestampCheck, Type,
-    Value,
+    Value, commit_operand,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -2584,6 +2584,869 @@ fn an_empty_ssh_command_fails_before_the_first_request() {
             assert!(server_a.seen().is_empty(), "{key}: {:?}", server_a.seen());
             assert_nothing_written(&dest).await;
         }
+    });
+}
+
+// --- commit operands ---------------------------------------------------------
+
+/// Returns the operand `NAME@CHECKSUM` of the ref `name` and `commit`.
+fn at(name: &str, commit: &Checksum) -> String {
+    commit_operand(&Ref::local(name), commit)
+}
+
+/// Copies the repository at `dir/from` to `dir/to`, so both hold the same
+/// commits.
+fn copy_repo(dir: &Path, from: &str, to: &str) {
+    let status = std::process::Command::new("cp")
+        .arg("-a")
+        .arg(dir.join(from))
+        .arg(dir.join(to))
+        .status()
+        .unwrap();
+    assert!(status.success());
+}
+
+/// Returns `true` if `server` received a request that reads refs: for the
+/// ref listing, the `summary`, or the `summary.sig`.
+fn refs_requested(server: &RepoServer) -> bool {
+    server
+        .seen()
+        .iter()
+        .any(|path| path == LISTING || path == "summary" || path == "summary.sig")
+}
+
+/// Two remotes serve the commit of a `REF@CHECKSUM` operand. The pull takes
+/// the commit from the first remote, and asks the second remote for nothing.
+/// The entry of the ref in the result holds the timestamp of the commit.
+#[test]
+fn the_first_remote_that_serves_the_commit_wins() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-first");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "c", None, REF, FIXED_TS, BOUND).await;
+        copy_repo(dir.path(), "a", "b");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(got, [(REF, "a", tip, FIXED_TS)]);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert!(objects_requested(&server_a));
+        assert!(server_b.seen().is_empty(), "{:?}", server_b.seen());
+    });
+}
+
+/// A remote that does not serve the commit gives way to the next remote,
+/// with no event. The pull asks it for the commit object alone.
+#[test]
+fn a_remote_without_the_commit_gives_way_to_the_next_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-next");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "c", None, REF, FIXED_TS, BOUND).await;
+        copy_repo(dir.path(), "a", "b");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        server_a.hide(&meta_path(&tip, "commit"));
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs[0].remote, "b");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert_eq!(server_a.seen(), [meta_path(&tip, "commit")]);
+    });
+}
+
+/// A remote whose answer to the commit request is a failure is skipped with
+/// an event, and the pull takes the commit from the next remote. A commit
+/// that no remote serves fails the pull, and a pull in which each remote
+/// fails fails too. Both failures write nothing.
+#[test]
+fn a_remote_that_fails_the_commit_request_is_skipped_with_an_event() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-failure");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "c", None, REF, FIXED_TS, BOUND).await;
+        copy_repo(dir.path(), "a", "b");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        server_a.answer_status(&meta_path(&tip, "commit"), 500);
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let absent = Checksum::from_bytes([7; 32]);
+        let (opts, events) = options(&[&at(REF, &absent)]);
+        let err = dest
+            .pull_collection(ID, &["a", "b"], opts)
+            .await
+            .unwrap_err();
+        let expected = format!("no remote of collection '{ID}' serves the commit {absent}");
+        assert!(matches!(&err, Error::Pull(m) if *m == expected), "{err:?}");
+        assert!(events.lock().unwrap().is_empty());
+        assert!(!server_a.seen().iter().any(|path| path == "config"));
+        assert_nothing_written(&dest).await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        let expected = format!("no remote of collection '{ID}' answered");
+        assert!(matches!(&err, Error::Pull(m) if *m == expected), "{err:?}");
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert_nothing_written(&dest).await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert_eq!(pulled.refs[0].remote, "b");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(
+                &events[..],
+                [CollectionPullEvent::RemoteSkipped { remote, message, .. }]
+                    if remote == "a" && message.contains("500")
+            ),
+            "{events:?}"
+        );
+    });
+}
+
+/// A pull whose operands each name a commit reads no ref listing, no
+/// `summary`, and no `summary.sig` of a remote, so a summary that fails the
+/// policy of the remote does not stop it. A pull that also names a ref with
+/// no commit reads the summary, and the policy applies.
+#[test]
+fn commit_operands_alone_read_no_summary_of_a_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-no-summary");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        // The policy refuses a summary with no signature.
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let policy =
+            format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), &policy)]).await;
+
+        let (opts, events) = options(&["os/next", &at(REF, &old)]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("answered")),
+            "{err:?}"
+        );
+        assert_eq!(events.lock().unwrap().len(), 1);
+        assert!(refs_requested(&server_a));
+        assert!(!objects_requested(&server_a));
+        assert_nothing_written(&dest).await;
+
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = reconfigure(
+            dir.path(),
+            &format!(
+                "\n[remote \"again\"]\nurl={}\ngpg-verify=false\n{policy}",
+                server_a.url()
+            ),
+        )
+        .await;
+        let (opts, events) = options(&[&at(REF, &old), &tip.to_hex()]);
+        let pulled = dest.pull_collection(ID, &["again"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs.len(), 1);
+        assert_eq!(mirror(&dest, REF).await, Some(old));
+        assert!(dest.has_object(ObjectType::Commit, &tip).await.unwrap());
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert!(!refs_requested(&server_a), "{:?}", server_a.seen());
+    });
+}
+
+/// Two operands that write one ref with two commits stop the pull before its
+/// first request: two `REF@CHECKSUM` operands, in either form of the ref, and
+/// a ref with no commit beside a `REF@CHECKSUM` operand. The error names the
+/// path of the ref. `REF@CHECKSUM` and `@ID:REF@CHECKSUM` of one commit are
+/// one operand. A pull that writes no ref takes two commits for one ref name.
+#[test]
+fn two_commit_operands_for_one_ref_are_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-one-ref");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let with_id = |commit: &Checksum| commit_operand(&Ref::collection(ID, REF), commit);
+
+        for (own, path) in [
+            (None, format!("refs/mirrors/{ID}/{REF}")),
+            (Some(ID), format!("refs/heads/{REF}")),
+        ] {
+            let dest = dest(dir.path(), own, &[("a", &server_a.url(), "")]).await;
+            let cases = [
+                [at(REF, &old), at(REF, &tip)],
+                [REF.to_owned(), at(REF, &old)],
+                [at(REF, &old), with_id(&tip)],
+            ];
+            for [first, second] in cases {
+                let (opts, _) = options(&[&first, &second]);
+                let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+                let expected = format!("the refs {first} and {second} write one ref {path}");
+                assert!(matches!(&err, Error::Pull(m) if *m == expected), "{err:?}");
+            }
+            assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+            assert_nothing_written(&dest).await;
+            drop(dest);
+            std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        }
+
+        let once = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let (opts, _) = options(&[&at(REF, &old), &with_id(&old)]);
+        let pulled = once.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert_eq!(pulled.refs.len(), 1);
+        assert_eq!(mirror(&once, REF).await, Some(old));
+        drop(once);
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+
+        // The remote lists the ref at the newer commit. The check of the
+        // listed timestamp applies to that commit alone.
+        let unwritten = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let (mut opts, events) = options(&[REF, &at(REF, &old)]);
+        opts.pull.no_ref_writes = true;
+        let pulled = unwritten.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(got, [(REF, tip, FIXED_TS + 10), (REF, old, FIXED_TS)]);
+        assert!(
+            unwritten
+                .has_object(ObjectType::Commit, &old)
+                .await
+                .unwrap()
+        );
+        assert!(
+            unwritten
+                .has_object(ObjectType::Commit, &tip)
+                .await
+                .unwrap()
+        );
+        assert!(unwritten.list_mirror_refs().await.unwrap().is_empty());
+        assert!(unwritten.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// The `ostree.collection-binding` of the commit of a `CHECKSUM` operand
+/// must state the collection of the pull. A commit with no binding key
+/// passes with `allow_unbound` alone. The pull writes no ref for the
+/// operand, makes no ref-binding check of its commit, and gives it no entry
+/// in the result.
+#[test]
+fn a_checksum_operand_must_be_bound_to_the_collection() {
+    block_on(async {
+        let other_ref: &[&str] = &["os/next"];
+        let cases: [(&str, Option<&str>, bool, Option<&str>); 4] = [
+            ("other collection", Some(OTHER), true, Some(OTHER)),
+            ("no binding", None, false, Some("no collection binding")),
+            ("no binding, allowed", None, true, None),
+            ("bound", Some(ID), false, None),
+        ];
+        for (tag, collection, allow_unbound, fragment) in cases {
+            let dir = TmpDir::new("pull-collection-commit-binding");
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let bind = Bind {
+                collection,
+                refs: Some(other_ref),
+            };
+            let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+            let (mut opts, _) = options(&[&tip.to_hex()]);
+            opts.allow_unbound = allow_unbound;
+            let pulled = dest.pull_collection(ID, &["a"], opts).await;
+            let Some(fragment) = fragment else {
+                let pulled = pulled.unwrap();
+                assert!(pulled.refs.is_empty(), "{tag}: {:?}", pulled.refs);
+                assert!(
+                    dest.has_object(ObjectType::Commit, &tip).await.unwrap(),
+                    "{tag}"
+                );
+                assert!(dest.list_refs(None).await.unwrap().is_empty(), "{tag}");
+                assert!(dest.list_mirror_refs().await.unwrap().is_empty(), "{tag}");
+                assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+                continue;
+            };
+            let err = pulled.unwrap_err();
+            assert!(
+                matches!(&err, Error::Pull(m) if m.contains(fragment)),
+                "{tag}: {err:?}"
+            );
+            assert_nothing_written(&dest).await;
+        }
+    });
+}
+
+/// The pull refuses a malformed commit operand, a commit operand of another
+/// collection, and a `CHECKSUM` operand that its options cannot take, before
+/// its first request.
+#[test]
+fn a_collection_pull_refuses_a_malformed_commit_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-malformed");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let hex = tip.to_hex();
+
+        let malformed = [
+            format!("{REF}@"),
+            format!("{REF}@{}", &hex[..10]),
+            format!("{REF}@{}", hex.to_uppercase()),
+            format!("{REF}@{hex}^"),
+            format!("origin:{REF}@{hex}"),
+            format!("a@b@{hex}"),
+            format!("@{hex}"),
+        ];
+        for name in malformed {
+            let (opts, _) = options(&[&name]);
+            let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(got) if *got == name),
+                "{name}: {err:?}"
+            );
+        }
+
+        let other = commit_operand(&Ref::collection(OTHER, REF), &tip);
+        let (opts, _) = options(&[&other]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+
+        let (mut opts, _) = options(&[&hex]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+
+        let (mut opts, _) = options(&[&hex]);
+        opts.pull.require_static_deltas = true;
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("Static deltas required")),
+            "{err:?}"
+        );
+
+        assert!(server_a.seen().is_empty(), "{:?}", server_a.seen());
+        assert_nothing_written(&dest).await;
+    });
+}
+
+/// A `REF@CHECKSUM` operand writes the ref of the collection to its commit,
+/// also for a commit that is older than the commit that the remote lists for
+/// the ref. Into a repository whose own id is the pulled id, the pull writes
+/// the local ref. The pull refuses a commit whose ref binding does not hold
+/// the ref.
+#[test]
+fn a_ref_at_checksum_operand_writes_the_collection_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-ref");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        commit(&a, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        let bind = Bind {
+            collection: Some(ID),
+            refs: Some(&["os/next"]),
+        };
+        let next = commit(&a, dir.path(), "next", None, "os/next", FIXED_TS, bind).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+
+        let plain = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let (opts, _) = options(&[&at(REF, &next)]);
+        let err = plain.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("in ref binding metadata")),
+            "{err:?}"
+        );
+        assert_nothing_written(&plain).await;
+
+        let operand = commit_operand(&Ref::collection(ID, REF), &old);
+        let (opts, events) = options(&[&operand]);
+        let pulled = plain.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(got, [(REF, "a", old, FIXED_TS)]);
+        assert_eq!(mirror(&plain, REF).await, Some(old));
+        assert!(plain.list_refs(None).await.unwrap().is_empty());
+        assert!(plain.list_remote_refs().await.unwrap().is_empty());
+        assert!(plain.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        drop(plain);
+
+        std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        let own = dest(dir.path(), Some(ID), &[("a", &server_a.url(), "")]).await;
+        let (opts, _) = options(&[&at(REF, &old)]);
+        own.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert_eq!(own.list_refs(None).await.unwrap(), [(REF.to_owned(), old)]);
+        assert!(own.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// A remote at a `file://` address serves commit operands from the local
+/// repository. The pull writes the ref of a `REF@CHECKSUM` operand and no
+/// ref for a `CHECKSUM` operand. With commit operands alone, the pull reads
+/// no summary of the repository, so a summary policy that the repository
+/// cannot meet does not stop it. With a ref that names no commit beside
+/// them, the policy skips the remote.
+#[test]
+fn a_file_remote_serves_commit_operands() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-file");
+        let a = create(dir.path(), "a", Some(OTHER)).await;
+        let old = commit(&a, dir.path(), "old", Some(ID), REF, FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "new", Some(ID), REF, FIXED_TS + 10, BOUND).await;
+        let policy =
+            format!("sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &file_url(dir.path(), "a"), &policy)],
+        )
+        .await;
+
+        let (opts, events) = options(&["os/next", &at(REF, &old)]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("answered")),
+            "{err:?}"
+        );
+        assert_eq!(skipped(dir.path(), &events), ["a"]);
+        assert_nothing_written(&dest).await;
+
+        let absent = Checksum::from_bytes([7; 32]);
+        let (opts, events) = options(&[&absent.to_hex()]);
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("serves the commit")),
+            "{err:?}"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        assert_nothing_written(&dest).await;
+
+        let (opts, events) = options(&[&at(REF, &old), &tip.to_hex()]);
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(got, [(REF, "a", old, FIXED_TS)]);
+        assert_eq!(mirror(&dest, REF).await, Some(old));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.has_object(ObjectType::Commit, &tip).await.unwrap());
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert!(pulled.local.content_imported > 0, "{:?}", pulled.local);
+    });
+}
+
+/// With commit operands alone, the pull stops the probe at the remote that
+/// serves the last commit, and opens no session to a later remote. So a
+/// later remote at a `file://` path with no repository gives no event. With
+/// a ref that names no commit, the pull probes each remote, and that remote
+/// gives an event.
+#[test]
+fn commit_operands_alone_open_no_session_to_a_later_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-no-session");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("missing", &file_url(dir.path(), "missing"), ""),
+            ],
+        )
+        .await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let pulled = dest
+            .pull_collection(ID, &["a", "missing"], opts)
+            .await
+            .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs[0].remote, "a");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+
+        let (opts, events) = options(&[REF]);
+        dest.pull_collection(ID, &["a", "missing"], opts)
+            .await
+            .unwrap();
+        assert_eq!(skipped(dir.path(), &events), ["missing"]);
+    });
+}
+
+/// A remote lists a ref whose name is the hex form of its commit. The pull
+/// writes that ref when the `CHECKSUM` operand of the same commit stands
+/// beside the ref: when one remote gives both, and when an earlier remote
+/// serves the commit of the `CHECKSUM` operand.
+#[test]
+fn a_listed_ref_named_as_its_commit_is_written_beside_the_checksum_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-hex-ref");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let bind = Bind {
+            collection: Some(ID),
+            refs: None,
+        };
+        let tip = commit(&a, dir.path(), "c", None, REF, FIXED_TS, bind).await;
+        summarize(&a).await;
+        // The second remote holds the commit and lists no ref of its name.
+        copy_repo(dir.path(), "a", "b");
+        let hex = tip.to_hex();
+        let txn = a.transaction().await.unwrap();
+        txn.set_ref(&Ref::local(&hex), Some(&tip));
+        txn.commit().await.unwrap();
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let named = format!("@{ID}:{hex}");
+
+        for remotes in [&["b", "a"][..], &["a"]] {
+            let dest = dest(
+                dir.path(),
+                None,
+                &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+            )
+            .await;
+            let (opts, events) = options(&[&named, &hex]);
+            let pulled = dest.pull_collection(ID, remotes, opts).await.unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            let got: Vec<(&str, &str, Checksum, u64)> = pulled
+                .refs
+                .iter()
+                .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+                .collect();
+            assert_eq!(got, [(hex.as_str(), "a", tip, FIXED_TS)], "{remotes:?}");
+            assert_eq!(mirror(&dest, &hex).await, Some(tip), "{remotes:?}");
+            assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+            assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+            drop(dest);
+            std::fs::remove_dir_all(dir.path().join("dest")).unwrap();
+        }
+        // The earlier remote served the commit of the `CHECKSUM` operand.
+        assert!(objects_requested(&server_b));
+    });
+}
+
+/// A remote whose commit object does not hash to its name is skipped with
+/// an event, and the pull takes the commit from the next remote.
+#[test]
+fn a_remote_with_a_damaged_commit_object_is_skipped_with_an_event() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-damaged");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "c", None, REF, FIXED_TS, BOUND).await;
+        copy_repo(dir.path(), "a", "b");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        server_a.tamper(&meta_path(&tip, "commit"), b"not the commit".to_vec());
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let (opts, events) = options(&[&at(REF, &tip)]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert_eq!(pulled.refs[0].remote, "b");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(server_a.seen(), [meta_path(&tip, "commit")]);
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(
+                &events[..],
+                [CollectionPullEvent::RemoteSkipped { remote, .. }] if remote == "a"
+            ),
+            "{events:?}"
+        );
+    });
+}
+
+/// A pull names a ref with no commit and a `CHECKSUM` operand. A remote
+/// whose answer to the commit request is a failure is skipped together with
+/// the refs that it lists. The pull takes the ref and the commit from the
+/// next remote.
+#[test]
+fn a_failed_commit_request_skips_the_listed_refs_of_the_remote() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-failure-mixed");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        summarize(&a).await;
+        copy_repo(dir.path(), "a", "b");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        server_a.answer_status(&meta_path(&old, "commit"), 500);
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let (opts, events) = options(&[REF, &old.to_hex()]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        let got: Vec<(&str, &str, Checksum)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit))
+            .collect();
+        assert_eq!(got, [(REF, "b", tip)]);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert!(dest.has_object(ObjectType::Commit, &old).await.unwrap());
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        // The pull read the refs of the skipped remote, and then asked it
+        // for nothing more.
+        assert!(refs_requested(&server_a));
+        assert!(!server_a.seen().iter().any(|path| path == "config"));
+        let events = events.lock().unwrap();
+        assert!(
+            matches!(
+                &events[..],
+                [CollectionPullEvent::RemoteSkipped { remote, message, .. }]
+                    if remote == "a" && message.contains("500")
+            ),
+            "{events:?}"
+        );
+    });
+}
+
+/// A pull that writes no ref makes the collection-binding check of the
+/// commit of each form of a commit operand.
+#[test]
+fn a_pull_with_no_ref_writes_checks_the_binding_of_each_commit_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-binding-unwritten");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let bind = Bind {
+            collection: Some(OTHER),
+            refs: Some(&[REF]),
+        };
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let operands = [
+            tip.to_hex(),
+            at(REF, &tip),
+            commit_operand(&Ref::collection(ID, REF), &tip),
+        ];
+        for operand in operands {
+            let (mut opts, _) = options(&[&operand]);
+            opts.pull.no_ref_writes = true;
+            let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::Pull(m) if m.contains(OTHER)),
+                "{operand}: {err:?}"
+            );
+            assert_nothing_written(&dest).await;
+        }
+    });
+}
+
+/// The operand `CHECKSUM@CHECKSUM` writes the ref whose name is the hex form
+/// of the commit. The `CHECKSUM` operand of the same commit beside it adds
+/// no entry to the result.
+#[test]
+fn a_checksum_operand_beside_its_ref_form_gives_one_entry() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-own-name");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let bind = Bind {
+            collection: Some(ID),
+            refs: None,
+        };
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, bind).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+        let hex = tip.to_hex();
+
+        let (opts, events) = options(&[&at(&hex, &tip), &hex]);
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(got, [(hex.as_str(), "a", tip, FIXED_TS)]);
+        assert_eq!(mirror(&dest, &hex).await, Some(tip));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// Two remotes serve one commit each. The pull asks the second remote only
+/// for the commit that the first remote does not serve, and sends no request
+/// to a third remote. The result follows the order of the operands.
+#[test]
+fn each_commit_comes_from_the_first_remote_that_serves_it() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-two-remotes");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let first = commit(&a, dir.path(), "first", None, REF, FIXED_TS, BOUND).await;
+        copy_repo(dir.path(), "a", "b");
+        let b = Repo::open(&dir.path().join("b")).await.unwrap();
+        let next = "os/next";
+        let bind = Bind {
+            collection: Some(ID),
+            refs: Some(&[next]),
+        };
+        let second = commit(&b, dir.path(), "second", None, next, FIXED_TS + 10, bind).await;
+        copy_repo(dir.path(), "b", "c");
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let server_c = RepoServer::start(&dir.path().join("c"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[
+                ("a", &server_a.url(), ""),
+                ("b", &server_b.url(), ""),
+                ("c", &server_c.url(), ""),
+            ],
+        )
+        .await;
+
+        let (opts, events) = options(&[&at(next, &second), &at(REF, &first)]);
+        let pulled = dest
+            .pull_collection(ID, &["a", "b", "c"], opts)
+            .await
+            .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum, u64)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit, r.timestamp))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (next, "b", second, FIXED_TS + 10),
+                (REF, "a", first, FIXED_TS)
+            ]
+        );
+        assert_eq!(mirror(&dest, REF).await, Some(first));
+        assert_eq!(mirror(&dest, next).await, Some(second));
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(server_a.requests_for(&meta_path(&second, "commit")), 1);
+        assert_eq!(server_b.requests_for(&meta_path(&first, "commit")), 0);
+        assert!(server_c.seen().is_empty(), "{:?}", server_c.seen());
+    });
+}
+
+/// Under `TimestampCheck::CurrentRef`, the pull refuses a `REF@CHECKSUM`
+/// operand whose commit is older than the current commit of the ref.
+#[test]
+fn the_current_ref_check_refuses_an_older_commit_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-downgrade");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let (mut opts, _) = options(&[&at(REF, &tip)]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+
+        let (mut opts, _) = options(&[&at(REF, &old)]);
+        opts.pull.timestamp_check = TimestampCheck::CurrentRef;
+        let err = dest.pull_collection(ID, &["a"], opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("chronologically older")),
+            "{err:?}"
+        );
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
+/// A pull names a ref with no commit and a `CHECKSUM` operand. The remote
+/// that gives the commit of the `CHECKSUM` operand and no ref still reads
+/// its summary in the pull.
+#[test]
+fn a_remote_with_commit_targets_alone_reads_its_summary_in_a_mixed_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-mixed-summary");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let old = commit(&a, dir.path(), "old", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        copy_repo(dir.path(), "a", "b");
+        let b = Repo::open(&dir.path().join("b")).await.unwrap();
+        let tip = commit(&b, dir.path(), "new", None, REF, FIXED_TS + 10, BOUND).await;
+        summarize(&b).await;
+        // The first remote answers the probe from its listing, so its probe
+        // reads no summary.
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        serve_listing(&server_a, &a, &[REF]).await;
+        let server_b = RepoServer::start(&dir.path().join("b"), false).await;
+        let dest = dest(
+            dir.path(),
+            None,
+            &[("a", &server_a.url(), ""), ("b", &server_b.url(), "")],
+        )
+        .await;
+
+        let (opts, events) = options(&[REF, &old.to_hex()]);
+        let pulled = dest.pull_collection(ID, &["a", "b"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        let got: Vec<(&str, &str, Checksum)> = pulled
+            .refs
+            .iter()
+            .map(|r| (r.name.as_str(), r.remote.as_str(), r.commit))
+            .collect();
+        assert_eq!(got, [(REF, "b", tip)]);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert!(dest.has_object(ObjectType::Commit, &old).await.unwrap());
+        assert_eq!(server_a.requests_for("summary"), 1, "{:?}", server_a.seen());
+        assert_eq!(server_b.requests_for(&meta_path(&old, "commit")), 0);
     });
 }
 

@@ -4295,6 +4295,48 @@ rules of `Repo::pull` and `Repo::pull_with_session`:
   unless `disable_static_deltas` or `COMMIT_ONLY` is set. The attachments
   of the commit keep the delta search of each attachment.
 
+`Repo::pull_collection` takes the same three forms, where `ID` is the
+collection of the call. The rules above apply to it, with these rules in
+place of the rules of the same name:
+
+- Candidate. The pull asks the candidates in the given order for the commit
+  object of each commit operand, and takes the first candidate that serves
+  it. A candidate that does not serve the object gives way to the next
+  candidate with no event. Another failure of the request skips the
+  candidate with an event, together with the refs that it lists. A commit
+  that no candidate serves fails the pull before the first pull from a
+  candidate. The newest listed timestamp selects the candidate of a ref,
+  and a commit operand has no listed timestamp, so the order of the
+  candidates selects.
+- Two requests for one commit. The probe requests the commit object,
+  checks its hash, reads its timestamp, and drops the bytes. The pull from
+  the candidate requests the commit again, unless the client holds it. A
+  commit object can be as large as the cap of a metadata object, and the
+  probe keeps no such bytes across the candidates.
+- Collection binding. The `ostree.collection-binding` of the commit of each
+  commit operand must be the `ID` of the call, as for each ref of the call,
+  also under `no_ref_writes`. `CollectionPullOptions::allow_unbound` passes
+  a commit with no binding key.
+- Two operands for one ref. `main@<C>` and `@ID:main@<C>` are one operand.
+  Two operands that give one ref name with two commits, and `main` beside
+  `main@<C>`, stop the pull with the same `Error::Pull` form before the
+  first request. The path is `refs/mirrors/ID/main`, or `refs/heads/main`
+  in a client whose collection id is `ID`.
+- Listed timestamp. The check of the listed timestamp applies to a commit
+  only if it is the commit that the candidate listed for the ref. So under
+  `no_ref_writes`, `main` beside `main@<C>` fetches both commits.
+- Summary. If each operand of the call is a commit operand, the pull reads
+  no ref listing, no `summary`, and no `summary.sig` of a candidate, and
+  the probe stops at the candidate that serves the last commit. If one
+  operand is not a commit operand, each candidate keeps the summary rules
+  of a ref, also a candidate that gives commits of commit operands alone.
+  A local candidate under `require_static_deltas` without
+  `disable_static_deltas` reads and verifies its summary in each case, and
+  its summary policy applies.
+- Result. `CollectionPullStats::refs` holds an entry for `REF@CHECKSUM`,
+  with the timestamp of the commit that the probe read. `CHECKSUM` has no
+  entry.
+
 These alternatives were rejected:
 
 - The last operand for a ref wins, as in the tool. The pull then fetches

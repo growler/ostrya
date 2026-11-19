@@ -112,7 +112,7 @@ struct Cli {
     /// A request for a built image fails with the code `repository` if the
     /// image is larger. The daemon computes the size before it writes the
     /// image, so a refused image takes no memory. The limit does not apply
-    /// to a stored image. The default is 100 MiB.
+    /// to the image of an image commit. The default is 100 MiB.
     #[arg(
         long,
         value_name = "BYTES",

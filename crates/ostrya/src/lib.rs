@@ -193,6 +193,7 @@ pub use gpg::{FromOstreeKeyrings, GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use image_commit::{
     COMPOSEFS_RELATION, ComposefsImage, ComposefsImageDefect, ComposefsImageSource,
+    ComposefsSupplementAdd,
 };
 pub use lock::LockKind;
 #[doc(hidden)]

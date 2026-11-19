@@ -78,7 +78,7 @@ Name an attachment of the commit in field \%2 of the commit object.
 .IP
 The argument splits at its last \fB\%=\fR, so NAME can hold \fB\%=\fR\&. CHECKSUM is \%64 lowercase hexadecimal characters. By convention, NAME has the form \fB\%<class>/<name>\fR, for example \fB\%container/fe\fR\&. The option can occur more than once. The commit holds the entries sorted by name in byte order.
 .IP
-The command refuses an argument with no \fB\%=\fR and a CHECKSUM of another form before it takes the repository lock. It refuses an empty NAME, a NAME that occurs two times, and an attachment that the repository does not hold complete before it reads the tree. The command does not check the attachments of an attachment. A refusal gives no new object and no ref. The option conflicts with \%\-\-skip\-if\-unchanged. This option is an extension of ostrya.
+The command refuses an argument with no \fB\%=\fR and a CHECKSUM of another form before it takes the repository lock. It refuses an empty NAME, a NAME that occurs two times, and an attachment that the repository does not hold complete before it reads the tree. The command does not check the attachments of an attachment. With \%\-\-generate\-composefs, the command refuses the NAME \fB\%composefs\fR before it takes the repository lock. A refusal gives no new object and no ref. The option conflicts with \%\-\-skip\-if\-unchanged. This option is an extension of ostrya.
 .TP
 \fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the commit metadata.
@@ -180,12 +180,14 @@ Store the composefs image digest of the tree in the commit metadata.
 .IP
 The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the committed tree alone. \fB\%archive\fR, \fB\%bare\fR, and \fB\%bare\-user\fR commit the same tree and give the same digest. \fB\%bare\-user\-only\fR canonicalizes the tree, so it can give another digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
 .IP
-If \fB\%[ex\-ostrya] generate\-composefs\fR of the repository is true, the command also stores the composefs image, as \%\-\-generate\-composefs does. It stores the image only for a commit that the repository does not hold already.
+If \fB\%[ex\-ostrya] generate\-composefs\fR of the repository is true, the command also stores the composefs image in the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR of the repository, where \fB\%<xx><rest>\fR is the checksum of the commit. It stores the image only for a commit that the repository does not hold already.
 .TP
 \fB\-\-generate\-composefs\fR
-Store the composefs image of the tree with the commit.
+Write the composefs image of the tree as an image commit, and name it as the attachment \fB\%composefs\fR of the commit.
 .IP
-The option turns on \%\-\-generate\-composefs\-metadata. The image is the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR of the repository, where \fB\%<xx><rest>\fR is the checksum of the commit, and its \%fs\-verity digest is the value of \fB\%ostree.composefs.digest.v0\fR\&. The command reads the tree one time for the digest and the image. The option stores the image whatever the value of \fB\%[ex\-ostrya] generate\-composefs\fR\&. It also stores the image of a commit that the repository holds already. This option is an extension of ostrya.
+The option turns on \%\-\-generate\-composefs\-metadata. The command builds the image of the tree one time. In the same transaction, it writes the image commit, whose tree holds the image as the file \fB\%/root.cfs\fR\&. The commit carries \fB\%ostree.composefs.digest.v0\fR with the \%fs\-verity digest of the image, and names the image commit as the attachment \fB\%composefs\fR in field \%2. The attachment makes the commit different from the commit that \%\-\-generate\-composefs\-metadata alone writes for the same tree. Each transfer that carries attachments carries the image commit.
+.IP
+The command refuses \%\-\-related with the name \fB\%composefs\fR before it takes the repository lock. It refuses an image commit that the repository marks partial. The option works in each repository mode. In \fB\%archive\fR mode, the image file is compressed, and a mount refuses the repository. This option is an extension of ostrya.
 .TP
 \fB\-\-tree\fR \fIdir=PATH or tar=TARFILE or ref=COMMIT\fR
 Add a tree source: a directory, a tar archive, or a committed tree.

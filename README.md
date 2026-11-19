@@ -91,21 +91,28 @@ Ostrya adds these functions, which the `ostree` command does not have:
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
-- The composefs image store. `ostrya commit --generate-composefs` and
-  `ostrya composefs-image --add` store the composefs image of a commit in the
-  repository, as `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside
-  `objects/`. The fs-verity digest of the image is the digest that the commit
-  records. `ostrya composefs-image` also checks a stored image and prints its
-  path. With `[ex-ostrya] generate-composefs=true`, each commit, pull,
-  receive, and offline delta apply stores the image of each new complete
-  commit that records a digest. Prune removes the image of each commit that
-  it removes, and fsck checks each image. No transfer carries the image.
+- The composefs image commit. A commit can name a second commit, whose tree
+  holds its composefs image as the file `/root.cfs`. `ostrya commit
+  --generate-composefs` writes the image commit and names it as the
+  attachment `composefs`, so each transfer of the commit carries its image.
+  `ostrya composefs-image --add` writes the image commit of a commit that
+  the repository holds and names it as the supplement `composefs`, a local
+  entry. The fs-verity digest of the image is the digest that the commit
+  records.
+- The composefs image store. With `[ex-ostrya] generate-composefs=true`,
+  each commit, pull, receive, and offline delta apply stores the image of
+  each new complete commit that records a digest in the repository, as
+  `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside `objects/`.
+  `ostrya composefs-image` checks a stored image and prints its path. Prune
+  removes the image of each commit that it removes, and fsck checks each
+  image. No transfer carries the stored image.
 - composefs mounts. The library `ostrya-mount` mounts a composefs image of a
   commit as a tree on Linux. The mount reads the objects of the repository in
   place. Root in the initial user namespace mounts in its own process, from
   an image that the caller opens. A process in its own user namespace asks
   the mount daemon `ostrya-mountd`, which runs as root. The daemon mounts the
-  stored image of a commit, or an image that it builds in memory.
+  image of the image commit of a commit, or an image that it builds in
+  memory.
 - Removable media. `ostrya media export` copies the commits of collection
   refs onto a mounted volume, for a host with no network. The media
   repository has the layout that `ostree create-usb` writes, and

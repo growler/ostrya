@@ -80,7 +80,8 @@ pub const REQUEST_FDS: usize = 2;
 /// The image that a request mounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// The stored image of the commit, `1`.
+    /// The image of the image commit that the commit names as the attachment
+    /// or the supplement `composefs`, `1`.
     Stored,
     /// An image that the daemon builds in memory, `2`.
     Built,

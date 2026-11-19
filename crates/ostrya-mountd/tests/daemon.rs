@@ -13,22 +13,28 @@
 //!
 //! The tests check these facts:
 //!
-//! - A caller in its own user namespace mounts a stored and a built image,
-//!   read-only and read-write. The mounted tree has the committed files. A
-//!   read-write mount writes a new file to `<target>/overlay`.
+//! - A caller in its own user namespace mounts the image of an image commit
+//!   and a built image, read-only and read-write. The mounted tree has the
+//!   committed files. A read-write mount writes a new file to
+//!   `<target>/overlay`.
 //! - A caller in its own PID namespace, with its own `/proc`, mounts and
 //!   gets the existing mount on a second request.
 //! - A request from the initial user namespace is refused.
 //! - An `objects` directory that is a mount of its own is refused.
 //! - A built image over the size limit of the daemon is refused.
-//! - A request for a stored and for a built image of an `archive`
-//!   repository is refused with the class `repository`.
-//! - A symlink at each component of the path of a stored image, at the
-//!   fan-out directory of the commit for a stored image, and at the fan-out
-//!   directory of a commit, a dirtree, a dirmeta, or a file for a built
-//!   image, is refused with the class `repository`.
-//! - The refusal of a stored image that is not the key of its commit names
-//!   the commit and neither digest.
+//! - A request for the image of an image commit and for a built image of an
+//!   `archive` repository is refused with the class `repository`.
+//! - A symlink at the fan-out directory of the commit, of the image commit,
+//!   of its root dirtree, or of the file object of `/root.cfs` for op 1, and
+//!   of a commit, a dirtree, a dirmeta, or a file for a built image, is
+//!   refused with the class `repository`.
+//! - Op 1 mounts the image of the attachment `composefs`, of the supplement
+//!   `composefs`, and of the attachment of a commit that also has a bad
+//!   supplement. A bad attachment next to a valid supplement, and a commit
+//!   with neither, are refused with the class `repository`. Op 2 mounts the
+//!   commit with neither.
+//! - The refusal of an image commit whose `/root.cfs` is not the key of the
+//!   commit names the commit and the image commit, and neither digest.
 //! - Each mount of the daemon has `nosuid` and `nodev`. A setuid file in a
 //!   read-only and in a read-write mount does not change the user id of a
 //!   process that runs it, and a device node in the image does not open.
@@ -51,8 +57,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ostrya::{
-    Checksum, CommitOptions, ComposefsImageAdd, ComposefsOptions, CreateOptions, MutableTree, Repo,
-    RepoMode, Type, Value,
+    COMPOSEFS_RELATION, Checksum, Commit, CommitOptions, ComposefsOptions, CreateOptions, DirMeta,
+    DirTree, FileMeta, MutableTree, ObjectType, Repo, RepoMode, Type, Value, Xattrs,
 };
 use ostrya_mount::{Access, Error, Helper, HelperCode, MountOptions};
 use rustix::mount::FsOpenFlags;
@@ -191,8 +197,8 @@ struct Fixture {
     scratch: Scratch,
     repo: PathBuf,
     commit: Checksum,
-    /// A commit of the same tree whose stored image holds `devnode` as a
-    /// character device.
+    /// A commit of the same tree with no key, whose image commit holds
+    /// `devnode` as a character device.
     dev_commit: Checksum,
     /// A copy of the test binary that the user 65534 can run.
     client_bin: PathBuf,
@@ -342,9 +348,19 @@ fn key_dict(digest: &[u8; 32]) -> Value {
     ])])
 }
 
-/// Commits `base/src` to `repo` with the image key and the stored image.
-/// Returns the commit and its root tree.
-async fn commit_with_stored_image(repo: &Repo, base: &Path) -> (Checksum, ostrya::RepoTree) {
+/// How a commit names its image commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Named {
+    /// The attachment `composefs`.
+    Attachment,
+    /// The supplement `composefs`.
+    Supplement,
+    /// No image commit.
+    Neither,
+}
+
+/// Writes `base/src` to `repo` and returns its root tree.
+async fn write_source(repo: &Repo, base: &Path) -> ostrya::RepoTree {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
     let dfd = std::fs::File::open(base).unwrap();
@@ -352,37 +368,111 @@ async fn commit_with_stored_image(repo: &Repo, base: &Path) -> (Checksum, ostrya
         .await
         .unwrap();
     let root = txn.write_mtree(&mut mtree).await.unwrap();
-    let staged = txn.build_composefs_image(&root).await.unwrap();
-    let opts = CommitOptions {
-        subject: Some("mountd tree".to_owned()),
-        timestamp: Some(1),
-        metadata: Some(key_dict(staged.digest())),
-        ..CommitOptions::default()
-    };
-    let commit = txn.write_commit(opts, &root).await.unwrap();
-    let added = txn.attach_composefs_image(&commit, staged).await.unwrap();
-    assert_eq!(added, ComposefsImageAdd::Added);
     txn.commit().await.unwrap();
-    (commit, root)
+    root
 }
 
-/// Commits `base/src` to `repo` with the image key and the stored image.
-/// Returns that commit and a second commit of the same tree, whose stored
-/// image holds `devnode` as a character device.
+/// Writes the image commit of `root` and a commit of `root` with the image
+/// key and the subject `subject`, which names the image commit as `named`
+/// gives. Returns the commit and the image commit.
+async fn commit_named(
+    repo: &Repo,
+    root: &ostrya::RepoTree,
+    subject: &str,
+    named: Named,
+) -> (Checksum, Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    let (image, digest) = txn.write_composefs_commit(root).await.unwrap();
+    let attachments = match named {
+        Named::Attachment => vec![(COMPOSEFS_RELATION.to_owned(), image)],
+        Named::Supplement | Named::Neither => Vec::new(),
+    };
+    let opts = CommitOptions {
+        subject: Some(subject.to_owned()),
+        timestamp: Some(1),
+        metadata: Some(key_dict(&digest)),
+        attachments,
+        ..CommitOptions::default()
+    };
+    let commit = txn.write_commit(opts, root).await.unwrap();
+    if named == Named::Supplement {
+        txn.add_supplement(&commit, COMPOSEFS_RELATION, &image)
+            .unwrap();
+    }
+    txn.commit().await.unwrap();
+    (commit, image)
+}
+
+/// Writes an image commit whose `/root.cfs` holds `image`, with the shape
+/// of an image commit, and returns its checksum.
+async fn write_image_commit(repo: &Repo, image: &[u8]) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let file = txn
+        .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o400), image)
+        .await
+        .unwrap();
+    let root_dirmeta = txn
+        .write_dirmeta(&DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o040755,
+            xattrs: Xattrs::empty(),
+        })
+        .await
+        .unwrap();
+    let tree = DirTree {
+        files: vec![("root.cfs".to_owned(), file)],
+        dirs: Vec::new(),
+    };
+    let root_dirtree = txn
+        .write_metadata(ObjectType::DirTree, None, &tree.serialize().unwrap())
+        .await
+        .unwrap();
+    let commit = Commit {
+        metadata: Value::Array(Vec::new()),
+        parent: None,
+        related: Vec::new(),
+        subject: "composefs image".to_owned(),
+        body: String::new(),
+        timestamp: 0,
+        root_dirtree,
+        root_dirmeta,
+    };
+    let checksum = txn
+        .write_metadata(ObjectType::Commit, None, &commit.serialize().unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    checksum
+}
+
+/// Commits `base/src` to `repo` with the image key and the attachment
+/// `composefs`. Returns that commit and a second commit of the same tree
+/// with no key, whose attachment `composefs` holds `devnode` as a
+/// character device.
 async fn commit_tree(repo: &Repo, base: &Path) -> (Checksum, Checksum) {
-    let (commit, root) = commit_with_stored_image(repo, base).await;
+    let root = write_source(repo, base).await;
+    let (commit, _) = commit_named(repo, &root, "mountd tree", Named::Attachment).await;
 
     // The commit format holds no device node, so the test writes one into a
-    // copy of the image. The daemon checks the image only against the key
-    // of its commit, and the caller writes both.
+    // copy of the image. The commit of that image has no key, so the daemon
+    // makes no check of the image.
     let mut image = repo
         .export_composefs(&commit, &ComposefsOptions::RECORDED)
         .await
         .unwrap()
         .bytes;
     make_devnode(&mut image);
-    let digest = image_digest(repo, &root, &image).await;
-    let dev_commit = commit_with_image(repo, &root, &digest, 3, &image).await;
+    let dev_image = write_image_commit(repo, &image).await;
+    let txn = repo.transaction().await.unwrap();
+    let opts = CommitOptions {
+        subject: Some("mountd device tree".to_owned()),
+        timestamp: Some(3),
+        attachments: vec![(COMPOSEFS_RELATION.to_owned(), dev_image)],
+        ..CommitOptions::default()
+    };
+    let dev_commit = txn.write_commit(opts, &root).await.unwrap();
+    txn.commit().await.unwrap();
     (commit, dev_commit)
 }
 
@@ -401,40 +491,6 @@ fn make_devnode(image: &mut [u8]) {
         .expect("the image holds the inode of devnode");
     image[at + 4..at + 6].copy_from_slice(&(0o020_666u16).to_le_bytes());
     image[at + 16..at + 20].copy_from_slice(&DEVNODE_RDEV.to_le_bytes());
-}
-
-/// Writes a commit of `root` whose key is `digest`, and stores `image` as
-/// its image. The image need not have the digest.
-async fn commit_with_image(
-    repo: &Repo,
-    root: &ostrya::RepoTree,
-    digest: &[u8; 32],
-    timestamp: u64,
-    image: &[u8],
-) -> Checksum {
-    let txn = repo.transaction().await.unwrap();
-    let opts = CommitOptions {
-        subject: Some("mountd device tree".to_owned()),
-        timestamp: Some(timestamp),
-        metadata: Some(key_dict(digest)),
-        ..CommitOptions::default()
-    };
-    let commit = txn.write_commit(opts, root).await.unwrap();
-    txn.commit().await.unwrap();
-    let path = repo.composefs_image_path(&commit);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, image).unwrap();
-    commit
-}
-
-/// Returns the fs-verity digest of `image`. The check of a stored image with
-/// a wrong key reports the digest of the image.
-async fn image_digest(repo: &Repo, root: &ostrya::RepoTree, image: &[u8]) -> [u8; 32] {
-    let probe = commit_with_image(repo, root, &[0; 32], 2, image).await;
-    match repo.open_composefs_image_checked(&probe).await {
-        Err(ostrya::Error::ComposefsDigestMismatch { actual, .. }) => actual,
-        other => panic!("the probe image has the key: {:?}", other.map(|_| ())),
-    }
 }
 
 /// The request of a client child.
@@ -1045,11 +1101,34 @@ fn hello_object(repo: &Path) -> PathBuf {
     panic!("no object holds the content");
 }
 
-/// A symlink at a component of the path of a stored image, or at the
-/// fan-out directory of an object that the daemon reads, is refused with the
-/// class `repository`, and the target stays empty. Op 1 reads the commit
-/// and the image. Op 2 reads the commit, the dirtrees, the dirmetas, and the
-/// files.
+/// Returns the image commit that `commit` names as the attachment
+/// `composefs` in the repository at `repo`, and the file object of its
+/// `/root.cfs`.
+fn image_commit_of(repo: &Path, commit: &Checksum) -> (Checksum, Checksum) {
+    ostrya_rt::block_on(async {
+        let repo = Repo::open(repo).await.unwrap();
+        let relations = repo.read_commit_relations(commit).await.unwrap();
+        let image = relations.attachments[0].1;
+        let (image_obj, _) = repo.load_commit(&image).await.unwrap();
+        let tree = repo.load_dirtree(&image_obj.root_dirtree).await.unwrap();
+        (image, tree.files[0].1)
+    })
+}
+
+/// Returns the path of the loose file object `object` in the `bare-user`
+/// repository at `repo`.
+fn file_object_path(repo: &Path, object: &Checksum) -> PathBuf {
+    let hex = object.to_hex();
+    repo.join("objects")
+        .join(&hex[..2])
+        .join(format!("{}.file", &hex[2..]))
+}
+
+/// A symlink at the fan-out directory of an object that the daemon reads is
+/// refused with the class `repository`, and the target stays empty. Op 1
+/// reads the commit, the image commit, its root dirtree, and the file object
+/// of `/root.cfs`. Op 2 reads the commit, the dirtrees, the dirmetas, and
+/// the files.
 #[test]
 fn a_symlink_in_the_repository_is_refused() {
     if !require_root() {
@@ -1071,24 +1150,28 @@ fn a_symlink_in_the_repository_is_refused() {
     };
 
     let hex = fx.commit.to_hex();
-    for part in [
-        "extensions".to_owned(),
-        "extensions/ostrya".to_owned(),
-        "extensions/ostrya/composefs".to_owned(),
-        format!("extensions/ostrya/composefs/{}", &hex[..2]),
-    ] {
-        with_symlink(&fx.repo.join(&part), &moved, || refused(false, &part));
-    }
-
-    let (commit_obj, _) = ostrya_rt::block_on(async {
+    let (commit_obj, image_obj) = ostrya_rt::block_on(async {
         let repo = Repo::open(&fx.repo).await.unwrap();
-        repo.load_commit(&fx.commit).await.unwrap()
+        let (commit_obj, _) = repo.load_commit(&fx.commit).await.unwrap();
+        let image = repo
+            .read_commit_relations(&fx.commit)
+            .await
+            .unwrap()
+            .attachments[0]
+            .1;
+        (commit_obj, repo.load_commit(&image).await.unwrap().0)
     });
+    let (image, image_file) = image_commit_of(&fx.repo, &fx.commit);
     let objects = fx.repo.join("objects");
     let fanout = |hex: String| objects.join(&hex[..2]);
-    with_symlink(&fanout(hex.clone()), &moved, || {
-        refused(false, "stored commit")
-    });
+    for (what, dir) in [
+        ("commit", fanout(hex.clone())),
+        ("image commit", fanout(image.to_hex())),
+        ("image dirtree", fanout(image_obj.root_dirtree.to_hex())),
+        ("image file", fanout(image_file.to_hex())),
+    ] {
+        with_symlink(&dir, &moved, || refused(false, what));
+    }
     let hello = hello_object(&fx.repo);
     for (what, dir) in [
         ("commit", fanout(hex.clone())),
@@ -1103,28 +1186,43 @@ fn a_symlink_in_the_repository_is_refused() {
     assert_no_temp_dirs(&fx);
 }
 
-/// The refusal of a stored image that is not the key of its commit names
-/// the commit and neither digest.
+/// The refusal of an image commit whose `/root.cfs` does not match the key
+/// of the commit names the commit and the image commit, and neither digest.
 #[test]
 fn the_refusal_of_a_changed_image_names_no_digest() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
     if !require_root() {
         return;
     }
     let fx = Fixture::new("mismatch");
     let sock = fx.scratch.path().join("mountd.sock");
     let _daemon = fx.standalone(&sock, None, 60);
+    let (image, image_file) = image_commit_of(&fx.repo, &fx.commit);
+    // The change writes in place, so the object keeps its xattrs.
+    let path = file_object_path(&fx.repo, &image_file);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .unwrap();
+    let middle = file.metadata().unwrap().len() / 2;
+    let mut byte = [0u8; 1];
+    file.seek(SeekFrom::Start(middle)).unwrap();
+    file.read_exact(&mut byte).unwrap();
+    byte[0] ^= 0xff;
+    file.seek(SeekFrom::Start(middle)).unwrap();
+    file.write_all(&byte).unwrap();
+    drop(file);
     let (expected, actual) = ostrya_rt::block_on(async {
         let repo = Repo::open(&fx.repo).await.unwrap();
-        let path = repo.composefs_image_path(&fx.commit);
-        let mut bytes = std::fs::read(&path).unwrap();
-        let middle = bytes.len() / 2;
-        bytes[middle] ^= 0xff;
-        std::fs::remove_file(&path).unwrap();
-        std::fs::write(&path, bytes).unwrap();
-        match repo.open_composefs_image_checked(&fx.commit).await {
-            Err(ostrya::Error::ComposefsDigestMismatch {
-                expected, actual, ..
-            }) => (expected, actual),
+        match repo.open_composefs_image(&fx.commit).await {
+            Err(ostrya::Error::InvalidComposefsImage { defect, .. }) => match *defect {
+                ostrya::ComposefsImageDefect::DigestMismatch { expected, actual } => {
+                    (expected, actual)
+                }
+                other => panic!("expected DigestMismatch, got {other:?}"),
+            },
             other => panic!("the changed image has the key: {:?}", other.map(|_| ())),
         }
     });
@@ -1136,6 +1234,8 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
         "{outcome}"
     );
     assert!(outcome.contains(&fx.commit.to_hex()), "{outcome}");
+    assert!(outcome.contains(&image.to_hex()), "{outcome}");
+    assert!(outcome.contains("does not match the key"), "{outcome}");
     for digest in [expected, actual] {
         let hex = Checksum::from_bytes(digest).to_hex();
         assert!(!outcome.contains(&hex), "{outcome}");
@@ -1144,8 +1244,8 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
 }
 
 /// An `archive` repository stores compressed `.filez` objects, so the daemon
-/// refuses a request for its stored image and for a built image with the
-/// class `repository`, and the target stays empty.
+/// refuses a request for the image of an image commit and for a built image
+/// with the class `repository`, and the target stays empty.
 #[test]
 fn an_archive_repository_is_refused() {
     if !require_root() {
@@ -1159,7 +1259,10 @@ fn an_archive_repository_is_refused() {
         let repo = Repo::create(&archive, CreateOptions::new(RepoMode::Archive))
             .await
             .unwrap();
-        commit_with_stored_image(&repo, fx.scratch.path()).await.0
+        let root = write_source(&repo, fx.scratch.path()).await;
+        commit_named(&repo, &root, "archive", Named::Attachment)
+            .await
+            .0
     });
     let target = fx.target("mnt");
     for built in [false, true] {
@@ -1187,5 +1290,129 @@ fn an_archive_repository_is_refused() {
             "built={built}"
         );
     }
+    assert_no_temp_dirs(&fx);
+}
+
+/// Opens the repository of the fixture and returns it with the root tree
+/// of the commit of the fixture.
+async fn fixture_root(fx: &Fixture) -> (Repo, ostrya::RepoTree) {
+    let repo = Repo::open(&fx.repo).await.unwrap();
+    let root = repo.read_commit(&fx.commit.to_hex()).await.unwrap().0;
+    (repo, root)
+}
+
+/// Op 1 mounts the image of the supplement `composefs`, and of the
+/// attachment of a commit that has both. The supplement of that commit
+/// names an image commit whose image is not the key, and the daemon does
+/// not read it.
+#[test]
+fn op_1_mounts_the_image_of_a_supplement_and_of_both() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("op1-sources");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit);
+    let (supplement, both) = ostrya_rt::block_on(async {
+        let (repo, root) = fixture_root(&fx).await;
+        let (supplement, _) = commit_named(&repo, &root, "supplement", Named::Supplement).await;
+        let (both, _) = commit_named(&repo, &root, "both", Named::Attachment).await;
+        repo.add_supplement(&both, COMPOSEFS_RELATION, &dev_image)
+            .await
+            .unwrap();
+        (supplement, both)
+    });
+    for (what, commit) in [("supplement", supplement), ("both", both)] {
+        let target = fx.target(&format!("mnt-{what}"));
+        let mut req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+        req.commit = commit;
+        let outcome = fx.client(&sock, &req, true);
+        assert!(outcome.starts_with("mounted 1 "), "{what}: {outcome}");
+    }
+    assert_no_temp_dirs(&fx);
+}
+
+/// Op 1 refuses a commit whose attachment `composefs` names an image commit
+/// with an image that is not the key, also if a valid supplement exists. The
+/// text names the attachment.
+#[test]
+fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("op1-bad-attachment");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit);
+    let (valid, _) = image_commit_of(&fx.repo, &fx.commit);
+    let commit = ostrya_rt::block_on(async {
+        let (repo, root) = fixture_root(&fx).await;
+        let digest = repo
+            .export_composefs(&fx.commit, &ComposefsOptions::RECORDED)
+            .await
+            .unwrap()
+            .fs_verity;
+        let txn = repo.transaction().await.unwrap();
+        let opts = CommitOptions {
+            subject: Some("bad attachment".to_owned()),
+            timestamp: Some(1),
+            metadata: Some(key_dict(&digest)),
+            attachments: vec![(COMPOSEFS_RELATION.to_owned(), dev_image)],
+            ..CommitOptions::default()
+        };
+        let commit = txn.write_commit(opts, &root).await.unwrap();
+        txn.add_supplement(&commit, COMPOSEFS_RELATION, &valid)
+            .unwrap();
+        txn.commit().await.unwrap();
+        commit
+    });
+    let target = fx.target("mnt");
+    let mut req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    req.commit = commit;
+    let outcome = fx.client(&sock, &req, true);
+    assert_eq!(
+        outcome,
+        format!(
+            "refused {}: composefs image of commit {commit}: attachment composefs names \
+             commit {dev_image}, whose /root.cfs does not match the key of the commit",
+            HelperCode::Repository
+        )
+    );
+    assert!(mounts_at(&target).is_empty());
+}
+
+/// Op 1 refuses a commit with no attachment and no supplement `composefs`
+/// with the class `repository`. Op 2 mounts the built image of the same
+/// commit.
+#[test]
+fn op_1_refuses_a_commit_with_no_image_commit() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("op1-neither");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let commit = ostrya_rt::block_on(async {
+        let (repo, root) = fixture_root(&fx).await;
+        commit_named(&repo, &root, "neither", Named::Neither)
+            .await
+            .0
+    });
+    let target = fx.target("mnt");
+    let mut req = ClientRequest::new(&fx, &target, false, Access::ReadOnly);
+    req.commit = commit;
+    let outcome = fx.client(&sock, &req, true);
+    assert_eq!(
+        outcome,
+        format!(
+            "refused {}: commit {commit} has no attachment or supplement composefs",
+            HelperCode::Repository
+        )
+    );
+    assert!(mounts_at(&target).is_empty());
+    req.built = true;
+    let outcome = fx.client(&sock, &req, true);
+    assert!(outcome.starts_with("mounted 1 "), "{outcome}");
     assert_no_temp_dirs(&fx);
 }

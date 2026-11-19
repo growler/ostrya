@@ -75,6 +75,9 @@ A commit: the metadata, the parent, the related objects, the subject, the body, 
 Ostrya uses the related objects for the attachments of the commit, which \fB\%ostrya commit \-\-related\fR writes.
 \fB\%ostrya prune\fR and \fB\%ostrya remote prune\fR keep the attachments of each commit that they keep.
 \fB\%ostrya fsck\fR and \fB\%ostrya remote fsck\fR report each attachment that is absent, partial, or defective.
+\fB\%ostrya commit \-\-generate\-composefs\fR names the composefs image commit of the commit as the attachment \fB\%composefs\fR.
+The tree of the image commit holds one file, \fB\%/root.cfs\fR, which is the composefs image of the tree of the commit.
+The image commit has the subject \fB\%composefs image\fR, the time 0, and no parent.
 .TP
 \fB\%.dirtree\fR
 A directory listing: the names and checksums of the files and of the subdirectories.
@@ -93,6 +96,7 @@ The detached metadata of a commit, for example its signatures.
 The checksum of a commit does not include it, so a signature can be added after the commit.
 The key \fB\%ostrya.related\fR, an extension of ostrya, holds the supplements of the commit.
 \fB\%ostrya prune\fR keeps the supplements of each commit that it keeps.
+\fB\%ostrya composefs\-image \-\-add\fR names the composefs image commit of the commit as the supplement \fB\%composefs\fR.
 A transfer into a repository whose \fB\%config\fR sets \fB\%keep\-detached\-related=false\fR does not store the key, as \fB\%ostrya\-config\fR(1) states.
 .TP
 \fB\%.tombstone\-commit\fR
@@ -273,8 +277,7 @@ The composefs image of a commit, an extension of ostrya.
 Its name is the checksum of the commit.
 Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
 Each mode stores it uncompressed, with the mode 0644 and no extended attribute.
-\fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it after the objects of the transaction, and make the directories at the first write.
-With \fB\%[ex\-ostrya] generate\-composefs=true\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, and \fB\%ostrya static\-delta apply\-offline\fR also write it for each complete commit that they add, in the same way.
+With \fB\%[ex\-ostrya] generate\-composefs=true\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, and \fB\%ostrya static\-delta apply\-offline\fR write it for each complete commit that they add, after the objects of the transaction, and make the directories at the first write.
 \fB\%ostrya\-config\fR(1) states the rule.
 \fB\%ostrya prune\fR removes the images of the commits that it removes before the first commit, and keeps an image whose commit is absent.
 \fB\%ostrya fsck\fR checks it against the key of its commit, and notes an image whose commit is absent.

@@ -52,7 +52,7 @@ use rustix::thread::{
     set_thread_res_uid,
 };
 
-use crate::repo::{self, RepoPlan, build_image};
+use crate::repo::{self, RepoPlan, build_image, open_named_image};
 
 /// The time that one connection can take, from the accept to the reply. The
 /// time covers the messages of the client, the worker process, and the work
@@ -186,7 +186,7 @@ impl Server {
         eprintln!(
             "ostrya-mountd: {} {} mount of {} at {} for uid {}",
             match request.op {
-                Op::Stored => "stored",
+                Op::Stored => "image commit",
                 Op::Built => "built",
             },
             match request.access {
@@ -416,12 +416,9 @@ async fn build(
     }
     let repo_plan = RepoPlan::new(&repo).map_err(failure_of)?;
     let image: OwnedFd = match request.op {
-        Op::Stored => repo
-            .open_composefs_image_checked(&request.commit)
+        Op::Stored => open_named_image(&repo, &request.commit)
             .await
-            .map_err(|e| failure_of(e.into()))?
-            .0
-            .into(),
+            .map_err(failure_of)?,
         Op::Built => build_image(&repo, &request.commit, &repo_plan, max_image_size)
             .await
             .map_err(failure_of)?,
@@ -1036,14 +1033,26 @@ fn errno_of(e: &std::io::Error) -> Errno {
 /// Returns the failure that the daemon reports for the error `e` of a read
 /// of the repository.
 ///
-/// The failure of a stored image whose fs-verity digest is not the key of
-/// its commit names the commit and neither digest.
+/// The failure of an image commit whose `/root.cfs` does not match the key
+/// of the commit names the commit, the field, and the image commit, and
+/// neither digest.
 fn failure_of(e: repo::Error) -> Failure {
     match e {
-        repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch { commit, .. }) => Failure::new(
-            HelperCode::Repository,
-            format!("the stored composefs image of commit {commit} does not match its key"),
-        ),
+        repo::Error::Repo(ostrya::Error::InvalidComposefsImage {
+            commit,
+            relation,
+            image,
+            defect,
+        }) if matches!(*defect, ostrya::ComposefsImageDefect::DigestMismatch { .. }) => {
+            Failure::new(
+                HelperCode::Repository,
+                format!(
+                    "composefs image of commit {commit}: {relation} {} names commit {image}, \
+                     whose /root.cfs does not match the key of the commit",
+                    ostrya::COMPOSEFS_RELATION
+                ),
+            )
+        }
         repo::Error::Sys { op, errno } => Failure::sys(HelperCode::Mount, op, errno),
         other => Failure::new(HelperCode::Repository, other.to_string()),
     }
@@ -1228,8 +1237,16 @@ mod tests {
     #[test]
     fn each_error_gives_its_class_its_errno_and_its_text() {
         let commit = ostrya::Checksum::from_bytes([3; 32]);
-        let mismatch = failure_of(repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch {
-            commit,
+        let image = ostrya::Checksum::from_bytes([4; 32]);
+        let invalid = |defect| {
+            repo::Error::Repo(ostrya::Error::InvalidComposefsImage {
+                commit,
+                relation: ostrya::ComposefsImageSource::Supplement,
+                image,
+                defect: Box::new(defect),
+            })
+        };
+        let mismatch = failure_of(invalid(ostrya::ComposefsImageDefect::DigestMismatch {
             expected: [1; 32],
             actual: [2; 32],
         }));
@@ -1237,15 +1254,39 @@ mod tests {
             mismatch,
             Failure::new(
                 HelperCode::Repository,
-                format!("the stored composefs image of commit {commit} does not match its key"),
+                format!(
+                    "composefs image of commit {commit}: supplement composefs names commit \
+                     {image}, whose /root.cfs does not match the key of the commit"
+                ),
+            )
+        );
+        assert!(!mismatch.text.contains(&"01".repeat(32)));
+        assert!(!mismatch.text.contains(&"02".repeat(32)));
+
+        let partial = invalid(ostrya::ComposefsImageDefect::Partial);
+        let text = partial.to_string();
+        assert_eq!(
+            failure_of(partial),
+            Failure::new(HelperCode::Repository, text)
+        );
+
+        assert_eq!(
+            failure_of(repo::Error::NoImage { commit }),
+            Failure::new(
+                HelperCode::Repository,
+                format!("commit {commit} has no attachment or supplement composefs"),
             )
         );
 
-        let absent = ostrya::Error::ComposefsImageNotFound { commit };
-        let text = absent.to_string();
         assert_eq!(
-            failure_of(absent.into()),
-            Failure::new(HelperCode::Repository, text)
+            failure_of(repo::Error::ImageSize { image, size: 4097 }),
+            Failure::new(
+                HelperCode::Repository,
+                format!(
+                    "the image of commit {image} has the size 4097, which is not a positive \
+                     multiple of 4096 bytes"
+                ),
+            )
         );
 
         assert_eq!(

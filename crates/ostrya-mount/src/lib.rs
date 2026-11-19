@@ -43,7 +43,8 @@
 //!   repository and the checksum of the commit, [`ostrya_core::Checksum`]. The
 //!   caller takes the type from `ostrya-core`, or from `ostrya`, which
 //!   re-exports it. The client opens no repository.
-//! - [`Helper::mount_stored`] mounts the stored image of a commit, after a
+//! - [`Helper::mount_stored`] mounts the image of the image commit that a
+//!   commit names as the attachment or the supplement `composefs`, after a
 //!   check of its digest against the key of the commit.
 //! - [`Helper::mount_built`] mounts an image of a commit that the daemon
 //!   builds in memory.
@@ -79,8 +80,8 @@
 //!   `RESOLVE_NO_SYMLINKS`, so a symlink at any component of its path stops
 //!   the read. The read does not wait on a FIFO, and it refuses a file that is
 //!   not a regular file.
-//! - It checks the digest of a stored image against the key of the commit.
-//!   It does not check a signature of the commit.
+//! - It checks the digest of the image of an image commit against the key of
+//!   the commit. It does not check a signature of the commit.
 //! - Each mount has `nosuid` and `nodev`. The EROFS layer takes the ID
 //!   mapping of the user namespace of the request. User 0 of that user
 //!   namespace mounts the top overlay in it: read-only, or read-write with an
@@ -99,15 +100,19 @@
 //! the socket can make the daemon read these files of a repository
 //! directory whose `objects` directory it can open:
 //!
-//! - each file below `objects`;
-//! - the file `config`;
-//! - the file `extensions/ostrya/composefs/<aa>/<62 hex>.cfs`.
+//! - each file below `objects`, which holds the commit object and the
+//!   `.commitmeta` file of the commit, and the commit object, the root
+//!   dirtree, and the file object of `/root.cfs` of its image commit;
+//! - the file `config`.
 //!
-//! The modes of these files, and of the directories between them and the
-//! repository directory, do not stop the read. The daemon mounts a stored
-//! image only if its fs-verity digest is the key of a commit that it reads
-//! from `objects`. That image holds the tree that a built mount makes from
-//! `objects`. A refusal tells the caller if the image exists.
+//! The daemon also checks if the file `state/<checksum>.commitpartial` of
+//! the image commit exists. The modes of these files, and of the directories
+//! between them and the repository directory, do not stop the read. If the
+//! commit carries the key `ostree.composefs.digest.v0`, the daemon mounts
+//! the image of an image commit only if its fs-verity digest is the key. The
+//! caller can write both the image commit and the commit, so the check does
+//! not limit the objects that an image can name. A refusal tells the caller
+//! if the image commit exists.
 //!
 //! # Verity
 //!

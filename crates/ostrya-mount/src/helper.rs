@@ -112,12 +112,23 @@ impl Helper {
         &self.socket
     }
 
-    /// Mounts the stored composefs image of `commit` at `target` through the
-    /// daemon.
+    /// Mounts the composefs image of the image commit that `commit` names at
+    /// `target` through the daemon.
     ///
-    /// The daemon opens the image and compares its digest with the key
-    /// `ostree.composefs.digest.v0` of the commit. It does not check a
+    /// The daemon finds the image commit that the commit names as the
+    /// attachment `composefs` in field 2, or else as the supplement
+    /// `composefs` in its detached metadata. It checks the image commit and
+    /// opens its `/root.cfs`. If the commit carries the key
+    /// `ostree.composefs.digest.v0`, the daemon compares the fs-verity digest
+    /// of `/root.cfs` with the key. It refuses an image whose size is 0 or not
+    /// a multiple of 4096 bytes. If the commit names no image commit, the
+    /// daemon refuses the request with [`HelperCode::Repository`]. It does not
+    /// build an image in place of an absent one, and it does not check a
     /// signature of the commit.
+    ///
+    /// The daemon does not copy the image. If the file object of `/root.cfs`
+    /// is not sealed with fs-verity, a process that can write it can change
+    /// the image while it is mounted.
     ///
     /// `repo` is the path of the repository directory, and `target` is the
     /// path of the target directory. Both paths must be absolute, as the
@@ -152,7 +163,7 @@ impl Helper {
     /// Builds the composefs image of `commit` and mounts it at `target`
     /// through the daemon.
     ///
-    /// The daemon needs no stored image and no key in the commit. It writes
+    /// The daemon needs no image commit and no key in the commit. It writes
     /// the image to a sealed memory file and attaches the file to the loop
     /// device. With `[ex-integrity] fsverity=yes`, the image carries the
     /// fs-verity digest that the kernel holds for each backing object, and a

@@ -31,7 +31,7 @@ The time starts again after each connection. The option applies to the standalon
 \fB\-\-max\-image\-size\fR \fIBYTES\fR
 Refuse to build an image larger than BYTES bytes.
 .IP
-A request for a built image fails with the code \fB\%repository\fR if the image is larger. The daemon computes the size before it writes the image, so a refused image takes no memory. The limit does not apply to a stored image. The default is \%100 MiB. Default: \%104857600.
+A request for a built image fails with the code \fB\%repository\fR if the image is larger. The daemon computes the size before it writes the image, so a refused image takes no memory. The limit does not apply to the image of an image commit. The default is \%100 MiB. Default: \%104857600.
 .TP
 \fB\-V\fR, \fB\-\-version\fR
 Print version.
@@ -78,8 +78,8 @@ Then run \fBsystemctl daemon\-reload\fR and restart the socket unit. With
 \fBAccept=no\fR, systemd starts \fBostrya\-mountd.service\fR.
 .SH REQUESTS
 The client is the \fBHelper\fR mounter of the \fBostrya\-mount\fR library.
-Each connection carries one request. The request gives the image, stored
-or built, the access, read-only or read-write, the commit, the source
+Each connection carries one request. The request gives the image, the
+image of an image commit or a built image, the access, read-only or read-write, the commit, the source
 label, and the absolute paths of the repository and of the target as the
 caller sees them. It also carries a descriptor of a user namespace and a
 descriptor of a mount namespace.
@@ -105,11 +105,23 @@ wait on a FIFO, and it refuses a file that is not a regular file. The
 daemon has no fallback for a kernel without \fBopenat2\fR(2).
 The daemon checks that the \fBobjects\fR directory of the repository is the
 directory that the worker opened, and refuses an \fBarchive\fR repository.
-For a stored image, it opens
-\fBextensions/ostrya/composefs/\fIaa\fB/\fIrest\fB.cfs\fR under the
-repository directory and compares the fs-verity digest of the image with
-the key \fBostree.composefs.digest.v0\fR of the commit. If the two are
-different, the reply names the commit and neither digest. For a built image, it
+For the image of an image commit, it finds the image commit that the
+commit names as the attachment \fBcomposefs\fR in field 2 of the commit
+object, or else as the supplement \fBcomposefs\fR in its detached
+metadata. The image commit must be in the repository with no partial
+marker, and its tree must hold the regular file \fB/root.cfs\fR and no
+other entry. If the commit carries the key
+\fBostree.composefs.digest.v0\fR, the fs-verity digest of
+\fB/root.cfs\fR must be the value of the key. If the two are different,
+the reply names the commit, the field, and the image commit, and neither
+digest. The size of the image must be a positive multiple of 4096 bytes.
+A defect of the selected image commit fails the request, and the daemon
+does not try the other field. If the commit names no image commit, the
+daemon refuses the request with the code \fBrepository\fR and the text
+\fBcommit\fR \fIchecksum\fR \fBhas no attachment or supplement
+composefs\fR. The daemon does not copy the image. If the file object of
+\fB/root.cfs\fR is not sealed with fs-verity, a process that can write it
+can change the image while it is mounted. For a built image, the daemon
 writes the image to a sealed memory file. It refuses a built image larger
 than \fB\-\-max\-image\-size\fR before it writes the image.
 .IP 4. 4
@@ -167,16 +179,17 @@ The access to the socket is the trust boundary. The daemon reads the
 repository with its own credentials, as overlayfs reads the data layer
 with the credentials of the mounter. A member of the group of the socket
 can make the daemon read these files of a repository directory whose
-\fBobjects\fR directory it can open: each file below \fBobjects\fR, the
-file \fBconfig\fR, and the file
-\fBextensions/ostrya/composefs/\fIaa\fB/\fIrest\fB.cfs\fR. The modes of
-these files, and of the directories between them and the repository
-directory, do not stop the read. This includes objects of other commits.
+\fBobjects\fR directory it can open: each file below \fBobjects\fR and
+the file \fBconfig\fR. The daemon also checks if the partial marker of an
+image commit exists in \fBstate\fR. The modes of these files, and of the
+directories between them and the repository directory, do not stop the
+read. This includes objects of other commits.
 .IP \(bu 2
-The daemon mounts a stored image only after its digest matches the key
-of the commit. The caller can write both the image and the commit, so the
-check does not limit the objects that an image can name. A refusal tells
-the caller if the image exists.
+If the commit carries the key \fBostree.composefs.digest.v0\fR, the
+daemon mounts the image of an image commit only after its digest matches
+the key. The caller can write both the image commit and the commit, so
+the check does not limit the objects that an image can name. A refusal
+tells the caller if the image commit exists.
 .IP \(bu 2
 Each mount of the daemon has \fBnosuid\fR and \fBnodev\fR. The top overlay
 belongs to the user namespace of the caller, so the caller can clear the

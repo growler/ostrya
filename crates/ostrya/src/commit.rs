@@ -88,7 +88,8 @@ pub struct CommitOptions {
 /// [`Transaction::check_attachments`] gives it, and
 /// [`Transaction::write_commit_checked`] takes it. It holds the entries sorted
 /// by name in byte order, and it borrows the transaction that checked them.
-/// A drop writes and removes nothing.
+/// [`add`](CheckedAttachments::add) checks one more entry and adds it. A drop
+/// writes and removes nothing.
 ///
 /// While the value lives, the calls that take the transaction as `&mut self`
 /// or by value do not compile: [`set_fsync`](Transaction::set_fsync),
@@ -108,6 +109,49 @@ impl std::fmt::Debug for CheckedAttachments<'_> {
         f.debug_struct("CheckedAttachments")
             .field("entries", &self.entries)
             .finish_non_exhaustive()
+    }
+}
+
+impl CheckedAttachments<'_> {
+    /// Checks the attachment `name` that names the commit `checksum`, and adds
+    /// it to the entries.
+    ///
+    /// The call checks the new entry alone, as
+    /// [`Transaction::check_attachments`] checks each entry: it refuses an
+    /// empty name and a name that the entries hold already, and the commit
+    /// must be complete in the repository or in the transaction. The call
+    /// does not check the other entries again. A commit that the transaction
+    /// stages, for example with [`Transaction::write_composefs_commit`],
+    /// passes. A commit that the repository marks partial is refused. On a
+    /// refusal, the entries do not change.
+    ///
+    /// The entries stay sorted by name in byte order.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRelations`] with no commit, if `name` is empty, if
+    ///   the entries hold `name` already, or if the commit `checksum` is
+    ///   absent or partial.
+    /// - The other errors of [`Transaction::check_attachments`].
+    pub async fn add(&mut self, name: &str, checksum: &Checksum) -> Result<()> {
+        let refused = |reason: String| Error::InvalidRelations {
+            commit: None,
+            field: RelationField::Attachments,
+            reason,
+        };
+        if name.is_empty() {
+            return Err(refused("the new entry has an empty name".to_owned()));
+        }
+        let Err(index) = self
+            .entries
+            .binary_search_by(|(entry, _)| entry.as_str().cmp(name))
+        else {
+            return Err(refused(format!("two entries have the name {name}")));
+        };
+        let entry = (name.to_owned(), *checksum);
+        related::check_attachments(self.txn, None, [&entry]).await?;
+        self.entries.insert(index, entry);
+        Ok(())
     }
 }
 
@@ -247,7 +291,8 @@ impl Transaction {
     /// does.
     ///
     /// The call does not check the attachments again.
-    /// [`check_attachments`](Transaction::check_attachments) checked them. A process
+    /// [`check_attachments`](Transaction::check_attachments) and
+    /// [`CheckedAttachments::add`] checked them. A process
     /// outside the transaction can make an attachment partial or absent after
     /// that check: for example, an fsck, which takes no repository lock, or a
     /// prune in a repository with `[core] locking=false`. The call does not

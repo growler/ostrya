@@ -1,5 +1,6 @@
 //! The reads of a repository that a mount needs: the check of the mode, the
-//! verity choice of the config, and the build of an image in memory.
+//! verity choice of the config, the open of the image of an image commit, and
+//! the build of an image in memory.
 
 use std::os::fd::{AsFd, OwnedFd};
 
@@ -7,16 +8,33 @@ use ostrya::{Checksum, Repo, RepoMode, Tristate, VerityPolicy};
 use ostrya_mount::Verity;
 use rustix::io::Errno;
 
+/// The block size of the loop device that carries the image. The size of
+/// an image must be a positive multiple of it.
+const IMAGE_BLOCK: u64 = 4096;
+
 /// The error of a read of the repository.
 #[derive(Debug)]
 pub(crate) enum Error {
-    /// An error of the repository: a failed open, an absent image, an image
-    /// whose digest is not the key of its commit, a failed export, or a
-    /// malformed config value.
+    /// An error of the repository: a failed open, an image commit with a
+    /// defect, a failed export, or a malformed config value.
     Repo(ostrya::Error),
     /// A repository whose mode a composefs mount cannot read. Only `archive`
     /// gives this error.
     UnsupportedMode(RepoMode),
+    /// A commit that names no image commit as the attachment or the
+    /// supplement `composefs`.
+    NoImage {
+        /// The commit of the request.
+        commit: Checksum,
+    },
+    /// The image of an image commit, whose size a loop device cannot carry
+    /// whole: 0, or not a multiple of 4096 bytes.
+    ImageSize {
+        /// The checksum of the image commit.
+        image: Checksum,
+        /// The size of the image in bytes.
+        size: u64,
+    },
     /// A system call of the memory file that failed.
     Sys {
         /// The call that failed.
@@ -34,6 +52,16 @@ impl std::fmt::Display for Error {
                 f,
                 "a repository of the mode {} cannot be mounted",
                 mode.as_mode_str()
+            ),
+            Error::NoImage { commit } => write!(
+                f,
+                "commit {commit} has no attachment or supplement {}",
+                ostrya::COMPOSEFS_RELATION
+            ),
+            Error::ImageSize { image, size } => write!(
+                f,
+                "the image of commit {image} has the size {size}, which is not a positive \
+                 multiple of {IMAGE_BLOCK} bytes"
             ),
             Error::Sys { op, errno } => write!(f, "{op}: {errno}"),
         }
@@ -91,6 +119,28 @@ fn check_mode(mode: RepoMode) -> Result<(), Error> {
         | RepoMode::BareSplitXattrs
         | RepoMode::BareUserShared => Ok(()),
     }
+}
+
+/// Opens the image of the image commit that `commit` names as the
+/// attachment or the supplement `composefs`.
+///
+/// The lookup and its checks are those of [`Repo::open_composefs_image`]. The
+/// call then refuses an image whose size is 0 or not a multiple of 4096
+/// bytes, because the loop device reads the image in blocks of 4096 bytes.
+/// The call does not copy the image. If the loose object of the image is not
+/// sealed with fs-verity, a process that can write the file can change it
+/// while it is mounted.
+pub(crate) async fn open_named_image(repo: &Repo, commit: &Checksum) -> Result<OwnedFd, Error> {
+    let Some(image) = repo.open_composefs_image(commit).await? else {
+        return Err(Error::NoImage { commit: *commit });
+    };
+    if image.size == 0 || !image.size.is_multiple_of(IMAGE_BLOCK) {
+        return Err(Error::ImageSize {
+            image: image.commit,
+            size: image.size,
+        });
+    }
+    Ok(image.file.into())
 }
 
 /// Builds the composefs image of `commit` into a sealed memory file.

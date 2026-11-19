@@ -10,6 +10,8 @@
 //!   tree.
 //! - [`Repo::open_composefs_image`] finds the image commit that a commit
 //!   names, checks it, and opens its `/root.cfs`.
+//! - [`Repo::add_composefs_supplement`] writes the image commit of a commit
+//!   and names it as the supplement [`COMPOSEFS_RELATION`] of the commit.
 //!
 //! The shape of the image commit is fixed:
 //!
@@ -24,11 +26,14 @@
 
 use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, Value, Xattrs};
 
+use async_compression::futures::bufread::DeflateDecoder;
+
 use crate::composefs::{
     ComposefsOptions, DIGEST_CHUNK, digest_hex, image_file_digest, recorded_digest,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject, Payload};
+use crate::inflate::BufSource;
 use crate::read::CommitState;
 use crate::related::{self, RelationField};
 use crate::repo::Repo;
@@ -86,6 +91,29 @@ pub struct ComposefsImage {
     pub source: ComposefsImageSource,
     /// The checksum of the image commit.
     pub commit: Checksum,
+}
+
+/// The result of [`Repo::add_composefs_supplement`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposefsSupplementAdd {
+    /// The commit has the supplement [`COMPOSEFS_RELATION`], and its image
+    /// commit passes the checks of [`Repo::open_composefs_image`]. The call
+    /// writes nothing.
+    Valid {
+        /// The checksum of the image commit.
+        image: Checksum,
+    },
+    /// The call wrote the image commit and set the supplement
+    /// [`COMPOSEFS_RELATION`] of the commit to it.
+    Written {
+        /// The checksum of the image commit.
+        image: Checksum,
+        /// The image commit that the supplement named before the call, if
+        /// the commit had the supplement and its image commit failed a
+        /// check. It can be equal to `image`: for example, a partial image
+        /// commit that the call completes.
+        replaced: Option<Checksum>,
+    },
 }
 
 /// The defect of an image commit that [`Repo::open_composefs_image`] refuses
@@ -323,45 +351,251 @@ impl Repo {
         .await
     }
 
+    /// Writes the composefs image commit of `commit` and names it as the
+    /// supplement [`COMPOSEFS_RELATION`] of `commit`, if the commit has no
+    /// valid image commit.
+    ///
+    /// The call begins a transaction before it reads the commit, so a prune
+    /// cannot remove the commit or its objects during the build. It then
+    /// makes these steps in this order:
+    ///
+    /// 1. If field 2 of the commit has the attachment
+    ///    [`COMPOSEFS_RELATION`], the call refuses the commit. It does not
+    ///    check the attachment.
+    /// 2. If the commit has the supplement [`COMPOSEFS_RELATION`], the call
+    ///    checks its image commit with the checks of
+    ///    [`open_composefs_image`](Repo::open_composefs_image). If the image
+    ///    commit passes, the call writes nothing and gives
+    ///    [`ComposefsSupplementAdd::Valid`]. If a check fails with
+    ///    [`Error::InvalidComposefsImage`], the call writes the entry again in
+    ///    step 5. Thus the call replaces an entry that names another image
+    ///    commit, an image commit that the repository does not hold or holds
+    ///    partial, or an image commit whose tree has a defect.
+    /// 3. The call builds the image of the tree of the commit with
+    ///    [`ComposefsOptions::RECORDED`] and stages the image commit with
+    ///    [`Transaction::write_composefs_commit`].
+    /// 4. If the commit carries `ostree.composefs.digest.v0` and the
+    ///    fs-verity digest of the image is not the value of the key, the call
+    ///    refuses the commit. A commit whose key records the digest of an
+    ///    image with labels that the port does not write is refused. If the
+    ///    commit has no key, the call makes no check of the image.
+    /// 5. The call sets the supplement [`COMPOSEFS_RELATION`] of the commit
+    ///    to the image commit, as [`Transaction::add_supplement`] does, and
+    ///    commits the transaction.
+    /// 6. If the repository marked the image commit partial before the call,
+    ///    the call removes the partial marker. After the commit of the
+    ///    transaction, the repository holds each object of the image commit.
+    ///
+    /// The transaction does not write an object that the repository already
+    /// holds. If the entry names the image commit that the build gives, and
+    /// the file object of its `/root.cfs` is changed on disk, the check of
+    /// step 2 fails and the build gives the same image commit. The call then
+    /// gives [`ComposefsSupplementAdd::Written`] with this image commit as
+    /// `replaced`, and the changed object stays. A changed object is a defect
+    /// that [`Repo::fsck`] reports.
+    ///
+    /// The checks of step 2 work in each repository mode. In `archive` mode,
+    /// the call inflates the image and streams it through the fs-verity
+    /// hasher. The call writes the image commit in each mode. In `archive`
+    /// mode, the image file is a `.filez` object, and
+    /// [`open_composefs_image`](Repo::open_composefs_image) refuses the
+    /// repository.
+    ///
+    /// The call does not check the state of `commit`. If an object of its
+    /// tree is absent, the build fails.
+    ///
+    /// On a refusal or an error before the commit of the transaction, the
+    /// call writes nothing.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`Repo::transaction`].
+    /// - The errors of [`Repo::load_object_bytes`] for the commit object.
+    /// - [`Error::Core`] if the commit object does not parse.
+    /// - [`Error::InvalidFormat`] if the first entry of
+    ///   `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
+    ///   bytes.
+    /// - [`Error::InvalidRelations`] with `commit` and the field, if an entry
+    ///   of field 2 or of `ostrya.related` is defective, or if two entries of
+    ///   one field have the name [`COMPOSEFS_RELATION`].
+    /// - [`Error::InvalidInput`] if field 2 of the commit has the attachment
+    ///   [`COMPOSEFS_RELATION`].
+    /// - The errors of the checks of step 2 other than
+    ///   [`Error::InvalidComposefsImage`], as
+    ///   [`open_composefs_image`](Repo::open_composefs_image) lists them.
+    /// - The errors of [`Transaction::write_composefs_commit`]. The build
+    ///   fails with [`Error::ObjectNotFound`] if an object of the tree is
+    ///   absent.
+    /// - [`Error::ComposefsDigestMismatch`] if the commit carries the key and
+    ///   the digest of the image is not its value.
+    /// - The errors of [`Transaction::commit`].
+    /// - The error of the removal of the partial marker.
+    pub async fn add_composefs_supplement(
+        &self,
+        commit: &Checksum,
+    ) -> Result<ComposefsSupplementAdd> {
+        let txn = self.transaction().await?;
+        let (result, was_partial) = match self.stage_composefs_supplement(&txn, commit).await {
+            Ok(staged) => staged,
+            Err(e) => {
+                txn.abort().await?;
+                return Err(e);
+            }
+        };
+        let ComposefsSupplementAdd::Written { image, .. } = result else {
+            txn.abort().await?;
+            return Ok(result);
+        };
+        let fsync = txn.fsync_flags()?.0;
+        txn.commit().await?;
+        if was_partial {
+            let failed = self.remove_partial_markers(vec![image], fsync).await?;
+            if let Some((_, e)) = failed.into_iter().next() {
+                return Err(e);
+            }
+        }
+        Ok(result)
+    }
+
+    /// Runs the steps of
+    /// [`add_composefs_supplement`](Repo::add_composefs_supplement) up to the
+    /// commit of `txn`.
+    ///
+    /// For [`ComposefsSupplementAdd::Written`], the call stages the image
+    /// commit and queues the supplement in `txn`. The second value is `true`
+    /// if the repository marked the image commit partial before the call.
+    /// For [`ComposefsSupplementAdd::Valid`], the call stages nothing.
+    async fn stage_composefs_supplement(
+        &self,
+        txn: &Transaction,
+        commit: &Checksum,
+    ) -> Result<(ComposefsSupplementAdd, bool)> {
+        let repo = self.clone();
+        let read_commit = *commit;
+        let read = ostrya_rt::unblock(move || repo.supplement_state_blocking(&read_commit)).await?;
+        let replaced = match read.state {
+            SupplementState::Valid(image) => {
+                return Ok((ComposefsSupplementAdd::Valid { image }, false));
+            }
+            SupplementState::Build { replaced } => replaced,
+        };
+        let root = RepoTree::from_parts(self.clone(), read.root_dirtree, read.root_dirmeta);
+        let (image, digest) = txn.write_composefs_commit(&root).await?;
+        if let Some(expected) = read.key
+            && expected != digest
+        {
+            return Err(Error::ComposefsDigestMismatch {
+                commit: *commit,
+                expected,
+                actual: digest,
+            });
+        }
+        let was_partial = self.commit_state(&image).await? == CommitState::Partial;
+        txn.add_supplement(commit, COMPOSEFS_RELATION, &image)?;
+        Ok((
+            ComposefsSupplementAdd::Written { image, replaced },
+            was_partial,
+        ))
+    }
+
+    /// Reads the commit object of `commit` one time and gives the parts of it
+    /// that [`add_composefs_supplement`](Repo::add_composefs_supplement) uses:
+    /// the root of its tree, the value of the key
+    /// `ostree.composefs.digest.v0`, and the state of its supplement
+    /// [`COMPOSEFS_RELATION`].
+    ///
+    /// The call refuses a commit whose field 2 has the attachment
+    /// [`COMPOSEFS_RELATION`]. If the commit has the supplement, the call
+    /// checks its image commit with
+    /// [`check_composefs_commit_blocking`](Repo::check_composefs_commit_blocking).
+    /// The reads block the thread, so an async caller runs this call on the
+    /// blocking pool.
+    fn supplement_state_blocking(&self, commit: &Checksum) -> Result<SupplementRead> {
+        let bytes = self.load_object_bytes_blocking(ObjectType::Commit, commit)?;
+        let parsed = Commit::parse(&bytes)?;
+        let key = recorded_digest(&parsed)?;
+        let mut replaced = None;
+        if let Some((source, image)) = self.named_entry_blocking(commit, &bytes)? {
+            if source == ComposefsImageSource::Attachment {
+                return Err(Error::InvalidInput(format!(
+                    "commit {commit} names its composefs image commit {image} as an \
+                     attachment; a supplement is not written"
+                )));
+            }
+            match self.check_composefs_commit_blocking(commit, source, &image, key) {
+                Ok(_) => {
+                    return Ok(SupplementRead {
+                        root_dirtree: parsed.root_dirtree,
+                        root_dirmeta: parsed.root_dirmeta,
+                        key,
+                        state: SupplementState::Valid(image),
+                    });
+                }
+                Err(Error::InvalidComposefsImage { .. }) => replaced = Some(image),
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(SupplementRead {
+            root_dirtree: parsed.root_dirtree,
+            root_dirmeta: parsed.root_dirmeta,
+            key,
+            state: SupplementState::Build { replaced },
+        })
+    }
+
     /// Reads the commit `commit` and returns the image commit that it names,
     /// as [`open_composefs_image`](Repo::open_composefs_image) selects it,
     /// with the value of the key `ostree.composefs.digest.v0` of `commit`.
     ///
-    /// The call reads the detached metadata only if field 2 has no entry
-    /// [`COMPOSEFS_RELATION`]. It parses the key only if `commit` names an
-    /// image commit. The reads and the parse block the thread, so an async
-    /// caller runs this call on the blocking pool.
+    /// The call parses the key only if `commit` names an image commit. The
+    /// reads and the parse block the thread, so an async caller runs this
+    /// call on the blocking pool.
     fn named_image_blocking(&self, commit: &Checksum) -> Result<Option<NamedImage>> {
         let bytes = self.load_object_bytes_blocking(ObjectType::Commit, commit)?;
-        let attachments = related::checked_entries(
-            RelationField::Attachments,
-            Some(*commit),
-            related::parse_attachments(&bytes)?,
-        )?;
-        let found = match composefs_entry(commit, RelationField::Attachments, &attachments)? {
-            Some(image) => Some((ComposefsImageSource::Attachment, image)),
-            None => {
-                let detached = self.read_supplement_dict_blocking(commit)?;
-                let supplements = related::supplements(detached.as_ref())
-                    .map_err(|reason| Error::InvalidRelations {
-                        commit: Some(*commit),
-                        field: RelationField::Supplements,
-                        reason,
-                    })?
-                    .map(|entries| {
-                        related::checked_entries(RelationField::Supplements, Some(*commit), entries)
-                    })
-                    .transpose()?
-                    .unwrap_or_default();
-                composefs_entry(commit, RelationField::Supplements, &supplements)?
-                    .map(|image| (ComposefsImageSource::Supplement, image))
-            }
-        };
-        let Some((source, image)) = found else {
+        let Some((source, image)) = self.named_entry_blocking(commit, &bytes)? else {
             return Ok(None);
         };
         let key = recorded_digest(&Commit::parse(&bytes)?)?;
         Ok(Some(NamedImage { source, image, key }))
+    }
+
+    /// Returns the field and the checksum of the image commit that the commit
+    /// `commit` names, as
+    /// [`open_composefs_image`](Repo::open_composefs_image) selects it.
+    /// `bytes` are the bytes of the commit object of `commit`.
+    ///
+    /// The call reads the detached metadata only if field 2 has no entry
+    /// [`COMPOSEFS_RELATION`]. The read blocks the thread, so an async caller
+    /// runs this call on the blocking pool.
+    fn named_entry_blocking(
+        &self,
+        commit: &Checksum,
+        bytes: &[u8],
+    ) -> Result<Option<(ComposefsImageSource, Checksum)>> {
+        let attachments = related::checked_entries(
+            RelationField::Attachments,
+            Some(*commit),
+            related::parse_attachments(bytes)?,
+        )?;
+        if let Some(image) = composefs_entry(commit, RelationField::Attachments, &attachments)? {
+            return Ok(Some((ComposefsImageSource::Attachment, image)));
+        }
+        let detached = self.read_supplement_dict_blocking(commit)?;
+        let supplements = related::supplements(detached.as_ref())
+            .map_err(|reason| Error::InvalidRelations {
+                commit: Some(*commit),
+                field: RelationField::Supplements,
+                reason,
+            })?
+            .map(|entries| {
+                related::checked_entries(RelationField::Supplements, Some(*commit), entries)
+            })
+            .transpose()?
+            .unwrap_or_default();
+        Ok(
+            composefs_entry(commit, RelationField::Supplements, &supplements)?
+                .map(|image| (ComposefsImageSource::Supplement, image)),
+        )
     }
 
     /// Checks the image commit `image`, which `commit` names in the field
@@ -375,43 +609,41 @@ impl Repo {
     /// offset 0, and its size. In `archive` mode, it returns `None`. If `key`
     /// is set, it first streams the inflated payload through the fs-verity
     /// hasher in chunks of 128 KiB. If `key` is `None`, it reads no byte of
-    /// the payload.
+    /// the payload. The reads block the thread, so an async caller runs this
+    /// call on the blocking pool.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidComposefsImage`] with `commit`, `relation`, `image`,
     /// and the defect, and the errors of the reads that
     /// [`open_composefs_image`](Repo::open_composefs_image) lists.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) async fn check_composefs_commit(
+    fn check_composefs_commit_blocking(
         &self,
         commit: &Checksum,
         relation: ComposefsImageSource,
         image: &Checksum,
-        key: Option<&[u8; 32]>,
+        key: Option<[u8; 32]>,
     ) -> Result<Option<(std::fs::File, u64)>> {
-        let repo = self.clone();
-        let (commit, image, key) = (*commit, *image, key.copied());
         if !self.mode().is_archive() {
-            return ostrya_rt::unblock(move || {
-                repo.check_raw_image_blocking(&commit, relation, &image, key)
-            })
-            .await
-            .map(Some);
+            return self
+                .check_raw_image_blocking(commit, relation, image, key)
+                .map(Some);
         }
-        let (object, payload) =
-            ostrya_rt::unblock(move || repo.image_file_blocking(&commit, relation, &image, false))
-                .await?;
-        if let Some(expected) = key {
-            let actual = inflated_digest(object.reader_over(payload)).await?;
-            check_digest(&expected, &actual)
-                .map_err(|defect| invalid_image(&commit, relation, &image, defect))?;
-        }
+        let (object, payload) = self.image_file_blocking(commit, relation, image, false)?;
+        let Some(expected) = key else {
+            return Ok(None);
+        };
+        let Some((file, len)) = payload else {
+            return Err(no_payload(&object));
+        };
+        let actual = inflated_digest_blocking(file, len)?;
+        check_digest(&expected, &actual)
+            .map_err(|defect| invalid_image(commit, relation, image, defect))?;
         Ok(None)
     }
 
     /// Checks the image commit `image` as
-    /// [`check_composefs_commit`](Repo::check_composefs_commit) does in a mode
+    /// [`check_composefs_commit_blocking`](Repo::check_composefs_commit_blocking) does in a mode
     /// other than `archive`, and returns the file object of `root.cfs`, open
     /// read-only at offset 0, and its size.
     ///
@@ -431,10 +663,7 @@ impl Repo {
 
         let (object, payload) = self.image_file_blocking(commit, relation, image, key.is_some())?;
         let Some((mut file, size)) = payload else {
-            return Err(Error::InvalidFormat(format!(
-                "the file object {} of /{IMAGE_FILE} has no payload",
-                object.checksum()
-            )));
+            return Err(no_payload(&object));
         };
         let Some(expected) = key else {
             return Ok((file, size));
@@ -484,6 +713,32 @@ impl Repo {
     }
 }
 
+/// The parts of a commit that [`Repo::add_composefs_supplement`] uses, from
+/// [`Repo::supplement_state_blocking`].
+struct SupplementRead {
+    /// The checksum of the root dirtree of the commit.
+    root_dirtree: Checksum,
+    /// The checksum of the root dirmeta of the commit.
+    root_dirmeta: Checksum,
+    /// The value of the key `ostree.composefs.digest.v0` of the commit, or
+    /// `None` if the commit does not carry the key.
+    key: Option<[u8; 32]>,
+    /// The state of the supplement [`COMPOSEFS_RELATION`] of the commit.
+    state: SupplementState,
+}
+
+/// The state of the supplement [`COMPOSEFS_RELATION`] of a commit, from
+/// [`Repo::supplement_state_blocking`].
+enum SupplementState {
+    /// The supplement names this image commit, and the image commit passes
+    /// the checks.
+    Valid(Checksum),
+    /// The call builds the image commit. `replaced` is the image commit that
+    /// the supplement names and that fails a check, or `None` if the commit
+    /// has no supplement.
+    Build { replaced: Option<Checksum> },
+}
+
 /// The image commit that a commit names, from
 /// [`Repo::named_image_blocking`].
 struct NamedImage {
@@ -510,6 +765,15 @@ fn invalid_image(
         image: *image,
         defect: Box::new(defect),
     }
+}
+
+/// Returns the error of the file object `object` of `/root.cfs` that the load
+/// gives with no payload.
+fn no_payload(object: &FileObject) -> Error {
+    Error::InvalidFormat(format!(
+        "the file object {} of /{IMAGE_FILE} has no payload",
+        object.checksum()
+    ))
 }
 
 /// Returns the error of a lookup of the composefs image in an `archive`
@@ -595,20 +859,31 @@ fn check_digest(
     })
 }
 
-/// Returns the fs-verity digest of the bytes of `reader`, which reads the
-/// inflated payload of an `archive` object, in chunks of 128 KiB.
-async fn inflated_digest(mut reader: crate::file::ContentReader) -> Result<[u8; 32]> {
+/// Returns the fs-verity digest of the inflated payload of an `archive`
+/// object. `file` is open at the start of the raw-DEFLATE stream, and `len`
+/// is the number of bytes from there to the end of the file.
+///
+/// The call reads the stream in bounded chunks and hashes the inflated bytes
+/// in chunks of 128 KiB. The reads block the thread, so an async caller runs
+/// this call on the blocking pool.
+fn inflated_digest_blocking(file: std::fs::File, len: u64) -> Result<[u8; 32]> {
     use futures_lite::AsyncReadExt;
 
+    let source = BufSource::with_len_hint(futures_lite::io::AssertAsync::new(file), len);
+    let mut decoder = DeflateDecoder::new(source);
     let mut hasher = ostrya_composefs::FsVerityHasher::new();
     let mut buf = vec![0u8; DIGEST_CHUNK];
-    loop {
-        let n = reader.read(&mut buf).await.map_err(Error::Io)?;
-        if n == 0 {
-            break;
+    // The reader over a blocking file never returns `Pending`, so `block_on`
+    // drives it on this thread with no executor.
+    futures_lite::future::block_on(async {
+        loop {
+            let n = decoder.read(&mut buf).await.map_err(Error::Io)?;
+            if n == 0 {
+                return Ok::<(), Error>(());
+            }
+            hasher.update(&buf[..n]);
         }
-        hasher.update(&buf[..n]);
-    }
+    })?;
     Ok(hasher.finalize())
 }
 
@@ -620,6 +895,7 @@ const _: fn() = || {
     assert_send_sync::<ComposefsImage>();
     assert_send_sync::<ComposefsImageDefect>();
     let _ = |repo: &Repo, commit: &Checksum| assert_send(&repo.open_composefs_image(commit));
+    let _ = |repo: &Repo, commit: &Checksum| assert_send(&repo.add_composefs_supplement(commit));
     let _ = |txn: &Transaction, root: &RepoTree| assert_send(&txn.write_composefs_commit(root));
     let _ = |txn: &Transaction, root: &RepoTree, meta: &FileMeta| {
         assert_send(&txn.write_composefs_content(root, &ComposefsOptions::RECORDED, meta));
@@ -680,15 +956,13 @@ mod tests {
             let source = ComposefsImageSource::Supplement;
             for key in [Some(&digest), None] {
                 let checked = repo
-                    .check_composefs_commit(&commit, source, &image, key)
-                    .await
+                    .check_composefs_commit_blocking(&commit, source, &image, key.copied())
                     .unwrap();
                 assert!(checked.is_none());
             }
             let wrong = [0x11; 32];
             match repo
-                .check_composefs_commit(&commit, source, &image, Some(&wrong))
-                .await
+                .check_composefs_commit_blocking(&commit, source, &image, Some(wrong))
                 .unwrap_err()
             {
                 Error::InvalidComposefsImage { defect, .. } => assert_eq!(

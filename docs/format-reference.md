@@ -7412,8 +7412,9 @@ branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
 A commit of the port can name a second commit that holds the composefs image
 of its tree. This document calls the first commit A and the second commit C,
 the image commit. The tool writes no image commit, and it reads C as a usual
-commit. A run of the library calls
-`Transaction::write_composefs_commit` and `Repo::open_composefs_image`, and a
+commit. A run of `ostrya commit --generate-composefs`, `ostrya composefs-image
+--add`, and the library calls `Transaction::write_composefs_commit`,
+`Repo::add_composefs_supplement`, and `Repo::open_composefs_image`, and a
 check of the objects, can verify each fact below.
 
 The shape of C:
@@ -7445,6 +7446,50 @@ The names:
 - Each transfer that carries the attachments of a commit carries the
   attachment `composefs` and C with it. No transfer follows a supplement, so
   the supplement `composefs` is local to a repository.
+
+The writers:
+
+- `ostrya commit --generate-composefs` builds the image of the tree of A one
+  time. In the transaction of A, it writes C, and then A with the key
+  `ostree.composefs.digest.v0` and the attachment `composefs` that names C.
+  The key is the fs-verity digest of `/root.cfs`. The option turns on
+  `--generate-composefs-metadata`, and the attachment makes A different from
+  the commit that `--generate-composefs-metadata` alone writes for the same
+  tree. The command refuses `--related` with the name `composefs` before it
+  takes the repository lock. It refuses a C that the repository holds and
+  marks partial, with the reason `which is partial` of the attachment check,
+  and then writes no object and no ref.
+- `ostrya composefs-image --add A` writes C and the supplement `composefs` of
+  A, in one transaction:
+  1. It refuses an A whose field 2 has the attachment `composefs`, with the
+     text `commit A names its composefs image commit C as an attachment; a
+     supplement is not written`.
+  2. If A has the supplement `composefs` and its C passes the checks of the
+     lookup below, the command writes nothing. In `archive` mode, the check
+     of the digest inflates the `.filez` object of `root.cfs` and streams it
+     through the fs-verity hasher.
+  3. Else it builds the image of the tree of A. If A has the key and the
+     fs-verity digest of the image is not the value of the key, it refuses A
+     and names both digests. If A has no key, it makes no check.
+  4. It writes C, sets the supplement `composefs` of A to C, and replaces an
+     entry whose C fails a check. The write of the supplement keeps the
+     other entries of `ostrya.related` and the other keys of the
+     `.commitmeta`. The transaction does not write an object that the
+     repository already holds. If the entry names the C that the build
+     gives, and the object of its `root.cfs` is changed on disk, the
+     command writes the same entry, and the changed object stays. A changed
+     object is a defect that `fsck` reports.
+  5. If the repository marked C partial before the command, the command
+     removes the partial marker after the transaction commits.
+  On a refusal, the command writes no object and no supplement.
+- Both writers accept an `archive` repository, where `root.cfs` is a
+  `.filez` object.
+
+A pull with the default config copies the `.commitmeta` of A, with the
+supplement `composefs`, and does not copy C. The lookup then fails with the
+defect `which the repository does not hold` until `composefs-image --add`
+writes C again. With `keep-detached-related=false`, the pull drops
+`ostrya.related`, and A names no image commit.
 
 The key `ostree.composefs.digest.v0` of A records the fs-verity digest of the
 image that A mounts with. That image can hold labels or other metadata that a
@@ -7505,10 +7550,10 @@ offset 0.
 ## The composefs image store
 
 A repository of the port can store the composefs image of a commit as a file
-outside `objects/`. The tool has no such file. A run of `ostrya commit
---generate-composefs`, `ostrya composefs-image --add`, or a write under
-`[ex-ostrya] generate-composefs`, and a check of the stored file can verify
-each fact below.
+outside `objects/`. The tool has no such file. A write under
+`[ex-ostrya] generate-composefs`, for example `ostrya commit
+--generate-composefs-metadata` with the key true, and a check of the stored
+file can verify each fact below.
 
 The file:
 
@@ -7583,9 +7628,7 @@ The generation:
   `ostrya static-delta apply-offline` record a commit only if the transaction
   stages it, so a commit that the repository holds partial also gets no image
   from them. The build also skips a commit with no key and a commit whose
-  image is staged. There is no backfill under the key. `ostrya commit
-  --generate-composefs` stores the image of a commit that the repository
-  holds, as `ostrya composefs-image --add` does.
+  image is staged. There is no backfill under the key.
 - A malformed key, or an image whose digest is not the key, fails the
   transaction. It publishes no object and writes no ref. For a pull, the rule
   covers each recorded commit, so one such commit fails the whole pull. A
@@ -7691,8 +7734,9 @@ The messages:
   bytes][repo_len: u16][source_len: u16][target_len: u16][repo][source]
   [target]`. One `SCM_RIGHTS` control message goes with the bytes. It holds
   two descriptors in this order: a user namespace and a mount namespace.
-  - `op` is 1 for the stored image of the commit and 2 for an image that
-    the daemon builds.
+  - `op` is 1 for the image of the image commit that the commit names as
+    the attachment or the supplement `composefs` ("The composefs image
+    commit"), and 2 for an image that the daemon builds.
   - `access` is 0 for read-only and 1 for read-write.
   - `commit` is the binary checksum of the commit.
   - `repo` and `target` are absolute paths, as the client sees them.
@@ -7720,9 +7764,10 @@ The codes of `Error`:
   are a target on FUSE and an `objects` directory that is the root of a
   mount.
 - 5, `repository`: the repository refuses the mount. Examples are a
-  repository on FUSE, an `archive` repository, a commit without
-  `ostree.composefs.digest.v0`, an absent image, an image whose digest is
-  not the key, and a built image larger than the limit of the daemon.
+  repository on FUSE, an `archive` repository, a commit that names no image
+  commit for op 1, an image commit with a defect, an image whose digest is
+  not the key, an image whose size is not a positive multiple of 4096
+  bytes, and a built image larger than the limit of the daemon.
 - 6, `mount`: a system call of the mount failed.
 - 7, `internal`: the daemon failed for another reason.
 - 8, `timeout`: no message of the client in time, or a request that does
@@ -7778,15 +7823,31 @@ The checks of the daemon, in order:
    refuse a file that is not a regular file, as "Object store layout" states.
    So a symlink at a directory component of the path, or at a file that the
    repository mode stores as a regular file, stops the read, and the request
-   is `repository`. The daemon opens the image
-   `extensions/ostrya/composefs/<xx>/<rest>.cfs` under the repository
-   directory. An error of `openat2`, `ENOSYS` included, fails the read: the
-   daemon has no fallback to `openat`.
-7. A stored image must have the digest that the commit key records. The
-   daemon checks no signature of the commit. If the digest is not the key,
-   the request is `repository`, and the text is `the stored composefs image
-   of commit <commit> does not match its key`. The text holds neither
-   digest.
+   is `repository`. For op 1, the daemon reads the commit object and the
+   `.commitmeta` of the commit, and the commit object, the root dirtree,
+   and the file object of `root.cfs` of the image commit, under `objects`.
+   It checks the partial marker of the image commit under `state`. An error
+   of `openat2`, `ENOSYS` included, fails the read: the daemon has no
+   fallback to `openat`.
+7. For op 1, the daemon runs the lookup of "The composefs image commit".
+   The daemon checks no signature of the commit. Each failure is
+   `repository`:
+   - If the commit names no image commit, the text is `commit <commit> has
+     no attachment or supplement composefs`. The daemon does not build an
+     image in place of the absent one.
+   - If the digest of `/root.cfs` is not the key, the text is `composefs
+     image of commit <commit>: <source> composefs names commit <image>,
+     whose /root.cfs does not match the key of the commit`. The text holds
+     neither digest.
+   - Each other defect of the image commit gives the text of the lookup.
+   - The size of the image must be more than 0 and a multiple of 4096
+     bytes. Else the text is `the image of commit <image> has the size
+     <size>, which is not a positive multiple of 4096 bytes`.
+
+   The daemon gives the loose object of `root.cfs` to the loop device and
+   copies no byte of it. If the object is not sealed with fs-verity, a
+   process that can write it can change the image while it is mounted. The
+   limit of the size of a built image does not apply to op 1.
 8. A built image larger than the limit of the daemon is `repository`. The
    daemon computes the size before it writes the image. The default limit
    is 104857600 bytes.

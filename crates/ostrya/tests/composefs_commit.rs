@@ -28,6 +28,16 @@
 //! - In a sealing repository, the returned descriptor is sealed and its
 //!   kernel digest is the key, and a wrong key gives `DigestMismatch`. These
 //!   tests skip if the file system has no fs-verity.
+//! - `Repo::add_composefs_supplement` writes the image commit and the
+//!   supplement, writes nothing for a valid supplement, replaces a bad
+//!   supplement, completes a partial image commit, refuses a commit with the
+//!   attachment and a key that is not the digest of the image, makes no
+//!   check with no key, and works in an `archive` repository. In `archive`
+//!   mode, it replaces a supplement that names another image commit.
+//! - `CheckedAttachments::add` checks the new entry alone: an entry of the
+//!   first check that the repository marks partial after that check fails
+//!   neither the add nor the write of the commit. The add keeps the entries
+//!   sorted.
 
 mod common;
 
@@ -36,8 +46,8 @@ use std::os::fd::AsFd;
 
 use ostrya::{
     COMPOSEFS_RELATION, Checksum, Commit, ComposefsImageDefect, ComposefsImageSource,
-    ComposefsOptions, DirMeta, DirTree, Error, FileMeta, ObjectType, RelationField, Repo, RepoMode,
-    RepoTree, Transaction, Value, Xattrs, loose_path,
+    ComposefsOptions, ComposefsSupplementAdd, DirMeta, DirTree, Error, FileMeta, ObjectType,
+    RelationField, Repo, RepoMode, RepoTree, Transaction, Value, Xattrs, loose_path,
 };
 use ostrya_rt::block_on;
 
@@ -1130,5 +1140,374 @@ fn the_image_commit_is_the_same_in_each_mode() {
         }
         assert_eq!(images[0], images[1]);
         assert_eq!(images[0], images[2]);
+    });
+}
+
+/// Returns the sorted paths of the files below `objects/` of `repo`.
+fn object_files(repo: &Repo) -> Vec<std::path::PathBuf> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&repo.path().join("objects"), &mut out);
+    out.sort();
+    out
+}
+
+/// Returns the bytes of the `.commitmeta` of `commit`, or `None` if the
+/// repository holds none.
+fn commitmeta_bytes(repo: &Repo, commit: &Checksum) -> Option<Vec<u8>> {
+    let path = loose_path(commit, ObjectType::CommitMeta, repo.mode());
+    std::fs::read(repo.path().join("objects").join(path)).ok()
+}
+
+/// Returns the supplements of `commit`.
+async fn supplements(repo: &Repo, commit: &Checksum) -> Vec<(String, Checksum)> {
+    repo.read_commit_relations(commit)
+        .await
+        .unwrap()
+        .supplements
+}
+
+/// A commit with the key and no image commit gets the image commit of its
+/// tree as the supplement. The lookup then gives it. A second call finds the
+/// valid supplement and writes nothing.
+#[test]
+fn the_add_writes_the_supplement_of_a_commit_with_the_key() {
+    let scratch = TmpDir::new("cfs-add-key");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let commit = store_named(&repo, &tree, "add", Some(&digest), &[]).await;
+
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, replaced } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+        assert_eq!(replaced, None);
+        assert_eq!(
+            supplements(&repo, &commit).await,
+            vec![(COMPOSEFS_RELATION.to_owned(), image)]
+        );
+        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+        assert_eq!(found.source, ComposefsImageSource::Supplement);
+        assert_eq!(found.commit, image);
+        assert_eq!(
+            read_all(&found.file),
+            recorded_export(&repo, &tree).await.bytes
+        );
+
+        let objects = object_files(&repo);
+        let meta = commitmeta_bytes(&repo, &commit);
+        assert_eq!(
+            repo.add_composefs_supplement(&commit).await.unwrap(),
+            ComposefsSupplementAdd::Valid { image }
+        );
+        assert_eq!(object_files(&repo), objects);
+        assert_eq!(commitmeta_bytes(&repo, &commit), meta);
+    });
+}
+
+/// A commit with no key gets the image commit with no check.
+#[test]
+fn the_add_makes_no_check_for_a_commit_with_no_key() {
+    let scratch = TmpDir::new("cfs-add-no-key");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let commit = store_named(&repo, &tree, "no key", None, &[]).await;
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, replaced } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+        assert_eq!(replaced, None);
+        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+        assert_eq!(found.commit, image);
+    });
+}
+
+/// A key that is not the digest of the built image refuses the commit with
+/// both digests, and the call writes no object and no supplement.
+#[test]
+fn the_add_refuses_a_key_that_is_not_the_digest() {
+    let scratch = TmpDir::new("cfs-add-mismatch");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let wrong = [0x11u8; 32];
+        let commit = store_named(&repo, &tree, "wrong key", Some(&wrong), &[]).await;
+        let objects = object_files(&repo);
+
+        match repo.add_composefs_supplement(&commit).await.unwrap_err() {
+            Error::ComposefsDigestMismatch {
+                commit: refused,
+                expected,
+                actual,
+            } => {
+                assert_eq!(refused, commit);
+                assert_eq!(expected, wrong);
+                assert_eq!(actual, digest);
+            }
+            other => panic!("expected ComposefsDigestMismatch, got {other:?}"),
+        }
+        assert_eq!(object_files(&repo), objects);
+        assert!(commitmeta_bytes(&repo, &commit).is_none());
+        assert!(repo.open_composefs_image(&commit).await.unwrap().is_none());
+    });
+}
+
+/// A commit that names an image commit as the attachment is refused, and
+/// the call writes nothing.
+#[test]
+fn the_add_refuses_a_commit_with_the_attachment() {
+    let scratch = TmpDir::new("cfs-add-attachment");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (image, digest) = write_image_commit(&repo, &tree).await;
+        let commit = store_named(
+            &repo,
+            &tree,
+            "attached",
+            Some(&digest),
+            &[(COMPOSEFS_RELATION, image.as_bytes())],
+        )
+        .await;
+        let objects = object_files(&repo);
+        match repo.add_composefs_supplement(&commit).await.unwrap_err() {
+            Error::InvalidInput(message) => assert_eq!(
+                message,
+                format!(
+                    "commit {commit} names its composefs image commit {image} as an \
+                     attachment; a supplement is not written"
+                )
+            ),
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+        assert_eq!(object_files(&repo), objects);
+        assert!(commitmeta_bytes(&repo, &commit).is_none());
+    });
+}
+
+/// A supplement whose image commit fails a check is replaced: an absent
+/// image commit, and an image commit whose digest is not the key.
+#[test]
+fn the_add_replaces_a_bad_supplement() {
+    let scratch = TmpDir::new("cfs-add-replace");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let txn = repo.transaction().await.unwrap();
+        let other = txn
+            .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o400), b"other")
+            .await
+            .unwrap();
+        let other = stage_image_commit(&txn, vec![("root.cfs".to_owned(), other)], vec![]).await;
+        txn.commit().await.unwrap();
+        let absent = Checksum::from_bytes([0x5a; 32]);
+
+        for (subject, bad) in [("absent", absent), ("other", other)] {
+            let commit = store_named(&repo, &tree, subject, Some(&digest), &[]).await;
+            repo.add_supplement(&commit, COMPOSEFS_RELATION, &bad)
+                .await
+                .unwrap();
+            let added = repo.add_composefs_supplement(&commit).await.unwrap();
+            let ComposefsSupplementAdd::Written { image, replaced } = added else {
+                panic!("expected Written, got {added:?}");
+            };
+            assert_eq!(replaced, Some(bad), "{subject}");
+            assert_eq!(
+                supplements(&repo, &commit).await,
+                vec![(COMPOSEFS_RELATION.to_owned(), image)]
+            );
+            let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+            assert_eq!(found.commit, image);
+        }
+    });
+}
+
+/// A supplement that names a partial image commit is replaced by the same
+/// image commit, and the call removes the partial marker.
+#[test]
+fn the_add_completes_a_partial_image_commit() {
+    let scratch = TmpDir::new("cfs-add-partial");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (image, digest) = write_image_commit(&repo, &tree).await;
+        let commit = store_named(&repo, &tree, "partial", Some(&digest), &[]).await;
+        repo.add_supplement(&commit, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        mark_partial(&repo, &image);
+        // The object of the image is absent, as after a pull that stopped.
+        let object = image_object(&repo, &image).await;
+        let path = loose_path(&object, ObjectType::File, repo.mode());
+        std::fs::remove_file(repo.path().join("objects").join(path)).unwrap();
+
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        assert_eq!(
+            added,
+            ComposefsSupplementAdd::Written {
+                image,
+                replaced: Some(image),
+            }
+        );
+        assert_eq!(
+            repo.commit_state(&image).await.unwrap(),
+            ostrya::CommitState::Normal
+        );
+        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+        assert_eq!(found.commit, image);
+    });
+}
+
+/// In an `archive` repository, the add writes the image commit, and a
+/// second call checks the inflated image and writes nothing. A supplement
+/// that names another image commit fails the check of the inflated image
+/// and is replaced. A supplement whose image is not the key of a commit
+/// fails the check, and the key refuses the built image.
+#[test]
+fn the_add_works_in_an_archive_repository() {
+    let scratch = TmpDir::new("cfs-add-archive");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::Archive, "").await;
+        let digest = recorded_export(&repo, &tree).await.fs_verity;
+        let commit = store_named(&repo, &tree, "archive", Some(&digest), &[]).await;
+        let added = repo.add_composefs_supplement(&commit).await.unwrap();
+        let ComposefsSupplementAdd::Written { image, replaced } = added else {
+            panic!("expected Written, got {added:?}");
+        };
+        assert_eq!(replaced, None);
+        let objects = object_files(&repo);
+        assert_eq!(
+            repo.add_composefs_supplement(&commit).await.unwrap(),
+            ComposefsSupplementAdd::Valid { image }
+        );
+        assert_eq!(object_files(&repo), objects);
+
+        // The supplement of a commit with the right key names the valid
+        // image commit of another tree: the digest of its inflated image is
+        // not the key, so the add builds the image and replaces the entry.
+        let plain = plain_tree_commit(&repo).await;
+        let (another, _) = write_image_commit(&repo, &plain).await;
+        let renamed = store_named(&repo, &tree, "archive another", Some(&digest), &[]).await;
+        repo.add_supplement(&renamed, COMPOSEFS_RELATION, &another)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.add_composefs_supplement(&renamed).await.unwrap(),
+            ComposefsSupplementAdd::Written {
+                image,
+                replaced: Some(another),
+            }
+        );
+        assert_eq!(
+            supplements(&repo, &renamed).await,
+            vec![(COMPOSEFS_RELATION.to_owned(), image)]
+        );
+
+        // The supplement of another commit with another key names the same
+        // image commit: its inflated digest is not that key, so the add
+        // builds the image, and the key refuses it.
+        let wrong = [0x11u8; 32];
+        let other = store_named(&repo, &tree, "archive wrong", Some(&wrong), &[]).await;
+        repo.add_supplement(&other, COMPOSEFS_RELATION, &image)
+            .await
+            .unwrap();
+        match repo.add_composefs_supplement(&other).await.unwrap_err() {
+            Error::ComposefsDigestMismatch {
+                expected, actual, ..
+            } => {
+                assert_eq!(expected, wrong);
+                assert_eq!(actual, digest);
+            }
+            other => panic!("expected ComposefsDigestMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            supplements(&repo, &other).await,
+            vec![(COMPOSEFS_RELATION.to_owned(), image)]
+        );
+    });
+}
+
+/// `CheckedAttachments::add` checks the new entry alone: after the first
+/// check, the repository marks the commit of the other entries partial, and
+/// the add and the write of the commit pass. The add takes an image commit
+/// that the transaction stages, keeps the entries sorted, and refuses an
+/// empty name, a name that the entries hold, and a partial commit with no
+/// change to the entries.
+#[test]
+fn checked_attachments_add_checks_the_new_entry() {
+    let scratch = TmpDir::new("cfs-checked-add");
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let (partial, _) = write_image_commit(&repo, &tree).await;
+        let other = plain_tree_commit(&repo).await;
+        let root = root_of(&repo, &tree).await;
+        let txn = repo.transaction().await.unwrap();
+        let mut checked = txn
+            .check_attachments(&[("z/last".to_owned(), other), ("a/first".to_owned(), other)])
+            .await
+            .unwrap();
+        // The repository holds the image commit `partial` and marks it
+        // partial. It also marks the checked attachment `other` partial, so
+        // a check of an entry of the first check fails.
+        mark_partial(&repo, &partial);
+        mark_partial(&repo, &other);
+        let refusal = |err: Error| match err {
+            Error::InvalidRelations {
+                commit: None,
+                field: RelationField::Attachments,
+                reason,
+            } => reason,
+            other => panic!("expected InvalidRelations, got {other:?}"),
+        };
+        assert_eq!(
+            refusal(checked.add("", &other).await.unwrap_err()),
+            "the new entry has an empty name"
+        );
+        assert_eq!(
+            refusal(checked.add("a/first", &other).await.unwrap_err()),
+            "two entries have the name a/first"
+        );
+        let reason = refusal(checked.add(COMPOSEFS_RELATION, &partial).await.unwrap_err());
+        assert!(reason.contains("partial"), "{reason}");
+        assert!(reason.contains(&partial.to_string()), "{reason}");
+        assert!(!reason.contains(&other.to_string()), "{reason}");
+        std::fs::remove_file(repo.path().join(format!("state/{partial}.commitpartial"))).unwrap();
+
+        let staged = txn
+            .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o400), b"staged")
+            .await
+            .unwrap();
+        let staged = stage_image_commit(&txn, vec![("root.cfs".to_owned(), staged)], vec![]).await;
+        checked.add(COMPOSEFS_RELATION, &staged).await.unwrap();
+        let commit = txn
+            .write_commit_checked(
+                ostrya::CommitOptions {
+                    subject: Some("checked".to_owned()),
+                    timestamp: Some(0),
+                    ..ostrya::CommitOptions::default()
+                },
+                checked,
+                &root,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let relations = repo.read_commit_relations(&commit).await.unwrap();
+        assert_eq!(
+            relations.attachments,
+            vec![
+                ("a/first".to_owned(), other),
+                (COMPOSEFS_RELATION.to_owned(), staged),
+                ("z/last".to_owned(), other),
+            ]
+        );
     });
 }

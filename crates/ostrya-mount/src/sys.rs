@@ -1,8 +1,13 @@
-//! The blocking mount steps: the loop device, the EROFS mount, the overlays,
-//! and the unmount.
+//! The blocking mount steps: the loop device, the EROFS mount, the composefs
+//! overlay, the top overlay, and the move of a mount onto its target.
 //!
-//! Each function blocks the calling thread. The callers run them on the
-//! blocking pool of the runtime.
+//! [`mount_composefs`], [`top_overlay`], and [`move_onto`] are the steps of
+//! one mount. The mount daemon runs them in two processes: the daemon makes
+//! the composefs mount, and its worker stacks the top overlay and moves it
+//! onto the target in the namespaces of the caller.
+//!
+//! Each function blocks the calling thread. A caller on an async runtime
+//! runs them on its blocking pool.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::DirBuilderExt;
@@ -18,7 +23,7 @@ use rustix::mount::{
 };
 
 use crate::error::{ATTACH_STEP, Error, Result};
-use crate::options::{Access, OverlayVerity};
+use crate::options::{Access, Verity};
 
 /// The block size of the loop device, in bytes. EROFS uses blocks of this
 /// size, and a loop device with the same block size reads each block in one
@@ -26,41 +31,49 @@ use crate::options::{Access, OverlayVerity};
 pub(crate) const IMAGE_BLOCK: u64 = 4096;
 
 /// The `f_type` that `statfs` reports for overlayfs.
-pub(crate) const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+pub const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 
 /// The number of names that [`TempDir::new`] tries before it fails.
 const TEMP_ATTEMPTS: u32 = 100;
 
 /// The settings of one mount.
 #[derive(Debug)]
-pub(crate) struct Plan {
+pub struct Plan {
     /// The `verity` option of the composefs overlay.
-    pub(crate) verity: OverlayVerity,
+    pub verity: Verity,
     /// Read-only, or read-write with an upper directory.
-    pub(crate) access: Access,
+    pub access: Access,
     /// The source label of the mount.
-    pub(crate) source: String,
+    pub source: String,
     /// The attribute flags that each mount of the tree adds, for example
     /// `MOUNT_ATTR_NOSUID`.
-    pub(crate) attrs: MountAttrFlags,
+    pub attrs: MountAttrFlags,
     /// The user namespace whose mapping the EROFS mount takes, or `None` for
     /// a mount with no ID mapping.
-    pub(crate) idmap: Option<OwnedFd>,
+    pub idmap: Option<OwnedFd>,
 }
 
 /// The upper and the work directory of a read-write mount.
 #[derive(Debug)]
-pub(crate) struct Layout {
+pub struct Layout {
     /// The upper directory, `<target>/overlay`.
-    pub(crate) upper: OwnedFd,
+    upper: OwnedFd,
     /// The work directory, `<target>/work`.
-    pub(crate) work: OwnedFd,
+    work: OwnedFd,
 }
 
 impl Layout {
     /// Creates `overlay` and `work` under the target `target_fd` if they are
     /// absent, and opens them.
-    pub(crate) fn ensure(target_fd: BorrowedFd<'_>) -> Result<Layout> {
+    ///
+    /// Each new directory gets the mode 0755. An existing directory keeps
+    /// its mode and its content.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Sys`] if a directory cannot be created or opened. A name
+    /// that is not a directory fails the open.
+    pub fn ensure(target_fd: BorrowedFd<'_>) -> Result<Layout> {
         Ok(Layout {
             upper: ensure_layout_dir(target_fd, "overlay")?,
             work: ensure_layout_dir(target_fd, "work")?,
@@ -70,25 +83,24 @@ impl Layout {
 
 /// The options of the overlay on the composefs mount.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct UpperOptions {
+pub struct UpperOptions {
     /// Keeps the overlay xattrs in the `user.overlay.` namespace. An overlay
     /// that a process mounts inside a user namespace needs it.
-    pub(crate) userxattr: bool,
+    pub userxattr: bool,
     /// The attribute flags that the mount adds to `MOUNT_ATTR_NOATIME`.
-    pub(crate) attrs: MountAttrFlags,
+    pub attrs: MountAttrFlags,
     /// The way the overlay takes each layer.
-    pub(crate) layers: LayerRef,
+    pub layers: LayerRef,
 }
 
 /// The way an overlay takes a layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LayerRef {
+pub enum LayerRef {
     /// The `/proc/self/fd/N` path of the descriptor of the layer. The kernel
     /// resolves the path in the mount namespace of the process.
     Path,
     /// The descriptor of the layer itself, with `FSCONFIG_SET_FD`. This form
     /// needs no `/proc` in the mount namespace of the process.
-    #[cfg_attr(not(feature = "server"), allow(dead_code))]
     Fd,
 }
 
@@ -115,7 +127,7 @@ pub(crate) fn mount_tree(
         Access::ReadWrite => Some(Layout::ensure(target_fd.as_fd())?),
     };
 
-    let composefs = build_composefs(image, objects, plan)?;
+    let composefs = mount_composefs(image, objects, plan)?;
     let top = match layout {
         None => composefs,
         Some(layout) => {
@@ -142,11 +154,27 @@ pub(crate) fn mount_tree(
 /// With [`Plan::idmap`], the EROFS mount takes the ID mapping of that user
 /// namespace before the overlay takes it. The overlay takes the detached
 /// EROFS mount as its layer.
-pub(crate) fn build_composefs(
-    image: OwnedFd,
-    objects: BorrowedFd<'_>,
-    plan: &Plan,
-) -> Result<OwnedFd> {
+///
+/// The function attaches the image to a read-only loop device with
+/// 4096-byte blocks. The loop device reads the image from offset 0. Each
+/// mount adds the attribute flags of [`Plan::attrs`]. The function does not
+/// read [`Plan::access`].
+///
+/// The function does not check these conditions, and the caller must hold
+/// each of them:
+///
+/// - The size of the image is more than zero and a multiple of 4096 bytes.
+/// - The image does not change while it is mounted. A sealed memory file
+///   and a file sealed with fs-verity give this guarantee.
+/// - `/proc` is mounted in the mount namespace of the process. The function
+///   gives the loop device, the EROFS mount, and `objects` to the kernel by
+///   their `/proc/self/fd/N` paths.
+///
+/// # Errors
+///
+/// [`Error::Sys`] if a step fails. The error names the step. For a refused
+/// file system option, it carries the message of the kernel.
+pub fn mount_composefs(image: OwnedFd, objects: BorrowedFd<'_>, plan: &Plan) -> Result<OwnedFd> {
     let erofs = erofs_mount(image.as_fd(), plan.attrs)?;
     // The loop device holds its own reference to the image.
     drop(image);
@@ -161,7 +189,11 @@ pub(crate) fn build_composefs(
 }
 
 /// Moves the detached mount `top` onto the directory `target_fd`.
-pub(crate) fn move_onto(top: OwnedFd, target_fd: BorrowedFd<'_>) -> Result<()> {
+///
+/// # Errors
+///
+/// [`Error::Sys`] if `move_mount` fails.
+pub fn move_onto(top: OwnedFd, target_fd: BorrowedFd<'_>) -> Result<()> {
     move_mount(
         &top,
         "",
@@ -191,10 +223,11 @@ pub(crate) fn unmount_overlay(target: &Path) -> Result<()> {
 }
 
 /// Opens the directory at `path` under `dir` read-only.
-pub(crate) fn open_dir(
-    dir: impl AsFd,
-    path: impl rustix::path::Arg,
-) -> rustix::io::Result<OwnedFd> {
+///
+/// # Errors
+///
+/// The error number of `openat`.
+pub fn open_dir(dir: impl AsFd, path: impl rustix::path::Arg) -> rustix::io::Result<OwnedFd> {
     openat(
         dir,
         path,
@@ -285,7 +318,12 @@ fn composefs_overlay(
 ///
 /// `lower` names the root of a mount. overlayfs takes each layer in the form
 /// of [`UpperOptions::layers`].
-pub(crate) fn top_overlay(
+///
+/// # Errors
+///
+/// [`Error::Sys`] if a step fails. The error names the step. For a refused
+/// file system option, it carries the message of the kernel.
+pub fn top_overlay(
     lower: BorrowedFd<'_>,
     layout: Option<&Layout>,
     source: &str,

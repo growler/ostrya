@@ -31,7 +31,6 @@ use std::time::Duration;
 
 use clap::Parser;
 use ostrya_mount::Mounter;
-use ostrya_mount::server::{Server, worker_main};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, chmodat, statat, unlinkat};
 use rustix::io::Errno;
@@ -43,6 +42,10 @@ use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 #[cfg(test)]
 mod man;
+mod repo;
+mod server;
+
+use server::{Server, worker_main};
 
 /// The program of the worker process: this binary.
 const WORKER_PROGRAM: &str = "/proc/self/exe";

@@ -139,12 +139,32 @@ process that builds the image: the caller for `Direct::mount_built`,
 and the daemon for `Helper::mount_built`. The daemon refuses an image
 larger than its limit, 100 MiB by default, before it writes the image.
 
+## The protocol and the mount steps
+
+The mount daemon is a program of its own, `ostrya-mountd`. It uses these
+items of the crate:
+
+- `proto` holds the protocol of the daemon: the limits, the kind bytes,
+  `proto::Request`, `proto::Failure`, and the calls `proto::send`
+  and `proto::recv`, which carry one message with its descriptors.
+- `Helper::exchange` runs the client side of one request on a connected
+  socket.
+- `sys` holds the mount steps. `sys::mount_composefs` mounts an EROFS
+  image and stacks the read-only composefs overlay on it.
+  `sys::top_overlay` stacks the overlay that the caller sees, and
+  `sys::move_onto` moves it onto the target. `sys::Plan` holds the
+  settings of a mount, and `Verity` is its `verity` option.
+
+Each call of the two modules blocks the calling thread. The items of
+`sys` name types of the `rustix` crate, version 1: `MountAttrFlags` in
+`sys::Plan` and `sys::UpperOptions`, and `path::Arg` and `io::Result`
+in `sys::open_dir`. A caller that builds these values names `rustix` 1
+with the feature `mount` in its own manifest.
+
 ## Features
 
 - `smol` (default): the `smol` backend of `ostrya-rt`.
 - `tokio`: the `tokio` backend of `ostrya-rt`, for a host on tokio.
-- `server`: the connection handler and the worker of `ostrya-mountd`.
-  The module is hidden and is not a stable API.
 
 ## Examples
 

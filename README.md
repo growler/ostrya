@@ -300,10 +300,11 @@ The project is a Cargo workspace of these crates:
   digest.
 - `ostrya-server`: the HTTP server of one repository, for pull and push.
 - `ostrya`: the library.
-- `ostrya-mount`: the composefs mount of a commit on Linux, and the client of
-  the mount daemon.
-- `ostrya-mountd`: the mount daemon `ostrya-mountd`. It is not published to
-  crates.io.
+- `ostrya-mount`: the composefs mount of a commit on Linux, the client of
+  the mount daemon, the protocol of the daemon, and the mount steps that the
+  daemon uses.
+- `ostrya-mountd`: the mount daemon `ostrya-mountd`, with its connection
+  handler and its worker. It is not published to crates.io.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.
 - `ostrya-conformance`: the conformance harness that compares Ostrya with the
   `ostree` command. It is not published to crates.io.

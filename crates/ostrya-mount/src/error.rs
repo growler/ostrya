@@ -102,7 +102,6 @@ pub enum HelperCode {
 
 impl HelperCode {
     /// Returns the byte of the class on the wire.
-    #[cfg(any(feature = "server", test))]
     pub(crate) fn to_wire(self) -> u8 {
         match self {
             HelperCode::Protocol => 1,
@@ -173,20 +172,6 @@ impl Error {
             code,
             errno: None,
             message: message.into(),
-        }
-    }
-
-    /// Returns the text of the error with no hint about the privilege of
-    /// the process. The mount daemon reports this text, because its steps
-    /// run with other privileges than a direct mount.
-    #[cfg(feature = "server")]
-    pub(crate) fn plain_text(&self) -> String {
-        match self {
-            Error::Sys { op, errno, log } => match log {
-                Some(log) => format!("{op}: {errno}: {log}"),
-                None => format!("{op}: {errno}"),
-            },
-            other => other.to_string(),
         }
     }
 }

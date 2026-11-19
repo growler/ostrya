@@ -7,7 +7,7 @@ use ostrya::{Checksum, Repo, VerityPolicy};
 use rustix::mount::MountAttrFlags;
 
 use crate::error::{Error, Result};
-use crate::options::{MountOptions, OverlayVerity, check_mode, verity_for};
+use crate::options::{MountOptions, Verity, check_mode, verity_for};
 use crate::sys::{IMAGE_BLOCK, Plan, mount_tree, unmount_overlay};
 
 /// The source label of a mount of an image of the caller, if the options
@@ -33,17 +33,17 @@ pub struct Direct {
 }
 
 /// The values that each mount of a repository takes from it.
-pub(crate) struct RepoPlan {
+struct RepoPlan {
     /// The `verity` option of the composefs overlay.
-    pub(crate) verity: OverlayVerity,
+    verity: Verity,
     /// The verity policy of a built image.
-    pub(crate) build: VerityPolicy,
+    build: VerityPolicy,
 }
 
 impl RepoPlan {
     /// Refuses a repository that cannot be mounted, and reads the verity
     /// choice from its config.
-    pub(crate) fn new(repo: &Repo) -> Result<RepoPlan> {
+    fn new(repo: &Repo) -> Result<RepoPlan> {
         check_mode(repo.mode())?;
         let (verity, policy) = verity_for(repo.config().fsverity()?);
         Ok(RepoPlan {
@@ -239,7 +239,7 @@ impl Direct {
 /// The build refuses an image larger than `max_size` bytes before it writes
 /// a byte. Under [`VerityPolicy::Computed`], it takes the digest of each
 /// backing object from the kernel, and refuses an object with no seal.
-pub(crate) async fn build_image(
+async fn build_image(
     repo: &Repo,
     commit: &Checksum,
     repo_plan: &RepoPlan,

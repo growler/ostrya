@@ -229,12 +229,10 @@ jobs:
           cargo check -p ostrya-cli --no-default-features --features smol,serve
 
       # The composefs mount library compiles on the smol backend with its own
-      # feature set, with and without the handler of the mount daemon, and so
-      # does the daemon.
+      # feature set, and so does the mount daemon.
       - name: ostrya-mount on the smol backend compiles
         run: |
           cargo check -p ostrya-mount --no-default-features --features smol
-          cargo check -p ostrya-mount --no-default-features --features smol,server
           cargo check -p ostrya-mountd --no-default-features --features smol
 
       # `Repo::send` takes no feature of `ostrya`, so `ostrya send` compiles
@@ -338,15 +336,15 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive`, the `push`, and the `s3` features, and so does
-      # a tokio build of `ostrya-server`, of `ostrya-mount` with and without
-      # `server`, and of `ostrya-mountd`. `ostrya-remote` is a regular dependency of
+      # a tokio build of `ostrya-server`, of `ostrya-mount`, and of
+      # `ostrya-mountd`. `ostrya-remote` is a regular dependency of
       # `ostrya`, so each of these builds holds it. This fails when one path
       # turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mountd:tokio; do
             package=${build%%:*}
             features=${build#*:}
             if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

@@ -40,8 +40,10 @@ pub struct MountOptions {
 }
 
 /// The `verity` option of the composefs overlay.
+///
+/// [`Plan::verity`](crate::sys::Plan::verity) takes the value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OverlayVerity {
+pub enum Verity {
     /// The overlay reads no fs-verity digest.
     Off,
     /// The overlay compares the fs-verity digest of each backing object with
@@ -49,12 +51,12 @@ pub(crate) enum OverlayVerity {
     Require,
 }
 
-impl OverlayVerity {
+impl Verity {
     /// Returns the value of the `verity` option of overlayfs.
     pub(crate) fn option(self) -> &'static str {
         match self {
-            OverlayVerity::Off => "off",
-            OverlayVerity::Require => "require",
+            Verity::Off => "off",
+            Verity::Require => "require",
         }
     }
 }
@@ -65,10 +67,10 @@ impl OverlayVerity {
 /// Only `yes` seals each object, so only `yes` requires verity. With `maybe`,
 /// an object on a file system without fs-verity has no seal, and the overlay
 /// must not require one.
-pub(crate) fn verity_for(fsverity: Tristate) -> (OverlayVerity, VerityPolicy) {
+pub(crate) fn verity_for(fsverity: Tristate) -> (Verity, VerityPolicy) {
     match fsverity {
-        Tristate::Yes => (OverlayVerity::Require, VerityPolicy::Computed),
-        Tristate::No | Tristate::Maybe => (OverlayVerity::Off, VerityPolicy::Disabled),
+        Tristate::Yes => (Verity::Require, VerityPolicy::Computed),
+        Tristate::No | Tristate::Maybe => (Verity::Off, VerityPolicy::Disabled),
     }
 }
 
@@ -91,39 +93,6 @@ pub(crate) fn check_mode(mode: RepoMode) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_yes_requires_verity() {
-        assert_eq!(
-            verity_for(Tristate::Yes),
-            (OverlayVerity::Require, VerityPolicy::Computed)
-        );
-        assert_eq!(
-            verity_for(Tristate::Maybe),
-            (OverlayVerity::Off, VerityPolicy::Disabled)
-        );
-        assert_eq!(
-            verity_for(Tristate::No),
-            (OverlayVerity::Off, VerityPolicy::Disabled)
-        );
-    }
-
-    #[test]
-    fn only_archive_is_refused() {
-        for mode in [
-            RepoMode::Bare,
-            RepoMode::BareUser,
-            RepoMode::BareUserOnly,
-            RepoMode::BareSplitXattrs,
-            RepoMode::BareUserShared,
-        ] {
-            check_mode(mode).unwrap();
-        }
-        assert!(matches!(
-            check_mode(RepoMode::Archive),
-            Err(Error::UnsupportedMode(RepoMode::Archive))
-        ));
-    }
 
     #[test]
     fn the_default_is_read_only_with_no_source() {

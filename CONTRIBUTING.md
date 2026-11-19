@@ -40,11 +40,11 @@ user namespaces for an unprivileged user. They run each client as the user
 65534 in its own user namespace, and keep their repositories and targets in
 `/var/tmp`, where that user can reach them.
 
-The unit tests of the protocol and of the daemon handler in `ostrya-mount`
-need the `server` feature:
+The unit tests of the protocol are in `ostrya-mount`, and the unit tests of
+the daemon handler are in `ostrya-mountd`. They need no privilege:
 
 ```sh
-cargo test -p ostrya-mount --features server
+cargo test -p ostrya-mount -p ostrya-mountd
 ```
 
 The test `exports_onto_vfat_and_exfat` in

@@ -185,6 +185,28 @@ impl Helper {
         ostrya_rt::unblock(move || unmount_overlay(&target)).await
     }
 
+    /// Runs the exchange of `request` on the connected socket `sock`: the
+    /// hello, the request with the namespaces of the client, and the reply.
+    ///
+    /// `sock` is a `SOCK_SEQPACKET` socket whose peer speaks the protocol of
+    /// the daemon. The call blocks the calling thread, and it does not close
+    /// the socket. The mount calls of the client connect to [`Helper::socket`]
+    /// and run this exchange.
+    ///
+    /// Returns the descriptor of the root of the mount that the peer sends.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRequest`] if a path of `request` is longer than 4096
+    ///   bytes, or if its source label is longer than 255 bytes.
+    /// - [`Error::Helper`] with the refusal or the failure that the peer
+    ///   reports, or if a reply breaks the protocol.
+    /// - [`Error::Sys`] if a send or a receive on the socket fails.
+    pub fn exchange(&self, sock: BorrowedFd<'_>, request: &Request) -> Result<OwnedFd> {
+        let bytes = request.encode().map_err(Error::InvalidRequest)?;
+        exchange(sock, &bytes, self.userns.as_fd(), self.mntns.as_fd())
+    }
+
     /// Sends one request and returns the root of the mount.
     async fn request(
         &self,
@@ -267,7 +289,7 @@ fn connect_to(path: &Path) -> Result<OwnedFd> {
 
 /// Runs the exchange of one request on the connected socket `sock`: the
 /// hello, the request `request` with the namespaces, and the reply.
-pub(crate) fn exchange(
+fn exchange(
     sock: BorrowedFd<'_>,
     request: &[u8],
     userns: BorrowedFd<'_>,

@@ -272,7 +272,6 @@ _GATES_STEPS = r"""
     STEP
     step "ostrya-mount on the smol backend compiles" <<'STEP'
     cargo check -p ostrya-mount --no-default-features --features smol
-    cargo check -p ostrya-mount --no-default-features --features smol,server
     cargo check -p ostrya-mountd --no-default-features --features smol
     STEP
     step "ostrya send without the push features compiles" <<'STEP'
@@ -332,7 +331,7 @@ _GATES_STEPS = r"""
     done
     STEP
     step "A tokio build holds no smol" <<'STEP'
-    for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
+    for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mountd:tokio; do
       package=${build%%:*}
       features=${build#*:}
       if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

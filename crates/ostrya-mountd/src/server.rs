@@ -1,9 +1,6 @@
 //! The mount daemon: the handler of one connection, and the worker process
 //! of one request.
 //!
-//! `ostrya-mountd` is the one user of this module. Its items are not a
-//! stable API.
-//!
 //! The handler runs in the daemon process, on the runtime. It reads the
 //! request, checks the namespaces, opens the repository, checks or builds
 //! the image, and mounts the EROFS layer and the composefs overlay in the
@@ -34,6 +31,15 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 
 use ostrya::Repo;
+use ostrya_mount::proto::{
+    self, Failure, KIND_ERROR, KIND_HELLO, KIND_HELLO_REPLY, KIND_MOUNTED, MAX_ERROR, MAX_REQUEST,
+    Message, Op, REQUEST_FDS, Request, VERSION, WireError,
+};
+use ostrya_mount::sys::{
+    LayerRef, Layout, OVERLAYFS_SUPER_MAGIC, Plan, UpperOptions, mount_composefs, move_onto,
+    open_dir, top_overlay,
+};
+use ostrya_mount::{Access, Error, HelperCode};
 use rustix::fs::{
     AtFlags, CWD, Mode, OFlags, StatxAttributes, StatxFlags, fstat, fstatfs, openat, statx,
 };
@@ -46,17 +52,7 @@ use rustix::thread::{
     set_thread_res_uid,
 };
 
-use crate::direct::{RepoPlan, build_image};
-use crate::error::{Error, HelperCode};
-use crate::options::Access;
-use crate::proto::{
-    self, Failure, KIND_ERROR, KIND_HELLO, KIND_HELLO_REPLY, KIND_MOUNTED, MAX_ERROR, MAX_REQUEST,
-    Message, Op, REQUEST_FDS, Request, VERSION, WireError,
-};
-use crate::sys::{
-    LayerRef, Layout, OVERLAYFS_SUPER_MAGIC, Plan, UpperOptions, build_composefs, move_onto,
-    open_dir, top_overlay,
-};
+use crate::repo::{self, RepoPlan, build_image};
 
 /// The time that one connection can take, from the accept to the reply. The
 /// time covers the messages of the client, the worker process, and the work
@@ -407,7 +403,7 @@ async fn build(
     // symlink, a FIFO, and a device in place of a file that the daemon reads.
     let repo = Repo::open_at_strict(repo_fd.as_fd(), Path::new("."))
         .await
-        .map_err(|e| failure_of(Error::Repo(e)))?;
+        .map_err(|e| failure_of(e.into()))?;
     let same = dev_ino(repo.objects_dir())
         .and_then(|a| dev_ino(&objects).map(|b| a == b))
         .map_err(|e| Failure::sys(HelperCode::Internal, "fstat objects", e))?;
@@ -423,7 +419,7 @@ async fn build(
         Op::Stored => repo
             .open_composefs_image_checked(&request.commit)
             .await
-            .map_err(|e| failure_of(Error::Repo(e)))?
+            .map_err(|e| failure_of(e.into()))?
             .0
             .into(),
         Op::Built => build_image(&repo, &request.commit, &repo_plan, max_image_size)
@@ -437,9 +433,9 @@ async fn build(
         attrs: DAEMON_ATTRS,
         idmap: Some(idmap),
     };
-    ostrya_rt::unblock(move || build_composefs(image, objects.as_fd(), &plan))
+    ostrya_rt::unblock(move || mount_composefs(image, objects.as_fd(), &plan))
         .await
-        .map_err(failure_of)
+        .map_err(step_failure)
 }
 
 /// Reads the credentials of the peer of `conn`, the hello, and the request.
@@ -723,20 +719,21 @@ fn worker(chan: BorrowedFd<'_>) -> Result<(), WorkerExit> {
     })?;
     let layout = match request.access {
         Access::ReadOnly => None,
-        Access::ReadWrite => Some(Layout::ensure(target.as_fd()).map_err(failure_of)?),
+        Access::ReadWrite => Some(Layout::ensure(target.as_fd()).map_err(step_failure)?),
     };
     let opts = UpperOptions {
         userxattr: true,
         attrs: DAEMON_ATTRS,
         layers: LayerRef::Fd,
     };
-    let top = top_overlay(composefs.as_fd(), layout.as_ref(), &label, opts).map_err(failure_of)?;
+    let top =
+        top_overlay(composefs.as_fd(), layout.as_ref(), &label, opts).map_err(step_failure)?;
     drop(composefs);
     // The descriptor of the root stays valid when the mount moves, so it is
     // opened before the move, and no step can fail after it.
     let root =
         open_dir(&top, ".").map_err(|e| Failure::sys(HelperCode::Mount, "open mount root", e))?;
-    move_onto(top, target.as_fd()).map_err(failure_of)?;
+    move_onto(top, target.as_fd()).map_err(step_failure)?;
     proto::send(chan, &[KIND_ROOT], &[root.as_fd()]).map_err(abort_or_failure)?;
     Ok(())
 }
@@ -1036,33 +1033,42 @@ fn errno_of(e: &std::io::Error) -> Errno {
     Errno::from_io_error(e).unwrap_or(Errno::IO)
 }
 
-/// Returns the failure that the daemon reports for the error `e` of a
-/// mount step or of the repository.
+/// Returns the failure that the daemon reports for the error `e` of a read
+/// of the repository.
 ///
 /// The failure of a stored image whose fs-verity digest is not the key of
 /// its commit names the commit and neither digest.
-fn failure_of(e: Error) -> Failure {
-    if let Error::Repo(ostrya::Error::ComposefsDigestMismatch { commit, .. }) = &e {
-        return Failure::new(
+fn failure_of(e: repo::Error) -> Failure {
+    match e {
+        repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch { commit, .. }) => Failure::new(
             HelperCode::Repository,
             format!("the stored composefs image of commit {commit} does not match its key"),
-        );
+        ),
+        repo::Error::Sys { op, errno } => Failure::sys(HelperCode::Mount, op, errno),
+        other => Failure::new(HelperCode::Repository, other.to_string()),
     }
-    let code = match &e {
+}
+
+/// Returns the failure that the daemon reports for the error `e` of a mount
+/// step.
+///
+/// The text of a failed system call has no hint about the privilege of the
+/// process, because the steps of the daemon run with other privileges than
+/// a direct mount.
+fn step_failure(e: Error) -> Failure {
+    match e {
+        Error::Sys { op, errno, log } => Failure {
+            code: HelperCode::Mount,
+            errno: errno.raw_os_error(),
+            text: match log {
+                Some(log) => format!("{op}: {errno}: {log}"),
+                None => format!("{op}: {errno}"),
+            },
+        },
         Error::Repo(_) | Error::UnsupportedMode(_) | Error::InvalidImage(_) => {
-            HelperCode::Repository
+            Failure::new(HelperCode::Repository, e.to_string())
         }
-        Error::Sys { .. } => HelperCode::Mount,
-        _ => HelperCode::Internal,
-    };
-    let errno = match &e {
-        Error::Sys { errno, .. } => errno.raw_os_error(),
-        _ => 0,
-    };
-    Failure {
-        code,
-        errno,
-        text: e.plain_text(),
+        other => Failure::new(HelperCode::Internal, other.to_string()),
     }
 }
 
@@ -1099,7 +1105,7 @@ mod tests {
 
     use rustix::fs::{CWD, Mode, OFlags, openat};
 
-    use crate::helper::exchange;
+    use ostrya_mount::Helper;
 
     fn own_ns(name: &str) -> OwnedFd {
         openat(
@@ -1147,12 +1153,7 @@ mod tests {
     #[test]
     fn a_request_from_the_initial_user_namespace_is_refused() {
         let (result, served) = with_server(|sock| {
-            exchange(
-                sock,
-                &request().encode().unwrap(),
-                own_ns("user").as_fd(),
-                own_ns("mnt").as_fd(),
-            )
+            Helper::with_namespaces(own_ns("user"), own_ns("mnt")).exchange(sock, &request())
         });
         let err = result.unwrap_err();
         match &err {
@@ -1169,12 +1170,7 @@ mod tests {
     #[test]
     fn swapped_namespaces_are_refused() {
         let (result, _) = with_server(|sock| {
-            exchange(
-                sock,
-                &request().encode().unwrap(),
-                own_ns("mnt").as_fd(),
-                own_ns("user").as_fd(),
-            )
+            Helper::with_namespaces(own_ns("mnt"), own_ns("user")).exchange(sock, &request())
         });
         let err = result.unwrap_err();
         assert!(
@@ -1229,6 +1225,102 @@ mod tests {
             Failure::decode(&reply.bytes).unwrap()
         });
         assert_eq!(failure.code, HelperCode::Protocol);
+    }
+
+    #[test]
+    fn each_error_gives_its_class_its_errno_and_its_text() {
+        let commit = ostrya::Checksum::from_bytes([3; 32]);
+        let mismatch = failure_of(repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch {
+            commit,
+            expected: [1; 32],
+            actual: [2; 32],
+        }));
+        assert_eq!(
+            mismatch,
+            Failure::new(
+                HelperCode::Repository,
+                format!("the stored composefs image of commit {commit} does not match its key"),
+            )
+        );
+
+        let absent = ostrya::Error::ComposefsImageNotFound { commit };
+        let text = absent.to_string();
+        assert_eq!(
+            failure_of(absent.into()),
+            Failure::new(HelperCode::Repository, text)
+        );
+
+        assert_eq!(
+            failure_of(repo::Error::UnsupportedMode(ostrya::RepoMode::Archive)),
+            Failure::new(
+                HelperCode::Repository,
+                "a repository of the mode archive-z2 cannot be mounted",
+            )
+        );
+
+        assert_eq!(
+            failure_of(repo::Error::Sys {
+                op: "memfd_create",
+                errno: Errno::NOMEM,
+            }),
+            Failure {
+                code: HelperCode::Mount,
+                errno: Errno::NOMEM.raw_os_error(),
+                text: format!("memfd_create: {}", Errno::NOMEM),
+            }
+        );
+
+        assert_eq!(
+            step_failure(Error::Sys {
+                op: "fsopen erofs",
+                errno: Errno::PERM,
+                log: None,
+            }),
+            Failure {
+                code: HelperCode::Mount,
+                errno: Errno::PERM.raw_os_error(),
+                text: format!("fsopen erofs: {}", Errno::PERM),
+            }
+        );
+        assert_eq!(
+            step_failure(Error::Sys {
+                op: "fsconfig overlay",
+                errno: Errno::INVAL,
+                log: Some("e overlay: Unknown parameter".to_owned()),
+            }),
+            Failure {
+                code: HelperCode::Mount,
+                errno: Errno::INVAL.raw_os_error(),
+                text: format!(
+                    "fsconfig overlay: {}: e overlay: Unknown parameter",
+                    Errno::INVAL
+                ),
+            }
+        );
+        assert_eq!(
+            step_failure(Error::InvalidImage("empty".to_owned())),
+            Failure::new(HelperCode::Repository, "invalid image: empty")
+        );
+        let absent = ostrya::Error::ComposefsImageNotFound { commit };
+        let text = absent.to_string();
+        assert_eq!(
+            step_failure(Error::Repo(absent)),
+            Failure::new(HelperCode::Repository, text)
+        );
+        assert_eq!(
+            step_failure(Error::UnsupportedMode(ostrya::RepoMode::Archive)),
+            Failure::new(
+                HelperCode::Repository,
+                "a repository of the mode archive-z2 cannot be mounted",
+            )
+        );
+        assert_eq!(
+            step_failure(Error::NotOverlayMount(PathBuf::from("/mnt"))),
+            Failure::new(
+                HelperCode::Internal,
+                "/mnt is not the root of an overlay mount"
+            )
+        );
     }
 
     #[test]

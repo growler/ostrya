@@ -3374,6 +3374,7 @@ The part holds these items:
 - the credential file of a push over HTTP;
 - the ssh transport;
 - the commit of `push-tree`;
+- the composefs image commit;
 - the composefs image store;
 - the protocol of the composefs mount daemon;
 - the mode `bare-user-shared`;
@@ -7405,6 +7406,101 @@ collection id on either side, both checksums are equal. The checks cover
 and next to `-m`, an explicit `--timestamp`, a second push onto the same
 branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
 `--orphan` on a new branch against `--parent=none`.
+
+## The composefs image commit
+
+A commit of the port can name a second commit that holds the composefs image
+of its tree. This document calls the first commit A and the second commit C,
+the image commit. The tool writes no image commit, and it reads C as a usual
+commit. A run of the library calls
+`Transaction::write_composefs_commit` and `Repo::open_composefs_image`, and a
+check of the objects, can verify each fact below.
+
+The shape of C:
+
+- The root directory holds one entry, the regular file `root.cfs`. Its
+  content is the image that an export of the tree with the verity digests of
+  the files writes ("composefs").
+- The file object of `root.cfs` has the owner `0:0`, the mode `0100400`, and
+  no extended attributes. In `archive` mode it is a `.filez` object, and in
+  each other mode it is a loose `.file` object with the raw image.
+- The root dirmeta has the owner `0:0`, the mode `040755`, and no extended
+  attributes.
+- The commit has the subject `composefs image`, an empty body, the
+  timestamp 0, and no parent. Its metadata dict is empty: it holds no
+  `ostree.composefs.digest.v0` and no `ostree.sizes`. Field 2 is empty, and
+  the write adds no detached metadata.
+- The shape is fixed, so the same image gives the same C, in each
+  transaction.
+- The write streams the image to an unnamed temp file in the staging
+  directory, and then streams that file into the content object. The content
+  object gets the seal, the compression, and the sync of the repository mode.
+
+The names:
+
+- A names C by the name `composefs`, as the attachment `composefs` in field 2
+  ("Related commits"), as the supplement `composefs` in `ostrya.related`, or
+  as both.
+- If A has both, the attachment wins.
+- Each transfer that carries the attachments of a commit carries the
+  attachment `composefs` and C with it. No transfer follows a supplement, so
+  the supplement `composefs` is local to a repository.
+
+The key `ostree.composefs.digest.v0` of A records the fs-verity digest of the
+image that A mounts with. That image can hold labels or other metadata that a
+build of the tree of A does not give. The port trusts the key. No path of the
+port builds an image to check the key of A. The lookup compares the key with
+the digest of `/root.cfs` alone.
+
+The lookup of the image of A:
+
+1. The lookup refuses an `archive` repository before it reads a file. The
+   repository stores `/root.cfs` compressed, and a mount needs the raw
+   image.
+2. It reads the commit object of A and each entry of field 2. A defective
+   entry fails the lookup, also if its name is not `composefs`. Two entries
+   with the name `composefs` fail the lookup.
+3. If field 2 has the entry `composefs`, C is that entry. The lookup does not
+   read the `.commitmeta` of A.
+4. Else the lookup reads the `.commitmeta` of A and each entry of
+   `ostrya.related`, with the same rules. If the key has the entry
+   `composefs`, C is that entry.
+5. Else A names no image commit, and the lookup gives no image.
+6. The lookup reads the key of A only if A names C. It does not check the
+   state of A, so a partial A gives its image.
+7. It checks C in this order. Each failure is an error that names A, the
+   source, C, and the defect, and the lookup does not try the other source:
+   - The repository holds C. The text of the defect is
+     `which the repository does not hold`.
+   - The repository does not mark C partial: `which is partial`.
+   - The root directory holds the entry `root.cfs`:
+     `whose tree holds no /root.cfs`.
+   - The entry `root.cfs` is not a directory:
+     `whose /root.cfs is not a regular file`.
+   - The root directory holds no other entry:
+     `whose tree holds the entry NAME next to /root.cfs`.
+   - The file object of `root.cfs` is not a symlink:
+     `whose /root.cfs is not a regular file`.
+   - If A has the key, the fs-verity digest of `/root.cfs` is the value of
+     the key: `whose /root.cfs has the fs-verity digest ACTUAL, and the
+     commit records EXPECTED`.
+8. If the repository holds C complete and does not hold the root dirtree of
+   C or the file object of `root.cfs`, the lookup fails with the error of the
+   read.
+
+The full text of a refusal is
+`composefs image of commit A: SOURCE composefs names commit C, DEFECT`, where
+`SOURCE` is `attachment` or `supplement`.
+
+The lookup does not check the owners, the modes, or the extended attributes
+of C. If A has no key, the lookup gives `/root.cfs` with no check of its
+content.
+
+The digest of `/root.cfs` comes from the kernel if the file is sealed with
+fs-verity with SHA-256, 4096-byte blocks, no salt, and its full size. Else the
+lookup streams the file through the fs-verity hasher in chunks of 128 KiB.
+The lookup measures the digest through the descriptor that it gives, at
+offset 0.
 
 ## The composefs image store
 

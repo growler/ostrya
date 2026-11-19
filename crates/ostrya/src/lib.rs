@@ -89,6 +89,7 @@ pub mod fsck;
 #[cfg(feature = "verify-gpg")]
 pub mod gpg;
 mod hashing;
+mod image_commit;
 mod image_store;
 mod inflate;
 mod ingest;
@@ -190,6 +191,9 @@ pub use gpg::GpgSigner;
 #[doc(hidden)]
 pub use gpg::{FromOstreeKeyrings, GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
+pub use image_commit::{
+    COMPOSEFS_RELATION, ComposefsImage, ComposefsImageDefect, ComposefsImageSource,
+};
 pub use lock::LockKind;
 #[doc(hidden)]
 pub use media::{

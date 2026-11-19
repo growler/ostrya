@@ -655,6 +655,25 @@ pub enum Error {
         /// The fs-verity digest of the image.
         actual: [u8; 32],
     },
+    /// A composefs image commit that a commit names and that has a defect.
+    ///
+    /// [`Repo::open_composefs_image`](crate::Repo::open_composefs_image)
+    /// gives this error. It does not try the next source.
+    #[error(
+        "composefs image of commit {commit}: {relation} {} names commit {image}, {defect}",
+        crate::COMPOSEFS_RELATION
+    )]
+    InvalidComposefsImage {
+        /// The commit that names the image commit.
+        commit: Checksum,
+        /// The field of `commit` that names the image commit.
+        relation: crate::ComposefsImageSource,
+        /// The checksum of the image commit.
+        image: Checksum,
+        /// The defect of the image commit. The box keeps the size of
+        /// `Error` small.
+        defect: Box<crate::ComposefsImageDefect>,
+    },
     /// A commit whose composefs image the repository does not hold.
     ///
     /// The image is the file

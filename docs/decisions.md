@@ -897,6 +897,81 @@ Rejected alternatives:
   `ostrya::Transaction::build_composefs_image`, which writes an image. The
   function mounts an image.
 
+## The composefs image commit
+
+The composefs image of a commit A can be a second commit C, the image
+commit (`format-reference.md`, "The composefs image commit"). The tree of C
+holds one file, `/root.cfs`, which is the EROFS image. The file is
+`root:root` with the mode `0400`. The root directory is `root:root 0755`
+with no extended attributes. C has the subject "composefs image", the
+timestamp 0, no parent, and no metadata key, so it carries no
+`ostree.composefs.digest.v0`. The shape is fixed, so the same image gives
+the same C. C is a usual commit, so the `ostree` command reads it, and each
+transfer of the port carries it as it carries other commits.
+
+The names:
+
+- A names C as the attachment `composefs` in field 2, as the supplement
+  `composefs` in `ostrya.related`, or as both. If A has both, the attachment
+  wins. The commit checksum of A covers the attachment, and the supplement
+  is a local cache that a repository adds after the commit.
+- An attachment goes with each transfer that carries attachments, so C goes
+  with A. No transfer follows a supplement, so the supplement stays in the
+  repository that added it.
+
+The key:
+
+- `ostree.composefs.digest.v0` stays on A. It records the fs-verity digest of
+  the image that A mounts with. That image can hold labels that the port
+  cannot reproduce from the tree.
+- The port trusts the key. The lookup builds no image to check the key of a
+  commit, because a check by a build refuses each labeled image. The one
+  check is the comparison of the key with the digest of a `/root.cfs`.
+
+The lookup of the image of A:
+
+1. If A has the attachment `composefs`, C must be held and complete, and its
+   tree must hold `/root.cfs` as a regular file and no other entry. If A has
+   the key, the fs-verity digest of `/root.cfs` must be the key. Each
+   failure is an error, and the lookup does not try the supplement.
+2. Else, if A has the supplement `composefs`, the same rules apply, and each
+   failure is an error.
+3. Else the lookup gives no image.
+
+A bad attachment or supplement is damage or a change from outside the port.
+A fallback to the next source gives an image that A does not name, so the
+lookup stops. If A has no key, the lookup gives `/root.cfs` with no check.
+The digest comes from the kernel if the file is sealed, and else from a hash
+of the file. The lookup does not check the owners, the modes, or the
+extended attributes of C, because a caller reads the image through the
+descriptor that the lookup gives. The lookup refuses an `archive`
+repository, because the repository stores `/root.cfs` compressed and a
+mount needs the raw image.
+
+The library surface, in `ostrya`:
+
+- `Transaction::write_composefs_content` stages the image of a tree as a
+  content object, and returns its checksum and the digest of the image. The
+  owner, the mode, and the extended attributes of the object come from the
+  caller.
+- `Transaction::write_composefs_commit` writes C and returns the checksum of
+  C and the digest of the image. The shape of C is in this one call. The
+  call accepts an `archive` repository, where `/root.cfs` is a `.filez`
+  object, so a server repository in `archive` mode can hold C and send it
+  to its clients.
+- `Repo::open_composefs_image` is the one lookup call. It gives the open
+  file of `/root.cfs`, its size, its source, and the checksum of C, or no
+  image. It reads the repository through `repo_fs`.
+- A defect of C is `Error::InvalidComposefsImage`, with A, the source, C,
+  and a `ComposefsImageDefect`.
+
+Rejected alternatives:
+
+- The lookup checks the key with a build of the image of the tree of A. The
+  build cannot reproduce a labeled image.
+- The lookup tries the supplement when the attachment is bad. It then gives
+  an image that A does not name.
+
 ## The spki sign engine
 
 The spki engine is pure Rust. It has four key types: ECDSA on NIST P-256

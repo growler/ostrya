@@ -8,6 +8,11 @@
 //!   the image digest under `ostree.composefs.digest.v0`.
 //! - [`Transaction::composefs_digest`] returns the image digest of a staged
 //!   tree.
+//! - [`Transaction::write_composefs_content`] stages the image of a staged
+//!   tree as a regular content object.
+//! - [`Transaction::write_composefs_commit`] stages the composefs image commit
+//!   of a staged tree, and [`Repo::open_composefs_image`] opens the image of
+//!   the image commit that a commit names.
 //!
 //! [`ComposefsOptions`] and [`VerityPolicy`] select the verity form of the
 //! image.
@@ -61,7 +66,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::io::BufWriter;
+use std::io::{BufWriter, Seek, SeekFrom};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -73,6 +78,7 @@ use ostrya_composefs::{
 use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
 };
+use ostrya_rt::FileReader;
 
 use crate::commit::append_dict_entry;
 use crate::error::{Error, Result};
@@ -81,9 +87,10 @@ use crate::image_store;
 use crate::read::CommitState;
 use crate::related::{self, RelationField};
 use crate::repo::Repo;
+use crate::repo_fs::{RepoDir, TempFile};
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
-use crate::write::{ImageTemp, link_image_blocking, write_image_temp_blocking};
+use crate::write::{FileMeta, ImageTemp, link_image_blocking, write_image_temp_blocking};
 
 /// The empty top-level directories that the `ostree` command adds to each
 /// exported image.
@@ -401,6 +408,70 @@ impl Transaction {
         )
         .await?;
         image_digest(dir).await
+    }
+
+    /// Writes the composefs image of a tree that this transaction staged as a
+    /// regular content object.
+    ///
+    /// The call returns the checksum of the content object and the fs-verity
+    /// digest of the image. The image is the image that an export with `opts`
+    /// writes for the same tree ([`Repo::export_composefs`]). The call reads
+    /// the objects of the tree as
+    /// [`composefs_digest`](Transaction::composefs_digest) reads them.
+    ///
+    /// `meta` is the owner, the mode, and the xattrs of the content object.
+    /// The caller sets them.
+    ///
+    /// The call writes the image in two steps, and each step holds no
+    /// image-sized buffer:
+    ///
+    /// 1. On the blocking pool, the writer writes the image to an unnamed temp
+    ///    file of the staging directory and computes the fs-verity digest as
+    ///    it writes. The call does not seal and does not sync this file.
+    /// 2. The call streams the temp file into a content object with
+    ///    [`write_content`](Transaction::write_content). The content writer
+    ///    applies the form of the repository mode, the fs-verity seal, and
+    ///    the sync of the transaction, and counts the object in the
+    ///    free-space budget.
+    ///
+    /// The image therefore goes to disk two times. The temp file goes away
+    /// when the call returns. In an `archive` repository, the content object
+    /// is a `.filez` object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    ///   The call refuses this mode before it reads the tree.
+    /// - The errors of [`composefs_digest`](Transaction::composefs_digest).
+    /// - The errors of [`write_content`](Transaction::write_content).
+    /// - [`Error::Io`] if the create of the temp file, a write to it, or a
+    ///   read from it fails.
+    pub async fn write_composefs_content(
+        &self,
+        root: &RepoTree,
+        opts: &ComposefsOptions,
+        meta: &FileMeta,
+    ) -> Result<(Checksum, [u8; 32])> {
+        if self.repo().mode() == RepoMode::BareSplitXattrs {
+            return Err(Error::Unsupported(
+                "bare-split-xattrs is read-only; the port does not write it".into(),
+            ));
+        }
+        let dir = composefs_model(
+            ObjectSource::Staged(self),
+            root,
+            opts.verity.into(),
+            &mut VerityCache::default(),
+        )
+        .await?;
+        let staging = self.staging_dir().clone();
+        let (file, size, digest) = self
+            .unblock(move || write_scratch_image_blocking(&staging, &dir))
+            .await?;
+        let checksum = self
+            .write_content(None, meta, FileReader::with_len_hint(file, size))
+            .await?;
+        Ok((checksum, digest))
     }
 
     /// Writes the composefs image of a tree to the staging directory of this
@@ -1494,6 +1565,26 @@ async fn composefs_model(
 fn write_image_to_fd(dir: &Directory, fd: OwnedFd) -> std::result::Result<[u8; 32], WriterError> {
     let mut out = BufWriter::with_capacity(DIGEST_CHUNK, std::fs::File::from(fd));
     write_image_to(dir, &mut out)
+}
+
+/// Writes the image of `dir` to an unnamed temp file of the staging directory
+/// `staging`, and returns the file at offset 0, its size in bytes, and the
+/// fs-verity digest of the image.
+///
+/// The writer computes the digest as it writes through a buffer of 128 KiB,
+/// so no step holds the whole image. The function sets no mode, does not sync
+/// the file, and does not seal it. The file goes away when it closes.
+fn write_scratch_image_blocking(
+    staging: &RepoDir,
+    dir: &Directory,
+) -> Result<(std::fs::File, u64, [u8; 32])> {
+    let mut file = TempFile::create(staging)?.into_file()?;
+    let mut out = BufWriter::with_capacity(DIGEST_CHUNK, &mut file);
+    let digest = write_image_to(dir, &mut out).map_err(writer_error)?;
+    out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+    let size = crate::repo_fs::stat_fd(file.as_fd())?.size;
+    file.seek(SeekFrom::Start(0))?;
+    Ok((file, size, digest))
 }
 
 /// Returns the fs-verity digest of the image of `dir`, for a caller that needs

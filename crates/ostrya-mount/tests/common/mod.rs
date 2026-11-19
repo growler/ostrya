@@ -4,14 +4,15 @@
 
 #![allow(dead_code)]
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya::{
-    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Repo, RepoMode, Type,
-    Value,
+    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Repo, RepoMode,
+    Tristate, Type, Value, VerityPolicy,
 };
+use ostrya_mount::Verity;
 use rustix::fs::{CWD, Mode, OFlags};
 use rustix::mount::{FsOpenFlags, UnmountFlags};
 
@@ -187,7 +188,6 @@ fn key_dict(digest: &[u8; 32]) -> Value {
 /// Commits `base/src` to `repo` at `timestamp`.
 ///
 /// - [`Key::None`]: the commit has no image key.
-/// - [`Key::Only`]: the commit has the key and the repository holds no image.
 /// - [`Key::Image`]: the commit has the key, and the transaction stores the
 ///   image.
 pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> Checksum {
@@ -201,13 +201,9 @@ pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> 
     let commit = {
         let staged = match key {
             Key::Image => Some(txn.build_composefs_image(&root).await.unwrap()),
-            Key::None | Key::Only => None,
+            Key::None => None,
         };
-        let metadata = match (&staged, key) {
-            (Some(staged), _) => Some(key_dict(staged.digest())),
-            (None, Key::Only) => Some(key_dict(&txn.composefs_digest(&root).await.unwrap())),
-            (None, _) => None,
-        };
+        let metadata = staged.as_ref().map(|staged| key_dict(staged.digest()));
         let opts = CommitOptions {
             subject: Some("mount tree".to_owned()),
             timestamp: Some(timestamp),
@@ -230,10 +226,43 @@ pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> 
 pub enum Key {
     /// No key and no image.
     None,
-    /// The key and no stored image.
-    Only,
     /// The key and the stored image.
     Image,
+}
+
+/// Returns the `verity` option of a mount of `repo` and the verity policy of
+/// an image that a test builds for it. Only `[ex-integrity] fsverity=yes`
+/// requires verity.
+pub fn verity_of(repo: &Repo) -> (Verity, VerityPolicy) {
+    match repo.config().fsverity().unwrap() {
+        Tristate::Yes => (Verity::Require, VerityPolicy::Computed),
+        Tristate::No | Tristate::Maybe => (Verity::Off, VerityPolicy::Disabled),
+    }
+}
+
+/// Opens the stored image of `commit`, after the check of its digest against
+/// the key of the commit.
+pub async fn stored_image(repo: &Repo, commit: &Checksum) -> OwnedFd {
+    let (image, _) = repo.open_composefs_image_checked(commit).await.unwrap();
+    image.into()
+}
+
+/// Returns the name of the memory file that [`built_image`] makes for
+/// `commit`.
+pub fn memfd_name(commit: &Checksum) -> String {
+    format!("ostrya-mount-test-{commit}")
+}
+
+/// Builds the image of `commit` into a sealed memory file, with the verity
+/// policy that [`verity_of`] gives for `repo`.
+pub async fn built_image(repo: &Repo, commit: &Checksum) -> OwnedFd {
+    let (_, policy) = verity_of(repo);
+    let image = ostrya_sys::sealable_memfd(&memfd_name(commit)).unwrap();
+    repo.export_composefs_for_mount(commit, policy, image.as_fd(), u64::MAX)
+        .await
+        .unwrap();
+    ostrya_sys::seal_contents(&image).unwrap();
+    image
 }
 
 /// One entry of a walked tree.

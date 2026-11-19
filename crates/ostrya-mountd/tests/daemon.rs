@@ -21,6 +21,8 @@
 //! - A request from the initial user namespace is refused.
 //! - An `objects` directory that is a mount of its own is refused.
 //! - A built image over the size limit of the daemon is refused.
+//! - A request for a stored and for a built image of an `archive`
+//!   repository is refused with the class `repository`.
 //! - A symlink at each component of the path of a stored image, at the
 //!   fan-out directory of the commit for a stored image, and at the fan-out
 //!   directory of a commit, a dirtree, a dirmeta, or a file for a built
@@ -160,7 +162,7 @@ fn runs(program: &str, args: &[&str]) -> bool {
 /// the user 65534. Without them, the test skips and prints a message. If
 /// [`REQUIRE_MOUNT`] is set, a missing requirement fails the test.
 fn require_root() -> bool {
-    let capable = ostrya_mount::Mounter::is_privileged()
+    let capable = ostrya_mount::is_privileged()
         && rustix::mount::fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC).is_ok()
         && runs(
             "setpriv",
@@ -341,9 +343,8 @@ fn key_dict(digest: &[u8; 32]) -> Value {
 }
 
 /// Commits `base/src` to `repo` with the image key and the stored image.
-/// Returns that commit and a second commit of the same tree, whose stored
-/// image holds `devnode` as a character device.
-async fn commit_tree(repo: &Repo, base: &Path) -> (Checksum, Checksum) {
+/// Returns the commit and its root tree.
+async fn commit_with_stored_image(repo: &Repo, base: &Path) -> (Checksum, ostrya::RepoTree) {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
     let dfd = std::fs::File::open(base).unwrap();
@@ -362,6 +363,14 @@ async fn commit_tree(repo: &Repo, base: &Path) -> (Checksum, Checksum) {
     let added = txn.attach_composefs_image(&commit, staged).await.unwrap();
     assert_eq!(added, ComposefsImageAdd::Added);
     txn.commit().await.unwrap();
+    (commit, root)
+}
+
+/// Commits `base/src` to `repo` with the image key and the stored image.
+/// Returns that commit and a second commit of the same tree, whose stored
+/// image holds `devnode` as a character device.
+async fn commit_tree(repo: &Repo, base: &Path) -> (Checksum, Checksum) {
+    let (commit, root) = commit_with_stored_image(repo, base).await;
 
     // The commit format holds no device node, so the test writes one into a
     // copy of the image. The daemon checks the image only against the key
@@ -1140,4 +1149,51 @@ fn the_refusal_of_a_changed_image_names_no_digest() {
         assert!(!outcome.contains(&hex), "{outcome}");
     }
     assert!(mounts_at(&target).is_empty());
+}
+
+/// An `archive` repository stores compressed `.filez` objects, so the daemon
+/// refuses a request for its stored image and for a built image with the
+/// class `repository`, and the target stays empty.
+#[test]
+fn an_archive_repository_is_refused() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("archive");
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let archive = fx.scratch.path().join("archive");
+    let commit = ostrya_rt::block_on(async {
+        let repo = Repo::create(&archive, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        commit_with_stored_image(&repo, fx.scratch.path()).await.0
+    });
+    let target = fx.target("mnt");
+    for built in [false, true] {
+        let req = ClientRequest {
+            repo: archive.clone(),
+            commit,
+            target: target.clone(),
+            built,
+            access: Access::ReadOnly,
+            times: 1,
+        };
+        let outcome = fx.client(&sock, &req, true);
+        assert!(
+            outcome.starts_with(&format!("refused {}", HelperCode::Repository)),
+            "built={built}: {outcome}"
+        );
+        assert!(
+            outcome.contains("a repository of the mode archive-z2 cannot be mounted"),
+            "built={built}: {outcome}"
+        );
+        assert!(mounts_at(&target).is_empty(), "built={built}");
+        assert_eq!(
+            std::fs::read_dir(&target).unwrap().count(),
+            0,
+            "built={built}"
+        );
+    }
+    assert_no_temp_dirs(&fx);
 }

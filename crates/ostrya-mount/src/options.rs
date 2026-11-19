@@ -1,8 +1,6 @@
-//! The options of a mount, and the choices that the repository config makes.
+//! The options of a mount.
 
-use ostrya::{RepoMode, Tristate, VerityPolicy};
-
-use crate::error::{Error, Result};
+use rustix::mount::MountAttrFlags;
 
 /// The access that a mount gives to the tree.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -37,6 +35,42 @@ pub struct MountOptions {
     /// kernel takes a label of at most 255 bytes, and
     /// [`Helper`](crate::Helper) refuses a longer one before it connects.
     pub source: Option<String>,
+    /// The attribute flags of the mount. The default sets no flag.
+    pub flags: MountFlags,
+}
+
+/// The attribute flags that a mount adds.
+///
+/// [`Direct::mount_image`](crate::Direct::mount_image) adds each flag that
+/// is `true` to each mount of the tree. The mount daemon sets `nosuid` and
+/// `nodev` on each mount, with or without the flags. It cannot set `noexec`,
+/// so [`Helper`](crate::Helper) refuses `noexec` before it connects.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MountFlags {
+    /// The mount ignores the set-user-ID bit, the set-group-ID bit, and the
+    /// file capabilities of each file: `MOUNT_ATTR_NOSUID`.
+    pub nosuid: bool,
+    /// The mount opens no device node: `MOUNT_ATTR_NODEV`.
+    pub nodev: bool,
+    /// The mount runs no program: `MOUNT_ATTR_NOEXEC`.
+    pub noexec: bool,
+}
+
+impl MountFlags {
+    /// Returns the flags as mount attributes of the kernel.
+    pub(crate) fn attrs(self) -> MountAttrFlags {
+        let mut attrs = MountAttrFlags::empty();
+        if self.nosuid {
+            attrs |= MountAttrFlags::MOUNT_ATTR_NOSUID;
+        }
+        if self.nodev {
+            attrs |= MountAttrFlags::MOUNT_ATTR_NODEV;
+        }
+        if self.noexec {
+            attrs |= MountAttrFlags::MOUNT_ATTR_NOEXEC;
+        }
+        attrs
+    }
 }
 
 /// The `verity` option of the composefs overlay.
@@ -61,43 +95,34 @@ impl Verity {
     }
 }
 
-/// Returns the overlay verity mode and the verity policy of a built image for
-/// the value of `[ex-integrity] fsverity`.
-///
-/// Only `yes` seals each object, so only `yes` requires verity. With `maybe`,
-/// an object on a file system without fs-verity has no seal, and the overlay
-/// must not require one.
-pub(crate) fn verity_for(fsverity: Tristate) -> (Verity, VerityPolicy) {
-    match fsverity {
-        Tristate::Yes => (Verity::Require, VerityPolicy::Computed),
-        Tristate::No | Tristate::Maybe => (Verity::Off, VerityPolicy::Disabled),
-    }
-}
-
-/// Refuses a repository mode whose objects a composefs mount cannot read.
-///
-/// The image names each backing object by its loose path,
-/// `<xx>/<rest>.file`. Each mode except `archive` stores the raw content of a
-/// regular file at that path. `archive` stores compressed `.filez` objects.
-pub(crate) fn check_mode(mode: RepoMode) -> Result<()> {
-    match mode {
-        RepoMode::Archive => Err(Error::UnsupportedMode(mode)),
-        RepoMode::Bare
-        | RepoMode::BareUser
-        | RepoMode::BareUserOnly
-        | RepoMode::BareSplitXattrs
-        | RepoMode::BareUserShared => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn the_default_is_read_only_with_no_source() {
+    fn the_default_is_read_only_with_no_source_and_no_flag() {
         let opts = MountOptions::default();
         assert_eq!(opts.access, Access::ReadOnly);
         assert_eq!(opts.source, None);
+        assert_eq!(opts.flags, MountFlags::default());
+        assert_eq!(opts.flags.attrs(), MountAttrFlags::empty());
+    }
+
+    #[test]
+    fn each_flag_gives_its_mount_attribute() {
+        let flags = MountFlags {
+            nosuid: true,
+            nodev: false,
+            noexec: true,
+        };
+        assert_eq!(
+            flags.attrs(),
+            MountAttrFlags::MOUNT_ATTR_NOSUID | MountAttrFlags::MOUNT_ATTR_NOEXEC
+        );
+        let flags = MountFlags {
+            nodev: true,
+            ..MountFlags::default()
+        };
+        assert_eq!(flags.attrs(), MountAttrFlags::MOUNT_ATTR_NODEV);
     }
 }

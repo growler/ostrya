@@ -1065,9 +1065,7 @@ fn step_failure(e: Error) -> Failure {
                 None => format!("{op}: {errno}"),
             },
         },
-        Error::Repo(_) | Error::UnsupportedMode(_) | Error::InvalidImage(_) => {
-            Failure::new(HelperCode::Repository, e.to_string())
-        }
+        Error::InvalidImage(_) => Failure::new(HelperCode::Repository, e.to_string()),
         other => Failure::new(HelperCode::Internal, other.to_string()),
     }
 }
@@ -1300,19 +1298,6 @@ mod tests {
         assert_eq!(
             step_failure(Error::InvalidImage("empty".to_owned())),
             Failure::new(HelperCode::Repository, "invalid image: empty")
-        );
-        let absent = ostrya::Error::ComposefsImageNotFound { commit };
-        let text = absent.to_string();
-        assert_eq!(
-            step_failure(Error::Repo(absent)),
-            Failure::new(HelperCode::Repository, text)
-        );
-        assert_eq!(
-            step_failure(Error::UnsupportedMode(ostrya::RepoMode::Archive)),
-            Failure::new(
-                HelperCode::Repository,
-                "a repository of the mode archive-z2 cannot be mounted",
-            )
         );
         assert_eq!(
             step_failure(Error::NotOverlayMount(PathBuf::from("/mnt"))),

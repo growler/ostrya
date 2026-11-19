@@ -100,11 +100,12 @@ Ostrya adds these functions, which the `ostree` command does not have:
   receive, and offline delta apply stores the image of each new complete
   commit that records a digest. Prune removes the image of each commit that
   it removes, and fsck checks each image. No transfer carries the image.
-- composefs mounts. The library `ostrya-mount` mounts a commit as a composefs
-  tree on Linux, from its stored image or from an image that it builds in
-  memory. The mount reads the objects of the repository in place. Root in the
-  initial user namespace mounts directly. A process in its own user namespace
-  asks the mount daemon `ostrya-mountd`, which runs as root.
+- composefs mounts. The library `ostrya-mount` mounts a composefs image of a
+  commit as a tree on Linux. The mount reads the objects of the repository in
+  place. Root in the initial user namespace mounts in its own process, from
+  an image that the caller opens. A process in its own user namespace asks
+  the mount daemon `ostrya-mountd`, which runs as root. The daemon mounts the
+  stored image of a commit, or an image that it builds in memory.
 - Removable media. `ostrya media export` copies the commits of collection
   refs onto a mounted volume, for a host with no network. The media
   repository has the layout that `ostree create-usb` writes, and

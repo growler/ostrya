@@ -112,9 +112,8 @@ impl Helper {
     /// daemon.
     ///
     /// The daemon opens the image and compares its digest with the key
-    /// `ostree.composefs.digest.v0` of the commit, as
-    /// [`Direct::mount_stored`](crate::Direct::mount_stored) does. It does
-    /// not check a signature of the commit.
+    /// `ostree.composefs.digest.v0` of the commit. It does not check a
+    /// signature of the commit.
     ///
     /// The path of `repo` and `target` must be absolute, as the caller sees
     /// them. The daemon opens the repository directory and its `objects`
@@ -127,7 +126,9 @@ impl Helper {
     /// # Errors
     ///
     /// - [`Error::InvalidRequest`] if a path is relative, if a path is longer
-    ///   than 4096 bytes, or if the source label is longer than 255 bytes.
+    ///   than 4096 bytes, if the source label is longer than 255 bytes, or if
+    ///   [`MountOptions::flags`] holds `noexec`. The daemon sets `nosuid` and
+    ///   `nodev` on each mount and cannot set `noexec`.
     /// - [`Error::Connect`] if the client cannot connect to the socket.
     /// - [`Error::Helper`] with the refusal or the failure that the daemon
     ///   reports.
@@ -145,8 +146,11 @@ impl Helper {
     /// Builds the composefs image of `commit` and mounts it at `target`
     /// through the daemon.
     ///
-    /// The daemon builds the image as
-    /// [`Direct::mount_built`](crate::Direct::mount_built) does. The memory
+    /// The daemon needs no stored image and no key in the commit. It writes
+    /// the image to a sealed memory file and attaches the file to the loop
+    /// device. With `[ex-integrity] fsverity=yes`, the image carries the
+    /// fs-verity digest that the kernel holds for each backing object, and a
+    /// backing object with no fs-verity seal fails the request. The memory
     /// of the image counts against the memory cgroup of the daemon until
     /// the unmount.
     ///
@@ -216,6 +220,11 @@ impl Helper {
         target: &Path,
         opts: &MountOptions,
     ) -> Result<OwnedFd> {
+        if opts.flags.noexec {
+            return Err(Error::InvalidRequest(
+                "the mount daemon cannot set the mount flag noexec".to_owned(),
+            ));
+        }
         for (name, path) in [("repository", repo.path()), ("target", target)] {
             if !path.is_absolute() {
                 return Err(Error::InvalidRequest(format!(
@@ -259,7 +268,7 @@ fn name_op(name: &str) -> &'static str {
 /// user namespace and runs with its real ids as its effective ids. A setuid
 /// or setgid program does not read it.
 fn socket_path() -> PathBuf {
-    let trusted = !crate::mounter::is_privileged() && crate::mounter::ids_match();
+    let trusted = !crate::privilege::is_privileged() && crate::privilege::ids_match();
     let from_env = trusted
         .then(|| std::env::var_os(SOCKET_ENV))
         .flatten()
@@ -552,6 +561,67 @@ mod tests {
             assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
             let err = helper
                 .mount_built(&repo, &commit, Path::new("/mnt"), &opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    Error::Connect {
+                        errno: rustix::io::Errno::NOENT,
+                        ..
+                    }
+                ),
+                "{err}"
+            );
+            let _ = std::fs::remove_dir_all(&scratch);
+        });
+    }
+
+    #[test]
+    fn noexec_is_refused_before_the_connect() {
+        ostrya_rt::block_on(async {
+            let scratch =
+                std::env::temp_dir().join(format!("ostrya-helper-flags-{}", std::process::id()));
+            let repo = ostrya::Repo::create(
+                &scratch,
+                ostrya::CreateOptions::new(ostrya::RepoMode::BareUser),
+            )
+            .await
+            .unwrap();
+            let helper = Helper {
+                socket: PathBuf::from("/nonexistent/socket"),
+                userns: Arc::new(own_ns("user")),
+                mntns: Arc::new(own_ns("mnt")),
+            };
+            let commit = Checksum::from_bytes([0; 32]);
+            let target = Path::new("/mnt");
+
+            let mut opts = MountOptions::default();
+            opts.flags.noexec = true;
+            let err = helper
+                .mount_stored(&repo, &commit, target, &opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRequest(text) if text.contains("noexec")),
+                "{err}"
+            );
+            let err = helper
+                .mount_built(&repo, &commit, target, &opts)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRequest(text) if text.contains("noexec")),
+                "{err}"
+            );
+
+            // The daemon sets these two flags itself, so the request goes to
+            // the connect.
+            let mut opts = MountOptions::default();
+            opts.flags.nosuid = true;
+            opts.flags.nodev = true;
+            let err = helper
+                .mount_stored(&repo, &commit, target, &opts)
                 .await
                 .unwrap_err();
             assert!(

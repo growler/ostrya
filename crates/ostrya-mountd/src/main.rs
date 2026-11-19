@@ -30,7 +30,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use ostrya_mount::Mounter;
+use ostrya_mount::is_privileged;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, chmodat, statat, unlinkat};
 use rustix::io::Errno;
@@ -207,7 +207,7 @@ fn main() -> ExitCode {
     if cli.worker {
         return worker();
     }
-    if !Mounter::is_privileged() {
+    if !is_privileged() {
         eprintln!("ostrya-mountd: the daemon must run as root in the initial user namespace");
         return ExitCode::FAILURE;
     }

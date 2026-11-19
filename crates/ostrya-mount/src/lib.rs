@@ -30,19 +30,26 @@
 //! # Entry points
 //!
 //! - [`Direct`] makes each mount in the process itself.
+//!   [`Direct::mount_image`] mounts an image that the caller opens, over the
+//!   `objects` directory that the caller opens, with the [`Verity`] value
+//!   that the caller gives. The call opens no repository.
 //! - [`Helper`] asks the mount daemon for each mount. It serves a caller in
 //!   its own user namespace.
-//! - [`Mounter`] selects [`Direct`] or [`Helper`] for the process.
-//! - [`Direct::mount_stored`] and [`Helper::mount_stored`] mount the stored
-//!   image of a commit, after a check of its digest against the key of the
-//!   commit.
-//! - [`Direct::mount_built`] and [`Helper::mount_built`] build the image of
-//!   a commit in memory and mount it.
-//! - [`Direct::mount_image`] mounts an image that the caller gives.
+//! - [`Helper::mount_stored`] mounts the stored image of a commit, after a
+//!   check of its digest against the key of the commit.
+//! - [`Helper::mount_built`] mounts an image of a commit that the daemon
+//!   builds in memory.
 //! - [`Direct::unmount`] and [`Helper::unmount`] unmount a composefs mount.
-//! - [`MountOptions`] selects the [`Access`] and the source label of a mount.
+//! - [`is_privileged`] tells if the process is root in the initial user
+//!   namespace. Such a process mounts with [`Direct`], and each other
+//!   process asks the daemon with [`Helper`].
+//! - [`MountOptions`] selects the [`Access`], the source label, and the
+//!   attribute flags ([`MountFlags`]) of a mount.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!   [`HelperCode`] is the class of a failure that the daemon reports.
+//!
+//! The calls of [`Direct`] and [`is_privileged`] block the calling thread.
+//! The mount calls and the unmount of [`Helper`] are `async`.
 //!
 //! # The mount daemon
 //!
@@ -96,24 +103,42 @@
 //!
 //! # Verity
 //!
-//! The `[ex-integrity] fsverity` key of the repository selects the `verity`
-//! option of the overlay:
+//! The `verity` option of the composefs overlay has two values:
 //!
-//! - `yes`: each object is sealed with fs-verity, and the overlay mounts with
-//!   `verity=require`. The kernel compares the fs-verity digest of each
+//! - `verity=require`: the kernel compares the fs-verity digest of each
 //!   backing object with the digest in the image when the file opens. A
-//!   changed object then fails to open with `EIO`. A built image carries the
-//!   digest that the kernel holds for each object. An object with no seal
-//!   fails the build.
-//! - `maybe` and `no`: the overlay mounts with `verity=off`. A built image
-//!   carries no digest.
+//!   changed object then fails to open with `EIO`. Each backed file of the
+//!   image must carry a digest, and each object must be sealed with
+//!   fs-verity.
+//! - `verity=off`: the overlay reads no digest.
+//!
+//! The `[ex-integrity] fsverity` key of the repository tells which value is
+//! correct. With `yes`, each object is sealed, and the overlay mounts with
+//! `verity=require`. With `maybe` and `no`, an object can be without a seal,
+//! and the overlay mounts with `verity=off`.
+//!
+//! - [`Direct::mount_image`] does not read the key. The caller reads it and
+//!   gives [`Verity::Require`] for `yes` alone, and [`Verity::Off`] for each
+//!   other value.
+//! - The daemon reads the key for each request of [`Helper`]. With `yes`, an
+//!   image that it builds carries the digest that the kernel holds for each
+//!   object, and an object with no seal fails the build. With `maybe` and
+//!   `no`, an image that it builds carries no digest.
 //!
 //! # Repository modes
 //!
 //! The repository modes `bare`, `bare-user`, `bare-user-only`,
 //! `bare-split-xattrs`, and `bare-user-shared` can be mounted: each of them
 //! stores the raw content of a file at the loose path that the image names.
-//! An `archive` repository can hold images, but it cannot be mounted.
+//! An `archive` repository can hold images, but it cannot be mounted,
+//! because it stores compressed `.filez` objects.
+//!
+//! - [`Direct::mount_image`] does not read the mode. The caller gives the
+//!   `objects` directory of a repository of a mode that can be mounted. Over
+//!   the `objects` directory of an `archive` repository, each regular file
+//!   with content fails to open.
+//! - The daemon reads the mode for each request of [`Helper`], and refuses
+//!   an `archive` repository.
 //!
 //! # Read-write mounts
 //!
@@ -126,12 +151,16 @@
 //!
 //! # Memory
 //!
-//! A built image stays in a sealed memory file. The size of the image grows
-//! with the number of entries of the tree, not with the size of the files.
-//! The memory counts until the unmount against the memory cgroup of the
-//! process that builds the image: the caller for [`Direct::mount_built`],
-//! and the daemon for [`Helper::mount_built`]. The daemon refuses an image
-//! larger than its limit, 100 MiB by default, before it writes the image.
+//! For [`Helper::mount_built`], the daemon builds the image in a sealed
+//! memory file. The size of the image grows with the number of entries of
+//! the tree, not with the size of the files. The memory counts against the
+//! memory cgroup of the daemon until the unmount. The daemon refuses an
+//! image larger than its limit, 100 MiB by default, before it writes the
+//! image.
+//!
+//! A caller of [`Direct::mount_image`] can give an image in a memory file.
+//! The memory of that file counts against the memory cgroup of the caller
+//! until the unmount and the close of each descriptor of the file.
 //!
 //! # The protocol and the mount steps
 //!
@@ -162,44 +191,32 @@
 //!
 //! # Examples
 //!
+//! A process that is root in the initial user namespace mounts an image
+//! file over the objects of a repository:
+//!
 //! ```no_run
+//! use std::fs::File;
+//! use std::os::fd::AsFd;
 //! use std::path::Path;
 //!
-//! use ostrya::Repo;
-//! use ostrya_mount::{Access, Direct, MountOptions};
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let repo = Repo::open(Path::new("/srv/repo")).await?;
-//! let (_, commit) = repo.read_commit("os/main").await?;
+//! use ostrya_mount::{Direct, MountOptions, Verity};
+//! # fn run() -> Result<(), Box<dyn std::error::Error>> {
+//! let image = File::open("/srv/images/os.cfs")?;
+//! let objects = File::open("/srv/repo/objects")?;
 //! let mut opts = MountOptions::default();
-//! opts.access = Access::ReadOnly;
+//! opts.flags.nosuid = true;
+//! opts.flags.nodev = true;
 //! let mounter = Direct::new();
-//! let root = mounter
-//!     .mount_stored(&repo, &commit, Path::new("/mnt/os"), &opts)
-//!     .await?;
+//! let root = mounter.mount_image(
+//!     image.as_fd(),
+//!     objects.as_fd(),
+//!     Verity::Off,
+//!     Path::new("/mnt/os"),
+//!     &opts,
+//! )?;
 //! // The descriptor of the root keeps the mount in use.
 //! drop(root);
-//! mounter.unmount(Path::new("/mnt/os")).await?;
-//! # Ok(())
-//! # }
-//! ```
-//!
-//! [`Mounter::from_env`] gives [`Direct`] to root in the initial user
-//! namespace and [`Helper`] to each other process:
-//!
-//! ```no_run
-//! use std::path::Path;
-//!
-//! use ostrya::Repo;
-//! use ostrya_mount::{MountOptions, Mounter};
-//! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-//! let repo = Repo::open(Path::new("/srv/repo")).await?;
-//! let (_, commit) = repo.read_commit("os/main").await?;
-//! let mounter = Mounter::from_env()?;
-//! let root = mounter
-//!     .mount_built(&repo, &commit, Path::new("/mnt/os"), &MountOptions::default())
-//!     .await?;
-//! drop(root);
-//! mounter.unmount(Path::new("/mnt/os")).await?;
+//! mounter.unmount(Path::new("/mnt/os"))?;
 //! # Ok(())
 //! # }
 //! ```
@@ -207,13 +224,13 @@
 mod direct;
 mod error;
 mod helper;
-mod mounter;
 mod options;
+mod privilege;
 pub mod proto;
 pub mod sys;
 
 pub use direct::Direct;
 pub use error::{Error, HelperCode, Result};
 pub use helper::{DEFAULT_SOCKET, Helper, SOCKET_ENV};
-pub use mounter::Mounter;
-pub use options::{Access, MountOptions, Verity};
+pub use options::{Access, MountFlags, MountOptions, Verity};
+pub use privilege::is_privileged;

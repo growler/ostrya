@@ -5,7 +5,10 @@
 //! `OSTRYA_REQUIRE_MOUNT` is set, a missing privilege or a file system
 //! without fs-verity fails them.
 //!
-//! The tests check these facts:
+//! Each test opens or builds the image with `ostrya` and gives its
+//! descriptor, the `objects` directory of the repository, and the `verity`
+//! value of the repository config to the mounter. The tests check these
+//! facts:
 //!
 //! - With `verity=off`, a stored image with fs-verity digests mounts on
 //!   objects without a seal, in `bare-user` and in `bare`, and the mounted
@@ -13,17 +16,20 @@
 //! - With `verity=require`, a stored image mounts on sealed objects. A
 //!   changed object fails to open, with a seal and without one. With
 //!   `verity=off`, the same object reads its new bytes.
-//! - A built image and the stored image give the same tree, with
-//!   `verity=off` and with `verity=require`.
-//! - The unmount detaches the loop device, for a stored and a built image.
+//! - An image that the test builds in a memory file and the stored image
+//!   give the same tree, with `verity=off` and with `verity=require`.
+//! - The unmount detaches the loop device, for an image file and for a
+//!   memory file.
 //! - A read-write mount writes each change to `<target>/overlay`, and the
 //!   repository does not change.
 //! - An unmount of a mount in use fails with `EBUSY`.
-//! - The image of the caller mounts as the stored image does.
+//! - An image file of the caller mounts with the source label `composefs`.
+//! - The attribute flags of the options show on the mount, read-only and
+//!   read-write, and a mount with no flag shows none of them.
 
 mod common;
 
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
 use ostrya::{Checksum, Repo, RepoMode};
@@ -32,8 +38,9 @@ use ostrya_rt::block_on;
 use rustix::io::Errno;
 
 use common::{
-    Entry, INJECTED_DIRS, Key, MountGuard, TmpDir, build_source, commit_tree, loop_device_of,
-    new_repo, object_with_content, require_mount, require_verity, wait_detached, walk,
+    Entry, INJECTED_DIRS, Key, MountGuard, TmpDir, build_source, built_image, commit_tree,
+    loop_device_of, memfd_name, new_repo, object_with_content, require_mount, require_verity,
+    stored_image, verity_of, wait_detached, walk,
 };
 
 /// The content of the file that the verity tests change.
@@ -68,17 +75,42 @@ fn walk_mount(target: &Path) -> Vec<Entry> {
     walk(target, &INJECTED_DIRS)
 }
 
+/// Mounts the stored image of `commit` at `target`, with the `objects`
+/// directory and the `verity` value of `repo`.
+async fn mount_stored(
+    repo: &Repo,
+    commit: &Checksum,
+    target: &Path,
+    opts: &MountOptions,
+) -> Result<OwnedFd, Error> {
+    let image = stored_image(repo, commit).await;
+    let (verity, _) = verity_of(repo);
+    Direct::new().mount_image(image.as_fd(), repo.objects_dir(), verity, target, opts)
+}
+
+/// Builds the image of `commit` in a memory file and mounts it at `target`,
+/// with the `objects` directory and the `verity` value of `repo`.
+async fn mount_built(
+    repo: &Repo,
+    commit: &Checksum,
+    target: &Path,
+    opts: &MountOptions,
+) -> Result<OwnedFd, Error> {
+    let image = built_image(repo, commit).await;
+    let (verity, _) = verity_of(repo);
+    Direct::new().mount_image(image.as_fd(), repo.objects_dir(), verity, target, opts)
+}
+
 /// Mounts the stored image of `commit` read-only at `target`, walks the
 /// tree, and unmounts it.
 async fn stored_tree(repo: &Repo, commit: &Checksum, target: &Path) -> Vec<Entry> {
     let direct = Direct::new();
-    let root = direct
-        .mount_stored(repo, commit, target, &read_only())
+    let root = mount_stored(repo, commit, target, &read_only())
         .await
         .unwrap();
     drop(root);
     let tree = walk_mount(target);
-    direct.unmount(target).await.unwrap();
+    direct.unmount(target).unwrap();
     tree
 }
 
@@ -86,13 +118,12 @@ async fn stored_tree(repo: &Repo, commit: &Checksum, target: &Path) -> Vec<Entry
 /// and unmounts it.
 async fn built_tree(repo: &Repo, commit: &Checksum, target: &Path) -> Vec<Entry> {
     let direct = Direct::new();
-    let root = direct
-        .mount_built(repo, commit, target, &read_only())
+    let root = mount_built(repo, commit, target, &read_only())
         .await
         .unwrap();
     drop(root);
     let tree = walk_mount(target);
-    direct.unmount(target).await.unwrap();
+    direct.unmount(target).unwrap();
     tree
 }
 
@@ -150,8 +181,7 @@ fn verity_require_mounts_sealed_objects_and_fails_on_a_changed_object() {
         std::fs::remove_file(&object).unwrap();
         std::fs::write(&object, changed).unwrap();
         drop(
-            direct
-                .mount_stored(&repo, &commit, &target, &read_only())
+            mount_stored(&repo, &commit, &target, &read_only())
                 .await
                 .unwrap(),
         );
@@ -161,7 +191,7 @@ fn verity_require_mounts_sealed_objects_and_fails_on_a_changed_object() {
             std::fs::read(target.join("sub/nested.txt")).unwrap(),
             b"nested\n"
         );
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
 
         // The same bytes with a seal: the digest is not the digest in the
         // image.
@@ -169,14 +199,13 @@ fn verity_require_mounts_sealed_objects_and_fails_on_a_changed_object() {
         ostrya_sys::enable_verity(ro.as_fd()).unwrap();
         drop(ro);
         drop(
-            direct
-                .mount_stored(&repo, &commit, &target, &read_only())
+            mount_stored(&repo, &commit, &target, &read_only())
                 .await
                 .unwrap(),
         );
         let err = std::fs::read(target.join("hello.txt")).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(Errno::IO.raw_os_error()), "{err}");
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
 
         // With `verity=off`, the overlay reads the changed object.
         drop(repo);
@@ -187,13 +216,12 @@ fn verity_require_mounts_sealed_objects_and_fails_on_a_changed_object() {
         std::fs::write(&config, text).unwrap();
         let repo = Repo::open(&root).await.unwrap();
         drop(
-            direct
-                .mount_stored(&repo, &commit, &target, &read_only())
+            mount_stored(&repo, &commit, &target, &read_only())
                 .await
                 .unwrap(),
         );
         assert_eq!(std::fs::read(target.join("hello.txt")).unwrap(), changed);
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
     });
 }
 
@@ -261,8 +289,7 @@ fn unmount_frees_the_loop_device() {
         let direct = Direct::new();
 
         drop(
-            direct
-                .mount_stored(&repo, &commit, &target, &read_only())
+            mount_stored(&repo, &commit, &target, &read_only())
                 .await
                 .unwrap(),
         );
@@ -270,18 +297,17 @@ fn unmount_frees_the_loop_device() {
         let image = std::fs::canonicalize(image).unwrap();
         let image = image.to_str().unwrap();
         let number = loop_device_of(image, false).expect("a loop device");
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
         wait_detached(number, image, false);
 
         drop(
-            direct
-                .mount_built(&repo, &commit, &target, &read_only())
+            mount_built(&repo, &commit, &target, &read_only())
                 .await
                 .unwrap(),
         );
-        let memfd = format!("/memfd:ostrya-cfs-{commit}");
+        let memfd = format!("/memfd:{}", memfd_name(&commit));
         let number = loop_device_of(&memfd, true).expect("a loop device");
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
         wait_detached(number, &memfd, true);
     });
 }
@@ -303,8 +329,7 @@ fn a_read_write_mount_writes_to_the_upper_directory() {
         let direct = Direct::new();
 
         drop(
-            direct
-                .mount_stored(&repo, &commit, &target, &read_write())
+            mount_stored(&repo, &commit, &target, &read_write())
                 .await
                 .unwrap(),
         );
@@ -315,7 +340,7 @@ fn a_read_write_mount_writes_to_the_upper_directory() {
         std::fs::write(target.join("new.txt"), b"new\n").unwrap();
         std::fs::remove_file(target.join("readonly.txt")).unwrap();
         std::fs::write(target.join("hello.txt"), b"changed\n").unwrap();
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
 
         let upper = target.join("overlay");
         assert_eq!(std::fs::read(upper.join("new.txt")).unwrap(), b"new\n");
@@ -351,11 +376,10 @@ fn an_unmount_of_a_mount_in_use_fails() {
         let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
         let commit = commit_tree(&repo, &base, 60, Key::Image).await;
         let direct = Direct::new();
-        let root = direct
-            .mount_stored(&repo, &commit, &target, &read_only())
+        let root = mount_stored(&repo, &commit, &target, &read_only())
             .await
             .unwrap();
-        let err = direct.unmount(&target).await.unwrap_err();
+        let err = direct.unmount(&target).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -367,7 +391,7 @@ fn an_unmount_of_a_mount_in_use_fails() {
             "{err}"
         );
         drop(root);
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
     });
 }
 
@@ -393,8 +417,13 @@ fn an_image_of_the_caller_mounts() {
         let direct = Direct::new();
         drop(
             direct
-                .mount_image(file.as_fd(), &repo, &target, &read_only())
-                .await
+                .mount_image(
+                    file.as_fd(),
+                    repo.objects_dir(),
+                    verity_of(&repo).0,
+                    &target,
+                    &read_only(),
+                )
                 .unwrap(),
         );
         drop(file);
@@ -405,7 +434,86 @@ fn an_image_of_the_caller_mounts() {
             .find(|l| l.contains(target.to_str().unwrap()))
             .expect("the mount is listed");
         assert!(line.contains(" overlay composefs "), "{line}");
-        direct.unmount(&target).await.unwrap();
+        direct.unmount(&target).unwrap();
         assert_eq!(tree, walk(&base.join("src"), &[]));
+    });
+}
+
+/// Returns the mount options of the mount at `target`, the sixth field of
+/// its mountinfo line.
+fn mount_options_at(target: &Path) -> Vec<String> {
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let line = mountinfo
+        .lines()
+        .rfind(|l| l.split(' ').nth(4) == target.to_str())
+        .expect("the mount is listed");
+    line.split(' ')
+        .nth(5)
+        .unwrap()
+        .split(',')
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn the_flags_of_the_options_show_on_the_mount() {
+    if !require_mount() {
+        return;
+    }
+    let scratch = TmpDir::new("flags");
+    let base = scratch.path().join("tree");
+    build_source(&base);
+    let (target, _guard) = mount_point(&scratch, "mnt");
+    let target = std::fs::canonicalize(target).unwrap();
+    const FLAGS: [&str; 3] = ["nosuid", "nodev", "noexec"];
+    block_on(async {
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
+        let commit = commit_tree(&repo, &base, 80, Key::Image).await;
+        let direct = Direct::new();
+        // One open checks the digest of the image. Each mount takes the same
+        // descriptor.
+        let image = stored_image(&repo, &commit).await;
+        let (verity, _) = verity_of(&repo);
+        let mount = |opts: &MountOptions| {
+            direct
+                .mount_image(image.as_fd(), repo.objects_dir(), verity, &target, opts)
+                .unwrap()
+        };
+        for access in [Access::ReadOnly, Access::ReadWrite] {
+            let mut opts = MountOptions::default();
+            opts.access = access;
+            drop(mount(&opts));
+            let shown = mount_options_at(&target);
+            for flag in FLAGS {
+                assert!(!shown.iter().any(|o| o == flag), "{access:?}: {shown:?}");
+            }
+            direct.unmount(&target).unwrap();
+
+            opts.flags.nosuid = true;
+            opts.flags.nodev = true;
+            opts.flags.noexec = true;
+            drop(mount(&opts));
+            let shown = mount_options_at(&target);
+            for flag in FLAGS {
+                assert!(shown.iter().any(|o| o == flag), "{access:?}: {shown:?}");
+            }
+            direct.unmount(&target).unwrap();
+
+            let mut one = MountOptions::default();
+            one.access = access;
+            one.flags.nodev = true;
+            drop(mount(&one));
+            let shown = mount_options_at(&target);
+            assert!(shown.iter().any(|o| o == "nodev"), "{access:?}: {shown:?}");
+            assert!(
+                !shown.iter().any(|o| o == "nosuid"),
+                "{access:?}: {shown:?}"
+            );
+            assert!(
+                !shown.iter().any(|o| o == "noexec"),
+                "{access:?}: {shown:?}"
+            );
+            direct.unmount(&target).unwrap();
+        }
     });
 }

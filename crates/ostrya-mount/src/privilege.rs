@@ -1,102 +1,7 @@
-//! The front end that selects [`Direct`] or [`Helper`] for the process.
+//! The facts about the ids of the process: root in the initial user
+//! namespace, and real ids that are the effective ids.
 
-use std::os::fd::OwnedFd;
-use std::path::Path;
 use std::sync::OnceLock;
-
-use ostrya::{Checksum, Repo};
-
-use crate::direct::Direct;
-use crate::error::Result;
-use crate::helper::Helper;
-use crate::options::MountOptions;
-
-/// A mounter with the calls of [`Direct`] and [`Helper`].
-///
-/// [`Mounter::from_env`] selects the front end for the process. Each call
-/// goes to the front end that the value holds.
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum Mounter {
-    /// The mounter that makes each mount in the process.
-    Direct(Direct),
-    /// The client of the mount daemon.
-    Helper(Helper),
-}
-
-impl Mounter {
-    /// Returns the mounter for the process.
-    ///
-    /// If [`Mounter::is_privileged`] is true, the mounter is [`Direct`].
-    /// Otherwise it is [`Helper::new`], with the namespaces of the calling
-    /// thread.
-    ///
-    /// # Errors
-    ///
-    /// The errors of [`Helper::new`].
-    pub fn from_env() -> Result<Mounter> {
-        if Mounter::is_privileged() {
-            Ok(Mounter::Direct(Direct::new()))
-        } else {
-            Helper::new().map(Mounter::Helper)
-        }
-    }
-
-    /// Returns `true` if the process is root in the initial user namespace.
-    ///
-    /// The real and the effective user id must be 0, and
-    /// `/proc/self/uid_map` must map the full range of ids from 0 to 0, as
-    /// the initial user namespace does. The process reads the two files once
-    /// and keeps the answer. If a file does not read, the answer is `false`.
-    pub fn is_privileged() -> bool {
-        is_privileged()
-    }
-
-    /// Mounts the stored composefs image of `commit` at `target`.
-    ///
-    /// [`Direct::mount_stored`] and [`Helper::mount_stored`] give the rules
-    /// and the errors.
-    pub async fn mount_stored(
-        &self,
-        repo: &Repo,
-        commit: &Checksum,
-        target: &Path,
-        opts: &MountOptions,
-    ) -> Result<OwnedFd> {
-        match self {
-            Mounter::Direct(direct) => direct.mount_stored(repo, commit, target, opts).await,
-            Mounter::Helper(helper) => helper.mount_stored(repo, commit, target, opts).await,
-        }
-    }
-
-    /// Builds the composefs image of `commit` and mounts it at `target`.
-    ///
-    /// [`Direct::mount_built`] and [`Helper::mount_built`] give the rules
-    /// and the errors.
-    pub async fn mount_built(
-        &self,
-        repo: &Repo,
-        commit: &Checksum,
-        target: &Path,
-        opts: &MountOptions,
-    ) -> Result<OwnedFd> {
-        match self {
-            Mounter::Direct(direct) => direct.mount_built(repo, commit, target, opts).await,
-            Mounter::Helper(helper) => helper.mount_built(repo, commit, target, opts).await,
-        }
-    }
-
-    /// Unmounts the composefs mount at `target`.
-    ///
-    /// [`Direct::unmount`] and [`Helper::unmount`] give the rules and the
-    /// errors.
-    pub async fn unmount(&self, target: &Path) -> Result<()> {
-        match self {
-            Mounter::Direct(direct) => direct.unmount(target).await,
-            Mounter::Helper(helper) => helper.unmount(target).await,
-        }
-    }
-}
 
 /// The facts about the ids of the process that the crate reads once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +29,17 @@ fn process_ids() -> ProcessIds {
     })
 }
 
-/// Returns `true` if the process is root in the initial user namespace. The
-/// answer is computed once.
-pub(crate) fn is_privileged() -> bool {
+/// Returns `true` if the process is root in the initial user namespace.
+///
+/// The real and the effective user id must be 0, and `/proc/self/uid_map`
+/// must map the full range of ids from 0 to 0, as the initial user namespace
+/// does. The process reads `/proc/self/status` and `/proc/self/uid_map` once
+/// and keeps the answer. If a file does not read, the answer is `false`.
+///
+/// A process for which the answer is `true` mounts with
+/// [`Direct`](crate::Direct). Each other process asks the mount daemon with
+/// [`Helper`](crate::Helper).
+pub fn is_privileged() -> bool {
     process_ids().privileged
 }
 

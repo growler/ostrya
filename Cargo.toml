@@ -35,7 +35,7 @@ ostrya-fetch = { path = "crates/ostrya-fetch", version = "0.14.0", default-featu
 ostrya-remote = { path = "crates/ostrya-remote", version = "0.14.0", default-features = false }
 ostrya-sys = { path = "crates/ostrya-sys", version = "0.14.0" }
 ostrya = { path = "crates/ostrya", version = "0.14.0", default-features = false }
-ostrya-mount = { path = "crates/ostrya-mount", version = "0.14.0", default-features = false }
+ostrya-mount = { path = "crates/ostrya-mount", version = "0.14.0" }
 ostrya-server = { path = "crates/ostrya-server", version = "0.14.0", default-features = false }
 
 # The RSA code of the spki engine computes with `num-bigint-dig`. The unit

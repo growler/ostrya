@@ -228,12 +228,37 @@ jobs:
           cargo check -p ostrya-server --no-default-features --features smol
           cargo check -p ostrya-cli --no-default-features --features smol,serve
 
-      # The composefs mount library compiles on the smol backend with its own
-      # feature set, and so does the mount daemon.
-      - name: ostrya-mount on the smol backend compiles
+      # The composefs mount library has no feature and links no runtime. The
+      # first command builds it and its tests, which make repositories with
+      # `ostrya` on the `smol` backend. The second builds the mount daemon on
+      # the smol backend.
+      - name: ostrya-mount and ostrya-mountd on the smol backend compile
         run: |
-          cargo check -p ostrya-mount --no-default-features --features smol
+          cargo check -p ostrya-mount --all-targets
           cargo check -p ostrya-mountd --no-default-features --features smol
+
+      # The in-process mount and the client of the mount daemon are in
+      # `ostrya-mount`. They link no repository code, no async runtime, no
+      # HTTP client, no TLS stack, and no xz library. `ostrya` and `ostrya-rt`
+      # are dev-dependencies of the crate alone. The workspace packages in the
+      # normal and the build graph of the crate are `ostrya-mount`,
+      # `ostrya-core`, `ostrya-sys`, and `ostrya-gvariant` alone. This fails
+      # when one of these packages enters that graph:
+      # - `ostrya`, or a package `ostrya-*` that is not one of these four;
+      # - the async runtime packages `smol`, `tokio`, `async-io`,
+      #   `async-executor`, and `blocking`;
+      # - the HTTP client `hyper`, the TLS stack `rustls`, and the xz library
+      #   `liblzma-sys`.
+      - name: ostrya-mount links no repository code and no runtime
+        run: |
+          tree=$(cargo tree -p ostrya-mount -e normal,build --prefix none -f '{p}')
+          grep -q '^ostrya-mount v' <<<"$tree"
+          if found=$(grep -E '^(ostrya(-[a-z0-9_-]+)?|smol|tokio|async-io|async-executor|blocking|hyper|rustls|liblzma-sys) v' <<<"$tree" \
+            | grep -vE '^ostrya-(mount|core|sys|gvariant) v'); then
+            echo "the graph of ostrya-mount holds:"
+            echo "$found"
+            exit 1
+          fi
 
       # `Repo::send` takes no feature of `ostrya`, so `ostrya send` compiles
       # without `receive`, `push`, and `serve`.
@@ -336,15 +361,14 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive`, the `push`, and the `s3` features, and so does
-      # a tokio build of `ostrya-server`, of `ostrya-mount`, and of
-      # `ostrya-mountd`. `ostrya-remote` is a regular dependency of
-      # `ostrya`, so each of these builds holds it. This fails when one path
-      # turns the smol backend on.
+      # a tokio build of `ostrya-server` and of `ostrya-mountd`.
+      # `ostrya-remote` is a regular dependency of `ostrya`, so each of these
+      # builds holds it. This fails when one path turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mountd:tokio; do
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mountd:tokio; do
             package=${build%%:*}
             features=${build#*:}
             if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

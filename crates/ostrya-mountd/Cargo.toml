@@ -14,15 +14,15 @@ path = "src/main.rs"
 
 [features]
 default = ["smol", "lzma-static"]
-smol = ["ostrya-mount/smol", "ostrya-rt/smol"]
-tokio = ["ostrya-mount/tokio", "ostrya-rt/tokio"]
+smol = ["ostrya/smol", "ostrya-rt/smol"]
+tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]
 
 [dependencies]
 # The repository code: the open of the repository of a request, its mode and
 # its config, the stored image, and the build of an image. The daemon also
-# names it for its `lzma-static` feature.
+# names it for its `smol`, `tokio`, and `lzma-static` features.
 ostrya = { workspace = true }
 # The protocol of the daemon and the mount steps.
 ostrya-mount = { workspace = true }

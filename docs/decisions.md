@@ -832,6 +832,71 @@ The reply of the daemon for a stored image that is not the key of its commit
 names the commit and neither digest. The error of the library keeps both
 digests for `composefs-image --check` and the fsck.
 
+## The split of the mount library
+
+A composefs mount has three functions:
+
+- The in-process mount, `ostrya_mount::Direct`. A process that is root in
+  the initial user namespace mounts in its own process.
+  `Direct::mount_image` takes the image and the `objects` directory as
+  descriptors that the caller opens, and the `verity` option of the overlay
+  as a `Verity` value. The call opens no repository.
+- The mount daemon, `ostrya-mountd`. It mounts for a caller in a user
+  namespace of its own. It opens the repository of a request, checks the
+  mode, reads `[ex-integrity] fsverity`, and reads the stored image or
+  builds an image. It depends on `ostrya`, `ostrya-mount`, `ostrya-rt`,
+  `ostrya-sys`, `clap`, and `rustix`.
+- The client of the daemon, `ostrya_mount::Helper`. It sends the path of
+  the repository and the checksum of the commit to the daemon. It opens no
+  repository.
+
+`Direct` and `Helper` are in `ostrya-mount`. The crate depends on
+`ostrya-core`, `ostrya-sys`, `rustix`, and `thiserror`, and has no
+features. It links no repository code, no async runtime, no HTTP client, no
+TLS stack, and no xz library. `ostrya` and `ostrya-rt` are dev-dependencies
+of the crate alone: the integration tests make repositories, commits, and
+images with them. The CI step "ostrya-mount links no repository code and no
+runtime" reads the normal and the build graph of the crate. It fails when
+the graph holds `ostrya`, a package `ostrya-*` other than `ostrya-mount`,
+`ostrya-core`, `ostrya-sys`, and `ostrya-gvariant`, or one of `smol`,
+`tokio`, `async-io`, `async-executor`, `blocking`, `hyper`, `rustls`, and
+`liblzma-sys`.
+
+Each call of `ostrya-mount` is synchronous. The mount steps and the
+exchange on the socket of the daemon block the calling thread. A caller on
+an async runtime runs them on the blocking pool of its runtime. The daemon
+runs `sys::mount_composefs` with `ostrya_rt::unblock`.
+
+The daemon holds the repository reads of a mount. `ostrya-mount` makes the
+items that the daemon uses public, with documentation:
+
+- `proto`, the wire protocol between the client and the daemon.
+- `sys`, the mount steps. `sys::mount_composefs` mounts an EROFS image and
+  stacks the read-only composefs overlay on it.
+- `is_privileged`, which tells if the process is root in the initial user
+  namespace. The daemon refuses to start if the answer is `false`.
+- `Verity`, the `verity` option of the overlay. It is a required argument
+  of `Direct::mount_image`. The caller reads `[ex-integrity] fsverity`
+  itself and gives `Verity::Require` for `yes` alone. The daemon gives the
+  same type in its `sys::Plan`.
+
+Rejected alternatives:
+
+- The daemon code stays in `ostrya-mount` behind a feature `server`, with
+  `ostrya` and `ostrya-rt` as optional dependencies. The mount library
+  holds no repository code under any feature.
+- The mount steps go into a hidden public module. The daemon is a separate
+  crate that calls the steps, so the steps are documented public items.
+- The `verity` option is a field of `MountOptions`. Its default `Off` lets a
+  caller that does not set the field mount a sealed repository with no
+  verity check and no error. `Helper` also ignores the field, because the
+  daemon reads the key from the repository.
+- `is_privileged` stays private. Each caller then holds its own copy of the
+  read of `/proc/self/status` and `/proc/self/uid_map`.
+- The name `build_composefs` for `sys::mount_composefs`. It is close to
+  `ostrya::Transaction::build_composefs_image`, which writes an image. The
+  function mounts an image.
+
 ## The spki sign engine
 
 The spki engine is pure Rust. It has four key types: ECDSA on NIST P-256

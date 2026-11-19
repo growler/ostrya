@@ -33,6 +33,11 @@ API documentation: <https://docs.rs/ostrya-mount>
   overlay to overlayfs by its descriptor. A kernel that refuses a layer by
   descriptor refuses each request of the daemon. Linux 7.1 accepts it.
 
+The crate has no features. It depends on `ostrya-core`, `ostrya-sys`,
+`rustix`, and `thiserror`. It links no repository code, no async runtime, no
+HTTP client, no TLS stack, and no xz library. A caller that opens a
+repository or builds an image takes `ostrya` in its own manifest.
+
 ## Entry points
 
 - `Direct` makes each mount in the process itself.
@@ -192,11 +197,6 @@ Each call of the two modules blocks the calling thread. The items of
 `sys::Plan` and `sys::UpperOptions`, and `path::Arg` and `io::Result`
 in `sys::open_dir`. A caller that builds these values names `rustix` 1
 with the feature `mount` in its own manifest.
-
-## Features
-
-- `smol` (default): the `smol` backend of `ostrya-rt`.
-- `tokio`: the `tokio` backend of `ostrya-rt`, for a host on tokio.
 
 ## Examples
 

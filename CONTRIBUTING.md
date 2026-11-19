@@ -47,6 +47,9 @@ the daemon handler are in `ostrya-mountd`. They need no privilege:
 cargo test -p ostrya-mount -p ostrya-mountd
 ```
 
+`ostrya-mount` has no features. Its integration tests make repositories with
+`ostrya` on the `smol` backend.
+
 The test `exports_onto_vfat_and_exfat` in
 `crates/ostrya/tests/media_export.rs` makes a vfat and an exFAT volume in an
 image file, mounts each one on a loop device, and exports onto it. It needs

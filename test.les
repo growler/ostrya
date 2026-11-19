@@ -270,9 +270,19 @@ _GATES_STEPS = r"""
     cargo check -p ostrya-server --no-default-features --features smol
     cargo check -p ostrya-cli --no-default-features --features smol,serve
     STEP
-    step "ostrya-mount on the smol backend compiles" <<'STEP'
-    cargo check -p ostrya-mount --no-default-features --features smol
+    step "ostrya-mount and ostrya-mountd on the smol backend compile" <<'STEP'
+    cargo check -p ostrya-mount --all-targets
     cargo check -p ostrya-mountd --no-default-features --features smol
+    STEP
+    step "ostrya-mount links no repository code and no runtime" <<'STEP'
+    tree=$(cargo tree -p ostrya-mount -e normal,build --prefix none -f '{p}')
+    grep -q '^ostrya-mount v' <<<"$tree"
+    if found=$(grep -E '^(ostrya(-[a-z0-9_-]+)?|smol|tokio|async-io|async-executor|blocking|hyper|rustls|liblzma-sys) v' <<<"$tree" \
+      | grep -vE '^ostrya-(mount|core|sys|gvariant) v'); then
+      echo "the graph of ostrya-mount holds:"
+      echo "$found"
+      exit 1
+    fi
     STEP
     step "ostrya send without the push features compiles" <<'STEP'
     cargo check -p ostrya-cli --no-default-features --features smol,send
@@ -331,7 +341,7 @@ _GATES_STEPS = r"""
     done
     STEP
     step "A tokio build holds no smol" <<'STEP'
-    for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mountd:tokio; do
+    for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mountd:tokio; do
       package=${build%%:*}
       features=${build#*:}
       if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

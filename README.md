@@ -303,7 +303,7 @@ The project is a Cargo workspace of these crates:
 - `ostrya`: the library.
 - `ostrya-mount`: the composefs mount of a commit on Linux, the client of
   the mount daemon, the protocol of the daemon, and the mount steps that the
-  daemon uses.
+  daemon uses. It links no repository code and no async runtime.
 - `ostrya-mountd`: the mount daemon `ostrya-mountd`, with its connection
   handler and its worker. It is not published to crates.io.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.

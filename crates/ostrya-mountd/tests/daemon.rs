@@ -517,63 +517,62 @@ fn client_child() {
         return;
     };
     let req = ClientRequest::decode(text.to_str().unwrap());
-    let outcome = ostrya_rt::block_on(async {
-        let repo = Repo::open(&req.repo).await.unwrap();
-        let helper = Helper::new().unwrap();
-        let mut opts = MountOptions::default();
-        opts.access = req.access;
-        let mut roots = Vec::new();
-        for _ in 0..req.times {
-            let result = if req.built {
-                helper
-                    .mount_built(&repo, &req.commit, &req.target, &opts)
-                    .await
-            } else {
-                helper
-                    .mount_stored(&repo, &req.commit, &req.target, &opts)
-                    .await
-            };
-            match result {
-                Ok(root) => roots.push(root),
-                Err(Error::Helper { code, message, .. }) => {
-                    return format!("refused {code}: {message}");
-                }
-                Err(other) => panic!("{other}"),
-            }
-        }
-        let first = rustix::fs::fstat(&roots[0]).unwrap();
-        for root in &roots[1..] {
-            let st = rustix::fs::fstat(root).unwrap();
-            assert_eq!((st.st_dev, st.st_ino), (first.st_dev, first.st_ino));
-        }
-        let mounts = mounts_at(&req.target);
-        let top = mounts.last().unwrap().clone();
-        assert!(top.contains(&req.commit.to_hex()), "{top}");
-        assert_eq!(std::fs::read(req.target.join("hello.txt")).unwrap(), HELLO);
-        assert_eq!(
-            std::fs::read(req.target.join("sub/nested.txt")).unwrap(),
-            b"nested\n"
-        );
-        let suid = std::fs::metadata(req.target.join("suid-id")).unwrap();
-        assert_eq!(suid.permissions().mode() & 0o7777, 0o4755);
-        let vfs = rustix::fs::fstatvfs(&roots[0]).unwrap();
-        let flags = rustix::fs::StatVfsMountFlags::NOSUID | rustix::fs::StatVfsMountFlags::NODEV;
-        assert!(vfs.f_flag.contains(flags), "{:?}", vfs.f_flag);
-        let options = top.split(' ').nth(5).unwrap().to_owned();
-        if req.access == Access::ReadWrite {
-            std::fs::write(req.target.join("new.txt"), b"new\n").unwrap();
-        }
-        drop(roots);
-        helper.unmount(&req.target).await.unwrap();
-        if req.access == Access::ReadWrite {
-            assert_eq!(
-                std::fs::read(req.target.join("overlay/new.txt")).unwrap(),
-                b"new\n"
-            );
-        }
-        format!("mounted {} {options}", mounts.len())
-    });
+    let outcome = client_outcome(&req);
     println!("outcome: {outcome}");
+}
+
+/// Sends the request `req` of a client child, checks the mounted tree, and
+/// unmounts it. Returns the text of the line `outcome`.
+fn client_outcome(req: &ClientRequest) -> String {
+    let helper = Helper::new().unwrap();
+    let mut opts = MountOptions::default();
+    opts.access = req.access;
+    let mut roots = Vec::new();
+    for _ in 0..req.times {
+        let result = if req.built {
+            helper.mount_built(&req.repo, &req.commit, &req.target, &opts)
+        } else {
+            helper.mount_stored(&req.repo, &req.commit, &req.target, &opts)
+        };
+        match result {
+            Ok(root) => roots.push(root),
+            Err(Error::Helper { code, message, .. }) => {
+                return format!("refused {code}: {message}");
+            }
+            Err(other) => panic!("{other}"),
+        }
+    }
+    let first = rustix::fs::fstat(&roots[0]).unwrap();
+    for root in &roots[1..] {
+        let st = rustix::fs::fstat(root).unwrap();
+        assert_eq!((st.st_dev, st.st_ino), (first.st_dev, first.st_ino));
+    }
+    let mounts = mounts_at(&req.target);
+    let top = mounts.last().unwrap().clone();
+    assert!(top.contains(&req.commit.to_hex()), "{top}");
+    assert_eq!(std::fs::read(req.target.join("hello.txt")).unwrap(), HELLO);
+    assert_eq!(
+        std::fs::read(req.target.join("sub/nested.txt")).unwrap(),
+        b"nested\n"
+    );
+    let suid = std::fs::metadata(req.target.join("suid-id")).unwrap();
+    assert_eq!(suid.permissions().mode() & 0o7777, 0o4755);
+    let vfs = rustix::fs::fstatvfs(&roots[0]).unwrap();
+    let flags = rustix::fs::StatVfsMountFlags::NOSUID | rustix::fs::StatVfsMountFlags::NODEV;
+    assert!(vfs.f_flag.contains(flags), "{:?}", vfs.f_flag);
+    let options = top.split(' ').nth(5).unwrap().to_owned();
+    if req.access == Access::ReadWrite {
+        std::fs::write(req.target.join("new.txt"), b"new\n").unwrap();
+    }
+    drop(roots);
+    helper.unmount(&req.target).unwrap();
+    if req.access == Access::ReadWrite {
+        assert_eq!(
+            std::fs::read(req.target.join("overlay/new.txt")).unwrap(),
+            b"new\n"
+        );
+    }
+    format!("mounted {} {options}", mounts.len())
 }
 
 /// Creates a listening `SOCK_SEQPACKET` socket at `path` with the mode
@@ -831,27 +830,20 @@ fn holder_child() {
         return;
     };
     let req = ClientRequest::decode(text.to_str().unwrap());
-    ostrya_rt::block_on(async {
-        let repo = Repo::open(&req.repo).await.unwrap();
-        let helper = Helper::new().unwrap();
-        let mut opts = MountOptions::default();
-        opts.access = req.access;
-        let root = if req.built {
-            helper
-                .mount_built(&repo, &req.commit, &req.target, &opts)
-                .await
-        } else {
-            helper
-                .mount_stored(&repo, &req.commit, &req.target, &opts)
-                .await
-        }
-        .unwrap();
-        drop(root);
-        std::fs::write(&marker, b"1").unwrap();
-        let mut sink = Vec::new();
-        let _ = std::io::stdin().read_to_end(&mut sink);
-        helper.unmount(&req.target).await.unwrap();
-    });
+    let helper = Helper::new().unwrap();
+    let mut opts = MountOptions::default();
+    opts.access = req.access;
+    let root = if req.built {
+        helper.mount_built(&req.repo, &req.commit, &req.target, &opts)
+    } else {
+        helper.mount_stored(&req.repo, &req.commit, &req.target, &opts)
+    }
+    .unwrap();
+    drop(root);
+    std::fs::write(&marker, b"1").unwrap();
+    let mut sink = Vec::new();
+    let _ = std::io::stdin().read_to_end(&mut sink);
+    helper.unmount(&req.target).unwrap();
 }
 
 /// A caller in its own PID namespace has a `/proc` that does not show the

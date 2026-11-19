@@ -40,7 +40,10 @@ API documentation: <https://docs.rs/ostrya-mount>
   `objects` directory that the caller opens, with the `Verity` value
   that the caller gives. The call opens no repository.
 - `Helper` asks the mount daemon for each mount. It serves a caller in
-  its own user namespace.
+  its own user namespace. The two mount calls take the path of the
+  repository and the checksum of the commit, `ostrya_core::Checksum`. The
+  caller takes the type from `ostrya-core`, or from `ostrya`, which
+  re-exports it. The client opens no repository.
 - `Helper::mount_stored` mounts the stored image of a commit, after a
   check of its digest against the key of the commit.
 - `Helper::mount_built` mounts an image of a commit that the daemon
@@ -54,16 +57,16 @@ API documentation: <https://docs.rs/ostrya-mount>
 - `Error` is the error of each fallible operation of the crate.
   `HelperCode` is the class of a failure that the daemon reports.
 
-The calls of `Direct` and `is_privileged` block the calling thread.
-The mount calls and the unmount of `Helper` are `async`.
+Each call of the crate blocks the calling thread. A caller on an async
+runtime runs the calls on the blocking pool of the runtime.
 
 ## The mount daemon
 
 `Helper` sends each request to `ostrya-mountd` over the Unix socket
 `DEFAULT_SOCKET`, one request for each connection. The request carries
 the paths of the repository and of the target as the caller sees them,
-and descriptors of the user namespace and the mount namespace of the
-caller. The daemon runs as root:
+the checksum of the commit, and descriptors of the user namespace and the
+mount namespace of the caller. The daemon runs as root:
 
 - It refuses a request whose user namespace is the initial user
   namespace, or does not own the mount namespace of the request.

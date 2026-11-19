@@ -1788,6 +1788,7 @@ name = "ostrya-mount"
 version = "0.14.0"
 dependencies = [
  "ostrya",
+ "ostrya-core",
  "ostrya-rt",
  "ostrya-sys",
  "rustix",

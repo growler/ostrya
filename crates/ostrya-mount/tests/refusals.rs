@@ -18,12 +18,10 @@ use ostrya_mount::{Access, Direct, Error, Helper, HelperCode, MountFlags, MountO
 
 use common::TmpDir;
 
-/// Compile-time checks that the public types are `Send + Sync`, and that the
-/// futures of the mount calls of the client are `Send`.
+/// Compile-time checks that the public types are `Send + Sync`.
 #[allow(dead_code)]
 fn public_types_are_send_and_sync() {
     fn send_sync<T: Send + Sync>() {}
-    fn send<T: Send>(_: &T) {}
     send_sync::<Direct>();
     send_sync::<Helper>();
     send_sync::<MountOptions>();
@@ -32,18 +30,6 @@ fn public_types_are_send_and_sync() {
     send_sync::<Verity>();
     send_sync::<Error>();
     send_sync::<HelperCode>();
-
-    let fut = async {
-        let repo = ostrya::Repo::open(Path::new("/")).await.unwrap();
-        let commit: ostrya::Checksum = "0".repeat(64).parse().unwrap();
-        let opts = MountOptions::default();
-        let target = Path::new("/");
-        let helper = Helper::new().unwrap();
-        let _ = helper.mount_stored(&repo, &commit, target, &opts).await;
-        let _ = helper.mount_built(&repo, &commit, target, &opts).await;
-        let _ = helper.unmount(target).await;
-    };
-    send(&fut);
 }
 
 /// Asserts that `dir` is empty.

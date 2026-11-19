@@ -20,6 +20,8 @@ targets = ["x86_64-unknown-linux-gnu"]
 [dependencies]
 ostrya = { workspace = true }
 ostrya-rt = { workspace = true }
+# The checksum of a commit in the client and in the protocol.
+ostrya-core = { workspace = true }
 # The loop device and the sealed memory file.
 ostrya-sys = { workspace = true }
 thiserror = "2"

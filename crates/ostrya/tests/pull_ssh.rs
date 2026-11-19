@@ -1609,3 +1609,230 @@ fn a_session_pull_over_a_stream_refuses_a_static_delta_list() {
         assert_eq!(snapshot(&dest_path), before);
     });
 }
+
+// --- commit operands ---------------------------------------------------------
+
+/// Returns the paths of the `Get` messages of `messages`, in order.
+fn gets(messages: &[Message]) -> Vec<&str> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Get(path) => Some(path.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The stream source pulls the same data as the HTTP pull for each form of
+/// a commit operand: `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`.
+/// The `REF@CHECKSUM` pull writes the ref to the named commit, the parent of
+/// the commit that the ref of the remote names.
+#[test]
+fn the_stream_source_pulls_commit_operands_as_the_http_pull_does() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-checksum-forms");
+        let (_remote, first, _second) = build_remote_two_commits(dir.path()).await;
+        let remote_path = dir.path().join("remote");
+        let named = |name: String| {
+            move || PullOptions {
+                refs: vec![name.clone()],
+                ..PullOptions::default()
+            }
+        };
+
+        pull_both(
+            dir.path(),
+            "bare",
+            &remote_path,
+            RepoMode::Archive,
+            named(first.to_hex()),
+        )
+        .await;
+        let dest = Repo::open(&dir.path().join("bare-ssh")).await.unwrap();
+        assert_eq!(
+            dest.commit_state(&first).await.unwrap(),
+            ostrya::CommitState::Normal
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+
+        pull_both(
+            dir.path(),
+            "ref",
+            &remote_path,
+            RepoMode::BareUser,
+            named(format!("test/main@{first}")),
+        )
+        .await;
+        let dest = Repo::open(&dir.path().join("ref-ssh")).await.unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), first)]
+        );
+
+        let other = dir.path().join("collection");
+        let (_remote, [_, _, a, _]) = build_collection_remote(&other).await;
+        pull_both(
+            dir.path(),
+            "collection",
+            &other.join("remote"),
+            RepoMode::Archive,
+            named(format!("@{ID_X}:a@{a}")),
+        )
+        .await;
+        let dest = Repo::open(&dir.path().join("collection-ssh"))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(ID_X.to_owned(), "a".to_owned(), a)]
+        );
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+    });
+}
+
+/// A pull of commit operands alone through the stream source requests
+/// `config` alone of the files at the root of the remote: no `summary`, no
+/// `summary.sig`, and no ref file.
+#[test]
+fn a_stream_pull_of_commit_operands_requests_the_config_alone() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-checksum-requests");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
+        let opts = PullOptions {
+            refs: vec![first.to_hex(), format!("test/main@{second}")],
+            remote: Some("origin".to_owned()),
+            ..PullOptions::default()
+        };
+
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            StreamSessionOptions::default(),
+            opts,
+        )
+        .await;
+        pulled.unwrap();
+        served.unwrap();
+
+        let gets = gets(&messages);
+        assert_eq!(gets[0], "config", "{gets:?}");
+        assert!(
+            gets.iter().all(|path| path.starts_with("objects/")
+                || path.starts_with("deltas/")
+                || path.starts_with("delta-indexes/")
+                || *path == "config"),
+            "{gets:?}"
+        );
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+        for commit in [first, second] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+        }
+    });
+}
+
+/// A pull through a session of the caller that requires static deltas
+/// refuses a `CHECKSUM` operand whose commit the repository does not hold
+/// complete. The pull sends no `Get` message and finishes the session, so
+/// the server ends with `Ok`.
+#[test]
+fn a_stream_pull_refuses_a_checksum_operand_that_requires_a_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-checksum-require");
+        let (remote, first, _second) = build_remote_two_commits(dir.path()).await;
+        let dest = dest_at(&dir.path().join("dest"), RepoMode::Archive, None).await;
+        let opts = PullOptions {
+            refs: vec![first.to_hex()],
+            require_static_deltas: true,
+            ..PullOptions::default()
+        };
+
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            StreamSessionOptions::default(),
+            opts,
+        )
+        .await;
+
+        match pulled {
+            Err(Error::Pull(message)) => assert_eq!(
+                message,
+                format!(
+                    "Static deltas required, but a commit named by its checksum takes none: \
+                     {first}"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        served.unwrap();
+        assert!(gets(&messages).is_empty(), "{messages:?}");
+        assert!(dest.list_objects().await.unwrap().is_empty());
+        assert_eq!(common::file_inventory(dest.path(), "state"), Vec::new());
+    });
+}
+
+/// The repository holds R and C of the chain R -> C -> D complete, and does
+/// not hold the commit object of D. A pull of R through the stream source
+/// reads field 2 of C from the repository, and requests D one time. It
+/// requests no file of C.
+#[test]
+fn the_stream_source_fetches_an_attachment_below_a_held_attachment() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-below-held");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let chain = common::write_chain(&remote, &dir.path().join("trees"), "test/main").await;
+        summarize(&remote).await;
+        let dest_dir = dir.path().join("dest");
+        let dest = dest_at(&dest_dir, RepoMode::Archive, None).await;
+        let (pulled, served) = pull_ssh(&dest, &remote, main_ref(0)).await;
+        pulled.unwrap();
+        served.unwrap();
+        let object = |commit: &Checksum, ty: ObjectType| {
+            format!("objects/{}", loose_path(commit, ty, RepoMode::Archive))
+        };
+        std::fs::remove_file(dest_dir.join(object(&chain.d, ObjectType::Commit))).unwrap();
+
+        let (pulled, served, messages) = pull_session_ssh(
+            &dest,
+            &remote,
+            PullTrust::unverified(),
+            StreamSessionOptions::default(),
+            PullOptions {
+                remote: Some("origin".to_owned()),
+                ..main_ref(0)
+            },
+        )
+        .await;
+        pulled.unwrap();
+        served.unwrap();
+
+        let gets = gets(&messages);
+        let count = |path: String| gets.iter().filter(|got| **got == path).count();
+        assert_eq!(count(object(&chain.d, ObjectType::Commit)), 1, "{gets:?}");
+        for ty in [ObjectType::Commit, ObjectType::CommitMeta] {
+            assert_eq!(count(object(&chain.c, ty)), 0, "{gets:?}");
+        }
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+        }
+        assert_eq!(common::file_inventory(&dest_dir, "state"), Vec::new());
+    });
+}

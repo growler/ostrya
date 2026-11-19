@@ -10012,37 +10012,51 @@ fn an_attachment_that_two_attachments_name_is_fetched_once() {
     });
 }
 
-/// The destination holds C of the chain R -> C -> D complete. The pull of R
-/// ignores field 2 of C and requests nothing below it: with the commit object
-/// of D gone from the destination and hidden on the remote, the pull passes.
-/// It requests no file of C or of D, and stores no commit object of D.
+/// The destination holds C of the chain R -> C -> D complete, and does not
+/// hold the commit object of D. The pull of R reads field 2 of C from the
+/// commit object of the destination, and requests D. The remote does not
+/// serve D, so the pull fails, and the error names C as the commit that names
+/// D. The pull requests no file of C.
 #[test]
-fn a_pull_requests_nothing_below_an_attachment_held_complete() {
+fn a_missing_attachment_below_an_attachment_held_complete_fails_the_pull() {
     block_on(async {
         let dir = TmpDir::new("pull-http-attachment-held");
-        let (remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
-        let server = RepoServer::start(remote.path(), false).await;
+        let (_remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = dest_holding(dir.path(), &server.url(), &chain.c).await;
         std::fs::remove_file(dest.path().join(meta_path(&chain.d, "commit"))).unwrap();
         server.hide(&meta_path(&chain.d, "commit"));
         server.forget();
 
-        pull_main(&dest, PullOptions::default()).await.unwrap();
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
 
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which neither a source nor this \
+                     repository holds",
+                    chain.d
+                )
+            )
+        );
         let seen = server.seen();
-        for commit in [chain.c, chain.d] {
-            for ext in ["commit", "commitmeta"] {
-                assert_eq!(server.requests_for(&meta_path(&commit, ext)), 0, "{seen:?}");
-            }
-            assert_eq!(server.requests_for(&index_path(&commit)), 0, "{seen:?}");
+        for ext in ["commit", "commitmeta"] {
+            assert_eq!(
+                server.requests_for(&meta_path(&chain.c, ext)),
+                0,
+                "{seen:?}"
+            );
         }
-        assert_complete(&remote, &dest, dest.path(), &chain.r).await;
+        assert_eq!(server.requests_for(&meta_path(&chain.d, "commit")), 1);
         assert_eq!(
             dest.commit_state(&chain.c).await.unwrap(),
             CommitState::Normal
         );
+        assert!(!dest.has_object(ObjectType::Commit, &chain.r).await.unwrap());
         assert!(!dest.has_object(ObjectType::Commit, &chain.d).await.unwrap());
-        assert_no_markers(dest.path());
+        assert_no_refs(&dest).await;
     });
 }
 
@@ -12456,5 +12470,1691 @@ fn two_names_that_write_one_ref_are_refused() {
             assert_root_files_alone(&plain_server);
         }
         assert_nothing_published(&dest).await;
+    });
+}
+
+// --- commit operands ---------------------------------------------------------
+
+/// Returns the commit operand `NAME@CHECKSUM`.
+fn name_at(name: &str, commit: &Checksum) -> String {
+    format!("{name}@{commit}")
+}
+
+/// Asserts that the server got no request for `summary`, for `summary.sig`,
+/// or for a ref file.
+fn assert_no_summary_and_no_ref_request(server: &RepoServer) {
+    let seen = server.seen();
+    assert!(
+        !seen
+            .iter()
+            .any(|path| path == "summary" || path == "summary.sig" || path.starts_with("refs/")),
+        "{seen:?}"
+    );
+}
+
+/// Asserts that the server got no request for a delta index or for a file of
+/// a static delta.
+fn assert_no_delta_request(server: &RepoServer) {
+    let seen = server.seen();
+    assert!(
+        !seen
+            .iter()
+            .any(|path| path.starts_with("deltas/") || path.starts_with("delta-indexes/")),
+        "{seen:?}"
+    );
+}
+
+/// Asserts that a pull failed with `Error::Pull` and a message that holds
+/// `part`.
+fn assert_pull_refused<T: std::fmt::Debug>(result: Result<T, Error>, part: &str) {
+    match result {
+        Err(Error::Pull(message)) => assert!(message.contains(part), "{message}"),
+        other => panic!("expected a refusal with {part:?}: {other:?}"),
+    }
+}
+
+/// A `CHECKSUM` operand fetches the commit complete and writes no ref. The
+/// pull makes no ref-binding check, and requests `config` first, and no
+/// `summary`, no `summary.sig`, and no ref file. Here the commit is the
+/// parent of the commit that the ref of the remote names. With `depth = 1`,
+/// the pull of the newer commit also takes its parent.
+#[test]
+fn a_checksum_operand_fetches_the_commit_and_writes_no_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-bare");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        dest.pull("origin", refs_of(&[&first.to_hex()]))
+            .await
+            .unwrap();
+
+        assert_complete(&remote, &dest, dest.path(), &first).await;
+        assert!(!dest.has_object(ObjectType::Commit, &second).await.unwrap());
+        assert_no_refs(&dest).await;
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+        assert_eq!(server.seen()[0], "config");
+        assert_no_summary_and_no_ref_request(&server);
+
+        let dest = mirror_dest(dir.path(), None, &server.url()).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                depth: 1,
+                ..refs_of(&[&second.to_hex()])
+            },
+        )
+        .await
+        .unwrap();
+        for commit in [first, second] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// A `REF@CHECKSUM` operand fetches the named commit and writes the ref to
+/// it, also if the ref of the remote names a newer commit. The pull requests
+/// no `summary`, no `summary.sig`, and no ref file. With `depth = 1`, the
+/// pull also takes the parent. Under `no_ref_writes`, the pull writes no ref.
+#[test]
+fn a_ref_at_checksum_operand_writes_the_ref_to_the_named_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-ref");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        dest.pull("origin", refs_of(&[&name_at("test/main", &first)]))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), first)]
+        );
+        assert_complete(&remote, &dest, dest.path(), &first).await;
+        assert!(!dest.has_object(ObjectType::Commit, &second).await.unwrap());
+        assert_eq!(server.seen()[0], "config");
+        assert_no_summary_and_no_ref_request(&server);
+
+        let dest = mirror_dest(dir.path(), None, &server.url()).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                depth: 1,
+                ..refs_of(&[&name_at("test/main", &second)])
+            },
+        )
+        .await
+        .unwrap();
+        for commit in [first, second] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+
+        let dest = mirror_dest(dir.path(), None, &server.url()).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                no_ref_writes: true,
+                ..refs_of(&[&name_at("test/main", &first)])
+            },
+        )
+        .await
+        .unwrap();
+        assert_complete(&remote, &dest, dest.path(), &first).await;
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// The ref-binding check of a `REF@CHECKSUM` operand reads `REF`:
+///
+/// - a commit bound to another ref is refused, and the pull publishes
+///   nothing;
+/// - the same pull passes under `DISABLE_VERIFY_BINDINGS`;
+/// - a bound name that is not a ref of the remote passes, with no request
+///   for a ref file;
+/// - a commit with no binding key passes under each name;
+/// - a `CHECKSUM` operand gets no check.
+#[test]
+fn the_ref_binding_of_a_commit_operand_reads_its_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-ref-binding");
+        build_tree(&dir.path().join("src"), b"hello\n");
+        let remote = create_remote(dir.path()).await;
+        commit_tree(&remote, dir.path(), "src", "test/main", None, FIXED_TS).await;
+        let side = commit_tree(&remote, dir.path(), "src", "side", None, FIXED_TS + 1).await;
+        let txn = remote.transaction().await.unwrap();
+        txn.set_ref(&Ref::local("side"), None);
+        txn.commit().await.unwrap();
+        // The commits of the chain have no binding key.
+        let unbound = write_chain(&remote, &dir.path().join("trees"), "chain")
+            .await
+            .d;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let wrong = name_at("test/main", &side);
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&wrong])).await,
+            "no requested ref 'test/main' in ref binding metadata",
+        );
+        assert_left_nothing(&dest).await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..refs_of(&[&wrong])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(side)
+        );
+
+        server.forget();
+        dest.pull("origin", refs_of(&[&name_at("side", &side)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:side", true).await.unwrap(),
+            Some(side)
+        );
+        assert_no_summary_and_no_ref_request(&server);
+
+        dest.pull("origin", refs_of(&[&name_at("any/name", &unbound)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:any/name", true).await.unwrap(),
+            Some(unbound)
+        );
+
+        let dest = mirror_dest(dir.path(), None, &server.url()).await;
+        dest.pull("origin", refs_of(&[&side.to_hex()]))
+            .await
+            .unwrap();
+        assert_complete(&remote, &dest, dest.path(), &side).await;
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// The collection-binding check of a commit operand:
+///
+/// - `@ID:REF@CHECKSUM` writes the collection ref of `ID`, or the local ref
+///   if `ID` is the collection id of this repository, and the binding of the
+///   commit must state `ID`;
+/// - `REF@CHECKSUM` in a repository with a collection id takes a commit bound
+///   to that id, and refuses a commit bound to another id and a commit with
+///   no binding key;
+/// - `REF@CHECKSUM` in a repository with no collection id refuses a commit
+///   with a binding key, also under `DISABLE_VERIFY_BINDINGS`, and takes a
+///   commit with no binding key;
+/// - under `no_ref_writes`, the pull does not make these checks.
+#[test]
+fn the_collection_binding_of_a_commit_operand_is_checked() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-collection-binding");
+        let (_remote, [main, c, a, _b]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let url = server.url();
+        let x_a = name_at(&at(ID_X, "a"), &a);
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", refs_of(&[&x_a])).await.unwrap();
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(ID_X.to_owned(), "a".to_owned(), a)]
+        );
+        assert_no_refs(&dest).await;
+        assert_no_summary_and_no_ref_request(&server);
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&name_at(&at(ID_Y, "a"), &a)]))
+                .await,
+            &format!("collection binding '{ID_X}' is not the requested collection '{ID_Y}'"),
+        );
+
+        let dest = mirror_dest(dir.path(), Some(ID_X), &url).await;
+        dest.pull("origin", refs_of(&[&x_a])).await.unwrap();
+        assert_eq!(dest.list_refs(None).await.unwrap(), [("a".to_owned(), a)]);
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+
+        // The repository has the collection id of the commit of `c`.
+        let dest = mirror_dest(dir.path(), Some(REMOTE_ID), &url).await;
+        dest.pull("origin", refs_of(&[&name_at("c", &c)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:c".to_owned(), c)]
+        );
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&name_at("a", &a)])).await,
+            &format!("collection binding '{ID_X}' is not the requested collection '{REMOTE_ID}'"),
+        );
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&name_at("main", &main)]))
+                .await,
+            "no collection binding metadata",
+        );
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:c".to_owned(), c)]
+        );
+
+        // The repository has no collection id.
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        let bound = name_at("c", &c);
+        for flags in [PullFlags::NONE, PullFlags::DISABLE_VERIFY_BINDINGS] {
+            assert_pull_refused(
+                dest.pull(
+                    "origin",
+                    PullOptions {
+                        flags,
+                        ..refs_of(&[&bound])
+                    },
+                )
+                .await,
+                "a repository with no collection id",
+            );
+        }
+        assert_left_nothing(&dest).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                no_ref_writes: true,
+                ..refs_of(&[&bound])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest.commit_state(&c).await.unwrap(), CommitState::Normal);
+        assert_no_refs(&dest).await;
+        dest.pull("origin", refs_of(&[&name_at("main", &main)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:main".to_owned(), main)]
+        );
+    });
+}
+
+/// The collection-binding check of a `CHECKSUM` operand reads the key
+/// `collection-id` of the remote section of this repository. With the key,
+/// the binding of the commit must state that id: another id and no binding
+/// key are refused, also under `no_ref_writes`. With no key, the pull makes
+/// no check.
+#[test]
+fn the_remote_key_gives_the_collection_of_a_checksum_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-remote-key");
+        let (_remote, [main, c, a, _b]) = build_collection_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let url = server.url();
+
+        mirror_dest(dir.path(), None, &url).await;
+        let keyed = format!("collection-id={REMOTE_ID}\n");
+        let dest = reconfigure_dest(dir.path(), &url, &keyed).await;
+        dest.pull("origin", refs_of(&[&c.to_hex()])).await.unwrap();
+        assert_eq!(dest.commit_state(&c).await.unwrap(), CommitState::Normal);
+        for no_ref_writes in [false, true] {
+            assert_pull_refused(
+                dest.pull(
+                    "origin",
+                    PullOptions {
+                        no_ref_writes,
+                        ..refs_of(&[&a.to_hex()])
+                    },
+                )
+                .await,
+                &format!(
+                    "collection binding '{ID_X}' is not the requested collection '{REMOTE_ID}'"
+                ),
+            );
+        }
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&main.to_hex()])).await,
+            "no collection binding metadata",
+        );
+        assert!(!dest.has_object(ObjectType::Commit, &a).await.unwrap());
+        assert!(!dest.has_object(ObjectType::Commit, &main).await.unwrap());
+        assert_no_refs(&dest).await;
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", refs_of(&[&a.to_hex(), &main.to_hex()]))
+            .await
+            .unwrap();
+        for commit in [a, main] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                CommitState::Normal
+            );
+        }
+        assert_no_refs(&dest).await;
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// The pull reads the key `collection-id` of the remote section for a
+/// `CHECKSUM` operand alone, before the first request. A value with a
+/// malformed escape sequence fails such a pull with `Error::Core` and no
+/// request. A pull of a ref and a pull of a `REF@CHECKSUM` operand do not
+/// read the key.
+#[test]
+fn a_malformed_remote_collection_id_fails_a_checksum_operand_alone() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-remote-key-malformed");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let extra = "collection-id=org.example\\q\n";
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), extra).await;
+
+        for names in [
+            vec![first.to_hex()],
+            vec!["test/main".to_owned(), first.to_hex()],
+        ] {
+            let err = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: names,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::Core(_)), "{err:?}");
+            assert!(server.seen().is_empty(), "{:?}", server.seen());
+        }
+        assert_left_nothing(&dest).await;
+
+        dest.pull("origin", refs_of(&["test/main"])).await.unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+        dest.pull("origin", refs_of(&[&name_at("test/main", &first)]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), first)]
+        );
+    });
+}
+
+/// A pull whose names are all commit operands reads no summary, so the
+/// summary policy does not apply to it. Here the policy requires a signed
+/// summary, and the remote serves a summary with no signature. A pull with
+/// one ref name beside a commit operand reads the summary, and fails.
+#[test]
+fn a_pull_of_commit_operands_alone_reads_no_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-no-summary");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let extra = format!(
+            "sign-verify=false\nsign-verify-summary=true\n\
+             verification-ed25519-key={PUBLIC_B64}\n"
+        );
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+
+        dest.pull(
+            "origin",
+            refs_of(&[&first.to_hex(), &name_at("test/main", &second)]),
+        )
+        .await
+        .unwrap();
+        assert_no_summary_and_no_ref_request(&server);
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+
+        let dest = mirror_dest(dir.path(), None, &server.url()).await;
+        drop(dest);
+        let dest = reconfigure_dest(dir.path(), &server.url(), &extra).await;
+        server.forget();
+        let err = dest
+            .pull("origin", refs_of(&["test/main", &first.to_hex()]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert!(server.seen().contains(&"summary".to_owned()));
+        assert_left_nothing(&dest).await;
+    });
+}
+
+/// Under `MIRROR`, a `REF@CHECKSUM` operand writes the local ref
+/// `refs/heads/REF`, also from a remote whose summary states a collection
+/// id. So the pull takes `main` beside `main@<CHECKSUM>`: the first writes
+/// the ref of the collection of the summary, and the second the local ref.
+#[test]
+fn a_mirror_pull_writes_a_ref_at_checksum_operand_as_a_local_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-mirror");
+        build_tree(&dir.path().join("src"), b"hello\n");
+        let remote = Repo::create(
+            &dir.path().join("remote"),
+            CreateOptions::new(RepoMode::Archive).collection_id(REMOTE_ID),
+        )
+        .await
+        .unwrap();
+        let main = Ref::local("main");
+        let unbound = commit_bound(&remote, dir.path(), "src", &main, None).await;
+        let bound = commit_bound(&remote, dir.path(), "src", &main, Some(REMOTE_ID)).await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let at_unbound = name_at("main", &unbound);
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", mirror_of(&[&at_unbound]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_refs(None).await.unwrap(),
+            [("main".to_owned(), unbound)]
+        );
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+        assert_no_summary_and_no_ref_request(&server);
+        assert!(!dest.path().join("summary").exists());
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", mirror_of(&["main", &at_unbound]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_refs(None).await.unwrap(),
+            [("main".to_owned(), unbound)]
+        );
+        assert_eq!(
+            dest.list_mirror_refs().await.unwrap(),
+            [(REMOTE_ID.to_owned(), "main".to_owned(), bound)]
+        );
+    });
+}
+
+/// A pull through a session of the caller takes the commit operands. With
+/// no `remote` option, a `REF@CHECKSUM` operand writes a local ref, and a
+/// `CHECKSUM` operand writes no ref. The pull requests `config` alone of the
+/// files at the root of the remote.
+#[test]
+fn a_session_pull_takes_commit_operands() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-session");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_with_no_remote(dir.path()).await;
+
+        dest.pull_with_session(
+            http_session(&server).await,
+            PullTrust::unverified(),
+            refs_of(&[&first.to_hex(), &name_at("test/main", &second)]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dest.list_refs(None).await.unwrap(),
+            [("test/main".to_owned(), second)]
+        );
+        for commit in [first, second] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_eq!(server.seen()[0], "config");
+        assert_no_summary_and_no_ref_request(&server);
+    });
+}
+
+/// The pull refuses a malformed commit operand with `Error::InvalidRefspec`
+/// and the operand as given, before the first request: through the remote of
+/// the config, and through a session of the caller.
+#[test]
+fn a_malformed_commit_operand_is_refused_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-malformed");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let before = repo_snapshot(dest.path());
+        let hex = commit.to_hex();
+        for name in [
+            "test/main@".to_owned(),
+            format!("@{hex}"),
+            format!("test/main@{}", &hex[..10]),
+            format!("test/main@{}", &hex[..63]),
+            format!("test/main@{}", hex.to_uppercase()),
+            format!("a@b@{hex}"),
+            format!("test/main@{hex}^"),
+            format!("test/main@{hex}x"),
+            format!("test/main@{hex}0"),
+            format!("origin:test/main@{hex}"),
+        ] {
+            let err = dest.pull("origin", refs_of(&[&name])).await.unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(given) if *given == name),
+                "{name}: {err:?}"
+            );
+            let err = dest
+                .pull_with_session(
+                    http_session(&server).await,
+                    PullTrust::unverified(),
+                    refs_of(&[&name]),
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidRefspec(given) if *given == name),
+                "{name}: {err:?}"
+            );
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_eq!(repo_snapshot(dest.path()), before);
+    });
+}
+
+/// The timestamp check of a commit operand:
+///
+/// - `CurrentRef` compares the commit of `REF@CHECKSUM` with the commit of
+///   the ref that the pull writes, and refuses an older commit. With no
+///   check, the pull moves the ref back.
+/// - `Rev` compares the commit of a `CHECKSUM` operand with the given
+///   commit.
+/// - `CurrentRef` with a `CHECKSUM` operand is refused before the first
+///   request, also through a session.
+#[test]
+fn the_timestamp_check_applies_to_a_commit_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-timestamp");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        let main = || dest.resolve_rev("origin:test/main", true);
+        // The repository holds both commits, and the ref names the newer one.
+        dest.pull(
+            "origin",
+            PullOptions {
+                depth: 1,
+                ..refs_of(&["test/main"])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(main().await.unwrap(), Some(second));
+
+        let older = name_at("test/main", &first);
+        assert_pull_refused(
+            dest.pull(
+                "origin",
+                PullOptions {
+                    timestamp_check: TimestampCheck::CurrentRef,
+                    ..refs_of(&[&older])
+                },
+            )
+            .await,
+            "is chronologically older than",
+        );
+        assert_eq!(main().await.unwrap(), Some(second));
+
+        assert_pull_refused(
+            dest.pull(
+                "origin",
+                PullOptions {
+                    timestamp_check: TimestampCheck::Rev(second),
+                    ..refs_of(&[&first.to_hex()])
+                },
+            )
+            .await,
+            "is chronologically older than",
+        );
+        dest.pull(
+            "origin",
+            PullOptions {
+                timestamp_check: TimestampCheck::Rev(first),
+                ..refs_of(&[&second.to_hex()])
+            },
+        )
+        .await
+        .unwrap();
+
+        server.forget();
+        let current = || PullOptions {
+            timestamp_check: TimestampCheck::CurrentRef,
+            ..refs_of(&["test/main", &first.to_hex()])
+        };
+        let err = dest.pull("origin", current()).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        let err = dest
+            .pull_with_session(
+                http_session(&server).await,
+                PullTrust::unverified(),
+                current(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_eq!(main().await.unwrap(), Some(second));
+
+        dest.pull("origin", refs_of(&[&older])).await.unwrap();
+        assert_eq!(main().await.unwrap(), Some(first));
+    });
+}
+
+/// Two operands that write one ref stop the pull, and the error states the
+/// operands as given: two commits for one ref, a ref beside a commit for it,
+/// and the plain form beside the `@OWN:` form where both write a local ref.
+/// The same operand two times is one operand. Under `no_ref_writes`, the pull
+/// writes no ref, makes no such check, and fetches each commit.
+#[test]
+fn two_commit_operands_for_one_ref_are_refused() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-one-place");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let at_first = name_at("test/main", &first);
+        let at_second = name_at("test/main", &second);
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        for (names, one, two) in [
+            (
+                [at_first.as_str(), at_second.as_str()],
+                &at_first,
+                &at_second,
+            ),
+            (
+                ["test/main", at_first.as_str()],
+                &"test/main".to_owned(),
+                &at_first,
+            ),
+        ] {
+            match dest.pull("origin", refs_of(&names)).await {
+                Err(Error::Pull(msg)) => assert_eq!(
+                    msg,
+                    format!("the refs {one} and {two} write one ref refs/remotes/origin/test/main")
+                ),
+                other => panic!("{names:?}: {other:?}"),
+            }
+        }
+        assert_left_nothing(&dest).await;
+
+        dest.pull("origin", refs_of(&[&at_first, &at_first]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), first)]
+        );
+
+        // Under `MIRROR`, the plain form and the form of the own collection
+        // id both write the local ref.
+        let own = "org.example.Own";
+        let dest = mirror_dest(dir.path(), Some(own), &url).await;
+        let own_first = name_at(&at(own, "test/main"), &first);
+        match dest
+            .pull("origin", mirror_of(&[&at_first, &own_first]))
+            .await
+        {
+            Err(Error::Pull(msg)) => assert_eq!(
+                msg,
+                format!("the refs {at_first} and {own_first} write one ref refs/heads/test/main")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_left_nothing(&dest).await;
+
+        for names in [
+            vec!["test/main", at_first.as_str()],
+            vec![at_first.as_str(), at_second.as_str()],
+        ] {
+            let dest = mirror_dest(dir.path(), None, &url).await;
+            dest.pull(
+                "origin",
+                PullOptions {
+                    no_ref_writes: true,
+                    ..refs_of(&names)
+                },
+            )
+            .await
+            .unwrap();
+            for commit in [first, second] {
+                assert_complete(&remote, &dest, dest.path(), &commit).await;
+            }
+            assert_no_refs(&dest).await;
+        }
+        // Under `MIRROR`, a ref and its form of the collection of the
+        // summary write one ref. The pull that writes no ref takes both.
+        let other = dir.path().join("collection");
+        let (_remote, [_, c, ..]) = build_collection_remote(&other).await;
+        let collection_server = RepoServer::start(&other.join("remote"), false).await;
+        let dest = mirror_dest(dir.path(), None, &collection_server.url()).await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                no_ref_writes: true,
+                ..mirror_of(&["c", &at(REMOTE_ID, "c")])
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest.commit_state(&c).await.unwrap(), CommitState::Normal);
+        assert_no_refs(&dest).await;
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+    });
+}
+
+/// A name of 64 lowercase hex characters is a valid ref name. A target is a
+/// commit with no ref only if its name is the hex form of its own commit:
+///
+/// - `<H>` beside `<H>@<C>`: the second operand writes the ref `<H>` to the
+///   commit C and gets the ref-binding check of `<H>`, and the first operand
+///   fetches the commit H with no ref;
+/// - `<C>` beside `<C>@<C>`: the operand that writes a ref wins, so the pull
+///   makes the ref-binding check and writes the ref `<C>` to the commit C.
+#[test]
+fn a_checksum_operand_beside_a_ref_of_the_same_name_keeps_the_ref() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-hex-ref");
+        let (remote, first, second) = build_remote_chain(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let unchecked = |names: &[&str]| PullOptions {
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..refs_of(names)
+        };
+
+        let h = first.to_hex();
+        let h_at_c = name_at(&h, &second);
+        let dest = build_dest(dir.path(), RepoMode::Archive, &url, "").await;
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&h, &h_at_c])).await,
+            &format!("no requested ref '{h}' in ref binding metadata"),
+        );
+        assert_left_nothing(&dest).await;
+        dest.pull("origin", unchecked(&[&h, &h_at_c]))
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [(format!("origin:{h}"), second)]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        for commit in [first, second] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+
+        let c = second.to_hex();
+        let c_at_c = name_at(&c, &second);
+        for names in [[&c, &c_at_c], [&c_at_c, &c]] {
+            let names = names.map(String::as_str);
+            let dest = mirror_dest(dir.path(), None, &url).await;
+            assert_pull_refused(
+                dest.pull("origin", refs_of(&names)).await,
+                &format!("no requested ref '{c}' in ref binding metadata"),
+            );
+            assert_left_nothing(&dest).await;
+            dest.pull("origin", unchecked(&names)).await.unwrap();
+            assert_eq!(
+                dest.list_remote_refs().await.unwrap(),
+                [(format!("origin:{c}"), second)]
+            );
+            assert!(dest.list_refs(None).await.unwrap().is_empty());
+            assert_complete(&remote, &dest, dest.path(), &second).await;
+        }
+    });
+}
+
+/// Sets `[core] indexed-deltas=true` in the config of the remote at `root`.
+fn state_indexed_deltas(root: &Path) {
+    let config = root.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("[core]\n"), "{text}");
+    std::fs::write(
+        &config,
+        text.replacen("[core]\n", "[core]\nindexed-deltas=true\n", 1),
+    )
+    .unwrap();
+}
+
+/// Returns the options of a pull of `test/main@<commit>` that requires static
+/// deltas.
+fn required_at(commit: &Checksum) -> PullOptions {
+    PullOptions {
+        require_static_deltas: true,
+        ..refs_of(&[&name_at("test/main", commit)])
+    }
+}
+
+/// A pull of commit operands alone that requires static deltas, from a
+/// remote whose `config` does not state `indexed-deltas`. The pull reads no
+/// summary and no delta index, and requests one superblock by name. If the
+/// remote serves that delta, the pull takes it. If the remote does not serve
+/// it, the pull fails with the error of a delta that is not found.
+#[test]
+fn required_deltas_of_a_commit_operand_are_requested_by_name() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-require-by-name");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+
+        let err = dest.pull("origin", required_at(&second)).await.unwrap_err();
+        match &err {
+            Error::Pull(message) => assert_eq!(
+                *message,
+                format!("Static deltas required, but none found for test/main to {second}")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            server.seen(),
+            ["config".to_owned(), scratch_superblock(&second)]
+        );
+        assert_left_nothing(&dest).await;
+
+        remote
+            .generate_static_delta(
+                None,
+                &second,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        server.forget();
+        dest.pull("origin", required_at(&second)).await.unwrap();
+        assert_eq!(server.requests_for(&scratch_superblock(&second)), 1);
+        assert_eq!(server.requests_for(&index_path(&second)), 0);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 0);
+        assert_no_summary_and_no_ref_request(&server);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+    });
+}
+
+/// A pull of commit operands alone that requires static deltas, from a
+/// remote whose `config` states `indexed-deltas=true`. The pull reads no
+/// summary, and requests the delta index of the commit:
+///
+/// - with no index, the pull fails with the error of a delta that is not
+///   found, and requests no superblock;
+/// - with an index, the pull takes the delta that the index names;
+/// - if the ref names a commit held complete and the index names the
+///   from-scratch delta alone, that delta counts as found, and the pull
+///   fetches the objects loose.
+#[test]
+fn required_deltas_of_a_commit_operand_come_from_the_delta_index() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-require-index");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        state_indexed_deltas(remote.path());
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &url, "").await;
+        let err = dest.pull("origin", required_at(&second)).await.unwrap_err();
+        match &err {
+            Error::Pull(message) => assert_eq!(
+                *message,
+                format!("Static deltas required, but none found for test/main to {second}")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(server.seen(), ["config".to_owned(), index_path(&second)]);
+        assert_left_nothing(&dest).await;
+
+        // The index of the remote names the from-scratch delta alone. The
+        // remote has no summary.
+        remote
+            .generate_static_delta(
+                None,
+                &second,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        remote.reindex_static_deltas().await.unwrap();
+        server.forget();
+        dest.pull("origin", required_at(&second)).await.unwrap();
+        assert_eq!(server.requests_for(&index_path(&second)), 1);
+        assert_eq!(server.requests_for(&scratch_superblock(&second)), 1);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 0);
+        assert_no_summary_and_no_ref_request(&server);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+
+        // The ref names the first commit, held complete.
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", refs_of(&[&name_at("test/main", &first)]))
+            .await
+            .unwrap();
+        server.forget();
+        dest.pull("origin", required_at(&second)).await.unwrap();
+        assert_eq!(server.requests_for(&index_path(&second)), 1);
+        assert_eq!(server.requests_for(&scratch_superblock(&second)), 0);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 1);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+    });
+}
+
+/// Two operands that name one commit make one search for its delta. Here the
+/// remote serves no delta, and the pull fetches the objects loose:
+///
+/// - from a remote whose `config` does not state `indexed-deltas`, the pull
+///   requests the from-scratch superblock by name one time;
+/// - from a remote whose `config` states `indexed-deltas=true`, the pull
+///   requests the delta index of the commit one time, also if the refs of
+///   the two operands name different commits in this repository.
+#[test]
+fn two_operands_for_one_commit_search_its_delta_one_time() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-one-search");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let unchecked = |names: &[&str]| PullOptions {
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..refs_of(names)
+        };
+        let both = [name_at("a", &second), name_at("b", &second)];
+        let both = [both[0].as_str(), both[1].as_str()];
+        let written = [
+            ("origin:a".to_owned(), second),
+            ("origin:b".to_owned(), second),
+        ];
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &url, "").await;
+        dest.pull("origin", unchecked(&both)).await.unwrap();
+        assert_eq!(server.requests_for(&scratch_superblock(&second)), 1);
+        assert_eq!(server.requests_for(&index_path(&second)), 0);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 1);
+        assert_eq!(dest.list_remote_refs().await.unwrap(), written);
+
+        state_indexed_deltas(remote.path());
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        server.forget();
+        dest.pull("origin", unchecked(&both)).await.unwrap();
+        assert_eq!(server.requests_for(&index_path(&second)), 1);
+        assert_eq!(server.requests_for(&scratch_superblock(&second)), 0);
+        assert_eq!(dest.list_remote_refs().await.unwrap(), written);
+
+        // The ref `a` names the first commit, held complete, and the ref `b`
+        // names no commit.
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        dest.pull("origin", unchecked(&[&name_at("a", &first)]))
+            .await
+            .unwrap();
+        server.forget();
+        dest.pull("origin", unchecked(&both)).await.unwrap();
+        assert_eq!(server.requests_for(&index_path(&second)), 1);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 1);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+        assert_eq!(dest.list_remote_refs().await.unwrap(), written);
+    });
+}
+
+/// A `CHECKSUM` operand takes no static delta:
+///
+/// - the pull sends no request for a delta index or for a delta of the
+///   commit, and fetches its objects loose, also from a remote that serves a
+///   delta and an index for it;
+/// - with a list of static deltas, the commit gets no chain;
+/// - under `require_static_deltas`, the pull refuses a commit that this
+///   repository does not hold complete before the first request, and takes
+///   a commit that it holds complete.
+#[test]
+fn a_checksum_operand_takes_no_static_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-no-delta");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, None, &second).await;
+        remote.reindex_static_deltas().await.unwrap();
+        state_indexed_deltas(remote.path());
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let bare = || refs_of(&[&second.to_hex()]);
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &url, "").await;
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    require_static_deltas: true,
+                    ..bare()
+                },
+            )
+            .await
+            .unwrap_err();
+        match &err {
+            Error::Pull(message) => assert_eq!(
+                *message,
+                format!(
+                    "Static deltas required, but a commit named by its checksum takes none: \
+                     {second}"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_left_nothing(&dest).await;
+
+        dest.pull("origin", bare()).await.unwrap();
+        assert_no_delta_request(&server);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 1);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+
+        // The repository holds the commit complete.
+        server.forget();
+        dest.pull(
+            "origin",
+            PullOptions {
+                require_static_deltas: true,
+                ..bare()
+            },
+        )
+        .await
+        .unwrap();
+        assert_no_delta_request(&server);
+        assert_no_refs(&dest).await;
+
+        // The list names the delta from scratch to the commit.
+        let superblock = std::fs::read(remote.path().join(scratch_superblock(&second))).unwrap();
+        let list = vec![AdvertisedDelta {
+            from: None,
+            to: second,
+            superblock: Checksum::sha256(&superblock),
+        }];
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        server.forget();
+        dest.pull(
+            "origin",
+            PullOptions {
+                static_deltas: Some(list),
+                ..bare()
+            },
+        )
+        .await
+        .unwrap();
+        assert_no_delta_request(&server);
+        assert_eq!(server.requests_for(&meta_path(&second, "commit")), 1);
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// Under `require_static_deltas`, the pull takes a `CHECKSUM` operand whose
+/// commit this repository does not hold complete in two cases: under
+/// `COMMIT_ONLY`, and with `disable_static_deltas`. The pull requests no
+/// delta.
+#[test]
+fn required_deltas_take_a_checksum_operand_that_needs_no_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-require-exempt");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let required = || PullOptions {
+            require_static_deltas: true,
+            ..refs_of(&[&second.to_hex()])
+        };
+
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &url, "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                ..required()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(dest.has_object(ObjectType::Commit, &second).await.unwrap());
+        assert_eq!(
+            dest.commit_state(&second).await.unwrap(),
+            CommitState::Partial
+        );
+        assert_no_delta_request(&server);
+        assert_no_refs(&dest).await;
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        server.forget();
+        dest.pull(
+            "origin",
+            PullOptions {
+                disable_static_deltas: true,
+                ..required()
+            },
+        )
+        .await
+        .unwrap();
+        assert_complete(&remote, &dest, dest.path(), &second).await;
+        assert_no_delta_request(&server);
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// A pull of commit operands alone reads the key `indexed-deltas` of the
+/// `config` of the remote. A value that is not a boolean, and a remote with
+/// no `config`, count as a `config` that does not state the key: the pull
+/// requests one superblock by name, and no delta index.
+#[test]
+fn a_remote_that_does_not_state_indexed_deltas_gets_a_request_by_name() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-index-key-absent");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &second,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        remote.reindex_static_deltas().await.unwrap();
+        let config = remote.path().join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert!(text.contains("[core]\n"), "{text}");
+        std::fs::write(
+            &config,
+            text.replacen("[core]\n", "[core]\nindexed-deltas=maybe\n", 1),
+        )
+        .unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+
+        for with_config in [true, false] {
+            if !with_config {
+                std::fs::remove_file(&config).unwrap();
+            }
+            let dest = mirror_dest(dir.path(), None, &url).await;
+            server.forget();
+            dest.pull("origin", required_at(&second)).await.unwrap();
+            let seen = server.seen();
+            assert_eq!(
+                seen[..2],
+                ["config".to_owned(), scratch_superblock(&second)],
+                "{seen:?}"
+            );
+            assert_eq!(server.requests_for(&scratch_superblock(&second)), 1);
+            assert_eq!(server.requests_for(&index_path(&second)), 0, "{seen:?}");
+            assert_eq!(server.requests_for(&meta_path(&second, "commit")), 0);
+            assert_no_summary_and_no_ref_request(&server);
+            assert_complete(&remote, &dest, dest.path(), &second).await;
+        }
+    });
+}
+
+/// With a list of static deltas, the chain of a `REF@CHECKSUM` target can
+/// make the commit of a `CHECKSUM` operand. That commit keeps the checks of
+/// a `CHECKSUM` operand. Here the chain to the second commit goes through
+/// the first commit, which a `CHECKSUM` operand names:
+///
+/// - the pull makes both commits from the deltas, writes the ref of the
+///   `REF@CHECKSUM` operand, and writes no ref for the first commit;
+/// - under a key `collection-id` of the remote section, the pull refuses the
+///   first commit, which has no collection binding.
+#[test]
+fn a_checksum_operand_that_a_chain_makes_keeps_its_checks() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-chain");
+        let (remote, first, second) = build_remote_two_commits(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &first,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        let superblock = std::fs::read(remote.path().join(scratch_superblock(&first))).unwrap();
+        let list = vec![
+            AdvertisedDelta {
+                from: None,
+                to: first,
+                superblock: Checksum::sha256(&superblock),
+            },
+            listed(&remote, &first, &second, DeltaOptions::default()).await,
+        ];
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let opts = || PullOptions {
+            static_deltas: Some(list.clone()),
+            ..refs_of(&[&first.to_hex(), &name_at("test/main", &second)])
+        };
+
+        let extra = format!("collection-id={ID_X}\n");
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &url, &extra).await;
+        assert_pull_refused(
+            dest.pull("origin", opts()).await,
+            &format!("commit {first}: no collection binding metadata"),
+        );
+        assert_left_nothing(&dest).await;
+        drop(dest);
+
+        let dest = reconfigure_dest(dir.path(), &url, "").await;
+        server.forget();
+        dest.pull("origin", opts()).await.unwrap();
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&scratch_superblock(&first)), 1);
+        assert_eq!(server.requests_for(&superblock_path(&first, &second)), 1);
+        for commit in [first, second] {
+            assert_eq!(
+                server.requests_for(&meta_path(&commit, "commit")),
+                0,
+                "{seen:?}"
+            );
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), second)]
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// A `CHECKSUM` operand can name the commit of another operand of the same
+/// pull. The other operand writes its ref and takes its delta, and the
+/// commit keeps the checks of both operands:
+///
+/// - beside a ref whose tip is the commit, the pull reads the summary, and
+///   takes the delta that the summary names for the ref;
+/// - beside a `REF@CHECKSUM` operand of the commit, the pull reads no
+///   summary, and requests the delta of that operand by name;
+/// - the ref-binding check of the `REF@CHECKSUM` operand applies;
+/// - under a key `collection-id` of the remote section, the
+///   collection-binding check of the `CHECKSUM` operand applies.
+#[test]
+fn a_checksum_operand_can_name_the_commit_of_another_operand() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-shared-commit");
+        let (remote, _first, second) = build_remote_two_commits(dir.path()).await;
+        publish_delta(&remote, None, &second).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let hex = second.to_hex();
+        let at = name_at("test/main", &second);
+
+        for (names, summary) in [
+            (["test/main", hex.as_str()], true),
+            ([hex.as_str(), "test/main"], true),
+            ([hex.as_str(), at.as_str()], false),
+            ([at.as_str(), hex.as_str()], false),
+        ] {
+            let dest = mirror_dest(dir.path(), None, &url).await;
+            server.forget();
+            dest.pull("origin", refs_of(&names)).await.unwrap();
+            let seen = server.seen();
+            assert_eq!(
+                server.requests_for(&scratch_superblock(&second)),
+                1,
+                "{names:?}: {seen:?}"
+            );
+            assert_eq!(
+                server.requests_for(&meta_path(&second, "commit")),
+                0,
+                "{names:?}: {seen:?}"
+            );
+            assert_eq!(seen.contains(&"summary".to_owned()), summary, "{seen:?}");
+            assert_complete(&remote, &dest, dest.path(), &second).await;
+            assert_eq!(
+                dest.list_remote_refs().await.unwrap(),
+                [("origin:test/main".to_owned(), second)],
+                "{names:?}"
+            );
+            assert!(dest.list_refs(None).await.unwrap().is_empty());
+        }
+
+        let dest = mirror_dest(dir.path(), None, &url).await;
+        assert_pull_refused(
+            dest.pull("origin", refs_of(&[&hex, &name_at("any/name", &second)]))
+                .await,
+            "no requested ref 'any/name' in ref binding metadata",
+        );
+        assert_left_nothing(&dest).await;
+        drop(dest);
+
+        let extra = format!("collection-id={ID_X}\n");
+        for names in [["test/main", hex.as_str()], [at.as_str(), hex.as_str()]] {
+            let dest = mirror_dest(dir.path(), None, &url).await;
+            drop(dest);
+            let dest = reconfigure_dest(dir.path(), &url, &extra).await;
+            assert_pull_refused(
+                dest.pull("origin", refs_of(&names)).await,
+                &format!("commit {second}: no collection binding metadata"),
+            );
+            assert_left_nothing(&dest).await;
+        }
+    });
+}
+
+/// The repository holds R, C, and D of the chain R -> C -> D complete. A
+/// pull of R, by its ref and by its checksum, reads field 2 of C and of D
+/// from the repository, and sends no request for C or for D. Its one object
+/// request is for the `.commitmeta` of R.
+#[test]
+fn a_pull_of_a_graph_held_complete_requests_no_attachment() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-below-held-all");
+        let (remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &chain.r).await;
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_eq!(
+                dest.commit_state(&commit).await.unwrap(),
+                CommitState::Normal
+            );
+        }
+        let root_files = ["summary.sig", "summary", "config"];
+
+        for bare in [false, true] {
+            let opts = if bare {
+                refs_of(&[&chain.r.to_hex()])
+            } else {
+                refs_of(&["test/main"])
+            };
+            server.forget();
+            dest.pull("origin", opts).await.unwrap();
+            let seen = server.seen();
+            let objects: Vec<&String> = seen
+                .iter()
+                .filter(|path| !root_files.contains(&path.as_str()))
+                .collect();
+            assert_eq!(objects, [&meta_path(&chain.r, "commitmeta")], "{seen:?}");
+            for commit in [chain.r, chain.c, chain.d] {
+                assert_complete(&remote, &dest, dest.path(), &commit).await;
+            }
+            assert_no_markers(dest.path());
+        }
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), chain.r)]
+        );
+    });
+}
+
+/// The repository holds a commit T complete, without its attachment, as a
+/// pull by the `ostree` command leaves it. The ref of the remote names a
+/// newer commit. A pull of the `CHECKSUM` of T at depth 0:
+///
+/// - fetches the attachment of T complete;
+/// - requests the `.commitmeta` of T one time and checks the signature of T,
+///   and requests no commit object of T;
+/// - requests no `summary`, no `summary.sig`, and no ref file;
+/// - requests no delta index and no delta of T;
+/// - writes no ref, and does not fetch the newer commit.
+///
+/// The same pull under a key that did not sign T fails with
+/// `Error::Signature`.
+#[test]
+fn a_checksum_pull_of_a_held_commit_fetches_its_attachments() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-checksum-adoption");
+        let (remote, tip, att) = build_attachment_remote(dir.path()).await;
+        remote
+            .sign_commit(&tip, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let newer = commit_tree(
+            &remote,
+            dir.path(),
+            "main",
+            "test/main",
+            Some(tip),
+            FIXED_TS + 1,
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let url = server.url();
+        let dest = dest_holding(dir.path(), &url, &tip).await;
+        std::fs::remove_file(dest.path().join(meta_path(&att, "commit"))).unwrap();
+        drop(dest);
+        let dest = reconfigure_dest(dir.path(), &url, &signed_policy()).await;
+        assert_eq!(dest.commit_state(&tip).await.unwrap(), CommitState::Normal);
+        assert!(!dest.has_object(ObjectType::Commit, &att).await.unwrap());
+        server.forget();
+
+        dest.pull("origin", refs_of(&[&tip.to_hex()]))
+            .await
+            .unwrap();
+
+        let seen = server.seen();
+        assert_complete(&remote, &dest, dest.path(), &att).await;
+        assert_eq!(
+            server.requests_for(&meta_path(&tip, "commitmeta")),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&tip, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&meta_path(&att, "commit")), 1);
+        assert_no_summary_and_no_ref_request(&server);
+        assert_eq!(server.requests_for(&index_path(&tip)), 0, "{seen:?}");
+        assert_eq!(server.requests_for(&scratch_superblock(&tip)), 0);
+        assert!(!dest.has_object(ObjectType::Commit, &newer).await.unwrap());
+        assert_no_refs(&dest).await;
+        assert_no_markers(dest.path());
+        drop(dest);
+
+        let other = format!("sign-verify=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n");
+        let dest = reconfigure_dest(dir.path(), &url, &other).await;
+        let err = dest
+            .pull("origin", refs_of(&[&tip.to_hex()]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Signature(_)), "{err:?}");
+        assert_no_refs(&dest).await;
+    });
+}
+
+/// The repository holds R and C of the chain R -> C -> D complete. The pull
+/// of R, by its checksum if `bare` is set and else by its ref, reads field 2
+/// of C from the commit object of the repository, and takes D.
+///
+/// If `partial` is set, the repository holds D partial, and the pull
+/// completes it. Else the repository does not hold the commit object of D,
+/// and the pull requests it one time. The pull requests no file of C.
+async fn pull_below_a_held_attachment(tag: &str, bare: bool, partial: bool) {
+    let dir = TmpDir::new(tag);
+    let (remote, chain) = build_chain_remote_of_attachments(dir.path()).await;
+    let server = RepoServer::start(remote.path(), false).await;
+    let dest = dest_holding(dir.path(), &server.url(), &chain.r).await;
+    if partial {
+        common::mark_partial(&dest, &chain.d);
+    } else {
+        std::fs::remove_file(dest.path().join(meta_path(&chain.d, "commit"))).unwrap();
+    }
+    assert_eq!(
+        dest.commit_state(&chain.c).await.unwrap(),
+        CommitState::Normal
+    );
+    server.forget();
+
+    let opts = if bare {
+        refs_of(&[&chain.r.to_hex()])
+    } else {
+        refs_of(&["test/main"])
+    };
+    dest.pull("origin", opts).await.unwrap();
+
+    let seen = server.seen();
+    for ext in ["commit", "commitmeta"] {
+        assert_eq!(
+            server.requests_for(&meta_path(&chain.c, ext)),
+            0,
+            "{seen:?}"
+        );
+    }
+    assert_eq!(server.requests_for(&index_path(&chain.c)), 0, "{seen:?}");
+    assert_eq!(
+        server.requests_for(&meta_path(&chain.d, "commit")),
+        usize::from(!partial),
+        "{seen:?}"
+    );
+    assert_eq!(
+        server.requests_for(&meta_path(&chain.d, "commitmeta")),
+        1,
+        "{seen:?}"
+    );
+    for commit in [chain.r, chain.c, chain.d] {
+        assert_complete(&remote, &dest, dest.path(), &commit).await;
+    }
+    assert_no_markers(dest.path());
+    assert!(dest.list_refs(None).await.unwrap().is_empty());
+    let refs = dest.list_remote_refs().await.unwrap();
+    if bare {
+        assert!(refs.is_empty(), "{refs:?}");
+    } else {
+        assert_eq!(refs, [("origin:test/main".to_owned(), chain.r)]);
+    }
+}
+
+#[test]
+fn a_checksum_pull_fetches_an_absent_attachment_below_a_held_attachment() {
+    block_on(pull_below_a_held_attachment(
+        "pull-http-below-held-bare-absent",
+        true,
+        false,
+    ));
+}
+
+#[test]
+fn a_checksum_pull_completes_a_partial_attachment_below_a_held_attachment() {
+    block_on(pull_below_a_held_attachment(
+        "pull-http-below-held-bare-partial",
+        true,
+        true,
+    ));
+}
+
+#[test]
+fn a_ref_pull_fetches_an_absent_attachment_below_a_held_attachment() {
+    block_on(pull_below_a_held_attachment(
+        "pull-http-below-held-ref-absent",
+        false,
+        false,
+    ));
+}
+
+#[test]
+fn a_ref_pull_completes_a_partial_attachment_below_a_held_attachment() {
+    block_on(pull_below_a_held_attachment(
+        "pull-http-below-held-ref-partial",
+        false,
+        true,
+    ));
+}
+
+/// The repository holds R, A, and B of the diamond complete, and does not
+/// hold the commit object of D, which A and B both name. The pull of R reads
+/// field 2 of A and of B from the repository, and requests D one time. It
+/// requests no file of A or of B.
+#[test]
+fn an_attachment_below_two_held_attachments_is_fetched_once() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-below-held-diamond");
+        let remote = create_remote(dir.path()).await;
+        let diamond = write_diamond(&remote, &dir.path().join("trees"), "test/main").await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &diamond.r).await;
+        std::fs::remove_file(dest.path().join(meta_path(&diamond.d, "commit"))).unwrap();
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        for ext in ["commit", "commitmeta"] {
+            assert_eq!(
+                server.requests_for(&meta_path(&diamond.d, ext)),
+                1,
+                "{seen:?}"
+            );
+            for held in [diamond.a, diamond.b] {
+                assert_eq!(server.requests_for(&meta_path(&held, ext)), 0, "{seen:?}");
+            }
+        }
+        for commit in [diamond.r, diamond.a, diamond.b, diamond.d] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+        assert_no_markers(dest.path());
+    });
+}
+
+/// The repository holds an attachment complete whose field 2 has a
+/// defective entry. A pull of a commit that names the attachment reads that
+/// field 2 from the repository, and fails with `Error::InvalidRelations`,
+/// which names the attachment.
+#[test]
+fn a_defective_entry_of_a_held_attachment_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-below-held-defective");
+        let (remote, tip, att) = build_attachment_remote(dir.path()).await;
+        let short: &[u8] = &att.as_bytes()[..31];
+        let defective = store_with_field2(&remote, &att, &[("lib/short", short)]).await;
+        let naming = store_with_field2(&remote, &tip, &[("boot/uki", defective.as_bytes())]).await;
+        move_ref(&remote, "test/main", &naming).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        dest.pull("origin", refs_of(&["dep/uki"])).await.unwrap();
+        assert_eq!(
+            store_with_field2(&dest, &att, &[("lib/short", short)]).await,
+            defective
+        );
+        assert_eq!(
+            dest.commit_state(&defective).await.unwrap(),
+            CommitState::Normal
+        );
+        server.forget();
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+
+        assert_eq!(
+            attachment_error(err),
+            (
+                Some(defective),
+                "entry 0 (lib/short) has a checksum of 31 bytes, not 32".to_owned()
+            )
+        );
+        assert_eq!(server.requests_for(&meta_path(&defective, "commit")), 0);
+        assert!(!dest.has_object(ObjectType::Commit, &naming).await.unwrap());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:dep/uki".to_owned(), att)]
+        );
     });
 }

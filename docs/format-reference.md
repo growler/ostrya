@@ -3718,10 +3718,14 @@ collection refs:
   one time, also if several commits name it. A prune of the destination
   accepts the parents that the pull did not fetch, as after a pull with a
   small depth.
-- The pull ignores field 2 of an attachment that the repository holds
-  complete: it checks no entry of that field, and requests nothing below the
-  attachment. Each write of a commit checks that its attachments are
-  complete, so the full set of attachments of a complete commit is complete.
+- For an attachment that the repository holds complete, the pull reads
+  field 2 from the commit object of the repository, and takes each
+  attachment that it names, level by level. It reads no tree of that
+  attachment, requests no `.commitmeta` of it, and sends no request for it.
+  The pull reads each commit at most one time. An attachment below it that
+  the repository does not hold is fetched, and one that the repository holds
+  partial is completed. One that neither the repository, a localcache
+  repository, nor the remote holds fails the pull.
 - The pull writes no ref for an attachment.
 - The pull checks no signature of an attachment commit. Field 2 holds the
   checksum of the attachment, and the checksum and the signatures of the
@@ -3751,7 +3755,7 @@ collection refs:
 - The pull does not follow a supplement.
 - A commit-only pull and a pull with subpaths fetch no attachment.
 
-The pull checks the format of field 2 of each commit that it reads, except
+The pull checks the format of field 2 of each commit that it reads, also of
 an attachment that the repository holds complete. A commit-only pull and a
 pull with subpaths check it too. A defective related value in field 2 fails
 the pull: an entry with an empty name, and an entry with a checksum that is
@@ -5393,8 +5397,8 @@ over both transports ("The pull of collection refs").
 A pull of the port requests the attachments of a commit over both
 transports, as `.commitmeta` and `.commit` requests of their own ("Attachments
 in a pull from a remote"). For an attachment that the repository holds
-complete, it requests neither file, and requests nothing below the
-attachment.
+complete, it requests neither file. It requests the attachments that the
+repository does not hold complete below that attachment.
 
 ## The ref listing
 
@@ -5923,7 +5927,8 @@ collections of the remote:
 
 A name that occurs two times counts one time. The pull refuses two other
 names that write one ref file with `Error::Pull`, also two refs of the
-summary in a mirror pull with no ref. It makes this check after it reads
+summary in a mirror pull with no ref. A pull of named refs with
+`no_ref_writes` does not make this check. It makes this check after it reads
 the summary and the `config` of the remote, and before it reads a ref file
 or an object.
 

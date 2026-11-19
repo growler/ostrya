@@ -479,8 +479,9 @@ enum Command {
     /// commit, unless it takes --commit-metadata-only or --subpath: the
     /// attachments that field 2 names, and the attachments of each
     /// attachment, level by level. It fetches each one with no parent and no
-    /// ref. It ignores field 2 of an attachment that this repository holds
-    /// complete, and requests nothing below it.
+    /// ref. For an attachment that this repository holds complete, it reads
+    /// field 2 from the commit object of this repository, and fetches the
+    /// attachments below it that this repository does not hold complete.
     ///
     /// With `[ex-ostrya] generate-composefs=true` in a repository that does
     /// not seal its objects with fs-verity, a pull that succeeds writes one

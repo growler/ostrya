@@ -296,7 +296,8 @@ impl PullFlags {
     /// fails the pull with [`Error::Pull`]. The flag does not skip the
     /// collection-binding check of an `@ID:NAME` name in a pull without
     /// [`no_ref_writes`](PullOptions::no_ref_writes) ([`Repo::pull_local`],
-    /// [`Repo::pull`]).
+    /// [`Repo::pull`]). It does not skip the collection-binding check of a
+    /// commit operand of [`Repo::pull`].
     /// [`Repo::pull_collection`] refuses this flag, because it always checks
     /// the bindings. To pull a tip with no
     /// collection binding, set
@@ -314,7 +315,8 @@ impl PullFlags {
     /// [`Repo::pull`] writes a plain name as a ref of the collection that the
     /// summary of the remote states, and as a local ref under `refs/heads/`
     /// if the summary states no collection id. It writes an `@ID:NAME` name
-    /// as without this flag. If [`refs`](PullOptions::refs) is empty, the
+    /// as without this flag, and a `NAME@CHECKSUM` operand as the local ref
+    /// `refs/heads/NAME`. If [`refs`](PullOptions::refs) is empty, the
     /// pull takes each ref that the summary of the remote lists, in field 0
     /// and in its collection map. If the pull takes each such ref, it copies
     /// the `summary` and `summary.sig` bytes of the remote to this
@@ -375,6 +377,10 @@ pub enum TimestampCheck {
     /// `refs/heads/<name>`, the path that [`Repo::resolve_ref_tip`] reads.
     ///
     /// A ref that this repository does not hold passes.
+    ///
+    /// A `CHECKSUM` operand of a pull from a remote has no ref. The pull
+    /// refuses it under this check with [`Error::InvalidInput`], before the
+    /// first request.
     CurrentRef,
     /// A given commit.
     ///
@@ -384,8 +390,9 @@ pub enum TimestampCheck {
     /// fetches a delta index, a static delta superblock, a `.commitmeta`, or
     /// an object. If this repository does not hold the commit, the pull fails
     /// with [`Error::ObjectNotFound`] at that point. A pull with no target
-    /// reads no commit. [`Repo::pull_local`] makes no timestamp check and
-    /// reads no commit.
+    /// reads no commit. The check applies to each target, the commit of a
+    /// `CHECKSUM` operand included. [`Repo::pull_local`] makes no timestamp
+    /// check and reads no commit.
     Rev(Checksum),
 }
 
@@ -459,6 +466,8 @@ pub enum TimestampCheck {
 /// The verification comes before the pull reads the refs or the deltas of
 /// the summary. If the policy covers the summary and the source has no
 /// `summary` or no `summary.sig`, the pull fails with [`Error::Signature`].
+/// A pull from a remote whose names are all commit operands reads no summary,
+/// and the policy of the summary does not apply to it.
 ///
 /// The policy belongs to the pull. The pull verifies each target, each
 /// parent that a depth pull follows, and each commit of a chain of static
@@ -578,9 +587,12 @@ pub struct PullOptions {
     /// A local pull reads each name as a revision of the source, `@ID:NAME`
     /// and a `^` suffix included, as [`Repo::pull_local`] states.
     /// [`Repo::pull`] and [`Repo::pull_with_session`] read each name as a ref
-    /// `NAME` or a collection ref `@ID:NAME`, and refuse each other form, as
-    /// [`Repo::pull`] states in "Refs". They take a name that occurs two
-    /// times one time.
+    /// `NAME`, a collection ref `@ID:NAME`, or a commit operand, and refuse
+    /// each other form, as [`Repo::pull`] states in "Refs". A commit operand
+    /// names the commit that the pull fetches: `CHECKSUM`, `NAME@CHECKSUM`,
+    /// or `@ID:NAME@CHECKSUM`. [`commit_operand`] makes the text of the
+    /// second and the third form. They take a name that occurs two times one
+    /// time.
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
@@ -616,10 +628,10 @@ pub struct PullOptions {
     /// revision syntax. So a caller pins the commit of a ref when it gives the
     /// checksum as the name.
     ///
-    /// A pull from a remote resolves each name as a ref name, through the
-    /// summary or the ref file of the remote. There, a checksum names no
-    /// commit and fails with [`Error::RefNotFound`], unless the remote holds a
-    /// ref of that name.
+    /// A pull from a remote resolves each ref name through the summary or
+    /// the ref file of the remote. A commit operand names the commit that the
+    /// pull fetches, as [`Repo::pull`] states in "Refs". Under this option,
+    /// the pull makes no check that two names write one ref.
     ///
     /// A pull from a remote still reads the ref that it writes without the
     /// option. Delta discovery takes the commit of that ref as the source of a
@@ -761,6 +773,13 @@ pub struct PullOptions {
     /// looks up.
     ///
     /// If the source serves no summary, the pull fails with [`Error::Pull`].
+    /// A pull from a remote whose names are all commit operands reads no
+    /// summary, and this rule does not apply to it. That pull fails with
+    /// [`Error::Pull`] for a delta that it requests and the remote does not
+    /// serve. A `CHECKSUM` operand takes no delta. So the pull refuses such
+    /// an operand with [`Error::Pull`] before the first request, unless this
+    /// repository holds its commit complete.
+    ///
     /// With a summary, the pull refuses with [`Error::Pull`] a commit that this
     /// repository does not hold complete, in two cases:
     ///
@@ -4087,18 +4106,167 @@ fn check_one_place<'a>(
     Ok(())
 }
 
+/// One operand of a pull, as [`refs`](PullOptions::refs) holds it.
+///
+/// A commit operand names its commit by the checksum: [`Operand::NameAt`]
+/// and [`Operand::Commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operand<'a> {
+    /// A ref, and each other text with no checksum part. The pull resolves
+    /// the commit of the ref.
+    Name(&'a str),
+    /// `REF@CHECKSUM`: the ref `name`, and the commit that the pull fetches
+    /// for it.
+    NameAt {
+        /// The text before the last `@`.
+        name: &'a str,
+        /// The commit.
+        commit: Checksum,
+    },
+    /// `CHECKSUM`: a commit with no ref.
+    Commit(Checksum),
+}
+
+impl<'a> Operand<'a> {
+    /// Reads the operand `text`.
+    ///
+    /// The checksum part starts after the last `@` of `text` that is not at
+    /// position 0. It must be 64 lowercase hex characters. A text with no
+    /// such `@` is [`Operand::Commit`] if it is 64 lowercase hex characters,
+    /// and else [`Operand::Name`]. The call does not check the ref part.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRefspec`] with `text` if the part after the `@` is not
+    /// 64 lowercase hex characters.
+    pub(crate) fn parse(text: &'a str) -> Result<Operand<'a>> {
+        match text.rfind('@').filter(|at| *at > 0) {
+            Some(at) => match Checksum::from_hex_lower(&text[at + 1..]) {
+                Ok(commit) => Ok(Operand::NameAt {
+                    name: &text[..at],
+                    commit,
+                }),
+                Err(_) => Err(Error::InvalidRefspec(text.to_owned())),
+            },
+            None => match Checksum::from_hex_lower(text) {
+                Ok(commit) => Ok(Operand::Commit(commit)),
+                Err(_) => Ok(Operand::Name(text)),
+            },
+        }
+    }
+}
+
+/// Returns the commit operand of a pull that names the ref `r` and the commit
+/// `commit`: the text `REF@CHECKSUM`.
+///
+/// [`PullOptions::refs`] takes the result. The pull fetches `commit`, checks
+/// it against `r`, and writes `r` to it. The operand that names a commit and
+/// no ref is the hex form of the checksum, [`Checksum::to_hex`].
+///
+/// A [`Ref::Local`] gives `NAME@CHECKSUM`, and a [`Ref::Collection`] gives
+/// `@ID:NAME@CHECKSUM`. A [`Ref::Remote`] gives `REMOTE:NAME@CHECKSUM`, which
+/// [`Repo::pull_local`] alone takes.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::{Checksum, Ref, commit_operand};
+///
+/// let commit = Checksum::from_bytes([0x5a; 32]);
+/// let operand = commit_operand(&Ref::local("exampleos/stable"), &commit);
+/// assert_eq!(operand, format!("exampleos/stable@{}", commit.to_hex()));
+/// ```
+pub fn commit_operand(r: &Ref, commit: &Checksum) -> String {
+    format!("{r}@{commit}")
+}
+
+/// The targets of a pull that come from its commit operands.
+#[derive(Default)]
+pub(crate) struct ChecksumTargets {
+    /// The commit of each target with no ref. The name of such a target is
+    /// the hex form of its commit.
+    bare: HashSet<Checksum>,
+    /// The name of each target of a `REF@CHECKSUM` operand whose ref has no
+    /// `@ID:` part.
+    named: HashSet<String>,
+    /// The collection id that the `ostree.collection-binding` of each target
+    /// with no ref must state, or `None` for no such check.
+    bare_collection: Option<String>,
+    /// `true` if each operand of the pull names its commit, so the pull read
+    /// no summary.
+    all: bool,
+}
+
+impl ChecksumTargets {
+    /// Returns `true` if the target `name` at `commit` has no ref.
+    ///
+    /// A name of 64 lowercase hex characters is also a valid ref name. So a
+    /// target has no ref only if its name is the hex form of its own commit.
+    pub(crate) fn is_bare(&self, name: &str, commit: &Checksum) -> bool {
+        self.bare.contains(commit)
+            && Checksum::from_hex_lower(name).is_ok_and(|named| named == *commit)
+    }
+}
+
 /// Checks each name of a pull from a remote.
 ///
-/// Each name must be a ref `NAME` or a collection ref `@ID:NAME` that
-/// [`Ref`] reads. The function refuses each other name with
-/// [`Error::InvalidRefspec`], which holds the name as given: a remote ref
-/// `REMOTE:NAME`, a `^` suffix, and a part that fails its rule. The check
-/// reads nothing.
+/// Each name must be a ref `NAME`, a collection ref `@ID:NAME`, or a commit
+/// operand that [`Operand`] reads: `CHECKSUM`, `NAME@CHECKSUM`, or
+/// `@ID:NAME@CHECKSUM`. [`Ref`] must read the ref part. The function refuses
+/// each other name with [`Error::InvalidRefspec`], which holds the name as
+/// given: a remote ref `REMOTE:NAME`, a `^` suffix, a part that fails its
+/// rule, and a part after the last `@` that is not 64 lowercase hex
+/// characters. The check reads nothing.
 fn check_remote_operands(opts: &PullOptions) -> Result<()> {
     for name in &opts.refs {
-        match name.parse::<Ref>() {
+        let r = match Operand::parse(name)? {
+            Operand::Commit(_) => continue,
+            Operand::Name(r) | Operand::NameAt { name: r, .. } => r,
+        };
+        match r.parse::<Ref>() {
             Ok(Ref::Local { .. } | Ref::Collection { .. }) => {}
             _ => return Err(Error::InvalidRefspec(name.clone())),
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a commit operand with no ref that a pull from a remote cannot
+/// take with its other options.
+///
+/// - Under [`TimestampCheck::CurrentRef`], such an operand has no ref to
+///   compare with.
+/// - Under [`require_static_deltas`](PullOptions::require_static_deltas),
+///   such an operand takes no delta. The pull refuses it unless `repo` holds
+///   the commit complete. The rule does not apply with
+///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or under
+///   [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY).
+///
+/// The check reads this repository alone, so a refusal sends no request.
+/// [`check_remote_operands`] checked each name.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] for the first rule.
+/// - [`Error::Pull`] for the second rule. The error names the commit.
+async fn check_commit_operands(repo: &Repo, opts: &PullOptions) -> Result<()> {
+    let needs_delta = opts.require_static_deltas
+        && !opts.disable_static_deltas
+        && !opts.flags.contains(PullFlags::COMMIT_ONLY);
+    for name in &opts.refs {
+        let Operand::Commit(commit) = Operand::parse(name)? else {
+            continue;
+        };
+        if opts.timestamp_check == TimestampCheck::CurrentRef {
+            return Err(Error::InvalidInput(format!(
+                "the timestamp check against the current ref takes no commit named by its \
+                 checksum with no ref: {commit}"
+            )));
+        }
+        if needs_delta && !delta::complete_here(repo, &commit).await? {
+            return Err(Error::Pull(format!(
+                "Static deltas required, but a commit named by its checksum takes none: {commit}"
+            )));
         }
     }
     Ok(())
@@ -4350,6 +4518,9 @@ struct TipChecks<'a> {
     /// The timestamp that the remote listed for each requested ref, which the
     /// timestamp of its tip must equal. `None` for no such check.
     listed: Option<&'a HashMap<String, u64>>,
+    /// The targets that come from the commit operands of the pull, or `None`
+    /// for a pull that takes no commit operand.
+    by_checksum: Option<&'a ChecksumTargets>,
 }
 
 impl<'a> TipChecks<'a> {
@@ -4357,7 +4528,8 @@ impl<'a> TipChecks<'a> {
     /// check `timestamp`, and its refs at `place`. The ref-binding check is on
     /// unless `flags` holds
     /// [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS). The
-    /// checks have no collection-binding check and no listed timestamps.
+    /// checks have no collection-binding check, no listed timestamps, and no
+    /// target of a commit operand.
     fn new(flags: PullFlags, timestamp: TimestampBase, place: RefPlace<'a>) -> TipChecks<'a> {
         TipChecks {
             bindings: !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
@@ -4367,7 +4539,15 @@ impl<'a> TipChecks<'a> {
             operand_collections: false,
             allow_unbound: false,
             listed: None,
+            by_checksum: None,
         }
+    }
+
+    /// Returns `true` if the target `name` at `commit` comes from a commit
+    /// operand with no ref.
+    fn is_bare(&self, name: &str, commit: &Checksum) -> bool {
+        self.by_checksum
+            .is_some_and(|targets| targets.is_bare(name, commit))
     }
 }
 
@@ -4378,6 +4558,17 @@ impl<'a> TipChecks<'a> {
 ///
 /// The ref-binding check of an `@ID:NAME` name reads the part after `@ID:`.
 /// The first check that fails stops the call.
+///
+/// A target of a commit operand with no ref has no ref-binding check and no
+/// check of a listed timestamp. Its `ostree.collection-binding` must state
+/// the collection id of the checks, else the id that [`ChecksumTargets`]
+/// holds for such targets. With neither id, it has no collection-binding
+/// check. Its timestamp check is the check against a given commit alone.
+///
+/// The target of a `NAME@CHECKSUM` operand, whose ref has no `@ID:` part,
+/// also gets [`check_own_collection_binding`], if the pull checks the
+/// collection of its `@ID:NAME` names and its place is
+/// [`RefPlace::Operands`].
 async fn check_tip_refs(
     repo: &Repo,
     checks: TipChecks<'_>,
@@ -4386,6 +4577,19 @@ async fn check_tip_refs(
     refs: &[&str],
 ) -> Result<()> {
     for ref_name in refs {
+        if let Some(targets) = checks
+            .by_checksum
+            .filter(|targets| targets.is_bare(ref_name, tip))
+        {
+            if let Some(id) = checks.collection.or(targets.bare_collection.as_deref()) {
+                check_collection_binding(tip, commit, id, checks.allow_unbound)?;
+            }
+            if matches!(checks.timestamp, TimestampBase::Rev { .. }) {
+                check_timestamp(repo, checks.timestamp, checks.place, ref_name, tip, commit)
+                    .await?;
+            }
+            continue;
+        }
         let operand = operand_collection(ref_name);
         if checks.bindings {
             let bound = operand.map_or(*ref_name, |(_, name)| name);
@@ -4396,6 +4600,15 @@ async fn check_tip_refs(
             .map(|(id, _)| id);
         if let Some(id) = checks.collection.or(operand_id) {
             check_collection_binding(tip, commit, id, checks.allow_unbound)?;
+        }
+        if operand.is_none()
+            && checks.operand_collections
+            && checks
+                .by_checksum
+                .is_some_and(|targets| targets.named.contains(*ref_name))
+            && let RefPlace::Operands { own, .. } = checks.place
+        {
+            check_own_collection_binding(tip, commit, own)?;
         }
         if let Some(listed) = checks.listed.and_then(|listed| listed.get(*ref_name)) {
             check_listed_timestamp(tip, commit, ref_name, *listed)?;
@@ -4432,6 +4645,32 @@ pub(crate) fn check_collection_binding(
                  collection '{id}'"
             ))),
         },
+    }
+}
+
+/// Checks the `ostree.collection-binding` of the commit of a `NAME@CHECKSUM`
+/// operand, whose ref has no `@ID:` part, against `own`, the
+/// `[core] collection-id` of the repository that writes the ref.
+///
+/// With an id, the binding must state it, as [`check_collection_binding`]
+/// states for a commit that must have a binding. With no id, the commit must
+/// have no `ostree.collection-binding` key.
+///
+/// # Errors
+///
+/// [`Error::Pull`] if the check fails. The error names the commit.
+pub(crate) fn check_own_collection_binding(
+    checksum: &Checksum,
+    commit: &Commit,
+    own: Option<&str>,
+) -> Result<()> {
+    match own {
+        Some(id) => check_collection_binding(checksum, commit, id, false),
+        None if commit.metadata_value("ostree.collection-binding").is_none() => Ok(()),
+        None => Err(Error::Pull(format!(
+            "commit {checksum}: collection binding metadata for a ref of a repository with no \
+             collection id"
+        ))),
     }
 }
 
@@ -4832,6 +5071,145 @@ mod tests {
     use rustix::fs::{AtFlags, Mode, OFlags};
 
     use super::*;
+
+    /// The checksum part of an operand starts after the last `@` that is not
+    /// at position 0, and must be 64 lowercase hex characters. A text with no
+    /// such `@` is a commit if it is 64 lowercase hex characters, and else a
+    /// name.
+    #[test]
+    fn an_operand_names_a_ref_a_commit_or_both() {
+        let hex = "5a".repeat(32);
+        let commit = Checksum::from_hex(&hex).unwrap();
+        let upper = hex.to_uppercase();
+        let at = |name: &str| format!("{name}@{hex}");
+        for (text, expected) in [
+            ("os/stable".to_owned(), Operand::Name("os/stable")),
+            (
+                "@org.example.Os:os/stable".to_owned(),
+                Operand::Name("@org.example.Os:os/stable"),
+            ),
+            ("os/stable^".to_owned(), Operand::Name("os/stable^")),
+            (upper.clone(), Operand::Name(&upper)),
+            (hex[..63].to_owned(), Operand::Name(&hex[..63])),
+            (format!("@{hex}"), Operand::Name(&format!("@{hex}"))),
+            (hex.clone(), Operand::Commit(commit)),
+            (
+                at("os/stable"),
+                Operand::NameAt {
+                    name: "os/stable",
+                    commit,
+                },
+            ),
+            (
+                at("@org.example.Os:os/stable"),
+                Operand::NameAt {
+                    name: "@org.example.Os:os/stable",
+                    commit,
+                },
+            ),
+            (
+                at("origin:os/stable"),
+                Operand::NameAt {
+                    name: "origin:os/stable",
+                    commit,
+                },
+            ),
+            (at(&hex), Operand::NameAt { name: &hex, commit }),
+            (
+                at("a@b"),
+                Operand::NameAt {
+                    name: "a@b",
+                    commit,
+                },
+            ),
+        ] {
+            assert_eq!(Operand::parse(&text).unwrap(), expected, "{text}");
+        }
+        for text in [
+            "os/stable@".to_owned(),
+            format!("os/stable@{}", &hex[..10]),
+            format!("os/stable@{}", &hex[..63]),
+            format!("os/stable@{upper}"),
+            format!("os/stable@{hex}^"),
+            format!("os/stable@{hex}x"),
+            format!("os/stable@{hex}0"),
+            format!("os/stable@{hex}@"),
+        ] {
+            match Operand::parse(&text) {
+                Err(Error::InvalidRefspec(given)) => assert_eq!(given, text),
+                other => panic!("{text}: {other:?}"),
+            }
+        }
+    }
+
+    /// The check of the names of a pull from a remote takes each ref and
+    /// each commit operand, and refuses each other name with the name as
+    /// given.
+    #[test]
+    fn a_pull_from_a_remote_checks_each_operand() {
+        let hex = "5a".repeat(32);
+        let upper = hex.to_uppercase();
+        let check = |name: &str| {
+            check_remote_operands(&PullOptions {
+                refs: vec![name.to_owned()],
+                ..PullOptions::default()
+            })
+        };
+        for name in [
+            "os/stable".to_owned(),
+            "@org.example.Os:os/stable".to_owned(),
+            hex.clone(),
+            upper.clone(),
+            format!("os/stable@{hex}"),
+            format!("@org.example.Os:os/stable@{hex}"),
+            format!("{hex}@{hex}"),
+        ] {
+            check(&name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        for name in [
+            "os/stable@".to_owned(),
+            format!("@{hex}"),
+            format!("os/stable@{}", &hex[..10]),
+            format!("os/stable@{}", &hex[..63]),
+            format!("os/stable@{upper}"),
+            format!("a@b@{hex}"),
+            format!("os/stable@{hex}^"),
+            format!("os/stable@{hex}x"),
+            format!("os/stable@{hex}0"),
+            format!("origin:os/stable@{hex}"),
+            format!("@:os/stable@{hex}"),
+            format!("@org.example.Os:@{hex}"),
+            "origin:os/stable".to_owned(),
+            "os/stable^".to_owned(),
+        ] {
+            match check(&name) {
+                Err(Error::InvalidRefspec(given)) => assert_eq!(given, name),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    /// The helper writes the ref, an `@`, and the hex form of the commit, and
+    /// the parser reads the result back.
+    #[test]
+    fn commit_operand_writes_what_the_parser_reads() {
+        let commit = Checksum::from_bytes([0x5a; 32]);
+        for (r, name) in [
+            (Ref::local("os/stable"), "os/stable"),
+            (
+                Ref::collection("org.example.Os", "os/stable"),
+                "@org.example.Os:os/stable",
+            ),
+            (Ref::remote("origin", "os/stable"), "origin:os/stable"),
+        ] {
+            let text = commit_operand(&r, &commit);
+            assert_eq!(text, format!("{name}@{}", commit.to_hex()));
+            assert_eq!(
+                Operand::parse(&text).unwrap(),
+                Operand::NameAt { name, commit }
+            );
+        }
+    }
 
     #[test]
     fn a_ref_place_gives_the_path_of_its_refs() {

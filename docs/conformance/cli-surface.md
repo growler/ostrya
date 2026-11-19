@@ -3868,8 +3868,9 @@ write. The `ostrya` command writes none.
 attachments that field 2 names, and the attachments of each attachment, level
 by level. It fetches each one at depth 0 and with no ref, unless the pull is
 commit-only or has a subpath (`../format-reference.md`, "Attachments in a pull
-from a remote"). It ignores field 2 of an attachment that the destination holds
-complete, and requests nothing below it. A field 2 entry with an empty name or
+from a remote"). For an attachment that the destination holds complete, it
+reads field 2 from the commit object of the destination, and fetches the
+attachments below it that the destination does not hold complete. A field 2 entry with an empty name or
 with a checksum that is not 32 bytes fails the pull at exit 1. At each level,
 an attachment that neither the repository, a localcache repository, nor the
 remote holds fails the pull at exit 1. The error names a commit that names the
@@ -4439,21 +4440,27 @@ is `REF` and `@ID:REF` with no `--remote`, into a destination whose collection
 id is ID. The port writes no object and no ref. An operand given two times
 counts one time.
 
-`pull` and `pull-local` of the port refuse a `REF@CHECKSUM` operand. They
-read a `CHECKSUM` operand as a ref name or as a revision. The tool takes both
-forms in `pull`, takes `CHECKSUM` in `pull-local`, and refuses `REF@CHECKSUM`
-in `pull-local` (`cli-behavior.md`, "Pull of a commit by its checksum"). The
-port gives these results:
+`pull REMOTE` of the port takes the operands `CHECKSUM`, `REF@CHECKSUM`,
+and `@ID:REF@CHECKSUM`. The tool takes the first two forms in `pull`
+(`cli-behavior.md`, "Pull of a commit by its checksum"). `CHECKSUM` fetches
+the commit and writes no ref, and `REF@CHECKSUM` fetches the commit and
+writes `REF` to it. The pull sends no request for `refs/heads/REF`. If each
+operand names its commit, the pull sends no request for `summary` or
+`summary.sig`. `../decisions.md`, "Commit operands of a pull", states the
+rules of the port. A malformed operand, for example `main@` or `main@` and an
+abbreviated checksum, gives `error: Invalid refspec <operand>` at exit 1,
+and `pull` sends no request.
 
-- `pull REMOTE REF@CHECKSUM` and `pull-local SRC REF@CHECKSUM` give `error:
-  Invalid refspec <operand>` at exit 1. `pull` sends no request.
-  `pull-local` refuses the operand after it opens the source, before it reads
-  a ref or an object of the source. With `--remote=NAME`, `pull-local` gives
-  `error: Invalid refspec NAME:REF@CHECKSUM`. A malformed operand, for
-  example `main@` or `main@` and an abbreviated checksum, gives the same text.
-- `pull REMOTE CHECKSUM` reads `CHECKSUM` as a ref name. From a remote that
-  serves a summary, the pull requests `summary.sig`, `summary`, `config`, and
-  `refs/heads/CHECKSUM`, and exits 1 with `error: ref not found: CHECKSUM`.
+`pull-local` of the port refuses a `REF@CHECKSUM` operand, and reads a
+`CHECKSUM` operand as a revision. The tool takes `CHECKSUM` in `pull-local`,
+and refuses `REF@CHECKSUM` there. The port gives these results:
+
+- `pull-local SRC REF@CHECKSUM` gives `error: Invalid refspec <operand>` at
+  exit 1. `pull-local` refuses the operand after it opens the source, before
+  it reads a ref or an object of the source. With `--remote=NAME`,
+  `pull-local` gives `error: Invalid refspec NAME:REF@CHECKSUM`. A malformed
+  operand, for example `main@` or `main@` and an abbreviated checksum, gives
+  the same text.
 - `pull-local SRC CHECKSUM` reads `CHECKSUM` as a revision of the source,
   and the ref-binding check reads `CHECKSUM` as the ref name. A commit with a
   ref binding gives `error: pull: commit <checksum>: no requested ref

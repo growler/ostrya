@@ -3217,12 +3217,19 @@ the rules.
   when a level has no new attachment. The record of the attachments adds
   each attachment one time, so a diamond fetches the shared attachment one
   time. The run of a level reads field 2 of each attachment from the commit
-  that it stages, so the next level needs no request of its own. The run
-  ignores field 2 of an attachment that the repository holds complete: it
-  checks no entry, records none, and requests nothing below the attachment.
-  The write rule above makes the full set of attachments of such an
-  attachment complete. Each attachment has depth 0, no ref, and no
-  signature check, at each level. An attachment that neither the
+  that it stages, so the next level needs no request of its own. For an
+  attachment that the repository holds complete, the run reads field 2 from
+  the commit object of the repository, and the next level takes each
+  attachment that it names. The run reads no tree of that attachment,
+  requests no `.commitmeta` of it, and sends no request for it. The pull
+  reads each commit at most one time, through the set of commits that its
+  runs reached. An attachment below it that is absent is fetched, and one
+  that is partial is completed. A defective entry in that field 2 fails the
+  pull with `Error::InvalidRelations`. The reason for the walk: a repository
+  that the `ostree` command wrote can hold an attachment complete with its
+  own attachments absent, because the tool follows no attachment in a pull.
+  Each attachment has depth 0, no ref, and no signature check, at each
+  level. An attachment that neither the
   repository, a localcache repository, nor the remote holds fails the pull,
   at each level. The error has the form of the local pull. It names a
   commit that names the attachment: of the commits of the lowest level that
@@ -3237,9 +3244,11 @@ the rules.
   whose fetch ends first. The pull reads no
   `.commitpartial` marker of the remote, and a bucket pull reads no
   `state/` file. An attachment that the remote holds partial fails the
-  pull on the first object that the remote does not hold. A run that also
-  reads below an attachment held complete was rejected: it requests commits
-  that the write rule already makes complete.
+  pull on the first object that the remote does not hold. A run that reads
+  nothing below an attachment held complete was rejected: the write rule
+  makes the attachments of a commit complete only in a repository that the
+  port alone wrote, so such a run leaves a repository of the tool without
+  the attachments below that attachment.
 - The commit write of `ostrya commit` checks each attachment one time.
   `Transaction::check_attachments` checks the attachments before the command
   reads the tree, and gives a `CheckedAttachments` that borrows the transaction.
@@ -3939,8 +3948,9 @@ The library has one typed ref, `ostrya_core::Ref`, with the cases `Local`,
   `from` commit at the ref that the name gives in the destination, with
   and without `no_ref_writes`. `PullOptions` has no collection id field.
 - `Repo::pull` and `Repo::pull_with_session` read each name of
-  `PullOptions::refs` as `NAME` or `@ID:NAME`, and refuse each other form
-  before the first request ("The collection refs of a named remote").
+  `PullOptions::refs` as `NAME`, as `@ID:NAME`, or as a commit operand, and
+  refuse each other form before the first request ("The collection refs of
+  a named remote", "Commit operands of a pull").
 - Each name field of the push protocol holds the text of a ref: `NAME` or
   `@ID:NAME`, and in a one-way stream also `REMOTE:NAME`. The receive path
   reads each name with the parser of `Ref` ("The namespace of each pushed
@@ -4101,7 +4111,8 @@ A pull from a named remote takes collection refs beside plain refs. The
 rules:
 
 - `Repo::pull`, `Repo::pull_with_session`, and `ostrya pull REMOTE` read
-  each name as `NAME` or `@ID:NAME`. One pull takes both forms, and the
+  each name as `NAME` or `@ID:NAME`, with or without a commit ("Commit
+  operands of a pull"). One pull takes both forms, and the
   refs of more than one collection. Before the first request, the pull
   refuses `REMOTE:NAME`, a `^` suffix, and a name that fails the rule of
   `Ref`, with `Error::InvalidRefspec`. The `branches` key of a remote
@@ -4166,7 +4177,9 @@ the own collection id"). The rules:
   names can read different refs of the remote, so the pull does not select
   one. The check needs the collection of the summary, so it runs after the
   read of the summary and of the `config`, and before the first read of a
-  ref file or an object. A name that occurs two times counts one time.
+  ref file or an object. A name that occurs two times counts one time. A
+  pull of named refs that writes no ref (`no_ref_writes`) does not make
+  this check.
 
 These alternatives were rejected:
 
@@ -4178,6 +4191,125 @@ These alternatives were rejected:
 - The check of two names that write one ref file before the first request.
   Without the summary, the pull does not know the collection of a plain
   name.
+
+## Commit operands of a pull
+
+A pull from a remote can name the commit that it fetches. An operand that
+names a commit by its checksum is a commit operand. The `ostree` command
+takes the forms `CHECKSUM` and `REF@CHECKSUM` in `pull`
+(`conformance/cli-behavior.md`, "Pull of a commit by its checksum"). The
+rules of `Repo::pull` and `Repo::pull_with_session`:
+
+- Forms. `CHECKSUM` fetches the commit and writes no ref. `REF@CHECKSUM`
+  fetches the commit, checks it against `REF`, and writes `REF` to it.
+  `@ID:REF@CHECKSUM` does the same for the collection ref `@ID:REF`.
+- Grammar. The operand is `[@ID:]REF@CHECKSUM` or `CHECKSUM`. The pull
+  splits at the last `@` after position 0, as the tool does. The ref-name
+  rule, the remote-name rule, and the collection-id rule refuse `@`, so an
+  `@` at position 0 starts `@ID:`, and the last `@` after it can only start
+  the checksum. `CHECKSUM` is exactly 64 lowercase hex characters. An
+  abbreviated checksum, an uppercase checksum, an empty checksum, and a
+  character after the checksum give `Error::InvalidRefspec` with the
+  operand as given, before the first request. So does a `REF` part that the
+  pull refuses with no commit: an empty `REF`, `REMOTE:REF`, and a `^`
+  suffix. An operand of 64 hex characters with an uppercase character is a
+  ref name, because the ref-name rule accepts it. The ref-name rule also
+  accepts 64 lowercase hex characters, so `<H>@<C>` writes the ref `<H>`.
+  A target has no ref only if its name is the hex form of its own commit:
+  `<H>` beside `<H>@<C>` fetches the commit H with no ref, and writes the
+  ref `<H>` to the commit C with the checks of `REF@CHECKSUM`. The operands
+  `<C>` and `<C>@<C>` name one target, and the operand that writes a ref
+  wins: the pull writes the ref `<C>` and makes the checks of
+  `REF@CHECKSUM`.
+- Text. `PullOptions::refs` holds each operand as text, as the command
+  line gives it. `ostrya::commit_operand` makes the text of `REF@CHECKSUM`
+  from a `Ref` and a `Checksum`. The text of `CHECKSUM` is the hex form of
+  the checksum.
+- Resolution. The pull does not look up a commit operand in the summary or
+  in a ref file of the remote. `REF` need not be a ref of the remote.
+  `depth`, `COMMIT_ONLY`, `subpaths`, the attachment rules, and the commit
+  signature checks apply to the commit as to the tip of a ref.
+- Ref write. `REF@CHECKSUM` and `@ID:REF@CHECKSUM` write the ref that
+  `REF` and `@ID:REF` write. Under `MIRROR`, a plain `REF@CHECKSUM` writes
+  `refs/heads/REF`, whatever collection id the summary states, as the tool
+  does. `CHECKSUM` writes no ref, and `no_ref_writes` writes no ref.
+- Ref binding. The `ostree.ref-binding` of the commit of `REF@CHECKSUM`
+  must hold `REF`, and a commit with no binding key passes.
+  `DISABLE_VERIFY_BINDINGS` turns the check off. `CHECKSUM` gets no
+  ref-binding check.
+- Collection binding. For `@ID:REF@CHECKSUM`, the
+  `ostree.collection-binding` of the commit must be `ID`. For
+  `REF@CHECKSUM`, it must be the `[core] collection-id` of the client, and
+  in a client with no collection id the commit must have no
+  `ostree.collection-binding` key. So each ref that the pull writes holds
+  a commit of the collection of that ref, as for `@ID:REF`.
+  `DISABLE_VERIFY_BINDINGS` does not turn these checks off, and
+  `no_ref_writes` turns them off. For `CHECKSUM` in `Repo::pull`, the
+  binding must be the key `collection-id` of the `[remote "NAME"]` section
+  of the client, if the section states the key, also under
+  `no_ref_writes`. The pull reads the key for a `CHECKSUM` operand alone,
+  before it connects, so a value with a malformed escape sequence fails
+  such a pull with `Error::Core` and no request. With no key, and in
+  `Repo::pull_with_session`, which
+  reads no remote section, the pull makes no check. A commit that is bound
+  to a collection thus needs `@ID:REF@CHECKSUM` or `CHECKSUM` in a client
+  with no collection id.
+- Timestamp. `TimestampCheck::CurrentRef` compares the commit of
+  `REF@CHECKSUM` with the commit of the ref that the pull writes. With no
+  check, the pull moves the ref back. `TimestampCheck::Rev` compares the
+  commit of `CHECKSUM` with the given commit. `CurrentRef` with a
+  `CHECKSUM` operand is `Error::InvalidInput` before the first request,
+  because the operand has no ref.
+- Two operands for one ref. Two operands that write one ref path stop the
+  pull with `Error::Pull("the refs A and B write one ref PATH")`, which
+  states the operands as given. Examples are `main@<C1>` beside
+  `main@<C2>`, and `main` beside `main@<C>`. The same text two times is
+  one operand. Under `MIRROR` with a summary that states `ID`, `main`
+  writes `refs/mirrors/ID/main` and `main@<C>` writes `refs/heads/main`, so
+  the pull takes both. `CHECKSUM` writes no ref and has no part in the
+  check. Under `no_ref_writes`, the pull makes no such check for each
+  operand form, and fetches each commit.
+- Summary. A pull whose operands are all commit operands sends no request
+  for `summary` or `summary.sig`, and `gpg-verify-summary` and
+  `sign-verify-summary` do not apply to it. The checksum is the anchor of
+  the operand, and the commit signature checks apply. A pull with at least
+  one other operand reads and verifies the summary, and a commit operand
+  takes no ref from it.
+- Delta search. Two targets that name one commit make one search for its
+  delta: the pull reads the delta index of a commit one time, and requests
+  one superblock by name one time for each source commit.
+- Static deltas of `REF@CHECKSUM`. The source commit of the delta is the
+  commit of the ref that the pull writes, as for `REF`. A pull that read no
+  summary requests the delta index of the commit if the `config` of the
+  remote states `[core] indexed-deltas=true`. A remote with no `config`, a
+  `config` with no such key, and a value that is not a boolean give one
+  superblock request by name: the delta from the commit of the ref, else
+  the from-scratch delta. Under `require_static_deltas`, the pull fails
+  with the "none found" error if the delta that it requests is absent. The
+  error of a remote with no summary does not apply to a pull whose operands
+  are all commit operands.
+- Static deltas of `CHECKSUM`. The pull requests no delta for the commit,
+  also with a `static_deltas` list, and fetches its objects loose. Under
+  `require_static_deltas`, the pull refuses a `CHECKSUM` that the client
+  does not hold complete, with `Error::Pull` before the first request,
+  unless `disable_static_deltas` or `COMMIT_ONLY` is set. The attachments
+  of the commit keep the delta search of each attachment.
+
+These alternatives were rejected:
+
+- The last operand for a ref wins, as in the tool. The pull then fetches
+  one of two commits that the caller named, with no message.
+- A read of the summary where the `config` of the remote does not state
+  `indexed-deltas=true`, as the tool does. A bad summary then fails a pull
+  that takes nothing from the summary.
+- A delta for `CHECKSUM`, as the tool requests. The operand has no ref, so
+  no commit of the client is the source of a delta. A caller that names the
+  commit of a ref gets the delta with `REF@CHECKSUM`.
+- The collection check of `REF@CHECKSUM` against the key `collection-id` of
+  the remote, as the tool does. The pull then writes a ref of the client
+  with a commit of another collection.
+- A structured operand type in `PullOptions::refs`. The field holds text,
+  because an operand of a local pull can hold a revision.
 
 ## The mirrored collections of a remote
 

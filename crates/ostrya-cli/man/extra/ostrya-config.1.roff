@@ -289,7 +289,8 @@ A malformed value stops the pull before it connects.
 \fB\%collection\-id\fR (string)
 The collection that the remote serves.
 \fB\%ostrya pull \-\-collection ID\fR takes each remote whose \fB\%collection\-id\fR is \fB\%ID\fR, or whose \fB\%mirrored\-collection\-ids\fR holds \fB\%ID\fR, as a candidate, in the order of the config.
-A pull that names the remote does not read this key.
+A pull that names the remote reads this key only for an operand that names a commit by its checksum with no ref.
+The \fB\%ostree.collection\-binding\fR of that commit must then be this id, and a value with a malformed escape sequence stops the pull before it connects.
 \fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
 A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs that the summary of its bucket repository lists, and the pull skips such a candidate if its bucket repository has no summary.
 A candidate whose pull address is a \fB\%file://\fR address is a local repository, which the pull reads through the file system.
@@ -322,6 +323,7 @@ A build without GPG support refuses \fB\%true\fR.
 .TP
 \fB\%gpg\-verify\-summary\fR (boolean, default false)
 A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
+A pull whose operands all name a commit by its checksum reads no summary, and makes no check of it.
 \fB\%ostrya remote fsck NAME\fR checks the signature of the summary of a bucket repository with these keys too.
 .TP
 \fB\%gpgkeypath\fR (list)
@@ -351,6 +353,7 @@ The keys are in the two keys below and in the system key stores of \fB\%ostrya\-
 .TP
 \fB\%sign\-verify\-summary\fR (boolean or list, default false)
 A pull checks the signature of the summary with the signature engines.
+A pull whose operands all name a commit by its checksum reads no summary, and makes no check of it.
 It is independent of \fB\%sign\-verify\fR.
 \fB\%ostrya remote fsck NAME\fR checks the signature of the summary of a bucket repository with these engines too.
 .TP

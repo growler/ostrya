@@ -224,6 +224,7 @@ pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 pub use pull::{
     CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats, PullFlags,
     PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
+    commit_operand,
 };
 #[cfg(feature = "push")]
 pub use push_repo::{ExportStreamOptions, PushOntoOptions, RepoPushOptions, is_push_address};

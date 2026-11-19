@@ -12,6 +12,36 @@ first.
 An item that starts with `Breaking:` needs a change in code or config that uses
 the release before it. An item that starts with `Fix:` corrects a defect.
 
+## [0.14.0] - unreleased
+
+### Library
+
+- `Repo::pull` and `Repo::pull_with_session` take commit operands in
+  `PullOptions::refs`: `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`.
+  The pull fetches the named commit, and reads no summary entry and no ref
+  file of the remote for it. `CHECKSUM` writes no ref, and the other forms
+  write their ref to the commit. A pull whose operands are all commit
+  operands requests no `summary` and no `summary.sig`.
+- A commit operand has these checks. The ref-binding check and the
+  `TimestampCheck::CurrentRef` check of `REF@CHECKSUM` read `REF`. The
+  collection binding of the commit of `REF@CHECKSUM` must be the `[core]
+  collection-id` of the repository, or absent if the repository has none. The
+  collection binding of the commit of `CHECKSUM` must be the key
+  `collection-id` of the remote section, if the section states it.
+  `TimestampCheck::CurrentRef` and `require_static_deltas` refuse a `CHECKSUM`
+  operand before the first request, the second unless the repository holds the
+  commit complete. A `CHECKSUM` operand takes no static delta.
+- `ostrya::commit_operand` makes the text `REF@CHECKSUM` from a `Ref` and a
+  `Checksum`.
+- A pull from a remote, over HTTP, over a stream, and from a bucket, reads
+  field 2 of an attachment that the repository holds complete from the local
+  commit object, and takes the attachments below it, level by level. The
+  0.13.0 release requested nothing below such an attachment. A defective entry
+  in field 2 of such an attachment fails the pull with
+  `Error::InvalidRelations`.
+- A pull from a remote with `no_ref_writes` does not refuse two operands that
+  write one ref. It fetches the commit of each operand.
+
 ## [0.13.0] - 2026-11-18
 
 ### Library

@@ -849,7 +849,9 @@ impl ParsedDelta {
 ///
 /// If `disable_static_deltas` is set, discovery returns before all other
 /// checks. A pull that requires static deltas from a source with no summary
-/// fails before the other skips. `advert` holds what the summary of the
+/// fails before the other skips, unless each operand of the pull names its
+/// commit. Discovery looks for no delta to a target that an operand names
+/// with no ref. `advert` holds what the summary of the
 /// source states about its deltas, and is `None` for a source with no
 /// summary. A pull that requires static deltas and finds no delta for a
 /// commit fails as [`discover_one`] states.
@@ -912,8 +914,13 @@ pub(crate) async fn discover(
     }
     let mut jobs = HashMap::new();
     // If there is no summary, nothing advertises a delta, so a pull that
-    // requires a delta fails whatever it looks for.
-    if opts.require_static_deltas && advert.is_none() {
+    // requires a delta fails whatever it looks for. A pull whose operands
+    // each name a commit reads no summary. It requests each delta by name,
+    // and fails only for a delta that the source does not serve.
+    if opts.require_static_deltas
+        && advert.is_none()
+        && !tips.by_checksum.is_some_and(|targets| targets.all)
+    {
         return Err(no_summary_error());
     }
     if opts.flags.contains(PullFlags::COMMIT_ONLY)
@@ -923,33 +930,63 @@ pub(crate) async fn discover(
     {
         return Ok(DeltaPlan::default());
     }
+    // The targets of each commit, in the order of the first target of the
+    // commit. The pull reads the advertisement of a commit one time, and
+    // makes each search of the commit one time, whatever the number of
+    // targets that name the commit.
+    let mut order: Vec<Checksum> = Vec::new();
+    let mut names: HashMap<Checksum, Vec<&str>> = HashMap::new();
     for (ref_name, to) in targets {
-        if jobs.contains_key(to) || complete_here(repo, to).await? {
+        // A commit that an operand names with no ref takes no delta.
+        if tips.is_bare(ref_name, to) {
             continue;
         }
-        let tip = repo
-            .resolve_relpath_tip(tips.place.ref_path(ref_name)?)
-            .await?;
-        let from = source_commit(repo, tip, to).await?;
-        let scratch = scratch_allowed(tip, from, to);
-        if let Some(found) = discover_one(
-            repo,
-            source,
-            advert,
-            None,
-            ref_name,
-            from,
-            scratch,
-            *to,
-            &HashMap::new(),
-            opts,
-            Some(verification),
-            progress,
-            None,
-        )
-        .await?
-        {
-            jobs.insert(*to, found.fetched.into_job(repo).await?);
+        names
+            .entry(*to)
+            .or_insert_with(|| {
+                order.push(*to);
+                Vec::new()
+            })
+            .push(ref_name);
+    }
+    for to in &order {
+        if complete_here(repo, to).await? {
+            continue;
+        }
+        let advertised = advertisement(source, advert, None, to, progress).await?;
+        // A request by name does not read `scratch`.
+        let by_name = matches!(advertised, Advertisement::Unlisted);
+        let mut searched: Vec<(Option<Checksum>, bool)> = Vec::new();
+        for ref_name in &names[to] {
+            let tip = repo
+                .resolve_relpath_tip(tips.place.ref_path(ref_name)?)
+                .await?;
+            let from = source_commit(repo, tip, to).await?;
+            let scratch = scratch_allowed(tip, from, to);
+            let search = (from, scratch && !by_name);
+            if searched.contains(&search) {
+                continue;
+            }
+            searched.push(search);
+            if let Some(found) = search_advertised(
+                repo,
+                source,
+                &advertised,
+                ref_name,
+                from,
+                scratch,
+                *to,
+                &HashMap::new(),
+                opts,
+                Some(verification),
+                progress,
+                None,
+            )
+            .await?
+            {
+                jobs.insert(*to, found.fetched.into_job(repo).await?);
+                break;
+            }
         }
     }
     Ok(DeltaPlan {
@@ -1487,7 +1524,7 @@ async fn discover_chain(
     related: RelatedRule,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
-    let (wanted, names) = chain_targets(repo, targets, tips.place).await?;
+    let (wanted, names) = chain_targets(repo, targets, tips).await?;
     if wanted.is_empty() {
         return Ok(DeltaPlan {
             edges: Some(edges),
@@ -1666,11 +1703,16 @@ impl Pass {
 /// for one of the refs that name the target. The checks of the commits run on
 /// the blocking pool in batches: one pass for the targets, and one for the
 /// commits that the refs name here.
+///
+/// A target that an operand names with no ref is not in the result, so it
+/// gets no chain. `checks` tells which targets these are, and gives the
+/// place of the refs.
 async fn chain_targets<'t>(
     repo: &Repo,
     targets: &'t [(String, Checksum)],
-    place: RefPlace<'_>,
+    checks: TipChecks<'_>,
 ) -> Result<(Vec<(Checksum, bool)>, Vec<&'t str>)> {
+    let place: RefPlace<'_> = checks.place;
     let mut unique: Vec<Checksum> = Vec::new();
     let mut seen: HashSet<Checksum> = HashSet::new();
     for (_, to) in targets {
@@ -1685,7 +1727,7 @@ async fn chain_targets<'t>(
         .collect();
     let mut tips: Vec<(&str, Checksum, Option<Checksum>)> = Vec::new();
     for (ref_name, to) in targets {
-        if held.contains(to) {
+        if held.contains(to) || checks.is_bare(ref_name, to) {
             continue;
         }
         let tip = repo.resolve_relpath_tip(place.ref_path(ref_name)?).await?;
@@ -2448,14 +2490,66 @@ async fn discover_one(
     progress: &PullCounters,
     keep: Option<&Arc<Mutex<RecordStore>>>,
 ) -> Result<Option<FoundDelta>> {
-    let advertised = match (edges, advert) {
+    let advertised = advertisement(source, advert, edges, &to, progress).await?;
+    search_advertised(
+        repo,
+        source,
+        &advertised,
+        subject,
+        from,
+        scratch,
+        to,
+        known,
+        opts,
+        verification,
+        progress,
+        keep,
+    )
+    .await
+}
+
+/// Returns what the source states about the deltas that produce `to`.
+///
+/// With `edges`, the result is that list, and the call reads nothing. With no
+/// `advert`, the source serves no summary. Else the call reads the map of
+/// `to`, as [`advertised_map`] states.
+async fn advertisement<'a>(
+    source: &DeltaSource<'_>,
+    advert: Option<&'a DeltaAdvert>,
+    edges: Option<&'a Edges>,
+    to: &Checksum,
+    progress: &PullCounters,
+) -> Result<Advertisement<'a>> {
+    Ok(match (edges, advert) {
         (Some(edges), _) => Advertisement::List(edges),
         (None, None) => Advertisement::Unlisted,
-        (None, Some(advert)) => match advertised_map(source, advert, &to, progress).await? {
+        (None, Some(advert)) => match advertised_map(source, advert, to, progress).await? {
             Some(map) => Advertisement::Map(map),
             None => Advertisement::Nothing,
         },
-    };
+    })
+}
+
+/// Makes the search of [`discover_one`] in `advertised`, which
+/// [`advertisement`] read for `to`.
+///
+/// A caller with more than one search for `to` reads the advertisement one
+/// time, and gives it to each search.
+#[allow(clippy::too_many_arguments)]
+async fn search_advertised(
+    repo: &Repo,
+    source: &DeltaSource<'_>,
+    advertised: &Advertisement<'_>,
+    subject: &str,
+    from: Option<Checksum>,
+    scratch: bool,
+    to: Checksum,
+    known: &HashMap<Checksum, bool>,
+    opts: &PullOptions,
+    verification: Option<&Verification>,
+    progress: &PullCounters,
+    keep: Option<&Arc<Mutex<RecordStore>>>,
+) -> Result<Option<FoundDelta>> {
     let none_found = || -> Result<Option<FoundDelta>> {
         if opts.require_static_deltas {
             return Err(none_found_error(subject, &to));
@@ -2463,7 +2557,7 @@ async fn discover_one(
         Ok(None)
     };
 
-    let choice = match &advertised {
+    let choice = match advertised {
         Advertisement::Map(map) => Some(choose_delta(repo, map, from, scratch, &to, known).await?),
         Advertisement::List(edges) => {
             Some(choose_listed(repo, edges, from, scratch, &to, known).await?)
@@ -2819,6 +2913,16 @@ impl DeltaAdvert {
         let indexed = indexed_deltas(&summary);
         let map = take_metadata_value(&mut summary.metadata, STATIC_DELTAS_KEY);
         DeltaAdvert { indexed, map }
+    }
+
+    /// Returns the values of a source that serves delta indexes and whose
+    /// summary the pull did not read: the pull requests the delta index of a
+    /// commit, and has no `ostree.static-deltas` map.
+    pub(crate) fn index_alone() -> DeltaAdvert {
+        DeltaAdvert {
+            indexed: true,
+            map: None,
+        }
     }
 }
 

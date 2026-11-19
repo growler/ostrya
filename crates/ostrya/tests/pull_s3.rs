@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use common::TmpDir;
-use common::s3::{ACCESS_KEY, Rclone, SECRET_KEY, rclone_available};
+use common::s3::{ACCESS_KEY, Rclone, SECRET_KEY, StandIn, rclone_available};
 use ostrya::endpoint::EndpointOverrides;
 use ostrya::remote::s3::{Address, Credentials, Location, S3Endpoint};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
@@ -37,7 +37,7 @@ use ostrya::{
     Checksum, CommitState, CreateOptions, Error, Proxy, PullOptions, Repo, RepoMode, SummaryOptions,
 };
 use ostrya_rt::block_on;
-use pull::{FIXED_TS, build_tree, commit_tree, commit_tree_related};
+use pull::{FIXED_TS, ID_X, build_tree, commit_bound, commit_tree, commit_tree_related};
 
 /// The variable that names the case of the child process.
 const CASE: &str = "OSTRYA_TEST_S3_CASE";
@@ -493,6 +493,227 @@ fn a_session_to_an_s3_endpoint_takes_the_full_set_of_attachments() {
             [(REF.to_owned(), chain.r)]
         );
         assert!(repo.list_remote_refs().await.unwrap().is_empty());
+        for commit in [chain.r, chain.c, chain.d] {
+            assert_eq!(
+                repo.commit_state(&commit).await.unwrap(),
+                CommitState::Normal
+            );
+        }
+        assert_eq!(object_names(&path), object_names(&bucket));
+    });
+}
+
+// --- commit operands ---------------------------------------------------------
+
+/// Builds an archive repository at `repo` with two commits on [`REF`], the
+/// second a child of the first, and a commit of the collection ref
+/// `@ID_X:a`, bound to that collection. The trees are under `base`. The
+/// repository has a summary. Returns the three commits in this order.
+async fn build_operand_remote(repo: &Path, base: &Path) -> [Checksum; 3] {
+    build_tree(&base.join("one"), b"one\n");
+    build_tree(&base.join("two"), b"two\n");
+    let remote = Repo::create(repo, CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let first = commit_tree(&remote, base, "one", REF, None, FIXED_TS).await;
+    let second = commit_tree(&remote, base, "two", REF, Some(first), FIXED_TS + 1).await;
+    let a = commit_bound(
+        &remote,
+        base,
+        "one",
+        &ostrya::Ref::collection(ID_X, "a"),
+        Some(ID_X),
+    )
+    .await;
+    remote
+        .regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+    [first, second, a]
+}
+
+/// Returns the options of a pull of the three forms of a commit operand:
+/// the `CHECKSUM` of `second`, [`REF`] at `first`, and `@ID_X:a` at `a`.
+fn operand_options([first, second, a]: [Checksum; 3]) -> PullOptions {
+    PullOptions {
+        refs: vec![
+            second.to_hex(),
+            format!("{REF}@{first}"),
+            format!("@{ID_X}:a@{a}"),
+        ],
+        ..PullOptions::default()
+    }
+}
+
+/// Asserts the result of a pull with [`operand_options`] into `repo`: the
+/// ref [`REF`] at `first`, the collection ref at `a`, and `second` complete
+/// with no ref.
+async fn assert_operands_pulled(repo: &Repo, [first, second, a]: [Checksum; 3]) {
+    assert_eq!(
+        repo.list_refs(None).await.unwrap(),
+        [(REF.to_owned(), first)]
+    );
+    assert_eq!(
+        repo.list_mirror_refs().await.unwrap(),
+        [(ID_X.to_owned(), "a".to_owned(), a)]
+    );
+    assert!(repo.list_remote_refs().await.unwrap().is_empty());
+    for commit in [first, second, a] {
+        assert_eq!(
+            repo.commit_state(&commit).await.unwrap(),
+            CommitState::Normal
+        );
+    }
+}
+
+/// A pull through a session to an `Endpoint::S3` takes each form of a commit
+/// operand: `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`. The bucket
+/// holds a `summary` that does not parse, and the pull passes, because it
+/// reads no summary.
+#[test]
+fn a_session_to_an_s3_endpoint_takes_commit_operands() {
+    if !rclone_available("a_session_to_an_s3_endpoint_takes_commit_operands") {
+        return;
+    }
+    let scratch = TmpDir::new("pull-s3-checksum-forms");
+    let root = scratch.path().join("root");
+    let bucket = root.join("bkt").join("repo");
+    std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+    let commits = block_on(build_operand_remote(&bucket, scratch.path()));
+    std::fs::write(bucket.join("summary"), b"not a summary").unwrap();
+    let server = Rclone::start(scratch.path(), &root);
+    block_on(async {
+        let endpoint = common::s3::endpoint(&server.endpoint(), "s3://bkt/repo");
+        let session = PullSession::connect(Endpoint::S3(endpoint), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let path = scratch.path().join("dest");
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        repo.pull_with_session(session, PullTrust::unverified(), operand_options(commits))
+            .await
+            .unwrap();
+        assert_operands_pulled(&repo, commits).await;
+        assert_eq!(object_names(&path), object_names(&bucket));
+    });
+}
+
+/// A pull of commit operands alone from a bucket repository sends no `GET`
+/// for `summary` or `summary.sig`, and no request for a ref file. It reads
+/// the `config` of the bucket repository.
+#[test]
+fn a_pull_of_commit_operands_from_a_bucket_requests_no_summary() {
+    let scratch = TmpDir::new("pull-s3-checksum-requests");
+    let source = scratch.path().join("remote");
+    let commits = block_on(build_operand_remote(&source, scratch.path()));
+    let server = StandIn::start();
+    let mut pending = vec![source.clone()];
+    while let Some(at) = pending.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let key = path.strip_prefix(&source).unwrap().to_str().unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                server.state().store(&format!("repo/{key}"), &bytes);
+            }
+        }
+    }
+    block_on(async {
+        let endpoint = common::s3::endpoint(&server.endpoint(), "s3://bkt/repo");
+        let session = PullSession::connect(Endpoint::S3(endpoint), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let repo = Repo::create(
+            &scratch.path().join("dest"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        repo.pull_with_session(session, PullTrust::unverified(), operand_options(commits))
+            .await
+            .unwrap();
+        assert_operands_pulled(&repo, commits).await;
+    });
+    let requests = server.state().requests.clone();
+    assert!(
+        requests
+            .iter()
+            .any(|(method, target)| method == "GET" && target == "/bkt/repo/config"),
+        "{requests:?}"
+    );
+    assert!(
+        !requests
+            .iter()
+            .any(|(_, target)| target.contains("summary") || target.contains("/refs/")),
+        "{requests:?}"
+    );
+}
+
+/// The repository holds R and C of the chain R -> C -> D complete, and does
+/// not hold the commit object of D. A pull of R through a session to an
+/// `Endpoint::S3` reads field 2 of C from the repository, and fetches D.
+#[test]
+fn a_session_to_an_s3_endpoint_fetches_an_attachment_below_a_held_attachment() {
+    let name = "a_session_to_an_s3_endpoint_fetches_an_attachment_below_a_held_attachment";
+    if !rclone_available(name) {
+        return;
+    }
+    let scratch = TmpDir::new("pull-s3-below-held");
+    let root = scratch.path().join("root");
+    let bucket = root.join("bkt").join("repo");
+    std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+    let chain = block_on(async {
+        let remote = Repo::create(&bucket, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let chain = common::write_chain(&remote, &scratch.path().join("trees"), REF).await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        chain
+    });
+    let server = Rclone::start(scratch.path(), &root);
+    block_on(async {
+        let path = scratch.path().join("dest");
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let pull = || async {
+            let endpoint = common::s3::endpoint(&server.endpoint(), "s3://bkt/repo");
+            let session =
+                PullSession::connect(Endpoint::S3(endpoint), StreamSessionOptions::default())
+                    .await
+                    .unwrap();
+            let opts = PullOptions {
+                refs: vec![REF.to_owned()],
+                ..PullOptions::default()
+            };
+            repo.pull_with_session(session, PullTrust::unverified(), opts)
+                .await
+                .unwrap();
+        };
+        pull().await;
+        let hex = chain.d.to_hex();
+        let object = path.join(format!("objects/{}/{}.commit", &hex[..2], &hex[2..]));
+        std::fs::remove_file(&object).unwrap();
+        assert_eq!(
+            repo.commit_state(&chain.c).await.unwrap(),
+            CommitState::Normal
+        );
+
+        pull().await;
+
+        assert!(object.exists());
         for commit in [chain.r, chain.c, chain.d] {
             assert_eq!(
                 repo.commit_state(&commit).await.unwrap(),

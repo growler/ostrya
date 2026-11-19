@@ -4451,23 +4451,27 @@ rules of the port. A malformed operand, for example `main@` or `main@` and an
 abbreviated checksum, gives `error: Invalid refspec <operand>` at exit 1,
 and `pull` sends no request.
 
-`pull-local` of the port refuses a `REF@CHECKSUM` operand, and reads a
-`CHECKSUM` operand as a revision. The tool takes `CHECKSUM` in `pull-local`,
-and refuses `REF@CHECKSUM` there. The port gives these results:
+`pull-local` of the port takes the operands `CHECKSUM`, `REF@CHECKSUM`, and
+`@ID:REF@CHECKSUM`, and with no `--remote` also `REMOTE:REF@CHECKSUM`, which
+writes `refs/remotes/REMOTE/REF`. The tool takes
+`CHECKSUM` in `pull-local`, and refuses `REF@CHECKSUM` there. The port gives
+these results:
 
-- `pull-local SRC REF@CHECKSUM` gives `error: Invalid refspec <operand>` at
-  exit 1. `pull-local` refuses the operand after it opens the source, before
-  it reads a ref or an object of the source. With `--remote=NAME`,
-  `pull-local` gives `error: Invalid refspec NAME:REF@CHECKSUM`. A malformed
-  operand, for example `main@` or `main@` and an abbreviated checksum, gives
-  the same text.
-- `pull-local SRC CHECKSUM` reads `CHECKSUM` as a revision of the source,
-  and the ref-binding check reads `CHECKSUM` as the ref name. A commit with a
-  ref binding gives `error: pull: commit <checksum>: no requested ref
-  '<checksum>' in ref binding metadata (<bound refs>)` at exit 1. A commit
-  with no binding key, and each commit under `--disable-verify-bindings`,
-  imports at exit 0. The port then writes the ref `refs/heads/CHECKSUM`, or
-  `refs/remotes/NAME/CHECKSUM` with `--remote=NAME`. The tool writes no ref.
+- `pull-local SRC REF@CHECKSUM` imports the commit at exit 0, and writes the
+  ref of `REF` to it: `refs/heads/REF`, or `refs/remotes/NAME/REF` with
+  `--remote=NAME`. The port reads no ref of the source for the operand. The
+  ref-binding check reads `REF`. The collection binding of the commit must
+  be the collection id of the destination, and a destination with no
+  collection id refuses a commit with a collection binding.
+  `../decisions.md`, "Commit operands of a pull", states the rules.
+- A malformed operand, for example `main@` or `main@` and an abbreviated
+  checksum, gives `error: Invalid refspec <operand>` at exit 1. `pull-local`
+  refuses the operand after it opens the source, before it reads a ref or
+  an object of the source.
+- `pull-local SRC CHECKSUM` imports the commit at exit 0 and writes no ref,
+  also with `--remote=NAME`. The port makes no ref-binding check and no
+  collection-binding check of the commit. An abbreviated checksum stays a
+  revision of the source, and writes the ref of its name.
 
 Each refusal writes no object and no ref.
 
@@ -4476,8 +4480,14 @@ The two GPG switches check what the tool checks and refuse where it refuses
 port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
 tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
-surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
-nothing, since `pull-local` reads no delta by default. Ten differences stand:
+surface", "Static deltas over pull-local"). With commit operands alone,
+`pull-local` reads no summary. It requests the delta of each target through
+the delta index where the `config` of the source states
+`[core] indexed-deltas=true`, and else one superblock by name: the delta from
+the commit of the ref, else the from-scratch delta. It refuses a `CHECKSUM`
+operand that the destination does not hold complete before it reads the
+source. `--disable-static-deltas` changes nothing, since `pull-local` reads
+no delta by default. Ten differences stand:
 
 - the verification keys of the remote. The port reads `gpg-verify`,
   `gpg-verify-summary`, `sign-verify`, `sign-verify-summary`, and `trust` of
@@ -4530,9 +4540,10 @@ nothing, since `pull-local` reads no delta by default. Ten differences stand:
   attachments of each pulled commit: the attachments that field 2 names, and
   the attachments of each attachment, level by level. It imports each one at
   depth 0 and with no ref, unless the pull is commit-only
-  (`../format-reference.md`, "Attachments in a local pull"). It skips an
-  attachment that the destination holds complete, and reads nothing below
-  it. A field 2 entry with an empty name or with a checksum that is not 32
+  (`../format-reference.md`, "Attachments in a local pull"). For an
+  attachment that the destination holds complete, it reads field 2 from the
+  commit object of the destination, and imports each attachment that field
+  2 names. It reads no tree of such an attachment. A field 2 entry with an empty name or with a checksum that is not 32
   bytes fails the pull at exit 1. At each level, an attachment that neither
   the source, a localcache repository, nor the destination holds fails the
   pull at exit 1, and so does an attachment that the first source that holds

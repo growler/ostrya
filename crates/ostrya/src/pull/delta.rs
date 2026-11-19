@@ -958,9 +958,7 @@ pub(crate) async fn discover(
         let by_name = matches!(advertised, Advertisement::Unlisted);
         let mut searched: Vec<(Option<Checksum>, bool)> = Vec::new();
         for ref_name in &names[to] {
-            let tip = repo
-                .resolve_relpath_tip(tips.place.ref_path(ref_name)?)
-                .await?;
+            let tip = ref_tip(repo, tips.place, ref_name, opts.no_ref_writes).await?;
             let from = source_commit(repo, tip, to).await?;
             let scratch = scratch_allowed(tip, from, to);
             let search = (from, scratch && !by_name);
@@ -1524,7 +1522,7 @@ async fn discover_chain(
     related: RelatedRule,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
-    let (wanted, names) = chain_targets(repo, targets, tips).await?;
+    let (wanted, names) = chain_targets(repo, targets, tips, opts.no_ref_writes).await?;
     if wanted.is_empty() {
         return Ok(DeltaPlan {
             edges: Some(edges),
@@ -1706,11 +1704,13 @@ impl Pass {
 ///
 /// A target that an operand names with no ref is not in the result, so it
 /// gets no chain. `checks` tells which targets these are, and gives the
-/// place of the refs.
+/// place of the refs. The commit of the ref of a target is as [`ref_tip`]
+/// reads it under `no_ref_writes`.
 async fn chain_targets<'t>(
     repo: &Repo,
     targets: &'t [(String, Checksum)],
     checks: TipChecks<'_>,
+    no_ref_writes: bool,
 ) -> Result<(Vec<(Checksum, bool)>, Vec<&'t str>)> {
     let place: RefPlace<'_> = checks.place;
     let mut unique: Vec<Checksum> = Vec::new();
@@ -1730,7 +1730,7 @@ async fn chain_targets<'t>(
         if held.contains(to) || checks.is_bare(ref_name, to) {
             continue;
         }
-        let tip = repo.resolve_relpath_tip(place.ref_path(ref_name)?).await?;
+        let tip = ref_tip(repo, place, ref_name, no_ref_writes).await?;
         tips.push((ref_name.as_str(), *to, tip));
     }
     // A tip can be the source commit only if it is not the target.
@@ -2118,6 +2118,31 @@ async fn read_local_superblock(
     let (parsed, _) =
         ostrya_rt::unblock(move || parse_superblock(bytes, digest, None, from, to, false)).await?;
     parsed.verify(None).await
+}
+
+/// Returns the commit that the ref of the target `ref_name` at `place` names
+/// in this repository, or `None` if the ref is absent.
+///
+/// Under `no_ref_writes`, a name that gives no valid ref path at `place`, for
+/// example `REMOTE:NAME` with a remote option, gives `None`: the pull writes
+/// no ref, so such a target takes no delta source from a ref.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRefspec`] if, without `no_ref_writes`, `ref_name` gives
+///   no valid ref path at `place`.
+/// - The errors of [`Repo::resolve_relpath_tip`].
+async fn ref_tip(
+    repo: &Repo,
+    place: RefPlace<'_>,
+    ref_name: &str,
+    no_ref_writes: bool,
+) -> Result<Option<Checksum>> {
+    match place.ref_path(ref_name) {
+        Ok(path) => repo.resolve_relpath_tip(path).await,
+        Err(_) if no_ref_writes => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Returns `true` if this repository holds a commit and each object that it

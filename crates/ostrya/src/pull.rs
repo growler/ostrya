@@ -297,7 +297,7 @@ impl PullFlags {
     /// collection-binding check of an `@ID:NAME` name in a pull without
     /// [`no_ref_writes`](PullOptions::no_ref_writes) ([`Repo::pull_local`],
     /// [`Repo::pull`]). It does not skip the collection-binding check of a
-    /// commit operand of [`Repo::pull`].
+    /// commit operand of [`Repo::pull`] and of [`Repo::pull_local`].
     /// [`Repo::pull_collection`] refuses this flag, because it always checks
     /// the bindings. To pull a tip with no
     /// collection binding, set
@@ -466,13 +466,10 @@ pub enum TimestampCheck {
 /// The verification comes before the pull reads the refs or the deltas of
 /// the summary. If the policy covers the summary and the source has no
 /// `summary` or no `summary.sig`, the pull fails with [`Error::Signature`].
-/// A pull from a remote whose names are all commit operands reads no summary,
-/// and the policy of the summary does not apply to it. The same rule applies
-/// to each remote of [`Repo::pull_collection`], as it states in "Commit
-/// operands". The one exception is a local repository under
-/// [`require_static_deltas`](PullOptions::require_static_deltas) without
-/// [`disable_static_deltas`](PullOptions::disable_static_deltas): that pull
-/// reads the summary, and the policy applies.
+/// A pull whose names are all commit operands reads no summary, and the
+/// policy of the summary does not apply to it. The rule applies to a pull
+/// from a remote, to [`Repo::pull_local`], and to each remote of
+/// [`Repo::pull_collection`], as it states in "Commit operands".
 ///
 /// The policy belongs to the pull. The pull verifies each target, each
 /// parent that a depth pull follows, and each commit of a chain of static
@@ -589,8 +586,11 @@ pub struct PullOptions {
     /// states. [`Repo::pull_with_session`] reads neither key,
     /// and refuses an empty list with [`Error::InvalidInput`].
     ///
-    /// A local pull reads each name as a revision of the source, `@ID:NAME`
-    /// and a `^` suffix included, as [`Repo::pull_local`] states.
+    /// A local pull reads each name that is not a commit operand as a
+    /// revision of the source, `@ID:NAME` and a `^` suffix included, as
+    /// [`Repo::pull_local`] states. An abbreviated checksum is such a
+    /// revision. A local pull also takes the commit operands `CHECKSUM`,
+    /// `NAME@CHECKSUM`, `REMOTE:NAME@CHECKSUM`, and `@ID:NAME@CHECKSUM`.
     /// [`Repo::pull`] and [`Repo::pull_with_session`] read each name as a ref
     /// `NAME`, a collection ref `@ID:NAME`, or a commit operand, and refuse
     /// each other form, as [`Repo::pull`] states in "Refs". A commit operand
@@ -629,24 +629,25 @@ pub struct PullOptions {
     /// `.commitpartial` marker of each commit that it completes, as without
     /// the option. The caller writes the refs.
     ///
-    /// [`PullStats`] does not report the commits of a pull. A local pull
-    /// resolves each name in [`refs`](PullOptions::refs) on the source with
-    /// revision syntax. So a caller pins the commit of a ref when it gives the
-    /// checksum as the name.
-    ///
-    /// A pull from a remote resolves each ref name through the summary or
-    /// the ref file of the remote. A commit operand names the commit that the
-    /// pull fetches, as [`Repo::pull`] states in "Refs". Under this option,
-    /// the pull makes no check that two names write one ref.
+    /// [`PullStats`] does not report the commits of a pull. A caller pins the
+    /// commit of a pull with a commit operand, which names the commit that the
+    /// pull fetches, as [`Repo::pull`] states in "Refs" and
+    /// [`Repo::pull_local`] states in "Names". A local pull resolves each other
+    /// name in [`refs`](PullOptions::refs) on the source with revision syntax.
+    /// A pull from a remote resolves each other name through the summary or
+    /// the ref file of the remote. Under this option, the pull makes no check
+    /// that two names write one ref.
     ///
     /// A pull from a remote still reads the ref that it writes without the
     /// option. Delta discovery takes the commit of that ref as the source of a
     /// delta, and [`TimestampCheck::CurrentRef`] compares against it. A local
     /// pull reads that ref only for delta discovery, under
     /// [`require_static_deltas`](PullOptions::require_static_deltas) or with a
-    /// list of [`static_deltas`](PullOptions::static_deltas). Under this
-    /// option, a [`MIRROR`](PullFlags::MIRROR) pull of each ref copies no
-    /// `summary` and no `summary.sig`.
+    /// list of [`static_deltas`](PullOptions::static_deltas). A name of a
+    /// local pull that gives no valid ref takes no source of a delta from a
+    /// ref under this option. Under this option, a
+    /// [`MIRROR`](PullFlags::MIRROR) pull of each ref copies no `summary` and
+    /// no `summary.sig`.
     ///
     /// If a pulled commit has detached metadata, the pull takes the update
     /// lock to write it, as [`Transaction::commit`] does. If the caller holds
@@ -779,15 +780,12 @@ pub struct PullOptions {
     /// looks up.
     ///
     /// If the source serves no summary, the pull fails with [`Error::Pull`].
-    /// A pull from a remote whose names are all commit operands reads no
-    /// summary, and this rule does not apply to it. That pull fails with
-    /// [`Error::Pull`] for a delta that it requests and the remote does not
-    /// serve. A `CHECKSUM` operand takes no delta. So the pull refuses such
-    /// an operand with [`Error::Pull`] before the first request, unless this
-    /// repository holds its commit complete. A pull of
-    /// [`Repo::pull_collection`] from a local repository reads the summary
-    /// under this option, also when each name is a commit operand, unless
-    /// [`disable_static_deltas`](PullOptions::disable_static_deltas) is set.
+    /// A pull whose names are all commit operands reads no summary, and this
+    /// rule does not apply to it. That pull fails with [`Error::Pull`] for a
+    /// delta that it requests and the source does not serve. A `CHECKSUM`
+    /// operand takes no delta. So the pull refuses such an operand with
+    /// [`Error::Pull`] before the first request, or before a local pull reads
+    /// the source, unless this repository holds its commit complete.
     ///
     /// With a summary, the pull refuses with [`Error::Pull`] a commit that this
     /// repository does not hold complete, in two cases:
@@ -1280,14 +1278,36 @@ impl Repo {
     ///
     /// # Names
     ///
-    /// The pull reads each name in [`refs`](PullOptions::refs) as a revision
-    /// of `src`, as [`Repo::resolve_rev`] reads it. So a name can be a
-    /// checksum, an abbreviated checksum, or a ref with a `^` suffix, and a
-    /// ref is `NAME`, `REMOTE:NAME`, or `@ID:NAME`. The pull reads `@ID:NAME`
-    /// in `src` at the path that [`Repo::resolve_ref_tip`] reads:
-    /// `refs/mirrors/<ID>/<NAME>`, or `refs/heads/<NAME>` if the
-    /// `[core] collection-id` of `src` is `ID`. One pull can take names of
-    /// more than one collection, and plain names beside them.
+    /// A name in [`refs`](PullOptions::refs) is a revision of `src` or a
+    /// commit operand.
+    ///
+    /// The pull reads each name that is not a commit operand as a revision of
+    /// `src`, as [`Repo::resolve_rev`] reads it. So a name can be an
+    /// abbreviated checksum or a ref with a `^` suffix, and a ref is `NAME`,
+    /// `REMOTE:NAME`, or `@ID:NAME`. The pull reads `@ID:NAME` in `src` at the
+    /// path that [`Repo::resolve_ref_tip`] reads: `refs/mirrors/<ID>/<NAME>`,
+    /// or `refs/heads/<NAME>` if the `[core] collection-id` of `src` is `ID`.
+    /// One pull can take names of more than one collection, and plain names
+    /// beside them. An abbreviated checksum writes the ref that it gives, as
+    /// each other revision does.
+    ///
+    /// A commit operand names the commit that the pull takes, and the pull
+    /// reads no ref of `src` for it. If `src` does not hold the commit, the
+    /// pull fails with [`Error::ObjectNotFound`]. The forms are:
+    ///
+    /// - `CHECKSUM`, 64 lowercase hex characters: the commit, with no ref.
+    ///   The pull writes no ref for it, and makes no ref-binding check and no
+    ///   collection-binding check of it, with or without
+    ///   [`remote`](PullOptions::remote).
+    /// - `REF@CHECKSUM`, where `REF` is `NAME`, `REMOTE:NAME`, or `@ID:NAME`:
+    ///   the commit, which the pull checks against `REF`, and the ref that
+    ///   `REF` writes. [`commit_operand`] makes the text. The pull splits the
+    ///   name at its last `@` after position 0.
+    ///
+    /// Each other text after that `@`, a part before it that [`Ref`] does not
+    /// read, and an uppercase or abbreviated checksum after it fail the pull
+    /// with [`Error::InvalidRefspec`] before it reads `src`. The error holds
+    /// the name as given.
     ///
     /// The pull writes the ref of each name in this repository:
     ///
@@ -1297,27 +1317,46 @@ impl Repo {
     /// - Each other name gives `refs/remotes/<remote>/<name>` if `remote` is
     ///   set, and else the ref of the name as a refspec: `refs/heads/<name>`,
     ///   or `refs/remotes/<REMOTE>/<NAME>` for `REMOTE:NAME`.
+    /// - A `REF@CHECKSUM` operand gives the ref of `REF` by these rules, at
+    ///   `CHECKSUM`. So `REMOTE:NAME@CHECKSUM` with `remote` set gives no valid
+    ///   ref, as `REMOTE:NAME` does.
     ///
     /// A name given two times counts one time. Two different names that write
-    /// one ref, such as `main` and `@ID:main` with no `remote` into a
-    /// repository whose `[core] collection-id` is `ID`, stop the pull before
-    /// it reads `src`. Under [`no_ref_writes`](PullOptions::no_ref_writes) the
-    /// pull makes no such check.
+    /// one ref stop the pull before it reads `src`. Examples are `main` and
+    /// `@ID:main` with no `remote` into a repository whose
+    /// `[core] collection-id` is `ID`, `main` and `main@<C>`, and two
+    /// operands `main@<C1>` and `main@<C2>`. The names `<C>` and `<C>@<C>`
+    /// give one target, which writes the ref `<C>` and takes the checks of
+    /// `REF@CHECKSUM`. A `CHECKSUM` operand writes no ref, so it stops no
+    /// other name. Under [`no_ref_writes`](PullOptions::no_ref_writes) the
+    /// pull makes no such check, and takes the commit of each name.
     ///
     /// Delta discovery reads the `from` commit of a delta at that ref, with
-    /// and without [`no_ref_writes`](PullOptions::no_ref_writes).
+    /// and without [`no_ref_writes`](PullOptions::no_ref_writes). Under
+    /// `no_ref_writes`, a name that gives no valid ref, for example
+    /// `REMOTE:NAME@CHECKSUM` with `remote` set, takes no `from` commit from a
+    /// ref.
     ///
     /// Without `no_ref_writes`, the pull checks the
-    /// `ostree.collection-binding` of the tip commit of each `@ID:NAME` name.
-    /// The pull fails with [`Error::Pull`] if the key is absent, if its value
-    /// is not a string, or if it states an id other than `ID`. This is also
-    /// true if `ID` is the `[core] collection-id` of this repository. The pull
-    /// makes this check before it writes an object, a marker, or a ref.
+    /// `ostree.collection-binding` of the tip commit of each `@ID:NAME` name
+    /// and of each `@ID:NAME@CHECKSUM` operand. The pull fails with
+    /// [`Error::Pull`] if the key is absent, if its value is not a string, or
+    /// if it states an id other than `ID`. This is also true if `ID` is the
+    /// `[core] collection-id` of this repository. For a `NAME@CHECKSUM` or a
+    /// `REMOTE:NAME@CHECKSUM` operand, the key must state the
+    /// `[core] collection-id` of this repository. If this repository has no
+    /// collection id, the commit must have no such key. A plain `NAME` and a
+    /// plain `REMOTE:NAME` get no collection-binding check. The pull makes
+    /// these checks before it writes an object, a marker, or a ref.
     /// [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS) skips
-    /// the ref-binding check alone, and the collection-binding check stays
+    /// the ref-binding check alone, and the collection-binding checks stay
     /// on. With `no_ref_writes`, the pull reads no
     /// `ostree.collection-binding`. The ref-binding check reads the part
-    /// after `@ID:` of an `@ID:NAME` name, and each other name whole.
+    /// after `@ID:` of an `@ID:NAME` name, and each other name whole. For a
+    /// `REF@CHECKSUM` operand, it reads `REF` by the same rule.
+    ///
+    /// The pull makes no timestamp check, so it takes a `CHECKSUM` operand
+    /// under [`TimestampCheck::CurrentRef`].
     ///
     /// # Attachments
     ///
@@ -1335,11 +1374,16 @@ impl Repo {
     ///   no parent to the pull. The pull takes an attachment one time, also if
     ///   several commits name it, and the walk of the attachments reads its
     ///   commit object one time.
-    /// - The pull skips an attachment that this repository holds complete, and
-    ///   reads nothing below it: a write and a pull of a commit make the
-    ///   attachments of the commit complete first. The walk of the attachments
-    ///   reads commit objects alone, and no tree, before the transaction
-    ///   opens.
+    /// - The pull reads field 2 of an attachment that this repository holds
+    ///   complete from the commit object of this repository, and takes each
+    ///   attachment that it names, level by level. It decodes field 2 alone,
+    ///   and checks no other field of that commit. A repository that the
+    ///   `ostree` command wrote can hold a commit complete with its
+    ///   attachments absent. The pull reads each commit at most one time. The
+    ///   walk of the attachments reads commit objects alone, and no tree,
+    ///   before the transaction opens. The rule applies to each name, also to
+    ///   a plain ref, and to the pulls of [`Repo::pull_collection`] from a
+    ///   local repository, of the media import, and of the media export.
     /// - The pull writes no ref for an attachment.
     /// - The pull checks no signature of an attachment commit. Field 2 holds
     ///   the checksum of the attachment, and the checksum and the signatures
@@ -1365,7 +1409,9 @@ impl Repo {
     ///   does not get the signatures that the source added after this
     ///   repository stored it. A pull that takes the attachment as a target
     ///   copies its `.commitmeta`. An attachment that this repository holds
-    ///   partial gets the walk of its whole tree and its `.commitmeta`.
+    ///   partial gets the walk of its whole tree and its `.commitmeta`. An
+    ///   attachment that this repository does not hold, below an attachment
+    ///   that it holds complete, is a commit of the pull by the same rules.
     /// - A pull that reads static deltas looks for a delta of each attachment
     ///   that it appends and that this repository does not hold complete, as
     ///   "Static deltas" states. The pull imports the objects of an attachment
@@ -1382,9 +1428,10 @@ impl Repo {
     /// writes no object and no ref:
     ///
     /// - An entry of field 2 has an empty name or a checksum that is not 32
-    ///   bytes.
+    ///   bytes, also in an attachment that this repository holds complete.
     /// - Neither a source nor this repository holds an attachment, at any
-    ///   level. This is also true for a parent that the source does not hold,
+    ///   level, also below an attachment that this repository holds
+    ///   complete. This is also true for a parent that the source does not hold,
     ///   if a commit of the pull names that parent as an attachment.
     /// - The first source or localcache repository that holds an attachment
     ///   marks it partial.
@@ -1394,10 +1441,10 @@ impl Repo {
     /// The pull reports these defects before a target or a parent that fails
     /// the signature policy, as for each other defect of the walk.
     ///
-    /// The pull checks each attachment that it skipped again after the
-    /// transaction opens, before it writes a marker. If this repository no
-    /// longer holds one of them complete, the pull fails, and writes no
-    /// object, no marker, and no ref.
+    /// The pull checks each attachment that the walk found complete in this
+    /// repository again after the transaction opens, before it writes a
+    /// marker. If this repository no longer holds one of them complete, the
+    /// pull fails, and writes no object, no marker, and no ref.
     ///
     /// # Remote config
     ///
@@ -1683,6 +1730,23 @@ impl Repo {
     /// `archive` mode. It finds each delta before it walks the commit chains
     /// and verifies their signatures.
     ///
+    /// A pull whose names are all commit operands reads no summary, and does
+    /// not refuse a source with no summary. If the `config` of the source
+    /// states `[core] indexed-deltas=true`, the pull reads the delta index of
+    /// each target commit, and takes no delta that the index does not name.
+    /// A `config` with no such key, and a value that is not a boolean, give
+    /// one read of a superblock by name, as for a remote with no summary. The
+    /// `from` commit of the delta of a `REF@CHECKSUM` operand is the commit of
+    /// the ref that the operand writes. Under `require_static_deltas`, a delta
+    /// that the pull looks for and does not find fails the pull with
+    /// [`Error::Pull`]. A `CHECKSUM` operand takes no delta, and the pull
+    /// imports its objects loose. Under `require_static_deltas` without
+    /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
+    /// without [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY), the pull refuses such
+    /// an operand before it reads `src`, unless this repository holds its
+    /// commit complete. The attachments of that commit keep the search of each
+    /// attachment.
+    ///
     /// The pull applies each delta that it finds into the transaction one part
     /// at a time, and stages the commit from the superblock. The import then
     /// walks each commit and imports what no part produced.
@@ -1728,9 +1792,10 @@ impl Repo {
     /// the pull looks for a delta of each attachment that the walk appends and
     /// that this repository does not hold complete. The search and its `from`
     /// are those of [`Repo::pull`] under `# Static deltas`: the summary and
-    /// the delta index of the source, or one entry of the list. A target whose
-    /// name is the full hex form of its commit is a pull by checksum, and
-    /// gives no paired entry. Under `require_static_deltas`, an attachment with
+    /// the delta index of the source, or one entry of the list. A pull that
+    /// reads no summary reads the delta index alone, or requests the delta by
+    /// name. A target whose name is the full hex form of its commit gives no
+    /// paired entry. Under `require_static_deltas`, an attachment with
     /// no delta fails the pull, and the pull writes nothing. The pull applies
     /// the deltas of the attachments after the deltas of the targets, one
     /// part at a time, in the order of the walk. The search keeps no
@@ -1762,6 +1827,11 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if a name starts with `@` and is not an
     ///   `@ID:NAME` ref that [`Ref`] reads, less each `^` at its end, before
     ///   the pull reads `src`. The error holds the name.
+    /// - [`Error::InvalidRefspec`] if the part of a name after its last `@`
+    ///   after position 0 is not 64 lowercase hex characters, or if [`Ref`]
+    ///   does not read the part before it, before the pull reads `src`, also
+    ///   under [`no_ref_writes`](PullOptions::no_ref_writes). The error holds
+    ///   the name.
     /// - [`Error::InvalidRefspec`] if, without
     ///   [`no_ref_writes`](PullOptions::no_ref_writes), a name gives no valid
     ///   ref to write, for example a name with a `^` suffix, before the pull
@@ -1769,7 +1839,10 @@ impl Repo {
     /// - [`Error::Pull`] if, without
     ///   [`no_ref_writes`](PullOptions::no_ref_writes), two different names
     ///   write one ref, before the pull reads `src`. The error names both
-    ///   names and the path of the ref.
+    ///   names as given and the path of the ref.
+    /// - [`Error::Pull`] if the pull requires static deltas, and this
+    ///   repository does not hold the commit of a `CHECKSUM` operand complete,
+    ///   before the pull reads `src`. The error names the commit.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote). With
     ///   [`trust_group`](PullOptions::trust_group), only a summary check needs
@@ -1797,7 +1870,8 @@ impl Repo {
     ///   be read.
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
     ///   summary, or no delta for a commit or for an attachment that this
-    ///   repository does not hold complete. With a `static_deltas` list, the
+    ///   repository does not hold complete. A pull whose names are all commit
+    ///   operands needs no summary. With a `static_deltas` list, the
     ///   pull needs no summary, and fails if no chain of the list reaches a
     ///   target commit. A listed delta from scratch to the target that the
     ///   rule of [`require_static_deltas`](PullOptions::require_static_deltas)
@@ -1814,8 +1888,10 @@ impl Repo {
     /// - [`Error::Pull`] if the ref binding of a commit does not name its ref.
     ///   Also, without [`no_ref_writes`](PullOptions::no_ref_writes), if the
     ///   `ostree.collection-binding` of the tip commit of an `@ID:NAME` name
-    ///   is absent, is not a string, or states an id other than `ID`, before
-    ///   the pull writes an object.
+    ///   is absent, is not a string, or states an id other than `ID`, or if
+    ///   the commit of a `NAME@CHECKSUM` or a `REMOTE:NAME@CHECKSUM` operand
+    ///   fails the check against the `[core] collection-id` of this
+    ///   repository, before the pull writes an object.
     /// - [`Error::Pull`] if an object fails the
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
@@ -1825,17 +1901,22 @@ impl Repo {
     ///   attachment, or if the first source that holds it marks it partial.
     ///   The pull reports it before a failed signature check of the walk, and
     ///   before a `.commitmeta` of the walk that does not parse. Also if an
-    ///   attachment that the walk skipped is no longer complete in this
-    ///   repository when the transaction opens.
+    ///   attachment that the walk found complete in this repository is no
+    ///   longer complete when the transaction opens, or if its commit object
+    ///   is absent when the walk reads its field 2.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
     ///   policy, each commit of a chain included. Also if the signatures of the
     ///   superblock of a target or of a step fail the policy, or if the policy
     ///   covers the summary and `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref. For a
     ///   collection ref, the error holds `@ID:NAME`.
-    /// - [`Error::ObjectNotFound`] if neither this repository nor a source
-    ///   holds an object that a pulled commit reaches. Also if a dirtree that
-    ///   this repository holds is a symlink that points to no file.
+    /// - [`Error::ObjectNotFound`] if `src` does not hold the commit of a
+    ///   commit operand, also under
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas) and
+    ///   with a [`static_deltas`](PullOptions::static_deltas) list, before the
+    ///   pull looks for a delta. Also if neither this repository nor a source holds an
+    ///   object that a pulled commit reaches, or if a dirtree that this
+    ///   repository holds is a symlink that points to no file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the `.filez`
     ///   copy and the re-ingest path. Also under
@@ -1886,8 +1967,20 @@ impl Repo {
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
         let related = RelatedRule::of(self.config())?;
-        check_local_operands(&opts)?;
-        check_local_places(self, &opts)?;
+        // The pull reads the names one time. The list of the parsed names
+        // takes the place of `opts.refs` for the rest of the pull.
+        let refs = std::mem::take(&mut opts.refs);
+        let operands = local_operands(&refs)?;
+        check_local_places(self, &opts, &operands)?;
+        check_commit_operand_deltas(
+            self,
+            &opts,
+            operands.iter().filter_map(|(_, operand)| match operand {
+                Operand::Commit(commit) => Some(*commit),
+                _ => None,
+            }),
+        )
+        .await?;
         let edges = take_static_deltas(&mut opts).await?;
         // The pull builds the signature policy before it reads the source. So
         // a check that the options ask for with no remote to take keys from
@@ -1908,7 +2001,7 @@ impl Repo {
             trust,
             related,
             opts,
-            LocalWanted::Named,
+            LocalWanted::Named(&operands),
             edges,
             started,
         )
@@ -1954,12 +2047,22 @@ impl Repo {
         // A commit-only pull ignores the list.
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
-        let needs_summary = fetching && edges.is_none();
-        // A commit operand names its commit. If each operand of a collection
-        // pull names its commit, the pull reads no summary of the source and
-        // makes no check of it, unless discovery needs the summary.
-        let commits_alone = matches!(wanted, LocalWanted::Pinned(pinned) if pinned.commits_alone);
-        let summary = if commits_alone && !needs_summary {
+        // A commit operand names its commit, so the pull takes no ref of it
+        // from the summary. If each operand names its commit, the pull reads
+        // no summary of the source and makes no check of it. It requests the
+        // delta index of a target if the `config` of the source states
+        // `[core] indexed-deltas=true`, and else a superblock by name.
+        let commits_alone = match wanted {
+            LocalWanted::Named(operands) => {
+                !operands.is_empty()
+                    && !operands
+                        .iter()
+                        .any(|(_, operand)| matches!(operand, Operand::Name(_)))
+            }
+            LocalWanted::Pinned(pinned) => pinned.commits_alone,
+        };
+        let needs_summary = fetching && edges.is_none() && !commits_alone;
+        let summary = if commits_alone {
             None
         } else {
             read_checked_local_summary(src, &verification, needs_summary).await?
@@ -1978,6 +2081,7 @@ impl Repo {
         // parsed summary alone. A summary can be as large as
         // `SUMMARY_READ_CAP`, so the parse runs on the blocking pool, and the
         // bytes and the rest of the parse drop there.
+        let by_name = fetching && edges.is_none() && commits_alone;
         let advert = match summary.filter(|_| needs_summary) {
             Some(bytes) => Some(
                 ostrya_rt::unblock(move || {
@@ -1985,23 +2089,40 @@ impl Repo {
                 })
                 .await?,
             ),
+            None if by_name
+                && matches!(
+                    src.config().keyfile().get_bool("core", "indexed-deltas"),
+                    Ok(Some(true))
+                ) =>
+            {
+                Some(delta::DeltaAdvert::index_alone())
+            }
             None => None,
         };
 
         let resolved;
+        // The targets that come from a commit operand.
+        let mut by_checksum;
         let (targets, pinned) = match wanted {
-            LocalWanted::Named => {
-                resolved = resolve_targets(src, &opts).await?;
+            LocalWanted::Named(operands) => {
+                (resolved, by_checksum) = resolve_targets(src, operands).await?;
                 (resolved.as_slice(), None)
             }
-            LocalWanted::Pinned(pinned) => (pinned.targets.as_slice(), Some(pinned)),
+            LocalWanted::Pinned(pinned) => {
+                by_checksum = ChecksumTargets {
+                    bare: pinned.bare.clone(),
+                    ..ChecksumTargets::default()
+                };
+                (pinned.targets.as_slice(), Some(pinned))
+            }
         };
+        by_checksum.all = commits_alone;
         let flags = opts.flags;
         // A pull of collection refs from a local candidate reads and writes
         // the refs of its collection, and checks the collection binding of
         // each tip. `Repo::pull_local` reads and writes the ref that each name
-        // gives, and checks the collection binding of each `@ID:NAME` name,
-        // unless it writes no ref.
+        // gives, and checks the collection binding of each `@ID:NAME` name
+        // and of each `REF@CHECKSUM` operand, unless it writes no ref.
         let collection = pinned.map(|pinned| (pinned.collection, pinned.allow_unbound));
         let place = match pinned {
             Some(pinned) => pinned.place,
@@ -2018,27 +2139,35 @@ impl Repo {
         } else {
             TimestampBase::Off
         };
-        // The targets of a collection pull that come from a commit operand
-        // with no ref.
-        let by_checksum = pinned.map(|pinned| ChecksumTargets {
-            bare: pinned.bare.clone(),
-            ..ChecksumTargets::default()
-        });
+        // A commit operand with no ref gets no ref-binding check and writes no
+        // ref. `Repo::pull_local` makes no collection-binding check of it. A
+        // `NAME@CHECKSUM` operand, and a `REMOTE:NAME@CHECKSUM` operand of
+        // `Repo::pull_local`, gets the check of the collection id of this
+        // repository, unless the pull writes no ref.
         let tip_checks = TipChecks {
             collection: collection.map(|(id, _)| id),
             allow_unbound: collection.is_some_and(|(_, allow_unbound)| allow_unbound),
             operand_collections: pinned.is_none() && !opts.no_ref_writes,
             listed: pinned.map(|pinned| &pinned.listed),
-            by_checksum: by_checksum.as_ref(),
+            by_checksum: Some(&by_checksum),
             ..TipChecks::new(flags, timestamp, place)
         };
 
         // The pull finds the deltas before the transaction opens, so a refusal
         // writes no object, no ref, and no marker. With a list, discovery also
         // checks each commit of a chain: the signatures, and the ref binding of
-        // each requested ref that names it.
+        // each requested ref that names it. A pull whose operands each name a
+        // commit reads no summary, and requests each delta by name or through
+        // the delta index.
+        //
+        // A commit operand gives its commit with no read of the source. So
+        // before discovery, the pull checks that the source holds the commit
+        // object of each target. A commit that the source does not hold fails
+        // the pull with the error of the read of the commit, and discovery
+        // reads no delta for it.
         let counters = PullCounters::new(None);
-        let deltas = if advert.is_some() || edges.is_some() {
+        let deltas = if advert.is_some() || edges.is_some() || by_name {
+            check_source_commits(src, targets).await?;
             delta::discover(
                 self,
                 &delta::DeltaSource::Local(src),
@@ -2091,14 +2220,16 @@ impl Repo {
         //
         // The attachments of the commits are commits of the pull too, with
         // the attachments of each attachment, level by level. The walk
-        // appends each one after the chains, at depth 0. It skips an
-        // attachment that this repository holds complete, and reads nothing
-        // below it. It checks no signature of an appended attachment: field 2
-        // of the commit that names it holds its checksum, and the signatures
-        // of that commit cover field 2. A pull that reads static deltas then
-        // looks for the delta of each attachment that it appended, before the
-        // transaction opens. The search checks no signature of the superblock
-        // of such a delta.
+        // appends each one after the chains, at depth 0. It appends no
+        // attachment that this repository holds complete, and reads field 2 of
+        // such an attachment from the commit object of this repository: a
+        // repository that the `ostree` command wrote can hold a commit complete
+        // with its attachments absent. It checks no signature of an appended
+        // attachment: field 2 of the commit that names it holds its checksum,
+        // and the signatures of that commit cover field 2. A pull that reads
+        // static deltas then looks for the delta of each attachment that it
+        // appended, before the transaction opens. The search checks no
+        // signature of the superblock of such a delta.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -2983,26 +3114,66 @@ impl<'a> RefPlace<'a> {
 /// Resolves the refs to pull against the source: the requested names, or
 /// each ref under `refs/heads` of the source if no name is given.
 ///
-/// The function reads each name as a revision of `src`
-/// ([`Repo::resolve_rev`]), and the target keeps the name as given.
-async fn resolve_targets(src: &Repo, opts: &PullOptions) -> Result<Vec<(String, Checksum)>> {
-    if opts.refs.is_empty() {
-        return src.list_refs(None).await;
+/// A commit operand gives its commit with no read of `src`. The target of
+/// `REF@CHECKSUM` is `REF` as given, and the target of `CHECKSUM` is the hex
+/// form of the commit. The second value of the result holds these targets.
+/// The operands `<C>` and `<C>@<C>` give one target: the name `<C>`, which
+/// writes the ref and takes the checks of `REF@CHECKSUM`. The function reads
+/// each other name as a revision of `src` ([`Repo::resolve_rev`]), and the
+/// target keeps the name as given. [`local_operands`] read each name, and
+/// gave each name one time.
+async fn resolve_targets(
+    src: &Repo,
+    operands: &[(&str, Operand<'_>)],
+) -> Result<(Vec<(String, Checksum)>, ChecksumTargets)> {
+    let mut by_checksum = ChecksumTargets::default();
+    if operands.is_empty() {
+        return Ok((src.list_refs(None).await?, by_checksum));
     }
-    let mut out = Vec::with_capacity(opts.refs.len());
-    for name in &opts.refs {
-        let checksum = src
-            .resolve_rev(name, false)
-            .await?
-            .ok_or_else(|| Error::RefNotFound(name.clone()))?;
-        out.push((name.clone(), checksum));
+    // The commit of each `REF@CHECKSUM` operand whose `REF` is the hex form
+    // of that commit.
+    let mut own_name = HashSet::new();
+    let mut out = Vec::with_capacity(operands.len());
+    for (name, operand) in operands {
+        let target = match *operand {
+            Operand::Commit(commit) => {
+                by_checksum.bare.insert(commit);
+                (commit.to_hex(), commit)
+            }
+            Operand::NameAt { name: r, commit } => {
+                if operand_collection(r).is_none() {
+                    by_checksum.named.insert(r.to_owned());
+                }
+                if Checksum::from_hex_lower(r) == Ok(commit) {
+                    own_name.insert(commit);
+                }
+                (r.to_owned(), commit)
+            }
+            Operand::Name(r) => {
+                let checksum = src
+                    .resolve_rev(r, false)
+                    .await?
+                    .ok_or_else(|| Error::RefNotFound((*name).to_owned()))?;
+                ((*name).to_owned(), checksum)
+            }
+        };
+        out.push(target);
     }
-    Ok(out)
+    // The bare target and the target of `<C>@<C>` are the same pair, so the
+    // pull keeps one of them.
+    if !own_name.is_empty() {
+        by_checksum.bare.retain(|commit| !own_name.contains(commit));
+        let mut kept = HashSet::new();
+        out.retain(|(name, commit)| {
+            !own_name.contains(commit) || kept.insert((name.clone(), *commit))
+        });
+    }
+    Ok((out, by_checksum))
 }
 
 /// Returns the collection id and the rest of an `@ID:NAME` name of a pull,
 /// or `None` if the name does not start with `@`. The rest of a name of a
-/// local pull can hold a `^` suffix. [`check_local_operands`] and
+/// local pull can hold a `^` suffix. [`local_operands`] and
 /// [`check_remote_operands`] checked each name that starts with `@`, and a
 /// mirror pull makes each other such name from a [`Ref`], so it holds a `:`.
 fn operand_collection(name: &str) -> Option<(&str, &str)> {
@@ -3225,12 +3396,13 @@ impl SkippedAttachment {
 /// An attachment that `seen` holds, or that `made` holds, needs no read: the
 /// walk of the chains collected it, or a chain of static deltas makes it.
 /// `atts` holds field 2 of each such commit. `made` holds the intermediate
-/// commits of the chains. The call skips an attachment that `repo` holds
-/// complete, and reads nothing below it: the write of that attachment and
-/// each pull of it make its full set of attachments complete. The call reads
-/// each other attachment from the first repository of `sources` that holds
-/// it, else from `repo`. It follows no parent of an attachment, and reads no
-/// tree.
+/// commits of the chains. The call does not append an attachment that `repo`
+/// holds complete. It reads field 2 of such an attachment from the commit
+/// object of `repo`, so the next level takes each attachment that it names:
+/// a repository that the `ostree` command wrote can hold a commit complete
+/// with its attachments absent. The call reads each other attachment from
+/// the first repository of `sources` that holds it, else from `repo`. It
+/// follows no parent of an attachment, and reads no tree.
 ///
 /// The call reads the attachments in one call on the blocking pool. It reads
 /// one commit object at a time, and keeps the root of the tree of the
@@ -3250,9 +3422,13 @@ impl SkippedAttachment {
 /// - [`Error::InvalidRelations`] if neither a source nor `repo` holds an
 ///   attachment, or if the first source that holds an attachment marks it
 ///   partial. The error names the commit that first named the attachment.
+/// - [`Error::InvalidRelations`] if `repo` holds an attachment complete, and
+///   its commit object is absent at the read, with the error of
+///   [`SkippedAttachment::no_longer_complete`].
 /// - [`Error::InvalidRelations`] if field 2 of an attachment that the call reads
-///   has an entry with an empty name or with a checksum that is not 32 bytes.
-///   The error names the attachment.
+///   has an entry with an empty name or with a checksum that is not 32 bytes,
+///   also for an attachment that `repo` holds complete. The error names the
+///   attachment.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and an attachment that
 ///   the call reads from a source does not hash to its name.
 /// - [`Error::Core`] if the commit object of an attachment does not parse.
@@ -3763,6 +3939,37 @@ async fn load_commit(repo: &Repo, checksum: &Checksum, hash: bool) -> Result<Loa
     .await
 }
 
+/// Checks that `src` holds the commit object of each target of `targets`.
+///
+/// The check reads no object. It runs in one call on the blocking pool, and
+/// checks each commit one time.
+///
+/// # Errors
+///
+/// [`Error::ObjectNotFound`] for the first commit of `targets` that `src`
+/// does not hold, as [`load_commit`] gives it.
+async fn check_source_commits(src: &Repo, targets: &[(String, Checksum)]) -> Result<()> {
+    let mut seen = HashSet::new();
+    let commits: Vec<Checksum> = targets
+        .iter()
+        .map(|(_, commit)| *commit)
+        .filter(|commit| seen.insert(*commit))
+        .collect();
+    let src = src.clone();
+    ostrya_rt::unblock(move || {
+        for checksum in commits {
+            if !src.has_object_blocking(ObjectType::Commit, &checksum)? {
+                return Err(Error::ObjectNotFound {
+                    checksum,
+                    ty: ObjectType::Commit,
+                });
+            }
+        }
+        Ok(())
+    })
+    .await
+}
+
 /// Loads a commit as [`load_commit`] does, or returns `None` for an absent
 /// object.
 async fn try_load_commit(
@@ -3783,8 +3990,9 @@ struct AttachmentWalk {
     /// Each attachment that the walk read, in the order of the walk, with the
     /// root of its tree.
     loaded: Vec<(Checksum, LoadedAttachment)>,
-    /// Each attachment that the walk skipped because this repository holds
-    /// it complete, in the order of the walk.
+    /// Each attachment that the walk did not append because this repository
+    /// holds it complete, in the order of the walk. The walk read field 2 of
+    /// each of them from this repository.
     skipped: Vec<Checksum>,
 }
 
@@ -3797,13 +4005,15 @@ struct AttachmentWalk {
 /// 2 of each attachment that it reads in `atts`. So the walk reads each level
 /// before the level below it, and ends when no attachment is left. It skips
 /// an attachment that `seen` or `made` holds, as [`collect_attachments`]
-/// states, and an attachment that this repository holds complete. For each
-/// other attachment, the call refuses a source that marks the attachment
-/// partial. If `untrusted` is set, it hashes a commit that it read from a
-/// source, and compares the result with the checksum of the attachment.
-/// Then it parses the commit and checks the format of its field 2. It keeps
-/// the root of the tree of the commit alone, and drops the bytes before it
-/// reads the next attachment. It stops at the first failure.
+/// states. For an attachment that this repository holds complete, it reads
+/// the commit object of this repository, decodes field 2 alone, checks its
+/// format, and records it in `atts`, with no hash. It checks no other field
+/// of that commit. For each other attachment, the call refuses a source that
+/// marks the attachment partial. If `untrusted` is set, it hashes a commit
+/// that it read from a source, and compares the result with the checksum of
+/// the attachment. Then it parses the commit and checks the format of its
+/// field 2. It keeps the root of the tree of the commit alone, and drops the
+/// bytes before it reads the next attachment. It stops at the first failure.
 ///
 /// The function reads on the calling thread. A caller on the executor calls
 /// it in one call on the blocking pool for the whole walk.
@@ -3816,9 +4026,16 @@ struct AttachmentWalk {
 ///   attachment.
 /// - [`Error::ChecksumMismatch`] if `untrusted` is set and a commit that the
 ///   call hashes does not hash to the checksum of its attachment.
+/// - [`Error::InvalidRelations`] if this repository holds an attachment
+///   complete, and its commit object is absent at the read. The error is the
+///   error of an attachment that this repository no longer holds complete,
+///   and names the commit that first named the attachment.
 /// - [`Error::InvalidRelations`] if field 2 of an attachment has an entry with
 ///   an empty name or with a checksum that is not 32 bytes. The error names
 ///   the attachment.
+/// - [`Error::Core`] if the commit tuple of an attachment that this
+///   repository holds complete does not frame, or if its field 2 does not
+///   decode.
 /// - The errors of [`parse_loaded`], and the errors of the read of a commit
 ///   object other than an absent object.
 fn walk_attachments_blocking(
@@ -3838,8 +4055,32 @@ fn walk_attachments_blocking(
         if seen.contains_key(&checksum) || made.contains(&checksum) {
             continue;
         }
+        // A repository that the `ostree` command wrote can hold a commit
+        // complete with its attachments absent. So the walk reads field 2 of
+        // an attachment that this repository holds complete from its commit
+        // object here, and the next level takes each attachment that it
+        // names. The walk reads no tree of it and imports nothing of it.
+        // The walk decodes field 2 alone, and checks no other field. Another
+        // process can remove the commit object after the check of its state.
+        // The pull then fails as the check after the open of the transaction
+        // fails for an attachment that is no longer complete.
         if delta::complete_here_blocking(repo, &checksum)? {
             walk.skipped.push(checksum);
+            let Some(bytes) = repo.held_object_bytes_blocking(ObjectType::Commit, &checksum)?
+            else {
+                return Err(atts
+                    .named_error(&checksum, related::NO_LONGER_COMPLETE_REASON)
+                    .expect("a commit names each attachment of the walk"));
+            };
+            let entries = related::parse_attachments(&bytes)?;
+            atts.record(
+                checksum,
+                related::checked_entries(
+                    related::RelationField::Attachments,
+                    Some(checksum),
+                    entries,
+                )?,
+            );
             continue;
         }
         let error = |end: &str| {
@@ -4001,11 +4242,12 @@ struct Pinned<'a> {
 
 /// The refs of a local pull.
 enum LocalWanted<'a> {
-    /// The refs of [`refs`](PullOptions::refs), or each ref under
-    /// `refs/heads` of the source if the list is empty. The pull reads the
-    /// commit of each name from the source as a revision
-    /// ([`resolve_targets`]).
-    Named,
+    /// The names of [`refs`](PullOptions::refs) as [`local_operands`] read
+    /// them, or each ref under `refs/heads` of the source if the list is
+    /// empty. The pull reads the commit of each name that is not a commit
+    /// operand from the source as a revision ([`resolve_targets`]). The pull
+    /// reads no name from [`refs`](PullOptions::refs) of its options.
+    Named(&'a [(&'a str, Operand<'a>)]),
     /// The refs of a collection pull from a local candidate, each at the
     /// commit that the probe of the candidate selected.
     ///
@@ -4076,33 +4318,65 @@ impl Repo {
     }
 }
 
-/// Checks each name of a local pull that starts with `@`.
+/// Reads the names `refs` of a local pull, and checks the names that start
+/// with `@` and the commit operands.
 ///
-/// Less each `^` at its end, the name must be an `@ID:NAME` ref that
-/// [`Ref`] reads. The function refuses each other such name with
-/// [`Error::InvalidRefspec`], which holds the name as given. The check reads
-/// nothing.
-fn check_local_operands(opts: &PullOptions) -> Result<()> {
-    for name in opts.refs.iter().filter(|name| name.starts_with('@')) {
-        if name.trim_end_matches('^').parse::<Ref>().is_err() {
+/// [`Operand`] must read each name. A commit operand `CHECKSUM` passes. The
+/// ref part of a commit operand `REF@CHECKSUM` must be a ref that [`Ref`]
+/// reads: `NAME`, `REMOTE:NAME`, or `@ID:NAME`. Each other name that starts
+/// with `@`, less each `^` at its end, must be an `@ID:NAME` ref that [`Ref`]
+/// reads. The function checks the names in order, and refuses the first name
+/// that fails. The check reads nothing.
+///
+/// The result holds each name as given, with its operand, in the order of
+/// `refs`. A name given two times is in the result one time.
+///
+/// # Errors
+///
+/// [`Error::InvalidRefspec`] for a name that fails the check. The error holds
+/// the name as given.
+fn local_operands(refs: &[String]) -> Result<Vec<(&str, Operand<'_>)>> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::with_capacity(refs.len());
+    for name in refs {
+        let operand = Operand::parse(name)?;
+        let valid = match operand {
+            Operand::Commit(_) => true,
+            Operand::NameAt { name: r, .. } => r.parse::<Ref>().is_ok(),
+            Operand::Name(r) if r.starts_with('@') => {
+                r.trim_end_matches('^').parse::<Ref>().is_ok()
+            }
+            Operand::Name(_) => true,
+        };
+        if !valid {
             return Err(Error::InvalidRefspec(name.clone()));
         }
+        if seen.insert(name.as_str()) {
+            out.push((name.as_str(), operand));
+        }
     }
-    Ok(())
+    Ok(out)
 }
 
 /// Refuses two different names of a local pull that write one ref.
 ///
-/// Each name of [`refs`](PullOptions::refs) writes its ref at
-/// [`RefPlace::Operands`] of [`remote`](PullOptions::remote) and of the
-/// `[core] collection-id` of `repo`. A name given two times counts one time.
-/// Under [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
-/// and the function checks nothing. The check reads nothing.
+/// Each name of `operands` writes its ref at [`RefPlace::Operands`] of
+/// [`remote`](PullOptions::remote) and of the `[core] collection-id` of
+/// `repo`. A commit operand `REF@CHECKSUM` writes the ref of `REF`, and a
+/// commit operand `CHECKSUM` writes no ref. Under
+/// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref, and
+/// the function checks nothing. The check reads nothing. [`local_operands`]
+/// read each name, and gave each name one time.
 ///
 /// # Errors
 ///
-/// The errors of [`check_one_place`].
-fn check_local_places(repo: &Repo, opts: &PullOptions) -> Result<()> {
+/// The errors of [`check_one_place`]. The error of two names that write one
+/// ref names both names as given.
+fn check_local_places(
+    repo: &Repo,
+    opts: &PullOptions,
+    operands: &[(&str, Operand<'_>)],
+) -> Result<()> {
     if opts.no_ref_writes {
         return Ok(());
     }
@@ -4110,14 +4384,14 @@ fn check_local_places(repo: &Repo, opts: &PullOptions) -> Result<()> {
         remote: opts.remote.as_deref(),
         own: repo.config().collection_id(),
     };
-    let mut seen = HashSet::new();
     check_one_place(
         place,
-        opts.refs
+        operands
             .iter()
-            .map(String::as_str)
-            .filter(|name| seen.insert(*name))
-            .map(|name| (name, name)),
+            .filter_map(|(name, operand)| match *operand {
+                Operand::Commit(_) => None,
+                Operand::NameAt { name: r, .. } | Operand::Name(r) => Some((*name, r)),
+            }),
     )
 }
 
@@ -4196,6 +4470,16 @@ impl<'a> Operand<'a> {
             },
         }
     }
+}
+
+/// Returns `true` if `refs` holds at least one name, and each name is a
+/// commit operand: a name that [`Operand`] reads as [`Operand::NameAt`] or
+/// [`Operand::Commit`]. A pull with such names reads no summary.
+pub(crate) fn commit_operands_alone(refs: &[String]) -> bool {
+    !refs.is_empty()
+        && !refs
+            .iter()
+            .any(|name| matches!(Operand::parse(name), Ok(Operand::Name(_))))
 }
 
 /// Returns the commit operand of a pull that names the ref `r` and the commit
@@ -4292,24 +4576,64 @@ fn check_remote_operands(opts: &PullOptions) -> Result<()> {
 /// - [`Error::InvalidInput`] for the first rule.
 /// - [`Error::Pull`] for the second rule. The error names the commit.
 async fn check_commit_operands(repo: &Repo, opts: &PullOptions) -> Result<()> {
-    let needs_delta = opts.require_static_deltas
-        && !opts.disable_static_deltas
-        && !opts.flags.contains(PullFlags::COMMIT_ONLY);
-    for name in &opts.refs {
-        let Operand::Commit(commit) = Operand::parse(name)? else {
-            continue;
-        };
-        if opts.timestamp_check == TimestampCheck::CurrentRef {
-            return Err(Error::InvalidInput(format!(
-                "the timestamp check against the current ref takes no commit named by its \
-                 checksum with no ref: {commit}"
-            )));
-        }
-        if needs_delta && !delta::complete_here(repo, &commit).await? {
-            return Err(Error::Pull(format!(
-                "Static deltas required, but a commit named by its checksum takes none: {commit}"
-            )));
-        }
+    let bare = || {
+        opts.refs
+            .iter()
+            .filter_map(|name| match Operand::parse(name) {
+                Ok(Operand::Commit(commit)) => Some(commit),
+                _ => None,
+            })
+    };
+    if opts.timestamp_check == TimestampCheck::CurrentRef
+        && let Some(commit) = bare().next()
+    {
+        return Err(Error::InvalidInput(format!(
+            "the timestamp check against the current ref takes no commit named by its checksum \
+             with no ref: {commit}"
+        )));
+    }
+    check_commit_operand_deltas(repo, opts, bare()).await
+}
+
+/// Refuses a commit operand with no ref under
+/// [`require_static_deltas`](PullOptions::require_static_deltas).
+///
+/// `bare` holds the commit of each such operand, in the order of the
+/// operands. Such an operand takes no delta. The function refuses it unless
+/// `repo` holds the commit complete. The rule does not apply with
+/// [`disable_static_deltas`](PullOptions::disable_static_deltas) or under
+/// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY). The check reads this repository
+/// alone, so a refusal reads no source. It checks each commit one time, in
+/// one batched check.
+///
+/// # Errors
+///
+/// [`Error::Pull`] for the first commit of `bare` that the rule refuses. The
+/// error names the commit.
+async fn check_commit_operand_deltas(
+    repo: &Repo,
+    opts: &PullOptions,
+    bare: impl IntoIterator<Item = Checksum>,
+) -> Result<()> {
+    if !opts.require_static_deltas
+        || opts.disable_static_deltas
+        || opts.flags.contains(PullFlags::COMMIT_ONLY)
+    {
+        return Ok(());
+    }
+    let mut seen = HashSet::new();
+    let commits: Vec<Checksum> = bare
+        .into_iter()
+        .filter(|commit| seen.insert(*commit))
+        .collect();
+    if let Some((commit, _)) = chain::check_complete(repo, &commits)
+        .await?
+        .into_iter()
+        .find(|(_, complete)| !complete)
+    {
+        return Err(Error::Pull(format!(
+            "Static deltas required, but a commit named by its checksum takes none: {commit}"
+        )));
     }
     Ok(())
 }
@@ -5234,6 +5558,136 @@ mod tests {
                 other => panic!("{name}: {other:?}"),
             }
         }
+    }
+
+    /// The check of the names of a local pull takes each revision, each
+    /// commit operand whose ref part is a `NAME`, a `REMOTE:NAME`, or an
+    /// `@ID:NAME`, and a `CHECKSUM` operand. It refuses each malformed commit
+    /// operand and each malformed `@ID:NAME` name with the name as given. It
+    /// gives a name that occurs again one time, and refuses the first name
+    /// that fails, in the given order.
+    #[test]
+    fn a_local_pull_checks_each_operand() {
+        let hex = "5a".repeat(32);
+        let upper = hex.to_uppercase();
+        let check = |name: &str| local_operands(&[name.to_owned()]).map(|_| ());
+        let commit = Checksum::from_hex_lower(&hex).unwrap();
+        let named = format!("main@{hex}");
+        let refs = [
+            "main".to_owned(),
+            hex.clone(),
+            "main".to_owned(),
+            named.clone(),
+            hex.clone(),
+        ];
+        assert_eq!(
+            local_operands(&refs).unwrap(),
+            [
+                ("main", Operand::Name("main")),
+                (hex.as_str(), Operand::Commit(commit)),
+                (
+                    named.as_str(),
+                    Operand::NameAt {
+                        name: "main",
+                        commit
+                    }
+                ),
+            ]
+        );
+        let refs = ["@bad".to_owned(), "main@zz".to_owned()];
+        match local_operands(&refs) {
+            Err(Error::InvalidRefspec(given)) => assert_eq!(given, "@bad"),
+            other => panic!("{other:?}"),
+        }
+        for name in [
+            "os/stable".to_owned(),
+            "os/stable^".to_owned(),
+            "origin:os/stable".to_owned(),
+            "@org.example.Os:os/stable".to_owned(),
+            "@org.example.Os:os/stable^".to_owned(),
+            hex[..10].to_owned(),
+            hex.clone(),
+            upper.clone(),
+            format!("os/stable@{hex}"),
+            format!("origin:os/stable@{hex}"),
+            format!("@org.example.Os:os/stable@{hex}"),
+            format!("{hex}@{hex}"),
+        ] {
+            check(&name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        }
+        for name in [
+            "os/stable@".to_owned(),
+            format!("@{hex}"),
+            format!("os/stable@{}", &hex[..10]),
+            format!("os/stable@{upper}"),
+            format!("a@b@{hex}"),
+            format!("os/stable@{hex}^"),
+            format!("os/stable^@{hex}"),
+            format!("@:os/stable@{hex}"),
+            format!("@org.example.Os:@{hex}"),
+            "@org.example.Os".to_owned(),
+        ] {
+            match check(&name) {
+                Err(Error::InvalidRefspec(given)) => assert_eq!(given, name),
+                other => panic!("{name}: {other:?}"),
+            }
+        }
+    }
+
+    /// The check of the refs of a local pull reads the ref part of a commit
+    /// operand, and skips a `CHECKSUM` operand. Under `no_ref_writes`, it
+    /// makes no check.
+    #[test]
+    fn a_local_pull_checks_the_ref_of_each_commit_operand() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-pull-local-places-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hex = "5a".repeat(32);
+        let at = |name: &str| format!("{name}@{hex}");
+        ostrya_rt::block_on(async {
+            let opts =
+                crate::CreateOptions::new(crate::RepoMode::Archive).collection_id("org.example.Os");
+            let repo = Repo::create(&dir.join("repo"), opts).await.unwrap();
+            let check = |refs: &[&str], no_ref_writes: bool| {
+                let refs: Vec<String> = refs.iter().map(|name| (*name).to_owned()).collect();
+                check_local_places(
+                    &repo,
+                    &PullOptions {
+                        no_ref_writes,
+                        ..PullOptions::default()
+                    },
+                    &local_operands(&refs)?,
+                )
+            };
+            for refs in [
+                vec![hex.clone(), at(&hex)],
+                vec![hex.clone(), at("main")],
+                vec![at("main"), at("main")],
+                vec![at("main"), at("origin:main")],
+            ] {
+                let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+                check(&refs, false).unwrap_or_else(|e| panic!("{refs:?}: {e:?}"));
+            }
+            for (first, second) in [
+                ("main".to_owned(), at("main")),
+                (at("main"), at("@org.example.Os:main")),
+                ("main".to_owned(), at("@org.example.Os:main")),
+            ] {
+                let refs = [first.as_str(), second.as_str()];
+                match check(&refs, false) {
+                    Err(Error::Pull(message)) => assert_eq!(
+                        message,
+                        format!("the refs {first} and {second} write one ref refs/heads/main")
+                    ),
+                    other => panic!("{refs:?}: {other:?}"),
+                }
+                check(&refs, true).unwrap();
+            }
+        });
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The helper writes the ref, an `@`, and the hex form of the commit, and

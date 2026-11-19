@@ -506,8 +506,10 @@ enum Command {
     /// The pull also imports the full set of attachments of each pulled
     /// commit, unless it takes --commit-metadata-only: the attachments that
     /// field 2 names, and the attachments of each attachment, level by level.
-    /// It imports each one with no parent and no ref. It skips an attachment
-    /// that this repository holds complete, and reads nothing below it.
+    /// It imports each one with no parent and no ref. For an attachment that
+    /// this repository holds complete, it reads field 2 from the commit object
+    /// of this repository, and imports each attachment that field 2 names. It
+    /// reads no tree of such an attachment.
     ///
     /// With `[ex-ostrya] generate-composefs=true` in a repository that does
     /// not seal its objects with fs-verity, a pull that succeeds writes one
@@ -5318,9 +5320,11 @@ enum MediaCommand {
     /// The command copies each commit at depth 0, with its `.commitmeta` and
     /// the full set of its attachments: the attachments in field 2, and the
     /// attachments of each attachment, level by level, each with no parent
-    /// and no ref. It skips an attachment that the media repository holds
-    /// complete, and reads nothing below it. It copies no static delta. It
-    /// writes the
+    /// and no ref. For an attachment that the media repository holds
+    /// complete, it reads field 2 from the commit object of the media
+    /// repository, and copies each attachment that field 2 names. It copies
+    /// nothing of such an attachment, and reads no tree of it. It copies no
+    /// static delta. It writes the
     /// ref NAME of the collection ID to `refs/mirrors/ID/NAME`, or to
     /// `refs/heads/NAME` when ID is the `collection-id` of the media
     /// repository. It moves a ref to an older commit with no error. Then it

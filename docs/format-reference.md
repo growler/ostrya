@@ -3799,18 +3799,23 @@ of each intermediate commit of a chain of static deltas. Discovery reads field
 attachments of the commit, the attachments of each attachment, and so on. The
 pull reads field 2 of each attachment that it reads, and takes the
 attachments that this field names, one level at a time, until a level has no
-new attachment. These rules apply to a pull of refs and to a pull of
-collection refs:
+new attachment. These rules apply to a pull of refs, to a pull of commit
+operands, to a pull of collection refs from a local candidate, and to the
+media import and the media export:
 
 - The pull imports each attachment at depth 0, at each level, so an
   attachment entry adds no parent to the pull. The pull imports an attachment
   one time, also if several commits name it, and the walk of the attachments
   reads its commit object one time.
-- The pull skips an attachment that the repository holds complete, and reads
-  nothing below it. Each write of a commit checks that its attachments are
-  complete, so the full set of attachments of a complete commit is complete.
-  The walk of the attachments reads commit objects alone, and no tree, before
-  the transaction opens.
+- For an attachment that the repository holds complete, the pull reads
+  field 2 from the commit object of the repository, and takes each
+  attachment that it names, level by level. It decodes field 2 alone, and
+  checks no other field of that commit. A repository that the `ostree`
+  command wrote can hold a commit complete with its attachments absent. The
+  pull reads each commit at most one time. An attachment below it that the
+  repository does not hold is imported, and one that the repository holds
+  partial is completed. The walk of the attachments reads commit objects
+  alone, and no tree, before the transaction opens.
 - The pull writes no ref for an attachment.
 - The pull checks no signature of an attachment commit. Field 2 holds the
   checksum of the attachment, and the checksum and the signatures of the
@@ -3849,15 +3854,17 @@ collection refs:
 - A commit-only pull imports no attachment.
 
 The pull checks the format of field 2 of each commit that it walks, of each
-commit of a chain of static deltas, and of each attachment that it reads. A
-commit-only pull checks it too, for the commits that it walks. A defective
-related value in field 2 fails the pull: an entry with an empty name, and an
-entry with a checksum that is not 32 bytes. These failures also fail the
+commit of a chain of static deltas, and of each attachment that it reads,
+also of an attachment that the repository holds complete. A commit-only pull
+checks it too, for the commits that it walks. A defective related value in
+field 2 fails the pull: an entry with an empty name, and an entry with a
+checksum that is not 32 bytes. These failures also fail the
 pull, at each level of the attachments:
 
-- An attachment that neither a source nor the repository holds. This is also
-  true for a parent that the source does not hold, if a commit of the pull
-  names it as an attachment.
+- An attachment that neither a source nor the repository holds, also below
+  an attachment that the repository holds complete. This is also true for a
+  parent that the source does not hold, if a commit of the pull names it as
+  an attachment.
 - An attachment that the first source or localcache repository that holds it
   marks partial. A partial copy in the repository is the copy that the pull
   completes.
@@ -3869,10 +3876,12 @@ same is true for an attachment with no delta under the requirement of static
 deltas.
 
 After the transaction opens, and before the pull writes a marker, the pull
-checks each attachment that it skipped again. If the repository no longer
-holds one of them complete, the pull fails with an error that names the
-commit that first names the attachment, and writes no object, no ref, and no
-marker.
+checks again each attachment that the walk found complete in the
+repository. If the repository no longer holds one of them complete, the pull
+fails with an error that names the commit that first names the attachment,
+and writes no object, no ref, and no marker. The walk gives the same error
+if the commit object of such an attachment is absent when the walk reads
+its field 2.
 
 The `pull-local` command of `ostree` imports no attachment
 (`conformance/cli-behavior.md`, "Related commits in a pull").
@@ -3904,11 +3913,11 @@ paired entry
   holds two entries with that name, the first entry applies.
 - A target gives no paired entry if the repository has no local ref for it,
   does not hold the commit of the ref, or reads a field 2 of that commit that
-  does not decode or has a defective entry. A local pull of a target whose
-  name is the full hex form of its commit is a pull by checksum, and gives no
-  paired entry. An intermediate commit of a chain of static deltas that the
-  depth does not take is not in the chain of a target, so it gives no paired
-  entry.
+  does not decode or has a defective entry. A target whose name is the full
+  hex form of its commit gives no paired entry, as the target of a
+  `CHECKSUM` operand of a pull. An intermediate commit of a chain of static
+  deltas that the depth does not take is not in the chain of a target, so it
+  gives no paired entry.
 - For a pull from a remote, an attachment X that no chain names, and that
   an attachment D of the level above names, takes its paired entries from
   the `from` of the delta of D. D gives at most one paired entry: the entry
@@ -5627,10 +5636,9 @@ holds, and the pull hashes no commit in this step.
 
 If each operand is a commit operand, the pull reads no ref listing, no
 `summary`, and no `summary.sig` of a candidate, and a summary policy does not
-apply. The one exception is a local candidate under `require_static_deltas`,
-as the paragraph on a local candidate below states. The pull opens no session
-to the candidates after the candidate that serves the last commit. If one
-operand is not a commit operand, items 1 to 4 apply to each candidate.
+apply. The pull opens no session to the candidates after the candidate that
+serves the last commit. If one operand is not a commit operand, items 1 to 4
+apply to each candidate.
 
 A candidate at an `s3://` address is a bucket repository ("The S3 bucket
 repository"), which serves no ref listing. The pull sends it no listing
@@ -5780,10 +5788,9 @@ from the verified summary, and the pull reads and verifies the `summary` and
 the `summary.sig` of the source again. Without a summary policy, the probe
 reads each tip commit for its timestamp, and keeps no bytes for the pull.
 If each operand is a commit operand, the pull reads no `summary` and no
-`summary.sig` of the source, unless `require_static_deltas` is set without
-`disable_static_deltas`. Under `require_static_deltas` alone, the pull reads
-and verifies the summary, the summary policy applies, and a source with no
-summary fails the pull.
+`summary.sig` of the source. Under `require_static_deltas`, it reads the
+static deltas of the commits as a local pull of commit operands alone
+reads them (`Repo::pull_local` below).
 With `--untrusted`, the pull hashes each commit that it reads for the checks
 and for the walk of the chain, and each dirtree that the walk of the tree
 reads. It compares each result with the name of the object before it uses
@@ -5875,6 +5882,35 @@ pull refuses an operand that starts with `@` and, less each `^` at its end,
 is not an `@ID:REF` ref, with `Error::InvalidRefspec`, before it reads the
 source.
 
+The pull also takes commit operands, which name the commit that it takes:
+`CHECKSUM`, `NAME@CHECKSUM`, `REMOTE:NAME@CHECKSUM`, and
+`@ID:NAME@CHECKSUM`. The pull splits an operand at its last `@` after
+position 0. `CHECKSUM` is 64 lowercase hex characters, and the part before
+the `@` must be a ref `NAME`, `REMOTE:NAME`, or `@ID:NAME`. Each other
+form gives `Error::InvalidRefspec` with the operand as given, before the
+pull reads the source, also under `no_ref_writes`. The pull reads no ref of
+the source for a commit operand, and a commit that the source does not
+hold fails the pull with `Error::ObjectNotFound`. A pull that reads static
+deltas checks that the source holds the commit of each target before it
+looks for a delta, so the same error applies under `require_static_deltas`
+and with a `static_deltas` list. An abbreviated checksum
+stays a revision of the source. `CHECKSUM` writes no ref, and gets no
+ref-binding check and no collection-binding check, with or without a remote
+name. `REF@CHECKSUM` writes the ref of `REF` at the commit, with the
+ref-binding check of `REF`. Unless the caller sets `no_ref_writes`, the
+`ostree.collection-binding` of the commit of `NAME@CHECKSUM` and of
+`REMOTE:NAME@CHECKSUM` must be the `[core] collection-id` of the
+destination, and a destination with no collection id refuses a commit with
+the key. The commit of `@ID:NAME@CHECKSUM` gets the check of `@ID:REF`
+below. `PullFlags::DISABLE_VERIFY_BINDINGS` does not skip a
+collection-binding check. If each operand is a commit operand, the pull
+reads no `summary` and no `summary.sig` of the source. Under
+`require_static_deltas`, it then reads the delta index of each target if the
+`config` of the source states `[core] indexed-deltas=true`, and else one
+superblock by name. `CHECKSUM` takes no delta, and under
+`require_static_deltas` the pull refuses it before it reads the source,
+unless the destination holds the commit complete.
+
 Each written ref names the commit that the pull read from the source. Unless
 the caller sets `no_ref_writes`, the pull writes `@ID:REF` to
 `refs/mirrors/ID/REF`, or to `refs/heads/REF` when `ID` is the
@@ -5882,15 +5918,19 @@ the caller sets `no_ref_writes`, the pull writes `@ID:REF` to
 not change this place: it selects the `[remote "NAME"]` section whose
 verification keys apply, and the place of each plain operand. Delta discovery
 reads the `from` commit of a delta at the place of the operand in the
-destination, with and without `no_ref_writes`.
+destination, with and without `no_ref_writes`. Under `no_ref_writes`, an
+operand that gives no valid ref, for example `REMOTE:NAME@CHECKSUM` with a
+remote name, takes no `from` commit from a ref.
 
 Unless the caller sets `no_ref_writes`, the pull refuses two different
 operands that write one ref, with `Error::Pull`, before it reads the source.
 An example is `main` and `@ID:main` with no remote name, into a destination
-whose `[core] collection-id` is `ID`: both write `refs/heads/main`. The text
-of the error is `the refs A and B write one ref PATH`. An operand given two
-times counts one time. The pull refuses an operand that gives no valid ref to
-write, for example an operand with a `^` suffix, with
+whose `[core] collection-id` is `ID`: both write `refs/heads/main`. Other
+examples are `main` and `main@<C>`, and `main@<C1>` and `main@<C2>`. The
+text of the error is `the refs A and B write one ref PATH`, with the operands
+as given. An operand given two times counts one time. `CHECKSUM` writes no
+ref, so it stops no operand. The pull refuses an operand that gives no valid
+ref to write, for example an operand with a `^` suffix, with
 `Error::InvalidRefspec`, at the same step.
 
 Unless the caller sets `no_ref_writes`, the pull refuses the tip commit of an

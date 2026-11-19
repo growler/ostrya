@@ -4927,21 +4927,19 @@ async fn dst_holding(base: &Path, name: &str, src: &Repo, commit: &Checksum) -> 
     (path, dst)
 }
 
-/// Pulls `commit` of `src` into `dst` complete, and leaves `dst` with no ref.
+/// Pulls `commit` of `src` into `dst` complete, with its attachments. The
+/// operand is the checksum of the commit, which writes no ref, so `dst` keeps
+/// no ref.
 async fn hold_commit(dst: &Repo, src: &Repo, commit: &Checksum) {
     dst.pull_local(
         src,
         PullOptions {
             refs: vec![commit.to_hex()],
-            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
             ..PullOptions::default()
         },
     )
     .await
     .unwrap();
-    let txn = dst.transaction().await.unwrap();
-    txn.set_ref(&Ref::local(commit.to_hex()), None);
-    txn.commit().await.unwrap();
     assert!(dst.list_refs(None).await.unwrap().is_empty());
 }
 
@@ -8356,12 +8354,12 @@ fn a_local_target_refused_by_its_ref_binding_applies_no_part() {
 }
 
 /// The source holds no commit object of the target of a chain, and the ref
-/// binding of the target lists another ref. Discovery reads the target from
-/// its superblock and refuses the ref binding. The walk of the chain, which
-/// reads the commit object, does not start, so the refusal reports and the
-/// missing object does not.
+/// binding of the target lists another ref. A pull that reads static deltas
+/// checks that the source holds the commit of each target before discovery.
+/// So the pull fails with `Error::ObjectNotFound` for the target, and
+/// discovery does not read the target from its superblock.
 #[test]
-fn a_local_target_refused_by_its_ref_binding_reports_before_the_walk() {
+fn a_local_target_that_the_source_lacks_fails_before_discovery() {
     let tmp = TmpDir::new("pull-chain-target-binding-first");
     block_on(async {
         let base = tmp.path();
@@ -8385,7 +8383,10 @@ fn a_local_target_refused_by_its_ref_binding_reports_before_the_walk() {
         let err = dst.pull_local(&src, opts).await.unwrap_err();
 
         assert!(
-            matches!(&err, Error::Pull(m) if m.contains("'alias'")),
+            matches!(
+                &err,
+                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if *checksum == d
+            ),
             "{err:?}"
         );
         assert!(dst.list_refs(None).await.unwrap().is_empty());
@@ -9691,11 +9692,12 @@ fn an_attachment_that_two_attachments_name_crosses_once() {
 }
 
 /// The destination holds C of the chain R -> C -> D complete. The pull of R
-/// skips C and reads nothing below it: with the commit object of D gone from
-/// the source and from the destination, the pull passes, and imports no
-/// commit object of D.
+/// reads field 2 of C from the commit object of the destination. With the
+/// commit object of D gone from the source and from the destination, the
+/// pull fails, the error names C as the commit that names D, and the pull
+/// writes nothing.
 #[test]
-fn a_local_pull_reads_nothing_below_an_attachment_held_complete() {
+fn a_missing_attachment_below_an_attachment_held_complete_fails_the_pull() {
     let tmp = TmpDir::new("pull-local-attachment-held");
     block_on(async {
         let base = tmp.path();
@@ -9706,16 +9708,22 @@ fn a_local_pull_reads_nothing_below_an_attachment_held_complete() {
         assert_complete(&src, &dst, &dst_dir, &chain.d).await;
         remove_commit_object(&src_dir, &chain.d);
         remove_commit_object(&dst_dir, &chain.d);
+        let before = repo_inventory(&dst_dir);
 
-        dst.pull_local(&src, pull_of("main")).await.unwrap();
+        let err = dst.pull_local(&src, pull_of("main")).await.unwrap_err();
 
-        assert_complete(&src, &dst, &dst_dir, &chain.r).await;
         assert_eq!(
-            dst.commit_state(&chain.c).await.unwrap(),
-            CommitState::Normal
+            attachment_error(err),
+            (
+                Some(chain.c),
+                format!(
+                    "attachment {CHAIN_D} names commit {}, which neither a source nor this \
+                     repository holds",
+                    chain.d
+                )
+            )
         );
-        assert!(!dst.has_object(ObjectType::Commit, &chain.d).await.unwrap());
-        assert_no_markers(&dst_dir);
+        assert_eq!(repo_inventory(&dst_dir), before);
     });
 }
 
@@ -9762,9 +9770,9 @@ fn a_missing_attachment_below_an_attachment_names_its_commit() {
 /// R, and writes no object, no marker, and no ref.
 ///
 /// An exclusive transaction of a second handle holds the pull at the open.
-/// Neither the source nor the destination holds the commit object of D, so
-/// a walk that sees C partial reads C from the destination and fails with
-/// another error, which names C and D.
+/// The source does not hold the commit objects of C and D, and the
+/// destination holds C and D complete. So a walk that sees C partial reads C
+/// from the destination, takes C as an attachment of the pull, and passes.
 #[test]
 fn an_attachment_that_the_walk_skips_is_checked_again_after_the_open() {
     let tmp = TmpDir::new("pull-local-attachment-recheck");
@@ -9776,7 +9784,6 @@ fn an_attachment_that_the_walk_skips_is_checked_again_after_the_open() {
         hold_commit(&dst, &src, &chain.c).await;
         remove_commit_object(&src_dir, &chain.c);
         remove_commit_object(&src_dir, &chain.d);
-        remove_commit_object(&dst_dir, &chain.d);
         let before = dst.list_objects().await.unwrap();
         let pulling = Repo::open(&dst_dir).await.unwrap();
 
@@ -10283,9 +10290,11 @@ fn the_first_local_target_gives_the_from_of_an_attachment() {
     });
 }
 
-/// A pull by checksum names no local ref, so an attachment gets no paired
-/// entry, and the pull takes its from-scratch delta. A pull of `main` holds
-/// the paired entry D1 complete and imports the attachment loose.
+/// The operand `other@<T2>` writes the ref `other`, which names no commit
+/// in the destination, so an attachment gets no paired entry, and the pull
+/// takes its from-scratch delta. The pull of commit operands alone reads no
+/// summary, and requests each delta by name. A pull of `main` holds the
+/// paired entry D1 complete and imports the attachment loose.
 #[test]
 fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_an_attachment() {
     let tmp = TmpDir::new("pull-local-dependency-delta-checksum");
@@ -10302,7 +10311,7 @@ fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_an_attachment() {
                 &src,
                 PullOptions {
                     flags: PullFlags::DISABLE_VERIFY_BINDINGS,
-                    ..required_refs(&[&t2.to_hex()])
+                    ..required_refs(&[&format!("other@{t2}")])
                 },
             )
             .await
@@ -10758,5 +10767,978 @@ fn a_bad_generate_composefs_value_fails_a_local_pull() {
             assert!(dst.list_refs(None).await.unwrap().is_empty(), "{name}");
             assert_eq!(file_inventory(dst.path(), "state"), Vec::new(), "{name}");
         }
+    });
+}
+
+// --- commit operands ------------------------------------------------------
+
+/// The collection id of the commit operand tests that is not [`COLLECTION`].
+const OTHER_COLLECTION: &str = "org.example.Other";
+
+/// The commits of [`binding_source`]. No commit has a ref binding.
+struct Bindings {
+    /// The commit bound to [`COLLECTION`].
+    own: Checksum,
+    /// The commit bound to [`OTHER_COLLECTION`].
+    other: Checksum,
+    /// The commit with no collection binding.
+    none: Checksum,
+}
+
+/// Creates an archive source under `base/src` with three commits, each under
+/// a collection ref of [`COLLECTION`], and returns the path, the source, and
+/// the commits.
+async fn binding_source(base: &Path) -> (PathBuf, Repo, Bindings) {
+    let (path, src) = make_repo(base, "src", RepoMode::Archive).await;
+    let own =
+        commit_collection_ref(&src, base, "own", "own", None, bound_to(COLLECTION), None).await;
+    let other = commit_collection_ref(
+        &src,
+        base,
+        "other",
+        "other",
+        None,
+        bound_to(OTHER_COLLECTION),
+        None,
+    )
+    .await;
+    let none = commit_collection_ref(&src, base, "none", "none", None, None, None).await;
+    (path, src, Bindings { own, other, none })
+}
+
+/// Creates an archive repository under `base/<name>` with the collection id
+/// `id`, or with none.
+async fn repo_of_collection(base: &Path, name: &str, id: Option<&str>) -> (PathBuf, Repo) {
+    let path = base.join(name);
+    let mut opts = CreateOptions::new(RepoMode::Archive);
+    if let Some(id) = id {
+        opts = opts.collection_id(id);
+    }
+    let repo = Repo::create(&path, opts).await.unwrap();
+    (path, repo)
+}
+
+/// Returns the options of a pull of the operands `refs`.
+fn operand_pull(refs: &[&str]) -> PullOptions {
+    pull_refs(refs)
+}
+
+/// Returns the path of each ref file of `repo`, sorted.
+fn ref_files(repo: &Repo) -> Vec<String> {
+    file_inventory(repo.path(), "refs")
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect()
+}
+
+/// Asserts that a pull failed with `Error::Pull` and a message that holds
+/// `part`.
+fn assert_refused<T: std::fmt::Debug>(result: Result<T, Error>, part: &str) {
+    match result {
+        Err(Error::Pull(message)) if message.contains(part) => {}
+        other => panic!("expected a refusal with {part:?}, got {other:?}"),
+    }
+}
+
+/// Sets `[core] indexed-deltas=true` in the config of the repository at
+/// `dir`, and returns a new handle of it.
+async fn state_indexed_deltas(dir: &Path) -> Repo {
+    let config = dir.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(
+        &config,
+        text.replacen("[core]\n", "[core]\nindexed-deltas=true\n", 1),
+    )
+    .unwrap();
+    Repo::open(dir).await.unwrap()
+}
+
+/// The collection-binding check of a `NAME@CHECKSUM` and of a
+/// `REMOTE:NAME@CHECKSUM` operand compares with the collection id of the
+/// destination:
+///
+/// - with an id, a commit bound to it passes, and a commit bound to another
+///   id and a commit with no binding key are refused;
+/// - with no id, a commit with no binding key passes, and each bound commit
+///   is refused;
+/// - `DISABLE_VERIFY_BINDINGS` keeps the check, and a refusal writes
+///   nothing;
+/// - under `no_ref_writes`, the pull makes no such check, and writes no ref.
+#[test]
+fn the_collection_binding_of_a_ref_at_checksum_operand_is_checked() {
+    let tmp = TmpDir::new("pull-local-operand-collection");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, bound) = binding_source(base).await;
+        let all = [bound.own, bound.other, bound.none];
+        let mut count = 0;
+        for (own, passes) in [(Some(COLLECTION), bound.own), (None, bound.none)] {
+            for (name, written) in [
+                ("main", Ref::local("main")),
+                ("r:main", Ref::remote("r", "main")),
+            ] {
+                for flags in [PullFlags::default(), PullFlags::DISABLE_VERIFY_BINDINGS] {
+                    count += 1;
+                    let (dst_dir, dst) =
+                        repo_of_collection(base, &format!("dst{count}"), own).await;
+                    let opts = |commit: &Checksum| PullOptions {
+                        flags,
+                        ..operand_pull(&[&format!("{name}@{commit}")])
+                    };
+                    dst.pull_local(&src, opts(&passes)).await.unwrap();
+                    assert_complete(&src, &dst, &dst_dir, &passes).await;
+                    assert_eq!(
+                        dst.resolve_ref_tip(&written).await.unwrap(),
+                        Some(passes),
+                        "{own:?} {name} {flags:?}"
+                    );
+                    let before = repo_inventory(&dst_dir);
+                    for commit in all.iter().filter(|commit| **commit != passes) {
+                        assert_refused(
+                            dst.pull_local(&src, opts(commit)).await,
+                            "collection binding",
+                        );
+                        assert_eq!(repo_inventory(&dst_dir), before, "{own:?} {name} {commit}");
+                    }
+                }
+                count += 1;
+                let (dst_dir, dst) = repo_of_collection(base, &format!("dst{count}"), own).await;
+                for commit in &all {
+                    dst.pull_local(
+                        &src,
+                        PullOptions {
+                            no_ref_writes: true,
+                            ..operand_pull(&[&format!("{name}@{commit}")])
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    assert_complete(&src, &dst, &dst_dir, commit).await;
+                }
+                assert_eq!(ref_files(&dst), Vec::<String>::new(), "{own:?} {name}");
+            }
+        }
+    });
+}
+
+/// An `@ID:NAME@CHECKSUM` operand writes the collection ref of `ID`, or the
+/// local ref if `ID` is the collection id of the destination. The binding of
+/// the commit must state `ID`: a commit bound to another id and a commit with
+/// no binding key are refused, also under `DISABLE_VERIFY_BINDINGS`.
+#[test]
+fn an_id_ref_at_checksum_operand_needs_the_binding_of_its_id() {
+    let tmp = TmpDir::new("pull-local-operand-id");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, bound) = binding_source(base).await;
+        for (dst_name, own, written) in [
+            ("plain", None, format!("refs/mirrors/{COLLECTION}/main")),
+            ("own", Some(COLLECTION), "refs/heads/main".to_owned()),
+        ] {
+            let (dst_dir, dst) = repo_of_collection(base, dst_name, own).await;
+            let operand = |commit: &Checksum| {
+                ostrya::commit_operand(&Ref::collection(COLLECTION, "main"), commit)
+            };
+            dst.pull_local(&src, operand_pull(&[&operand(&bound.own)]))
+                .await
+                .unwrap();
+            assert_complete(&src, &dst, &dst_dir, &bound.own).await;
+            assert_eq!(ref_files(&dst), [written], "{dst_name}");
+            let before = repo_inventory(&dst_dir);
+            for commit in [bound.other, bound.none] {
+                for flags in [PullFlags::default(), PullFlags::DISABLE_VERIFY_BINDINGS] {
+                    let result = dst
+                        .pull_local(
+                            &src,
+                            PullOptions {
+                                flags,
+                                ..operand_pull(&[&operand(&commit)])
+                            },
+                        )
+                        .await;
+                    assert_refused(result, "collection binding");
+                    assert_eq!(repo_inventory(&dst_dir), before, "{dst_name} {commit}");
+                }
+            }
+        }
+    });
+}
+
+/// A `CHECKSUM` operand fetches the commit complete with no ref. The pull
+/// makes no ref-binding check of it and no collection-binding check, also
+/// with a remote whose section states another `collection-id`, and in a
+/// repository with no collection id. Here one commit is bound to `main` and
+/// to [`COLLECTION`], and the other has no binding key. The pull writes no
+/// ref named by the checksum: with no flag, under
+/// `DISABLE_VERIFY_BINDINGS`, and with the remote name `origin`. A commit
+/// operand whose commit the source does not hold fails with
+/// `Error::ObjectNotFound`.
+#[test]
+fn a_checksum_operand_writes_no_ref_and_gets_no_binding_check() {
+    let tmp = TmpDir::new("pull-local-operand-bare");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let bound = commit_collection_ref(
+            &src,
+            base,
+            "bound",
+            "bound",
+            None,
+            bound_to(COLLECTION),
+            Some(&["main"]),
+        )
+        .await;
+        let unbound =
+            commit_collection_ref(&src, base, "unbound", "unbound", None, None, None).await;
+        let dst = dest_with_remote(
+            base,
+            &format!("gpg-verify=false\ncollection-id={OTHER_COLLECTION}\n"),
+        )
+        .await;
+        let dst_dir = dst.path().to_path_buf();
+
+        for (flags, remote) in [
+            (PullFlags::default(), None),
+            (PullFlags::DISABLE_VERIFY_BINDINGS, None),
+            (PullFlags::default(), Some("origin".to_owned())),
+        ] {
+            for commit in [bound, unbound] {
+                dst.pull_local(
+                    &src,
+                    PullOptions {
+                        flags,
+                        remote: remote.clone(),
+                        ..operand_pull(&[&commit.to_hex()])
+                    },
+                )
+                .await
+                .unwrap();
+                assert_complete(&src, &dst, &dst_dir, &commit).await;
+                assert_eq!(
+                    ref_files(&dst),
+                    Vec::<String>::new(),
+                    "{flags:?} {remote:?}"
+                );
+            }
+        }
+
+        // A commit that the source does not hold fails the pull.
+        let absent = Checksum::from_bytes([0x77; 32]);
+        for operand in [absent.to_hex(), format!("main@{absent}")] {
+            match dst.pull_local(&src, operand_pull(&[&operand])).await {
+                Err(Error::ObjectNotFound { .. }) => {}
+                other => panic!("{operand}: {other:?}"),
+            }
+        }
+    });
+}
+
+/// The local pull makes no timestamp check, so a `CHECKSUM` operand under
+/// `TimestampCheck::CurrentRef` passes. The pull takes the commit complete
+/// and writes no ref.
+#[test]
+fn a_checksum_operand_passes_under_the_current_ref_timestamp_check() {
+    let tmp = TmpDir::new("pull-local-operand-current-ref");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                timestamp_check: TimestampCheck::CurrentRef,
+                ..operand_pull(&[&c2.to_hex()])
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+        assert_eq!(ref_files(&dst), Vec::<String>::new());
+    });
+}
+
+/// An abbreviated checksum is a revision of the source. It writes the ref of
+/// its name and gets the ref-binding check of that name: a commit bound to
+/// `main` is refused, and passes under `DISABLE_VERIFY_BINDINGS`. A ref of
+/// the source whose name is the abbreviation does not change the commit.
+#[test]
+fn an_abbreviated_checksum_stays_a_revision_of_the_source() {
+    let tmp = TmpDir::new("pull-local-operand-abbreviated");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let hex = c2.to_hex();
+        let abbreviated = &hex[..10];
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        assert_refused(
+            dst.pull_local(&src, operand_pull(&[abbreviated])).await,
+            "ref binding",
+        );
+        assert!(dst.list_objects().await.unwrap().is_empty());
+
+        move_ref(&src, abbreviated, &c1).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                ..operand_pull(&[abbreviated])
+            },
+        )
+        .await
+        .unwrap();
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            [(abbreviated.to_owned(), c2)]
+        );
+    });
+}
+
+/// Two operands that write one ref stop the pull before it reads the source,
+/// and the error names both operands as given. The source here holds no
+/// commit and no ref, so a check after the first read of the source fails
+/// with another error. The cases are two commits for one ref, a ref beside a
+/// commit for it, two `REMOTE:NAME@CHECKSUM` operands, the same with the
+/// remote option, and the plain form beside the `@OWN:` form.
+#[test]
+fn two_commit_operands_for_one_ref_are_refused_before_the_source_is_read() {
+    let tmp = TmpDir::new("pull-local-operand-one-ref");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let c1 = Checksum::from_bytes([0x11; 32]);
+        let c2 = Checksum::from_bytes([0x22; 32]);
+        let (_plain_dir, plain) = repo_of_collection(base, "plain", None).await;
+        let (_own_dir, own) = repo_of_collection(base, "own", Some(COLLECTION)).await;
+        let at = |name: &str, commit: &Checksum| format!("{name}@{commit}");
+        for (dst, remote, first, second, path) in [
+            (
+                &plain,
+                None,
+                at("main", &c1),
+                at("main", &c2),
+                "refs/heads/main",
+            ),
+            (
+                &plain,
+                None,
+                "main".to_owned(),
+                at("main", &c1),
+                "refs/heads/main",
+            ),
+            (
+                &plain,
+                None,
+                at("r:main", &c1),
+                at("r:main", &c2),
+                "refs/remotes/r/main",
+            ),
+            (
+                &plain,
+                Some("origin"),
+                at("main", &c1),
+                at("main", &c2),
+                "refs/remotes/origin/main",
+            ),
+            (
+                &own,
+                None,
+                at("main", &c1),
+                at(&format!("@{COLLECTION}:main"), &c1),
+                "refs/heads/main",
+            ),
+        ] {
+            let result = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        remote: remote.map(str::to_owned),
+                        ..operand_pull(&[&first, &second])
+                    },
+                )
+                .await;
+            match result {
+                Err(Error::Pull(message)) => assert_eq!(
+                    message,
+                    format!("the refs {first} and {second} write one ref {path}")
+                ),
+                other => panic!("{first} {second}: {other:?}"),
+            }
+            assert!(dst.list_objects().await.unwrap().is_empty());
+        }
+    });
+}
+
+/// The same operand two times is one operand. Under `no_ref_writes`, the
+/// pull makes no check that two operands write one ref, and fetches the
+/// commit of each operand. The operands `<C>` and `<C>@<C>` give one target,
+/// which writes the ref `<C>` and gets the ref-binding check of `<C>`.
+#[test]
+fn commit_operands_for_one_ref_that_the_pull_takes() {
+    let tmp = TmpDir::new("pull-local-operand-one-ref-taken");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let at = |name: &str, commit: &Checksum| format!("{name}@{commit}");
+
+        let (twice_dir, twice) = make_repo(base, "twice", RepoMode::Archive).await;
+        twice
+            .pull_local(&src, operand_pull(&[&at("main", &c1), &at("main", &c1)]))
+            .await
+            .unwrap();
+        assert_complete(&src, &twice, &twice_dir, &c1).await;
+        assert_eq!(
+            twice.list_refs(None).await.unwrap(),
+            [("main".to_owned(), c1)]
+        );
+
+        let (both_dir, both) = make_repo(base, "both", RepoMode::Archive).await;
+        both.pull_local(
+            &src,
+            PullOptions {
+                no_ref_writes: true,
+                ..operand_pull(&["main", &at("main", &c1)])
+            },
+        )
+        .await
+        .unwrap();
+        for commit in [c1, c2] {
+            assert_complete(&src, &both, &both_dir, &commit).await;
+        }
+        assert_eq!(ref_files(&both), Vec::<String>::new());
+
+        let (named_dir, named) = make_repo(base, "named", RepoMode::Archive).await;
+        let hex = c2.to_hex();
+        let operands = [hex.clone(), at(&hex, &c2)];
+        let operands: Vec<&str> = operands.iter().map(String::as_str).collect();
+        assert_refused(
+            named.pull_local(&src, operand_pull(&operands)).await,
+            "ref binding",
+        );
+        assert!(named.list_objects().await.unwrap().is_empty());
+        named
+            .pull_local(
+                &src,
+                PullOptions {
+                    flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                    ..operand_pull(&operands)
+                },
+            )
+            .await
+            .unwrap();
+        assert_complete(&src, &named, &named_dir, &c2).await;
+        assert_eq!(named.list_refs(None).await.unwrap(), [(hex, c2)]);
+    });
+}
+
+/// The pull refuses a malformed operand with `Error::InvalidRefspec` and the
+/// operand as given, before it reads the source, with and without
+/// `no_ref_writes`. The source holds no ref `main`, so a check after the
+/// first read of the source fails with `Error::RefNotFound` for the operand
+/// `main` before it.
+#[test]
+fn a_malformed_commit_operand_is_refused_before_the_source_is_read() {
+    let tmp = TmpDir::new("pull-local-operand-malformed");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let before = repo_inventory(&dst_dir);
+        let hex = "5a".repeat(32);
+        let upper = hex.to_uppercase();
+        for no_ref_writes in [false, true] {
+            for operand in [
+                "main@".to_owned(),
+                format!("main@{}", &hex[..10]),
+                format!("main@{}", &hex[..63]),
+                format!("main@{upper}"),
+                format!("main@{hex}^"),
+                format!("main@{hex}x"),
+                format!("a@b@{hex}"),
+                format!("@{hex}"),
+                format!("@{COLLECTION}:@{hex}"),
+                format!("@:main@{hex}"),
+                format!("main^@{hex}"),
+            ] {
+                let result = dst
+                    .pull_local(
+                        &src,
+                        PullOptions {
+                            no_ref_writes,
+                            ..operand_pull(&["main", &operand])
+                        },
+                    )
+                    .await;
+                match result {
+                    Err(Error::InvalidRefspec(given)) => {
+                        assert_eq!(given, operand, "{no_ref_writes}")
+                    }
+                    other => panic!("{operand} {no_ref_writes}: {other:?}"),
+                }
+                assert_eq!(repo_inventory(&dst_dir), before, "{operand}");
+            }
+        }
+    });
+}
+
+/// A plain `@ID:<C>` operand beside the `CHECKSUM` operand `<C>`: the first
+/// is the collection ref of the source whose name is the hex form of C, and
+/// writes the collection ref. The second writes no ref.
+#[test]
+fn a_collection_ref_named_by_a_checksum_beside_that_checksum() {
+    let tmp = TmpDir::new("pull-local-operand-id-hex");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let commit = commit_collection_ref(
+            &src,
+            base,
+            "hexed",
+            "hexed",
+            None,
+            bound_to(COLLECTION),
+            None,
+        )
+        .await;
+        let hex = commit.to_hex();
+        set_ref(&src, COLLECTION, &hex, &commit).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        dst.pull_local(&src, operand_pull(&[&format!("@{COLLECTION}:{hex}"), &hex]))
+            .await
+            .unwrap();
+
+        assert_complete(&src, &dst, &dst_dir, &commit).await;
+        assert_eq!(
+            ref_files(&dst),
+            [format!("refs/mirrors/{COLLECTION}/{hex}")]
+        );
+    });
+}
+
+/// A pull whose operands are all commit operands reads no summary of the
+/// source, so the summary policy does not apply to it. Here the policy
+/// requires a signed summary, and the source has a summary with no
+/// signature. A pull of a ref fails. Under `require_static_deltas`, a
+/// directory in place of the summary fails a pull with a ref operand, and a
+/// pull of commit operands alone takes the delta by name.
+#[test]
+fn a_local_pull_of_commit_operands_alone_reads_no_summary() {
+    let tmp = TmpDir::new("pull-local-operand-no-summary");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        summarize(&src).await;
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\nsign-verify-summary=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let dst_dir = dst.path().to_path_buf();
+        let origin = |refs: &[&str]| PullOptions {
+            remote: Some("origin".to_owned()),
+            ..operand_pull(refs)
+        };
+
+        let err = dst.pull_local(&src, origin(&["main"])).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig")),
+            "{err}"
+        );
+        dst.pull_local(&src, origin(&[&c2.to_hex()])).await.unwrap();
+        dst.pull_local(&src, origin(&[&format!("main@{c2}")]))
+            .await
+            .unwrap();
+        assert_complete(&src, &dst, &dst_dir, &c2).await;
+        assert_eq!(
+            dst.resolve_rev("origin:main", false).await.unwrap(),
+            Some(c2)
+        );
+
+        std::fs::remove_file(src_dir.join("summary")).unwrap();
+        std::fs::create_dir(src_dir.join("summary")).unwrap();
+        let (_required_dir, required) = make_repo(base, "required", RepoMode::Archive).await;
+        let err = required
+            .pull_local(
+                &src,
+                PullOptions {
+                    no_ref_writes: true,
+                    ..required_refs(&["main", &format!("main@{c2}")])
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err:?}");
+        let stats = required
+            .pull_local(&src, required_refs(&[&format!("main@{c2}")]))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 1);
+        assert_eq!(
+            required.list_refs(None).await.unwrap(),
+            [("main".to_owned(), c2)]
+        );
+    });
+}
+
+/// A pull of commit operands alone that requires static deltas, from a
+/// source with no summary:
+///
+/// - with no index key, the pull reads the from-scratch delta by name, and
+///   with no such delta it fails with the error of a delta that is not
+///   found;
+/// - with `[core] indexed-deltas=true`, the pull reads the delta index of the
+///   commit, and with no index it fails, also where the superblock is there;
+/// - a pull with a ref operand beside a commit operand needs the summary.
+#[test]
+fn required_deltas_of_a_local_commit_operand_need_no_summary() {
+    let tmp = TmpDir::new("pull-local-operand-required");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let operand = format!("main@{c2}");
+
+        let (_none_dir, none) = make_repo(base, "none", RepoMode::Archive).await;
+        assert_refused(
+            none.pull_local(&src, required_refs(&[&operand])).await,
+            &format!("Static deltas required, but none found for main to {c2}"),
+        );
+        assert!(none.list_objects().await.unwrap().is_empty());
+
+        delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        let (by_name_dir, by_name) = make_repo(base, "by-name", RepoMode::Archive).await;
+        let stats = by_name
+            .pull_local(&src, required_refs(&[&operand]))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 1);
+        assert_complete(&src, &by_name, &by_name_dir, &c2).await;
+
+        let (_mixed_dir, mixed) = make_repo(base, "mixed", RepoMode::Archive).await;
+        assert_refused(
+            mixed
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        no_ref_writes: true,
+                        ..required_refs(&["main", &operand])
+                    },
+                )
+                .await,
+            "no summary deltas or delta index found",
+        );
+
+        let src = state_indexed_deltas(&src_dir).await;
+        let (_unindexed_dir, unindexed) = make_repo(base, "unindexed", RepoMode::Archive).await;
+        assert_refused(
+            unindexed.pull_local(&src, required_refs(&[&operand])).await,
+            "Static deltas required, but none found",
+        );
+        src.reindex_static_deltas().await.unwrap();
+        let (indexed_dir, indexed) = make_repo(base, "indexed", RepoMode::Archive).await;
+        let stats = indexed
+            .pull_local(&src, required_refs(&[&operand]))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 1);
+        assert_complete(&src, &indexed, &indexed_dir, &c2).await;
+    });
+}
+
+/// Under `require_static_deltas`, a `CHECKSUM` operand takes no delta. The
+/// pull refuses it before it reads the source if this repository does not
+/// hold the commit complete, and writes nothing. A commit that this
+/// repository holds complete passes. With `disable_static_deltas` or under
+/// `COMMIT_ONLY`, the rule does not apply.
+#[test]
+fn a_required_delta_refuses_a_checksum_operand_that_is_not_held() {
+    let tmp = TmpDir::new("pull-local-operand-required-bare");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (_empty_dir, empty) = make_repo(base, "empty", RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let hex = c2.to_hex();
+
+        for source in [&src, &empty] {
+            assert_refused(
+                dst.pull_local(source, required_refs(&[&hex])).await,
+                &format!(
+                    "Static deltas required, but a commit named by its checksum takes none: {c2}"
+                ),
+            );
+            assert_left_nothing(&dst).await;
+        }
+
+        let (disabled_dir, disabled) = make_repo(base, "disabled", RepoMode::Archive).await;
+        disabled
+            .pull_local(
+                &src,
+                PullOptions {
+                    disable_static_deltas: true,
+                    ..required_refs(&[&hex])
+                },
+            )
+            .await
+            .unwrap();
+        assert_complete(&src, &disabled, &disabled_dir, &c2).await;
+
+        let (_commit_only_dir, commit_only) =
+            make_repo(base, "commit-only", RepoMode::Archive).await;
+        commit_only
+            .pull_local(
+                &src,
+                PullOptions {
+                    flags: PullFlags::COMMIT_ONLY,
+                    ..required_refs(&[&hex])
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            commit_only.commit_state(&c2).await.unwrap(),
+            CommitState::Partial
+        );
+
+        hold_commit(&dst, &src, &c1).await;
+        dst.pull_local(&src, required_refs(&[&c1.to_hex()]))
+            .await
+            .unwrap();
+        assert_complete(&src, &dst, &dst_dir, &c1).await;
+        assert_eq!(ref_files(&dst), Vec::<String>::new());
+    });
+}
+
+/// A pull that reads static deltas checks that the source holds the commit
+/// of each target before it looks for a delta. The source here does not hold
+/// the commit object of C, and holds the from-scratch delta of C with a
+/// spoiled superblock, so a pull that read the delta would fail with another
+/// error. `main@<C>` fails with `Error::ObjectNotFound` for C under
+/// `require_static_deltas` and with a list of static deltas, and the pull
+/// writes nothing.
+#[test]
+fn a_commit_that_the_source_lacks_fails_before_the_delta_search() {
+    let tmp = TmpDir::new("pull-local-operand-absent-delta");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dir = delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        let listed = AdvertisedDelta {
+            from: None,
+            to: c2,
+            superblock: Checksum::sha256(&std::fs::read(dir.join("superblock")).unwrap()),
+        };
+        spoil_superblock(&dir);
+        remove_commit_object(&src_dir, &c2);
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let before = repo_inventory(&dst_dir);
+        let operand = format!("main@{c2}");
+
+        for (case, opts) in [
+            ("required", required_refs(&[&operand])),
+            (
+                "list",
+                PullOptions {
+                    static_deltas: Some(vec![listed]),
+                    ..operand_pull(&[&operand])
+                },
+            ),
+        ] {
+            match dst.pull_local(&src, opts).await {
+                Err(Error::ObjectNotFound { checksum, ty }) => {
+                    assert_eq!((checksum, ty), (c2, ObjectType::Commit), "{case}")
+                }
+                other => panic!("{case}: {other:?}"),
+            }
+            assert_eq!(repo_inventory(&dst_dir), before, "{case}");
+        }
+    });
+}
+
+/// Under `no_ref_writes`, an operand that gives no valid ref takes no source
+/// of a delta from a ref. With the remote option `r`, `o:main@<C>` gives no
+/// valid ref. The commit of C names `main` in its ref binding, so the pull
+/// runs under `DISABLE_VERIFY_BINDINGS`. The pull takes the from-scratch
+/// delta of C, under `require_static_deltas` and with a list of static
+/// deltas, and writes no ref. Without `no_ref_writes`, the pull refuses the
+/// operand with `Error::InvalidRefspec`.
+#[test]
+fn an_operand_with_no_valid_ref_takes_a_delta_under_no_ref_writes() {
+    let tmp = TmpDir::new("pull-local-operand-no-ref-delta");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dir = delta_with(&src, None, &c2, DeltaOptions::default()).await;
+        let listed = AdvertisedDelta {
+            from: None,
+            to: c2,
+            superblock: Checksum::sha256(&std::fs::read(dir.join("superblock")).unwrap()),
+        };
+        let operand = format!("o:main@{c2}");
+        let with_remote = |opts: PullOptions| PullOptions {
+            remote: Some("r".to_owned()),
+            no_ref_writes: true,
+            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+            ..opts
+        };
+
+        for (case, opts) in [
+            ("required", with_remote(required_refs(&[&operand]))),
+            (
+                "list",
+                with_remote(PullOptions {
+                    static_deltas: Some(vec![listed]),
+                    ..operand_pull(&[&operand])
+                }),
+            ),
+        ] {
+            let (dst_dir, dst) = make_repo(base, case, RepoMode::Archive).await;
+            let stats = dst.pull_local(&src, opts).await.unwrap();
+            assert_eq!(stats.delta_parts, 1, "{case}");
+            assert_complete(&src, &dst, &dst_dir, &c2).await;
+            assert_eq!(ref_files(&dst), Vec::<String>::new(), "{case}");
+        }
+
+        let (dst_dir, dst) = make_repo(base, "refused", RepoMode::Archive).await;
+        let before = repo_inventory(&dst_dir);
+        let result = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    no_ref_writes: false,
+                    ..with_remote(required_refs(&[&operand]))
+                },
+            )
+            .await;
+        match result {
+            Err(Error::InvalidRefspec(given)) => assert_eq!(given, "r:o:main"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(repo_inventory(&dst_dir), before);
+    });
+}
+
+/// The destination holds C of the chain R -> C -> D complete, and D absent
+/// or partial. The pull of R, by its checksum and by the ref `main`, reads
+/// field 2 of C from the destination, and takes D complete. The pull copies
+/// nothing of C: the `.commitmeta` that the source holds for C stays out of
+/// the destination.
+#[test]
+fn a_local_pull_takes_an_attachment_below_an_attachment_held_complete() {
+    let tmp = TmpDir::new("pull-local-attachment-below-held");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let chain = write_chain(&src, base, "main").await;
+        let mut count = 0;
+        for operand in [chain.r.to_hex(), "main".to_owned()] {
+            for partial in [false, true] {
+                count += 1;
+                let (dst_dir, dst) =
+                    make_repo(base, &format!("dst{count}"), RepoMode::Archive).await;
+                hold_commit(&dst, &src, &chain.c).await;
+                if partial {
+                    mark_partial(&dst, &chain.d);
+                } else {
+                    remove_commit_object(&dst_dir, &chain.d);
+                }
+                src.write_commit_detached_metadata(&chain.c, Some(&two_property_metadata()))
+                    .await
+                    .unwrap();
+
+                dst.pull_local(&src, operand_pull(&[&operand]))
+                    .await
+                    .unwrap();
+
+                for commit in [chain.r, chain.c, chain.d] {
+                    assert_complete(&src, &dst, &dst_dir, &commit).await;
+                }
+                assert_no_markers(&dst_dir);
+                assert_eq!(
+                    dst.read_commit_detached_metadata(&chain.c).await.unwrap(),
+                    None,
+                    "{operand} {partial}"
+                );
+                let refs = dst.list_refs(None).await.unwrap();
+                if operand == "main" {
+                    assert_eq!(refs, [("main".to_owned(), chain.r)]);
+                } else {
+                    assert!(refs.is_empty(), "{refs:?}");
+                }
+                src.write_commit_detached_metadata(&chain.c, None)
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+}
+
+/// In the diamond, the destination holds A and B complete, and not D, which
+/// both name. The pull of R reads field 2 of A and of B, and takes D one
+/// time: it counts the `.commitmeta` of D one time.
+#[test]
+fn an_attachment_that_two_held_attachments_name_crosses_once() {
+    let tmp = TmpDir::new("pull-local-attachment-held-diamond");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let diamond = write_diamond(&src, base, "main").await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &diamond.a).await;
+        hold_commit(&dst, &src, &diamond.b).await;
+        remove_commit_object(&dst_dir, &diamond.d);
+        src.write_commit_detached_metadata(&diamond.d, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+
+        let stats = dst.pull_local(&src, counted_pull()).await.unwrap();
+
+        for commit in [diamond.r, diamond.a, diamond.b, diamond.d] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_eq!(stats.metadata_fetched, stats.metadata_imported + 1);
+        assert_eq!(
+            dst.read_commit_detached_metadata(&diamond.d).await.unwrap(),
+            Some(two_property_metadata())
+        );
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The destination holds C' complete, a copy of C whose field 2 holds an
+/// entry with a checksum of 3 bytes. The pull of R', which names C', reads
+/// field 2 of C' from the destination, fails with the error that names C',
+/// and writes nothing.
+#[test]
+fn a_defective_entry_of_an_attachment_held_complete_fails_the_pull() {
+    let tmp = TmpDir::new("pull-local-attachment-held-defective");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let chain = write_chain(&src, base, "main").await;
+        let defective: &[(&str, &[u8])] = &[(CHAIN_D, &[1, 2, 3])];
+        let held = store_with_field2(&src, &chain.c, defective).await;
+        let tip = store_with_field2(&src, &chain.r, &[(CHAIN_C, held.as_bytes())]).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &chain.c).await;
+        assert_eq!(store_with_field2(&dst, &chain.c, defective).await, held);
+        assert_eq!(dst.commit_state(&held).await.unwrap(), CommitState::Normal);
+        let before = repo_inventory(&dst_dir);
+
+        let err = dst
+            .pull_local(&src, operand_pull(&[&tip.to_hex()]))
+            .await
+            .unwrap_err();
+
+        assert_eq!(attachment_error(err).0, Some(held));
+        assert_eq!(repo_inventory(&dst_dir), before);
     });
 }

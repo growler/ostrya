@@ -68,7 +68,8 @@ use super::{
     PullOptions, PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks,
     apply_durability, check_commit_operands, check_commit_signatures_filtered, check_depth,
     check_one_place, check_remote_operands, check_remote_option, check_static_deltas,
-    check_tip_refs, completes_marked, operand_collection, take_static_deltas,
+    check_tip_refs, commit_operands_alone, completes_marked, operand_collection,
+    take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -1414,13 +1415,7 @@ impl Repo {
         // no summary and no `summary.sig`, and makes no check of them.
         let by_checksum_only = match wanted {
             Wanted::Pinned(pinned) => pinned.commits_alone,
-            _ => {
-                !opts.refs.is_empty()
-                    && !opts
-                        .refs
-                        .iter()
-                        .any(|name| matches!(Operand::parse(name), Ok(Operand::Name(_))))
-            }
+            _ => commit_operands_alone(&opts.refs),
         };
         let summary = if let Some(bytes) = probed {
             // The parse runs on the blocking pool, as below.

@@ -48,11 +48,37 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   collection binding of the commit must be the collection of the call. Two
   operands that write one ref with two commits are refused, unless
   `no_ref_writes` is set. A pull whose operands are all commit operands reads
-  no ref listing, no `summary`, and no `summary.sig` of a remote. The one
-  exception is a remote at a `file://` address under `require_static_deltas`
-  without `disable_static_deltas`, whose summary the pull reads and verifies.
+  no ref listing, no `summary`, and no `summary.sig` of a remote.
   `CollectionPullStats::refs` holds an entry for `REF@CHECKSUM`, and none for
   `CHECKSUM`.
+- `Repo::pull_local` takes commit operands in `PullOptions::refs`:
+  `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`, where `REF` can also be
+  `REMOTE:NAME`. The pull reads no ref of the source for them. An abbreviated
+  checksum stays a revision of the source. The collection binding of the
+  commit of `NAME@CHECKSUM` and of `REMOTE:NAME@CHECKSUM` must be the
+  `[core] collection-id` of the repository, or absent if the repository has
+  none. `CHECKSUM` gets no ref-binding check and no collection-binding check.
+  Two operands that write one ref with two commits, and `REF` beside
+  `REF@CHECKSUM`, are refused before the pull reads the source, unless
+  `no_ref_writes` is set. A malformed commit operand is refused with
+  `Error::InvalidRefspec` before the pull reads the source.
+- A local pull whose operands are all commit operands reads no `summary` and
+  no `summary.sig` of the source. Under `require_static_deltas`, it reads the
+  delta index of each target if the `config` of the source states `[core]
+  indexed-deltas=true`, and else one superblock by name. The pull refuses a
+  `CHECKSUM` operand under `require_static_deltas` before it reads the source,
+  unless the repository holds the commit complete. The pull of a local
+  candidate of `Repo::pull_collection` takes the same rules.
+- A local pull reads field 2 of an attachment that the repository holds
+  complete from the local commit object, and takes the attachments below it,
+  level by level. The rule also applies to the pull of a local candidate of
+  `Repo::pull_collection`, and to the media import and the media export. The
+  0.13.0 release read nothing below such an attachment. A defective entry in
+  field 2 of such an attachment fails the pull with `Error::InvalidRelations`.
+- Fix: `Repo::pull_local` of an operand of 64 lowercase hex characters wrote a
+  ref named by the checksum, `refs/heads/<checksum>` or
+  `refs/remotes/<remote>/<checksum>`. Such an operand is a `CHECKSUM` operand
+  and writes no ref.
 
 ## [0.13.0] - 2026-11-18
 

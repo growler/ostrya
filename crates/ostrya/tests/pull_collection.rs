@@ -3077,6 +3077,98 @@ fn a_file_remote_serves_commit_operands() {
     });
 }
 
+/// A remote at a `file://` address under `require_static_deltas`, with
+/// commit operands alone and no summary: the pull reads no summary, and
+/// reads the from-scratch delta of the commit by name.
+#[test]
+fn a_file_remote_takes_a_required_delta_of_a_commit_operand_by_name() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-commit-file-delta");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        a.generate_static_delta(None, &tip, &DeltaOptions::default())
+            .await
+            .unwrap();
+        assert!(!dir.path().join("a/summary").exists());
+        let dest = dest(dir.path(), None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+
+        let (mut opts, events) = options(&[&at(REF, &tip)]);
+        opts.pull.require_static_deltas = true;
+        let pulled = dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert!(events.lock().unwrap().is_empty());
+        assert!(pulled.stats.delta_parts > 0, "{:?}", pulled.stats);
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// The destination holds C of the chain R -> C -> D complete, and not the
+/// commit object of D. A pull from a remote at a `file://` address of a
+/// commit that names C reads field 2 of C from the destination, and takes D
+/// complete. Each operand form runs into a new destination: the ref, and the
+/// commit operand `REF@CHECKSUM`.
+#[test]
+fn a_file_remote_takes_an_attachment_below_an_attachment_held_complete() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-file-attachment-held");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let chain = common::write_chain(&a, &dir.path().join("trees"), "os/chain").await;
+        let plain = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let tip = store_with_field2(&a, &plain, &[(common::CHAIN_C, chain.c.as_bytes())]).await;
+        let txn = a.transaction().await.unwrap();
+        txn.set_ref(&Ref::local(REF), Some(&tip));
+        txn.commit().await.unwrap();
+        let hex = chain.d.to_hex();
+
+        for (case, operand) in [("ref", REF.to_owned()), ("commit", at(REF, &tip))] {
+            let base = dir.path().join(case);
+            std::fs::create_dir(&base).unwrap();
+            let dest = dest(&base, None, &[("a", &file_url(dir.path(), "a"), "")]).await;
+            dest.pull_local(
+                &a,
+                PullOptions {
+                    refs: vec![chain.c.to_hex()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            std::fs::remove_file(
+                base.join("dest/objects")
+                    .join(&hex[..2])
+                    .join(format!("{}.commit", &hex[2..])),
+            )
+            .unwrap();
+            assert!(!dest.has_object(ObjectType::Commit, &chain.d).await.unwrap());
+
+            let (opts, events) = options(&[&operand]);
+            dest.pull_collection(ID, &["a"], opts).await.unwrap();
+            assert!(events.lock().unwrap().is_empty(), "{case}");
+
+            assert_eq!(mirror(&dest, REF).await, Some(tip), "{case}");
+            for commit in [tip, chain.c, chain.d] {
+                assert_eq!(
+                    dest.commit_state(&commit).await.unwrap(),
+                    ostrya::CommitState::Normal,
+                    "{case}"
+                );
+                for name in &a.traverse_commit(&commit, 0).await.unwrap() {
+                    assert!(
+                        dest.has_object(name.ty, &name.checksum).await.unwrap(),
+                        "{case}: {name} missing from the destination"
+                    );
+                }
+            }
+            assert_eq!(
+                common::file_inventory(&base.join("dest"), "state"),
+                Vec::new(),
+                "{case}"
+            );
+        }
+    });
+}
+
 /// With commit operands alone, the pull stops the probe at the remote that
 /// serves the last commit, and opens no session to a later remote. So a
 /// later remote at a `file://` path with no repository gives no event. With

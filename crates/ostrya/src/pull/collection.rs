@@ -600,9 +600,7 @@ impl Repo {
     ///
     /// If each name is a commit operand, the pull reads no ref listing, no
     /// `summary`, and no `summary.sig` of a remote, and the summary policy
-    /// of a remote does not apply. The one exception is a local repository
-    /// under [`require_static_deltas`](PullOptions::require_static_deltas),
-    /// as "Local repository" states. The probe stops at the remote that
+    /// of a remote does not apply. The probe stops at the remote that
     /// serves the last commit, and opens no session to the remotes after it.
     /// If one name is not a commit operand, the probe and the pull read and
     /// verify the summaries as "Probe" and "Pull" state, also the pull from
@@ -746,12 +744,12 @@ impl Repo {
     ///
     /// A local repository serves the commit of a commit operand if it holds
     /// the commit object. If each name is a commit operand, the pull reads no
-    /// `summary` and no `summary.sig` of the repository, unless
-    /// [`require_static_deltas`](PullOptions::require_static_deltas) is set
-    /// without [`disable_static_deltas`](PullOptions::disable_static_deltas).
-    /// Under `require_static_deltas` alone, the pull reads and checks the
-    /// summary as for a ref, the summary policy of the remote applies, and a
-    /// repository with no summary fails the pull.
+    /// `summary` and no `summary.sig` of the repository. Under
+    /// [`require_static_deltas`](PullOptions::require_static_deltas), it
+    /// reads the delta index of each target if the `config` of the
+    /// repository states `[core] indexed-deltas=true`, and else reads one
+    /// superblock by name, as [`Repo::pull_local`] states in "Static
+    /// deltas".
     ///
     /// If the trust of the remote checks the signatures of the commits or of
     /// the summary, the pull runs as with [`UNTRUSTED`](PullFlags::UNTRUSTED).

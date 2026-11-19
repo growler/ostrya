@@ -6296,21 +6296,16 @@ fn required_delta_opts() -> PullOptions {
 async fn dest_holding(dir: &Path, url: &str, commit: &Checksum) -> Repo {
     let dest = build_dest(dir, RepoMode::BareUser, url, "").await;
     let remote = Repo::open(&dir.join("remote")).await.unwrap();
+    // A local pull of a checksum writes no ref.
     dest.pull_local(
         &remote,
         PullOptions {
             refs: vec![commit.to_hex()],
-            flags: PullFlags::DISABLE_VERIFY_BINDINGS,
             ..PullOptions::default()
         },
     )
     .await
     .unwrap();
-    // A local pull of a checksum writes a ref with that name. This destination
-    // does not keep the ref.
-    let txn = dest.transaction().await.unwrap();
-    txn.set_ref(&Ref::local(commit.to_hex()), None);
-    txn.commit().await.unwrap();
     assert!(dest.list_refs(None).await.unwrap().is_empty());
     dest
 }

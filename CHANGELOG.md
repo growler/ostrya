@@ -75,6 +75,16 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   `Repo::pull_collection`, and to the media import and the media export. The
   0.13.0 release read nothing below such an attachment. A defective entry in
   field 2 of such an attachment fails the pull with `Error::InvalidRelations`.
+- The receive side (`Repo::receive`, `Repo::receive_selected`,
+  `Repo::receive_stream`, `Repo::receive_stream_to_commit`, and
+  `ReceiveService::commit`) reads field 2 of an attachment or of a new
+  commit that the repository holds complete from the local commit object,
+  and checks the attachments below it, level by level. An attachment below
+  it that the session did not stage and that the repository does not hold is
+  `missing-objects`, and one that the repository marks partial is
+  `missing-objects` with no object listed. The 0.13.0 release read nothing
+  below such a commit. A defective entry in field 2 of such a commit is
+  `internal`.
 - Fix: `Repo::pull_local` of an operand of 64 lowercase hex characters wrote a
   ref named by the checksum, `refs/heads/<checksum>` or
   `refs/remotes/<remote>/<checksum>`. Such an operand is a `CHECKSUM` operand
@@ -108,6 +118,10 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   and take the attachments below it, level by level.
 - The help text and the man pages of `ostrya pull` and `ostrya pull-local`
   describe the commit operands.
+- `ostrya receive` and `ostrya serve` read field 2 of an attachment or of a
+  new commit that the repository holds complete, and check the attachments
+  below it, level by level. An attachment below it that the push or the stream does not carry
+  and that the repository does not hold gives `missing-objects`.
 - Fix: `ostrya pull-local SRC CHECKSUM` read the checksum as a ref name. It
   refused a commit with a ref binding at exit 1 with `error: pull: commit
   <checksum>: no requested ref '<checksum>' in ref binding metadata (<refs>)`.

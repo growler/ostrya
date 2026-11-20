@@ -4044,8 +4044,8 @@ marks partial, refuses the push too, also below an attachment that the
 server holds. This is also true for a parent that ends a chain, if a commit
 of the push names it as an attachment. The error names the commit that
 first names the attachment. Each write of a commit checks that its
-attachments are complete, so this refusal occurs in a damaged repository
-alone.
+attachments are complete, so this refusal occurs in a damaged repository, or
+in a repository that the `ostree` command wrote.
 `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` give
 `Error::InvalidRelations` for each of these failures.
 
@@ -4062,8 +4062,9 @@ commit.
 `ostrya push --onto` and `ostrya push-tree` send no attachment. The field 2 of
 a server commit is empty ("Server commit").
 
-The server checks the attachments of the commits that it stages ("Commit and
-CommitReply", check 6). It checks no signature of an attachment and adds no
+The server checks the attachments of the commits that it stages and of the
+new commits, and the attachments below each attachment that it holds
+complete ("Commit and CommitReply", check 6). It checks no signature of an attachment and adds no
 server signature to it, unless the attachment is also a new commit (checks 8
 and 9).
 
@@ -4832,25 +4833,38 @@ Each failed check ends the session, and the session writes nothing:
    new commit included ("Related commits"). A new commit that the repository
    holds with a partial-commit marker gets the same check, because the walk
    above completes its tree and the session removes its marker. The server
-   takes the new commits that it checks in the order of the updates, then
-   the other staged commits in the order of their checksums. An entry with an empty
-   name or with a checksum that is not 32 bytes is `protocol`. Then the
-   server reads each attachment that the session did not stage and that is
-   not a new commit. If the repository holds such an attachment with no
-   partial-commit marker and its field 2 does not decode, the check is
-   `internal`. An attachment that the session did not stage and that the
-   repository does not hold is `missing-objects`. The absent attachments
-   fail together, and the `missing` detail names each one. Then, in the order of the commits that
-   name them, an attachment that the repository holds with a partial-commit
-   marker is `missing-objects` with no `missing` detail. The message names
-   the commit that holds the entry, field 2, and the defect. An attachment
-   can have attachments of its own. An attachment that the session staged
-   is a staged commit, so its entries get this check. The attachment check
-   reads nothing below an attachment that the server holds complete. An
-   attachment that the session staged, and an attachment that is a new
+   takes the new commits in the order of the updates, then the other staged
+   commits in the order of their checksums. An entry with an empty name or
+   with a checksum that is not 32 bytes is `protocol`. A new commit that the
+   repository holds with no partial-commit marker gets the same check, in the
+   same order, but a defective entry in its field 2 is `internal`, and the
+   message names that commit. Then the server reads each attachment that the
+   session did not stage and that is not a new commit. An attachment can have
+   attachments of its own. For an attachment that the repository holds with
+   no partial-commit marker, the server reads field 2 from its commit object
+   and checks each attachment that it names by the same rules, one level at a
+   time, until a level is empty. It reads the commit objects alone, each one
+   time, and reads no tree. A repository that the `ostree` command wrote can
+   hold a commit complete with its own attachments absent. If field 2 of such
+   a held attachment does not decode, the check is `internal`. If it holds an
+   entry with an empty name or with a checksum that is not 32 bytes, the check
+   is `internal`, and the message names the held attachment. An attachment
+   that the session did not stage and that the repository does not hold is
+   `missing-objects`. The absent attachments of all levels fail together, and
+   the `missing` detail names each one, in level order, and in the order of
+   the commits that name them in a level. The message is `<n> objects that
+   the commits of the session and the held attachments below them name as
+   attachments are neither staged nor present`, and past the cap of the
+   detail it ends with `, the first <k> listed`. Then, in the same order, an attachment that the repository holds
+   with a partial-commit marker is `missing-objects` with no `missing` detail.
+   The message names the commit that holds the entry, a held attachment for an
+   attachment below the first level, field 2, and the defect. An attachment
+   that the session staged is a staged commit, so its entries get this check.
+   An attachment that the session staged, and an attachment that is a new
    commit, are complete through the walk above, also with a partial-commit
-   marker. The server does not check field 2 of a new commit that the
-   repository holds with no partial-commit marker.
+   marker. An entry below a held attachment that names such a commit passes,
+   and the walk does not read that commit: the entries of its field 2 are in
+   the first level.
 7. The bindings of each new commit must agree with the ref of each update
    that takes the commit as its new value, else `binding-mismatch`. The
    server checks each ref in its own namespace:

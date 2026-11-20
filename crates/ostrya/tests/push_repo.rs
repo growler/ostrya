@@ -2478,6 +2478,57 @@ fn a_push_reads_the_full_set_below_an_attachment_the_server_holds() {
     assert_eq!(written, 0);
 }
 
+/// The server holds C of the chain R -> C -> D with no partial marker and
+/// without D. A push of R sends D: the client reads field 2 of C from its own
+/// repository and offers D in `Have`, and the server lacks D. The server then
+/// holds R, C, and D complete. If neither side holds
+/// D, the client refuses the push before it writes a byte.
+#[test]
+fn a_push_sends_an_attachment_below_an_attachment_the_server_holds() {
+    let pair = Pair::new(
+        "attachment-below-held",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "",
+    );
+    let chain = chain_in(&pair.client, "main");
+    move_ref(&pair.client, "c", &chain.c);
+    let (report, outcome) = push(&pair, opts(&["c"]));
+    report.unwrap();
+    outcome.unwrap();
+    remove_commit_object(&pair.server, &chain.d);
+    assert_eq!(
+        block_on(pair.server.commit_state(&chain.c)).unwrap(),
+        ostrya::CommitState::Normal
+    );
+    assert!(!has_commit(&pair.server, &chain.d));
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+    for commit in [chain.r, chain.c, chain.d] {
+        assert_complete(&pair.client, &pair.server, &commit);
+    }
+    assert_eq!(tip(&pair.server, "main"), Some(chain.r));
+    assert!(has_commit(&pair.server, &chain.d));
+
+    remove_commit_object(&pair.server, &chain.d);
+    remove_commit_object(&pair.client, &chain.d);
+    let (error, written) = refused(&pair.client, opts(&["main"]));
+    assert_eq!(
+        attachment_error(error),
+        (
+            Some(chain.c),
+            format!(
+                "attachment {CHAIN_D} names commit {}, which the repository does not hold",
+                chain.d
+            )
+        )
+    );
+    assert_eq!(written, 0);
+    assert!(!has_commit(&pair.server, &chain.d));
+}
+
 /// An attachment below the first level that the local repository marks
 /// partial, or does not hold, refuses the push before it writes a byte. The
 /// error names the commit that names it.

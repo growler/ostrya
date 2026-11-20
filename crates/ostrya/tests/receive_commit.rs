@@ -2420,9 +2420,10 @@ fn absent_attachments_are_missing_objects_together() {
         ]
     );
     assert!(
-        error
-            .message
-            .contains("2 objects that the staged commits name as attachments"),
+        error.message.contains(
+            "2 objects that the commits of the session and the held attachments below \
+             them name as attachments"
+        ),
         "{}",
         error.message
     );
@@ -2544,52 +2545,304 @@ fn a_chain_of_attachments_staged_in_one_session_commits() {
     assert!(ed25519_signatures(&repo, &chain.d).is_empty());
 }
 
-/// The repository holds C of the chain R -> C -> D complete, and a session
-/// stages R alone. The check reads nothing below C: with the commit object
-/// of D gone from the repository, the session commits.
+/// The repository holds C of the chain R -> C -> D with no partial marker
+/// and without D, and a session stages R. The check reads field 2 of C:
+///
+/// - If the session does not stage D, the session is `missing-objects`, and
+///   the error lists D.
+/// - If the session stages D, the session commits, and the repository holds
+///   D with no partial marker.
+/// - If the repository holds D with a partial marker, the session is
+///   `missing-objects` with no object listed, and the message names C as the
+///   commit that holds the entry.
 #[test]
-fn an_attachment_held_complete_is_not_read_below() {
-    let src_tmp = TmpDir::new("recv-dep-chain-held-src");
-    let (src, chain) = source_chain(&src_tmp);
-    let tmp = TmpDir::new("recv-dep-chain-held");
+fn an_absent_attachment_below_a_held_attachment_is_missing_objects() {
+    let d = build_commit(None, "details", no_metadata(), &[]);
+    let c = build_commit(None, "container", no_metadata(), &[entry("details/fe", &d)]);
+    let r = build_commit(None, "root", no_metadata(), &[entry("container/fe", &c)]);
+    let main = || vec![update("main", Expected::Absent, Some(r.checksum))];
+
+    let tmp = TmpDir::new("recv-dep-below-held-absent");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    committed(push(
-        &repo,
-        &policy(),
-        &chain_objects(&src, &[chain.c, chain.d]),
-        &[],
-        vec![update("container", Expected::Absent, Some(chain.c))],
-        false,
-    ));
-    std::fs::remove_file(repo.path().join("objects").join(ostrya::loose_path(
-        &chain.d,
-        ObjectType::Commit,
-        repo.mode(),
-    )))
-    .unwrap();
-    committed(push(
-        &repo,
-        &policy(),
-        &chain_objects(&src, &[chain.r]),
-        &[],
-        vec![update("main", Expected::Absent, Some(chain.r))],
-        false,
-    ));
-    assert_eq!(
-        refs(&repo),
-        [
-            ("container".to_owned(), chain.c),
-            ("main".to_owned(), chain.r),
-        ]
+    hold_commit(&repo, &c);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(&repo, &policy(), &with_tree(&[&r]), &[], main(), false),
+        ErrorCode::MissingObjects,
     );
     assert_eq!(
-        block_on(repo.commit_state(&chain.c)).unwrap(),
+        error.missing,
+        [ObjectName::new(d.checksum, ObjectType::Commit)]
+    );
+    assert_eq!(
+        error.message,
+        "1 objects that the commits of the session and the held attachments below them \
+         name as attachments are neither staged nor present"
+    );
+    assert_unchanged(&repo, &before);
+
+    let tmp = TmpDir::new("recv-dep-below-held-staged");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &c);
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&r, &d]),
+        &[],
+        main(),
+        false,
+    ));
+    assert_eq!(refs(&repo), [("main".to_owned(), r.checksum)]);
+    assert_eq!(
+        block_on(repo.commit_state(&d.checksum)).unwrap(),
         ostrya::CommitState::Normal
     );
-    assert!(!block_on(repo.has_object(ObjectType::Commit, &chain.d)).unwrap());
-    for commit in [chain.r, chain.c] {
-        assert!(!marker(&repo, &commit).exists(), "{commit}");
-    }
+    assert!(!marker(&repo, &d.checksum).exists());
+
+    let tmp = TmpDir::new("recv-dep-below-held-partial");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &c);
+    hold_commit(&repo, &d);
+    mark_partial(&repo, &d.checksum);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(&repo, &policy(), &with_tree(&[&r]), &[], main(), false),
+        ErrorCode::MissingObjects,
+    );
+    assert!(error.missing.is_empty(), "{:?}", error.missing);
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: attachment details/fe names commit {}, \
+             which is partial",
+            c.checksum, d.checksum
+        )
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// The repository holds C and D of the chain R -> C -> D -> E with no
+/// partial marker and without E, and a session stages R alone. The check
+/// reads field 2 of C, then field 2 of D, so the session is
+/// `missing-objects`, and the error lists E.
+#[test]
+fn an_absent_attachment_two_levels_below_a_held_attachment_is_missing_objects() {
+    let e = build_commit(None, "extra", no_metadata(), &[]);
+    let d = build_commit(None, "details", no_metadata(), &[entry("extra/fe", &e)]);
+    let c = build_commit(None, "container", no_metadata(), &[entry("details/fe", &d)]);
+    let r = build_commit(None, "root", no_metadata(), &[entry("container/fe", &c)]);
+    let tmp = TmpDir::new("recv-dep-two-below-held");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &c);
+    hold_commit(&repo, &d);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&r]),
+            &[],
+            vec![update("main", Expected::Absent, Some(r.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    assert_eq!(
+        error.missing,
+        [ObjectName::new(e.checksum, ObjectType::Commit)]
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// The repository holds an attachment with no partial marker, and an entry
+/// of its field 2 has a checksum that is not 32 bytes. A session that stages
+/// a commit that names the attachment is `internal`, and the message names
+/// the held attachment.
+#[test]
+fn a_defective_entry_of_a_held_attachment_is_internal() {
+    let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &short)]);
+    let tmp = TmpDir::new("recv-dep-held-defect");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &short);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&target]),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::Internal,
+    );
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: entry 0 (lib/s) has a checksum of 31 \
+             bytes, not 32",
+            short.checksum
+        )
+    );
+    assert!(error.missing.is_empty(), "{:?}", error.missing);
+    assert_unchanged(&repo, &before);
+}
+
+/// The repository holds C and D with no partial marker, and a session stages
+/// R. R names C, C names D, and an entry of field 2 of D has a checksum that
+/// is not 32 bytes. The session is `internal`, and the message names D.
+#[test]
+fn a_held_defect_two_levels_below_is_internal_and_names_the_held_commit() {
+    let deep = build_commit(None, "deep", no_metadata(), &[("lib/s", &[7; 31])]);
+    let held = build_commit(None, "held", no_metadata(), &[entry("deep/fe", &deep)]);
+    let root = build_commit(None, "root", no_metadata(), &[entry("held/fe", &held)]);
+    let tmp = TmpDir::new("recv-dep-held-defect-deep");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &held);
+    hold_commit(&repo, &deep);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&root]),
+            &[],
+            vec![update("main", Expected::Absent, Some(root.checksum))],
+            false,
+        ),
+        ErrorCode::Internal,
+    );
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: entry 0 (lib/s) has a checksum of 31 \
+             bytes, not 32",
+            deep.checksum
+        )
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// The repository holds C1 and C2 with no partial marker. A session stages R,
+/// which names C1, the absent A, and C2, in that order. C1 names D, then D1,
+/// and C2 names D, then D2. D, D1, and D2 are absent. The error lists A, then
+/// D, D1, and D2, each one time: level order, then the order of the commits
+/// that name them in a level.
+#[test]
+fn absent_attachments_below_held_attachments_are_listed_in_level_order() {
+    let a = build_commit(None, "a", no_metadata(), &[]);
+    let d = build_commit(None, "d", no_metadata(), &[]);
+    let d1 = build_commit(None, "d1", no_metadata(), &[]);
+    let d2 = build_commit(None, "d2", no_metadata(), &[]);
+    let c1 = build_commit(
+        None,
+        "c1",
+        no_metadata(),
+        &[entry("d/fe", &d), entry("e/fe", &d1)],
+    );
+    let c2 = build_commit(
+        None,
+        "c2",
+        no_metadata(),
+        &[entry("d/fe", &d), entry("f/fe", &d2)],
+    );
+    let r = build_commit(
+        None,
+        "r",
+        no_metadata(),
+        &[entry("a/fe", &c1), entry("b/fe", &a), entry("c/fe", &c2)],
+    );
+    let tmp = TmpDir::new("recv-dep-held-order");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &c1);
+    hold_commit(&repo, &c2);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&r]),
+            &[],
+            vec![update("main", Expected::Absent, Some(r.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    let name = |commit: &Obj| ObjectName::new(commit.checksum, ObjectType::Commit);
+    assert_eq!(error.missing, [name(&a), name(&d), name(&d1), name(&d2)]);
+    assert_unchanged(&repo, &before);
+}
+
+/// A session stages R, which names P, then C. The repository holds P with a
+/// partial marker, and holds C with no partial marker. C names X, which is
+/// absent. The absent attachments fail before the partial ones, so the error
+/// lists X.
+#[test]
+fn an_absent_attachment_below_a_held_attachment_fails_before_a_partial_one() {
+    let p = build_commit(None, "p", no_metadata(), &[]);
+    let x = build_commit(None, "x", no_metadata(), &[]);
+    let c = build_commit(None, "c", no_metadata(), &[entry("x/fe", &x)]);
+    let r = build_commit(
+        None,
+        "r",
+        no_metadata(),
+        &[entry("a/fe", &p), entry("b/fe", &c)],
+    );
+    let tmp = TmpDir::new("recv-dep-held-absent-first");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &p);
+    mark_partial(&repo, &p.checksum);
+    hold_commit(&repo, &c);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&r]),
+            &[],
+            vec![update("main", Expected::Absent, Some(r.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    assert_eq!(
+        error.missing,
+        [ObjectName::new(x.checksum, ObjectType::Commit)]
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// The repository holds C with no partial marker. A session stages R and S.
+/// R names C, C names S, and S names Z, which is absent. The entry of C that
+/// names S passes, and S gets the checks of a staged commit, so the error
+/// lists Z.
+#[test]
+fn an_entry_below_a_held_attachment_that_names_a_staged_commit_passes() {
+    let z = build_commit(None, "z", no_metadata(), &[]);
+    let s = build_commit(None, "s", no_metadata(), &[entry("z/fe", &z)]);
+    let c = build_commit(None, "c", no_metadata(), &[entry("s/fe", &s)]);
+    let r = build_commit(None, "r", no_metadata(), &[entry("c/fe", &c)]);
+    let tmp = TmpDir::new("recv-dep-held-names-staged");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &c);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&r, &s]),
+            &[],
+            vec![update("main", Expected::Absent, Some(r.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    assert_eq!(
+        error.missing,
+        [ObjectName::new(z.checksum, ObjectType::Commit)]
+    );
+    assert_unchanged(&repo, &before);
 }
 
 /// A session stages R and C, where R names C and C names D. C is a staged
@@ -2639,8 +2892,8 @@ fn an_attachment_below_a_staged_attachment_gets_the_checks() {
             );
             assert_eq!(
                 error.message,
-                "1 objects that the staged commits name as attachments are neither staged nor \
-                 present"
+                "1 objects that the commits of the session and the held attachments below \
+                 them name as attachments are neither staged nor present"
             );
         }
         assert_unchanged(&repo, &before);
@@ -2987,6 +3240,101 @@ fn a_partial_held_target_gets_the_attachment_checks() {
             Some(text) => assert_eq!(error.message, text),
         }
         assert!(marker(&repo, &target.checksum).exists(), "the marker stays");
+        assert_unchanged(&repo, &before);
+    }
+}
+
+/// The repository holds C and N with no partial marker. C names N, and N
+/// names Y, which is absent. A new commit that the repository holds complete
+/// gets the checks of a held attachment, so each of these sessions is
+/// `missing-objects`, and the error lists Y:
+///
+/// - The session stages R, which names C, and updates `main` to R and
+///   `other` to N.
+/// - The session stages R and updates `main` to R alone.
+/// - The session sends the tree of N alone and updates `other` to N.
+#[test]
+fn a_new_commit_held_complete_gets_the_checks_of_a_held_attachment() {
+    let y = build_commit(None, "y", no_metadata(), &[]);
+    let n = build_commit(None, "n", no_metadata(), &[entry("y/fe", &y)]);
+    let c = build_commit(None, "c", no_metadata(), &[entry("n/fe", &n)]);
+    let r = build_commit(None, "r", no_metadata(), &[entry("c/fe", &c)]);
+    let main = update("main", Expected::Absent, Some(r.checksum));
+    let other = update("other", Expected::Absent, Some(n.checksum));
+    let cases = [
+        (with_tree(&[&r]), vec![main.clone(), other.clone()]),
+        (with_tree(&[&r]), vec![main]),
+        (tree_objects(), vec![other]),
+    ];
+    for (objects, updates) in cases {
+        let tmp = TmpDir::new("recv-dep-held-new");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        hold_commit(&repo, &c);
+        hold_commit(&repo, &n);
+        let before = snapshot(&repo);
+        let error = refused(
+            push(&repo, &policy(), &objects, &[], updates, false),
+            ErrorCode::MissingObjects,
+        );
+        assert_eq!(
+            error.missing,
+            [ObjectName::new(y.checksum, ObjectType::Commit)]
+        );
+        assert_unchanged(&repo, &before);
+    }
+}
+
+/// The repository holds a new commit N with no partial marker, and the
+/// session sends its tree and updates `main` to N. An attachment of N that
+/// the repository marks partial is `missing-objects` with no object listed,
+/// and the message names N. A defective entry of field 2 of N is `internal`,
+/// and the message names N.
+#[test]
+fn a_new_commit_held_complete_gets_the_partial_and_defect_checks() {
+    let att = build_commit(None, "dependency", no_metadata(), &[]);
+    let names_partial = build_commit(None, "target", no_metadata(), &[entry("lib/d", &att)]);
+    let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
+    let cases = [
+        (
+            &names_partial,
+            ErrorCode::MissingObjects,
+            format!(
+                "related commits in field 2 of commit {}: attachment lib/d names commit {}, \
+                 which is partial",
+                names_partial.checksum, att.checksum
+            ),
+        ),
+        (
+            &short,
+            ErrorCode::Internal,
+            format!(
+                "related commits in field 2 of commit {}: entry 0 (lib/s) has a checksum of 31 \
+                 bytes, not 32",
+                short.checksum
+            ),
+        ),
+    ];
+    for (target, code, text) in cases {
+        let tmp = TmpDir::new("recv-dep-held-new-checks");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        hold_commit(&repo, &att);
+        mark_partial(&repo, &att.checksum);
+        hold_commit(&repo, target);
+        let before = snapshot(&repo);
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &tree_objects(),
+                &[],
+                vec![update("main", Expected::Absent, Some(target.checksum))],
+                false,
+            ),
+            code,
+        );
+        assert_eq!(error.message, text);
+        assert!(error.missing.is_empty(), "{:?}", error.missing);
+        assert!(!marker(&repo, &target.checksum).exists());
         assert_unchanged(&repo, &before);
     }
 }

@@ -3422,7 +3422,8 @@ the rules.
   that the local repository does not hold or marks partial refuses the
   push, also below an attachment that the server holds. The error names the
   commit that first names the attachment. By the write rule above, this
-  occurs in a damaged repository alone. A defective entry of field 2 of an
+  occurs in a damaged repository, or in a repository that the `ostree`
+  command wrote. A defective entry of field 2 of an
   attachment refuses the push, and the error names that attachment. The
   push finds each refusal before the first upload. With a depth, the push
   resolves each attachment before it writes a byte. With no depth, the
@@ -3456,16 +3457,26 @@ the rules.
   new commit counts as complete. Each other attachment must be staged or
   held complete. An attachment can have attachments of its own. A staged
   attachment is a staged commit, so the receiver checks its attachments too,
-  at each depth. The attachment check reads nothing below an attachment that
-  the receiver holds complete. The write rule above makes the full set of
-  attachments of such an attachment complete. As the writes do, the receiver
-  accepts a held attachment whose own field 2 holds a defective entry. It
-  refuses with `internal` a held attachment with no partial-commit marker
-  whose field 2 does not decode. An attachment check that also reads below
-  an attachment held complete was rejected: it reads commits that the write
-  rule already makes complete. The receiver checks no signature of an
-  attachment and adds no server signature to it. An attachment that is also
-  a new commit gets the check and the signatures of its own updates alone.
+  at each depth. For an attachment that the receiver holds complete, it
+  reads field 2 from the commit object, and checks each attachment that this
+  field names by the same rules, one level at a time, until a level is
+  empty. A new commit that the receiver holds complete gets the same check:
+  its field 2 comes from the commit object that the session reads for the
+  update. The walk reads the commit objects alone, each one time, and reads
+  no tree. An attachment below them that the session did not stage and that
+  the receiver does not hold is `missing-objects`, together with the absent
+  attachments of the other levels. An entry below a held attachment that
+  names a staged commit or a new commit passes, and the walk does not read
+  that commit: the entries of its field 2 are in the first level. The
+  receiver refuses with `internal` a held attachment or a held new commit
+  with no partial-commit marker whose field 2 does not decode, or holds an
+  entry with an empty name or with a checksum that is not 32 bytes. An
+  attachment check that reads nothing below a commit held complete was
+  rejected: a repository that the `ostree` command wrote can hold a commit
+  complete with its own attachments absent. The receiver checks no
+  signature of an attachment and adds no server signature to it. An
+  attachment that is also a new commit gets the check and the signatures of
+  its own updates alone.
   The checksum of an attachment is in field 2 of a commit of the session. A
   new commit is that commit, or binds it through the parent checksums of its
   history, and the signature rules cover the new commit. The receiver checks

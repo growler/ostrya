@@ -482,8 +482,10 @@ impl ReceiveService {
     ///   with `ref-denied`.
     /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
-    /// - [`remote::Error::MissingObjects`] if an attachment of a staged commit
-    ///   is neither staged nor present. The error lists each such attachment.
+    /// - [`remote::Error::MissingObjects`] if an attachment of a staged commit,
+    ///   of a new commit that the repository holds complete, or of an
+    ///   attachment below them that the repository holds complete, is neither
+    ///   staged nor present. The error lists each such attachment.
     ///   An attachment that the repository holds and marks partial also gives
     ///   this error, with no object listed and the text of
     ///   [`Error::InvalidRelations`], unless it is a new commit of an update.
@@ -529,6 +531,10 @@ impl ReceiveService {
     ///   holds does not parse.
     /// - [`Error::Core`] if the field 2 of an attachment that the repository
     ///   holds does not decode.
+    /// - [`Error::InvalidRelations`] if an entry of field 2 of an attachment,
+    ///   or of a new commit, that the repository holds complete has an empty
+    ///   name or a checksum that is not 32 bytes. The error names that held
+    ///   commit.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if a stored detached
     ///   metadata dict is not an `a{sv}` in normal form.
     /// - [`Error::InvalidFormat`] if a stored dict holds a value that is not an

@@ -227,8 +227,11 @@ impl Repo {
     ///    of field 2 has a name that is not empty and a 32-byte checksum
     ///    (`protocol`), and each attachment is staged, a new commit, or held
     ///    complete (`missing-objects`). A staged attachment gets these checks
-    ///    as a staged commit. The check reads nothing below a held
-    ///    attachment.
+    ///    as a staged commit. For an attachment and a new commit that the
+    ///    repository holds complete, the check reads field 2 from its commit
+    ///    object, and each attachment that it names gets the same checks, one
+    ///    level at a time. A defective entry in field 2 of such a held commit
+    ///    is `internal`.
     /// 6. The ref binding and the collection binding of each new commit
     ///    (`binding-mismatch`), for each ref in its namespace. The ref binding
     ///    must hold the name of the ref, without the `@ID:` part. A commit

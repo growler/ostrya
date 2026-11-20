@@ -5,6 +5,7 @@
 //! writes, the transaction commit, and the summary.
 
 use std::any::Any;
+use std::borrow::Cow;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::read::CommitState;
 use crate::refs::{RefFileState, nested_ref_paths};
-use crate::related::{self, HeldAttachment, RelatedRule};
+use crate::related::{self, HeldAttachment, RelatedRule, RelationField};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
@@ -52,6 +53,13 @@ pub(super) type Checked<T> = std::result::Result<T, Failure>;
 
 /// A serialized detached-metadata dict, shared with the blocking pool.
 type Bytes = Arc<Vec<u8>>;
+
+/// The states of the held attachments, and the entries below the first level
+/// of attachments, that [`held_levels_blocking`] reads.
+type HeldLevels = (
+    HashMap<Checksum, HeldAttachment>,
+    Vec<(Checksum, Checksum, String)>,
+);
 
 pub(super) fn protocol(message: String) -> Failure {
     Failure::Wire(remote::Error::Protocol(message))
@@ -244,9 +252,13 @@ struct Edit<'a> {
 ///   staged or held (`missing-objects`, with each absent attachment listed).
 ///   A held attachment is complete (`missing-objects`, with no object
 ///   listed). A staged attachment is a staged commit, so its own entries get
-///   these checks. The check reads nothing below a held attachment. An
-///   attachment that is a new commit is complete, also with a partial marker,
-///   because the completeness walk ran over its tree.
+///   these checks. For an attachment that the repository holds complete, and
+///   for a new commit that the repository holds complete, the check reads
+///   field 2 from its commit object, and each attachment that it names gets
+///   the same checks, one level at a time. A defective entry in field 2 of
+///   such a held commit is `internal`. An attachment that is a new commit is
+///   complete, also with a partial marker, because the completeness walk ran
+///   over its tree.
 /// - The ref binding and the collection binding of each new commit name each
 ///   of its refs and the namespace of each ref (`binding-mismatch`), as
 ///   [`check_bindings`] states.
@@ -1154,34 +1166,43 @@ pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
     })
 }
 
-/// Checks the attachments of each checked commit of the session.
+/// Checks the attachments of each commit of the session.
 ///
 /// The checked commits are the staged commits, and each new commit that the
 /// repository holds with a partial marker: the session completes the tree of
-/// that commit, and the publication removes its marker. The checked commits
-/// with a field 2 that is not empty are taken in order: the new commits in
-/// the order of the updates, then the other staged commits in the order of
-/// their checksums. These checks run in order, and the first failure is the
-/// refusal:
+/// that commit, and the publication removes its marker. A new commit that
+/// the repository holds with no partial marker is a held commit. The commits
+/// of the session with a field 2 that is not empty are taken in order: the
+/// new commits in the order of the updates, then the other staged commits in
+/// the order of their checksums. These checks run in order, and the first
+/// failure is the refusal:
 ///
-/// - Each entry of field 2 of each checked commit has a name that is not
-///   empty and a 32-byte checksum (`protocol`).
-/// - Field 2 of each held attachment with no partial marker decodes
+/// - Each entry of field 2 of each commit of the session has a name that is
+///   not empty and a 32-byte checksum, in the order of the commits
+///   (`protocol` for a checked commit, `internal` for a held commit).
+/// - Field 2 of each held attachment with no partial marker decodes, and
+///   each of its entries has a name that is not empty and a 32-byte checksum
 ///   (`internal`).
 /// - Each attachment is staged or held (`missing-objects`). The failure lists
-///   each attachment that is neither, in the order of the commits that name
-///   them.
+///   each attachment that is neither, in level order, and in the order of the
+///   commits that name them in a level.
 /// - Each held attachment is complete (`missing-objects`, with no object
-///   listed), in the order of the commits that name them.
+///   listed), in the same order.
 ///
 /// An attachment that is a commit of the session is complete, because the
 /// completeness walk ran over its tree. A new commit that the repository
-/// marks partial is such an attachment too. A staged attachment is a checked
-/// commit, so its own entries get these checks, at each depth. The check
-/// reads nothing below a held attachment. The reads of the partial markers of
-/// the held new commits run in one trip to the blocking pool, and the reads
-/// of the other held attachments in one more trip. Field 2 of a new commit
-/// that the repository holds with no partial marker gets no check.
+/// marks partial is such an attachment too. A repository that the `ostree`
+/// command wrote can hold a commit complete with its own attachments absent.
+/// So the attachments of each commit of the session get these checks: the
+/// first level is the attachments that field 2 of these commits names. For
+/// each held attachment with no partial marker, the check reads field 2 from
+/// its commit object, and each attachment that it names gets these checks,
+/// one level at a time, until a level is empty. An entry that names a commit
+/// of the session passes, and its own entries are in the first level. The
+/// check takes field 2 of a commit of the session from `fields`, reads each
+/// other commit object one time, and reads no tree. The reads of the partial
+/// markers of the held new commits run in one trip to the blocking pool, and
+/// the reads of the held attachments, at all levels, in one more trip.
 async fn check_attachments(
     txn: &Transaction,
     targets: &[Target],
@@ -1218,47 +1239,51 @@ async fn check_attachments(
     // Each commit of `fields` that no update names is a staged commit.
     let mut others: Vec<&Checksum> = fields.keys().filter(|c| !news.contains(c)).collect();
     others.sort_unstable();
-    let naming = targets
-        .iter()
-        .map(|t| &t.checksum)
-        .filter(|c| staged.contains(c) || partial.contains(c))
-        .chain(others);
+    let naming = targets.iter().map(|t| &t.checksum).chain(others);
     // Each attachment, the commit that first names it, and the name of that
     // entry.
     let mut known = HashSet::new();
-    let mut named: Vec<(Checksum, Checksum, &str)> = Vec::new();
+    let mut named: Vec<(Checksum, Checksum, Cow<'_, str>)> = Vec::new();
     for commit in naming {
         let Some(field) = fields.get(commit) else {
             continue;
         };
-        let entries =
-            related::borrowed_attachments(commit, field).map_err(|e| protocol(e.to_string()))?;
+        // A new commit that the repository holds complete is a held commit,
+        // so a defect in its field 2 is a failure on the server side.
+        let checked = staged.contains(commit) || partial.contains(commit);
+        let entries = related::borrowed_attachments(commit, field).map_err(|e| {
+            if checked {
+                protocol(e.to_string())
+            } else {
+                Failure::Internal(e)
+            }
+        })?;
         for (name, attachment) in entries {
             if known.insert(attachment) {
-                named.push((attachment, *commit, name));
+                named.push((attachment, *commit, Cow::Borrowed(name)));
             }
         }
     }
+    // The staged and the new commits. The walk reads none of them, and an
+    // entry that names one of them passes: its own entries are in `named`.
+    let stop: HashSet<Checksum> = staged.iter().chain(news.iter().copied()).copied().collect();
     let held: Vec<Checksum> = named
         .iter()
         .map(|(attachment, ..)| *attachment)
-        .filter(|attachment| !staged.contains(attachment) && !news.contains(attachment))
+        .filter(|attachment| !stop.contains(attachment))
         .collect();
-    let states: HashMap<Checksum, HeldAttachment> = if held.is_empty() {
-        HashMap::new()
+    let (states, deep) = if held.is_empty() {
+        (HashMap::new(), Vec::new())
     } else {
         let repo = txn.repo().clone();
-        ostrya_rt::unblock(move || {
-            held.into_iter()
-                .map(|attachment| {
-                    related::held_attachment_blocking(&repo, None, &attachment, |_, _| Ok(()))
-                        .map(|state| (attachment, state))
-                })
-                .collect::<Result<_>>()
-        })
-        .await
-        .map_err(Failure::Internal)?
+        ostrya_rt::unblock(move || held_levels_blocking(&repo, held, known, &stop))
+            .await
+            .map_err(Failure::Internal)?
     };
+    named.extend(
+        deep.into_iter()
+            .map(|(attachment, naming, name)| (attachment, naming, Cow::Owned(name))),
+    );
     let mut absent = Missing::default();
     for (attachment, ..) in &named {
         if states.get(attachment) == Some(&HeldAttachment::Absent) {
@@ -1268,18 +1293,74 @@ async fn check_attachments(
     if absent.total > 0 {
         return Err(missing_objects(
             absent,
-            "the staged commits name as attachments",
+            "the commits of the session and the held attachments below them name as attachments",
         ));
     }
     for (attachment, naming, name) in named {
         if states.get(&attachment) == Some(&HeldAttachment::Partial) {
             return Err(Failure::Wire(remote::Error::MissingObjects {
-                message: related::partial_attachment(naming, name, &attachment).to_string(),
+                message: related::partial_attachment(naming, &name, &attachment).to_string(),
                 missing: Vec::new(),
             }));
         }
     }
     Ok(())
+}
+
+/// Reads the held attachments `held`, then the attachments below them, one
+/// level at a time, on the calling thread.
+///
+/// `held` is the first level. For each attachment of a level, the call reads
+/// its state. For an attachment with no partial marker, it also reads field 2
+/// from the commit object. Each entry that names a commit that is not in
+/// `known` adds that commit to `known`. If the commit is not in `stop`, the
+/// entry also adds it to the next level. The walk stops at an empty level.
+/// So the call reads each commit object one time, and reads no tree.
+///
+/// Returns the state of each attachment that the call read, and each entry
+/// below the first level that added a commit to a level, as the commit, the
+/// held attachment that names it, and the name of the entry, in level order.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRelations`] with the held attachment, for the first entry
+///   of its field 2 with an empty name or with a checksum that is not 32
+///   bytes.
+/// - Each error of [`related::held_attachment_blocking`].
+fn held_levels_blocking(
+    repo: &Repo,
+    held: Vec<Checksum>,
+    mut known: HashSet<Checksum>,
+    stop: &HashSet<Checksum>,
+) -> Result<HeldLevels> {
+    let mut states = HashMap::new();
+    let mut deep = Vec::new();
+    let mut level = held;
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for attachment in level {
+            let state =
+                related::held_attachment_blocking(repo, None, &attachment, |_, entries| {
+                    related::checked_entries(RelationField::Attachments, Some(attachment), entries)
+                })?;
+            let state = match state {
+                HeldAttachment::Absent => HeldAttachment::Absent,
+                HeldAttachment::Partial => HeldAttachment::Partial,
+                HeldAttachment::Complete { value } => {
+                    for (name, below) in value {
+                        if known.insert(below) && !stop.contains(&below) {
+                            next.push(below);
+                            deep.push((below, attachment, name));
+                        }
+                    }
+                    HeldAttachment::Complete { value: () }
+                }
+            };
+            states.insert(attachment, state);
+        }
+        level = next;
+    }
+    Ok((states, deep))
 }
 
 /// Checks the ref binding and the collection binding of each new commit,

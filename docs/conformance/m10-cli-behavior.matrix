@@ -15251,3 +15251,32 @@ note: a summary that lists no delta, or lists none the destination can apply,
  is refused in both with `Static deltas required, but none found for <ref> to
  <commit>`, and no object is fetched. A from-scratch delta the destination's
  ref declines pulls loose in both.
+
+# ---------------------------------------------------------------------------
+# pull -- commit operands. The harness serves no remote, so the cell cites the
+# `cli.rs` test that pulls with each implementation from a standard-library
+# server of its own, over a remote that each implementation wrote.
+# ---------------------------------------------------------------------------
+
+family: M10
+subcommand: pull
+cell: pull/ref-at-checksum
+setup: repo
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::pull_of_a_ref_at_a_checksum_crosses_the_two_implementations
+spec: cli-behavior.md#pull-of-a-commit-by-its-checksum
+note: `pull origin main@<C>` names the commit of `main` that is not its tip,
+ and `pull origin <C>` names it with no ref, into `bare-user`. From a remote
+ that the tool wrote, the port fetches C, writes `refs/remotes/origin/main` to
+ C for the first form and no ref for the second, and leaves the objects, the
+ refs, and the `state/` entries that the tool leaves. From a remote that the
+ port wrote, the tool does the same. Neither requests a ref file of the
+ remote, and the `fsck` of each implementation accepts the repository that
+ the other wrote. The requests of the two differ where the `config` of the
+ remote does not state `[core] indexed-deltas=true` (`cli-surface.md`, "P2").
+ For `<C>`, they also differ where it states it: from the remote that the
+ tool wrote, the tool requests `config`, the delta index of C,
+ `objects/<C>.commitmeta`, and `objects/<C>.commit`, and the port requests the
+ same files with no delta index. For `main@<C>` from that remote, the two
+ request the same files.

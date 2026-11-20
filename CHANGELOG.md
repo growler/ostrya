@@ -80,6 +80,44 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   `refs/remotes/<remote>/<checksum>`. Such an operand is a `CHECKSUM` operand
   and writes no ref.
 
+### CLI
+
+- `ostrya pull` takes the commit operands `CHECKSUM`, `REF@CHECKSUM`, and
+  `@ID:REF@CHECKSUM`. The pull fetches the named commit, and reads no summary
+  entry and no ref file of the remote for it. `CHECKSUM` writes no ref, and
+  the other forms write their ref to the commit. A pull whose operands are all
+  commit operands requests no `summary` and no `summary.sig`.
+- `ostrya pull` refuses a malformed commit operand with `error: Invalid refspec
+  <operand>`, and two operands that write one ref, `REF` beside `REF@CHECKSUM`
+  included, at exit 1. `-T` refuses a `CHECKSUM` operand before the first
+  request. `--require-static-deltas` refuses a `CHECKSUM` operand before the
+  first request, unless the repository holds the commit complete or
+  `--commit-metadata-only` is given. In a pull whose operands are all commit
+  operands, `--require-static-deltas` needs no summary of the remote.
+- `ostrya pull --collection` takes the same commit operands. The pull takes
+  the commit from the first candidate in the order of the config that serves
+  its commit object. A pull whose operands are all commit operands reads no
+  ref listing and no summary of a candidate.
+- `ostrya pull-local` takes the commit operands `CHECKSUM`, `REF@CHECKSUM`,
+  and `@ID:REF@CHECKSUM`, where `REF` can also be `REMOTE:NAME`. The pull
+  reads no ref of the source for them. An abbreviated checksum stays a
+  revision of the source. A pull whose operands are all commit operands reads
+  no summary of the source.
+- `ostrya pull`, `pull --collection`, `pull-local`, `media export`, and `media
+  import` read field 2 of an attachment that the repository holds complete,
+  and take the attachments below it, level by level.
+- The help text and the man pages of `ostrya pull` and `ostrya pull-local`
+  describe the commit operands.
+- Fix: `ostrya pull-local SRC CHECKSUM` read the checksum as a ref name. It
+  refused a commit with a ref binding at exit 1 with `error: pull: commit
+  <checksum>: no requested ref '<checksum>' in ref binding metadata (<refs>)`.
+  An `--orphan` commit has an empty ref binding, and the command refused it
+  in the same way, with `(no refs)`, also with `--remote`. For a commit with
+  no `ostree.ref-binding` key, and with `--disable-verify-bindings`, it
+  imported the commit and wrote a ref named by the checksum,
+  `refs/heads/<checksum>`, or `refs/remotes/<remote>/<checksum>` with
+  `--remote`. It imports the commit at exit 0 and writes no ref.
+
 ## [0.13.0] - 2026-11-18
 
 ### Library

@@ -3985,17 +3985,21 @@ struct PullArgs {
     /// that breaks the collection-id rule does not. A
     /// `mirrored-collection-ids` value that breaks a rule of that key in any
     /// remote fails the command. With this option, each operand is a ref of
-    /// the collection, REF or @ID:REF, and the command takes no REMOTE. An operand @C:REF of another collection C is refused before
-    /// the first request. With no ref, the pull takes each ref of the
+    /// the collection, REF or @ID:REF, and the command takes no REMOTE. An
+    /// operand can also be a commit operand of the collection: CHECKSUM,
+    /// REF@CHECKSUM, or @ID:REF@CHECKSUM. An operand @C:REF of another
+    /// collection C is refused before the first request. With no ref, the pull takes each ref of the
     /// collection that a candidate lists, and fails if no candidate lists a
     /// ref. The pull asks
     /// each candidate for the commit of each ref, through the ref listing of
     /// the server or else through its summary. Under `gpg-verify-summary` or
     /// `sign-verify-summary`, it reads the refs from the verified summary
     /// alone. A candidate at an `s3://` address is a bucket repository: the
-    /// pull reads its refs from its summary alone, and skips it if it has no
-    /// summary. A build without the feature `s3` refuses an `s3://`
-    /// candidate, and the pull fails before its first request. The S3
+    /// pull reads its refs from its summary alone. In a pull with no operand
+    /// or with an operand that is not a commit operand, the pull skips a
+    /// bucket repository with no summary. A build without the feature `s3`
+    /// refuses an `s3://` candidate, and the pull fails before its first
+    /// request. The S3
     /// settings of each candidate come from the config, and the command
     /// refuses the `--s3-*` options. It refuses --allow-cleartext-credentials
     /// if the pull address of a candidate is an HTTP or an ssh address.
@@ -4008,7 +4012,11 @@ struct PullArgs {
     /// pull also refuses --subpath, --http-header, --network-retries above 0,
     /// and the low-speed options with a local candidate. For
     /// each ref, it selects the candidate with the newest commit, and a tie
-    /// goes to the first candidate in the config. A candidate that fails to
+    /// goes to the first candidate in the config. For a commit operand, the
+    /// pull asks the candidates in the order of the config for the commit,
+    /// and takes the first candidate that serves it. If each operand is a
+    /// commit operand, the pull reads no ref listing and no summary of a
+    /// candidate. A candidate that fails to
     /// answer is skipped with a warning. A listed ref whose name fails the
     /// ref-name rule is skipped with a warning. The pull from each selected
     /// candidate is a pull of its own, so a failure of a later candidate
@@ -4047,7 +4055,9 @@ struct PullArgs {
     /// `refs/heads/REF` if the `collection-id` of this repository is ID, and
     /// the commit must be bound to ID. If the remote serves no summary, or
     /// its summary states no collection id, the pull writes
-    /// `refs/heads/REF`. A ref @ID:REF keeps its collection.
+    /// `refs/heads/REF`. A ref @ID:REF keeps its collection. A commit operand
+    /// REF@CHECKSUM writes `refs/heads/REF`, and @ID:REF@CHECKSUM keeps its
+    /// collection.
     ///
     /// If no ref is named, the pull takes every ref that the summary of the
     /// remote lists, in its ref list and in its collection map, and fails if
@@ -4109,7 +4119,8 @@ struct PullArgs {
     /// Without this switch, the list must name the ref that the commit is
     /// pulled under, or the pull fails. A commit with no ostree.ref-binding
     /// key passes. The switch does not skip the collection-binding check of
-    /// a ref @ID:REF.
+    /// a ref @ID:REF or of a commit operand. A CHECKSUM operand gets no
+    /// ref-binding check.
     #[arg(long)]
     disable_verify_bindings: bool,
     /// Copy each object from a localcache repository, and make no hardlink.
@@ -4195,7 +4206,9 @@ struct PullArgs {
     ///
     /// The current commit is the commit that the ref names in this
     /// repository. A tip with an equal timestamp passes. A ref that this
-    /// repository does not hold passes.
+    /// repository does not hold passes. For REF@CHECKSUM, the ref is the ref
+    /// that the pull writes. The command refuses a CHECKSUM operand with this
+    /// option, before the first request.
     #[arg(short = 'T', long)]
     timestamp_check: bool,
     /// Refuse a fetched tip that is older than the commit that REV names.
@@ -4212,7 +4225,13 @@ struct PullArgs {
     ///
     /// A missing commit is a commit that this repository does not hold
     /// complete, an attachment of a pulled commit included. The pull also fails
-    /// if the remote serves no summary. The option conflicts with
+    /// if the remote serves no summary, unless each operand is a commit
+    /// operand. Such a pull requests the delta of a REF@CHECKSUM operand
+    /// through the delta index of the commit if the `config` of the remote
+    /// states `[core] indexed-deltas=true`, else by name. A CHECKSUM operand
+    /// takes no delta, so the command refuses it before the first request,
+    /// unless this repository holds the commit complete or
+    /// --commit-metadata-only is given. The option conflicts with
     /// --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
@@ -4239,7 +4258,8 @@ struct PullArgs {
     /// applies, and its default is false. `--gpg-verify-summary` requires a
     /// signature, and `--gpg-verify-summary=false` requires none. If a
     /// signature is required and the remote has no `summary` or no
-    /// `summary.sig`, the pull fails.
+    /// `summary.sig`, the pull fails. A pull whose operands are all commit
+    /// operands reads no summary, so the option has no effect on it.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify_summary: Option<bool>,
     /// Require an ed25519 or spki signature on the pulled commits.
@@ -4263,7 +4283,9 @@ struct PullArgs {
     /// Without this option, the `sign-verify-summary` key of the remote
     /// applies, and its default is off. `--sign-verify-summary` requires a
     /// signature and selects every engine of this build.
-    /// `--sign-verify-summary=false` requires none.
+    /// `--sign-verify-summary=false` requires none. A pull whose operands are
+    /// all commit operands reads no summary, so the option has no effect on
+    /// it.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify_summary: Option<bool>,
     #[cfg(feature = "s3")]
@@ -4301,9 +4323,32 @@ struct PullArgs {
     /// `refs/mirrors/ID/REF`, or `refs/heads/REF` if the `collection-id` of
     /// this repository is ID. The
     /// commit must be bound to ID, also with --disable-verify-bindings. The
-    /// ref-binding check reads REF. A ref named two times counts one time.
-    /// The command refuses two other refs that write one ref, after it reads
-    /// the summary and before it reads a ref file.
+    /// ref-binding check reads REF.
+    ///
+    /// An operand can also name a commit by its checksum, 64 lowercase hex
+    /// characters. Such a commit operand is CHECKSUM, REF@CHECKSUM, or
+    /// @ID:REF@CHECKSUM. The pull fetches the commit, and reads no summary
+    /// entry and no ref file of the remote for it. CHECKSUM writes no ref and
+    /// gets no ref-binding check. Without --collection, if the
+    /// `[remote "REMOTE"]` section has the key `collection-id`, the commit of
+    /// CHECKSUM must be bound to that collection id, also with
+    /// --disable-verify-bindings. Without --mirror, REF@CHECKSUM writes the
+    /// ref that REF writes. Under --mirror, REF@CHECKSUM writes
+    /// `refs/heads/REF`. @ID:REF@CHECKSUM writes the ref that @ID:REF writes.
+    /// The ref-binding check reads REF. Without --collection, the
+    /// commit of REF@CHECKSUM must be bound to the `collection-id` of this
+    /// repository, also with --disable-verify-bindings. If this repository
+    /// has no `collection-id`, the commit must have no collection binding.
+    /// If each operand is a commit operand, the pull reads no summary. The
+    /// command refuses an operand with an `@` after its first character that
+    /// does not end in `@` and 64 lowercase hex characters, before the first
+    /// request.
+    ///
+    /// An operand named two times counts one time. With --collection, REF and
+    /// @ID:REF count as one operand, and REF@CHECKSUM and @ID:REF@CHECKSUM
+    /// with one checksum count as one operand. The command refuses two
+    /// different operands that write one ref, also REF beside REF@CHECKSUM,
+    /// before it reads a ref file or an object.
     refs: Vec<String>,
 }
 
@@ -5576,6 +5621,8 @@ struct PullLocalArgs {
     ///
     /// The pull uses the keys of the remote that --remote names. Without
     /// --remote, the command refuses this switch. The switch takes no value.
+    /// A pull whose operands are all commit operands reads no summary, so the
+    /// switch has no effect on it.
     #[arg(long)]
     gpg_verify_summary: bool,
     /// Require an ed25519 or spki signature on the commits that the pull
@@ -5594,8 +5641,9 @@ struct PullLocalArgs {
     ///
     /// The switch selects every engine of this build, and takes the keys that
     /// --sign-verify takes. If the source has no `summary` or no
-    /// `summary.sig`, the pull fails. The switch needs --remote and takes no
-    /// value.
+    /// `summary.sig`, the pull fails. A pull whose operands are all commit
+    /// operands reads no summary, so the switch has no effect on it. The
+    /// switch needs --remote and takes no value.
     #[arg(long, requires = "remote")]
     sign_verify_summary: bool,
     /// Do not require a GPG signature on the commits.
@@ -5634,9 +5682,15 @@ struct PullLocalArgs {
     /// If the source advertises no delta for a commit, the command refuses the
     /// pull. This includes each attachment that the pull imports and that this
     /// repository does not hold complete. The source must be an archive
-    /// repository with a summary. The
-    /// statistics line then has the form of a pull from a remote. This switch
-    /// conflicts with --disable-static-deltas.
+    /// repository, with a summary unless each operand is a commit operand.
+    /// Such a pull reads the delta of a REF@CHECKSUM operand through the
+    /// delta index of the commit if the `config` of the source states
+    /// `[core] indexed-deltas=true`, else by name. The command refuses a
+    /// CHECKSUM operand that this repository does not hold complete, after it
+    /// opens the source, before it reads a ref or an object of the source,
+    /// unless --commit-metadata-only is given. With this
+    /// switch, the statistics line has the form of a pull from a remote. This
+    /// switch conflicts with --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
     /// Read no static delta.
@@ -5652,16 +5706,34 @@ struct PullLocalArgs {
     /// The refs to pull.
     ///
     /// Each value is a revision of the source: a ref NAME, REMOTE:NAME, or
-    /// @ID:NAME, or a checksum. The command refuses a value with a `^` suffix,
-    /// before it reads the source. @ID:NAME is the ref NAME of the collection
-    /// ID in the source, under `refs/mirrors/ID`, or the local ref NAME if ID
-    /// is the collection id of the source. The pull writes @ID:NAME to
+    /// @ID:NAME, or an abbreviated checksum. A value can also name a commit by
+    /// its checksum, 64 lowercase hex characters. Such a commit operand is
+    /// CHECKSUM or REF@CHECKSUM, where REF is NAME, REMOTE:NAME, or @ID:NAME.
+    /// The pull reads no ref of the source for it. CHECKSUM writes no ref,
+    /// also with --remote, and gets no binding check. REF@CHECKSUM writes the
+    /// ref that REF writes. The ref-binding check reads NAME, or REMOTE:NAME
+    /// for REMOTE:NAME@CHECKSUM. The commit of NAME@CHECKSUM and of
+    /// REMOTE:NAME@CHECKSUM must be bound to the collection id of this
+    /// repository, also with --disable-verify-bindings. If this repository
+    /// has no collection id, the commit must have no collection binding. With
+    /// --remote, the command refuses REMOTE:NAME@CHECKSUM. If each value is a
+    /// commit operand, the pull reads no summary of the source.
+    ///
+    /// The command refuses a value with a `^` suffix, and a value with an `@`
+    /// after its first character that does not end in `@` and 64 lowercase
+    /// hex characters, after it opens the source, before it reads a ref or an
+    /// object of the source. @ID:NAME is the ref NAME of
+    /// the collection ID in the source, under `refs/mirrors/ID`, or the local
+    /// ref NAME if ID is the collection id of the source. The pull writes
+    /// @ID:NAME to
     /// `refs/mirrors/ID/NAME`, or to the local ref NAME if ID is the
     /// collection id of this repository, also with --remote. The commit of
     /// @ID:NAME must hold the `ostree.collection-binding` ID, and
-    /// --disable-verify-bindings does not change this. A ref named two times
-    /// counts one time. The command refuses two different refs that write one
-    /// ref, before it reads the source. With none, the pull takes every local
+    /// --disable-verify-bindings does not change this. A value named two times
+    /// counts one time. The command refuses two different values that write
+    /// one ref, also NAME beside NAME@CHECKSUM, after it opens the source,
+    /// before it reads a ref or an object of the source.
+    /// With none, the pull takes every local
     /// ref of the source, under `refs/heads`.
     refs: Vec<String>,
 }

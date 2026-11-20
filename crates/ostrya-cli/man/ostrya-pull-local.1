@@ -23,7 +23,9 @@ The repository to pull from. Required.
 \fIREFS...\fR
 The refs to pull.
 .IP
-Each value is a revision of the source: a ref NAME, \%REMOTE:NAME, or \%@ID:NAME, or a checksum. The command refuses a value with a \fB\%^\fR suffix, before it reads the source. \%@ID:NAME is the ref NAME of the collection ID in the source, under \fB\%refs/mirrors/ID\fR, or the local ref NAME if ID is the collection id of the source. The pull writes \%@ID:NAME to \fB\%refs/mirrors/ID/NAME\fR, or to the local ref NAME if ID is the collection id of this repository, also with \%\-\-remote. The commit of \%@ID:NAME must hold the \fB\%ostree.collection\-binding\fR ID, and \%\-\-disable\-verify\-bindings does not change this. A ref named two times counts one time. The command refuses two different refs that write one ref, before it reads the source. With none, the pull takes every local ref of the source, under \fB\%refs/heads\fR\&.
+Each value is a revision of the source: a ref NAME, \%REMOTE:NAME, or \%@ID:NAME, or an abbreviated checksum. A value can also name a commit by its checksum, \%64 lowercase hex characters. Such a commit operand is CHECKSUM or \%REF@CHECKSUM, where REF is NAME, \%REMOTE:NAME, or \%@ID:NAME. The pull reads no ref of the source for it. CHECKSUM writes no ref, also with \%\-\-remote, and gets no binding check. \%REF@CHECKSUM writes the ref that REF writes. The \%ref\-binding check reads NAME, or \%REMOTE:NAME for \%REMOTE:NAME@CHECKSUM. The commit of \%NAME@CHECKSUM and of \%REMOTE:NAME@CHECKSUM must be bound to the collection id of this repository, also with \%\-\-disable\-verify\-bindings. If this repository has no collection id, the commit must have no collection binding. With \%\-\-remote, the command refuses \%REMOTE:NAME@CHECKSUM. If each value is a commit operand, the pull reads no summary of the source.
+.IP
+The command refuses a value with a \fB\%^\fR suffix, and a value with an \fB\%@\fR after its first character that does not end in \fB\%@\fR and \%64 lowercase hex characters, after it opens the source, before it reads a ref or an object of the source. \%@ID:NAME is the ref NAME of the collection ID in the source, under \fB\%refs/mirrors/ID\fR, or the local ref NAME if ID is the collection id of the source. The pull writes \%@ID:NAME to \fB\%refs/mirrors/ID/NAME\fR, or to the local ref NAME if ID is the collection id of this repository, also with \%\-\-remote. The commit of \%@ID:NAME must hold the \fB\%ostree.collection\-binding\fR ID, and \%\-\-disable\-verify\-bindings does not change this. A value named two times counts one time. The command refuses two different values that write one ref, also NAME beside \%NAME@CHECKSUM, after it opens the source, before it reads a ref or an object of the source. With none, the pull takes every local ref of the source, under \fB\%refs/heads\fR\&.
 .SH OPTIONS
 .TP
 \fB\-\-remote\fR \fIREMOTE\fR
@@ -87,7 +89,7 @@ The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remo
 \fB\-\-gpg\-verify\-summary\fR
 Require a GPG signature on the summary of the source.
 .IP
-The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value.
+The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value. A pull whose operands are all commit operands reads no summary, so the switch has no effect on it.
 .TP
 \fB\-\-sign\-verify\fR
 Require an \%ed25519 or spki signature on the commits that the pull carries.
@@ -97,7 +99,7 @@ The switch selects every engine of this build, and a valid signature of one engi
 \fB\-\-sign\-verify\-summary\fR
 Require an \%ed25519 or spki signature on the summary of the source.
 .IP
-The switch selects every engine of this build, and takes the keys that \%\-\-sign\-verify takes. If the source has no \fB\%summary\fR or no \fB\%summary.sig\fR, the pull fails. The switch needs \%\-\-remote and takes no value.
+The switch selects every engine of this build, and takes the keys that \%\-\-sign\-verify takes. If the source has no \fB\%summary\fR or no \fB\%summary.sig\fR, the pull fails. A pull whose operands are all commit operands reads no summary, so the switch has no effect on it. The switch needs \%\-\-remote and takes no value.
 .TP
 \fB\-\-no\-gpg\-verify\fR
 Do not require a GPG signature on the commits.
@@ -122,7 +124,7 @@ The switch turns off the \fB\%sign\-verify\-summary\fR key of the remote that \%
 \fB\-\-require\-static\-deltas\fR
 Apply the static delta that the summary of the source advertises.
 .IP
-If the source advertises no delta for a commit, the command refuses the pull. This includes each attachment that the pull imports and that this repository does not hold complete. The source must be an archive repository with a summary. The statistics line then has the form of a pull from a remote. This switch conflicts with \%\-\-disable\-static\-deltas.
+If the source advertises no delta for a commit, the command refuses the pull. This includes each attachment that the pull imports and that this repository does not hold complete. The source must be an archive repository, with a summary unless each operand is a commit operand. Such a pull reads the delta of a \%REF@CHECKSUM operand through the delta index of the commit if the \fB\%config\fR of the source states \fB\%[core] indexed\-deltas=true\fR, else by name. The command refuses a CHECKSUM operand that this repository does not hold complete, after it opens the source, before it reads a ref or an object of the source, unless \%\-\-commit\-metadata\-only is given. With this switch, the statistics line has the form of a pull from a remote. This switch conflicts with \%\-\-disable\-static\-deltas.
 .TP
 \fB\-\-disable\-static\-deltas\fR
 Read no static delta.

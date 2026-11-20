@@ -3887,9 +3887,14 @@ The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID or whose
 `mirrored-collection-ids` holds ID (`format-reference.md`, "The pull of
 collection refs"). With it, each operand is a ref of the collection, `REF` or
-`@ID:REF`, and the command takes no REMOTE. An operand `@C:REF` of another
-collection C fails the command at exit 1 before the first request. `clap`
-refuses it together with `--url`,
+`@ID:REF`, and the command takes no REMOTE. An operand can also be a commit
+operand of the collection: `CHECKSUM`, `REF@CHECKSUM`, or
+`@ID:REF@CHECKSUM`. The pull asks the candidates in the order of the config
+for the commit object, and takes the first candidate that serves it. If each
+operand is a commit operand, the pull reads no ref listing and no summary of
+a candidate (`../decisions.md`, "Commit operands of a pull"). An operand
+`@C:REF` of another collection C fails the command at exit 1 before the
+first request. `clap` refuses it together with `--url`,
 `--mirror`, or `--disable-verify-bindings`. A collection pull always checks
 the bindings of each commit. The command reads the `collection-id` key and
 the `mirrored-collection-ids` key of each remote. A `collection-id` value
@@ -4277,8 +4282,10 @@ port generated for a signed commit.
 
 `--require-static-deltas` refuses where the tool refuses
 (`cli-behavior.md`, "HTTP pull surface", "Delta selection in a pull"): a
-remote with no summary, and a commit the destination does not hold for which no
-advertised delta can be taken, with the tool's words behind `pull: `. Where the
+remote with no summary in a pull with no operand or with an operand that is
+not a commit operand, and a commit the destination does not hold for which no
+advertised delta can be taken, with the tool's words behind `pull: `. The
+list of the commit operand differences below states the other cases. Where the
 superblock of the delta taken is absent, the tool writes the checksum of the
 start commit of the delta in place of `<ref>`. For a from-scratch delta it
 writes `(null)`, and the port writes the ref name in both cases. Both take a
@@ -4428,16 +4435,18 @@ collection id of the destination, also with `--remote`. The tip commit of
 `@ID:REF` must hold the `ostree.collection-binding` `ID`, and
 `--disable-verify-bindings` does not skip this check. An operand that starts
 with `@` and is not an `@ID:REF` ref gives `error: Invalid refspec
-<operand>` at exit 1, before the port reads the source. An operand that
-gives no valid ref to write gives `error: Invalid refspec <ref>` at exit 1,
-before the port reads the source, and `<ref>` names the ref that the port
-writes: `--remote=origin SRC 'a b'` gives `error: Invalid refspec origin:a b`.
-The port refuses each operand with a `^` suffix in this way: `@ID:main^` into
-a destination whose collection id is ID gives `error: Invalid refspec main^`.
-Two different operands that write one ref give `error: pull: the refs A and B
-write one ref <path>` at exit 1, before the port reads the source. An example
-is `REF` and `@ID:REF` with no `--remote`, into a destination whose collection
-id is ID. The port writes no object and no ref. An operand given two times
+<operand>` at exit 1, after the port opens the source, before it reads a ref
+or an object of the source. An operand that gives no valid ref to write gives
+`error: Invalid refspec <ref>` at exit 1, after the port opens the source,
+before it reads a ref or an object of the source, and `<ref>` names the ref
+that the port writes: `--remote=origin SRC 'a b'` gives `error: Invalid
+refspec origin:a b`. The port refuses each operand with a `^` suffix in this
+way: `@ID:main^` into a destination whose collection id is ID gives `error:
+Invalid refspec main^`. Two different operands that write one ref give
+`error: pull: the refs A and B write one ref <path>` at exit 1, after the
+port opens the source, before it reads a ref or an object of the source. An
+example is `REF` and `@ID:REF` with no `--remote`, into a destination whose
+collection id is ID. The port writes no object and no ref. An operand given two times
 counts one time.
 
 `pull REMOTE` of the port takes the operands `CHECKSUM`, `REF@CHECKSUM`,
@@ -4451,6 +4460,82 @@ rules of the port. A malformed operand, for example `main@` or `main@` and an
 abbreviated checksum, gives `error: Invalid refspec <operand>` at exit 1,
 and `pull` sends no request.
 
+`pull` with commit operands differs from the tool in these points
+(`cli-behavior.md`, "Pull of a commit by its checksum"). Nine differences
+stand:
+
+- two operands for one ref. The tool takes the last operand for a ref and
+  fetches its commit alone, so `main@<M2> main@<M1>` and `main main@<M1>`
+  write M1. The port refuses two different operands that write one ref
+  path, `main` beside `main@<C>` included. It gives `error: pull: the refs A
+  and B write one ref PATH` at exit 1, with the operands as given, before it
+  reads a ref file or an object, and writes no object and no ref;
+- a malformed commit operand. The port gives `error: Invalid refspec
+  <operand>` with the operand as given. The tool gives `error: Invalid rev
+  <value>`, `error: Invalid ref name <value>`, or `error: Invalid character
+  '<n>' in rev '<value>'`, with a part of the operand as the value. Both
+  exit 1 and send no request;
+- the collection binding of `REF@CHECKSUM`. The tool compares the
+  `ostree.collection-binding` of the commit with the remote key
+  `collection-id`, and makes no check where the remote has no such key. The
+  port compares it with the `[core] collection-id` of the destination. In a
+  destination with no collection id, the port refuses a commit that has a
+  collection binding with `error: pull: commit <c>: collection binding
+  metadata for a ref of a repository with no collection id` at exit 1. So
+  each refuses commits that the other takes. In such a destination, a commit
+  bound to a collection needs `@ID:REF@CHECKSUM` or `CHECKSUM`;
+- the static delta of a commit operand. In a pull whose operands are all
+  commit operands, from a remote that serves a summary and whose `config`
+  does not state `[core] indexed-deltas=true`, the tool requests the delta
+  index of the commit, and the port requests one superblock by name: the
+  delta from the commit of the ref that the pull writes, else the
+  from-scratch delta. For `CHECKSUM`, the port requests no delta and fetches
+  the objects loose, also where the `config` states
+  `[core] indexed-deltas=true`, and the tool requests a delta as for
+  `REF@CHECKSUM`;
+- `-T` (`--timestamp-check`) with a `CHECKSUM` operand. The tool sends the
+  requests up to `objects/<c>.commit`, then ends on an assertion
+  (`SIGABRT`, exit 134 from a shell). The port refuses the operand with
+  `error: invalid input: the timestamp check against the current ref takes
+  no commit named by its checksum with no ref: <c>` at exit 1, before the
+  first request;
+- the summary of a pull whose operands are all commit operands. Where the
+  `config` of the remote does not state `[core] indexed-deltas=true`, the
+  tool requests `summary.sig` and `summary`, and verifies the summary under
+  `gpg-verify-summary` and `sign-verify-summary`. A summary that fails the
+  verification fails such a pull of the tool at exit 1. The port requests no
+  `summary` and no `summary.sig` in each config state, and the two summary
+  keys do not apply. The commit signature checks apply in both;
+- `--require-static-deltas` with commit operands alone, from a remote with
+  no summary and no key `indexed-deltas` in its `config`. The tool refuses
+  with `error: Fetch configured to require static deltas, but no summary
+  deltas or delta index found` at exit 1, also where the remote serves the
+  delta. For `REF@CHECKSUM` and `@ID:REF@CHECKSUM`, the port requests the
+  delta by name and applies it. Where the remote does not serve it, the
+  port refuses with `error: pull: Static deltas required, but none found
+  for <ref> to <c>` at exit 1;
+- `--require-static-deltas` with a `CHECKSUM` operand. The port refuses the
+  operand with `error: pull: Static deltas required, but a commit named by
+  its checksum takes none: <c>` at exit 1, before the first request, also
+  with `--collection`. It takes the operand where the destination holds the
+  commit complete, and with `--commit-metadata-only`. The tool requests a
+  delta for `CHECKSUM` as for `REF@CHECKSUM`, and exits 0 from the shapes
+  `A1`, `A2`, and `C` (`cli-behavior.md`, "Static deltas of a checksum
+  pull");
+- what a refused pull leaves in `tmp/`. A refusal of the tool by the ref
+  binding, by the collection binding, or by `-T` leaves the staging
+  directory `tmp/staging-<boot id>-<random>/` with the commit object of the
+  target, and `state/<c>.commitpartial`. The next pull of the tool that
+  succeeds uses the staging directory again. It moves that commit object
+  into `objects/` with no tree, and `fsck` then reports `1 partial commits
+  not verified` (`cli-behavior.md`, "Temporary files after a refused
+  checksum pull"). A refusal of the port by the ref binding, by the
+  collection binding, or by `-T` of `REF@CHECKSUM` comes after it fetches
+  the commit object, and leaves no staging directory in `tmp/` and no
+  marker in `state/`. The port stores no object of the refused commit. Its
+  refusal of `-T` with a `CHECKSUM` operand comes before the first
+  request.
+
 `pull-local` of the port takes the operands `CHECKSUM`, `REF@CHECKSUM`, and
 `@ID:REF@CHECKSUM`, and with no `--remote` also `REMOTE:REF@CHECKSUM`, which
 writes `refs/remotes/REMOTE/REF`. The tool takes
@@ -4463,15 +4548,26 @@ these results:
   ref-binding check reads `REF`. The collection binding of the commit must
   be the collection id of the destination, and a destination with no
   collection id refuses a commit with a collection binding.
-  `../decisions.md`, "Commit operands of a pull", states the rules.
+  `../decisions.md`, "Commit operands of a pull", states the rules. The
+  tool refuses the operand with `error: Invalid ref name REF@CHECKSUM` at
+  exit 1, also with `--remote`.
 - A malformed operand, for example `main@` or `main@` and an abbreviated
   checksum, gives `error: Invalid refspec <operand>` at exit 1. `pull-local`
   refuses the operand after it opens the source, before it reads a ref or
   an object of the source.
+- With `--remote=NAME`, the port refuses `REMOTE:REF@CHECKSUM`. The text
+  names the ref that the port writes, as for a plain operand:
+  `--remote=origin SRC origin:main@<C>` gives `error: Invalid refspec
+  origin:origin:main` at exit 1.
 - `pull-local SRC CHECKSUM` imports the commit at exit 0 and writes no ref,
   also with `--remote=NAME`. The port makes no ref-binding check and no
-  collection-binding check of the commit. An abbreviated checksum stays a
-  revision of the source, and writes the ref of its name.
+  collection-binding check of the commit. The tool also writes no ref and
+  makes no ref-binding check. It compares the `ostree.collection-binding`
+  of the commit with the `[core] collection-id` of the source, with or
+  without `--remote`. So from a source whose collection id is
+  `org.example.Other`, the tool refuses `<C1>`, a commit bound to
+  `org.example.Test`, and the port imports it. An abbreviated checksum
+  stays a revision of the source, and writes the ref of its name.
 
 Each refusal writes no object and no ref.
 
@@ -4485,8 +4581,9 @@ surface", "Static deltas over pull-local"). With commit operands alone,
 the delta index where the `config` of the source states
 `[core] indexed-deltas=true`, and else one superblock by name: the delta from
 the commit of the ref, else the from-scratch delta. It refuses a `CHECKSUM`
-operand that the destination does not hold complete before it reads the
-source. `--disable-static-deltas` changes nothing, since `pull-local` reads
+operand that the destination does not hold complete, after it opens the
+source, before it reads a ref or an object of the source, unless
+`--commit-metadata-only` is given. `--disable-static-deltas` changes nothing, since `pull-local` reads
 no delta by default. Ten differences stand:
 
 - the verification keys of the remote. The port reads `gpg-verify`,
@@ -4919,7 +5016,11 @@ No matrix cell needs these. The shell suite invokes them.
     `collection-id` and `mirrored-collection-ids` of each remote.
   - The operands are refs of one collection. The tool takes
     `COLLECTION-ID REF` pairs. The port pulls the refs of more than one
-    collection from one named remote with `pull REMOTE @ID:REF...`.
+    collection from one named remote with `pull REMOTE @ID:REF...`. An
+    operand of the port can also be a commit operand of the collection:
+    `CHECKSUM`, `REF@CHECKSUM`, or `@ID:REF@CHECKSUM`. The port takes the
+    commit from the first candidate in the order of the config that serves
+    the commit object.
   - The port prints the statistics line of a pull, and one warning line for
     each candidate that it skips. When the pull fetched objects, and the
     local candidates imported objects and fetched nothing, the port prints

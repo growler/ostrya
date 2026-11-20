@@ -49780,6 +49780,663 @@ fn refs_delete_of_an_empty_selection_takes_no_lock() {
     assert_eq!(describe_refs(&repo), refs);
 }
 
+// --- commit operands of pull and pull-local ----------------------------------
+
+/// Creates an archive repository at `base/<name>` with the commits C1 and C2 on
+/// `main`, the commit CX on `@org.example.X:a`, and a summary. C2 is the tip of
+/// `main`. Returns the path and the three commits.
+fn commit_operand_source(base: &Path, name: &str) -> (PathBuf, String, String, String) {
+    let tree = base.join(format!("{name}-tree"));
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"one\n").unwrap();
+    let repo = init_archive(&base.join(name), None);
+    let commit = |branch: &str, subject: &str| {
+        commit_no_parent(&repo, &["-b", branch, &format!("-s={subject}")], &tree)
+            .ok()
+            .stdout_trimmed()
+    };
+    let c1 = commit("main", "one");
+    std::fs::write(tree.join("b"), b"two\n").unwrap();
+    let c2 = commit("main", "two");
+    let cx = commit("@org.example.X:a", "x");
+    ostrya_at(&repo, &["summary", "-u"]).ok();
+    (repo, c1, c2, cx)
+}
+
+/// Creates a `bare-user` repository at `base/<name>/repo` with the remote
+/// `origin` at `url` and no GPG check, and returns its path.
+fn commit_operand_client(base: &Path, name: &str, url: &str) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let client = create_repo(&dir, RepoMode::BareUser);
+    configure_remote(&client, url, "gpg-verify=false\n");
+    client
+}
+
+/// No pair: the ref files of a repository with no ref, and the loose objects
+/// of a repository with no object.
+const NO_PAIRS: Vec<(String, String)> = Vec::new();
+
+/// One row of a commit operand case: the arguments, each ref file that the
+/// pull leaves as its path and its checksum, and a commit that the pull must
+/// leave in the repository.
+type OperandRow<'a> = (Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
+
+/// Returns each ref file of the repository at `repo` as its path under the
+/// repository and the checksum in it, in path order.
+fn ref_files(repo: &Path) -> Vec<(String, String)> {
+    files_under(&repo.join("refs"))
+        .into_iter()
+        .map(|path| {
+            let relpath = Path::new("refs").join(&path);
+            let checksum = ref_file(repo, relpath.to_str().unwrap()).unwrap();
+            (relpath.to_str().unwrap().to_owned(), checksum)
+        })
+        .collect()
+}
+
+/// Runs `pull --repo=<client>` with `args` by ostrya if `who` is `"port"`, and
+/// by the `ostree` command otherwise.
+fn pull_by(who: &str, client: &Path, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", client.display());
+    let mut argv = vec!["pull", repo_arg.as_str()];
+    argv.extend_from_slice(args);
+    if who == "port" {
+        ostrya(&argv, None, &[])
+    } else {
+        ostree(&argv)
+    }
+}
+
+/// `pull` takes each commit operand form. `main@<C1>` writes
+/// `refs/remotes/origin/main` to C1, which is not the tip of `main`. `<C2>`
+/// fetches C2 and writes no ref. `@org.example.X:a@<CX>` writes
+/// `refs/mirrors/org.example.X/a`, and `--mirror main@<C1>` writes
+/// `refs/heads/main`. No pull requests the summary or a ref file of the
+/// remote.
+#[test]
+fn pull_takes_each_commit_operand_form() {
+    let tmp = TmpDir::new("pull-commit-operands");
+    let base = tmp.path();
+    let (remote, c1, c2, cx) = commit_operand_source(base, "remote");
+    let server = FileServer::start(&remote);
+    let main_c1 = format!("main@{c1}");
+    let x_cx = format!("@org.example.X:a@{cx}");
+    let rows: Vec<OperandRow> = vec![
+        (
+            vec!["origin", &main_c1],
+            vec![("refs/remotes/origin/main", &c1)],
+            &c1,
+        ),
+        (vec!["origin", &c2], vec![], &c2),
+        (
+            vec!["origin", &x_cx],
+            vec![("refs/mirrors/org.example.X/a", &cx)],
+            &cx,
+        ),
+        (
+            vec!["--mirror", "origin", &main_c1],
+            vec![("refs/heads/main", &c1)],
+            &c1,
+        ),
+    ];
+    for (i, (args, refs, held)) in rows.iter().enumerate() {
+        let client = commit_operand_client(base, &format!("client-{i}"), &server.url());
+        server.clear();
+        pull_by("port", &client, args).ok();
+        let refs: Vec<(String, String)> = refs
+            .iter()
+            .map(|(path, commit)| ((*path).to_owned(), (*commit).to_owned()))
+            .collect();
+        assert_eq!(ref_files(&client), refs, "{args:?}");
+        assert!(holds_commit(&client, held), "{args:?}");
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with(".commit")),
+            "{seen:?}"
+        );
+        assert!(
+            seen.iter().all(|path| path != "summary"
+                && path != "summary.sig"
+                && !path.starts_with("refs/")),
+            "{args:?}: {seen:?}"
+        );
+    }
+    assert!(!holds_commit(&base.join("client-0/repo"), &c2));
+}
+
+/// Under `--mirror`, `main@<U1>` writes `refs/heads/main`, also where the
+/// summary of the remote states a collection id. U1 has no collection
+/// binding. Plain `main` takes the collection of the summary: the port
+/// refuses U1 at exit 1 and writes no object and no ref, and the `ostree`
+/// command writes `refs/mirrors/org.example.Test/main`.
+#[test]
+fn pull_mirror_writes_the_local_ref_of_a_ref_at_checksum() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-mirror-ref-at-checksum");
+    let base = tmp.path();
+    let tree = base.join("remote-tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"one\n").unwrap();
+    let remote = init_archive(&base.join("remote"), None);
+    let u1 = commit_no_parent(&remote, &["-b", "main", "-s=u1"], &tree)
+        .ok()
+        .stdout_trimmed();
+    ostrya_at(
+        &remote,
+        &["config", "set", "core.collection-id", "org.example.Test"],
+    )
+    .ok();
+    ostrya_at(&remote, &["summary", "-u"]).ok();
+    let server = FileServer::start(&remote);
+    let main_u1 = format!("main@{u1}");
+    let mut who_list = vec!["port"];
+    if tool {
+        who_list.push("tool");
+    }
+    for who in who_list {
+        let client = commit_operand_client(base, &format!("{who}-at"), &server.url());
+        pull_by(who, &client, &["--mirror", "origin", &main_u1]).ok();
+        assert_eq!(
+            ref_files(&client),
+            vec![("refs/heads/main".to_owned(), u1.clone())],
+            "{who}"
+        );
+
+        let client = commit_operand_client(base, &format!("{who}-plain"), &server.url());
+        let run = pull_by(who, &client, &["--mirror", "origin", "main"]);
+        if who == "port" {
+            assert_eq!(run.status.code(), Some(1));
+            assert_eq!(
+                String::from_utf8_lossy(&run.stderr),
+                format!(
+                    "error: pull: commit {u1}: no collection binding metadata for the requested \
+                     collection 'org.example.Test'\n"
+                )
+            );
+            assert_eq!(ref_files(&client), NO_PAIRS);
+            assert_eq!(loose_objects(&client), NO_PAIRS);
+        } else {
+            run.ok();
+            assert_eq!(
+                ref_files(&client),
+                vec![("refs/mirrors/org.example.Test/main".to_owned(), u1.clone())]
+            );
+        }
+    }
+}
+
+/// A malformed commit operand fails the pull at exit 1 with `Invalid refspec`
+/// and the operand as given, before the first request. The pull writes no
+/// object and no ref. The `ostree` command also exits 1 with no request.
+#[test]
+fn pull_refuses_a_malformed_commit_operand_before_a_request() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-malformed-commit-operand");
+    let base = tmp.path();
+    let (remote, c1, _, _) = commit_operand_source(base, "remote");
+    let server = FileServer::start(&remote);
+    let operands = [
+        "main@".to_owned(),
+        format!("main@{}", &c1[..10]),
+        format!("main@{}", c1.to_uppercase()),
+        format!("main@{c1}^"),
+        format!("main@{c1}x"),
+        format!("@{c1}"),
+        format!("a@b@{c1}"),
+        format!("origin:main@{c1}"),
+    ];
+    for (i, operand) in operands.iter().enumerate() {
+        let mut who_list = vec!["port"];
+        if tool {
+            who_list.push("tool");
+        }
+        for who in who_list {
+            let client = commit_operand_client(base, &format!("{who}-{i}"), &server.url());
+            server.clear();
+            let run = pull_by(who, &client, &["origin", operand]);
+            assert_eq!(run.status.code(), Some(1), "{who} {operand}");
+            if who == "port" {
+                assert_eq!(
+                    String::from_utf8_lossy(&run.stderr),
+                    format!("error: Invalid refspec {operand}\n")
+                );
+            }
+            assert_eq!(server.seen(), Vec::<String>::new(), "{who} {operand}");
+            assert_eq!(ref_files(&client), NO_PAIRS, "{who} {operand}");
+            assert_eq!(loose_objects(&client), NO_PAIRS, "{who} {operand}");
+        }
+    }
+}
+
+/// Two operands that write one ref fail the pull at exit 1, `main` beside
+/// `main@<C1>` included, before the pull requests an object. The pull writes
+/// no object and no ref. The `ostree` command takes the last operand for the
+/// ref.
+#[test]
+fn pull_refuses_two_commit_operands_for_one_ref() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-two-commit-operands");
+    let base = tmp.path();
+    let (remote, c1, c2, _) = commit_operand_source(base, "remote");
+    let server = FileServer::start(&remote);
+    let main_c1 = format!("main@{c1}");
+    let main_c2 = format!("main@{c2}");
+    let rows: [(&str, &str, &str); 2] = [("main", &main_c1, &c1), (&main_c1, &main_c2, &c2)];
+    for (i, (first, second, last)) in rows.into_iter().enumerate() {
+        let client = commit_operand_client(base, &format!("port-{i}"), &server.url());
+        server.clear();
+        let run = pull_by("port", &client, &["origin", first, second]);
+        assert_eq!(run.status.code(), Some(1), "{first} {second}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "error: pull: the refs {first} and {second} write one ref \
+                 refs/remotes/origin/main\n"
+            )
+        );
+        let seen = server.seen();
+        assert!(
+            !seen.iter().any(|path| path.starts_with("objects/")),
+            "{seen:?}"
+        );
+        assert_eq!(ref_files(&client), NO_PAIRS);
+        assert_eq!(loose_objects(&client), NO_PAIRS);
+
+        if tool {
+            let client = commit_operand_client(base, &format!("tool-{i}"), &server.url());
+            pull_by("tool", &client, &["origin", first, second]).ok();
+            assert_eq!(
+                ref_files(&client),
+                vec![("refs/remotes/origin/main".to_owned(), last.to_owned())]
+            );
+        }
+    }
+}
+
+/// `-T` refuses a `CHECKSUM` operand at exit 1 before the first request,
+/// because the operand writes no ref.
+#[test]
+fn pull_timestamp_check_refuses_a_checksum_operand() {
+    let tmp = TmpDir::new("pull-timestamp-checksum-operand");
+    let base = tmp.path();
+    let (remote, c1, _, _) = commit_operand_source(base, "remote");
+    let server = FileServer::start(&remote);
+    let client = commit_operand_client(base, "client", &server.url());
+    let run = pull_by("port", &client, &["-T", "origin", &c1]);
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        format!(
+            "error: invalid input: the timestamp check against the current ref takes no \
+             commit named by its checksum with no ref: {c1}\n"
+        )
+    );
+    assert_eq!(server.seen(), Vec::<String>::new());
+    assert_eq!(ref_files(&client), NO_PAIRS);
+    assert_eq!(loose_objects(&client), NO_PAIRS);
+}
+
+/// `pull origin main@<C1>` names the commit of `main` that is not its tip,
+/// and `pull origin <C1>` names it with no ref. The port pulls from a remote
+/// that the `ostree` command wrote, and the `ostree` command pulls from a
+/// remote that the port wrote. Each pull exits 0 and requests no ref file.
+/// Each implementation leaves the objects, the refs, and the `state/` entries
+/// that the other leaves, and the `fsck` of each implementation accepts the
+/// repository that the other wrote.
+///
+/// The test does not compare the requests of the two implementations. They
+/// differ where the `config` of the remote does not state
+/// `[core] indexed-deltas=true`. For `<C1>`, they also differ where it states
+/// it: the `ostree` command requests the delta index of C1, and the port
+/// requests no delta index.
+#[test]
+fn pull_of_a_ref_at_a_checksum_crosses_the_two_implementations() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-ref-at-checksum");
+    let base = tmp.path();
+    let (tool_remote, t1, t2) = pull_local_delta_source(base, "tool-remote", &[], true);
+    let (port_remote, p1, p2, _) = commit_operand_source(base, "port-remote");
+    for (writer, remote, older, newer) in [
+        ("tool", &tool_remote, &t1, &t2),
+        ("port", &port_remote, &p1, &p2),
+    ] {
+        let server = FileServer::start(remote);
+        let main_older = format!("main@{older}");
+        for (operand, refs) in [
+            (
+                main_older.as_str(),
+                vec![("refs/remotes/origin/main".to_owned(), older.clone())],
+            ),
+            (older.as_str(), NO_PAIRS),
+        ] {
+            let mut left = Vec::new();
+            for who in ["port", "tool"] {
+                let tag = format!("{writer}-remote-{who}-{}", refs.len());
+                let client = commit_operand_client(base, &tag, &server.url());
+                server.clear();
+                pull_by(who, &client, &["origin", operand]).ok();
+                let seen = server.seen();
+                assert!(
+                    !seen.iter().any(|path| path.starts_with("refs/")),
+                    "{tag}: {seen:?}"
+                );
+                assert_eq!(ref_files(&client), refs, "{tag}");
+                assert!(holds_commit(&client, older), "{tag}");
+                assert!(!holds_commit(&client, newer), "{tag}");
+                if who == "port" {
+                    ostree_ok(&client, &["fsck"]);
+                } else {
+                    ostrya_at(&client, &["fsck"]).ok();
+                }
+                left.push(pull_result(&client));
+            }
+            assert_eq!(left[0], left[1], "{writer} remote, {operand}");
+        }
+    }
+}
+
+/// A pull of `REF@CHECKSUM` fetches the commit object, and a check then
+/// refuses the commit at exit 1: the ref binding of `nosuchref@<C1>`, the
+/// collection binding of `a@<CX>` in a repository with no collection id, and
+/// `-T` of `main@<C1>` where the ref names C3, a newer commit. Each refusal
+/// writes no object of the commit and no ref, and leaves no staging
+/// directory in `tmp/` and no `.commitpartial` marker in `state/`.
+#[test]
+fn pull_refusals_of_a_ref_at_checksum_leave_no_staging_directory() {
+    let tmp = TmpDir::new("pull-ref-at-checksum-refusals");
+    let base = tmp.path();
+    let (remote, c1, _, cx) = commit_operand_source(base, "remote");
+    let tree = base.join("remote-tree");
+    let c3 = ostrya_at(
+        &remote,
+        &[
+            "commit",
+            "-b",
+            "main",
+            "-s=three",
+            "--timestamp=@1700000100",
+            tree.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya_at(&remote, &["summary", "-u"]).ok();
+    let server = FileServer::start(&remote);
+    let rows = [
+        (
+            Vec::new(),
+            format!("nosuchref@{c1}"),
+            &c1,
+            format!(
+                "error: pull: commit {c1}: no requested ref 'nosuchref' in ref binding \
+                 metadata (main)\n"
+            ),
+        ),
+        (
+            Vec::new(),
+            format!("a@{cx}"),
+            &cx,
+            format!(
+                "error: pull: commit {cx}: collection binding metadata for a ref of a \
+                 repository with no collection id\n"
+            ),
+        ),
+        (
+            vec![("refs/remotes/origin/main".to_owned(), c3.clone())],
+            format!("main@{c1}"),
+            &c1,
+            format!(
+                "error: pull: commit {c1} (timestamp 1700000000) is chronologically older \
+                 than {c3} (timestamp 1700000100)\n"
+            ),
+        ),
+    ];
+    for (i, (refs, operand, refused, message)) in rows.iter().enumerate() {
+        let client = commit_operand_client(base, &format!("client-{i}"), &server.url());
+        let mut args = vec!["origin", operand.as_str()];
+        if !refs.is_empty() {
+            pull_by("port", &client, &["origin", "main"]).ok();
+            args.insert(0, "-T");
+        }
+        let objects_before = loose_objects(&client);
+        let tmp_before = entry_names(&client.join("tmp"));
+        server.clear();
+
+        let run = pull_by("port", &client, &args);
+        assert_eq!(run.status.code(), Some(1), "{operand}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), *message);
+        let commit = format!("objects/{}/{}.commit", &refused[..2], &refused[2..]);
+        assert_eq!(server.requests_for(&commit), 1, "{operand}");
+        assert!(!holds_commit(&client, refused), "{operand}");
+        assert_eq!(ref_files(&client), *refs, "{operand}");
+        assert_eq!(loose_objects(&client), objects_before, "{operand}");
+        let tmp_after = entry_names(&client.join("tmp"));
+        assert!(
+            !tmp_after.iter().any(|name| name.starts_with("staging-")),
+            "{operand}: {tmp_after:?}"
+        );
+        assert_eq!(tmp_after, tmp_before, "{operand}");
+        assert_eq!(
+            entry_names(&client.join("state")),
+            Vec::<String>::new(),
+            "{operand}"
+        );
+    }
+}
+
+/// Runs `pull-local --repo=<dest>` with `args` into a new `bare-user`
+/// repository at `base/<name>/repo`, by ostrya if `who` is `"port"`, and by
+/// the `ostree` command otherwise. Returns the run and the repository path.
+fn pull_local_into(base: &Path, name: &str, who: &str, args: &[&str]) -> (Run, PathBuf) {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, RepoMode::BareUser);
+    let repo_arg = format!("--repo={}", dest.display());
+    let mut argv = vec!["pull-local", repo_arg.as_str()];
+    argv.extend_from_slice(args);
+    let run = if who == "port" {
+        ostrya(&argv, None, &[])
+    } else {
+        ostree(&argv)
+    };
+    (run, dest)
+}
+
+/// `pull-local` takes each commit operand form. `main@<C1>` writes the ref of
+/// `main` to C1, which is not the tip of `main`, also with `--remote`. `<C2>`
+/// imports C2 and writes no ref, also with `--remote`. `origin:main@<C1>`
+/// writes `refs/remotes/origin/main`, and `@org.example.X:a@<CX>` writes
+/// `refs/mirrors/org.example.X/a`. `<CX>` gets no collection-binding check.
+/// An abbreviated checksum stays a revision of the source and writes the ref
+/// of its name. The `ostree` command refuses `main@<C1>` and takes `<C2>`.
+#[test]
+fn pull_local_takes_each_commit_operand_form() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-local-commit-operands");
+    let base = tmp.path();
+    let (src, c1, c2, cx) = commit_operand_source(base, "source");
+    let src_s = src.to_str().unwrap();
+    let main_c1 = format!("main@{c1}");
+    let origin_main_c1 = format!("origin:main@{c1}");
+    let x_cx = format!("@org.example.X:a@{cx}");
+    let abbrev = &c1[..10];
+    let abbrev_ref = format!("refs/heads/{abbrev}");
+    let rows: Vec<OperandRow> = vec![
+        (vec![src_s, &main_c1], vec![("refs/heads/main", &c1)], &c1),
+        (vec![src_s, &c2], vec![], &c2),
+        (
+            vec!["--remote=origin", src_s, &main_c1],
+            vec![("refs/remotes/origin/main", &c1)],
+            &c1,
+        ),
+        (vec!["--remote=origin", src_s, &c2], vec![], &c2),
+        (
+            vec!["--disable-verify-bindings", src_s, &origin_main_c1],
+            vec![("refs/remotes/origin/main", &c1)],
+            &c1,
+        ),
+        (
+            vec![src_s, &x_cx],
+            vec![("refs/mirrors/org.example.X/a", &cx)],
+            &cx,
+        ),
+        (vec![src_s, &cx], vec![], &cx),
+        (
+            vec!["--disable-verify-bindings", src_s, abbrev],
+            vec![(&abbrev_ref, &c1)],
+            &c1,
+        ),
+    ];
+    for (i, (args, refs, held)) in rows.iter().enumerate() {
+        let (run, dest) = pull_local_into(base, &format!("port-{i}"), "port", args);
+        run.ok();
+        let refs: Vec<(String, String)> = refs
+            .iter()
+            .map(|(path, commit)| ((*path).to_owned(), (*commit).to_owned()))
+            .collect();
+        assert_eq!(ref_files(&dest), refs, "{args:?}");
+        assert!(holds_commit(&dest, held), "{args:?}");
+    }
+    assert!(!holds_commit(&base.join("port-0/repo"), &c2));
+
+    if tool {
+        let (run, dest) = pull_local_into(base, "tool-ref", "tool", &[src_s, &main_c1]);
+        assert_eq!(run.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!("error: Invalid ref name {main_c1}\n")
+        );
+        assert_eq!(ref_files(&dest), NO_PAIRS);
+        assert_eq!(loose_objects(&dest), NO_PAIRS);
+        let (run, dest) = pull_local_into(base, "tool-checksum", "tool", &[src_s, &c2]);
+        run.ok();
+        assert_eq!(ref_files(&dest), NO_PAIRS);
+        assert!(holds_commit(&dest, &c2));
+    }
+}
+
+/// `pull-local` checks the commit of `REF@CHECKSUM` against `REF`. The
+/// ref-binding check of `origin:main@<C1>` reads `origin:main`. The commit of
+/// `main@<CX>` must have no collection binding in a repository with no
+/// collection id, also with `--disable-verify-bindings`. Each refusal exits 1
+/// and writes no object and no ref.
+#[test]
+fn pull_local_checks_the_bindings_of_a_commit_operand() {
+    let tmp = TmpDir::new("pull-local-commit-operand-bindings");
+    let base = tmp.path();
+    let (src, c1, _, cx) = commit_operand_source(base, "source");
+    let src_s = src.to_str().unwrap();
+    let origin_main_c1 = format!("origin:main@{c1}");
+    let main_cx = format!("main@{cx}");
+    let rows: [(Vec<&str>, String); 2] = [
+        (
+            vec![src_s, &origin_main_c1],
+            format!(
+                "pull: commit {c1}: no requested ref 'origin:main' in ref binding metadata (main)"
+            ),
+        ),
+        (
+            vec!["--disable-verify-bindings", src_s, &main_cx],
+            format!(
+                "pull: commit {cx}: collection binding metadata for a ref of a repository with \
+                 no collection id"
+            ),
+        ),
+    ];
+    for (i, (args, message)) in rows.iter().enumerate() {
+        let (run, dest) = pull_local_into(base, &format!("dest-{i}"), "port", args);
+        refused_with_message(&run, message);
+        assert_eq!(ref_files(&dest), NO_PAIRS, "{args:?}");
+        assert_eq!(loose_objects(&dest), NO_PAIRS, "{args:?}");
+    }
+}
+
+/// `pull-local SRC <CX>` makes no collection-binding check of CX. From a source
+/// whose collection id is `org.example.Other`, the port imports CX, a commit
+/// bound to `org.example.X`, and writes no ref. The `ostree` command compares
+/// the binding with the collection id of the source, and refuses CX at exit 1.
+#[test]
+fn pull_local_checksum_operand_gets_no_collection_check() {
+    let tool = ostree_available();
+    let tmp = TmpDir::new("pull-local-checksum-collection");
+    let base = tmp.path();
+    let (src, _, _, cx) = commit_operand_source(base, "source");
+    ostrya_at(
+        &src,
+        &["config", "set", "core.collection-id", "org.example.Other"],
+    )
+    .ok();
+    let src_s = src.to_str().unwrap();
+
+    let (run, dest) = pull_local_into(base, "port", "port", &[src_s, &cx]);
+    run.ok();
+    assert!(holds_commit(&dest, &cx));
+    assert_eq!(ref_files(&dest), NO_PAIRS);
+
+    if tool {
+        let (run, dest) = pull_local_into(base, "tool", "tool", &[src_s, &cx]);
+        assert_eq!(run.status.code(), Some(1));
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!(
+                "error: Commit {cx}: Commit has collection ID \u{2018}org.example.X\u{2019} in \
+                 collection binding metadata, while the remote it came from has collection ID \
+                 \u{2018}org.example.Other\u{2019}\n"
+            )
+        );
+        assert_eq!(ref_files(&dest), NO_PAIRS);
+        assert_eq!(loose_objects(&dest), NO_PAIRS);
+    }
+}
+
+/// `pull-local` refuses a malformed commit operand with `Invalid refspec` and
+/// the operand as given, and two operands that write one ref, `main` beside
+/// `main@<C1>` included. With `--remote=origin`, it refuses
+/// `origin:main@<C1>`, which gives no valid ref. Each refusal exits 1 and
+/// writes no object and no ref.
+#[test]
+fn pull_local_refuses_a_malformed_commit_operand() {
+    let tmp = TmpDir::new("pull-local-malformed-commit-operand");
+    let base = tmp.path();
+    let (src, c1, _, _) = commit_operand_source(base, "source");
+    let src_s = src.to_str().unwrap();
+    let main_c1 = format!("main@{c1}");
+    let mut rows: Vec<(Vec<String>, String)> = [
+        "main@".to_owned(),
+        format!("main@{}", &c1[..10]),
+        format!("main@{}", c1.to_uppercase()),
+        format!("main@{c1}^"),
+    ]
+    .into_iter()
+    .map(|operand| {
+        let message = format!("Invalid refspec {operand}");
+        (vec![src_s.to_owned(), operand], message)
+    })
+    .collect();
+    rows.push((
+        vec![src_s.to_owned(), "main".to_owned(), main_c1.clone()],
+        format!("pull: the refs main and {main_c1} write one ref refs/heads/main"),
+    ));
+    rows.push((
+        vec![
+            "--remote=origin".to_owned(),
+            src_s.to_owned(),
+            format!("origin:{main_c1}"),
+        ],
+        "Invalid refspec origin:origin:main".to_owned(),
+    ));
+    for (i, (args, message)) in rows.iter().enumerate() {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (run, dest) = pull_local_into(base, &format!("dest-{i}"), "port", &args);
+        refused_with_message(&run, message);
+        assert_eq!(ref_files(&dest), NO_PAIRS, "{args:?}");
+        assert_eq!(loose_objects(&dest), NO_PAIRS, "{args:?}");
+    }
+}
+
 // --- media export ------------------------------------------------------------
 
 /// Returns the lines that `media export` prints on standard output: the media

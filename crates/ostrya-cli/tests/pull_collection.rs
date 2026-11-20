@@ -509,6 +509,142 @@ fn an_operand_of_another_collection_is_refused_before_a_request() {
     assert!(!client.join("refs/mirrors").join(ID).exists());
 }
 
+/// Returns `true` if the archive repository `repo` holds the commit object of
+/// `commit`.
+fn holds_commit(repo: &Path, commit: &str) -> bool {
+    repo.join("objects")
+        .join(&commit[..2])
+        .join(format!("{}.commit", &commit[2..]))
+        .is_file()
+}
+
+/// A commit operand names the commit that the pull takes. `REF@<A1>` writes
+/// `refs/mirrors/ID/REF` to A1, which is not the tip of REF on the candidate,
+/// and `@ID:REF@<A1>` beside it counts as the same operand.
+/// `@ID:os/next@<N>` writes `refs/mirrors/ID/os/next`. `<A2>` fetches A2 and
+/// writes no ref. Into a repository whose collection id is ID, `REF@<A1>`
+/// writes `refs/heads/REF`.
+#[test]
+fn collection_commit_operands_name_the_commit() {
+    let dir = TmpDir::new("commit-operands");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    let a1 = commit(&a, "a1", REF, TS);
+    let a2 = commit(&a, "a2", REF, TS + 10);
+    let next = commit(&a, "n1", "os/next", TS);
+    let serving = Serving::start(&a);
+    let ref_a1 = format!("{REF}@{a1}");
+    let id_ref_a1 = format!("@{ID}:{REF}@{a1}");
+    let id_next = format!("@{ID}:os/next@{next}");
+    let mirrors = format!("refs/mirrors/{ID}");
+
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", &serving.url, ID));
+    let out = ostrya(
+        &client,
+        &["pull", "--collection", ID, &ref_a1, &id_ref_a1, &id_next],
+    );
+    assert_pulled(&out, 0);
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/{REF}")),
+        Some(a1.clone())
+    );
+    assert_eq!(
+        ref_file(&client, &format!("{mirrors}/os/next")),
+        Some(next.clone())
+    );
+    assert!(!holds_commit(&client, &a2));
+
+    let bare = dir.path().join("bare");
+    init(&bare, None);
+    configure(&bare, &http_remote("a", &serving.url, ID));
+    let out = ostrya(&bare, &["pull", "--collection", ID, &a2]);
+    assert_pulled(&out, 0);
+    assert!(holds_commit(&bare, &a2));
+    assert!(!bare.join(&mirrors).exists());
+    assert!(!bare.join("refs/heads").join(&a2).exists());
+
+    let own = dir.path().join("own");
+    init(&own, Some(ID));
+    configure(&own, &http_remote("a", &serving.url, ID));
+    let out = ostrya(&own, &["pull", "--collection", ID, &ref_a1]);
+    assert_pulled(&out, 0);
+    assert_eq!(ref_file(&own, &format!("refs/heads/{REF}")), Some(a1));
+    assert!(!own.join(&mirrors).exists());
+    ok(&own, &["fsck"]);
+}
+
+/// REF and @ID:REF name one ref of the collection, and count as one operand.
+/// The pull takes the tip A2 of REF and writes `refs/mirrors/ID/REF` to it.
+/// The pull refuses REF beside REF@CHECKSUM, and REF@<C1> beside
+/// @ID:REF@<C2>, which write one ref with two different texts.
+#[test]
+fn the_two_forms_of_one_collection_ref_count_as_one_operand() {
+    let dir = TmpDir::new("two-forms-one-operand");
+    let a = dir.path().join("a");
+    init(&a, Some(ID));
+    commit(&a, "a1", REF, TS);
+    let a2 = commit(&a, "a2", REF, TS + 10);
+    let serving = Serving::start(&a);
+    let id_ref = format!("@{ID}:{REF}");
+
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", &serving.url, ID));
+    let out = ostrya(&client, &["pull", "--collection", ID, REF, &id_ref]);
+    assert_pulled(&out, 0);
+    assert_eq!(
+        ref_file(&client, &format!("refs/mirrors/{ID}/{REF}")),
+        Some(a2)
+    );
+}
+
+/// A malformed commit operand, REF beside REF@CHECKSUM, and REF@<C1> beside
+/// @ID:REF@<C2>, fail the pull with exit 1 before the first request, so the
+/// candidate at a closed port gives no warning. REF@CHECKSUM and
+/// @ID:REF@CHECKSUM count as one operand only with one checksum. The pull
+/// writes no ref.
+#[test]
+fn a_malformed_collection_commit_operand_is_refused_before_a_request() {
+    let dir = TmpDir::new("malformed-commit-operand");
+    let client = dir.path().join("client");
+    init(&client, None);
+    configure(&client, &http_remote("a", "http://127.0.0.1:1/", ID));
+    let checksum = "5a".repeat(32);
+    let ref_at = format!("{REF}@{checksum}");
+    let ref_at_empty = format!("{REF}@");
+    let id_ref_at_other = format!("@{ID}:{REF}@{}", "6b".repeat(32));
+
+    for (operands, message) in [
+        (
+            vec![ref_at_empty.as_str()],
+            format!("error: Invalid refspec {REF}@\n"),
+        ),
+        (
+            vec![REF, ref_at.as_str()],
+            format!(
+                "error: pull: the refs {REF} and {ref_at} write one ref refs/mirrors/{ID}/{REF}\n"
+            ),
+        ),
+        (
+            vec![ref_at.as_str(), id_ref_at_other.as_str()],
+            format!(
+                "error: pull: the refs {ref_at} and {id_ref_at_other} write one ref \
+                 refs/mirrors/{ID}/{REF}\n"
+            ),
+        ),
+    ] {
+        let mut args = vec!["pull", "--collection", ID];
+        args.extend_from_slice(&operands);
+        let out = ostrya(&client, &args);
+        assert_eq!(out.status.code(), Some(1), "{operands:?}");
+        assert_eq!(stdout(&out), "");
+        assert_eq!(stderr(&out), message);
+        assert!(!client.join("refs/mirrors").join(ID).exists());
+    }
+}
+
 /// A remote whose `mirrored-collection-ids` holds ID, with no
 /// `collection-id`, is a candidate, and its server gives the ref from
 /// `refs/mirrors/ID/`. A remote of another collection that does not mirror

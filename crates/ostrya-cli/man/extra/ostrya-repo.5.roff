@@ -499,7 +499,10 @@ A summary that names a static delta that a prune deleted stays as it is until an
 A pull of a named ref reads the ref file when the summary does not list the ref.
 A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.
 A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya pull \-\-collection\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
-\fB\%ostrya pull \-\-collection\fR reads the refs of the collection from the summary alone, and skips a bucket repository with no summary.
+A commit operand names a commit by its checksum, as \fB\%ostrya\-pull\fR(1) states.
+A pull and \fB\%ostrya pull \-\-collection\fR whose operands are all commit operands read no summary, and need none.
+\fB\%ostrya pull \-\-collection\fR reads the refs of the collection from the summary alone.
+In a pull with no operand or with an operand that is not a commit operand, it skips a bucket repository with no summary.
 \fB\%ostrya remote fsck\fR reports a summary that differs from the ref files or from the deltas as a note, and a summary that names a commit or a delta that the bucket does not hold as an error.
 .TP
 \fB\%objects/<xx>/<62 hex digits>.<ext>\fR

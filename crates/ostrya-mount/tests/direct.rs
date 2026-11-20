@@ -10,16 +10,17 @@
 //! value of the repository config to the mounter. The tests check these
 //! facts:
 //!
-//! - With `verity=off`, a stored image with fs-verity digests mounts on
-//!   objects without a seal, in `bare-user` and in `bare`, and the mounted
-//!   tree is the committed tree.
-//! - With `verity=require`, a stored image mounts on sealed objects. A
-//!   changed object fails to open, with a seal and without one. With
-//!   `verity=off`, the same object reads its new bytes.
-//! - An image that the test builds in a memory file and the stored image
-//!   give the same tree, with `verity=off` and with `verity=require`.
-//! - The unmount detaches the loop device, for an image file and for a
-//!   memory file.
+//! - With `verity=off`, the image of an image commit, with fs-verity
+//!   digests, mounts on objects without a seal, in `bare-user` and in
+//!   `bare`, and the mounted tree is the committed tree.
+//! - With `verity=require`, the image of an image commit mounts on sealed
+//!   objects. A changed object fails to open, with a seal and without one.
+//!   With `verity=off`, the same object reads its new bytes.
+//! - An image that the test builds in a memory file and the image of the
+//!   image commit give the same tree, with `verity=off` and with
+//!   `verity=require`.
+//! - The unmount detaches the loop device, for the image file of an image
+//!   commit and for a memory file.
 //! - A read-write mount writes each change to `<target>/overlay`, and the
 //!   repository does not change.
 //! - An unmount of a mount in use fails with `EBUSY`.
@@ -29,10 +30,10 @@
 
 mod common;
 
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use ostrya::{Checksum, Repo, RepoMode};
+use ostrya::{Checksum, ComposefsImage, Repo, RepoMode};
 use ostrya_mount::{Access, Direct, Error, MountOptions};
 use ostrya_rt::block_on;
 use rustix::io::Errno;
@@ -75,17 +76,20 @@ fn walk_mount(target: &Path) -> Vec<Entry> {
     walk(target, &INJECTED_DIRS)
 }
 
-/// Mounts the stored image of `commit` at `target`, with the `objects`
-/// directory and the `verity` value of `repo`.
+/// Mounts the image of the image commit that `commit` names at `target`,
+/// with the `objects` directory and the `verity` value of `repo`. Returns
+/// the root of the mount and the opened image.
 async fn mount_stored(
     repo: &Repo,
     commit: &Checksum,
     target: &Path,
     opts: &MountOptions,
-) -> Result<OwnedFd, Error> {
+) -> Result<(OwnedFd, ComposefsImage), Error> {
     let image = stored_image(repo, commit).await;
     let (verity, _) = verity_of(repo);
-    Direct::new().mount_image(image.as_fd(), repo.objects_dir(), verity, target, opts)
+    Direct::new()
+        .mount_image(image.file.as_fd(), repo.objects_dir(), verity, target, opts)
+        .map(|root| (root, image))
 }
 
 /// Builds the image of `commit` in a memory file and mounts it at `target`,
@@ -101,17 +105,22 @@ async fn mount_built(
     Direct::new().mount_image(image.as_fd(), repo.objects_dir(), verity, target, opts)
 }
 
-/// Mounts the stored image of `commit` read-only at `target`, walks the
-/// tree, and unmounts it.
-async fn stored_tree(repo: &Repo, commit: &Checksum, target: &Path) -> Vec<Entry> {
+/// Mounts the image of the image commit that `commit` names read-only at
+/// `target`, walks the tree, and unmounts it. Returns the tree and the
+/// opened image.
+async fn stored_tree(
+    repo: &Repo,
+    commit: &Checksum,
+    target: &Path,
+) -> (Vec<Entry>, ComposefsImage) {
     let direct = Direct::new();
-    let root = mount_stored(repo, commit, target, &read_only())
+    let (root, image) = mount_stored(repo, commit, target, &read_only())
         .await
         .unwrap();
     drop(root);
     let tree = walk_mount(target);
     direct.unmount(target).unwrap();
-    tree
+    (tree, image)
 }
 
 /// Mounts the built image of `commit` read-only at `target`, walks the tree,
@@ -145,9 +154,8 @@ fn verity_off_mounts_a_computed_image_on_unsealed_objects() {
             )
             .await;
             let commit = commit_tree(&repo, &base, 10, Key::Image).await;
-            let image = repo.composefs_image_path(&commit);
-            assert_eq!(std::fs::metadata(&image).unwrap().len() % 4096, 0);
-            let tree = stored_tree(&repo, &commit, &target).await;
+            let (tree, image) = stored_tree(&repo, &commit, &target).await;
+            assert_eq!(image.size % 4096, 0);
             assert_eq!(tree, walk(&base.join("src"), &[]), "{mode:?}");
         });
         assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
@@ -173,7 +181,7 @@ fn verity_require_mounts_sealed_objects_and_fails_on_a_changed_object() {
         let direct = Direct::new();
         let source = walk(&base.join("src"), &[]);
 
-        assert_eq!(stored_tree(&repo, &commit, &target).await, source);
+        assert_eq!(stored_tree(&repo, &commit, &target).await.0, source);
 
         // An unsealed object with other bytes of the same size.
         let object = object_with_content(&root, HELLO);
@@ -247,7 +255,7 @@ fn mount_built_and_mount_stored_give_the_same_tree() {
             )
             .await;
             let commit = commit_tree(&repo, &base, timestamp, Key::Image).await;
-            let stored = stored_tree(&repo, &commit, &stored_at).await;
+            let (stored, _) = stored_tree(&repo, &commit, &stored_at).await;
             let built = built_tree(&repo, &commit, &built_at).await;
             assert_eq!(built, stored, "fsverity={fsverity}");
             assert_eq!(stored, walk(&base.join("src"), &[]));
@@ -288,13 +296,12 @@ fn unmount_frees_the_loop_device() {
         let commit = commit_tree(&repo, &base, 40, Key::Image).await;
         let direct = Direct::new();
 
-        drop(
-            mount_stored(&repo, &commit, &target, &read_only())
-                .await
-                .unwrap(),
-        );
-        let image = repo.composefs_image_path(&commit);
-        let image = std::fs::canonicalize(image).unwrap();
+        let (root, image) = mount_stored(&repo, &commit, &target, &read_only())
+            .await
+            .unwrap();
+        drop(root);
+        let image =
+            std::fs::read_link(format!("/proc/self/fd/{}", image.file.as_raw_fd())).unwrap();
         let image = image.to_str().unwrap();
         let number = loop_device_of(image, false).expect("a loop device");
         direct.unmount(&target).unwrap();
@@ -376,7 +383,7 @@ fn an_unmount_of_a_mount_in_use_fails() {
         let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
         let commit = commit_tree(&repo, &base, 60, Key::Image).await;
         let direct = Direct::new();
-        let root = mount_stored(&repo, &commit, &target, &read_only())
+        let (root, _image) = mount_stored(&repo, &commit, &target, &read_only())
             .await
             .unwrap();
         let err = direct.unmount(&target).unwrap_err();
@@ -476,7 +483,13 @@ fn the_flags_of_the_options_show_on_the_mount() {
         let (verity, _) = verity_of(&repo);
         let mount = |opts: &MountOptions| {
             direct
-                .mount_image(image.as_fd(), repo.objects_dir(), verity, &target, opts)
+                .mount_image(
+                    image.file.as_fd(),
+                    repo.objects_dir(),
+                    verity,
+                    &target,
+                    opts,
+                )
                 .unwrap()
         };
         for access in [Access::ReadOnly, Access::ReadWrite] {

@@ -1,16 +1,16 @@
 .TH "OSTRYA\-COMPOSEFS\-IMAGE" "1" "" "ostrya" "User Commands"
 .SH NAME
-ostrya\-composefs\-image \- Write, locate, or check the composefs image of a commit
+ostrya\-composefs\-image \- Write the composefs image of a commit as an image commit
 .SH SYNOPSIS
 .nf
-ostrya composefs\-image [OPTIONS] <\-\-add <REV>|\-\-get\-path <REV>|\-\-check <REV>>
+ostrya composefs\-image [OPTIONS] \-\-add <REV>
 .fi
 .SH DESCRIPTION
-Write, locate, or check the composefs image of a commit.
+Write the composefs image of a commit as an image commit.
 .PP
-\%\-\-add writes the image commit of a commit and names it as the supplement \fB\%composefs\fR of the commit. \%\-\-get\-path and \%\-\-check read the stored image of a commit: the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR of the repository, where \fB\%<xx><rest>\fR is the checksum of the commit. The command takes exactly one of \%\-\-add, \%\-\-get\-path, and \%\-\-check.
+\%\-\-add writes the image commit of a commit and names it as the supplement \fB\%composefs\fR of the commit. The option is required.
 .PP
-\%\-\-add and \%\-\-check print nothing on success, and \%\-\-get\-path prints one line. If the action fails, the command writes one \fB\%error:\fR line to standard error and exits \%1. This command is an extension of ostrya.
+The command prints nothing on success. If the action fails, the command writes one \fB\%error:\fR line to standard error and exits \%1. This command is an extension of ostrya.
 .SH OPTIONS
 .TP
 \fB\-\-add\fR \fIREV\fR
@@ -23,16 +23,6 @@ The command does not write again an object that the repository already holds. If
 If REV carries \fB\%ostree.composefs.digest.v0\fR and the \%fs\-verity digest of the built image is not the value of the key, the command refuses REV and names both digests. If REV has no key, the command makes no check. A refusal writes no object and no supplement. The command works in each repository mode. It does not refuse a partial commit, and the build fails if an object of the tree is absent.
 .IP
 No transfer copies a supplement. A pull of REV copies its detached metadata, and not the image commit.
-.TP
-\fB\-\-get\-path\fR \fIREV\fR
-Print the absolute path of the stored image of the commit REV.
-.IP
-The command does not read the image. If the image is absent, the command exits \%1.
-.TP
-\fB\-\-check\fR \fIREV\fR
-Check the stored image of the commit REV against the key of the commit.
-.IP
-The command reads the whole image and computes its \%fs\-verity digest. It exits \%0 if the digest is the value of \fB\%ostree.composefs.digest.v0\fR\&. It exits \%1 if the image is absent, if the commit does not carry the key, or if the digests are different. The error line names the reason, and for different digests it names both digests.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

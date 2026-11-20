@@ -265,7 +265,8 @@ pub(crate) enum RepoLayout {
     Refs,
     /// `state/`, the markers of partial commits.
     State,
-    /// `extensions/`, the files of the extensions, such as the image store.
+    /// `extensions/`, the files of the extensions, such as the summaries of
+    /// the client groups.
     Extensions,
     /// `deltas/`, the static deltas.
     Deltas,

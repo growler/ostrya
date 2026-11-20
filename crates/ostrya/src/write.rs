@@ -724,12 +724,6 @@ impl Transaction {
     /// [`write_commit_checked`](Transaction::write_commit_checked) writes the
     /// entries that [`check_attachments`](Transaction::check_attachments) checked.
     ///
-    /// The call does not record a commit as complete, because a pull writes
-    /// partial commits through it. So a commit that it writes gets no
-    /// composefs image under `[ex-ostrya] generate-composefs`. A caller that
-    /// writes a complete commit uses
-    /// [`write_commit_checked`](Transaction::write_commit_checked).
-    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`,
@@ -1227,108 +1221,6 @@ pub(crate) fn stage_metadata_blocking(
     })
 }
 
-/// A composefs image in a temp file of the staging directory, not yet linked
-/// under its staging name.
-///
-/// [`write_image_temp_blocking`] makes it, and [`link_image_blocking`] links
-/// it. A drop of the image removes its temp file.
-pub(crate) struct ImageTemp {
-    /// The temp file. It is read-only if the image is sealed.
-    pub(crate) temp: TempFile,
-    /// The fs-verity digest of the image bytes, which the writer computed as
-    /// it wrote them.
-    pub(crate) digest: [u8; 32],
-    /// The size of the image file in bytes.
-    pub(crate) size: u64,
-}
-
-/// Writes the composefs image of `dir` to a temp file in the staging
-/// directory `staging`.
-///
-/// The function runs these steps:
-///
-/// 1. It makes a temp file with [`TempFile::create`].
-/// 2. It writes the image through a buffer of 128 KiB, and the writer
-///    computes the fs-verity digest of the bytes that it writes. No step holds
-///    the whole image.
-/// 3. It sets the mode 0644 with `fchmod`, so the umask does not change the
-///    mode. A seal needs write permission on the inode, and the mode gives it.
-/// 4. If `do_fsync` is set, it runs `fsync` on the file.
-/// 5. If `verity` is not [`Tristate::No`], it seals the file with
-///    [`TempFile::seal`], which closes the writable descriptor. If the file
-///    is sealed, the function reads the digest of the seal from the kernel
-///    with [`repo_fs::verity_digest`]. If the kernel digest is not the digest
-///    of the writer, the function fails with [`Error::InvalidFormat`]. If the
-///    digest cannot be read, the function fails with [`Error::Unsupported`]
-///    under [`Tristate::Yes`], and continues under [`Tristate::Maybe`].
-///
-/// On a failure, the drop of the temp file removes it.
-pub(crate) fn write_image_temp_blocking(
-    staging: &RepoDir,
-    dir: &ostrya_composefs::Directory,
-    do_fsync: bool,
-    verity: Tristate,
-) -> Result<ImageTemp> {
-    let mut temp = TempFile::create(staging)?;
-    let mut out =
-        std::io::BufWriter::with_capacity(crate::composefs::DIGEST_CHUNK, temp.file_mut());
-    let digest =
-        ostrya_composefs::write_image_to(dir, &mut out).map_err(crate::composefs::writer_error)?;
-    out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
-    temp.set_mode(FIXED_MODE)?;
-    if do_fsync {
-        temp.sync()?;
-    }
-    let size = repo_fs::stat_fd(temp.file_mut().as_fd())?.size;
-    if seal_temp(&mut temp, verity)? {
-        match repo_fs::verity_digest(temp.file_mut().as_fd(), size) {
-            Some(sealed) if sealed != digest => {
-                return Err(Error::InvalidFormat(format!(
-                    "the fs-verity digest of the sealed composefs image is {}, and the \
-                     writer computed {}",
-                    crate::composefs::digest_hex(&sealed),
-                    crate::composefs::digest_hex(&digest)
-                )));
-            }
-            Some(_) => {}
-            None if verity == Tristate::Maybe => {}
-            None => {
-                return Err(Error::Unsupported(
-                    "the fs-verity digest of the sealed composefs image cannot be read".into(),
-                ));
-            }
-        }
-    }
-    Ok(ImageTemp { temp, digest, size })
-}
-
-/// Links a composefs image temp into the staging directory `staging` as the
-/// image of `commit`, under the name `<checksum>.cfs`.
-///
-/// The publish keeps an image that the transaction staged under the name.
-/// The function returns the outcome for the record of the image. Its `dest`
-/// is the path of the image under `extensions/ostrya/composefs/`. The image
-/// is never a dedup hit: the caller decides if a stored image stays. On a
-/// failure, the drop of the temp file removes it.
-pub(crate) fn link_image_blocking(
-    staging: &RepoDir,
-    image: ImageTemp,
-    commit: &Checksum,
-) -> Result<StageOutcome> {
-    let staging_name = crate::image_store::staging_name(commit);
-    image
-        .temp
-        .publish(staging, &staging_name, Publish::KeepExisting, false)?;
-    Ok(StageOutcome {
-        deduped: false,
-        on_disk_size: image.size,
-        blocks: Blocks::Written,
-        unpacked: 0,
-        staging_name,
-        dest: crate::image_store::rel_path(commit),
-    })
-}
-
 /// Imports one loose object of another repository into the staging directory.
 ///
 /// The function does not read the payload. It hardlinks the object, so the
@@ -1667,8 +1559,8 @@ fn clone_metadata(
     Ok((opened.stat.size, blocks))
 }
 
-/// Publishes staged objects into `objects/`, and then staged composefs images
-/// into `extensions/ostrya/composefs/`, in the order of the durability rules.
+/// Publishes staged objects into `objects/`, in the order of the durability
+/// rules.
 ///
 /// 1. If `syncfs` is set, the function runs `syncfs` on the repository.
 /// 2. It moves each object from `staging` into `objects/<xx>/` with
@@ -1680,18 +1572,14 @@ fn clone_metadata(
 /// 3. If `fsync` is set, it runs `fsync` on each fan-out directory that got
 ///    a new entry. Then, if one or more fan-out directories got a new entry,
 ///    it runs `fsync` one time on `objects/`.
-/// 4. It renames each image into the store, as
-///    [`image_store::publish_blocking`](crate::image_store::publish_blocking)
-///    states, with the same `fsync`.
 ///
 /// A caller clears `syncfs` with fsync on only if a `syncfs` after the staging
-/// of the last object and the last image already made them durable.
+/// of the last object already made the objects durable.
 pub(crate) fn publish_blocking(
     root: &RepoDir,
     objects: &RepoDir,
     staging: &RepoDir,
     staged: &[(String, String)],
-    images: &[(String, String)],
     syncfs: bool,
     fsync: bool,
 ) -> Result<()> {
@@ -1714,7 +1602,7 @@ pub(crate) fn publish_blocking(
         }
         root.sync_dir("objects")?;
     }
-    crate::image_store::publish_blocking(root, staging, images, fsync)
+    Ok(())
 }
 
 /// Moves the entry `src_path` of `src` to the loose path `dest` below

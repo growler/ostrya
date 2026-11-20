@@ -97,8 +97,6 @@ pub(super) fn cut(message: &mut String) {
 /// - the objects of the session
 /// - the collection anchor ref and the rule of the policy
 /// - the completeness of the tree
-/// - the form of the key `ostree.composefs.digest.v0` under
-///   `[ex-ostrya] generate-composefs` (`protocol`)
 ///
 /// Then the staged objects become durable, and the hook runs. If the commit
 /// fails one of these checks, it does not call the hook.
@@ -108,13 +106,6 @@ pub(super) fn cut(message: &mut String) {
 /// in one namespace. The new commit does not exist yet, because the server
 /// builds it under the update lock. The hook gives no detached-metadata
 /// entries.
-///
-/// After the hook and before the update lock, under
-/// `[ex-ostrya] generate-composefs`, the commit builds the composefs image of
-/// the tree and checks its digest against the key. An image whose digest is
-/// not the key is `checksum-mismatch`, and each other failure of the build is
-/// `internal`. After a failure, the carried value drops once, and
-/// `after_update` does not run.
 ///
 /// These checks run after the hook, under the update lock, in this order:
 ///
@@ -134,7 +125,7 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// A host that does not implement `before_server_commit` refuses each server
 /// commit with `ref-denied`, after the staged objects become durable and
-/// before the image build and the update lock.
+/// before the update lock.
 ///
 /// # The entries of the host
 ///
@@ -246,9 +237,8 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// The host can put the guards of its locks in [`UpdatePlan::carried`] or in
 /// the value that `before_server_commit` returns. Then the guards stay held
-/// from the hook, across the image build of a server commit, the wait for the
-/// update lock, and the ref update, until `after_update` drops the carried
-/// value.
+/// from the hook, across the wait for the update lock and the ref update,
+/// until `after_update` drops the carried value.
 /// `carried` is a `Box<dyn Any + Send>`, which is `'static`, so each guard in
 /// it must be an owned guard. The session does not examine the contents of
 /// `carried`.

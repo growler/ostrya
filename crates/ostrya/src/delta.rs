@@ -427,12 +427,6 @@ impl Repo {
     /// the repository, the attachments of the target must be complete, and
     /// the call sets no ref.
     ///
-    /// If the call stages the target commit object, it records the target as
-    /// complete. If `[ex-ostrya] generate-composefs` is `true` and the target
-    /// carries `ostree.composefs.digest.v0`, the commit of the transaction then
-    /// builds and stores its composefs image. A target that the repository
-    /// holds already, complete or partial, is not staged, so it gets no image.
-    ///
     /// # Errors
     ///
     /// - [`Error::ObjectNotFound`] if a fallback object of the delta, or a
@@ -472,9 +466,7 @@ impl Repo {
     ///   `yes` and the seal of an object fails.
     /// - The errors of [`Repo::transaction`], before the call writes an
     ///   object.
-    /// - The errors of [`Transaction::commit`](crate::Transaction::commit),
-    ///   the image build included. On an error of the image build, the call
-    ///   publishes no object.
+    /// - The errors of [`Transaction::commit`](crate::Transaction::commit).
     pub async fn apply_static_delta(
         &self,
         mut sb: DeltaSuperblock,
@@ -544,11 +536,6 @@ impl Repo {
             }
         }
 
-        // A target that the repository holds already, complete or partial,
-        // is not staged, and gets no image.
-        if txn.is_staged(&sb.to, ObjectType::Commit) {
-            txn.mark_complete(&sb.to);
-        }
         txn.commit().await?;
         Ok(sb.to)
     }

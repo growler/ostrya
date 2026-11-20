@@ -15,7 +15,6 @@ use super::hooks::{self, HookRefusal, ReceiveHooks, ReceiveServerCommit};
 use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveCommit, ReceiveRefOutcome};
 use super::walk;
-use crate::composefs::{StagedComposefsImage, digest_hex, entries_digest};
 use crate::error::Error;
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message, ServerCommit};
 use crate::remote::{self, RefOutcome};
@@ -23,7 +22,6 @@ use crate::repo::Repo;
 use crate::server_commit::{CommitFields, clock, commit_bytes};
 use crate::summary::OSTREE_METADATA_REF;
 use crate::transaction::Transaction;
-use crate::tree::RepoTree;
 
 /// The type of a `v` at the depth of a metadata value in a commit.
 ///
@@ -68,21 +66,12 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 ///
 /// # Hooks
 ///
-/// After the checks, if `[ex-ostrya] generate-composefs` of the repository is
-/// `true` and the metadata of the commit carries `ostree.composefs.digest.v0`,
-/// this function reads the key. A malformed key is `protocol`. Then the
-/// staged objects become durable. If `hooks` are given,
+/// After the checks, the staged objects become durable. If `hooks` are given,
 /// [`ReceiveHooks::before_server_commit`] runs next with the server commit
 /// and the canonical name of its branch and of each tag. If the hook
 /// refuses, the session ends with the code of the refusal. The default method
 /// of the trait refuses with `ref-denied`, so a host without the method
 /// refuses each server commit at this step.
-///
-/// After the hook and before the update lock, if this function read a key, it
-/// builds the composefs image of the tree and checks its digest against the
-/// key. An image whose digest is not the key is `checksum-mismatch`. Each
-/// other failure of the build is `internal`. After a failure, nothing is
-/// published.
 ///
 /// If a failure occurs after the hook, the carried value drops once. If the
 /// update lock is held, it drops after the release of the lock.
@@ -109,12 +98,6 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 /// client, else the system clock. The server keys of the rule sign the
 /// commit. The branch moves to the commit, and each tag is created at the
 /// commit. A bound name gets no ref. A failure of the build is `internal`.
-///
-/// If `[ex-ostrya] generate-composefs` of the repository is `true` and the
-/// metadata of the commit carries `ostree.composefs.digest.v0`, the image of
-/// the tree is built after the hook and before the update lock. This step
-/// stages it as the composefs image of the commit. A commit that the
-/// repository holds already gets no image.
 ///
 /// The steps of [`publish`] follow. The report holds the outcome of the
 /// branch, then the outcome of each tag.
@@ -189,7 +172,6 @@ pub(super) async fn finish(
             "the tree of the server commit reaches",
         ));
     }
-    let key = image_key(&txn, &sc)?;
     txn.sync_staged().await.map_err(Failure::Internal)?;
 
     // Declared before the update lock, so on each failure the carried value
@@ -203,12 +185,6 @@ pub(super) async fn finish(
                 .await
                 .map_err(HookRefusal::into_failure)?,
         ),
-    };
-    // The future of the build is large. The box keeps it out of the future
-    // of the session.
-    let image = match key {
-        Some(key) => Some(Box::pin(build_image(&txn, &sc, key)).await?),
-        None => None,
     };
     let held = repo.lock_update().await.map_err(Failure::Internal)?;
     let anchor = policy.regenerates_summary() && repo.config().collection_id().is_some();
@@ -287,13 +263,6 @@ pub(super) async fn finish(
         .write_metadata(ObjectType::Commit, None, &bytes)
         .await
         .map_err(Failure::Internal)?;
-    // A commit that the repository holds already is not staged, and gets no
-    // image.
-    if let Some(image) = image.filter(|_| txn.is_staged(&commit, ObjectType::Commit)) {
-        Box::pin(txn.attach_composefs_image(&commit, image))
-            .await
-            .map_err(Failure::Internal)?;
-    }
     sign_server_commit(repo, &txn, commit, &bytes, rule.signers).await?;
     drop(bytes);
 
@@ -338,52 +307,6 @@ pub(super) async fn finish(
         return Err(Failure::Wire(remote::Error::Internal(message)));
     }
     Ok(ReceiveCommit { report, reply })
-}
-
-/// Returns the digest that `ostree.composefs.digest.v0` of `sc` records,
-/// under `[ex-ostrya] generate-composefs`.
-///
-/// Returns `None` with the key `false` or with no digest key. This step
-/// reads no tree, so it runs before the hook of the host. A malformed key is
-/// `protocol`. An error of the config read is `internal`.
-fn image_key(txn: &Transaction, sc: &ReceiveServerCommit) -> Checked<Option<[u8; 32]>> {
-    if !txn
-        .repo()
-        .config()
-        .generate_composefs()
-        .map_err(Failure::Internal)?
-    {
-        return Ok(None);
-    }
-    entries_digest(&sc.metadata).map_err(|e| protocol(e.to_string()))
-}
-
-/// Builds the composefs image of the tree of `sc` and checks the digest of
-/// the image against `key`.
-///
-/// The build runs after the hook of the host, so a request that the host
-/// refuses reads no tree. It runs before the update lock, so the other
-/// writers of refs do not wait for it. An image whose digest is not `key` is
-/// `checksum-mismatch`. Each other error of the build is `internal`.
-async fn build_image<'t>(
-    txn: &'t Transaction,
-    sc: &ReceiveServerCommit,
-    key: [u8; 32],
-) -> Checked<StagedComposefsImage<'t>> {
-    let tree = RepoTree::from_parts(txn.repo().clone(), sc.root_dirtree, sc.root_dirmeta);
-    let image = txn
-        .build_composefs_image(&tree)
-        .await
-        .map_err(Failure::Internal)?;
-    if *image.digest() != key {
-        return Err(Failure::Wire(remote::Error::ChecksumMismatch(format!(
-            "the composefs image of the tree of the server commit has the fs-verity digest {}, \
-             and ostree.composefs.digest.v0 records {}",
-            digest_hex(image.digest()),
-            digest_hex(&key)
-        ))));
-    }
-    Ok(image)
 }
 
 /// Returns the names of the refs of `sc`, as the client sent them: the

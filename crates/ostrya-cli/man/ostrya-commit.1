@@ -179,8 +179,6 @@ The command reads the kernel version from the committed tree. The version is the
 Store the composefs image digest of the tree in the commit metadata.
 .IP
 The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the committed tree alone. \fB\%archive\fR, \fB\%bare\fR, and \fB\%bare\-user\fR commit the same tree and give the same digest. \fB\%bare\-user\-only\fR canonicalizes the tree, so it can give another digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
-.IP
-If \fB\%[ex\-ostrya] generate\-composefs\fR of the repository is true, the command also stores the composefs image in the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR of the repository, where \fB\%<xx><rest>\fR is the checksum of the commit. It stores the image only for a commit that the repository does not hold already.
 .TP
 \fB\-\-generate\-composefs\fR
 Write the composefs image of the tree as an image commit, and name it as the attachment \fB\%composefs\fR of the commit.

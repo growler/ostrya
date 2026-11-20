@@ -668,9 +668,6 @@ impl Repo {
     ///   rule.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
-    /// - The errors of
-    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
-    ///   for this repository.
     /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` of
     ///   this repository is not a boolean.
     /// - [`Error::InvalidFormat`] if [`refs`](PullOptions::refs) is empty,
@@ -852,9 +849,6 @@ impl Repo {
         // The pull reads the rule one time, here. A value that is not a
         // boolean stops the pull before its first request.
         let related = RelatedRule::of(self.config())?;
-        // The commit of the transaction reads the key again. This read fails
-        // a bad value before the first request.
-        self.config().generate_composefs()?;
         // The writes of the transaction read these keys again. This read
         // fails a bad value before the first request.
         self.config().fsync()?;
@@ -974,9 +968,6 @@ impl Repo {
     ///
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
-    /// - The errors of
-    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
-    ///   for this repository.
     /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` of
     ///   this repository is not a boolean.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
@@ -1038,7 +1029,6 @@ impl Repo {
     ) -> Result<PullStats> {
         let started = Instant::now();
         let checked = match RelatedRule::of(self.config())
-            .and_then(|related| self.config().generate_composefs().map(|_| related))
             .and_then(|related| self.config().fsync().map(|_| related))
             .and_then(|related| self.config().per_object_fsync().map(|_| related))
         {
@@ -1171,11 +1161,6 @@ impl Repo {
                 if !opts.no_ref_writes {
                     for (name, tip) in &targets {
                         place.queue(&txn, name, tip);
-                    }
-                }
-                if completes_marked(opts) {
-                    for commit in &marked {
-                        txn.mark_complete(commit);
                     }
                 }
                 txn.commit().await.map(|stats| (stats, summary, signature))

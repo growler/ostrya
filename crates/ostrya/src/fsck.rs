@@ -108,8 +108,7 @@ pub struct FsckOptions {
     ///
     /// The unlink of a commit follows no symlink at `objects/<xx>`. If
     /// `[core] fsync` is `true`, the step syncs the `objects/<xx>` directory
-    /// after the unlink of each commit, and the directory of the composefs
-    /// image of the commit after the removal of the image.
+    /// after the unlink of each commit.
     pub add_tombstones: bool,
     /// The switch that checks that the commit of each ref is bound to the ref.
     ///
@@ -278,70 +277,6 @@ pub enum FsckBindingErrorKind {
         /// The bound name.
         ref_name: String,
     },
-}
-
-/// A composefs image that fails the image check of [`Repo::fsck`].
-#[derive(Debug, Clone)]
-pub struct FsckImageError {
-    /// The commit of the image. It is also the name of the image file.
-    pub commit: Checksum,
-    /// The cause of the finding.
-    pub kind: FsckImageErrorKind,
-}
-
-/// The cause of a finding on a composefs image.
-#[derive(Debug, Clone)]
-pub enum FsckImageErrorKind {
-    /// The commit does not carry `ostree.composefs.digest.v0`.
-    NoKey,
-    /// The commit does not parse, or the first entry of
-    /// `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
-    /// bytes. The payload is the reason.
-    BadKey(String),
-    /// The fs-verity digest of the image is not the value of the key.
-    Mismatch {
-        /// The digest that the commit records.
-        expected: [u8; 32],
-        /// The fs-verity digest of the image.
-        actual: [u8; 32],
-    },
-    /// The commit object is present and does not load. The payload is the
-    /// reason.
-    CommitUnreadable(String),
-    /// The image does not read. The payload is the reason.
-    ImageUnreadable(String),
-}
-
-impl std::fmt::Display for FsckImageError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "composefs image of commit {}: ", self.commit)?;
-        match &self.kind {
-            FsckImageErrorKind::NoKey => {
-                write!(f, "the commit does not carry ostree.composefs.digest.v0")
-            }
-            FsckImageErrorKind::BadKey(reason)
-            | FsckImageErrorKind::CommitUnreadable(reason)
-            | FsckImageErrorKind::ImageUnreadable(reason) => f.write_str(reason),
-            FsckImageErrorKind::Mismatch { expected, actual } => write!(
-                f,
-                "the commit records the digest {}, the image has {}",
-                crate::composefs::digest_hex(expected),
-                crate::composefs::digest_hex(actual)
-            ),
-        }
-    }
-}
-
-/// The key of the commit of a composefs image, as the image check of
-/// [`Repo::fsck`] reads it.
-enum ImageKey {
-    /// The commit object is absent.
-    CommitAbsent,
-    /// The commit gives a finding before the check reads the image.
-    Fault(FsckImageErrorKind),
-    /// The digest that the commit records, or `None` if the commit does not
-    /// carry the key.
-    Read(Option<[u8; 32]>),
 }
 
 /// An attachment of a commit that is absent, partial, or defective.
@@ -554,27 +489,6 @@ pub struct FsckReport {
     pub tombstoned: Vec<Checksum>,
     /// The condition that ended the run early, if one did.
     pub failure: Option<FsckFailure>,
-    /// The number of composefs images whose commit object is present.
-    ///
-    /// The run checks each of these images against the key of its commit.
-    pub images_checked: usize,
-    /// The composefs images that fail the image check, sorted by commit.
-    ///
-    /// In a run with [`delete`](FsckOptions::delete), the run removed each
-    /// image of the list that it can remove. [`Repo::fsck`] states the rule
-    /// under "Composefs images".
-    pub image_errors: Vec<FsckImageError>,
-    /// The composefs images whose commit object is absent, sorted.
-    ///
-    /// Such an image is not an error. No prune removes it.
-    pub orphan_images: Vec<Checksum>,
-    /// The complete commits that carry `ostree.composefs.digest.v0` and have
-    /// no composefs image, sorted.
-    ///
-    /// The run fills the list only if `[ex-ostrya] generate-composefs` is
-    /// `true`. Such a commit is not an error. [`Repo::fsck`] states the rule
-    /// under "Composefs images".
-    pub missing_images: Vec<Checksum>,
     /// The attachments that are absent, partial, or defective, sorted by
     /// the commit that names them, then in the stored order of its field 2.
     ///
@@ -599,14 +513,12 @@ pub struct FsckReport {
 impl FsckReport {
     /// Returns `true` if the repository passed with no finding.
     ///
-    /// A pass has no faulty object, no faulty composefs image, no faulty
-    /// attachment, no condition that ended the run, and no commit that the
-    /// run skipped as already partial. A composefs image with no commit and
-    /// a ref of [`own_mirror_refs`](FsckReport::own_mirror_refs) do not stop
+    /// A pass has no faulty object, no faulty attachment, no condition that
+    /// ended the run, and no commit that the run skipped as already partial.
+    /// A ref of [`own_mirror_refs`](FsckReport::own_mirror_refs) does not stop
     /// a pass.
     pub fn is_ok(&self) -> bool {
         self.errors.is_empty()
-            && self.image_errors.is_empty()
             && self.attachment_errors.is_empty()
             && self.failure.is_none()
             && self.commits_partial == 0
@@ -635,14 +547,6 @@ struct Ctx {
     verified: Vec<Checksum>,
     /// The number of commit objects skipped as already partial.
     commits_partial: usize,
-    /// The number of composefs images that the image check read.
-    images_checked: usize,
-    /// The findings of the image check.
-    image_errors: Vec<FsckImageError>,
-    /// The composefs images with no commit object.
-    orphan_images: Vec<Checksum>,
-    /// The complete commits with a digest key and no composefs image.
-    missing_images: Vec<Checksum>,
     /// The commits that reach an absent or a deleted object, also when the
     /// run marks no commit.
     incomplete: HashSet<Checksum>,
@@ -684,9 +588,6 @@ impl Ctx {
         deleted.sort_by_key(|name| (name.checksum, name.ty as u32));
         let mut tombstoned: Vec<Checksum> = self.tombstoned.into_iter().collect();
         tombstoned.sort();
-        self.image_errors.sort_by_key(|e| e.commit);
-        self.orphan_images.sort();
-        self.missing_images.sort();
         FsckReport {
             reached,
             commits_checked: self.verified.len(),
@@ -697,31 +598,9 @@ impl Ctx {
             deleted,
             tombstoned,
             failure,
-            images_checked: self.images_checked,
-            image_errors: self.image_errors,
-            orphan_images: self.orphan_images,
-            missing_images: self.missing_images,
             attachment_errors: self.attachment_errors,
             own_mirror_refs: self.own_mirror_refs,
         }
-    }
-
-    /// Notes each commit of `keyed`, the commits with a digest key and no
-    /// composefs image, that the run did not remove, that is complete, and
-    /// that the run did not mark partial.
-    fn note_missing_images(&mut self, keyed: Vec<Checksum>) {
-        let missing: Vec<Checksum> = keyed
-            .into_iter()
-            .filter(|c| {
-                !self
-                    .deleted
-                    .contains(&ObjectName::new(*c, ObjectType::Commit))
-                    && !self.tombstoned.contains(c)
-                    && !self.incomplete.contains(c)
-                    && !self.marked_partial.contains(c)
-            })
-            .collect();
-        self.missing_images = missing;
     }
 }
 
@@ -824,53 +703,6 @@ impl Repo {
     ///
     /// A run that ends early does not reach this check.
     ///
-    /// # Composefs images
-    ///
-    /// The run lists the composefs images, the files
-    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs`, in phase 3. After the
-    /// tombstone step, it checks the image of each commit object of that
-    /// listing that is still present, the partial commits included. It streams
-    /// the image through the fs-verity hasher and compares the digest with the
-    /// key `ostree.composefs.digest.v0` of the commit.
-    ///
-    /// - [`FsckReport::image_errors`] holds each image whose digest is not the
-    ///   key, each image that does not read, and each image whose commit has
-    ///   no key or a malformed key. If [`delete`](FsckOptions::delete) is set,
-    ///   the run removes each of these images. [`FsckReport::deleted`] does
-    ///   not name an image. An image finding marks no commit as partial.
-    /// - [`FsckReport::image_errors`] also holds each image whose commit
-    ///   object is present and does not load. The run does not remove such an
-    ///   image.
-    /// - [`FsckReport::orphan_images`] holds each image whose commit object is
-    ///   absent. The run lists the commits and the images one time, after the
-    ///   phases of the refs. An image whose commit is not in that listing, or
-    ///   whose commit is absent when the run reads it for the check, is an
-    ///   orphan. Such an image is not an error.
-    ///
-    /// Each removal of a commit object in the run, by
-    /// [`delete`](FsckOptions::delete) or by
-    /// [`add_tombstones`](FsckOptions::add_tombstones), removes the image of
-    /// the commit first. An absent image counts as a success. The image check
-    /// does not report the image of a commit that the run removed.
-    ///
-    /// The run reads the key of a commit that phase 4 walked from the read of
-    /// that walk, so it reads each of these commit objects once.
-    ///
-    /// If `[ex-ostrya] generate-composefs` is `true`, the run also reads the
-    /// key of each commit that phase 4 walked and that has no image in the
-    /// listing. [`FsckReport::missing_images`] holds each such commit whose
-    /// key reads, that is complete, and that the run did not remove or mark
-    /// partial. A commit with a malformed key gets no note, and a partial
-    /// commit gets no note. A commit that the run marks partial for an absent
-    /// or a partial attachment gets no note.
-    /// A note is not an error, and the run repairs nothing for it. The run
-    /// takes no lock, so a transaction that publishes an image during the run
-    /// can make a note that is already stale. With the key `false`, the list
-    /// is empty.
-    ///
-    /// No count of the run includes an image. A run that ends early does not
-    /// reach this check.
-    ///
     /// # Early end
     ///
     /// A run ends early at three conditions:
@@ -892,8 +724,7 @@ impl Repo {
     /// # Tombstones
     ///
     /// If [`add_tombstones`](FsckOptions::add_tombstones) is set, one step
-    /// follows the four phases and the attachment check. The image check
-    /// follows the step.
+    /// follows the four phases and the attachment check.
     /// The step deletes each commit object whose parent commit object is
     /// absent. It writes a `.tombstone-commit` object that names each deleted
     /// commit. The step also deletes such a commit if another commit names it
@@ -912,16 +743,10 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8, or if
-    ///   `extensions/ostrya/composefs/`, a directory above it, or a
-    ///   directory below it that holds an image to remove is a symlink or no
-    ///   directory.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
     /// - [`Error::Core`] if a ref file holds no checksum, if the header of a
     ///   content object does not serialize, or if `[core] fsync` is not a
     ///   boolean.
-    /// - The errors of
-    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs),
-    ///   before the first phase.
     /// - [`Error::Io`] if a read or a write on the file system fails. These
     ///   are the listing of the refs and of the objects, the read of a commit
     ///   that a ref names or of a dirtree, the check for a `.commitpartial`
@@ -936,7 +761,6 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `state` is a symlink or is not a
     ///   directory.
     pub async fn fsck(&self, opts: &FsckOptions) -> Result<FsckReport> {
-        let note = self.config().generate_composefs()?;
         let mut ctx = Ctx::default();
         // Every phase that reads a ref reads this one listing.
         let (ref_targets, collection_refs) = self.fsck_read_refs().await?;
@@ -965,11 +789,8 @@ impl Repo {
         }
         ctx.ref_findings = ctx.errors.len();
 
-        // Phase 3: the commit objects, and the composefs images.
+        // Phase 3: the commit objects.
         let commits = self.list_commits().await?;
-        let repo = self.clone();
-        let images =
-            ostrya_rt::unblock(move || crate::image_store::list_blocking(repo.root_dir())).await?;
         if let Some(failure) = self
             .fsck_enumerate_commits(&commits, &ref_targets, &collection_refs, opts, &mut ctx)
             .await?
@@ -983,17 +804,9 @@ impl Repo {
 
         // Phase 4: collect the object set the verified commits reference, then
         // verify each object in it.
-        let mut image_keys = HashMap::new();
-        let mut keyed = note.then(Vec::new);
         let mut attachments = Vec::new();
         let order = match self
-            .fsck_collect_objects(
-                &ctx.verified,
-                &images,
-                &mut image_keys,
-                keyed.as_mut(),
-                &mut attachments,
-            )
+            .fsck_collect_objects(&ctx.verified, &mut attachments)
             .await?
         {
             Ok(order) => order,
@@ -1024,13 +837,6 @@ impl Repo {
             .any(|error| !matches!(error.kind, FsckErrorKind::Missing));
         if opts.add_tombstones && (opts.all || opts.delete || !corrupt) {
             self.fsck_add_tombstones(&commits, &mut ctx).await?;
-        }
-
-        // The composefs images, against the commits that are still present.
-        self.fsck_check_images(&commits, &images, image_keys, opts, &mut ctx)
-            .await?;
-        if let Some(keyed) = keyed {
-            ctx.note_missing_images(keyed);
         }
 
         Ok(ctx.finish(FsckPhase::VerifyObjects, objects_checked, None))
@@ -1240,22 +1046,12 @@ impl Repo {
     /// absent dirmeta or content object is in the set, and the second half
     /// reports it.
     ///
-    /// For each commit in `images`, the sorted list of the commits that have
-    /// a composefs image, the function adds the key
-    /// `ostree.composefs.digest.v0` of the commit to `image_keys`, if the key
-    /// reads. The image check then does not read the commit again. If
-    /// `keyed` is given, the function adds each other commit whose key reads
-    /// and has a value to it.
-    ///
     /// For each commit whose field 2 is not empty, the function adds the
     /// commit and the entries of field 2 to `attachments`, in the order of
     /// `commits`.
     async fn fsck_collect_objects(
         &self,
         commits: &[Checksum],
-        images: &[Checksum],
-        image_keys: &mut HashMap<Checksum, Option<[u8; 32]>>,
-        mut keyed: Option<&mut Vec<Checksum>>,
         attachments: &mut Vec<(Checksum, Vec<RelatedEntry>)>,
     ) -> Result<std::result::Result<Vec<ObjectName>, FsckFailure>> {
         let mut order = Vec::new();
@@ -1270,18 +1066,6 @@ impl Repo {
             let Ok(mut parsed) = Commit::parse(&bytes) else {
                 continue;
             };
-            let has_image = images.binary_search(commit).is_ok();
-            if (has_image || keyed.is_some())
-                && let Ok(key) = crate::composefs::recorded_digest(&parsed)
-            {
-                if has_image {
-                    image_keys.insert(*commit, key);
-                } else if key.is_some()
-                    && let Some(keyed) = keyed.as_deref_mut()
-                {
-                    keyed.push(*commit);
-                }
-            }
             if !parsed.related.is_empty() {
                 attachments.push((
                     *commit,
@@ -1548,112 +1332,6 @@ impl Repo {
         Ok(())
     }
 
-    /// Checks each composefs image against the key of its commit.
-    ///
-    /// `all` is the sorted commit listing of phase 3, and `images` is the
-    /// image listing of the same phase. An image whose commit is not in
-    /// `all` is an orphan. The function skips the image of a commit that the
-    /// run removed, because the removal took the image first. `image_keys`
-    /// holds the keys that phase 4 read. The function reads each other commit
-    /// of an image.
-    async fn fsck_check_images(
-        &self,
-        all: &[Checksum],
-        images: &[Checksum],
-        mut image_keys: HashMap<Checksum, Option<[u8; 32]>>,
-        opts: &FsckOptions,
-        ctx: &mut Ctx,
-    ) -> Result<()> {
-        if images.is_empty() {
-            return Ok(());
-        }
-        let fsync = opts.delete && self.config().fsync()?;
-        let removed = |c: &Checksum| {
-            ctx.deleted
-                .contains(&ObjectName::new(*c, ObjectType::Commit))
-                || ctx.tombstoned.contains(c)
-        };
-        let present: HashSet<Checksum> = all.iter().copied().filter(|c| !removed(c)).collect();
-        for &commit in images {
-            if all.binary_search(&commit).is_err() {
-                ctx.orphan_images.push(commit);
-                continue;
-            }
-            if !present.contains(&commit) {
-                continue;
-            }
-            let key = match image_keys.remove(&commit) {
-                Some(key) => ImageKey::Read(key),
-                None => self.fsck_image_key(&commit).await,
-            };
-            let finding = match key {
-                // A concurrent prune removed the commit before its image.
-                ImageKey::CommitAbsent => {
-                    ctx.orphan_images.push(commit);
-                    continue;
-                }
-                ImageKey::Fault(kind) => Some(kind),
-                ImageKey::Read(None) => Some(FsckImageErrorKind::NoKey),
-                ImageKey::Read(Some(expected)) => self.fsck_image_finding(&commit, expected).await,
-            };
-            ctx.images_checked += 1;
-            let Some(kind) = finding else {
-                continue;
-            };
-            let commit_fault = matches!(kind, FsckImageErrorKind::CommitUnreadable(_));
-            ctx.image_errors.push(FsckImageError { commit, kind });
-            if opts.delete && !commit_fault {
-                self.fsck_unlink_image(&commit, fsync).await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Reads the key `ostree.composefs.digest.v0` of the commit of a
-    /// composefs image.
-    async fn fsck_image_key(&self, commit: &Checksum) -> ImageKey {
-        let bytes = match self.load_object_bytes(ObjectType::Commit, commit).await {
-            Ok(bytes) => bytes,
-            Err(Error::ObjectNotFound { .. }) => return ImageKey::CommitAbsent,
-            Err(e) => {
-                return ImageKey::Fault(FsckImageErrorKind::CommitUnreadable(format!(
-                    "the commit does not load: {e}"
-                )));
-            }
-        };
-        let commit_obj = match Commit::parse(&bytes) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                return ImageKey::Fault(FsckImageErrorKind::BadKey(format!(
-                    "the commit does not parse: {e}"
-                )));
-            }
-        };
-        match crate::composefs::recorded_digest(&commit_obj) {
-            Ok(key) => ImageKey::Read(key),
-            Err(e) => ImageKey::Fault(FsckImageErrorKind::BadKey(e.to_string())),
-        }
-    }
-
-    /// Returns the finding on the composefs image of `commit` against the
-    /// digest `expected` that the commit records, or `None` if the image is
-    /// valid or absent.
-    async fn fsck_image_finding(
-        &self,
-        commit: &Checksum,
-        expected: [u8; 32],
-    ) -> Option<FsckImageErrorKind> {
-        match self.stored_image_digest(commit).await {
-            Ok(Some(actual)) if actual == expected => None,
-            Ok(Some(actual)) => Some(FsckImageErrorKind::Mismatch { expected, actual }),
-            // A concurrent prune removed the image.
-            Ok(None) => None,
-            Err(e) => Some(FsckImageErrorKind::ImageUnreadable(format!(
-                "the image does not read: {e}"
-            ))),
-        }
-    }
-
     /// Deletes each commit object whose parent commit object is absent from
     /// the store, and writes a `.tombstone-commit` that names it.
     ///
@@ -1691,16 +1369,9 @@ impl Repo {
     /// `fsync`, the call syncs the `objects/<xx>` directory of the object
     /// after the unlink.
     ///
-    /// Before it unlinks a commit object, the call removes the composefs
-    /// image of the commit, as [`fsck_unlink_image`](Repo::fsck_unlink_image)
-    /// does. So the run leaves no image whose commit it removed.
-    ///
     /// The unlink follows no symlink at `objects/<xx>`. Such a symlink gives
     /// [`Error::InvalidFormat`], and the run stops.
     async fn fsck_unlink_object(&self, name: ObjectName, fsync: bool) -> Result<()> {
-        if name.ty == ObjectType::Commit {
-            self.fsck_unlink_image(&name.checksum, fsync).await?;
-        }
         let repo = self.clone();
         let path = name.loose_path(repo.mode());
         ostrya_rt::unblock(move || {
@@ -1708,18 +1379,6 @@ impl Repo {
                 .remove_file(&path, fsync)
                 .map(drop)
                 .map_err(|e| crate::read::object_path_error(e, &path).into())
-        })
-        .await
-    }
-
-    /// Removes the composefs image of `commit`. An absent image counts as a
-    /// success. With `fsync`, the call syncs the directory of the image after
-    /// the removal.
-    async fn fsck_unlink_image(&self, commit: &Checksum, fsync: bool) -> Result<()> {
-        let repo = self.clone();
-        let commit = *commit;
-        ostrya_rt::unblock(move || {
-            crate::image_store::unlink_blocking(repo.root_dir(), [commit], fsync)
         })
         .await
     }

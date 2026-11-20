@@ -16,8 +16,6 @@ With no REF, the pull reads the keys \fB\%branches\fR and \fB\%pull\-branches\fR
 .PP
 The pull also fetches the full set of attachments of each pulled commit, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath: the attachments that field \%2 names, and the attachments of each attachment, level by level. It fetches each one with no parent and no ref. It ignores field \%2 of an attachment that this repository holds complete, and requests nothing below it.
 .PP
-With \fB\%[ex\-ostrya] generate\-composefs=true\fR in a repository that does not seal its objects with \%fs\-verity, a pull that succeeds writes one warning line to standard error, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
-.PP
 On success, the command prints one statistics line to standard output. A pull with \%\-\-collection can print two lines, as \%\-\-collection states. If standard output is a terminal, a progress line shows while the pull runs, and the first statistics line is drawn over it.
 .SH ARGUMENTS
 .TP

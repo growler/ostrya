@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ostrya::{
-    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Repo, RepoMode,
-    Tristate, Type, Value, VerityPolicy,
+    COMPOSEFS_RELATION, Checksum, CommitOptions, ComposefsImage, CreateOptions, MutableTree, Repo,
+    RepoMode, Tristate, Type, Value, VerityPolicy,
 };
 use ostrya_mount::Verity;
 use rustix::fs::{CWD, Mode, OFlags};
@@ -188,8 +188,9 @@ fn key_dict(digest: &[u8; 32]) -> Value {
 /// Commits `base/src` to `repo` at `timestamp`.
 ///
 /// - [`Key::None`]: the commit has no image key.
-/// - [`Key::Image`]: the commit has the key, and the transaction stores the
-///   image.
+/// - [`Key::Image`]: the transaction writes the image commit of the tree. The
+///   commit has the key and names the image commit as the attachment
+///   `composefs`.
 pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
@@ -198,25 +199,24 @@ pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> 
         .await
         .unwrap();
     let root = txn.write_mtree(&mut mtree).await.unwrap();
-    let commit = {
-        let staged = match key {
-            Key::Image => Some(txn.build_composefs_image(&root).await.unwrap()),
-            Key::None => None,
-        };
-        let metadata = staged.as_ref().map(|staged| key_dict(staged.digest()));
-        let opts = CommitOptions {
-            subject: Some("mount tree".to_owned()),
-            timestamp: Some(timestamp),
-            metadata,
-            ..CommitOptions::default()
-        };
-        let commit = txn.write_commit(opts, &root).await.unwrap();
-        if let Some(staged) = staged {
-            let added = txn.attach_composefs_image(&commit, staged).await.unwrap();
-            assert_eq!(added, ComposefsImageAdd::Added);
+    let (metadata, attachments) = match key {
+        Key::Image => {
+            let (image, digest) = txn.write_composefs_commit(&root).await.unwrap();
+            (
+                Some(key_dict(&digest)),
+                vec![(COMPOSEFS_RELATION.to_owned(), image)],
+            )
         }
-        commit
+        Key::None => (None, Vec::new()),
     };
+    let opts = CommitOptions {
+        subject: Some("mount tree".to_owned()),
+        timestamp: Some(timestamp),
+        metadata,
+        attachments,
+        ..CommitOptions::default()
+    };
+    let commit = txn.write_commit(opts, &root).await.unwrap();
     txn.commit().await.unwrap();
     commit
 }
@@ -224,9 +224,9 @@ pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> 
 /// The image key and the image of a commit that [`commit_tree`] writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Key {
-    /// No key and no image.
+    /// No key and no image commit.
     None,
-    /// The key and the stored image.
+    /// The key and the attachment `composefs`.
     Image,
 }
 
@@ -240,11 +240,10 @@ pub fn verity_of(repo: &Repo) -> (Verity, VerityPolicy) {
     }
 }
 
-/// Opens the stored image of `commit`, after the check of its digest against
-/// the key of the commit.
-pub async fn stored_image(repo: &Repo, commit: &Checksum) -> OwnedFd {
-    let (image, _) = repo.open_composefs_image_checked(commit).await.unwrap();
-    image.into()
+/// Opens the image of the image commit that `commit` names, after the check
+/// of its digest against the key of the commit.
+pub async fn stored_image(repo: &Repo, commit: &Checksum) -> ComposefsImage {
+    repo.open_composefs_image(commit).await.unwrap().unwrap()
 }
 
 /// Returns the name of the memory file that [`built_image`] makes for

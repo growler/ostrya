@@ -90,7 +90,6 @@ pub mod fsck;
 pub mod gpg;
 mod hashing;
 mod image_commit;
-mod image_store;
 mod inflate;
 mod ingest;
 mod jobs;
@@ -154,9 +153,7 @@ pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMod
 #[doc(hidden)]
 pub use commit::{CheckedAttachments, CommitOptions};
 #[doc(hidden)]
-pub use composefs::{
-    ComposefsImageAdd, ComposefsImageState, ComposefsOptions, StagedComposefsImage, VerityPolicy,
-};
+pub use composefs::{ComposefsOptions, VerityPolicy};
 #[doc(hidden)]
 pub use config::{
     MinFreeSpace, Remote, RemoteSource, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate,
@@ -181,8 +178,7 @@ pub use file::{ContentReader, FileKind, FileObject};
 #[doc(hidden)]
 pub use fsck::{
     FsckAttachmentError, FsckAttachmentErrorKind, FsckBindingError, FsckBindingErrorKind,
-    FsckError, FsckErrorKind, FsckFailure, FsckImageError, FsckImageErrorKind, FsckOptions,
-    FsckPhase, FsckReport,
+    FsckError, FsckErrorKind, FsckFailure, FsckOptions, FsckPhase, FsckReport,
 };
 #[cfg(feature = "sign-gpg")]
 #[doc(hidden)]

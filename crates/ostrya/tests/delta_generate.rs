@@ -3479,7 +3479,7 @@ fn a_signed_inline_delta_verifies_in_both() {
 
 /// Commits `tree` into `repo` as [`commit_tree`] does. If `key` is set, the
 /// commit records the composefs image digest of the tree under
-/// `ostree.composefs.digest.v0`, and the repository stores no image.
+/// `ostree.composefs.digest.v0`.
 async fn commit_tree_keyed(
     repo: &Repo,
     tree: &Path,
@@ -3569,11 +3569,10 @@ async fn part_payload_digests(dir: &Path) -> Vec<String> {
     out
 }
 
-/// The image rule changes no byte of a delta of commits with no stored
-/// composefs image: a commit with no key, and a commit with the key and no
-/// stored image. The test pins the SHA-256 of each decompressed part payload
-/// and of the superblock with the part checksums and sizes left out. Neither
-/// depends on the xz encoder.
+/// A delta of a commit with no `ostree.composefs.digest.v0` key, and of a
+/// commit with the key, keeps its bytes. The test pins the SHA-256 of each
+/// decompressed part payload and of the superblock with the part checksums
+/// and sizes left out. Neither depends on the xz encoder.
 #[test]
 fn a_delta_of_commits_without_an_image_keeps_its_bytes() {
     let tmp = TmpDir::new("gen-no-image-pin");
@@ -3596,7 +3595,6 @@ fn a_delta_of_commits_without_an_image_keeps_its_bytes() {
         data[70_000..70_100].copy_from_slice(&[0x5a; 100]);
         std::fs::write(tree.join("usr/bin/data.bin"), data).unwrap();
         let keyed = commit_tree_keyed(&repo, &tree, Some(plain), true).await;
-        assert!(!repo.composefs_image_path(&keyed).exists());
 
         let mut pins = Vec::new();
         for (name, from, to) in [

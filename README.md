@@ -99,13 +99,6 @@ Ostrya adds these functions, which the `ostree` command does not have:
   the repository holds and names it as the supplement `composefs`, a local
   entry. The fs-verity digest of the image is the digest that the commit
   records.
-- The composefs image store. With `[ex-ostrya] generate-composefs=true`,
-  each commit, pull, receive, and offline delta apply stores the image of
-  each new complete commit that records a digest in the repository, as
-  `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside `objects/`.
-  `ostrya composefs-image` checks a stored image and prints its path. Prune
-  removes the image of each commit that it removes, and fsck checks each
-  image. No transfer carries the stored image.
 - composefs mounts. The library `ostrya-mount` mounts a composefs image of a
   commit as a tree on Linux. The mount reads the objects of the repository in
   place. Root in the initial user namespace mounts in its own process, from

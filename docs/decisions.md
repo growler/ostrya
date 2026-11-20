@@ -221,6 +221,21 @@ These alternatives were rejected:
 The last paragraph of "The options of an open and of a create" states the
 open of `objects` and the reads that do not depend on the open mode.
 
+Each read and write of the summaries of the client groups refuses a symlink
+at `extensions/`, `extensions/ostrya/`, and `extensions/ostrya/summary/`. A
+symlink there makes a write or a removal reach a file outside the
+repository. Each open of these paths is one `openat2` with `RESOLVE_BENEATH`
+and `RESOLVE_NO_SYMLINKS`: one for `extensions/`, one for the directory
+below it, and one for a file. The error names the path of the open,
+relative to the repository root:
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
+The read of a summary is one `openat2` of the path of the file, with
+`O_NONBLOCK`, and one `statx` of the open file, so a symlink in the path and
+a file that is not a regular file fail the read with `InvalidFormat`, and a
+FIFO does not block it. `ostrya serve` reads a summary with the same opens,
+relative to a handle of `extensions/ostrya/summary/`. A symlink there gives
+no error, and the server answers 404, as for an absent summary.
+
 ## The options of an open and of a create
 
 `OpenOptions` holds the options of an open, in the form of
@@ -295,7 +310,7 @@ expected form, so the command resolves it.
 
 The open of `objects`, the read of `config`, each read of an object, each
 read of a summary of the repository by `Repo`, the server, and the media
-finder, each read of a stored composefs image, and each read and write of a
+finder, and each read and write of a
 static delta and of a delta index file do not depend on the open mode. Each
 is one `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, with no
 fallback to `openat`. A local pull reads `summary`, `summary.sig`, and the
@@ -650,135 +665,6 @@ The XATTR_FILTER field hashes each xattr name with xxHash32. The xxHash32 in
 `crates/ostrya-composefs/src/xxhash.rs` is written in the tree to add no
 crate. The golden filter bytes verify it.
 
-## The composefs image store
-
-The port stores the composefs image of a commit as a file of the repository
-outside `objects/`, `extensions/ostrya/composefs/<xx>/<rest>.cfs`
-(`format-reference.md`, "The composefs image store"). So `objects/` holds
-only the object types that the `ostree` command knows. No transfer carries an
-image: a repository that needs an image builds it.
-
-The name of the file is the checksum of the commit. Two commits that share
-one tree each have their own file, with the same bytes, because the image
-depends on the tree alone.
-
-Rejected alternatives:
-
-- An image commit that the commit names by `root/composefs` in
-  `ostrya.related`. No transfer follows a supplement,
-  `keep-detached-related=false` drops the entry, and the prune of a bucket
-  repository reads no `.commitmeta`. So the image stays local, with more
-  indirection than a file.
-- A file named by the fs-verity digest of the image. The prune must then
-  check each kept commit before it deletes an image.
-
-The prune deletes the image of a commit before the commit, so it leaves no
-image whose commit it deleted. It deletes the images of all the commits that
-it deletes in one pass before the first commit, and syncs each directory of
-the images one time. One sync for each commit costs one open and one sync
-of the directories for each deleted commit. A stop between the pass and the
-commits leaves unreachable commits with no image, and the next prune deletes
-them. The prune does not list the images. An image whose commit is absent
-comes only from a change outside the port, and the fsck notes it.
-
-The repository holds no symlink. A ref alias and a symlink object of a
-`bare` repository are symlinks that the format allows. They are entries of
-the format, so the rule does not apply to them. Each read and write of the
-composefs images and of the summaries of the client groups refuses a symlink
-at `extensions/`, `extensions/ostrya/`, `extensions/ostrya/composefs/`, and
-`extensions/ostrya/summary/`. Each prune and fsck of the composefs images
-refuses the same symlinks. A symlink there makes a write or a removal reach
-a file outside the repository. Each open of these paths is one `openat2`
-with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`: one for `extensions/`, one
-for the directory below it, and one for a file. The error names the path of
-the open, relative to the repository root:
-`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
-The read of a stored image and of a summary is one `openat2` of the path of
-the file, with `O_NONBLOCK`, and one `statx` of the open file, so a symlink
-in the path and a file that is not a regular file fail the read with
-`InvalidFormat`, and a FIFO does not block it. `ostrya serve` reads a
-summary with the same opens, relative to a handle of
-`extensions/ostrya/summary/`. A symlink there gives no error, and the
-server answers 404, as for an absent summary.
-
-## The generation of the composefs image
-
-The key `[ex-ostrya] generate-composefs`, default `false`, makes the commit
-of a transaction build the image of each complete commit that carries the
-digest key. The rule is in `Transaction`, so each writer gets it from one
-place.
-
-The writer records its complete commits with the crate-internal
-`Transaction::mark_complete`. The transaction cannot find them alone: it
-does not see a held partial commit that a pull completes, and at its commit
-each commit that a pull staged has a `.commitpartial` marker. The writers
-are the commit writes of `Transaction` (`write_commit` and
-`write_commit_checked`), the pull from a remote and the local pull, the
-receive with ref updates, and `Repo::apply_static_delta`. A pull records the
-commits of its markers under the condition that removes the markers after
-the commit, and one helper holds that condition.
-`Transaction::write_metadata` records no commit, because a pull writes
-partial commits through it. `Repo::commit_add_composefs_metadata` and the
-server commit of a receive build the image themselves, as
-`commit --generate-composefs-metadata` does under the key, so each of them
-reads the tree one time.
-They stage the image only if the transaction stages the commit.
-
-The build skips a commit that the transaction did not stage and that has no
-marker. So a commit that the repository holds complete before the
-transaction gets no image from it, also when a writer writes it again. The
-commit writes and `Repo::apply_static_delta` record a commit only if the
-transaction stages it. A commit that the repository holds partial is not
-staged again, so it gets no image from them. There is no backfill under
-the key.
-
-The build runs in the commit of the transaction, after the transaction
-stages its objects and before the publication. `publish()` renames the
-images after the objects, so an image is in place only after each object
-that its commit reaches. A malformed key, or an image whose digest is not
-the key, fails the transaction, so it publishes no object and writes no ref.
-For a pull this covers each recorded commit: a target, a parent within the
-depth, an attachment, or a held partial commit. One such commit fails the
-whole pull, also for a target whose image is correct. A failed pull keeps
-no staged object, so a retry fetches each object again.
-
-A receive builds before it takes the update lock, so the other writers of
-refs do not wait for the build. A server commit gets its parent from the tip
-that the receive reads under the lock. The image depends on the tree alone,
-so the receive builds the image of the tree before the lock and checks its
-digest against the key of the client. Under the lock, it writes the commit
-and stages the image as the image of the commit.
-
-`Repo::transaction_with_lock` reads the key before it takes the lock and
-discards the value, so a value that is not a boolean fails each writer
-before its first write. A pull from a remote opens its transaction after its
-first requests, so the pulls also read the key at their start. The fsck
-reads the key at its start for its note of a commit with no image.
-
-The key `true` in an `archive` repository is refused. The generation is for
-production repositories, and the mount refuses `archive`. In the other modes
-the key is accepted. Where the objects have no fs-verity seal, the build of
-the recorded images of a transaction reads and hashes each object one time.
-It uses that digest for each commit of the build and each path that names
-the object. `Repo::seals_objects` tells if the
-repository seals its objects, and the commands that write warn of the cost.
-An object that the repository holds from before can have no seal, and the
-build reads it. The port does not seal an object at the dedup of a write,
-and the fsck does not check the seals.
-
-With the key `true`, `commit --generate-composefs-metadata` builds the image
-one time for the digest and the stored image, so the command reads the tree
-one time. The key stores no image of a commit that the repository holds
-already. `commit --generate-composefs` writes an image commit
-("The composefs image commit"). With the key `true`, the commit of its
-transaction also stores the image of the new commit, so the command builds
-the image two times.
-
-Rejected alternative: the transaction removes the markers of a pull, so that
-one call decides the marker and the image. It changes the error handling of
-three writers and the order of the removal and the refs. The writers keep
-the removal of the markers.
-
 ## The mount daemon
 
 `ostrya-mountd` mounts a commit as composefs for a caller in a user
@@ -896,8 +782,9 @@ Rejected alternatives:
 - `is_privileged` stays private. Each caller then holds its own copy of the
   read of `/proc/self/status` and `/proc/self/uid_map`.
 - The name `build_composefs` for `sys::mount_composefs`. It is close to
-  `ostrya::Transaction::build_composefs_image`, which writes an image. The
-  function mounts an image.
+  the names of the calls that write an image, such as
+  `ostrya::Transaction::write_composefs_content`. The function mounts an
+  image.
 
 ## The composefs image commit
 
@@ -910,6 +797,14 @@ timestamp 0, no parent, and no metadata key, so it carries no
 `ostree.composefs.digest.v0`. The shape is fixed, so the same image gives
 the same C. C is a usual commit, so the `ostree` command reads it, and each
 transfer of the port carries it as it carries other commits.
+
+The image commit is the one form in which the port keeps an image, and only
+`commit --generate-composefs` and `composefs-image --add` build one. A
+rejected alternative is a file of the image of each commit outside
+`objects/`, which a config key makes each writer build. No transfer carries
+such a file, the prune and fsck need a second kind of file, and a labeled
+image has no place in it. The port does not read or remove the files of an
+earlier version below `extensions/`.
 
 The names:
 
@@ -5050,7 +4945,7 @@ These alternatives were rejected:
   and the caller gets no error.
 - One `Transaction` for each set of `Repo::remove_refs_immediate`. A
   transaction creates a staging directory, scans `tmp/`, and parses
-  `tmp-expiry-secs`, the `min-free-space-*` keys, and `generate-composefs`.
+  `tmp-expiry-secs` and the `min-free-space-*` keys.
   It can fail with `ENOSPC` on a full disk, where a removal frees space.
 - A wider check in the CLI before it removes the refs of a prefix one by
   one with `Repo::set_ref_immediate`. The CLI holds no lock between the

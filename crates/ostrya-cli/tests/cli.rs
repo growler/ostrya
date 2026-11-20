@@ -25439,32 +25439,6 @@ fn append_config(repo: &Path, text: &str) {
     std::fs::write(repo.join("config"), config).unwrap();
 }
 
-/// Flips one byte in the middle of the file at `path`. The size of the file
-/// does not change.
-fn flip_middle_byte(path: &Path) {
-    use std::io::{Read, Seek, SeekFrom};
-
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .unwrap();
-    let middle = file.metadata().unwrap().len() / 2;
-    let mut byte = [0u8; 1];
-    file.seek(SeekFrom::Start(middle)).unwrap();
-    file.read_exact(&mut byte).unwrap();
-    byte[0] ^= 0xff;
-    file.seek(SeekFrom::Start(middle)).unwrap();
-    file.write_all(&byte).unwrap();
-}
-
-/// The path of the composefs image of `commit` under the repository `repo`.
-fn image_path(repo: &Path, commit: &str) -> PathBuf {
-    repo.join("extensions/ostrya/composefs")
-        .join(&commit[..2])
-        .join(format!("{}.cfs", &commit[2..]))
-}
-
 /// The hex digest that `commit` records under `ostree.composefs.digest.v0`.
 fn recorded_digest_hex(repo: &Path, commit: &str) -> String {
     ostrya_repo(
@@ -25533,8 +25507,7 @@ fn digest_hex(digest: &[u8; 32]) -> String {
 /// `commit --generate-composefs` writes the image commit of the tree and
 /// names it as the attachment `composefs`. The key is the digest of the
 /// image, as `--generate-composefs-metadata` writes it, and the attachment
-/// makes the commit different. The command stores no image in the image
-/// store. In `bare-user` mode, the lookup gives the image of the attachment,
+/// makes the commit different. In `bare-user` mode, the lookup gives the image of the attachment,
 /// which is the export with the recorded options. In `archive` mode, the
 /// write works. Where the `ostree` command is installed, its commit with
 /// `--generate-composefs-metadata` is the commit of the port with that
@@ -25562,8 +25535,6 @@ fn commit_generate_composefs_writes_the_image_commit_as_the_attachment() {
         let checksum = commit(&meta, "--generate-composefs-metadata");
         let attached = commit(&image, "--generate-composefs");
         assert_ne!(attached, checksum, "{mode:?}");
-        assert!(!image_path(&meta, &checksum).exists());
-        assert!(!image_path(&image, &attached).exists());
 
         let export = recorded_export_of(&image, &Checksum::from_hex(&attached).unwrap());
         let key = recorded_digest_hex(&image, &attached);
@@ -25701,8 +25672,7 @@ fn commit_generate_composefs_refuses_a_partial_image_commit() {
 
 /// `composefs-image --add` writes the image commit of a commit without the
 /// key and names it as the supplement `composefs`, with no output. The
-/// command stores no image in the image store, so `--check` and `--get-path`
-/// fail for the same commit. The command takes exactly one action.
+/// command refuses a call without --add.
 #[test]
 fn composefs_image_add_writes_the_supplement_of_a_commit_without_the_key() {
     let tmp = TmpDir::new("composefs-image-nokey");
@@ -25720,7 +25690,6 @@ fn composefs_image_add_writes_the_supplement_of_a_commit_without_the_key() {
     let add = ostrya_repo(&repo, &["composefs-image", "--add", "p"]);
     add.ok();
     assert!(add.stdout.is_empty() && add.stderr.is_empty());
-    assert!(!image_path(&repo, &checksum).exists());
     let a = Checksum::from_hex(&checksum).unwrap();
     let relations = relations_of(&repo, &a);
     assert!(relations.attachments.is_empty());
@@ -25732,20 +25701,7 @@ fn composefs_image_add_writes_the_supplement_of_a_commit_without_the_key() {
     assert_eq!(found, *c);
     assert!(bytes == recorded_export_of(&repo, &a).bytes);
 
-    let check = ostrya_repo(&repo, &["composefs-image", "--check", "p"]);
-    assert_eq!(check.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8_lossy(&check.stderr),
-        format!("error: commit {checksum} does not carry ostree.composefs.digest.v0\n")
-    );
-    let get = ostrya_repo(&repo, &["composefs-image", "--get-path", "p"]);
-    assert_eq!(get.status.code(), Some(1));
-    assert!(get.stdout.is_empty());
-
-    for args in [
-        &["composefs-image"][..],
-        &["composefs-image", "--add", "p", "--check", "p"],
-    ] {
+    for args in [&["composefs-image"][..], &["composefs-image", "p"]] {
         let run = ostrya_repo(&repo, args);
         assert!(!run.status.success(), "{args:?}");
     }
@@ -25946,208 +25902,6 @@ fn composefs_image_add_completes_a_partial_image_commit() {
     assert_eq!(found, c);
 }
 
-/// `composefs-image --check` fails on a stored image with one changed byte
-/// and names both digests in one line. fsck fails with a line for the image.
-#[test]
-fn composefs_image_check_fails_on_a_changed_image() {
-    let tmp = TmpDir::new("composefs-image-changed");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let repo = create_repo(base, RepoMode::BareUser);
-    append_config(
-        &repo,
-        "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n",
-    );
-    let src = base.join("src");
-    let checksum = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src.to_str().unwrap(),
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    let key = recorded_digest_hex(&repo, &checksum);
-    ostrya_repo(&repo, &["composefs-image", "--check", "m"]).ok();
-    ostrya_repo(&repo, &["fsck"]).ok();
-
-    let path = image_path(&repo, &checksum);
-    let size = std::fs::metadata(&path).unwrap().len();
-    flip_middle_byte(&path);
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
-
-    let check = ostrya_repo(&repo, &["composefs-image", "--check", "m"]);
-    assert_eq!(check.status.code(), Some(1));
-    assert!(check.stdout.is_empty());
-    let stderr = String::from_utf8_lossy(&check.stderr);
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    let line = stderr.lines().next().unwrap();
-    let prefix = format!(
-        "error: composefs image of commit {checksum}: the commit records the digest {key}, the image has "
-    );
-    let actual = line
-        .strip_prefix(&prefix)
-        .unwrap_or_else(|| panic!("{line}"));
-    assert_eq!(actual.len(), 64);
-    assert_ne!(actual, key);
-
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    assert_eq!(fsck.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&fsck.stderr);
-    assert!(
-        stderr.contains(&format!("composefs image of commit {checksum}:")),
-        "{stderr}"
-    );
-    assert!(
-        stderr.ends_with("error: Repository corruption encountered\n"),
-        "{stderr}"
-    );
-}
-
-/// The warning of `[ex-ostrya] generate-composefs` true in a repository that
-/// does not seal its objects.
-const UNSEALED_WARNING: &str = "warning: [ex-ostrya] generate-composefs is true, but the \
-     repository does not seal its objects with fs-verity; the image build reads and hashes each \
-     object with no seal";
-
-/// With `[ex-ostrya] generate-composefs` true, `commit
-/// --generate-composefs-metadata` stores the image of the commit, and a
-/// commit with no digest key stores none. With `fsverity=no`, the command
-/// writes the warning and exits 0. With the key false, the command writes no
-/// warning and stores no image.
-#[test]
-fn the_generate_composefs_key_stores_the_image_of_a_commit() {
-    let tmp = TmpDir::new("composefs-generate-key");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let src = base.join("src");
-    let src = src.to_str().unwrap();
-
-    let on = base.join("on");
-    std::fs::create_dir_all(&on).unwrap();
-    let on = create_repo(&on, RepoMode::BareUser);
-    append_config(
-        &on,
-        "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n",
-    );
-    let run = ostrya_repo(
-        &on,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src,
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
-    let checksum = run.ok().stdout_trimmed();
-    assert_eq!(stderr, format!("{UNSEALED_WARNING}\n"));
-    assert!(image_path(&on, &checksum).exists());
-    ostrya_repo(&on, &["composefs-image", "--check", "m"]).ok();
-    let plain = ostrya_repo(&on, &["commit", "-b", "p", FIXED_TIMESTAMP, src])
-        .ok()
-        .stdout_trimmed();
-    assert!(!image_path(&on, &plain).exists());
-
-    let off = base.join("off");
-    std::fs::create_dir_all(&off).unwrap();
-    let off = create_repo(&off, RepoMode::BareUser);
-    append_config(&off, "[ex-integrity]\nfsverity=no\n");
-    let run = ostrya_repo(
-        &off,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src,
-        ],
-    );
-    assert!(
-        run.stderr.is_empty(),
-        "{}",
-        String::from_utf8_lossy(&run.stderr)
-    );
-    let same = run.ok().stdout_trimmed();
-    assert_eq!(same, checksum);
-    assert!(!image_path(&off, &same).exists());
-}
-
-/// With `[ex-ostrya] generate-composefs` true and `fsverity=no`, `pull` and
-/// `pull-local` write the warning only after a pull that succeeds and records
-/// its commits as complete. A pull with `--commit-metadata-only`, or a
-/// `pull` with `--subpath`, writes no warning. A pull that the request checks
-/// refuse writes only its error. The fixture commits have no composefs
-/// digest, so no pull builds an image.
-#[test]
-fn the_unsealed_warning_follows_a_pull_that_builds_an_image() {
-    let tmp = TmpDir::new("composefs-unsealed-pull");
-    let base = tmp.path();
-    let remote = build_subpath_remote(base, "remote", false);
-    let server = FileServer::start(&remote);
-    let config = "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n";
-
-    let dest = base.join("dest");
-    std::fs::create_dir_all(&dest).unwrap();
-    let dest = create_repo(&dest, RepoMode::BareUser);
-    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
-    append_config(&dest, config);
-
-    for args in [
-        &["pull", "origin", BRANCH, "--commit-metadata-only"][..],
-        &["pull", "origin", BRANCH, "--subpath=/sub"],
-    ] {
-        let run = ostrya_repo(&dest, args);
-        assert_eq!(code_and_stderr(&run), (Some(0), String::new()), "{args:?}");
-    }
-    let run = ostrya_repo(&dest, &["pull", "origin", BRANCH, "--subpath=sub"]);
-    assert_eq!(
-        code_and_stderr(&run),
-        (
-            Some(1),
-            "error: pull: subpath 'sub' is not an absolute path\n".to_owned()
-        )
-    );
-    let run = ostrya_repo(&dest, &["pull", "origin", BRANCH]);
-    assert_eq!(
-        code_and_stderr(&run),
-        (Some(0), format!("{UNSEALED_WARNING}\n"))
-    );
-
-    let local = base.join("local");
-    std::fs::create_dir_all(&local).unwrap();
-    let local = create_repo(&local, RepoMode::BareUser);
-    append_config(&local, config);
-    // The commit binds the ref `test/main`. A pull of `origin:test/main`
-    // fails the binding check, so the source gets a local ref of that name.
-    let remote_ref = format!("origin:{BRANCH}");
-    let create = format!("--create={BRANCH}");
-    ostrya_repo(&dest, &["refs", &create, &remote_ref]).ok();
-    let run = ostrya_repo(
-        &local,
-        &[
-            "pull-local",
-            "--commit-metadata-only",
-            dest.to_str().unwrap(),
-            BRANCH,
-        ],
-    );
-    assert_eq!(code_and_stderr(&run), (Some(0), String::new()));
-    let run = ostrya_repo(&local, &["pull-local", dest.to_str().unwrap(), BRANCH]);
-    assert_eq!(
-        code_and_stderr(&run),
-        (Some(0), format!("{UNSEALED_WARNING}\n"))
-    );
-}
-
 /// fsck writes one line on standard output for each ref under
 /// `refs/mirrors/ID/` of the `collection-id` of the repository, also with
 /// --quiet, and exits 0. The command checks the commit of such a ref: with
@@ -26192,251 +25946,6 @@ fn fsck_notes_a_ref_under_the_own_collection_id() {
         "{}",
         fsck.stdout_trimmed()
     );
-}
-
-/// With `[ex-ostrya] generate-composefs` true, fsck writes one line on
-/// standard output for a commit with the digest key and no image, and exits
-/// 0. A value of the key that is not a boolean fails `commit` and `fsck`, and
-/// the commit writes no object.
-#[test]
-fn fsck_notes_a_commit_with_no_composefs_image() {
-    let tmp = TmpDir::new("composefs-generate-fsck");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let src = base.join("src");
-    let src = src.to_str().unwrap();
-    let repo = create_repo(base, RepoMode::BareUser);
-    append_config(&repo, "[ex-integrity]\nfsverity=no\n");
-    let checksum = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src,
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    assert!(
-        !fsck
-            .ok()
-            .stdout_trimmed()
-            .contains("Commit with no composefs image")
-    );
-
-    let config = config_text(&repo);
-    append_config(&repo, "[ex-ostrya]\ngenerate-composefs=true\n");
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    fsck.ok();
-    let line = format!("Commit with no composefs image: {checksum}");
-    assert!(
-        fsck.stdout_trimmed().lines().any(|l| l == line),
-        "{}",
-        fsck.stdout_trimmed()
-    );
-
-    std::fs::write(
-        repo.join("config"),
-        format!("{config}[ex-ostrya]\ngenerate-composefs=maybe\n"),
-    )
-    .unwrap();
-    let before = files_under(&repo.join("objects"));
-    std::fs::write(base.join("src/new.txt"), b"new\n").unwrap();
-    let commit = ostrya_repo(&repo, &["commit", "-b", "n", FIXED_TIMESTAMP, src]);
-    assert_eq!(commit.status.code(), Some(1));
-    assert_eq!(files_under(&repo.join("objects")), before);
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    assert_eq!(fsck.status.code(), Some(1));
-}
-
-/// With `[ex-ostrya] generate-composefs` true, `commit
-/// --generate-composefs-metadata` stores no image of a commit that the
-/// repository holds already, and fsck notes the commit.
-#[test]
-fn the_generate_composefs_key_gives_no_image_to_a_held_commit() {
-    let tmp = TmpDir::new("composefs-generate-held");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let src = base.join("src");
-    let src = src.to_str().unwrap();
-    let repo = create_repo(base, RepoMode::BareUser);
-    append_config(&repo, "[ex-integrity]\nfsverity=no\n");
-    let checksum = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src,
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    assert!(!image_path(&repo, &checksum).exists());
-
-    append_config(&repo, "[ex-ostrya]\ngenerate-composefs=true\n");
-    let again = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            "--parent=none",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src,
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    assert_eq!(again, checksum);
-    assert!(!image_path(&repo, &checksum).exists());
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    fsck.ok();
-    let line = format!("Commit with no composefs image: {checksum}");
-    assert!(
-        fsck.stdout_trimmed().lines().any(|l| l == line),
-        "{}",
-        fsck.stdout_trimmed()
-    );
-}
-
-/// `composefs-image --check` and `--get-path` fail for a commit that carries
-/// the key and has no image. `--check` writes the reason in one line.
-#[test]
-fn composefs_image_check_and_get_path_fail_on_an_absent_image() {
-    let tmp = TmpDir::new("composefs-image-absent");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let repo = create_repo(base, RepoMode::BareUser);
-    let src = base.join("src");
-    let checksum = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src.to_str().unwrap(),
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    assert!(!image_path(&repo, &checksum).exists());
-
-    let check = ostrya_repo(&repo, &["composefs-image", "--check", "m"]);
-    assert_eq!(check.status.code(), Some(1));
-    assert!(check.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&check.stderr),
-        format!("error: commit {checksum} has no composefs image\n")
-    );
-    let get = ostrya_repo(&repo, &["composefs-image", "--get-path", "m"]);
-    assert_eq!(get.status.code(), Some(1));
-    assert!(get.stdout.is_empty());
-    assert_eq!(
-        String::from_utf8_lossy(&get.stderr),
-        format!("error: commit {checksum} has no composefs image\n")
-    );
-}
-
-/// A stored image that does not read fails `composefs-image --check` and
-/// fsck. `fsck --delete` removes such an image. The mode 000 makes a read
-/// fail as an I/O error does.
-#[test]
-fn composefs_image_check_fails_on_an_image_that_does_not_read() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let tmp = TmpDir::new("composefs-image-unreadable");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let repo = create_repo(base, RepoMode::BareUser);
-    append_config(
-        &repo,
-        "[ex-integrity]\nfsverity=no\n[ex-ostrya]\ngenerate-composefs=true\n",
-    );
-    let src = base.join("src");
-    let checksum = ostrya_repo(
-        &repo,
-        &[
-            "commit",
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src.to_str().unwrap(),
-        ],
-    )
-    .ok()
-    .stdout_trimmed();
-    let path = image_path(&repo, &checksum);
-    let lock = |path: &Path| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
-    };
-
-    lock(&path);
-    if std::fs::File::open(&path).is_ok() {
-        eprintln!("skipping: this user reads a file with the mode 000");
-        return;
-    }
-    let check = ostrya_repo(&repo, &["composefs-image", "--check", "m"]);
-    assert_eq!(check.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&check.stderr);
-    assert_eq!(stderr.lines().count(), 1, "{stderr}");
-    assert!(stderr.starts_with("error: "), "{stderr}");
-    let fsck = ostrya_repo(&repo, &["fsck"]);
-    assert_eq!(fsck.status.code(), Some(1));
-    let stderr = String::from_utf8_lossy(&fsck.stderr);
-    assert!(
-        stderr.contains(&format!(
-            "composefs image of commit {checksum}: the image does not read:"
-        )),
-        "{stderr}"
-    );
-    assert!(path.exists(), "fsck without --delete keeps the image");
-
-    let fsck = ostrya_repo(&repo, &["fsck", "--delete"]);
-    assert_eq!(fsck.status.code(), Some(1));
-    assert!(!path.exists(), "fsck --delete removes the image");
-}
-
-/// In a `bare-user-shared` repository with `[ex-ostrya] generate-composefs`
-/// true, under umask 077, the image that `commit
-/// --generate-composefs-metadata` stores has mode 0644.
-#[test]
-fn composefs_image_mode_does_not_follow_the_umask() {
-    let tmp = TmpDir::new("composefs-image-umask");
-    let base = tmp.path();
-    build_fixture_source(base);
-    let repo = create_repo(base, RepoMode::BareUserShared);
-    append_config(&repo, "[ex-ostrya]\ngenerate-composefs=true\n");
-    let repo_arg = format!("--repo={}", repo.display());
-    let src = base.join("src");
-    let bin = env!("CARGO_BIN_EXE_ostrya");
-    let commit = program_with_umask(
-        bin,
-        "077",
-        &[
-            "commit",
-            &repo_arg,
-            "-b",
-            "m",
-            FIXED_TIMESTAMP,
-            "--generate-composefs-metadata",
-            src.to_str().unwrap(),
-        ],
-    );
-    let checksum = commit.ok().stdout_trimmed();
-    let path = image_path(&repo, &checksum);
-    let mode = |path: &Path| std::fs::metadata(path).unwrap().mode() & 0o7777;
-    assert_eq!(mode(&path), 0o644);
 }
 
 /// In a `bare-user-shared` repository, `static-delta generate` and

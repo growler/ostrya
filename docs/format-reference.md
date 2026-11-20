@@ -1350,43 +1350,28 @@ stops part way through leaves no commit object whose tree it started to
 remove. A pull reads a commit with no `.commitpartial` marker as complete, so
 such a commit is damage that no reader reports.
 
-1. The image phase. The port unlinks the composefs image of each doomed
-   commit. It opens `extensions/ostrya/composefs/` and each `<xx>/`
-   directory one time. If `[core] fsync` is true, it then syncs each `<xx>/`
-   directory from which it removed an image, one time for each directory.
-2. The commit phase. For each doomed commit, the port writes the tombstone
+1. The commit phase. For each doomed commit, the port writes the tombstone
    where the run writes tombstones, unlinks the commit object, and then
    unlinks its `.commitmeta`. Then it unlinks each `.commitmeta` whose
    commit is absent.
-3. The barrier. If `[core] fsync` is true, the port syncs each `objects/`
+2. The barrier. If `[core] fsync` is true, the port syncs each `objects/`
    fanout directory in which the commit phase removed an entry, one time for
    each directory. If `[core] fsync` is false, a crash gives no guarantee of
    the order in which the removals reach the disk.
-4. The content phase. The port removes each other doomed object, in any
+3. The content phase. The port removes each other doomed object, in any
    order. If `[core] fsync` is true, it then syncs each `objects/` fanout
    directory in which the content phase removed an entry, one time for each
    directory.
-5. The leftover sweep. See below. If `[core] fsync` is true, the sweep syncs
+4. The leftover sweep. See below. If `[core] fsync` is true, the sweep syncs
    `state/` one time after the last unlink of a marker, if it unlinked one.
-
-Each image goes before its commit. If `[core] fsync` is true, each image
-removal is durable before the port unlinks the first commit object. A stop or
-a crash between the image phase and the commit phase leaves unreachable
-commits with no image, and the next prune removes these commits. The reverse
-order leaves an image whose commit is absent. The prune does not list
-`extensions/ostrya/composefs/`, so no prune removes such an image ("The
-composefs image store"). The image phase is one pass before the commit phase,
-so the port opens and syncs each directory of the images one time, and not
-one time for each commit.
 
 The commit goes before its `.commitmeta`. A `.commitmeta` with no commit is
 unreachable, and the next prune removes it. The reverse order leaves a commit
 with no signatures.
 
-A `--delete-commit` run removes the image of the named commit, and then the
-commit in the order of the commit phase. It syncs the directory of the image
-before it removes the commit, and the fanout directory of the commit before
-the other phases start.
+A `--delete-commit` run removes the named commit in the order of the commit
+phase. It syncs the fanout directory of the commit before the other phases
+start.
 
 No phase before the leftover sweep removes a `state/<commit>.commitpartial`
 marker. The commit can already be partial. If a crash made the unlink of the
@@ -1395,8 +1380,7 @@ complete.
 
 The order changes no count. The port reads the size of each doomed object
 before its unlink and counts the object one time. A `.commitmeta` that the
-commit phase removes with its commit is in no count, and no count includes a
-composefs image.
+commit phase removes with its commit is in no count.
 An object that is absent when the port reads its size is in no count. A
 `--no-prune` run goes through the same phases, removes nothing, and reports
 the counts that the removal would give.
@@ -3375,7 +3359,6 @@ The part holds these items:
 - the ssh transport;
 - the commit of `push-tree`;
 - the composefs image commit;
-- the composefs image store;
 - the protocol of the composefs mount daemon;
 - the mode `bare-user-shared`;
 - the S3 bucket repository.
@@ -4487,14 +4470,10 @@ give the condition of each refusal.
   `[core] locking=false`.
 - `unauthorized` -- the server refuses the credential of an HTTP request.
 - `protocol` -- a frame is malformed, a kind is unknown, a message comes out
-  of order, or a message breaks a rule of the session. Under
-  `[ex-ostrya] generate-composefs`, a malformed `ostree.composefs.digest.v0`
-  of a commit or of a server commit gets this code too.
+  of order, or a message breaks a rule of the session.
 - `limit-exceeded` -- a frame, a chunk, a batch, a reply, a metadata object,
   a listing, or a session is over its limit.
-- `checksum-mismatch` -- the bytes of an object do not hash to its name, or
-  the composefs image of a commit or of a server commit has a digest that is
-  not its `ostree.composefs.digest.v0`.
+- `checksum-mismatch` -- the bytes of an object do not hash to its name.
 - `mode-refused` -- the repository mode cannot store the content, or the
   client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
@@ -4886,12 +4865,7 @@ Each failed check ends the session, and the session writes nothing:
    updates alone, and the message names it as a new commit.
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
-   destination"). Under `[ex-ostrya] generate-composefs`, the server then
-   builds the composefs images of the session ("The composefs image store"),
-   with these codes: `protocol` for a malformed `ostree.composefs.digest.v0`,
-   `checksum-mismatch` for an image whose digest is not the key, and
-   `internal` for each other failure.
-   The server then makes the staged objects durable, and signs each new commit one time with each key
+   destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
    of the key `sign` of the client group. The server signs no other commit,
    a staged parent and an attachment included. The incoming dict of each
    other commit of the session, a staged attachment included, merges into
@@ -4978,18 +4952,11 @@ do not apply. The trust in a server commit comes from the authentication of
 the client and from `sign`. A client group that must verify the commits of
 its clients takes a mirror push.
 
-Under `[ex-ostrya] generate-composefs`, the server then reads the key
-`ostree.composefs.digest.v0` of a server commit. A malformed key is
-`protocol`. The server then makes the staged objects durable. In a session
+After the checks, the server makes the staged objects durable. In a session
 with the hooks of a host application, the hook of the host gets the server
 commit next, with the branch and the tags in canonical form. The hook can
 refuse with `ref-denied` or `internal`, and no ref changes. A host whose
 hooks take no server commit refuses with `ref-denied` at this step.
-
-If the server commit carries the key, the server then builds the composefs
-image of its tree, with these codes: `checksum-mismatch` for an image whose
-digest is not the key, and `internal` for each other failure. So a request
-that the host refuses reads no tree.
 
 The server then takes the update lock. Under the lock it reads the branch and
 the tags in their namespace, and check 10 applies, with a write
@@ -6224,9 +6191,7 @@ whose timestamp is older than the timestamp of the commit of the current
 ref. The `ostree` command moves the ref back. If the current ref is the
 ref at the place that the import writes, and the client does not store its
 commit, the pull refuses the ref. The pull also refuses a commit whose
-timestamp is not the timestamp that the summary lists for the ref. Under
-`[ex-ostrya] generate-composefs`, the transaction builds the composefs
-image of the commit, as each pull does.
+timestamp is not the timestamp that the summary lists for the ref.
 
 A read of the current ref that fails refuses its ref, and so does a pull
 that fails. The import then continues with the next ref. The result of the
@@ -7547,162 +7512,6 @@ lookup streams the file through the fs-verity hasher in chunks of 128 KiB.
 The lookup measures the digest through the descriptor that it gives, at
 offset 0.
 
-## The composefs image store
-
-A repository of the port can store the composefs image of a commit as a file
-outside `objects/`. The tool has no such file. A write under
-`[ex-ostrya] generate-composefs`, for example `ostrya commit
---generate-composefs-metadata` with the key true, and a check of the stored
-file can verify each fact below.
-
-The file:
-
-- The path is `extensions/ostrya/composefs/<first 2 hex>/<remaining 62
-  hex>.cfs` under the repository root. The name is the checksum of the
-  commit. Two commits that share one tree each have their own file, and the
-  two files hold the same bytes.
-- The content is the image that an export of the commit with the verity
-  digests of the files writes ("composefs"). The repository stores it raw in
-  every mode, `archive` included, with no header and no compression. The
-  image depends on the tree alone, so `bare`, `bare-user`, and `archive`
-  store the same bytes for the same tree.
-- The file has the mode `0644` in every mode, whatever the umask, and no
-  extended attribute.
-- The write creates `extensions/`, `extensions/ostrya/composefs/`, and each
-  `<xx>/` at the first write into them, with the mode `0775` reduced by the
-  umask. In a
-  `bare-user-shared` repository each directory that the write creates gets
-  `02770` ("bare-user-shared mode"). A directory that exists keeps its mode.
-
-The key rule:
-
-- An image exists only for a commit that carries `ostree.composefs.digest.v0`.
-  The fs-verity digest of the image is the value of that key.
-- The write reads the first entry of the key. Its value must be a variant of
-  type `ay` with 32 bytes. The write refuses a commit without the key, a value
-  of another form, and an image whose digest is not the value. It checks the
-  digest before it installs the image.
-- A stored image whose digest is the value stays as it is. The write replaces
-  a stored image whose digest is not the value and a stored image whose read
-  fails with an I/O error. A symlink on the path of the stored image, and a
-  stored image that is not a regular file, fail the write with the error of
-  the read.
-
-The write:
-
-- The writer computes the fs-verity digest of the bytes as it writes them, so
-  no step holds the whole image.
-- With `[ex-integrity] fsverity` not `no`, the write seals the image as it
-  seals the objects ("Write path: fs-verity"). After the seal, it compares the
-  digest that the kernel measures with the digest of the writer.
-- A transaction renames its objects into `objects/` first and its images
-  into `extensions/ostrya/composefs/<xx>/` next. So an image is in place
-  only after each object of the transaction. The detached metadata and the
-  refs come after the images. The rename replaces a stored image of the same
-  commit in one step.
-- With `[core] fsync` true, the transaction syncs each `<xx>/` directory that
-  got an image, and then `extensions/ostrya/composefs/`, after the renames of
-  the images. It syncs each directory that it creates into its parent.
-
-The generation:
-
-- The key `[ex-ostrya] generate-composefs` is a boolean, and the default is
-  `false`. The key `true` in an `archive` repository is refused.
-- With the key `true`, the commit of a transaction builds the image of each
-  commit that its writer records as complete and that carries
-  `ostree.composefs.digest.v0`. The writers are `ostrya commit`, a pull from a
-  remote, a local pull, a receive (the push session, the one-way stream, and
-  the server commit), and `ostrya static-delta apply-offline`. A pull records
-  its targets, the parents within its depth, the attachments, and each held
-  partial commit that it completes. A commit-only pull and a subpath pull
-  record no commit.
-- The build runs after the transaction stages its objects and before it
-  renames them into `objects/`. A receive builds before it takes the update
-  lock. For a server commit, the receive builds the image of the tree and
-  checks its digest against the key of the client after the hook of the host
-  application and before the lock. Under the lock, it writes the commit and
-  stages the image as the image of the commit.
-- The build skips a commit that the transaction did not stage and that has no
-  `.commitpartial` marker. So a commit that the repository holds complete
-  before the transaction gets no image. `ostrya commit` and
-  `ostrya static-delta apply-offline` record a commit only if the transaction
-  stages it, so a commit that the repository holds partial also gets no image
-  from them. The build also skips a commit with no key and a commit whose
-  image is staged. There is no backfill under the key.
-- A malformed key, or an image whose digest is not the key, fails the
-  transaction. It publishes no object and writes no ref. For a pull, the rule
-  covers each recorded commit, so one such commit fails the whole pull. A
-  receive refuses a malformed key with `protocol` and an image whose digest
-  is not the key with `checksum-mismatch`. Each other failure of the build in
-  a receive is `internal`.
-- A value of the key that is not a boolean fails each write through a
-  transaction at the open of the transaction. A pull from a remote reads the
-  key before its first request. A receive fails at `Hello`.
-- The build reads the fs-verity digest of a sealed object from the kernel. It
-  reads and hashes each other object one time for each build of the recorded
-  images of a transaction, and uses that digest for each commit of the build
-  and each path that names the object.
-
-The read:
-
-- Each read opens the image with one `openat2` of its path under the
-  repository root, with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
-  `O_NONBLOCK`, and checks its type with one `statx` of the open file, in
-  each open mode. A symlink at `extensions/`, `ostrya/`, `composefs/`,
-  `<xx>/`, or the file fails the read with
-  `invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
-  A FIFO, a socket, a device, or a directory at the file fails the read with
-  `invalid format: PATH is not a regular file`, and a FIFO does not block
-  it. `PATH` is the path of the image relative to the repository root. Only
-  `ENOENT` reads as an absent image. Each other error of `openat2`, `ENOSYS`
-  included, fails the read.
-- The write, the prune, and the fsck open `extensions` with one `openat2`,
-  and then `ostrya/composefs` below it with one `openat2`, with
-  `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`. A symlink at a component gives
-  the error
-  `invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
-  Each other entry that is no directory gives the error
-  `invalid format: PATH is not a directory`. `PATH` is the path of the open
-  relative to the repository root: `extensions` or
-  `extensions/ostrya/composefs`. The write opens each `<xx>/` directory of
-  its images one time with one `openat2`. When that open gives `ENOENT`, the
-  write makes the directory and opens it. It moves each image into its
-  `<xx>/` directory with one `renameat` relative to that descriptor. The
-  removal of images opens each `<xx>/` directory of its commits one time
-  with one `openat2`, and unlinks each image relative to it.
-
-No transfer carries the image. A pull, a push, a one-way stream, a static
-delta, the archive view, `ostrya serve`, and a bucket repository carry no
-image. A repository that needs an image builds it.
-
-`ostree.sizes` has no entry for the image.
-
-The prune and the fsck:
-
-- The prune deletes the image of each commit that it deletes. It deletes
-  these images before the first commit ("Prune removal order"). A kept
-  commit keeps its image. The prune does not list
-  `extensions/ostrya/composefs/`, so it keeps an image whose commit is
-  absent. No prune count and no byte count of freed space includes
-  the image. The removal refuses a symlink or an entry that is no directory
-  at `extensions/`, `ostrya/`, `composefs/`, or `<xx>/`, with the error of
-  the write.
-- The fsck lists the commits and the images one time, after the checks of
-  the refs. It checks each image whose commit is present against the key of
-  the commit, and notes each image whose commit is absent. Each commit that the fsck deletes loses its
-  image first. No fsck count includes an image. The listing refuses a
-  symlink or an entry that is no directory at `extensions/`, `ostrya/`, or
-  `composefs/`, with the error of the write, and skips such an entry at
-  `<xx>/`. The removal refuses it at each of the four, with the same error.
-- With `[ex-ostrya] generate-composefs` true, the fsck also notes each
-  complete commit whose key reads, that has no image, and that the run did not
-  delete, tombstone, or mark partial. A note is not an error.
-
-`ostree fsck` and `ostree prune` on a repository that holds images neither
-check, count, nor remove an image, and they keep the modes of the directories
-(`conformance/cli-behavior.md`, "CLI output formats", "Composefs images in a
-prune" and "Composefs images in fsck").
-
 ## The mount daemon protocol
 
 `ostrya-mountd` mounts a commit as a composefs tree for a client in its own
@@ -7942,7 +7751,6 @@ the file-creation mask of the process has no effect:
 - A directory gets 02770. This rule applies to these directories:
   - the repository root and each layout directory at `init`;
   - the `objects/<xx>` fanout directories;
-  - `extensions/ostrya/composefs/` and its `<xx>/` directories;
   - the parent directories under `refs/`;
   - `deltas/`, `delta-indexes/`, and each directory below them;
   - `tmp/`, and each staging directory of a transaction.

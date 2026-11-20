@@ -275,6 +275,9 @@ These paths and crates are outside the scope:
   `objects`, which it gives to `open_tree` as the sources of a mount, and
   its mount checks on these descriptors (`fstatfs`, the mount id of
   `statx`, and `fstat`);
+- the helper `mount.ostrya` of `ostrya-mountd`: its open of the repository
+  root on the in-process path with `sys::open_dir`, which it gives to
+  `Repo::open_at_strict`;
 - `ostrya-conformance`, a black-box harness that does not link `ostrya`.
 
 Each change to `repo_fs` needs the explicit confirmation of the maintainer

@@ -45,6 +45,7 @@ mod man;
 mod repo;
 mod server;
 
+use repo::DEFAULT_MAX_IMAGE_SIZE;
 use server::{Server, worker_main};
 
 /// The program of the worker process: this binary.
@@ -55,9 +56,6 @@ const WORKER_FLAG: &str = "--worker";
 
 /// The exit status of a usage error.
 const USAGE_ERROR: u8 = 2;
-
-/// The default largest size of a built image, in bytes: 100 MiB.
-const DEFAULT_MAX_IMAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// The command line of `ostrya-mountd`.
 #[derive(Debug, Parser)]
@@ -418,6 +416,13 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The committed page `ostrya-mountd.8` is the page that the `clap`
+    /// definition renders.
+    #[test]
+    fn man_page_matches_the_committed_file() {
+        man::assert_page_matches(Cli::command(), "ostrya-mountd", "8");
     }
 
     #[test]

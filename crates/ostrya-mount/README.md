@@ -58,6 +58,10 @@ repository or builds an image takes `ostrya` in its own manifest.
 - `is_privileged` tells if the process is root in the initial user
   namespace. Such a process mounts with `Direct`, and each other
   process asks the daemon with `Helper`.
+- `in_initial_user_namespace` tells if the process is in the initial
+  user namespace. The daemon refuses the namespaces of such a process, so
+  a process that is not privileged and is in the initial user namespace
+  sends the namespaces of another process.
 - `MountOptions` selects the `Access`, the source label, and the
   attribute flags (`MountFlags`) of a mount.
 - `Error` is the error of each fallible operation of the crate.

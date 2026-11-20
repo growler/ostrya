@@ -38,10 +38,16 @@ OSTRYA_REQUIRE_MOUNT=1 cargo test -p ostrya-sys -p ostrya-mount -p ostrya-mountd
 The tests of `ostrya-mountd` also need `setpriv`, `unshare`, `nsenter`, and
 user namespaces for an unprivileged user. They run each client as the user
 65534 in its own user namespace, and keep their repositories and targets in
-`/var/tmp`, where that user can reach them.
+`/var/tmp`, where that user can reach them. `tests/daemon.rs` tests the
+daemon, and `tests/helper.rs` tests the mount helper `mount.ostrya` on each
+of its paths. Two tests of `tests/helper.rs` run mount(8) in a private mount
+namespace with the helper bound over `/sbin`. They skip on a host with no
+`/sbin`, for example NixOS. The fixtures of the two files are in
+`tests/common/mod.rs`.
 
 The unit tests of the protocol are in `ostrya-mount`, and the unit tests of
-the daemon handler are in `ostrya-mountd`. They need no privilege:
+the daemon handler and of the parse of the arguments of the mount helper are
+in `ostrya-mountd`. They need no privilege:
 
 ```sh
 cargo test -p ostrya-mount -p ostrya-mountd
@@ -610,9 +616,10 @@ OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
 The hand-written sections, for example ENVIRONMENT and EXAMPLES, are in
 `crates/ostrya-cli/man/extra/<page>.roff`.
 
-The man page `ostrya-mountd(8)` is in `crates/ostrya-mountd/man/`, and its
-hand-written sections are in
-`crates/ostrya-mountd/man/extra/ostrya-mountd.8.roff`. Write it again with:
+The man pages `ostrya-mountd(8)` and `mount.ostrya(8)` are in
+`crates/ostrya-mountd/man/`, and their hand-written sections are in
+`crates/ostrya-mountd/man/extra/ostrya-mountd.8.roff` and
+`crates/ostrya-mountd/man/extra/mount.ostrya.8.roff`. Write them again with:
 
 ```sh
 OSTRYA_BLESS_MAN=1 cargo test -p ostrya-mountd man_page

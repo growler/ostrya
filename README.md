@@ -105,7 +105,10 @@ Ostrya adds these functions, which the `ostree` command does not have:
   an image that the caller opens. A process in its own user namespace asks
   the mount daemon `ostrya-mountd`, which runs as root. The daemon mounts the
   image of the image commit of a commit, or an image that it builds in
-  memory.
+  memory. The mount helper `mount.ostrya` gives the command
+  `mount -t ostrya -o ro <repo>:<rev> <dir>`. It mounts in its own process
+  for root in the initial user namespace, and asks the daemon for each other
+  caller.
 - Removable media. `ostrya media export` copies the commits of collection
   refs onto a mounted volume, for a host with no network. The media
   repository has the layout that `ostree create-usb` writes, and
@@ -305,7 +308,8 @@ The project is a Cargo workspace of these crates:
   the mount daemon, the protocol of the daemon, and the mount steps that the
   daemon uses. It links no repository code and no async runtime.
 - `ostrya-mountd`: the mount daemon `ostrya-mountd`, with its connection
-  handler and its worker. It is not published to crates.io.
+  handler and its worker, and the mount helper `mount.ostrya`. It is not
+  published to crates.io.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.
 - `ostrya-conformance`: the conformance harness that compares Ostrya with the
   `ostree` command. It is not published to crates.io.
@@ -362,9 +366,11 @@ services.ostrya-serve.instances =
   };
 ```
 
-The flake gives the mount daemon as the package `ostrya-mountd`. The option
-`services.ostrya-mountd.enable` installs the units of the daemon, enables the
-socket unit, and creates the group `ostrya-mount`. The options `socketConfig`
+The flake gives the mount daemon and the mount helper `mount.ostrya` as the
+package `ostrya-mountd`. The option `services.ostrya-mountd.enable` installs
+the units of the daemon, enables the socket unit, creates the group
+`ostrya-mount`, and puts the package in `environment.systemPackages`, where
+mount(8) finds the helper. The options `socketConfig`
 and `serviceConfig` add settings to the units. The example below serves all
 connections with one process and lets the user `alice` mount through the
 daemon:
@@ -390,7 +396,8 @@ the other arguments of `ostrya serve`. Two instances can serve the same
 repository, for example one with plain HTTP and one with HTTPS. The package
 does not enable the unit. The unit is in `crates/ostrya-cli/systemd`.
 `crates/ostrya-mountd/debian` builds the package `ostrya-mountd`, with the
-mount daemon at `/usr/sbin/ostrya-mountd`, its systemd units, and the
+mount daemon at `/usr/sbin/ostrya-mountd`, the mount helper at
+`/usr/sbin/mount.ostrya`, the systemd units of the daemon, and the
 sysusers.d file of the group `ostrya-mount`. The package does not enable the
 socket unit. The units are in `crates/ostrya-mountd/systemd`. The Nix package
 and the Debian packages install the man pages.

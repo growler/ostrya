@@ -1,16 +1,20 @@
 //! The reads of a repository that a mount needs: the check of the mode, the
 //! verity choice of the config, the open of the image of an image commit, and
-//! the build of an image in memory.
+//! the build of an image in memory. The daemon and the mount helper share
+//! them.
 
 use std::os::fd::{AsFd, OwnedFd};
 
-use ostrya::{Checksum, Repo, RepoMode, Tristate, VerityPolicy};
+use ostrya::{Checksum, ComposefsImageSource, Repo, RepoMode, Tristate, VerityPolicy};
 use ostrya_mount::Verity;
 use rustix::io::Errno;
 
 /// The block size of the loop device that carries the image. The size of
 /// an image must be a positive multiple of it.
 const IMAGE_BLOCK: u64 = 4096;
+
+/// The default largest size of a built image, in bytes: 100 MiB.
+pub(crate) const DEFAULT_MAX_IMAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// The error of a read of the repository.
 #[derive(Debug)]
@@ -130,9 +134,16 @@ fn check_mode(mode: RepoMode) -> Result<(), Error> {
 /// The call does not copy the image. If the loose object of the image is not
 /// sealed with fs-verity, a process that can write the file can change it
 /// while it is mounted.
-pub(crate) async fn open_named_image(repo: &Repo, commit: &Checksum) -> Result<OwnedFd, Error> {
+///
+/// Returns the descriptor of the image, the field that names the image
+/// commit, and the checksum of the image commit, or `None` if the commit
+/// names no image commit.
+pub(crate) async fn find_image(
+    repo: &Repo,
+    commit: &Checksum,
+) -> Result<Option<(OwnedFd, ComposefsImageSource, Checksum)>, Error> {
     let Some(image) = repo.open_composefs_image(commit).await? else {
-        return Err(Error::NoImage { commit: *commit });
+        return Ok(None);
     };
     if image.size == 0 || !image.size.is_multiple_of(IMAGE_BLOCK) {
         return Err(Error::ImageSize {
@@ -140,7 +151,16 @@ pub(crate) async fn open_named_image(repo: &Repo, commit: &Checksum) -> Result<O
             size: image.size,
         });
     }
-    Ok(image.file.into())
+    Ok(Some((image.file.into(), image.source, image.commit)))
+}
+
+/// Opens the image of the image commit that `commit` names, as
+/// [`find_image`] does, and refuses a commit that names no image commit.
+pub(crate) async fn open_named_image(repo: &Repo, commit: &Checksum) -> Result<OwnedFd, Error> {
+    match find_image(repo, commit).await? {
+        Some((image, _, _)) => Ok(image),
+        None => Err(Error::NoImage { commit: *commit }),
+    }
 }
 
 /// Builds the composefs image of `commit` into a sealed memory file.

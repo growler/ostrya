@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-mountd"
-description = "Mount daemon of ostrya: mounts composefs trees for callers in their own user namespace"
+description = "Mount daemon and mount helper of ostrya: mount commits as composefs trees for root and for callers in their own user namespace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,12 @@ publish = false
 [[bin]]
 name = "ostrya-mountd"
 path = "src/main.rs"
+
+# The mount helper. Cargo takes no dot in the name of a target, so the
+# packages install this binary as `mount.ostrya`, the name that mount(8) runs.
+[[bin]]
+name = "mount-ostrya"
+path = "src/mount_ostrya.rs"
 
 [features]
 default = ["smol", "lzma-static"]

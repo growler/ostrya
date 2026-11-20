@@ -9,11 +9,12 @@
 //! parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
 //! caller can also map a file read-only. On Linux, a caller attaches a file
 //! to a loop device, and writes bytes to a memory file that it then seals.
-//! It reads the type and the owner of a namespace, sets an ID mapping on a
-//! detached mount, reads the groups of the peer of a Unix socket, and takes
-//! the socket that systemd passes. The crate depends on `rustix`. On Linux
-//! it also depends on `libc`, for the two calls that `rustix` does not give:
-//! `mount_setattr` and `SO_PEERGROUPS`.
+//! It reads the type and the owner of a namespace, gives a thread its own
+//! file system attributes, sets an ID mapping on a detached mount, reads the
+//! groups of the peer of a Unix socket, and takes the socket that systemd
+//! passes. The crate depends on `rustix`. On Linux it also depends on
+//! `libc`, for the two calls that `rustix` does not give: `mount_setattr`
+//! and `SO_PEERGROUPS`.
 //!
 //! # Entry points
 //!
@@ -27,6 +28,9 @@
 //!   [`seal_contents`] seals its bytes and its size. Linux only.
 //! - [`ns_type`] returns the type of a namespace, and [`ns_owner_userns`]
 //!   returns the user namespace that owns it. Linux only.
+//! - [`unshare_fs`] gives the calling thread its own root directory,
+//!   working directory, and umask, so that the thread can enter a mount
+//!   namespace. Linux only.
 //! - [`mount_setattr_idmap`] sets an ID mapping on a detached mount. Linux
 //!   only.
 //! - [`peer_groups`] returns the supplementary groups of the peer of a Unix
@@ -555,7 +559,7 @@ pub use loop_dev::{
 #[cfg(target_os = "linux")]
 pub use memfd::{seal_contents, sealable_memfd};
 #[cfg(target_os = "linux")]
-pub use ns::{mount_setattr_idmap, ns_owner_userns, ns_type};
+pub use ns::{mount_setattr_idmap, ns_owner_userns, ns_type, unshare_fs};
 #[cfg(target_os = "linux")]
 pub use sock::{peer_groups, systemd_listen_fd};
 
@@ -996,6 +1000,30 @@ mod ns {
             )?;
             Ok(OwnedFd::from_raw_fd(raw as RawFd))
         }
+    }
+
+    /// Gives the calling thread its own copy of its file system attributes:
+    /// the root directory, the working directory, and the umask.
+    ///
+    /// The call is `unshare(CLONE_FS)`. The kernel refuses `setns` into a
+    /// mount namespace with `EINVAL` for a thread that shares these
+    /// attributes with another thread or process. Each thread of a process
+    /// shares them, so a process with more than one thread calls this
+    /// function in the thread that then calls `setns`. After the call, a
+    /// change of the root or of the working directory in the calling thread,
+    /// `setns` included, does not change the other threads.
+    ///
+    /// # Errors
+    ///
+    /// The `Errno` of `unshare`, for example `ENOMEM`.
+    pub fn unshare_fs() -> Result<()> {
+        // SAFETY: rustix makes `unshare_unsafe` unsafe because of
+        // `CLONE_FILES`: a thread with its own descriptor table can hold a
+        // descriptor number that another thread then uses for another file.
+        // The call gives `UnshareFlags::FS` alone. It copies the root, the
+        // working directory, and the umask of the thread, and does not change
+        // the descriptor table, so each descriptor stays valid in each thread.
+        unsafe { rustix::thread::unshare_unsafe(rustix::thread::UnshareFlags::FS) }
     }
 
     /// Sets an ID mapping on the detached mount `mount`, with the user
@@ -1506,7 +1534,7 @@ mod linux_tests {
 mod ns_sock_tests {
     use super::{
         mount_setattr_idmap, ns_owner_userns, ns_type, peer_groups, sock::listen_vars_match,
-        systemd_listen_fd,
+        systemd_listen_fd, unshare_fs,
     };
     use std::ffi::OsStr;
     use std::os::fd::{AsFd, AsRawFd, OwnedFd};
@@ -1553,6 +1581,23 @@ mod ns_sock_tests {
         assert_eq!(ns_type(&owner).unwrap(), LinkNameSpaceType::User);
         let flags = rustix::io::fcntl_getfd(&owner).unwrap();
         assert!(flags.contains(FdFlags::CLOEXEC));
+    }
+
+    /// After the call, a change of the working directory in the calling
+    /// thread does not change the working directory of the main thread.
+    #[test]
+    fn a_thread_with_its_own_attributes_changes_its_directory_alone() {
+        let before = std::fs::read_link("/proc/self/cwd").unwrap();
+        assert_ne!(before, std::path::Path::new("/"));
+        std::thread::spawn(move || {
+            unshare_fs().unwrap();
+            std::env::set_current_dir("/").unwrap();
+            let own = std::fs::read_link("/proc/thread-self/cwd").unwrap();
+            assert_eq!(own, std::path::Path::new("/"));
+            assert_eq!(std::fs::read_link("/proc/self/cwd").unwrap(), before);
+        })
+        .join()
+        .unwrap();
     }
 
     /// A directory descriptor is not a detached mount. Without the privilege

@@ -720,6 +720,141 @@ error of the library. A commit that names no image commit gets the reply
 `commit <commit> has no attachment or supplement composefs`, with the code
 `repository`.
 
+### The mount helper
+
+`mount.ostrya` is the helper that mount(8) runs for
+`mount -t ostrya -o ro <repo>:<rev> <dir>`. It is a second binary of
+`ostrya-mountd`, which already links `ostrya` and `clap` and holds the
+repository reads of a mount. Cargo takes no dot in the name of a binary
+target, so the target is `mount-ostrya`. The Debian package installs it as
+`/usr/sbin/mount.ostrya`, and the Nix package as `bin/mount.ostrya`, each
+with the man page `mount.ostrya(8)`.
+
+The spec is `<repo>:<rev>`. The helper splits it at the first colon, so a
+revision can hold a colon, as `remote:ref` and `@ID:REF` do. A repository
+path cannot hold a colon. The helper resolves the revision with
+`Repo::resolve_rev` under its own credentials.
+
+The helper selects its path with `ostrya_mount::is_privileged`:
+
+- Root in the initial user namespace mounts in its own process. The helper
+  opens the repository in the strict open mode, refuses an `archive`
+  repository, reads `[ex-integrity] fsverity`, and finds or builds the
+  image. With no `-N`, it calls `Direct::mount_image`. With `-N`, it
+  mounts the tree with `sys::mount_composefs` in its own mount namespace,
+  calls `ostrya_sys::unshare_fs`, enters the target mount namespace with
+  `setns`, opens the target there, and moves the mount onto it with
+  `sys::move_onto`. The kernel refuses `setns` into a mount namespace for
+  a thread that shares its file system attributes, and the threads of the
+  blocking pool of the runtime share them. A built image has the limit of
+  100 MiB, the default of the daemon.
+- Each other caller asks the daemon. The helper opens the repository with
+  `Repo::open` under its own credentials, resolves the revision, and reads
+  the relations of the commit. If a field has an entry `composefs`, it
+  sends op 1, else op 2. A duplicate entry is left to the lookup of the
+  daemon. The helper sends the commit checksum, so the bytes of the wire
+  protocol do not change.
+
+The source label of each mount is the commit checksum.
+
+The namespaces of a mount:
+
+- With no `-N`, the mount goes into the namespaces of the helper. On the
+  daemon path, the helper sends its own user namespace and mount
+  namespace, as `Helper::new` does. The daemon refuses the initial user
+  namespace. A caller that is not root and is in the initial user
+  namespace gets that refusal from the helper before a connect, also with
+  `-f`. The helper reads the answer from
+  `ostrya_mount::in_initial_user_namespace`. The message names
+  `podman unshare mount ...` and a direct call with `-N <pid>`.
+- With `-N`, a value of digits alone is a process id, and the target is
+  `/proc/<pid>/ns/mnt`. Each other value is a namespace file. The daemon
+  path sends the mount namespace and the user namespace that owns it, from
+  `NS_GET_USERNS`, with `Helper::with_namespaces`. The helper reads the
+  repository path in its own namespace, and the daemon opens it in the
+  target namespace. The in-process path gives the mount no ID mapping.
+- With `-N`, a relative target is refused. With no `-N`, the helper makes a
+  relative target absolute against its working directory.
+- With `-N`, a relative repository path is refused on each path, also on a
+  direct run. With `-N`, mount(8) runs the helper with its working
+  directory at `/`, so a relative repository path resolves against `/`.
+  With no `-N`, the daemon path makes a relative repository path absolute
+  with `std::path::absolute`.
+
+The image is the image of the attachment `composefs`, else of the
+supplement `composefs`, else a built image. A defect of the selected image
+commit stops the mount, and the helper does not try the next source.
+
+The options:
+
+- `-o` accepts `ro`, `nosuid`, `nodev`, and `exec`. It refuses `rw`, because
+  each mount is read-only, also with `-s`. The in-process path also accepts
+  `noexec`, `suid`, and `dev`, and the last option of a name wins. The
+  daemon path refuses `noexec`, because the daemon cannot set it, and
+  refuses `suid` and `dev`, because the daemon sets `nosuid` and `nodev` on
+  each mount. With no `-o`, a direct run of the helper mounts read-only.
+  The values of more than one `-o` are joined.
+- `nofail`, `_netdev`, `user`, `users`, `owner`, and `group` are out of the
+  scope of the helper. It refuses each of them unless `-s` is given.
+- `-s` ignores each option that the helper does not know.
+- `-f` does each check and finds the image, and mounts nothing. The
+  in-process path builds no image. The daemon path does not connect.
+- `-n` has no effect, because the helper writes no mtab and no utab.
+- `-v` writes one line to standard error:
+  `mount.ostrya: commit <hex>, image attachment <C>|supplement <C>|built,
+  path in-process|daemon`.
+- `-t` accepts `ostrya` alone, and refuses a subtype.
+
+The exit status follows mount(8): 1 for a usage error or a refused
+argument, and 32 for each failure after the check of the arguments. The
+unmount is `umount <dir>` in the namespace of the mount. There is no
+`umount.ostrya`.
+
+mount(8) of util-linux 2.41 and 2.42, observed on Debian and NixOS, gives
+the helper these arguments:
+
+- mount(8) runs `/sbin/mount.<type> <spec> <dir> [-sfnv] [-o <options>]
+  [-N <ns>]`. On NixOS it looks first in `/run/wrappers/bin` and in
+  `/run/current-system/sw/bin`, where the NixOS module puts the package.
+- With no `-o`, mount(8) gives `-o rw`. `-w` and `-o defaults` also give
+  `-o rw`, and `-r` gives `-o ro`. The helper cannot tell an `rw` of
+  mount(8) from an `rw` of the user, so `mount -t ostrya <spec> <dir>` with
+  no `-o` gets the refusal of `rw`, and its message names `-o ro` and `-r`.
+- mount(8) merges the options. The last option of a name wins. `user` and
+  `users` add `noexec,nosuid,nodev`, and `owner` and `group` add
+  `nosuid,nodev`. `comment=`, `x-*`, `auto`, `noauto`, and the propagation
+  options do not reach the helper. `loop`, `bind`, and `rbind` stop
+  mount(8) before it runs the helper.
+- mount(8) opens the namespace of `-N` itself and gives the helper
+  `-N /proc/<pid of mount>/fd/<N>`, for a process id and for a file. The
+  helper runs in the mount namespace of mount(8), with its working
+  directory at `/`. With `-N`, if a relative target resolves at the root of
+  the target namespace, mount(8) makes it absolute against that root. A
+  relative target that does not resolve there reaches the helper as the
+  user writes it, and the helper refuses it. With no `-N`, mount(8) gives
+  the canonical absolute path.
+- A user who is not root runs mount(8) with no setuid rights, so the
+  helper runs as that user. Such a user in the initial user namespace
+  cannot give `-N` to mount(8): mount(8) fails to enter the namespace and
+  runs no helper. A direct run of the helper accepts `-N`.
+- `-t ostrya` gives the helper no `-t`. `-t ostrya.sub` gives
+  `-t ostrya.sub`.
+- The exit status of the helper is the exit status of mount(8).
+- umount(8) runs no helper for an overlay mount. It calls
+  `umount2(<dir>, 0)`, and the kernel then releases the layers and
+  detaches the loop device.
+
+Rejected alternatives:
+
+- The helper is a crate of its own. It would repeat the dependencies of
+  `ostrya-mountd`.
+- The helper is an `argv[0]` mode of the `ostrya` command. That binary also
+  links the HTTP client, the TLS stack, and the S3 support.
+- With no `-N`, the helper finds the pause process of rootless podman by
+  itself. That ties the helper to the private layout of podman.
+- The helper mounts the recorded image alone, and builds an image only with
+  `-o build`.
+
 ## The split of the mount library
 
 A composefs mount has three functions:

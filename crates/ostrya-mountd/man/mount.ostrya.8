@@ -1,0 +1,257 @@
+.TH "MOUNT.OSTRYA" "8" "" "ostrya" "System Administration Commands"
+.SH NAME
+mount.ostrya \- Mount a commit of an ostrya repository as a \%read\-only composefs tree
+.SH SYNOPSIS
+.nf
+mount.ostrya [OPTIONS] <SPEC> <DIR>
+.fi
+.SH DESCRIPTION
+Mount a commit of an ostrya repository as a \%read\-only composefs tree.
+.PP
+\%mount(8) runs \%mount.ostrya for \fB\%mount \-t ostrya \-o ro REPO:REV DIR\fR\&. The helper resolves the revision REV in the repository REPO and mounts the commit at DIR.
+.PP
+A caller that is root in the initial user namespace mounts in its own process. Each other caller asks the mount daemon \%ostrya\-mountd for the mount. Such a caller is in a user namespace of its own, for example under \fB\%podman unshare\fR, or gives the mount namespace of such a process with \%\-N.
+.SH ARGUMENTS
+.TP
+\fISPEC\fR
+The repository and the revision, in the form \%REPO:REV.
+.IP
+The helper splits the value at the first colon. REPO is the path of the repository directory, and cannot hold a colon. With \%\-N, REPO must be an absolute path. REV is a commit checksum, a ref, \fB\%remote:ref\fR, or \fB\%@ID:REF\fR, as \fB\%ostrya rev\-parse\fR reads it.
+.TP
+\fIDIR\fR
+The target directory of the mount.
+.IP
+With \%\-N, DIR must be an absolute path in the target mount namespace.
+.SH OPTIONS
+.TP
+\fB\-s\fR
+Ignore each mount option that the helper does not know.
+.IP
+The option does not make the helper accept a known option that it refuses, for example rw.
+.TP
+\fB\-f\fR
+Do each check and the lookup of the image, and mount nothing.
+.IP
+The helper builds no image. On the daemon path it does not connect to the daemon.
+.TP
+\fB\-n\fR
+Has no effect. The helper writes no mtab and no utab.
+.TP
+\fB\-v\fR
+Write the commit, the source of the image, and the path of the mount to standard error.
+.TP
+\fB\-N\fR \fINS\fR
+Mount in the mount namespace NS.
+.IP
+A value of digits alone is a process id, and the namespace is \fB\%/proc/NS/ns/mnt\fR\&. Each other value is the path of a mount namespace file.
+.TP
+\fB\-o\fR \fIOPTIONS\fR
+The mount options, as a list with commas.
+.IP
+The helper accepts ro, nosuid, nodev, noexec, suid, dev, and exec. It refuses rw, because each mount is \%read\-only. On the daemon path, it also refuses noexec, suid, and dev. The helper joins the values of more than one \%\-o.
+.TP
+\fB\-t\fR \fITYPE\fR
+The file system type. The helper accepts \fB\%ostrya\fR alone.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version.
+.SH PATHS
+The helper selects one of two paths when it starts.
+.TP
+\fBIn-process\fR
+The caller is root in the initial user namespace: its real and effective
+user ids are 0, and \fB/proc/self/uid_map\fR maps the full range of ids
+from 0 to 0. The helper opens the repository with its own credentials,
+refuses an \fBarchive\fR repository, reads the key
+\fB[ex\-integrity] fsverity\fR, finds or builds the image, and mounts it in
+its own process. The overlay mounts with \fBverity=require\fR if the key is
+\fByes\fR, and with \fBverity=off\fR for each other value. A built image
+larger than 100 MiB is refused before the helper writes it.
+.TP
+\fBDaemon\fR
+Each other caller. The helper opens the repository with the credentials
+of the caller, resolves the revision, and reads the relations of the
+commit. It then asks the mount daemon \fBostrya\-mountd\fR(8) for the mount,
+and sends the absolute path of the repository, the commit checksum, the
+absolute path of the target, a user namespace, and a mount namespace. The
+daemon opens the repository again with the credentials of the caller,
+checks the image, and mounts the tree. Each mount of the daemon has
+\fBnosuid\fR and \fBnodev\fR.
+.PP
+The source label of the mount, which \fB/proc/self/mountinfo\fR shows, is
+the commit checksum on each path.
+.SH NAMESPACES
+With no \fB\-N\fR, the mount goes into the mount namespace of the helper.
+On the daemon path, the helper sends its own user namespace and mount
+namespace. The daemon refuses the initial user namespace. A user who is
+not root, in the initial user namespace, and with no \fB\-N\fR therefore
+gets a refusal from the helper before it connects. Such a user runs the
+mount in a user namespace of its own, for example with \fBpodman
+unshare\fR, or gives \fB\-N\fR to a direct run of the helper.
+.PP
+With \fB\-N\fR \fINS\fR, the mount goes into the mount namespace of
+\fINS\fR. A value of digits alone is a process id, and the namespace file
+is \fB/proc/\fR\fINS\fR\fB/ns/mnt\fR. Each other value is the path of a
+mount namespace file. The helper refuses a file that is not a mount
+namespace. With \fB\-N\fR, \fIDIR\fR must be an absolute path, and the
+helper resolves it in the target namespace. With no \fB\-N\fR, the helper
+makes a relative \fIDIR\fR absolute against its working directory.
+.PP
+With \fB\-N\fR, \fIREPO\fR must also be an absolute path. With \fB\-N\fR,
+mount(8) runs the helper with its working directory at \fB/\fR, so a
+relative \fIREPO\fR resolves against \fB/\fR. The helper refuses a relative
+\fIREPO\fR with \fB\-N\fR on each path, also on a direct run.
+.TP
+\fBIn-process path with \-N\fR
+The helper opens the repository, the image, and the \fBobjects\fR
+directory, and mounts the tree in its own mount namespace. It then gives
+its thread its own file system attributes, enters the target namespace
+with \fBsetns\fR(2), opens \fIDIR\fR there, and moves the mount onto it.
+The mount takes no ID mapping. In a mount namespace that another user
+namespace owns, the files show the owners that the image records.
+.TP
+\fBDaemon path with \-N\fR
+The helper sends the mount namespace of \fINS\fR and the user namespace
+that owns it. The helper reads the repository path in its own mount
+namespace. The daemon opens the repository and the target in the target
+namespace, so the repository path must name the same repository there.
+.SH IMAGE
+The helper mounts the image of the image commit that the commit names as
+the attachment \fBcomposefs\fR. If the commit has no such attachment, the
+helper mounts the image of the supplement \fBcomposefs\fR. If the commit
+has neither, the helper builds the image in a sealed memory file.
+.PP
+The image commit must be in the repository with no partial marker, and its
+tree must hold the regular file \fB/root.cfs\fR and no other entry. If the
+commit carries the key \fBostree.composefs.digest.v0\fR, the fs-verity
+digest of \fB/root.cfs\fR must be the value of the key. The size of the
+image must be a positive multiple of 4096 bytes. A defect of the selected
+image commit stops the mount, and the helper does not try the next
+source.
+.PP
+On the daemon path, the helper reads the two fields of the commit. If one
+of them has an entry \fBcomposefs\fR, the helper asks the daemon for the
+image of the image commit. Else it asks the daemon to build the image.
+.SH MOUNT OPTIONS
+.TP
+\fBro\fR
+The mount is read-only. Each mount of the helper is read-only, also with
+no \fBro\fR.
+.TP
+\fBnosuid\fR, \fBnodev\fR
+The mount sets the flag. The daemon sets both flags on each mount.
+.TP
+\fBnoexec\fR
+The mount sets the flag. The daemon path refuses the option, because the
+daemon cannot set it.
+.TP
+\fBsuid\fR, \fBdev\fR, \fBexec\fR
+The option clears the flag \fBnosuid\fR, \fBnodev\fR, or \fBnoexec\fR
+that an earlier option sets. The daemon path accepts \fBexec\fR, and
+refuses \fBsuid\fR and \fBdev\fR.
+.TP
+\fBrw\fR
+The helper refuses the option, also with \fB\-s\fR.
+.PP
+The helper refuses each other option. With \fB\-s\fR, it ignores an option
+that it does not know. The options \fBnofail\fR, \fB_netdev\fR, \fBuser\fR,
+\fBusers\fR, \fBowner\fR, and \fBgroup\fR are not in the scope of the
+helper. It refuses them, and ignores them with \fB\-s\fR.
+.SH MOUNT(8)
+mount(8) runs the helper as \fB/sbin/mount.ostrya\fR \fISPEC DIR\fR
+[\fB\-sfnv\fR] [\fB\-o\fR \fIoptions\fR] [\fB\-N\fR \fIns\fR]. On NixOS, it
+also looks in \fB/run/wrappers/bin\fR and \fB/run/current\-system/sw/bin\fR.
+mount(8) changes the arguments before it runs the helper:
+.IP \(bu 2
+With no \fB\-o\fR, mount(8) gives \fB\-o rw\fR. \fB\-w\fR and
+\fB\-o defaults\fR also give \fB\-o rw\fR, and \fB\-r\fR gives \fB\-o ro\fR.
+The helper refuses \fBrw\fR, so give \fB\-o ro\fR or \fB\-r\fR.
+.IP \(bu 2
+mount(8) merges the options into one list, and the last option of a name
+wins. \fBuser\fR and \fBusers\fR add \fBnoexec\fR, \fBnosuid\fR, and
+\fBnodev\fR. \fBowner\fR and \fBgroup\fR add \fBnosuid\fR and \fBnodev\fR.
+mount(8) removes the options \fBcomment=\fR, \fBx\-\fR, \fBX\-\fR,
+\fBauto\fR, \fBnoauto\fR, and the propagation options, and gives the helper
+the other options. \fBnouser\fR reaches the helper. With \fBloop\fR,
+\fBoffset=\fR, or \fBsizelimit=\fR, mount(8) tries to set up a loop device
+for \fISPEC\fR. It writes \fBfailed to setup loop device\fR, exits 32, and
+runs no helper. \fBbind\fR and \fBrbind\fR also stop mount(8) with exit
+status 32 before it runs the helper.
+.IP \(bu 2
+mount(8) opens the namespace of \fB\-N\fR itself, and gives the helper
+\fB\-N /proc/\fR\fIpid\fR\fB/fd/\fR\fIN\fR, where \fIpid\fR is the process id
+of mount(8). The helper runs in the mount namespace of mount(8), with its
+working directory at \fB/\fR. If a relative \fIDIR\fR resolves at the root
+of the target namespace, mount(8) makes it absolute against that root. A
+relative \fIDIR\fR that does not resolve there reaches the helper as the
+user writes it, and the helper refuses it. A user who is
+not root in the initial user namespace cannot give \fB\-N\fR to mount(8):
+mount(8) fails to enter the namespace and runs no helper.
+.IP \(bu 2
+mount(8) gives \fB\-t\fR only for a subtype, as \fB\-t ostrya.\fR\fIsub\fR.
+The helper refuses each type other than \fBostrya\fR.
+.IP \(bu 2
+A user who is not root runs mount(8) with no setuid rights, so the helper
+runs as that user. mount(8) removes \fBPATH\fR and \fBHOME\fR from the
+environment of a root caller, and keeps \fBOSTRYA_MOUNTD_SOCKET\fR.
+.PP
+The exit status of the helper is the exit status of mount(8).
+.SH UNMOUNT
+Run \fBumount\fR \fIDIR\fR in the mount namespace of the mount. umount(8)
+runs no helper for an overlay mount. After the unmount, the kernel releases
+the layers of the tree and detaches the loop device of the image. The
+memory of a built image is free when no descriptor of its memory file is
+open. The helper writes no mtab and no utab.
+.SH EXAMPLES
+As root, mount the commit of the ref \fBos/stable\fR:
+.PP
+.nf
+mount \-t ostrya \-o ro /srv/repo:os/stable /mnt/os
+umount /mnt/os
+.fi
+.PP
+As a user who is not root, mount a commit in the user namespace of
+rootless podman, with \fB/mnt/os\fR in the mount namespace of podman:
+.PP
+.nf
+podman unshare mount \-t ostrya \-o ro /srv/repo:os/stable /mnt/os
+podman unshare ls /mnt/os
+podman unshare umount /mnt/os
+.fi
+.PP
+As a user who is not root, mount a commit in the namespaces of the process
+\fIpid\fR, which runs in a user namespace of that user:
+.PP
+.nf
+mount.ostrya /srv/repo:os/stable /mnt/os \-o ro \-N \fIpid\fR
+nsenter \-\-target \fIpid\fR \-\-user \-\-mount \-\-preserve\-credentials ls /mnt/os
+.fi
+.SH ENVIRONMENT
+.TP
+\fBOSTRYA_MOUNTD_SOCKET\fR
+The path of the socket of the daemon, for the daemon path. The default is
+\fB/run/ostrya/mountd.sock\fR. A helper that is root in the initial user
+namespace does not read it, and a helper whose real user or group id is
+not its effective one does not read it.
+.SH EXIT STATUS
+.TP
+\fB0\fR
+The mount is in place, or \fB\-f\fR found each argument valid.
+.TP
+\fB1\fR
+An argument is not valid or is refused, for example \fBrw\fR, an option
+that the helper does not know, a spec with no colon, or a mount with no
+\fB\-N\fR in the initial user namespace on the daemon path.
+.TP
+\fB32\fR
+The mount failed after the check of the arguments, for example on the
+open of the repository, the resolve of the revision, the lookup of the
+image, a mount step, or a refusal of the daemon.
+.SH SEE ALSO
+\fBmount\fR(8),
+\fBumount\fR(8),
+\fBostrya\-mountd\fR(8),
+\fBostrya\fR(1),
+\fBostrya\-repo\fR(5),
+\fBpodman\-unshare\fR(1),
+\fBnsenter\fR(1)

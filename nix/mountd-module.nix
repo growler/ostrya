@@ -34,7 +34,10 @@ in
       type = types.package;
       default = self.packages.${pkgs.stdenv.hostPlatform.system}.ostrya-mountd;
       defaultText = lib.literalExpression "ostrya.packages.\${system}.ostrya-mountd";
-      description = "The package that supplies `ostrya-mountd` and its systemd units.";
+      description = ''
+        The package that supplies `ostrya-mountd`, its systemd units, and the
+        mount helper `mount.ostrya`.
+      '';
     };
 
     socketConfig = mkOption {
@@ -58,6 +61,7 @@ in
 
   config = mkIf cfg.enable {
     systemd.packages = [ cfg.package ];
+    # mount(8) finds `mount.ostrya` in `/run/current-system/sw/bin`.
     environment.systemPackages = [ cfg.package ];
 
     # NixOS reads no sysusers.d file from `systemd.packages`, so the module

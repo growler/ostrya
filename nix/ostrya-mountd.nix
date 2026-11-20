@@ -30,6 +30,8 @@ rustPlatform.buildRustPackage {
     "ostrya-mountd"
     "--bin"
     "ostrya-mountd"
+    "--bin"
+    "mount-ostrya"
   ];
 
   # The default feature set of `ostrya-mountd` carries `lzma-static`, so
@@ -41,7 +43,12 @@ rustPlatform.buildRustPackage {
   # The units name `/usr/sbin/ostrya-mountd`, the path of the Debian package,
   # so the service units get the store path of the binary. The sysusers.d file
   # is installed for completeness; the NixOS module creates the group itself.
+  # Cargo takes no dot in the name of a binary, so the mount helper is built as
+  # `mount-ostrya` and renamed to `mount.ostrya`, the name that mount(8) runs.
+  # The NixOS module puts the package in `environment.systemPackages`, and
+  # mount(8) finds the helper in `/run/current-system/sw/bin`.
   postInstall = ''
+    mv "$out/bin/mount-ostrya" "$out/bin/mount.ostrya"
     for unit in ostrya-mountd.socket ostrya-mountd.service ostrya-mountd@.service; do
       install -Dm644 "crates/ostrya-mountd/systemd/$unit" "$out/lib/systemd/system/$unit"
     done
@@ -53,6 +60,7 @@ rustPlatform.buildRustPackage {
       "$out/lib/sysusers.d/ostrya-mountd.conf"
 
     installManPage crates/ostrya-mountd/man/ostrya-mountd.8
+    installManPage crates/ostrya-mountd/man/mount.ostrya.8
   '';
 
   # The daemon tests mount EROFS and overlayfs, which needs root on the host.

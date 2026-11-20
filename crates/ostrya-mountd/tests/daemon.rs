@@ -48,32 +48,26 @@
 //!   existing mount and stacks no new mount.
 //! - The daemon leaves no temp directory behind.
 
+mod common;
+
 use std::io::Write;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use common::{
+    ChildGuard, Fixture, HELLO, Named, OWN_NAMESPACES, Unmount, commit_named, file_object_path,
+    fixture_root, image_commit_of, key_dict, mounts_at, require_root, wait_for_path, write_source,
+};
 use ostrya::{
-    COMPOSEFS_RELATION, Checksum, Commit, CommitOptions, ComposefsOptions, CreateOptions, DirMeta,
-    DirTree, FileMeta, MutableTree, ObjectType, Repo, RepoMode, Type, Value, Xattrs,
+    COMPOSEFS_RELATION, Checksum, CommitOptions, ComposefsOptions, CreateOptions, Repo, RepoMode,
 };
 use ostrya_mount::{Access, Error, Helper, HelperCode, MountOptions};
-use rustix::mount::FsOpenFlags;
 use rustix::net::{
     AddressFamily, SocketAddrUnix, SocketFlags, SocketType, bind, listen, socket_with,
 };
-
-/// The environment variable that turns the skip of a test into a failure.
-const REQUIRE_MOUNT: &str = "OSTRYA_REQUIRE_MOUNT";
-
-/// The commit metadata key that holds the image digest.
-const DIGEST_KEY: &str = "ostree.composefs.digest.v0";
-
-/// The user of each client.
-const CLIENT_UID: u32 = 65534;
 
 /// The name of the ignored test that runs a client in a child process.
 const CLIENT_TEST: &str = "client_child";
@@ -81,214 +75,7 @@ const CLIENT_TEST: &str = "client_child";
 /// The environment variable that gives the request of the client child.
 const CLIENT_ENV: &str = "OSTRYA_TEST_MOUNTD_CLIENT";
 
-/// The content of `hello.txt` in the committed tree.
-const HELLO: &[u8] = b"hello composefs\n";
-
-/// The mode of the empty file `devnode` in the committed tree. The test
-/// finds the inode of the file in the image by this mode, and changes it
-/// into a character device.
-const DEVNODE_MODE: u16 = 0o100602;
-
-/// The device of `devnode` in the changed image: 1:3, `/dev/null`.
-const DEVNODE_RDEV: u32 = (1 << 8) | 3;
-
-/// The arguments that put a client in its own user namespace and mount
-/// namespace.
-const OWN_NAMESPACES: &[&str] = &["unshare", "-Ur", "-m"];
-
-/// A scratch directory under `/var/tmp` that any user can traverse. The
-/// directory is removed when the value drops.
-struct Scratch(PathBuf);
-
-impl Scratch {
-    fn new(tag: &str) -> Scratch {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = PathBuf::from("/var/tmp")
-            .join(format!("ostrya-mountd-{}-{tag}-{n}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Scratch(path)
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// A child process that is killed and reaped when the value drops.
-struct ChildGuard(Option<Child>);
-
-impl ChildGuard {
-    /// Waits at most `limit` for the child to exit and returns its status.
-    fn wait_for(&mut self, limit: Duration) -> Option<std::process::ExitStatus> {
-        let deadline = Instant::now() + limit;
-        let child = self.0.as_mut().unwrap();
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                return Some(status);
-            }
-            if Instant::now() > deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
-}
-
-/// Returns `true` if a command runs with exit status 0.
-fn runs(program: &str, args: &[&str]) -> bool {
-    Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-/// Returns `true` if the process can run the daemon and the clients: root
-/// in the initial user namespace, the mount calls, and a user namespace for
-/// the user 65534. Without them, the test skips and prints a message. If
-/// [`REQUIRE_MOUNT`] is set, a missing requirement fails the test.
-fn require_root() -> bool {
-    let capable = ostrya_mount::is_privileged()
-        && rustix::mount::fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC).is_ok()
-        && runs(
-            "setpriv",
-            &[
-                "--reuid=65534",
-                "--regid=65534",
-                "--clear-groups",
-                "unshare",
-                "-Ur",
-                "-m",
-                "true",
-            ],
-        );
-    if !capable {
-        assert!(
-            std::env::var_os(REQUIRE_MOUNT).is_none(),
-            "{REQUIRE_MOUNT} is set and the process cannot run the daemon tests"
-        );
-        eprintln!("skipped: the tests need root, mounts, setpriv, and unshare");
-    }
-    capable
-}
-
-/// The tree, the repository, and the commits of a test.
-struct Fixture {
-    scratch: Scratch,
-    repo: PathBuf,
-    commit: Checksum,
-    /// A commit of the same tree with no key, whose image commit holds
-    /// `devnode` as a character device.
-    dev_commit: Checksum,
-    /// A copy of the test binary that the user 65534 can run.
-    client_bin: PathBuf,
-}
-
 impl Fixture {
-    fn new(tag: &str) -> Fixture {
-        let scratch = Scratch::new(tag);
-        let src = scratch.path().join("src");
-        std::fs::create_dir_all(src.join("sub")).unwrap();
-        std::fs::write(src.join("hello.txt"), HELLO).unwrap();
-        std::fs::write(src.join("sub/nested.txt"), b"nested\n").unwrap();
-        std::fs::copy("/usr/bin/id", src.join("suid-id")).unwrap();
-        std::fs::set_permissions(src.join("suid-id"), std::fs::Permissions::from_mode(0o4755))
-            .unwrap();
-        std::fs::write(src.join("devnode"), b"").unwrap();
-        std::fs::set_permissions(
-            src.join("devnode"),
-            std::fs::Permissions::from_mode(u32::from(DEVNODE_MODE) & 0o7777),
-        )
-        .unwrap();
-        let repo = scratch.path().join("repo");
-        let (commit, dev_commit) = ostrya_rt::block_on(async {
-            let r = Repo::create(&repo, CreateOptions::new(RepoMode::BareUser))
-                .await
-                .unwrap();
-            commit_tree(&r, scratch.path()).await
-        });
-        let client_bin = scratch.path().join("client");
-        std::fs::copy(std::env::current_exe().unwrap(), &client_bin).unwrap();
-        std::fs::set_permissions(&client_bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Fixture {
-            scratch,
-            repo,
-            commit,
-            dev_commit,
-            client_bin,
-        }
-    }
-
-    /// Creates the empty directory `name`, owned by the client user.
-    fn target(&self, name: &str) -> PathBuf {
-        let path = self.scratch.path().join(name);
-        std::fs::create_dir(&path).unwrap();
-        rustix::fs::chown(
-            &path,
-            Some(rustix::fs::Uid::from_raw(CLIENT_UID)),
-            Some(rustix::fs::Gid::from_raw(CLIENT_UID)),
-        )
-        .unwrap();
-        path
-    }
-
-    /// The directory for the temp files of the daemon.
-    fn daemon_tmp(&self) -> PathBuf {
-        let path = self.scratch.path().join("daemon-tmp");
-        let _ = std::fs::create_dir(&path);
-        path
-    }
-
-    /// Starts the daemon in the standalone mode at `sock`.
-    fn standalone(&self, sock: &Path, parent: Option<u32>, idle: u64) -> ChildGuard {
-        self.standalone_with(sock, parent, idle, &[])
-    }
-
-    /// Starts the daemon in the standalone mode at `sock`, with the options
-    /// `extra`.
-    fn standalone_with(
-        &self,
-        sock: &Path,
-        parent: Option<u32>,
-        idle: u64,
-        extra: &[&str],
-    ) -> ChildGuard {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ostrya-mountd"));
-        cmd.arg("--listen").arg(sock).args(extra);
-        cmd.arg("--idle-timeout").arg(idle.to_string());
-        if let Some(pid) = parent {
-            cmd.arg("--parent-pid").arg(pid.to_string());
-        }
-        let child = ChildGuard(Some(
-            cmd.env("TMPDIR", self.daemon_tmp())
-                .stdin(Stdio::null())
-                .spawn()
-                .unwrap(),
-        ));
-        wait_for_path(sock);
-        child
-    }
-
     /// Runs one client request in a child process and returns its outcome
     /// line. `userns` puts the client in its own user namespace and mount
     /// namespace.
@@ -305,7 +92,7 @@ impl Fixture {
         cmd.args(["--reuid=65534", "--regid=65534", "--clear-groups"]);
         cmd.args(unshare);
         let out = cmd
-            .arg(&self.client_bin)
+            .arg(self.client_bin())
             .args([CLIENT_TEST, "--exact", "--ignored", "--nocapture"])
             .env("OSTRYA_MOUNTD_SOCKET", sock)
             .env(CLIENT_ENV, req.encode())
@@ -325,172 +112,6 @@ impl Fixture {
             .unwrap_or_default()
             .to_owned()
     }
-}
-
-/// Waits at most 10 seconds until `path` exists.
-fn wait_for_path(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "{} never appeared",
-            path.display()
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Returns the metadata dict that records `digest` under the image key.
-fn key_dict(digest: &[u8; 32]) -> Value {
-    Value::Array(vec![Value::Tuple(vec![
-        Value::Str(DIGEST_KEY.to_owned()),
-        Value::variant(Type::parse("ay").unwrap(), Value::Bytes(digest.to_vec())),
-    ])])
-}
-
-/// How a commit names its image commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Named {
-    /// The attachment `composefs`.
-    Attachment,
-    /// The supplement `composefs`.
-    Supplement,
-    /// No image commit.
-    Neither,
-}
-
-/// Writes `base/src` to `repo` and returns its root tree.
-async fn write_source(repo: &Repo, base: &Path) -> ostrya::RepoTree {
-    let txn = repo.transaction().await.unwrap();
-    let mut mtree = MutableTree::new();
-    let dfd = std::fs::File::open(base).unwrap();
-    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
-        .await
-        .unwrap();
-    let root = txn.write_mtree(&mut mtree).await.unwrap();
-    txn.commit().await.unwrap();
-    root
-}
-
-/// Writes the image commit of `root` and a commit of `root` with the image
-/// key and the subject `subject`, which names the image commit as `named`
-/// gives. Returns the commit and the image commit.
-async fn commit_named(
-    repo: &Repo,
-    root: &ostrya::RepoTree,
-    subject: &str,
-    named: Named,
-) -> (Checksum, Checksum) {
-    let txn = repo.transaction().await.unwrap();
-    let (image, digest) = txn.write_composefs_commit(root).await.unwrap();
-    let attachments = match named {
-        Named::Attachment => vec![(COMPOSEFS_RELATION.to_owned(), image)],
-        Named::Supplement | Named::Neither => Vec::new(),
-    };
-    let opts = CommitOptions {
-        subject: Some(subject.to_owned()),
-        timestamp: Some(1),
-        metadata: Some(key_dict(&digest)),
-        attachments,
-        ..CommitOptions::default()
-    };
-    let commit = txn.write_commit(opts, root).await.unwrap();
-    if named == Named::Supplement {
-        txn.add_supplement(&commit, COMPOSEFS_RELATION, &image)
-            .unwrap();
-    }
-    txn.commit().await.unwrap();
-    (commit, image)
-}
-
-/// Writes an image commit whose `/root.cfs` holds `image`, with the shape
-/// of an image commit, and returns its checksum.
-async fn write_image_commit(repo: &Repo, image: &[u8]) -> Checksum {
-    let txn = repo.transaction().await.unwrap();
-    let file = txn
-        .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o400), image)
-        .await
-        .unwrap();
-    let root_dirmeta = txn
-        .write_dirmeta(&DirMeta {
-            uid: 0,
-            gid: 0,
-            mode: 0o040755,
-            xattrs: Xattrs::empty(),
-        })
-        .await
-        .unwrap();
-    let tree = DirTree {
-        files: vec![("root.cfs".to_owned(), file)],
-        dirs: Vec::new(),
-    };
-    let root_dirtree = txn
-        .write_metadata(ObjectType::DirTree, None, &tree.serialize().unwrap())
-        .await
-        .unwrap();
-    let commit = Commit {
-        metadata: Value::Array(Vec::new()),
-        parent: None,
-        related: Vec::new(),
-        subject: "composefs image".to_owned(),
-        body: String::new(),
-        timestamp: 0,
-        root_dirtree,
-        root_dirmeta,
-    };
-    let checksum = txn
-        .write_metadata(ObjectType::Commit, None, &commit.serialize().unwrap())
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
-    checksum
-}
-
-/// Commits `base/src` to `repo` with the image key and the attachment
-/// `composefs`. Returns that commit and a second commit of the same tree
-/// with no key, whose attachment `composefs` holds `devnode` as a
-/// character device.
-async fn commit_tree(repo: &Repo, base: &Path) -> (Checksum, Checksum) {
-    let root = write_source(repo, base).await;
-    let (commit, _) = commit_named(repo, &root, "mountd tree", Named::Attachment).await;
-
-    // The commit format holds no device node, so the test writes one into a
-    // copy of the image. The commit of that image has no key, so the daemon
-    // makes no check of the image.
-    let mut image = repo
-        .export_composefs(&commit, &ComposefsOptions::RECORDED)
-        .await
-        .unwrap()
-        .bytes;
-    make_devnode(&mut image);
-    let dev_image = write_image_commit(repo, &image).await;
-    let txn = repo.transaction().await.unwrap();
-    let opts = CommitOptions {
-        subject: Some("mountd device tree".to_owned()),
-        timestamp: Some(3),
-        attachments: vec![(COMPOSEFS_RELATION.to_owned(), dev_image)],
-        ..CommitOptions::default()
-    };
-    let dev_commit = txn.write_commit(opts, &root).await.unwrap();
-    txn.commit().await.unwrap();
-    (commit, dev_commit)
-}
-
-/// Changes the compact inode of the empty file with [`DEVNODE_MODE`] in the
-/// EROFS image `image` into the character device [`DEVNODE_RDEV`].
-///
-/// A compact inode is 32 bytes at a 32-byte boundary. It starts with the
-/// format, the xattr count, and the mode, each 16 bits. The device number is
-/// at byte 16.
-fn make_devnode(image: &mut [u8]) {
-    let at = (0..image.len() - 32)
-        .step_by(32)
-        .find(|&i| {
-            image[i..i + 4] == [0, 0, 0, 0] && image[i + 4..i + 6] == DEVNODE_MODE.to_le_bytes()
-        })
-        .expect("the image holds the inode of devnode");
-    image[at + 4..at + 6].copy_from_slice(&(0o020_666u16).to_le_bytes());
-    image[at + 16..at + 20].copy_from_slice(&DEVNODE_RDEV.to_le_bytes());
 }
 
 /// The request of a client child.
@@ -546,18 +167,6 @@ impl ClientRequest {
             times: 1,
         }
     }
-}
-
-/// Returns the mountinfo lines of the mounts at `target`.
-fn mounts_at(target: &Path) -> Vec<String> {
-    let resolved = std::fs::canonicalize(target).unwrap();
-    let want = resolved.to_str().unwrap();
-    std::fs::read_to_string("/proc/self/mountinfo")
-        .unwrap()
-        .lines()
-        .filter(|l| l.split(' ').nth(4) == Some(want))
-        .map(str::to_owned)
-        .collect()
 }
 
 /// The body of each client child. Outside a child, the test does nothing.
@@ -747,7 +356,7 @@ impl Holder {
         let mut child = Command::new("setpriv")
             .args(["--reuid=65534", "--regid=65534", "--clear-groups"])
             .args(OWN_NAMESPACES)
-            .arg(&fx.client_bin)
+            .arg(fx.client_bin())
             .args(["holder_child", "--exact", "--ignored", "--nocapture"])
             .env("OSTRYA_MOUNTD_SOCKET", sock)
             .env(CLIENT_ENV, req.encode())
@@ -808,7 +417,7 @@ fn a_setuid_file_and_a_device_node_stay_inert() {
     for access in [Access::ReadOnly, Access::ReadWrite] {
         let target = fx.target(&format!("mnt-{access:?}"));
         let mut req = ClientRequest::new(&fx, &target, false, access);
-        req.commit = fx.dev_commit;
+        req.commit = fx.dev_commit();
         let holder = Holder::start(&fx, &sock, &req, &markers.join(format!("{access:?}")));
 
         let kind = holder.run_in_mount_ns(&[
@@ -922,15 +531,6 @@ fn a_caller_in_its_own_pid_namespace_mounts() {
         assert!(outcome.starts_with("mounted 1 "), "{access:?}: {outcome}");
     }
     assert_no_temp_dirs(&fx);
-}
-
-/// Unmounts a mount of the test at the path when the value drops.
-struct Unmount(PathBuf);
-
-impl Drop for Unmount {
-    fn drop(&mut self) {
-        let _ = Command::new("umount").arg("-l").arg(&self.0).status();
-    }
 }
 
 /// An `objects` directory that is the root of a mount is refused. The test
@@ -1099,29 +699,6 @@ fn hello_object(repo: &Path) -> PathBuf {
         }
     }
     panic!("no object holds the content");
-}
-
-/// Returns the image commit that `commit` names as the attachment
-/// `composefs` in the repository at `repo`, and the file object of its
-/// `/root.cfs`.
-fn image_commit_of(repo: &Path, commit: &Checksum) -> (Checksum, Checksum) {
-    ostrya_rt::block_on(async {
-        let repo = Repo::open(repo).await.unwrap();
-        let relations = repo.read_commit_relations(commit).await.unwrap();
-        let image = relations.attachments[0].1;
-        let (image_obj, _) = repo.load_commit(&image).await.unwrap();
-        let tree = repo.load_dirtree(&image_obj.root_dirtree).await.unwrap();
-        (image, tree.files[0].1)
-    })
-}
-
-/// Returns the path of the loose file object `object` in the `bare-user`
-/// repository at `repo`.
-fn file_object_path(repo: &Path, object: &Checksum) -> PathBuf {
-    let hex = object.to_hex();
-    repo.join("objects")
-        .join(&hex[..2])
-        .join(format!("{}.file", &hex[2..]))
 }
 
 /// A symlink at the fan-out directory of an object that the daemon reads is
@@ -1293,14 +870,6 @@ fn an_archive_repository_is_refused() {
     assert_no_temp_dirs(&fx);
 }
 
-/// Opens the repository of the fixture and returns it with the root tree
-/// of the commit of the fixture.
-async fn fixture_root(fx: &Fixture) -> (Repo, ostrya::RepoTree) {
-    let repo = Repo::open(&fx.repo).await.unwrap();
-    let root = repo.read_commit(&fx.commit.to_hex()).await.unwrap().0;
-    (repo, root)
-}
-
 /// Op 1 mounts the image of the supplement `composefs`, and of the
 /// attachment of a commit that has both. The supplement of that commit
 /// names an image commit whose image is not the key, and the daemon does
@@ -1313,7 +882,7 @@ fn op_1_mounts_the_image_of_a_supplement_and_of_both() {
     let fx = Fixture::new("op1-sources");
     let sock = fx.scratch.path().join("mountd.sock");
     let _daemon = fx.standalone(&sock, None, 60);
-    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit);
+    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit());
     let (supplement, both) = ostrya_rt::block_on(async {
         let (repo, root) = fixture_root(&fx).await;
         let (supplement, _) = commit_named(&repo, &root, "supplement", Named::Supplement).await;
@@ -1344,7 +913,7 @@ fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
     let fx = Fixture::new("op1-bad-attachment");
     let sock = fx.scratch.path().join("mountd.sock");
     let _daemon = fx.standalone(&sock, None, 60);
-    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit);
+    let (dev_image, _) = image_commit_of(&fx.repo, &fx.dev_commit());
     let (valid, _) = image_commit_of(&fx.repo, &fx.commit);
     let commit = ostrya_rt::block_on(async {
         let (repo, root) = fixture_root(&fx).await;

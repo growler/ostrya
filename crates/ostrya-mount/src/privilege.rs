@@ -1,5 +1,6 @@
 //! The facts about the ids of the process: root in the initial user
-//! namespace, and real ids that are the effective ids.
+//! namespace, the initial user namespace, and real ids that are the
+//! effective ids.
 
 use std::sync::OnceLock;
 
@@ -11,6 +12,8 @@ struct ProcessIds {
     /// The real user id is the effective user id, and the real group id is
     /// the effective group id.
     ids_match: bool,
+    /// The process is in the initial user namespace.
+    initial_userns: bool,
 }
 
 /// Returns the [`ProcessIds`] of the process. The answer is computed once,
@@ -21,10 +24,12 @@ fn process_ids() -> ProcessIds {
         let status = std::fs::read_to_string("/proc/self/status").ok();
         let uid = status.as_deref().and_then(|text| id_pair(text, "Uid:"));
         let gid = status.as_deref().and_then(|text| id_pair(text, "Gid:"));
-        let map = std::fs::read_to_string("/proc/self/uid_map").ok();
+        let initial_userns = std::fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|text| uid_map_is_initial(&text));
         ProcessIds {
-            privileged: uid == Some((0, 0)) && map.is_some_and(|text| uid_map_is_initial(&text)),
+            privileged: uid == Some((0, 0)) && initial_userns,
             ids_match: matches!((uid, gid), (Some((ru, eu)), Some((rg, eg))) if ru == eu && rg == eg),
+            initial_userns,
         }
     })
 }
@@ -41,6 +46,24 @@ fn process_ids() -> ProcessIds {
 /// [`Helper`](crate::Helper).
 pub fn is_privileged() -> bool {
     process_ids().privileged
+}
+
+/// Returns `true` if the process is in the initial user namespace.
+///
+/// The answer is `true` if `/proc/self/uid_map` maps the full range of ids
+/// from 0 to 0, as the map of the initial user namespace does. The user id
+/// of the process does not change the answer. The process reads the file
+/// once and keeps the answer. If the file does not read, the answer is
+/// `false`.
+///
+/// The mount daemon refuses a request whose user namespace is the initial
+/// user namespace. A process that is not [privileged](is_privileged) and
+/// for which the answer is `true` therefore cannot mount in its own
+/// namespaces through [`Helper::new`](crate::Helper::new). It sends the
+/// namespaces of another process with
+/// [`Helper::with_namespaces`](crate::Helper::with_namespaces).
+pub fn in_initial_user_namespace() -> bool {
+    process_ids().initial_userns
 }
 
 /// Returns `true` if the real user id of the process is its effective user
@@ -94,6 +117,15 @@ mod tests {
         assert_eq!(id_pair("Uid:\t0\t0\t0\t0\n", "Uid:"), Some((0, 0)));
         assert_eq!(id_pair("Name:\tx\n", "Uid:"), None);
         assert_eq!(id_pair("Uid:\tx\t0\n", "Uid:"), None);
+    }
+
+    #[test]
+    fn the_initial_user_namespace_follows_the_uid_map() {
+        let text = std::fs::read_to_string("/proc/self/uid_map").unwrap();
+        assert_eq!(in_initial_user_namespace(), uid_map_is_initial(&text));
+        if is_privileged() {
+            assert!(in_initial_user_namespace());
+        }
     }
 
     #[test]

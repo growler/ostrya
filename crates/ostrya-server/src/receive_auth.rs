@@ -292,11 +292,6 @@ pub struct SessionSetup {
     /// The commit of a server commit runs these checks after
     /// `before_server_commit` returns:
     ///
-    /// - Before the update lock, under `[ex-ostrya] generate-composefs`, the
-    ///   commit builds the composefs image of the tree. An image whose digest
-    ///   is not the key `ostree.composefs.digest.v0` gets 422 with
-    ///   `checksum-mismatch`, and each other failure of the build gets 500
-    ///   with `internal`.
     /// - Under the update lock, the checks of the ref paths get 422 with
     ///   `ref-denied`.
     /// - Under the update lock, `orphan` on a branch that is present, which

@@ -422,6 +422,21 @@ impl Repo {
         Ok(self.file_object(checksum, loaded))
     }
 
+    /// Runs [`open_file`](Repo::open_file) on the calling thread. If `measure`
+    /// is set, the load also reads the fs-verity digest that the kernel holds
+    /// for the payload, as [`load_file_with`](Repo::load_file_with) does.
+    pub(crate) fn open_file_blocking(
+        &self,
+        checksum: &Checksum,
+        measure: bool,
+    ) -> Result<(FileObject, Option<Payload>)> {
+        let mode = self.mode();
+        let path = loose_path(checksum, ObjectType::File, mode);
+        let loaded = load_by_mode(self.objects(), &path, mode, measure, true)
+            .map_err(|e| e.into_error(checksum))?;
+        Ok(self.file_object(checksum, loaded))
+    }
+
     /// Runs the loader of the repository mode on the blocking pool for the
     /// loose file object `checksum`. `measure` and `keep` are the flags of
     /// [`load_by_mode`].

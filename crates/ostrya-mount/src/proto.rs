@@ -1,5 +1,9 @@
 //! The protocol between the helper client and the mount daemon.
 //!
+//! [`Helper`](crate::Helper) is the client. A daemon reads a [`Request`] with
+//! [`recv`] and [`Request::decode`], and replies with the `Mounted` message
+//! or with a [`Failure`].
+//!
 //! The protocol runs over a `SOCK_SEQPACKET` Unix socket, one message for
 //! each packet. A connection carries one request:
 //!
@@ -24,7 +28,7 @@ use std::os::fd::{BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
-use ostrya::Checksum;
+use ostrya_core::Checksum;
 use rustix::io::Errno;
 use rustix::net::{
     RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
@@ -35,50 +39,49 @@ use crate::error::HelperCode;
 use crate::options::Access;
 
 /// The version of the protocol.
-pub(crate) const VERSION: u8 = 1;
+pub const VERSION: u8 = 1;
 
 /// The largest length of a path in a request, and of the text of an error,
 /// in bytes.
-pub(crate) const MAX_STRING: usize = 4096;
+pub const MAX_STRING: usize = 4096;
 
 /// The largest length of the source label of a request, in bytes. The kernel
 /// takes a string option of a file system of at most this length.
-pub(crate) const MAX_LABEL: usize = 255;
+pub const MAX_LABEL: usize = 255;
 
 /// The kind byte of `Hello`.
-pub(crate) const KIND_HELLO: u8 = 0x01;
+pub const KIND_HELLO: u8 = 0x01;
 /// The kind byte of `HelloReply`.
-pub(crate) const KIND_HELLO_REPLY: u8 = 0x02;
+pub const KIND_HELLO_REPLY: u8 = 0x02;
 /// The kind byte of `Request`.
-pub(crate) const KIND_REQUEST: u8 = 0x03;
+pub const KIND_REQUEST: u8 = 0x03;
 /// The kind byte of `Mounted`.
-pub(crate) const KIND_MOUNTED: u8 = 0x04;
+pub const KIND_MOUNTED: u8 = 0x04;
 /// The kind byte of `Error`.
-pub(crate) const KIND_ERROR: u8 = 0x05;
+pub const KIND_ERROR: u8 = 0x05;
 
 /// The length of the fixed part of a request: the kind, the operation, the
 /// access, the commit, and three lengths.
 const REQUEST_HEADER: usize = 1 + 1 + 1 + 32 + 2 + 2 + 2;
 
 /// The largest length of a request.
-#[cfg(any(feature = "server", test))]
-pub(crate) const MAX_REQUEST: usize = REQUEST_HEADER + 2 * MAX_STRING + MAX_LABEL;
+pub const MAX_REQUEST: usize = REQUEST_HEADER + 2 * MAX_STRING + MAX_LABEL;
 
 /// The length of the fixed part of an error: the kind, the code, and the
 /// error number.
 const ERROR_HEADER: usize = 1 + 1 + 4;
 
 /// The largest length of an error.
-pub(crate) const MAX_ERROR: usize = ERROR_HEADER + MAX_STRING;
+pub const MAX_ERROR: usize = ERROR_HEADER + MAX_STRING;
 
 /// The number of descriptors of a request.
-#[cfg(any(feature = "server", test))]
-pub(crate) const REQUEST_FDS: usize = 2;
+pub const REQUEST_FDS: usize = 2;
 
 /// The image that a request mounts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Op {
-    /// The stored image of the commit, `1`.
+pub enum Op {
+    /// The image of the image commit that the commit names as the attachment
+    /// or the supplement `composefs`, `1`.
     Stored,
     /// An image that the daemon builds in memory, `2`.
     Built,
@@ -86,37 +89,37 @@ pub(crate) enum Op {
 
 /// The fields of a request. The descriptors go beside the bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Request {
+pub struct Request {
     /// The image to mount.
-    pub(crate) op: Op,
+    pub op: Op,
     /// Read-only or read-write.
-    pub(crate) access: Access,
+    pub access: Access,
     /// The commit.
-    pub(crate) commit: Checksum,
+    pub commit: Checksum,
     /// The absolute path of the repository, as the caller sees it.
-    pub(crate) repo: PathBuf,
+    pub repo: PathBuf,
     /// The source label of the mount. An empty label stands for the
     /// checksum of the commit.
-    pub(crate) source: String,
+    pub source: String,
     /// The absolute path of the target, as the caller sees it.
-    pub(crate) target: PathBuf,
+    pub target: PathBuf,
 }
 
 /// A failure that an `Error` message carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Failure {
+pub struct Failure {
     /// The class of the failure.
-    pub(crate) code: HelperCode,
+    pub code: HelperCode,
     /// The error number of the failed call, or `0`.
-    pub(crate) errno: i32,
+    pub errno: i32,
     /// The text of the failure.
-    pub(crate) text: String,
+    pub text: String,
 }
 
 impl Failure {
-    /// Returns a failure with no error number.
-    #[cfg(any(feature = "server", test))]
-    pub(crate) fn new(code: HelperCode, text: impl Into<String>) -> Failure {
+    /// Returns a failure of the class `code` with the text `text` and no
+    /// error number.
+    pub fn new(code: HelperCode, text: impl Into<String>) -> Failure {
         Failure {
             code,
             errno: 0,
@@ -125,8 +128,7 @@ impl Failure {
     }
 
     /// Returns a failure of the system call `op` with `errno`.
-    #[cfg(feature = "server")]
-    pub(crate) fn sys(code: HelperCode, op: &str, errno: Errno) -> Failure {
+    pub fn sys(code: HelperCode, op: &str, errno: Errno) -> Failure {
         Failure {
             code,
             errno: errno.raw_os_error(),
@@ -136,8 +138,7 @@ impl Failure {
 
     /// Returns the bytes of the `Error` message. A text longer than
     /// [`MAX_STRING`] bytes is cut at a character boundary.
-    #[cfg(any(feature = "server", test))]
-    pub(crate) fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut end = self.text.len().min(MAX_STRING);
         while !self.text.is_char_boundary(end) {
             end -= 1;
@@ -151,7 +152,12 @@ impl Failure {
     }
 
     /// Reads an `Error` message.
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Failure, String> {
+    ///
+    /// # Errors
+    ///
+    /// The text of the refusal if the message has another kind, is shorter
+    /// than its header, or is longer than [`MAX_ERROR`] bytes.
+    pub fn decode(bytes: &[u8]) -> Result<Failure, String> {
         if bytes.first() != Some(&KIND_ERROR) {
             return Err("the message is not an error".to_owned());
         }
@@ -191,12 +197,17 @@ impl std::fmt::Display for Failure {
 }
 
 /// Returns the bytes of `Hello` or `HelloReply`.
-pub(crate) fn encode_hello(kind: u8, version: u8) -> [u8; 2] {
+pub fn encode_hello(kind: u8, version: u8) -> [u8; 2] {
     [kind, version]
 }
 
 /// Reads the version of a `Hello` or a `HelloReply` of the kind `kind`.
-pub(crate) fn decode_hello(kind: u8, bytes: &[u8]) -> Result<u8, String> {
+///
+/// # Errors
+///
+/// The text of the refusal if the message has another kind or another
+/// length.
+pub fn decode_hello(kind: u8, bytes: &[u8]) -> Result<u8, String> {
     match bytes {
         [k, version] if *k == kind => Ok(*version),
         [k, ..] if *k == kind => Err("the hello has a wrong length".to_owned()),
@@ -211,7 +222,7 @@ impl Request {
     ///
     /// The text of the refusal if a path is longer than [`MAX_STRING`]
     /// bytes, or if the label is longer than [`MAX_LABEL`] bytes.
-    pub(crate) fn encode(&self) -> Result<Vec<u8>, String> {
+    pub fn encode(&self) -> Result<Vec<u8>, String> {
         let repo = self.repo.as_os_str().as_bytes();
         let source = self.source.as_bytes();
         let target = self.target.as_os_str().as_bytes();
@@ -244,13 +255,14 @@ impl Request {
 
     /// Reads a request.
     ///
-    /// The call refuses a message of another kind, an unknown operation or
-    /// access byte, a path longer than [`MAX_STRING`] bytes, a label longer
-    /// than [`MAX_LABEL`] bytes, lengths that do not sum to the length of the
-    /// message, a NUL byte, an empty or relative path, and a label that is
-    /// not UTF-8.
-    #[cfg(any(feature = "server", test))]
-    pub(crate) fn decode(bytes: &[u8]) -> Result<Request, String> {
+    /// # Errors
+    ///
+    /// The text of the refusal. The call refuses a message of another kind,
+    /// an unknown operation or access byte, a path longer than
+    /// [`MAX_STRING`] bytes, a label longer than [`MAX_LABEL`] bytes, lengths
+    /// that do not sum to the length of the message, a NUL byte, an empty or
+    /// relative path, and a label that is not UTF-8.
+    pub fn decode(bytes: &[u8]) -> Result<Request, String> {
         if bytes.first() != Some(&KIND_REQUEST) {
             return Err("the message is not a request".to_owned());
         }
@@ -306,8 +318,7 @@ impl Request {
 
     /// Returns the source label of the mount: the label of the request, or
     /// the checksum of the commit if the label is empty.
-    #[cfg(any(feature = "server", test))]
-    pub(crate) fn label(&self) -> String {
+    pub fn label(&self) -> String {
         if self.source.is_empty() {
             self.commit.to_hex()
         } else {
@@ -318,16 +329,16 @@ impl Request {
 
 /// A message that [`recv`] reads.
 #[derive(Debug)]
-pub(crate) struct Message {
+pub struct Message {
     /// The bytes of the message.
-    pub(crate) bytes: Vec<u8>,
+    pub bytes: Vec<u8>,
     /// The descriptors that came with the message, in order.
-    pub(crate) fds: Vec<OwnedFd>,
+    pub fds: Vec<OwnedFd>,
 }
 
 /// An error of [`send`] or [`recv`].
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum WireError {
+pub enum WireError {
     /// The system call failed. `EAGAIN` is the end of a receive timeout.
     Sys(&'static str, Errno),
     /// The peer closed the connection.
@@ -339,8 +350,7 @@ pub(crate) enum WireError {
 
 impl WireError {
     /// Returns the failure that the daemon reports for the error.
-    #[cfg(feature = "server")]
-    pub(crate) fn into_failure(self) -> Failure {
+    pub fn into_failure(self) -> Failure {
         match self {
             WireError::Sys(op, Errno::AGAIN) => {
                 Failure::new(HelperCode::Timeout, format!("{op}: no message in time"))
@@ -368,11 +378,11 @@ impl WireError {
 
 /// Sends `bytes` as one message on `sock`, with the descriptors `fds` in one
 /// `SCM_RIGHTS` message.
-pub(crate) fn send(
-    sock: BorrowedFd<'_>,
-    bytes: &[u8],
-    fds: &[BorrowedFd<'_>],
-) -> Result<(), WireError> {
+///
+/// # Errors
+///
+/// [`WireError::Sys`] if `sendmsg` fails or sends a part of the message.
+pub fn send(sock: BorrowedFd<'_>, bytes: &[u8], fds: &[BorrowedFd<'_>]) -> Result<(), WireError> {
     let mut space = vec![MaybeUninit::<u8>::uninit(); rustix::cmsg_space!(ScmRights(fds.len()))];
     let mut ancillary = SendAncillaryBuffer::new(&mut space);
     if !fds.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(fds)) {
@@ -396,12 +406,14 @@ pub(crate) fn send(
 ///
 /// Each received descriptor has the close-on-exec flag. The call refuses a
 /// message that the kernel truncated, a longer message, and a message with
-/// more descriptors. An end of file gives [`WireError::Closed`].
-pub(crate) fn recv(
-    sock: BorrowedFd<'_>,
-    max_len: usize,
-    max_fds: usize,
-) -> Result<Message, WireError> {
+/// more descriptors.
+///
+/// # Errors
+///
+/// - [`WireError::Sys`] if `recvmsg` fails.
+/// - [`WireError::Closed`] at an end of file.
+/// - [`WireError::Protocol`] for a refused message.
+pub fn recv(sock: BorrowedFd<'_>, max_len: usize, max_fds: usize) -> Result<Message, WireError> {
     // One byte more than the largest message, and space for one descriptor
     // more, so that a longer message and an extra descriptor show.
     let mut buf = vec![0u8; max_len + 1];

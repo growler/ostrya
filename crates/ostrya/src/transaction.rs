@@ -9,7 +9,7 @@
 //! transaction. [`FileMeta`] holds the uid, the gid, the mode, and the
 //! extended attributes of a file object.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 #[cfg(test)]
 use std::os::fd::AsFd;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,9 +34,8 @@ pub use crate::write::{ContentWriter, FileMeta};
 
 /// The counts and sizes of the work of a transaction.
 ///
-/// [`commit`](Transaction::commit) returns them. No field counts a composefs
-/// image that the transaction stages, as no field counts detached commit
-/// metadata.
+/// [`commit`](Transaction::commit) returns them. No field counts detached
+/// commit metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionStats {
     /// The number of metadata objects offered for staging, dedup hits included.
@@ -92,8 +91,7 @@ pub struct TransactionStats {
 struct StagedObject {
     /// The flat name of the object in the staging directory.
     staging_name: String,
-    /// The loose path under `objects/` that the object publishes to. For a
-    /// composefs image, the path under `extensions/ostrya/composefs/`.
+    /// The loose path under `objects/` that the object publishes to.
     dest: String,
 }
 
@@ -120,12 +118,6 @@ struct Staged {
     /// The objects staged so far, by identity and type, for the dedup in the
     /// transaction and for publication at commit.
     objects: HashMap<(Checksum, ObjectType), StagedObject>,
-    /// The composefs images staged so far, by the checksum of their commit,
-    /// for publication into `extensions/ostrya/composefs/` at commit.
-    images: HashMap<Checksum, StagedObject>,
-    /// The commits that the writers recorded as complete, for the image build
-    /// of the commit.
-    complete: BTreeSet<Checksum>,
     /// The size record of each object in archive mode, by checksum. The
     /// records cover content and metadata objects, the input of `ostree.sizes`.
     sizes: HashMap<Checksum, SizeRecord>,
@@ -371,8 +363,6 @@ impl Transaction {
             generate_sizes_override: None,
             staged: Mutex::new(Staged {
                 objects: HashMap::new(),
-                images: HashMap::new(),
-                complete: BTreeSet::new(),
                 sizes: HashMap::new(),
                 size_scope: None,
                 free_budget,
@@ -444,9 +434,9 @@ impl Transaction {
     /// Runs `f` on the blocking pool as a job of this transaction, and
     /// returns a future of its result.
     ///
-    /// The jobs that stage an object, detached metadata, or a composefs
-    /// image, that open the temp file of an object to stage, or that probe
-    /// the owner of a fresh object run through this call. The marker write
+    /// The jobs that stage an object or detached metadata, that open the temp
+    /// file of an object to stage, or that probe the owner of a fresh object
+    /// run through this call. The marker write
     /// of a step of a pull from a remote runs through
     /// [`track`](Transaction::track). If the future drops before the job
     /// ends, the job continues, and [`settle`](Transaction::settle) waits for
@@ -603,45 +593,6 @@ impl Transaction {
             .unwrap()
             .objects
             .contains_key(&(*checksum, ty))
-    }
-
-    /// Returns `true` if the commit object `commit` is staged in this
-    /// transaction.
-    ///
-    /// [`write_commit`](Transaction::write_commit) stages a new commit. A
-    /// commit that the repository holds before the write, complete or
-    /// partial, is not staged. A caller that attaches the image of a new
-    /// commit alone with
-    /// [`attach_composefs_image`](Transaction::attach_composefs_image) checks
-    /// the commit with this call. The call reads the staged set of this
-    /// transaction, so another writer under the shared lock does not change
-    /// its result. A [`Repo::has_object`] check after the write reads the
-    /// object store, and another transaction can publish the same commit
-    /// before that check.
-    pub fn is_commit_staged(&self, commit: &Checksum) -> bool {
-        self.is_staged(commit, ObjectType::Commit)
-    }
-
-    /// Returns `true` if a composefs image of `commit` is staged in this
-    /// transaction.
-    pub(crate) fn is_image_staged(&self, commit: &Checksum) -> bool {
-        self.staged.lock().unwrap().images.contains_key(commit)
-    }
-
-    /// Records `commit` as a complete commit of this transaction.
-    ///
-    /// Each writer of a complete commit calls it. Under
-    /// `[ex-ostrya] generate-composefs`, the commit of the transaction builds
-    /// the composefs image of each recorded commit that this transaction
-    /// staged or that has a `.commitpartial` marker.
-    pub(crate) fn mark_complete(&self, commit: &Checksum) {
-        self.staged.lock().unwrap().complete.insert(*commit);
-    }
-
-    /// Takes the commits that [`mark_complete`](Transaction::mark_complete)
-    /// recorded.
-    pub(crate) fn take_complete(&self) -> BTreeSet<Checksum> {
-        std::mem::take(&mut self.staged.lock().unwrap().complete)
     }
 
     /// Returns, for each checksum of `checksums`, `true` if an object of that
@@ -1321,33 +1272,6 @@ impl Transaction {
         self.record_object(checksum, ty, mode, outcome, true, payload, false)
     }
 
-    /// Records a composefs image that the caller linked into the staging
-    /// directory as the image of `commit`.
-    ///
-    /// The image takes its size from the free-space budget. It adds no size
-    /// record and no statistic. A second record of an image of the same
-    /// commit does nothing.
-    pub(crate) fn record_image(&self, commit: Checksum, outcome: StageOutcome) -> Result<()> {
-        let mut staged = self.staged.lock().unwrap();
-        if staged.images.contains_key(&commit) {
-            return Ok(());
-        }
-        if outcome.on_disk_size > staged.free_budget {
-            return Err(Error::InsufficientFreeSpace {
-                shortfall: outcome.on_disk_size - staged.free_budget,
-            });
-        }
-        staged.free_budget -= outcome.on_disk_size;
-        staged.images.insert(
-            commit,
-            StagedObject {
-                staging_name: outcome.staging_name,
-                dest: outcome.dest,
-            },
-        );
-        Ok(())
-    }
-
     /// Records the outcome of a staged object, as [`record`](Transaction::record)
     /// does, with all flags.
     ///
@@ -1496,61 +1420,24 @@ impl Transaction {
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     ///    queued, as [`Repo::write_commit_detached_metadata`] does. On a
     ///    refusal the call publishes no object and writes nothing.
-    /// 2. If `[ex-ostrya] generate-composefs` is `true`, the call builds the
-    ///    composefs image of each commit that the writer recorded as complete,
-    ///    as `# Composefs images` states. If a build fails, the call publishes
-    ///    no object and writes nothing.
-    /// 3. The call renames each staged object into `objects/<xx>/`, and then
-    ///    each staged composefs image into
-    ///    `extensions/ostrya/composefs/<xx>/`. So an image is in place only
-    ///    after each object of the transaction. The rename of an object keeps
-    ///    an object that `objects/` holds, for example from another writer
-    ///    after the stage. The rename of an image replaces a stored image of
-    ///    the same commit.
-    /// 4. The call checks the queued refs against the ref store, as
+    /// 2. The call renames each staged object into `objects/<xx>/`. The rename
+    ///    of an object keeps an object that `objects/` holds, for example from
+    ///    another writer after the stage.
+    /// 3. The call checks the queued refs against the ref store, as
     ///    [`set_ref`](Transaction::set_ref) states. It also compares each
     ///    entry of [`set_ref_expecting`](Transaction::set_ref_expecting) with
     ///    the ref store. On a refusal the call writes no detached metadata
     ///    and no ref.
-    /// 5. The call writes the queued detached-metadata edits.
-    /// 6. The call writes the queued refs. Each ref write is atomic: a temp
+    /// 4. The call writes the queued detached-metadata edits.
+    /// 5. The call writes the queued refs. Each ref write is atomic: a temp
     ///    file, then a rename. The set of ref writes is not atomic as a whole.
     ///    If a ref write fails after the check, for example on a full disk or
     ///    below an alias as [`set_ref`](Transaction::set_ref) states, the refs
     ///    written before it stay. The call does not roll them back.
-    /// 7. The call removes the staging directory and releases the repository
+    /// 6. The call removes the staging directory and releases the repository
     ///    lock.
     ///
-    /// Steps 4, 5, and 6 run in one trip to the blocking pool.
-    ///
-    /// # Composefs images
-    ///
-    /// Each writer of a complete commit records the commit for the build of
-    /// step 2: [`write_commit`](Transaction::write_commit),
-    /// [`write_commit_checked`](Transaction::write_commit_checked), a pull
-    /// from a remote, a local pull, a receive with ref updates, and
-    /// [`Repo::apply_static_delta`]. The commit writes and
-    /// [`Repo::apply_static_delta`] record a commit only if they stage its
-    /// object, so a commit that the repository holds already, complete or
-    /// partial, gets no image from them. A pull records each commit that it
-    /// completes: the targets, the parents within the depth, the
-    /// attachments, and each held partial commit. A partial commit is not
-    /// recorded. [`write_metadata`](Transaction::write_metadata) records no
-    /// commit. [`Repo::commit_add_composefs_metadata`] and the server commit
-    /// of a receive build the image of their commit themselves, and stage it
-    /// if the transaction stages the commit. So step 2 does not build it
-    /// again.
-    ///
-    /// The build reads each recorded commit, staged first. It skips a commit
-    /// that the transaction did not stage and that has no `.commitpartial`
-    /// marker, so a commit that the repository holds complete before the
-    /// transaction gets no image. It also skips a commit with no
-    /// `ostree.composefs.digest.v0` key and a commit whose image is staged.
-    /// For each other commit, it makes the steps of
-    /// [`write_composefs_image`](Transaction::write_composefs_image). The
-    /// build reads the fs-verity digest of a sealed object from the kernel.
-    /// It reads and hashes each other object one time, and uses that digest
-    /// for each commit and each path that names the object.
+    /// Steps 3, 4, and 5 run in one trip to the blocking pool.
     ///
     /// # Durability
     ///
@@ -1558,14 +1445,10 @@ impl Transaction {
     /// [`set_fsync`](Transaction::set_fsync), or else `[core] fsync` of the
     /// repository config. With fsync on, the call syncs as follows:
     ///
-    /// - Before the renames of step 3, it runs `syncfs` on the repository.
+    /// - Before the renames of step 2, it runs `syncfs` on the repository.
     /// - After the renames of the objects, it runs `fsync` on each fanout
     ///   directory that got an object, and then on `objects/` if one or more
     ///   fanout directories got an object.
-    /// - After the renames of the images, it runs `fsync` on each
-    ///   `extensions/ostrya/composefs/<xx>/` directory that got an image, and
-    ///   on `extensions/ostrya/composefs/`. It syncs each directory that the
-    ///   call creates into its parent.
     /// - When a ref write makes a directory under `refs/`, it runs `fsync` at
     ///   once on the directory that holds the new directory.
     /// - Before the rename of each ref, it runs `fsync` on the temp file.
@@ -1579,11 +1462,11 @@ impl Transaction {
     /// # Locks
     ///
     /// The transaction holds the repository lock from its begin to the end of
-    /// this call, in the [`LockKind`](crate::LockKind) of its begin. Steps 2
-    /// and 3 run with no update lock.
+    /// this call, in the [`LockKind`](crate::LockKind) of its begin. Step 2
+    /// runs with no update lock.
     ///
     /// If the transaction writes a ref, a ref removal included, or detached
-    /// metadata, the call takes the update lock for steps 4 to 6. The update
+    /// metadata, the call takes the update lock for steps 3 to 5. The update
     /// lock excludes the other writers of refs and detached metadata, as
     /// [`UpdateGuard`](crate::UpdateGuard) states. The wait is for the update
     /// lock alone, because the transaction holds the repository lock already. A
@@ -1592,7 +1475,7 @@ impl Transaction {
     /// # Cancellation
     ///
     /// The update lock, the repository lock, and the staging directory move
-    /// into the blocking closure of steps 4 to 6. The closure releases them
+    /// into the blocking closure of steps 3 to 5. The closure releases them
     /// when its writes end. If a caller drops the returned future, the writes
     /// complete, and the locks and the staged files stay until the writes end.
     ///
@@ -1610,26 +1493,13 @@ impl Transaction {
     ///   [`add_supplement`](Transaction::add_supplement) queued
     ///   meets a defective stored `ostrya.related` value. The published
     ///   objects stay, and the call writes no ref.
-    /// - Under `[ex-ostrya] generate-composefs`, the errors of
-    ///   [`write_composefs_image`](Transaction::write_composefs_image) for a
-    ///   recorded commit. Among them, [`Error::InvalidFormat`] if the value of
-    ///   the digest key of the commit is malformed, and
-    ///   [`Error::ComposefsDigestMismatch`] if the image of its tree does not
-    ///   have the digest that the key records. The call publishes no object
-    ///   and writes nothing.
-    /// - The errors of [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
-    ///   if a writer recorded a commit.
     /// - [`Error::InvalidFormat`] if `objects/<xx>` of a staged object is a
     ///   symlink or is not a directory. The objects that the call renamed
-    ///   before stay, and the call writes no detached metadata and no ref.
-    /// - [`Error::InvalidFormat`] if a staged composefs image meets a
-    ///   component of `extensions/ostrya/composefs/<xx>/` that is a symlink or
-    ///   no directory. The objects and the images that the call renamed
     ///   before stay, and the call writes no detached metadata and no ref.
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`. The published objects stay, and the call
     ///   writes no detached metadata and no ref.
-    /// - [`Error::RefNotWritable`] if the check of step 4 refuses a queued
+    /// - [`Error::RefNotWritable`] if the check of step 3 refuses a queued
     ///   ref. The published objects stay, and the call writes no detached
     ///   metadata and no ref.
     /// - [`Error::RefMismatch`] if the ref of an entry of
@@ -1653,7 +1523,7 @@ impl Transaction {
     ///   file, or is a symlink, or if `tmp` or `objects/<xx>` of a
     ///   `.commitmeta` file is a symlink or is not a directory. The published
     ///   objects stay, and the call writes no ref.
-    /// - [`Error::Io`] if the check of step 4 cannot read a queued ref path,
+    /// - [`Error::Io`] if the check of step 3 cannot read a queued ref path,
     ///   or cannot open or read the ref file of an entry of
     ///   [`set_ref_expecting`](Transaction::set_ref_expecting), for example
     ///   with `EACCES` or `ELOOP`. The call then writes no detached metadata
@@ -1663,7 +1533,6 @@ impl Transaction {
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
-        Box::pin(self.build_recorded_images()).await?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
             let stats = self.staged.lock().unwrap().stats;
@@ -1686,7 +1555,6 @@ impl Transaction {
         );
         let refs = self.resolve_ref_queue()?;
         self.check_queued_related()?;
-        Box::pin(self.build_recorded_images()).await?;
         let synced = self.publish().await?;
         self.write_tail(refs, synced, None).await
     }
@@ -1765,12 +1633,8 @@ impl Transaction {
             return Ok(());
         }
         // Each object in the count is in the staging directory before the
-        // `syncfs` starts, because an object is recorded after its write. A
-        // composefs image is in the staging directory too.
-        let count = {
-            let staged = self.staged.lock().unwrap();
-            staged.objects.len() + staged.images.len()
-        };
+        // `syncfs` starts, because an object is recorded after its write.
+        let count = self.staged.lock().unwrap().objects.len();
         let root = self.repo.root_dir().clone();
         ostrya_rt::unblock(move || root.syncfs()).await?;
         self.staged.lock().unwrap().presynced = Some(count);
@@ -1783,7 +1647,7 @@ impl Transaction {
     /// object durable already.
     fn syncfs_at_publish(&self, fsync: bool) -> bool {
         let staged = self.staged.lock().unwrap();
-        fsync && staged.presynced != Some(staged.objects.len() + staged.images.len())
+        fsync && staged.presynced != Some(staged.objects.len())
     }
 
     /// Discards the transaction and its staged objects, and releases the lock.
@@ -1800,20 +1664,12 @@ impl Transaction {
         Ok(())
     }
 
-    /// Renames each staged object into `objects/`, and then each staged
-    /// composefs image into `extensions/ostrya/composefs/`, on the blocking
-    /// pool.
+    /// Renames each staged object into `objects/` on the blocking pool.
     ///
     /// Returns `true` if the step ran its `syncfs`.
     async fn publish(&self) -> Result<bool> {
-        let (objects, images) = {
-            let staged = self.staged.lock().unwrap();
-            (
-                rename_pairs(staged.objects.values()),
-                rename_pairs(staged.images.values()),
-            )
-        };
-        if objects.is_empty() && images.is_empty() {
+        let objects = rename_pairs(self.staged.lock().unwrap().objects.values());
+        if objects.is_empty() {
             return Ok(false);
         }
         let (fsync, _) = self.fsync_flags()?;
@@ -1822,15 +1678,7 @@ impl Transaction {
         let objects_dir = self.repo.objects().clone();
         let staging = self.staging_dir().clone();
         ostrya_rt::unblock(move || {
-            publish_blocking(
-                &root,
-                &objects_dir,
-                &staging,
-                &objects,
-                &images,
-                syncfs,
-                fsync,
-            )
+            publish_blocking(&root, &objects_dir, &staging, &objects, syncfs, fsync)
         })
         .await?;
         Ok(syncfs)
@@ -1931,9 +1779,6 @@ impl DetachedJob {
 const _: fn() = || {
     fn is_send_sync<T: Send + Sync>() {}
     is_send_sync::<Transaction>();
-    is_send_sync::<crate::StagedComposefsImage<'static>>();
-    is_send_sync::<crate::ComposefsImageAdd>();
-    is_send_sync::<crate::ComposefsImageState>();
 };
 
 /// A gate for the unit tests, at the commit step that writes detached metadata

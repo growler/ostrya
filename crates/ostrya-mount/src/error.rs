@@ -2,22 +2,12 @@
 
 use std::path::PathBuf;
 
-use ostrya::RepoMode;
 use rustix::io::Errno;
 
 /// The error of each fallible operation of the crate.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// An error of the repository: a commit without the composefs key, an
-    /// absent image, an image whose digest is not the key, a failed export,
-    /// or a malformed config value.
-    #[error(transparent)]
-    Repo(#[from] ostrya::Error),
-    /// A repository whose mode a composefs mount cannot read. Only `archive`
-    /// gives this error.
-    #[error("a repository of the mode {} cannot be mounted", .0.as_mode_str())]
-    UnsupportedMode(RepoMode),
     /// A system call that failed.
     ///
     /// `op` names the call or the step. If the kernel logged a message for a
@@ -39,8 +29,8 @@ pub enum Error {
     #[error("{} is not the root of an overlay mount", .0.display())]
     NotOverlayMount(PathBuf),
     /// A request that the helper client refuses before it connects: a
-    /// relative repository or target path, or a value longer than the
-    /// protocol allows.
+    /// relative repository or target path, a value longer than the protocol
+    /// allows, or the mount flag `noexec`, which the daemon cannot set.
     #[error("invalid mount request: {0}")]
     InvalidRequest(String),
     /// A connect to the socket of the mount daemon that failed.
@@ -102,7 +92,6 @@ pub enum HelperCode {
 
 impl HelperCode {
     /// Returns the byte of the class on the wire.
-    #[cfg(any(feature = "server", test))]
     pub(crate) fn to_wire(self) -> u8 {
         match self {
             HelperCode::Protocol => 1,
@@ -173,20 +162,6 @@ impl Error {
             code,
             errno: None,
             message: message.into(),
-        }
-    }
-
-    /// Returns the text of the error with no hint about the privilege of
-    /// the process. The mount daemon reports this text, because its steps
-    /// run with other privileges than a direct mount.
-    #[cfg(feature = "server")]
-    pub(crate) fn plain_text(&self) -> String {
-        match self {
-            Error::Sys { op, errno, log } => match log {
-                Some(log) => format!("{op}: {errno}: {log}"),
-                None => format!("{op}: {errno}"),
-            },
-            other => other.to_string(),
         }
     }
 }
@@ -306,14 +281,5 @@ mod tests {
         assert_eq!(HelperCode::from_wire(200), HelperCode::Other(200));
         let err = Error::helper(HelperCode::Namespace, "refused");
         assert_eq!(err.to_string(), "mount daemon: refused (namespace)");
-    }
-
-    #[test]
-    fn archive_names_its_mode() {
-        let text = Error::UnsupportedMode(RepoMode::Archive).to_string();
-        assert_eq!(
-            text,
-            "a repository of the mode archive-z2 cannot be mounted"
-        );
     }
 }

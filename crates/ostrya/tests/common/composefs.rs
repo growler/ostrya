@@ -6,10 +6,7 @@ use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use ostrya::{
-    Checksum, CommitOptions, ComposefsImageAdd, CreateOptions, MutableTree, Ref, Repo, RepoMode,
-    TransactionStats, Type, Value,
-};
+use ostrya::{Checksum, CommitOptions, CreateOptions, MutableTree, Repo, RepoMode, Type, Value};
 
 use super::{TmpDir, fixture_repo, fixture_root};
 
@@ -154,58 +151,6 @@ pub fn dict(key: &str, signature: &str, value: Value) -> Value {
 /// Returns the metadata dict that records `digest` under the image key.
 pub fn key_dict(digest: &[u8; 32]) -> Value {
     dict(DIGEST_KEY, "ay", Value::Bytes(digest.to_vec()))
-}
-
-/// Walks `base/src` into a new transaction of `repo` and commits it at
-/// `timestamp` with `metadata`. If `image` is set, the transaction builds the
-/// image of the tree, takes its digest for the key, and attaches the image, as
-/// `ostrya commit --generate-composefs` does. Otherwise the key comes from
-/// `composefs_digest`, as `--generate-composefs-metadata` gives it. If `branch`
-/// is given, the ref names the commit.
-///
-/// Returns the commit and the statistics of the transaction.
-pub async fn commit_tree(
-    repo: &Repo,
-    base: &Path,
-    timestamp: u64,
-    image: bool,
-    branch: Option<&str>,
-) -> (Checksum, TransactionStats) {
-    let txn = repo.transaction().await.unwrap();
-    let mut mtree = MutableTree::new();
-    let dfd = std::fs::File::open(base).unwrap();
-    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
-        .await
-        .unwrap();
-    let root = txn.write_mtree(&mut mtree).await.unwrap();
-    let commit = {
-        let staged = if image {
-            Some(txn.build_composefs_image(&root).await.unwrap())
-        } else {
-            None
-        };
-        let digest = match &staged {
-            Some(staged) => *staged.digest(),
-            None => txn.composefs_digest(&root).await.unwrap(),
-        };
-        let opts = CommitOptions {
-            subject: Some("image tree".to_owned()),
-            timestamp: Some(timestamp),
-            metadata: Some(key_dict(&digest)),
-            ..CommitOptions::default()
-        };
-        let commit = txn.write_commit(opts, &root).await.unwrap();
-        if let Some(staged) = staged {
-            let added = txn.attach_composefs_image(&commit, staged).await.unwrap();
-            assert_eq!(added, ComposefsImageAdd::Added);
-        }
-        commit
-    };
-    if let Some(branch) = branch {
-        txn.set_ref(&Ref::local(branch), Some(&commit));
-    }
-    let stats = txn.commit().await.unwrap();
-    (commit, stats)
 }
 
 /// Returns `true` if the file system of `dir` seals a file with fs-verity.

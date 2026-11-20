@@ -8,32 +8,30 @@ license.workspace = true
 repository.workspace = true
 readme = "README.md"
 
-[features]
-default = ["smol"]
-smol = ["ostrya/smol", "ostrya-rt/smol"]
-tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
-# The connection handler and the worker of `ostrya-mountd`. The module is
-# hidden and is not a stable API.
-server = ["rustix/thread"]
-
 # The crate builds on Linux alone.
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [dependencies]
-ostrya = { workspace = true }
-ostrya-rt = { workspace = true }
-# The loop device and the sealed memory file.
+# The checksum of a commit in the client and in the protocol.
+ostrya-core = { workspace = true }
+# The loop device and the ID-mapped mount of the EROFS layer.
 ostrya-sys = { workspace = true }
 thiserror = "2"
 # The new mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`) and the
 # unmount. `net` gives the socket of the mount daemon and the descriptors
-# that go over it. `thread`, which the `server` feature turns on, gives
-# `setns` and the switch of the ids in the worker of the daemon. Each of
-# these calls is safe in rustix.
+# that go over it. Each of these calls is safe in rustix.
 rustix = { version = "1", default-features = false, features = [
     "std",
     "fs",
     "mount",
     "net",
 ] }
+
+[dev-dependencies]
+# The integration tests make repositories, commits, and images with the
+# library, and run its async calls with `ostrya_rt::block_on`. The workspace
+# entries turn off the default features, so each entry names the `smol`
+# backend.
+ostrya = { workspace = true, features = ["smol"] }
+ostrya-rt = { workspace = true, features = ["smol"] }

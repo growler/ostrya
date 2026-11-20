@@ -28,9 +28,9 @@ use ostrya::remote::proto::ErrorMessage;
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
-    Checksum, Commit, ComposefsImageState, DictBuilder, Ed25519Verifier, Error, FsckOptions,
-    ObjectName, ObjectType, ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep,
-    ReceiveVerify, Ref, Repo, RepoMode, Summary, SummaryOptions, Type, Value,
+    Checksum, Commit, DictBuilder, Ed25519Verifier, Error, FsckOptions, ObjectName, ObjectType,
+    ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep, ReceiveVerify, Ref, Repo, RepoMode,
+    Summary, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -485,59 +485,18 @@ fn a_partial_commit_pushed_again_loses_its_marker() {
 }
 
 // ---------------------------------------------------------------------------
-// The composefs image of `[ex-ostrya] generate-composefs`.
+// The composefs digest key.
 // ---------------------------------------------------------------------------
 
-/// The config that turns on the composefs image of each complete commit.
-const GENERATE: &str = "[ex-ostrya]\ngenerate-composefs=true\n";
-
-/// With `[ex-ostrya] generate-composefs=true`, a push session stores a valid
-/// composefs image of each commit of the session that carries the digest key:
-/// the new commit and its staged parent. A commit without the key gets no
-/// image. With the key false, no commit gets an image.
-#[test]
-fn a_push_stores_the_image_of_each_keyed_commit() {
-    let digest = common::receive::fixture_tree_digest();
-    let plain = build_commit(None, "plain", no_metadata(), &[]);
-    let parent = keyed_commit(Some(plain.checksum), "parent", &digest);
-    let tip = keyed_commit(Some(parent.checksum), "tip", &digest);
-    let mut objects = tree_objects();
-    objects.extend([plain.clone(), parent.clone(), tip.clone()]);
-    for (config, stored) in [(GENERATE, true), ("", false)] {
-        let tmp = TmpDir::new("recv-cfs-push");
-        let repo = new_repo(&tmp, RepoMode::BareUser, config);
-        committed(push(
-            &repo,
-            &policy(),
-            &objects,
-            &[],
-            vec![update("test/main", Expected::Absent, Some(tip.checksum))],
-            false,
-        ));
-        for commit in [&parent, &tip] {
-            let state = block_on(repo.check_composefs_image(&commit.checksum)).unwrap();
-            if stored {
-                assert_eq!(state, ComposefsImageState::Valid, "{config}");
-            } else {
-                assert_eq!(state, ComposefsImageState::Absent, "{config}");
-            }
-        }
-        assert!(!block_on(repo.has_composefs_image(&plain.checksum)).unwrap());
-        assert!(staging_entries(repo.path()).is_empty());
-    }
-}
-
-/// A session that completes a commit that the repository holds with a
-/// partial marker stores the image of that commit. The commit is not staged
-/// in the session, because the repository holds its object.
-#[test]
-fn a_push_that_completes_a_partial_commit_stores_its_image() {
-    let tmp = TmpDir::new("recv-cfs-partial");
-    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE);
-    let commit = keyed_commit(None, "keyed", &common::receive::fixture_tree_digest());
+/// Pushes `commit` with the fixture tree, and asserts that the session
+/// accepts it: the ref names the commit, and the repository holds the
+/// commit object with the bytes that the client sent.
+fn assert_keyed_push_accepted(commit: Obj) {
+    let tmp = TmpDir::new("recv-cfs-key");
+    let repo = new_repo(&tmp, RepoMode::BareUser, "");
     let mut objects = tree_objects();
     objects.push(commit.clone());
-    committed(push(
+    let report = committed(push(
         &repo,
         &policy(),
         &objects,
@@ -545,87 +504,35 @@ fn a_push_that_completes_a_partial_commit_stores_its_image() {
         vec![update("test/main", Expected::Absent, Some(commit.checksum))],
         false,
     ));
-    let image = repo.composefs_image_path(&commit.checksum);
-    assert!(image.exists());
-
-    // The commit becomes partial: one content object is gone, its marker is
-    // present, and the image is gone.
-    std::fs::remove_file(&image).unwrap();
-    let content = objects.iter().find(|o| o.ty == ObjectType::File).unwrap();
-    std::fs::remove_file(repo.path().join("objects").join(ostrya::loose_path(
-        &content.checksum,
-        ObjectType::File,
-        RepoMode::BareUser,
-    )))
-    .unwrap();
-    mark_partial(&repo, &commit.checksum);
-
-    committed(push(
-        &repo,
-        &policy(),
-        &objects,
-        &[],
-        vec![update(
-            "test/main",
-            Expected::Commit(commit.checksum),
-            Some(commit.checksum),
-        )],
-        false,
-    ));
     assert_eq!(
-        block_on(repo.check_composefs_image(&commit.checksum)).unwrap(),
-        ComposefsImageState::Valid
+        outcomes(&report),
+        vec![RefOutcome {
+            name: "test/main".into(),
+            old: None,
+            new: Some(commit.checksum),
+        }]
     );
     assert_eq!(
-        block_on(repo.commit_state(&commit.checksum)).unwrap(),
-        ostrya::CommitState::Normal
+        ref_file(&repo, "refs/heads/test/main"),
+        Some(format!("{}\n", commit.checksum))
     );
+    let stored = block_on(repo.load_object_bytes(ObjectType::Commit, &commit.checksum)).unwrap();
+    assert_eq!(stored, commit.bytes);
+    assert!(staging_entries(repo.path()).is_empty());
 }
 
-/// Pushes `commit` with the fixture tree to a repository under
-/// `generate-composefs`, and asserts that the session fails with `code`. The
-/// message names the commit, and the session publishes no object, writes no
-/// ref, and stores no image.
-fn assert_keyed_push_refused(commit: Obj, code: ErrorCode) {
-    let tmp = TmpDir::new("recv-cfs-refused");
-    let repo = new_repo(&tmp, RepoMode::BareUser, GENERATE);
-    let before = snapshot(&repo);
-    let mut objects = tree_objects();
-    objects.push(commit.clone());
-    let error = refused(
-        push(
-            &repo,
-            &policy(),
-            &objects,
-            &[],
-            vec![update("test/main", Expected::Absent, Some(commit.checksum))],
-            false,
-        ),
-        code,
-    );
-    assert!(
-        error.message.contains(&commit.checksum.to_hex()),
-        "{error:?}"
-    );
-    assert_unchanged(&repo, &before);
-    assert!(!repo.path().join("extensions/ostrya/composefs").exists());
-}
-
-/// A pushed commit whose digest key is not the digest of its tree fails the
-/// session with `checksum-mismatch`.
+/// A pushed commit whose digest key is not the digest of its tree is
+/// accepted. The receive does not check the key.
 #[test]
-fn a_pushed_commit_with_a_wrong_digest_is_checksum_mismatch() {
-    assert_keyed_push_refused(
-        keyed_commit(None, "wrong", &[0x5a; 32]),
-        ErrorCode::ChecksumMismatch,
-    );
+fn a_pushed_commit_with_a_wrong_digest_is_accepted() {
+    assert_keyed_push_accepted(keyed_commit(None, "wrong", &[0x5a; 32]));
 }
 
 /// A pushed commit whose digest key is not a variant of type `ay` with 32
-/// bytes fails the session with `protocol`.
+/// bytes is accepted. The receive does not read the key.
 #[test]
-fn a_pushed_commit_with_a_malformed_digest_is_protocol() {
-    let malformed = build_commit(
+fn a_pushed_commit_with_a_malformed_digest_is_accepted() {
+    assert_keyed_push_accepted(build_commit(
         None,
         "malformed",
         common::composefs::dict(
@@ -634,8 +541,7 @@ fn a_pushed_commit_with_a_malformed_digest_is_protocol() {
             Value::Str("digest".into()),
         ),
         &[],
-    );
-    assert_keyed_push_refused(malformed, ErrorCode::Protocol);
+    ));
 }
 
 /// If the session cannot remove a partial marker, the report holds a warning,

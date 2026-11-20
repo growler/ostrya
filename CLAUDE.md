@@ -271,10 +271,13 @@ These paths and crates are outside the scope:
 - the mount scan of `media/find.rs`;
 - the repository resolution of the `ostrya` command: `find_repo` and
   `is_system_repo` in `crates/ostrya-cli/src/main.rs`;
-- the worker of `ostrya-mount`: its opens of the repository root and of
+- the worker of `ostrya-mountd`: its opens of the repository root and of
   `objects`, which it gives to `open_tree` as the sources of a mount, and
   its mount checks on these descriptors (`fstatfs`, the mount id of
   `statx`, and `fstat`);
+- the helper `mount.ostrya` of `ostrya-mountd`: its open of the repository
+  root on the in-process path with `sys::open_dir`, which it gives to
+  `Repo::open_at_strict`;
 - `ostrya-conformance`, a black-box harness that does not link `ostrya`.
 
 Each change to `repo_fs` needs the explicit confirmation of the maintainer

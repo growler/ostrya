@@ -57,19 +57,19 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 #[cfg(feature = "gpg")]
 use ostrya::gpg::MAX_KEYRING;
 use ostrya::{
-    BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionPullOptions, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
-    ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions,
-    DeltaPartStats, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
-    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
-    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode, PruneOptions,
-    PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, Ref,
-    RefAlias, RefNamespace, RefSelector, RemoteSource, RemotesDir, Repo, RepoConfig, RepoMode,
-    RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions, TarImportOptions,
-    TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value, Verifier, VerifyOutcome,
-    VerityPolicy, WeakRefFilter, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from, to_text,
-    to_text_unannotated, validate_refspec,
+    BootableMetadata, BootableRefusal, COMPOSEFS_RELATION, CheckoutFilterFn, CheckoutMode,
+    CheckoutOptions, Checksum, CollectionPullOptions, CollectionRefEntry, CommitModifier,
+    CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions, DeltaEndianness,
+    DeltaOptions, DeltaPartStats, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange,
+    DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
+    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
+    FsckOptions, FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode,
+    PruneOptions, PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats,
+    PullVerify, Ref, RefAlias, RefNamespace, RefSelector, RemoteSource, RemotesDir, Repo,
+    RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
+    Verifier, VerifyOutcome, VerityPolicy, WeakRefFilter, Xattrs, from_bytes, load_sign_keys,
+    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -341,11 +341,6 @@ enum Command {
     /// is true, the command writes a `.tombstone-commit` for each deleted
     /// commit.
     ///
-    /// The command deletes the composefs image of each commit that it
-    /// deletes, the file `extensions/ostrya/composefs/<xx>/<rest>.cfs`. It
-    /// deletes these images before it deletes the first commit. It keeps each
-    /// image whose commit is not in the store. No count includes an image.
-    ///
     /// The command prints the total number of objects. It then prints the
     /// number of deleted objects and the freed size, or
     /// `No unreachable objects`. If `[core] locking` is false, the command
@@ -371,24 +366,6 @@ enum Command {
     /// partial, at each depth. The command marks a commit with an absent or a
     /// partial attachment as partial, so a later pull fetches the attachment.
     /// --no-mark-partial and --no-mark-attachments each stop these marks.
-    ///
-    /// After the walk, the command checks each composefs image in
-    /// `extensions/ostrya/composefs/` against the key
-    /// `ostree.composefs.digest.v0` of its commit. A faulty image is an
-    /// error, and --delete removes it: an image whose digest is not the key,
-    /// an image that does not read, and an image whose commit has no key or a
-    /// malformed key. If the commit of an image does not load, the command
-    /// reports an error and keeps the image. An image whose commit is absent
-    /// gets one line on standard output and is not an error. Each commit that
-    /// --delete or --add-tombstones deletes loses its image first.
-    ///
-    /// If `[ex-ostrya] generate-composefs` is true, the command also writes
-    /// the line `Commit with no composefs image: <commit>` on standard output
-    /// for each complete commit that carries `ostree.composefs.digest.v0` and
-    /// has no image. Such a commit is not an error, and the command repairs
-    /// nothing for it. `composefs-image --add` stores the image. A commit with
-    /// a malformed key gets no line. A value of the key that is not a boolean
-    /// fails the command before the first phase.
     ///
     /// The refs of the `collection-id` of the repository are the local refs.
     /// For each ref under `refs/mirrors/<collection-id>/` of that id, the
@@ -483,11 +460,6 @@ enum Command {
     /// field 2 from the commit object of this repository, and fetches the
     /// attachments below it that this repository does not hold complete.
     ///
-    /// With `[ex-ostrya] generate-composefs=true` in a repository that does
-    /// not seal its objects with fs-verity, a pull that succeeds writes one
-    /// warning line to standard error, unless it takes --commit-metadata-only
-    /// or --subpath.
-    ///
     /// On success, the command prints one statistics line to standard output.
     /// A pull with --collection can print two lines, as --collection states.
     /// If standard output is a terminal, a progress line shows while the pull
@@ -511,27 +483,20 @@ enum Command {
     /// of this repository, and imports each attachment that field 2 names. It
     /// reads no tree of such an attachment.
     ///
-    /// With `[ex-ostrya] generate-composefs=true` in a repository that does
-    /// not seal its objects with fs-verity, a pull that succeeds writes one
-    /// warning line to standard error, unless it takes --commit-metadata-only.
-    ///
     /// On success, the command prints one statistics line to standard output:
     /// `M metadata, C content objects imported; SIZE content written`. Under
     /// --require-static-deltas, the line has the form of a pull from a
     /// remote. The command writes no progress line.
     #[command(name = "pull-local")]
     PullLocal(PullLocalArgs),
-    /// Store, locate, or check the composefs image of a commit.
+    /// Write the composefs image of a commit as an image commit.
     ///
-    /// The image of a commit is the file
-    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository, where
-    /// `<xx><rest>` is the checksum of the commit. Its fs-verity digest is the
-    /// value of `ostree.composefs.digest.v0` in the metadata of the commit. The command takes exactly one of --add,
-    /// --get-path, and --check.
+    /// --add writes the image commit of a commit and names it as the
+    /// supplement `composefs` of the commit. The option is required.
     ///
-    /// --add and --check print nothing on success, and --get-path prints one
-    /// line. If the action fails, the command writes one `error:` line to
-    /// standard error and exits 1. This command is an extension of ostrya.
+    /// The command prints nothing on success. If the action fails, the command
+    /// writes one `error:` line to standard error and exits 1. This command is
+    /// an extension of ostrya.
     #[command(name = "composefs-image")]
     ComposefsImage(ComposefsImageArgs),
     /// Copy collection refs onto removable media, or pull them from it.
@@ -1088,9 +1053,10 @@ struct CommitArgs {
     /// form before it takes the repository lock. It refuses an empty NAME, a
     /// NAME that occurs two times, and an attachment that the repository does
     /// not hold complete before it reads the tree. The command does not check
-    /// the attachments of an attachment. A refusal gives no new object and no
-    /// ref. The option conflicts with --skip-if-unchanged. This option is an
-    /// extension of ostrya.
+    /// the attachments of an attachment. With --generate-composefs, the
+    /// command refuses the NAME `composefs` before it takes the repository
+    /// lock. A refusal gives no new object and no ref. The option conflicts
+    /// with --skip-if-unchanged. This option is an extension of ostrya.
     #[arg(
         long = "related",
         value_name = "NAME=CHECKSUM",
@@ -1271,24 +1237,25 @@ struct CommitArgs {
     /// tree, so it can give another digest. It replaces a
     /// value that --add-metadata-string, --add-metadata, or --keep-metadata
     /// gives for the same key.
-    ///
-    /// If `[ex-ostrya] generate-composefs` of the repository is true, the
-    /// command also stores the composefs image, as --generate-composefs does.
-    /// It stores the image only for a commit that the repository does not
-    /// hold already.
     #[arg(long)]
     generate_composefs_metadata: bool,
-    /// Store the composefs image of the tree with the commit.
+    /// Write the composefs image of the tree as an image commit, and name it
+    /// as the attachment `composefs` of the commit.
     ///
-    /// The option turns on --generate-composefs-metadata. The image is the
-    /// file `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository,
-    /// where `<xx><rest>` is the checksum of the commit, and its fs-verity
-    /// digest is the value of `ostree.composefs.digest.v0`. The
-    /// command reads the tree one time for the digest and the image. The
-    /// option stores the image whatever the value of
-    /// `[ex-ostrya] generate-composefs`. It also stores the image of a commit
-    /// that the repository holds already. This option is an extension of
-    /// ostrya.
+    /// The option turns on --generate-composefs-metadata. The command builds
+    /// the image of the tree one time. In the same transaction, it writes the
+    /// image commit, whose tree holds the image as the file `/root.cfs`. The
+    /// commit carries `ostree.composefs.digest.v0` with the fs-verity digest
+    /// of the image, and names the image commit as the attachment `composefs`
+    /// in field 2. The attachment makes the commit different from the commit
+    /// that --generate-composefs-metadata alone writes for the same tree.
+    /// Each transfer that carries attachments carries the image commit.
+    ///
+    /// The command refuses --related with the name `composefs` before it
+    /// takes the repository lock. It refuses an image commit that the
+    /// repository marks partial. The option works in each repository mode.
+    /// In `archive` mode, the image file is compressed, and a mount refuses
+    /// the repository. This option is an extension of ostrya.
     #[arg(long)]
     generate_composefs: bool,
     /// Add a tree source: a directory, a tar archive, or a committed tree.
@@ -5311,35 +5278,35 @@ struct PushTreeArgs {
 }
 
 #[derive(Args)]
-#[group(required = true, multiple = false)]
 struct ComposefsImageArgs {
-    /// Build and store the image of the commit REV.
+    /// Write the image commit of the commit REV, and name it as the
+    /// supplement `composefs` of REV.
     ///
-    /// The commit must carry `ostree.composefs.digest.v0`. The command builds
-    /// the image of the tree, checks its digest against the key, and stores
-    /// it. If a valid image is present already, the command does nothing. An
-    /// image whose digest is not the key, or an image whose read fails with an
-    /// I/O error, is replaced. A symlink on the path of the image, or an image
-    /// that is not a regular file, fails the command. The command does not
-    /// refuse a partial commit, and the build fails if an object of the tree
-    /// is absent.
-    #[arg(long, value_name = "REV")]
-    add: Option<String>,
-    /// Print the absolute path of the image of the commit REV.
+    /// The command refuses a commit that names an image commit as the
+    /// attachment `composefs`. If the supplement `composefs` names a valid
+    /// image commit, the command does nothing. Else the command builds the
+    /// image of the tree, writes the image commit, and sets the supplement
+    /// `composefs` of REV to it. This replaces an entry that names another
+    /// image commit, an image commit that the repository does not hold or
+    /// holds partial, or an image commit whose tree has a defect.
     ///
-    /// The command does not read the image. If the image is absent, the
-    /// command exits 1.
-    #[arg(long, value_name = "REV")]
-    get_path: Option<String>,
-    /// Check the image of the commit REV against the key of the commit.
+    /// The command does not write again an object that the repository
+    /// already holds. If the entry names the image commit that the build
+    /// gives, and the object of its `/root.cfs` is changed on disk, the
+    /// command writes the same entry and exits 0, and the changed object
+    /// stays. A changed object is a defect that `fsck` reports.
     ///
-    /// The command reads the whole image and computes its fs-verity digest.
-    /// It exits 0 if the digest is the value of `ostree.composefs.digest.v0`.
-    /// It exits 1 if the image is absent, if the commit does not carry the
-    /// key, or if the digests are different. The error line names the reason,
-    /// and for different digests it names both digests.
+    /// If REV carries `ostree.composefs.digest.v0` and the fs-verity digest
+    /// of the built image is not the value of the key, the command refuses
+    /// REV and names both digests. If REV has no key, the command makes no
+    /// check. A refusal writes no object and no supplement. The command
+    /// works in each repository mode. It does not refuse a partial commit,
+    /// and the build fails if an object of the tree is absent.
+    ///
+    /// No transfer copies a supplement. A pull of REV copies its detached
+    /// metadata, and not the image commit.
     #[arg(long, value_name = "REV")]
-    check: Option<String>,
+    add: String,
 }
 
 #[derive(Args)]
@@ -6173,7 +6140,6 @@ async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.
-    warn_unsealed(&repo).await;
     let report = repo
         .receive_selected(stdin_file()?, stdout_file()?, select)
         .await?;
@@ -6230,7 +6196,6 @@ async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
         },
         None => stdin_file()?,
     };
-    warn_unsealed(&repo).await;
     let report = if args.stop_at_commit {
         repo.receive_stream_to_commit(input, &policy).await?
     } else {
@@ -6238,32 +6203,6 @@ async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
     };
     write_receive_warnings(&report.warnings);
     Ok(())
-}
-
-/// Writes a warning on standard error if `[ex-ostrya] generate-composefs` of
-/// `repo` is true and the repository does not seal its objects with
-/// fs-verity.
-///
-/// The image build then reads and hashes each object with no seal. A value
-/// of the key that is not true gives no warning and no probe. The warning
-/// does not change the exit status: an error of the key or of the probe
-/// gives no warning, and the writer of the command reports a bad setting
-/// itself.
-///
-/// `pull` and `pull-local` call it after a pull that succeeds and that
-/// records its commits as complete: a pull with no --commit-metadata-only
-/// and, for `pull`, no --subpath. The other callers call it before their
-/// work.
-async fn warn_unsealed(repo: &Repo) {
-    if matches!(repo.config().generate_composefs(), Ok(true))
-        && matches!(repo.seals_objects().await, Ok(false))
-    {
-        eprintln!(
-            "warning: [ex-ostrya] generate-composefs is true, but the repository does not seal \
-             its objects with fs-verity; the image build reads and hashes each object with no \
-             seal"
-        );
-    }
 }
 
 /// Writes each warning of a receive report to standard error as one
@@ -7622,7 +7561,6 @@ async fn pull(
     let line = progress
         .clone()
         .map(|progress| ProgressLine::start(progress, redraw));
-    let builds_image = !args.commit_metadata_only && args.subpath.is_empty();
     let opts = PullOptions {
         refs,
         flags,
@@ -7681,9 +7619,6 @@ async fn pull(
         } else {
             println!("{text}");
         }
-    }
-    if builds_image {
-        warn_unsealed(&repo).await;
     }
     Ok(())
 }
@@ -7982,38 +7917,11 @@ fn format_transferred(bytes: u64) -> String {
     }
 }
 
-/// Runs the one action of `composefs-image` that `args` names.
+/// Runs `composefs-image --add`.
 async fn composefs_image(repo: Repo, args: ComposefsImageArgs) -> Result<()> {
-    if let Some(rev) = args.add {
-        let commit = resolve(&repo, &rev).await?;
-        repo.add_composefs_image(&commit).await?;
-        return Ok(());
-    }
-    if let Some(rev) = args.get_path {
-        let commit = resolve(&repo, &rev).await?;
-        if !repo.has_composefs_image(&commit).await? {
-            exit_error(&format!("commit {commit} has no composefs image"));
-        }
-        let path = std::path::absolute(repo.composefs_image_path(&commit))?;
-        println!("{}", path.display());
-        return Ok(());
-    }
-    let rev = args.check.expect("clap requires one action");
-    let commit = resolve(&repo, &rev).await?;
-    match repo.check_composefs_image(&commit).await? {
-        ComposefsImageState::Valid => Ok(()),
-        ComposefsImageState::Absent => {
-            exit_error(&format!("commit {commit} has no composefs image"))
-        }
-        ComposefsImageState::NoKey => exit_error(&format!(
-            "commit {commit} does not carry {COMPOSEFS_DIGEST_KEY}"
-        )),
-        ComposefsImageState::Mismatch { expected, actual } => Err(Error::ComposefsDigestMismatch {
-            commit,
-            expected,
-            actual,
-        }),
-    }
+    let commit = resolve(&repo, &args.add).await?;
+    repo.add_composefs_supplement(&commit).await?;
+    Ok(())
 }
 
 /// Copies the commits of the refs of `args` onto the volume at the mount
@@ -8179,7 +8087,6 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         flags |= PullFlags::FORCE_COPY;
     }
 
-    let builds_image = !args.commit_metadata_only;
     let stats = repo
         .pull_local(
             &src,
@@ -8216,9 +8123,6 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
         PullSource::Local
     };
     println!("{}", statistics_line(&stats, source));
-    if builds_image {
-        warn_unsealed(&repo).await;
-    }
     Ok(())
 }
 
@@ -8775,7 +8679,6 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
             }
         }
     }
-    warn_unsealed(repo).await;
     repo.apply_static_delta(sb, &parts).await?;
     Ok(())
 }
@@ -9538,6 +9441,15 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     let added_variants = refuse_unlocked!(parse_added_metadata(&args.add_metadata));
     let detached_pairs = refuse_unlocked!(metadata_pairs(&args.add_detached_metadata_string));
     let related = refuse_unlocked!(related_pairs(&args.related));
+    // Under `--generate-composefs`, the command names the image commit as the
+    // attachment `composefs`, so a value of `--related` for that name is
+    // refused before the lock and the tree.
+    if args.generate_composefs && related.iter().any(|(name, _)| name == COMPOSEFS_RELATION) {
+        exit_error(&format!(
+            "--generate-composefs writes the attachment {COMPOSEFS_RELATION}; \
+             --related cannot name it"
+        ));
+    }
     let kept = match parent.as_ref() {
         Some(parent) => refuse_unlocked!(kept_metadata(&repo, parent, &args.keep_metadata).await?),
         None => Vec::new(),
@@ -9573,7 +9485,6 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // can run while the user writes the message. The `ostree` command takes
     // its lock at the same point.
     let mut txn = repo.transaction().await?;
-    warn_unsealed(&repo).await;
     // `--fsync` can narrow the configured policy and never widens it. A
     // repository with `[core] fsync=false` syncs nothing under `--fsync=true`.
     // Only `false` reaches the transaction, and with `true` the config applies.
@@ -9589,7 +9500,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // The attachments are checked before the tree is read, so a refused
     // attachment stops the command before the ingest and the composefs build.
     // The commit write takes the checked list and does not check it again.
-    let checked = match txn.check_attachments(&related).await {
+    let mut checked = match txn.check_attachments(&related).await {
         Ok(checked) => checked,
         Err(err) => {
             txn.abort().await?;
@@ -9755,50 +9666,35 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // repeated key becomes that one entry.
     //
     // Under `--generate-composefs`, the one build of the image gives the
-    // digest, and the image goes in with the commit. The image borrows the
-    // transaction, so it lives in this block alone. With
-    // `[ex-ostrya] generate-composefs` true, the commit of the transaction
-    // stores the image of a commit with the digest, so
-    // `--generate-composefs-metadata` takes the same path, and the tree is
-    // read one time. Under the key alone, a commit that the repository holds
-    // already is not staged, and gets no image. The drop of the image removes
-    // its file.
-    let store_image = args.generate_composefs
-        || (args.generate_composefs_metadata && repo.config().generate_composefs()?);
-    let checksum = {
-        let mut image = None;
-        if args.generate_composefs_metadata || store_image {
-            let digest = if store_image {
-                let staged = txn.build_composefs_image(&root).await?;
-                let digest = *staged.digest();
-                image = Some(staged);
-                digest
-            } else {
-                txn.composefs_digest(&root).await?
-            };
-            let entry = Value::Tuple(vec![
-                Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
-                Value::variant(Type::array(Type::Byte), Value::Bytes(digest.to_vec())),
-            ]);
-            set_metadata_entry(&mut metadata, COMPOSEFS_DIGEST_KEY, entry)?;
-        }
-
-        let opts = CommitOptions {
-            parent,
-            subject,
-            body,
-            timestamp,
-            metadata: Some(metadata),
-            attachments: Vec::new(),
-        };
-        let checksum = txn.write_commit_checked(opts, checked, &root).await?;
-        if let Some(image) =
-            image.filter(|_| args.generate_composefs || txn.is_commit_staged(&checksum))
-        {
-            txn.attach_composefs_image(&checksum, image).await?;
-        }
-        checksum
+    // digest. The image commit is staged in this transaction, and the commit
+    // names it as the attachment `composefs`. The check of the new attachment
+    // refuses an image commit that the repository marks partial.
+    let digest = if args.generate_composefs {
+        let (image_commit, digest) = txn.write_composefs_commit(&root).await?;
+        checked.add(COMPOSEFS_RELATION, &image_commit).await?;
+        Some(digest)
+    } else if args.generate_composefs_metadata {
+        Some(txn.composefs_digest(&root).await?)
+    } else {
+        None
     };
+    if let Some(digest) = digest {
+        let entry = Value::Tuple(vec![
+            Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
+            Value::variant(Type::array(Type::Byte), Value::Bytes(digest.to_vec())),
+        ]);
+        set_metadata_entry(&mut metadata, COMPOSEFS_DIGEST_KEY, entry)?;
+    }
+
+    let opts = CommitOptions {
+        parent,
+        subject,
+        body,
+        timestamp,
+        metadata: Some(metadata),
+        attachments: Vec::new(),
+    };
+    let checksum = txn.write_commit_checked(opts, checked, &root).await?;
     // A branch name that the revision syntax shadows is reported after the
     // commit is written and before the signing step. A name that the refspec
     // grammar refuses is reported at the same step. The `ostree` command
@@ -15752,17 +15648,6 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
         std::io::stdout().flush().ok();
         fsck_report_failure(failure);
     }
-    // A repository with no composefs image gets none of these lines.
-    for error in &report.image_errors {
-        eprintln!("{error}");
-    }
-    for commit in &report.orphan_images {
-        println!("Composefs image with no commit: {commit}");
-    }
-    // The list is empty unless `[ex-ostrya] generate-composefs` is true.
-    for commit in &report.missing_images {
-        println!("Commit with no composefs image: {commit}");
-    }
     for commit in &report.tombstoned {
         println!("Adding tombstone for commit {commit}");
     }
@@ -15773,10 +15658,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     }
 
     std::io::stdout().flush().ok();
-    if !report.errors.is_empty()
-        || !report.image_errors.is_empty()
-        || !report.attachment_errors.is_empty()
-    {
+    if !report.errors.is_empty() || !report.attachment_errors.is_empty() {
         eprintln!("error: Repository corruption encountered");
         exit_process(1);
     }

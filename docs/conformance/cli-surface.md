@@ -5810,8 +5810,8 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 
 ## Port extensions
 
-The tool has no push, no pull over ssh, no server, no composefs image
-store, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
+The tool has no push, no pull over ssh, no server, and no bucket
+repository. `receive`, `push`, `push-tree`, `serve`,
 `send`, `composefs-image`, `remote init`, `remote fsck`, and `remote prune`
 are commands of the port alone, so no matrix cell compares them with the
 tool. `media export` does the work of `create-usb`, and `media import` does
@@ -7169,76 +7169,64 @@ ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
 ### `composefs-image`
 
 ```text
-ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
+ostrya composefs-image [--repo=PATH] --add=REV
 ```
 
-- The command takes no feature. It takes exactly one of `--add`,
-  `--get-path`, and `--check`. With none or with two, the option parser
-  writes the usage text and the error, and the command exits 1.
-- `--add` builds the composefs image of the commit and stores it as
-  `extensions/ostrya/composefs/<xx>/<rest>.cfs`, where `<xx><rest>` is the
-  checksum of the commit. The commit must carry
-  `ostree.composefs.digest.v0`. A commit without the key, or with a value
-  that is not an `ay` of 32 bytes, gets `error: MESSAGE` at exit 1, and the
-  command stores nothing. The command checks the digest of the image
-  against the key before it installs the image. A valid stored image stays,
-  and an image whose digest is not the key or that does not read is
-  replaced. A partial commit is
-  not refused, and the build fails if an object of its tree is absent. On
-  success the command writes nothing.
-- `--get-path` prints the absolute path of the image, also for a relative
-  `--repo`. It does not read the image. If the image is absent, the command
-  writes `error: commit CHECKSUM has no composefs image` and exits 1.
-- `--check` reads the whole image and computes its fs-verity digest. It
-  writes nothing and exits 0 if the digest is the key. It writes one
-  `error:` line and exits 1 if the image is absent, if the commit does not
-  carry the key, or if the digests are different. The line for different
-  digests names both digests.
-- `commit --generate-composefs` stores the image with the commit. The
-  option turns on `--generate-composefs-metadata`, so the commit is the
-  commit that the tool writes with `--generate-composefs-metadata`. The tool
-  refuses `--generate-composefs` as an unknown option. The option stores
-  the image also with `[ex-ostrya] generate-composefs` false, and also for
-  a commit that the repository holds already. With the key true, `commit
-  --generate-composefs-metadata` also stores the image and reads the tree
-  one time. It stores no image of a commit that the repository holds
-  already. Each of the two options writes the commit of the tool.
-- With `[ex-ostrya] generate-composefs` true, `commit`, `pull`,
-  `pull-local`, `receive`, `serve`, and `static-delta apply-offline` store
-  the image of each complete commit that they add and that carries the key
-  (`ostrya-config(1)`). If the repository does not seal its objects,
-  `commit`, `pull`, `pull-local`, `receive`, and `static-delta
-  apply-offline` write one `warning:` line to standard error, and the exit
-  status does not change. `pull` and `pull-local` write the line only after
-  a pull that succeeds, and not with `--commit-metadata-only` or, for
-  `pull`, `--subpath`. The tool ignores the group `[ex-ostrya]`.
-- The tool has no image store. `objects/` of a repository that holds images
-  holds only the object types of the tool, so the tool reads the
-  repository. `ostree fsck` and `ostree prune` neither check, count, nor
-  remove an image (`cli-behavior.md`, "CLI output formats", "Composefs
-  images in a prune" and "Composefs images in fsck"). So a prune of the tool
-  keeps the image of each commit that it deletes, and the `fsck` of the port
-  then notes the image. `../format-reference.md`, "The composefs image
-  store", states the store.
-- `prune` removes the image of each commit that it removes. It removes
-  these images before the first commit. It keeps an image whose commit is absent, because it does not
-  list the images. No count of its output includes an image.
-- `fsck` checks each image against the key of its commit after the object
-  walk. For an image whose digest is not the key, an image that does not
-  read, or an image whose commit has no key or a malformed key, it writes
-  one `composefs image of commit CHECKSUM: REASON` line to standard error,
-  and the run ends with `error: Repository corruption encountered` at exit
-  1. `--delete` unlinks such an image, and no image marks a commit as
-  partial. Each commit that `--delete` or `--add-tombstones` deletes loses
-  its image first, and the run writes no line for that image. If the commit of an image is present and does not load, `fsck`
-  writes the same line and keeps the image. For an image whose commit is
-  absent, it writes `Composefs image with no commit: CHECKSUM` to standard
-  output, and this line is not an error. A repository with no image gets
-  none of these lines. With `[ex-ostrya] generate-composefs` true, `fsck`
-  also writes `Commit with no composefs image: CHECKSUM` to standard output
-  for each complete commit that carries the key and has no image, after the
-  lines of the images whose commit is absent. This line is not an error.
-- `crates/ostrya/tests/composefs_image.rs` and
+- The command takes no feature. `--add` is required. Without it, the option
+  parser writes the usage text and the error, and the command exits 1.
+- `--add` writes the image commit of the commit and names it as the
+  supplement `composefs` of the commit (`../format-reference.md`, "The
+  composefs image commit"). The command refuses a commit that names an
+  image commit as the attachment `composefs`, with `error: invalid input:
+  commit CHECKSUM names its composefs image commit IMAGE as an attachment;
+  a supplement is not written` at exit 1. If the supplement `composefs`
+  names an image commit that passes the checks of the lookup, the command
+  writes nothing. Else it builds the image of the tree, writes the image
+  commit, and sets the supplement to it. This replaces an entry that names
+  another image commit, an image commit that the repository does not hold
+  or holds partial, or an image commit whose tree has a defect. The command
+  does not write again an object that the repository already holds. If the
+  entry names the image commit that the build gives, and the object of its
+  `/root.cfs` is changed on disk, the command writes the same entry and
+  exits 0, and the changed object stays. A changed object is a defect that
+  `fsck` reports. If the commit carries `ostree.composefs.digest.v0` and the
+  digest of the built image is not the value of the key, the command writes
+  one `error:` line that names both digests and exits 1. A commit with no
+  key gets no check. A refusal writes no object and no supplement. If the
+  repository held the image commit partial, the command removes its partial
+  marker. The command works in each repository mode, `archive` included. A
+  partial commit is not refused, and the build fails if an object of its
+  tree is absent. On success the command writes nothing.
+- No transfer copies a supplement. A pull with the default config copies
+  the `.commitmeta` with the supplement `composefs` and not the image
+  commit, so a lookup of the image fails on the absent image commit until
+  `--add` runs again. With `keep-detached-related=false`, the pull drops the
+  supplement.
+- `commit --generate-composefs` writes the image commit of the tree in the
+  transaction of the commit and names it as the attachment `composefs` in
+  field 2. The option turns on `--generate-composefs-metadata`, and the key
+  is the digest of `/root.cfs`. The tool refuses `--generate-composefs` as
+  an unknown option. The attachment makes the commit different from the
+  commit of `--generate-composefs-metadata` alone, so the commit of the
+  tool with `--generate-composefs-metadata` matches only the commit of the
+  port with `--generate-composefs-metadata`. Each transfer that carries
+  attachments carries the image commit, and the tool reads it as a usual
+  commit. The option works in each repository mode, `archive` included.
+- `commit --generate-composefs` refuses `--related=composefs=CHECKSUM`
+  before it takes the repository lock, with one `error:` line at exit 1, no
+  object, and no ref. It refuses an image commit that the repository holds
+  partial at the check of the attachment, with the reason `which is
+  partial`, and writes no object and no ref.
+- With `commit --generate-composefs`:
+  - `--skip-if-unchanged` gives the parent when the tree does not change,
+    and the parent can have no attachment;
+  - the counts of `--table-output` include the objects of the image commit;
+  - a sign option signs the commit alone, and the image commit has no
+    signature.
+- `commit --generate-composefs-metadata --related=composefs=CHECKSUM` writes
+  the attachment of the caller and makes no check of its image commit
+  against the key.
+- `crates/ostrya/tests/composefs_commit.rs` and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### `media export`
@@ -8200,11 +8188,9 @@ Observed by running the tool (2026.1).
     content phase removed an object, at the end of that phase, and one time
     on `state/` after the leftover sweep unlinks a marker.
   - `fsck --delete` runs `fsync` on `objects/<xx>` after the unlink of each
-    object, and on the directory of each composefs image that it removes.
-    It writes the markers of the run before it unlinks the objects.
+    object. It writes the markers of the run before it unlinks the objects.
     `fsck --add-tombstones` runs `fsync` on `objects/<xx>` after the unlink
-    of each commit that it deletes, and on the directory of the composefs
-    image of the commit after the removal of the image.
+    of each commit that it deletes.
   The observations below come from `strace` of the tool, libostree 2026.4,
   on 2026-11-16.
   - `fsck` creates the marker with `openat(repo,

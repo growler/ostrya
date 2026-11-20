@@ -75,6 +75,9 @@ A commit: the metadata, the parent, the related objects, the subject, the body, 
 Ostrya uses the related objects for the attachments of the commit, which \fB\%ostrya commit \-\-related\fR writes.
 \fB\%ostrya prune\fR and \fB\%ostrya remote prune\fR keep the attachments of each commit that they keep.
 \fB\%ostrya fsck\fR and \fB\%ostrya remote fsck\fR report each attachment that is absent, partial, or defective.
+\fB\%ostrya commit \-\-generate\-composefs\fR names the composefs image commit of the commit as the attachment \fB\%composefs\fR.
+The tree of the image commit holds one file, \fB\%/root.cfs\fR, which is the composefs image of the tree of the commit.
+The image commit has the subject \fB\%composefs image\fR, the time 0, and no parent.
 .TP
 \fB\%.dirtree\fR
 A directory listing: the names and checksums of the files and of the subdirectories.
@@ -93,6 +96,7 @@ The detached metadata of a commit, for example its signatures.
 The checksum of a commit does not include it, so a signature can be added after the commit.
 The key \fB\%ostrya.related\fR, an extension of ostrya, holds the supplements of the commit.
 \fB\%ostrya prune\fR keeps the supplements of each commit that it keeps.
+\fB\%ostrya composefs\-image \-\-add\fR names the composefs image commit of the commit as the supplement \fB\%composefs\fR.
 A transfer into a repository whose \fB\%config\fR sets \fB\%keep\-detached\-related=false\fR does not store the key, as \fB\%ostrya\-config\fR(1) states.
 .TP
 \fB\%.tombstone\-commit\fR
@@ -238,16 +242,14 @@ The repository holds no symbolic link.
 A ref alias and a symbolic link object of a \fB\%bare\fR, \fB\%bare\-user\-only\fR, or \fB\%bare\-split\-xattrs\fR repository are entries of the format, and the rule does not apply to them.
 The rule also does not apply to these entries: \fB\%<repo>/<remote>.trustedkeys.gpg\fR and \fB\%<repo>/gpgkeys.gpg\fR, which can be symbolic links, and a remotes directory in the repository, each component of its path, and each entry in it.
 The read of a symbolic link object reads its target and does not follow it.
-Each read of the files under \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, these two directories, and each path below them.
+Each read of the files under \fB\%extensions/ostrya/summary/\fR refuses a symbolic link at \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, and each path below it.
 Each write and each removal of these files refuses a symbolic link at the same directories and at each directory below them.
 A write of a file under \fB\%extensions/ostrya/summary/\fR replaces a symbolic link at the file, and a removal removes a symbolic link at the file as the link.
 The target of the link stays.
-Each write of a composefs image reads the stored image first, so a symbolic link at the image fails the write.
-Each prune and fsck of the composefs images refuses the symbolic links at the same directories.
 The error names the path that ostrya opens, relative to the repository: \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
-For a directory, the path is \fB\%extensions\fR, \fB\%extensions/ostrya/summary\fR, or \fB\%extensions/ostrya/composefs\fR.
+For a directory, the path is \fB\%extensions\fR or \fB\%extensions/ostrya/summary\fR.
 For a read of a file, the path is the path of the file.
-A read of \fB\%summary\fR, \fB\%summary.sig\fR, a file under \fB\%extensions/ostrya/summary/\fR, or a composefs image also refuses a FIFO, a socket, a device, or a directory at the file, with the error \fB\%invalid format: <path> is not a regular file\fR, and a FIFO does not block it.
+A read of \fB\%summary\fR, \fB\%summary.sig\fR, or a file under \fB\%extensions/ostrya/summary/\fR also refuses a FIFO, a socket, a device, or a directory at the file, with the error \fB\%invalid format: <path> is not a regular file\fR, and a FIFO does not block it.
 A read of a summary by \fB\%ostrya serve\fR refuses a symbolic link with no error, and the server answers 404, as for a summary that does not exist.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR open \fB\%extensions/ostrya/summary/\fR as a directory, so they need read permission on it.
 .TP
@@ -267,22 +269,6 @@ The summary states the mode \fB\%archive\-z2\fR, and in a mode other than archiv
 The access digest of an item, in 64 lowercase hex digits and a newline.
 Each item with a summary has this file, \fB\%anonymous\fR included.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR serve the summary of the item only when the file holds the access digest of the current client groups.
-.TP
-\fB\%<repo>/extensions/ostrya/composefs/<first 2 hex>/<last 62 hex>.cfs\fR
-The composefs image of a commit, an extension of ostrya.
-Its name is the checksum of the commit.
-Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
-Each mode stores it uncompressed, with the mode 0644 and no extended attribute.
-\fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it after the objects of the transaction, and make the directories at the first write.
-With \fB\%[ex\-ostrya] generate\-composefs=true\fR, \fB\%ostrya commit\fR, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, \fB\%ostrya serve\fR, and \fB\%ostrya static\-delta apply\-offline\fR also write it for each complete commit that they add, in the same way.
-\fB\%ostrya\-config\fR(1) states the rule.
-\fB\%ostrya prune\fR removes the images of the commits that it removes before the first commit, and keeps an image whose commit is absent.
-\fB\%ostrya fsck\fR checks it against the key of its commit, and notes an image whose commit is absent.
-With \fB\%generate\-composefs=true\fR, it also notes a complete commit with the key and no image.
-ostrya opens it with \fBopenat2\fR(2), \fB\%RESOLVE_BENEATH\fR, \fB\%RESOLVE_NO_SYMLINKS\fR, and \fB\%O_NONBLOCK\fR, so a symbolic link in its path stops each read and each write with the error \fB\%invalid format: <path> passes through a symlink; ostrya refuses a symlink in the repository\fR.
-An image that is not a regular file stops each read and each write with the error \fB\%invalid format: <path> is not a regular file\fR.
-No transfer carries it, and \fB\%ostrya serve\fR does not serve it.
-The \fB\%ostree\fR tool does not check, count, or remove it.
 .TP
 \fB\%<repo>/deltas/\fR
 The static deltas.
@@ -373,14 +359,14 @@ In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>
 .SH PERMISSIONS
 In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775 less the umask.
 An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
-It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR and \fB\%extensions/ostrya/composefs/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
 .PP
 In each mode other than \fB\%bare\-user\-shared\fR, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
 .PP
 In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
 .TP
 Directories: 02770
-The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, \fB\%extensions/ostrya/composefs/\fR, and each directory below it, and \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them.
+The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, \fB\%extensions/ostrya/summary/\fR, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below \fB\%deltas/\fR or \fB\%delta\-indexes/\fR.
 The setgid bit makes each new entry take the group of its directory.
 .TP
 Lock files: 0660
@@ -388,7 +374,7 @@ Lock files: 0660
 Each member of the group can then take the locks.
 .TP
 Objects: 0644
-Each object, each \fB\%.commitmeta\fR, and each composefs image.
+Each object and each \fB\%.commitmeta\fR.
 .TP
 Markers: 0644
 Each \fB\%state/<checksum>.commitpartial\fR.
@@ -587,8 +573,6 @@ The finder skips the client repository.
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2
 the mode \fB\%bare\-user\-shared\fR and its permissions;
-.IP \(bu 2
-the directory \fB\%extensions/ostrya/composefs/\fR and its files;
 .IP \(bu 2
 the lock file \fB\%.update.lock\fR;
 .IP \(bu 2

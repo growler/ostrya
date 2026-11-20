@@ -221,6 +221,21 @@ These alternatives were rejected:
 The last paragraph of "The options of an open and of a create" states the
 open of `objects` and the reads that do not depend on the open mode.
 
+Each read and write of the summaries of the client groups refuses a symlink
+at `extensions/`, `extensions/ostrya/`, and `extensions/ostrya/summary/`. A
+symlink there makes a write or a removal reach a file outside the
+repository. Each open of these paths is one `openat2` with `RESOLVE_BENEATH`
+and `RESOLVE_NO_SYMLINKS`: one for `extensions/`, one for the directory
+below it, and one for a file. The error names the path of the open,
+relative to the repository root:
+`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
+The read of a summary is one `openat2` of the path of the file, with
+`O_NONBLOCK`, and one `statx` of the open file, so a symlink in the path and
+a file that is not a regular file fail the read with `InvalidFormat`, and a
+FIFO does not block it. `ostrya serve` reads a summary with the same opens,
+relative to a handle of `extensions/ostrya/summary/`. A symlink there gives
+no error, and the server answers 404, as for an absent summary.
+
 ## The options of an open and of a create
 
 `OpenOptions` holds the options of an open, in the form of
@@ -295,7 +310,7 @@ expected form, so the command resolves it.
 
 The open of `objects`, the read of `config`, each read of an object, each
 read of a summary of the repository by `Repo`, the server, and the media
-finder, each read of a stored composefs image, and each read and write of a
+finder, and each read and write of a
 static delta and of a delta index file do not depend on the open mode. Each
 is one `openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`, with no
 fallback to `openat`. A local pull reads `summary`, `summary.sig`, and the
@@ -650,134 +665,6 @@ The XATTR_FILTER field hashes each xattr name with xxHash32. The xxHash32 in
 `crates/ostrya-composefs/src/xxhash.rs` is written in the tree to add no
 crate. The golden filter bytes verify it.
 
-## The composefs image store
-
-The port stores the composefs image of a commit as a file of the repository
-outside `objects/`, `extensions/ostrya/composefs/<xx>/<rest>.cfs`
-(`format-reference.md`, "The composefs image store"). So `objects/` holds
-only the object types that the `ostree` command knows. No transfer carries an
-image: a repository that needs an image builds it.
-
-The name of the file is the checksum of the commit. Two commits that share
-one tree each have their own file, with the same bytes, because the image
-depends on the tree alone.
-
-Rejected alternatives:
-
-- An image commit that the commit names by `root/composefs` in
-  `ostrya.related`. No transfer follows a supplement,
-  `keep-detached-related=false` drops the entry, and the prune of a bucket
-  repository reads no `.commitmeta`. So the image stays local, with more
-  indirection than a file.
-- A file named by the fs-verity digest of the image. The prune must then
-  check each kept commit before it deletes an image.
-
-The prune deletes the image of a commit before the commit, so it leaves no
-image whose commit it deleted. It deletes the images of all the commits that
-it deletes in one pass before the first commit, and syncs each directory of
-the images one time. One sync for each commit costs one open and one sync
-of the directories for each deleted commit. A stop between the pass and the
-commits leaves unreachable commits with no image, and the next prune deletes
-them. The prune does not list the images. An image whose commit is absent
-comes only from a change outside the port, and the fsck notes it.
-
-The repository holds no symlink. A ref alias and a symlink object of a
-`bare` repository are symlinks that the format allows. They are entries of
-the format, so the rule does not apply to them. Each read and write of the
-composefs images and of the summaries of the client groups refuses a symlink
-at `extensions/`, `extensions/ostrya/`, `extensions/ostrya/composefs/`, and
-`extensions/ostrya/summary/`. Each prune and fsck of the composefs images
-refuses the same symlinks. A symlink there makes a write or a removal reach
-a file outside the repository. Each open of these paths is one `openat2`
-with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`: one for `extensions/`, one
-for the directory below it, and one for a file. The error names the path of
-the open, relative to the repository root:
-`invalid format: PATH passes through a symlink; ostrya refuses a symlink in the repository`.
-The read of a stored image and of a summary is one `openat2` of the path of
-the file, with `O_NONBLOCK`, and one `statx` of the open file, so a symlink
-in the path and a file that is not a regular file fail the read with
-`InvalidFormat`, and a FIFO does not block it. `ostrya serve` reads a
-summary with the same opens, relative to a handle of
-`extensions/ostrya/summary/`. A symlink there gives no error, and the
-server answers 404, as for an absent summary.
-
-## The generation of the composefs image
-
-The key `[ex-ostrya] generate-composefs`, default `false`, makes the commit
-of a transaction build the image of each complete commit that carries the
-digest key. The rule is in `Transaction`, so each writer gets it from one
-place.
-
-The writer records its complete commits with the crate-internal
-`Transaction::mark_complete`. The transaction cannot find them alone: it
-does not see a held partial commit that a pull completes, and at its commit
-each commit that a pull staged has a `.commitpartial` marker. The writers
-are the commit writes of `Transaction` (`write_commit` and
-`write_commit_checked`), the pull from a remote and the local pull, the
-receive with ref updates, and `Repo::apply_static_delta`. A pull records the
-commits of its markers under the condition that removes the markers after
-the commit, and one helper holds that condition.
-`Transaction::write_metadata` records no commit, because a pull writes
-partial commits through it. `Repo::commit_add_composefs_metadata` and the
-server commit of a receive build the image themselves, as
-`commit --generate-composefs` does, so each of them reads the tree one time.
-They stage the image only if the transaction stages the commit.
-
-The build skips a commit that the transaction did not stage and that has no
-marker. So a commit that the repository holds complete before the
-transaction gets no image from it, also when a writer writes it again. The
-commit writes and `Repo::apply_static_delta` record a commit only if the
-transaction stages it. A commit that the repository holds partial is not
-staged again, so it gets no image from them. There is no backfill under
-the key: `composefs-image --add` and `commit --generate-composefs` build the
-image of a held commit.
-
-The build runs in the commit of the transaction, after the transaction
-stages its objects and before the publication. `publish()` renames the
-images after the objects, so an image is in place only after each object
-that its commit reaches. A malformed key, or an image whose digest is not
-the key, fails the transaction, so it publishes no object and writes no ref.
-For a pull this covers each recorded commit: a target, a parent within the
-depth, an attachment, or a held partial commit. One such commit fails the
-whole pull, also for a target whose image is correct. A failed pull keeps
-no staged object, so a retry fetches each object again.
-
-A receive builds before it takes the update lock, so the other writers of
-refs do not wait for the build. A server commit gets its parent from the tip
-that the receive reads under the lock. The image depends on the tree alone,
-so the receive builds the image of the tree before the lock and checks its
-digest against the key of the client. Under the lock, it writes the commit
-and stages the image as the image of the commit.
-
-`Repo::transaction_with_lock` reads the key before it takes the lock and
-discards the value, so a value that is not a boolean fails each writer
-before its first write. A pull from a remote opens its transaction after its
-first requests, so the pulls also read the key at their start. The fsck
-reads the key at its start for its note of a commit with no image.
-
-The key `true` in an `archive` repository is refused. The generation is for
-production repositories, and the mount refuses `archive`. In the other modes
-the key is accepted. Where the objects have no fs-verity seal, the build of
-the recorded images of a transaction reads and hashes each object one time.
-It uses that digest for each commit of the build and each path that names
-the object. `Repo::seals_objects` tells if the
-repository seals its objects, and the commands that write warn of the cost.
-An object that the repository holds from before can have no seal, and the
-build reads it. The port does not seal an object at the dedup of a write,
-and the fsck does not check the seals.
-
-`commit --generate-composefs` stores the image also with the key `false`.
-With the key `true`, `commit --generate-composefs-metadata` takes the same
-path, so the command reads the tree one time. The key alone stores no
-image of a commit that the repository holds already.
-`commit --generate-composefs` stores the image of such a commit, as
-`composefs-image --add` does.
-
-Rejected alternative: the transaction removes the markers of a pull, so that
-one call decides the marker and the image. It changes the error handling of
-three writers and the order of the removal and the refs. The writers keep
-the removal of the markers.
-
 ## The mount daemon
 
 `ostrya-mountd` mounts a commit as composefs for a caller in a user
@@ -805,32 +692,409 @@ that the peer is a member of the namespaces that it sends. A client such as
 ostree-podman sends the namespaces of podman, which are not its own.
 
 The daemon opens the repository in the strict open mode, which reads no
-remotes directory. Each read of an object, of `config`, and of the stored
-image takes `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
+remotes directory. Each read of an object, of a `.commitmeta`, and of
+`config` takes `openat2` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and
 `O_NONBLOCK` in each open mode, so a symlink at any component of the path
 stops the read, a FIFO does not block it, and a file that is not a regular
 file fails it. The open has no fallback to `openat`: kernels older than 5.6
 are not a target of the port, and `ENOSYS` is an error of the open, as each
 other errno is.
 
-The daemon reads the stored image as root, and the check of the `objects`
-directory does not cover its path. The access to the socket is the trust
-boundary, and the documents state the files that a member of the group of
-the socket can make the daemon read. Two alternatives were rejected:
+The daemon reads the repository as root. For op 1, it reads the commit
+object and the `.commitmeta` of the commit, and the commit object, the root
+dirtree, and the file object of `/root.cfs` of the image commit. Each of
+them is below `objects`, so the check of the `objects` directory covers its
+path. The daemon also checks the partial marker of the image commit under
+`state`. The access to the socket is the trust boundary, and the documents
+state the files that a member of the group of the socket can make the daemon
+read.
 
-- The worker opens the image with the credentials of the caller and gives
-  the descriptor to the daemon. This needs a new message between the worker
-  and the daemon, and a variant of `Repo::open_composefs_image_checked` that
-  takes an open file. The image adds little that the read of `objects/` does
-  not give: the daemon mounts an image only if its digest is the key of a
-  commit that it reads from `objects/`, and that image holds the tree that a
-  built mount makes from `objects/`.
-- The worker reads `config` with the credentials of the caller. That change
-  is outside the image store.
+Rejected alternative: the worker reads `config` with the credentials of the
+caller. This needs a new message between the worker and the daemon.
 
-The reply of the daemon for a stored image that is not the key of its commit
-names the commit and neither digest. The error of the library keeps both
-digests for `composefs-image --check` and the fsck.
+The reply of the daemon for an image commit whose `/root.cfs` does not
+match the key of the commit names the commit, the field, and the image
+commit, and neither digest. The error of the library keeps both digests.
+For each other defect of the image commit, the reply is the text of the
+error of the library. A commit that names no image commit gets the reply
+`commit <commit> has no attachment or supplement composefs`, with the code
+`repository`.
+
+### The mount helper
+
+`mount.ostrya` is the helper that mount(8) runs for
+`mount -t ostrya -o ro <repo>:<rev> <dir>`. It is a second binary of
+`ostrya-mountd`, which already links `ostrya` and `clap` and holds the
+repository reads of a mount. Cargo takes no dot in the name of a binary
+target, so the target is `mount-ostrya`. The Debian package installs it as
+`/usr/sbin/mount.ostrya`, and the Nix package as `bin/mount.ostrya`, each
+with the man page `mount.ostrya(8)`.
+
+The spec is `<repo>:<rev>`. The helper splits it at the first colon, so a
+revision can hold a colon, as `remote:ref` and `@ID:REF` do. A repository
+path cannot hold a colon. The helper resolves the revision with
+`Repo::resolve_rev` under its own credentials.
+
+The helper selects its path with `ostrya_mount::is_privileged`:
+
+- Root in the initial user namespace mounts in its own process. The helper
+  opens the repository in the strict open mode, refuses an `archive`
+  repository, reads `[ex-integrity] fsverity`, and finds or builds the
+  image. With no `-N`, it calls `Direct::mount_image`. With `-N`, it
+  mounts the tree with `sys::mount_composefs` in its own mount namespace,
+  calls `ostrya_sys::unshare_fs`, enters the target mount namespace with
+  `setns`, opens the target there, and moves the mount onto it with
+  `sys::move_onto`. The kernel refuses `setns` into a mount namespace for
+  a thread that shares its file system attributes, and the threads of the
+  blocking pool of the runtime share them. A built image has the limit of
+  100 MiB, the default of the daemon.
+- Each other caller asks the daemon. The helper opens the repository with
+  `Repo::open` under its own credentials, resolves the revision, and reads
+  the relations of the commit. If a field has an entry `composefs`, it
+  sends op 1, else op 2. A duplicate entry is left to the lookup of the
+  daemon. The helper sends the commit checksum, so the bytes of the wire
+  protocol do not change.
+
+The source label of each mount is the commit checksum.
+
+The namespaces of a mount:
+
+- With no `-N`, the mount goes into the namespaces of the helper. On the
+  daemon path, the helper sends its own user namespace and mount
+  namespace, as `Helper::new` does. The daemon refuses the initial user
+  namespace. A caller that is not root and is in the initial user
+  namespace gets that refusal from the helper before a connect, also with
+  `-f`. The helper reads the answer from
+  `ostrya_mount::in_initial_user_namespace`. The message names
+  `podman unshare mount ...` and a direct call with `-N <pid>`.
+- With `-N`, a value of digits alone is a process id, and the target is
+  `/proc/<pid>/ns/mnt`. Each other value is a namespace file. The daemon
+  path sends the mount namespace and the user namespace that owns it, from
+  `NS_GET_USERNS`, with `Helper::with_namespaces`. The helper reads the
+  repository path in its own namespace, and the daemon opens it in the
+  target namespace. The in-process path gives the mount no ID mapping.
+- With `-N`, a relative target is refused. With no `-N`, the helper makes a
+  relative target absolute against its working directory.
+- With `-N`, a relative repository path is refused on each path, also on a
+  direct run. With `-N`, mount(8) runs the helper with its working
+  directory at `/`, so a relative repository path resolves against `/`.
+  With no `-N`, the daemon path makes a relative repository path absolute
+  with `std::path::absolute`.
+
+The image is the image of the attachment `composefs`, else of the
+supplement `composefs`, else a built image. A defect of the selected image
+commit stops the mount, and the helper does not try the next source.
+
+The options:
+
+- `-o` accepts `ro`, `nosuid`, `nodev`, and `exec`. It refuses `rw`, because
+  each mount is read-only, also with `-s`. The in-process path also accepts
+  `noexec`, `suid`, and `dev`, and the last option of a name wins. The
+  daemon path refuses `noexec`, because the daemon cannot set it, and
+  refuses `suid` and `dev`, because the daemon sets `nosuid` and `nodev` on
+  each mount. With no `-o`, a direct run of the helper mounts read-only.
+  The values of more than one `-o` are joined.
+- `nofail`, `_netdev`, `user`, `users`, `owner`, and `group` are out of the
+  scope of the helper. It refuses each of them unless `-s` is given.
+- `-s` ignores each option that the helper does not know.
+- `-f` does each check and finds the image, and mounts nothing. The
+  in-process path builds no image. The daemon path does not connect.
+- `-n` has no effect, because the helper writes no mtab and no utab.
+- `-v` writes one line to standard error:
+  `mount.ostrya: commit <hex>, image attachment <C>|supplement <C>|built,
+  path in-process|daemon`.
+- `-t` accepts `ostrya` alone, and refuses a subtype.
+
+The exit status follows mount(8): 1 for a usage error or a refused
+argument, and 32 for each failure after the check of the arguments. The
+unmount is `umount <dir>` in the namespace of the mount. There is no
+`umount.ostrya`.
+
+mount(8) of util-linux 2.41 and 2.42, observed on Debian and NixOS, gives
+the helper these arguments:
+
+- mount(8) runs `/sbin/mount.<type> <spec> <dir> [-sfnv] [-o <options>]
+  [-N <ns>]`. On NixOS it looks first in `/run/wrappers/bin` and in
+  `/run/current-system/sw/bin`, where the NixOS module puts the package.
+- With no `-o`, mount(8) gives `-o rw`. `-w` and `-o defaults` also give
+  `-o rw`, and `-r` gives `-o ro`. The helper cannot tell an `rw` of
+  mount(8) from an `rw` of the user, so `mount -t ostrya <spec> <dir>` with
+  no `-o` gets the refusal of `rw`, and its message names `-o ro` and `-r`.
+- mount(8) merges the options. The last option of a name wins. `user` and
+  `users` add `noexec,nosuid,nodev`, and `owner` and `group` add
+  `nosuid,nodev`. `comment=`, `x-*`, `auto`, `noauto`, and the propagation
+  options do not reach the helper. `loop`, `bind`, and `rbind` stop
+  mount(8) before it runs the helper.
+- mount(8) opens the namespace of `-N` itself and gives the helper
+  `-N /proc/<pid of mount>/fd/<N>`, for a process id and for a file. The
+  helper runs in the mount namespace of mount(8), with its working
+  directory at `/`. With `-N`, if a relative target resolves at the root of
+  the target namespace, mount(8) makes it absolute against that root. A
+  relative target that does not resolve there reaches the helper as the
+  user writes it, and the helper refuses it. With no `-N`, mount(8) gives
+  the canonical absolute path.
+- A user who is not root runs mount(8) with no setuid rights, so the
+  helper runs as that user. Such a user in the initial user namespace
+  cannot give `-N` to mount(8): mount(8) fails to enter the namespace and
+  runs no helper. A direct run of the helper accepts `-N`.
+- `-t ostrya` gives the helper no `-t`. `-t ostrya.sub` gives
+  `-t ostrya.sub`.
+- The exit status of the helper is the exit status of mount(8).
+- umount(8) runs no helper for an overlay mount. It calls
+  `umount2(<dir>, 0)`, and the kernel then releases the layers and
+  detaches the loop device.
+
+Rejected alternatives:
+
+- The helper is a crate of its own. It would repeat the dependencies of
+  `ostrya-mountd`.
+- The helper is an `argv[0]` mode of the `ostrya` command. That binary also
+  links the HTTP client, the TLS stack, and the S3 support.
+- With no `-N`, the helper finds the pause process of rootless podman by
+  itself. That ties the helper to the private layout of podman.
+- The helper mounts the recorded image alone, and builds an image only with
+  `-o build`.
+
+## The split of the mount library
+
+A composefs mount has three functions:
+
+- The in-process mount, `ostrya_mount::Direct`. A process that is root in
+  the initial user namespace mounts in its own process.
+  `Direct::mount_image` takes the image and the `objects` directory as
+  descriptors that the caller opens, and the `verity` option of the overlay
+  as a `Verity` value. The call opens no repository.
+- The mount daemon, `ostrya-mountd`. It mounts for a caller in a user
+  namespace of its own. It opens the repository of a request, checks the
+  mode, reads `[ex-integrity] fsverity`, and opens the image of an image
+  commit or builds an image. It depends on `ostrya`, `ostrya-mount`, `ostrya-rt`,
+  `ostrya-sys`, `clap`, and `rustix`.
+- The client of the daemon, `ostrya_mount::Helper`. It sends the path of
+  the repository and the checksum of the commit to the daemon. It opens no
+  repository.
+
+`Direct` and `Helper` are in `ostrya-mount`. The crate depends on
+`ostrya-core`, `ostrya-sys`, `rustix`, and `thiserror`, and has no
+features. It links no repository code, no async runtime, no HTTP client, no
+TLS stack, and no xz library. `ostrya` and `ostrya-rt` are dev-dependencies
+of the crate alone: the integration tests make repositories, commits, and
+images with them. The CI step "ostrya-mount links no repository code and no
+runtime" reads the normal and the build graph of the crate. It fails when
+the graph holds `ostrya`, a package `ostrya-*` other than `ostrya-mount`,
+`ostrya-core`, `ostrya-sys`, and `ostrya-gvariant`, or one of `smol`,
+`tokio`, `async-io`, `async-executor`, `blocking`, `hyper`, `rustls`, and
+`liblzma-sys`.
+
+Each call of `ostrya-mount` is synchronous. The mount steps and the
+exchange on the socket of the daemon block the calling thread. A caller on
+an async runtime runs them on the blocking pool of its runtime. The daemon
+runs `sys::mount_composefs` with `ostrya_rt::unblock`.
+
+The daemon holds the repository reads of a mount. `ostrya-mount` makes the
+items that the daemon uses public, with documentation:
+
+- `proto`, the wire protocol between the client and the daemon.
+- `sys`, the mount steps. `sys::mount_composefs` mounts an EROFS image and
+  stacks the read-only composefs overlay on it.
+- `is_privileged`, which tells if the process is root in the initial user
+  namespace. The daemon refuses to start if the answer is `false`.
+- `Verity`, the `verity` option of the overlay. It is a required argument
+  of `Direct::mount_image`. The caller reads `[ex-integrity] fsverity`
+  itself and gives `Verity::Require` for `yes` alone. The daemon gives the
+  same type in its `sys::Plan`.
+
+Rejected alternatives:
+
+- The daemon code stays in `ostrya-mount` behind a feature `server`, with
+  `ostrya` and `ostrya-rt` as optional dependencies. The mount library
+  holds no repository code under any feature.
+- The mount steps go into a hidden public module. The daemon is a separate
+  crate that calls the steps, so the steps are documented public items.
+- The `verity` option is a field of `MountOptions`. Its default `Off` lets a
+  caller that does not set the field mount a sealed repository with no
+  verity check and no error. `Helper` also ignores the field, because the
+  daemon reads the key from the repository.
+- `is_privileged` stays private. Each caller then holds its own copy of the
+  read of `/proc/self/status` and `/proc/self/uid_map`.
+- The name `build_composefs` for `sys::mount_composefs`. It is close to
+  the names of the calls that write an image, such as
+  `ostrya::Transaction::write_composefs_content`. The function mounts an
+  image.
+
+## The composefs image commit
+
+The composefs image of a commit A can be a second commit C, the image
+commit (`format-reference.md`, "The composefs image commit"). The tree of C
+holds one file, `/root.cfs`, which is the EROFS image. The file is
+`root:root` with the mode `0400`. The root directory is `root:root 0755`
+with no extended attributes. C has the subject "composefs image", the
+timestamp 0, no parent, and no metadata key, so it carries no
+`ostree.composefs.digest.v0`. The shape is fixed, so the same image gives
+the same C. C is a usual commit, so the `ostree` command reads it, and each
+transfer of the port carries it as it carries other commits.
+
+The image commit is the one form in which the port keeps an image, and only
+`commit --generate-composefs` and `composefs-image --add` build one. A
+rejected alternative is a file of the image of each commit outside
+`objects/`, which a config key makes each writer build. No transfer carries
+such a file, the prune and fsck need a second kind of file, and a labeled
+image has no place in it. The port does not read or remove the files of an
+earlier version below `extensions/`.
+
+The names:
+
+- A names C as the attachment `composefs` in field 2, as the supplement
+  `composefs` in `ostrya.related`, or as both. If A has both, the attachment
+  wins. The commit checksum of A covers the attachment, and the supplement
+  is a local cache that a repository adds after the commit.
+- An attachment goes with each transfer that carries attachments, so C goes
+  with A. No transfer follows a supplement, so the supplement stays in the
+  repository that added it.
+
+The key:
+
+- `ostree.composefs.digest.v0` stays on A. It records the fs-verity digest of
+  the image that A mounts with. That image can hold labels that the port
+  cannot reproduce from the tree.
+- The port trusts the key. The lookup builds no image to check the key of a
+  commit, because a check by a build refuses each labeled image. The one
+  check is the comparison of the key with the digest of a `/root.cfs`.
+
+The lookup of the image of A:
+
+1. If A has the attachment `composefs`, C must be held and complete, and its
+   tree must hold `/root.cfs` as a regular file and no other entry. If A has
+   the key, the fs-verity digest of `/root.cfs` must be the key. Each
+   failure is an error, and the lookup does not try the supplement.
+2. Else, if A has the supplement `composefs`, the same rules apply, and each
+   failure is an error.
+3. Else the lookup gives no image.
+
+A bad attachment or supplement is damage or a change from outside the port.
+A fallback to the next source gives an image that A does not name, so the
+lookup stops. If A has no key, the lookup gives `/root.cfs` with no check.
+The digest comes from the kernel if the file is sealed, and else from a hash
+of the file. The lookup does not check the owners, the modes, or the
+extended attributes of C, because a caller reads the image through the
+descriptor that the lookup gives. The lookup refuses an `archive`
+repository, because the repository stores `/root.cfs` compressed and a
+mount needs the raw image.
+
+The library surface, in `ostrya`:
+
+- `Transaction::write_composefs_content` stages the image of a tree as a
+  content object, and returns its checksum and the digest of the image. The
+  owner, the mode, and the extended attributes of the object come from the
+  caller.
+- `Transaction::write_composefs_commit` writes C and returns the checksum of
+  C and the digest of the image. The shape of C is in this one call. The
+  call accepts an `archive` repository, where `/root.cfs` is a `.filez`
+  object, so a server repository in `archive` mode can hold C and send it
+  to its clients.
+- `Repo::open_composefs_image` is the one lookup call. It gives the open
+  file of `/root.cfs`, its size, its source, and the checksum of C, or no
+  image. It reads the repository through `repo_fs`.
+- A defect of C is `Error::InvalidComposefsImage`, with A, the source, C,
+  and a `ComposefsImageDefect`.
+- `Repo::add_composefs_supplement` writes C and the supplement of A, with
+  the steps of `composefs-image --add` below. It gives
+  `ComposefsSupplementAdd`: `Valid` with C if A has a valid supplement,
+  and `Written` with C and the replaced entry if it wrote C.
+- `CheckedAttachments::add` checks one more attachment and adds it to the
+  attachments that `Transaction::check_attachments` checked. It checks the
+  new entry alone, so each attachment is checked one time. A C that the
+  same transaction staged passes the check.
+
+The commands:
+
+- `commit --generate-composefs` turns on `--generate-composefs-metadata`.
+  It builds the image of the tree of A with the verity digests of the files
+  one time, writes C in the same transaction, and writes A with the key and
+  the attachment `composefs` that names C. The key is the digest of the
+  image in C. The attachment makes A a commit with C in its closure, so each
+  transfer of A carries its image.
+- `commit --generate-composefs` refuses `--related=composefs=CHECKSUM`
+  before it takes the repository lock and before it reads the tree. The
+  command writes the attachment itself, and two entries of one name are
+  refused.
+- `composefs-image --add REV` refuses a commit that has the attachment
+  `composefs`. The attachment is part of the commit checksum, and a
+  supplement under the same name is never read. If the commit has the
+  supplement `composefs` and its C passes the checks of the lookup, the
+  command does nothing. Else it builds the image of the tree of the commit
+  with the verity digests of the files. If the commit has the key and the
+  digest of the image is different, the command refuses. A commit with the
+  key of a labeled image therefore gets a refusal, because the build cannot
+  give the labels. If the commit has no key, the command makes no check. It
+  writes C and sets the supplement `composefs` of the commit to C. This
+  replaces an entry that names another C, a C that the repository does not
+  hold or holds partial, or a C whose tree has a defect. The transaction
+  does not write an object that the repository already holds, so a changed
+  `root.cfs` object of the C that the build gives stays. A changed object
+  is a defect that `fsck` reports, and `--add` adds no check for it.
+- Both commands accept an `archive` repository, where `/root.cfs` is a
+  `.filez` object, so a server repository can hold C and send it. The
+  lookup refuses an `archive` repository, as the mount does. In `archive`
+  mode, `composefs-image --add` checks the digest of a supplement through
+  an inflate of the object, in one call on the blocking pool.
+
+A partial C:
+
+- `Transaction::write_composefs_commit` does not remove the partial marker
+  of a C that the repository holds partial.
+- `composefs-image --add` removes the partial marker of C after its
+  transaction commits, because the repository then holds each object of C.
+  So a partial C from an interrupted pull becomes complete.
+- `commit --generate-composefs` refuses a C that the repository holds
+  partial. The check of the attachment refuses it, as it refuses each
+  partial attachment, and the command writes no object and no ref.
+
+The mount daemon:
+
+- Op 1 of the protocol is the image of the attachment or of the supplement
+  `composefs`, by the lookup above. The daemon refuses op 1 with
+  `repository` if the commit names no image commit, and does not build an
+  image in its place. Op 2 builds. The client selects the op. The bytes of
+  the wire protocol are the same for the two ops.
+- The daemon gives the loose object of `/root.cfs` to the loop device. It
+  does not copy an unsealed object into a sealed memory file, so a process
+  that can write the object can change the image while it is mounted. The
+  daemon refuses an image whose size is 0 or not a multiple of 4096 bytes,
+  as the loop device reads the image in blocks of 4096 bytes. The limit of
+  the size of a built image does not apply to op 1.
+
+The key and the `ostree` command:
+
+- The `ostree` command does not check `ostree.composefs.digest.v0` against
+  the tree. A commit whose key is not the digest of the image of its tree
+  passes `ostree commit`, `ostree fsck` (also with `-a`, and with
+  `ex-integrity.composefs` true), `ostree pull-local` (also with
+  `--untrusted`, and into an `archive` repository), and `ostree checkout`
+  with no message about the key. The probe ran on libostree 2026.4 with the
+  features `composefs` and `ex-fsverity`. So the fsck and the pulls of the
+  port do not check the key either.
+
+Accepted consequences:
+
+- A pull with the default config copies the `.commitmeta` of A, with the
+  supplement, and does not copy C. The lookup then fails with an absent C
+  until `composefs-image --add` writes C. `keep-detached-related=false`
+  drops the supplement.
+- `commit --skip-if-unchanged --generate-composefs` gives the parent when
+  the tree does not change. The parent can have no attachment.
+- `commit --table-output --generate-composefs` counts the objects of C with
+  the objects of A.
+- `commit --generate-composefs` with a sign option signs A alone. C has no
+  signature.
+- `commit --generate-composefs-metadata --related=composefs=CHECKSUM` writes
+  the attachment of the caller with no check of C against the key.
+
+Rejected alternatives:
+
+- The lookup checks the key with a build of the image of the tree of A. The
+  build cannot reproduce a labeled image.
+- The lookup tries the supplement when the attachment is bad. It then gives
+  an image that A does not name.
 
 ## The spki sign engine
 
@@ -5066,7 +5330,7 @@ These alternatives were rejected:
   and the caller gets no error.
 - One `Transaction` for each set of `Repo::remove_refs_immediate`. A
   transaction creates a staging directory, scans `tmp/`, and parses
-  `tmp-expiry-secs`, the `min-free-space-*` keys, and `generate-composefs`.
+  `tmp-expiry-secs` and the `min-free-space-*` keys.
   It can fail with `ENOSPC` on a full disk, where a removal frees space.
 - A wider check in the CLI before it removes the refs of a prefix one by
   one with `Repo::set_ref_immediate`. The CLI holds no lock between the

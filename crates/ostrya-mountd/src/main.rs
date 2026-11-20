@@ -30,8 +30,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use clap::Parser;
-use ostrya_mount::Mounter;
-use ostrya_mount::server::{Server, worker_main};
+use ostrya_mount::is_privileged;
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::fs::{AtFlags, CWD, FileType, Mode, chmodat, statat, unlinkat};
 use rustix::io::Errno;
@@ -43,6 +42,11 @@ use rustix::process::{Pid, PidfdFlags, pidfd_open};
 
 #[cfg(test)]
 mod man;
+mod repo;
+mod server;
+
+use repo::DEFAULT_MAX_IMAGE_SIZE;
+use server::{Server, worker_main};
 
 /// The program of the worker process: this binary.
 const WORKER_PROGRAM: &str = "/proc/self/exe";
@@ -52,9 +56,6 @@ const WORKER_FLAG: &str = "--worker";
 
 /// The exit status of a usage error.
 const USAGE_ERROR: u8 = 2;
-
-/// The default largest size of a built image, in bytes: 100 MiB.
-const DEFAULT_MAX_IMAGE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// The command line of `ostrya-mountd`.
 #[derive(Debug, Parser)]
@@ -109,7 +110,7 @@ struct Cli {
     /// A request for a built image fails with the code `repository` if the
     /// image is larger. The daemon computes the size before it writes the
     /// image, so a refused image takes no memory. The limit does not apply
-    /// to a stored image. The default is 100 MiB.
+    /// to the image of an image commit. The default is 100 MiB.
     #[arg(
         long,
         value_name = "BYTES",
@@ -204,7 +205,7 @@ fn main() -> ExitCode {
     if cli.worker {
         return worker();
     }
-    if !Mounter::is_privileged() {
+    if !is_privileged() {
         eprintln!("ostrya-mountd: the daemon must run as root in the initial user namespace");
         return ExitCode::FAILURE;
     }
@@ -415,6 +416,13 @@ mod tests {
     #[test]
     fn the_command_line_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The committed page `ostrya-mountd.8` is the page that the `clap`
+    /// definition renders.
+    #[test]
+    fn man_page_matches_the_committed_file() {
+        man::assert_page_matches(Cli::command(), "ostrya-mountd", "8");
     }
 
     #[test]

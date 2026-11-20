@@ -2,9 +2,8 @@
 
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use ostrya::{Checksum, Repo};
+use ostrya_core::Checksum;
 use rustix::fs::{CWD, Mode, OFlags, openat};
 use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType, connect, socket_with};
 
@@ -48,6 +47,11 @@ pub const SOCKET_ENV: &str = "OSTRYA_MOUNTD_SOCKET";
 /// source label and the same access, the daemon mounts nothing and returns
 /// the root of that mount.
 ///
+/// The client opens no repository. A mount call blocks the calling thread
+/// until the daemon replies, and the unmount blocks the calling thread too.
+/// A caller on an async runtime runs these calls on the blocking pool of the
+/// runtime.
+///
 /// # Socket
 ///
 /// The socket is [`DEFAULT_SOCKET`]. The environment variable [`SOCKET_ENV`]
@@ -61,9 +65,9 @@ pub struct Helper {
     socket: PathBuf,
     /// The user namespace that each request sends. The calls share the
     /// descriptor and duplicate it for no request.
-    userns: Arc<OwnedFd>,
+    userns: OwnedFd,
     /// The mount namespace that each request sends.
-    mntns: Arc<OwnedFd>,
+    mntns: OwnedFd,
 }
 
 impl Helper {
@@ -98,8 +102,8 @@ impl Helper {
     pub fn with_namespaces(userns: OwnedFd, mntns: OwnedFd) -> Helper {
         Helper {
             socket: socket_path(),
-            userns: Arc::new(userns),
-            mntns: Arc::new(mntns),
+            userns,
+            mntns,
         }
     }
 
@@ -108,18 +112,30 @@ impl Helper {
         &self.socket
     }
 
-    /// Mounts the stored composefs image of `commit` at `target` through the
-    /// daemon.
+    /// Mounts the composefs image of the image commit that `commit` names at
+    /// `target` through the daemon.
     ///
-    /// The daemon opens the image and compares its digest with the key
-    /// `ostree.composefs.digest.v0` of the commit, as
-    /// [`Direct::mount_stored`](crate::Direct::mount_stored) does. It does
-    /// not check a signature of the commit.
+    /// The daemon finds the image commit that the commit names as the
+    /// attachment `composefs` in field 2, or else as the supplement
+    /// `composefs` in its detached metadata. It checks the image commit and
+    /// opens its `/root.cfs`. If the commit carries the key
+    /// `ostree.composefs.digest.v0`, the daemon compares the fs-verity digest
+    /// of `/root.cfs` with the key. It refuses an image whose size is 0 or not
+    /// a multiple of 4096 bytes. If the commit names no image commit, the
+    /// daemon refuses the request with [`HelperCode::Repository`]. It does not
+    /// build an image in place of an absent one, and it does not check a
+    /// signature of the commit.
     ///
-    /// The path of `repo` and `target` must be absolute, as the caller sees
-    /// them. The daemon opens the repository directory and its `objects`
-    /// directory with the user, the group, and the supplementary groups of
-    /// the caller.
+    /// The daemon does not copy the image. If the file object of `/root.cfs`
+    /// is not sealed with fs-verity, a process that can write it can change
+    /// the image while it is mounted.
+    ///
+    /// `repo` is the path of the repository directory, and `target` is the
+    /// path of the target directory. Both paths must be absolute, as the
+    /// caller sees them. The client does not open the repository and does
+    /// not read the commit. The daemon opens the repository directory and its
+    /// `objects` directory with the user, the group, and the supplementary
+    /// groups of the caller.
     ///
     /// Returns a descriptor of the root of the new mount. The descriptor
     /// keeps the mount in use, so close it before [`Helper::unmount`].
@@ -127,26 +143,31 @@ impl Helper {
     /// # Errors
     ///
     /// - [`Error::InvalidRequest`] if a path is relative, if a path is longer
-    ///   than 4096 bytes, or if the source label is longer than 255 bytes.
+    ///   than 4096 bytes, if the source label is longer than 255 bytes, or if
+    ///   [`MountOptions::flags`] holds `noexec`. The daemon sets `nosuid` and
+    ///   `nodev` on each mount and cannot set `noexec`.
     /// - [`Error::Connect`] if the client cannot connect to the socket.
     /// - [`Error::Helper`] with the refusal or the failure that the daemon
     ///   reports.
     /// - [`Error::Sys`] if a send or a receive on the socket fails.
-    pub async fn mount_stored(
+    pub fn mount_stored(
         &self,
-        repo: &Repo,
+        repo: &Path,
         commit: &Checksum,
         target: &Path,
         opts: &MountOptions,
     ) -> Result<OwnedFd> {
-        self.request(Op::Stored, repo, commit, target, opts).await
+        self.request(Op::Stored, repo, commit, target, opts)
     }
 
     /// Builds the composefs image of `commit` and mounts it at `target`
     /// through the daemon.
     ///
-    /// The daemon builds the image as
-    /// [`Direct::mount_built`](crate::Direct::mount_built) does. The memory
+    /// The daemon needs no image commit and no key in the commit. It writes
+    /// the image to a sealed memory file and attaches the file to the loop
+    /// device. With `[ex-integrity] fsverity=yes`, the image carries the
+    /// fs-verity digest that the kernel holds for each backing object, and a
+    /// backing object with no fs-verity seal fails the request. The memory
     /// of the image counts against the memory cgroup of the daemon until
     /// the unmount.
     ///
@@ -156,14 +177,14 @@ impl Helper {
     /// # Errors
     ///
     /// The errors of [`Helper::mount_stored`].
-    pub async fn mount_built(
+    pub fn mount_built(
         &self,
-        repo: &Repo,
+        repo: &Path,
         commit: &Checksum,
         target: &Path,
         opts: &MountOptions,
     ) -> Result<OwnedFd> {
-        self.request(Op::Built, repo, commit, target, opts).await
+        self.request(Op::Built, repo, commit, target, opts)
     }
 
     /// Unmounts the composefs mount at `target`.
@@ -172,7 +193,7 @@ impl Helper {
     /// the daemon. The process needs `CAP_SYS_ADMIN` in the user namespace
     /// that owns its mount namespace. The call refuses a target that is not
     /// the root of an overlay mount, as [`Direct::unmount`](crate::Direct::unmount)
-    /// does.
+    /// does. The call blocks the calling thread.
     ///
     /// # Errors
     ///
@@ -180,21 +201,47 @@ impl Helper {
     ///   mount.
     /// - [`Error::Sys`] with `EBUSY` if a process still uses the mount, and
     ///   [`Error::Sys`] if another call fails.
-    pub async fn unmount(&self, target: &Path) -> Result<()> {
-        let target = target.to_owned();
-        ostrya_rt::unblock(move || unmount_overlay(&target)).await
+    pub fn unmount(&self, target: &Path) -> Result<()> {
+        unmount_overlay(target)
+    }
+
+    /// Runs the exchange of `request` on the connected socket `sock`: the
+    /// hello, the request with the namespaces of the client, and the reply.
+    ///
+    /// `sock` is a `SOCK_SEQPACKET` socket whose peer speaks the protocol of
+    /// the daemon. The call blocks the calling thread, and it does not close
+    /// the socket. The mount calls of the client connect to [`Helper::socket`]
+    /// and run this exchange.
+    ///
+    /// Returns the descriptor of the root of the mount that the peer sends.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRequest`] if a path of `request` is longer than 4096
+    ///   bytes, or if its source label is longer than 255 bytes.
+    /// - [`Error::Helper`] with the refusal or the failure that the peer
+    ///   reports, or if a reply breaks the protocol.
+    /// - [`Error::Sys`] if a send or a receive on the socket fails.
+    pub fn exchange(&self, sock: BorrowedFd<'_>, request: &Request) -> Result<OwnedFd> {
+        let bytes = request.encode().map_err(Error::InvalidRequest)?;
+        exchange(sock, &bytes, self.userns.as_fd(), self.mntns.as_fd())
     }
 
     /// Sends one request and returns the root of the mount.
-    async fn request(
+    fn request(
         &self,
         op: Op,
-        repo: &Repo,
+        repo: &Path,
         commit: &Checksum,
         target: &Path,
         opts: &MountOptions,
     ) -> Result<OwnedFd> {
-        for (name, path) in [("repository", repo.path()), ("target", target)] {
+        if opts.flags.noexec {
+            return Err(Error::InvalidRequest(
+                "the mount daemon cannot set the mount flag noexec".to_owned(),
+            ));
+        }
+        for (name, path) in [("repository", repo), ("target", target)] {
             if !path.is_absolute() {
                 return Err(Error::InvalidRequest(format!(
                     "the {name} path {} is not absolute",
@@ -206,19 +253,18 @@ impl Helper {
             op,
             access: opts.access,
             commit: *commit,
-            repo: repo.path().to_owned(),
+            repo: repo.to_owned(),
             source: opts.source.clone().unwrap_or_default(),
             target: target.to_owned(),
         };
         let bytes = request.encode().map_err(Error::InvalidRequest)?;
-        let socket = self.socket.clone();
-        let userns = self.userns.clone();
-        let mntns = self.mntns.clone();
-        ostrya_rt::unblock(move || {
-            let sock = connect_to(&socket)?;
-            exchange(sock.as_fd(), &bytes, userns.as_fd(), mntns.as_fd())
-        })
-        .await
+        let sock = connect_to(&self.socket)?;
+        exchange(
+            sock.as_fd(),
+            &bytes,
+            self.userns.as_fd(),
+            self.mntns.as_fd(),
+        )
     }
 }
 
@@ -237,7 +283,7 @@ fn name_op(name: &str) -> &'static str {
 /// user namespace and runs with its real ids as its effective ids. A setuid
 /// or setgid program does not read it.
 fn socket_path() -> PathBuf {
-    let trusted = !crate::mounter::is_privileged() && crate::mounter::ids_match();
+    let trusted = !crate::privilege::is_privileged() && crate::privilege::ids_match();
     let from_env = trusted
         .then(|| std::env::var_os(SOCKET_ENV))
         .flatten()
@@ -267,7 +313,7 @@ fn connect_to(path: &Path) -> Result<OwnedFd> {
 
 /// Runs the exchange of one request on the connected socket `sock`: the
 /// hello, the request `request` with the namespaces, and the reply.
-pub(crate) fn exchange(
+fn exchange(
     sock: BorrowedFd<'_>,
     request: &[u8],
     userns: BorrowedFd<'_>,
@@ -505,44 +551,87 @@ mod tests {
         }
     }
 
+    fn test_helper() -> Helper {
+        Helper {
+            socket: PathBuf::from("/nonexistent/socket"),
+            userns: own_ns("user"),
+            mntns: own_ns("mnt"),
+        }
+    }
+
     #[test]
     fn a_relative_path_is_refused_before_the_connect() {
-        ostrya_rt::block_on(async {
-            let scratch =
-                std::env::temp_dir().join(format!("ostrya-helper-{}", std::process::id()));
-            let repo = ostrya::Repo::create(
-                &scratch,
-                ostrya::CreateOptions::new(ostrya::RepoMode::BareUser),
-            )
-            .await
-            .unwrap();
-            let helper = Helper {
-                socket: PathBuf::from("/nonexistent/socket"),
-                userns: Arc::new(own_ns("user")),
-                mntns: Arc::new(own_ns("mnt")),
-            };
-            let commit = Checksum::from_bytes([0; 32]);
-            let opts = MountOptions::default();
-            let err = helper
-                .mount_stored(&repo, &commit, Path::new("mnt"), &opts)
-                .await
-                .unwrap_err();
-            assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
-            let err = helper
-                .mount_built(&repo, &commit, Path::new("/mnt"), &opts)
-                .await
-                .unwrap_err();
-            assert!(
-                matches!(
-                    err,
-                    Error::Connect {
-                        errno: rustix::io::Errno::NOENT,
-                        ..
-                    }
-                ),
-                "{err}"
-            );
-            let _ = std::fs::remove_dir_all(&scratch);
-        });
+        let helper = test_helper();
+        let commit = Checksum::from_bytes([0; 32]);
+        let opts = MountOptions::default();
+        let repo = Path::new("/srv/repo");
+        let err = helper
+            .mount_stored(repo, &commit, Path::new("mnt"), &opts)
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidRequest(_)), "{err}");
+        let err = helper
+            .mount_built(Path::new("repo"), &commit, Path::new("/mnt"), &opts)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRequest(text) if text.contains("repository")),
+            "{err}"
+        );
+        let err = helper
+            .mount_built(repo, &commit, Path::new("/mnt"), &opts)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Connect {
+                    errno: rustix::io::Errno::NOENT,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn noexec_is_refused_before_the_connect() {
+        let helper = test_helper();
+        let commit = Checksum::from_bytes([0; 32]);
+        let repo = Path::new("/srv/repo");
+        let target = Path::new("/mnt");
+
+        let mut opts = MountOptions::default();
+        opts.flags.noexec = true;
+        let err = helper
+            .mount_stored(repo, &commit, target, &opts)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRequest(text) if text.contains("noexec")),
+            "{err}"
+        );
+        let err = helper
+            .mount_built(repo, &commit, target, &opts)
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidRequest(text) if text.contains("noexec")),
+            "{err}"
+        );
+
+        // The daemon sets these two flags itself, so the request goes to the
+        // connect.
+        let mut opts = MountOptions::default();
+        opts.flags.nosuid = true;
+        opts.flags.nodev = true;
+        let err = helper
+            .mount_stored(repo, &commit, target, &opts)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::Connect {
+                    errno: rustix::io::Errno::NOENT,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 }

@@ -17,10 +17,15 @@ Package: ostrya-mountd
 Architecture: linux-any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Recommends: systemd
-Description: composefs mount daemon of ostrya
+Description: composefs mount daemon and mount helper of ostrya
  ostrya-mountd mounts a commit of an ostrya repository as a composefs tree
  for a caller in its own user namespace, for example a rootless container
  tool. The members of the group ostrya-mount can connect to the daemon.
  .
- This package contains the daemon, its systemd units, and the sysusers.d
- file of the group. The package does not enable the socket unit.
+ The mount helper mount.ostrya runs for "mount -t ostrya -o ro REPO:REV DIR".
+ It mounts the commit in its own process for root in the initial user
+ namespace, and asks the daemon for each other caller.
+ .
+ This package contains the daemon, the mount helper, the systemd units, and
+ the sysusers.d file of the group. The package does not enable the socket
+ unit.

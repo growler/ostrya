@@ -689,8 +689,8 @@ impl Repo {
     /// remotes directory, so the handle has no remotes directory.
     ///
     /// Each read of the handle is the same as in [`open_at`](Repo::open_at).
-    /// In each open mode, a read of an object, of the stored composefs image,
-    /// or of a summary through [`read_summary`](Repo::read_summary),
+    /// In each open mode, a read of an object or of a summary through
+    /// [`read_summary`](Repo::read_summary),
     /// [`read_summary_signature`](Repo::read_summary_signature), and
     /// [`read_summary_of`](Repo::read_summary_of) opens the file with
     /// `openat2`, `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`, and `O_NONBLOCK`,
@@ -896,11 +896,7 @@ impl Repo {
     /// The result covers the objects that a write stages. An object that the
     /// repository holds from before, for example from a write with
     /// `fsverity=no`, can have no seal. A composefs image build reads the
-    /// digest of a sealed object from the kernel. The build of the recorded
-    /// images of a transaction reads and hashes each other object one time.
-    /// So with the result `false`, that build under
-    /// `[ex-ostrya] generate-composefs` reads and hashes each object of its
-    /// commits one time.
+    /// digest of a sealed object from the kernel.
     ///
     /// # Errors
     ///
@@ -947,9 +943,6 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `lock-timeout-secs` is less than `-1`,
     ///   if `min-free-space-size` is malformed, or if `min-free-space-percent`
     ///   is outside the range `0` to `100`.
-    /// - The errors of [`RepoConfig::generate_composefs`]: a value of
-    ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
-    ///   `true` in an `archive` repository.
     /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
     ///   not a directory. The call makes each of them that is absent.
     /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
@@ -998,9 +991,6 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `lock-timeout-secs` is less than `-1`,
     ///   if `min-free-space-size` is malformed, or if `min-free-space-percent`
     ///   is outside the range `0` to `100`.
-    /// - The errors of [`RepoConfig::generate_composefs`]: a value of
-    ///   `[ex-ostrya] generate-composefs` that is not a boolean, or the value
-    ///   `true` in an `archive` repository.
     /// - [`Error::InvalidFormat`] if `tmp` or `tmp/cache` is a symlink or is
     ///   not a directory. The call makes each of them that is absent.
     /// - [`Error::InvalidFormat`] if a symlink or an entry that is not a
@@ -1016,9 +1006,6 @@ impl Repo {
         // any wait on a contended repository.
         let expiry_secs = self.inner.config.tmp_expiry_secs()?;
         let min_free = self.inner.config.min_free_space()?;
-        // The commit of the transaction reads the key again. This read fails
-        // a bad value before the first write.
-        self.inner.config.generate_composefs()?;
         let guard = self.lock_repo(kind).await?;
 
         let repo = self.clone();

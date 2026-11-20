@@ -91,20 +91,24 @@ Ostrya adds these functions, which the `ostree` command does not have:
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
-- The composefs image store. `ostrya commit --generate-composefs` and
-  `ostrya composefs-image --add` store the composefs image of a commit in the
-  repository, as `extensions/ostrya/composefs/<xx>/<rest>.cfs`, outside
-  `objects/`. The fs-verity digest of the image is the digest that the commit
-  records. `ostrya composefs-image` also checks a stored image and prints its
-  path. With `[ex-ostrya] generate-composefs=true`, each commit, pull,
-  receive, and offline delta apply stores the image of each new complete
-  commit that records a digest. Prune removes the image of each commit that
-  it removes, and fsck checks each image. No transfer carries the image.
-- composefs mounts. The library `ostrya-mount` mounts a commit as a composefs
-  tree on Linux, from its stored image or from an image that it builds in
-  memory. The mount reads the objects of the repository in place. Root in the
-  initial user namespace mounts directly. A process in its own user namespace
-  asks the mount daemon `ostrya-mountd`, which runs as root.
+- The composefs image commit. A commit can name a second commit, whose tree
+  holds its composefs image as the file `/root.cfs`. `ostrya commit
+  --generate-composefs` writes the image commit and names it as the
+  attachment `composefs`, so each transfer of the commit carries its image.
+  `ostrya composefs-image --add` writes the image commit of a commit that
+  the repository holds and names it as the supplement `composefs`, a local
+  entry. The fs-verity digest of the image is the digest that the commit
+  records.
+- composefs mounts. The library `ostrya-mount` mounts a composefs image of a
+  commit as a tree on Linux. The mount reads the objects of the repository in
+  place. Root in the initial user namespace mounts in its own process, from
+  an image that the caller opens. A process in its own user namespace asks
+  the mount daemon `ostrya-mountd`, which runs as root. The daemon mounts the
+  image of the image commit of a commit, or an image that it builds in
+  memory. The mount helper `mount.ostrya` gives the command
+  `mount -t ostrya -o ro <repo>:<rev> <dir>`. It mounts in its own process
+  for root in the initial user namespace, and asks the daemon for each other
+  caller.
 - Removable media. `ostrya media export` copies the commits of collection
   refs onto a mounted volume, for a host with no network. The media
   repository has the layout that `ostree create-usb` writes, and
@@ -300,10 +304,12 @@ The project is a Cargo workspace of these crates:
   digest.
 - `ostrya-server`: the HTTP server of one repository, for pull and push.
 - `ostrya`: the library.
-- `ostrya-mount`: the composefs mount of a commit on Linux, and the client of
-  the mount daemon.
-- `ostrya-mountd`: the mount daemon `ostrya-mountd`. It is not published to
-  crates.io.
+- `ostrya-mount`: the composefs mount of a commit on Linux, the client of
+  the mount daemon, the protocol of the daemon, and the mount steps that the
+  daemon uses. It links no repository code and no async runtime.
+- `ostrya-mountd`: the mount daemon `ostrya-mountd`, with its connection
+  handler and its worker, and the mount helper `mount.ostrya`. It is not
+  published to crates.io.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.
 - `ostrya-conformance`: the conformance harness that compares Ostrya with the
   `ostree` command. It is not published to crates.io.
@@ -360,9 +366,11 @@ services.ostrya-serve.instances =
   };
 ```
 
-The flake gives the mount daemon as the package `ostrya-mountd`. The option
-`services.ostrya-mountd.enable` installs the units of the daemon, enables the
-socket unit, and creates the group `ostrya-mount`. The options `socketConfig`
+The flake gives the mount daemon and the mount helper `mount.ostrya` as the
+package `ostrya-mountd`. The option `services.ostrya-mountd.enable` installs
+the units of the daemon, enables the socket unit, creates the group
+`ostrya-mount`, and puts the package in `environment.systemPackages`, where
+mount(8) finds the helper. The options `socketConfig`
 and `serviceConfig` add settings to the units. The example below serves all
 connections with one process and lets the user `alice` mount through the
 daemon:
@@ -388,7 +396,8 @@ the other arguments of `ostrya serve`. Two instances can serve the same
 repository, for example one with plain HTTP and one with HTTPS. The package
 does not enable the unit. The unit is in `crates/ostrya-cli/systemd`.
 `crates/ostrya-mountd/debian` builds the package `ostrya-mountd`, with the
-mount daemon at `/usr/sbin/ostrya-mountd`, its systemd units, and the
+mount daemon at `/usr/sbin/ostrya-mountd`, the mount helper at
+`/usr/sbin/mount.ostrya`, the systemd units of the daemon, and the
 sysusers.d file of the group `ostrya-mount`. The package does not enable the
 socket unit. The units are in `crates/ostrya-mountd/systemd`. The Nix package
 and the Debian packages install the man pages.

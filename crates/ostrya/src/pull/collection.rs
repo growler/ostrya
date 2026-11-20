@@ -829,9 +829,6 @@ impl Repo {
     ///   holds both names as given, and the path of the ref.
     /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
-    /// - The errors of
-    ///   [`RepoConfig::generate_composefs`](crate::RepoConfig::generate_composefs)
-    ///   for this repository.
     /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` of
     ///   this repository is not a boolean.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
@@ -923,9 +920,6 @@ impl Repo {
         // boolean stops the pull before its first request. Each run of each
         // remote takes this value.
         let related = RelatedRule::of(self.config())?;
-        // The commit of each transaction reads the key again. This read fails
-        // a bad value before the first request.
-        self.config().generate_composefs()?;
         // The writes of the transaction read these keys again. This read
         // fails a bad value before the first request.
         self.config().fsync()?;

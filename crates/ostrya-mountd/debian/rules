@@ -9,7 +9,7 @@ override_dh_auto_configure:
 	cargo fetch --locked
 
 override_dh_auto_build:
-	cargo build --release --locked -p ostrya-mountd --bin ostrya-mountd
+	cargo build --release --locked -p ostrya-mountd --bin ostrya-mountd --bin mount-ostrya
 
 # The suite reaches the network, so a package build passes nocheck.
 override_dh_auto_test:
@@ -19,9 +19,13 @@ endif
 
 # The units and the sysusers.d file are in systemd/. Debhelper compat 13 runs
 # no dh_installsysusers, so ostrya-mountd.postinst runs systemd-sysusers.
+# Cargo takes no dot in the name of a binary, so the mount helper is built as
+# mount-ostrya and installed as mount.ostrya, the name that mount(8) runs.
 override_dh_auto_install:
 	install -Dm755 $(CURDIR)/../../target/release/ostrya-mountd \
 		$(CURDIR)/debian/ostrya-mountd/usr/sbin/ostrya-mountd
+	install -Dm755 $(CURDIR)/../../target/release/mount-ostrya \
+		$(CURDIR)/debian/ostrya-mountd/usr/sbin/mount.ostrya
 	for unit in ostrya-mountd.socket ostrya-mountd.service ostrya-mountd@.service; do \
 		install -Dm644 $(CURDIR)/systemd/$$unit \
 			$(CURDIR)/debian/ostrya-mountd/usr/lib/systemd/system/$$unit; \

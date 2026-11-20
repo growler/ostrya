@@ -16,8 +16,6 @@ The related commits of each commit that the walk reaches are also roots, under t
 .PP
 The command also deletes each static delta whose target commit it deleted. A run with neither \%\-\-no\-prune nor \%\-\-static\-deltas\-only also deletes each static delta and each \fB\%state/<commit>.commitpartial\fR marker whose commit is not in the store. If \fB\%[core] tombstone\-commits\fR is true, the command writes a \fB\%\&.tombstone\-commit\fR for each deleted commit.
 .PP
-The command deletes the composefs image of each commit that it deletes, the file \fB\%extensions/ostrya/composefs/<xx>/<rest>.cfs\fR\&. It deletes these images before it deletes the first commit. It keeps each image whose commit is not in the store. No count includes an image.
-.PP
 The command prints the total number of objects. It then prints the number of deleted objects and the freed size, or \fB\%No unreachable objects\fR\&. If \fB\%[core] locking\fR is false, the command takes no repository lock and prints a warning on standard error.
 .SH OPTIONS
 .TP

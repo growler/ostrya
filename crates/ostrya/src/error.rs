@@ -645,8 +645,8 @@ pub enum Error {
     /// A composefs image whose fs-verity digest is not the value of the
     /// `ostree.composefs.digest.v0` key of its commit.
     ///
-    /// A write of an image refuses the image with this error and installs
-    /// nothing.
+    /// [`Repo::add_composefs_supplement`](crate::Repo::add_composefs_supplement)
+    /// gives this error and writes nothing.
     #[error(
         "composefs image of commit {commit}: the commit records the digest {}, the image has {}",
         crate::composefs::digest_hex(.expected),
@@ -660,14 +660,24 @@ pub enum Error {
         /// The fs-verity digest of the image.
         actual: [u8; 32],
     },
-    /// A commit whose composefs image the repository does not hold.
+    /// A composefs image commit that a commit names and that has a defect.
     ///
-    /// The image is the file
-    /// `extensions/ostrya/composefs/<xx>/<rest>.cfs` of the repository.
-    #[error("no composefs image of commit {commit}")]
-    ComposefsImageNotFound {
-        /// The commit of the image.
+    /// [`Repo::open_composefs_image`](crate::Repo::open_composefs_image)
+    /// gives this error. It does not try the next source.
+    #[error(
+        "composefs image of commit {commit}: {relation} {} names commit {image}, {defect}",
+        crate::COMPOSEFS_RELATION
+    )]
+    InvalidComposefsImage {
+        /// The commit that names the image commit.
         commit: Checksum,
+        /// The field of `commit` that names the image commit.
+        relation: crate::ComposefsImageSource,
+        /// The checksum of the image commit.
+        image: Checksum,
+        /// The defect of the image commit. The box keeps the size of
+        /// `Error` small.
+        defect: Box<crate::ComposefsImageDefect>,
     },
     /// No media repository on the mounted volumes, or in the directory that
     /// the caller gave in place of the mount table.
@@ -897,7 +907,6 @@ impl From<Error> for std::io::Error {
             Error::PathNotFound { .. }
             | Error::DanglingSymlink { .. }
             | Error::ObjectNotFound { .. }
-            | Error::ComposefsImageNotFound { .. }
             | Error::MediaNotFound { .. }
             | Error::RefNotFound(_)
             | Error::RemoteNotFound(_)
@@ -952,12 +961,6 @@ mod tests {
                 Error::ObjectNotFound {
                     checksum: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
                     ty: ObjectType::Commit,
-                },
-                ErrorKind::NotFound,
-            ),
-            (
-                Error::ComposefsImageNotFound {
-                    commit: Checksum::from_hex(&"ab".repeat(32)).unwrap(),
                 },
                 ErrorKind::NotFound,
             ),

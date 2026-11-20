@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-mountd"
-description = "Mount daemon of ostrya: mounts composefs trees for callers in their own user namespace"
+description = "Mount daemon and mount helper of ostrya: mount commits as composefs trees for root and for callers in their own user namespace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,26 +12,40 @@ publish = false
 name = "ostrya-mountd"
 path = "src/main.rs"
 
+# The mount helper. Cargo takes no dot in the name of a target, so the
+# packages install this binary as `mount.ostrya`, the name that mount(8) runs.
+[[bin]]
+name = "mount-ostrya"
+path = "src/mount_ostrya.rs"
+
 [features]
 default = ["smol", "lzma-static"]
-smol = ["ostrya-mount/smol", "ostrya-rt/smol"]
-tokio = ["ostrya-mount/tokio", "ostrya-rt/tokio"]
+smol = ["ostrya/smol", "ostrya-rt/smol"]
+tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]
 
 [dependencies]
-# The repository code. The daemon names it for its `lzma-static` feature.
+# The repository code: the open of the repository of a request, its mode and
+# its config, the image of an image commit, and the build of an image. The
+# daemon also names it for its `smol`, `tokio`, and `lzma-static` features.
 ostrya = { workspace = true }
-ostrya-mount = { workspace = true, features = ["server"] }
+# The protocol of the daemon and the mount steps.
+ostrya-mount = { workspace = true }
 ostrya-rt = { workspace = true }
-# The socket that systemd passes.
+# The socket that systemd passes, the namespace checks, the groups of the
+# peer, and the sealed memory file of a built image.
 ostrya-sys = { workspace = true }
 clap = { version = "4", features = ["derive"] }
-# The listening socket, `poll` on it, and the pidfd of the parent.
+# The listening socket, `poll` on it, and the pidfd of the parent. `mount`
+# gives `open_tree` and the mount attribute flags. `thread` gives `setns` and
+# the switch of the ids in the worker. Each of these calls is safe in rustix.
 rustix = { version = "1", default-features = false, features = [
     "std",
     "fs",
+    "mount",
     "net",
     "event",
     "process",
+    "thread",
 ] }

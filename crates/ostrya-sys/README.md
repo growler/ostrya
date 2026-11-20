@@ -13,11 +13,12 @@ parameters that the kernel holds for the sealed file. The seal has the
 parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
 caller can also map a file read-only. On Linux, a caller attaches a file
 to a loop device, and writes bytes to a memory file that it then seals.
-It reads the type and the owner of a namespace, sets an ID mapping on a
-detached mount, reads the groups of the peer of a Unix socket, and takes
-the socket that systemd passes. The crate depends on `rustix`. On Linux
-it also depends on `libc`, for the two calls that `rustix` does not give:
-`mount_setattr` and `SO_PEERGROUPS`.
+It reads the type and the owner of a namespace, gives a thread its own
+file system attributes, sets an ID mapping on a detached mount, reads the
+groups of the peer of a Unix socket, and takes the socket that systemd
+passes. The crate depends on `rustix`. On Linux it also depends on
+`libc`, for the two calls that `rustix` does not give: `mount_setattr`
+and `SO_PEERGROUPS`.
 
 API documentation: <https://docs.rs/ostrya-sys>
 
@@ -33,6 +34,9 @@ API documentation: <https://docs.rs/ostrya-sys>
   `seal_contents` seals its bytes and its size. Linux only.
 - `ns_type` returns the type of a namespace, and `ns_owner_userns`
   returns the user namespace that owns it. Linux only.
+- `unshare_fs` gives the calling thread its own root directory,
+  working directory, and umask, so that the thread can enter a mount
+  namespace. Linux only.
 - `mount_setattr_idmap` sets an ID mapping on a detached mount. Linux
   only.
 - `peer_groups` returns the supplementary groups of the peer of a Unix

@@ -449,9 +449,7 @@ impl Repo {
     /// - [`Error::Core`] if the `collection-id` of a remote holds a malformed
     ///   escape sequence, and the errors of
     ///   [`Remote::mirrored_collection_ids`](crate::config::Remote::mirrored_collection_ids).
-    /// - The errors of
-    ///   [`generate_composefs`](crate::config::RepoConfig::generate_composefs),
-    ///   and [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
+    /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
     ///   repository is not a boolean.
     /// - [`Error::Io`] if the finder cannot open
     ///   [`mount`](MediaImportOptions::mount), cannot read the mount table,
@@ -484,9 +482,8 @@ impl Repo {
                 prefixes.push(id);
             }
         }
-        // The commit of each transaction reads these keys again. These reads
-        // fail a bad value before the scan of the media.
-        self.config().generate_composefs()?;
+        // The commit of each transaction reads this key again. This read
+        // fails a bad value before the scan of the media.
         RelatedRule::of(self.config())?;
 
         // Each collection of the options, with its matched remote, before

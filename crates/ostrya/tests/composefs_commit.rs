@@ -38,16 +38,23 @@
 //!   first check that the repository marks partial after that check fails
 //!   neither the add nor the write of the commit. The add keeps the entries
 //!   sorted.
+//! - With a hook, the image file is the image that
+//!   `Repo::export_composefs_to` writes for the tree with the same hook, and
+//!   the call returns its digest. A commit that names the image commit as
+//!   the attachment and carries that digest as the key gives the image. A
+//!   key with the digest of the image with no hook gives `DigestMismatch`.
 
 mod common;
 
 use std::io::Read;
 use std::os::fd::AsFd;
+use std::path::Path;
 
 use ostrya::{
-    COMPOSEFS_RELATION, Checksum, Commit, ComposefsImageDefect, ComposefsImageSource,
-    ComposefsOptions, ComposefsSupplementAdd, DirMeta, DirTree, Error, FileMeta, ObjectType,
-    RelationField, Repo, RepoMode, RepoTree, Transaction, Value, Xattrs, loose_path,
+    COMPOSEFS_RELATION, Checksum, Commit, ComposefsEntryFn, ComposefsImageDefect,
+    ComposefsImageSource, ComposefsOptions, ComposefsSupplementAdd, DirMeta, DirTree, EntryKind,
+    Error, FileMeta, Metadata, ObjectType, RelationField, Repo, RepoMode, RepoTree, Transaction,
+    Value, Xattrs, loose_path,
 };
 use ostrya_rt::block_on;
 
@@ -80,7 +87,7 @@ async fn root_of(repo: &Repo, commit: &Checksum) -> RepoTree {
 async fn write_image_commit(repo: &Repo, tree: &Checksum) -> (Checksum, [u8; 32]) {
     let root = root_of(repo, tree).await;
     let txn = repo.transaction().await.unwrap();
-    let written = txn.write_composefs_commit(&root).await.unwrap();
+    let written = txn.write_composefs_commit(&root, None).await.unwrap();
     txn.commit().await.unwrap();
     written
 }
@@ -191,6 +198,50 @@ async fn recorded_export(repo: &Repo, tree: &Checksum) -> ostrya::Image {
     repo.export_composefs(tree, &ComposefsOptions::RECORDED, None)
         .await
         .unwrap()
+}
+
+/// Returns the SELinux label that [`label_entry`] gives the node at `path`,
+/// with a NUL at its end.
+fn label_of(path: &Path) -> Vec<u8> {
+    let mut label = format!("system_u:object_r:image_t:s0:{}", path.display()).into_bytes();
+    label.push(0);
+    label
+}
+
+/// A hook that adds to each node the label of its path.
+fn label_entry(path: &Path, _: EntryKind, meta: &mut Metadata) -> Result<(), Error> {
+    meta.xattrs
+        .push((b"security.selinux".to_vec(), label_of(path)));
+    Ok(())
+}
+
+/// Writes the RECORDED export of the commit `tree` with the hook `filter` to
+/// the file `path`. Returns the bytes of the file and the returned digest.
+async fn hooked_export(
+    repo: &Repo,
+    tree: &Checksum,
+    filter: ComposefsEntryFn<'_>,
+    path: &Path,
+) -> (Vec<u8>, [u8; 32]) {
+    let file = std::fs::File::create(path).unwrap();
+    let digest = repo
+        .export_composefs_to(
+            tree,
+            &ComposefsOptions::RECORDED,
+            Some(filter),
+            file.as_fd(),
+        )
+        .await
+        .unwrap();
+    drop(file);
+    (std::fs::read(path).unwrap(), digest)
+}
+
+/// Returns `true` if `haystack` holds `needle`.
+fn holds(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// Reads the whole file `file` from its current offset.
@@ -361,7 +412,7 @@ fn the_lookup_gives_the_image_of_an_attachment() {
         let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
         let root = root_of(&repo, &tree).await;
         let txn = repo.transaction().await.unwrap();
-        let (image, digest) = txn.write_composefs_commit(&root).await.unwrap();
+        let (image, digest) = txn.write_composefs_commit(&root, None).await.unwrap();
         let commit = txn
             .write_commit(
                 ostrya::CommitOptions {
@@ -383,6 +434,103 @@ fn the_lookup_gives_the_image_of_an_attachment() {
         let export = recorded_export(&repo, &tree).await;
         assert_eq!(found.size, export.bytes.len() as u64);
         assert_eq!(read_all(&found.file), export.bytes);
+    });
+}
+
+/// With a hook, the image file holds the export of the tree with the same
+/// hook, and the call returns the digest of that export. The image holds the
+/// label of each path, and differs from the image with no hook.
+#[test]
+fn the_image_commit_holds_the_image_of_the_hook() {
+    let scratch = TmpDir::new("cfs-commit-hook");
+    let hook: ComposefsEntryFn<'_> = &label_entry;
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let root = root_of(&repo, &tree).await;
+        let txn = repo.transaction().await.unwrap();
+        let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+        txn.commit().await.unwrap();
+
+        let object = image_object(&repo, &image).await;
+        let stored = raw_object(&repo, &object);
+        let (export, export_digest) =
+            hooked_export(&repo, &tree, hook, &scratch.path().join("hooked.cfs")).await;
+        assert_eq!(stored, export);
+        assert_eq!(digest, export_digest);
+        for path in [
+            "/",
+            "/hello.txt",
+            "/sub",
+            "/sub/nested.txt",
+            "/link",
+            "/usr",
+        ] {
+            assert!(holds(&stored, &label_of(Path::new(path))), "{path}");
+        }
+
+        let plain = recorded_export(&repo, &tree).await;
+        assert_ne!(stored, plain.bytes);
+        assert_ne!(digest, plain.fs_verity);
+    });
+}
+
+/// A transaction writes the image commit with a hook, and a commit of the
+/// same tree that names the image commit as the attachment and carries the
+/// returned digest as the key. The lookup gives the image of the hook. A
+/// commit with the key of the image with no hook fails the lookup.
+#[test]
+fn the_lookup_accepts_the_key_of_the_image_of_the_hook() {
+    let scratch = TmpDir::new("cfs-commit-hook-lookup");
+    let hook: ComposefsEntryFn<'_> = &label_entry;
+    block_on(async {
+        let (repo, tree) = setup(&scratch, RepoMode::BareUser, "").await;
+        let root = root_of(&repo, &tree).await;
+        let txn = repo.transaction().await.unwrap();
+        let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+        let commit = txn
+            .write_commit(
+                ostrya::CommitOptions {
+                    subject: Some("with labeled image".to_owned()),
+                    timestamp: Some(0),
+                    metadata: Some(key_dict(&digest)),
+                    attachments: vec![(COMPOSEFS_RELATION.to_owned(), image)],
+                    ..ostrya::CommitOptions::default()
+                },
+                &root,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+
+        let found = repo.open_composefs_image(&commit).await.unwrap().unwrap();
+        assert_eq!(found.source, ComposefsImageSource::Attachment);
+        assert_eq!(found.commit, image);
+        let stored = raw_object(&repo, &image_object(&repo, &image).await);
+        assert_eq!(found.size, stored.len() as u64);
+        assert_eq!(read_all(&found.file), stored);
+
+        let plain = recorded_export(&repo, &tree).await.fs_verity;
+        let unlabeled = store_named(
+            &repo,
+            &tree,
+            "key of the image with no hook",
+            Some(&plain),
+            &[(COMPOSEFS_RELATION, image.as_bytes())],
+        )
+        .await;
+        let err = repo.open_composefs_image(&unlabeled).await.unwrap_err();
+        assert_eq!(
+            invalid_image(err),
+            (
+                unlabeled,
+                ComposefsImageSource::Attachment,
+                image,
+                ComposefsImageDefect::DigestMismatch {
+                    expected: plain,
+                    actual: digest,
+                }
+            )
+        );
     });
 }
 
@@ -808,7 +956,7 @@ fn the_image_commit_is_written_in_an_archive_repository() {
         let root = root_of(&repo, &tree).await;
         let mut txn = repo.transaction().await.unwrap();
         txn.set_generate_sizes(true);
-        let (image, digest) = txn.write_composefs_commit(&root).await.unwrap();
+        let (image, digest) = txn.write_composefs_commit(&root, None).await.unwrap();
         txn.commit().await.unwrap();
 
         let (commit, _) = repo.load_commit(&image).await.unwrap();

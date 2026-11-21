@@ -18,7 +18,8 @@
 //! - The root directory is `0:0` with the mode `040755` and no xattrs.
 //! - The root directory holds the file `root.cfs` alone. The file is `0:0`
 //!   with the mode `0100400` and no xattrs. Its content is the image that an
-//!   export with [`ComposefsOptions::RECORDED`] writes for the tree.
+//!   export with [`ComposefsOptions::RECORDED`] writes for the tree, with the
+//!   hook that the caller gives or with no hook.
 //! - The commit has the subject `composefs image`, an empty body, the
 //!   timestamp 0, no parent, no metadata key, and no related entry.
 //!
@@ -29,7 +30,8 @@ use ostrya_core::{Checksum, Commit, DirMeta, DirTree, ObjectType, Value, Xattrs}
 use async_compression::futures::bufread::DeflateDecoder;
 
 use crate::composefs::{
-    ComposefsOptions, DIGEST_CHUNK, digest_hex, image_file_digest, recorded_digest,
+    ComposefsEntryFn, ComposefsOptions, DIGEST_CHUNK, digest_hex, image_file_digest,
+    recorded_digest,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject, Payload};
@@ -172,10 +174,16 @@ impl Transaction {
     /// staged.
     ///
     /// The call returns the checksum of the image commit and the fs-verity
-    /// digest of the image. The image is the image that an export with
-    /// [`ComposefsOptions::RECORDED`] writes for the tree, so the digest is
-    /// the value that [`composefs_digest`](Transaction::composefs_digest)
-    /// gives.
+    /// digest of the image. The image is the image that
+    /// [`Repo::export_composefs_to`] writes for the tree with
+    /// [`ComposefsOptions::RECORDED`] and the hook `filter`. With `None`, the
+    /// digest is the value that
+    /// [`composefs_digest`](Transaction::composefs_digest) gives.
+    ///
+    /// `filter` is a hook, as in [`Repo::export_composefs`]. The hook gets one
+    /// call for each node of the tree, and for each top-level directory that
+    /// the call adds to the image. The whiteout stubs of the image get no
+    /// call. With `None`, the call uses no hook.
     ///
     /// The image commit has a fixed shape:
     ///
@@ -208,10 +216,14 @@ impl Transaction {
     ///   [`write_composefs_content`](Transaction::write_composefs_content).
     /// - The errors of [`write_dirmeta`](Transaction::write_dirmeta) and of
     ///   [`write_metadata`](Transaction::write_metadata).
-    pub async fn write_composefs_commit(&self, root: &RepoTree) -> Result<(Checksum, [u8; 32])> {
+    pub async fn write_composefs_commit(
+        &self,
+        root: &RepoTree,
+        filter: Option<ComposefsEntryFn<'_>>,
+    ) -> Result<(Checksum, [u8; 32])> {
         let meta = FileMeta::regular(0, 0, IMAGE_PERM);
         let (image, digest) = self
-            .write_composefs_content(root, &ComposefsOptions::RECORDED, &meta)
+            .write_composefs_content(root, &ComposefsOptions::RECORDED, filter, &meta)
             .await?;
         let root_dirmeta = self
             .write_dirmeta(&DirMeta {
@@ -376,9 +388,10 @@ impl Repo {
     ///    [`Transaction::write_composefs_commit`].
     /// 4. If the commit carries `ostree.composefs.digest.v0` and the
     ///    fs-verity digest of the image is not the value of the key, the call
-    ///    refuses the commit. A commit whose key records the digest of an
-    ///    image with labels that the port does not write is refused. If the
-    ///    commit has no key, the call makes no check of the image.
+    ///    refuses the commit with [`Error::ComposefsDigestMismatch`]. The call
+    ///    builds the image with no hook, so it refuses a commit whose key
+    ///    records the digest of an image that a hook changed. If the commit
+    ///    has no key, the call makes no check of the image.
     /// 5. The call sets the supplement [`COMPOSEFS_RELATION`] of the commit
     ///    to the image commit, as [`Transaction::add_supplement`] does, and
     ///    commits the transaction.
@@ -480,7 +493,7 @@ impl Repo {
             SupplementState::Build { replaced } => replaced,
         };
         let root = RepoTree::from_parts(self.clone(), read.root_dirtree, read.root_dirmeta);
-        let (image, digest) = txn.write_composefs_commit(&root).await?;
+        let (image, digest) = txn.write_composefs_commit(&root, None).await?;
         if let Some(expected) = read.key
             && expected != digest
         {
@@ -896,9 +909,16 @@ const _: fn() = || {
     assert_send_sync::<ComposefsImageDefect>();
     let _ = |repo: &Repo, commit: &Checksum| assert_send(&repo.open_composefs_image(commit));
     let _ = |repo: &Repo, commit: &Checksum| assert_send(&repo.add_composefs_supplement(commit));
-    let _ = |txn: &Transaction, root: &RepoTree| assert_send(&txn.write_composefs_commit(root));
-    let _ = |txn: &Transaction, root: &RepoTree, meta: &FileMeta| {
-        assert_send(&txn.write_composefs_content(root, &ComposefsOptions::RECORDED, meta));
+    let _ = |txn: &Transaction, root: &RepoTree, filter: ComposefsEntryFn<'_>| {
+        assert_send(&txn.write_composefs_commit(root, Some(filter)));
+    };
+    let _ = |txn: &Transaction, root: &RepoTree, filter: ComposefsEntryFn<'_>, meta: &FileMeta| {
+        assert_send(&txn.write_composefs_content(
+            root,
+            &ComposefsOptions::RECORDED,
+            Some(filter),
+            meta,
+        ));
     };
 };
 
@@ -949,7 +969,7 @@ mod tests {
                 .await
                 .unwrap();
             let root = RepoTree::from_parts(repo.clone(), dirtree, dirmeta);
-            let (image, digest) = txn.write_composefs_commit(&root).await.unwrap();
+            let (image, digest) = txn.write_composefs_commit(&root, None).await.unwrap();
             txn.commit().await.unwrap();
 
             let commit = Checksum::from_bytes([1; 32]);

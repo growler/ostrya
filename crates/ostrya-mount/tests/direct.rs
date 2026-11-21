@@ -27,13 +27,18 @@
 //! - An image file of the caller mounts with the source label `composefs`.
 //! - The attribute flags of the options show on the mount, read-only and
 //!   read-write, and a mount with no flag shows none of them.
+//! - The image of an image commit that a hook labels mounts through the
+//!   lookup, and the mount shows the xattr that the hook adds to a file.
 
 mod common;
 
 use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 
-use ostrya::{Checksum, ComposefsImage, Repo, RepoMode};
+use ostrya::{
+    COMPOSEFS_DIGEST_KEY, COMPOSEFS_RELATION, Checksum, CommitOptions, ComposefsEntryFn,
+    ComposefsImage, MutableTree, Repo, RepoMode, Type, Value,
+};
 use ostrya_mount::{Access, Direct, Error, MountOptions};
 use ostrya_rt::block_on;
 use rustix::io::Errno;
@@ -534,4 +539,79 @@ fn the_flags_of_the_options_show_on_the_mount() {
             direct.unmount(&target).unwrap();
         }
     });
+}
+
+/// The name of the xattr that [`commit_labeled`] adds to `/hello.txt`.
+const HOOK_XATTR: &str = "user.hooklabel";
+
+/// The value of [`HOOK_XATTR`].
+const HOOK_VALUE: &[u8] = b"labeled by the hook";
+
+/// Commits `base/src` to `repo` at `timestamp`. The transaction writes the
+/// image commit of the tree with a hook that adds [`HOOK_XATTR`] to
+/// `/hello.txt`. The commit has the key with the digest of that image and
+/// names the image commit as the attachment `composefs`.
+async fn commit_labeled(repo: &Repo, base: &Path, timestamp: u64) -> Checksum {
+    let hook: ComposefsEntryFn<'_> = &|path, _, meta| {
+        if path == Path::new("/hello.txt") {
+            meta.xattrs
+                .push((HOOK_XATTR.as_bytes().to_vec(), HOOK_VALUE.to_vec()));
+        }
+        Ok(())
+    };
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    let dfd = std::fs::File::open(base).unwrap();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("src"), &mut mtree, None)
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await.unwrap();
+    let key = Value::Array(vec![Value::Tuple(vec![
+        Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
+        Value::variant(Type::parse("ay").unwrap(), Value::Bytes(digest.to_vec())),
+    ])]);
+    let opts = CommitOptions {
+        subject: Some("labeled mount tree".to_owned()),
+        timestamp: Some(timestamp),
+        metadata: Some(key),
+        attachments: vec![(COMPOSEFS_RELATION.to_owned(), image)],
+        ..CommitOptions::default()
+    };
+    let commit = txn.write_commit(opts, &root).await.unwrap();
+    txn.commit().await.unwrap();
+    commit
+}
+
+#[test]
+fn the_image_of_a_hook_mounts_with_the_xattr_of_the_hook() {
+    if !require_mount() {
+        return;
+    }
+    let scratch = TmpDir::new("hook");
+    let base = scratch.path().join("tree");
+    build_source(&base);
+    let (target, _guard) = mount_point(&scratch, "mnt");
+    block_on(async {
+        let repo = new_repo(
+            &scratch.path().join("repo"),
+            RepoMode::BareUser,
+            "[ex-integrity]\nfsverity=no\n",
+        )
+        .await;
+        let commit = commit_labeled(&repo, &base, 90).await;
+        let (tree, _) = stored_tree(&repo, &commit, &target).await;
+
+        let mut expected = walk(&base.join("src"), &[]);
+        let hello = expected
+            .iter_mut()
+            .find(|entry| entry.path == Path::new("hello.txt"))
+            .unwrap();
+        hello
+            .xattrs
+            .push((HOOK_XATTR.to_owned(), HOOK_VALUE.to_vec()));
+        hello.xattrs.sort();
+        assert_eq!(tree, expected);
+    });
+    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 0);
 }

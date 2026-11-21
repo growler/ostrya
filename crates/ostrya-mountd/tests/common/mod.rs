@@ -311,7 +311,7 @@ pub async fn commit_named(
     named: Named,
 ) -> (Checksum, Checksum) {
     let txn = repo.transaction().await.unwrap();
-    let (image, digest) = txn.write_composefs_commit(root).await.unwrap();
+    let (image, digest) = txn.write_composefs_commit(root, None).await.unwrap();
     let attachments = match named {
         Named::Attachment => vec![(COMPOSEFS_RELATION.to_owned(), image)],
         Named::Supplement | Named::Neither => Vec::new(),

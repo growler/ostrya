@@ -9670,7 +9670,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // names it as the attachment `composefs`. The check of the new attachment
     // refuses an image commit that the repository marks partial.
     let digest = if args.generate_composefs {
-        let (image_commit, digest) = txn.write_composefs_commit(&root).await?;
+        let (image_commit, digest) = txn.write_composefs_commit(&root, None).await?;
         checked.add(COMPOSEFS_RELATION, &image_commit).await?;
         Some(digest)
     } else if args.generate_composefs_metadata {

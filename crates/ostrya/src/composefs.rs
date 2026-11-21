@@ -155,7 +155,8 @@ impl ComposefsOptions {
     ///
     /// `ostree.composefs.digest.v0` holds the fs-verity digest of the image
     /// that [`Repo::export_composefs`] and [`Repo::export_composefs_to`] write
-    /// with these options. A target machine computes the same digest at boot.
+    /// with these options and no hook. A target machine computes the same
+    /// digest at boot.
     ///
     /// The policy is [`VerityPolicy::Computed`]. Each backed file in the image
     /// carries the fs-verity digest of its content, so the image digest covers
@@ -257,7 +258,7 @@ impl Transaction {
     ///
     /// The value is the one that `ostree.composefs.digest.v0` holds: the
     /// fs-verity digest of the image that an export with
-    /// [`ComposefsOptions::RECORDED`] writes for the same tree.
+    /// [`ComposefsOptions::RECORDED`] and no hook writes for the same tree.
     /// [`Repo::export_composefs`] describes the image.
     ///
     /// The call reads each object that this transaction staged from the
@@ -300,9 +301,14 @@ impl Transaction {
     ///
     /// The call returns the checksum of the content object and the fs-verity
     /// digest of the image. The image is the image that an export with `opts`
-    /// writes for the same tree ([`Repo::export_composefs`]). The call reads
-    /// the objects of the tree as
+    /// and the hook `filter` writes for the same tree
+    /// ([`Repo::export_composefs`]). The call reads the objects of the tree as
     /// [`composefs_digest`](Transaction::composefs_digest) reads them.
+    ///
+    /// `filter` is a hook, as in [`Repo::export_composefs`]. The hook gets one
+    /// call for each node of the tree, and for each top-level directory that
+    /// the call adds to the image. The whiteout stubs of the image get no
+    /// call. With `None`, the call uses no hook.
     ///
     /// `meta` is the owner, the mode, and the xattrs of the content object.
     /// The caller sets them.
@@ -328,6 +334,10 @@ impl Transaction {
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
     ///   The call refuses this mode before it reads the tree.
     /// - The errors of [`composefs_digest`](Transaction::composefs_digest).
+    /// - [`Error::Unsupported`] if the xattrs of an inode after `filter` do
+    ///   not fit a limit of the image, or if they hold an empty name, a name
+    ///   with a NUL byte, or one name two times.
+    /// - The error that `filter` returns.
     /// - The errors of [`write_content`](Transaction::write_content).
     /// - [`Error::Io`] if the create of the temp file, a write to it, or a
     ///   read from it fails.
@@ -335,6 +345,7 @@ impl Transaction {
         &self,
         root: &RepoTree,
         opts: &ComposefsOptions,
+        filter: Option<ComposefsEntryFn<'_>>,
         meta: &FileMeta,
     ) -> Result<(Checksum, [u8; 32])> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
@@ -345,7 +356,7 @@ impl Transaction {
         let walk = Walk {
             source: ObjectSource::Staged(self),
             digests: opts.verity.into(),
-            filter: None,
+            filter,
         };
         let dir = composefs_model(walk, root, &mut VerityCache::default()).await?;
         let staging = self.staging_dir().clone();
@@ -364,8 +375,9 @@ impl Repo {
     /// Builds the composefs EROFS image of `commit` in memory.
     ///
     /// The returned [`Image`] holds the bytes of the image and its fs-verity
-    /// digest. With [`ComposefsOptions::RECORDED`], the digest is the value
-    /// that [`commit_add_composefs_metadata`](Repo::commit_add_composefs_metadata)
+    /// digest. With [`ComposefsOptions::RECORDED`] and no hook (`filter` is
+    /// `None`), the digest is the value that
+    /// [`commit_add_composefs_metadata`](Repo::commit_add_composefs_metadata)
     /// records for the tree of the commit. Under [`VerityPolicy::Disabled`],
     /// the digest is different from that value. The image assembly runs on the
     /// blocking pool.
@@ -628,8 +640,8 @@ impl Repo {
     ///
     /// The digest is the fs-verity digest of the image that
     /// [`export_composefs`](Repo::export_composefs) writes with
-    /// [`ComposefsOptions::RECORDED`]. The `ostree` command stores this value
-    /// and verifies it at boot.
+    /// [`ComposefsOptions::RECORDED`] and no hook. The `ostree` command stores
+    /// this value and verifies it at boot.
     ///
     /// The call appends the key `ostree.composefs.digest.v0` to the metadata
     /// dict of `commit`, with the 32-byte digest as an `ay` value. The other

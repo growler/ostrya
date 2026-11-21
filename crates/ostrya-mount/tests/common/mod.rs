@@ -201,7 +201,7 @@ pub async fn commit_tree(repo: &Repo, base: &Path, timestamp: u64, key: Key) -> 
     let root = txn.write_mtree(&mut mtree).await.unwrap();
     let (metadata, attachments) = match key {
         Key::Image => {
-            let (image, digest) = txn.write_composefs_commit(&root).await.unwrap();
+            let (image, digest) = txn.write_composefs_commit(&root, None).await.unwrap();
             (
                 Some(key_dict(&digest)),
                 vec![(COMPOSEFS_RELATION.to_owned(), image)],

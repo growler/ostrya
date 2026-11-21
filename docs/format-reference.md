@@ -7519,7 +7519,9 @@ The shape of C:
 
 - The root directory holds one entry, the regular file `root.cfs`. Its
   content is the image that an export of the tree with the verity digests of
-  the files writes ("composefs").
+  the files writes ("composefs"). If the caller of
+  `Transaction::write_composefs_commit` gives an entry hook, the content is
+  the image of the same export with that hook.
 - The file object of `root.cfs` has the owner `0:0`, the mode `0100400`, and
   no extended attributes. In `archive` mode it is a `.filez` object, and in
   each other mode it is a loose `.file` object with the raw image.
@@ -7591,9 +7593,9 @@ writes C again. With `keep-detached-related=false`, the pull drops
 
 The key `ostree.composefs.digest.v0` of A records the fs-verity digest of the
 image that A mounts with. That image can hold labels or other metadata that a
-build of the tree of A does not give. The port trusts the key. No path of the
-port builds an image to check the key of A. The lookup compares the key with
-the digest of `/root.cfs` alone.
+build of the tree of A with no entry hook does not give. The port trusts the
+key. No path of the port builds an image to check the key of A. The lookup
+compares the key with the digest of `/root.cfs` alone.
 
 The lookup of the image of A:
 

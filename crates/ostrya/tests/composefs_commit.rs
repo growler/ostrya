@@ -188,7 +188,7 @@ fn raw_object(repo: &Repo, object: &Checksum) -> Vec<u8> {
 
 /// Returns the bytes of the RECORDED export of the commit `tree`.
 async fn recorded_export(repo: &Repo, tree: &Checksum) -> ostrya::Image {
-    repo.export_composefs(tree, &ComposefsOptions::RECORDED)
+    repo.export_composefs(tree, &ComposefsOptions::RECORDED, None)
         .await
         .unwrap()
 }

@@ -343,7 +343,7 @@ fn composefs_export_matches_the_tool() {
         let tool_bytes = fs::read(&dest).unwrap();
         let port_bytes = block_on(async {
             let repo = Repo::open(&root).await.unwrap();
-            repo.export_composefs(&commit, &ostrya::ComposefsOptions { verity })
+            repo.export_composefs(&commit, &ostrya::ComposefsOptions { verity }, None)
                 .await
                 .expect("the port exports from bare-split-xattrs")
                 .bytes

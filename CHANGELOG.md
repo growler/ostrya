@@ -16,6 +16,20 @@ the release before it. An item that starts with `Fix:` corrects a defect.
 
 ### Library
 
+- Breaking: `Repo::export_composefs` and `Repo::export_composefs_to` take a
+  `filter` argument after `opts`. With `None`, the export writes the image
+  of the 0.13.0 release.
+- `filter` is a hook of the type `ComposefsEntryFn`. The export calls it one
+  time for each node of the tree, and for each top-level directory that the
+  export adds. Each call gets the absolute path of the node, its `EntryKind`,
+  and its `Metadata`. The whiteout stubs get no call. The hook can change the
+  mode, the owner, the mtime, and the xattrs. An error of the hook stops the export, and the
+  export returns that error.
+- After the hook, the export checks the xattrs of each inode. It refuses with
+  `Error::Unsupported` a name longer than 255 bytes, more than 32755 bytes of
+  xattrs on one inode, an empty name, a name with a NUL byte, and a name that
+  occurs two times. Each xattr spends its name, its value, and 7 bytes.
+- `ostrya` exports `COMPOSEFS_DIGEST_KEY` and `ostrya_composefs::Metadata`.
 - `Repo::pull` and `Repo::pull_with_session` take commit operands in
   `PullOptions::refs`: `CHECKSUM`, `REF@CHECKSUM`, and `@ID:REF@CHECKSUM`.
   The pull fetches the named commit, and reads no summary entry and no ref
@@ -89,6 +103,11 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   ref named by the checksum, `refs/heads/<checksum>` or
   `refs/remotes/<remote>/<checksum>`. Such an operand is a `CHECKSUM` operand
   and writes no ref.
+- Fix: the composefs image writer of `ostrya-composefs` refuses with
+  `Error::Unsupported` a symlink whose xattrs fill its inode block. The
+  refusal states 0 bytes of target. The writer panicked in a debug build, and
+  stated a very large number of bytes in a release build. Each composefs
+  export of `ostrya` uses this writer.
 
 ### CLI
 

@@ -45,15 +45,21 @@
 //!
 //! The tests that seal objects also skip if the file system has no fs-verity.
 //! All other tests read no composefs fixture and always run.
+//!
+//! The tests of the entry hook read no image structure. They search the image
+//! for unique byte strings, and they compare the image of a hook on one tree
+//! with the image of a second tree that stores the same metadata.
 
 mod common;
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ostrya::{
-    Checksum, CommitOptions, ComposefsOptions, CreateOptions, DirMeta, Error, FileMeta,
-    MutableTree, Repo, RepoMode, VerityPolicy,
+    Checksum, CommitOptions, ComposefsEntryFn, ComposefsOptions, CreateOptions, DirMeta, EntryKind,
+    Error, FileMeta, Metadata, MutableTree, Repo, RepoMode, VerityPolicy,
 };
 use ostrya_composefs::FsVerityHasher;
 use ostrya_core::{ObjectType, Xattrs, loose_path};
@@ -131,7 +137,7 @@ fn check_export_from(mode: &str, stem: &str, digest_key: &str, verity: VerityPol
         let repo = Repo::open(&repo_dir).await.unwrap();
         let commit = Checksum::from_hex(COMMIT).unwrap();
         let image = repo
-            .export_composefs(&commit, &ComposefsOptions { verity })
+            .export_composefs(&commit, &ComposefsOptions { verity }, None)
             .await
             .unwrap();
 
@@ -156,7 +162,7 @@ fn check_export_from(mode: &str, stem: &str, digest_key: &str, verity: VerityPol
 
         let file = std::fs::File::create(&image_path).expect("create the image file");
         let streamed = repo
-            .export_composefs_to(&commit, &ComposefsOptions { verity }, file.as_fd())
+            .export_composefs_to(&commit, &ComposefsOptions { verity }, None, file.as_fd())
             .await
             .unwrap();
         drop(file);
@@ -267,6 +273,7 @@ fn transaction_digest_matches_recorded_digest() {
                 &ComposefsOptions {
                     verity: VerityPolicy::Computed,
                 },
+                None,
             )
             .await
             .unwrap();
@@ -483,8 +490,8 @@ fn bare_and_bare_user_export_the_same_image() {
         let mut images = Vec::new();
         for verity in [VerityPolicy::Computed, VerityPolicy::Disabled] {
             let opts = ComposefsOptions { verity };
-            let from_bare = bare.export_composefs(&commit, &opts).await.unwrap();
-            let from_user = user.export_composefs(&commit, &opts).await.unwrap();
+            let from_bare = bare.export_composefs(&commit, &opts, None).await.unwrap();
+            let from_user = user.export_composefs(&commit, &opts, None).await.unwrap();
             assert_eq!(
                 from_bare.bytes.len(),
                 from_user.bytes.len(),
@@ -591,7 +598,7 @@ fn a_sealed_bare_export_measures_the_recorded_digest() {
 
         let file = std::fs::File::create(&image_path).expect("create the image file");
         let returned = repo
-            .export_composefs_to(&stored, &ComposefsOptions::RECORDED, file.as_fd())
+            .export_composefs_to(&stored, &ComposefsOptions::RECORDED, None, file.as_fd())
             .await
             .unwrap();
         drop(file);
@@ -635,13 +642,25 @@ fn disabled_policy_reads_no_payload() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let commit = Checksum::from_hex(COMMIT).unwrap();
 
-        let before_computed = repo.export_composefs(&commit, &computed).await.unwrap();
-        let before_disabled = repo.export_composefs(&commit, &disabled).await.unwrap();
+        let before_computed = repo
+            .export_composefs(&commit, &computed, None)
+            .await
+            .unwrap();
+        let before_disabled = repo
+            .export_composefs(&commit, &disabled, None)
+            .await
+            .unwrap();
 
         rewrite_payload(&content_object(&repo_dir, HELLO_TXT));
 
-        let after_computed = repo.export_composefs(&commit, &computed).await.unwrap();
-        let after_disabled = repo.export_composefs(&commit, &disabled).await.unwrap();
+        let after_computed = repo
+            .export_composefs(&commit, &computed, None)
+            .await
+            .unwrap();
+        let after_disabled = repo
+            .export_composefs(&commit, &disabled, None)
+            .await
+            .unwrap();
 
         assert_eq!(
             before_disabled.bytes, after_disabled.bytes,
@@ -739,7 +758,7 @@ async fn export_xattrs(
 
     // `Image` does not implement `Debug`, so the code maps each value to `()`.
     let exported = repo
-        .export_composefs(&commit, &ComposefsOptions::default())
+        .export_composefs(&commit, &ComposefsOptions::default(), None)
         .await
         .map(|_| ());
     assert_eq!(
@@ -903,7 +922,7 @@ async fn export_symlink(dir: &Path, len: usize) -> Result<(), Error> {
         .unwrap();
     txn.commit().await.unwrap();
     // `Image` does not implement `Debug`, so the code maps the value to `()`.
-    repo.export_composefs(&commit, &ComposefsOptions::default())
+    repo.export_composefs(&commit, &ComposefsOptions::default(), None)
         .await
         .map(|_| ())
 }
@@ -981,7 +1000,7 @@ async fn export_child_name(dir: &Path, len: usize) -> Result<(), Error> {
         .unwrap();
     txn.commit().await.unwrap();
     // `Image` does not implement `Debug`, so the code maps the value to `()`.
-    repo.export_composefs(&commit, &ComposefsOptions::default())
+    repo.export_composefs(&commit, &ComposefsOptions::default(), None)
         .await
         .map(|_| ())
 }
@@ -1109,7 +1128,10 @@ fn the_mount_export_writes_the_export_and_refuses_an_unsealed_object() {
         let disabled = ComposefsOptions {
             verity: VerityPolicy::Disabled,
         };
-        let want = repo.export_composefs(&commit, &disabled).await.unwrap();
+        let want = repo
+            .export_composefs(&commit, &disabled, None)
+            .await
+            .unwrap();
 
         let file = std::fs::File::create(&image_path).unwrap();
         let size = repo
@@ -1152,7 +1174,7 @@ fn the_mount_export_writes_the_export_and_refuses_an_unsealed_object() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let commit = Checksum::from_hex(COMMIT).unwrap();
         let want = repo
-            .export_composefs(&commit, &ComposefsOptions::RECORDED)
+            .export_composefs(&commit, &ComposefsOptions::RECORDED, None)
             .await
             .unwrap();
         let file = std::fs::File::create(&image_path).unwrap();
@@ -1161,5 +1183,392 @@ fn the_mount_export_writes_the_export_and_refuses_an_unsealed_object() {
             .unwrap();
         drop(file);
         assert_eq!(std::fs::read(&image_path).unwrap(), want.bytes);
+    });
+}
+
+/// The test label of the inode at `path`: a SELinux context that names the
+/// path, with a NUL at its end. The NUL ends the label, so no label is a part
+/// of another label.
+fn label_of(path: &Path) -> Vec<u8> {
+    let mut label = format!("system_u:object_r:hook_t:s0:{}", path.display()).into_bytes();
+    label.push(0);
+    label
+}
+
+/// Returns the number of times that `needle` occurs in `haystack`.
+fn occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+/// Commits a flat tree in `repo` at timestamp 0 and returns the commit
+/// checksum. The root dirmeta holds `root_xattrs`. Each entry of `files` is a
+/// regular file with the mode 0644, the owner 0:0, its name, its content, and
+/// its xattrs.
+async fn commit_flat(
+    repo: &Repo,
+    root_xattrs: &Xattrs,
+    files: &[(&str, &[u8], &Xattrs)],
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let mut mtree = MutableTree::new();
+    for (name, content, xattrs) in files {
+        let meta = FileMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o100644,
+            xattrs: (*xattrs).clone(),
+        };
+        let file = txn
+            .write_regfile_inline(None, &meta, content)
+            .await
+            .unwrap();
+        mtree.replace_file(name, file).unwrap();
+    }
+    let dirmeta_bytes = DirMeta {
+        uid: 0,
+        gid: 0,
+        mode: 0o040755,
+        xattrs: root_xattrs.clone(),
+    }
+    .serialize()
+    .unwrap();
+    let dirmeta = txn
+        .write_metadata(ObjectType::DirMeta, None, &dirmeta_bytes)
+        .await
+        .unwrap();
+    mtree.set_metadata_checksum(dirmeta);
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                subject: Some("flat tree".to_owned()),
+                timestamp: Some(0),
+                ..CommitOptions::default()
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// The hook sees each inode of the image one time, the five added top-level
+/// directories included, with the kind of the inode. A label that the hook
+/// sets on an inode goes into the image. The two export forms give the same
+/// bytes with the hook, and the bytes differ from the image with no hook.
+#[test]
+fn the_entry_hook_sees_and_labels_each_inode() {
+    let scratch = TmpDir::new("composefs-hook-label");
+    let image_path = scratch.path().join("labeled.cfs");
+    let repo_dir = fixture_repo("bare-user");
+    let calls = Mutex::new(Vec::new());
+    let hook: ComposefsEntryFn<'_> = &|path, kind, meta| {
+        calls.lock().unwrap().push((path.to_path_buf(), kind));
+        meta.xattrs
+            .push((b"security.selinux".to_vec(), label_of(path)));
+        Ok(())
+    };
+    let mut want: Vec<(PathBuf, EntryKind)> = [
+        ("/", EntryKind::Directory),
+        ("/boot", EntryKind::Directory),
+        ("/etc", EntryKind::Directory),
+        ("/sysroot", EntryKind::Directory),
+        ("/usr", EntryKind::Directory),
+        ("/var", EntryKind::Directory),
+        ("/empty.txt", EntryKind::Regular),
+        ("/hello.txt", EntryKind::Regular),
+        ("/link", EntryKind::Symlink),
+        ("/subdir", EntryKind::Directory),
+        ("/subdir/nested.txt", EntryKind::Regular),
+    ]
+    .into_iter()
+    .map(|(path, kind)| (PathBuf::from(path), kind))
+    .collect();
+    want.sort_by(|a, b| a.0.cmp(&b.0));
+
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+        let opts = ComposefsOptions::RECORDED;
+
+        let image = repo
+            .export_composefs(&commit, &opts, Some(hook))
+            .await
+            .unwrap();
+        let mut seen = std::mem::take(&mut *calls.lock().unwrap());
+        seen.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(seen, want, "the hook sees each inode one time");
+        for (path, _) in &want {
+            assert!(
+                occurrences(&image.bytes, &label_of(path)) > 0,
+                "the image holds the label of {}",
+                path.display()
+            );
+        }
+
+        let file = std::fs::File::create(&image_path).unwrap();
+        let digest = repo
+            .export_composefs_to(&commit, &opts, Some(hook), file.as_fd())
+            .await
+            .unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&image_path).unwrap(), image.bytes);
+        assert_eq!(digest, image.fs_verity);
+        assert_eq!(calls.lock().unwrap().len(), want.len());
+
+        let plain = repo.export_composefs(&commit, &opts, None).await.unwrap();
+        assert_ne!(plain.bytes, image.bytes);
+    });
+}
+
+/// A label that the hook sets on the root gives the image of a tree whose
+/// root dirmeta stores the same label. The whiteout stubs copy the label of
+/// the root, so the two images are the same only if the stubs copy the label
+/// that the hook set.
+#[test]
+fn the_whiteout_stubs_hold_the_root_label_of_the_hook() {
+    let scratch = TmpDir::new("composefs-hook-whiteout");
+    let label = label_of(Path::new("/"));
+    let opts = ComposefsOptions::RECORDED;
+    let hook: ComposefsEntryFn<'_> = &|path, _, meta| {
+        if path == Path::new("/") {
+            meta.xattrs
+                .push((b"security.selinux".to_vec(), label.clone()));
+        }
+        Ok(())
+    };
+    block_on(async {
+        let repo = new_repo(scratch.path(), RepoMode::Archive, "").await;
+        let empty = Xattrs::empty();
+        let mut stored_name = b"security.selinux".to_vec();
+        stored_name.push(0);
+        let stored = Xattrs::new([(stored_name, label.clone())]).unwrap();
+        let x = commit_flat(&repo, &empty, &[("f", b"", &empty)]).await;
+        let y = commit_flat(&repo, &stored, &[("f", b"", &empty)]).await;
+
+        let hooked = repo.export_composefs(&x, &opts, Some(hook)).await.unwrap();
+        let stored = repo.export_composefs(&y, &opts, None).await.unwrap();
+        let plain = repo.export_composefs(&x, &opts, None).await.unwrap();
+        assert_eq!(hooked.bytes, stored.bytes);
+        assert_eq!(hooked.fs_verity, stored.fs_verity);
+        assert_ne!(hooked.bytes, plain.bytes);
+    });
+}
+
+/// A file capability is the xattr `security.capability` with a binary value.
+/// The image holds the value that the hook sets byte for byte. On an empty
+/// file, the hook gives the image of a tree that stores the same value.
+#[test]
+fn the_entry_hook_sets_a_binary_capability() {
+    const CAP: [u8; 20] = [
+        0x01, 0x00, 0x00, 0x02, 0xff, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let opts = ComposefsOptions::RECORDED;
+    let on = |target: &'static str| {
+        move |path: &Path, _: EntryKind, meta: &mut Metadata| {
+            if path == Path::new(target) {
+                meta.xattrs
+                    .push((b"security.capability".to_vec(), CAP.to_vec()));
+            }
+            Ok(())
+        }
+    };
+    let on_hello = on("/hello.txt");
+    let on_f = on("/f");
+
+    let scratch = TmpDir::new("composefs-hook-capability");
+    let repo_dir = fixture_repo("bare-user");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+        let image = repo
+            .export_composefs(&commit, &opts, Some(&on_hello))
+            .await
+            .unwrap();
+        let plain = repo.export_composefs(&commit, &opts, None).await.unwrap();
+        assert_eq!(occurrences(&image.bytes, &CAP), 1);
+        assert_eq!(occurrences(&plain.bytes, &CAP), 0);
+
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::Archive, "").await;
+        let empty = Xattrs::empty();
+        let stored = Xattrs::new([(b"security.capability\0".to_vec(), CAP.to_vec())]).unwrap();
+        let x = commit_flat(&repo, &empty, &[("f", b"", &empty)]).await;
+        let y = commit_flat(&repo, &empty, &[("f", b"", &stored)]).await;
+        let hooked = repo.export_composefs(&x, &opts, Some(&on_f)).await.unwrap();
+        let stored = repo.export_composefs(&y, &opts, None).await.unwrap();
+        assert_eq!(hooked.bytes, stored.bytes);
+    });
+}
+
+/// Exports the fixture commit with a hook that pushes `xattrs` onto the inode
+/// at `target`, and returns the error of the export.
+async fn refusal_of(target: &str, xattrs: Vec<(Vec<u8>, Vec<u8>)>) -> Error {
+    let repo = Repo::open(&fixture_repo("bare-user")).await.unwrap();
+    let commit = Checksum::from_hex(COMMIT).unwrap();
+    let hook: ComposefsEntryFn<'_> = &|path, _, meta| {
+        if path == Path::new(target) {
+            meta.xattrs.extend(xattrs.iter().cloned());
+        }
+        Ok(())
+    };
+    // `Image` does not implement `Debug`, so the code maps the value to `()`.
+    repo.export_composefs(&commit, &ComposefsOptions::RECORDED, Some(hook))
+        .await
+        .map(|_| ())
+        .expect_err("the export refuses the xattrs of the hook")
+}
+
+/// The check after the hook holds each inode to the xattr budget and each
+/// name to 255 bytes, the added top-level directories included. It refuses
+/// an empty name, a name with a NUL byte, and a name that occurs two times.
+/// Each refusal is `Unsupported`, and the writer does not panic.
+#[test]
+fn the_check_after_the_hook_refuses_xattrs_the_image_cannot_hold() {
+    let long_name = |len: usize| {
+        let mut name = b"user.".to_vec();
+        name.resize(len, b'n');
+        name
+    };
+    block_on(async {
+        for target in ["/", "/etc"] {
+            let err = refusal_of(target, vec![(b"user.big".to_vec(), vec![b'x'; 70_000])]).await;
+            assert!(
+                matches!(&err, Error::Unsupported(text)
+                    if text.contains("user.big") && text.contains("70015") && text.contains("32755")),
+                "{target}: {err:?}"
+            );
+        }
+        for (target, len) in [("/hello.txt", 305), ("/link", 256)] {
+            let err = refusal_of(target, vec![(long_name(len), b"v".to_vec())]).await;
+            assert!(
+                matches!(&err, Error::Unsupported(text)
+                    if text.contains(&format!("{len} bytes long")) && text.contains("255")),
+                "{target}: {err:?}"
+            );
+        }
+        let cases = [
+            (
+                vec![
+                    (b"user.dup".to_vec(), b"a".to_vec()),
+                    (b"user.dup".to_vec(), b"b".to_vec()),
+                ],
+                "two times",
+            ),
+            (vec![(Vec::new(), b"v".to_vec())], "empty"),
+            (vec![(b"user.a\0b".to_vec(), b"v".to_vec())], "NUL"),
+        ];
+        for (xattrs, fragment) in cases {
+            let err = refusal_of("/subdir/nested.txt", xattrs).await;
+            assert!(
+                matches!(&err, Error::Unsupported(text) if text.contains(fragment)),
+                "{fragment}: {err:?}"
+            );
+        }
+    });
+}
+
+/// Xattrs of 5000 bytes on a symlink fit the budget of the inode and fill
+/// the inode block, so the block holds no byte of target. The export refuses
+/// the symlink with `Unsupported`, and the writer does not panic.
+#[test]
+fn a_symlink_whose_xattrs_fill_its_block_is_refused() {
+    block_on(async {
+        let err = refusal_of("/link", vec![(b"user.big".to_vec(), vec![b'x'; 5000])]).await;
+        assert!(
+            matches!(&err, Error::Unsupported(text) if text.contains("holds 0 bytes of target")),
+            "{err:?}"
+        );
+    });
+}
+
+/// An error of the hook stops the export, and the export returns that error
+/// unchanged. The file form writes no byte, and the export calls the hook no
+/// more after the error.
+#[test]
+fn an_error_of_the_hook_stops_the_export() {
+    let scratch = TmpDir::new("composefs-hook-error");
+    let image_path = scratch.path().join("refused.cfs");
+    let opts = ComposefsOptions::RECORDED;
+    let on_link: ComposefsEntryFn<'_> = &|path, _, _| {
+        if path == Path::new("/link") {
+            return Err(Error::InvalidInput("the hook refuses /link".to_owned()));
+        }
+        Ok(())
+    };
+    let calls = AtomicUsize::new(0);
+    let always: ComposefsEntryFn<'_> = &|_, _, _| {
+        calls.fetch_add(1, Ordering::Relaxed);
+        Err(Error::InvalidInput(
+            "the hook refuses each inode".to_owned(),
+        ))
+    };
+    let is_link_refusal =
+        |err: &Error| matches!(err, Error::InvalidInput(text) if text == "the hook refuses /link");
+    block_on(async {
+        let repo = Repo::open(&fixture_repo("bare-user")).await.unwrap();
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+
+        let err = repo
+            .export_composefs(&commit, &opts, Some(on_link))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(is_link_refusal(&err), "{err:?}");
+
+        let file = std::fs::File::create(&image_path).unwrap();
+        let err = repo
+            .export_composefs_to(&commit, &opts, Some(on_link), file.as_fd())
+            .await
+            .unwrap_err();
+        drop(file);
+        assert!(is_link_refusal(&err), "{err:?}");
+        assert_eq!(std::fs::metadata(&image_path).unwrap().len(), 0);
+
+        let err = repo
+            .export_composefs(&commit, &opts, Some(always))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+    });
+}
+
+/// Two paths that name one file object give two inodes, and the hook sees
+/// each one with its own metadata. Each label occurs one time in the image.
+#[test]
+fn the_hook_labels_each_path_to_one_object_on_its_own() {
+    let scratch = TmpDir::new("composefs-hook-shared-object");
+    let hook: ComposefsEntryFn<'_> = &|path, _, meta| {
+        meta.xattrs
+            .push((b"security.selinux".to_vec(), label_of(path)));
+        Ok(())
+    };
+    block_on(async {
+        let repo = new_repo(scratch.path(), RepoMode::Archive, "").await;
+        let empty = Xattrs::empty();
+        let content: &[u8] = b"shared bytes\n";
+        let commit = commit_flat(
+            &repo,
+            &empty,
+            &[("a", content, &empty), ("b", content, &empty)],
+        )
+        .await;
+        let image = repo
+            .export_composefs(&commit, &ComposefsOptions::RECORDED, Some(hook))
+            .await
+            .unwrap();
+        for path in ["/a", "/b"] {
+            assert_eq!(
+                occurrences(&image.bytes, &label_of(Path::new(path))),
+                1,
+                "the label of {path} occurs one time"
+            );
+        }
     });
 }

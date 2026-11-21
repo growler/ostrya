@@ -11,14 +11,13 @@ use ostrya_core::{
     write_array,
 };
 
+use crate::composefs::COMPOSEFS_DIGEST_KEY;
 use crate::error::Error;
 
 /// The metadata key of the ref binding.
 const REF_BINDING_KEY: &str = "ostree.ref-binding";
 /// The metadata key of the collection binding.
 const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
-/// The metadata key of the composefs digest of a commit.
-const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The metadata key of the size records of a commit.
 const SIZES_KEY: &str = "ostree.sizes";
 

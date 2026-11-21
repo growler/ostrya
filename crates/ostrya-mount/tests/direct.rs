@@ -416,9 +416,14 @@ fn an_image_of_the_caller_mounts() {
         let commit = commit_tree(&repo, &base, 70, Key::None).await;
         let path = scratch.path().join("image.cfs");
         let file = std::fs::File::create(&path).unwrap();
-        repo.export_composefs_to(&commit, &ostrya::ComposefsOptions::default(), file.as_fd())
-            .await
-            .unwrap();
+        repo.export_composefs_to(
+            &commit,
+            &ostrya::ComposefsOptions::default(),
+            None,
+            file.as_fd(),
+        )
+        .await
+        .unwrap();
         drop(file);
         let file = std::fs::File::open(&path).unwrap();
         let direct = Direct::new();

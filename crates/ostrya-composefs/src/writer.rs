@@ -827,7 +827,7 @@ fn check_symlinks(inodes: &[Inode], min_mtime: (u64, u32)) -> Result<(), Error> 
                  which holds {} bytes of target, and a composefs image states \
                  a target inline",
                 target.len(),
-                BLOCK - header - xattr_size - 1,
+                BLOCK.saturating_sub(header + xattr_size + 1),
             )));
         }
     }
@@ -1401,6 +1401,18 @@ mod tests {
         plan(&tree_with_symlink(BLOCK - 32 - 20, xattrs))
             .map(|_| ())
             .expect_err("4044 bytes do not fit");
+    }
+
+    /// If the xattrs of a symlink fill its inode block, the block holds no
+    /// byte of target. The refusal states 0 bytes of target.
+    #[test]
+    fn a_symlink_whose_xattrs_fill_its_block_is_refused() {
+        let xattrs = vec![(b"user.k".to_vec(), vec![b'v'; BLOCK])];
+        let msg = refusal(&tree_with_symlink(1, xattrs));
+        assert!(
+            msg.contains("holds 0 bytes of target"),
+            "the refusal states 0 bytes of target: {msg}"
+        );
     }
 
     /// Returns `small_tree` plus one empty regular file named `name`.

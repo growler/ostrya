@@ -392,7 +392,7 @@ pub async fn commit_dev_tree(repo: &Repo, root: &ostrya::RepoTree, commit: &Chec
     // copy of the image. The commit of that image has no key, so the daemon
     // makes no check of the image.
     let mut image = repo
-        .export_composefs(commit, &ComposefsOptions::RECORDED)
+        .export_composefs(commit, &ComposefsOptions::RECORDED, None)
         .await
         .unwrap()
         .bytes;

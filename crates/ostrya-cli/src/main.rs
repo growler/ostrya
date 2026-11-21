@@ -57,19 +57,19 @@ use clap::{Args, CommandFactory, Parser, Subcommand};
 #[cfg(feature = "gpg")]
 use ostrya::gpg::MAX_KEYRING;
 use ostrya::{
-    BootableMetadata, BootableRefusal, COMPOSEFS_RELATION, CheckoutFilterFn, CheckoutMode,
-    CheckoutOptions, Checksum, CollectionPullOptions, CollectionRefEntry, CommitModifier,
-    CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions, DeltaEndianness,
-    DeltaOptions, DeltaPartStats, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange,
-    DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
-    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
-    FsckOptions, FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions, OverwriteMode,
-    PruneOptions, PullFlags, PullOptions, PullProgress, PullProgressSnapshot, PullStats,
-    PullVerify, Ref, RefAlias, RefNamespace, RefSelector, RemoteSource, RemotesDir, Repo,
-    RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
-    TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
-    Verifier, VerifyOutcome, VerityPolicy, WeakRefFilter, Xattrs, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    BootableMetadata, BootableRefusal, COMPOSEFS_DIGEST_KEY, COMPOSEFS_RELATION, CheckoutFilterFn,
+    CheckoutMode, CheckoutOptions, Checksum, CollectionPullOptions, CollectionRefEntry,
+    CommitModifier, CommitModifierFlags, CommitOptions, ComposefsOptions, CreateOptions,
+    DeltaEndianness, DeltaOptions, DeltaPartStats, DeltaSuperblock, DevInoCache, DictBuilder,
+    DiffChange, DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta,
+    FileObject, FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind,
+    FsckFailure, FsckOptions, FsckPhase, KeyFile, MutableTree, ObjectType, OpenOptions,
+    OverwriteMode, PruneOptions, PullFlags, PullOptions, PullProgress, PullProgressSnapshot,
+    PullStats, PullVerify, Ref, RefAlias, RefNamespace, RefSelector, RemoteSource, RemotesDir,
+    Repo, RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions,
+    TarExportOptions, TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry,
+    Type, Value, Verifier, VerifyOutcome, VerityPolicy, WeakRefFilter, Xattrs, from_bytes,
+    load_sign_keys, load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
@@ -11839,7 +11839,7 @@ async fn export_composefs(
         return Err(Error::Io(err));
     }
     let written = repo
-        .export_composefs_to(commit, opts, out.as_fd())
+        .export_composefs_to(commit, opts, None, out.as_fd())
         .await
         .and_then(|_| std::fs::rename(&temp, destination).map_err(Error::Io));
     if written.is_err() {
@@ -16765,10 +16765,6 @@ fn report_resolution_failure(err: Error) -> Error {
 const LINUX_KEY: &str = "ostree.linux";
 /// The metadata key that `--bootable` sets to true.
 const BOOTABLE_KEY: &str = "ostree.bootable";
-/// The metadata key for the composefs image digest of the tree.
-///
-/// `--generate-composefs-metadata` fills this key.
-const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The directory that two of the `--bootable` refusals name.
 const MODULES_DIR: &str = "/usr/lib/modules";
 

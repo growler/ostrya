@@ -3534,7 +3534,7 @@ fn composefs_checkout_matches_library() {
     let lib_bytes = block_on(async {
         let repo = Repo::open(&repo).await.unwrap();
         let checksum = repo.resolve_rev(&commit, false).await.unwrap().unwrap();
-        repo.export_composefs(&checksum, &ComposefsOptions::default())
+        repo.export_composefs(&checksum, &ComposefsOptions::default(), None)
             .await
             .unwrap()
             .bytes
@@ -25493,7 +25493,7 @@ fn composefs_lookup(
 fn recorded_export_of(repo: &Path, commit: &Checksum) -> ostrya::Image {
     block_on(async {
         let repo = Repo::open(repo).await.unwrap();
-        repo.export_composefs(commit, &ComposefsOptions::RECORDED)
+        repo.export_composefs(commit, &ComposefsOptions::RECORDED, None)
             .await
             .unwrap()
     })

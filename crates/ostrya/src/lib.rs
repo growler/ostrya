@@ -153,7 +153,9 @@ pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMod
 #[doc(hidden)]
 pub use commit::{CheckedAttachments, CommitOptions};
 #[doc(hidden)]
-pub use composefs::{ComposefsOptions, VerityPolicy};
+pub use composefs::{
+    COMPOSEFS_DIGEST_KEY, ComposefsEntryFn, ComposefsOptions, EntryKind, VerityPolicy,
+};
 #[doc(hidden)]
 pub use config::{
     MinFreeSpace, Remote, RemoteSource, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate,
@@ -204,7 +206,7 @@ pub use modifier::{
 #[doc(hidden)]
 pub use mtree::MutableTree;
 pub use object::MAX_METADATA_SIZE;
-pub use ostrya_composefs::Image;
+pub use ostrya_composefs::{Image, Metadata};
 pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DictBuilder, DirMeta, DirTree, KeyFile, ObjectName, ObjectType,

@@ -918,7 +918,7 @@ fn op_1_refuses_a_bad_attachment_next_to_a_valid_supplement() {
     let commit = ostrya_rt::block_on(async {
         let (repo, root) = fixture_root(&fx).await;
         let digest = repo
-            .export_composefs(&fx.commit, &ComposefsOptions::RECORDED)
+            .export_composefs(&fx.commit, &ComposefsOptions::RECORDED, None)
             .await
             .unwrap()
             .fs_verity;

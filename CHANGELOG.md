@@ -12,10 +12,58 @@ first.
 An item that starts with `Breaking:` needs a change in code or config that uses
 the release before it. An item that starts with `Fix:` corrects a defect.
 
-## [0.14.0] - unreleased
+## [0.14.0] - 2026-11-22
 
 ### Library
 
+- Breaking: `ostrya` keeps a composefs image in one form, the image commit.
+  The image store below `extensions/ostrya/composefs/` and its API are
+  removed: `Transaction::build_composefs_image`,
+  `Transaction::attach_composefs_image`, `Transaction::write_composefs_image`,
+  `Repo::add_composefs_image`, `Repo::composefs_image_path`,
+  `Repo::has_composefs_image`, `Repo::check_composefs_image`,
+  `Repo::open_composefs_image_checked`, `StagedComposefsImage`,
+  `ComposefsImageAdd`, `ComposefsImageState`, `RepoConfig::generate_composefs`,
+  and `Error::ComposefsImageNotFound`. `FsckReport` has no fields
+  `images_checked`, `image_errors`, `orphan_images`, and `missing_images`, and
+  `FsckImageError` and `FsckImageErrorKind` are removed. Fsck, prune, and the
+  receive side read and write no image file.
+- `Transaction::write_composefs_content` writes the composefs image of a tree
+  into a content object. `Transaction::write_composefs_commit` writes the image
+  commit: one file `/root.cfs`, `root:root` 0400, in a root directory
+  `root:root` 0755, with the subject `composefs image`, the timestamp 0, no
+  parent, and no metadata. The same image gives the same commit in each
+  repository mode.
+- `Repo::open_composefs_image` finds the image commit through the attachment
+  `composefs` of a commit, else through its supplement `composefs`, and
+  returns a `ComposefsImage`. The image commit must be complete, and its tree
+  must hold the regular file `/root.cfs` and no other entry. If the commit has
+  the key `ostree.composefs.digest.v0`, the fs-verity digest of `/root.cfs`
+  must be its value. Each refusal is `Error::InvalidComposefsImage` with a
+  `ComposefsImageDefect`. The call refuses an `archive` repository.
+- `Repo::add_composefs_supplement` writes the image commit of a commit, sets
+  the supplement `composefs` of the commit to it, and returns a
+  `ComposefsSupplementAdd`. `CheckedAttachments::add` checks one attachment
+  and adds it to the entries, for example an image commit that the
+  transaction stages. `ostrya` exports `COMPOSEFS_RELATION`.
+- Breaking: `ostrya-mount` opens no repository and has no async API. It
+  depends on `ostrya-core`, `ostrya-sys`, `rustix`, and `thiserror`. The
+  features `server`, `smol`, and `tokio`, the module `ostrya_mount::server`,
+  `Mounter`, `Direct::mount_stored`, `Direct::mount_built`, `Error::Repo`, and
+  `Error::UnsupportedMode` are removed.
+- Breaking: `Direct::mount_image` and `Direct::unmount` of `ostrya-mount` are
+  synchronous. `mount_image` takes the image descriptor, a descriptor of the
+  `objects` directory, a `Verity` value, the target, and `MountOptions`.
+- Breaking: `Helper::mount_stored`, `Helper::mount_built`, and
+  `Helper::unmount` of `ostrya-mount` block the calling thread. The mount calls
+  take the repository path and an `ostrya_core::Checksum` in place of a
+  `Repo`. The helper refuses a relative repository path.
+- `MountOptions` of `ostrya-mount` has the field `flags` of the type
+  `MountFlags`, with `nosuid`, `nodev`, and `noexec`. `Direct` gives the flags
+  to each mount of the tree. `Helper` refuses `noexec` before it connects.
+- `ostrya-mount` makes public the module `proto`, the protocol of the mount
+  daemon, the module `sys`, the mount steps of the daemon, and `Verity`,
+  `Helper::exchange`, `is_privileged`, and `in_initial_user_namespace`.
 - Breaking: `Repo::export_composefs` and `Repo::export_composefs_to` take a
   `filter` argument after `opts`. With `None`, the export writes the image
   of the 0.13.0 release.
@@ -143,6 +191,29 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   new commit that the repository holds complete, and check the attachments
   below it, level by level. An attachment below it that the push or the stream does not carry
   and that the repository does not hold gives `missing-objects`.
+- Breaking: `ostrya commit --generate-composefs` writes the composefs image of
+  the tree as an image commit, and names the image commit as the attachment
+  `composefs` of the commit. The commit is different from the commit that
+  `--generate-composefs-metadata` alone writes for the same tree. Each
+  transfer that carries attachments carries the image commit. The option
+  refuses `--related` with the name `composefs`.
+- Breaking: `ostrya composefs-image --add REV` writes the image commit of REV
+  and names it as the supplement `composefs` of REV. It refuses a commit that
+  names an image commit as the attachment `composefs`. No transfer copies a
+  supplement. `--get-path` and `--check` are refused.
+- Breaking: the config key `[ex-ostrya] generate-composefs` has no effect.
+  `ostrya fsck`, `ostrya prune`, `ostrya receive`, and `ostrya serve` read and
+  write no file below `extensions/ostrya/composefs/`. A receive accepts a
+  commit whose `ostree.composefs.digest.v0` is wrong or malformed.
+- `mount.ostrya`, in the `ostrya-mountd` package, is the helper that mount(8)
+  runs for `mount -t ostrya -o ro REPO:REV DIR`. For root in the initial user
+  namespace, it mounts the image in its own process. For each other caller, it
+  asks `ostrya-mountd`. The man page is mount.ostrya(8).
+- Breaking: `ostrya-mountd` mounts the image of the image commit that a commit
+  names as the attachment `composefs`, or else as the supplement `composefs`.
+  It reads no image file below `extensions/ostrya/composefs/`. It refuses an
+  image whose size is not a positive multiple of 4096 bytes, and a commit that
+  names no image commit with the code `repository`.
 - Fix: `ostrya pull-local SRC CHECKSUM` read the checksum as a ref name. It
   refused a commit with a ref binding at exit 1 with `error: pull: commit
   <checksum>: no requested ref '<checksum>' in ref binding metadata (<refs>)`.

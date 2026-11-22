@@ -1096,6 +1096,71 @@ Rejected alternatives:
 - The lookup tries the supplement when the attachment is bad. It then gives
   an image that A does not name.
 
+## The composefs entry hook
+
+A caller can give the composefs export an entry hook. The export calls the
+hook for each node of the tree and for each top-level directory that it
+adds. The hook can change the mode, the owner, the mtime, and the extended
+attributes of the node. For example, the image gets the SELinux labels of a
+policy of the caller, and the objects of the commit do not change. The
+rustdoc of `ostrya::composefs::ComposefsEntryFn` states the rules of the
+hook.
+
+The type of the hook:
+
+- The hook is `&(dyn Fn(&Path, EntryKind, &mut Metadata) -> Result<()> +
+  Sync)`. A labeler is a function of the path and the metadata, so `Fn` fits
+  it. The hook is `Sync`, so the reference is `Send`, the future of an export
+  stays `Send`, and concurrent exports can share one hook.
+- The hook returns an `ostrya::Error` of its choice. The export stops at the
+  first error and returns that error unchanged.
+
+The place of the hook:
+
+- Each call that takes the hook has the separate argument
+  `filter: Option<ComposefsEntryFn<'_>>`.
+
+The calls with no hook:
+
+- `Transaction::composefs_digest`, `Repo::commit_add_composefs_metadata`, and
+  `Repo::export_composefs_for_mount` take no hook. The `ostrya` command gives
+  no hook.
+- The first two give and record the digest of the image that a target
+  machine computes from the tree at boot. A hook changes the image, and the
+  computation at boot then gives another digest.
+- `export_composefs_for_mount` builds the image of a mount from the tree of
+  the commit. A labeled image goes into an image commit, and the mount opens
+  it from there.
+- The library has no SELinux policy backend, so a command has no hook to
+  give.
+
+The labeled image commit:
+
+- A caller stages the tree and calls `Transaction::write_composefs_commit`
+  with its hook. The call writes the image commit C and returns the checksum
+  of C and the digest of the labeled image.
+- The caller writes the commit A of the tree. A names C as the attachment
+  `composefs`, and carries `ostree.composefs.digest.v0` with the digest of the
+  labeled image as an `ay` value. `ostrya` exports the name of the key as
+  `COMPOSEFS_DIGEST_KEY`.
+- C carries no `ostree.composefs.digest.v0`.
+- The lookup trusts the key of A ("The composefs image commit"). The lookup
+  builds no image to check the key, because a build with no hook cannot give
+  the labels. The lookup compares the key with the digest of `/root.cfs`.
+- `Repo::add_composefs_supplement` and `composefs-image --add` build the
+  image with no hook. If they build the image of a commit whose key records
+  the digest of a labeled image, they refuse the commit.
+
+Rejected alternatives:
+
+- A boxed `FnMut + Send`, the form of `CommitModifier::label_callback`. An
+  `FnMut` needs exclusive access, so one hook cannot serve two exports at the
+  same time.
+- A field of `ComposefsOptions`. A reference to a `dyn Fn` has no `Debug` and
+  no `PartialEq`, so `ComposefsOptions` loses its derives of `Debug`,
+  `PartialEq`, and `Eq`. The field also adds a lifetime parameter to
+  `ComposefsOptions`.
+
 ## The spki sign engine
 
 The spki engine is pure Rust. It has four key types: ECDSA on NIST P-256

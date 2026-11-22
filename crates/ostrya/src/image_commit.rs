@@ -180,10 +180,16 @@ impl Transaction {
     /// digest is the value that
     /// [`composefs_digest`](Transaction::composefs_digest) gives.
     ///
-    /// `filter` is a hook, as in [`Repo::export_composefs`]. The hook gets one
-    /// call for each node of the tree, and for each top-level directory that
-    /// the call adds to the image. The whiteout stubs of the image get no
-    /// call. With `None`, the call uses no hook.
+    /// The call takes no [`ComposefsOptions`]. It always uses
+    /// [`ComposefsOptions::RECORDED`], so each backed file of the image carries
+    /// the fs-verity digest of its content.
+    ///
+    /// `filter` is an entry hook. [`ComposefsEntryFn`] states its rules. The
+    /// hook gets one call for each node of the tree, and for each top-level
+    /// directory that the call adds to the image. The whiteout stubs of the
+    /// image get no call. Each stub takes the owner, the mtime, and the
+    /// `security.selinux` xattr of the root after the hook. With `None`, the
+    /// call uses no hook.
     ///
     /// The image commit has a fixed shape:
     ///
@@ -202,6 +208,12 @@ impl Transaction {
     /// does not name the commit of the tree. The caller names the image commit
     /// from that commit as the attachment or the supplement
     /// [`COMPOSEFS_RELATION`].
+    ///
+    /// With a hook, the caller writes the returned digest in the commit of the
+    /// tree under
+    /// [`COMPOSEFS_DIGEST_KEY`](crate::composefs::COMPOSEFS_DIGEST_KEY).
+    /// [`Repo::open_composefs_image`] compares that key with the digest of
+    /// `/root.cfs`.
     ///
     /// In an `archive` repository, the image file is a `.filez` object.
     /// [`Repo::open_composefs_image`] refuses an `archive` repository.

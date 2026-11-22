@@ -17,7 +17,94 @@
 //!   composefs mount reads the backing objects of the image through it.
 //!
 //! [`ComposefsOptions`] and [`VerityPolicy`] select the verity form of the
-//! image.
+//! image. [`ComposefsEntryFn`] is the entry hook, and [`EntryKind`] is the kind
+//! of a node that the hook gets. [`COMPOSEFS_DIGEST_KEY`] is the commit
+//! metadata key of the image digest.
+//!
+//! # Entry hook
+//!
+//! [`Repo::export_composefs`], [`Repo::export_composefs_to`],
+//! [`Transaction::write_composefs_content`], and
+//! [`Transaction::write_composefs_commit`] take an entry hook as the argument
+//! `filter`. The hook gets the path, the kind, and the [`Metadata`] of each
+//! node. It can change the mode, the owner, the mtime, and the xattrs. For
+//! example, the hook gives each inode the SELinux label of a policy of the
+//! caller. The image gets the labels, and the objects of the commit do not
+//! change. [`ComposefsEntryFn`] states the rules of the hook.
+//!
+//! [`Transaction::composefs_digest`] and
+//! [`Repo::commit_add_composefs_metadata`] take no hook. The digest that they
+//! give and record is the digest of the image with no hook.
+//!
+//! # Labeled images
+//!
+//! The lookup ([`Repo::open_composefs_image`]) and the mount daemon have no
+//! hook, so they cannot build a labeled image from the tree. A labeled image
+//! therefore goes into the repository as an image commit. To write a commit
+//! with a labeled image:
+//!
+//! 1. Stage the tree. Call [`Transaction::write_composefs_commit`] with the
+//!    hook. The call returns the checksum of the image commit and the
+//!    fs-verity digest of the image.
+//! 2. In [`CommitOptions::attachments`], name the image commit as
+//!    [`COMPOSEFS_RELATION`].
+//! 3. In [`CommitOptions::metadata`], put the digest under
+//!    [`COMPOSEFS_DIGEST_KEY`] as an `ay` value.
+//! 4. Write the commit of the tree with these options and
+//!    [`Transaction::write_commit`].
+//! 5. Commit the transaction.
+//!
+//! The image commit carries no [`COMPOSEFS_DIGEST_KEY`]. The lookup trusts
+//! the key of the commit of the tree. [`Repo::open_composefs_image`] builds no
+//! image to check the key. It compares the key with the fs-verity digest of
+//! `/root.cfs`. [`Repo::add_composefs_supplement`] builds the image with no
+//! hook. If it builds the image of a commit whose key records the digest of a
+//! labeled image, it refuses the commit with
+//! [`Error::ComposefsDigestMismatch`].
+//!
+//! ```no_run
+//! # async fn run(
+//! #     txn: ostrya::transaction::Transaction,
+//! #     root: ostrya::tree::RepoTree,
+//! # ) -> ostrya::Result<()> {
+//! use std::path::Path;
+//!
+//! use ostrya::commit::CommitOptions;
+//! use ostrya::composefs::{COMPOSEFS_DIGEST_KEY, ComposefsEntryFn, EntryKind};
+//! use ostrya::{COMPOSEFS_RELATION, DictBuilder, Metadata};
+//!
+//! fn label(
+//!     path: &Path,
+//!     _kind: EntryKind,
+//!     meta: &mut Metadata,
+//! ) -> ostrya::Result<()> {
+//!     let label: &[u8] = if path.starts_with("/etc") {
+//!         b"system_u:object_r:etc_t:s0\0"
+//!     } else {
+//!         b"system_u:object_r:usr_t:s0\0"
+//!     };
+//!     meta.xattrs.retain(|(name, _)| name != b"security.selinux");
+//!     meta.xattrs.push((b"security.selinux".to_vec(), label.to_vec()));
+//!     Ok(())
+//! }
+//!
+//! let hook: ComposefsEntryFn<'_> = &label;
+//! let (image, digest) = txn.write_composefs_commit(&root, Some(hook)).await?;
+//! let mut metadata = DictBuilder::new();
+//! metadata.insert_bytes(COMPOSEFS_DIGEST_KEY, &digest);
+//! let opts = CommitOptions {
+//!     metadata: Some(metadata.build()),
+//!     attachments: vec![(COMPOSEFS_RELATION.to_owned(), image)],
+//!     ..CommitOptions::default()
+//! };
+//! txn.write_commit(opts, &root).await?;
+//! txn.commit().await?;
+//! # Ok(()) }
+//! ```
+//!
+//! [`CommitOptions::attachments`]: crate::commit::CommitOptions::attachments
+//! [`CommitOptions::metadata`]: crate::commit::CommitOptions::metadata
+//! [`COMPOSEFS_RELATION`]: crate::COMPOSEFS_RELATION
 
 use std::collections::{HashMap, btree_map};
 use std::future::Future;
@@ -51,7 +138,15 @@ const INJECTED_DIRS: [&str; 5] = ["boot", "etc", "sysroot", "usr", "var"];
 /// The mode that the `ostree` command gives each added top-level directory
 /// (`040755`).
 const INJECTED_DIR_MODE: u32 = 0o040755;
-/// The commit metadata key that holds the fs-verity digest of the image.
+/// The commit metadata key that holds the fs-verity digest of the composefs
+/// image of the commit.
+///
+/// The value is the 32-byte digest as an `ay`.
+/// [`Repo::commit_add_composefs_metadata`] writes the key with the digest of
+/// the image with no hook, and [`Transaction::composefs_digest`] gives that
+/// digest. For an image with a hook, the caller writes the key with the digest
+/// that [`Transaction::write_composefs_commit`] returns. The module
+/// documentation, "Labeled images", gives the steps.
 pub const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The GVariant type of the digest value, a 32-byte `ay`.
 const DIGEST_SIGNATURE: &str = "ay";
@@ -115,8 +210,10 @@ impl ObjectSource<'_> {
 ///
 /// The policy selects if each backed file carries the fs-verity digest of its
 /// content. The export opens each backing object under both policies. The
-/// mode, the owner, the size, and the xattrs of the inode come from the file
-/// object.
+/// size of the inode comes from the file object. The mode, the owner, and the
+/// xattrs come from the file object, and the mtime is 0. An entry hook
+/// ([`ComposefsEntryFn`]) can change the mode, the owner, the mtime, and the
+/// xattrs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VerityPolicy {
     /// Each backed file carries the 36-byte metacopy record with the fs-verity
@@ -164,12 +261,18 @@ impl ComposefsOptions {
     /// [`Repo::commit_add_composefs_metadata`] and
     /// [`Transaction::composefs_digest`] use these options, so a change of the
     /// default does not change the recorded digest.
+    /// [`Transaction::write_composefs_commit`] also uses these options, with
+    /// the hook of its caller.
     pub const RECORDED: ComposefsOptions = ComposefsOptions {
         verity: VerityPolicy::Computed,
     };
 }
 
-/// The kind of an inode of a composefs image.
+/// The kind of a node that an entry hook gets.
+///
+/// The export gives the kind to each call of a [`ComposefsEntryFn`]. The image
+/// takes the file type of the inode from the kind, and the hook cannot change
+/// it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EntryKind {
     /// A directory.
@@ -180,14 +283,72 @@ pub enum EntryKind {
     Symlink,
 }
 
-/// A hook that a composefs export calls for each node of the tree.
+/// A hook that a composefs export calls for each node of the image.
 ///
-/// The export calls the hook one time for each node of the tree, and for each
-/// top-level directory that the export adds. The whiteout stubs of the image
-/// get no call. The hook gets the absolute path of the node in the image, the
-/// kind of the node, and its [`Metadata`]. It can change the mode, the owner, the mtime,
-/// and the xattrs. If the hook returns an error, the export stops and returns
-/// that error.
+/// [`Repo::export_composefs`], [`Repo::export_composefs_to`],
+/// [`Transaction::write_composefs_content`], and
+/// [`Transaction::write_composefs_commit`] take the hook as `filter`. The
+/// export calls the hook one time for each node of the tree, and one time for
+/// each top-level directory that it adds. A hook must not depend on the order
+/// of the calls.
+///
+/// Each call gets these arguments:
+///
+/// - The absolute path of the node in the image. The path of the root is `/`.
+/// - The [`EntryKind`] of the node.
+/// - The [`Metadata`] of the node. For a node of the tree, the mode, the
+///   owner, and the xattrs come from the tree. For a top-level directory that
+///   the export adds, the mode is `040755`, the owner is 0:0, and the node
+///   has no xattrs. The mtime is `(0, 0)`. An xattr name has no NUL byte at
+///   its end, and each value is the stored value.
+///
+/// The hook can change the mode, the uid, the gid, the mtime, and the xattrs.
+/// The image holds the metadata that the hook leaves, with these rules:
+///
+/// - The image takes the file type from the [`EntryKind`]. A change to the
+///   file-type bits of the mode has no effect.
+/// - The export adds no byte to a value and removes none. If a SELinux label
+///   must end in a NUL byte, the hook adds the NUL.
+/// - A file capability is the xattr `security.capability` with a binary
+///   value. The hook sets it as any other xattr.
+/// - The hook does not see the xattrs that the image writer adds:
+///   `trusted.overlay.redirect` and `trusted.overlay.metacopy` of a backed
+///   file, and `trusted.overlay.opaque` of the root.
+/// - The image writer escapes a name `trusted.overlay.X` as
+///   `trusted.overlay.overlay.X`, so a hook cannot set an overlay xattr of
+///   the image.
+///
+/// After each call, the export checks the xattrs of the node against the
+/// first two limits of the image ([`Repo::export_composefs`], "Limits"): the
+/// length of a name and the xattr budget of the inode. It also refuses an
+/// empty name, a name with a NUL byte, and a name that occurs two times. Each
+/// refusal is [`Error::Unsupported`]. The check also covers the added
+/// top-level directories, so a hook cannot make the image writer panic.
+///
+/// The xattrs of a symlink share the block of the inode with the target. The
+/// image writer refuses with [`Error::Unsupported`] a symlink whose xattrs and
+/// target do not fit in the block.
+///
+/// The image writer adds a whiteout stub to the root for each name `00` to
+/// `ff` that the root does not hold. The stubs are not nodes of the tree, so
+/// the hook gets no call for them. Each stub is a character device 0:0 with
+/// the mode `0644`. It takes the uid, the gid, the mtime, and the
+/// `security.selinux` xattr that the root has after the hook. A stub has no
+/// other xattr.
+///
+/// The export calls the hook on the thread of its async task, one time for
+/// each node, between the reads of the objects. The export does not call the
+/// hook on the blocking pool. A hook that blocks or runs for a long time stops
+/// the other tasks on that thread. The caller therefore loads the policy
+/// before the export, and the hook does no I/O.
+///
+/// The export keeps the metadata of each node, with its xattrs, in memory
+/// until it writes the image. Each xattr that the hook adds thus uses memory
+/// for each node that gets it.
+///
+/// If the hook returns an error, the export stops and returns that error
+/// unchanged. The hook is `Sync`, so several exports can share one hook at the
+/// same time.
 pub type ComposefsEntryFn<'a> = &'a (dyn Fn(&Path, EntryKind, &mut Metadata) -> Result<()> + Sync);
 
 /// The inputs of one walk of a tree that are the same for each node.
@@ -305,16 +466,16 @@ impl Transaction {
     /// ([`Repo::export_composefs`]). The call reads the objects of the tree as
     /// [`composefs_digest`](Transaction::composefs_digest) reads them.
     ///
-    /// `filter` is a hook, as in [`Repo::export_composefs`]. The hook gets one
-    /// call for each node of the tree, and for each top-level directory that
-    /// the call adds to the image. The whiteout stubs of the image get no
-    /// call. With `None`, the call uses no hook.
+    /// `filter` is an entry hook. [`ComposefsEntryFn`] states its rules. The
+    /// hook gets one call for each node of the tree, and for each top-level
+    /// directory that the call adds to the image. The whiteout stubs of the
+    /// image get no call. With `None`, the call uses no hook.
     ///
     /// `meta` is the owner, the mode, and the xattrs of the content object.
     /// The caller sets them.
     ///
-    /// The call writes the image in two steps, and each step holds no
-    /// image-sized buffer:
+    /// The call writes the image in two steps, and no step holds a buffer of
+    /// the image bytes:
     ///
     /// 1. On the blocking pool, the writer writes the image to an unnamed temp
     ///    file of the staging directory and computes the fs-verity digest as
@@ -325,9 +486,14 @@ impl Transaction {
     ///    the sync of the transaction, and counts the object in the
     ///    free-space budget.
     ///
-    /// The image therefore goes to disk two times. The temp file goes away
-    /// when the call returns. In an `archive` repository, the content object
+    /// The image therefore goes to disk two times. The temp file does not
+    /// count in the free-space budget. During step 2, the disk holds the temp
+    /// file and the content object at the same time. The temp file goes away
+    /// before the call returns. In an `archive` repository, the content object
     /// is a `.filez` object.
+    ///
+    /// The model of the tree, with the metadata and the xattrs of each node,
+    /// stays in memory until step 1 writes the image.
     ///
     /// # Errors
     ///
@@ -382,10 +548,10 @@ impl Repo {
     /// the digest is different from that value. The image assembly runs on the
     /// blocking pool.
     ///
-    /// `filter` is a hook that the export calls one time for each node of the
-    /// tree, and for each top-level directory that the export adds. The
-    /// whiteout stubs of the image get no call. With `None`, the export calls
-    /// no hook.
+    /// `filter` is an entry hook. The export calls it one time for each node of
+    /// the tree, and for each top-level directory that it adds. The whiteout
+    /// stubs of the image get no call. [`ComposefsEntryFn`] states the rules of
+    /// the hook. With `None`, the export calls no hook.
     ///
     /// # Tree model
     ///
@@ -406,6 +572,18 @@ impl Repo {
     /// command adds: `boot`, `etc`, `sysroot`, `usr`, and `var`. Each one has
     /// the mode `040755` and the uid and gid 0. If the root of the commit
     /// already holds one of these names, the entry of the commit stays.
+    ///
+    /// The export gives the metadata of each node to the hook `filter`, the
+    /// added top-level directories included. The hook can change the mode, the
+    /// owner, the mtime, and the xattrs. The image holds the metadata after the
+    /// hook. The image writer escapes an xattr name `trusted.overlay.X` as
+    /// `trusted.overlay.overlay.X`.
+    ///
+    /// The image writer adds a whiteout stub to the root for each name `00` to
+    /// `ff` that the root does not hold, and sets `trusted.overlay.opaque` to
+    /// `y` on the root. Each stub takes the owner, the mtime, and the
+    /// `security.selinux` xattr of the root after the hook.
+    /// [`ComposefsEntryFn`] states the rules.
     ///
     /// # Verity digests
     ///
@@ -434,13 +612,13 @@ impl Repo {
     ///
     /// The export runs in every repository mode. The EROFS metadata of each
     /// file comes from the file object, as [`Repo::load_file`] reads it in the
-    /// mode of the repository. The image stores the logical uid and gid of
-    /// each file, whoever runs the export. composefs presents the ownership
-    /// through uid mapping at mount.
+    /// mode of the repository. The hook `filter` can change this metadata. The
+    /// image stores the logical uid and gid of each file, whoever runs the
+    /// export. composefs presents the ownership through uid mapping at mount.
     ///
-    /// The image depends on the committed tree alone. Each regular file
-    /// redirects to its `.file` loose path, the form that a composefs backing
-    /// store holds. Each digest covers the content of the file, so a
+    /// The image depends on the committed tree and the hook alone. Each regular
+    /// file redirects to its `.file` loose path, the form that a composefs
+    /// backing store holds. Each digest covers the content of the file, so a
     /// repository of any mode that holds the tree gives the same image and
     /// digest.
     ///
@@ -474,6 +652,9 @@ impl Repo {
     ///   same trees with `File name too long`. A file system holds no name
     ///   this long. A tar import can produce one.
     /// - A child name that is empty, is `.` or `..`, or holds `/`.
+    ///
+    /// The export checks the first two limits on the xattrs of each node after
+    /// the hook `filter`, the added top-level directories included.
     ///
     /// # Errors
     ///
@@ -514,8 +695,10 @@ impl Repo {
     /// the same hook `filter`, the same repository modes, and the same limits.
     ///
     /// The call writes the image to the file descriptor as it serializes it.
-    /// The output is append-only, so the call holds no image-sized buffer. It
-    /// writes `out` from its current offset and never seeks it. If the call
+    /// The output is append-only, so the call holds no buffer of the image
+    /// bytes. The model of the tree, with the metadata and the xattrs of each
+    /// node, stays in memory until the image is written. The call writes `out`
+    /// from its current offset and never seeks it. If the call
     /// fails, the bytes that it already wrote stay in `out`.
     ///
     /// # Errors

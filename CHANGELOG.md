@@ -23,10 +23,10 @@ the release before it. An item that starts with `Fix:` corrects a defect.
   time for each node of the tree, and for each top-level directory that the
   export adds. Each call gets the absolute path of the node, its `EntryKind`,
   and its `Metadata`. The whiteout stubs get no call. The hook can change the
-  mode, the owner, the mtime, and the xattrs. An error of the hook stops the export, and the
-  export returns that error. `Transaction::write_composefs_content` takes
-  the same hook after `opts`, and `Transaction::write_composefs_commit`
-  takes it after `root`.
+  mode, the owner, the mtime, and the xattrs. An error of the hook stops the
+  export, and the export returns that error.
+  `Transaction::write_composefs_content` takes the same hook after `opts`,
+  and `Transaction::write_composefs_commit` takes it after `root`.
 - After the hook, the export checks the xattrs of each inode. It refuses with
   `Error::Unsupported` a name longer than 255 bytes, more than 32755 bytes of
   xattrs on one inode, an empty name, a name with a NUL byte, and a name that

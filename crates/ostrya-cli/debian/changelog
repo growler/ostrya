@@ -1,8 +1,37 @@
-ostrya (0.14.0) UNRELEASED; urgency=medium
+ostrya (0.14.0) unstable; urgency=medium
 
-  * New upstream release.
+  * pull takes the commit operands CHECKSUM, REF@CHECKSUM, and
+    @ID:REF@CHECKSUM. The pull fetches the named commit, and reads no
+    summary entry and no ref file of the remote for it. CHECKSUM writes
+    no ref, and the other forms write their ref to the commit. A pull
+    whose operands are all commit operands requests no summary and no
+    summary.sig.
+  * pull --collection takes the same commit operands. The pull takes
+    the commit from the first candidate in the order of the config that
+    serves its commit object.
+  * pull-local takes the commit operands CHECKSUM, REF@CHECKSUM, and
+    @ID:REF@CHECKSUM, where REF can also be REMOTE:NAME. The pull reads
+    no ref of the source for them.
+  * pull, pull --collection, pull-local, media export, and media import
+    read field 2 of an attachment that the repository holds complete,
+    and take the attachments below it, level by level. receive and
+    serve check the attachments below such an attachment or new commit.
+  * commit --generate-composefs writes the composefs image of the tree
+    as an image commit, whose tree holds the file /root.cfs, and names
+    the image commit as the attachment composefs of the commit. Each
+    transfer that carries attachments carries the image commit. The
+    option refuses --related with the name composefs.
+  * composefs-image --add writes the image commit of a commit and names
+    it as the supplement composefs of the commit. composefs-image
+    --get-path and --check are refused.
+  * The repository keeps no image files below
+    extensions/ostrya/composefs. The config key [ex-ostrya]
+    generate-composefs has no effect. fsck, prune, and receive read and
+    write no image files.
+  * Fix: pull-local SRC CHECKSUM read the checksum as a ref name. It
+    imports the commit and writes no ref.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 18 Nov 2026 11:19:55 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 22 Nov 2026 08:05:49 +0100
 
 ostrya (0.13.0) unstable; urgency=medium
 

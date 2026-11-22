@@ -1,8 +1,14 @@
-ostrya-mountd (0.14.0) UNRELEASED; urgency=medium
+ostrya-mountd (0.14.0) unstable; urgency=medium
 
-  * New upstream release.
+  * The mount helper mount.ostrya runs for "mount -t ostrya". For root
+    in the initial user namespace, it mounts the image of the commit in
+    its own process. For each other caller, it asks the daemon.
+  * The daemon mounts the image of the image commit that a commit names
+    as the attachment composefs, or else as the supplement composefs.
+    It reads no image file below extensions/ostrya/composefs. It refuses
+    an image whose size is not a positive multiple of 4096 bytes.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 18 Nov 2026 11:19:55 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 22 Nov 2026 08:05:49 +0100
 
 ostrya-mountd (0.13.0) unstable; urgency=medium
 

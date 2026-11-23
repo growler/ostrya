@@ -254,7 +254,9 @@ pub fn memfd_name(commit: &Checksum) -> String {
 }
 
 /// Builds the image of `commit` into a sealed memory file, with the verity
-/// policy that [`verity_of`] gives for `repo`.
+/// policy that [`verity_of`] gives for `repo`. Under `verity=require`, the
+/// build compares the digest of the image with the key of the commit, if the
+/// commit carries the key.
 pub async fn built_image(repo: &Repo, commit: &Checksum) -> OwnedFd {
     let (_, policy) = verity_of(repo);
     let image = ostrya_sys::sealable_memfd(&memfd_name(commit)).unwrap();

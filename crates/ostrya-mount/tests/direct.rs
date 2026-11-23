@@ -18,7 +18,8 @@
 //!   With `verity=off`, the same object reads its new bytes.
 //! - An image that the test builds in a memory file and the image of the
 //!   image commit give the same tree, with `verity=off` and with
-//!   `verity=require`.
+//!   `verity=require`. With `verity=require`, the build compares the digest
+//!   of the image with the key of the commit.
 //! - The unmount detaches the loop device, for the image file of an image
 //!   commit and for a memory file.
 //! - A read-write mount writes each change to `<target>/overlay`, and the

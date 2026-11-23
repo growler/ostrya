@@ -1266,6 +1266,43 @@ pub fn write_image_unhashed_to(
     out: &mut impl Write,
     max_size: u64,
 ) -> Result<u64, Error> {
+    let (size, _) = bounded(root, out, max_size, None)?;
+    Ok(size)
+}
+
+/// Writes the composefs EROFS image of the tree at `root` through `out`.
+/// Returns the size of the image in bytes and its fs-verity digest.
+///
+/// The bytes and the digest are those of [`write_image_to`]. The call computes
+/// the size of the image before it writes, and refuses an image larger than
+/// `max_size` bytes with no write. The digest comes from the bytes as the call
+/// writes them.
+///
+/// The function is not a stable API.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if the image is larger than `max_size` bytes.
+/// - The errors of [`write_image_to`].
+#[doc(hidden)]
+pub fn write_image_bounded_to(
+    root: &Directory,
+    out: &mut impl Write,
+    max_size: u64,
+) -> Result<(u64, [u8; 32]), Error> {
+    let (size, digest) = bounded(root, out, max_size, Some(FsVerityHasher::new()))?;
+    Ok((size, digest.expect("the pass has a hasher")))
+}
+
+/// Plans the image of `root`, refuses it with no write if it is larger than
+/// `max_size` bytes, and runs the emitting pass with `hasher`. Returns the size
+/// of the image and the digest of `emit_with`.
+fn bounded(
+    root: &Directory,
+    out: &mut impl Write,
+    max_size: u64,
+    hasher: Option<FsVerityHasher>,
+) -> Result<(u64, Option<[u8; 32]>), Error> {
     let plan = plan(root)?;
     let size = plan.size as u64;
     if size > max_size {
@@ -1273,8 +1310,8 @@ pub fn write_image_unhashed_to(
             "the image is {size} bytes, more than the limit of {max_size} bytes"
         )));
     }
-    emit_with(&plan, out, None)?;
-    Ok(size)
+    let digest = emit_with(&plan, out, hasher)?;
+    Ok((size, digest))
 }
 
 #[cfg(test)]
@@ -1346,6 +1383,39 @@ mod tests {
         assert_eq!(sink.written, 64, "the sink took bytes after it failed");
         assert_eq!(sink.errors, 1, "the sink was written to after it failed");
         assert_eq!(sink.flushes, 0, "a failed emission flushed the sink");
+    }
+
+    /// The bounded writer gives the bytes and the digest of `write_image_to`.
+    /// A limit one byte below the size refuses the image with no write.
+    #[test]
+    fn the_bounded_writer_hashes_and_caps_the_image() {
+        let root = small_tree();
+        let mut want = Vec::new();
+        let want_digest = write_image_to(&root, &mut want).expect("the image writes");
+        let size = want.len() as u64;
+
+        let mut got = Vec::new();
+        let (got_size, got_digest) =
+            write_image_bounded_to(&root, &mut got, size).expect("the image fits the limit");
+        assert_eq!(got_size, size, "the bounded writer gave another size");
+        assert_eq!(got, want, "the bounded writer wrote other bytes");
+        assert_eq!(
+            got_digest, want_digest,
+            "the bounded writer gave another digest"
+        );
+
+        let mut sink = FailingSink {
+            left: usize::MAX,
+            ..Default::default()
+        };
+        let err = write_image_bounded_to(&root, &mut sink, size - 1)
+            .expect_err("the image is larger than the limit");
+        assert!(
+            matches!(&err, Error::Unsupported(_)),
+            "the refusal reached the caller as {err:?}"
+        );
+        assert_eq!(sink.written, 0, "the refused image wrote bytes");
+        assert_eq!(sink.flushes, 0, "the refused image flushed the sink");
     }
 
     /// Returns `small_tree` plus one symlink with a target of `len` bytes and

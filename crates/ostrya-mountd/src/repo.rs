@@ -20,7 +20,8 @@ pub(crate) const DEFAULT_MAX_IMAGE_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Debug)]
 pub(crate) enum Error {
     /// An error of the repository: a failed open, an image commit with a
-    /// defect, a failed export, or a malformed config value.
+    /// defect, a failed export, a built image whose digest is not the key,
+    /// or a malformed config value.
     Repo(ostrya::Error),
     /// A repository whose mode a composefs mount cannot read. Only `archive`
     /// gives this error.
@@ -168,7 +169,10 @@ pub(crate) async fn open_named_image(repo: &Repo, commit: &Checksum) -> Result<O
 ///
 /// The build refuses an image larger than `max_size` bytes before it writes
 /// a byte. Under [`VerityPolicy::Computed`], it takes the digest of each
-/// backing object from the kernel, and refuses an object with no seal.
+/// backing object from the kernel, and refuses an object with no seal. If
+/// the commit also carries the key `ostree.composefs.digest.v0`, the build
+/// compares the digest of the image with the key, and a mismatch fails the
+/// build before the seal.
 pub(crate) async fn build_image(
     repo: &Repo,
     commit: &Checksum,

@@ -139,6 +139,36 @@ pub fn require_root() -> bool {
     capable
 }
 
+/// Returns `true` if the file system of `dir` seals a file with fs-verity.
+/// Without fs-verity, the test skips and prints a message. If
+/// [`REQUIRE_MOUNT`] is set, a file system without fs-verity fails the test.
+pub fn require_verity(dir: &Path) -> bool {
+    let probe = dir.join("verity-probe");
+    std::fs::write(&probe, b"probe\n").unwrap();
+    let ro = std::fs::File::open(&probe).unwrap();
+    let mut attempts = 0;
+    let sealed = loop {
+        attempts += 1;
+        match ostrya_sys::enable_verity(ro.as_fd()) {
+            Err(rustix::io::Errno::TXTBSY) if attempts < 50 => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => break result.is_ok(),
+        }
+    };
+    drop(ro);
+    let _ = std::fs::remove_file(&probe);
+    if !sealed {
+        assert!(
+            std::env::var_os(REQUIRE_MOUNT).is_none(),
+            "{REQUIRE_MOUNT} is set and {} has no fs-verity",
+            dir.display()
+        );
+        eprintln!("skipped: the file system has no fs-verity");
+    }
+    sealed
+}
+
 /// The tree, the repository, and the commits of a test.
 pub struct Fixture {
     pub scratch: Scratch,

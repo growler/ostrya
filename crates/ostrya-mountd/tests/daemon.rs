@@ -36,6 +36,11 @@
 //! - The refusal of a supplement image commit whose `/root.cfs` is not the
 //!   key of the commit names the commit and the image commit, and neither
 //!   digest.
+//! - Under `[ex-integrity] fsverity=yes`, op 2 mounts a commit with the
+//!   right key and a commit with no key, and refuses a commit with a wrong
+//!   key with the class `repository` and a text that names the commit and
+//!   neither digest. With no `fsverity`, op 2 mounts a commit with a wrong
+//!   key. This test also skips if the file system has no fs-verity.
 //! - Each mount of the daemon has `nosuid` and `nodev`. A setuid file in a
 //!   read-only and in a read-write mount does not change the user id of a
 //!   process that runs it, and a device node in the image does not open.
@@ -60,8 +65,8 @@ use std::time::{Duration, Instant};
 
 use common::{
     ChildGuard, Fixture, HELLO, Named, OWN_NAMESPACES, Unmount, commit_named, file_object_path,
-    fixture_root, image_commit_of, key_dict, mounts_at, require_root, root_cfs_of, wait_for_path,
-    write_source,
+    fixture_root, image_commit_of, key_dict, mounts_at, require_root, require_verity, root_cfs_of,
+    wait_for_path, write_source,
 };
 use ostrya::{
     COMPOSEFS_RELATION, Checksum, CommitOptions, ComposefsOptions, CreateOptions, Repo, RepoMode,
@@ -996,6 +1001,101 @@ fn op_1_refuses_a_commit_with_no_image_commit() {
     assert!(mounts_at(&target).is_empty());
     req.built = true;
     let outcome = fx.client(&sock, &req, true);
+    assert!(outcome.starts_with("mounted 1 "), "{outcome}");
+    assert_no_temp_dirs(&fx);
+}
+
+/// Commits the tree `root` with the subject `subject` and no image commit.
+/// The commit carries `key` under the image key, or no key for `None`.
+async fn commit_with_key(
+    repo: &Repo,
+    root: &ostrya::RepoTree,
+    subject: &str,
+    key: Option<&[u8; 32]>,
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let opts = CommitOptions {
+        subject: Some(subject.to_owned()),
+        timestamp: Some(1),
+        metadata: key.map(key_dict),
+        ..CommitOptions::default()
+    };
+    let commit = txn.write_commit(opts, root).await.unwrap();
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Op 2 compares the digest of a built image with the key of the commit
+/// under `[ex-integrity] fsverity=yes` alone. In such a repository, a commit
+/// with the right key and a commit with no key mount, and a commit with a
+/// wrong key is refused with the class `repository` and a text that names
+/// the commit and neither digest. In a repository with no `fsverity`, a
+/// commit with a wrong key mounts. Skips if the file system has no
+/// fs-verity.
+#[test]
+fn op_2_compares_the_key_only_under_fsverity_yes() {
+    if !require_root() {
+        return;
+    }
+    let fx = Fixture::new("op2-key");
+    if !require_verity(fx.scratch.path()) {
+        return;
+    }
+    let sock = fx.scratch.path().join("mountd.sock");
+    let _daemon = fx.standalone(&sock, None, 60);
+    let verity = fx.scratch.path().join("verity");
+    let (right, plain, wrong, digest) = ostrya_rt::block_on(async {
+        let repo = Repo::create(&verity, CreateOptions::new(RepoMode::BareUser))
+            .await
+            .unwrap();
+        drop(repo);
+        let mut config = std::fs::OpenOptions::new()
+            .append(true)
+            .open(verity.join("config"))
+            .unwrap();
+        config.write_all(b"[ex-integrity]\nfsverity=yes\n").unwrap();
+        drop(config);
+        let repo = Repo::open(&verity).await.unwrap();
+        let root = write_source(&repo, fx.scratch.path()).await;
+        let plain = commit_with_key(&repo, &root, "no key", None).await;
+        let digest = repo
+            .export_composefs(&plain, &ComposefsOptions::RECORDED, None)
+            .await
+            .unwrap()
+            .fs_verity;
+        let right = commit_with_key(&repo, &root, "right key", Some(&digest)).await;
+        let wrong = commit_with_key(&repo, &root, "wrong key", Some(&[0x11; 32])).await;
+        (right, plain, wrong, digest)
+    });
+    let request = |repo: &Path, commit: Checksum, name: &str| ClientRequest {
+        repo: repo.to_owned(),
+        commit,
+        target: fx.target(name),
+        built: true,
+        access: Access::ReadOnly,
+        times: 1,
+    };
+    for (name, commit) in [("right", right), ("plain", plain)] {
+        let outcome = fx.client(&sock, &request(&verity, commit, name), true);
+        assert!(outcome.starts_with("mounted 1 "), "{name}: {outcome}");
+    }
+
+    let outcome = fx.client(&sock, &request(&verity, wrong, "wrong"), true);
+    assert_eq!(
+        outcome,
+        format!(
+            "refused {}: composefs image of commit {wrong}: the built image does not match \
+             the key of the commit",
+            HelperCode::Repository
+        )
+    );
+    assert!(!outcome.contains(&Checksum::from_bytes(digest).to_hex()));
+
+    let off = ostrya_rt::block_on(async {
+        let (repo, root) = fixture_root(&fx).await;
+        commit_with_key(&repo, &root, "wrong key", Some(&[0x11; 32])).await
+    });
+    let outcome = fx.client(&sock, &request(&fx.repo, off, "off"), true);
     assert!(outcome.starts_with("mounted 1 "), "{outcome}");
     assert_no_temp_dirs(&fx);
 }

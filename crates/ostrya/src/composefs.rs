@@ -122,7 +122,7 @@ use std::pin::Pin;
 
 use ostrya_composefs::{
     Content, Directory, Error as WriterError, FsVerityHasher, Image, Metadata, Node, Regular,
-    Symlink, build_image, write_image_to, write_image_unhashed_to,
+    Symlink, build_image, write_image_bounded_to, write_image_to, write_image_unhashed_to,
 };
 use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
@@ -758,7 +758,15 @@ impl Repo {
     ///   of each backed file from the kernel alone, and reads no payload. An
     ///   object with no seal, or with a seal of other parameters, fails the
     ///   call. An overlay with `verity=require` cannot open such an object.
-    /// - The call computes no fs-verity digest of the image.
+    /// - Under [`VerityPolicy::Computed`], if the commit carries the key
+    ///   `ostree.composefs.digest.v0`, the call computes the fs-verity digest
+    ///   of the image as it writes the image, and compares the digest with
+    ///   the key. A digest other than the key fails the call after the write,
+    ///   and the bytes stay in `out`. The call reads the key before it walks
+    ///   the tree.
+    /// - Under [`VerityPolicy::Disabled`], or if the commit carries no key,
+    ///   the call computes no fs-verity digest of the image. Under
+    ///   [`VerityPolicy::Disabled`] the call does not read the key.
     /// - The call computes the size of the image before it writes, and
     ///   refuses an image larger than `max_size` bytes with no write.
     ///
@@ -766,9 +774,13 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] under [`VerityPolicy::Computed`] if the
+    ///   value of the key is not a variant of type `ay` with 32 bytes.
     /// - [`Error::Unsupported`] if a backed file has no seal under
     ///   [`VerityPolicy::Computed`], or if the image is larger than
     ///   `max_size` bytes.
+    /// - [`Error::ComposefsDigestMismatch`] under [`VerityPolicy::Computed`]
+    ///   if the fs-verity digest of the image is not the key.
     /// - The errors of [`export_composefs_to`](Repo::export_composefs_to).
     #[doc(hidden)]
     pub async fn export_composefs_for_mount(
@@ -778,18 +790,37 @@ impl Repo {
         out: BorrowedFd<'_>,
         max_size: u64,
     ) -> Result<u64> {
-        let digests = match verity {
-            VerityPolicy::Computed => Digests::Sealed,
-            VerityPolicy::Disabled => Digests::Disabled,
+        let (commit_obj, _) = self.load_commit(commit).await?;
+        let (digests, key) = match verity {
+            VerityPolicy::Computed => (Digests::Sealed, recorded_digest(&commit_obj)?),
+            VerityPolicy::Disabled => (Digests::Disabled, None),
         };
-        let dir = self.composefs_export_model(commit, digests, None).await?;
+        let dir = self
+            .composefs_commit_model(&commit_obj, digests, None)
+            .await?;
         let fd = out.try_clone_to_owned()?;
-        ostrya_rt::unblock(move || {
+        let hash = key.is_some();
+        let (size, actual) = ostrya_rt::unblock(move || {
             let mut out = BufWriter::with_capacity(DIGEST_CHUNK, std::fs::File::from(fd));
-            write_image_unhashed_to(&dir, &mut out, max_size)
+            if hash {
+                write_image_bounded_to(&dir, &mut out, max_size)
+                    .map(|(size, digest)| (size, Some(digest)))
+            } else {
+                write_image_unhashed_to(&dir, &mut out, max_size).map(|size| (size, None))
+            }
         })
         .await
-        .map_err(writer_error)
+        .map_err(writer_error)?;
+        if let (Some(expected), Some(actual)) = (key, actual)
+            && expected != actual
+        {
+            return Err(Error::ComposefsDigestMismatch {
+                commit: *commit,
+                expected,
+                actual,
+            });
+        }
+        Ok(size)
     }
 
     /// Returns the composefs tree model of the root of `commit`. The two

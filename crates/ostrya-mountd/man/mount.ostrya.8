@@ -133,6 +133,13 @@ multiple of 4096 bytes. A defect of the selected
 image commit stops the mount, and the helper does not try the next
 source.
 .PP
+For a built image, if the repository sets \fB[ex\-integrity] fsverity=yes\fR,
+the image takes the fs-verity digest of each backing object from the
+kernel, and an object with no fs-verity seal stops the mount. If the commit
+also carries the key \fBostree.composefs.digest.v0\fR, the fs-verity digest
+of the built image must be the value of the key. With another value of
+\fBfsverity\fR, the helper does not compare a built image with the key.
+.PP
 On the daemon path, the helper reads the two fields of the commit. If one
 of them has an entry \fBcomposefs\fR, the helper asks the daemon for the
 image of the image commit. Else it asks the daemon to build the image.

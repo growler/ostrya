@@ -169,9 +169,13 @@ impl Helper {
     /// the image to a sealed memory file and attaches the file to the loop
     /// device. With `[ex-integrity] fsverity=yes`, the image carries the
     /// fs-verity digest that the kernel holds for each backing object, and a
-    /// backing object with no fs-verity seal fails the request. The memory
-    /// of the image counts against the memory cgroup of the daemon until
-    /// the unmount.
+    /// backing object with no fs-verity seal fails the request. If the commit
+    /// also carries the key `ostree.composefs.digest.v0`, the fs-verity
+    /// digest of the built image must be the key, or the daemon refuses the
+    /// request with [`HelperCode::Repository`]. With another value of
+    /// `fsverity`, the daemon does not compare the image with the key. The
+    /// memory of the image counts against the memory cgroup of the daemon
+    /// until the unmount.
     ///
     /// Returns a descriptor of the root of the new mount. The descriptor
     /// keeps the mount in use, so close it before [`Helper::unmount`].

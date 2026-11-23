@@ -51,7 +51,7 @@ pub use fsverity::FsVerityHasher;
 pub use tree::{Content, Directory, Metadata, Node, Regular, Symlink};
 pub use writer::write_image_to;
 #[doc(hidden)]
-pub use writer::write_image_unhashed_to;
+pub use writer::{write_image_bounded_to, write_image_unhashed_to};
 
 /// The error of [`build_image`] and [`write_image_to`].
 #[derive(Debug)]

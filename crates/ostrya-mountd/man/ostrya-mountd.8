@@ -126,7 +126,18 @@ composefs\fR. The daemon does not copy the image. If the file object of
 \fB/root.cfs\fR is not sealed with fs-verity, a process that can write it
 can change the image while it is mounted. For a built image, the daemon
 writes the image to a sealed memory file. It refuses a built image larger
-than \fB\-\-max\-image\-size\fR before it writes the image.
+than \fB\-\-max\-image\-size\fR before it writes the image. If the
+repository sets \fB[ex\-integrity] fsverity=yes\fR, the built image takes
+the fs-verity digest of each backing object from the kernel, and an object
+with no fs-verity seal fails the request. If the commit also carries the key
+\fBostree.composefs.digest.v0\fR, the fs-verity digest of the built image
+must be the value of the key. If the two are different, the daemon refuses
+the request with the code \fBrepository\fR and the text
+\fBcomposefs image of commit\fR \fIchecksum\fB: the built image does not
+match the key of the commit\fR. The text holds neither digest. With
+another value of \fBfsverity\fR, the daemon does not compare a built image
+with the key. The daemon builds and mounts the image of a commit that
+carries no key with no check of the image.
 .IP 4. 4
 The daemon attaches the image to a loop device and mounts it as EROFS
 with the ID mapping of the user namespace of the request. It stacks the
@@ -192,10 +203,19 @@ The daemon mounts the image of a supplement only if the commit carries
 the key \fBostree.composefs.digest.v0\fR and the digest of the image
 matches the key. For an attachment, the checksum chain from the commit to
 \fB/root.cfs\fR binds the image to the commit, and the daemon does not
-compare the key. The checks guard against damage and against a writer of
-the repository other than the caller. They do not guard against the
-caller, who can write both the image commit and the commit. A refusal
-tells the caller if the image commit exists.
+compare the key. If the repository sets \fB[ex\-integrity] fsverity=yes\fR,
+the daemon mounts a built image of a commit that carries the key only if
+the digest of the image matches the key. With another value of
+\fBfsverity\fR, the daemon does not compare a built image with the key. A
+writer of the repository can then change the mode, the owner, or the
+xattrs of a loose object, and the built image shows the change. A built
+image of a commit with no key gets no comparison under each value of
+\fBfsverity\fR, and has the same exposure. fs-verity seals the content of a
+file. It does not seal the mode, the owner, or the xattrs. The checks
+guard against damage and against a writer of the repository other than the
+caller. They do not guard against the caller, who can write both the image
+commit and the commit. A refusal tells the caller if the image commit
+exists.
 .IP \(bu 2
 Each mount of the daemon has \fBnosuid\fR and \fBnodev\fR. The top overlay
 belongs to the user namespace of the caller, so the caller can clear the

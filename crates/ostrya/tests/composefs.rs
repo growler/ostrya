@@ -43,6 +43,15 @@
 //! writes no composefs fixture if its `ostree` command has no composefs
 //! support, or if `composefs-info` is not available.
 //!
+//! The export for a mount under [`VerityPolicy::Computed`] compares the
+//! fs-verity digest of the image with the key of the commit. One test shows
+//! that a commit with no key and a commit with the right key give the image of
+//! the [`ComposefsOptions::RECORDED`] export, that a wrong key fails the export
+//! after the write, and that a malformed key fails it before the write and
+//! before the walk of the tree. A
+//! second test shows that the export under [`VerityPolicy::Disabled`] does not
+//! read the key.
+//!
 //! The tests that seal objects also skip if the file system has no fs-verity.
 //! All other tests read no composefs fixture and always run.
 //!
@@ -59,15 +68,15 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ostrya::{
     Checksum, CommitOptions, ComposefsEntryFn, ComposefsOptions, CreateOptions, DirMeta, EntryKind,
-    Error, FileMeta, Metadata, MutableTree, Repo, RepoMode, VerityPolicy,
+    Error, FileMeta, Metadata, MutableTree, Repo, RepoMode, Value, VerityPolicy,
 };
 use ostrya_composefs::FsVerityHasher;
 use ostrya_core::{ObjectType, Xattrs, loose_path};
 use ostrya_rt::block_on;
 
 use common::composefs::{
-    build_owned_source, commit_owned, composefs_dir, manifest_digest, new_repo,
-    scratch_fixture_repo,
+    DIGEST_KEY, build_owned_source, commit_owned, composefs_dir, dict, key_dict, manifest_digest,
+    new_repo, scratch_fixture_repo, verity_supported,
 };
 use common::{COMMIT, HELLO_TXT, TmpDir, fixture_repo};
 
@@ -1183,6 +1192,173 @@ fn the_mount_export_writes_the_export_and_refuses_an_unsealed_object() {
             .unwrap();
         drop(file);
         assert_eq!(std::fs::read(&image_path).unwrap(), want.bytes);
+    });
+}
+
+/// Stores a copy of the commit `commit` with the metadata `metadata`, and
+/// returns the checksum of the copy.
+async fn store_with_metadata(repo: &Repo, commit: &Checksum, metadata: Value) -> Checksum {
+    let (mut obj, _) = repo.load_commit(commit).await.unwrap();
+    obj.metadata = metadata;
+    let txn = repo.transaction().await.unwrap();
+    let written = txn
+        .write_metadata(ObjectType::Commit, None, &obj.serialize().unwrap())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    written
+}
+
+/// Removes each file object of the repository at `repo_dir`, and returns the
+/// number of objects that it removed.
+fn remove_file_objects(repo_dir: &Path) -> usize {
+    let mut removed = 0;
+    for fanout in std::fs::read_dir(repo_dir.join("objects")).unwrap() {
+        let fanout = fanout.unwrap().path();
+        if !fanout.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&fanout).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|e| e == "file") {
+                std::fs::remove_file(&path).unwrap();
+                removed += 1;
+            }
+        }
+    }
+    removed
+}
+
+/// Writes the export for a mount of `commit` under `verity` to `path`.
+/// Returns the result of the export and the bytes of the file.
+async fn mount_export(
+    repo: &Repo,
+    commit: &Checksum,
+    verity: VerityPolicy,
+    path: &Path,
+) -> (Result<u64, Error>, Vec<u8>) {
+    let file = std::fs::File::create(path).unwrap();
+    let result = repo
+        .export_composefs_for_mount(commit, verity, file.as_fd(), u64::MAX)
+        .await;
+    drop(file);
+    (result, std::fs::read(path).unwrap())
+}
+
+/// Under `Computed`, the export for a mount compares the fs-verity digest of
+/// the image with the key of the commit. A commit with no key and a commit
+/// with the right key give the image of the `RECORDED` export. A wrong key
+/// fails the export after the write. A malformed key fails it before the
+/// write and before the walk of the tree: with no file object in the
+/// repository, the export fails with `InvalidFormat`. Skips if the file system
+/// has no fs-verity.
+#[test]
+fn the_mount_export_compares_the_key_under_computed() {
+    let scratch = TmpDir::new("composefs-mount-key");
+    if !verity_supported(scratch.path()) {
+        eprintln!("skipping: filesystem lacks fs-verity");
+        return;
+    }
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let image_path = scratch.path().join("mount.cfs");
+    let repo_dir = scratch.path().join("repo");
+
+    block_on(async {
+        let repo = new_repo(
+            &repo_dir,
+            RepoMode::BareUser,
+            "[ex-integrity]\nfsverity=yes\n",
+        )
+        .await;
+        let plain = commit_owned(&repo, &base).await;
+        let txn = repo.transaction().await.unwrap();
+        let keyed = repo
+            .commit_add_composefs_metadata(&txn, &plain)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let wrong = store_with_metadata(&repo, &plain, key_dict(&[0x11; 32])).await;
+        let malformed = store_with_metadata(
+            &repo,
+            &plain,
+            dict(DIGEST_KEY, "ay", Value::Bytes(vec![0x11; 31])),
+        )
+        .await;
+        let want = repo
+            .export_composefs(&plain, &ComposefsOptions::RECORDED, None)
+            .await
+            .unwrap();
+
+        for commit in [&plain, &keyed] {
+            let (result, bytes) =
+                mount_export(&repo, commit, VerityPolicy::Computed, &image_path).await;
+            assert_eq!(result.unwrap(), want.bytes.len() as u64, "commit {commit}");
+            assert_eq!(bytes, want.bytes, "commit {commit}");
+        }
+
+        let (result, bytes) =
+            mount_export(&repo, &wrong, VerityPolicy::Computed, &image_path).await;
+        match result.unwrap_err() {
+            Error::ComposefsDigestMismatch {
+                commit,
+                expected,
+                actual,
+            } => {
+                assert_eq!(commit, wrong);
+                assert_eq!(expected, [0x11; 32]);
+                assert_eq!(actual, want.fs_verity);
+            }
+            other => panic!("expected ComposefsDigestMismatch, got {other:?}"),
+        }
+        assert_eq!(bytes, want.bytes, "the image stays in the file");
+
+        assert!(remove_file_objects(&repo_dir) > 0);
+        let (result, _) = mount_export(&repo, &plain, VerityPolicy::Computed, &image_path).await;
+        let err = result.unwrap_err();
+        assert!(matches!(&err, Error::ObjectNotFound { .. }), "{err:?}");
+
+        let (result, bytes) =
+            mount_export(&repo, &malformed, VerityPolicy::Computed, &image_path).await;
+        let err = result.unwrap_err();
+        assert!(matches!(&err, Error::InvalidFormat(_)), "{err:?}");
+        assert!(bytes.is_empty(), "a malformed key fails before the write");
+    });
+}
+
+/// Under `Disabled`, the export for a mount does not read the key. A wrong key
+/// and a malformed key give the image of the `Disabled` export.
+#[test]
+fn the_mount_export_makes_no_comparison_under_disabled() {
+    let scratch = TmpDir::new("composefs-mount-nokey");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    let image_path = scratch.path().join("mount.cfs");
+
+    block_on(async {
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
+        let plain = commit_owned(&repo, &base).await;
+        let wrong = store_with_metadata(&repo, &plain, key_dict(&[0x11; 32])).await;
+        let malformed = store_with_metadata(
+            &repo,
+            &plain,
+            dict(DIGEST_KEY, "ay", Value::Bytes(vec![0x11; 31])),
+        )
+        .await;
+        let disabled = ComposefsOptions {
+            verity: VerityPolicy::Disabled,
+        };
+        let want = repo
+            .export_composefs(&plain, &disabled, None)
+            .await
+            .unwrap();
+
+        for commit in [&wrong, &malformed] {
+            let (result, bytes) =
+                mount_export(&repo, commit, VerityPolicy::Disabled, &image_path).await;
+            assert_eq!(result.unwrap(), want.bytes.len() as u64, "commit {commit}");
+            assert_eq!(bytes, want.bytes, "commit {commit}");
+        }
     });
 }
 

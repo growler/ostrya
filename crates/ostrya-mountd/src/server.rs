@@ -1035,7 +1035,8 @@ fn errno_of(e: &std::io::Error) -> Errno {
 ///
 /// The failure of an image commit whose `/root.cfs` does not match the key
 /// of the commit names the commit, the field, and the image commit, and
-/// neither digest.
+/// neither digest. The failure of a built image whose digest is not the key
+/// of the commit names the commit, and neither digest.
 fn failure_of(e: repo::Error) -> Failure {
     match e {
         repo::Error::Repo(ostrya::Error::InvalidComposefsImage {
@@ -1053,6 +1054,13 @@ fn failure_of(e: repo::Error) -> Failure {
                 ),
             )
         }
+        repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch { commit, .. }) => Failure::new(
+            HelperCode::Repository,
+            format!(
+                "composefs image of commit {commit}: the built image does not match the key of \
+                 the commit"
+            ),
+        ),
         repo::Error::Sys { op, errno } => Failure::sys(HelperCode::Mount, op, errno),
         other => Failure::new(HelperCode::Repository, other.to_string()),
     }
@@ -1262,6 +1270,24 @@ mod tests {
         );
         assert!(!mismatch.text.contains(&"01".repeat(32)));
         assert!(!mismatch.text.contains(&"02".repeat(32)));
+
+        let built = failure_of(repo::Error::Repo(ostrya::Error::ComposefsDigestMismatch {
+            commit,
+            expected: [1; 32],
+            actual: [2; 32],
+        }));
+        assert_eq!(
+            built,
+            Failure::new(
+                HelperCode::Repository,
+                format!(
+                    "composefs image of commit {commit}: the built image does not match the key \
+                     of the commit"
+                ),
+            )
+        );
+        assert!(!built.text.contains(&"01".repeat(32)));
+        assert!(!built.text.contains(&"02".repeat(32)));
 
         let partial = invalid(ostrya::ComposefsImageDefect::Partial);
         let text = partial.to_string();

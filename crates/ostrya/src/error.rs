@@ -646,7 +646,9 @@ pub enum Error {
     /// `ostree.composefs.digest.v0` key of its commit.
     ///
     /// [`Repo::add_composefs_supplement`](crate::Repo::add_composefs_supplement)
-    /// gives this error and writes nothing.
+    /// gives this error and writes nothing. The build of an image for a mount
+    /// under [`VerityPolicy::Computed`](crate::VerityPolicy::Computed) also
+    /// gives it, after it writes the image.
     #[error(
         "composefs image of commit {commit}: the commit records the digest {}, the image has {}",
         crate::composefs::digest_hex(.expected),

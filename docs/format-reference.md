@@ -7617,7 +7617,9 @@ such an image can only be the attachment of A. The lookup uses the key for a
 supplement alone, and compares it with the digest of `/root.cfs`. For an
 attachment, the lookup does not read the key: the checksum chain from A to
 C, the tree of C, and `/root.cfs` binds the image to A. The lookup builds no
-image to check the key of A.
+image to check the key of A. The mount daemon also compares the key with
+the digest of a built image under `[ex-integrity] fsverity=yes`, as "The
+mount daemon protocol" states.
 
 The lookup of the image of A:
 
@@ -7740,9 +7742,10 @@ The codes of `Error`:
   mount.
 - 5, `repository`: the repository refuses the mount. Examples are a
   repository on FUSE, an `archive` repository, a commit that names no image
-  commit for op 1, an image commit with a defect, an image whose digest is
-  not the key, an image whose size is not a positive multiple of 4096
-  bytes, and a built image larger than the limit of the daemon.
+  commit for op 1, an image commit with a defect, an image commit or a
+  built image whose digest is not the key, an image whose size is not a
+  positive multiple of 4096 bytes, and a built image larger than the limit
+  of the daemon.
 - 6, `mount`: a system call of the mount failed.
 - 7, `internal`: the daemon failed for another reason.
 - 8, `timeout`: no message of the client in time, or a request that does
@@ -7827,9 +7830,24 @@ The checks of the daemon, in order:
    sealed with fs-verity, a process that can write it can change the image
    while it is mounted. The
    limit of the size of a built image does not apply to op 1.
-8. A built image larger than the limit of the daemon is `repository`. The
-   daemon computes the size before it writes the image. The default limit
-   is 104857600 bytes.
+8. For op 2, the daemon builds the image of the commit. A built image
+   larger than the limit of the daemon is `repository`. The daemon computes
+   the size before it writes the image. The default limit is 104857600
+   bytes.
+   - With `[ex-integrity] fsverity=yes`, the image takes the fs-verity
+     digest of each backing object from the kernel, and an object with no
+     seal is `repository`. If the commit carries the key, the daemon
+     computes the fs-verity digest of the image as it writes the image, and
+     compares the digest with the key. If the two are different, the
+     failure is `repository` with the text `composefs image of commit
+     <commit>: the built image does not match the key of the commit`. The
+     text holds neither digest. A key that is not a variant of type `ay`
+     with 32 bytes fails the request before the build, and the text is the
+     text of the library.
+   - With another value, the daemon does not compare the built image with
+     the key.
+   - For a commit with no key, the daemon builds and mounts the image with
+     no check of the image.
 
 The mount:
 

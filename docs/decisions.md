@@ -719,7 +719,9 @@ digests. For each other defect, also a supplement of a commit with no key
 and a `/root.cfs` with no seal under `fsverity=yes`, the reply is the text
 of the error of the library. A commit that names no image commit gets the
 reply `commit <commit> has no attachment or supplement composefs`, with the
-code `repository`.
+code `repository`. For a built image whose digest is not the key, the reply
+is `composefs image of commit <commit>: the built image does not match the
+key of the commit`, with the code `repository`, and holds neither digest.
 
 ### The mount helper
 
@@ -755,6 +757,9 @@ The helper selects its path with `ostrya_mount::is_privileged`:
   sends op 1, else op 2. A duplicate entry is left to the lookup of the
   daemon. The helper sends the commit checksum, so the bytes of the wire
   protocol do not change.
+
+The two paths share the build of an image and the comparison of its digest
+with the key.
 
 The source label of each mount is the commit checksum.
 
@@ -974,6 +979,8 @@ The key:
 - `checkout --composefs`, `Repo::export_composefs`, and
   `Repo::export_composefs_to` make no comparison with the key. The caller
   of `checkout --composefs` selects the verity option.
+- `Repo::export_composefs_for_mount` compares the key under
+  `VerityPolicy::Computed` alone.
 
 The lookup of the image of A:
 
@@ -1110,6 +1117,15 @@ The mount daemon:
   mounted. The daemon refuses an image whose size is 0 or not a multiple of
   4096 bytes, as the loop device reads the image in blocks of 4096 bytes.
   The limit of the size of a built image does not apply to op 1.
+- Op 2 builds the image of the commit. `mount.ostrya` sends op 2 for a
+  commit that names no image commit. If the commit carries the key and the repository sets `fsverity=yes`, the daemon
+  builds the image with the digests of the kernel, computes the fs-verity
+  digest of the image as it writes it, and compares the digest with the
+  key. A mismatch fails the mount. With `fsverity=no` or `maybe`, the built
+  image holds no digest of a file and cannot match the key, so the daemon
+  builds and mounts it with no comparison. A commit with no key gets the
+  build and the mount with no check. The author of the commit decides, and
+  no permission of the caller or of the admin is necessary.
 
 The key and the `ostree` command:
 
@@ -1143,6 +1159,12 @@ Accepted consequences:
   --add` refuses it. Such a commit mounts an attachment or a built image.
 - After a repository sets `fsverity=yes`, the lookup refuses each C whose
   `/root.cfs` the repository wrote with no seal.
+- With `fsverity=no` or `maybe`, a built image gets no check against the
+  key. A writer of the repository can change the mode, the owner, or the
+  xattrs of a loose object, and the built image shows the change.
+- A built image of a commit with no key gets no check under each
+  `fsverity` value, and has the same exposure. fs-verity seals the content
+  of a file. It does not seal the mode, the owner, or the xattrs.
 
 Rejected alternatives:
 

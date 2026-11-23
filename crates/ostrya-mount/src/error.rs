@@ -75,9 +75,10 @@ pub enum HelperCode {
     Access,
     /// The repository refuses the mount: a repository on FUSE, a mode that
     /// cannot be mounted, an absent image, a supplement image of a commit
-    /// that carries no composefs key, an image whose digest is not the key,
-    /// a `/root.cfs` with no fs-verity seal under `[ex-integrity]
-    /// fsverity=yes`, or a built image larger than the limit of the daemon.
+    /// that carries no composefs key, a supplement image or a built image
+    /// whose digest is not the key, a `/root.cfs` with no fs-verity seal
+    /// under `[ex-integrity] fsverity=yes`, or a built image larger than the
+    /// limit of the daemon.
     Repository,
     /// A system call of the mount failed.
     Mount,

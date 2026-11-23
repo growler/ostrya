@@ -54,7 +54,9 @@ repository or builds an image takes `ostrya` in its own manifest.
   checks of the image lookup. For a supplement, the lookup compares the
   digest of the image with the key of the commit.
 - `Helper::mount_built` mounts an image of a commit that the daemon
-  builds in memory.
+  builds in memory. Under `[ex-integrity] fsverity=yes`, the daemon
+  compares the digest of the built image with the key of the commit, if
+  the commit carries the key.
 - `Direct::unmount` and `Helper::unmount` unmount a composefs mount.
 - `is_privileged` tells if the process is root in the initial user
   namespace. Such a process mounts with `Direct`, and each other
@@ -95,6 +97,10 @@ mount namespace of the caller. The daemon runs as root:
   supplement, the lookup compares the digest of the image with the key of
   the commit. Under `[ex-integrity] fsverity=yes`, the lookup requires a
   sealed `/root.cfs`. The daemon does not check a signature of the commit.
+- For a built image under `[ex-integrity] fsverity=yes`, it compares the
+  fs-verity digest of the image with the key `ostree.composefs.digest.v0`
+  of the commit, if the commit carries the key. A digest other than the key
+  fails the request. Under `no` and `maybe`, it makes no comparison.
 - Each mount has `nosuid` and `nodev`. The EROFS layer takes the ID
   mapping of the user namespace of the request. User 0 of that user
   namespace mounts the top overlay in it: read-only, or read-write with an
@@ -125,10 +131,18 @@ daemon mounts the image of a supplement only if the commit carries the key
 `ostree.composefs.digest.v0` and the fs-verity digest of the image is the
 key. For an attachment, the checksum chain from the commit to `/root.cfs`
 binds the image to the commit, and the daemon does not compare the key.
-The checks guard against damage and against a writer of the repository
-other than the caller. They do not guard against the caller, who can
-write both the image commit and the commit. A refusal tells the caller if
-the image commit exists.
+Under `[ex-integrity] fsverity=yes`, the daemon mounts a built image of a
+commit that carries the key only if the fs-verity digest of the image is
+the key. Under `no` and `maybe`, the daemon does not compare a built image
+with the key. A writer of the repository can then change the mode, the
+owner, or the xattrs of a loose object, and the built image shows the
+change. A built image of a commit with no key gets no comparison under
+each value of `fsverity`, and has the same exposure. fs-verity seals the
+content of a file. It does not seal the mode, the owner, or the xattrs.
+The checks guard against damage and against a writer of the
+repository other than the caller. They do not guard against the caller,
+who can write both the image commit and the commit. A refusal tells the
+caller if the image commit exists.
 
 ## Verity
 
@@ -151,8 +165,11 @@ and the overlay mounts with `verity=off`.
   other value.
 - The daemon reads the key for each request of `Helper`. With `yes`, an
   image that it builds carries the digest that the kernel holds for each
-  object, and an object with no seal fails the build. With `maybe` and
-  `no`, an image that it builds carries no digest.
+  object, and an object with no seal fails the build. If the commit carries
+  the commit key `ostree.composefs.digest.v0`, the daemon compares the
+  fs-verity digest of the built image with the commit key, and refuses an
+  image whose digest is another value. With `maybe` and `no`, an image that
+  it builds carries no digest, and the daemon makes no comparison.
 
 ## Repository modes
 

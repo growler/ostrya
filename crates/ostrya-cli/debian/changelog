@@ -1,8 +1,14 @@
-ostrya (0.15.0) UNRELEASED; urgency=medium
+ostrya (0.15.0) unstable; urgency=medium
 
-  * New upstream release.
+  * composefs-image --add refuses a commit that carries no
+    ostree.composefs.digest.v0, and writes no object.
+  * With [ex-integrity] fsverity=yes, composefs-image --add checks the
+    fs-verity seal of /root.cfs. It replaces a supplement whose
+    /root.cfs has no seal, unless the digest of the file is the key. It
+    refuses the commit if the repository holds the /root.cfs of the
+    built image commit with no seal.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:19:17 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:32:20 +0100
 
 ostrya (0.14.0) unstable; urgency=medium
 

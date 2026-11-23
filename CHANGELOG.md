@@ -12,6 +12,60 @@ first.
 An item that starts with `Breaking:` needs a change in code or config that uses
 the release before it. An item that starts with `Fix:` corrects a defect.
 
+## [0.15.0] - 2026-11-23
+
+### Library
+
+- Breaking: `Repo::open_composefs_image` compares the key
+  `ostree.composefs.digest.v0` with the image for a supplement `composefs`
+  alone. A supplement of a commit that carries no key fails the lookup with
+  `ComposefsImageDefect::NoKey`. For an attachment `composefs`, the lookup
+  reads no key. The checksum chain from the commit to `/root.cfs` binds the
+  image to the commit.
+- Breaking: under `[ex-integrity] fsverity=yes`, `Repo::open_composefs_image`
+  requires an fs-verity seal on the object of `/root.cfs`, with SHA-256,
+  4096-byte blocks, no salt, and the full size of the file. An object with no
+  such seal fails the lookup with `ComposefsImageDefect::NotSealed`.
+- Breaking: `ComposefsImageDefect` is `#[non_exhaustive]` and has the variants
+  `NoKey` and `NotSealed`.
+- Breaking: `Repo::add_composefs_supplement` refuses a commit that carries no
+  key `ostree.composefs.digest.v0` with `Error::InvalidInput`, before the
+  build. `Repo::commit_add_composefs_metadata` stages a commit that carries the
+  key.
+- Under `[ex-integrity] fsverity=yes`, `Repo::add_composefs_supplement`
+  replaces a supplement whose `/root.cfs` has no seal and whose digest is not
+  the key. It refuses the commit with `ComposefsImageDefect::NotSealed` if the
+  digest of such a file is the key, or if the repository holds the
+  `/root.cfs` of the built image commit with no seal.
+- The key `ostree.composefs.digest.v0` records the fs-verity digest of the
+  image with no hook, which `Transaction::composefs_digest` gives. A commit
+  with a labeled image records this digest, or carries no key. The module
+  documentation of `ostrya::composefs`, "Labeled images", gives the steps.
+
+### CLI
+
+- Breaking: `ostrya composefs-image --add REV` refuses a commit that carries
+  no `ostree.composefs.digest.v0` at exit 1, and writes no object. The error
+  text names `commit --generate-composefs-metadata` and
+  `commit --generate-composefs`, which write a commit with the key.
+- With `[ex-integrity] fsverity=yes`, `ostrya composefs-image --add` checks
+  the fs-verity seal of `/root.cfs`. It replaces a supplement whose
+  `/root.cfs` has no seal, unless the digest of the file is the key. It
+  refuses REV if the repository holds the `/root.cfs` of the built image
+  commit with no seal. In `archive` mode, the seal checks do not apply.
+- Breaking: `mount.ostrya` and `ostrya-mountd` mount the image of a supplement
+  `composefs` only if the commit carries `ostree.composefs.digest.v0` and the
+  fs-verity digest of `/root.cfs` is the value of the key. They do not compare
+  the key for an attachment `composefs`. With `[ex-integrity] fsverity=yes`,
+  the object of `/root.cfs` must have an fs-verity seal. The daemon refuses a
+  defect with the code `repository`.
+- With `[ex-integrity] fsverity=yes`, `mount.ostrya` and `ostrya-mountd`
+  compare the fs-verity digest of a built image with
+  `ostree.composefs.digest.v0`, if the commit carries the key. The daemon
+  refuses a mismatch with the code `repository` and the text `composefs image
+  of commit <checksum>: the built image does not match the key of the
+  commit`. With another value of `fsverity`, they make no comparison.
+
 ## [0.14.0] - 2026-11-22
 
 ### Library

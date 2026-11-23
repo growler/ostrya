@@ -1,8 +1,14 @@
-ostrya-mountd (0.15.0) UNRELEASED; urgency=medium
+ostrya-mountd (0.15.0) unstable; urgency=medium
 
-  * New upstream release.
+  * mount.ostrya and the daemon mount the image of a supplement
+    composefs only if the commit carries ostree.composefs.digest.v0 and
+    the digest of /root.cfs is the key. They do not compare the key for
+    an attachment composefs.
+  * With [ex-integrity] fsverity=yes, the object of /root.cfs must have
+    an fs-verity seal. If the commit carries ostree.composefs.digest.v0,
+    the digest of a built image must be the key.
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:19:17 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 23 Nov 2026 13:32:20 +0100
 
 ostrya-mountd (0.14.0) unstable; urgency=medium
 
